@@ -46,6 +46,7 @@ Final render: markers hidden, tables as a grid, images as previews. The third mo
 
 - **One file for all.** All modes edit the same raw md string; save writes exactly it, without normalization. Switching a mode does not touch the bytes.
 - **Edit / Preview is an orthogonal axis.** The **Preview** button in the topbar, in any mode, shows the note's final HTML render (the same one as in read mode), without saving. "How I work" (Source/WYSIWYM) and "edit/view" (Edit/Preview) are independent.
+- **View blocks follow that same split.** Source/WYSIWYM always edits the raw `nota` fence. Preview mounts the same inline view runtime as the current reader, but a draft is read-only and has no saved-note mutation target. Revision and deleted-note surfaces deliberately show frozen raw source rather than executing today's corpus against historical configuration.
 - **The agent sees the same body.** An MCP agent reads and writes the same markdown as a human (P4) — the writing mode has nothing to do with it, it is purely client-side.
 
 ## Routed Role and Skill authoring (#309)

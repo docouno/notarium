@@ -1,13 +1,23 @@
 import { type EditorView } from '@codemirror/view'
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import type { ParsedViewBlock } from '@notarium/core'
 import { CodeEditor, type EditorStatsReport } from '../../core/CodeEditor'
 import { ContextMenu, type MenuItem } from '../../core/ContextMenu'
 import { IconCrosshair, IconTypewriter } from '../../core/Icons'
 import { IconToggle } from '../../core/IconToggle'
+import { MarkdownDocument } from '../../core/MarkdownDocument'
 import { cx } from '../../libs/cx/cx'
 import { textStats, type TextStats } from '../../libs/editorStats'
 import { type EditorBinding } from '../../libs/hotkeys'
-import { renderMarkdown } from '../../libs/markdown/markdown'
+import { renderMarkdown, renderMarkdownDocument } from '../../libs/markdown/markdown'
 import { useMarkdownEnhance } from '../../libs/markdown/useMarkdownEnhance'
 import styles from './EditorBody.module.scss'
 
@@ -119,6 +129,7 @@ export const EditorBody = ({
   onToggleFocus,
   onToggleTypewriter,
   editorKeys,
+  renderViewBlock,
 }: {
   editor: EditorBodyBinding
   preview: boolean
@@ -133,6 +144,7 @@ export const EditorBody = ({
   /** Active editor keymap (#30), passed down from the layout so editor shortcuts —
    *  formatting + the focus/typewriter toggles — follow the user's preset/overrides. */
   editorKeys?: EditorBinding[]
+  renderViewBlock?: (block: ParsedViewBlock) => ReactNode
 }) => {
   const viewRef = useRef<EditorView | null>(null)
   const [stats, setStats] = useState<EditorStatsReport>(() => ({
@@ -168,10 +180,16 @@ export const EditorBody = ({
   }, [preview])
   // Only render when previewing — avoids a wasted marked+DOMPurify pass on every
   // edit-session open (previewSrc starts '').
-  const previewHtml = useMemo(
-    () => (preview ? renderMarkdown(previewSrc) : ''),
-    [preview, previewSrc],
+  const previewDocument = useMemo(
+    () =>
+      preview
+        ? renderViewBlock
+          ? renderMarkdownDocument(previewSrc)
+          : { html: renderMarkdown(previewSrc), views: undefined }
+        : { html: '', views: undefined },
+    [preview, previewSrc, renderViewBlock],
   )
+  const previewHtml = previewDocument.html
   // Preview is the same rendered view as the reader (editor.md invariant), so it gets
   // the same post-render enhancements: copy buttons, table fades, mermaid diagrams
   // (#236). The ref is on the conditionally-mounted preview div — null while editing,
@@ -223,11 +241,13 @@ export const EditorBody = ({
             />
           </div>
           {preview && (
-            <div
-              ref={previewRef}
+            <MarkdownDocument
+              rootRef={previewRef}
               className="markdown"
               data-testid="editor-preview"
-              dangerouslySetInnerHTML={{ __html: previewHtml }}
+              html={previewHtml}
+              viewBlocks={previewDocument.views?.blocks}
+              renderViewBlock={renderViewBlock}
             />
           )}
         </div>

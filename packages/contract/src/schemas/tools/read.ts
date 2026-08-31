@@ -1,5 +1,12 @@
 import { z } from 'zod'
-import { IsoTimestampSchema, NoteClassSchema, prototypeSafeRecord } from '../primitives'
+import { VIEW_AGENT_ROW_MAX } from '../../consts/views'
+import {
+  DurableScalarSchema,
+  IsoTimestampSchema,
+  NoteClassSchema,
+  prototypeSafeRecord,
+} from '../primitives'
+import { ViewManifestItemSchema, ViewRowSchema } from '../rest/views'
 import { locationFields, sessionField } from './_fields'
 import {
   ProjectHandleSchema,
@@ -34,6 +41,7 @@ export const SearchHitSchema = z.object({
   class: NoteClassSchema.optional(),
   score: z.number().optional(),
   modifiedAt: IsoTimestampSchema,
+  viewType: DurableScalarSchema.optional(),
 })
 
 export const SearchOutputSchema = z.object({ results: z.array(SearchHitSchema) })
@@ -64,6 +72,20 @@ export const NoteLinkSchema = z.object({
   relation: z.string(),
 })
 
+export const GetNoteViewSchema = ViewManifestItemSchema.extend({
+  rows: z.array(ViewRowSchema).max(VIEW_AGENT_ROW_MAX).optional(),
+  rowsTruncated: z.literal(true).optional(),
+})
+
+const ViewRowPublishedSchema = ViewRowSchema.extend({
+  fields: z.record(z.string(), ViewRowSchema.shape.group.unwrap()).optional(),
+})
+
+const GetNoteViewPublishedSchema = ViewManifestItemSchema.extend({
+  rows: z.array(ViewRowPublishedSchema).max(VIEW_AGENT_ROW_MAX).optional(),
+  rowsTruncated: z.literal(true).optional(),
+})
+
 /** get_note's full-note payload. `frontmatter` is the raw free-form metadata map,
  *  orthogonal to the mount-derived `class`; `outline`/`links` ride only on a
  *  `detailed` read. canon: docs/mcp-gateway.md#tools */
@@ -84,12 +106,16 @@ export const GetNoteOutputSchema = z.object({
       incoming: z.array(NoteLinkSchema),
     })
     .optional(),
+  /** Semantic view projection in authored order. Raw nota config remains in content. */
+  views: z.array(GetNoteViewSchema).optional(),
+  viewRowsTruncated: z.literal(true).optional(),
 })
 
 /** JSON-schema publication twin: prototype safety is a runtime parsing concern,
  * while MCP discovery needs a representable open-object schema. */
 export const GetNotePublishedOutputSchema = GetNoteOutputSchema.extend({
   frontmatter: z.record(z.string(), z.unknown()),
+  views: z.array(GetNoteViewPublishedSchema).optional(),
 })
 
 /** Tool `recall`: assemble a token-budgeted context bundle around a query (seed
@@ -139,6 +165,8 @@ export type GetNoteOutput = z.infer<typeof GetNoteOutputSchema>
 export type OutlineEntry = z.infer<typeof OutlineEntrySchema>
 
 export type NoteLink = z.infer<typeof NoteLinkSchema>
+
+export type GetNoteView = z.infer<typeof GetNoteViewSchema>
 
 export type RecallInput = z.infer<typeof RecallInputSchema>
 

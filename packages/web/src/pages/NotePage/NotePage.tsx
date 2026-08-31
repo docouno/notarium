@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router'
 import { NOTE_CLASS } from '@notarium/contract/enums'
 import { directoryOf, isFolderPageNote } from '@notarium/core'
@@ -9,6 +9,11 @@ import { FolderChildrenSummary } from '../../composers/FolderChildrenSummary'
 import { type NoteError, useNotes } from '../../composers/NotesProvider'
 import { useSpace } from '../../composers/SpaceProvider'
 import { Splash } from '../../composers/Splash'
+import {
+  useViewRefreshRevision,
+  VIEW_READER_REGISTRY,
+  ViewRuntime,
+} from '../../composers/ViewRuntime'
 import { Button } from '../../core/Button'
 import { useDialog } from '../../core/Dialog'
 import { IconDocPage, IconSync, IconX } from '../../core/Icons'
@@ -43,6 +48,20 @@ export const NotePage = () => {
   const navigate = useNavigate()
   const location = useLocation()
   const [trashBusy, setTrashBusy] = useState(false)
+  const viewRefresh = useViewRefreshRevision()
+  const canManageOpenNote =
+    canWrite ||
+    (note?.class === NOTE_CLASS.skill && personalSpace != null && note.space === personalSpace.slug)
+  const renderViewBlock = useCallback(
+    (block: Parameters<typeof ViewRuntime>[0]['block']) => (
+      <ViewRuntime
+        block={block}
+        mode={canManageOpenNote ? 'current-writer' : 'current-reader'}
+        refreshKey={viewRefresh}
+      />
+    ),
+    [canManageOpenNote, viewRefresh],
+  )
 
   // Canonical URL (#100 phase 1, #169): once the note is in hand, replace a bare/stale/
   // wrong slug tail with the note's current slug and the correct namespace:
@@ -107,9 +126,7 @@ export const NotePage = () => {
   if (!note) {
     return null
   }
-  const canManageNote =
-    canWrite ||
-    (note.class === NOTE_CLASS.skill && personalSpace != null && note.space === personalSpace.slug)
+  const canManageNote = canManageOpenNote
 
   // A DELETED note (#79) opened by link: its last state, read-only, under a
   // "deleted" banner with Restore / Delete forever. The page owns the transport
@@ -198,6 +215,8 @@ export const NotePage = () => {
       // A tag chip → the tag's feed (#109), SPA-navigated within this space.
       onOpenTag={(tag) => navigate(feedTagRoute(space, tag))}
       afterContent={folderSummary}
+      renderViewBlock={renderViewBlock}
+      viewPresentation={(type) => VIEW_READER_REGISTRY.get(type)?.presentation ?? 'document'}
     />
   )
 }

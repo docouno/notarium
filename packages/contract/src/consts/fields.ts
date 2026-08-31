@@ -16,10 +16,11 @@ export const PROJECTED_FIELD_KEYS = [
   'aliases',
   'slug',
   'created',
+  'view',
 ] as const
 
 /** Protected keys the fields column does carry — filterable, never declarable. */
-export const INDEXED_PROTECTED_FIELD_KEYS = ['type', 'summary', 'muted', 'view'] as const
+export const INDEXED_PROTECTED_FIELD_KEYS = ['type', 'summary', 'muted'] as const
 
 /** Every key a declaration or a field write is refused for. */
 export const PROTECTED_FIELD_KEYS = [

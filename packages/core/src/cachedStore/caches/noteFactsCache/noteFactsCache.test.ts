@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { NoteMeta } from '../../../knowledgeStore'
 import { estimateTokens } from '../../../libs/markdown'
+import { semanticViewContent } from '../../../views'
 import { NoteFactsCache } from './noteFactsCache'
 
 const meta = (title = 'Fallback'): NoteMeta => ({
@@ -35,6 +36,27 @@ describe('NoteFactsCache', () => {
       muted: true,
       bodyTokens: estimateTokens('Body with [[Link]] and **markup**.'),
       noteClass: 'agent-memory',
+    })
+  })
+
+  it('keeps the note class while excluding view config from eager facts', () => {
+    const cache = new NoteFactsCache({ getMeta: () => meta() })
+    const body = [
+      'Visible prose.',
+      '',
+      '```nota',
+      'version: 1',
+      'source: { kind: notes, scope: space }',
+      'views: [{ name: Board, type: board }]',
+      '```',
+    ].join('\n')
+    const semantic = semanticViewContent(body)
+
+    expect(cache.setFromRaw('n', `# Board\n\n${body}`)).toBe(true)
+    expect(cache.get('n')).toMatchObject({
+      noteClass: 'agent-memory',
+      snippet: 'Visible prose.',
+      bodyTokens: estimateTokens(semantic),
     })
   })
 

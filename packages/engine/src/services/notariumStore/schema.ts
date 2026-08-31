@@ -316,6 +316,67 @@ CREATE TRIGGER notes_au AFTER UPDATE OF title, body, tags ON notes BEGIN
 END;
 `
 
+/** View documents split raw file body from the prose projection consumed by FTS/vector
+ * search and add one dedicated discovery marker. Rebuilding only the FTS table keeps
+ * `notes.rowid` and its vector rows stable; the fingerprint wipe then source-verifies
+ * every file and changes a vector hash only when its semantic prose actually changed.
+ * canon: docs/search.md#how-it-is-indexed-write-path */
+const VIEW_DOCUMENT_SCHEMA = `
+ALTER TABLE notes ADD COLUMN semantic_body TEXT NOT NULL DEFAULT '';
+ALTER TABLE notes ADD COLUMN view_type TEXT;
+UPDATE notes SET semantic_body = body;
+CREATE INDEX IF NOT EXISTS idx_notes_view_type ON notes(view_type);
+
+DROP TRIGGER IF EXISTS notes_ai;
+DROP TRIGGER IF EXISTS notes_ad;
+DROP TRIGGER IF EXISTS notes_au;
+DROP TABLE IF EXISTS notes_fts;
+
+CREATE VIRTUAL TABLE notes_fts USING fts5(
+  title, semantic_body, tags,
+  content='notes',
+  content_rowid='rowid'
+);
+INSERT INTO notes_fts(notes_fts) VALUES('rebuild');
+
+CREATE TRIGGER notes_ai AFTER INSERT ON notes BEGIN
+  INSERT INTO notes_fts(rowid, title, semantic_body, tags)
+  VALUES (new.rowid, new.title, new.semantic_body, new.tags);
+END;
+
+CREATE TRIGGER notes_ad AFTER DELETE ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, title, semantic_body, tags)
+  VALUES ('delete', old.rowid, old.title, old.semantic_body, old.tags);
+END;
+
+CREATE TRIGGER notes_au AFTER UPDATE OF title, semantic_body, tags ON notes BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, title, semantic_body, tags)
+  VALUES ('delete', old.rowid, old.title, old.semantic_body, old.tags);
+  INSERT INTO notes_fts(rowid, title, semantic_body, tags)
+  VALUES (new.rowid, new.title, new.semantic_body, new.tags);
+END;
+
+DELETE FROM file_fingerprints;
+`
+
+/** SQLite's UPDATE OF predicate observes columns named by a statement, not whether
+ * their values changed. Keep the full row update race-safe, but make identical
+ * FTS inputs a trigger no-op. This is a trigger-only forward step: no rowid,
+ * fingerprint, FTS rebuild or vector invalidation moves. */
+const FTS_VALUE_CHANGE_TRIGGER_SCHEMA = `
+DROP TRIGGER IF EXISTS notes_au;
+CREATE TRIGGER notes_au AFTER UPDATE OF title, semantic_body, tags ON notes
+WHEN old.title IS NOT new.title
+  OR old.semantic_body IS NOT new.semantic_body
+  OR old.tags IS NOT new.tags
+BEGIN
+  INSERT INTO notes_fts(notes_fts, rowid, title, semantic_body, tags)
+  VALUES ('delete', old.rowid, old.title, old.semantic_body, old.tags);
+  INSERT INTO notes_fts(rowid, title, semantic_body, tags)
+  VALUES (new.rowid, new.title, new.semantic_body, new.tags);
+END;
+`
+
 /** The ladder. INDEX_MIGRATIONS[0] is the FROZEN baseline — the meta+notes+FTS schema
  *  as it shipped at legacy version '7' (note_type included). A fresh index replays it
  *  from 0; a legacy '7' index replays it too, but every statement is CREATE IF NOT
@@ -336,6 +397,8 @@ export const INDEX_MIGRATIONS: readonly IndexMigration[] = [
   { sql: DOCUMENT_PROOF_CONTEXT_SCHEMA },
   { sql: NOTE_FIELDS_SCHEMA },
   { sql: FTS_UPDATE_TRIGGER_SCHEMA },
+  { sql: VIEW_DOCUMENT_SCHEMA },
+  { sql: FTS_VALUE_CHANGE_TRIGGER_SCHEMA },
 ]
 
 /** The current ladder length — the integer version an index converges to. */

@@ -117,7 +117,7 @@ describe('MetaPanel field rows', () => {
     expect(container.querySelector('[data-field="keeper"]')?.textContent).not.toContain(
       'Empty value',
     )
-    expect(container.querySelector('[data-field="view"] input')).toBeNull()
+    expect(container.querySelector('[data-field="view"]')).toBeNull()
     expect(container.textContent).not.toContain('Read-only metadata')
     expect(container.querySelector('[data-field="Folder"]')).toBeNull()
     const rows = [...container.querySelectorAll('[data-field]')].map((row) =>
@@ -133,7 +133,7 @@ describe('MetaPanel field rows', () => {
     const openRows = [
       ...container.querySelectorAll('[data-testid="undeclared-fields"] [data-field]'),
     ].map((element) => element.getAttribute('data-field'))
-    expect(openRows).toEqual(['broken', 'reviewers', 'keeper', 'view', 'large'])
+    expect(openRows).toEqual(['broken', 'reviewers', 'keeper', 'large'])
   })
 
   it('offers no field mutation affordance in read mode', async () => {

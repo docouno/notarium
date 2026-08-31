@@ -3,7 +3,7 @@ import { type ReactNode } from 'react'
 // Minimal line icons (24x24, currentColor) — keeps the bundle dependency-free.
 // `className` is forwarded to the <svg> so callers can style/animate the glyph
 // itself (e.g. rotating a chevron via a `.open` class on expand).
-type IconProps = { size?: number; className?: string }
+export type IconProps = { size?: number; className?: string }
 
 const S = ({
   children,
@@ -39,6 +39,18 @@ export const IconDoc = (p: IconProps) => (
   <S {...p}>
     <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
     <path d="M14 3v5h5" />
+  </S>
+)
+export const IconBoard = (p: IconProps) => (
+  <S {...p}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M9 4v16M15 4v16M5.5 8h1M11.5 11h1M17.5 7h1" />
+  </S>
+)
+export const IconView = (p: IconProps) => (
+  <S {...p}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="M7 8h10M7 12h7M7 16h5" />
   </S>
 )
 // Download (Lucide `download`) — export-to-disk affordance (#105).

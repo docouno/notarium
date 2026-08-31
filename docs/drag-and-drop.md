@@ -12,6 +12,8 @@ Key files (paths are post-#19 monorepo layout):
 - `packages/web/src/core/Modal/` + `packages/web/src/core/Dialog/` — the modal primitive and the
   app-wide `useDialog().confirm()` system that replaced native `confirm()` for deletes
 - `packages/web/src/libs/dnd/dnd/dnd.ts` — drag payload + `canDropInto` rules
+- `packages/web/src/widgets/Board/BoardColumn.tsx` — single-note board gap/drop decision;
+  persisted semantics are in [views](views.md#board-move)
 - `packages/web/src/libs/tree/tree/tree.ts` — `buildTree` (flat note list → nested folder/file tree)
 - `packages/web/src/composers/useNoteActions/` (+ `NotesProvider`/`EditingProvider`) — `moveItem`,
   `renameItem`, `removeNote`, `removeFolder`, `duplicateNote`, `openNote`, routing/reveal wiring
@@ -166,6 +168,40 @@ which travels with the move). Both reach the engine's `move` (folders with
   changes it; the reload refreshes the path metadata and points `nav` at the new folder
   (reveal). No re-resolution by title, no re-routing.
 
+### Board cards use the payload, not the folder mutation <a id="board-dnd"></a>
+
+The board is a separate semantic drop surface over the same `DragNoteItem`/`DRAG_MIME` carrier.
+It consumes and stops the event inside a board column, then calls `boardMove`; it never falls
+through to the tree's folder destination. Board v1 accepts exactly one note. A selected tree set
+with two or more items gets `dropEffect:none`, no indicator and no mutation — it is not reduced to
+one arbitrary member.
+
+The column list resolves one before/after gap from pointer Y against card midpoints after first
+removing the dragged card from that column's candidate sequence. It therefore owns cards, empty area
+and inter-row space as one continuous drop surface instead of delegating correctness to row events.
+The original gap is an explicit no-op, including the only gap in a one-card column: no placeholder and
+no request. The active payload and last target decision are synchronous slots; cosmetic state may lag.
+Exactly one shared card-shaped insertion placeholder occupies a real destination gap, using the same
+neutral fill/outline language as Explorer, so adjacent rows never publish competing edge lines and a
+column never gets a full drop wash. A release commits the stored target, never recomputes from the
+final event. The whole card is the drag surface; its title link has `draggable=false` so dragging text
+does not produce a browser link preview, and no grip/Move field adds card noise. The card relocates
+optimistically at release; the server result reconciles only the affected loaded columns without
+clearing the board into skeletons.
+A pre-effect failure restores the local snapshot, while partial/unknown outcomes retain explicit
+warnings and converge through stale-while-revalidate. Live announcements remain part of the surface
+contract.
+
+Keyboard movement is the same semantic surface without resting card chrome. A writer focuses the
+card itself and presses `Space` to enter move mode. `ArrowLeft`/`ArrowRight` select a column and
+scroll/load it before commit; `ArrowUp`/`ArrowDown` select a loaded gap. The one neutral insertion
+placeholder is shared with pointer DnD. `Space` commits that exact target through `boardMove`, while
+`Escape` cancels and retains focus. The title link keeps ordinary link keys, and readers/drafts expose
+no move mode. If refresh removes the active card or makes the board read-only, the mode cancels and
+returns focus to a reachable card/board surface. Structural source columns that are not writable
+destinations can still start keyboard movement into a writable column. There is deliberately no grip
+icon, permanent Move action, select or field.
+
 ### Post-mutation refresh is **narrow** (#94, easy to regress back to broad)
 - Every tree mutation (`moveItem`/`renameItem`/`removeNote`/`removeFolder`/`duplicateNote`,
   plus the editor save) refreshes **only the folders it touches** — `refreshFolders(paths)` in
@@ -308,7 +344,7 @@ callbacks. `useNoteActions` and the providers own the actions.
 
 ## 7. Native HTML5 DnD mechanics (matters for tests)
 
-### Responsive-drop recipe — build it into EVERY drag surface (don't re-explain it case by case)
+### Responsive-drop recipe — build it into EVERY drag surface (don't re-explain it case by case) <a id="responsive-drop"></a>
 
 Native HTML5 DnD has three traps that each read to a user as "the drop didn't work / I have to
 go slow and hold." Every drag surface we add (tree move, list reorder, external-file import,

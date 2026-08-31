@@ -309,6 +309,7 @@ export const useFeedState = () => {
           // Warm previews ride the window inline; cold ones stay null and the
           // cards batch them through POST /api/previews (services/previews).
           preview: true,
+          viewSummary: true,
           // The folder facet (#93/#109): keep notes under any selected subtree (OR).
           ...(includeList.length ? { folders: includeList } : {}),
           // The tag filter (#109): OR/union over the selected set, server-applied.

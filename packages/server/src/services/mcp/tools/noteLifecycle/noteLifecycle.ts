@@ -7,7 +7,13 @@ import {
   type MoveNoteInput,
   type RenameNoteInput,
 } from '@notarium/contract/tools'
-import { editNote } from '@notarium/core'
+import {
+  applyEdit,
+  editNote,
+  parseViewDocument,
+  patchViewConfig,
+  sameViewCarriers,
+} from '@notarium/core'
 
 import { safeRelAddress } from '../../../../libs/relPath'
 import { prepareFieldWrite } from '../../../fields'
@@ -19,7 +25,7 @@ import { writeAttributionOf } from '../../helpers/writeAttribution'
 import { isUnsafeMcpFieldKey, sanitizeText } from '../../sanitize'
 
 export const handleEditNote: Handler = async (ctx, rawArgs) => {
-  const { ref, operation, content, fields, section, find, versionToken, idempotencyKey } =
+  const { ref, operation, content, fields, view, section, find, versionToken, idempotencyKey } =
     rawArgs as EditNoteInput
   const hasOperation = operation !== undefined
   const hasContent = content !== undefined
@@ -33,8 +39,11 @@ export const handleEditNote: Handler = async (ctx, rawArgs) => {
   if (hasOperation !== hasContent) {
     throw new ToolFailure('`operation` and `content` must be provided together')
   }
-  if (!hasOperation && fieldKeys.length === 0) {
-    throw new ToolFailure('provide an operation/content pair, at least one field, or both')
+  if (view && (hasOperation || fieldKeys.length > 0)) {
+    throw new ToolFailure('a structural view patch cannot be combined with body or field edits')
+  }
+  if (!hasOperation && fieldKeys.length === 0 && !view) {
+    throw new ToolFailure('provide an operation/content pair, at least one field, or a view patch')
   }
   // Set inside the run; stays undefined on an idempotency replay (run skipped) —
   // writeEcho omits path/space on a skip anyway.
@@ -62,6 +71,58 @@ export const handleEditNote: Handler = async (ctx, rawArgs) => {
       const fieldsUnquoted = fieldPatch
         ? await prepareFieldWrite(ctx.fieldSchemaStore, hit.space, fieldPatch)
         : undefined
+
+      if (view) {
+        const currentToken = hit.note.versionToken
+
+        if (!currentToken) {
+          throw new ToolFailure('this view document has no writable version token')
+        }
+        const parsed = parseViewDocument(hit.note.content, {
+          documentId: hit.noteId,
+          versionToken: currentToken,
+        })
+        let patched: ReturnType<typeof patchViewConfig>
+
+        try {
+          patched = patchViewConfig(hit.note.content, parsed, view.viewRef, view)
+        } catch (error) {
+          throw new ToolFailure((error as Error).message || 'view patch failed')
+        }
+        const r = await hit.store.write(
+          {
+            originalId: hit.noteId,
+            title: hit.note.title ?? '',
+            content: patched.content,
+            versionToken: versionToken ?? currentToken,
+            ...(patched.viewType !== undefined ? { viewType: patched.viewType } : {}),
+            derivedContentUnchanged: true,
+            ...writeAttributionOf(ctx),
+          },
+          mcpNoteMutationOptions,
+        )
+
+        return {
+          noteId: r.id ?? hit.noteId,
+          versionToken: r.versionToken ?? '',
+          filePath: r.filePath,
+        }
+      }
+      if (hasOperation) {
+        const next = applyEdit(hit.note.content, {
+          noteId: hit.noteId,
+          operation,
+          content,
+          section,
+          find,
+        })
+
+        if (!sameViewCarriers(hit.note.content, next)) {
+          throw new ToolFailure(
+            'generic text editing cannot structurally change `nota` view blocks; use `edit_note.view` with a fresh `viewRef`',
+          )
+        }
+      }
       // canon: docs/contract.md#cas
       const r = await editNote(
         hit.store,
@@ -94,6 +155,7 @@ export const handleEditNote: Handler = async (ctx, rawArgs) => {
   const changes = [
     ...(operation ? [operation] : []),
     ...(fieldKeys.length ? [`fields: ${fieldKeys.map(sanitizeText).join(', ')}`] : []),
+    ...(view ? ['view'] : []),
   ].join('; ')
   const markdown = `Edited note \`${result.noteId}\` (${changes})${wasHit ? ' — idempotent replay, no change' : ''}.`
   return { markdown, structured }

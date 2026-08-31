@@ -44,7 +44,7 @@ space-id — the consistency invariants from the task statement fall out «for f
 2. **Cases** (`test/cases/cases/`) — they **compose** fragments + structure + activity
    (they do not inline content). Reader cases are built FROM the corpus and auto-grow
    together with it.
-3. **Axes + coverage matrix** (`axes.ts`, `coverage.ts`) — 21 product axes, each tied to
+3. **Axes + coverage matrix** (`axes.ts`, `coverage.ts`) — 22 product axes, each tied to
    surfaces + a canon doc; cases tag `axes`. `make seed-coverage` prints the matrix; the
    coverage test fails on a gap.
 4. **Appliers** — `caseToFixture` (fake) and `scripts/seed.ts` (real). The case model is
@@ -121,6 +121,13 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 | `fields` | a shared writer/reader field lab plus the authored-frontmatter corpus and real schema: all six types, stable enum labels/colors, semantic palette, five uncapped `card:true`, exact list scalar ` Doe, Jane `, day/moment, empty/mismatch/protected/open-world and every indexed cap state, including primary Type outside the blob. Three sibling spaces carry exact future/form/structural `schema.yaml` states. Both fake and real appliers materialize valid and raw schema resources without hand preparation | fields, auth |
 | `fields-scale` | 10000 notes with twelve author keys each (ten scalars and two lists) — the corpus the snapshot's field projection is measured on by `make bench-fields-snapshot`, and the one the ladder's re-derivation is priced on by `FIELDS_BACKFILL_CASE=fields-scale npx vitest run test/integration/fieldsBackfill.test.ts` (that gate namespaces its knobs on purpose — a bare `CASE` exported for the seed CLI must not steer a test `npm test` sweeps up) | fields, scale |
 
+**View documents and boards:**
+
+| Case | About | Axes |
+|---|---|---|
+| `views` | writer/reader board project: declared zero-count colored columns, observed/absent/empty/unreadable/rankless cards, an enum `card:true` color chip omitted from authored view fields, two boards with independent ranks, unknown secondary reader, duplicate/count/byte/resource and unsafe-YAML carrier states, missing/mismatch/stale markers, exact CRLF/comment witness, prose-only and config-only search tokens | views, fields, auth, search |
+| `views-scale` | 10000 task notes, 10 columns, 50 view documents over one snapshot, a 9900-line JSONL rank scalar and deterministic rankless tail; `SCALE` scales only task population | views, scale |
+
 **The last three states of `fields` are sized FROM `FIELDS_BLOB_BYTE_CAP`, never against it.**
 The cap-overflow notes carry twice the cap's worth of key names, computed in the case rather
 than typed in, so retuning the cap retunes the corpus with it. Written the other way round —
@@ -193,10 +200,10 @@ Normally each applier derives a note's physical identity for itself — the fake
 
 ## Axes and coverage
 
-21 axes (`axes.ts`): `content`, `structure`, `folder-page`, `activity`, `history`,
-`trash`, `identity`, `search`, `graph`, `agent-memory`, `note-classes`, `import`,
-`jobs`, `scale`, `auth`, `favorites`, `agent-audit`, `agent-sessions`, `agent-roles`,
-`fields`, `providers`. Each is tied to surfaces + canon docs.
+22 axes (`axes.ts`): `content`, `structure`, `folder-page`, `activity`, `history`,
+`trash`, `identity`, `search`, `graph`, `agent-memory`, `agent-audit`,
+`agent-sessions`, `agent-roles`, `note-classes`, `import`, `jobs`, `scale`, `auth`,
+`fields`, `views`, `favorites`, `providers`. Each is tied to surfaces + canon docs.
 
 ```
 make seed-coverage      # axis×case + feature×fragment matrix + gaps
@@ -215,6 +222,8 @@ make seed CASE=providers                            # provider management/consen
 make seed CASE=providers-disabled                   # populated DB, served capability off
 make provider-scale-gate                            # 10k provider startup/read/maintenance artifact
 make seed CASE=tree-sort                            # explorer Name/Created/Modified QA
+make seed CASE=views                               # board/discovery/failure QA
+make seed CASE=views-scale SCALE=.01               # reduced summary/rank scale stand
 make seed CASE=dashboard-activity SCALE=1 SEED=x PASSWORD=secret
 make seed CASE=reader-showcase,graph,trash-mixed    # COMBINATION of cases
 make graph-revision-gate                           # disposable #410 runtime + memory gate

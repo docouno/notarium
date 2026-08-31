@@ -2406,6 +2406,13 @@ export class WriteEngine {
       noteType:
         (input.noteType !== undefined ? normalizeNoteType(input.noteType) : undefined) ??
         (noteTypeAddressed ? projectedNoteType : (prev?.noteType ?? DEFAULT_NOTE_TYPE)),
+      ...(input.viewType !== undefined
+        ? input.viewType.trim()
+          ? { viewType: input.viewType.trim() }
+          : {}
+        : prev?.viewType
+          ? { viewType: prev.viewType }
+          : {}),
       ...(fields ? { fields } : {}),
       ...(sourceLocator ? { sourceLocator } : {}),
       // Class is mount-derived and AUTHORITATIVE from the write result — no optimistic guess, so an

@@ -28,6 +28,7 @@ export type Axis =
   | 'favorites'
   | 'providers'
   | 'fields'
+  | 'views'
 
 export type AxisInfo = {
   axis: Axis
@@ -152,6 +153,19 @@ export const AXES: readonly AxisInfo[] = [
     title: 'Declared meta fields',
     surfaces: ['feed-field-facet', 'note-sidebar', 'card-chip', 'space-settings-fields'],
     refs: ['#384', 'note-model.md', 'feed-page.md'],
+  },
+  {
+    axis: 'views',
+    title: 'View documents / boards',
+    surfaces: [
+      'reader-view-runtime',
+      'board',
+      'tree-icon',
+      'feed-summary',
+      'mcp-get-note',
+      'history-raw',
+    ],
+    refs: ['#385', 'views.md', 'drag-and-drop.md'],
   },
   {
     axis: 'favorites',

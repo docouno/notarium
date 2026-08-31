@@ -11,6 +11,7 @@
 import { NOTE_CLASS, READ_SCOPE } from '../../knowledgeStore'
 import type { Graph, NoteContent, NoteMeta } from '../../knowledgeStore'
 import { isPathUnder } from '../../libs/path'
+import { semanticViewContent } from '../../views'
 import { isInScope } from '../../visibility'
 import { isMutedFlag, memoryDirOf } from '../memory'
 import type {
@@ -288,7 +289,7 @@ export const recall = async (
       note.title ?? '(untitled)',
       c.isPersonal ? undefined : c.slug,
       project,
-      note.content,
+      semanticViewContent(note.content),
     )
     // Apply the per-source cap; a trim means content was dropped → the bundle is
     // truncated (the agent can get the whole note via get_note).

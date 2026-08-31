@@ -38,6 +38,7 @@ type SpotlightItem = {
   modifiedAt: string | null
   createdAt: string | null
   noteType?: string
+  viewType?: string
   snippet?: string
   href?: string
 }
@@ -70,6 +71,7 @@ export const Spotlight = ({ space, onClose }: { space: string; onClose: () => vo
         modifiedAt: r.modifiedAt,
         createdAt: r.createdAt,
         noteType: r.noteType,
+        viewType: r.viewType,
         snippet: r.snippet,
       }))
       return [{ key: 'notes', label: 'Notes', items }]
@@ -83,6 +85,7 @@ export const Spotlight = ({ space, onClose }: { space: string; onClose: () => vo
       modifiedAt: n.modifiedAt,
       createdAt: n.createdAt,
       noteType: n.noteType,
+      viewType: n.viewType,
       href: n.href,
     }))
     return [{ key: 'recent', label: 'Recent', items }]

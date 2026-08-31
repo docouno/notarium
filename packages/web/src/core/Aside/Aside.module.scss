@@ -38,22 +38,9 @@
 }
 /* Pad the title so its text lands on the gutter, matching a first tab's text. */
 .aside-title { padding-left: var(--tab-pad); font-size: 13px; font-weight: 600; color: var(--text); }
-/* Tab strip — a minimal base for multi-view asides (graph: Display | Filters | Focus).
-   Shares the gutter/--tab-pad grid with AsideGroups: no inter-tab gap (each tab's
-   --tab-pad gives the spacing and keeps hit areas touching), underline = text + 2·--tab-pad. */
-.aside-tabs { display: flex; align-items: stretch; gap: 0; height: 100%; }
-.aside-tab {
-  position: relative; display: inline-flex; align-items: center;
-  padding: 0 var(--tab-pad); border: none; background: none; cursor: pointer;
-  font-size: 13px; font-weight: 500; color: var(--text-faint);
-  transition: color 0.12s;
-}
-.aside-tab:hover { color: var(--text-dim); }
-.aside-tab.active { color: var(--text); font-weight: 600; }
-.aside-tab.active::after {
-  content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
-  background: var(--accent); border-radius: 2px 2px 0 0;
-}
+/* The shared Tabs primitive owns interaction and active-state visuals; this shell
+   only gives the strip the flexible header slot. */
+.aside-tabs { min-width: 0; }
 /* The header's right control (panel toggle / filters close). The margin adds --tab-pad
    back so its edge lands on the gutter — matching AsideGroups and the topbar. */
 .aside-action { display: flex; align-items: center; margin-right: var(--tab-pad); }

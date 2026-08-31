@@ -9,6 +9,7 @@ import {
   IsoTimestampSchema,
   SpaceSlugSchema,
 } from '../primitives'
+import { ViewConfigPatchPublishedSchema, ViewConfigPatchSchema } from '../rest/views'
 import { McpFieldPatchPublishedSchema, McpFieldPatchSchema, sessionField } from './_fields'
 import { ProjectHandleSchema, RefSchema } from './primitives'
 
@@ -164,6 +165,7 @@ export const EditNoteInputSchema = z
     operation: EditOperationSchema.optional(),
     content: DurableTextSchema.optional(),
     fields: McpFieldPatchSchema.optional(),
+    view: ViewConfigPatchSchema.optional(),
     section: DurableScalarSchema.optional(),
     find: DurableScalarSchema.optional(),
     ...casFields,
@@ -172,6 +174,7 @@ export const EditNoteInputSchema = z
 
 export const EditNotePublishedInputSchema = EditNoteInputSchema.extend({
   fields: McpFieldPatchPublishedSchema.optional(),
+  view: ViewConfigPatchPublishedSchema.optional(),
 })
 
 /** Tool `link`: create a typed wikilink between two notes in the same space

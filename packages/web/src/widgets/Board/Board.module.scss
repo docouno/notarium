@@ -1,0 +1,202 @@
+.board {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.jump {
+  display: none;
+  margin-bottom: 0.75rem;
+}
+
+.scroller {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(16rem, 1fr);
+  align-items: stretch;
+  gap: 0.75rem;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+  scroll-snap-type: x proximity;
+  padding: 0.25rem 0 0.35rem;
+}
+
+.column {
+  min-width: 0;
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  scroll-snap-align: start;
+}
+
+.column-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.55rem 0.35rem 0.6rem;
+  border-top: 3px solid var(--board-column-color, var(--border-strong));
+  background: var(--bg);
+}
+
+.column-label {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  font-weight: 650;
+}
+
+.column-count {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.cards {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.15rem 0 0.35rem;
+  overflow-y: auto;
+}
+
+.card,
+.card-skeleton {
+  padding: 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+}
+
+.card {
+  transition:
+    border-color 0.12s ease,
+    background 0.12s ease,
+    opacity 0.12s ease;
+}
+
+.card[draggable='true'] {
+  cursor: grab;
+}
+
+.card[tabindex='0']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.card:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+
+.card[aria-busy='true'] {
+  opacity: 0.58;
+}
+
+.card-dragging {
+  opacity: 0.35;
+  cursor: grabbing;
+}
+
+.card-keyboard-moving {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.card .card-link {
+  display: inline-block;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--text);
+  border-bottom: 0;
+  font-weight: 600;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.card .card-link:hover {
+  color: var(--text);
+  border-bottom-color: transparent;
+  text-decoration: underline;
+  text-decoration-color: currentColor;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.16em;
+}
+
+.card-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.55rem;
+}
+
+.card-title-skeleton {
+  width: 62%;
+  height: 1lh;
+}
+
+.card-chip-skeleton,
+.card-chip-skeleton-wide {
+  width: 2.8rem;
+  height: 18.5px;
+  border-radius: var(--radius-pill);
+}
+
+.card-chip-skeleton-wide {
+  width: 3.8rem;
+}
+
+.column-title-skeleton {
+  width: 42%;
+  height: 1lh;
+}
+
+.column-count-skeleton {
+  width: 1.25rem;
+  height: 1lh;
+}
+
+.column-error {
+  color: var(--danger);
+  font-size: 0.85rem;
+}
+
+@media (max-width: 700px) {
+  .jump {
+    display: block;
+  }
+
+  .scroller {
+    grid-auto-columns: minmax(min(86vw, 20rem), 1fr);
+  }
+
+  .scroller {
+    scroll-snap-type: x mandatory;
+  }
+}

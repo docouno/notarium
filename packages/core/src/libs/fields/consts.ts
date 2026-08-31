@@ -67,11 +67,12 @@ export const PROJECTED_FIELD_KEYS = [
   'aliases',
   'slug',
   'created',
+  'view',
 ] as const
 
 /** Protected keys that DO ride the fields column: the note has no metadata field
  *  for them, so the column is the only place a filter could read them from. */
-export const INDEXED_PROTECTED_FIELD_KEYS = ['type', 'summary', 'muted', 'view'] as const
+export const INDEXED_PROTECTED_FIELD_KEYS = ['type', 'summary', 'muted'] as const
 
 /** Every key a human may not declare as a field and an agent may not write
  *  through the field channel — the two subgroups above, which differ only in

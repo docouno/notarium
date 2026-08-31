@@ -20,6 +20,7 @@ import { spacesApi } from './spaces'
 import { syncApi } from './sync'
 import { trashApi } from './trash'
 import { usersApi } from './users'
+import { viewsApi } from './views'
 
 // The composed API facade: one flat object over every /api/* resource family so
 // callers keep writing `api.notesGet(...)`. The families are split by resource
@@ -57,6 +58,7 @@ export const api = {
   ...usersApi,
   ...membersApi,
   ...importApi,
+  ...viewsApi,
 }
 
 /** Client fallback cadence (ms) for polling a durable job's status (#105) — the

@@ -43,11 +43,13 @@ import {
   noteTypeFrontmatter,
   parseBodyFrontmatterBlock,
   parseFrontmatterBlock,
+  parseViewDocument,
   singleLine,
   slugify,
   stripTitleHeading,
   summaryFrontmatter,
   type TypedFrontmatterEmission,
+  viewTypeFrontmatter,
   yamlNodeReferenceWriteError,
 } from '@notarium/core'
 
@@ -68,6 +70,8 @@ export type ParsedNote = {
   /** Decorative note type from frontmatter `type:`; absent on externally-authored
    *  files that omit it. */
   noteType: string | null
+  /** Dedicated discovery marker from frontmatter `view:`. Body authority is parsed separately. */
+  viewType: string | null
   tags: string[]
   /** Past human names the resolver still honours (#100), from frontmatter
    *  `aliases:` (Obsidian-native). Empty when the note was never renamed. */
@@ -99,6 +103,8 @@ export type ParsedNote = {
   /** The body as read() serves it: frontmatter and encoding prologue split off, the
    *  storage-format title heading stripped. */
   body: string
+  /** The sole prose projection used by search, snippets, recall and embeddings. */
+  semanticBody: string
 }
 
 /** Preserve the engine's legacy title semantics exactly: unlike the importer, a
@@ -212,11 +218,17 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
   const entries = fm?.entries ?? []
   let fields: string | undefined
 
+  const body = stripTitleHeading(afterFm.replace(/^\r?\n/, ''), title)
+
   return {
     title,
     noteType:
       typeof frontmatter.type === 'string' && frontmatter.type.trim()
         ? frontmatter.type.trim()
+        : null,
+    viewType:
+      typeof frontmatter.view === 'string' && frontmatter.view.trim()
+        ? frontmatter.view.trim()
         : null,
     tags: normTags(frontmatter.tags) ?? [],
     aliases: normAliases(frontmatter.aliases) ?? [],
@@ -230,13 +242,15 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
       fields ??= buildNoteFieldsBlob(entries)
       return fields
     },
-    body: stripTitleHeading(afterFm.replace(/^\r?\n/, ''), title),
+    body,
+    semanticBody: parseViewDocument(body).semanticContent,
   }
 }
 
 export type SerializeInput = {
   title: string
   noteType?: string
+  viewType?: string
   /** undefined = leave the file's tags alone; [] = drop them. */
   tags?: string[]
   /** Alias-history (#100), same carry-forward semantics as tags: undefined =
@@ -599,6 +613,7 @@ export const assembleNoteFile = (assembly: NoteFileAssembly): string => {
 export const serializeNoteFile = ({
   title,
   noteType,
+  viewType,
   tags,
   aliases,
   slug,
@@ -795,6 +810,7 @@ export const serializeNoteFile = ({
 
   put(frontmatterScalarEntry('title', title))
   emit(noteTypeFrontmatter(noteType))
+  emit(viewTypeFrontmatter(viewType))
   if (tags !== undefined) {
     if (tags.length) {
       put(frontmatterListEntry('tags', tags))

@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest'
 
-import { compileFieldFilter, matchesFieldFilter } from './match'
+import {
+  andFieldFilters,
+  compileFieldFilter,
+  compileFieldFilterEvaluator,
+  evaluateFieldFilter,
+  FIELD_MATCH_STATE,
+  fieldFilterKeys,
+  matchesFieldFilter,
+  normalizeFieldFilter,
+} from './match'
 import type { FieldFilter, NoteFields } from './types'
 
 const fields = (value: Partial<NoteFields>): NoteFields => ({
@@ -119,5 +128,136 @@ describe('matchesFieldFilter', () => {
       false,
     )
     expect(probes).toBeLessThan(1_000)
+  })
+})
+
+describe('FieldFilterAstV1 evaluator', () => {
+  it('distinguishes a proven miss from a capped ambiguous key', () => {
+    const status = filter([
+      { op: 'or', ns: 'note', key: 'status', values: [{ kind: 'eq', value: 'doing' }] },
+    ])
+
+    expect(evaluateFieldFilter({ fields: fields({ keys: {} }) }, status)).toBe(
+      FIELD_MATCH_STATE.miss,
+    )
+    expect(evaluateFieldFilter({ fields: fields({ keys: {}, truncatedMore: 1 }) }, status)).toBe(
+      FIELD_MATCH_STATE.ambiguous,
+    )
+    expect(evaluateFieldFilter({}, status)).toBe(FIELD_MATCH_STATE.ambiguous)
+  })
+
+  it('routes note.view through the dedicated marker instead of the fields blob', () => {
+    const view = filter([
+      { op: 'or', ns: 'note', key: 'view', values: [{ kind: 'eq', value: 'board' }] },
+    ])
+
+    expect(
+      evaluateFieldFilter(
+        { viewType: 'board', fields: fields({ keys: {}, truncatedMore: 10 }) },
+        view,
+      ),
+    ).toBe(FIELD_MATCH_STATE.match)
+    expect(evaluateFieldFilter({ viewType: 'table' }, view)).toBe(FIELD_MATCH_STATE.miss)
+  })
+
+  it('deduplicates repeated conditions without widening same-key AND clauses', () => {
+    const base = filter([
+      { op: 'or', ns: 'note', key: 'status', values: [{ kind: 'eq', value: 'doing' }] },
+    ])
+    const perView = filter([
+      {
+        op: 'or',
+        ns: 'note',
+        key: 'status',
+        values: [
+          { kind: 'eq', value: 'doing' },
+          { kind: 'eq', value: 'doing' },
+          { kind: 'eq', value: 'done' },
+        ],
+      },
+      { op: 'or', ns: 'note', key: 'owner', values: [{ kind: 'present' }] },
+    ])
+    const combined = andFieldFilters(base, perView)
+
+    expect(combined).toEqual({
+      op: 'and',
+      nodes: [
+        {
+          op: 'or',
+          ns: 'note',
+          key: 'status',
+          values: [{ kind: 'eq', value: 'doing' }],
+        },
+        {
+          op: 'or',
+          ns: 'note',
+          key: 'status',
+          values: [
+            { kind: 'eq', value: 'doing' },
+            { kind: 'eq', value: 'done' },
+          ],
+        },
+        { op: 'or', ns: 'note', key: 'owner', values: [{ kind: 'present' }] },
+      ],
+    })
+    expect(fieldFilterKeys(combined)).toEqual(['status', 'owner'])
+    expect(
+      evaluateFieldFilter(
+        { fields: fields({ keys: { status: 'doing', owner: 'ann' } }) },
+        combined,
+      ),
+    ).toBe(FIELD_MATCH_STATE.match)
+    expect(
+      evaluateFieldFilter({ fields: fields({ keys: { status: 'done', owner: 'ann' } }) }, combined),
+    ).toBe(FIELD_MATCH_STATE.miss)
+    expect(normalizeFieldFilter({ op: 'and', nodes: [] })).toBeUndefined()
+  })
+
+  it('keeps contradictory base and per-view clauses unsatisfiable', () => {
+    const combined = andFieldFilters(
+      filter([{ op: 'or', ns: 'note', key: 'kind', values: [{ kind: 'eq', value: 'task' }] }]),
+      filter([{ op: 'or', ns: 'note', key: 'kind', values: [{ kind: 'eq', value: 'note' }] }]),
+    )
+
+    expect(evaluateFieldFilter({ fields: fields({ keys: { kind: 'task' } }) }, combined)).toBe(
+      FIELD_MATCH_STATE.miss,
+    )
+    expect(evaluateFieldFilter({ fields: fields({ keys: { kind: 'note' } }) }, combined)).toBe(
+      FIELD_MATCH_STATE.miss,
+    )
+  })
+
+  it('does not revisit or compile the AST while evaluating a hot loop', () => {
+    let nodeReads = 0
+    const nodes = new Proxy(
+      [
+        {
+          op: 'or' as const,
+          ns: 'note' as const,
+          key: 'status',
+          values: [{ kind: 'eq' as const, value: 'doing' }],
+        },
+      ],
+      {
+        get: (target, property, receiver) => {
+          if (typeof property === 'string' && /^\d+$/u.test(property)) {
+            nodeReads++
+          }
+
+          return Reflect.get(target, property, receiver)
+        },
+      },
+    )
+    const evaluate = compileFieldFilterEvaluator(filter(nodes))
+    const readsAfterCompile = nodeReads
+
+    for (let index = 0; index < 1_000; index++) {
+      expect(evaluate({ fields: fields({ keys: { status: 'doing' } }) })).toBe(
+        FIELD_MATCH_STATE.match,
+      )
+    }
+
+    expect(readsAfterCompile).toBeGreaterThan(0)
+    expect(nodeReads).toBe(readsAfterCompile)
   })
 })

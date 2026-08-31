@@ -25,6 +25,11 @@ export const PreviewSchema = z.object({
   tokens: z.number(),
 })
 
+export const ViewSummarySchema = z.object({
+  text: z.string(),
+  status: z.enum(['ready', 'unavailable']),
+})
+
 /** One note as the flat list reports it. `createdAt`/`modifiedAt` are null when
  *  the engine honestly doesn't know (the Feed then falls back created→modified).
  *  `preview` rides along only under `?preview=1` — the warm cached preview or
@@ -57,6 +62,10 @@ export const NoteListItemSchema = z.object({
   /** Authored note type projected for compact card metadata. Absent when the
    * default is implicit or the snapshot cannot prove it. */
   noteType: DurableScalarSchema.optional(),
+  /** Dedicated discovery marker, independent of the capped authored-field blob. */
+  viewType: DurableScalarSchema.optional(),
+  /** Primary-view summary requested only for marker-bearing Feed rows. */
+  viewSummary: ViewSummarySchema.optional(),
   /** Values requested for card presentation. This compact map deliberately omits
    * the index blob's unreadable/truncation bookkeeping. */
   fields: prototypeSafeRecord(z.union([z.string(), z.array(z.string())])).optional(),
@@ -121,6 +130,29 @@ type FieldCondition =
 
 type ParsedFieldAddress = { ns: 'note'; key: string; condition: FieldCondition }
 type FieldQueryKind = FieldCondition['kind']
+
+export const FieldConditionV1Schema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('eq'), value: DurableScalarSchema }),
+  z.object({ kind: z.literal('day'), value: DurableScalarSchema }),
+  z.object({ kind: z.literal('present') }),
+  z.object({ kind: z.literal('unreadable') }),
+])
+
+export const FieldClauseV1Schema = z
+  .object({
+    op: z.literal('or'),
+    ns: z.literal('note'),
+    key: DurableScalarSchema,
+    values: z.array(FieldConditionV1Schema).min(1).max(128),
+  })
+  .strict()
+
+export const FieldFilterAstV1Schema = z
+  .object({
+    op: z.literal('and'),
+    nodes: z.array(FieldClauseV1Schema).max(128),
+  })
+  .strict()
 
 const projectedFieldKeys = new Set<string>(PROJECTED_FIELD_KEYS)
 
@@ -187,7 +219,10 @@ const parseFieldAddress = (
   if (!key) {
     return { error: 'field key must not be empty' }
   }
-  if (projectedFieldKeys.has(key)) {
+  if (key === 'view' && kind !== 'eq' && kind !== 'present') {
+    return { error: 'note.view supports equality and presence filters only' }
+  }
+  if (projectedFieldKeys.has(key) && key !== 'view') {
     return { error: projectedFieldMessage(key) }
   }
   if (!carriesValue) {
@@ -329,6 +364,8 @@ export const NotesQuerySchema = z.object({
   /** '1' = decorate each note with its warm cached preview (or null). Off by
    *  default — only the Feed wants the extra bytes. */
   preview: z.literal('1').optional(),
+  /** '1' = derive bounded primary-view summaries for marker-bearing rows. Feed only. */
+  viewSummary: z.literal('1').optional(),
 })
 
 /** `total` is the filtered population size BEFORE the offset/limit slice — the
@@ -467,6 +504,8 @@ export const PreviewsResponseSchema = z.object({
 export type NoteListItem = z.infer<typeof NoteListItemSchema>
 export type NotesQuery = z.infer<typeof NotesQuerySchema>
 
+export type FieldFilterAstV1 = z.infer<typeof FieldFilterAstV1Schema>
+
 export type NotesResponse = z.infer<typeof NotesResponseSchema>
 export type BucketsQuery = z.infer<typeof BucketsQuerySchema>
 
@@ -486,6 +525,7 @@ export type FieldFacet = z.infer<typeof FieldFacetSchema>
 export type FieldsResponse = z.infer<typeof FieldsResponseSchema>
 
 export type Preview = z.infer<typeof PreviewSchema>
+export type ViewSummary = z.infer<typeof ViewSummarySchema>
 
 export type PreviewsRequest = z.infer<typeof PreviewsRequestSchema>
 

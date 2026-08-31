@@ -39,6 +39,8 @@ export type NotesQueryParams = {
   favorite?: boolean
   /** Decorate each note with its warm cached preview (or null) — Feed only. */
   preview?: boolean
+  /** Derive primary-view summaries for marker-bearing rows — Feed only. */
+  viewSummary?: boolean
 }
 
 /** GET …/notes/buckets params — the date histogram of a notes query (#64).

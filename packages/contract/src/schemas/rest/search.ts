@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { IsoTimestampSchema, NoteClassSchema } from '../primitives'
+import { DurableScalarSchema, IsoTimestampSchema, NoteClassSchema } from '../primitives'
 
 /** One search hit — always a known note: the identity layer maps every engine
  *  hit onto a note-id and drops the ones it can't place. Note references are ids only,
@@ -22,6 +22,8 @@ export const SearchResultSchema = z.object({
    *  Optional: absent means the note stays on the implicit default `note`
    *  (@notarium/core `DEFAULT_NOTE_TYPE`). */
   noteType: z.string().optional(),
+  /** Dedicated view marker for Spotlight/search discovery; never runtime authority. */
+  viewType: DurableScalarSchema.optional(),
   /** Decorative engine-supplied hit kind — NOT the model class and not the
    *  noteType badge. Kept for back-compat; usually `note`. */
   type: z.string().optional(),

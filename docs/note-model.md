@@ -234,12 +234,50 @@ and every ordinary note item remain; no extra diagnostic field is added to the a
 - `kind`/`class` — the note's class (`user-doc` / `agent-memory` / …); the single point of surface filtering (a policy invariant, not a bypassable `WHERE` — #74 §2).
 - `summary` — on `agent-memory` files; feeds the derived memory-index. Write semantics (#102): a `summary` passed to `remember_*` **overwrites** the previous one, an omitted one is **carry-forward** (the previous is kept); the response carries `summaryUpdated` (true = overwritten, false = kept) — there is no silent loss.
 - `type`, `tags` — the `user-doc` ontology (escape-parameters of `create_note`); `path` is normalized, `..`/absolute paths are rejected.
+- `view` — a protected, discovery-only reader marker. The derived index projects it into
+  `NoteMeta.viewType`; it does not consume the bounded authored-fields blob. The first carrier's
+  first executable view is authoritative; if that carrier cannot be proven executable, authority
+  remains unproven instead of falling through to a later block. An externally authored marker/body
+  mismatch remains a readable warning state rather than being healed on read. A marker without a view block remains
+  quiet metadata: it neither changes ordinary-note rendering nor creates a Feed failure label.
+  List/tree/search/MCP discovery rows carry the dedicated marker when present; Feed may separately
+  request the primary-view summary defined in [views](views.md#discovery).
 - always-load — **scoped** `(scope, tag)`, not a flat global tag: user-level is always loaded, project-level — only on a hint (#22, bootstrap §2).
 
 The primary `type` projection is canonical at every write/read-model seam: edge whitespace is
 removed and an empty value means the implicit `note` type rather than a second blank identity.
 An explicitly authored creation date likewise projects as one UTC ISO instant immediately; a
 later file derivation cannot change the value shape exposed by list and detail reads.
+
+#### View document carrier <a id="view-document-carrier"></a>
+
+The complete current source/runtime/board contract lives in [views.md](views.md).
+
+A view document is an ordinary `user-doc` with author prose around one or more fenced `nota`
+blocks. The carrier is versioned YAML: a tagged `source` and an ordered non-empty `views` array.
+The carrier root does not know reader-specific options; each view owns its `options` mapping.
+Multiple blocks and multiple views per block are legal. Names are display labels and may collide;
+an exact operation uses an opaque `viewRef` bound to the note version plus block/view occurrence.
+
+The parser keeps exact block/payload ranges and classifies malformed YAML, future versions,
+duplicate names and unsafe YAML references locally. Anchors, aliases, merge keys and duplicate
+semantic keys remain raw-readable but are non-executable and cannot be structurally rewritten.
+The document limits are 1 MiB of `nota` payload, 32 blocks, 64 views, 128 filter leaves, 128
+requested properties, 2,048 YAML nodes, 8,192 lexer tokens and 64 nesting levels. Payload bytes,
+block count and YAML shape are bounded before semantic composition; cumulative reader limits stop
+later blocks once crossed. Result blocks and diagnostics are capped at the first 32 carriers even
+when hostile input contains more, while semantic composition still strips every overflow carrier.
+A limit failure disables only view execution; live rendering also erases overflow carriers instead
+of handing them to the Markdown code-block renderer. The note and its raw bytes remain readable.
+
+One body therefore has two deliberate projections. `NoteContent.content`, revision history and
+export use the exact raw body. Search, embeddings, snippets, previews, recall and eager NoteFacts
+use one shared semantic body in which every `nota` fence is replaced by a stable empty separator.
+A config/rank-only edit still advances normal note CAS/history, but it does not change semantic
+hashes or enqueue embedding work. Structured config writes splice only the addressed payload;
+point rank writes splice one JSONL line and preserve bytes outside that line. Generic prose edits
+stream-compare every carrier, including overflow carriers omitted from the bounded diagnostic array,
+and refuse any structural difference.
 
 #### Fields as a typed axis (#301/#384) <a id="fields-as-a-typed-axis-301"></a>
 

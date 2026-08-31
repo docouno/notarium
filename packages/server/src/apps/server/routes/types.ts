@@ -1,3 +1,4 @@
+import type { ReaderRegistry } from '@notarium/core'
 import type { ArtifactStore } from '../../../libs/artifactStore'
 import type { BuildInfo } from '../../../libs/buildInfo'
 import type { HostInfo } from '../../../libs/hostInfo'
@@ -23,6 +24,8 @@ import type { MarkerStore } from '../../../services/projects'
 import type { ProviderRegistry } from '../../../services/providerRegistry'
 import type { RolesService } from '../../../services/roles'
 import type { SpaceManager } from '../../../services/spaces'
+import type { ViewSourceRegistry } from '../../../services/views/sourceRegistry'
+import type { ViewProjectionAdapters } from '../../../services/views/viewProjection'
 
 /** Dependency-injection options for the API routes; optional deps are honest
  *  capability degradation (P5) — a meta-DB-less / FS-less host omits them and the
@@ -44,6 +47,12 @@ export type ApiRoutesOptions = {
   sessionAudit?: AgentSessionAuditPersistence
   markerStore?: MarkerStore
   fieldSchemaStore?: FieldSchemaStore
+  /** Pure reader definitions; injectable for conformance and composed with built-ins in production. */
+  viewReaders?: ReaderRegistry
+  /** Tagged source executors; unknown kinds stay locally unsupported. */
+  viewSources?: ViewSourceRegistry
+  /** Reader-owned MCP/Feed projections. */
+  viewProjectionAdapters?: ViewProjectionAdapters
   spacesPersistence?: SpacesPersistence
   about?: HostInfo
   /** This build's identity. Absent ⇒ the bundle's own inlined identity, which is

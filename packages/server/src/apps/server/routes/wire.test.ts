@@ -9,10 +9,16 @@ import {
   sha256Hex,
 } from '@notarium/core'
 
-import { conflictToWire, noteDetailToWire, noteToWire, revisionDetailToWire } from './wire'
+import {
+  conflictToWire,
+  noteDetailToWire,
+  noteToWire,
+  revisionDetailToWire,
+  searchResultToWire,
+} from './wire'
 
 describe('note list wire', () => {
-  it('projects the protected type separately from requested custom card fields', () => {
+  it('projects protected type and view marker separately from requested custom card fields', () => {
     const note: NoteMeta = {
       id: 'note-1',
       title: 'Task',
@@ -20,19 +26,32 @@ describe('note list wire', () => {
       modifiedAt: null,
       createdAt: null,
       noteType: 'task',
+      viewType: 'board',
       fields: {
         keys: { status: 'doing', hidden: 'kept-off-wire' },
-        truncated: ['type'],
+        truncated: ['type', 'view'],
       },
     }
 
     expect(noteToWire(note, ['status'])).toMatchObject({
       noteType: 'task',
+      viewType: 'board',
       fields: { status: 'doing' },
     })
     expect(noteToWire({ ...note, noteType: undefined, fields: { keys: {} } })).toMatchObject({
       noteType: 'note',
     })
+  })
+
+  it('keeps the dedicated marker on search discovery rows', () => {
+    expect(
+      searchResultToWire({
+        id: 'view-1',
+        title: 'Board',
+        snippet: 'Sprint prose',
+        viewType: 'board',
+      }),
+    ).toMatchObject({ id: 'view-1', viewType: 'board' })
   })
 })
 

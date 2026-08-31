@@ -21,6 +21,7 @@ export const QUERY_KEY = {
   dateField: 'dateField',
   favorite: 'favorite',
   preview: 'preview',
+  viewSummary: 'viewSummary',
   group: 'group',
   author: 'author',
   agent: 'agent',

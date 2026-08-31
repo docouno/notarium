@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 import { NOTE_CLASS } from '@notarium/contract'
-import type { KnowledgeStore, NoteContent, WriteInput, WriteResult } from '@notarium/core'
+import {
+  type KnowledgeStore,
+  type NoteContent,
+  parseViewDocument,
+  type WriteInput,
+  type WriteResult,
+} from '@notarium/core'
 
 import type { Ctx } from '../../gateway'
 import { handleDeleteNote, handleEditNote, handleMoveNote, handleRenameNote } from './noteLifecycle'
@@ -100,6 +106,61 @@ const ordinaryContextWithLegacySkillReplay = (replay: 'durable' | 'in-flight'): 
     personalSpace: vi.fn().mockResolvedValue('personal-id'),
     now: () => new Date('2026-08-22T00:00:00.000Z'),
   } as unknown as Ctx
+}
+
+const viewEditContext = () => {
+  const content = [
+    'Prose.',
+    '```nota',
+    'version: 1',
+    'source:',
+    '  kind: notes',
+    '  scope: project',
+    '  # keep source comment',
+    'views:',
+    '  - name: Board',
+    '    type: board',
+    '    options:',
+    '      groupBy: note.status',
+    '      order:',
+    '        kind: manual',
+    '        ranks: |-',
+    '          ["task-a","a0V"]',
+    '```',
+  ].join('\n')
+  const current = {
+    id: 'view-note',
+    class: NOTE_CLASS.userDoc,
+    title: 'Sprint',
+    content,
+    frontmatter: { view: 'board' },
+    filePath: 'work/sprint.md',
+    versionToken: 'v1:view-note',
+  }
+  const write = vi.fn(async (input: WriteInput) => ({
+    id: 'view-note',
+    filePath: 'work/sprint.md',
+    versionToken: 'v1:view-note-next',
+    input,
+  }))
+  const ctx = {
+    principal: { id: 'pat:alice:test' },
+    store: {
+      noteStore: vi.fn().mockResolvedValue({
+        space: 'personal-id',
+        store: { read: vi.fn().mockResolvedValue(current), write },
+      }),
+    },
+    spaces: { slugOf: vi.fn().mockReturnValue('personal') },
+    personalSpace: vi.fn().mockResolvedValue('personal-id'),
+    now: () => new Date('2026-08-30T00:00:00.000Z'),
+  } as unknown as Ctx
+  const parsed = parseViewDocument(content, {
+    documentId: 'view-note',
+    versionToken: 'v1:view-note',
+  })
+
+  return { ctx, current, write, viewRef: parsed.views[0]!.viewRef! }
 }
 
 const reoccupiedContext = () => {
@@ -323,5 +384,90 @@ describe('handleEditNote field composition', () => {
     expect(writes).toHaveLength(1)
     expect(writes[0].fields).toBeUndefined()
     expect(result.markdown).toContain('(append)')
+  })
+})
+
+describe('handleEditNote structural view patch', () => {
+  it('patches source/common/options by fresh viewRef without exposing ranks', async () => {
+    const { ctx, write, viewRef } = viewEditContext()
+    const result = await handleEditNote(ctx, {
+      ref: 'view-note',
+      view: {
+        viewRef,
+        source: { set: { scope: 'space' } },
+        options: { set: { groupBy: 'note.stage' } },
+      },
+    })
+    const input = write.mock.calls[0]![0]
+
+    expect(input.content).toContain('scope: space')
+    expect(input.content).toContain('groupBy: note.stage')
+    expect(input.content).toContain('# keep source comment')
+    expect(input.content).toContain('["task-a","a0V"]')
+    expect(input.viewType).toBe('board')
+    expect(input.derivedContentUnchanged).toBe(true)
+    expect(result.markdown).toContain('(view)')
+  })
+
+  it('refuses a stale viewRef and mixed body/view intent before writing', async () => {
+    const { ctx, write, viewRef } = viewEditContext()
+
+    await expect(
+      handleEditNote(ctx, {
+        ref: 'view-note',
+        view: { viewRef: `${viewRef}stale`, source: { set: { scope: 'space' } } },
+      }),
+    ).rejects.toThrow(/viewRef|stale/u)
+    await expect(
+      handleEditNote(ctx, {
+        ref: 'view-note',
+        operation: 'append',
+        content: 'x',
+        view: { viewRef, source: { set: { scope: 'space' } } },
+      }),
+    ).rejects.toThrow('cannot be combined')
+    expect(write).not.toHaveBeenCalled()
+  })
+
+  it('routes structural carrier changes away from generic text editing', async () => {
+    const blocked = viewEditContext()
+
+    await expect(
+      handleEditNote(blocked.ctx, {
+        ref: 'view-note',
+        operation: 'findReplace',
+        find: 'groupBy: note.status',
+        content: 'groupBy: note.stage',
+      }),
+    ).rejects.toThrow('edit_note.view')
+    expect(blocked.write).not.toHaveBeenCalled()
+
+    const prose = viewEditContext()
+
+    await handleEditNote(prose.ctx, {
+      ref: 'view-note',
+      operation: 'prepend',
+      content: 'Safe prose before the carrier.',
+    })
+    expect(prose.write.mock.calls[0]![0].content).toContain('Safe prose before the carrier.')
+    expect(prose.write.mock.calls[0]![0].content).toContain('groupBy: note.status')
+  })
+
+  it('protects a carrier beyond the bounded parser result from generic text editing', async () => {
+    const overflow = viewEditContext()
+
+    overflow.current.content = Array.from(
+      { length: 33 },
+      (_, index) => `\`\`\`nota\nvalue: carrier-${index}\n\`\`\``,
+    ).join('\n')
+    await expect(
+      handleEditNote(overflow.ctx, {
+        ref: 'view-note',
+        operation: 'findReplace',
+        find: 'value: carrier-32',
+        content: 'value: changed',
+      }),
+    ).rejects.toThrow('edit_note.view')
+    expect(overflow.write).not.toHaveBeenCalled()
   })
 })

@@ -200,9 +200,9 @@ describe('the fields seed case keeps every key state the index encodes (#384)', 
   it('seeds the states that do not depend on the cap', () => {
     expect(blobOf('states/unreadable.md').unreadable).toEqual(['shape'])
     expect(blobOf('states/empty.md').keys.note).toBe('')
-    // `view` is protected but indexed: the column is the only place a filter for it
-    // could read from.
-    expect(blobOf('states/reader-marker.md').keys.view).toBe('board')
+    // `view` is protected and indexed through dedicated NoteMeta.viewType; it must
+    // not consume the capped authored-field column.
+    expect(blobOf('states/reader-marker.md').keys.view).toBeUndefined()
     expect(blobOf('states/display-mismatch.md').keys).toMatchObject({
       'card-state': 'Unknown',
       priority: 'high',

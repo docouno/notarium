@@ -49,35 +49,9 @@
   padding: 0 calc(var(--gutter) - var(--tab-pad));
 }
 
-/* Tab strip — text buttons with an active underline on the head's bottom border.
-   No inter-tab gap: each tab's --tab-pad gives the visual spacing AND keeps the hit
-   areas touching (no dead space between tabs). Overflows horizontally if a group
-   holds many tabs, but the scrollbar chrome is hidden (Linux/GTK draws a thick
-   always-on bar otherwise) — scroll still works. */
-.tabs {
-  display: flex; align-items: stretch; gap: 0; height: 100%; min-width: 0;
-  overflow-x: auto; overflow-y: hidden;
-  scrollbar-width: none; -ms-overflow-style: none;
-}
-.tabs::-webkit-scrollbar { display: none; }
-.tab {
-  position: relative; display: inline-flex; align-items: center; gap: 5px;
-  padding: 0 var(--tab-pad); border: none; background: none; cursor: pointer; white-space: nowrap;
-  font-size: 13px; font-weight: 500; color: var(--text-faint);
-  transition: color 0.12s;
-}
-.tab:hover { color: var(--text-dim); }
-.tab.active { color: var(--text); font-weight: 600; }
-.tab.active::after {
-  content: ''; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
-  background: var(--accent); border-radius: 2px 2px 0 0;
-}
-.badge {
-  font-size: 11px; font-weight: 600; line-height: 1;
-  padding: 1px 5px; border-radius: var(--radius-md);
-  color: var(--text-faint); background: var(--bg-elevated);
-}
-.tab.active .badge { color: var(--accent); }
+/* The shared header Tabs primitive is extracted from this layout; the group only
+   contributes its flexible slot inside the glass head. */
+.tabs { min-width: 0; }
 
 /* Holds the panel toggle (collapse) in the first group's head. The margin adds the
    tab pad back on the right, so the toggle's edge lands on the gutter — same x as the

@@ -104,6 +104,7 @@ import {
   parseFrontmatterBlock,
   parseFrontmatterLines,
   resolveLink,
+  semanticViewContent,
   shapeGraph,
   skillNameConflict,
   skillPackagePathOf,
@@ -118,6 +119,7 @@ import {
   unionLegacyNameAliases,
   versionConflict,
   versionTokenRequired,
+  viewTypeFrontmatter,
   yamlNodeReferenceWriteError,
 } from '@notarium/core'
 // Slug + de-kebab come from CORE (#100): the fake now shares the production
@@ -144,6 +146,8 @@ type StoredNote = {
   filePath: string
   content: string
   noteType: string
+  /** Dedicated discovery marker, mirrored from frontmatter `view:`. */
+  viewType?: string
   tags: string[]
   /** Alias-history (#100): past human names the resolver still honours, so a
    *  rename never breaks inbound [[Old Name]]. Mirrors the real engine's
@@ -458,6 +462,9 @@ const carriedTyped = (carried: readonly FrontmatterEntry[] | undefined) => {
     noteType: carriedField(carried, 'type', (value) =>
       typeof value === 'string' && value.trim() ? value.trim() : DEFAULT_NOTE_TYPE,
     ),
+    viewType: carriedField(carried, 'view', (value) =>
+      typeof value === 'string' && value.trim() ? value.trim() : undefined,
+    ),
     summary: carriedField(carried, 'summary', (value) =>
       typeof value === 'string' && value ? value : undefined,
     ),
@@ -630,6 +637,7 @@ export class InMemoryStore implements KnowledgeStore {
             : fromCarry.noteType.present
               ? fromCarry.noteType.value
               : DEFAULT_NOTE_TYPE,
+        viewType: fromCarry.viewType.present ? fromCarry.viewType.value : undefined,
         tags: n.tags ?? (fromCarry.tags.present ? fromCarry.tags.value : []),
         aliases: n.aliases ?? (fromCarry.aliases.present ? fromCarry.aliases.value : []),
         slug:
@@ -853,6 +861,7 @@ export class InMemoryStore implements KnowledgeStore {
       ...(legacyNameAliases.length ? { legacyNameAliases } : {}),
       ...(n.tags.length ? { tags: n.tags } : {}),
       noteType: n.noteType || DEFAULT_NOTE_TYPE,
+      ...(n.viewType ? { viewType: n.viewType } : {}),
       get fields() {
         return fields()
       },
@@ -1190,6 +1199,7 @@ export class InMemoryStore implements KnowledgeStore {
     }
 
     typedChannel(noteTypeFrontmatter(n.noteType))
+    typedChannel(viewTypeFrontmatter(n.viewType))
     if (!isCarried('tags') && n.tags.length) {
       typed.push({ key: 'tags', lines: ['tags:', ...n.tags.map((t) => `- ${fmScalar(t)}`)] })
     }
@@ -1309,7 +1319,10 @@ export class InMemoryStore implements KnowledgeStore {
     // The fake keeps a note's authored text as given, inline frontmatter included (it has
     // no serializer to fold it in — see the write path below), so this stand's "body" is
     // unparsed and the block is answered for here.
-    return derivePreview(stripTitleHeading(stripFrontmatter(n.content), n.title), n.tags)
+    return derivePreview(
+      semanticViewContent(stripTitleHeading(stripFrontmatter(n.content), n.title)),
+      n.tags,
+    )
   }
 
   async search(q: string): Promise<SearchResult[]> {
@@ -1320,10 +1333,17 @@ export class InMemoryStore implements KnowledgeStore {
     }
 
     return this.notes
+      .map((note) => ({
+        note,
+        semanticBody: semanticViewContent(
+          stripTitleHeading(stripFrontmatter(note.content), note.title),
+        ),
+      }))
       .filter(
-        (n) => n.title.toLowerCase().includes(needle) || n.content.toLowerCase().includes(needle),
+        ({ note, semanticBody }) =>
+          note.title.toLowerCase().includes(needle) || semanticBody.toLowerCase().includes(needle),
       )
-      .map((n) => ({
+      .map(({ note: n, semanticBody }) => ({
         id: n.id,
         title: n.title,
         class: n.class,
@@ -1331,8 +1351,9 @@ export class InMemoryStore implements KnowledgeStore {
         modifiedAt: n.modifiedAt,
         createdAt: n.createdAt,
         score: 1,
-        snippet: makeSnippet(stripTitleHeading(stripFrontmatter(n.content), n.title), 160),
+        snippet: makeSnippet(semanticBody, 160),
         noteType: n.noteType || DEFAULT_NOTE_TYPE,
+        ...(n.viewType ? { viewType: n.viewType } : {}),
         type: 'note',
       }))
   }
@@ -1387,6 +1408,7 @@ export class InMemoryStore implements KnowledgeStore {
     content = '',
     directory,
     noteType,
+    viewType,
     tags,
     slug: rawSlug,
     summary,
@@ -1420,6 +1442,7 @@ export class InMemoryStore implements KnowledgeStore {
       title,
       directory,
       noteType,
+      viewType,
       rawSlug,
       summary,
       fileName,
@@ -1572,7 +1595,7 @@ export class InMemoryStore implements KnowledgeStore {
       // Once the emission has replaced a carried key the old raw entry is gone from
       // the file and cannot lurk here to reappear after a later clear — a clear drops
       // the key outright, same as the serializer.
-      let carried = withIndexedTypedChannels(merged, { noteType, summary, muted })
+      let carried = withIndexedTypedChannels(merged, { noteType, viewType, summary, muted })
 
       // The remaining typed channels project onto metadata fields of the note's own,
       // never onto the fields column, so only their presence matters here.
@@ -1602,6 +1625,15 @@ export class InMemoryStore implements KnowledgeStore {
         ? normalizeNoteType(noteType)
         : carried.noteType.present
           ? carried.noteType.value
+          : prev
+    const viewTypeFor = (
+      prev: string | undefined,
+      carried: ReturnType<typeof carriedTyped>,
+    ): string | undefined =>
+      viewType !== undefined
+        ? viewType.trim() || undefined
+        : carried.viewType.present
+          ? carried.viewType.value
           : prev
     const tagsFor = (prev: string[], carried: ReturnType<typeof carriedTyped>): string[] =>
       tags !== undefined ? (normTags(tags) ?? []) : carried.tags.present ? carried.tags.value : prev
@@ -1712,6 +1744,7 @@ export class InMemoryStore implements KnowledgeStore {
         title,
         content: inlineBody,
         noteType: noteTypeFor(replacing ? DEFAULT_NOTE_TYPE : prev.noteType, carriedState.typed),
+        viewType: viewTypeFor(replacing ? undefined : prev.viewType, carriedState.typed),
         tags: tagsFor(replacing ? [] : prev.tags, carriedState.typed),
         aliases: nextAliases,
         slug: newSlug,
@@ -1814,6 +1847,7 @@ export class InMemoryStore implements KnowledgeStore {
         title,
         content: inlineBody,
         noteType: noteTypeFor(replacing ? DEFAULT_NOTE_TYPE : prev.noteType, carriedState.typed),
+        viewType: viewTypeFor(replacing ? undefined : prev.viewType, carriedState.typed),
         tags: tagsFor(replacing ? [] : prev.tags, carriedState.typed),
         aliases: aliasesFor(replacing ? [] : prev.aliases, carriedState.typed),
         slug: slugFor(replacing ? undefined : prev.slug, carriedState.typed),
@@ -1851,6 +1885,7 @@ export class InMemoryStore implements KnowledgeStore {
       filePath,
       content: inlineBody,
       noteType: noteTypeFor(DEFAULT_NOTE_TYPE, carriedState.typed),
+      viewType: viewTypeFor(undefined, carriedState.typed),
       tags: tagsFor([], carriedState.typed),
       // An imported file's own `aliases:`/`slug:` are live from the first write —
       // the real engine gets that by re-reading the file, the fake derives it here.

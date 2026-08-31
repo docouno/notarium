@@ -1,6 +1,7 @@
 import { type ReactNode } from 'react'
 import { cx } from '../../libs/cx/cx'
 import { ASIDE_PANEL, usePanelWidth } from '../../libs/hooks/usePanelWidth'
+import { Tabs } from '../Tabs'
 import styles from './Aside.module.scss'
 
 // Generic right-docked aside: a system panel whose *content* is decided by the
@@ -39,19 +40,14 @@ export const Aside = ({
       <div className={styles.asideResize} onMouseDown={startResize} />
       <div className={cx(styles.asideHead, 'glass', 'glass-edge-bottom')}>
         {tabs ? (
-          <div className={styles.asideTabs} role="tablist">
-            {tabs.map((t) => (
-              <button
-                key={t.id}
-                role="tab"
-                aria-selected={t.id === activeTab}
-                className={cx(styles.asideTab, t.id === activeTab && styles.active)}
-                onClick={() => onTabChange?.(t.id)}
-              >
-                {t.label}
-              </button>
-            ))}
-          </div>
+          <Tabs
+            className={styles.asideTabs}
+            variant="header"
+            value={activeTab ?? tabs[0]?.id ?? ''}
+            options={tabs.map((tab) => ({ value: tab.id, label: tab.label }))}
+            onChange={(id) => onTabChange?.(id)}
+            ariaLabel="Panel views"
+          />
         ) : (
           <span className={styles.asideTitle}>{title}</span>
         )}

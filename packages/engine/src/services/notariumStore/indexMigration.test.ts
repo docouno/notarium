@@ -29,10 +29,13 @@ import { type EngineMount, engineMountOf } from './types'
 import { describeVector } from './vectorGate.fixture'
 
 describe('planIndexMigration', () => {
-  it('narrows FTS update churn to the columns the virtual table owns', () => {
+  it('updates FTS only when one of its materialized values actually changes', () => {
     const sql = INDEX_MIGRATIONS.at(-1)?.sql ?? ''
 
-    expect(sql).toContain('AFTER UPDATE OF title, body, tags ON notes')
+    expect(sql).toContain('AFTER UPDATE OF title, semantic_body, tags ON notes')
+    expect(sql).toContain('WHEN old.title IS NOT new.title')
+    expect(sql).toContain('old.semantic_body IS NOT new.semantic_body')
+    expect(sql).toContain('old.tags IS NOT new.tags')
     expect(sql).not.toContain('AFTER UPDATE ON notes')
   })
 

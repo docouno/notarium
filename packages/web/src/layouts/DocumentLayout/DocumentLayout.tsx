@@ -1,7 +1,7 @@
-import { useRef, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router'
 import { NOTE_CLASS } from '@notarium/contract/enums'
-import { isFolderPageNote } from '@notarium/core'
+import { isFolderPageNote, type ParsedViewBlock, parseViewDocument } from '@notarium/core'
 import { useChrome } from '../../composers/ChromeProvider'
 import { useEditing } from '../../composers/EditingProvider'
 import { useFavorites } from '../../composers/FavoritesProvider'
@@ -15,6 +15,11 @@ import { useProjects } from '../../composers/ProjectsProvider'
 import { useSpace } from '../../composers/SpaceProvider'
 import { useSync } from '../../composers/SyncProvider'
 import { useNoteActions } from '../../composers/useNoteActions'
+import {
+  useViewRefreshRevision,
+  VIEW_READER_REGISTRY,
+  ViewRuntime,
+} from '../../composers/ViewRuntime'
 import { Aside } from '../../core/Aside'
 import { AsideGroups } from '../../core/AsideGroups'
 import { Button } from '../../core/Button'
@@ -95,8 +100,20 @@ export const DocumentLayout = () => {
   const feed = useFeed()
   const favorites = useFavorites()
   const { subscribe } = useSync()
+  const viewRefresh = useViewRefreshRevision()
   const location = useLocation()
   const navigate = useNavigate()
+  const renderDraftViewBlock = useCallback(
+    (block: ParsedViewBlock) => (
+      <ViewRuntime
+        block={block}
+        mode="draft"
+        context={{ kind: 'draft', space, directory: draft?.directory ?? '' }}
+        refreshKey={viewRefresh}
+      />
+    ),
+    [draft?.directory, space, viewRefresh],
+  )
 
   const {
     historySel,
@@ -125,6 +142,20 @@ export const DocumentLayout = () => {
 
   const feedActive = location.pathname === feedRoute(space) && !isEditing
   const reading = mode === 'read' && !isEditing
+  const workspaceReader = useMemo(() => {
+    if (!reading || !note?.id || !note.versionToken) {
+      return false
+    }
+    const primary = parseViewDocument(note.content, {
+      documentId: note.id,
+      versionToken: note.versionToken,
+    }).primaryReader
+
+    return (
+      primary.kind === 'value' &&
+      VIEW_READER_REGISTRY.get(primary.value)?.presentation === 'workspace'
+    )
+  }, [note?.content, note?.id, note?.versionToken, reading])
   const parsedPath = parseAppPath(location.pathname)
   const virtualFolderPath = parsedPath.kind === 'files' ? parsedPath.path : null
   const virtualFolder =
@@ -155,7 +186,8 @@ export const DocumentLayout = () => {
   // actions (Restore / Delete forever) — the document actions (Edit, kebab) and
   // the inspector step back, exactly like the revision-history banner does.
   const deletedNote = !!note?.deleted
-  const canPanel = (reading && note && !deletedNote) || isEditing || feedActive
+  const canPanel =
+    ((reading && note && !deletedNote) || isEditing || feedActive) && !workspaceReader
   const panelToggle = (
     <IconToggle
       icon={<IconPanelRight size={15} />}
@@ -421,6 +453,7 @@ export const DocumentLayout = () => {
             onToggleFocus={toggleFocus}
             onToggleTypewriter={toggleTypewriter}
             editorKeys={editorBindings(resolved)}
+            renderViewBlock={renderDraftViewBlock}
           />
         )}
 

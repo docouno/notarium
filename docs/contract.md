@@ -25,10 +25,12 @@ The wire speaks the domain's language; engines map their dialects at their own e
 
 ## Route families <a id="routing"></a>
 
+View endpoint behavior and window semantics are specified in [views.md](views.md#execution).
+
 The surface splits into three route classes (#16):
 
-- **Space-scoped** — under the `/api/s/<slug>/…` prefix (notes, tree, buckets, graph, search, status, events, note creation, folder moves). A request without a space physically has no route — fail-closed by construction. Its Feed list projection may carry compact `noteType` and only the requested `card:true` field values; detail-only state and unreadable/truncation bookkeeping never ride this window.
-- **Id-addressed global** — `/api/note*`, `/api/previews`, `/api/move`: the arbiter of which space a note lives in is the identity registry, not a query parameter. The ordinary `POST /api/note` update may carry an authored-field patch inside the same document CAS. `PUT /api/note/fields` is the atomic custom-field point-intent used by Meta, boards and agents; it resolves the space from the note id, not from client input, and returns the fresh note token. Future system metadata may share the resource path through explicit typed members, never by bypassing protected keys inside the generic `fields` map.
+- **Space-scoped** — under the `/api/s/<slug>/…` prefix (notes, tree, buckets, graph, search, status, events, note creation, folder moves). A request without a space physically has no route — fail-closed by construction. List/tree/search rows may carry the dedicated discovery-only `viewType`; it is independent of both `noteType` and the capped custom-field blob. A Feed list projection may additionally carry only requested `card:true` field values and, when `viewSummary=1`, a bounded primary-view summary; detail-only state and unreadable/truncation bookkeeping never ride this window. Draft view preview uses `POST /api/s/:space/view-query` with a closed `{kind:'draft', directory}` context; the server resolves the containing project and the operation is read-only. Its first response returns source/schema generations; later column windows echo them so a prepared plan can be reused or a changed snapshot can conflict.
+- **Id-addressed global** — `/api/note*`, `/api/previews`, `/api/move`: the arbiter of which space a note lives in is the identity registry, not a query parameter. `GET /api/note/views?id=` returns the saved carrier manifest/group skeleton, per-view source/schema generations, authoritative mutation capabilities and an opaque version-bound `viewRef`; `POST /api/note/view-window` accepts that ref, the returned generations, an opaque group key and a window ≤100. An evicted plan may be recomputed, but a generation mismatch is 409 rather than a mixed board. `POST /api/note/board-move` accepts the ref, card id, destination value/absence and optional neighbor ids; it derives the field/rank server-side and returns the explicit two-document outcome described in [views](views.md#board-move). A stale ref conflicts rather than retargeting by name. The ordinary `POST /api/note` update may carry an authored-field patch inside the same document CAS. `PUT /api/note/fields` is the atomic custom-field point-intent used by Meta, boards and agents; it resolves the space from the note id, not from client input, and returns the fresh note token. Future system metadata may share the resource path through explicit typed members, never by bypassing protected keys inside the generic `fields` map.
 - **Host-level** — `/api/spaces`, `/api/config`, `/api/health`, `/api/about`.
 - **Provider management** — `/api/providers/resources*` and
   `/api/providers/credentials*` are host-addressed but session-only (`self:manage`).
@@ -102,6 +104,13 @@ Writes are compare-and-swap (#50): `versionToken` (from a read) proves the compl
 ## Filter language (inclusion) <a id="filters"></a>
 
 One inclusion language across every selection facet (folders #93, tags #109, class, search): nothing selected = everything; each value **adds** (widens the result). Within a facet it is OR (union), across facets AND (folder ∧ tag ∧ q). Multiple values arrive as a repeated query key (`folders=a&folders=b`) — one key parses to a string, many to an array (preprocess normalizes both). Tags match case-insensitively and hierarchically (`ml` catches `ml/nlp`). The filter is applied **BEFORE** the offset/limit slice, so `total` is the honest population (the scrollbar / "jump anywhere"). Set caps are a DoS/URL guard, not a product limit.
+
+Field filters compile into the persisted closed `FieldFilterAstV1`: top-level field clauses are
+AND, conditions of one key are OR, and the only condition kinds are exact equality/list
+containment, authored day, presence and unreadable. Feed query params and MCP repeatable args are
+adapters into that same AST. Saved views store the AST directly. `note.view` equality/presence is
+the one dedicated-marker branch; other projected/storage keys remain rejected. Broad recursive
+query syntax, text grammar and non-field facets are not part of this v1 node shape.
 
 ## Deliberate boundaries / caveats
 

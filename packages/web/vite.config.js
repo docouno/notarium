@@ -109,6 +109,7 @@ const CHUNK_FAMILIES = {
   ],
   'markdown-math': ['katex'],
   'syntax-highlighting': ['highlight.js'],
+  'view-carrier': ['yaml'],
   graph: [
     'bezier-js',
     'd3-array',

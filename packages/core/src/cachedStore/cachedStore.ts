@@ -66,6 +66,7 @@ import { normTags } from '../libs/tags'
 import { buildLinkIndex, type FolderAlias, resolveLink } from '../referenceResolver'
 import { InMemoryRevisionPersistence, RevisionJournal } from '../revisionJournal'
 import { derivePreview } from '../snippet'
+import { viewTypeForBody } from '../views'
 import { classesForScope, DEFAULT_NOTE_CLASS, isVisibleOn, SURFACE } from '../visibility'
 import { GraphCache } from './caches/graphCache'
 import { NoteFactsCache } from './caches/noteFactsCache'
@@ -2213,6 +2214,7 @@ export class CachedStore implements KnowledgeStore {
         class: cls,
         modifiedAt: r.modifiedAt ?? meta?.modifiedAt ?? null,
         createdAt: r.createdAt ?? meta?.createdAt ?? null,
+        viewType: r.viewType ?? meta?.viewType,
       })
     }
 
@@ -3739,8 +3741,14 @@ export class CachedStore implements KnowledgeStore {
   }
 
   private canonicalWriteInput(input: WriteInput): WriteInput {
+    const marker =
+      input.viewType !== undefined || input.content === undefined
+        ? input.viewType
+        : viewTypeForBody(input.content)
+
     return {
       ...input,
+      ...(marker !== undefined ? { viewType: marker } : {}),
       id: input.id ? this.canonicalMutationId(input.id) : input.id,
       originalId: input.originalId ? this.canonicalMutationId(input.originalId) : input.originalId,
     }

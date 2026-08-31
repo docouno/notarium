@@ -198,6 +198,16 @@ import {
   UserSchema,
   UsersResponseSchema,
 } from './schemas/rest/users'
+import {
+  BoardMoveRequestSchema,
+  BoardMoveResponseSchema,
+  DraftViewQueryRequestSchema,
+  DraftViewQueryResponseSchema,
+  ViewManifestQuerySchema,
+  ViewManifestResponseSchema,
+  ViewWindowRequestSchema,
+  ViewWindowResponseSchema,
+} from './schemas/rest/views'
 
 /** Flat map of every operation, keyed by the api.js method name; the #18.2 fake
  *  backend and tests resolve schemas by that key.
@@ -225,6 +235,13 @@ export const contract = {
   },
   graph: { response: GraphResponseSchema },
   note: { response: NoteDetailResponseSchema },
+  noteViews: { request: ViewManifestQuerySchema, response: ViewManifestResponseSchema },
+  viewWindow: { request: ViewWindowRequestSchema, response: ViewWindowResponseSchema },
+  draftViewQuery: {
+    request: DraftViewQueryRequestSchema,
+    response: DraftViewQueryResponseSchema,
+  },
+  boardMove: { request: BoardMoveRequestSchema, response: BoardMoveResponseSchema },
   previews: { request: PreviewsRequestSchema, response: PreviewsResponseSchema },
   search: { response: SearchResponseSchema },
   create: {

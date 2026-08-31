@@ -47,6 +47,31 @@ notarium-id: BfinKTnjxP1w
 `
 
 describe('parseNoteFile', () => {
+  it('projects the view marker separately and keeps nota config out of semantic body', () => {
+    const raw = [
+      '---',
+      'title: Sprint',
+      'view: board',
+      '---',
+      '',
+      '# Sprint',
+      '',
+      'Visible prose.',
+      '',
+      '```nota',
+      'version: 1',
+      'source: { kind: notes }',
+      'views: [{ name: Board, type: board, options: { groupBy: note.status } }]',
+      '```',
+    ].join('\n')
+    const parsed = parseNoteFile(raw, 'sprint.md')
+
+    expect(parsed.viewType).toBe('board')
+    expect(parsed.body).toContain('note.status')
+    expect(parsed.semanticBody).toContain('Visible prose.')
+    expect(parsed.semanticBody).not.toContain('note.status')
+  })
+
   it('reads the canonical file shape: title, flush-left tags, id claim, normalised body', () => {
     const p = parseNoteFile(BM_FILE, 'inbox/engine-live-probe.md')
     expect(p.title).toBe('Engine Live Probe')
@@ -1393,6 +1418,23 @@ describe('serializeNoteFile — point field patch', () => {
 })
 
 describe('serializeNoteFile — the typed keys that only the frontmatter carries', () => {
+  it('sets, preserves and clears the dedicated view marker', () => {
+    const body =
+      '```nota\nversion: 1\nsource: { kind: notes }\nviews: [{ name: B, type: board }]\n```'
+    const marked = serializeNoteFile({ title: 'T', viewType: 'board', body })
+
+    expect(parseNoteFile(marked, 't.md').viewType).toBe('board')
+    expect(
+      parseNoteFile(serializeNoteFile({ title: 'T', body, existingRaw: marked }), 't.md').viewType,
+    ).toBe('board')
+    expect(
+      parseNoteFile(
+        serializeNoteFile({ title: 'T', viewType: '', body: 'plain', existingRaw: marked }),
+        't.md',
+      ).viewType,
+    ).toBeNull()
+  })
+
   const existing = serializeNoteFile({
     title: 'T',
     noteType: 'task',

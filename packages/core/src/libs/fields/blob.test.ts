@@ -125,12 +125,11 @@ describe('the column carries exactly the keys the note has no field of its own f
     expect(serializeNoteFields(built)).toBe('{"keys":{}}')
   })
 
-  it('keeps the protected keys the snapshot has nowhere else to read', () => {
+  it('keeps protected keys without a dedicated metadata projection', () => {
     expect(fields('type: task\nsummary: s\nmuted: "true"\nview: board').keys).toEqual({
       type: 'task',
       summary: 's',
       muted: 'true',
-      view: 'board',
     })
   })
 

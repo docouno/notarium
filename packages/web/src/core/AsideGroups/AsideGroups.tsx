@@ -3,6 +3,7 @@ import { cx } from '../../libs/cx/cx'
 import { useKeyboardLayer } from '../../libs/hooks/useKeyboardLayer'
 import { ASIDE_PANEL, usePanelWidth } from '../../libs/hooks/usePanelWidth'
 import { KEYBOARD_LAYER } from '../../libs/keyboardLayers'
+import { Tabs } from '../Tabs'
 import {
   type GroupState,
   type LayoutSpec,
@@ -198,57 +199,32 @@ export const AsideGroups = ({
               data-testid="aside-group"
             >
               <div className={cx(styles.groupHead, 'glass', 'glass-edge-bottom')}>
-                <div className={styles.tabs} role="tablist" aria-orientation="horizontal">
-                  {group.panels.map((pid, panelIndex) => {
-                    const def = byId.get(pid)
+                <Tabs
+                  className={styles.tabs}
+                  variant="header"
+                  value={group.activeTab}
+                  ariaLabel="Inspector panels"
+                  onChange={(panelId) => setActiveTab(group.id, panelId)}
+                  options={group.panels.flatMap((panelId) => {
+                    const definition = byId.get(panelId)
 
-                    if (!def) {
-                      return null
-                    }
-
-                    return (
-                      <button
-                        key={pid}
-                        id={`aside-${group.id}-${pid}-tab`}
-                        role="tab"
-                        aria-selected={pid === group.activeTab}
-                        aria-controls={`aside-${group.id}-${pid}-panel`}
-                        tabIndex={pid === group.activeTab ? 0 : -1}
-                        className={cx(styles.tab, pid === group.activeTab && styles.active)}
-                        onClick={() => setActiveTab(group.id, pid)}
-                        onKeyDown={(event) => {
-                          const lastIndex = group.panels.length - 1
-                          const nextIndex =
-                            event.key === 'ArrowRight'
-                              ? (panelIndex + 1) % group.panels.length
-                              : event.key === 'ArrowLeft'
-                                ? (panelIndex - 1 + group.panels.length) % group.panels.length
-                                : event.key === 'Home'
-                                  ? 0
-                                  : event.key === 'End'
-                                    ? lastIndex
-                                    : null
-
-                          if (nextIndex == null) {
-                            return
-                          }
-                          event.preventDefault()
-                          const nextId = group.panels[nextIndex]!
-                          setActiveTab(group.id, nextId)
-                          requestAnimationFrame(() =>
-                            document.getElementById(`aside-${group.id}-${nextId}-tab`)?.focus(),
-                          )
-                        }}
-                        data-testid={`aside-tab-${pid}`}
-                      >
-                        {def.label}
-                        {def.badge != null && def.badge > 0 && (
-                          <span className={styles.badge}>{def.badge}</span>
-                        )}
-                      </button>
-                    )
+                    return definition
+                      ? [
+                          {
+                            value: panelId,
+                            label: definition.label,
+                            badge:
+                              definition.badge != null && definition.badge > 0
+                                ? definition.badge
+                                : undefined,
+                            id: `aside-${group.id}-${panelId}-tab`,
+                            panelId: `aside-${group.id}-${panelId}-panel`,
+                            testId: `aside-tab-${panelId}`,
+                          },
+                        ]
+                      : []
                   })}
-                </div>
+                />
                 {i === 0 && headerAction && (
                   <div className={styles.groupActions}>{headerAction}</div>
                 )}

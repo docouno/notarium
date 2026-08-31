@@ -19,6 +19,7 @@ export type TypedFrontmatterEmission = {
 
 export type TypedFrontmatterChannels = {
   noteType?: string
+  viewType?: string
   summary?: string
   muted?: boolean
 }
@@ -37,6 +38,14 @@ export const noteTypeFrontmatter = (noteType?: string): TypedFrontmatterEmission
             normalized !== DEFAULT_NOTE_TYPE ? frontmatterScalarEntry('type', normalized) : null,
         }
       })()
+
+export const viewTypeFrontmatter = (viewType?: string): TypedFrontmatterEmission | undefined =>
+  viewType === undefined
+    ? undefined
+    : {
+        key: 'view',
+        entry: viewType.trim() ? frontmatterScalarEntry('view', viewType.trim()) : null,
+      }
 
 /** An empty digest is an explicit clear, not an empty value. */
 export const summaryFrontmatter = (summary?: string): TypedFrontmatterEmission | undefined =>
@@ -66,6 +75,7 @@ export const indexedTypedFrontmatter = (
 ): TypedFrontmatterEmission[] =>
   [
     noteTypeFrontmatter(channels.noteType),
+    viewTypeFrontmatter(channels.viewType),
     summaryFrontmatter(channels.summary),
     mutedFrontmatter(channels.muted),
   ].filter((emission): emission is TypedFrontmatterEmission => emission !== undefined)

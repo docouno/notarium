@@ -216,6 +216,10 @@ export type NoteRow = {
    *  note has no custom slug (the implicit slug(title) default is not stored). */
   slug: string | null
   body: string
+  /** Config-stripped prose projection. Optional only for a store pinned before the view rung. */
+  semantic_body?: string
+  /** Dedicated discovery marker. Optional only for a store pinned before the view rung. */
+  view_type?: string | null
   /** The author's own frontmatter as the serialized fields blob — the note's whole
    *  metadata surface beyond the typed columns above. OPTIONAL because the column is
    *  the newest ladder rung: a store pinned to a shorter ladder has no such column, so

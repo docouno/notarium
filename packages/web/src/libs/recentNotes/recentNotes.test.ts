@@ -55,6 +55,7 @@ describe('recent notes keep the most specific address known for a document', () 
       title: 'Reviewer',
       slug: 'reviewer',
       filePath: 'agents/roles/reviewer.md',
+      viewType: 'board',
       modifiedAt: '2026-08-18T10:00:00.000Z',
       createdAt: null,
       ...over,
@@ -74,6 +75,7 @@ describe('recent notes keep the most specific address known for a document', () 
       filePath: 'agents/roles/reviewer.md',
       slug: 'reviewer',
       modifiedAt: '2026-08-18T10:00:00.000Z',
+      viewType: 'board',
     })
   })
 

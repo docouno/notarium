@@ -1,11 +1,18 @@
 import { type MouseEvent, type ReactNode, useEffect, useMemo, useRef } from 'react'
 import type { FieldDeclaration } from '@notarium/contract'
-import { DEFAULT_NOTE_TYPE } from '@notarium/core'
+import { DEFAULT_NOTE_TYPE, type ParsedViewBlock, type ReaderPresentation } from '@notarium/core'
 import { effectiveSlug } from '@notarium/core/slug'
 import { Chip, TagChips } from '../../core/Chips'
+import { MarkdownDocument } from '../../core/MarkdownDocument'
+import { Notice } from '../../core/Notice'
+import { cx } from '../../libs/cx/cx'
 import { absoluteDate, exactDateTime } from '../../libs/datetime'
 import { cardFieldValues } from '../../libs/fields'
-import { renderMarkdown, wikiLinkTarget } from '../../libs/markdown/markdown'
+import {
+  renderMarkdown,
+  renderMarkdownDocument,
+  wikiLinkTarget,
+} from '../../libs/markdown/markdown'
 import { useMarkdownEnhance } from '../../libs/markdown/useMarkdownEnhance'
 import { feedTagRoute, isModifiedClick, noteRouteForClass } from '../../libs/routing/routePaths'
 import type { NoteDetailView, NoteView } from '../../libs/wire'
@@ -32,7 +39,28 @@ type NoteReaderProps = {
   afterContent?: ReactNode
   schemaError?: string | null
   onRetrySchema?: () => void
+  /** Presence opts this current note into live view placeholders. History/deleted
+   * callers omit it and keep raw fenced source. */
+  renderViewBlock?: (block: ParsedViewBlock) => ReactNode
+  /** Resolve reader-owned page geometry after the body, not the marker, proves
+   * which primary reader is authoritative. */
+  viewPresentation?: (type: string) => ReaderPresentation
 }
+
+const safeMarkerLabel = (value: string): string =>
+  [...value]
+    .map((character) => {
+      const code = character.codePointAt(0) ?? 0
+
+      return code <= 0x1f ||
+        (code >= 0x7f && code <= 0x9f) ||
+        (code >= 0x202a && code <= 0x202e) ||
+        (code >= 0x2066 && code <= 0x2069)
+        ? '�'
+        : character
+    })
+    .join('')
+    .slice(0, 80)
 
 export const NoteReader = ({
   note,
@@ -44,8 +72,24 @@ export const NoteReader = ({
   afterContent,
   schemaError = null,
   onRetrySchema,
+  renderViewBlock,
+  viewPresentation,
 }: NoteReaderProps) => {
-  const html = useMemo(() => renderMarkdown(note.content || ''), [note.content])
+  const rendered = useMemo(
+    () =>
+      renderViewBlock
+        ? renderMarkdownDocument(
+            note.content || '',
+            {},
+            {
+              documentId: note.id,
+              versionToken: note.versionToken,
+            },
+          )
+        : { html: renderMarkdown(note.content || ''), views: undefined },
+    [note.content, note.id, note.versionToken, renderViewBlock],
+  )
+  const html = rendered.html
   const ref = useRef<HTMLDivElement>(null)
   // Post-render enhancements (#235): copy buttons on code blocks + scroll-edge
   // fades on tables. Re-applied whenever the body re-renders (React wipes our
@@ -59,6 +103,18 @@ export const NoteReader = ({
     () => cardFieldValues(note.fields?.keys, schema),
     [note.fields?.keys, schema],
   )
+  const marker = typeof fm.view === 'string' && fm.view.trim() ? fm.view.trim() : undefined
+  const markerLabel = marker ? safeMarkerLabel(marker) : undefined
+  const primary = rendered.views?.primaryReader
+  const workspace = primary?.kind === 'value' && viewPresentation?.(primary.value) === 'workspace'
+  const markerWarning =
+    primary?.kind === 'value'
+      ? marker === primary.value
+        ? null
+        : marker
+          ? `View marker “${markerLabel}” does not match primary reader “${primary.value}”; the body is authoritative.`
+          : 'View marker is missing; discovery may be incomplete.'
+      : null
   // A tag chip links to its feed when we know the note's space (#109). The
   // shared TagChips primitive preserves the authored label but gives href/data-tag
   // the folded filter key (`ML` and `ml` land on the same feed).
@@ -119,7 +175,13 @@ export const NoteReader = ({
     if (!a) {
       return
     }
-    if (a.dataset.wiki !== undefined) {
+    if (a.dataset.noteRoute !== undefined) {
+      if (isModifiedClick(e)) {
+        return
+      }
+      e.preventDefault()
+      onOpenWikiLink?.(a.dataset.noteRoute)
+    } else if (a.dataset.wiki !== undefined) {
       if (isModifiedClick(e)) {
         return
       } // let the browser open the route in a new tab
@@ -174,48 +236,58 @@ export const NoteReader = ({
   }
 
   return (
-    <article className="doc">
-      <header className="doc-head">
+    <article
+      className={cx('doc', workspace && styles.workspaceDoc)}
+      data-view-presentation={workspace ? 'workspace' : undefined}
+    >
+      <header className={cx('doc-head', workspace && styles.workspaceHead)}>
         <FieldSchemaWarning error={schemaError} onRetry={onRetrySchema ?? (() => undefined)} />
-        <h1 className="doc-title">{note.documentTitle || note.title}</h1>
-        <div className={styles.docMeta} data-testid="note-detail-meta">
-          {created ? (
-            <span
-              className={styles.date}
-              title={`Created: ${exactDateTime(note.createdAt)}`}
-              aria-label={`Created: ${created}`}
-              data-testid="note-detail-created"
-            >
-              {created}
-            </span>
-          ) : null}
-          <Chip
-            variant="accent"
-            title={`Type: ${noteType}`}
-            ariaLabel={`Type: ${noteType}`}
-            testId="note-detail-type"
-          >
-            {noteType}
-          </Chip>
-          {shownFields.map((field) => (
+        <h1 className={cx('doc-title', workspace && styles.workspaceTitle)}>
+          {note.documentTitle || note.title}
+        </h1>
+        {!workspace ? (
+          <div className={styles.docMeta} data-testid="note-detail-meta">
+            {created ? (
+              <span
+                className={styles.date}
+                title={`Created: ${exactDateTime(note.createdAt)}`}
+                aria-label={`Created: ${created}`}
+                data-testid="note-detail-created"
+              >
+                {created}
+              </span>
+            ) : null}
             <Chip
-              key={field.key}
-              color={field.color}
-              title={`${field.fieldLabel}: ${field.label}`}
-              ariaLabel={`${field.fieldLabel}: ${field.label}`}
-              testId="note-detail-field"
+              variant="accent"
+              title={`Type: ${noteType}`}
+              ariaLabel={`Type: ${noteType}`}
+              testId="note-detail-type"
             >
-              {field.label}
+              {noteType}
             </Chip>
-          ))}
-          <TagChips tags={tags} hrefForTag={tagHref} onOpenTag={onOpenTag} />
-        </div>
+            {shownFields.map((field) => (
+              <Chip
+                key={field.key}
+                color={field.color}
+                title={`${field.fieldLabel}: ${field.label}`}
+                ariaLabel={`${field.fieldLabel}: ${field.label}`}
+                testId="note-detail-field"
+              >
+                {field.label}
+              </Chip>
+            ))}
+            <TagChips tags={tags} hrefForTag={tagHref} onOpenTag={onOpenTag} />
+          </div>
+        ) : null}
       </header>
-      <div
-        ref={ref}
-        className="markdown"
+      {markerWarning ? <Notice variant="warning">{markerWarning}</Notice> : null}
+      <MarkdownDocument
+        rootRef={ref}
+        className={cx('markdown', workspace && styles.workspaceBody)}
         onClick={onClick}
-        dangerouslySetInnerHTML={{ __html: html }}
+        html={html}
+        viewBlocks={rendered.views?.blocks}
+        renderViewBlock={renderViewBlock}
       />
       {afterContent}
     </article>

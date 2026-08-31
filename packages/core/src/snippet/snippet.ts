@@ -13,6 +13,7 @@ import {
   stripTitleHeading,
 } from '../libs/markdown'
 import { normTags } from '../libs/tags'
+import { semanticViewContent } from '../views'
 
 /**
  * First image in a note BODY, for the Feed card preview. Markdown image first,
@@ -77,13 +78,17 @@ export const makeSnippet = (body: string, max = 1600): string => {
  * normalises it the same way the editor does, so one note shows the same chips whichever
  * engine served it.
  */
-export const derivePreview = (body: string, tags?: unknown): Preview => ({
-  snippet: makeSnippet(body),
-  image: firstImage(body),
-  tags: normTags(tags) || [],
-  words: countWords(body),
-  tokens: estimateTokens(body),
-})
+export const derivePreview = (body: string, tags?: unknown): Preview => {
+  const semanticBody = semanticViewContent(body)
+
+  return {
+    snippet: makeSnippet(semanticBody),
+    image: firstImage(semanticBody),
+    tags: normTags(tags) || [],
+    words: countWords(semanticBody),
+    tokens: estimateTokens(semanticBody),
+  }
+}
 
 /**
  * Preview from a RAW markdown file (frontmatter still attached, storage-format

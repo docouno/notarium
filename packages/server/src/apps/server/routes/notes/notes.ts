@@ -1,4 +1,4 @@
-import type { FastifyInstance, FastifyRequest } from 'fastify'
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 
 import {
   BucketsQuerySchema,
@@ -18,23 +18,50 @@ import { bucketCounts, deriveNoteTitle, type NoteMeta, queryNotes, tagFacet } fr
 import { safeRelAddress } from '../../../../libs/relPath'
 import { fieldDayFilterError, prepareFieldWrite } from '../../../../services/fields'
 import type { SpaceStore } from '../../../../services/spaces'
+import {
+  VIEW_PROJECTION_ADAPTERS,
+  VIEW_READER_REGISTRY,
+  VIEW_SOURCE_REGISTRY,
+} from '../../../../services/views/registry'
+import { viewCacheScope } from '../../../../services/views/sourceRegistry'
+import { ViewSummaryService } from '../../../../services/views/summary'
 import { type ApiRouteCtx, authz, missing, s } from '../_shared'
 import { createToDomain, noteToWire } from '../wire'
 
+const requestAbort = (reply: FastifyReply): AbortSignal => {
+  const abort = new AbortController()
+
+  reply.raw.on('close', () => {
+    if (!reply.raw.writableEnded) {
+      abort.abort()
+    }
+  })
+
+  return abort.signal
+}
+
 export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   const { spaceStoreFor, favoriteOwner, favorites, principalId, fieldSchemaStore } = ctx
+  const viewSummaries = new ViewSummaryService(
+    ctx.viewReaders ?? VIEW_READER_REGISTRY,
+    ctx.viewProjectionAdapters ?? VIEW_PROJECTION_ADAPTERS,
+    ctx.viewSources ?? VIEW_SOURCE_REGISTRY,
+  )
 
   /** Cap on the lexical-hit set intersected into a `q`-narrowed Feed query.
    *  list() and search() both default to scope 'user', so the intersection stays visibility-consistent.
    *  canon: docs/feed-page.md#data-flow */
   const FEED_Q_CAP = 10_000
 
-  const notesForQuery = async (store: SpaceStore, q?: string): Promise<NoteMeta[]> => {
-    const notes = await store.list()
+  const notesForQuery = async (
+    store: SpaceStore,
+    q?: string,
+  ): Promise<{ notes: NoteMeta[]; snapshot: NoteMeta[] }> => {
+    const snapshot = await store.list()
     const text = (q ?? '').trim()
 
     if (!text) {
-      return notes
+      return { notes: snapshot, snapshot }
     }
     const hits = await store.search(text, { pageSize: FEED_Q_CAP, lexicalOnly: true })
 
@@ -43,7 +70,7 @@ export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       console.warn(`[api] q="${text}" hit FEED_Q_CAP (${FEED_Q_CAP}); the Feed's q-total is capped`)
     }
     const ids = new Set(hits.map((h) => h.id).filter((id): id is string => id != null))
-    return notes.filter((n) => n.id != null && ids.has(n.id))
+    return { notes: snapshot.filter((n) => n.id != null && ids.has(n.id)), snapshot }
   }
   const favoriteNoteIdsFor = (req: FastifyRequest): Promise<string[]> =>
     favorites
@@ -69,6 +96,7 @@ export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       q: textQuery,
       favorite,
       preview,
+      viewSummary,
       ...query
     } = q.data
     const [notes, schema, ids] = await Promise.all([
@@ -82,7 +110,7 @@ export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     if (fieldError) {
       return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: fieldError })
     }
-    const page = queryNotes(notes, {
+    const page = queryNotes(notes.notes, {
       ...query,
       fields,
       ids,
@@ -91,11 +119,32 @@ export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     const cardFieldKeys = (schema?.fields ?? [])
       .filter((declaration) => declaration.card === true)
       .map((declaration) => declaration.key)
+    const summaryIds =
+      viewSummary === '1'
+        ? page.notes.flatMap((note) => (note.id && note.viewType ? [note.id] : []))
+        : []
+    const summaries = summaryIds.length
+      ? await viewSummaries.batch({
+          store,
+          noteIds: summaryIds,
+          projects: (await ctx.projects?.listForSpace(req.spaceId)) ?? [],
+          schema,
+          signal: requestAbort(reply),
+          snapshot: notes.snapshot,
+          cacheScope: viewCacheScope(req.spaceId, req.principal.id),
+        })
+      : new Map()
+
     return NotesResponseSchema.parse({
-      notes: page.notes.map((n) => ({
-        ...noteToWire(n, cardFieldKeys),
-        ...(withPreview ? { preview: n.id ? store.previewPeek(n.id) : null } : {}),
-      })),
+      notes: page.notes.map((n) => {
+        const summary = n.id ? summaries.get(n.id) : undefined
+
+        return {
+          ...noteToWire(n, cardFieldKeys),
+          ...(summary?.status === 'ready' ? { viewSummary: summary } : {}),
+          ...(withPreview ? { preview: n.id ? store.previewPeek(n.id) : null } : {}),
+        }
+      }),
       total: page.total,
     })
   })
@@ -122,7 +171,7 @@ export const notesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     }
 
     return BucketsResponseSchema.parse(
-      bucketCounts(await notesForQuery(await spaceStoreFor(req), textQuery), {
+      bucketCounts((await notesForQuery(await spaceStoreFor(req), textQuery)).notes, {
         ...query,
         fields,
         ids,

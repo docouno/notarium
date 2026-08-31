@@ -1,9 +1,10 @@
 // Read tools: search / get_note / recall / list_notes / recent_activity — the agent's retrieval surface.
 // canon: docs/mcp-gateway.md#tools
-import { NOTE_CLASS, NOTE_SORT, parseFieldFilter } from '@notarium/contract'
+import { NOTE_CLASS, NOTE_SORT, parseFieldFilter, VIEW_AGENT_ROW_MAX } from '@notarium/contract'
 import {
   type FolderEntry,
   type GetNoteInput,
+  type GetNoteView,
   type ListNotesInput,
   type ListNotesItem,
   type NoteLink,
@@ -15,6 +16,7 @@ import {
   type SearchInput,
 } from '@notarium/contract/tools'
 import {
+  createReaderRegistry,
   FrontmatterLimitError,
   type Graph,
   isPathUnder,
@@ -22,10 +24,12 @@ import {
   memoryDirOf,
   type NoteClass,
   parseBodyFrontmatterBlock,
+  parseViewDocument,
   queryNotes,
   READ_SCOPE,
   recall,
   type RecallTarget,
+  replaceViewCarriers,
   treeChildren,
 } from '@notarium/core'
 
@@ -33,6 +37,10 @@ import { safeRelAddress } from '../../../../libs/relPath'
 import { fieldDayFilterError } from '../../../fields'
 import { type ProjectRecord } from '../../../metaDb'
 import { type SpaceStore } from '../../../spaces'
+import { ViewExecutionService } from '../../../views/execution'
+import { VIEW_SOURCE_REGISTRY } from '../../../views/registry'
+import { viewCacheScope } from '../../../views/sourceRegistry'
+import { projectReaderView } from '../../../views/viewProjection'
 import { type Handler, ToolFailure } from '../../gateway'
 import { openMcpNoteDoor } from '../../helpers/noteDoor'
 import { handleOf, notePath, projectLabelForNote } from '../../helpers/projectAddressing'
@@ -60,6 +68,163 @@ const bodyWithoutMetadata = (body: string): string => {
       return body
     }
     throw error
+  }
+}
+
+const sanitizeViewValue = (value: unknown): unknown => {
+  if (typeof value === 'string') {
+    return sanitizeText(value)
+  }
+  if (Array.isArray(value)) {
+    return value.map(sanitizeViewValue)
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+        sanitizeText(key),
+        sanitizeViewValue(entry),
+      ]),
+    )
+  }
+
+  return value
+}
+
+const detailedViewProjection = async (
+  ctx: Parameters<Handler>[0],
+  hit: NonNullable<Awaited<ReturnType<typeof openMcpNoteDoor>>>,
+  noteId: string,
+): Promise<{
+  content: string
+  views?: GetNoteView[]
+  viewRowsTruncated?: true
+}> => {
+  if (!hit) {
+    return { content: '' }
+  }
+  const registry = ctx.viewReaders ?? createReaderRegistry([])
+  const execution = new ViewExecutionService(registry, ctx.viewSources ?? VIEW_SOURCE_REGISTRY)
+  const schema = await ctx.fieldSchemaStore?.read(hit.space)
+  const saved = await execution.saved({
+    store: hit.store,
+    noteId,
+    note: hit.note,
+    projects: await ctx.projectsInSpace(hit.space),
+    schema,
+    cacheScope: viewCacheScope(hit.space, ctx.principal.id),
+  })
+  const views: GetNoteView[] = []
+  const proseByBlock = new Map<number, string[]>()
+  let remaining = VIEW_AGENT_ROW_MAX
+  let anyTruncated = false
+
+  for (const view of saved.parsed.views) {
+    const prepared = view.viewRef ? saved.prepared.get(view.viewRef) : undefined
+    const rows: unknown[] = []
+
+    if (prepared?.rows && prepared.dataNeeds && remaining > 0) {
+      if (prepared.groups?.length) {
+        for (const group of prepared.groups) {
+          if (remaining <= 0) {
+            break
+          }
+          const window = execution.window(
+            prepared,
+            { group: group.key, offset: 0, limit: Math.min(remaining, VIEW_AGENT_ROW_MAX) },
+            schema,
+          )
+
+          for (const row of window.rows) {
+            rows.push(row)
+          }
+          remaining -= window.rows.length
+        }
+      } else {
+        const window = execution.window(
+          prepared,
+          { offset: 0, limit: Math.min(remaining, VIEW_AGENT_ROW_MAX) },
+          schema,
+        )
+
+        for (const row of window.rows) {
+          rows.push(row)
+        }
+        remaining -= window.rows.length
+      }
+    }
+    const rowsTruncated = (prepared?.total ?? 0) > rows.length
+
+    anyTruncated ||= rowsTruncated
+    views.push(
+      sanitizeViewValue({
+        viewRef: view.viewRef,
+        block: view.block,
+        occurrence: view.occurrence,
+        name: view.name,
+        type: view.type,
+        status: prepared?.status ?? 'invalid',
+        total: prepared?.total,
+        groups: prepared?.groups,
+        totalGroups: prepared?.totalGroups,
+        groupsTruncated: prepared?.groupsTruncated,
+        diagnostics: prepared?.diagnostics,
+        execution: prepared?.execution,
+        capabilities: prepared?.capabilities,
+        snapshotGeneration: prepared?.snapshotGeneration,
+        schemaVersionToken: prepared?.schemaVersionToken,
+        ...(rows.length ? { rows } : {}),
+        ...(rowsTruncated ? { rowsTruncated: true } : {}),
+      }) as GetNoteView,
+    )
+    let prose: string
+
+    if (
+      prepared &&
+      (prepared.status === 'ready' || prepared.status === 'incomplete') &&
+      ctx.viewProjectionAdapters
+    ) {
+      const projected = projectReaderView(registry, ctx.viewProjectionAdapters, view.definition, {
+        rows,
+        groups: prepared.groups,
+        total: prepared.total,
+      })
+
+      prose =
+        projected.status === 'ready'
+          ? projected.prose
+          : projected.status === 'unsupported'
+            ? `View “${view.name}” uses unavailable reader “${view.type}”.`
+            : (projected.diagnostics[0] ?? `View “${view.name}” is invalid.`)
+    } else {
+      prose =
+        prepared?.status === 'unsupported'
+          ? `View “${view.name}” uses unavailable reader “${view.type}”.`
+          : prepared?.status === 'invalid'
+            ? (prepared.diagnostics?.[0] ?? `View “${view.name}” is invalid.`)
+            : `View “${view.name}” · ${prepared?.total ?? 0} rows${prepared?.status === 'incomplete' ? ' · incomplete' : ''}.`
+    }
+    const blockProse = proseByBlock.get(view.block) ?? []
+
+    blockProse.push(sanitizeText(prose))
+    proseByBlock.set(view.block, blockProse)
+  }
+  const blocks = new Map(saved.parsed.blocks.map((block) => [block.occurrence, block]))
+  const content = replaceViewCarriers(saved.note.content, (occurrence) => {
+    const block = blocks.get(occurrence)
+
+    if (!block) {
+      return '\n\n'
+    }
+    const prose = proseByBlock.get(occurrence)
+    const fallback = block.diagnostics.map((diagnostic) => sanitizeText(diagnostic.message))
+
+    return `\n\n${(prose?.length ? prose : fallback).join('\n\n')}\n\n`
+  })
+
+  return {
+    content,
+    ...(views.length ? { views } : {}),
+    ...(anyTruncated ? { viewRowsTruncated: true } : {}),
   }
 }
 
@@ -110,6 +275,7 @@ export const handleSearch: Handler = async (ctx, rawArgs) => {
     // Search port carries no date/path — enrich from the note list. Same agentRecall scope so memory ids line up.
     const modifiedById = new Map<string, string | null>()
     const filePathById = new Map<string, string>()
+    const viewTypeById = new Map<string, string>()
 
     for (const n of await spaceStore.list({ scope: READ_SCOPE.agentRecall })) {
       if (!n.id) {
@@ -117,6 +283,9 @@ export const handleSearch: Handler = async (ctx, rawArgs) => {
       }
       modifiedById.set(n.id, n.modifiedAt)
       filePathById.set(n.id, n.filePath)
+      if (n.viewType) {
+        viewTypeById.set(n.id, n.viewType)
+      }
     }
     // Fetch projects even for the personal/default space: in none-mode the default space holds projects (empty registry → no label).
     const projectsHere = await ctx.projectsInSpace(spaceId)
@@ -146,6 +315,7 @@ export const handleSearch: Handler = async (ctx, rawArgs) => {
         ...(path ? { path } : {}),
         ...(r.class ? { class: r.class } : {}),
         ...(r.score != null ? { score: r.score } : {}),
+        ...(viewTypeById.get(r.id) ? { viewType: sanitizeText(viewTypeById.get(r.id)!) } : {}),
         modifiedAt: modifiedById.get(r.id) ?? null,
       }
       scored.push({ hit, score: r.score ?? 0 })
@@ -189,8 +359,14 @@ export const handleGetNote: Handler = async (ctx, rawArgs) => {
   // body-frontmatter reader keeps rule-fenced prose visible to both operations.
   // and graph edges. agent-memory notes aren't graph nodes → empty links, honest.
   const detailed = responseFormat === RESPONSE_FORMAT.detailed
+  const carrier = parseViewDocument(note.content)
+  const semanticContent = carrier.semanticContent
+  const viewProjection =
+    detailed && carrier.blocks.length > 0
+      ? await detailedViewProjection(ctx, hit, noteId)
+      : { content: semanticContent }
   const outline = detailed
-    ? listHeadings(bodyWithoutMetadata(note.content)).map((h) => ({
+    ? listHeadings(bodyWithoutMetadata(semanticContent)).map((h) => ({
         level: h.level,
         title: sanitizeText(h.text),
       }))
@@ -215,8 +391,13 @@ export const handleGetNote: Handler = async (ctx, rawArgs) => {
     ...(provenance ? { provenance } : {}),
     ...(outline ? { outline } : {}),
     ...(links ? { links } : {}),
+    ...(viewProjection.views ? { views: viewProjection.views } : {}),
+    ...(viewProjection.viewRowsTruncated ? { viewRowsTruncated: true as const } : {}),
   }
-  const markdown = renderNote(structured, responseFormat)
+  const markdown = renderNote(
+    { ...structured, content: sanitizeText(viewProjection.content) },
+    responseFormat,
+  )
   return { markdown, structured }
 }
 
@@ -407,6 +588,7 @@ export const handleListNotes: Handler = async (ctx, rawArgs) => {
       path: notePath(m.filePath) ?? m.filePath,
       ...(tags && tags.length ? { tags: tags.map(sanitizeText) } : {}),
       modifiedAt: m.modifiedAt,
+      ...(m.viewType ? { viewType: sanitizeText(m.viewType) } : {}),
     }
   })
 

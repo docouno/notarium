@@ -26,6 +26,7 @@ import {
   DurableScalarSchema,
   ErrorResponseSchema,
   FieldDeclarationSchema,
+  FieldFilterAstV1Schema,
   FieldsResponseSchema,
   GraphNodeSchema,
   GraphResponseSchema,
@@ -80,7 +81,11 @@ import {
   TreeChildrenResponseSchema,
   UpdateNoteRequestSchema,
 } from '@notarium/contract'
-import { RecallInputSchema, RoleSelectorSchema } from '@notarium/contract/tools'
+import {
+  EditNoteInputSchema,
+  RecallInputSchema,
+  RoleSelectorSchema,
+} from '@notarium/contract/tools'
 
 // These tests give the /api/* contract teeth: they pin the v2 shapes (#54 —
 // camelCase, note-ids, ISO instants, no permalink) by validating
@@ -107,6 +112,52 @@ describe('field declaration contract', () => {
         key: 'status',
         type: 'enum',
         values: [{ value: 'In progress', color: 'amber' }],
+      }).success,
+    ).toBe(false)
+  })
+})
+
+describe('view structural edit contract', () => {
+  it('accepts source/common/options patches and keeps manual ranks agent-inaccessible', () => {
+    expect(
+      EditNoteInputSchema.safeParse({
+        ref: 'view-note',
+        view: {
+          viewRef: 'view-v1.opaque',
+          source: { set: { scope: 'space' } },
+          options: { set: { groupBy: 'note.status' } },
+        },
+      }).success,
+    ).toBe(true)
+    expect(
+      EditNoteInputSchema.safeParse({
+        ref: 'view-note',
+        view: {
+          viewRef: 'view-v1.opaque',
+          options: { set: { order: { kind: 'manual', ranks: '["a","x"]' } } },
+        },
+      }).success,
+    ).toBe(false)
+
+    expect(
+      EditNoteInputSchema.safeParse({
+        ref: 'view-note',
+        view: {
+          viewRef: 'view-v1.opaque',
+          source: { remove: ['scope'] },
+        },
+      }).success,
+    ).toBe(true)
+    expect(
+      EditNoteInputSchema.safeParse({
+        ref: 'view-note',
+        view: { viewRef: 'view-v1.opaque', source: {} },
+      }).success,
+    ).toBe(false)
+    expect(
+      EditNoteInputSchema.safeParse({
+        ref: 'view-note',
+        view: { viewRef: 'view-v1.opaque' },
       }).success,
     ).toBe(false)
   })
@@ -684,6 +735,44 @@ describe('previews (#64)', () => {
       },
     ])
     expect(NotesQuerySchema.safeParse({ fieldAny: 'note.https://example' }).success).toBe(true)
+  })
+  it('routes the dedicated view marker through the field AST without reopening projected keys', () => {
+    const parsed = NotesQuerySchema.parse({
+      field: 'note.view:board',
+      fieldAny: 'note.view',
+    })
+
+    expect(parseFieldFilter(parsed)?.nodes).toEqual([
+      {
+        op: 'or',
+        ns: 'note',
+        key: 'view',
+        values: [{ kind: 'eq', value: 'board' }, { kind: 'present' }],
+      },
+    ])
+    expect(NotesQuerySchema.safeParse({ fieldDay: 'note.view:2026-01-01' }).success).toBe(false)
+    expect(NotesQuerySchema.safeParse({ fieldBad: 'note.view' }).success).toBe(false)
+  })
+  it('validates the persisted v1 AST as a closed bounded shape', () => {
+    expect(
+      FieldFilterAstV1Schema.safeParse({
+        op: 'and',
+        nodes: [
+          {
+            op: 'or',
+            ns: 'note',
+            key: 'status',
+            values: [{ kind: 'eq', value: 'doing' }],
+          },
+        ],
+      }).success,
+    ).toBe(true)
+    expect(
+      FieldFilterAstV1Schema.safeParse({
+        op: 'and',
+        nodes: [{ op: 'or', ns: 'note', key: 'status', values: [], extra: true }],
+      }).success,
+    ).toBe(false)
   })
   it('fails loudly when parseFieldFilter is called without schema validation', () => {
     expect(() => parseFieldFilter({ field: ['garbage'] })).toThrow(/namespace/)

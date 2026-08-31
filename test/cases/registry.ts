@@ -37,6 +37,7 @@ import { searchCorpus } from './cases/searchCorpus'
 import { trashEmpty, trashLong, trashMixed } from './cases/trash'
 import { trashRecovery } from './cases/trashRecovery'
 import { treeSort } from './cases/treeSort'
+import { views, viewsScale } from './cases/views'
 import { wikiWeb } from './cases/wikiWeb'
 import type { CaseSpec } from './types'
 
@@ -77,6 +78,8 @@ export const CASES: readonly CaseSpec[] = [
   // declared meta fields (the field axis)
   fields,
   fieldsScale,
+  views,
+  viewsScale,
   // content / reader
   readerShowcase,
   longDocument,

@@ -546,6 +546,9 @@ export type NoteMeta = {
   tags?: string[]
   /** Typed primary note kind, projected independently from the bounded custom-fields blob. */
   noteType?: string
+  /** Cheap view-reader marker, projected independently from the bounded custom-fields blob.
+   * The carrier in the note body remains authoritative; this field is discovery-only. */
+  viewType?: string
   /** The note's authored frontmatter beyond the typed fields above — THE field axis
    *  on the snapshot. Absent means "this row did not carry the column", never "the
    *  note has no author keys": a delta poll sends it only for changed rows, and the
@@ -689,6 +692,8 @@ export type SearchResult = {
   snippet: string
   /** Decorative note type label — NOT the model class. Defaults to `note`. */
   noteType?: string
+  /** Dedicated view discovery marker; the carrier body remains authoritative. */
+  viewType?: string
   /** Decorative engine-supplied hit kind (legacy back-compat) — NOT the model class or noteType. */
   type?: string
   /** The note's class, carried as a label (user search only returns visible classes). */
@@ -702,6 +707,9 @@ export type WriteInput = {
   content?: string
   directory?: string
   noteType?: string
+  /** Internal typed frontmatter channel for the derived primary view marker. Undefined
+   * preserves, an empty string clears, and a non-empty string sets `view:`. */
+  viewType?: string
   tags?: string[] | string
   /** The user-typed display slug — three-state like tags: `undefined` LEAVES `slug:` untouched, a
    *  string SETS it (kept only when it diverges from slug(title)), `''` CLEARS it. Never touches

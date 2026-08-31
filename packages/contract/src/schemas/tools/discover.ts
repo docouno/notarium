@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import {
+  DurableScalarSchema,
   IsoTimestampSchema,
   RevisionKindSchema,
   RevisionUnavailableReasonSchema,
@@ -34,6 +35,7 @@ export const ListNotesItemSchema = z.object({
   path: z.string(),
   tags: z.array(z.string()).optional(),
   modifiedAt: IsoTimestampSchema,
+  viewType: DurableScalarSchema.optional(),
 })
 
 /** list_notes' payload: `items` (direct notes, title-ordered) + `folders` (direct

@@ -31,10 +31,13 @@ export type FieldClause = {
   >
 }
 
-export type FieldFilter = {
+export type FieldFilterAstV1 = {
   op: 'and'
   nodes: FieldClause[]
 }
+
+/** Compatibility name for the existing REST/MCP field-filter surface. */
+export type FieldFilter = FieldFilterAstV1
 
 export type FieldValue = string | string[] | null
 

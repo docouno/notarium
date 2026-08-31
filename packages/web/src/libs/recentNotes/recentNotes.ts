@@ -23,6 +23,8 @@ export type RecentNote = {
   /** Decorative note type label. Old localStorage rows omit it; loadRecentNotes
    *  keeps those as type-less. */
   noteType?: string
+  /** Dedicated view discovery marker. Old localStorage rows omit it. */
+  viewType?: string
   /** The note's real modification signal (mtime/journal, #186). Old localStorage
    *  rows omit it; loadRecentNotes normalises those to null. */
   modifiedAt?: string | null
@@ -131,6 +133,7 @@ const normalizeRecentNote = (note: RecentNote): RecentNote => ({
   ...(typeof note.slug === 'string' ? { slug: note.slug } : {}),
   ...(typeof note.filePath === 'string' ? { filePath: note.filePath } : {}),
   ...(typeof note.noteType === 'string' && note.noteType ? { noteType: note.noteType } : {}),
+  ...(typeof note.viewType === 'string' && note.viewType ? { viewType: note.viewType } : {}),
   ...(typeof note.href === 'string' && note.kind === 'owned-ability' ? { href: note.href } : {}),
   modifiedAt:
     typeof note.modifiedAt === 'string' || note.modifiedAt === null ? note.modifiedAt : null,

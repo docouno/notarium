@@ -2,6 +2,12 @@ import DOMPurify from 'dompurify'
 import { marked, Renderer } from 'marked'
 import markedFootnote from 'marked-footnote'
 import { markedHighlight } from 'marked-highlight'
+import {
+  type ParsedViewDocument,
+  parseViewDocument,
+  replaceViewCarriers,
+  type ViewDocumentContext,
+} from '@notarium/core'
 import { parseBodyFrontmatterBlock } from '@notarium/core/markdown'
 import { slugify } from '@notarium/core/slug'
 import { calloutExtension } from './callout'
@@ -163,6 +169,11 @@ export type RenderMarkdownOptions = {
   idPrefix?: string
 }
 
+export type RenderedMarkdownDocument = {
+  html: string
+  views: ParsedViewDocument
+}
+
 export const prefixDocumentFragments = (html: string, rawPrefix: string | undefined): string => {
   const prefix = (rawPrefix ?? '').replace(/[^a-zA-Z0-9_-]/g, '-')
 
@@ -186,8 +197,7 @@ export const prefixDocumentFragments = (html: string, rawPrefix: string | undefi
     )
 }
 
-export const renderMarkdown = (md = '', options: RenderMarkdownOptions = {}): string => {
-  const body = stripLeadingFrontmatter(md)
+const renderMarkdownBody = (body: string, options: RenderMarkdownOptions): string => {
   const previousOffset = headingDepthOffset
   headingDepthOffset = Math.max(0, Math.min(5, Math.trunc(options.headingOffset ?? 0)))
 
@@ -205,12 +215,41 @@ export const renderMarkdown = (md = '', options: RenderMarkdownOptions = {}): st
     // on*-handlers / javascript: are still stripped, and KaTeX runs with trust:false so no
     // \href link is ever produced in the first place).
     const sanitized = DOMPurify.sanitize(html, {
-      ADD_ATTR: ['target', 'rel'],
+      ADD_ATTR: ['target', 'rel', 'data-notarium-view-block'],
       ADD_TAGS: ['semantics', 'annotation'],
     })
     return prefixDocumentFragments(sanitized, options.idPrefix)
   } finally {
     headingDepthOffset = previousOffset
+  }
+}
+
+export const renderMarkdown = (md = '', options: RenderMarkdownOptions = {}): string =>
+  renderMarkdownBody(stripLeadingFrontmatter(md), options)
+
+const withViewPlaceholders = (body: string, views: ParsedViewDocument): string => {
+  const occurrences = new Set(views.blocks.map((block) => block.occurrence))
+
+  return replaceViewCarriers(body, (occurrence) =>
+    occurrences.has(occurrence)
+      ? `\n<div data-notarium-view-block="${occurrence}"></div>\n`
+      : '\n\n',
+  )
+}
+
+/** Live note/editor rendering keeps one Markdown parse and replaces only exact nota
+ * ranges with inert hosts. React portals are mounted by MarkdownDocument later. */
+export const renderMarkdownDocument = (
+  md = '',
+  options: RenderMarkdownOptions = {},
+  context?: ViewDocumentContext,
+): RenderedMarkdownDocument => {
+  const body = stripLeadingFrontmatter(md)
+  const views = parseViewDocument(body, context)
+
+  return {
+    html: renderMarkdownBody(withViewPlaceholders(body, views), options),
+    views,
   }
 }
 

@@ -14,6 +14,10 @@ export const asNote = (d: NoteDetailView, seed?: NoteView | null): NoteView | nu
         aliases: d.aliases,
         modifiedAt: seed?.modifiedAt ?? null,
         createdAt: d.createdAt ?? seed?.createdAt ?? null,
+        viewType:
+          typeof d.frontmatter?.view === 'string' && d.frontmatter.view
+            ? d.frontmatter.view
+            : undefined,
       }
     : null
 
@@ -26,6 +30,10 @@ export const asRecent = (d: NoteDetailView, seed?: NoteView | null): RecentNote 
         slug: d.slug,
         filePath: d.filePath,
         noteType: typeof d.frontmatter?.type === 'string' ? d.frontmatter.type : undefined,
+        viewType:
+          typeof d.frontmatter?.view === 'string' && d.frontmatter.view
+            ? d.frontmatter.view
+            : undefined,
         modifiedAt: d.modifiedAt ?? seed?.modifiedAt ?? null,
         createdAt: d.createdAt ?? seed?.createdAt ?? null,
       }

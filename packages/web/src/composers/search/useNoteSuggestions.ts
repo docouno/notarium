@@ -26,6 +26,7 @@ export type NoteSuggestion = {
   modifiedAt: string | null
   createdAt: string | null
   noteType?: string
+  viewType?: string
   snippet?: string
   href?: string
 }
@@ -131,6 +132,7 @@ export const useNoteSuggestions = (
       slug?: string
       filePath?: string
       noteType?: string
+      viewType?: string
       modifiedAt?: string | null
       createdAt?: string | null
       href?: string
@@ -146,6 +148,7 @@ export const useNoteSuggestions = (
         slug: backfill?.slug ?? n.slug,
         filePath: backfill?.filePath ?? n.filePath,
         noteType: n.noteType,
+        viewType: backfill?.viewType ?? n.viewType,
         modifiedAt: n.modifiedAt ?? backfill?.modifiedAt ?? null,
         createdAt: n.createdAt ?? backfill?.createdAt ?? null,
         href: n.href,
@@ -183,6 +186,7 @@ export const useNoteSuggestions = (
       modifiedAt: r.modifiedAt,
       createdAt: r.createdAt,
       noteType: r.noteType,
+      viewType: r.viewType,
       snippet: r.snippet,
     }))
   }, [q, results])

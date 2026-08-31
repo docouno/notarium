@@ -2,6 +2,7 @@ import type { NoteContent, NoteFacts } from '../../../knowledgeStore'
 import { analyzeDocumentState, estimateTokens } from '../../../libs/markdown'
 import { basenameOf } from '../../../libs/path'
 import { makeSnippet } from '../../../snippet'
+import { semanticViewContent } from '../../../views'
 import type { NoteFactsCacheOptions } from './types'
 
 const encoder = new TextEncoder()
@@ -11,14 +12,18 @@ const factsOf = (
   content: string,
   frontmatter: Record<string, unknown>,
   noteClass?: NoteContent['class'],
-): NoteFacts => ({
-  title,
-  summary: typeof frontmatter.summary === 'string' ? frontmatter.summary : null,
-  snippet: makeSnippet(content, 160),
-  muted: frontmatter.muted === true || frontmatter.muted === 'true',
-  bodyTokens: estimateTokens(content),
-  ...(noteClass ? { noteClass } : {}),
-})
+): NoteFacts => {
+  const semanticContent = semanticViewContent(content)
+
+  return {
+    title,
+    summary: typeof frontmatter.summary === 'string' ? frontmatter.summary : null,
+    snippet: makeSnippet(semanticContent, 160),
+    muted: frontmatter.muted === true || frontmatter.muted === 'true',
+    bodyTokens: estimateTokens(semanticContent),
+    ...(noteClass ? { noteClass } : {}),
+  }
+}
 
 /** Whole-population cache of tiny body facts. It intentionally stores no body and
  * has no LRU cap: eager context must not randomly fall back to O(file parsing) when

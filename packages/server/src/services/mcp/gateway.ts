@@ -12,7 +12,7 @@ import {
   type ToolName,
   tools,
 } from '@notarium/contract/tools'
-import { asciiSlug, STORE_ERROR_REASON } from '@notarium/core'
+import { asciiSlug, type ReaderRegistry, STORE_ERROR_REASON } from '@notarium/core'
 
 import { clientFailureOf } from '../../libs/clientFailure'
 import type { AbilitiesService } from '../abilities'
@@ -38,6 +38,13 @@ import type { ProviderRegistry } from '../providerRegistry'
 import type { RolesService } from '../roles'
 import { ensurePersonalSpace, peekPersonalSpace, type SpaceManager } from '../spaces'
 import { createStoreAccess, type StoreAccess } from '../storeAccess'
+import {
+  VIEW_PROJECTION_ADAPTERS,
+  VIEW_READER_REGISTRY,
+  VIEW_SOURCE_REGISTRY,
+} from '../views/registry'
+import type { ViewSourceRegistry } from '../views/sourceRegistry'
+import type { ViewProjectionAdapters } from '../views/viewProjection'
 import { TOOL_META, type ToolAnnotations } from './descriptions'
 import { projectSummaryOf } from './helpers/projectAddressing'
 import { retrievalRowOf } from './helpers/retrievalAudit'
@@ -101,6 +108,9 @@ export type GatewayDeps = {
   /** Space-owned field declarations used by field writes without exposing a
    * schema-management tool to agents. */
   fieldSchemaStore?: FieldSchemaStore
+  viewReaders?: ReaderRegistry
+  viewSources?: ViewSourceRegistry
+  viewProjectionAdapters?: ViewProjectionAdapters
   /** The context-sets registry. Absent (meta-DB-less host) → no sets exist
    *  (honest degradation; the location-bound pin still works). */
   contextSets?: ContextSetsPersistence
@@ -151,6 +161,9 @@ export type Ctx = {
   folders?: FolderIdentityPersistence
   markerStore?: MarkerStore
   fieldSchemaStore?: FieldSchemaStore
+  viewReaders?: ReaderRegistry
+  viewSources?: ViewSourceRegistry
+  viewProjectionAdapters?: ViewProjectionAdapters
   contextSets?: ContextSetsPersistence
   scopePins?: ScopePinsPersistence
   contextOrder?: ContextOrderPersistence
@@ -292,6 +305,9 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
       folders: deps.folders,
       markerStore: deps.markerStore,
       fieldSchemaStore: deps.fieldSchemaStore,
+      viewReaders: deps.viewReaders ?? VIEW_READER_REGISTRY,
+      viewSources: deps.viewSources ?? VIEW_SOURCE_REGISTRY,
+      viewProjectionAdapters: deps.viewProjectionAdapters ?? VIEW_PROJECTION_ADAPTERS,
       contextSets: deps.contextSets,
       scopePins: deps.scopePins,
       contextOrder: deps.contextOrder,

@@ -6,6 +6,7 @@ import { cx } from '../../libs/cx/cx'
 import { type DragItem, dragKey } from '../../libs/dnd/dnd'
 import { noteRoute } from '../../libs/routing/routePaths'
 import type { NoteView } from '../../libs/wire'
+import { ViewTypeIcon } from '../../widgets/ViewBlock'
 import { noteMenuItems } from './helpers/menuItems'
 import { baseName, dirOfPath } from './helpers/paths'
 import { RenameInput } from './RenameInput'
@@ -50,6 +51,11 @@ export const NoteRow = ({
   const selected = selectable && dnd.selectedKeys.has(key)
   const dragging = dnd.draggingKeys.has(key)
   const editing = tree.renaming && tree.renaming.kind === 'note' && tree.renaming.id === id
+  const icon = note.viewType ? (
+    <ViewTypeIcon viewType={note.viewType} size={14} />
+  ) : (
+    <IconDoc size={14} />
+  )
 
   // A modifier-click drives multi-select in the tree (#163), overriding the
   // anchor's native new-tab (canon §2 change) — middle-click + the context
@@ -98,6 +104,7 @@ export const NoteRow = ({
       )}
       style={{ paddingLeft: depth * 12 }}
       data-drop-folder={parent}
+      data-view-type={note.viewType}
       role={selectable ? 'treeitem' : undefined}
       aria-level={selectable ? depth + 1 : undefined}
       aria-selected={selectable ? selected : undefined}
@@ -105,7 +112,7 @@ export const NoteRow = ({
       <span className={styles.chevSpacer} />
       {editing ? (
         <span className={cx(styles.navItemBtn, styles.noteRow)}>
-          <IconDoc size={14} />
+          {icon}
           <RenameInput
             initial={note.title}
             onCommit={(v) => tree.commitRename('note', note, v)}
@@ -114,7 +121,7 @@ export const NoteRow = ({
         </span>
       ) : href ? (
         <Link to={href} {...rowProps}>
-          <IconDoc size={14} />
+          {icon}
           <span className={styles.navLabel}>{note.title}</span>
         </Link>
       ) : (
@@ -130,7 +137,7 @@ export const NoteRow = ({
             }
           }}
         >
-          <IconDoc size={14} />
+          {icon}
           <span className={styles.navLabel}>{note.title}</span>
         </a>
       )}

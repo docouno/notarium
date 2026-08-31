@@ -35,6 +35,7 @@ import { spacesRoutes } from './spaces'
 import { trashRoutes } from './trash'
 import { treeRoutes } from './tree'
 import type { ApiRoutesOptions } from './types'
+import { viewsRoutes } from './views'
 
 export const apiRoutes = async (app: FastifyInstance, opts: ApiRoutesOptions) => {
   const {
@@ -68,6 +69,7 @@ export const apiRoutes = async (app: FastifyInstance, opts: ApiRoutesOptions) =>
   await spacesRoutes(app, ctx)
   await eventsRoutes(app, ctx)
   await notesRoutes(app, ctx)
+  await viewsRoutes(app, ctx)
   await favoritesRoutes(app, ctx)
   await fieldsRoutes(app, ctx)
   await treeRoutes(app, ctx)

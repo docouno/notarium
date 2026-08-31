@@ -1,0 +1,10 @@
+.placeholder {
+  flex: 0 0 var(--insertion-placeholder-height, calc(var(--control-height) * 2));
+  height: var(--insertion-placeholder-height, calc(var(--control-height) * 2));
+  min-height: var(--control-height);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+  pointer-events: none;
+}

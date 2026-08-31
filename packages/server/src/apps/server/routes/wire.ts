@@ -88,6 +88,7 @@ export const noteToWire = (
     modifiedAt: n.modifiedAt,
     createdAt: n.createdAt,
     noteType,
+    ...(n.viewType ? { viewType: n.viewType } : {}),
     ...(Object.keys(fields).length ? { fields } : {}),
   }
 }
@@ -173,6 +174,7 @@ export const searchResultToWire = (
   modifiedAt: r.modifiedAt ?? null,
   createdAt: r.createdAt ?? null,
   noteType: r.noteType,
+  viewType: r.viewType,
   score: r.score,
   snippet: r.snippet,
   type: r.type,

@@ -71,6 +71,8 @@ export type NoteView = {
   modifiedAt: string | null
   createdAt: string | null
   noteType?: string
+  viewType?: string
+  viewSummary?: WireNote['viewSummary']
   /** Warm cached preview, present only on a window asked for it (?preview=1). */
   preview?: Preview | null
   fields?: WireNote['fields']
@@ -86,6 +88,8 @@ export const noteView = (n: WireNote): NoteView => ({
   modifiedAt: n.modifiedAt,
   createdAt: n.createdAt,
   noteType: n.noteType,
+  viewType: n.viewType,
+  viewSummary: n.viewSummary,
   preview: n.preview,
   fields: n.fields,
 })
@@ -187,6 +191,7 @@ export type SearchResultView = {
   modifiedAt: string | null
   createdAt: string | null
   noteType?: string
+  viewType?: string
   score?: number
   snippet: string
   type?: string
@@ -199,6 +204,7 @@ export const searchResultView = (r: WireSearchResult): SearchResultView => ({
   modifiedAt: r.modifiedAt,
   createdAt: r.createdAt,
   noteType: r.noteType,
+  viewType: r.viewType,
   score: r.score,
   snippet: r.snippet,
   type: r.type,

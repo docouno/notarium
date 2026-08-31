@@ -59,6 +59,9 @@ export const notesQs = (p: NotesQueryParams): string => {
   if (p.preview) {
     q.set(QUERY_KEY.preview, '1')
   }
+  if (p.viewSummary) {
+    q.set(QUERY_KEY.viewSummary, '1')
+  }
   const s = q.toString()
   return s ? `?${s}` : ''
 }

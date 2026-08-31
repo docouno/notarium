@@ -185,7 +185,7 @@ import { WikilinkLabelCache, type WikilinkLabelCacheStats } from './wikilinkLabe
  *  back; which read takes which list, and what the per-row decode costs those two, is
  *  stated once, in the canon below.
  *  canon: docs/search.md#how-it-is-indexed-write-path */
-const NOTE_META_COLS =
+const NOTE_META_BASE_COLS =
   'path, title, class, created_at, modified_at, note_type, id_claim, source_locator, aliases, slug, tags'
 /** The empty string a delta poll parks in `fields` for a row it did not re-send.
  *  Distinct from the column's default, which is a valid blob meaning "no author
@@ -210,7 +210,7 @@ type NoteMetaRow = Pick<
   | 'aliases'
   | 'slug'
   | 'tags'
-> & { fields?: string }
+> & { fields?: string; view_type?: string | null }
 type ReconcileRow = Pick<NoteRow, 'path' | 'class' | 'mtime_ms' | 'size' | 'seq'> & {
   rowid: number
   change_token: string | null
@@ -547,7 +547,7 @@ vec AS (
 SELECT COALESCE(fts.note_rowid, vec.note_rowid) AS note_rowid,
        n.path AS path, n.title AS title, n.class AS class, n.note_type AS note_type,
        n.modified_at AS modified_at, n.created_at AS created_at,
-       substr(n.body, 1, 200) AS body_head,
+       substr(n.semantic_body, 1, 200) AS body_head,
        vec.best_chunk AS best_chunk,
        fts.rnk AS fts_rnk,
        vec.rnk AS vec_rnk
@@ -561,7 +561,7 @@ JOIN notes n ON n.rowid = COALESCE(fts.note_rowid, vec.note_rowid)
  *  visibility post-filter OPEN and could leak agent-memory (#78). `?ids` is
  *  substituted with one placeholder per missing path at call time. */
 const GRAPH_NEIGHBOR_SQL = `
-SELECT rowid AS note_rowid, path, title, class, note_type, modified_at, created_at, substr(body, 1, 200) AS body_head
+SELECT rowid AS note_rowid, path, title, class, note_type, modified_at, created_at, substr(semantic_body, 1, 200) AS body_head
 FROM notes WHERE path IN (?ids)
 `
 
@@ -765,6 +765,9 @@ export class NotariumStore implements KnowledgeStore {
    *  flag above and read for the same reason: a store pinned to a truncated ladder
    *  (the migration tests) must still write, select and reconcile rows. */
   private fieldsReady = false
+  /** The view-document rung is optional only for migration tests pinned below it. */
+  private semanticBodyReady = false
+  private viewTypeReady = false
   /** Rescan work since boot, for the migration gate and the numbers a re-derivation is
    *  reported with: files whose bytes the scan actually read, and rows the scan
    *  actually re-derived. A forced re-derivation publishes no delta on the boot pass,
@@ -1142,6 +1145,8 @@ export class NotariumStore implements KnowledgeStore {
       const noteColumns = await this.sql.all<{ name: string }>(`PRAGMA table_info(notes)`)
 
       this.fieldsReady = noteColumns.some((column) => column.name === 'fields')
+      this.semanticBodyReady = noteColumns.some((column) => column.name === 'semantic_body')
+      this.viewTypeReady = noteColumns.some((column) => column.name === 'view_type')
       // The vector half (#81), only with an embedder: builds note_vectors, wipes
       // a stale partition (model/chunker drift OR a notes rebuild), and may degrade
       // to FTS if vec0 turns out absent. Done before rescan so upsertRow can enqueue
@@ -1619,7 +1624,12 @@ export class NotariumStore implements KnowledgeStore {
       body: string
       content_hash: string | null
       embedded_hash: string | null
-    }>(`SELECT title, body, content_hash, embedded_hash FROM notes WHERE rowid = ?`, [rowid])
+    }>(
+      `SELECT title, ${this.semanticBodyReady ? 'semantic_body' : 'body'} AS body,
+              content_hash, embedded_hash
+         FROM notes WHERE rowid = ?`,
+      [rowid],
+    )
 
     if (!row || !row.content_hash) {
       return
@@ -1701,9 +1711,9 @@ export class NotariumStore implements KnowledgeStore {
     // Commit point: mark the note embedded for THIS hash, LAST. Guarded on
     // content_hash so a concurrent edit slipping in between the re-read and here
     // can't mark stale vectors complete (0 rows → embedded_hash stays behind →
-    // the note re-embeds). This UPDATE fires notes_au (a redundant FTS re-index of
-    // unchanged text) — negligible next to inference, and it leaves seq untouched
-    // so it never surfaces as a note change in the delta feed.
+    // the note re-embeds). The FTS trigger names only its materialized columns and
+    // its value-change predicate keeps this sentinel-only UPDATE out of FTS. It
+    // also leaves seq untouched, so it never surfaces as a note change in the delta feed.
     await this.sql.run(`UPDATE notes SET embedded_hash = ? WHERE rowid = ? AND content_hash = ?`, [
       hash,
       rowid,
@@ -1891,6 +1901,8 @@ export class NotariumStore implements KnowledgeStore {
       row.aliases === JSON.stringify(parsed.aliases) &&
       row.slug === parsed.slug &&
       row.body === parsed.body &&
+      (!this.semanticBodyReady || row.semantic_body === parsed.semanticBody) &&
+      (!this.viewTypeReady || row.view_type === parsed.viewType) &&
       (!this.fieldsReady || row.fields === parsed.fields) &&
       (!this.fieldsReady || row.source_locator === (parsed.sourceLocator ?? null)) &&
       (parsed.createdAt == null || row.created_at === parsed.createdAt)
@@ -2209,27 +2221,19 @@ export class NotariumStore implements KnowledgeStore {
     knownSourceHash?: string,
   ): Promise<void> {
     const parsed = parseNoteFile(raw, fullPath)
-    const existing = await this.sql.get<
-      Pick<
-        NoteRow,
-        | 'seq'
-        | 'title'
-        | 'class'
-        | 'note_type'
-        | 'id_claim'
-        | 'source_locator'
-        | 'tags'
-        | 'aliases'
-        | 'slug'
-        | 'body'
-        | 'content_hash'
-      > & { rowid: number }
-    >(
-      `SELECT rowid, seq, title, class, note_type, id_claim, source_locator,
-              tags, aliases, slug, body, content_hash
-         FROM notes WHERE path = ?`,
-      [fullPath],
-    )
+    type ExistingProjection = Pick<
+      NoteRow,
+      | 'seq'
+      | 'title'
+      | 'class'
+      | 'id_claim'
+      | 'tags'
+      | 'aliases'
+      | 'slug'
+      | 'body'
+      | 'semantic_body'
+      | 'content_hash'
+    > & { rowid: number }
     // `modified` is always the file's real mtime; `created:` frontmatter (an
     // import, #11) overrides birthtime so a note keeps the date it happened.
     const modifiedAt = isoOrNull(stat.mtimeMs)
@@ -2238,39 +2242,15 @@ export class NotariumStore implements KnowledgeStore {
     const aliases = JSON.stringify(parsed.aliases)
     const slug = parsed.slug // #100 phase 1: NULL when no custom `slug:` in frontmatter
     const noteType = parsed.noteType ?? DEFAULT_NOTE_TYPE
+    const semanticBody = this.semanticBodyReady ? parsed.semanticBody : parsed.body
     // content_hash is computed for EVERY upsert (cheap), not just when an embedder
     // is wired in: it must be present so that adding an embedder on a later boot
     // can backfill vectors for files that didn't change (#81/P13 invalidation
     // arbiter; mtime/size are the cheap pre-filter the rescan already applies).
-    const vectorInputsUnchanged = Boolean(
-      existing && existing.title === parsed.title && existing.body === parsed.body,
-    )
-    const contentHash =
-      vectorInputsUnchanged && existing?.content_hash
-        ? existing.content_hash
-        : await this.embedContentHash(parsed.title, parsed.body)
-    const sourceHash = knownSourceHash ?? (await sha256Hex(raw))
-    const graphInputsUnchanged = Boolean(
-      existing &&
-      existing.title === parsed.title &&
-      existing.class === cls &&
-      existing.id_claim === parsed.idClaim &&
-      existing.aliases === aliases &&
-      existing.slug === slug &&
-      existing.body === parsed.body,
-    )
-    const metadataOnly = Boolean(graphInputsUnchanged && existing?.tags === tags)
-    const vectorChanged = !existing || existing.content_hash !== contentHash
-    const priorLabels =
-      existing && existing.body === parsed.body && this.wikilinkParseCacheEnabled
-        ? await this.sourceFingerprint(existing.rowid, existing.seq).then((fingerprint) =>
-            fingerprint ? this.wikilinkLabels.get(existing.rowid, fingerprint) : undefined,
-          )
-        : undefined
-
-    if (!graphInputsUnchanged) {
-      this.invalidateGraphCache()
-    }
+    const [contentHash, sourceHash] = await Promise.all([
+      this.embedContentHash(parsed.title, semanticBody),
+      knownSourceHash == null ? sha256Hex(raw) : Promise.resolve(knownSourceHash),
+    ])
     // created_at on UPDATE rides COALESCE(claim, existing): a `created:` frontmatter
     // claim (import #11 / an authored date edit #186) REFRESHES the index so the new
     // date is visible at once; a note with NO claim keeps its first-seen value (NULL
@@ -2278,12 +2258,45 @@ export class NotariumStore implements KnowledgeStore {
     // note's Feed position. The INSERT branch seeds created_at for a brand-new row.
     const fieldsSet = this.fieldsReady ? 'fields = ?, ' : ''
     const fieldsValue = this.fieldsReady ? [parsed.fields] : []
+    const viewTypeSet = this.viewTypeReady ? 'view_type = ?, ' : ''
+    const viewTypeValue = this.viewTypeReady ? [parsed.viewType] : []
+    const semanticBodySet = this.semanticBodyReady ? 'semantic_body = ?, ' : ''
+    const semanticBodyValue = this.semanticBodyReady ? [semanticBody] : []
     const published = await this.publishWithSeq(async (seq) => {
+      const existing = await this.sql.get<ExistingProjection>(
+        `SELECT rowid, seq, title, class, id_claim, tags, aliases, slug, body,
+                ${this.semanticBodyReady ? 'semantic_body,' : ''}
+                content_hash
+           FROM notes WHERE path = ?`,
+        [fullPath],
+      )
+      const previousSemanticBody = this.semanticBodyReady ? existing?.semantic_body : existing?.body
+      const vectorInputsUnchanged = Boolean(
+        existing && existing.title === parsed.title && previousSemanticBody === semanticBody,
+      )
+      const graphInputsUnchanged = Boolean(
+        existing &&
+        existing.title === parsed.title &&
+        existing.class === cls &&
+        existing.id_claim === parsed.idClaim &&
+        existing.aliases === aliases &&
+        existing.slug === slug &&
+        previousSemanticBody === semanticBody,
+      )
+      const metadataOnly = Boolean(
+        graphInputsUnchanged && existing?.body === parsed.body && existing.tags === tags,
+      )
+      const priorLabels =
+        existing && previousSemanticBody === semanticBody && this.wikilinkParseCacheEnabled
+          ? await this.sourceFingerprint(existing.rowid, existing.seq).then((fingerprint) =>
+              fingerprint ? this.wikilinkLabels.get(existing.rowid, fingerprint) : undefined,
+            )
+          : undefined
       const updated = metadataOnly
         ? await this.sql.run(
             `UPDATE notes SET mtime_ms = ?, size = ?, modified_at = ?, note_type = ?,
                               created_at = COALESCE(?, created_at), source_locator = ?,
-                              ${fieldsSet}seq = ?
+                              ${viewTypeSet}${fieldsSet}content_hash = ?, seq = ?
              WHERE path = ?`,
             [
               stat.mtimeMs,
@@ -2292,7 +2305,9 @@ export class NotariumStore implements KnowledgeStore {
               noteType,
               parsed.createdAt,
               parsed.sourceLocator,
+              ...viewTypeValue,
               ...fieldsValue,
+              contentHash,
               seq,
               fullPath,
             ],
@@ -2300,7 +2315,8 @@ export class NotariumStore implements KnowledgeStore {
         : await this.sql.run(
             `UPDATE notes SET title = ?, class = ?, mtime_ms = ?, size = ?, modified_at = ?,
                           note_type = ?, created_at = COALESCE(?, created_at),
-                          id_claim = ?, source_locator = ?, tags = ?, aliases = ?, slug = ?, body = ?, ${fieldsSet}content_hash = ?, seq = ?
+                          id_claim = ?, source_locator = ?, tags = ?, aliases = ?, slug = ?,
+                          body = ?, ${semanticBodySet}${viewTypeSet}${fieldsSet}content_hash = ?, seq = ?
          WHERE path = ?`,
             [
               parsed.title,
@@ -2316,6 +2332,8 @@ export class NotariumStore implements KnowledgeStore {
               aliases,
               slug,
               parsed.body,
+              ...semanticBodyValue,
+              ...viewTypeValue,
               ...fieldsValue,
               contentHash,
               seq,
@@ -2323,10 +2341,12 @@ export class NotariumStore implements KnowledgeStore {
             ],
           )
 
-      if (updated.changes === 0) {
+      const inserted = updated.changes === 0
+
+      if (inserted) {
         await this.sql.run(
-          `INSERT INTO notes (path, title, class, mtime_ms, size, created_at, modified_at, note_type, id_claim, source_locator, tags, aliases, slug, body, ${this.fieldsReady ? 'fields, ' : ''}content_hash, seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${this.fieldsReady ? '?, ' : ''}?, ?)`,
+          `INSERT INTO notes (path, title, class, mtime_ms, size, created_at, modified_at, note_type, id_claim, source_locator, tags, aliases, slug, body, ${this.semanticBodyReady ? 'semantic_body, ' : ''}${this.viewTypeReady ? 'view_type, ' : ''}${this.fieldsReady ? 'fields, ' : ''}content_hash, seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ${this.semanticBodyReady ? '?, ' : ''}${this.viewTypeReady ? '?, ' : ''}${this.fieldsReady ? '?, ' : ''}?, ?)`,
           [
             fullPath,
             parsed.title,
@@ -2342,6 +2362,8 @@ export class NotariumStore implements KnowledgeStore {
             aliases,
             slug,
             parsed.body,
+            ...semanticBodyValue,
+            ...viewTypeValue,
             ...fieldsValue,
             contentHash,
             seq,
@@ -2352,8 +2374,19 @@ export class NotariumStore implements KnowledgeStore {
         fullPath,
       ])
 
-      return { seq, rowid: row?.rowid }
+      return {
+        seq,
+        rowid: row?.rowid,
+        graphInputsChanged: inserted || !graphInputsUnchanged,
+        vectorChanged: inserted || !existing || existing.content_hash !== contentHash,
+        vectorInputsUnchanged: !inserted && vectorInputsUnchanged,
+        priorLabels: inserted ? undefined : priorLabels,
+      }
     })
+
+    if (published.graphInputsChanged) {
+      this.invalidateGraphCache()
+    }
 
     // Enqueue the (re)embed off the note's rowid — stable across this UPDATE and
     // across renames, the same key FTS and note_vectors ride. The loop dedups by
@@ -2375,9 +2408,10 @@ export class NotariumStore implements KnowledgeStore {
               // A path-only move keeps rowid + raw bytes. Its existing exact entry is
               // already valid, so do not re-run the markdown parser merely because
               // the resolver metadata/path changed.
-              let labels = priorLabels ?? this.wikilinkLabels.get(published.rowid, sourceHash)
+              let labels =
+                published.priorLabels ?? this.wikilinkLabels.get(published.rowid, sourceHash)
 
-              if (!labels && !vectorInputsUnchanged) {
+              if (!labels && !published.vectorInputsUnchanged) {
                 this.wikilinkLabels.observeParserCall()
                 labels = parseWikilinks(parsed.body)
               }
@@ -2408,7 +2442,7 @@ export class NotariumStore implements KnowledgeStore {
           this.wikilinkLabels.cancelPublication(labelPublication)
         }
       }
-      if (this.vecReady && vectorChanged) {
+      if (this.vecReady && published.vectorChanged) {
         this.enqueueEmbed(BigInt(published.rowid))
       }
     }
@@ -2814,7 +2848,7 @@ export class NotariumStore implements KnowledgeStore {
     // Bare/degraded direct reads use the same name algebra as graph derivation.
     // Production CachedStore resolves a human target before its exact-id read; the
     // shared index keeps this fallback from copying the resolver's pass order.
-    const all = await this.sql.all<NoteMetaRow>(`SELECT ${NOTE_META_COLS} FROM notes ORDER BY path`)
+    const all = await this.sql.all<NoteMetaRow>(`SELECT ${this.metaCols} FROM notes ORDER BY path`)
     const currentFolders = await this.mountForClass(undefined).files.listDirs()
     const index = buildLinkIndex(
       all.map((r) => this.linkMeta(this.metaOf(r))),
@@ -2845,6 +2879,7 @@ export class NotariumStore implements KnowledgeStore {
       slug?: string | null
       tags?: string
       fields?: string
+      view_type?: string | null
     },
   ): NoteMeta {
     const aliases = parseJsonArray(row.aliases)
@@ -2862,6 +2897,7 @@ export class NotariumStore implements KnowledgeStore {
       ...(aliases.length ? { aliases } : {}),
       ...(tags.length ? { tags } : {}),
       noteType: row.note_type || DEFAULT_NOTE_TYPE,
+      ...(row.view_type ? { viewType: row.view_type } : {}),
       ...(fields ? { fields } : {}),
       modifiedAt: row.modified_at,
       createdAt: row.created_at,
@@ -2875,8 +2911,12 @@ export class NotariumStore implements KnowledgeStore {
    *  resolve fallback deliberately keep the narrow `NOTE_META_COLS` — both walk the
    *  whole corpus, neither reads fields, and a mandatory JSON decode per row is
    *  measurable against their loop-block budget. */
+  private get metaCols(): string {
+    return this.viewTypeReady ? `${NOTE_META_BASE_COLS}, view_type` : NOTE_META_BASE_COLS
+  }
+
   private get metaColsWithFields(): string {
-    return this.fieldsReady ? `${NOTE_META_COLS}, fields` : NOTE_META_COLS
+    return this.fieldsReady ? `${this.metaCols}, fields` : this.metaCols
   }
 
   /** Rescan work since boot — see `rescanCounters` for what the two numbers mean and
@@ -3722,7 +3762,7 @@ export class NotariumStore implements KnowledgeStore {
   private async referenceWikilinkRows(): Promise<WikilinkDerivationRow[]> {
     this.wikilinkLabels.observeFallback()
     const rows = await this.sql.all<NoteMetaRow & { rowid: number; body: string }>(
-      `SELECT rowid AS rowid, ${NOTE_META_COLS}, body FROM notes ORDER BY path`,
+      `SELECT rowid AS rowid, ${this.metaCols}, body FROM notes ORDER BY path`,
     )
 
     this.wikilinkLabels.observeMetadataRows(rows.length)
@@ -3742,7 +3782,7 @@ export class NotariumStore implements KnowledgeStore {
       return null
     }
     const rows = await this.sql.all<WikilinkMetadataRow>(
-      `SELECT notes.rowid AS rowid, ${NOTE_META_COLS}, notes.seq,
+      `SELECT notes.rowid AS rowid, ${this.metaCols}, notes.seq,
               CASE WHEN file_fingerprints.note_seq = notes.seq
                    THEN file_fingerprints.source_hash ELSE NULL END AS source_hash
          FROM notes
@@ -4014,6 +4054,7 @@ export class NotariumStore implements KnowledgeStore {
       content = '',
       directory,
       noteType,
+      viewType,
       tags,
       slug,
       summary,
@@ -4048,6 +4089,7 @@ export class NotariumStore implements KnowledgeStore {
       title,
       directory,
       noteType,
+      viewType,
       slug,
       summary,
       fileName,
@@ -4422,6 +4464,7 @@ export class NotariumStore implements KnowledgeStore {
     const bytes = serializeNoteFile({
       title,
       noteType,
+      viewType,
       tags: normTags(tags),
       aliases,
       slug: slugChannel,
@@ -5095,7 +5138,7 @@ export class NotariumStore implements KnowledgeStore {
       const rows = await this.sql.all<
         NoteMetaRow & { seq: number; body: string; requires_exact_state: number }
       >(
-        `SELECT ${NOTE_META_COLS}, seq,
+        `SELECT ${this.metaCols}, seq,
                 CASE WHEN seq > ? THEN body ELSE '' END AS body,
                 EXISTS(
                   SELECT 1 FROM document_proofs

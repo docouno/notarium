@@ -20,6 +20,7 @@ import { z } from 'zod'
 import { AUTH_MODE } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 import type { InteractiveSignal } from '@notarium/core'
+import type { ReaderRegistry } from '@notarium/core'
 
 import type { MutationGate } from '../../../../libs/mutationGate'
 import { isCrossOrigin } from '../../../../libs/requestOrigin'
@@ -48,6 +49,8 @@ import type { MarkerStore } from '../../../../services/projects'
 import type { ProviderRegistry } from '../../../../services/providerRegistry'
 import type { RolesService } from '../../../../services/roles'
 import type { SpaceManager } from '../../../../services/spaces'
+import type { ViewSourceRegistry } from '../../../../services/views/sourceRegistry'
+import type { ViewProjectionAdapters } from '../../../../services/views/viewProjection'
 import { baseUrlOf, wwwAuthenticateChallenge } from '../oauth'
 
 export type McpOptions = {
@@ -70,6 +73,9 @@ export type McpOptions = {
   contextOrder?: ContextOrderPersistence
   markerStore?: MarkerStore
   fieldSchemaStore?: FieldSchemaStore
+  viewReaders?: ReaderRegistry
+  viewSources?: ViewSourceRegistry
+  viewProjectionAdapters?: ViewProjectionAdapters
   /** On ⇒ an unauthenticated /mcp answers 401 with the RFC 9728 WWW-Authenticate
    *  challenge; off ⇒ a plain 401. */
   oauthChallenge?: boolean
@@ -216,6 +222,9 @@ export const registerMcp = async (
     contextOrder,
     markerStore,
     fieldSchemaStore,
+    viewReaders,
+    viewSources,
+    viewProjectionAdapters,
     oauthChallenge,
     publicBaseUrl,
     scheduler,
@@ -239,6 +248,9 @@ export const registerMcp = async (
     contextOrder,
     markerStore,
     fieldSchemaStore,
+    viewReaders,
+    viewSources,
+    viewProjectionAdapters,
     runMutation: mutationGate ? (task) => mutationGate.run(task) : undefined,
   })
 

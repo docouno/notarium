@@ -82,6 +82,8 @@ export const FeedCard = ({
   const fields = useCardFields(note)
   const date = absoluteDate(dateValue)
   const tagBudget = Math.max(0, 4 - fields.length - (note.noteType ? 1 : 0))
+  const summary = note.viewSummary?.status === 'ready' ? note.viewSummary : undefined
+  const snippet = summary?.text ?? meta?.snippet
   return (
     <CardLink
       ref={ref}
@@ -98,10 +100,10 @@ export const FeedCard = ({
       {meta?.image && <img className={styles.feedThumb} {...thumbProps(meta.image)} />}
       <span className={styles.feedBody}>
         <span className={styles.feedRowTitle}>{note.title}</span>
-        {loading ? (
+        {!summary && loading ? (
           <SkeletonText className="feed-snippet-skeleton" lines={lines} />
         ) : (
-          meta?.snippet && <span className={styles.feedSnippet}>{meta.snippet}</span>
+          snippet && <span className={styles.feedSnippet}>{snippet}</span>
         )}
       </span>
       {(fields.length > 0 || date || note.noteType || tags.length > 0 || loading) && (
@@ -148,6 +150,8 @@ export const FeedTimelineRow = ({
   const fields = useCardFields(note)
   const date = absoluteDate(dateValue)
   const tagBudget = Math.max(0, 4 - fields.length - (note.noteType ? 1 : 0))
+  const summary = note.viewSummary?.status === 'ready' ? note.viewSummary : undefined
+  const snippet = summary?.text ?? meta?.snippet
   return (
     <CardLink
       ref={ref}
@@ -174,12 +178,10 @@ export const FeedTimelineRow = ({
             )}
           </span>
         </div>
-        {loading ? (
+        {!summary && loading ? (
           <SkeletonText className="feed-snippet-skeleton" lines={lines} />
         ) : (
-          meta?.snippet && (
-            <span className={cx(styles.feedSnippet, styles.feedTlSnippet)}>{meta.snippet}</span>
-          )
+          snippet && <span className={cx(styles.feedSnippet, styles.feedTlSnippet)}>{snippet}</span>
         )}
       </div>
     </CardLink>
