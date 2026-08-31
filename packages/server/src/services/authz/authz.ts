@@ -12,6 +12,7 @@ export type Action =
   | 'spaces:list'
   | 'spaces:create'
   | 'config:read'
+  | 'config:manage'
   | 'members:read'
   | 'members:manage'
   | 'users:manage'
@@ -79,6 +80,7 @@ const RULES: Record<Action, Rule> = {
   'spaces:list': { level: 'read', need: 'any' },
   'spaces:create': { level: 'manage', need: 'admin' },
   'config:read': { level: 'read', need: 'any' },
+  'config:manage': { level: 'manage', need: 'admin' },
   'members:read': { level: 'read', need: 'reader' },
   'members:manage': { level: 'manage', need: 'owner' },
   'users:manage': { level: 'manage', need: 'admin' },

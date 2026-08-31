@@ -1,6 +1,5 @@
 import { parseAbilityLocator, serializeAbilityLocator } from '@notarium/core'
 import type {
-  AgentSessionInferredStart,
   AgentSessionNamedStart,
   AgentSessionRecord,
   AgentSessionsPersistence,
@@ -95,7 +94,11 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
     const row = ctx.required
       .prepare(
         `SELECT ${COLUMNS} FROM agent_sessions
-          WHERE owner = ? AND id = ? AND last_seen_at >= ?`,
+          WHERE owner = ? AND id = ? AND last_seen_at >= ?
+            AND NOT EXISTS (
+              SELECT 1 FROM agent_session_cleanup_markers marker
+               WHERE marker.owner = agent_sessions.owner AND marker.session_id = agent_sessions.id
+            )`,
       )
       .get(owner, id, retainedSince) as AgentSessionRow | undefined
     return row ? sessionOf(row) : null
@@ -106,6 +109,10 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
       .prepare(
         `SELECT ${COLUMNS} FROM agent_sessions
           WHERE owner = ? AND name = ? AND last_seen_at >= ?
+            AND NOT EXISTS (
+              SELECT 1 FROM agent_session_cleanup_markers marker
+               WHERE marker.owner = agent_sessions.owner AND marker.session_id = agent_sessions.id
+            )
           ORDER BY last_seen_at DESC, id DESC LIMIT ?`,
       )
       .all(owner, name, retainedSince, limit) as AgentSessionRow[]
@@ -119,6 +126,10 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
             SET last_seen_at = MAX(last_seen_at, ?), calls = calls + 1,
                 project_id = CASE WHEN ? = 1 THEN ? ELSE project_id END
           WHERE owner = ? AND id = ? AND last_seen_at >= ?
+            AND NOT EXISTS (
+              SELECT 1 FROM agent_session_cleanup_markers marker
+               WHERE marker.owner = agent_sessions.owner AND marker.session_id = agent_sessions.id
+            )
         RETURNING ${COLUMNS}`,
       )
       .get(
@@ -131,94 +142,6 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
       ) as AgentSessionRow | undefined
     return row ? sessionOf(row) : null
   },
-  inferActiveAndTouch: async (owner, activeSince, lastSeenAt, projectId) => {
-    await ctx.ensureInit()
-    const row = ctx.required
-      .prepare(
-        `UPDATE agent_sessions
-            SET last_seen_at = MAX(last_seen_at, ?), calls = calls + 1,
-                project_id = CASE WHEN ? = 1 THEN ? ELSE project_id END
-          WHERE owner = ?
-            AND id = (
-              SELECT CASE WHEN COUNT(*) = 1 THEN MIN(id) END
-                FROM agent_sessions
-               WHERE owner = ? AND last_seen_at >= ?
-            )
-        RETURNING ${COLUMNS}`,
-      )
-      .get(
-        lastSeenAt,
-        projectId === undefined ? 0 : 1,
-        projectId ?? null,
-        owner,
-        owner,
-        activeSince,
-      ) as AgentSessionRow | undefined
-    return row ? sessionOf(row) : null
-  },
-  startInferred: async (candidate, activeSince, recentSince, limit, projectId) => {
-    await ctx.ensureInit()
-    ctx.required.exec('BEGIN IMMEDIATE')
-
-    try {
-      const active = ctx.required
-        .prepare(
-          `SELECT ${COLUMNS} FROM agent_sessions
-            WHERE owner = ? AND last_seen_at >= ?
-            ORDER BY last_seen_at DESC, id DESC LIMIT 2`,
-        )
-        .all(candidate.owner, activeSince) as AgentSessionRow[]
-      let result: AgentSessionInferredStart
-
-      if (active.length === 1) {
-        const row = ctx.required
-          .prepare(
-            `UPDATE agent_sessions
-                SET last_seen_at = MAX(last_seen_at, ?), calls = calls + 1,
-                    project_id = CASE WHEN ? = 1 THEN ? ELSE project_id END
-              WHERE owner = ? AND id = ?
-            RETURNING ${COLUMNS}`,
-          )
-          .get(
-            candidate.lastSeenAt,
-            projectId === undefined ? 0 : 1,
-            projectId ?? null,
-            candidate.owner,
-            active[0]!.id,
-          ) as AgentSessionRow
-        result = { kind: 'resumed', record: sessionOf(row) }
-      } else {
-        const recentSessions =
-          active.length >= 2
-            ? (
-                ctx.required
-                  .prepare(
-                    `SELECT ${COLUMNS} FROM agent_sessions
-                    WHERE owner = ? AND last_seen_at >= ?
-                    ORDER BY last_seen_at DESC, id DESC LIMIT ?`,
-                  )
-                  .all(candidate.owner, recentSince, limit) as AgentSessionRow[]
-              ).map(sessionOf)
-            : undefined
-        result = {
-          kind: 'new',
-          record: insertSession(ctx, {
-            ...candidate,
-            projectId: projectId ?? candidate.projectId,
-          }),
-          ...(recentSessions ? { recentSessions } : {}),
-        }
-      }
-
-      ctx.required.exec('COMMIT')
-      return result
-    } catch (error) {
-      if (ctx.required.isTransaction) {
-        ctx.required.exec('ROLLBACK')
-      }
-      throw error
-    }
-  },
   startNamed: async (candidate, activeSince, retainedSince, limit, projectId) => {
     await ctx.ensureInit()
     ctx.required.exec('BEGIN IMMEDIATE')
@@ -228,6 +151,10 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
         .prepare(
           `SELECT ${COLUMNS} FROM agent_sessions
             WHERE owner = ? AND name = ? AND last_seen_at >= ?
+              AND NOT EXISTS (
+                SELECT 1 FROM agent_session_cleanup_markers marker
+                 WHERE marker.owner = agent_sessions.owner AND marker.session_id = agent_sessions.id
+              )
             ORDER BY last_seen_at DESC, id DESC LIMIT ?`,
         )
         .all(candidate.owner, candidate.name, retainedSince, limit + 1) as AgentSessionRow[]
@@ -297,6 +224,10 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
       .prepare(
         `SELECT ${COLUMNS} FROM agent_sessions
           WHERE owner = ? AND last_seen_at >= ?
+            AND NOT EXISTS (
+              SELECT 1 FROM agent_session_cleanup_markers marker
+               WHERE marker.owner = agent_sessions.owner AND marker.session_id = agent_sessions.id
+            )
           ORDER BY last_seen_at DESC, id DESC LIMIT ?`,
       )
       .all(owner, since, limit) as AgentSessionRow[]

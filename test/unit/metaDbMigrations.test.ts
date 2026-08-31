@@ -19,6 +19,7 @@ import {
   PROVIDER_CONTOUR_TABLES,
   splitProviderContour,
   sqliteMetaDbCatalog,
+  withoutAgentCallTrace,
 } from '../meta-db-contract/metaDbCatalog'
 
 type LedgerRow = {
@@ -82,6 +83,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
       { version: 3, name: 'causal_identity' },
       { version: 4, name: 'import_reservations' },
       { version: 5, name: 'provider_contour' },
+      { version: 6, name: 'agent_call_trace' },
     ])
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
@@ -121,8 +123,9 @@ describe('meta-DB migration assets and SQLite runner', () => {
     // keyring, the three facets and the call journal — and eleven named indexes: the
     // keyring's single-active partial, eight lookup/page keys across the facets, plus
     // the journal's owner and retention indexes. Every primary/UNIQUE autoindex stays
-    // excluded by the query above, the journal's send-fence key among them.
-    expect(counts).toEqual({ index: 75, table: 48, trigger: 31 })
+    // excluded by the query above, the journal's send-fence key among them. Agent
+    // trace then adds four tables and seventeen named indexes.
+    expect(counts).toEqual({ index: 92, table: 52, trigger: 31 })
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'meta_schema'").get(),
     ).toBeUndefined()
@@ -147,7 +150,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
       'USING INDEX idx_provider_call_log_retention',
     )
     expect(retentionPlan.map(({ detail }) => detail).join('\n')).not.toContain('USE TEMP B-TREE')
-    const live = splitProviderContour(sqliteMetaDbCatalog(db))
+    const live = splitProviderContour(withoutAgentCallTrace(sqliteMetaDbCatalog(db)))
     expect(live.contour).toEqual(PROVIDER_CONTOUR_TABLES)
     expect(live.published).toEqual(approvedTargetCatalog(sqliteGolden))
   })

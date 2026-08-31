@@ -99,6 +99,7 @@ export const AGENT_ACTIVITY_URL_PARAMS = {
   agent: 'agent',
   tool: 'tool',
   q: 'q',
+  outcome: 'outcome',
 } as const
 
 /** The shared Abilities library's bookmarkable state. Cursor pagination is

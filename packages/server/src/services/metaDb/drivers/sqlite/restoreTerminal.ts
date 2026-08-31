@@ -213,11 +213,11 @@ export const createRestoreTerminalFacet = (ctx: SqliteDriverCtx): RestoreTermina
         .prepare(
           `INSERT INTO note_revisions
              (note_id, space, base_rev, their_rev, source_rev, kind, principal,
-              agent_owner, agent_name, session_id, session_name, session_attach,
+              agent_owner, agent_name, session_id, session_name, session_attach, agent_call_id,
               content_hash, semantic_fingerprint, restore_safety, state_format,
               title, class, slug, tags, created_at, chars_added, chars_removed,
               entry_role, integrity)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           revision.noteId,
@@ -232,6 +232,7 @@ export const createRestoreTerminalFacet = (ctx: SqliteDriverCtx): RestoreTermina
           revision.agent?.session?.id ?? null,
           revision.agent?.session?.name ?? null,
           revision.agent?.session?.attach ?? null,
+          revision.agent?.agentCallId ?? null,
           revision.contentHash,
           revision.semanticFingerprint ?? null,
           revision.restoreSafety ?? null,

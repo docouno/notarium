@@ -113,12 +113,14 @@ export const loadSavedSessionRole = async (
 
 /** Session names are agent-supplied labels, so normalise control characters and
  * defang prompt-control pseudo-tags before storage and every wire projection. */
-const safeSessionName = (name: string): string =>
+const normalizedSessionName = (name: string): string =>
   sanitizeText(name)
     // eslint-disable-next-line no-control-regex -- labels cannot carry line/control boundaries
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
     .trim()
-    .slice(0, 160) || 'session'
+    .slice(0, 160)
+
+const safeSessionName = (name: string): string => normalizedSessionName(name) || 'session'
 
 /** The per-project sub-bundle (project hint only): a capped subtree index + the
  *  delta (journal) since the bound episode or unbound owner last looked;
@@ -300,6 +302,7 @@ const buildKnownValues = async (
 export const handleStartSession: Handler = async (ctx, rawArgs) => {
   const {
     project,
+    task,
     role,
     session: sessionRequest,
     acknowledge,
@@ -316,7 +319,7 @@ export const handleStartSession: Handler = async (ctx, rawArgs) => {
   const hinted = project !== undefined ? await ctx.resolveProject(project) : undefined
   const previewedSession =
     selectedRole && !hinted && ctx.agentSessions && ctx.sessionOwner
-      ? await ctx.agentSessions.preview(ctx.sessionOwner, requestedSession)
+      ? await ctx.agentSessions.preview(ctx.sessionOwner, requestedSession, ctx.sessionRetentionMs)
       : null
   let effectiveRoleContext = await roleContext(ctx, hinted, previewedSession ?? undefined)
   let effectiveRoleListing =
@@ -353,8 +356,14 @@ export const handleStartSession: Handler = async (ctx, rawArgs) => {
       ? await ctx.agentSessions.start(
           ctx.sessionOwner,
           requestedSession,
-          `${hinted ? handleOf(hinted, ctx.spaces.slugOf(hinted.space) ?? hinted.space) : 'personal'} · ${now.toISOString().slice(0, 16).replace('T', ' ')}`,
+          {
+            autoName: `${hinted ? handleOf(hinted, ctx.spaces.slugOf(hinted.space) ?? hinted.space) : 'personal'} · ${now.toISOString().slice(0, 16).replace('T', ' ')}`,
+            ...(task && normalizedSessionName(task)
+              ? { taskName: normalizedSessionName(task) }
+              : {}),
+          },
           hinted?.id,
+          ctx.sessionRetentionMs,
         )
       : undefined
   ctx.session = opened?.session

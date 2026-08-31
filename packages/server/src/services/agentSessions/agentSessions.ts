@@ -11,7 +11,6 @@ import type {
 import {
   AGENT_SESSION_IDLE_MS,
   AGENT_SESSION_RECENT_LIMIT,
-  AGENT_SESSION_RECENT_MS,
   AGENT_SESSION_RETENTION_MS,
 } from './consts'
 
@@ -33,20 +32,22 @@ export type AgentSessions = {
   preview(
     owner: string,
     request: StartAgentSessionRequest | undefined,
+    retentionMs?: number,
   ): Promise<AgentSessionRecord | null>
   /** Resolve an ordinary call's episode and sticky context without changing its
-   * activity. Explicit ids remain fail-closed; omission reads exactly one active row. */
-  read(owner: string, id?: string): Promise<BoundAgentSession | null>
+   * activity. Explicit ids remain fail-closed; omission stays outside sessions. */
+  read(owner: string, id?: string, retentionMs?: number): Promise<BoundAgentSession | null>
   /** Resolve a normal tool call. An explicit id must exist for this owner; omission
-   * attaches only when the exact-one-active decision can be made atomically. */
-  attach(owner: string, id?: string): Promise<BoundAgentSession | null>
+   * stays outside sessions. */
+  attach(owner: string, id?: string, retentionMs?: number): Promise<BoundAgentSession | null>
   /** Open/resume/fork from start_session. `defaultName` is already the canonical
    * project/personal label chosen by the caller. */
   start(
     owner: string,
     request: StartAgentSessionRequest | undefined,
-    defaultName: string,
+    fresh: { autoName: string; taskName?: string },
     projectId?: string,
+    retentionMs?: number,
   ): Promise<AgentSessionStart>
   /** Persist one selected role for the bound episode. */
   setRole(session: BoundAgentSession, role: AgentSessionRoleSelection): Promise<AgentSessionRoleSet>
@@ -88,30 +89,26 @@ export const createAgentSessions = ({
   }
 
   return {
-    preview: async (owner, request) => {
+    preview: async (owner, request, retentionMs = AGENT_SESSION_RETENTION_MS) => {
       const now = getNow()
-      const activeSince = before(now, AGENT_SESSION_IDLE_MS)
-      const retainedSince = before(now, AGENT_SESSION_RETENTION_MS)
+      const retainedSince = before(now, retentionMs)
 
       if (request && 'id' in request) {
         return persistence.getRetained(owner, request.id, retainedSince)
       }
-      const matches = request
-        ? await persistence.listNamed(owner, request.name, retainedSince, 2)
-        : await persistence.listRecent(owner, activeSince, 2)
+      if (!request) {
+        return null
+      }
+      const matches = await persistence.listNamed(owner, request.name, retainedSince, 2)
 
       return matches.length === 1 ? matches[0]! : null
     },
 
-    read: async (owner, id) => {
+    read: async (owner, id, retentionMs = AGENT_SESSION_RETENTION_MS) => {
       const now = getNow()
 
       if (id !== undefined) {
-        const record = await persistence.getRetained(
-          owner,
-          id,
-          before(now, AGENT_SESSION_RETENTION_MS),
-        )
+        const record = await persistence.getRetained(owner, id, before(now, retentionMs))
 
         if (!record) {
           throw new NoSuchAgentSessionError()
@@ -120,24 +117,15 @@ export const createAgentSessions = ({
         return { record, attach: AGENT_SESSION_ATTACH.declared }
       }
 
-      const matches = await persistence.listRecent(owner, before(now, AGENT_SESSION_IDLE_MS), 2)
-
-      return matches.length === 1
-        ? { record: matches[0]!, attach: AGENT_SESSION_ATTACH.inferred }
-        : null
+      return null
     },
 
-    attach: async (owner, id) => {
+    attach: async (owner, id, retentionMs = AGENT_SESSION_RETENTION_MS) => {
       const now = getNow()
       const at = now.toISOString()
 
       if (id !== undefined) {
-        const record = await persistence.touch(
-          owner,
-          id,
-          at,
-          before(now, AGENT_SESSION_RETENTION_MS),
-        )
+        const record = await persistence.touch(owner, id, at, before(now, retentionMs))
 
         if (!record) {
           throw new NoSuchAgentSessionError()
@@ -147,29 +135,14 @@ export const createAgentSessions = ({
         return { record, attach: AGENT_SESSION_ATTACH.declared }
       }
 
-      const record = await persistence.inferActiveAndTouch(
-        owner,
-        before(now, AGENT_SESSION_IDLE_MS),
-        at,
-      )
-
-      if (record) {
-        changed(owner)
-      }
-
-      return record ? { record, attach: AGENT_SESSION_ATTACH.inferred } : null
+      return null
     },
 
-    start: async (owner, request, defaultName, projectId) => {
+    start: async (owner, request, fresh, projectId, retentionMs = AGENT_SESSION_RETENTION_MS) => {
       const now = getNow()
       const at = now.toISOString()
       const activeSince = before(now, AGENT_SESSION_IDLE_MS)
-      const retainedSince = before(now, AGENT_SESSION_RETENTION_MS)
-      const prunedOwners = await persistence.prune(retainedSince)
-
-      for (const prunedOwner of prunedOwners) {
-        changed(prunedOwner)
-      }
+      const retainedSince = before(now, retentionMs)
 
       if (request && 'id' in request) {
         const record = await persistence.touch(owner, request.id, at, retainedSince, projectId)
@@ -224,34 +197,28 @@ export const createAgentSessions = ({
         }
       }
 
-      const result = await persistence.startInferred(
-        {
-          id: mintId(),
-          owner,
-          name: defaultName,
-          named: false,
-          parentId: null,
-          createdAt: at,
-          lastSeenAt: at,
-          calls: 1,
-          role: null,
-          roleLocator: null,
-          roleContextProjectId: null,
-          projectId: projectId ?? null,
-        },
-        activeSince,
-        before(now, AGENT_SESSION_RECENT_MS),
-        AGENT_SESSION_RECENT_LIMIT,
-        projectId,
-      )
+      const record: AgentSessionRecord = {
+        id: mintId(),
+        owner,
+        name: fresh.taskName ?? fresh.autoName,
+        named: fresh.taskName !== undefined,
+        parentId: null,
+        createdAt: at,
+        lastSeenAt: at,
+        calls: 1,
+        role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
+        projectId: projectId ?? null,
+      }
+      await persistence.insert(record)
       changed(owner)
       return {
         session: {
-          record: result.record,
+          record,
           attach: AGENT_SESSION_ATTACH.inferred,
-          state: AGENT_SESSION_STATE[result.kind],
+          state: AGENT_SESSION_STATE.new,
         },
-        ...(result.recentSessions ? { recentSessions: result.recentSessions } : {}),
       }
     },
 

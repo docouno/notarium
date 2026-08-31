@@ -7,6 +7,7 @@ import type { AbilitiesService } from '../../../services/abilities'
 import type { AuthService } from '../../../services/auth'
 import type { FieldSchemaStore } from '../../../services/fields'
 import type {
+  AgentCallTracePersistence,
   AgentSessionAuditPersistence,
   AgentSessionsPersistence,
   ContextOrderPersistence,
@@ -44,6 +45,7 @@ export type ApiRoutesOptions = {
   scopePins?: ScopePinsPersistence
   contextOrder?: ContextOrderPersistence
   retrievalLog?: RetrievalLogPersistence
+  agentCalls?: AgentCallTracePersistence
   sessionAudit?: AgentSessionAuditPersistence
   markerStore?: MarkerStore
   fieldSchemaStore?: FieldSchemaStore

@@ -1,5 +1,7 @@
 import type {
   AgentAbilityPreferenceDecl,
+  AgentCallDecl,
+  AgentCleanupMarkerDecl,
   AgentDeltaCursorDecl,
   AgentRoleDecl,
   AgentSessionDecl,
@@ -199,6 +201,9 @@ export class WorldBuilder {
   private readonly favorites: FavoriteDecl[] = []
   private readonly retrievals: RetrievalDecl[] = []
   private readonly agentSessions: AgentSessionDecl[] = []
+  private readonly agentCalls: AgentCallDecl[] = []
+  private readonly agentCleanupMarkers: AgentCleanupMarkerDecl[] = []
+  private agentTelemetryDetailed = false
   private readonly agentRoles: AgentRoleDecl[] = []
   private readonly agentSkills: AgentSkillDecl[] = []
   private readonly agentAbilityPreferences: AgentAbilityPreferenceDecl[] = []
@@ -358,6 +363,21 @@ export class WorldBuilder {
     return this
   }
 
+  agentCall(decl: AgentCallDecl): this {
+    this.agentCalls.push(decl)
+    return this
+  }
+
+  agentCleanupMarker(decl: AgentCleanupMarkerDecl): this {
+    this.agentCleanupMarkers.push(decl)
+    return this
+  }
+
+  detailedAgentTelemetry(enabled = true): this {
+    this.agentTelemetryDetailed = enabled
+    return this
+  }
+
   /** Declare one Owned Role package. */
   agentRole(decl: AgentRoleDecl): this {
     this.agentRoles.push(decl)
@@ -454,6 +474,9 @@ export class WorldBuilder {
       favorites: this.favorites.length ? this.favorites : undefined,
       ...(this.retrievals.length ? { retrievals: this.retrievals } : {}),
       ...(this.agentSessions.length ? { agentSessions: this.agentSessions } : {}),
+      ...(this.agentCalls.length ? { agentCalls: this.agentCalls } : {}),
+      ...(this.agentCleanupMarkers.length ? { agentCleanupMarkers: this.agentCleanupMarkers } : {}),
+      ...(this.agentTelemetryDetailed ? { agentTelemetryDetailed: true } : {}),
       ...(this.agentRoles.length ? { agentRoles: this.agentRoles } : {}),
       ...(this.agentSkills.length ? { agentSkills: this.agentSkills } : {}),
       ...(this.agentAbilityPreferences.length

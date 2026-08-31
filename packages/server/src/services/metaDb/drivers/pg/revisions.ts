@@ -247,8 +247,8 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       }
       const res = await client.query(
         `INSERT INTO note_revisions
-             (note_id, space, base_rev, their_rev, source_rev, kind, entry_role, principal, agent_owner, agent_name, session_id, session_name, session_attach, content_hash, semantic_fingerprint, restore_safety, state_format, title, class, slug, tags, created_at, chars_added, chars_removed, integrity)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+             (note_id, space, base_rev, their_rev, source_rev, kind, entry_role, principal, agent_owner, agent_name, session_id, session_name, session_attach, agent_call_id, content_hash, semantic_fingerprint, restore_safety, state_format, title, class, slug, tags, created_at, chars_added, chars_removed, integrity)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
            RETURNING id`,
         [
           rev.noteId,
@@ -264,6 +264,7 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
           rev.agent?.session?.id ?? null,
           rev.agent?.session?.name ?? null,
           rev.agent?.session?.attach ?? null,
+          rev.agent?.agentCallId ?? null,
           rev.contentHash,
           rev.semanticFingerprint ?? null,
           rev.restoreSafety ?? null,

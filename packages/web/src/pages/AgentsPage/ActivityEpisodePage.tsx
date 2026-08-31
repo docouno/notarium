@@ -50,6 +50,7 @@ export const ActivityEpisodePage = () => {
           agent: state.agent ?? undefined,
           tool: state.tool ?? undefined,
           q: state.q ?? undefined,
+          outcome: state.outcome === 'all' ? undefined : state.outcome,
         })
 
         if (seq !== requestSeq.current) {
@@ -69,7 +70,7 @@ export const ActivityEpisodePage = () => {
         }
       }
     },
-    [id, state.agent, state.q, state.show, state.tool],
+    [id, state.agent, state.outcome, state.q, state.show, state.tool],
   )
 
   useEffect(() => {
@@ -84,9 +85,10 @@ export const ActivityEpisodePage = () => {
   const title = target ? targetTitle(target) : 'Activity'
   const counts =
     target?.kind === 'session'
-      ? `${target.calls == null ? 'Archived' : countLabel(target.calls, 'call')} · ${countLabel(target.reads, 'read')} · ${countLabel(target.writes, 'write')}`
+      ? `${target.calls == null ? 'Archived' : countLabel(target.calls, 'call')} · ${countLabel(target.reads, 'read')} · ${countLabel(target.writes, 'mutation')}`
       : null
-  const filtered = state.show !== 'all' || !!state.agent || !!state.q
+  const filtered =
+    state.show !== 'all' || state.outcome !== 'all' || !!state.agent || !!state.tool || !!state.q
 
   useEffect(() => {
     setDetailTitle(title)
@@ -94,11 +96,11 @@ export const ActivityEpisodePage = () => {
   }, [setDetailTitle, title])
 
   const setShow = (show: ActivityShow) => {
-    setState(show === 'writes' ? { show, tool: null, q: null } : { show })
+    setState(show === 'writes' ? { show, q: null } : { show })
   }
 
   const resetFilters = () => {
-    setState({ show: 'all', agent: null, tool: null, q: null })
+    setState({ show: 'all', agent: null, tool: null, q: null, outcome: 'all' })
   }
 
   return (
@@ -147,7 +149,7 @@ export const ActivityEpisodePage = () => {
             options={[
               { value: 'all', label: 'All' },
               { value: 'reads', label: 'Reads' },
-              { value: 'writes', label: 'Writes' },
+              { value: 'writes', label: 'Mutations' },
             ]}
           />
           {data?.total != null && data.total > 0 && (

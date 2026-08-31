@@ -50,6 +50,10 @@
   color: var(--text);
 }
 
+.call-detail {
+  --reading-size: 13.5px;
+}
+
 .result-empty {
   color: var(--text-faint);
 }

@@ -384,11 +384,11 @@ export const createAbilityCreateFacet = (ctx: SqliteDriverCtx): AbilityCreatePer
         .prepare(
           `INSERT INTO note_revisions
              (note_id, space, base_rev, their_rev, source_rev, kind, principal,
-              agent_owner, agent_name, session_id, session_name, session_attach,
+              agent_owner, agent_name, session_id, session_name, session_attach, agent_call_id,
               content_hash, semantic_fingerprint, restore_safety, state_format,
               title, class, slug, tags, created_at, chars_added, chars_removed,
               entry_role, integrity)
-           VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           revision.noteId,
@@ -400,6 +400,7 @@ export const createAbilityCreateFacet = (ctx: SqliteDriverCtx): AbilityCreatePer
           revision.agent?.session?.id ?? null,
           revision.agent?.session?.name ?? null,
           revision.agent?.session?.attach ?? null,
+          revision.agent?.agentCallId ?? null,
           revision.contentHash,
           revision.semanticFingerprint,
           revision.restoreSafety ?? null,

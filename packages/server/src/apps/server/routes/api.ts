@@ -45,6 +45,7 @@ export const apiRoutes = async (app: FastifyInstance, opts: ApiRoutesOptions) =>
     scopePins,
     contextOrder,
     retrievalLog,
+    agentCalls,
     sessionAudit,
     abilities,
   } = opts
@@ -58,6 +59,7 @@ export const apiRoutes = async (app: FastifyInstance, opts: ApiRoutesOptions) =>
     scopePins,
     contextOrder,
     retrievalLog,
+    agentCalls,
     sessionAudit,
     abilities,
   })

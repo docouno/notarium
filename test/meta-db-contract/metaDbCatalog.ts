@@ -102,6 +102,44 @@ const checksOf = (sql: string): string[] => {
 
 const quoteSqliteName = (name: string): string => `"${name.replaceAll('"', '""')}"`
 
+const indexKeysOf = (definition: string): string[] => {
+  const openAt = definition.indexOf('(')
+
+  if (openAt === -1) {
+    return []
+  }
+  const keys: string[] = []
+  let start = openAt + 1
+  let depth = 1
+  let quoted = false
+
+  for (let index = start; index < definition.length; index += 1) {
+    const char = definition[index]
+
+    if (char === "'") {
+      if (quoted && definition[index + 1] === "'") {
+        index += 1
+      } else {
+        quoted = !quoted
+      }
+    } else if (!quoted && char === '(') {
+      depth += 1
+    } else if (!quoted && char === ')') {
+      depth -= 1
+
+      if (depth === 0) {
+        keys.push(definition.slice(start, index).trim())
+        break
+      }
+    } else if (!quoted && char === ',' && depth === 1) {
+      keys.push(definition.slice(start, index).trim())
+      start = index + 1
+    }
+  }
+
+  return keys.filter(Boolean)
+}
+
 export const sqliteMetaDbCatalog = (db: DatabaseSync): MetaDbCatalog => {
   const tableRows = db
     .prepare(
@@ -296,12 +334,12 @@ export const pgMetaDbCatalog = async (
             index.definition.replace(/^CREATE\s+(?:UNIQUE\s+)?INDEX\s+\S+\s+ON\s+\S+\s+/i, ''),
           )
           const where = definition.match(/\swhere\s([\s\S]+)$/)?.[1]
-          const keys = definition.match(/\(([^)]*)\)/)?.[1] ?? ''
+          const keys = indexKeysOf(definition)
 
           return {
             name: null,
             unique: index.unique,
-            columns: keys.split(',').map((column) => ({
+            columns: keys.map((column) => ({
               name: normalizeSql(column.replace(/\s+desc$/i, '')),
               descending: /\s+desc$/i.test(column),
             })),
@@ -399,3 +437,272 @@ export const approvedTargetCatalog = (golden: MetaDbCatalog): MetaDbCatalog => {
 
   return target
 }
+
+/** Remove the 0005 trace carrier so the immutable pre-cut golden can keep proving
+ * every older table while the new carrier is asserted by its executable contract. */
+export const withoutAgentCallTrace = (catalog: MetaDbCatalog): MetaDbCatalog => {
+  const target = structuredClone(catalog)
+  const newTables = new Set([
+    'agent_calls',
+    'agent_call_details',
+    'agent_telemetry_config',
+    'agent_session_cleanup_markers',
+  ])
+  target.tables = target.tables.filter((table) => !newTables.has(table.name))
+
+  for (const name of ['agent_retrievals', 'note_revisions']) {
+    const table = target.tables.find((candidate) => candidate.name === name)
+
+    if (!table) {
+      continue
+    }
+    table.columns = table.columns.filter((column) => column.name !== 'agent_call_id')
+    table.indexes = table.indexes.filter((index) => {
+      const columns = index.columns.map((column) => column.name)
+      const traceLink =
+        index.columns.length === 1 &&
+        index.columns[0]?.name === 'agent_call_id' &&
+        index.unique === false
+      const legacyAgent =
+        index.predicate?.includes('agent_call_id') === true &&
+        (name === 'agent_retrievals'
+          ? columns.length === 2 && columns[0] === 'owner' && columns[1] === 'agent'
+          : columns.length === 2 && columns[0] === 'agent_owner' && columns[1] === 'agent_name')
+
+      return !traceLink && !legacyAgent
+    })
+  }
+
+  return target
+}
+
+const TRACE_TABLES = new Set([
+  'agent_calls',
+  'agent_call_details',
+  'agent_telemetry_config',
+  'agent_session_cleanup_markers',
+])
+const TRACE_JSON_COLUMNS = new Set([
+  'payload',
+  'input_shape',
+  'issue_summary',
+  'target_summary',
+  'result_summary',
+])
+const TRACE_BOOLEAN_COLUMNS = new Set([
+  'redacted',
+  'truncated',
+  'detail_capture_failed',
+  'detailed_enabled',
+  'cleanup_pending',
+])
+const TRACE_PRIMARY_KEYS: Readonly<Record<string, readonly string[]>> = {
+  agent_calls: ['id'],
+  agent_call_details: ['agent_call_id'],
+  agent_telemetry_config: ['singleton'],
+  agent_session_cleanup_markers: ['owner', 'session_id'],
+}
+
+const traceType = (column: CatalogColumn): string => {
+  if (TRACE_JSON_COLUMNS.has(column.name)) {
+    return 'json'
+  }
+  if (TRACE_BOOLEAN_COLUMNS.has(column.name)) {
+    return 'boolean'
+  }
+
+  return column.type === 'bigint' ? 'integer' : column.type
+}
+
+const withoutOuterParentheses = (value: string): string => {
+  let current = value.trim()
+
+  while (current.startsWith('(') && current.endsWith(')')) {
+    let depth = 0
+    let quoted = false
+    let wrapsWholeValue = true
+
+    for (let index = 0; index < current.length; index += 1) {
+      const char = current[index]
+
+      if (char === "'") {
+        if (quoted && current[index + 1] === "'") {
+          index += 1
+        } else {
+          quoted = !quoted
+        }
+      } else if (!quoted && char === '(') {
+        depth += 1
+      } else if (!quoted && char === ')') {
+        depth -= 1
+
+        if (depth === 0 && index !== current.length - 1) {
+          wrapsWholeValue = false
+          break
+        }
+      }
+    }
+
+    if (!wrapsWholeValue || depth !== 0) {
+      break
+    }
+    current = current.slice(1, -1).trim()
+  }
+
+  return current
+}
+
+const tracePredicate = (predicate: string | null): string | null => {
+  if (!predicate) {
+    return null
+  }
+  const normalized = withoutOuterParentheses(normalizeSql(predicate.replaceAll('::text', '')))
+
+  if (
+    normalized.includes("tool = 'start_session'") &&
+    normalized.includes("outcome = 'success'") &&
+    normalized.includes('session.state') &&
+    normalized.includes("'new'") &&
+    normalized.includes("'forked'")
+  ) {
+    return '<complete-start>'
+  }
+  if (
+    normalized.includes('outcome is not null') &&
+    normalized.includes('agent is not null') &&
+    (normalized.includes("agent != ''") || normalized.includes("agent <> ''"))
+  ) {
+    return '<terminal-agent>'
+  }
+  if (
+    normalized.includes('agent_call_id is null') &&
+    normalized.includes('agent is not null') &&
+    (normalized.includes("agent != ''") || normalized.includes("agent <> ''"))
+  ) {
+    return '<legacy-agent>'
+  }
+  if (
+    normalized.includes('agent_call_id is null') &&
+    normalized.includes("integrity = 'trusted'") &&
+    normalized.includes('agent_name is not null') &&
+    (normalized.includes("agent_name != ''") || normalized.includes("agent_name <> ''"))
+  ) {
+    return '<legacy-trusted-agent>'
+  }
+
+  return normalized
+}
+
+const traceForeignKey = (foreignKey: CatalogForeignKey): CatalogForeignKey => {
+  if (foreignKey.referencedTable) {
+    return foreignKey
+  }
+  const definition = normalizeSql(foreignKey.columns.join(' '))
+  const parsed = definition.match(
+    /^foreign key \(([^)]+)\) references ([^(\s]+)\(([^)]+)\)([\s\S]*)$/,
+  )
+
+  if (!parsed) {
+    return foreignKey
+  }
+  const tail = parsed[4] ?? ''
+
+  return {
+    columns: parsed[1]!.split(',').map((column) => column.trim()),
+    referencedTable: parsed[2]!,
+    referencedColumns: parsed[3]!.split(',').map((column) => column.trim()),
+    onUpdate: tail.match(/on update ([a-z ]+?)(?: on delete|$)/)?.[1]?.trim() ?? 'no action',
+    onDelete: tail.match(/on delete ([a-z ]+?)$/)?.[1]?.trim() ?? 'no action',
+  }
+}
+
+/** Dialect-neutral structural carrier used by the live SQLite↔Postgres migration test. */
+export const agentCallTraceCatalog = (catalog: MetaDbCatalog) => ({
+  tables: catalog.tables
+    .filter((table) => TRACE_TABLES.has(table.name))
+    .map((table) => {
+      const expectedPrimaryKey = TRACE_PRIMARY_KEYS[table.name] ?? []
+      const indexColumns = (index: CatalogIndex) => index.columns.map((column) => column.name)
+      const isPrimaryKeyIndex = (index: CatalogIndex) =>
+        index.unique &&
+        indexColumns(index).length === expectedPrimaryKey.length &&
+        indexColumns(index).every((column, indexAt) => column === expectedPrimaryKey[indexAt])
+      const hasPrimaryKey =
+        expectedPrimaryKey.every((name) =>
+          table.columns.some((column) => column.name === name && column.primaryKeyPosition > 0),
+        ) || table.indexes.some(isPrimaryKeyIndex)
+      const indexes = table.indexes
+        .filter((index) => !isPrimaryKeyIndex(index))
+        .map((index) => ({
+          unique: index.unique,
+          columns: index.columns.map((column) => ({
+            name:
+              column.name === '<expression>' || column.name.includes('coalesce(')
+                ? '<expression>'
+                : column.name,
+            descending: column.descending,
+          })),
+          predicate: tracePredicate(index.predicate),
+        }))
+      const uniqueIndexes = [
+        ...new Map(indexes.map((index) => [JSON.stringify(index), index])).values(),
+      ]
+
+      return {
+        name: table.name,
+        columns: table.columns.map((column) => ({
+          name: column.name,
+          type: traceType(column),
+          notNull: column.notNull || column.primaryKeyPosition > 0,
+          hasDefault: column.defaultValue != null,
+        })),
+        primaryKey: hasPrimaryKey ? expectedPrimaryKey : null,
+        checkCount:
+          table.checks.length -
+          table.columns.filter(
+            (column) => TRACE_BOOLEAN_COLUMNS.has(column.name) && column.type !== 'boolean',
+          ).length,
+        foreignKeys: table.foreignKeys.map(traceForeignKey),
+        indexes: uniqueIndexes.sort((left, right) =>
+          JSON.stringify(left).localeCompare(JSON.stringify(right)),
+        ),
+      }
+    }),
+  links: ['agent_retrievals', 'note_revisions'].map((name) => {
+    const table = tableOf(catalog, name)
+    const column = table.columns.find((candidate) => candidate.name === 'agent_call_id')
+    const index = table.indexes.find((candidate) =>
+      candidate.columns.some((candidateColumn) => candidateColumn.name === 'agent_call_id'),
+    )
+    const legacyColumns =
+      name === 'agent_retrievals' ? ['owner', 'agent'] : ['agent_owner', 'agent_name']
+    const legacyAgentIndex = table.indexes.find(
+      (candidate) =>
+        candidate.columns.length === legacyColumns.length &&
+        candidate.columns.every(
+          (candidateColumn, indexAt) => candidateColumn.name === legacyColumns[indexAt],
+        ) &&
+        candidate.predicate?.includes('agent_call_id') === true,
+    )
+    return {
+      table: name,
+      column: column
+        ? { type: traceType(column), notNull: column.notNull, defaultValue: column.defaultValue }
+        : null,
+      index: index
+        ? {
+            unique: index.unique,
+            columns: index.columns.map((candidate) => candidate.name),
+            predicate: index.predicate,
+          }
+        : null,
+      legacyAgentIndex: legacyAgentIndex
+        ? {
+            unique: legacyAgentIndex.unique,
+            columns: legacyAgentIndex.columns.map((candidate) => candidate.name),
+            predicate: tracePredicate(legacyAgentIndex.predicate),
+          }
+        : null,
+    }
+  }),
+})

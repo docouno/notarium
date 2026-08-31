@@ -66,6 +66,7 @@ import {
   ProfileTab,
   ProviderResourcesTab,
   SettingsPage,
+  TelemetryTab,
   UsersTab,
 } from './pages/SettingsPage'
 import { TrashPage } from './pages/TrashPage'
@@ -223,6 +224,7 @@ const router = createBrowserRouter([
             ),
           },
           { path: 'about', element: <AboutTab /> },
+          { path: 'telemetry', element: <TelemetryTab /> },
           { path: 'users', element: <UsersTab /> },
         ],
       },

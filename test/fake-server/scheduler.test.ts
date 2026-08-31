@@ -10,6 +10,8 @@ import type { FastifyInstance } from 'fastify'
 import net from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { buildCaseWorld } from '../cases/build.js'
+import { caseToFixture } from '../cases/toFixture.js'
 import { createApp, type Fixture } from './app.js'
 
 const spyScheduler = () => {
@@ -83,6 +85,34 @@ describe('#196 scheduler interactive-signal wiring (buildApp hooks)', () => {
     const res = await app.inject({ method: 'GET', url: '/api/__test/ll' })
     expect(res.statusCode).toBe(200)
     expect(s.enters).toBe(0)
+    expect(s.count).toBe(0)
+  })
+
+  it('keeps the real agent trace export outside the interactive count', async () => {
+    const s = spyScheduler()
+    const seeded = caseToFixture(
+      buildCaseWorld('agent-telemetry-detailed', { now: '2026-08-30T12:00:00.000Z' }),
+    )
+    app = await createApp(seeded, { scheduler: s.signal })
+    const login = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { username: 'sergey', password: 'sergey' },
+    })
+    const cookie = login.cookies.map((item) => `${item.name}=${item.value}`).join('; ')
+    const session = seeded.agentSessions?.find((item) =>
+      seeded.agentCalls?.some((call) => call.sessionId === item.id && call.outcome),
+    )
+    expect(session).toBeDefined()
+    const entersBefore = s.enters
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-sessions/${session!.id}/export`,
+      headers: { cookie },
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(s.enters).toBe(entersBefore)
     expect(s.count).toBe(0)
   })
 

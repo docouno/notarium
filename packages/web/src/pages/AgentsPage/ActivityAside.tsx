@@ -6,14 +6,16 @@ import type {
   AgentSessionEventAggregates,
 } from '@notarium/contract'
 import { AGENT_RETRIEVAL_TOOL } from '@notarium/contract/enums'
+import type { ToolName } from '@notarium/contract/tools'
 import { AsideSection, AsideSections } from '../../core/AsidePanel'
 import { Button } from '../../core/Button'
 import { IconX } from '../../core/Icons'
 import { Notice } from '../../core/Notice'
 import { SearchField } from '../../core/SearchField'
 import { Segmented } from '../../core/Segmented'
+import { Select } from '../../core/Select'
 import { FolderTree } from '../../widgets/FolderTree'
-import type { ActivityState } from './activityState'
+import { ACTIVITY_TOOL_NAMES, type ActivityState } from './activityState'
 import { RECURRING_MISS_MIN } from './AgentsProvider'
 import { QueryStatRow } from './AuditRows'
 import { PanelsSkeleton } from './AuditSkeletons'
@@ -23,29 +25,39 @@ const QUERY_FILTER_DEBOUNCE_MS = 300
 const NO_EXPANDED_AGENTS = new Set<string>()
 type QueryTool = AgentRetrievalTool | 'all'
 type ActivityAgentOption = Omit<AgentSessionAgentStat, 'count'> & { count?: number }
+const queryToolOf = (tool: ActivityState['tool']): QueryTool =>
+  tool && Object.values(AGENT_RETRIEVAL_TOOL).includes(tool as AgentRetrievalTool)
+    ? (tool as AgentRetrievalTool)
+    : 'all'
 
 export const ActivityFilters = ({
   state,
   agents,
   onAgent,
   onQuery,
+  onTool,
 }: {
   state: ActivityState
   agents: ActivityAgentOption[]
   onAgent: (agent: string | null) => void
   onQuery: (tool: AgentRetrievalTool | null, q: string | null) => void
+  onTool: (tool: ActivityState['tool']) => void
 }) => {
-  const [tool, setTool] = useState<QueryTool>(state.tool ?? 'all')
+  const [tool, setTool] = useState<QueryTool>(queryToolOf(state.tool))
   const [query, setQuery] = useState(state.q ?? '')
 
   useEffect(() => {
-    setTool(state.tool ?? 'all')
+    setTool(queryToolOf(state.tool))
     setQuery(state.q ?? '')
   }, [state.agent, state.group, state.q, state.show, state.tool])
 
   useEffect(() => {
     const next = query.trim()
     const nextTool = next && tool !== 'all' ? tool : null
+
+    if (!next && state.tool && queryToolOf(state.tool) === 'all') {
+      return undefined
+    }
 
     if (next === (state.q ?? '') && nextTool === state.tool) {
       return undefined
@@ -62,6 +74,20 @@ export const ActivityFilters = ({
 
   return (
     <AsideSections testId="activity-filters">
+      <AsideSection heading="Tool" testId="activity-tool-filter">
+        <Select
+          aria-label="Agent tool"
+          value={state.tool ?? undefined}
+          placeholder="All tools"
+          clearLabel="All tools"
+          onClear={() => onTool(null)}
+          onChange={onTool}
+          options={ACTIVITY_TOOL_NAMES.map((value) => ({
+            value,
+            label: value.replaceAll('_', ' '),
+          }))}
+        />
+      </AsideSection>
       <AsideSection
         heading="Retrieval query"
         testId="activity-query-filter"
@@ -145,6 +171,7 @@ export const ActivityDiagnostics = ({
   state,
   onSelect,
   onRetry,
+  onProblem,
 }: {
   aggregates: AgentSessionEventAggregates | null
   loading: boolean
@@ -152,6 +179,7 @@ export const ActivityDiagnostics = ({
   state: ActivityState
   onSelect: (stat: AgentAuditQueryStat) => void
   onRetry: () => void
+  onProblem: (tool: ToolName) => void
 }) => {
   if (loading && !aggregates) {
     return <PanelsSkeleton />
@@ -171,10 +199,40 @@ export const ActivityDiagnostics = ({
   const retrieval = aggregates?.retrieval
   const blindSpots = (retrieval?.misses ?? []).filter((item) => item.misses >= RECURRING_MISS_MIN)
   const frequent = retrieval?.top ?? []
+  const recurringProblems = aggregates?.recurringProblems ?? []
   const active = (stat: AgentAuditQueryStat) => state.tool === stat.tool && state.q === stat.query
 
   return (
     <AsideSections testId="activity-diagnostics">
+      <AsideSection
+        heading="Recurring problems"
+        hint="Repeated invalid argument shapes from Compact trace."
+      >
+        {recurringProblems.length > 0 ? (
+          <ul className={styles.statList} data-testid="activity-recurring-problems">
+            {recurringProblems.map((problem) => {
+              const tool = ACTIVITY_TOOL_NAMES.includes(problem.tool as ToolName)
+                ? (problem.tool as ToolName)
+                : null
+              return (
+                <li key={problem.fingerprint}>
+                  <button
+                    type="button"
+                    className={styles.problemRow}
+                    disabled={!tool}
+                    onClick={() => tool && onProblem(tool)}
+                  >
+                    <span>{problem.tool.replaceAll('_', ' ')}</span>
+                    <span>{problem.count} repeats</span>
+                  </button>
+                </li>
+              )
+            })}
+          </ul>
+        ) : (
+          <p className={styles.diagnosticsEmpty}>No recurring invalid calls.</p>
+        )}
+      </AsideSection>
       <AsideSection heading="Blind spots" hint="Queries that repeatedly returned no results.">
         {blindSpots.length > 0 ? (
           <ul className={styles.statList} data-testid="activity-blind-spots">

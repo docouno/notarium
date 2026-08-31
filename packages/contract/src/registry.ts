@@ -45,10 +45,19 @@ import {
   MeAgentRolesResponseSchema,
 } from './schemas/rest/agent/roles'
 import {
+  AgentCallDetailResponseSchema,
+  AgentSessionDeleteAcceptedSchema,
+  AgentSessionDeleteActiveConflictSchema,
+  AgentSessionDeleteQuerySchema,
   AgentSessionEventsQuerySchema,
   AgentSessionEventsResponseSchema,
   AgentSessionsQuerySchema,
   AgentSessionsResponseSchema,
+  AgentTelemetryConfigPatchSchema,
+  AgentTelemetryConfigSchema,
+  AgentTraceExportEventSchema,
+  AgentTraceExportMetadataSchema,
+  AgentTraceExportSummarySchema,
 } from './schemas/rest/agent/sessions'
 import {
   AddAgentSkillRequestSchema,
@@ -321,6 +330,22 @@ export const contract = {
   agentSessionEvents: {
     request: AgentSessionEventsQuerySchema,
     response: AgentSessionEventsResponseSchema,
+  },
+  agentCallDetail: { response: AgentCallDetailResponseSchema },
+  agentSessionDelete: {
+    request: AgentSessionDeleteQuerySchema,
+    response: AgentSessionDeleteAcceptedSchema,
+    conflict: AgentSessionDeleteActiveConflictSchema,
+  },
+  agentTelemetryConfigGet: { response: AgentTelemetryConfigSchema },
+  agentTelemetryConfigPatch: {
+    request: AgentTelemetryConfigPatchSchema,
+    response: AgentTelemetryConfigSchema,
+  },
+  agentSessionExport: {
+    metadata: AgentTraceExportMetadataSchema,
+    event: AgentTraceExportEventSchema,
+    summary: AgentTraceExportSummarySchema,
   },
   agentRoles: { request: AgentPackageLibraryQuerySchema, response: MeAgentRolesResponseSchema },
   agentAbilityDetail: { response: AgentAbilityDetailResponseSchema },

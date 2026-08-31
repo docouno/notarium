@@ -148,6 +148,8 @@ export type RetrievalDecl = {
   agent?: string
   /** Optional episode snapshot. Absent means this row belongs to Outside sessions. */
   sessionRef?: string
+  /** Optional primary call row; when present this retrieval is detail, not a legacy event. */
+  callRef?: string
   sessionAttach?: 'declared' | 'inferred'
   tool: 'search' | 'recall' | 'get_note'
   /** The search/recall query, or the get_note ref. */
@@ -182,6 +184,40 @@ export type AgentSessionDecl = {
   role?: string
   /** Sticky project hint stored on the episode. */
   project?: { space: string; path: string }
+}
+
+export type AgentCallDecl = {
+  ref: string
+  owner?: string
+  principal: string
+  agent?: string
+  sessionRef?: string
+  sessionAttach?: 'declared' | 'inferred'
+  tool: string
+  effect: 'read' | 'mutation' | 'control'
+  domain: string
+  outcome: 'success' | 'invalid_arguments' | 'denied' | 'tool_error' | 'internal_error'
+  reasonCode?: string
+  /** Stable diagnostic grouping key; repeated values drive recurring-problem aggregates. */
+  fingerprint?: string
+  daysAgo: number
+  durationMs?: number
+  target?: Record<string, string | number | boolean | null>
+  result?: Record<string, string | number | boolean | null>
+  issues?: Record<string, string | number | boolean | null>
+  detailed?: Record<string, string | number | boolean | null>
+  detailCaptureFailed?: boolean
+  redacted?: boolean
+  truncated?: boolean
+}
+
+export type AgentCleanupMarkerDecl = {
+  sessionRef: string
+  owner?: string
+  operations: Array<{
+    reason: 'retention' | 'human-delete'
+    cleanup: 'pending' | 'complete'
+  }>
 }
 
 /** One Owned fork from the read-only Catalog role inventory. The declaration
@@ -452,6 +488,8 @@ export type AgentWriteAuditDecl = {
    * match a bound session. */
   owner?: string
   agent?: string
+  /** Primary trace call whose linked revisions this mutation produced. */
+  callRef?: string
   sessionRef?: string
   sessionAttach?: 'declared' | 'inferred'
 }
@@ -666,6 +704,12 @@ export type CaseWorld = {
   retrievals?: RetrievalDecl[]
   /** Durable agent episodes, projected to both the fake and real meta-DB. */
   agentSessions?: AgentSessionDecl[]
+  /** Compact terminal call rows that make trace-first Activity states reproducible. */
+  agentCalls?: AgentCallDecl[]
+  /** Durable cleanup reason/progress states, applied after calls/retrievals/revisions. */
+  agentCleanupMarkers?: AgentCleanupMarkerDecl[]
+  /** Host-global telemetry mode for a dedicated seed case. */
+  agentTelemetryDetailed?: boolean
   /** Owned Role packages: authored here, or forked from a Catalog template. */
   agentRoles?: AgentRoleDecl[]
   /** Owned Skill packages at a Personal or Space home: authored, forked from a

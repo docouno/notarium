@@ -61,14 +61,21 @@ const revision = (over: Partial<RevisionInput> = {}): RevisionInput => ({
 
 const eventKey = (
   event: Awaited<ReturnType<AgentSessionAuditPersistence['events']>>['items'][number],
-) => (event.type === 'retrieval' ? `retrieval:${event.record.id}` : `write:${event.id}`)
+) =>
+  event.type === 'call'
+    ? `call:${event.record.id}`
+    : event.type === 'retrieval'
+      ? `retrieval:${event.record.id}`
+      : `write:${event.id}`
 
 const eventCursor = (
   event: Awaited<ReturnType<AgentSessionAuditPersistence['events']>>['items'][number],
 ) =>
-  event.type === 'retrieval'
-    ? { at: event.record.createdAt, source: 'retrieval' as const, id: event.record.id }
-    : { at: event.at, source: 'write' as const, id: event.id }
+  event.type === 'call'
+    ? { at: event.record.startedAt, source: 'call' as const, id: event.record.id }
+    : event.type === 'retrieval'
+      ? { at: event.record.createdAt, source: 'retrieval' as const, id: event.record.id }
+      : { at: event.at, source: 'write' as const, id: event.id }
 
 export const describeSessionAuditContract = (
   name: string,
@@ -368,6 +375,54 @@ export const describeSessionAuditContract = (
           limit: 10,
         }),
       ).toMatchObject({ total: 1, items: [expect.objectContaining({ type: 'write' })] })
+      await expect(
+        facets.audit.events({
+          owner: 'alice',
+          scope: { kind: 'session', id: 'ses_timeline' },
+          type: 'write',
+          tool: 'create_note',
+          limit: 10,
+        }),
+      ).resolves.toMatchObject({ total: 0, items: [] })
+    })
+
+    it('never assigns an outcome to legacy events and can skip export totals', async () => {
+      await facets.retrievals.append(
+        retrieval({
+          sessionId: 'ses_legacy',
+          sessionName: 'Legacy',
+          sessionAttach: 'declared',
+          createdAt: '2026-07-03T00:00:00.000Z',
+        }),
+      )
+      await facets.revisions.append(
+        revision({
+          noteId: 'legacy-write',
+          agent: {
+            owner: 'alice',
+            agent: 'CLI',
+            session: { id: 'ses_legacy', name: 'Legacy', attach: 'declared' },
+          },
+        }),
+        'legacy write',
+      )
+
+      await expect(
+        facets.audit.events({
+          owner: 'alice',
+          scope: { kind: 'session', id: 'ses_legacy' },
+          outcome: 'errors',
+          limit: 10,
+        }),
+      ).resolves.toMatchObject({ items: [], total: 0 })
+      await expect(
+        facets.audit.events({
+          owner: 'alice',
+          scope: { kind: 'session', id: 'ses_legacy' },
+          withTotal: false,
+          limit: 10,
+        }),
+      ).resolves.toMatchObject({ total: null })
     })
 
     it('pages the owner-global union without duplicates while preserving scope and filters', async () => {

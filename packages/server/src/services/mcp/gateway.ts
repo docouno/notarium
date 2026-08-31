@@ -4,7 +4,7 @@
 // canon: docs/mcp-gateway.md#security · docs/architecture.md#p4
 
 import type { z } from 'zod'
-import { PROJECT_STATUS } from '@notarium/contract'
+import { AGENT_CALL_OUTCOME, PROJECT_STATUS } from '@notarium/contract'
 import {
   type ProjectSummary,
   toolActions,
@@ -16,11 +16,13 @@ import { asciiSlug, type ReaderRegistry, STORE_ERROR_REASON } from '@notarium/co
 
 import { clientFailureOf } from '../../libs/clientFailure'
 import type { AbilitiesService } from '../abilities'
+import { type AgentCallSpan, createAgentCalls } from '../agentCalls'
 import { type AgentSessions, type BoundAgentSession, createAgentSessions } from '../agentSessions'
 import type { AuthService } from '../auth'
 import { type Action, agentOwnerOf, can, type Principal, scopeAllows } from '../authz'
 import type { FieldSchemaStore } from '../fields'
 import type {
+  AgentCallTracePersistence,
   AgentDeltaCursorsPersistence,
   AgentSessionsPersistence,
   ContextOrderPersistence,
@@ -93,6 +95,8 @@ export type GatewayDeps = {
   /** Agent-retrieval audit log: read-tool calls (search/recall/get_note) appended
    *  fire-and-forget. Absent → no capture (honest degradation). */
   retrievalLog?: RetrievalLogPersistence
+  /** Durable compact call trace. Absent is the meta-DB-less P5 degradation. */
+  agentCalls?: AgentCallTracePersistence
   /** Tracks fire-and-forget persistence in the online-backup write barrier. */
   runMutation?: <T>(task: () => Promise<T>) => Promise<T>
   /** The project registry. Absent (meta-DB-less host) → no projects exist
@@ -146,7 +150,12 @@ export type ToolResult = {
 
 export type McpGateway = {
   listTools(principal: Principal): ToolListing[]
-  callTool(principal: Principal, name: string, args: unknown): Promise<ToolResult>
+  callTool(
+    principal: Principal,
+    name: string,
+    args: unknown,
+    meta?: { requestId?: string | number },
+  ): Promise<ToolResult>
 }
 
 /** Per-call context handed to every handler: the principal plus the shared
@@ -180,6 +189,10 @@ export type Ctx = {
   providerRegistry?: Pick<ProviderRegistry, 'hasUsableForPrincipal'>
   /** Stable session owner: username in password mode, reserved `@system` in none mode. */
   sessionOwner: string | null
+  /** Transport-neutral identity of the admitted agent operation. */
+  agentCallId?: string
+  /** Compact retention snapshot captured at call admission. */
+  sessionRetentionMs?: number
   /** Episode attached to this call. start_session fills it after opening one. */
   session?: BoundAgentSession
   now(): Date
@@ -270,6 +283,13 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
   const agentSessions = deps.sessions
     ? createAgentSessions({
         persistence: deps.sessions,
+        now,
+        onChange: deps.auth.notifyAgentSessionsChanged,
+      })
+    : undefined
+  const agentCalls = deps.agentCalls
+    ? createAgentCalls({
+        persistence: deps.agentCalls,
         now,
         onChange: deps.auth.notifyAgentSessionsChanged,
       })
@@ -454,51 +474,88 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
           }
         }),
 
-    callTool: async (principal, name, args) => {
-      const handler = HANDLERS[name as ToolName]
+    callTool: async (principal, name, args, meta) => {
+      let callSpan: AgentCallSpan | null = null
 
-      if (!handler || !(name in TOOL_META)) {
-        return errorResult(`unknown tool: ${name}`)
+      try {
+        callSpan = (await agentCalls?.begin(principal, name, args ?? {}, meta?.requestId)) ?? null
+      } catch (err) {
+        console.error('[mcp] trace admission ->', (err as Error)?.message)
+        return errorResult('internal error: agent telemetry admission failed')
+      }
+      const complete = async (
+        result: ToolResult,
+        outcome: (typeof AGENT_CALL_OUTCOME)[keyof typeof AGENT_CALL_OUTCOME],
+        options: { reasonCode?: string; output?: unknown; issues?: readonly z.ZodIssue[] } = {},
+      ): Promise<ToolResult> => {
+        try {
+          await agentCalls?.finish(callSpan, {
+            outcome,
+            ...(options.reasonCode ? { reasonCode: options.reasonCode } : {}),
+            ...(options.output !== undefined ? { output: options.output } : {}),
+            ...(options.issues ? { issues: options.issues } : {}),
+          })
+          return result
+        } catch (err) {
+          console.error('[mcp] trace finalize ->', (err as Error)?.message)
+          return errorResult('internal error: agent telemetry finalization failed')
+        }
+      }
+      const handler = Object.hasOwn(HANDLERS, name) ? HANDLERS[name as ToolName] : undefined
+
+      if (!handler || !Object.hasOwn(TOOL_META, name) || !Object.hasOwn(tools, name)) {
+        return complete(errorResult(`unknown tool: ${name}`), AGENT_CALL_OUTCOME.toolError, {
+          reasonCode: 'unknown_tool',
+        })
       }
       // Defence in depth: the tools/list filter is visibility; this is the gate — a
       // hidden tool still 404s here if called.
       const action = toolActions[name as ToolName] as Action
 
       if (!scopeAllows(principal, action)) {
-        return errorResult(`your token cannot use the "${name}" tool`)
+        return complete(
+          errorResult(`your token cannot use the "${name}" tool`),
+          AGENT_CALL_OUTCOME.denied,
+          { reasonCode: 'scope_denied' },
+        )
       }
       const parsed = tools[name as ToolName].input.safeParse(args ?? {})
 
       if (!parsed.success) {
         const issue = parsed.error.issues[0]
         const where = issue?.path.length ? `\`${issue.path.join('.')}\`: ` : ''
-        return errorResult(
-          `invalid arguments for ${name} — ${where}${issue?.message ?? 'bad input'}`,
+        return complete(
+          errorResult(`invalid arguments for ${name} — ${where}${issue?.message ?? 'bad input'}`),
+          AGENT_CALL_OUTCOME.invalidArguments,
+          { reasonCode: 'input_validation', issues: parsed.error.issues },
         )
       }
       try {
+        await agentCalls?.projectInput(callSpan, parsed.data)
         const ctx = ctxFor(principal)
+        ctx.agentCallId = callSpan?.id
+        ctx.sessionRetentionMs = callSpan ? callSpan.compactRetentionDays * 86_400_000 : undefined
         let loopGuard: { session: string; signature: string } | undefined
 
-        if (
-          agentSessions &&
-          ctx.sessionOwner &&
-          name !== 'start_session' &&
-          name !== 'whoami' &&
-          name !== 'get_my_projects'
-        ) {
+        if (agentSessions && ctx.sessionOwner && name !== 'start_session') {
           const sessionId = (parsed.data as { session?: string }).session
           ctx.session =
-            (await (name === 'use_skill'
-              ? agentSessions.read(ctx.sessionOwner, sessionId)
-              : agentSessions.attach(ctx.sessionOwner, sessionId))) ?? undefined
+            (await (name === 'use_skill' || name === 'whoami' || name === 'get_my_projects'
+              ? agentSessions.read(ctx.sessionOwner, sessionId, ctx.sessionRetentionMs)
+              : agentSessions.attach(ctx.sessionOwner, sessionId, ctx.sessionRetentionMs))) ??
+            undefined
         }
+        await agentCalls?.bind(callSpan, ctx.session)
         if (ctx.session) {
           if (LOOP_GUARDED_TOOLS.has(name as ToolName)) {
             const signature = `${name}\0${stableJson(parsed.data)}`
 
             if (lastProceduralBySession.get(ctx.session.record.id) === signature) {
-              return loopGuardResult(name as 'search' | 'recall')
+              return complete(
+                loopGuardResult(name as 'search' | 'recall'),
+                AGENT_CALL_OUTCOME.toolError,
+                { reasonCode: 'loop_guard' },
+              )
             }
             loopGuard = { session: ctx.session.record.id, signature }
           } else {
@@ -513,7 +570,15 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
 
         if (!out.success) {
           console.error(`[mcp] ${name} output drift ->`, out.error.issues[0]?.message)
-          return errorResult('internal error: malformed tool response')
+          return complete(
+            errorResult('internal error: malformed tool response'),
+            AGENT_CALL_OUTCOME.internalError,
+            { reasonCode: 'output_validation', issues: out.error.issues },
+          )
+        }
+        // start_session binds inside its handler; all other tools bound before it.
+        if (name === 'start_session') {
+          await agentCalls?.bind(callSpan, ctx.session)
         }
         // start_session binds only inside its handler, after the pre-handler attach
         // seam above. A successful bootstrap is still an intervening tool call and
@@ -528,8 +593,7 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
             lastProceduralBySession.delete(lastProceduralBySession.keys().next().value!)
           }
         }
-        // Retrieval audit: fire-and-forget AFTER the answer is built, so capture never
-        // adds latency and a failed append never fails the call.
+        // Compact retrieval detail is mandatory and precedes the terminal call row.
         if (deps.retrievalLog) {
           const row = retrievalRowOf(
             name as ToolName,
@@ -538,20 +602,48 @@ export const createGateway = (deps: GatewayDeps): McpGateway => {
             out.data as Record<string, unknown>,
             (deps.now?.() ?? new Date()).toISOString(),
             ctx.session,
+            callSpan?.id,
           )
 
           if (row) {
-            const append = () => deps.retrievalLog!.append(row)
-            void (deps.runMutation ? deps.runMutation(append) : append()).catch(() => {})
+            try {
+              await deps.retrievalLog.append(row)
+            } catch (err) {
+              console.error('[mcp] compact retrieval detail ->', (err as Error)?.message)
+              return complete(
+                errorResult('internal error: agent telemetry detail failed'),
+                AGENT_CALL_OUTCOME.internalError,
+                { reasonCode: 'retrieval_detail_persistence' },
+              )
+            }
           }
         }
 
-        return {
+        const result: ToolResult = {
           content: [{ type: 'text', text: markdown }],
           structuredContent: out.data as Record<string, unknown>,
         }
+        return complete(result, AGENT_CALL_OUTCOME.success, { output: out.data })
       } catch (err) {
-        return mapError(err, name)
+        const clientFailure = clientFailureOf(err)
+        const e = err as {
+          isConflict?: boolean
+          isNotFound?: boolean
+          isToolError?: boolean
+          reason?: string
+        }
+        const isExpected =
+          err instanceof ToolFailure ||
+          clientFailure != null ||
+          e.isConflict ||
+          e.isNotFound ||
+          e.isToolError ||
+          e.reason === STORE_ERROR_REASON.memoryConvergenceExhausted
+        return complete(
+          mapError(err, name),
+          isExpected ? AGENT_CALL_OUTCOME.toolError : AGENT_CALL_OUTCOME.internalError,
+          { reasonCode: isExpected ? 'tool_failure' : 'internal_failure' },
+        )
       }
     },
   }

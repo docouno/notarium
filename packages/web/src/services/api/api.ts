@@ -1,5 +1,6 @@
 import type { Job } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
+import { agentTraceApi } from './agentTrace'
 import { authApi } from './auth'
 import { ApiError } from './client'
 import { contextApi } from './context'
@@ -28,6 +29,7 @@ import { viewsApi } from './views'
 // only assembles them (spread) and hosts the job-poll helper. Method naming and
 // the #16 space-scoping convention live with the families and ./client.
 export { ApiError } from './client'
+export { AGENT_TRACE_COPY_MAX_BYTES } from './agentTrace'
 export type {
   ImportProgressLine,
   ImportStartOptions,
@@ -52,6 +54,7 @@ export const api = {
   ...authApi,
   ...meApi,
   ...contextApi,
+  ...agentTraceApi,
   ...credentialsApi,
   ...providersApi,
   ...providerAttachmentsApi,

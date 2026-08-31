@@ -8,6 +8,7 @@ import { describeAbilityAvailabilityContract } from './abilityAvailabilityContra
 import { describeAbilityCreateContract } from './abilityCreateContract'
 import { describeAbilityPlacementContract } from './abilityPlacementContract'
 import { describeAbilityPreferencesContract } from './abilityPreferencesContract'
+import { describeAgentCallsContract } from './agentCallsContract'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeCausalMetadataContract } from './causalMetadataContract'
@@ -91,6 +92,32 @@ describeAgentDeltaCursorsContract('SQLite', async () => {
 describeAgentSessionsContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
   return { persistence: db.sessions, teardown: () => db.close() }
+})
+
+describeAgentCallsContract('SQLite', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'notarium-agent-calls-contract-'))
+  const path = join(root, 'meta.db')
+  let db = new SqliteMetaDb(path)
+  const facets = () => ({
+    calls: db.agentCalls,
+    sessions: db.sessions,
+    audit: db.sessionAudit,
+    retrievals: db.retrievalLog,
+    revisions: db.revisions,
+  })
+
+  return {
+    ...facets(),
+    restart: async () => {
+      await db.close()
+      db = new SqliteMetaDb(path)
+      return facets()
+    },
+    teardown: async () => {
+      await db.close()
+      rmSync(root, { recursive: true, force: true })
+    },
+  }
 })
 
 describeAbilityPreferencesContract('SQLite', async () => {

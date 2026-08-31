@@ -4,6 +4,7 @@
 // maps it to the wire envelope.
 // canon: docs/auth.md#model · docs/projects.md#personal-domain-as-a-working-space-13-2026-06-20
 import type { FastifyInstance, FastifyRequest } from 'fastify'
+import { Readable } from 'node:stream'
 
 import {
   ABILITY_AVAILABILITY_MODE,
@@ -14,17 +15,27 @@ import {
   AddAgentRoleResponseSchema,
   AddAgentSkillRequestSchema,
   AddAgentSkillResponseSchema,
+  AGENT_TRACE_PROJECTION_VERSION,
   type AgentAbilityAvailability,
   AgentAbilityDetailResponseSchema,
   AgentAuditQuerySchema,
   AgentAuditResponseSchema,
+  AgentCallDetailResponseSchema,
   AgentContextQuerySchema,
   AgentPackageLibraryQuerySchema,
+  AgentSessionDeleteAcceptedSchema,
+  AgentSessionDeleteActiveConflictSchema,
+  AgentSessionDeleteQuerySchema,
   AgentSessionEventsQuerySchema,
   AgentSessionEventsResponseSchema,
   AgentSessionsQuerySchema,
   AgentSessionsResponseSchema,
   type AgentSkillSummary,
+  AgentTelemetryConfigPatchSchema,
+  AgentTelemetryConfigSchema,
+  AgentTraceExportEventSchema,
+  AgentTraceExportMetadataSchema,
+  AgentTraceExportSummarySchema,
   ConnectionPatchRequestSchema,
   ConnectionsResponseSchema,
   CONTEXT_KIND,
@@ -68,7 +79,9 @@ import type { AbilitiesService } from '../../../../services/abilities'
 import { AGENT_SESSION_IDLE_MS } from '../../../../services/agentSessions'
 import { AuthError, type AuthService } from '../../../../services/auth'
 import { agentOwnerOf, can } from '../../../../services/authz'
+import { SERVER_INFO } from '../../../../services/mcp/descriptions'
 import type {
+  AgentCallTracePersistence,
   AgentSessionAuditEvent,
   AgentSessionAuditPersistence,
   ContextOrderPersistence,
@@ -152,7 +165,7 @@ const decodeSummaryCursor = (raw: string | undefined): { at: string; id: string 
 
 const decodeEventCursor = (
   raw: string | undefined,
-): { at: string; source: 'retrieval' | 'write'; id: string } | undefined => {
+): { at: string; source: 'call' | 'retrieval' | 'write'; id: string } | undefined => {
   if (!raw) {
     return undefined
   }
@@ -164,8 +177,11 @@ const decodeEventCursor = (
 
     if (
       isCanonicalIsoInstant(value.at) &&
-      isPositiveSqliteInteger(value.id) &&
-      (value.source === 'retrieval' || value.source === 'write')
+      ((value.source === 'call' &&
+        typeof value.id === 'string' &&
+        /^call_[A-Za-z0-9_-]{12}$/.test(value.id)) ||
+        ((value.source === 'retrieval' || value.source === 'write') &&
+          isPositiveSqliteInteger(value.id)))
     ) {
       return { at: value.at, id: value.id, source: value.source }
     }
@@ -176,6 +192,33 @@ const decodeEventCursor = (
 }
 
 const sessionEventToWire = (event: AgentSessionAuditEvent) => {
+  if (event.type === 'call') {
+    const record = event.record
+    return {
+      type: 'call' as const,
+      id: record.id,
+      transport: record.transport,
+      tool: record.tool,
+      effect: record.effect,
+      domain: record.domain,
+      at: record.startedAt,
+      finishedAt: record.finishedAt!,
+      durationMs: record.durationMs!,
+      outcome: record.outcome!,
+      reason: record.reasonCode,
+      principal: record.principal,
+      agent: record.agent,
+      sessionId: record.sessionId,
+      sessionName: record.sessionName,
+      sessionAttach: record.sessionAttach,
+      target: record.targetSummary,
+      result: record.resultSummary,
+      redacted: record.redacted,
+      truncated: record.truncated,
+      detailCaptureFailed: record.detailCaptureFailed,
+      projectionVersion: record.projectionVersion,
+    }
+  }
   if (event.type === 'write') {
     return event
   }
@@ -304,6 +347,7 @@ export const meRoutes = async (
     scopePins,
     contextOrder,
     retrievalLog,
+    agentCalls,
     sessionAudit,
     abilities,
   }: {
@@ -314,6 +358,7 @@ export const meRoutes = async (
     scopePins?: ScopePinsPersistence
     contextOrder?: ContextOrderPersistence
     retrievalLog?: RetrievalLogPersistence
+    agentCalls?: AgentCallTracePersistence
     sessionAudit?: AgentSessionAuditPersistence
     abilities?: AbilitiesService
   },
@@ -1229,6 +1274,141 @@ export const meRoutes = async (
   )
 
   app.get(
+    '/api/me/agent-sessions/:id/export',
+    { config: { ...authz('self:manage', 'host'), longLived: true } },
+    async (req, reply) => {
+      const owner = agentOwnerOf(req.principal)
+      const sessionId = (req.params as { id: string }).id
+
+      if (
+        !owner ||
+        !agentCalls ||
+        !sessionAudit ||
+        !AgentSessionIdSchema.safeParse(sessionId).success
+      ) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const target = await sessionAudit.find(
+        owner,
+        sessionId,
+        new Date(Date.now() - AGENT_SESSION_IDLE_MS).toISOString(),
+      )
+
+      if (!target) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const generatedAt = new Date().toISOString()
+      const telemetry = await agentCalls.config()
+      const stream = Readable.from(
+        (async function* () {
+          yield `${JSON.stringify(
+            AgentTraceExportMetadataSchema.parse({
+              type: 'metadata',
+              schema: 'notarium-agent-trace-v1',
+              generatedAt,
+              target: { kind: 'session', ...target },
+              projectionVersion: AGENT_TRACE_PROJECTION_VERSION,
+              redactionVersion: AGENT_TRACE_PROJECTION_VERSION,
+              build: SERVER_INFO,
+              filters: {},
+              telemetry: {
+                detailedEnabled: telemetry.detailedEnabled,
+                compactRetentionDays: telemetry.compactRetentionDays,
+                detailedRetentionDays: telemetry.detailedRetentionDays,
+              },
+              complete: target.complete,
+            }),
+          )}\n`
+          let before: ReturnType<typeof decodeEventCursor> = undefined
+          let count = 0
+          let expectedTotal: number | null = null
+
+          for (;;) {
+            const page = await sessionAudit.events({
+              owner,
+              scope: { kind: 'session', id: sessionId },
+              limit: 1_000,
+              before,
+              withTotal: before == null,
+            })
+            expectedTotal ??= page.total
+            const callIds = page.items.flatMap((event) =>
+              event.type === 'call' ? [event.record.id] : [],
+            )
+            const details = await agentCalls.exportDetails(owner, callIds, generatedAt)
+
+            for (const event of page.items) {
+              count += 1
+              const wire =
+                event.type === 'write'
+                  ? sessionEventToWire({
+                      ...event,
+                      space: spaces.slugOf(event.space) ?? event.space,
+                    })
+                  : sessionEventToWire(event)
+              const linked = event.type === 'call' ? details[event.record.id] : undefined
+              const detail =
+                linked &&
+                (linked.detailed != null ||
+                  linked.retrievals.length > 0 ||
+                  linked.revisions.length > 0)
+                  ? {
+                      detailed: linked.detailed,
+                      links: {
+                        retrievals: linked.retrievals.map((item) =>
+                          sessionEventToWire({ type: 'retrieval', record: item }),
+                        ),
+                        revisions: linked.revisions.map((item) =>
+                          sessionEventToWire({
+                            ...item,
+                            space: spaces.slugOf(item.space) ?? item.space,
+                          }),
+                        ),
+                      },
+                    }
+                  : undefined
+              yield `${JSON.stringify(
+                AgentTraceExportEventSchema.parse({
+                  type: 'event',
+                  event: wire,
+                  ...(detail ? { detail } : {}),
+                }),
+              )}\n`
+            }
+            const last = page.items.at(-1)
+
+            if (!page.hasMore || !last) {
+              break
+            }
+            before =
+              last.type === 'call'
+                ? { at: last.record.startedAt, source: 'call', id: last.record.id }
+                : last.type === 'retrieval'
+                  ? { at: last.record.createdAt, source: 'retrieval', id: last.record.id }
+                  : { at: last.at, source: 'write', id: last.id }
+          }
+          const surviving = await sessionAudit.find(
+            owner,
+            sessionId,
+            new Date(Date.now() - AGENT_SESSION_IDLE_MS).toISOString(),
+          )
+
+          if (!surviving || expectedTotal == null || count !== expectedTotal) {
+            throw new Error('agent trace changed during export')
+          }
+          yield `${JSON.stringify(
+            AgentTraceExportSummarySchema.parse({ type: 'summary', events: count, complete: true }),
+          )}\n`
+        })(),
+      )
+      reply.header('content-type', 'application/x-ndjson')
+      reply.header('content-disposition', `attachment; filename="agent-trace-${sessionId}.ndjson"`)
+      reply.header('cache-control', 'no-store')
+      return reply.send(stream)
+    },
+  )
+
+  app.get(
     '/api/me/agent-sessions/:id',
     { config: authz('self:manage', 'host') },
     async (req, reply) => {
@@ -1264,7 +1444,7 @@ export const meRoutes = async (
           nextCursor: null,
           aggregates:
             q.data.aggregates === '1'
-              ? { retrieval: emptyRetrievalAggregates(), agents: [] }
+              ? { retrieval: emptyRetrievalAggregates(), agents: [], recurringProblems: [] }
               : null,
         })
       }
@@ -1285,6 +1465,7 @@ export const meRoutes = async (
           agent: q.data.agent,
           tool: q.data.tool,
           query: q.data.q,
+          outcome: q.data.outcome,
           limit: q.data.limit,
           before,
         }),
@@ -1294,7 +1475,24 @@ export const meRoutes = async (
                 ? retrievalLog.aggregates(owner)
                 : Promise.resolve(emptyRetrievalAggregates()),
               sessionAudit.agentFacet(owner),
-            ]).then(([retrieval, agents]) => ({ retrieval, agents }))
+              agentCalls
+                ? agentCalls
+                    .config()
+                    .then((config) =>
+                      agentCalls.recurringProblems(
+                        owner,
+                        new Date(
+                          Date.now() - config.compactRetentionDays * 86_400_000,
+                        ).toISOString(),
+                        12,
+                      ),
+                    )
+                : Promise.resolve([]),
+            ]).then(([retrieval, agents, recurringProblems]) => ({
+              retrieval,
+              agents,
+              recurringProblems,
+            }))
           : Promise.resolve(null),
       ])
 
@@ -1309,18 +1507,28 @@ export const meRoutes = async (
             ? {
                 kind: 'outside' as const,
                 lastSeenAt:
-                  first?.type === 'retrieval' ? first.record.createdAt : (first?.at ?? null),
+                  first?.type === 'call'
+                    ? first.record.startedAt
+                    : first?.type === 'retrieval'
+                      ? first.record.createdAt
+                      : (first?.at ?? null),
               }
             : { kind: 'session' as const, ...sessionTarget! }
       const last = events.hasMore ? events.items.at(-1) : null
       const cursor = last
-        ? last.type === 'retrieval'
+        ? last.type === 'call'
           ? encodeAuditCursor({
-              at: last.record.createdAt,
-              source: 'retrieval',
+              at: last.record.startedAt,
+              source: 'call',
               id: last.record.id,
             })
-          : encodeAuditCursor({ at: last.at, source: 'write', id: last.id })
+          : last.type === 'retrieval'
+            ? encodeAuditCursor({
+                at: last.record.createdAt,
+                source: 'retrieval',
+                id: last.record.id,
+              })
+            : encodeAuditCursor({ at: last.at, source: 'write', id: last.id })
         : null
       return AgentSessionEventsResponseSchema.parse({
         target,
@@ -1336,6 +1544,139 @@ export const meRoutes = async (
         hasMore: events.hasMore,
         nextCursor: cursor,
         aggregates,
+      })
+    },
+  )
+
+  app.get('/api/me/agent-calls/:callId', { config: authz('self:manage', 'host') }, async (req) => {
+    const owner = agentOwnerOf(req.principal)
+    const callId = (req.params as { callId: string }).callId
+
+    if (!owner || !agentCalls || !/^call_[A-Za-z0-9_-]{12}$/.test(callId)) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+    const now = new Date().toISOString()
+    const [record, detailed, links, config] = await Promise.all([
+      agentCalls.get(owner, callId),
+      agentCalls.getDetail(owner, callId, now),
+      agentCalls.links(owner, callId),
+      agentCalls.config(),
+    ])
+
+    if (!record || !record.outcome || !record.finishedAt || record.durationMs == null) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+    const base = sessionEventToWire({ type: 'call', record })
+    return AgentCallDetailResponseSchema.parse({
+      ...base,
+      requestId: record.requestId,
+      inputBytes: record.inputBytes,
+      outputBytes: record.outputBytes,
+      inputShape: record.inputShape,
+      issues: record.issueSummary,
+      detailed: detailed
+        ? { status: 'available', payload: detailed }
+        : config.detailedEnabled
+          ? { status: 'expired_or_missing' }
+          : { status: 'disabled' },
+      links: {
+        retrievals: links.retrievals.map((item) =>
+          sessionEventToWire({ type: 'retrieval', record: item }),
+        ),
+        revisions: links.revisions.map((item) =>
+          sessionEventToWire({ ...item, space: spaces.slugOf(item.space) ?? item.space }),
+        ),
+      },
+    })
+  })
+
+  app.delete(
+    '/api/me/agent-sessions/:id',
+    { config: authz('self:manage', 'host') },
+    async (req, reply) => {
+      const owner = agentOwnerOf(req.principal)
+      const sessionId = (req.params as { id: string }).id
+      const query = AgentSessionDeleteQuerySchema.parse(req.query ?? {})
+
+      if (!owner || !agentCalls || !AgentSessionIdSchema.safeParse(sessionId).success) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const activeSince = new Date(Date.now() - AGENT_SESSION_IDLE_MS).toISOString()
+      const target = sessionAudit ? await sessionAudit.find(owner, sessionId, activeSince) : null
+      const result = await agentCalls.deleteSession({
+        owner,
+        sessionId,
+        activeSince,
+        confirmActive: query.confirmActive,
+        acceptedAt: new Date().toISOString(),
+        batchSize: 500,
+      })
+
+      if (result === 'active') {
+        if (!target) {
+          throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+        }
+
+        return reply.code(HTTP_STATUS.CONFLICT).send(
+          AgentSessionDeleteActiveConflictSchema.parse({
+            reason: 'active_session',
+            session: target,
+          }),
+        )
+      }
+      auth.notifyAgentSessionsChanged(owner)
+      if (result === 'deleting') {
+        return reply
+          .code(HTTP_STATUS.ACCEPTED)
+          .send(AgentSessionDeleteAcceptedSchema.parse({ status: 'deleting' }))
+      }
+
+      return reply.code(204).send()
+    },
+  )
+
+  app.get('/api/config/agent-telemetry', { config: authz('config:read', 'host') }, async () => {
+    if (!agentCalls) {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+    const config = await agentCalls.config()
+    return AgentTelemetryConfigSchema.parse({
+      available: true,
+      ...config,
+      projectionVersion: AGENT_TRACE_PROJECTION_VERSION,
+      compactDisclosure: { retrievalQuery: true, topHitTitles: true, rawContent: false },
+    })
+  })
+
+  app.patch(
+    '/api/config/agent-telemetry',
+    { config: authz('config:manage', 'host') },
+    async (req, reply) => {
+      if (!agentCalls) {
+        throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+      }
+      const body = AgentTelemetryConfigPatchSchema.parse(req.body ?? {})
+      const updated = await agentCalls.patchConfig({
+        expectedVersionToken: body.versionToken,
+        ...(body.detailedEnabled !== undefined ? { detailedEnabled: body.detailedEnabled } : {}),
+        ...(body.compactRetentionDays !== undefined
+          ? { compactRetentionDays: body.compactRetentionDays }
+          : {}),
+        ...(body.detailedRetentionDays !== undefined
+          ? { detailedRetentionDays: body.detailedRetentionDays }
+          : {}),
+        updatedAt: new Date().toISOString(),
+      })
+
+      if (!updated) {
+        return reply.code(HTTP_STATUS.CONFLICT).send({ error: 'configuration changed' })
+      }
+
+      return AgentTelemetryConfigSchema.parse({
+        available: true,
+        ...updated,
+        projectionVersion: AGENT_TRACE_PROJECTION_VERSION,
+        compactDisclosure: { retrievalQuery: true, topHitTitles: true, rawContent: false },
       })
     },
   )

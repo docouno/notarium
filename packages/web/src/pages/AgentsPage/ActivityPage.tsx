@@ -6,26 +6,32 @@ import type {
   AgentSessions,
   AgentSessionSummary,
 } from '@notarium/contract'
+import { HTTP_STATUS } from '@notarium/contract/http'
 import { ActivityTimeline, ActivityTimelineRow } from '../../core/ActivityTimeline'
 import { Button } from '../../core/Button'
 import { ContextMenu } from '../../core/ContextMenu'
+import { useDialog } from '../../core/Dialog'
 import { EmptyState } from '../../core/EmptyState'
 import {
   IconArchive,
   IconClock,
+  IconCopy,
   IconCrosshair,
+  IconDownload,
   IconExternal,
   IconHistory,
   IconMore,
+  IconTrash,
 } from '../../core/Icons'
 import { Notice } from '../../core/Notice'
 import { Segmented } from '../../core/Segmented'
+import { useCopy, useToast } from '../../core/Toast'
 import { exactDateTime, timeAgo } from '../../libs/datetime'
 import { agentActivityRoute } from '../../libs/routing/routePaths'
-import { api } from '../../services/api'
+import { AGENT_TRACE_COPY_MAX_BYTES, api, ApiError } from '../../services/api'
 import { ActivityEventRow } from './ActivityEventRows'
 import { useActivityFrame } from './ActivityFrame'
-import { type ActivityGroup, type ActivityShow } from './activityState'
+import { type ActivityGroup, type ActivityOutcome, type ActivityShow } from './activityState'
 import { ActivityListSkeleton, SessionListSkeleton } from './AuditSkeletons'
 import { countLabel } from './consts'
 import styles from './ActivityPage.module.scss'
@@ -43,17 +49,109 @@ const sessionCounts = (session: AgentSessionSummary): string => {
       ? 'Archived snapshot · no audited activity'
       : `${countLabel(session.calls, 'call')} · no audited activity`
   }
-  const audited = `${countLabel(session.reads, 'read')} · ${countLabel(session.writes, 'write')}`
+  const audited = `${countLabel(session.reads, 'read')} · ${countLabel(session.writes, 'mutation')}`
   return session.calls == null
     ? `${audited} · archived snapshot`
     : `${countLabel(session.calls, 'call')} · ${audited}`
 }
 
-const EpisodeActions = ({ to }: { to: string }) => {
+const EpisodeActions = ({
+  to,
+  id,
+  name,
+  onDeleted,
+}: {
+  to: string
+  id?: string
+  name?: string
+  onDeleted?: () => void
+}) => {
   const navigate = useNavigate()
+  const { confirm } = useDialog()
+  const copyText = useCopy()
+  const toast = useToast()
   const triggerRef = useRef<HTMLButtonElement>(null)
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null)
   const closeMenu = () => setMenu(null)
+
+  const download = () => {
+    if (!id) {
+      return
+    }
+    const link = document.createElement('a')
+    link.href = api.agentSessionExportUrl(id)
+    link.download = ''
+    link.click()
+  }
+
+  const copyTrace = async () => {
+    if (!id) {
+      return
+    }
+    try {
+      const result = await api.agentSessionTraceCopy(id, AGENT_TRACE_COPY_MAX_BYTES)
+
+      if (result.status === 'too-large') {
+        toast.warning(
+          `Trace is larger than ${Math.round(result.limitBytes / 1024)} KB and wasn’t copied.`,
+          { action: { label: 'Download', onClick: download } },
+        )
+        return
+      }
+      copyText(result.text, { label: 'session trace', subject: name ?? id })
+    } catch {
+      toast.error('Couldn’t prepare the session trace for copying.')
+    }
+  }
+
+  const remove = async () => {
+    if (!id) {
+      return
+    }
+    const accepted = await confirm({
+      title: `Delete “${name ?? id}”?`,
+      message:
+        'This removes the session and its retained call and retrieval diagnostics. Notes and revision history remain.',
+      confirmLabel: 'Delete',
+      danger: true,
+    })
+
+    if (!accepted) {
+      return
+    }
+    try {
+      const result = await api.agentSessionDelete(id)
+
+      if (result === 'deleting') {
+        toast.info('Deletion is in progress. The session is already hidden and cannot be reused.')
+      }
+      onDeleted?.()
+    } catch (error) {
+      if (error instanceof ApiError && error.status === HTTP_STATUS.CONFLICT) {
+        const confirmedActive = await confirm({
+          title: 'Delete active session?',
+          message:
+            'Running agent work will not be cancelled. The session and its retained diagnostics will be removed, and later calls using this session id will fail.',
+          confirmLabel: 'Delete anyway',
+          danger: true,
+        })
+
+        if (confirmedActive) {
+          const result = await api.agentSessionDelete(id, true)
+
+          if (result === 'deleting') {
+            toast.info(
+              'Deletion is in progress. The session is already hidden and cannot be reused.',
+            )
+          }
+          onDeleted?.()
+        }
+
+        return
+      }
+      throw error
+    }
+  }
 
   return (
     <>
@@ -91,6 +189,23 @@ const EpisodeActions = ({ to }: { to: string }) => {
               icon: <IconExternal size={15} />,
               onClick: () => navigate(to),
             },
+            ...(id
+              ? [
+                  {
+                    label: 'Copy trace',
+                    icon: <IconCopy size={15} />,
+                    onClick: () => void copyTrace(),
+                  },
+                  { label: 'Download trace', icon: <IconDownload size={15} />, onClick: download },
+                  { divider: true },
+                  {
+                    label: 'Delete session',
+                    icon: <IconTrash size={15} />,
+                    danger: true,
+                    onClick: () => void remove(),
+                  },
+                ]
+              : []),
           ]}
           onClose={closeMenu}
         />
@@ -143,6 +258,7 @@ export const ActivityPage = () => {
           agent: state.agent ?? undefined,
           tool: state.tool ?? undefined,
           q: state.q ?? undefined,
+          outcome: state.outcome === 'all' ? undefined : state.outcome,
         })
 
         if (seq !== requestSeq.current) {
@@ -162,7 +278,7 @@ export const ActivityPage = () => {
         }
       }
     },
-    [state.agent, state.q, state.show, state.tool],
+    [state.agent, state.outcome, state.q, state.show, state.tool],
   )
 
   const loadOverview = useCallback(
@@ -248,6 +364,8 @@ export const ActivityPage = () => {
           limit: 50,
           cursor,
           filter: state.show === 'all' ? undefined : state.show,
+          tool: state.tool ?? undefined,
+          outcome: state.outcome === 'all' ? undefined : state.outcome,
         })
 
         if (episodeRequests.current.get(id) !== seq) {
@@ -279,7 +397,7 @@ export const ActivityPage = () => {
         }
       }
     },
-    [state.show],
+    [state.outcome, state.show, state.tool],
   )
 
   const toggleEpisode = (id: string, open: boolean) => {
@@ -308,18 +426,19 @@ export const ActivityPage = () => {
 
   const changeShow = (show: ActivityShow) => {
     clearEpisodes()
-    setState(show === 'writes' ? { show, tool: null, q: null } : { show })
+    setState(show === 'writes' ? { show, q: null } : { show })
   }
 
   const resetFilters = () => {
     clearEpisodes()
-    setState({ agent: null, tool: null, q: null, show: 'all' })
+    setState({ agent: null, tool: null, q: null, show: 'all', outcome: 'all' })
   }
 
   const streamEmpty = !loading && !failed && stream?.events.length === 0
   const overviewEmpty =
     !loading && !failed && overview?.sessions.length === 0 && overview.outside == null
-  const filtered = state.show !== 'all' || !!state.agent || !!state.q
+  const filtered =
+    state.show !== 'all' || state.outcome !== 'all' || !!state.agent || !!state.tool || !!state.q
 
   const episodeBody = (id: string) => {
     const episodeState = episodes[id]
@@ -397,8 +516,8 @@ export const ActivityPage = () => {
         <header className={styles.head}>
           <h1 className={styles.title}>Activity</h1>
           <p className={styles.sub}>
-            What your agents retrieved and changed, newest first. Group the stream to inspect
-            complete work episodes.
+            Every retained agent call and its terminal outcome, newest first. Group the stream to
+            inspect work episodes.
           </p>
         </header>
 
@@ -432,6 +551,22 @@ export const ActivityPage = () => {
             />
           </div>
           <div className={styles.controlGroup}>
+            <span>Outcome</span>
+            <Segmented<ActivityOutcome>
+              value={state.outcome}
+              onChange={(outcome) => {
+                clearEpisodes()
+                setState({ outcome })
+              }}
+              ariaLabel="Filter by call outcome"
+              options={[
+                { value: 'all', label: 'All' },
+                { value: 'success', label: 'Success' },
+                { value: 'errors', label: 'Errors' },
+              ]}
+            />
+          </div>
+          <div className={styles.controlGroup}>
             <span>Show</span>
             <Segmented<ActivityShow>
               value={state.show}
@@ -440,7 +575,7 @@ export const ActivityPage = () => {
               options={[
                 { value: 'all', label: 'All' },
                 { value: 'reads', label: 'Reads' },
-                { value: 'writes', label: 'Writes' },
+                { value: 'writes', label: 'Mutations' },
               ]}
             />
           </div>
@@ -554,7 +689,7 @@ export const ActivityPage = () => {
                               : 'Never'}
                           </span>
                         }
-                        outcome={`${countLabel(overview.outside.reads, 'read')} · ${countLabel(overview.outside.writes, 'write')} without a session`}
+                        outcome={`${countLabel(overview.outside.reads, 'read')} · ${countLabel(overview.outside.writes, 'mutation')} without a session`}
                         detail={episodeBody('outside')}
                         expanded={expandedIds.has('outside')}
                         onExpandedChange={(open) => toggleEpisode('outside', open)}
@@ -593,6 +728,9 @@ export const ActivityPage = () => {
                               {session.named === false && (
                                 <span className={styles.sessionKindLabel}>Automatic</span>
                               )}
+                              {!session.complete && (
+                                <span className={styles.sessionKindLabel}>Legacy / partial</span>
+                              )}
                               {session.active && <span className={styles.activeLabel}>Active</span>}
                             </span>
                           }
@@ -609,7 +747,29 @@ export const ActivityPage = () => {
                           disclosureLabel={`Toggle activity for ${session.name}`}
                           detailClassName={styles.sessionDetail}
                           trailing={
-                            <EpisodeActions to={agentActivityRoute(session.id, searchParams)} />
+                            <EpisodeActions
+                              to={agentActivityRoute(session.id, searchParams)}
+                              id={session.id}
+                              name={session.name}
+                              onDeleted={() => {
+                                setOverview((current) =>
+                                  current
+                                    ? {
+                                        ...current,
+                                        sessions: current.sessions.filter(
+                                          (candidate) => candidate.id !== session.id,
+                                        ),
+                                        total: Math.max(0, current.total - 1),
+                                        active: Math.max(
+                                          0,
+                                          current.active - (session.active ? 1 : 0),
+                                        ),
+                                      }
+                                    : current,
+                                )
+                                toggleEpisode(session.id, false)
+                              }}
+                            />
                           }
                           testId="activity-session-row"
                         />

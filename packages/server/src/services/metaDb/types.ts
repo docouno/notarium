@@ -1,4 +1,11 @@
-import { type ABILITY_AVAILABILITY_MODE } from '@notarium/contract'
+import {
+  type ABILITY_AVAILABILITY_MODE,
+  type AgentCallEffect,
+  type AgentCallOutcome,
+  type AgentCallTransport,
+  type AgentTelemetryCompactRetentionDays,
+  type AgentTelemetryDetailedRetentionDays,
+} from '@notarium/contract'
 import type { OwnedAbilityLocator, SystemAbilityLocator } from '@notarium/contract'
 import type {
   AttachmentState,
@@ -1038,6 +1045,7 @@ export type RetrievalHit = { noteId: string; title?: string; score?: number; cla
  *  recall/get_note and for a zero-result search). */
 export type RetrievalLogRecord = {
   id: string
+  agentCallId: string | null
   owner: string
   principal: string
   /** Friendly name of the acting agent — the PAT's name or the connected app's,
@@ -1057,7 +1065,9 @@ export type RetrievalLogRecord = {
   createdAt: string
 }
 
-export type RetrievalLogInput = Omit<RetrievalLogRecord, 'id'>
+export type RetrievalLogInput = Omit<RetrievalLogRecord, 'id' | 'agentCallId'> & {
+  agentCallId?: string | null
+}
 
 /** A windowed history read, owner-scoped + newest-first. `tool` narrows to one
  *  tool; `missesOnly` keeps only zero-result calls (the "searched but didn't find"
@@ -1098,7 +1108,8 @@ export type RetrievalAggregates = {
  *  Agents → Activity surface. Owner-keyed and cross-space (a search fans out) — so it is
  *  NOT swept by purgeSpace, exactly like the per-user oauth facet. */
 export type RetrievalLogPersistence = {
-  append(input: RetrievalLogInput): Promise<RetrievalLogRecord>
+  /** Null means a session cleanup marker won and discarded this diagnostic child. */
+  append(input: RetrievalLogInput): Promise<RetrievalLogRecord | null>
   history(
     q: RetrievalHistoryQuery,
   ): Promise<{ items: RetrievalLogRecord[]; total: number; hasMore: boolean }>
@@ -1327,6 +1338,184 @@ export type AgentSessionRoleSet = {
   changed: boolean
 }
 
+// ── Agent call trace + telemetry config ──────────────────────────────
+
+export type AgentTraceJson =
+  null | boolean | number | string | AgentTraceJson[] | { [key: string]: AgentTraceJson }
+
+export type AgentCallRecord = {
+  id: string
+  owner: string
+  principal: string
+  agent: string | null
+  transport: AgentCallTransport
+  requestId: string | null
+  sessionId: string | null
+  sessionName: string | null
+  sessionAttach: AgentSessionAttach | null
+  tool: string
+  effect: AgentCallEffect
+  domain: string
+  startedAt: string
+  finishedAt: string | null
+  durationMs: number | null
+  outcome: AgentCallOutcome | null
+  reasonCode: string | null
+  inputBytes: number
+  outputBytes: number | null
+  inputShape: AgentTraceJson
+  issueSummary: AgentTraceJson | null
+  targetSummary: AgentTraceJson | null
+  resultSummary: AgentTraceJson | null
+  fingerprint: string
+  projectionVersion: number
+  redacted: boolean
+  truncated: boolean
+  detailCaptureFailed: boolean
+}
+
+export type AgentCallAdmission = Omit<
+  AgentCallRecord,
+  | 'sessionId'
+  | 'sessionName'
+  | 'sessionAttach'
+  | 'finishedAt'
+  | 'durationMs'
+  | 'outcome'
+  | 'reasonCode'
+  | 'outputBytes'
+  | 'issueSummary'
+  | 'resultSummary'
+  | 'detailCaptureFailed'
+> & {
+  sessionId?: null
+  sessionName?: null
+  sessionAttach?: null
+  finishedAt?: null
+  durationMs?: null
+  outcome?: null
+  reasonCode?: null
+  outputBytes?: null
+  issueSummary?: null
+  resultSummary?: null
+  detailCaptureFailed?: false
+}
+
+export type AgentCallFinal = Pick<
+  AgentCallRecord,
+  | 'finishedAt'
+  | 'durationMs'
+  | 'outcome'
+  | 'reasonCode'
+  | 'outputBytes'
+  | 'issueSummary'
+  | 'resultSummary'
+  | 'redacted'
+  | 'truncated'
+  | 'detailCaptureFailed'
+  | 'fingerprint'
+>
+
+export type AgentTelemetryConfig = {
+  detailedEnabled: boolean
+  compactRetentionDays: AgentTelemetryCompactRetentionDays
+  detailedRetentionDays: AgentTelemetryDetailedRetentionDays
+  versionToken: string
+  updatedAt: string
+}
+
+export type AgentRecurringProblem = {
+  fingerprint: string
+  tool: string
+  issues: AgentTraceJson | null
+  count: number
+  firstAt: string
+  lastAt: string
+  agents: number
+}
+
+export type AgentCallTracePersistence = {
+  admit(input: AgentCallAdmission): Promise<void>
+  projectInput(
+    owner: string,
+    id: string,
+    targetSummary: AgentTraceJson,
+    redacted: boolean,
+    truncated: boolean,
+  ): Promise<boolean>
+  /** Attach a retained episode snapshot. False means a cleanup marker already won. */
+  bind(
+    owner: string,
+    id: string,
+    session: { id: string; name: string; attach: AgentSessionAttach },
+  ): Promise<boolean>
+  discard(owner: string, id: string): Promise<void>
+  /** Finalize an admitted row. False means cleanup removed/blocked the row. */
+  finalize(owner: string, id: string, final: AgentCallFinal): Promise<boolean>
+  appendDetail(input: {
+    owner: string
+    id: string
+    payload: AgentTraceJson
+    createdAt: string
+    expiresAt: string
+  }): Promise<boolean>
+  get(owner: string, id: string): Promise<AgentCallRecord | null>
+  getDetail(owner: string, id: string, now: string): Promise<AgentTraceJson | null>
+  links(
+    owner: string,
+    id: string,
+  ): Promise<{
+    retrievals: RetrievalLogRecord[]
+    revisions: AgentSessionAuditWriteEvent[]
+  }>
+  exportDetails(
+    owner: string,
+    ids: readonly string[],
+    now: string,
+  ): Promise<
+    Record<
+      string,
+      {
+        detailed: AgentTraceJson | null
+        retrievals: RetrievalLogRecord[]
+        revisions: AgentSessionAuditWriteEvent[]
+      }
+    >
+  >
+  recurringProblems(owner: string, since: string, limit: number): Promise<AgentRecurringProblem[]>
+  recoverInterrupted(before: string, finishedAt: string): Promise<number>
+  config(): Promise<AgentTelemetryConfig>
+  patchConfig(input: {
+    expectedVersionToken: string
+    detailedEnabled?: boolean
+    compactRetentionDays?: AgentTelemetryCompactRetentionDays
+    detailedRetentionDays?: AgentTelemetryDetailedRetentionDays
+    updatedAt: string
+  }): Promise<AgentTelemetryConfig | null>
+  deleteSession(input: {
+    owner: string
+    sessionId: string
+    activeSince: string
+    confirmActive: boolean
+    acceptedAt: string
+    batchSize: number
+  }): Promise<'active' | 'deleting' | 'complete'>
+  expireSession(input: {
+    owner: string
+    sessionId: string
+    expiredBefore: string
+    acceptedAt: string
+    batchSize: number
+  }): Promise<'fresh' | 'dominated' | 'deleting' | 'complete'>
+  maintain(input: { now: string; batchSize: number }): Promise<string[]>
+  /** Opportunistic bounded resumption for durable cleanup markers. */
+  resumeCleanup(batchSize: number): Promise<{
+    completedOwners: string[]
+    processed: number
+    pending: boolean
+  }>
+}
+
 /** Atomic outcome of starting a named session. The persistence layer owns the
  * whole observe-and-decide sequence so concurrent starts cannot both resume a
  * sleeping row or both create unrelated roots. */
@@ -1334,19 +1523,10 @@ export type AgentSessionNamedStart =
   | { kind: 'ambiguous'; matches: AgentSessionRecord[] }
   | { kind: 'new' | 'resumed' | 'forked'; record: AgentSessionRecord }
 
-/** Atomic outcome of an unaddressed start. A zero/ambiguous active world creates one
- * root; exactly one active episode resumes it. Ambiguity carries the choices observed
- * before the new root was inserted. */
-export type AgentSessionInferredStart = {
-  kind: 'new' | 'resumed'
-  record: AgentSessionRecord
-  recentSessions?: AgentSessionRecord[]
-}
-
 /** Durable storage for agent work sessions. Policy (2h active / 30d retention,
  * resume vs fork) lives in the transport-independent agentSessions service.
- * `inferActiveAndTouch`, `startInferred` and `startNamed` are deliberately atomic: their
- * observe-and-update decisions must remain one linearizable operation. */
+ * `startNamed` is deliberately atomic: its observe-and-update decision must remain
+ * one linearizable operation. Unaddressed starts are unconditional root inserts. */
 export type AgentSessionsPersistence = {
   insert(session: AgentSessionRecord): Promise<void>
   /** Read one retained owner episode without touching activity or calls. */
@@ -1365,19 +1545,6 @@ export type AgentSessionsPersistence = {
     retainedSince: string,
     projectId?: string,
   ): Promise<AgentSessionRecord | null>
-  inferActiveAndTouch(
-    owner: string,
-    activeSince: string,
-    lastSeenAt: string,
-    projectId?: string,
-  ): Promise<AgentSessionRecord | null>
-  startInferred(
-    candidate: AgentSessionRecord,
-    activeSince: string,
-    recentSince: string,
-    limit: number,
-    projectId?: string,
-  ): Promise<AgentSessionInferredStart>
   startNamed(
     candidate: AgentSessionRecord,
     activeSince: string,
@@ -1411,6 +1578,8 @@ export type AgentSessionAuditSummary = {
   writes: number
   retained: boolean
   active: boolean
+  /** Proven only by a retained successful linked start_session under this projection. */
+  complete: boolean
 }
 
 export type AgentSessionAuditOutside = {
@@ -1425,13 +1594,18 @@ export type AgentSessionAuditScope =
 export type AgentSessionAuditSummaryCursor = { at: string; id: string }
 export type AgentSessionAuditEventCursor = {
   at: string
-  source: 'retrieval' | 'write'
+  source: 'call' | 'retrieval' | 'write'
   id: string
 }
 
 export type AgentSessionAuditRetrievalEvent = {
   type: 'retrieval'
   record: RetrievalLogRecord
+}
+
+export type AgentSessionAuditCallEvent = {
+  type: 'call'
+  record: AgentCallRecord
 }
 
 export type AgentSessionAuditWriteEvent = {
@@ -1452,7 +1626,8 @@ export type AgentSessionAuditWriteEvent = {
   revisionKind: RevisionKind
 }
 
-export type AgentSessionAuditEvent = AgentSessionAuditRetrievalEvent | AgentSessionAuditWriteEvent
+export type AgentSessionAuditEvent =
+  AgentSessionAuditCallEvent | AgentSessionAuditRetrievalEvent | AgentSessionAuditWriteEvent
 
 /** Cross-space, self-scoped read model over retained sessions plus the two durable
  * audit sources. It owns no writes and keeps archived session snapshots visible. */
@@ -1480,8 +1655,11 @@ export type AgentSessionAuditPersistence = {
     scope: AgentSessionAuditScope
     type?: 'retrieval' | 'write'
     agent?: string
-    tool?: RetrievalTool
+    tool?: string
     query?: string
+    outcome?: 'success' | 'errors' | AgentCallOutcome
+    /** Session pages expose a total; streaming export disables repeated counts. */
+    withTotal?: boolean
     limit: number
     before?: AgentSessionAuditEventCursor
   }): Promise<{ items: AgentSessionAuditEvent[]; total: number | null; hasMore: boolean }>
@@ -1973,6 +2151,7 @@ export type MetaDb = {
   agentDeltaCursors: AgentDeltaCursorsPersistence
   /** Owner-scoped/cross-space; retained independently of any one project or space. */
   sessions: AgentSessionsPersistence
+  agentCalls: AgentCallTracePersistence
   sessionAudit: AgentSessionAuditPersistence
   projects: ProjectsPersistence
   /** `type='folder'` rows of the same table as `projects`, not a separate tenant. */

@@ -169,7 +169,11 @@ describe('GET /api/me/agent-sessions/:id query', () => {
     expect(
       AgentSessionEventsQuerySchema.safeParse({ q: 'same query', tool: 'search' }).success,
     ).toBe(true)
-    expect(AgentSessionEventsQuerySchema.safeParse({ tool: 'search' }).success).toBe(false)
+    expect(AgentSessionEventsQuerySchema.safeParse({ tool: 'search' }).success).toBe(true)
+    expect(AgentSessionEventsQuerySchema.safeParse({ tool: 'create_note' }).success).toBe(true)
+    expect(
+      AgentSessionEventsQuerySchema.safeParse({ q: 'same query', tool: 'create_note' }).success,
+    ).toBe(false)
     expect(
       AgentSessionEventsQuerySchema.safeParse({ q: 'same query', filter: 'writes' }).success,
     ).toBe(false)
@@ -425,8 +429,8 @@ describe('zod 4 migration boundaries', () => {
         },
       },
       {
-        result: AgentSessionEventsQuerySchema.safeParse({ tool: 'search' }),
-        expected: { code: 'custom', path: [], message: 'tool requires q' },
+        result: AgentSessionEventsQuerySchema.safeParse({ q: 'query', tool: 'create_note' }),
+        expected: { code: 'custom', path: [], message: 'query requires a retrieval tool' },
       },
       {
         result: AgentSessionEventsQuerySchema.safeParse({ q: 'query', filter: 'writes' }),

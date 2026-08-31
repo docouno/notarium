@@ -105,6 +105,58 @@ export const agentSessions: CaseSpec = {
       calls: 4,
     })
 
+    b.agentCall({
+      ref: 'review-root-start',
+      principal: 'pat:CLI:seed',
+      agent: 'CLI',
+      sessionRef: 'review-root',
+      tool: 'start_session',
+      effect: 'mutation',
+      domain: 'session',
+      outcome: 'success',
+      daysAgo: 0.8,
+      target: { taskBytes: 16 },
+      result: { 'session.state': 'new' },
+    })
+    b.agentCall({
+      ref: 'review-root-search',
+      principal: 'pat:CLI:seed',
+      agent: 'CLI',
+      sessionRef: 'review-root',
+      tool: 'search',
+      effect: 'read',
+      domain: 'retrieval',
+      outcome: 'success',
+      daysAgo: 0.05,
+      target: { query: 'migration checklist' },
+      result: { resultCount: 1 },
+    })
+    b.agentCall({
+      ref: 'review-root-move',
+      principal: 'pat:CLI:seed',
+      agent: 'CLI',
+      sessionRef: 'review-root',
+      tool: 'move_folder',
+      effect: 'mutation',
+      domain: 'container',
+      outcome: 'success',
+      daysAgo: 0.04,
+      target: { path: 'sessions/drafts' },
+      result: { path: 'sessions/reviewed' },
+    })
+    b.agentCall({
+      ref: 'outside-invalid',
+      principal: 'pat:Codex:seed',
+      agent: 'Codex',
+      tool: 'search',
+      effect: 'read',
+      domain: 'retrieval',
+      outcome: 'invalid_arguments',
+      reasonCode: 'input_validation',
+      daysAgo: 0.02,
+      result: { issueCode: 'invalid_type' },
+    })
+
     const rootFindings = b.note({
       space: 'main',
       path: 'sessions/root-findings.md',
@@ -201,6 +253,7 @@ export const agentSessions: CaseSpec = {
     b.retrieval({
       ...cli,
       sessionRef: 'review-root',
+      callRef: 'review-root-search',
       sessionAttach: 'declared',
       tool: 'search',
       query: 'migration checklist',

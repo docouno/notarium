@@ -20,16 +20,18 @@ sqlite/0002_agent_state.sql
 sqlite/0003_causal_identity.sql
 sqlite/0004_import_reservations.sql
 sqlite/0005_provider_contour.sql
+sqlite/0006_agent_call_trace.sql
 postgres/0000_baseline.sql
 postgres/0001_revision_history.sql
 postgres/0002_agent_state.sql
 postgres/0003_causal_identity.sql
 postgres/0004_import_reservations.sql
 postgres/0005_provider_contour.sql
+postgres/0006_agent_call_trace.sql
 ```
 
 `0000_baseline` is the published `v0.1.0` support floor. Its bytes and pair
-checksum are immutable. The five later carriers are the supported transition
+checksum are immutable. The six later carriers are the supported transition
 from that baseline to the current schema; development-only predecessor ladders
 are not accepted prefixes.
 
@@ -198,6 +200,37 @@ never collide. Spend lives on the event with the source that reported it, absent
 counters mean unknown rather than zero, and no total is stored anywhere — the
 rollup is summed from the rows.
 
+### `0006_agent_call_trace`
+
+The agent observability carrier adds terminal `agent_calls`, optional expiring
+`agent_call_details`, transport-neutral `agent_call_id` links on retrievals and revisions, one
+host-global CAS-versioned telemetry configuration row, and durable owner/session cleanup markers.
+The marker reason is monotone: `human-delete` dominates `retention`.
+
+Compact calls are the primary Activity event. Linked retrieval/revision rows enrich that call and
+never re-enter the legacy top-level fallback. Human deletion removes session diagnostics while
+leaving revision rows and note state untouched; automatic retention removes only linked new-data
+diagnostics, so historical unlinked audit remains honestly partial.
+
+The marker is also a read fence: call detail, unexpired Detail, linked rows, compatibility
+retrieval audit and recurring diagnostics cannot expose a logically removed episode while a 202
+cleanup is still physical. PostgreSQL cleanup reads the current reason only after taking the
+owner/session advisory guard and clears `cleanup_pending` with a same-reason predicate, so a stale
+retention worker cannot complete a later human deletion. Retrieval, agent and recurring-problem
+aggregates probe owner markers inside the same read snapshot as their complete result: the ordinary
+no-marker path uses covering partial indexes, while the guarded path retains the per-session
+anti-join. Retrieval top/miss groups share one materialized grouping inside that snapshot. Separate
+partial indexes keep legacy unlinked agent rows out of wide retrieval/revision scans, so adding
+Compact calls does not restore the pre-RC Activity aggregate regression.
+
+Retention candidates come from indexed `agent_sessions.last_seen_at`; terminal writes advance that
+timestamp unless the call is one of the explicit attribution-without-touch reads. A partial index
+proves the episode-opening `new|forked` start, and Outside expiry has its own expression index. The
+background worker accepts one session batch on the 60-second discovery tick. A pending marker then
+continues after one-second event-loop yields, one fixed batch per turn, until physical cleanup is
+complete. It never performs a grouped whole-`agent_calls` scan, a multi-session SQLite cleanup
+transaction, or an hours-long interval-only cleanup on request traffic.
+
 ## Lock and lifecycle invariants
 
 The normative PostgreSQL order lives in
@@ -233,6 +266,11 @@ not introduce hidden edges that contradict it.
 - Revision append and purge share bounded Space, note, and blob lock stripes.
   A successful irreversible purge leaves a compact fence; a late direct SQL
   append is serialized and rejected by the database trigger.
+- Session bind/touch/role, retrieval/detail/finalize and cleanup acceptance share one
+  owner/session guard. Either the diagnostic writer commits before the marker and cleanup sees it,
+  or the marker wins and the writer appends nothing. PostgreSQL uses the same advisory key for all
+  participants and re-reads marker reason after acquiring it; SQLite's immediate writer transaction
+  provides the equivalent order.
 
 ## Database ledger and startup <a id="startup"></a>
 

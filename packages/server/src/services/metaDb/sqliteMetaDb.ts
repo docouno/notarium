@@ -11,6 +11,7 @@ import { createAbilityAvailabilityFacet } from './drivers/sqlite/abilityAvailabi
 import { createAbilityCreateFacet } from './drivers/sqlite/abilityCreate'
 import { createAbilityPlacementFacet } from './drivers/sqlite/abilityPlacement'
 import { createAbilityPreferencesFacet } from './drivers/sqlite/abilityPreferences'
+import { createAgentCallsFacet } from './drivers/sqlite/agentCalls'
 import { createAgentDeltaCursorsFacet } from './drivers/sqlite/agentDeltaCursors'
 import { createAuthFacet } from './drivers/sqlite/auth'
 import { createCausalOutboxFacet } from './drivers/sqlite/causalOutbox'
@@ -570,6 +571,8 @@ export class SqliteMetaDb implements MetaDb {
   readonly agentDeltaCursors = createAgentDeltaCursorsFacet(this.ctx)
 
   readonly sessions = createSessionsFacet(this.ctx)
+
+  readonly agentCalls = createAgentCallsFacet(this.ctx)
 
   readonly sessionAudit = createSessionAuditFacet(this.ctx)
 

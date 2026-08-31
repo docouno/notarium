@@ -21,7 +21,7 @@ import {
 export const SearchInputSchema = z
   .object({
     ...sessionField,
-    query: z.string().min(1),
+    query: z.string().min(1).max(4096),
     project: ProjectHandleSchema.optional(),
     /** `agent-memory` = only memory, `user-doc` = exclude it, omit = every visible
      *  class. canon: docs/note-model.md#agent-memory */
@@ -51,7 +51,7 @@ export const SearchOutputSchema = z.object({ results: z.array(SearchHitSchema) }
 export const GetNoteInputSchema = z
   .object({
     ...sessionField,
-    ref: RefSchema,
+    ref: RefSchema.refine((value) => value.length <= 4096, 'must contain at most 4096 characters'),
     responseFormat: ResponseFormatSchema.default(RESPONSE_FORMAT.detailed),
   })
   .strict()
@@ -123,7 +123,7 @@ export const GetNotePublishedOutputSchema = GetNoteOutputSchema.extend({
 export const RecallInputSchema = z
   .object({
     ...sessionField,
-    query: z.string().min(1),
+    query: z.string().min(1).max(4096),
     project: ProjectHandleSchema.optional(),
     /** Token cap on the whole assembled bundle. */
     budgetTokens: z.number().int().min(1).default(4000),

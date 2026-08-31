@@ -6,6 +6,7 @@ import {
   benchmarkGateFailures,
   type BenchmarkGateProbe,
   type BenchmarkGateReport,
+  type BenchmarkGateTraceProbe,
 } from '../../scripts/benchSessionAuditGates'
 
 const DRIVERS = ['sqlite', 'postgres'] as const
@@ -20,31 +21,91 @@ const PROBES: BenchmarkGateProbe['kind'][] = [
   'outside-reads',
   'outside-writes',
 ]
+const TRACE_PROBES: BenchmarkGateTraceProbe['kind'][] = [
+  'compact-write',
+  'detailed-write',
+  'maintenance',
+  'dense-export',
+]
 
-const report = (over: Partial<BenchmarkGateReport> = {}): BenchmarkGateReport => ({
-  phase: 'post',
-  cells: DRIVERS.flatMap((driver) =>
-    DATASETS.flatMap((dataset) =>
-      SCOPES.flatMap((scope) =>
-        FILTERS.flatMap((filter) =>
-          PAGES.map((page) => ({
-            driver,
-            dataset,
-            scope,
-            filter,
-            page,
-            mode: 'production' as const,
-            medianMs: 1,
-          })),
+const report = (over: Partial<BenchmarkGateReport> = {}): BenchmarkGateReport => {
+  const phase = over.phase ?? 'post'
+  return {
+    phase,
+    gitCommit: phase === 'pre' ? 'base-commit' : 'post-commit',
+    gitTree: phase === 'pre' ? 'base-tree' : 'post-tree',
+    cells: DRIVERS.flatMap((driver) =>
+      DATASETS.flatMap((dataset) =>
+        SCOPES.flatMap((scope) =>
+          FILTERS.flatMap((filter) =>
+            PAGES.map((page) => ({
+              driver,
+              dataset,
+              scope,
+              filter,
+              page,
+              mode: 'production' as const,
+              medianMs: 1,
+            })),
+          ),
         ),
       ),
     ),
-  ),
-  probes: DRIVERS.flatMap((driver) =>
-    DATASETS.flatMap((dataset) => PROBES.map((kind) => ({ driver, dataset, kind, medianMs: 1 }))),
-  ),
-  ...over,
-})
+    probes: DRIVERS.flatMap((driver) =>
+      DATASETS.flatMap((dataset) => PROBES.map((kind) => ({ driver, dataset, kind, medianMs: 1 }))),
+    ),
+    aggregatePairs: DRIVERS.flatMap((driver) =>
+      DATASETS.map((dataset) => ({
+        driver,
+        dataset,
+        disabledMedianMs: 1,
+        enabledMedianMs: 2,
+        ratio: 2,
+      })),
+    ),
+    traceProbes: DRIVERS.flatMap((driver) =>
+      DATASETS.flatMap((dataset) =>
+        TRACE_PROBES.map((kind) => ({
+          driver,
+          dataset,
+          kind,
+          rows: kind === 'dense-export' ? dataset : 1,
+          medianMs: 1,
+          ...(kind === 'maintenance'
+            ? {
+                rows: dataset,
+                components: {
+                  passes: 2,
+                  maxPassMs: 1,
+                  p99PassMs: 1,
+                  processed: dataset,
+                  remaining: 0,
+                  yields: 1,
+                },
+              }
+            : {}),
+        })),
+      ),
+    ),
+    storageProbes: DRIVERS.flatMap((driver) =>
+      DATASETS.flatMap((dataset) =>
+        (['compact', 'detailed'] as const).map((mode) => {
+          const bytesPerRow = mode === 'compact' ? 1_000 : 1_500
+          return {
+            driver,
+            dataset,
+            mode,
+            method: driver === 'sqlite' ? 'sqlite-json-payload-v1' : 'postgres-row-size-v1',
+            rows: 25,
+            bytes: bytesPerRow * 25,
+            bytesPerRow,
+          }
+        }),
+      ),
+    ),
+    ...over,
+  }
+}
 
 describe('session audit benchmark gates', () => {
   it('keeps both bulk revision seeders on the final mandatory row contract', () => {
@@ -82,13 +143,20 @@ describe('session audit benchmark gates', () => {
 
   it('fails closed on empty or incomplete reports', () => {
     const baseline = report({ phase: 'pre' })
-    const empty = benchmarkGateFailures(report({ cells: [], probes: [] }), baseline)
+    const empty = benchmarkGateFailures(
+      report({ cells: [], probes: [], traceProbes: [], storageProbes: [] }),
+      baseline,
+    )
     expect(empty).toContain('post report is missing benchmark cells')
     expect(empty).toContain('post report is missing benchmark probes')
+    expect(
+      empty.some((failure) => failure.startsWith('post report is missing storage probe')),
+    ).toBe(true)
 
     const incomplete = report()
     incomplete.cells.pop()
     incomplete.probes.pop()
+    incomplete.traceProbes!.pop()
     const failures = benchmarkGateFailures(incomplete, baseline)
     expect(failures.some((failure) => failure.startsWith('post report is missing cell '))).toBe(
       true,
@@ -131,7 +199,7 @@ describe('session audit benchmark gates', () => {
     const lastDetail = post.probes.find(
       (probe) => probe.driver === 'sqlite' && probe.dataset === 500_000 && probe.kind === 'detail',
     )!
-    lastDetail.medianMs = 2.01
+    lastDetail.medianMs = 12.01
     const failures = benchmarkGateFailures(post, report({ phase: 'pre' }))
 
     expect(failures.some((failure) => failure.includes('diagnostic-reference'))).toBe(true)
@@ -151,7 +219,7 @@ describe('session audit benchmark gates', () => {
         candidate.filter === 'all' &&
         candidate.page === 'first',
     )!
-    cell.medianMs = 2.01
+    cell.medianMs = 7.01
 
     expect(
       benchmarkGateFailures(regressed, baseline).some((failure) =>
@@ -159,6 +227,69 @@ describe('session audit benchmark gates', () => {
       ),
     ).toBe(true)
     expect(benchmarkGateFailures(report(), baseline)).toEqual([])
+  })
+
+  it('rejects stale identity and unbounded trace write, maintenance and export probes', () => {
+    const baseline = report({ phase: 'pre' })
+    const post = report({ gitCommit: baseline.gitCommit, gitTree: baseline.gitTree })
+    post.traceProbes!.find((probe) => probe.kind === 'compact-write')!.medianMs = 101
+    post.traceProbes!.find((probe) => probe.kind === 'maintenance')!.components!.p99PassMs = 1_001
+    post.traceProbes!.find(
+      (probe) => probe.driver === 'postgres' && probe.kind === 'maintenance',
+    )!.components!.maxPassMs = 5_001
+    const exported = post.traceProbes!.find((probe) => probe.kind === 'dense-export')!
+    exported.rows = exported.dataset - 1
+    exported.medianMs = exported.rows
+    post.aggregatePairs![0]!.enabledMedianMs = 1_001
+    const oversized = post.storageProbes!.find((probe) => probe.mode === 'compact')!
+    oversized.bytesPerRow = 20_000
+    oversized.bytes = oversized.rows * oversized.bytesPerRow
+    const failures = benchmarkGateFailures(post, baseline)
+
+    expect(failures).toContain('post and baseline report the same git commit')
+    expect(failures).toContain('post and baseline report the same git tree')
+    expect(failures.some((failure) => failure.includes('compact-write'))).toBe(true)
+    expect(failures.some((failure) => failure.includes('maintenance'))).toBe(true)
+    expect(failures.some((failure) => failure.includes('exported fewer rows'))).toBe(true)
+    expect(failures.some((failure) => failure.includes('ms/1k rows'))).toBe(true)
+    expect(failures.some((failure) => failure.includes('aggregates'))).toBe(true)
+    expect(failures.some((failure) => failure.includes('storage probe'))).toBe(true)
+  })
+
+  it('compares an established aggregate cost to baseline without blessing a new regression', () => {
+    const baseline = report({ phase: 'pre' })
+    const before = baseline.aggregatePairs!.find(
+      (pair) => pair.driver === 'sqlite' && pair.dataset === 500_000,
+    )!
+    before.enabledMedianMs = 2_500
+    const withinBaseline = report()
+    withinBaseline.aggregatePairs!.find(
+      (pair) => pair.driver === 'sqlite' && pair.dataset === 500_000,
+    )!.enabledMedianMs = 2_600
+    const regressed = structuredClone(withinBaseline)
+    regressed.aggregatePairs!.find(
+      (pair) => pair.driver === 'sqlite' && pair.dataset === 500_000,
+    )!.enabledMedianMs = 3_100
+
+    expect(benchmarkGateFailures(withinBaseline, baseline)).toEqual([])
+    expect(
+      benchmarkGateFailures(regressed, baseline).some((failure) =>
+        failure.includes('post aggregate sqlite:500000:aggregates'),
+      ),
+    ).toBe(true)
+
+    const absoluteRegression = report()
+    baseline.aggregatePairs!.find(
+      (pair) => pair.driver === 'postgres' && pair.dataset === 500_000,
+    )!.enabledMedianMs = 250
+    absoluteRegression.aggregatePairs!.find(
+      (pair) => pair.driver === 'postgres' && pair.dataset === 500_000,
+    )!.enabledMedianMs = 301
+    expect(
+      benchmarkGateFailures(absoluteRegression, baseline).some((failure) =>
+        failure.includes('post aggregate postgres:500000:aggregates'),
+      ),
+    ).toBe(true)
   })
 
   it('fails closed on malformed benchmark medians before calculating ratios', () => {

@@ -206,34 +206,6 @@ export const describeAgentSessionsContract = (
       })
     })
 
-    it('atomically infers and touches exactly one active session, never zero or two', async () => {
-      expect(
-        await persistence.inferActiveAndTouch(
-          'alice',
-          '2026-08-04T08:00:00.000Z',
-          '2026-08-04T10:00:00.000Z',
-        ),
-      ).toBeNull()
-
-      await persistence.insert(row('ses_aaaaaaaaaaaa', 'alice', '2026-08-04T09:00:00.000Z'))
-      expect(
-        await persistence.inferActiveAndTouch(
-          'alice',
-          '2026-08-04T08:00:00.000Z',
-          '2026-08-04T10:00:00.000Z',
-        ),
-      ).toMatchObject({ id: 'ses_aaaaaaaaaaaa', calls: 2 })
-
-      await persistence.insert(row('ses_bbbbbbbbbbbb', 'alice', '2026-08-04T09:30:00.000Z'))
-      expect(
-        await persistence.inferActiveAndTouch(
-          'alice',
-          '2026-08-04T08:00:00.000Z',
-          '2026-08-04T11:00:00.000Z',
-        ),
-      ).toBeNull()
-    })
-
     it('serializes concurrent starts of one sleeping named session into resume then fork', async () => {
       await persistence.insert(
         row('ses_aaaaaaaaaaaa', 'alice', '2026-08-04T06:00:00.000Z', {
@@ -294,38 +266,6 @@ export const describeAgentSessionsContract = (
         throw new Error('missing new root outcome')
       }
       expect(forked).toMatchObject({ record: { parentId: root.record.id } })
-    })
-
-    it('serializes concurrent unaddressed first starts into one root and one resume', async () => {
-      const results = await Promise.all([
-        persistence.startInferred(
-          row('ses_aaaaaaaaaaaa', 'alice', '2026-08-04T12:00:00.000Z', {
-            name: 'personal · now',
-            named: false,
-          }),
-          '2026-08-04T10:00:00.000Z',
-          '2026-07-28T12:00:00.000Z',
-          10,
-        ),
-        persistence.startInferred(
-          row('ses_bbbbbbbbbbbb', 'alice', '2026-08-04T12:00:00.000Z', {
-            name: 'personal · now',
-            named: false,
-          }),
-          '2026-08-04T10:00:00.000Z',
-          '2026-07-28T12:00:00.000Z',
-          10,
-        ),
-      ])
-
-      expect(results.map(({ kind }) => kind).sort()).toEqual(['new', 'resumed'])
-      const created = results.find(({ kind }) => kind === 'new')
-      const resumed = results.find(({ kind }) => kind === 'resumed')
-
-      expect(resumed?.record.id).toBe(created?.record.id)
-      expect(await persistence.listRecent('alice', '2026-07-28T12:00:00.000Z', 10)).toEqual([
-        expect.objectContaining({ id: created?.record.id, calls: 2, parentId: null }),
-      ])
     })
 
     it('prunes strictly before the boundary and nulls a surviving child parent', async () => {

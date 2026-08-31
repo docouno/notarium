@@ -35,6 +35,7 @@ import {
 } from '@notarium/core'
 import { InMemoryStore, type StoreSnapshot } from '@notarium/engine-memory'
 import {
+  type AgentCallRecord,
   type AgentSessionRecord,
   buildApp,
   createAuthService,
@@ -93,6 +94,7 @@ import type {
 } from '../cases/types'
 import { createInMemoryAbilityPlacement } from './abilityPlacement'
 import { InMemoryAbilityPreferences } from './abilityPreferences'
+import { InMemoryAgentCalls } from './agentCalls'
 import { InMemoryAgentDeltaCursors } from './agentDeltaCursors'
 import { InMemoryAgentSessions } from './agentSessions'
 import { AuditedRevisionPersistence } from './auditedRevisionPersistence'
@@ -217,6 +219,20 @@ export type Fixture = {
   providerRuntime?: Omit<ProviderRuntimeOptions, 'privateOrigins' | 'callLog' | 'mutationGate'>
   auth?: AuthFixture
   agentSessions?: AgentSessionRecord[]
+  agentCalls?: AgentCallRecord[]
+  agentCleanupMarkers?: Array<{
+    owner: string
+    sessionId: string
+    operations: Array<{
+      reason: 'retention' | 'human-delete'
+      cleanup: 'pending' | 'complete'
+    }>
+  }>
+  agentCallDetails?: Array<{
+    id: string
+    payload: Record<string, string | number | boolean | null>
+  }>
+  agentTelemetryDetailed?: boolean
   agentRoles?: AgentRoleDecl[]
   agentSkills?: AgentSkillDecl[]
   /** Owner Enable/Disable overrides, applied AFTER the packages above so each row can
@@ -483,7 +499,9 @@ export const createApp = async (
   })
   const agentSessions = new InMemoryAgentSessions()
   const retrievalLog = new InMemoryRetrievalLog()
-  const sessionAudit = new InMemorySessionAudit(agentSessions, retrievalLog)
+  const agentCalls = new InMemoryAgentCalls(agentSessions, retrievalLog)
+  const sessionAudit = new InMemorySessionAudit(agentSessions, retrievalLog, agentCalls)
+  agentCalls.attachRevisionLinks((owner, id) => sessionAudit.linkedRevisions(owner, id))
   const agentDeltaCursors = new InMemoryAgentDeltaCursors()
   projects.attachLifecycle(agentDeltaCursors)
   agentSessions.attachLifecycle(agentDeltaCursors)
@@ -1104,6 +1122,37 @@ export const createApp = async (
     agentSessions.seed(records)
   }
   await seedAgentSessions(fixture)
+  agentCalls.seed(
+    fixture.agentCalls ?? [],
+    fixture.agentCallDetails ?? [],
+    fixture.agentTelemetryDetailed ?? false,
+  )
+  const seedAgentCleanup = async (fx: Fixture) => {
+    for (const marker of fx.agentCleanupMarkers ?? []) {
+      for (const operation of marker.operations) {
+        const common = {
+          owner: marker.owner,
+          sessionId: marker.sessionId,
+          acceptedAt: fx.now ?? new Date().toISOString(),
+          batchSize: operation.cleanup === 'pending' ? 0 : 10_000,
+        }
+
+        if (operation.reason === 'retention') {
+          await agentCalls.expireSession({
+            ...common,
+            expiredBefore: fx.now ?? new Date().toISOString(),
+          })
+        } else {
+          await agentCalls.deleteSession({
+            ...common,
+            activeSince: fx.now ?? new Date().toISOString(),
+            confirmActive: true,
+          })
+        }
+      }
+    }
+  }
+  await seedAgentCleanup(fixture)
   // Deterministic tests want every fixture space live before the first request — no
   // lazy-boot timing in the suite (now keyed + booted by the stable id).
   for (const rec of manager.list()) {
@@ -1303,6 +1352,7 @@ export const createApp = async (
     agentDeltaCursors,
     gatewayState: fixture.noGatewayState ? undefined : gatewayState,
     retrievalLog,
+    agentCalls,
     sessionAudit: fixture.noSessionAudit ? undefined : sessionAudit,
     projects,
     folders,
@@ -1546,12 +1596,19 @@ export const createApp = async (
     gatewayState.clear()
     agentDeltaCursors.clear()
     retrievalLog.clear()
+    agentCalls.clear()
     oauthDb.clear()
     projects.seed(projectRecords(next, idOf))
     abilityAvailability.clearAll()
     abilityPreferences.clear()
     await seedAgentPackages(next)
     await seedAgentSessions(next)
+    agentCalls.seed(
+      next.agentCalls ?? [],
+      next.agentCallDetails ?? [],
+      next.agentTelemetryDetailed ?? false,
+    )
+    await seedAgentCleanup(next)
     favorites.clear()
     contextSets.clear()
     scopePins.clear()

@@ -182,6 +182,7 @@ thresholds.
 |---|---|---|
 | `agent-context` | pins + personal/project memory + projects of varying density (#165), including the pinned `product/index.md` **Folder overview #311**; **heavy pins over budget + a `Budget Lab` space for all token-budget cases #208** (fits / squeeze / no-pins / set-trim — nesting the personal set into project Q's budget; `squeeze` lands the cut on a heavy pin and `set-trim` lands it INSIDE the cross-space set, the one state where a trimmed set item and a trimmed pin are under one caption); **cross-space context set #209** (`Frontend Canon` in the `Conventions` space, connected to project Product OS + personal) **+ cross-space loose pin #209** (`Security Baseline` from `Conventions`, pinned directly into Product OS + personal) — both resolve cross-space; **retrieval audit #243** (search/recall/get_note history: hits + a recurrent vocabulary-mismatch miss + frequent queries) | agent-memory, agent-audit, structure, note-classes, scale |
 | `agent-sessions` | Activity: active fork siblings, a sticky project hint, exact call vs audited read/write counts, declared/inferred attachment, `Outside sessions`, an archived snapshot whose lifecycle row was GC'd, a mixed history longer than one 50-row page, an equal-timestamp read/write cursor boundary, hostile and max-length unbroken labels, owner isolation, distinct root/fork/owner delta positions, and an owner whose Agent facet runs five labels long — past the compact ceiling that facet used to carry, kept as a real-stand state (see below) | agent-sessions, agent-audit, auth, history |
+| `agent-telemetry-detailed` | Full session review corpus with Detailed enabled: Compact-vs-Detailed calls, every real producer outcome/effect/domain, recurring validation failures, linked retrievals and multi-revision mutations, Outside, complete/partial/archived and cross-owner episodes, plus durable retention→human pending and human-cleanup-complete marker states | agent-sessions, agent-audit, auth, history |
 | `agent-roles` | five principals keep the boundary visible: Fresh is catalog-only; Bob owns an idle Personal fork; the default stand owner Sergey owns a Personal `release-reviewer` with distinct Base/Role pins plus editable Personal and Main-project Memory rows; Maya owns switchable Personal `research`/`grooming` presets plus same-name Research Space + two Project role forks. Its skill library has Personal and Space homes, `coder` bound to Team Alpha/Beta but not Gamma, an all-projects skill, a direct catalog fork with provenance, an exact-linked rename, a custom exact link, duplicate names, and a deleted package retained as a broken role reference. A long Custom role preserves authored body and carries one legacy malformed attachment for preserve-vs-detach editing; another owned role remains in Personal Trash. Robin can inspect the Team home read-only. Base Personal/Project pins remain visible, each role placement has a distinct pin, the Team Project role adds a set plus an oversized tail that trims under the shared `Role → Project → Personal` budget, and an active episode rehydrates `research` | agent-roles, agent-sessions, agent-memory, auth, structure, scale |
 | `agent-abilities-rich` | the same axis at VOLUME on the default login, where `agent-roles` proves boundaries with one placement each: Personal, Space and three Project role groups populated at once, BOTH inventories past the library/explorer page sizes, a title long enough to force truncation everywhere it is listed, one display name deliberately held at two placements, a `launch-review` Space role narrowed to two of the Space's projects with its own version in one of them, a version whose base was never created, and a Space skill fleet whose availability differs per project (all / one / several). It seeds project and personal Catalog dependencies at their real homes, exact-linked rename, malformed and deleted attachment health, plus the RC package-delete boundaries: both Markdown and non-Markdown auxiliaries make agent `delete_ability` refuse and preserve the package, while the unchanged human multi-file door can remove the Markdown package into Trash. `agent-created-oversized-proof` is published through the durable agent creator with PAT/session provenance, exceeds 64k characters, and is pinned by its real note id into Web; it simultaneously proves Activity attribution, fail-closed `use_skill` and generic MCP context filtering. Most of its projects hold no ability at all, and that is deliberate: the library aside's Project facet has no pagination and no scroller of its own, so the LENGTH of that facet is the state — long enough that the aside's own scroller is the one that moves. Counts are derived from `buildCasesWorld`, never pinned in prose. | agent-roles, agent-memory, agent-audit, structure, auth, scale |
 | `agent-abilities-sparse` | the other end of the same axis: a first-run stand with System and Catalog plus exactly one Owned skill and no Owned role at all — the empty groups, the single-row group and the skeleton geometry that a fully populated stand can never show | agent-roles, structure, auth |
@@ -221,6 +222,8 @@ make seed CASE=reader-showcase                      # (re)seed the local stand
 make seed CASE=providers                            # provider management/consent states
 make seed CASE=providers-disabled                   # populated DB, served capability off
 make provider-scale-gate                            # 10k provider startup/read/maintenance artifact
+make bench-session-audit BENCH_PHASE=pre            # current-main Activity baseline
+make bench-session-audit BENCH_PHASE=post           # trace pages/writes/storage/export/full cleanup
 make seed CASE=tree-sort                            # explorer Name/Created/Modified QA
 make seed CASE=views                               # board/discovery/failure QA
 make seed CASE=views-scale SCALE=.01               # reduced summary/rank scale stand
@@ -231,6 +234,22 @@ make seed CASE=context-sets-cost                   # #406 heavy/small/role conte
 make graph-revision-gate GRAPH_REVISION_COMMIT=<frozen-tree> # explicit dirty-tree proof
 make seed-coverage                                  # coverage matrix
 ```
+
+`bench-session-audit` refuses tracked or untracked working-tree changes so its commit/tree
+identity describes the exact copied source. The post report exercises production Activity reads,
+Compact and Detailed writes, paged export and complete bounded-cleanup convergence on both drivers.
+Its storage samples are logical row payload, not database-file or index allocation: SQLite records
+the encoded persisted columns and linked sidecars (`sqlite-json-payload-v1`), while PostgreSQL uses
+`pg_column_size` over the same owned rows (`postgres-row-size-v1`). The method is carried per sample
+so values are compared across modes and dataset sizes within a driver, never presented as identical
+physical-byte accounting across engines.
+Cleanup convergence reports every yielded pass and gates both its p99 transaction time
+(250 ms SQLite / 1 s PostgreSQL) and a separate hang ceiling (500 ms / 5 s); history-scale ratios
+use the same 5 ms material floor as baseline comparisons so sub-millisecond planner noise cannot
+masquerade as dataset-proportional work.
+The aggregate bundle is limited to the stricter of its driver ceiling (3.5 s SQLite / 300 ms
+PostgreSQL) and baseline plus the greater of 20% or 150 ms; the fixed allowance accounts for the
+new agent/problem summaries without permitting the earlier multi-second regression.
 
 `graph-revision` is a gate fixture rather than a manual showcase. `make graph-revision-gate`
 builds a provenance-labelled production image, seeds the fixed corpus into an isolated volume,

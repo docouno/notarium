@@ -5,17 +5,25 @@ import { performance } from 'node:perf_hooks'
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import pg from 'pg'
 
+import { createMutationGate } from '../packages/server/src/libs/mutationGate'
+import { createAgentCalls } from '../packages/server/src/services/agentCalls'
+import { createAgentCallsFacet as createPgAgentCallsFacet } from '../packages/server/src/services/metaDb/drivers/pg/agentCalls'
 import { createRetrievalLogFacet as createPgRetrievalLogFacet } from '../packages/server/src/services/metaDb/drivers/pg/retrievalLog'
 import { createSessionAuditFacet as createPgSessionAuditFacet } from '../packages/server/src/services/metaDb/drivers/pg/sessionAudit'
+import { createSessionsFacet as createPgSessionsFacet } from '../packages/server/src/services/metaDb/drivers/pg/sessions'
+import { createAgentCallsFacet as createSqliteAgentCallsFacet } from '../packages/server/src/services/metaDb/drivers/sqlite/agentCalls'
 import { createRetrievalLogFacet as createSqliteRetrievalLogFacet } from '../packages/server/src/services/metaDb/drivers/sqlite/retrievalLog'
 import { createSessionAuditFacet as createSqliteSessionAuditFacet } from '../packages/server/src/services/metaDb/drivers/sqlite/sessionAudit'
+import { createSessionsFacet as createSqliteSessionsFacet } from '../packages/server/src/services/metaDb/drivers/sqlite/sessions'
 import {
   runPgMigrations,
   runSqliteMigrations,
 } from '../packages/server/src/services/metaDb/migrations'
 import type {
+  AgentCallTracePersistence,
   AgentSessionAuditEventCursor,
   AgentSessionAuditPersistence,
+  AgentSessionsPersistence,
   RetrievalLogPersistence,
 } from '../packages/server/src/services/metaDb/types'
 import {
@@ -29,6 +37,7 @@ const TARGET_SESSION = 'ses_target_bench'
 const LIMIT = 50
 const WARMUPS = 5
 const MEASURED = 20
+const STORAGE_ROWS = 25
 const BASE_TIME = Date.parse('2025-01-01T00:00:00.000Z')
 
 type Scope = { kind: 'all' } | { kind: 'outside' } | { kind: 'session'; id: string }
@@ -67,6 +76,12 @@ type AggregatePair = {
   enabledRawMs: number[]
   enabledMedianMs: number
   ratio: number
+  components: {
+    timelineMedianMs: number
+    retrievalsMedianMs: number
+    agentsMedianMs: number
+    problemsMedianMs: number
+  }
 }
 
 type ScaleProbe = {
@@ -80,11 +95,42 @@ type ScaleProbe = {
   plans: Plan[]
 }
 
+type TraceProbe = {
+  driver: DriverName
+  dataset: number
+  kind: 'compact-write' | 'detailed-write' | 'maintenance' | 'dense-export'
+  rows: number
+  rawMs: number[]
+  medianMs: number
+  components?: {
+    pages?: number
+    eventsMs?: number
+    detailsMs?: number
+    passes?: number
+    maxPassMs?: number
+    p99PassMs?: number
+    processed?: number
+    remaining?: number
+    yields?: number
+  }
+}
+
+type StorageProbe = {
+  driver: DriverName
+  dataset: number
+  mode: 'compact' | 'detailed'
+  method: 'sqlite-json-payload-v1' | 'postgres-row-size-v1'
+  rows: number
+  bytes: number
+  bytesPerRow: number
+}
+
 type Report = {
   phase: string
   startedAt: string
   finishedAt?: string
   gitCommit: string | null
+  gitTree: string | null
   node: string
   images: { node: string | null; postgres: string | null }
   policy: {
@@ -99,7 +145,15 @@ type Report = {
   cells: CellResult[]
   aggregatePairs: AggregatePair[]
   probes: ScaleProbe[]
-  gate?: { baseline: string; failures: string[]; passed: boolean }
+  traceProbes: TraceProbe[]
+  storageProbes: StorageProbe[]
+  gate?: {
+    baseline: string
+    baselineCommit: string | null
+    baselineTree: string | null
+    failures: string[]
+    passed: boolean
+  }
 }
 
 type ReferenceRow = {
@@ -118,6 +172,8 @@ type Driver = {
   name: DriverName
   audit: AgentSessionAuditPersistence
   retrievals: RetrievalLogPersistence
+  calls: AgentCallTracePersistence
+  sessions: AgentSessionsPersistence
   seed(size: number): Promise<void>
   supportsAll(): Promise<boolean>
   reference(filter: Filter, before?: AgentSessionAuditEventCursor): Promise<ReferenceRow[]>
@@ -132,6 +188,19 @@ type Driver = {
   prepareRetrievalOrder(): Promise<void>
   prepareOutsideOrder(): Promise<void>
   agents(): Promise<unknown>
+  setTraceDetailed(enabled: boolean): Promise<void>
+  traceWrite(): Promise<string>
+  storageBytes(ids: readonly string[]): Promise<number>
+  prepareDenseTrace(): Promise<number>
+  exportDenseTrace(): Promise<{ rows: number; pages: number; eventsMs: number; detailsMs: number }>
+  maintainTrace(): Promise<{
+    passes: number
+    maxPassMs: number
+    p99PassMs: number
+    processed: number
+    remaining: number
+    yields: number
+  }>
   version(): Promise<string>
   close(): Promise<void>
 }
@@ -158,6 +227,11 @@ const median = (values: readonly number[]): number => {
     : (ordered[middle] ?? 0)
 }
 
+const p99 = (values: readonly number[]): number => {
+  const ordered = [...values].sort((left, right) => left - right)
+  return ordered[Math.max(0, Math.ceil(ordered.length * 0.99) - 1)] ?? 0
+}
+
 const measure = async (run: () => Promise<unknown>): Promise<{ raw: number[]; median: number }> => {
   for (let index = 0; index < WARMUPS; index += 1) {
     await run()
@@ -172,6 +246,20 @@ const measure = async (run: () => Promise<unknown>): Promise<{ raw: number[]; me
 
   return { raw, median: median(raw) }
 }
+
+const measureComponent = async (run: () => Promise<unknown>): Promise<number> => {
+  const raw: number[] = []
+
+  for (let index = 0; index < 3; index += 1) {
+    const started = performance.now()
+    await run()
+    raw.push(performance.now() - started)
+  }
+
+  return median(raw)
+}
+
+const yieldTurn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve))
 
 const filterType = (filter: Filter): 'retrieval' | 'write' | undefined =>
   filter === 'reads' ? 'retrieval' : filter === 'writes' ? 'write' : undefined
@@ -213,9 +301,11 @@ const events = (
 const cursorOfEvent = (
   event: Awaited<ReturnType<AgentSessionAuditPersistence['events']>>['items'][number],
 ): AgentSessionAuditEventCursor =>
-  event.type === 'retrieval'
-    ? { at: event.record.createdAt, source: 'retrieval', id: event.record.id }
-    : { at: event.at, source: 'write', id: event.id }
+  event.type === 'call'
+    ? { at: event.record.startedAt, source: 'call', id: event.record.id }
+    : event.type === 'retrieval'
+      ? { at: event.record.createdAt, source: 'retrieval', id: event.record.id }
+      : { at: event.at, source: 'write', id: event.id }
 
 const cursorOfReference = (row: ReferenceRow): AgentSessionAuditEventCursor => ({
   at: row.at,
@@ -228,6 +318,78 @@ const safeParams = (params: readonly unknown[]): unknown[] =>
 
 const timestamp = (index: number): string => new Date(BASE_TIME + index * 1000).toISOString()
 
+const traceSessionRecord = {
+  id: 'ses_trace_write',
+  owner: OWNER,
+  name: 'Trace write benchmark',
+  named: true,
+  parentId: null,
+  createdAt: timestamp(1),
+  lastSeenAt: timestamp(1),
+  calls: 1,
+  role: null,
+  roleLocator: null,
+  roleContextProjectId: null,
+  projectId: null,
+}
+
+const productionTraceWriter = (
+  calls: AgentCallTracePersistence,
+  retrievals: RetrievalLogPersistence,
+  next: () => { id: string; at: string },
+) => {
+  const gate = createMutationGate()
+  let current = { id: '', at: timestamp(1) }
+  const service = createAgentCalls({
+    persistence: calls,
+    mintId: () => current.id,
+    now: () => new Date(current.at),
+  })
+  const principal = {
+    id: `pat:${OWNER}:bench`,
+    username: OWNER,
+    admin: false,
+    scope: 'write' as const,
+    grants: new Map(),
+    spaces: null,
+    system: false,
+    label: 'Bench agent',
+  }
+
+  return async (): Promise<string> => {
+    current = next()
+    const query = `trace-write-${current.id}`
+
+    await gate.run(async () => {
+      const span = await service.begin(principal, 'search', { query }, current.id)
+      await service.projectInput(span, { query })
+      await service.bind(span, { record: traceSessionRecord, attach: 'declared' })
+      await retrievals.append({
+        owner: OWNER,
+        principal: principal.id,
+        agent: principal.label,
+        sessionId: traceSessionRecord.id,
+        sessionName: traceSessionRecord.name,
+        sessionAttach: 'declared',
+        agentCallId: span?.id ?? null,
+        tool: 'search',
+        query,
+        project: null,
+        classFilter: null,
+        resultCount: 0,
+        topScore: null,
+        hits: [],
+        createdAt: current.at,
+      })
+      await service.finish(span, {
+        outcome: 'success',
+        output: { hits: [], resultCount: 0 },
+      })
+    })
+    return current.id
+  }
+}
+
 const sessionOf = (index: number, sessionPerSource: number): string | null => {
   if (index <= 100) {
     return TARGET_SESSION
@@ -238,6 +400,8 @@ const sessionOf = (index: number, sessionPerSource: number): string | null => {
 
   return `ses_other_${String((index - 101) % 100).padStart(3, '0')}`
 }
+
+const callIdOf = (index: number): string => `call_${index.toString(16).padStart(12, '0')}`
 
 const sqliteReferenceQuery = (
   filter: Filter,
@@ -406,33 +570,86 @@ const createSqliteDriver = (): Driver => {
   const ctx = { ensureInit: async () => {}, close: async () => {}, required: db }
   const audit = createSqliteSessionAuditFacet(ctx)
   const retrievals = createSqliteRetrievalLogFacet(ctx)
+  const calls = createSqliteAgentCallsFacet(ctx)
+  const sessions = createSqliteSessionsFacet(ctx)
+  let traceCounter = 0
+  const traceWrite = productionTraceWriter(calls, retrievals, () => {
+    traceCounter += 1
+    return {
+      id: `call_perf_${String(traceCounter).padStart(8, '0')}`,
+      at: new Date(BASE_TIME + 700_000_000 + traceCounter).toISOString(),
+    }
+  })
 
   return {
     name: 'sqlite',
     audit,
     retrievals,
+    calls,
+    sessions,
     seed: async (size) => {
       const half = size / 2
       const sessionPerSource = size / 4
-      db.exec(`DELETE FROM agent_retrievals; DELETE FROM note_revisions;
+      db.exec(`DELETE FROM agent_call_details; DELETE FROM agent_retrievals; DELETE FROM note_revisions;
+        DELETE FROM agent_calls; DELETE FROM agent_session_cleanup_markers;
+        DELETE FROM mcp_delta_session_cursors; DELETE FROM agent_sessions;
         DELETE FROM sqlite_sequence WHERE name IN ('agent_retrievals', 'note_revisions')`)
+      const call = db.prepare(
+        `INSERT INTO agent_calls
+           (id, owner, principal, agent, transport, request_id, session_id, session_name,
+            session_attach, tool, effect, domain, started_at, finished_at, duration_ms,
+            outcome, reason_code, input_bytes, output_bytes, input_shape, issue_summary,
+            target_summary, result_summary, fingerprint, projection_version, redacted,
+            truncated, detail_capture_failed)
+         VALUES (?, ?, ?, ?, 'mcp', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 64, 32,
+                 '{}', ?, ?, '{}', ?, 1, 1, 0, 0)`,
+      )
       const retrieval = db.prepare(
         `INSERT INTO agent_retrievals
-           (owner, principal, agent, session_id, session_name, session_attach, tool, query,
+           (owner, principal, agent, session_id, session_name, session_attach, agent_call_id, tool, query,
             project, class_filter, result_count, top_score, hits, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, '[]', ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, '[]', ?)`,
       )
       const revision = db.prepare(
         `INSERT INTO note_revisions
            (note_id, space, kind, principal, content_hash, title, tags, created_at,
             chars_added, chars_removed, class, agent_owner, agent_name, session_id,
-            session_name, session_attach, entry_role, state_format, integrity)
-         VALUES (?, 'bench-space', 'write', ?, NULL, ?, '[]', ?, 1, 0, 'user-doc', ?, ?, ?, ?, ?,
+            session_name, session_attach, agent_call_id, entry_role, state_format, integrity)
+         VALUES (?, 'bench-space', 'write', ?, NULL, ?, '[]', ?, 1, 0, 'user-doc', ?, ?, ?, ?, ?, ?,
                  'change', NULL, 'trusted')`,
       )
       db.exec('BEGIN IMMEDIATE')
 
       try {
+        for (let index = 1; index <= size; index += 1) {
+          const session = sessionOf(index, size / 2)
+          const agent = index % 17 === 0 ? 'Deleted token' : `Bench agent ${index % 8}`
+          const at = timestamp(index)
+          const invalid = index % 11 === 0
+          const effect = index % 3 === 0 ? 'read' : index % 3 === 1 ? 'mutation' : 'control'
+          const tool =
+            effect === 'read' ? 'search' : effect === 'mutation' ? 'create_note' : 'whoami'
+          call.run(
+            callIdOf(index),
+            OWNER,
+            `pat:${OWNER}:bench`,
+            agent,
+            session,
+            session ? `Benchmark ${session}` : null,
+            session ? (index % 2 === 0 ? 'declared' : 'inferred') : null,
+            tool,
+            effect,
+            effect === 'read' ? 'retrieval' : effect === 'mutation' ? 'note' : 'identity',
+            at,
+            at,
+            1,
+            invalid ? 'invalid_arguments' : 'success',
+            invalid ? 'input_validation' : null,
+            invalid ? '[{"path":["limit"],"code":"invalid_type"}]' : null,
+            effect === 'read' ? JSON.stringify({ query: `query-${index % 64}` }) : '{}',
+            invalid ? `invalid-${index % 64}` : `shape-${index % 64}`,
+          )
+        }
         for (let index = 1; index <= half; index += 1) {
           const session = sessionOf(index, sessionPerSource)
           const agent = index % 17 === 0 ? 'Deleted token' : `Bench agent ${index % 8}`
@@ -444,6 +661,7 @@ const createSqliteDriver = (): Driver => {
             session,
             session ? `Benchmark ${session}` : null,
             session ? (index % 2 === 0 ? 'declared' : 'inferred') : null,
+            index % 10 === 0 ? null : callIdOf(index),
             index % 3 === 0 ? 'recall' : 'search',
             `query-${index % 64}`,
             index % 11 === 0 ? 0 : 3,
@@ -460,6 +678,7 @@ const createSqliteDriver = (): Driver => {
             session,
             session ? `Benchmark ${session}` : null,
             session ? (index % 2 === 0 ? 'declared' : 'inferred') : null,
+            index % 10 === 0 ? null : callIdOf(index),
           )
         }
         db.exec('COMMIT')
@@ -467,6 +686,21 @@ const createSqliteDriver = (): Driver => {
         db.exec('ROLLBACK')
         throw error
       }
+      traceCounter = 0
+      await sessions.insert({
+        id: 'ses_trace_write',
+        owner: OWNER,
+        name: 'Trace write benchmark',
+        named: true,
+        parentId: null,
+        createdAt: timestamp(size + 1),
+        lastSeenAt: timestamp(size + 1),
+        calls: 1,
+        role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
+        projectId: null,
+      })
     },
     supportsAll: async () => (await events(audit, { kind: 'all' }, 'all')).items.length > 0,
     reference: async (filter, before) => {
@@ -513,19 +747,167 @@ const createSqliteDriver = (): Driver => {
           WHERE agent_owner = ?`,
       ).run(timestamp(1), timestamp(2), OWNER)
     },
-    agents: async () =>
-      db
+    agents: async () => audit.agentFacet(OWNER),
+    setTraceDetailed: async (enabled) => {
+      const config = await calls.config()
+
+      if (config.detailedEnabled !== enabled) {
+        await calls.patchConfig({
+          expectedVersionToken: config.versionToken,
+          detailedEnabled: enabled,
+          updatedAt: timestamp(1),
+        })
+      }
+    },
+    traceWrite,
+    storageBytes: async (ids) => {
+      const encoded = JSON.stringify(ids)
+      const row = db
         .prepare(
-          `SELECT agent, COUNT(*) AS count FROM (
-             SELECT agent FROM agent_retrievals
-              WHERE owner = ? AND agent IS NOT NULL AND agent != ''
-             UNION ALL
-             SELECT agent_name AS agent FROM note_revisions
-              WHERE agent_owner = ? AND integrity != 'quarantined'
-                AND agent_name IS NOT NULL AND agent_name != ''
-           ) GROUP BY agent ORDER BY count DESC, agent`,
+          `SELECT
+             COALESCE((
+               SELECT SUM(length(json_object(
+                 'id', id, 'owner', owner, 'principal', principal, 'agent', agent,
+                 'transport', transport, 'request_id', request_id, 'session_id', session_id,
+                 'session_name', session_name, 'session_attach', session_attach, 'tool', tool,
+                 'effect', effect, 'domain', domain, 'started_at', started_at,
+                 'finished_at', finished_at, 'duration_ms', duration_ms, 'outcome', outcome,
+                 'reason_code', reason_code, 'input_bytes', input_bytes,
+                 'output_bytes', output_bytes, 'input_shape', input_shape,
+                 'issue_summary', issue_summary, 'target_summary', target_summary,
+                 'result_summary', result_summary, 'fingerprint', fingerprint,
+                 'projection_version', projection_version, 'redacted', redacted,
+                 'truncated', truncated, 'detail_capture_failed', detail_capture_failed
+               ))) FROM agent_calls WHERE id IN (SELECT value FROM json_each(?))
+             ), 0) +
+             COALESCE((
+               SELECT SUM(length(payload)) FROM agent_call_details
+                WHERE agent_call_id IN (SELECT value FROM json_each(?))
+             ), 0) +
+             COALESCE((
+               SELECT SUM(length(json_object(
+                 'id', id, 'agent_call_id', agent_call_id, 'owner', owner,
+                 'principal', principal, 'agent', agent, 'session_id', session_id,
+                 'session_name', session_name, 'session_attach', session_attach,
+                 'tool', tool, 'query', query, 'project', project,
+                 'class_filter', class_filter, 'result_count', result_count,
+                 'top_score', top_score, 'hits', hits, 'created_at', created_at
+               ))) FROM agent_retrievals
+                WHERE agent_call_id IN (SELECT value FROM json_each(?))
+             ), 0) AS bytes`,
         )
-        .all(OWNER, OWNER),
+        .get(encoded, encoded, encoded) as { bytes: number | bigint }
+      return Number(row.bytes)
+    },
+    prepareDenseTrace: async () => {
+      db.prepare(
+        `UPDATE agent_calls SET session_id = ?, session_name = ?, session_attach = 'declared'`,
+      ).run(TARGET_SESSION, 'Dense export')
+      db.prepare(
+        `UPDATE agent_calls SET tool = 'start_session', effect = 'mutation', domain = 'session',
+                result_summary = ?
+          WHERE id = (SELECT id FROM agent_calls ORDER BY started_at, id LIMIT 1)`,
+      ).run(JSON.stringify({ 'session.state': 'new' }))
+      const row = db.prepare('SELECT COUNT(*) AS n FROM agent_calls').get() as {
+        n: number | bigint
+      }
+      db.prepare(
+        `INSERT OR REPLACE INTO agent_sessions
+           (id, owner, name, named, parent_id, created_at, last_seen_at, calls, role,
+            role_locator, role_context_project_id, project_id)
+         VALUES (?, ?, ?, 1, NULL, ?, ?, ?, NULL, NULL, NULL, NULL)`,
+      ).run(TARGET_SESSION, OWNER, 'Dense export', timestamp(0), timestamp(0), Number(row.n))
+      return Number(row.n)
+    },
+    exportDenseTrace: async () => {
+      let before: AgentSessionAuditEventCursor | undefined
+      let count = 0
+      let pages = 0
+      let eventsMs = 0
+      let detailsMs = 0
+
+      for (;;) {
+        let started = performance.now()
+        const page = await audit.events({
+          owner: OWNER,
+          scope: { kind: 'session', id: TARGET_SESSION },
+          limit: 1_000,
+          before,
+          withTotal: before == null,
+        })
+        eventsMs += performance.now() - started
+        const ids = page.items.flatMap((event) => (event.type === 'call' ? [event.record.id] : []))
+        started = performance.now()
+        await calls.exportDetails(OWNER, ids, '2026-01-01T00:00:00.000Z')
+        detailsMs += performance.now() - started
+        count += page.items.length
+        pages += 1
+        const last = page.items.at(-1)
+
+        if (!page.hasMore || !last) {
+          return { rows: count, pages, eventsMs, detailsMs }
+        }
+        before = cursorOfEvent(last)
+      }
+    },
+    maintainTrace: async () => {
+      const remaining = () =>
+        Number(
+          (
+            db
+              .prepare(
+                `SELECT
+                   (SELECT COUNT(*) FROM agent_calls
+                     WHERE owner = ? AND session_id = ?) +
+                   (SELECT COUNT(*) FROM agent_retrievals
+                     WHERE owner = ? AND session_id = ? AND agent_call_id IS NOT NULL) +
+                   (SELECT COUNT(*) FROM agent_call_details detail
+                     JOIN agent_calls call ON call.id = detail.agent_call_id
+                    WHERE call.owner = ? AND call.session_id = ?) AS n`,
+              )
+              .get(OWNER, TARGET_SESSION, OWNER, TARGET_SESSION, OWNER, TARGET_SESSION) as {
+              n: number | bigint
+            }
+          ).n,
+        )
+      const initial = remaining()
+      let passes = 0
+      let maxPassMs = 0
+      const passMs: number[] = []
+      let yields = 0
+      let pending = true
+
+      while (pending) {
+        const started = performance.now()
+
+        if (passes === 0) {
+          await calls.maintain({ now: '2026-01-01T00:00:00.000Z', batchSize: 500 })
+        }
+        const progress = await calls.resumeCleanup(500)
+        const elapsed = performance.now() - started
+        passMs.push(elapsed)
+        maxPassMs = Math.max(maxPassMs, elapsed)
+        passes += 1
+        pending = progress.pending
+
+        if (pending) {
+          if (progress.processed === 0) {
+            throw new Error('SQLite trace cleanup made no progress')
+          }
+          await yieldTurn()
+          yields += 1
+        }
+      }
+      const left = remaining()
+      return {
+        passes,
+        maxPassMs,
+        p99PassMs: p99(passMs),
+        processed: initial - left,
+        remaining: left,
+        yields,
+      }
+    },
     version: async () => {
       const row = db.prepare('SELECT sqlite_version() AS version').get() as { version: string }
       return row.version
@@ -546,11 +928,23 @@ const createPostgresDriver = async (url: string): Promise<Driver> => {
   const ctx = { ensureInit: async () => {}, close: async () => {}, required: pool }
   const audit = createPgSessionAuditFacet(ctx)
   const retrievals = createPgRetrievalLogFacet(ctx)
+  const calls = createPgAgentCallsFacet(ctx)
+  const sessions = createPgSessionsFacet(ctx)
+  let traceCounter = 0
+  const traceWrite = productionTraceWriter(calls, retrievals, () => {
+    traceCounter += 1
+    return {
+      id: `call_perf_${String(traceCounter).padStart(8, '0')}`,
+      at: new Date(BASE_TIME + 700_000_000 + traceCounter).toISOString(),
+    }
+  })
 
   return {
     name: 'postgres',
     audit,
     retrievals,
+    calls,
+    sessions,
     seed: async (size) => {
       const half = size / 2
       const sessionPerSource = size / 4
@@ -559,11 +953,47 @@ const createPostgresDriver = async (url: string): Promise<Driver> => {
       try {
         await seedClient.query('BEGIN')
         await seedClient.query('SET LOCAL synchronous_commit = off')
-        await seedClient.query('TRUNCATE agent_retrievals, note_revisions RESTART IDENTITY')
+        await seedClient.query(
+          'TRUNCATE agent_call_details, agent_retrievals, note_revisions, agent_calls, agent_session_cleanup_markers, mcp_delta_session_cursors, agent_sessions RESTART IDENTITY',
+        )
         await seedClient.query('ALTER TABLE note_revisions DISABLE TRIGGER USER')
         await seedClient.query(
+          `INSERT INTO agent_calls
+             (id, owner, principal, agent, transport, request_id, session_id, session_name,
+              session_attach, tool, effect, domain, started_at, finished_at, duration_ms,
+              outcome, reason_code, input_bytes, output_bytes, input_shape, issue_summary,
+              target_summary, result_summary, fingerprint, projection_version, redacted,
+              truncated, detail_capture_failed)
+           SELECT 'call_' || lpad(to_hex(n), 12, '0'), $1, 'pat:' || $1 || ':bench',
+                  CASE WHEN n % 17 = 0 THEN 'Deleted token' ELSE 'Bench agent ' || n % 8 END,
+                  'mcp', NULL,
+                  CASE WHEN n <= 100 THEN $2
+                       WHEN n <= $3 THEN 'ses_other_' || lpad(((n - 101) % 100)::text, 3, '0')
+                       ELSE NULL END,
+                  CASE WHEN n <= 100 THEN 'Benchmark ' || $2
+                       WHEN n <= $3 THEN 'Benchmark ses_other_' || lpad(((n - 101) % 100)::text, 3, '0')
+                       ELSE NULL END,
+                  CASE WHEN n <= $3 THEN CASE WHEN n % 2 = 0 THEN 'declared' ELSE 'inferred' END ELSE NULL END,
+                  CASE WHEN n % 3 = 0 THEN 'search' WHEN n % 3 = 1 THEN 'create_note' ELSE 'whoami' END,
+                  CASE WHEN n % 3 = 0 THEN 'read' WHEN n % 3 = 1 THEN 'mutation' ELSE 'control' END,
+                  CASE WHEN n % 3 = 0 THEN 'retrieval' WHEN n % 3 = 1 THEN 'note' ELSE 'identity' END,
+                  to_char(timestamp '2025-01-01 00:00:00' + n * interval '1 second', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+                  to_char(timestamp '2025-01-01 00:00:00' + n * interval '1 second', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+                  1,
+                  CASE WHEN n % 11 = 0 THEN 'invalid_arguments' ELSE 'success' END,
+                  CASE WHEN n % 11 = 0 THEN 'input_validation' ELSE NULL END,
+                  64, 32, '{}'::jsonb,
+                  CASE WHEN n % 11 = 0 THEN '[{"path":["limit"],"code":"invalid_type"}]'::jsonb ELSE NULL END,
+                  CASE WHEN n % 3 = 0 THEN jsonb_build_object('query', 'query-' || n % 64) ELSE '{}'::jsonb END,
+                  '{}'::jsonb,
+                  CASE WHEN n % 11 = 0 THEN 'invalid-' || n % 64 ELSE 'shape-' || n % 64 END,
+                  1, true, false, false
+             FROM generate_series(1, $4::integer) AS generated(n)`,
+          [OWNER, TARGET_SESSION, size / 2, size],
+        )
+        await seedClient.query(
           `INSERT INTO agent_retrievals
-             (owner, principal, agent, session_id, session_name, session_attach, tool, query,
+             (owner, principal, agent, session_id, session_name, session_attach, agent_call_id, tool, query,
               project, class_filter, result_count, top_score, hits, created_at)
            SELECT $1,
                   'pat:' || $1 || ':bench',
@@ -576,6 +1006,7 @@ const createPostgresDriver = async (url: string): Promise<Driver> => {
                        ELSE NULL END,
                   CASE WHEN n <= $3 THEN CASE WHEN n % 2 = 0 THEN 'declared' ELSE 'inferred' END
                        ELSE NULL END,
+                  CASE WHEN n % 10 = 0 THEN NULL ELSE 'call_' || lpad(to_hex(n), 12, '0') END,
                   CASE WHEN n % 3 = 0 THEN 'recall' ELSE 'search' END,
                   'query-' || n % 64,
                   NULL, NULL,
@@ -591,7 +1022,7 @@ const createPostgresDriver = async (url: string): Promise<Driver> => {
           `INSERT INTO note_revisions
              (note_id, space, kind, principal, content_hash, title, tags, created_at,
               chars_added, chars_removed, class, agent_owner, agent_name, session_id,
-              session_name, session_attach, entry_role, state_format, integrity)
+              session_name, session_attach, agent_call_id, entry_role, state_format, integrity)
            SELECT 'bench-note-' || n,
                   'bench-space', 'write', 'pat:' || $1 || ':bench', NULL,
                   'Benchmark note ' || n, '[]',
@@ -607,6 +1038,7 @@ const createPostgresDriver = async (url: string): Promise<Driver> => {
                        ELSE NULL END,
                   CASE WHEN n <= $3 THEN CASE WHEN n % 2 = 0 THEN 'declared' ELSE 'inferred' END
                        ELSE NULL END,
+                  CASE WHEN n % 10 = 0 THEN NULL ELSE 'call_' || lpad(to_hex(n), 12, '0') END,
                   'change', NULL, 'trusted'
              FROM generate_series(1, $4::integer) AS generated(n)`,
           [OWNER, TARGET_SESSION, sessionPerSource, half],
@@ -621,6 +1053,22 @@ const createPostgresDriver = async (url: string): Promise<Driver> => {
       }
       await pool.query('ANALYZE agent_retrievals')
       await pool.query('ANALYZE note_revisions')
+      await pool.query('ANALYZE agent_calls')
+      traceCounter = 0
+      await sessions.insert({
+        id: 'ses_trace_write',
+        owner: OWNER,
+        name: 'Trace write benchmark',
+        named: true,
+        parentId: null,
+        createdAt: timestamp(size + 1),
+        lastSeenAt: timestamp(size + 1),
+        calls: 1,
+        role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
+        projectId: null,
+      })
     },
     supportsAll: async () => (await events(audit, { kind: 'all' }, 'all')).items.length > 0,
     reference: async (filter, before) => {
@@ -676,20 +1124,145 @@ const createPostgresDriver = async (url: string): Promise<Driver> => {
       await pool.query('VACUUM ANALYZE agent_retrievals')
       await pool.query('VACUUM ANALYZE note_revisions')
     },
-    agents: async () =>
-      (
+    agents: async () => audit.agentFacet(OWNER),
+    setTraceDetailed: async (enabled) => {
+      const config = await calls.config()
+
+      if (config.detailedEnabled !== enabled) {
+        await calls.patchConfig({
+          expectedVersionToken: config.versionToken,
+          detailedEnabled: enabled,
+          updatedAt: timestamp(1),
+        })
+      }
+    },
+    traceWrite,
+    storageBytes: async (ids) => {
+      const row = (
         await pool.query(
-          `SELECT agent, COUNT(*) AS count FROM (
-             SELECT agent FROM agent_retrievals
-              WHERE owner = $1 AND agent IS NOT NULL AND agent != ''
-             UNION ALL
-             SELECT agent_name AS agent FROM note_revisions
-              WHERE agent_owner = $1 AND integrity != 'quarantined'
-                AND agent_name IS NOT NULL AND agent_name != ''
-           ) AS attributed GROUP BY agent ORDER BY count DESC, agent`,
-          [OWNER],
+          `SELECT
+             COALESCE((SELECT SUM(pg_column_size(call)) FROM agent_calls call
+                        WHERE id = ANY($1::text[])), 0) +
+             COALESCE((SELECT SUM(pg_column_size(detail)) FROM agent_call_details detail
+                        WHERE agent_call_id = ANY($1::text[])), 0) +
+             COALESCE((SELECT SUM(pg_column_size(retrieval)) FROM agent_retrievals retrieval
+                        WHERE agent_call_id = ANY($1::text[])), 0) AS bytes`,
+          [ids],
         )
-      ).rows,
+      ).rows[0] as { bytes: number | string }
+      return Number(row.bytes)
+    },
+    prepareDenseTrace: async () => {
+      await pool.query(
+        `UPDATE agent_calls SET session_id = $1, session_name = 'Dense export',
+                session_attach = 'declared'`,
+        [TARGET_SESSION],
+      )
+      await pool.query(
+        `UPDATE agent_calls SET tool = 'start_session', effect = 'mutation', domain = 'session',
+                result_summary = $1::jsonb
+          WHERE id = (SELECT id FROM agent_calls ORDER BY started_at, id LIMIT 1)`,
+        [JSON.stringify({ 'session.state': 'new' })],
+      )
+      const count = Number((await pool.query('SELECT COUNT(*) AS n FROM agent_calls')).rows[0].n)
+      await pool.query(
+        `INSERT INTO agent_sessions
+           (id, owner, name, named, parent_id, created_at, last_seen_at, calls, role,
+            role_locator, role_context_project_id, project_id)
+         VALUES ($1, $2, 'Dense export', true, NULL, $3, $3, $4, NULL, NULL, NULL, NULL)
+         ON CONFLICT(id) DO UPDATE SET owner = EXCLUDED.owner, name = EXCLUDED.name,
+           last_seen_at = EXCLUDED.last_seen_at, calls = EXCLUDED.calls`,
+        [TARGET_SESSION, OWNER, timestamp(0), count],
+      )
+      await pool.query('ANALYZE agent_calls')
+      return count
+    },
+    exportDenseTrace: async () => {
+      let before: AgentSessionAuditEventCursor | undefined
+      let count = 0
+      let pages = 0
+      let eventsMs = 0
+      let detailsMs = 0
+
+      for (;;) {
+        let started = performance.now()
+        const page = await audit.events({
+          owner: OWNER,
+          scope: { kind: 'session', id: TARGET_SESSION },
+          limit: 1_000,
+          before,
+          withTotal: before == null,
+        })
+        eventsMs += performance.now() - started
+        const ids = page.items.flatMap((event) => (event.type === 'call' ? [event.record.id] : []))
+        started = performance.now()
+        await calls.exportDetails(OWNER, ids, '2026-01-01T00:00:00.000Z')
+        detailsMs += performance.now() - started
+        count += page.items.length
+        pages += 1
+        const last = page.items.at(-1)
+
+        if (!page.hasMore || !last) {
+          return { rows: count, pages, eventsMs, detailsMs }
+        }
+        before = cursorOfEvent(last)
+      }
+    },
+    maintainTrace: async () => {
+      const remaining = async () =>
+        Number(
+          (
+            await pool.query(
+              `SELECT
+                 (SELECT COUNT(*) FROM agent_calls
+                   WHERE owner = $1 AND session_id = $2) +
+                 (SELECT COUNT(*) FROM agent_retrievals
+                   WHERE owner = $1 AND session_id = $2 AND agent_call_id IS NOT NULL) +
+                 (SELECT COUNT(*) FROM agent_call_details detail
+                   JOIN agent_calls call ON call.id = detail.agent_call_id
+                  WHERE call.owner = $1 AND call.session_id = $2) AS n`,
+              [OWNER, TARGET_SESSION],
+            )
+          ).rows[0].n,
+        )
+      const initial = await remaining()
+      let passes = 0
+      let maxPassMs = 0
+      const passMs: number[] = []
+      let yields = 0
+      let pending = true
+
+      while (pending) {
+        const started = performance.now()
+
+        if (passes === 0) {
+          await calls.maintain({ now: '2026-01-01T00:00:00.000Z', batchSize: 500 })
+        }
+        const progress = await calls.resumeCleanup(500)
+        const elapsed = performance.now() - started
+        passMs.push(elapsed)
+        maxPassMs = Math.max(maxPassMs, elapsed)
+        passes += 1
+        pending = progress.pending
+
+        if (pending) {
+          if (progress.processed === 0) {
+            throw new Error('PostgreSQL trace cleanup made no progress')
+          }
+          await yieldTurn()
+          yields += 1
+        }
+      }
+      const left = await remaining()
+      return {
+        passes,
+        maxPassMs,
+        p99PassMs: p99(passMs),
+        processed: initial - left,
+        remaining: left,
+        yields,
+      }
+    },
     version: async () => String((await pool.query('SHOW server_version')).rows[0].server_version),
     close: async () => {
       await pool.end()
@@ -773,8 +1346,21 @@ const benchmarkDriver = async (
       : () => driver.reference('all')
     const disabled = await measure(allRun)
     const enabled = await measure(() =>
-      Promise.all([allRun(), driver.retrievals.aggregates(OWNER), driver.agents()]),
+      Promise.all([
+        allRun(),
+        driver.retrievals.aggregates(OWNER),
+        driver.agents(),
+        driver.calls.recurringProblems(OWNER, timestamp(0), 8),
+      ]),
     )
+    const components = {
+      timelineMedianMs: await measureComponent(allRun),
+      retrievalsMedianMs: await measureComponent(() => driver.retrievals.aggregates(OWNER)),
+      agentsMedianMs: await measureComponent(() => driver.agents()),
+      problemsMedianMs: await measureComponent(() =>
+        driver.calls.recurringProblems(OWNER, timestamp(0), 8),
+      ),
+    }
     report.aggregatePairs.push({
       driver: driver.name,
       dataset: size,
@@ -783,10 +1369,15 @@ const benchmarkDriver = async (
       enabledRawMs: enabled.raw,
       enabledMedianMs: enabled.median,
       ratio: enabled.median / disabled.median,
+      components,
     })
     process.stdout.write(
       `session-audit-bench: ${driver.name} ${size} aggregates ` +
-        `${disabled.median.toFixed(3)} -> ${enabled.median.toFixed(3)} ms\n`,
+        `${disabled.median.toFixed(3)} -> ${enabled.median.toFixed(3)} ms ` +
+        `(timeline ${components.timelineMedianMs.toFixed(3)}, ` +
+        `retrievals ${components.retrievalsMedianMs.toFixed(3)}, ` +
+        `agents ${components.agentsMedianMs.toFixed(3)}, ` +
+        `problems ${components.problemsMedianMs.toFixed(3)})\n`,
     )
     persist()
 
@@ -858,6 +1449,80 @@ const benchmarkDriver = async (
         `${outsideReads.median.toFixed(3)}/${outsideWrites.median.toFixed(3)} ms\n`,
     )
     persist()
+
+    for (const [kind, detailed] of [
+      ['compact-write', false],
+      ['detailed-write', true],
+    ] as const) {
+      await driver.setTraceDetailed(detailed)
+      const measured = await measure(() => driver.traceWrite())
+      report.traceProbes.push({
+        driver: driver.name,
+        dataset: size,
+        kind,
+        rows: 1,
+        rawMs: measured.raw,
+        medianMs: measured.median,
+      })
+      const storageIds: string[] = []
+
+      for (let index = 0; index < STORAGE_ROWS; index += 1) {
+        storageIds.push(await driver.traceWrite())
+      }
+      const bytes = await driver.storageBytes(storageIds)
+      report.storageProbes.push({
+        driver: driver.name,
+        dataset: size,
+        mode: detailed ? 'detailed' : 'compact',
+        method: driver.name === 'sqlite' ? 'sqlite-json-payload-v1' : 'postgres-row-size-v1',
+        rows: storageIds.length,
+        bytes,
+        bytesPerRow: bytes / storageIds.length,
+      })
+      process.stdout.write(
+        `session-audit-bench: ${driver.name} ${size} ${kind} ${measured.median.toFixed(3)} ms, ` +
+          `${(bytes / storageIds.length).toFixed(1)} logical bytes/row\n`,
+      )
+    }
+
+    await driver.prepareDenseTrace()
+    let started = performance.now()
+    const exported = await driver.exportDenseTrace()
+    const exportMs = performance.now() - started
+    report.traceProbes.push({
+      driver: driver.name,
+      dataset: size,
+      kind: 'dense-export',
+      rows: exported.rows,
+      rawMs: [exportMs],
+      medianMs: exportMs,
+      components: {
+        pages: exported.pages,
+        eventsMs: exported.eventsMs,
+        detailsMs: exported.detailsMs,
+      },
+    })
+    started = performance.now()
+    const maintenance = await driver.maintainTrace()
+    const maintenanceMs = performance.now() - started
+    report.traceProbes.push({
+      driver: driver.name,
+      dataset: size,
+      kind: 'maintenance',
+      rows: maintenance.processed,
+      rawMs: [maintenanceMs],
+      medianMs: maintenanceMs,
+      components: maintenance,
+    })
+    process.stdout.write(
+      `session-audit-bench: ${driver.name} ${size} dense-export ${exported.rows} rows / ` +
+        `${exportMs.toFixed(3)} ms (events ${exported.eventsMs.toFixed(3)}, ` +
+        `details ${exported.detailsMs.toFixed(3)}); maintenance ${maintenanceMs.toFixed(3)} ms ` +
+        `(${maintenance.passes} passes, p99/max ${maintenance.p99PassMs.toFixed(3)}/` +
+        `${maintenance.maxPassMs.toFixed(3)} ms, ` +
+        `${maintenance.remaining} remaining)\n`,
+    )
+    persist()
   }
 }
 
@@ -869,6 +1534,7 @@ const main = async () => {
     phase: process.env.BENCH_PHASE ?? 'manual',
     startedAt: new Date().toISOString(),
     gitCommit: process.env.BENCH_COMMIT ?? process.env.CI_COMMIT_SHA ?? null,
+    gitTree: process.env.BENCH_TREE ?? null,
     node: process.version,
     images: {
       node: process.env.BENCH_NODE_IMAGE ?? null,
@@ -886,6 +1552,8 @@ const main = async () => {
     cells: [],
     aggregatePairs: [],
     probes: [],
+    traceProbes: [],
+    storageProbes: [],
   }
 
   const persist = () => {
@@ -906,12 +1574,20 @@ const main = async () => {
     }
     if (report.phase === 'post') {
       const baselinePath = process.env.BENCH_BASELINE
-      const baseline = baselinePath
+      const baselineRaw = baselinePath
         ? (JSON.parse(readFileSync(baselinePath, 'utf8')) as BenchmarkGateReport)
+        : undefined
+      const baseline = baselineRaw
+        ? {
+            ...baselineRaw,
+            gitTree: baselineRaw.gitTree ?? process.env.BENCH_BASELINE_TREE ?? null,
+          }
         : undefined
       const failures = benchmarkGateFailures(report, baseline)
       report.gate = {
         baseline: baselinePath ?? '',
+        baselineCommit: baseline?.gitCommit ?? null,
+        baselineTree: baseline?.gitTree ?? null,
         failures,
         passed: failures.length === 0,
       }

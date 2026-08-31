@@ -2,6 +2,9 @@ import { buildCaseWorld, caseToFixture } from '../cases'
 import { expect, type Page, test } from './fixtures'
 
 const WORLD = caseToFixture(buildCaseWorld('agent-sessions', { now: '2099-08-05T12:00:00.000Z' }))
+const DETAILED_WORLD = caseToFixture(
+  buildCaseWorld('agent-telemetry-detailed', { now: '2099-08-05T12:00:00.000Z' }),
+)
 
 test.beforeEach(async ({ page, baseURL }) => {
   await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: WORLD } })
@@ -80,7 +83,72 @@ const RETRIEVAL_AGGREGATES = {
     { agent: 'CLI', count: 58 },
     { agent: 'Claude', count: 1 },
   ],
+  recurringProblems: [
+    {
+      fingerprint: 'search-invalid-type',
+      tool: 'search',
+      issues: { code: 'invalid_type' },
+      count: 3,
+      firstAt: '2099-08-05T10:45:00.000Z',
+      lastAt: '2099-08-05T10:55:00.000Z',
+      agents: 2,
+    },
+  ],
 } as const
+
+test('trace-first call detail and instance telemetry settings stay inspectable', async ({
+  page,
+  baseURL,
+}) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: DETAILED_WORLD } })
+  await login(page)
+  await page.goto('/agents/activity')
+
+  await expect(page.getByTestId('agent-telemetry-notice')).toHaveCount(0)
+  await expect(page.getByTestId('agent-call-row')).toHaveCount(18)
+  const detailedListCall = page
+    .getByTestId('agent-call-row')
+    .filter({ hasText: 'list_notes' })
+    .filter({ hasText: 'migration review' })
+  await detailedListCall
+    .getByRole('button', { name: 'Toggle call details for list_notes' })
+    .press('Enter')
+  await expect(detailedListCall).toContainText('"status": "available"')
+  await expect(detailedListCall.getByRole('button', { name: 'Copy code' })).toBeVisible()
+  await expect(detailedListCall.locator('.hljs-string').first()).toBeVisible()
+  const compactListCall = page
+    .getByTestId('agent-call-row')
+    .filter({ hasText: 'list_notes' })
+    .filter({ hasText: 'Compact-only comparison' })
+  await compactListCall
+    .getByRole('button', { name: 'Toggle call details for list_notes' })
+    .press('Enter')
+  await expect(compactListCall).toContainText('"status": "expired_or_missing"')
+  await page.getByRole('button', { name: 'Errors', exact: true }).click()
+  await expect(page).toHaveURL(/outcome=errors/)
+  const errorRows = page.getByTestId('agent-call-row')
+  await expect(errorRows.first()).toBeVisible()
+  expect(await errorRows.count()).toBeLessThan(18)
+  await page
+    .getByRole('group', { name: 'Filter by call outcome' })
+    .getByRole('button', { name: 'All', exact: true })
+    .click()
+  await page.getByRole('button', { name: 'Session', exact: true }).click()
+  const failureEpisode = page
+    .getByTestId('activity-session-row')
+    .filter({ hasText: 'Failure outcome matrix' })
+  await failureEpisode.getByRole('button', { name: 'More actions' }).click()
+  await expect(page.getByRole('menuitem', { name: 'Copy trace' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'Download trace' })).toBeVisible()
+  await expect(page.getByRole('menuitem', { name: 'Delete session' })).toBeVisible()
+
+  await page.goto('/settings/telemetry')
+  await expect(page.getByTestId('agent-telemetry-detailed')).toBeChecked()
+  await expect(page.getByText('Compact retention')).toBeVisible()
+  await expect(page.getByText(/additional allowlisted detail row/)).toBeVisible()
+  await expect(page.getByText(/does not add token charges/)).toBeVisible()
+  await expect(page.getByText(/Note bodies, edit content/)).toBeVisible()
+})
 
 test('Activity opens as a flat URL-restorable stream and keeps Outside explicit', async ({
   page,
@@ -118,19 +186,22 @@ test('Activity opens as a flat URL-restorable stream and keeps Outside explicit'
   expect(eventRequests).not.toHaveLength(0)
   expect(eventRequests.every((url) => !url.searchParams.has('aggregates'))).toBe(true)
 
-  await page.getByRole('button', { name: 'Writes', exact: true }).click()
+  await page.getByRole('button', { name: 'Mutations', exact: true }).click()
   await expect(page).toHaveURL(/\/agents\/activity\?show=writes$/)
   await expect(page.getByTestId('session-write-row').first()).toBeVisible()
   await expect(page.getByTestId('audit-row')).toHaveCount(0)
 
   await page.reload()
-  await expect(page.getByRole('button', { name: 'Writes', exact: true })).toHaveAttribute(
+  await expect(page.getByRole('button', { name: 'Mutations', exact: true })).toHaveAttribute(
     'aria-pressed',
     'true',
   )
   await expect(page.getByTestId('session-write-row').first()).toBeVisible()
 
-  await page.getByRole('button', { name: 'All', exact: true }).click()
+  await page
+    .getByRole('group', { name: 'Show activity' })
+    .getByRole('button', { name: 'All', exact: true })
+    .click()
   await expect(page).toHaveURL(/\/agents\/activity$/)
 })
 
@@ -321,7 +392,10 @@ test('Session grouping filters before pagination and separates nested episode ti
   await expect(page.getByText('No activity matches these filters')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Reset filters' })).toBeVisible()
 
-  await page.getByRole('button', { name: 'All', exact: true }).click()
+  await page
+    .getByRole('group', { name: 'Show activity' })
+    .getByRole('button', { name: 'All', exact: true })
+    .click()
   const unaudited = page.getByTestId('activity-session-row').filter({
     hasText: 'main · automatic seed',
   })
@@ -582,7 +656,7 @@ test('agent facet stays visible and URL-restorable', async ({ page }) => {
       .getByTestId('activity-filters')
       .locator(':scope > section')
       .evaluateAll((sections) => sections.map((section) => section.getAttribute('data-testid'))),
-  ).toEqual(['activity-query-filter', 'activity-agent-filter'])
+  ).toEqual(['activity-tool-filter', 'activity-query-filter', 'activity-agent-filter'])
   await expect(facet.getByText('All agents')).toHaveCount(0)
   await expect(claude.locator('span').last()).toHaveText(/^\d+$/)
   await expect(claude).toHaveAttribute('aria-pressed', 'false')
@@ -686,14 +760,14 @@ test('Diagnostics opts in once and narrows the stream with one URL write', async
   const diagnostics = page.getByTestId('activity-diagnostics')
   const blindSpot = page.getByRole('button', { name: /^Search legacy rollout guide/ })
   await expect(blindSpot).toBeVisible()
-  await expect(diagnostics.locator('[data-aside-section-heading]')).toHaveCount(2)
+  await expect(diagnostics.locator('[data-aside-section-heading]')).toHaveCount(3)
   expect(
     await diagnostics
       .locator('section')
       .evaluateAll((sections) =>
         sections.map((section) => getComputedStyle(section).backgroundColor),
       ),
-  ).toEqual(['rgba(0, 0, 0, 0)', 'rgba(0, 0, 0, 0)'])
+  ).toEqual(Array.from({ length: 3 }, () => 'rgba(0, 0, 0, 0)'))
   await expect(blindSpot).toHaveCSS('padding-left', '8px')
   const sections = diagnostics.locator('section')
   await expect(sections.nth(1)).toHaveCSS('border-top-width', '1px')
@@ -786,7 +860,7 @@ test('Diagnostics opts in once and narrows the stream with one URL write', async
     )
   })
   await queryFilter.getByRole('textbox', { name: 'Retrieval query' }).fill('stale draft')
-  await page.getByRole('button', { name: 'Writes', exact: true }).click()
+  await page.getByRole('button', { name: 'Mutations', exact: true }).click()
   await writesStream
   // The switch CANCELS the pending query debounce instead of racing it. The box is fed by the
   // very state the debounce closes over, so an emptied box is the app reporting that the
@@ -857,6 +931,51 @@ test('Diagnostics opts in once and narrows the stream with one URL write', async
   await expect(page.getByTestId('activity-active-filter')).toHaveCount(0)
 })
 
+test('Recurring problems drill into the flat error stream', async ({ page, baseURL }) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: DETAILED_WORLD } })
+  await login(page)
+  await page.goto('/agents/activity?show=writes&group=session')
+  await page.getByRole('button', { name: 'Open activity panels' }).click()
+  await page.getByTestId('aside-tab-diagnostics').click()
+
+  const problem = page
+    .getByTestId('activity-recurring-problems')
+    .getByRole('button', { name: 'search 3 repeats', exact: true })
+  await expect(problem).toBeEnabled()
+  const errorStream = page.waitForRequest((request) => {
+    const url = new URL(request.url())
+    return (
+      url.pathname === '/api/me/agent-sessions/all' &&
+      url.searchParams.get('tool') === 'search' &&
+      url.searchParams.get('outcome') === 'errors' &&
+      !url.searchParams.has('filter')
+    )
+  })
+  await problem.click()
+  await errorStream
+
+  await expect(page).toHaveURL('/agents/activity?tool=search&outcome=errors')
+  await expect(page.getByRole('button', { name: 'None', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  await expect(
+    page
+      .getByRole('group', { name: 'Show activity' })
+      .getByRole('button', { name: 'All', exact: true }),
+  ).toHaveAttribute('aria-pressed', 'true')
+  await expect(page.getByRole('button', { name: 'Errors', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  const errorRows = page.getByTestId('agent-call-row')
+  await expect(errorRows).toHaveCount(3)
+  for (const row of await errorRows.all()) {
+    await expect(row).toContainText('search')
+    await expect(row).toContainText('invalid arguments')
+  }
+})
+
 test('Diagnostics shows honest empty panels after an empty aggregate response', async ({
   page,
 }) => {
@@ -905,7 +1024,7 @@ test('legacy session links preserve the episode id and back preserves view state
   await page.goto(`/agents/sessions/${id}?show=writes&neighbor=kept`)
   await expect(page).toHaveURL(new RegExp(`/agents/activity/${id}\\?show=writes&neighbor=kept$`))
   await expect(page.getByTestId('agent-activity-episode')).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Writes', exact: true })).toHaveAttribute(
+  await expect(page.getByRole('button', { name: 'Mutations', exact: true })).toHaveAttribute(
     'aria-pressed',
     'true',
   )

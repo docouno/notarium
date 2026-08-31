@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { afterEach, expect, it, vi } from 'vitest'
@@ -10,14 +11,18 @@ import {
   loadMetaMigrations,
   type MetaMigration,
   runPgMigrations,
+  runSqliteMigrations,
 } from '../../packages/server/src/services/metaDb/migrations'
 import { PgMetaDb } from '../../packages/server/src/services/metaDb/pgMetaDb'
 import {
+  agentCallTraceCatalog,
   approvedTargetCatalog,
   type MetaDbCatalog,
   pgMetaDbCatalog,
   PROVIDER_CONTOUR_TABLES,
   splitProviderContour,
+  sqliteMetaDbCatalog,
+  withoutAgentCallTrace,
 } from './metaDbCatalog'
 import type { PostgresTestSchema } from './postgresHarness'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
@@ -118,7 +123,18 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
 
     try {
       await runPgMigrations(client)
-      const live = splitProviderContour(await pgMetaDbCatalog(client, testSchema.schema))
+      const liveCatalog = await pgMetaDbCatalog(client, testSchema.schema)
+      const sqlite = new DatabaseSync(':memory:')
+
+      try {
+        runSqliteMigrations(sqlite)
+        expect(agentCallTraceCatalog(liveCatalog)).toEqual(
+          agentCallTraceCatalog(sqliteMetaDbCatalog(sqlite)),
+        )
+      } finally {
+        sqlite.close()
+      }
+      const live = splitProviderContour(withoutAgentCallTrace(liveCatalog))
       expect(live.contour).toEqual(PROVIDER_CONTOUR_TABLES)
       expect(live.published).toEqual(approvedTargetCatalog(postgresGolden))
     } finally {
@@ -479,7 +495,9 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
         { column_name: 'integrity', column_default: null },
         { column_name: 'entry_role', column_default: null },
       ])
-      const live = splitProviderContour(await pgMetaDbCatalog(client, testSchema.schema))
+      const live = splitProviderContour(
+        withoutAgentCallTrace(await pgMetaDbCatalog(client, testSchema.schema)),
+      )
       expect(live.contour).toEqual(PROVIDER_CONTOUR_TABLES)
       expect(live.published).toEqual(approvedTargetCatalog(postgresGolden))
     } finally {

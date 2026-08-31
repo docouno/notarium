@@ -11,6 +11,7 @@ import { createAbilityAvailabilityFacet } from './drivers/pg/abilityAvailability
 import { createAbilityCreateFacet } from './drivers/pg/abilityCreate'
 import { createAbilityPlacementFacet } from './drivers/pg/abilityPlacement'
 import { createAbilityPreferencesFacet } from './drivers/pg/abilityPreferences'
+import { createAgentCallsFacet } from './drivers/pg/agentCalls'
 import { createAgentDeltaCursorsFacet } from './drivers/pg/agentDeltaCursors'
 import { createAuthFacet } from './drivers/pg/auth'
 import { lockCausalBarriers } from './drivers/pg/causalBarriers'
@@ -695,6 +696,8 @@ export class PgMetaDb implements MetaDb {
   readonly agentDeltaCursors = createAgentDeltaCursorsFacet(this.ctx)
 
   readonly sessions = createSessionsFacet(this.ctx)
+
+  readonly agentCalls = createAgentCallsFacet(this.ctx)
 
   readonly sessionAudit = createSessionAuditFacet(this.ctx)
 

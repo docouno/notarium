@@ -33,7 +33,14 @@ export const SettingsPage = () => {
       // About is general info — visible to everyone, including a mode-'none' host.
       { id: 'about', label: 'About' },
     ],
-    ...(user?.admin ? [[{ id: 'users', label: 'Users' }]] : []),
+    ...(mode === AUTH_MODE.none || user?.admin
+      ? [
+          [
+            { id: 'telemetry', label: 'Agent telemetry' },
+            ...(user?.admin ? [{ id: 'users', label: 'Users' }] : []),
+          ],
+        ]
+      : []),
   ]
   return (
     <SettingsLayout

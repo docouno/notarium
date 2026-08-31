@@ -475,10 +475,19 @@ graph-revision-gate: ## Run the #410 production-shaped graph revision + memory g
 BENCH_PHASE ?= pre
 BENCH_SIZES ?= 10000,100000,500000
 BENCH_OUTPUT_DIR ?= $(CURDIR)/test-results/session-audit-bench
-BENCH_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 
 bench-session-audit: ## Benchmark the session activity read-model on SQLite and Postgres
 	@set -eu; \
+	  bench_commit="$$(git rev-parse HEAD)"; \
+	  bench_tree="$$(git rev-parse HEAD^{tree})"; \
+	  baseline_tree=""; \
+	  if [ "$(BENCH_PHASE)" = post ]; then \
+	    baseline_commit="$$(node -e 'const fs=require("fs"); const report=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); if (!report.gitCommit) process.exit(1); process.stdout.write(report.gitCommit)' "$(BENCH_OUTPUT_DIR)/pre.json")"; \
+	    baseline_tree="$$(git rev-parse "$$baseline_commit^{tree}")"; \
+	  fi; \
+	  test -z "$$(git status --porcelain)" || { \
+	    echo 'bench-session-audit requires a clean working tree' >&2; exit 1; \
+	  }; \
 	  cleanup() { \
 	    docker rm -f $(CHECKUP_RUNNER_CONTAINER) >/dev/null 2>&1 || true; \
 	    $(COMPOSE_TEST) down --volumes --remove-orphans >/dev/null 2>&1 || true; \
@@ -515,9 +524,10 @@ bench-session-audit: ## Benchmark the session activity read-model on SQLite and 
 	    --workdir /app -e HOME=/tmp -e NODE_ENV=test \
 	    -e TEST_PG_URL=postgres://notarium:notarium@postgres:5432/notarium_test \
 	    -e BENCH_PHASE="$(BENCH_PHASE)" -e BENCH_SIZES="$(BENCH_SIZES)" \
-	    -e BENCH_COMMIT="$(BENCH_COMMIT)" \
+	    -e BENCH_COMMIT="$$bench_commit" -e BENCH_TREE="$$bench_tree" \
 	    -e BENCH_OUTPUT="/output/$(BENCH_PHASE).json" \
 	    -e BENCH_BASELINE="/output/pre.json" \
+	    -e BENCH_BASELINE_TREE="$$baseline_tree" \
 	    -e BENCH_NODE_IMAGE="$(NODE_TEST_IMAGE)" -e BENCH_PG_IMAGE=postgres:16-alpine \
 	    --entrypoint npx "$(NODE_TEST_IMAGE)" tsx scripts/benchSessionAudit.ts
 

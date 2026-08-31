@@ -42,6 +42,13 @@
       "checksum": "sha256:258a1fa1e3538675665f2fa3cc5e38e82aef064fc894a3b6d8461e6d2a2f9d12",
       "sqlite": "sqlite/0005_provider_contour.sql",
       "postgres": "postgres/0005_provider_contour.sql"
+    },
+    {
+      "version": 6,
+      "name": "agent_call_trace",
+      "checksum": "sha256:21f90a6dd11ddb5adae1216f7acd35c79fab4a37ad6f1e25cfbac8e773c4599f",
+      "sqlite": "sqlite/0006_agent_call_trace.sql",
+      "postgres": "postgres/0006_agent_call_trace.sql"
     }
   ]
 }

@@ -6,6 +6,7 @@ import {
   auditWriteGapOf,
 } from '@notarium/server'
 
+import type { InMemoryAgentCalls } from './agentCalls'
 import type { InMemoryAgentSessions } from './agentSessions'
 import type { InMemoryRetrievalLog } from './retrievalLog'
 
@@ -16,6 +17,7 @@ type AuditWrite = Extract<AgentSessionAuditEvent, { type: 'write' }> & {
   /** The journal row this tap mirrors, so a later quarantine of that row reaches
    *  the audit too — the SQL drivers read one row and see `integrity` directly. */
   revisionId: string
+  agentCallId: string | null
 }
 
 type AuditGroup = {
@@ -25,6 +27,8 @@ type AuditGroup = {
   lastAt: string
   reads: number
   writes: number
+  calls: number
+  complete: boolean
 }
 
 const compareIdDesc = (left: string, right: string): number => {
@@ -34,7 +38,9 @@ const compareIdDesc = (left: string, right: string): number => {
 }
 
 const byNewest = (left: { at: string; source: number; id: string }, right: typeof left): number =>
-  right.at.localeCompare(left.at) || right.source - left.source || compareIdDesc(left.id, right.id)
+  right.at.localeCompare(left.at) ||
+  right.source - left.source ||
+  (left.source === 2 ? right.id.localeCompare(left.id) : compareIdDesc(left.id, right.id))
 
 /** Executable in-memory twin used by the full fake-server vertical. SQL parity is
  * pinned separately by the shared SQLite/PostgreSQL persistence contract. */
@@ -46,6 +52,7 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
   constructor(
     private readonly sessions: InMemoryAgentSessions,
     private readonly retrievals: InMemoryRetrievalLog,
+    private readonly calls: InMemoryAgentCalls,
   ) {}
 
   captureRevision(revision: Revision): void {
@@ -58,6 +65,7 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
       type: 'write',
       id: String(++this.nextWriteId),
       revisionId: revision.id,
+      agentCallId: attribution.agentCallId ?? null,
       at: revision.createdAt,
       owner: attribution.owner,
       agent: attribution.agent,
@@ -90,10 +98,23 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
     this.writes = this.writes.filter((write) => write.space !== space)
   }
 
+  linkedRevisions(owner: string, agentCallId: string) {
+    return this.writes
+      .filter((write) => write.owner === owner && write.agentCallId === agentCallId)
+      .map((write) => {
+        const event = { ...write }
+
+        Reflect.deleteProperty(event, 'owner')
+        Reflect.deleteProperty(event, 'revisionId')
+        Reflect.deleteProperty(event, 'agentCallId')
+        return this.quarantined.has(write.revisionId) ? auditWriteGapOf(event) : event
+      })
+  }
+
   private auditGroups(owner: string): Map<string, AuditGroup> {
     const groups = new Map<string, AuditGroup>()
 
-    const add = (id: string, name: string | null, at: string, type: 'read' | 'write') => {
+    const add = (id: string, name: string | null, at: string, type: 'read' | 'write' | 'call') => {
       const current = groups.get(id)
 
       if (!current) {
@@ -104,6 +125,8 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
           lastAt: at,
           reads: type === 'read' ? 1 : 0,
           writes: type === 'write' ? 1 : 0,
+          calls: type === 'call' ? 1 : 0,
+          complete: false,
         })
         return
       }
@@ -114,16 +137,52 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
       }
       current.reads += type === 'read' ? 1 : 0
       current.writes += type === 'write' ? 1 : 0
+      current.calls += type === 'call' ? 1 : 0
     }
 
     for (const retrieval of this.retrievals.snapshot()) {
-      if (retrieval.owner === owner && retrieval.sessionId) {
+      if (retrieval.owner === owner && retrieval.sessionId && retrieval.agentCallId == null) {
         add(retrieval.sessionId, retrieval.sessionName, retrieval.createdAt, 'read')
       }
     }
     for (const write of this.writes) {
-      if (write.owner === owner && write.sessionId) {
+      if (write.owner === owner && write.sessionId && write.agentCallId == null) {
         add(write.sessionId, write.sessionName, write.at, 'write')
+      }
+    }
+    for (const call of this.calls.snapshot()) {
+      if (
+        call.owner === owner &&
+        call.sessionId &&
+        call.outcome &&
+        !this.calls.isHidden(owner, call.sessionId)
+      ) {
+        add(
+          call.sessionId,
+          call.sessionName,
+          call.startedAt,
+          call.effect === 'read' ? 'read' : call.effect === 'mutation' ? 'write' : 'call',
+        )
+        const group = groups.get(call.sessionId)
+
+        if (group && call.effect !== 'control') {
+          group.calls += 1
+        }
+        const state =
+          call.resultSummary &&
+          typeof call.resultSummary === 'object' &&
+          !Array.isArray(call.resultSummary)
+            ? call.resultSummary['session.state']
+            : null
+
+        if (
+          group &&
+          call.tool === 'start_session' &&
+          call.outcome === 'success' &&
+          (state === 'new' || state === 'forked')
+        ) {
+          group.complete = true
+        }
       }
     }
 
@@ -143,11 +202,12 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
         parentId: session.parentId,
         createdAt: session.createdAt,
         lastSeenAt: group && group.lastAt > session.lastSeenAt ? group.lastAt : session.lastSeenAt,
-        calls: session.calls,
+        calls: group?.complete ? group.calls : session.calls,
         reads: group?.reads ?? 0,
         writes: group?.writes ?? 0,
         retained: true,
         active: session.lastSeenAt >= activeSince,
+        complete: group?.complete ?? false,
       }
     })
 
@@ -159,11 +219,12 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
         parentId: null,
         createdAt: group.firstAt,
         lastSeenAt: group.lastAt,
-        calls: null,
+        calls: group.calls || null,
         reads: group.reads,
         writes: group.writes,
         retained: false,
         active: false,
+        complete: group.complete,
       })
     }
 
@@ -176,12 +237,27 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
   private outside(owner: string) {
     const reads = this.retrievals
       .snapshot()
-      .filter((row) => row.owner === owner && row.sessionId == null)
-    const writes = this.writes.filter((row) => row.owner === owner && row.sessionId == null)
-    const lastSeenAt = [...reads.map((row) => row.createdAt), ...writes.map((row) => row.at)]
+      .filter((row) => row.owner === owner && row.sessionId == null && row.agentCallId == null)
+    const writes = this.writes.filter(
+      (row) => row.owner === owner && row.sessionId == null && row.agentCallId == null,
+    )
+    const calls = this.calls
+      .snapshot()
+      .filter((row) => row.owner === owner && row.sessionId == null && row.outcome)
+    const lastSeenAt = [
+      ...reads.map((row) => row.createdAt),
+      ...writes.map((row) => row.at),
+      ...calls.map((row) => row.startedAt),
+    ]
       .sort()
       .at(-1)
-    return lastSeenAt ? { reads: reads.length, writes: writes.length, lastSeenAt } : null
+    return lastSeenAt
+      ? {
+          reads: reads.length + calls.filter((row) => row.effect === 'read').length,
+          writes: writes.length + calls.filter((row) => row.effect === 'mutation').length,
+          lastSeenAt,
+        }
+      : null
   }
 
   async overview({
@@ -225,6 +301,8 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
     agent,
     tool,
     query,
+    outcome,
+    withTotal,
     limit,
     before,
   }: Parameters<AgentSessionAuditPersistence['events']>[0]) {
@@ -236,11 +314,14 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
       .filter(
         (row) =>
           row.owner === owner &&
+          row.agentCallId == null &&
+          !(row.sessionId && this.calls.isHumanDeleted(owner, row.sessionId)) &&
           inScope(row.sessionId) &&
           (agent == null || row.agent === agent) &&
           (tool == null || row.tool === tool) &&
           (query == null || row.query.toLowerCase().includes(query.toLowerCase())) &&
-          (type == null || type === 'retrieval'),
+          (type == null || type === 'retrieval') &&
+          outcome == null,
       )
       .map((record) => ({
         event: { type: 'retrieval' as const, record },
@@ -252,11 +333,14 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
       .filter(
         (row) =>
           row.owner === owner &&
+          row.agentCallId == null &&
+          !(row.sessionId && this.calls.isHumanDeleted(owner, row.sessionId)) &&
           inScope(row.sessionId) &&
           (agent == null || (!this.quarantined.has(row.revisionId) && row.agent === agent)) &&
           tool == null &&
           query == null &&
-          (type == null || type === 'write'),
+          (type == null || type === 'write') &&
+          outcome == null,
       )
       .map((row) => {
         const event = {
@@ -281,20 +365,52 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
           id: row.id,
         }
       })
-    const all = [...retrievals, ...writes].sort(byNewest)
-    const rank = before?.source === 'retrieval' ? 1 : 0
+    const calls = this.calls
+      .snapshot()
+      .filter(
+        (row) =>
+          row.owner === owner &&
+          row.outcome != null &&
+          !(row.sessionId && this.calls.isHidden(owner, row.sessionId)) &&
+          inScope(row.sessionId) &&
+          (agent == null || row.agent === agent) &&
+          (tool == null || row.tool === tool) &&
+          (query == null ||
+            (['search', 'recall', 'get_note'].includes(row.tool) &&
+              row.targetSummary &&
+              typeof row.targetSummary === 'object' &&
+              !Array.isArray(row.targetSummary) &&
+              typeof (row.targetSummary.query ?? row.targetSummary.ref) === 'string' &&
+              String(row.targetSummary.query ?? row.targetSummary.ref)
+                .toLowerCase()
+                .includes(query.toLowerCase()))) &&
+          (type == null ||
+            (type === 'retrieval' ? row.effect === 'read' : row.effect === 'mutation')) &&
+          (outcome == null ||
+            (outcome === 'errors' ? row.outcome !== 'success' : row.outcome === outcome)),
+      )
+      .map((record) => ({
+        event: { type: 'call' as const, record },
+        at: record.startedAt,
+        source: 2,
+        id: record.id,
+      }))
+    const all = [...calls, ...retrievals, ...writes].sort(byNewest)
+    const rank = before?.source === 'call' ? 2 : before?.source === 'retrieval' ? 1 : 0
     const matched = before
       ? all.filter(
           (row) =>
             row.at < before.at ||
             (row.at === before.at &&
-              (row.source < rank || (row.source === rank && BigInt(row.id) < BigInt(before.id)))),
+              (row.source < rank ||
+                (row.source === rank &&
+                  (row.source === 2 ? row.id < before.id : BigInt(row.id) < BigInt(before.id))))),
         )
       : all
     const page = matched.slice(0, limit + 1)
     return {
       items: page.slice(0, limit).map((row) => row.event),
-      total: scope.kind === 'session' ? all.length : null,
+      total: scope.kind === 'session' && withTotal !== false ? all.length : null,
       hasMore: page.length > limit,
     }
   }
@@ -309,13 +425,23 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
     }
 
     for (const retrieval of this.retrievals.snapshot()) {
-      if (retrieval.owner === owner) {
+      if (retrieval.owner === owner && retrieval.agentCallId == null) {
         add(retrieval.agent)
       }
     }
     for (const write of this.writes) {
-      if (write.owner === owner && !this.quarantined.has(write.revisionId)) {
+      if (
+        write.owner === owner &&
+        write.agentCallId == null &&
+        !(write.sessionId && this.calls.isHumanDeleted(owner, write.sessionId)) &&
+        !this.quarantined.has(write.revisionId)
+      ) {
         add(write.agent)
+      }
+    }
+    for (const call of this.calls.snapshot()) {
+      if (call.owner === owner && call.outcome) {
+        add(call.agent)
       }
     }
 

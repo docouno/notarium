@@ -15,6 +15,18 @@ import type {
 export class InMemoryRetrievalLog implements RetrievalLogPersistence {
   private rows: RetrievalLogRecord[] = []
   private seq = 0
+  private hiddenByCleanup: (owner: string, sessionId: string, linked: boolean) => boolean = () =>
+    false
+
+  attachCleanupFence(hidden: (owner: string, sessionId: string, linked: boolean) => boolean): void {
+    this.hiddenByCleanup = hidden
+  }
+
+  private visible(row: RetrievalLogRecord): boolean {
+    return (
+      !row.sessionId || !this.hiddenByCleanup(row.owner, row.sessionId, row.agentCallId != null)
+    )
+  }
 
   clear(): void {
     this.rows = []
@@ -26,8 +38,48 @@ export class InMemoryRetrievalLog implements RetrievalLogPersistence {
     return this.rows.map((row) => ({ ...row, hits: [...row.hits] }))
   }
 
+  deleteSession(owner: string, sessionId: string, linkedOnly: boolean): void {
+    this.deleteSessionBatch(owner, sessionId, linkedOnly, Number.POSITIVE_INFINITY)
+  }
+
+  deleteSessionBatch(
+    owner: string,
+    sessionId: string,
+    linkedOnly: boolean,
+    limit: number,
+  ): { complete: boolean; removed: number } {
+    let removed = 0
+    this.rows = this.rows.filter((row) => {
+      const matches =
+        row.owner === owner &&
+        row.sessionId === sessionId &&
+        (!linkedOnly || row.agentCallId != null)
+
+      if (matches && removed < limit) {
+        removed += 1
+        return false
+      }
+
+      return true
+    })
+    return {
+      complete: !this.rows.some(
+        (row) =>
+          row.owner === owner &&
+          row.sessionId === sessionId &&
+          (!linkedOnly || row.agentCallId != null),
+      ),
+      removed,
+    }
+  }
+
   async append(input: RetrievalLogInput): Promise<RetrievalLogRecord> {
-    const row: RetrievalLogRecord = { ...input, hits: [...input.hits], id: String(++this.seq) }
+    const row: RetrievalLogRecord = {
+      ...input,
+      agentCallId: input.agentCallId ?? null,
+      hits: [...input.hits],
+      id: String(++this.seq),
+    }
     this.rows.push(row)
     return { ...row, hits: [...row.hits] }
   }
@@ -38,6 +90,7 @@ export class InMemoryRetrievalLog implements RetrievalLogPersistence {
     const baseMatched = this.rows.filter(
       (r) =>
         r.owner === q.owner &&
+        this.visible(r) &&
         (q.tool ? r.tool === q.tool : true) &&
         (q.missesOnly ? r.resultCount === 0 : true),
     )
@@ -62,7 +115,7 @@ export class InMemoryRetrievalLog implements RetrievalLogPersistence {
     const limit = opts?.limit ?? 8
     // A "query" is a search/recall call; get_note is a follow-through, not a query.
     const queries = this.rows.filter(
-      (r) => r.owner === owner && (r.tool === 'search' || r.tool === 'recall'),
+      (r) => r.owner === owner && this.visible(r) && (r.tool === 'search' || r.tool === 'recall'),
     )
     const byKey = new Map<string, RetrievalQueryStat>()
 

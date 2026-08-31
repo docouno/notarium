@@ -1220,10 +1220,8 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
         .json()
         .sessions.find((candidate: { id: string }) => candidate.id === session)
 
-      expect(afterSkillEpisode).toMatchObject({
-        calls: beforeSkillEpisode.calls,
-        lastSeenAt: beforeSkillEpisode.lastSeenAt,
-      })
+      expect(afterSkillEpisode.calls).toBe(beforeSkillEpisode.calls + 1)
+      expect(afterSkillEpisode.lastSeenAt >= beforeSkillEpisode.lastSeenAt).toBe(true)
 
       const resumed = await call('start_session', { session: { id: session } })
       expect(resumed.result?.structuredContent).toMatchObject({

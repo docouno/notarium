@@ -1,6 +1,5 @@
 import { parseAbilityLocator, serializeAbilityLocator } from '@notarium/core'
 import type {
-  AgentSessionInferredStart,
   AgentSessionNamedStart,
   AgentSessionRecord,
   AgentSessionRoleSelection,
@@ -15,9 +14,7 @@ type AgentSessionLifecycleView = {
   deleteSessions(sessions: ReadonlySet<string>): void
 }
 
-/** In-memory executable twin of the durable agent-sessions facet. Every method is
- * synchronous up to its resolved Promise, so inferActiveAndTouch keeps the same
- * exact-one atomic observation as a single SQL statement. */
+/** In-memory executable twin of the durable agent-sessions facet. */
 export class InMemoryAgentSessions implements AgentSessionsPersistence {
   private readonly records = new Map<string, AgentSessionRecord>()
   private lifecycleView?: AgentSessionLifecycleView
@@ -35,6 +32,21 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
   /** Test read-model seam: immutable lifecycle snapshot for the session-audit twin. */
   snapshot(): AgentSessionRecord[] {
     return [...this.records.values()].map(clone)
+  }
+
+  delete(owner: string, id: string): void {
+    const record = this.records.get(id)
+
+    if (!record || record.owner !== owner) {
+      return
+    }
+    this.records.delete(id)
+    this.lifecycleView?.deleteSessions(new Set([id]))
+    for (const child of this.records.values()) {
+      if (child.parentId === id) {
+        child.parentId = null
+      }
+    }
   }
 
   seed(records: readonly AgentSessionRecord[]): void {
@@ -122,61 +134,6 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     }
 
     return clone(record)
-  }
-
-  async inferActiveAndTouch(
-    owner: string,
-    activeSince: string,
-    lastSeenAt: string,
-    projectId?: string,
-  ): Promise<AgentSessionRecord | null> {
-    const active = [...this.records.values()].filter(
-      (record) => record.owner === owner && record.lastSeenAt >= activeSince,
-    )
-
-    if (active.length !== 1) {
-      return null
-    }
-    const record = active[0]
-    record.lastSeenAt = record.lastSeenAt > lastSeenAt ? record.lastSeenAt : lastSeenAt
-    record.calls += 1
-    if (projectId !== undefined) {
-      record.projectId = projectId
-    }
-
-    return clone(record)
-  }
-
-  async startInferred(
-    candidate: AgentSessionRecord,
-    activeSince: string,
-    recentSince: string,
-    limit: number,
-    projectId?: string,
-  ): Promise<AgentSessionInferredStart> {
-    const active = this.list(candidate.owner, activeSince, 2)
-
-    if (active.length === 1) {
-      const stored = this.records.get(active[0]!.id)!
-      stored.lastSeenAt =
-        stored.lastSeenAt > candidate.lastSeenAt ? stored.lastSeenAt : candidate.lastSeenAt
-      stored.calls += 1
-      if (projectId !== undefined) {
-        stored.projectId = projectId
-      }
-
-      return { kind: 'resumed', record: clone(stored) }
-    }
-
-    const recentSessions =
-      active.length >= 2 ? this.list(candidate.owner, recentSince, limit) : undefined
-    const created = { ...candidate, projectId: projectId ?? candidate.projectId }
-    this.insertChecked(created)
-    return {
-      kind: 'new',
-      record: clone(created),
-      ...(recentSessions ? { recentSessions } : {}),
-    }
   }
 
   async startNamed(

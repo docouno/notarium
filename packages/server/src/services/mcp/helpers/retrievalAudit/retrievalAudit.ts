@@ -35,6 +35,7 @@ export const retrievalRowOf = (
   output: Record<string, unknown>,
   at: string,
   session?: BoundAgentSession,
+  agentCallId?: string,
 ): RetrievalLogInput | null => {
   const owner = agentOwnerOf(principal)
 
@@ -43,6 +44,7 @@ export const retrievalRowOf = (
   }
   const base = {
     owner,
+    agentCallId: agentCallId ?? null,
     principal: principal.id,
     agent: principal.label ?? null,
     sessionId: session?.record.id ?? null,

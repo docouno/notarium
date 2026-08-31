@@ -116,10 +116,18 @@ query syntax, text grammar and non-field facets are not part of this v1 node sha
 
 - The package's public surface is the `index.ts` barrel; the domain split by layer (`consts/` · `schemas/` [`rest/` · `rest/agent/` · `tools/` · `primitives.ts`] · `libs/` · `registry.ts`) is internal — downstream imports from the barrel and never notices a refactor.
 - `/api/*` paths as client-side string literals — extraction deferred (#56 backlog), non-breaking.
+- Agent trace uses registry operations for telemetry config, episode/event lists, call detail and
+  deletion. NDJSON export is validated record-by-record against metadata/event/summary schemas;
+  event records may carry the call's surviving Detailed projection and linked retrieval/revisions,
+  while absence of the terminal summary means the concurrent stream was incomplete. A long-lived
+  stream is not one JSON response.
+- `agentCallId` is transport-neutral core correlation; the call row separately names its transport.
+  Linked retrievals/revisions are detail and never duplicate the top-level call event.
 
 ## Seams (files)
 
 - `packages/contract/src/` — schemas + registry + zod-free consts.
+- `packages/contract/src/schemas/rest/agent/sessions.ts` — trace event/detail/config/delete/export.
 - `packages/server/src/apps/server/routes/` — REST transport + `wire.ts`.
 - `packages/contract/src/schemas/rest/providers.ts`, `providerAttachments.ts` and
   `credentials.ts` — provider

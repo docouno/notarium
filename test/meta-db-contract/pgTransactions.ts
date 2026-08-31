@@ -41,9 +41,20 @@ export type PgTransaction = {
 export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   // Outside the hierarchy entirely: no tiered table, no tiered lock.
   { id: 'auth.createFirstUser', levels: [] },
-  { id: 'sessions.startInferred', levels: [] },
+  // Session diagnostics are serialized by their own owner/session advisory-key
+  // domain. They never enter the note-identity lock hierarchy.
+  { id: 'agentCalls.appendDetail', levels: [] },
+  { id: 'agentCalls.bind', levels: [] },
+  { id: 'agentCalls.deleteSession', levels: [] },
+  { id: 'agentCalls.expireSession', levels: [] },
+  { id: 'agentCalls.finalize', levels: [] },
+  { id: 'agentCalls.maintain', levels: [] },
+  { id: 'agentCalls.recoverInterrupted', levels: [] },
+  { id: 'agentCalls.resumeCleanup', levels: [] },
+  { id: 'retrievalLog.append', levels: [] },
   { id: 'sessions.startNamed', levels: [] },
   { id: 'sessions.setRole', levels: [] },
+  { id: 'sessions.touch', levels: [] },
   { id: 'oauth.upsertPendingClient', levels: [] },
   { id: 'pgMetaDb.grantMemberToActiveSpace', levels: [] },
   { id: 'causalOutbox.append', levels: [] },

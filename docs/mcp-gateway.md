@@ -145,19 +145,20 @@ forks with `parentId`; multiple matches return up to ten matching retained choic
 are sanitized before they return to the agent. The first Markdown response line carries the id
 instruction so it survives compact clients.
 
-With no address, `start_session` resumes the exact one active episode when that choice is unique.
-With zero active episodes it creates an auto-named personal/project episode (`named:false`). With
-two or more it also creates a fresh auto-named episode, but returns the recent alternatives so the
-agent can explicitly switch by id instead of guessing.
+With no address, `start_session` always creates a new root. A non-empty `task` becomes its sanitized,
+160-character human name (`named:true`); otherwise the project/personal timestamp label remains
+automatic (`named:false`). Resume and fork require an explicit id or name. `task` never renames an
+explicit target.
 
-Every tool except `whoami` and `get_my_projects` is session-aware. On an ordinary call an explicit
-id is owner-checked and touched; an unknown or foreign id is a tool error. With no id, the gateway
-attaches only when exactly one active episode exists — the exact-one decision and touch are one
-atomic persistence operation. Batch tools bind once at the top level, never once per item.
+Every tool is session-aware. On an ordinary call an explicit id is owner-checked and touched; an
+unknown, foreign, expired or deleted id is the same tool error. Omission always means `Outside
+sessions` and never infers an active episode. `whoami`, `get_my_projects` and `use_skill` can carry an
+explicit id for trace attribution through a read-without-touch path. Batch tools bind once at the
+top level, never once per item.
 
-Active means seen in the last two hours. Rows are retained for thirty days. General recent choices
-cover the last 24 hours; same-name ambiguity returns the matching retained rows even when older,
-so it is always resolvable. Both are capped at ten. There is deliberately no close operation. The
+Active means seen in the last two hours. Compact episode retention is instance-configured
+(30/90/180/365 days, default 90); same-name ambiguity returns up to ten retained matches. Human
+deletion is available only through the self-management REST/UI surface, never an MCP tool. The
 transport's stateless HTTP session remains unchanged: this is a transport-independent core
 service carried through `Ctx.session`, ready for future chat callers. A host without a meta-DB
 degrades honestly: `start_session` omits the session fields and other tools silently ignore the
@@ -165,8 +166,8 @@ argument.
 
 Every successful episode create, touch or role mutation emits the owner-scoped named SSE nudge
 `agent-sessions` on that owner's live tabs, independent of which Space each tab is viewing. Global
-retention pruning returns every owner whose rows were removed and nudges each of them, including
-when the triggering call then exits with a missing or ambiguous session. The event carries no
+post-terminal trace commits, logical deletion and bounded retention cleanup nudge every affected
+owner, including Outside calls. The event carries no
 snapshot: `GET /api/me/agent-sessions` remains truth. `SyncProvider` advances the same typed
 revision on every successful EventSource connection, reconciling mutations missed while the tab
 was disconnected. The Agents Explorer invalidates only its Sessions dataset, without broad
@@ -197,6 +198,43 @@ base bundle. A later `use_role.context` exposes that role slice plus `replacemen
 surviving base after joint dedup/trim; callers replace the earlier base rather than append another
 P/Q allowance. A resumed session rehydrates both instructions and preset. A host without those
 meta-DB facets returns an empty preset while the role package remains usable.
+
+### Durable call trace
+
+The capture boundary is an authenticated, envelope-valid `tools/call`, before per-tool visibility
+and Zod validation. The transport routes SDK-invalid, hidden and unknown tools through the same
+gateway admission without publishing hidden tools in `tools/list`. One mutation-gate scope owns
+admission, validation/authz, session binding, handler execution, mandatory Compact retrieval detail
+and terminal finalize.
+
+Every call gets a transport-neutral `agentCallId`. The terminal row records transport,
+principal/agent/session snapshot, intended effect (`read | mutation | control`), timing, outcome,
+bounded input shape, safe target/result summaries and normalized validation fingerprint. Linked
+retrieval rows and zero-to-many revisions carry the same id and are detail, not additional Activity
+events. A complete episode is proven by a retained successful linked `start_session`; historical
+unlinked retrieval/revision rows remain visible as Legacy/partial fallback.
+
+Compact is always on for a trace-capable host. Retrieval query/ref input is capped at 4096
+characters on the MCP contract and stored intact; Compact also keeps at most five
+hit ids/titles/scores because Activity diagnostics consume them. It never stores note bodies, edit
+content/find text, memory observations, ability instructions, full recall/get-note context,
+credentials, `versionToken`, `idempotencyKey`, arbitrary invalid values or internal exception text.
+Instance-opt-in Detailed telemetry is a separate allowlisted sidecar (7/30/90-day retention,
+default 30 and never longer than Compact); disabling it affects new calls and does not claim an
+immediate purge.
+
+Session diagnostics and cleanup share one owner/session guard. Human deletion dominates retention,
+hides immediately, removes lifecycle/cursors/calls/Detail and linked+legacy retrieval diagnostics,
+and never changes revisions. Retention removes only new linked diagnostics. A marker that wins a
+race makes later diagnostic bind/detail/finalize operations no-ops; already-admitted domain work and
+its immutable revision may still finish.
+
+Crash recovery runs once before the MCP route opens and turns abandoned pre-boot admissions into
+terminal `interrupted` calls. Retention discovery runs from an unref'ed 60-second background tick,
+never from request admission. A pending physical cleanup schedules an unref'ed one-second
+continuation and resumes one fixed marker batch per turn until complete. SQLite therefore yields
+between bounded writer transactions rather than scanning/cleaning the retained world under an MCP
+call, while a large accepted delete converges without waiting one minute per 500 rows.
 
 ### Delta positions
 
@@ -337,7 +375,7 @@ independent.
 - **Errors are explicit, not reflected.** An expected ability/auth refusal reaches MCP only through the symbol-backed client-failure projection (`not-found`, safe conflict, or safe actionable guidance). A raw domain/storage `Error.message` is never treated as client-safe because it happens to carry a legacy marker; the same rule applies inside `edit_ability.steps[]`. Unclassified failures are logged server-side and become opaque `internal error (ref: <6 hex>)` — whole-call refusals and per-item batch failures (`link_many`/`create_notes`) alike carry the ref, `edit_ability.steps[]` alone stays a bare `internal error`. The ref is random, never derived from the error or its content, and the same ref sits in the server log line beside the real message — a lookup anchor, not a leak. Human REST keeps its existing status/reason mapping.
 - **Space narrowing binds the personal domain (#395).** A token narrowed away from its owner's Personal Space brings no personal background into the gateway: `start_session` returns empty `profile.alwaysLoad`/`profile.memory`, and the project bundle's embedded personal section is empty. The personal space is resolved from `principal.spaces`, not the registry, at one point (`peekPersonalSpace`), so this is the same not-found/empty every out-of-reach placement gives — canon [auth.md#model](auth.md). A write to personal memory (`remember_about_user`) refuses the narrowed token by its true reason, not a false "host cannot provision."
 - **Provenance for free.** Every write carries the `principal` (from the PAT) into the journal #12 — per-agent attribution; `get_note`/`recall` can return who edited (human vs agent).
-- **Session audit (#243, #321).** Read tools (`search`/`recall`/`get_note`) are logged at the `gateway.callTool` checkpoint **fire-and-forget** (without affecting latency/correctness) — query/scope + the top hits with `score` → the owner-scoped meta-DB facet `agent_retrievals`. When an episode is bound, the row also snapshots its id/name and whether the attachment was declared or inferred. Agent writes keep the same snapshot in the revision journal; there is no parallel write log. These snapshots intentionally survive session-row GC, so Agents → Activity can show a unified read/write timeline for retained and archived episodes. Activity without a bound episode remains visible under `Outside sessions`. The tool contract does not change — this is server-side observation, not a tool.
+- **Agent call trace (#331).** Every authenticated `tools/call` is admitted before tool validation and terminally classified. Compact projection is allowlist-first; retrieval detail is awaited before terminal success, while Detailed sidecars never hold authored bodies or credentials. The transport-neutral call id correlates retrieval/revision detail without duplicate Activity rows. Activity without an explicit id remains visible under `Outside sessions`; agents cannot read, export, configure or delete this human self-management trace through MCP.
 - **Ability authoring.** Owned agent mutation requires a write-ceiling credential and a writer grant at the resolved home. The existing human Enable/Disable door is narrower state, not authoring: a reader may change only their owner-scoped preference for an exact readable Owned or System ability. System is readable only through `get_ability`; MCP create refuses a same-kind System name, while the unchanged human REST create policy may author an Owned override. Catalog is absent from MCP authoring. Generic MCP note/link/context doors exclude `class:skill`, while the human-compatible REST note door remains open — this is package-integrity poka-yoke, not a credential boundary.
 
 ## Known v1 limitations <a id="limits"></a>

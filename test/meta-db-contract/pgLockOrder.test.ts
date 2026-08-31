@@ -41,6 +41,10 @@ import {
   LOCK_LEVEL_REQUIRES,
   LOCK_LEVELS,
 } from '../../packages/server/src/services/metaDb/drivers/pg/lockOrder'
+import type {
+  AgentCallAdmission,
+  AgentCallFinal,
+} from '../../packages/server/src/services/metaDb/types'
 import { providerDisclosureOf } from '../../packages/server/src/services/providerRegistry'
 import { pooledPgTransactions } from './pgTransactions'
 import { createPostgresTestSchema, describePostgres } from './postgresHarness'
@@ -419,6 +423,45 @@ const violationsOf = (id: string, transaction: Transaction): string[] => {
 
 const AT = '2026-08-11T10:00:00.000Z'
 
+const agentCallAdmission = (
+  id: string,
+  owner: string,
+  startedAt: string,
+  tool = 'whoami',
+): AgentCallAdmission => ({
+  id,
+  owner,
+  principal: `pat:${owner}:lock-order`,
+  agent: 'Lock order probe',
+  transport: 'mcp',
+  requestId: id,
+  tool,
+  effect: tool === 'start_session' ? 'mutation' : 'read',
+  domain: tool === 'start_session' ? 'session' : 'system',
+  startedAt,
+  inputBytes: 2,
+  inputShape: [{ path: '$', type: 'object' }],
+  targetSummary: {},
+  fingerprint: `${id}-input`,
+  projectionVersion: 1,
+  redacted: false,
+  truncated: false,
+})
+
+const agentCallFinal = (id: string, finishedAt: string): AgentCallFinal => ({
+  finishedAt,
+  durationMs: 1,
+  outcome: 'success',
+  reasonCode: null,
+  outputBytes: 2,
+  issueSummary: null,
+  resultSummary: { 'session.state': 'new' },
+  fingerprint: `${id}-output`,
+  redacted: false,
+  truncated: false,
+  detailCaptureFailed: false,
+})
+
 const identity = (over: Partial<IdentityRecord> & { id: string }): IdentityRecord => ({
   filePath: `${over.id}.md`,
   space: 'alpha',
@@ -697,27 +740,6 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
       await run('abilityCreate.reject', () =>
         db.abilityCreate.reject(abilityCreateRejected.id, 'probe-rejection', AT),
       )
-      await run('sessions.startInferred', () =>
-        db.sessions.startInferred(
-          {
-            id: 'session-inferred',
-            owner: 'user:inferred',
-            name: 'personal · now',
-            named: false,
-            parentId: null,
-            createdAt: AT,
-            lastSeenAt: AT,
-            calls: 1,
-            role: null,
-            roleLocator: null,
-            roleContextProjectId: null,
-            projectId: null,
-          },
-          AT,
-          AT,
-          10,
-        ),
-      )
       await run('sessions.startNamed', () =>
         db.sessions.startNamed(
           {
@@ -750,6 +772,121 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
           },
           contextProjectId: null,
         }),
+      )
+      await run('sessions.touch', () => db.sessions.touch('user:al', 'session-1', AT, AT))
+
+      const tracedCallId = 'call-lock-order-main'
+
+      await db.agentCalls.admit(agentCallAdmission(tracedCallId, 'user:al', AT))
+      await run('agentCalls.bind', () =>
+        db.agentCalls.bind('user:al', tracedCallId, {
+          id: 'session-1',
+          name: 'work',
+          attach: 'declared',
+        }),
+      )
+      await run('agentCalls.appendDetail', () =>
+        db.agentCalls.appendDetail({
+          owner: 'user:al',
+          id: tracedCallId,
+          payload: { probe: true },
+          createdAt: AT,
+          expiresAt: '2026-09-11T10:00:00.000Z',
+        }),
+      )
+      await run('agentCalls.finalize', () =>
+        db.agentCalls.finalize('user:al', tracedCallId, agentCallFinal(tracedCallId, AT)),
+      )
+      const interruptedCallId = 'call-lock-order-interrupted'
+
+      await db.agentCalls.admit(
+        agentCallAdmission(interruptedCallId, 'user:al', '2025-01-01T00:00:00.000Z'),
+      )
+      await run('agentCalls.recoverInterrupted', () =>
+        db.agentCalls.recoverInterrupted('2025-01-02T00:00:00.000Z', AT),
+      )
+      await run('retrievalLog.append', () =>
+        db.retrievalLog.append({
+          owner: 'user:al',
+          principal: 'pat:user:al:lock-order',
+          agent: 'Lock order probe',
+          sessionId: 'session-1',
+          sessionName: 'work',
+          sessionAttach: 'declared',
+          agentCallId: tracedCallId,
+          tool: 'search',
+          query: 'lock order',
+          project: null,
+          classFilter: null,
+          resultCount: 0,
+          topScore: null,
+          hits: [],
+          createdAt: AT,
+        }),
+      )
+
+      const cleanupSession = async (
+        owner: string,
+        sessionId: string,
+        startedAt: string,
+        calls: number,
+      ) => {
+        await db.sessions.insert({
+          id: sessionId,
+          owner,
+          name: sessionId,
+          named: true,
+          parentId: null,
+          createdAt: startedAt,
+          lastSeenAt: startedAt,
+          calls: 1,
+          role: null,
+          roleLocator: null,
+          roleContextProjectId: null,
+          projectId: null,
+        })
+        for (let index = 0; index < calls; index += 1) {
+          const id = `${sessionId}-call-${index}`
+
+          await db.agentCalls.admit(agentCallAdmission(id, owner, startedAt, 'start_session'))
+          await db.agentCalls.bind(owner, id, {
+            id: sessionId,
+            name: sessionId,
+            attach: 'declared',
+          })
+          await db.agentCalls.finalize(owner, id, agentCallFinal(id, startedAt))
+        }
+      }
+
+      await cleanupSession('user:delete', 'session-delete', AT, 2)
+      await run('agentCalls.deleteSession', () =>
+        db.agentCalls.deleteSession({
+          owner: 'user:delete',
+          sessionId: 'session-delete',
+          activeSince: AT,
+          confirmActive: true,
+          acceptedAt: AT,
+          batchSize: 1,
+        }),
+      )
+      await run('agentCalls.resumeCleanup', () => db.agentCalls.resumeCleanup(100))
+
+      const oldAt = '2025-01-01T00:00:00.000Z'
+
+      await cleanupSession('user:expire', 'session-expire', oldAt, 1)
+      await run('agentCalls.expireSession', () =>
+        db.agentCalls.expireSession({
+          owner: 'user:expire',
+          sessionId: 'session-expire',
+          expiredBefore: AT,
+          acceptedAt: AT,
+          batchSize: 100,
+        }),
+      )
+
+      await cleanupSession('user:maintain', 'session-maintain', oldAt, 1)
+      await run('agentCalls.maintain', () =>
+        db.agentCalls.maintain({ now: '2027-08-11T10:00:00.000Z', batchSize: 100 }),
       )
       await run('agentDeltaCursors.advance', () =>
         db.agentDeltaCursors.advance(

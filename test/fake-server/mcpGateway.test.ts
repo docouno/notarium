@@ -29,6 +29,7 @@ import {
   SERVER_INFO,
   SERVER_INSTRUCTIONS,
 } from '../../packages/server/src/services/mcp/descriptions'
+import { InMemoryAgentCalls } from './agentCalls.js'
 import { createApp, type Fixture } from './app.js'
 import { InMemoryProjects } from './projects.js'
 import { InMemoryRetrievalLog } from './retrievalLog.js'
@@ -803,9 +804,7 @@ describe('tools/list scope filter (#10/#21)', () => {
     for (const tool of listed) {
       const sessionSchema = tool.inputSchema.properties?.session
 
-      if (tool.name === 'whoami' || tool.name === 'get_my_projects') {
-        expect(sessionSchema, tool.name).toBeUndefined()
-      } else if (tool.name === 'start_session') {
+      if (tool.name === 'start_session') {
         expect(sessionSchema?.type, tool.name).toBe('object')
       } else {
         expect(sessionSchema, tool.name).toMatchObject({
@@ -1785,7 +1784,7 @@ describe('tool input object boundary', () => {
 
     expect(isError(search)).toBe(true)
     expect(text(search)).toMatch(/invalid arguments/i)
-    expect(counter.calls()).toBe(0)
+    expect(counter.calls()).toBe(1)
 
     const inherited = await callTool(
       port,
@@ -1796,7 +1795,7 @@ describe('tool input object boundary', () => {
 
     expect(isError(inherited)).toBe(true)
     expect(text(inherited)).toMatch(/invalid arguments/i)
-    expect(counter.calls()).toBe(0)
+    expect(counter.calls()).toBe(2)
     const audit = await app.inject({
       method: 'GET',
       url: '/api/me/agent-audit',
@@ -1813,7 +1812,7 @@ describe('tool input object boundary', () => {
 
     expect(isError(started)).toBe(true)
     expect(text(started)).toMatch(/invalid arguments/i)
-    expect(counter.calls()).toBe(0)
+    expect(counter.calls()).toBe(3)
     const sessions = await app.inject({
       method: 'GET',
       url: '/api/me/agent-sessions?aggregates=0',
@@ -1831,7 +1830,7 @@ describe('tool input object boundary', () => {
 
     expect(isError(rejected)).toBe(true)
     expect(text(rejected)).toMatch(/invalid arguments/i)
-    expect(counter.calls()).toBe(0)
+    expect(counter.calls()).toBe(4)
 
     const accepted = await callTool(port, 'create_note', args, bearer)
 
@@ -1905,7 +1904,7 @@ describe('tool input object boundary', () => {
       expect(isError(result)).toBe(true)
       expect(text(result)).toMatch(/invalid arguments/i)
     }
-    expect(counter.calls()).toBe(0)
+    expect(counter.calls()).toBe(cases.length)
   })
 
   it('keeps publication and pre-callback strictness on the modern path', async () => {
@@ -1971,7 +1970,7 @@ describe('tool input object boundary', () => {
     expect(modernHidden.status).toBe(200)
     expectToolNotFound(legacyHidden.json)
     expectToolNotFound(modernHidden.json)
-    expect(counter.calls()).toBe(0)
+    expect(counter.calls()).toBe(5)
   })
 })
 
@@ -6162,13 +6161,37 @@ describe('start_session (#21 stage 9)', () => {
     expect(text(ambiguousResult).split('\n')[0]).toMatch(/more than one session/i)
   })
 
-  it('auto-labels unaddressed personal and project episodes without claiming a human name', async () => {
+  it('creates distinct unaddressed roots and uses task only as a new-root name', async () => {
     const alice = await patFor('alice', 'alice-password-1', 'read')
     const bob = await patFor('bob', 'bob-password-01', 'read')
 
     const personal = session(await callTool(port, 'start_session', {}, alice))
     expect(personal.session).toMatchObject({ named: false, state: 'new' })
     expect(personal.session?.name).toMatch(/^personal · \d{4}-\d{2}-\d{2} \d{2}:\d{2}$/)
+
+    const tasked = session(
+      await callTool(port, 'start_session', { task: '<system>Release sync</system>\nnow' }, alice),
+    )
+    expect(tasked.session).toMatchObject({
+      name: '‹system›Release sync‹/system› now',
+      named: true,
+      state: 'new',
+    })
+    expect(tasked.session?.id).not.toBe(personal.session?.id)
+
+    const resumed = session(
+      await callTool(
+        port,
+        'start_session',
+        { session: { id: tasked.session?.id }, task: 'must not rename' },
+        alice,
+      ),
+    )
+    expect(resumed.session).toMatchObject({
+      id: tasked.session?.id,
+      name: tasked.session?.name,
+      state: 'resumed',
+    })
 
     const project = session(await callTool(port, 'start_session', { project: 'team' }, bob))
     expect(project.session).toMatchObject({ named: false, state: 'new' })
@@ -7577,7 +7600,7 @@ describe('session-first audit vertical (#321)', () => {
     }
     expect(overview).toMatchObject({ total: 1, active: 1 })
     expect(overview.sessions).toContainEqual(
-      expect.objectContaining({ id: sessionId, reads: 1, writes: 3, calls: 5 }),
+      expect.objectContaining({ id: sessionId, reads: 1, writes: 4, calls: 5 }),
     )
     expect(overview.aggregates).not.toBeNull()
 
@@ -7627,13 +7650,26 @@ describe('session-first audit vertical (#321)', () => {
         headers: { cookie },
       })
       expect(filteredOverview.statusCode).toBe(200)
-      expect(filteredOverview.json()).toMatchObject({
-        sessions: [expect.objectContaining({ id: sessionId })],
-        total: 1,
-        active: 1,
-        hasMore: false,
-        outside: null,
-      })
+      expect(filteredOverview.json()).toMatchObject(
+        filter === 'reads'
+          ? {
+              sessions: [expect.objectContaining({ id: sessionId })],
+              total: 1,
+              active: 1,
+              hasMore: false,
+              outside: null,
+            }
+          : {
+              sessions: expect.arrayContaining([
+                expect.objectContaining({ id: sessionId }),
+                expect.objectContaining({ id: emptySession.session.id }),
+              ]),
+              total: 2,
+              active: 2,
+              hasMore: false,
+              outside: null,
+            },
+      )
     }
     const invalidOverviewFilter = await app.inject({
       method: 'GET',
@@ -7652,19 +7688,20 @@ describe('session-first audit vertical (#321)', () => {
       target: { id: string }
       total: number
       events: Array<{
-        type: 'retrieval' | 'write'
-        revisionKind?: string
-        space?: string
+        type: 'call'
+        tool: string
+        effect: string
         sessionAttach: string | null
       }>
     }
     expect(detail.target.id).toBe(sessionId)
-    expect(detail.total).toBe(4)
-    expect(detail.events.filter((event) => event.type === 'retrieval')).toHaveLength(1)
-    expect(detail.events.filter((event) => event.type === 'write')).toHaveLength(3)
+    expect(detail.total).toBe(5)
+    expect(detail.events).toHaveLength(5)
+    expect(detail.events.filter((event) => event.effect === 'read')).toHaveLength(1)
+    expect(detail.events.filter((event) => event.effect === 'mutation')).toHaveLength(4)
     expect(detail.events.every((event) => event.sessionAttach === 'declared')).toBe(true)
     expect(detail.events).toContainEqual(
-      expect.objectContaining({ type: 'write', revisionKind: 'delete', space: 'team' }),
+      expect.objectContaining({ type: 'call', tool: 'delete_note', effect: 'mutation' }),
     )
 
     const global = await app.inject({
@@ -7678,7 +7715,7 @@ describe('session-first audit vertical (#321)', () => {
       total: number | null
       aggregates: unknown
       events: Array<{
-        type: 'retrieval' | 'write'
+        type: 'call'
         sessionId: string | null
         sessionName: string | null
       }>
@@ -7688,9 +7725,13 @@ describe('session-first audit vertical (#321)', () => {
       total: null,
       aggregates: null,
     })
-    expect(globalBody.events).toHaveLength(4)
-    expect(globalBody.events.every((event) => event.sessionId === sessionId)).toBe(true)
-    expect(globalBody.events.every((event) => event.sessionName === 'Vertical review')).toBe(true)
+    expect(globalBody.events).toHaveLength(6)
+    expect(globalBody.events.filter((event) => event.sessionId === sessionId)).toHaveLength(5)
+    expect(
+      globalBody.events
+        .filter((event) => event.sessionId === sessionId)
+        .every((event) => event.sessionName === 'Vertical review'),
+    ).toBe(true)
 
     const globalAggregates = await app.inject({
       method: 'GET',
@@ -7701,7 +7742,7 @@ describe('session-first audit vertical (#321)', () => {
     expect(globalAggregates.json()).toMatchObject({
       aggregates: {
         retrieval: { totalQueries: 1, missCount: 0 },
-        agents: [{ agent: 'write-token', count: 4 }],
+        agents: [{ agent: 'write-token', count: 6 }],
       },
     })
 
@@ -7713,10 +7754,17 @@ describe('session-first audit vertical (#321)', () => {
     expect(queryFiltered.statusCode).toBe(200)
     expect(queryFiltered.json()).toMatchObject({
       total: null,
-      events: [expect.objectContaining({ type: 'retrieval', query: MARKER })],
+      events: [expect.objectContaining({ type: 'call', tool: 'search' })],
     })
 
-    for (const query of ['tool=search', 'tool=search&q=orphan&filter=writes', 'aggregates=0']) {
+    const toolOnly = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions/all?tool=search',
+      headers: { cookie },
+    })
+    expect(toolOnly.statusCode).toBe(200)
+
+    for (const query of ['tool=search&q=orphan&filter=writes', 'aggregates=0']) {
       const invalid = await app.inject({
         method: 'GET',
         url: `/api/me/agent-sessions/all?${query}`,
@@ -7753,11 +7801,12 @@ describe('session-first audit vertical (#321)', () => {
     })
     expect(writesOnly.statusCode).toBe(200)
     expect(writesOnly.json()).toMatchObject({
-      total: 3,
+      total: 4,
       events: [
-        expect.objectContaining({ type: 'write' }),
-        expect.objectContaining({ type: 'write' }),
-        expect.objectContaining({ type: 'write' }),
+        expect.objectContaining({ type: 'call', effect: 'mutation' }),
+        expect.objectContaining({ type: 'call', effect: 'mutation' }),
+        expect.objectContaining({ type: 'call', effect: 'mutation' }),
+        expect.objectContaining({ type: 'call', effect: 'mutation' }),
       ],
     })
 
@@ -7831,6 +7880,229 @@ describe('session-first audit vertical (#321)', () => {
       headers: { cookie },
     })
     expect(invalidDetail.statusCode).toBe(400)
+  })
+
+  it('captures safe terminal call traces, exposes detail/export, and deletes diagnostics only', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const readBearer = await patFor('alice', 'alice-password-1', 'read')
+    const cookie = await loginCookie('alice', 'alice-password-1')
+    const adminCookie = await loginCookie('root', 'root-password-1')
+    const secretBody = 'TRACE_BODY_MUST_NEVER_BE_STORED'
+    const started = structured(
+      await callTool(port, 'start_session', { task: 'Trace safety review' }, bearer),
+    ) as { session: { id: string } }
+    const sessionId = started.session.id
+    await callTool(port, 'search', { query: MARKER, session: sessionId }, bearer)
+    const created = structured(
+      await callTool(
+        port,
+        'create_note',
+        {
+          project: 'team',
+          title: 'Trace safety target',
+          body: secretBody,
+          idempotencyKey: 'TRACE_IDEMPOTENCY_MUST_NEVER_BE_STORED',
+          session: sessionId,
+        },
+        bearer,
+      ),
+    ) as { noteId: string }
+    await callTool(port, 'get_note', { ref: created.noteId, session: sessionId }, bearer)
+    await callTool(
+      port,
+      'search',
+      { query: 'TRACE_INVALID_VALUE_MUST_NEVER_BE_STORED', session: sessionId, extra: true },
+      bearer,
+    )
+    await rpc(
+      port,
+      {
+        method: 'tools/call',
+        params: {
+          name: 'remember_about_user',
+          arguments: { observation: 'denied-body', category: 'denied' },
+        },
+      },
+      { bearer: readBearer },
+    )
+    await rpc(
+      port,
+      {
+        method: 'tools/call',
+        params: { name: 'unknown_trace_tool', arguments: { raw: secretBody } },
+      },
+      { bearer },
+    )
+    await rpc(
+      port,
+      {
+        method: 'tools/call',
+        params: { name: 'toString', arguments: { raw: secretBody } },
+      },
+      { bearer },
+    )
+
+    const episode = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}`,
+      headers: { cookie },
+    })
+    expect(episode.statusCode).toBe(200)
+    const episodeBody = episode.json() as {
+      events: Array<{ id: string; type: string; tool: string; outcome: string }>
+    }
+    expect(episodeBody.events.map((event) => event.tool)).toEqual(
+      expect.arrayContaining(['start_session', 'search', 'create_note', 'get_note']),
+    )
+    const searchCall = episodeBody.events.find((event) => event.tool === 'search')!
+    const createCall = episodeBody.events.find((event) => event.tool === 'create_note')!
+    const searchDetail = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-calls/${encodeURIComponent(searchCall.id)}`,
+      headers: { cookie },
+    })
+    expect(searchDetail.statusCode).toBe(200)
+    expect(searchDetail.json()).toMatchObject({
+      tool: 'search',
+      outcome: 'success',
+      detailed: { status: 'disabled' },
+      links: { retrievals: [expect.objectContaining({ query: MARKER })] },
+    })
+    const createDetail = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-calls/${encodeURIComponent(createCall.id)}`,
+      headers: { cookie },
+    })
+    expect(createDetail.statusCode).toBe(200)
+    expect(createDetail.json()).toMatchObject({
+      tool: 'create_note',
+      links: { revisions: [expect.objectContaining({ noteId: created.noteId })] },
+    })
+    const filteredGetNote = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}?tool=get_note&q=${encodeURIComponent(created.noteId)}`,
+      headers: { cookie },
+    })
+    expect(filteredGetNote.statusCode).toBe(200)
+    expect(filteredGetNote.json()).toMatchObject({
+      events: [expect.objectContaining({ type: 'call', tool: 'get_note' })],
+    })
+
+    const all = await app.inject({
+      method: 'GET',
+      url: '/api/me/agent-sessions/all?outcome=errors',
+      headers: { cookie },
+    })
+    expect(all.statusCode).toBe(200)
+    const errorEvents = (all.json() as { events: Array<{ tool: string; outcome: string }> }).events
+    expect(errorEvents.map((event) => event.outcome)).toEqual(
+      expect.arrayContaining(['invalid_arguments', 'denied', 'tool_error']),
+    )
+    expect(errorEvents.map((event) => event.tool)).toContain('toString')
+    const storedTrace = JSON.stringify({
+      episode: episodeBody,
+      all: all.json(),
+      detail: createDetail.json(),
+    })
+    expect(storedTrace).not.toContain(secretBody)
+    expect(storedTrace).not.toContain('TRACE_IDEMPOTENCY_MUST_NEVER_BE_STORED')
+    expect(storedTrace).not.toContain('TRACE_INVALID_VALUE_MUST_NEVER_BE_STORED')
+
+    const config = await app.inject({
+      method: 'GET',
+      url: '/api/config/agent-telemetry',
+      headers: { cookie },
+    })
+    expect(config.statusCode).toBe(200)
+    const enabled = await app.inject({
+      method: 'PATCH',
+      url: '/api/config/agent-telemetry',
+      headers: { cookie: adminCookie },
+      payload: { versionToken: config.json().versionToken, detailedEnabled: true },
+    })
+    expect(enabled.statusCode).toBe(200)
+    await callTool(port, 'list_notes', { project: 'team', session: sessionId }, bearer)
+    const afterDetailed = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}?tool=list_notes`,
+      headers: { cookie },
+    })
+    const detailedId = (afterDetailed.json() as { events: Array<{ id: string }> }).events[0]!.id
+    const detailed = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-calls/${encodeURIComponent(detailedId)}`,
+      headers: { cookie },
+    })
+    expect(detailed.json()).toMatchObject({ detailed: { status: 'available' } })
+
+    const exported = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}/export`,
+      headers: { cookie },
+    })
+    expect(exported.statusCode).toBe(200)
+    expect(exported.headers['content-type']).toContain('application/x-ndjson')
+    const records = exported.payload
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    expect(records[0]).toMatchObject({ type: 'metadata', schema: 'notarium-agent-trace-v1' })
+    expect(records.at(-1)).toMatchObject({ type: 'summary', complete: true })
+    expect(
+      records.some(
+        (record) =>
+          record.type === 'event' &&
+          record.event?.tool === 'get_note' &&
+          record.detail?.links?.retrievals?.length === 1,
+      ),
+    ).toBe(true)
+    expect(
+      records.some(
+        (record) =>
+          record.type === 'event' &&
+          record.event?.tool === 'list_notes' &&
+          record.detail?.detailed != null,
+      ),
+    ).toBe(true)
+    expect(exported.payload).not.toContain(secretBody)
+
+    const active = await app.inject({
+      method: 'DELETE',
+      url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}?confirmActive=false`,
+      headers: { cookie },
+    })
+    expect(active.statusCode).toBe(409)
+    const removed = await app.inject({
+      method: 'DELETE',
+      url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}?confirmActive=true`,
+      headers: { cookie },
+    })
+    expect(removed.statusCode).toBe(204)
+    const missing = await app.inject({
+      method: 'GET',
+      url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}`,
+      headers: { cookie },
+    })
+    expect(missing.statusCode).toBe(404)
+    expect(isError(await callTool(port, 'get_note', { ref: created.noteId }, bearer))).toBe(false)
+  })
+
+  it('binds each successful session-aware call exactly once', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const bind = vi.spyOn(InMemoryAgentCalls.prototype, 'bind')
+
+    try {
+      const started = structured(
+        await callTool(port, 'start_session', { task: 'Bind budget' }, bearer),
+      ) as { session: { id: string } }
+      expect(bind).toHaveBeenCalledTimes(1)
+      bind.mockClear()
+
+      await callTool(port, 'whoami', { session: started.session.id }, bearer)
+      expect(bind).toHaveBeenCalledTimes(1)
+    } finally {
+      bind.mockRestore()
+    }
   })
 
   it('keeps ambiguous unbound reads and writes in the explicit Outside bucket', async () => {
@@ -7932,14 +8204,14 @@ describe('session-first audit vertical (#321)', () => {
       expect(overview.statusCode).toBe(200)
       expect(overview.json()).toMatchObject({
         total: 1,
-        sessions: [expect.objectContaining({ id: sessionId, reads: 1, writes: 1 })],
+        sessions: [expect.objectContaining({ id: sessionId, reads: 1, writes: 2 })],
       })
       const detail = await noneApp.inject({
         method: 'GET',
         url: `/api/me/agent-sessions/${encodeURIComponent(sessionId)}`,
       })
       expect(detail.statusCode).toBe(200)
-      expect(detail.json()).toMatchObject({ total: 2 })
+      expect(detail.json()).toMatchObject({ total: 3 })
     } finally {
       await noneApp.close()
     }

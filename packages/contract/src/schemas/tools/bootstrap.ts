@@ -20,7 +20,12 @@ import {
 } from './primitives'
 import { UseRoleOutputSchema } from './roles'
 
-export const WhoamiInputSchema = z.object({}).strict()
+export const WhoamiInputSchema = z
+  .object({
+    /** Optional work-episode attribution. This read never touches lifecycle state. */
+    session: AgentSessionIdSchema.optional(),
+  })
+  .strict()
 
 /** Tool `whoami`: the principal, its action ceiling (`read | write`), reachable
  *  projects, engine capabilities and principal-specific model availability.
@@ -33,7 +38,12 @@ export const WhoamiOutputSchema = z.object({
   hasModel: z.boolean(),
 })
 
-export const GetMyProjectsInputSchema = z.object({}).strict()
+export const GetMyProjectsInputSchema = z
+  .object({
+    /** Optional work-episode attribution. This read never touches lifecycle state. */
+    session: AgentSessionIdSchema.optional(),
+  })
+  .strict()
 
 /** Tool `get_my_projects`: the project workspaces you can access (personal-domain
  *  projects appear by handle too). canon: docs/note-model.md#note-ontology */
@@ -46,8 +56,9 @@ export const StartSessionInputSchema = z
     /** Hint (a project handle); without it the bundle is user-level only (profile
      *  + projects). */
     project: ProjectHandleSchema.optional(),
-    /** Free-form task hint; no v1 effect. */
-    task: z.string().optional(),
+    /** Human task label for a newly created unaddressed root. An explicit locator
+     * keeps the existing session name. The service sanitizes and bounds storage. */
+    task: z.string().max(4096).optional(),
     /** Canonical explicit role selector; when given, the role body rides this response. */
     role: RoleNameSchema.optional(),
     /** Address an existing session by id, or open/resume/fork by a non-unique name.

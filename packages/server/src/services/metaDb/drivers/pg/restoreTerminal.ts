@@ -333,12 +333,12 @@ export const createRestoreTerminalFacet = (ctx: PgDriverCtx): RestoreTerminalPer
       const inserted = await client.query(
         `INSERT INTO note_revisions
            (note_id, space, base_rev, their_rev, source_rev, kind, principal,
-            agent_owner, agent_name, session_id, session_name, session_attach,
+            agent_owner, agent_name, session_id, session_name, session_attach, agent_call_id,
             content_hash, semantic_fingerprint, restore_safety, state_format,
             title, class, slug, tags, created_at, chars_added, chars_removed,
             entry_role, integrity)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+                 $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
          RETURNING id`,
         [
           revision.noteId,
@@ -353,6 +353,7 @@ export const createRestoreTerminalFacet = (ctx: PgDriverCtx): RestoreTerminalPer
           revision.agent?.session?.id ?? null,
           revision.agent?.session?.name ?? null,
           revision.agent?.session?.attach ?? null,
+          revision.agent?.agentCallId ?? null,
           revision.contentHash,
           revision.semanticFingerprint ?? null,
           revision.restoreSafety ?? null,

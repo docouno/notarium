@@ -1,8 +1,12 @@
 import type {
   AgentAudit,
+  AgentCallDetail,
+  AgentCallOutcome,
   AgentRetrievalTool,
   AgentSessionEvents,
   AgentSessions,
+  AgentTelemetryConfig,
+  AgentTelemetryConfigPatch,
   ContextOrderEntry,
   ContextSetItemsAddResponse,
   ContextSetItemsResponse,
@@ -14,6 +18,7 @@ import type {
   PinNoteResponse,
 } from '@notarium/contract'
 import { QUERY_KEY } from '@notarium/contract/query'
+import type { ToolName } from '@notarium/contract/tools'
 import { req, sp } from './client'
 
 export const contextApi = {
@@ -110,8 +115,9 @@ export const contextApi = {
       cursor?: string
       filter?: 'reads' | 'writes'
       agent?: string
-      tool?: AgentRetrievalTool
+      tool?: ToolName
       q?: string
+      outcome?: 'success' | 'errors' | AgentCallOutcome
       aggregates?: '1'
     } = {},
     signal?: AbortSignal,
@@ -136,6 +142,9 @@ export const contextApi = {
     if (params.q) {
       q.set(QUERY_KEY.q, params.q)
     }
+    if (params.outcome) {
+      q.set('outcome', params.outcome)
+    }
     if (params.aggregates) {
       q.set(QUERY_KEY.aggregates, params.aggregates)
     }
@@ -144,6 +153,24 @@ export const contextApi = {
       `/api/me/agent-sessions/${encodeURIComponent(id)}${s ? `?${s}` : ''}`,
       { signal },
     )
+  },
+  agentCallDetailGet: (id: string, signal?: AbortSignal) =>
+    req<AgentCallDetail>(`/api/me/agent-calls/${encodeURIComponent(id)}`, { signal }),
+  agentTelemetryConfigGet: () => req<AgentTelemetryConfig>('/api/config/agent-telemetry'),
+  agentTelemetryConfigPatch: (body: AgentTelemetryConfigPatch) =>
+    req<AgentTelemetryConfig>('/api/config/agent-telemetry', {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  agentSessionDelete: async (
+    id: string,
+    confirmActive = false,
+  ): Promise<'complete' | 'deleting'> => {
+    const result = await req<{ status?: 'deleting' }>(
+      `/api/me/agent-sessions/${encodeURIComponent(id)}?confirmActive=${confirmActive ? 'true' : 'false'}`,
+      { method: 'DELETE' },
+    )
+    return result.status === 'deleting' ? 'deleting' : 'complete'
   },
   /** Toggle a note's `always-load` membership (id-addressed). Pin/unpin = the
    *  «Pin to agent context» action and the Context constructor. */

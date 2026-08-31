@@ -20,6 +20,7 @@ import { createAbilities, type CustomAbilityCreator } from '../../services/abili
 import { AuthError, type AuthService, createAuthService } from '../../services/auth'
 import type { FieldSchemaStore } from '../../services/fields'
 import type {
+  AgentCallTracePersistence,
   AgentDeltaCursorsPersistence,
   AgentSessionAuditPersistence,
   AgentSessionsPersistence,
@@ -77,6 +78,7 @@ export type BuildAppOptions = {
   scopePins?: ScopePinsPersistence
   contextOrder?: ContextOrderPersistence
   retrievalLog?: RetrievalLogPersistence
+  agentCalls?: AgentCallTracePersistence
   sessionAudit?: AgentSessionAuditPersistence
   markerStore?: MarkerStore
   fieldSchemaStore?: FieldSchemaStore
@@ -118,6 +120,7 @@ export const buildApp = async ({
   agentDeltaCursors,
   gatewayState,
   retrievalLog,
+  agentCalls,
   sessionAudit,
   projects,
   folders,
@@ -416,6 +419,7 @@ export const buildApp = async ({
     scopePins,
     contextOrder,
     retrievalLog,
+    agentCalls,
     sessionAudit,
     sessions,
     roles,
@@ -454,6 +458,7 @@ export const buildApp = async ({
     agentDeltaCursors,
     gatewayState,
     retrievalLog,
+    agentCalls,
     projects,
     folders,
     contextSets,

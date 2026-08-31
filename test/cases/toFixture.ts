@@ -19,7 +19,8 @@ import {
   unionLegacyNameAliases,
 } from '@notarium/core'
 import { deterministicNoteId, type NoteSnapshot } from '@notarium/engine-memory'
-import { AGENT_SYSTEM_OWNER, type AgentSessionRecord } from '@notarium/server'
+import { AGENT_SYSTEM_OWNER, type AgentCallRecord, type AgentSessionRecord } from '@notarium/server'
+import { TRACE_TOOL_POLICY } from '../../packages/server/src/services/agentCalls/traceProjectors'
 import type {
   ActivityFixture,
   AuthFixture,
@@ -29,7 +30,7 @@ import type {
 } from '../fake-server/app'
 import { compareEvents, normDate } from './generators'
 import { materializeRevisionState } from './revisionStates'
-import { agentSessionId } from './sessionIds'
+import { agentCallId, agentSessionId } from './sessionIds'
 import type { CaseEvent, CaseWorld } from './types'
 
 // The FAKE projection of a case (#175): reduce the neutral timeline to the fake
@@ -304,9 +305,15 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     const session = audit.sessionRef
       ? world.agentSessions?.find((candidate) => candidate.ref === audit.sessionRef)
       : undefined
+    const call = audit.callRef
+      ? world.agentCalls?.find((candidate) => candidate.ref === audit.callRef)
+      : undefined
 
     if (audit.sessionRef && !session) {
       throw new Error(`agent write references unknown session: ${audit.sessionRef}`)
+    }
+    if (audit.callRef && !call) {
+      throw new Error(`agent write references unknown call: ${audit.callRef}`)
     }
     const owner = audit.owner ?? session?.owner ?? defaultOwner
 
@@ -317,6 +324,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     return {
       owner,
       agent: audit.agent ?? null,
+      ...(audit.callRef ? { agentCallId: agentCallId(audit.callRef) } : {}),
       ...(session && audit.sessionRef
         ? {
             session: {
@@ -655,6 +663,55 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
         projectId: project && projectSlug ? `proj-${project.space}-${projectSlug}` : null,
       }
     })
+  const agentCalls: AgentCallRecord[] | undefined = world.agentTelemetryDetailed
+    ? world.agentCalls?.map((call) => {
+        const startedAt = new Date(now - call.daysAgo * 86_400_000).toISOString()
+        const sessionDecl = call.sessionRef
+          ? world.agentSessions?.find((candidate) => candidate.ref === call.sessionRef)
+          : undefined
+        const policy = Object.hasOwn(TRACE_TOOL_POLICY, call.tool)
+          ? TRACE_TOOL_POLICY[call.tool as keyof typeof TRACE_TOOL_POLICY]
+          : null
+
+        if (policy && (call.effect !== policy.effect || call.domain !== policy.domain)) {
+          throw new Error(
+            `agent call ${call.ref} declares ${call.effect}/${call.domain}; ` +
+              `${call.tool} emits ${policy.effect}/${policy.domain}`,
+          )
+        }
+
+        return {
+          id: agentCallId(call.ref),
+          owner: call.owner ?? sessionDecl?.owner ?? defaultOwner,
+          principal: call.principal,
+          agent: call.agent ?? null,
+          transport: 'mcp',
+          requestId: null,
+          sessionId: call.sessionRef ? agentSessionId(call.sessionRef) : null,
+          sessionName: sessionDecl?.name ?? null,
+          sessionAttach: call.sessionRef ? (call.sessionAttach ?? 'declared') : null,
+          tool: call.tool,
+          effect: policy?.effect ?? call.effect,
+          domain: policy?.domain ?? call.domain,
+          startedAt,
+          finishedAt: new Date(Date.parse(startedAt) + (call.durationMs ?? 12)).toISOString(),
+          durationMs: call.durationMs ?? 12,
+          outcome: call.outcome,
+          reasonCode: call.reasonCode ?? null,
+          inputBytes: 0,
+          outputBytes: 0,
+          inputShape: [],
+          issueSummary: call.issues ?? null,
+          targetSummary: call.target ?? null,
+          resultSummary: call.result ?? null,
+          fingerprint: call.fingerprint ?? agentCallId(call.ref).slice(5),
+          projectionVersion: 1,
+          redacted: call.redacted ?? false,
+          truncated: call.truncated ?? false,
+          detailCaptureFailed: call.detailCaptureFailed ?? false,
+        }
+      })
+    : undefined
 
   return {
     now: world.now,
@@ -669,6 +726,19 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
         }
       : {}),
     agentSessions,
+    agentCalls,
+    agentCleanupMarkers: world.agentCleanupMarkers?.map((marker) => {
+      const session = world.agentSessions?.find((candidate) => candidate.ref === marker.sessionRef)
+      return {
+        owner: marker.owner ?? session?.owner ?? defaultOwner,
+        sessionId: agentSessionId(marker.sessionRef),
+        operations: marker.operations,
+      }
+    }),
+    agentCallDetails: world.agentCalls?.flatMap((call) =>
+      call.detailed ? [{ id: agentCallId(call.ref), payload: call.detailed }] : [],
+    ),
+    agentTelemetryDetailed: world.agentTelemetryDetailed,
     agentRoles: world.agentRoles,
     agentSkills: world.agentSkills,
     // Carried verbatim, like the package declarations beside it: a preference row

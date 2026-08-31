@@ -605,6 +605,7 @@ export const jobOfRow = (r: JobRow): JobRecord => ({
 /** A raw `agent_retrievals` row. */
 export type RetrievalRow = {
   id: number | bigint | string
+  agent_call_id: string | null
   owner: string
   principal: string
   agent: string | null
@@ -656,6 +657,7 @@ const parseHits = (raw: string | null): RetrievalHit[] => {
 
 export const retrievalOfRow = (r: RetrievalRow): RetrievalLogRecord => ({
   id: String(r.id),
+  agentCallId: r.agent_call_id ?? null,
   owner: r.owner,
   principal: r.principal,
   agent: r.agent,

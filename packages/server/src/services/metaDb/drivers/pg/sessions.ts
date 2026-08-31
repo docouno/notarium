@@ -3,7 +3,6 @@ import type pg from 'pg'
 import { parseAbilityLocator, serializeAbilityLocator } from '@notarium/core'
 
 import type {
-  AgentSessionInferredStart,
   AgentSessionNamedStart,
   AgentSessionRecord,
   AgentSessionsPersistence,
@@ -52,6 +51,14 @@ const COLUMNS =
 
 type Queryable = Pick<pg.Pool, 'query'>
 
+const lockSession = async (client: pg.PoolClient, owner: string, sessionId: string) => {
+  // eslint-disable-next-line no-restricted-syntax -- shared session diagnostics guard, outside the note hierarchy
+  await client.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
+    `agent-session-diagnostics:${owner}`,
+    sessionId,
+  ])
+}
+
 const insertSession = async (
   db: Queryable,
   session: AgentSessionRecord,
@@ -99,7 +106,11 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
     await ctx.ensureInit()
     const result = await ctx.required.query(
       `SELECT ${COLUMNS} FROM agent_sessions
-        WHERE owner = $1 AND id = $2 AND last_seen_at >= $3`,
+        WHERE owner = $1 AND id = $2 AND last_seen_at >= $3
+          AND NOT EXISTS (
+            SELECT 1 FROM agent_session_cleanup_markers marker
+             WHERE marker.owner = agent_sessions.owner AND marker.session_id = agent_sessions.id
+          )`,
       [owner, id, retainedSince],
     )
     const row = result.rows[0] as AgentSessionRow | undefined
@@ -110,6 +121,10 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
     const result = await ctx.required.query(
       `SELECT ${COLUMNS} FROM agent_sessions
         WHERE owner = $1 AND name = $2 AND last_seen_at >= $3
+          AND NOT EXISTS (
+            SELECT 1 FROM agent_session_cleanup_markers marker
+             WHERE marker.owner = agent_sessions.owner AND marker.session_id = agent_sessions.id
+          )
         ORDER BY last_seen_at DESC, id DESC LIMIT $4`,
       [owner, name, retainedSince, limit],
     )
@@ -117,102 +132,26 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
   },
   touch: async (owner, id, lastSeenAt, retainedSince, projectId) => {
     await ctx.ensureInit()
-    const result = await ctx.required.query(
-      `UPDATE agent_sessions
-          SET last_seen_at = GREATEST(last_seen_at, $1), calls = calls + 1,
-              project_id = CASE WHEN $5::boolean THEN $6 ELSE project_id END
-        WHERE owner = $2 AND id = $3 AND last_seen_at >= $4
-      RETURNING ${COLUMNS}`,
-      [lastSeenAt, owner, id, retainedSince, projectId !== undefined, projectId ?? null],
-    )
-    const row = result.rows[0] as AgentSessionRow | undefined
-    return row ? sessionOf(row) : null
-  },
-  inferActiveAndTouch: async (owner, activeSince, lastSeenAt, projectId) => {
-    await ctx.ensureInit()
-    const result = await ctx.required.query(
-      `WITH candidate AS (
-         SELECT MIN(id) AS id
-           FROM agent_sessions
-          WHERE owner = $1 AND last_seen_at >= $2
-         HAVING COUNT(*) = 1
-       )
-       UPDATE agent_sessions AS session
-          SET last_seen_at = GREATEST(session.last_seen_at, $3), calls = session.calls + 1,
-              project_id = CASE WHEN $4::boolean THEN $5 ELSE session.project_id END
-         FROM candidate
-        WHERE session.owner = $1 AND session.id = candidate.id
-      RETURNING session.${COLUMNS.replaceAll(', ', ', session.')}`,
-      [owner, activeSince, lastSeenAt, projectId !== undefined, projectId ?? null],
-    )
-    const row = result.rows[0] as AgentSessionRow | undefined
-    return row ? sessionOf(row) : null
-  },
-  startInferred: async (candidate, activeSince, recentSince, limit, projectId) => {
-    await ctx.ensureInit()
     const client = await ctx.required.connect()
 
     try {
       await client.query('BEGIN')
-      // All start_session decisions for one owner share one world. A name-specific
-      // lock would not serialize this all-active-episodes observation with named starts.
-      // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: one owner's session-start world
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
-        `agent-session:${candidate.owner}`,
-        'start',
-      ])
-      const selected = await client.query(
-        `SELECT ${COLUMNS} FROM agent_sessions
-          WHERE owner = $1 AND last_seen_at >= $2
-          ORDER BY last_seen_at DESC, id DESC LIMIT 2`,
-        [candidate.owner, activeSince],
+      await lockSession(client, owner, id)
+      const result = await client.query(
+        `UPDATE agent_sessions
+          SET last_seen_at = GREATEST(last_seen_at, $1), calls = calls + 1,
+              project_id = CASE WHEN $5::boolean THEN $6 ELSE project_id END
+        WHERE owner = $2 AND id = $3 AND last_seen_at >= $4
+          AND NOT EXISTS (
+            SELECT 1 FROM agent_session_cleanup_markers marker
+             WHERE marker.owner = agent_sessions.owner AND marker.session_id = agent_sessions.id
+          )
+      RETURNING ${COLUMNS}`,
+        [lastSeenAt, owner, id, retainedSince, projectId !== undefined, projectId ?? null],
       )
-      const active = selected.rows as AgentSessionRow[]
-      let result: AgentSessionInferredStart
-
-      if (active.length === 1) {
-        const updated = await client.query(
-          `UPDATE agent_sessions
-              SET last_seen_at = GREATEST(last_seen_at, $1), calls = calls + 1,
-                  project_id = CASE WHEN $4::boolean THEN $5 ELSE project_id END
-            WHERE owner = $2 AND id = $3
-          RETURNING ${COLUMNS}`,
-          [
-            candidate.lastSeenAt,
-            candidate.owner,
-            active[0]!.id,
-            projectId !== undefined,
-            projectId ?? null,
-          ],
-        )
-        result = {
-          kind: 'resumed',
-          record: sessionOf(updated.rows[0] as AgentSessionRow),
-        }
-      } else {
-        const recentSessions =
-          active.length >= 2
-            ? (
-                await client.query(
-                  `SELECT ${COLUMNS} FROM agent_sessions
-                    WHERE owner = $1 AND last_seen_at >= $2
-                    ORDER BY last_seen_at DESC, id DESC LIMIT $3`,
-                  [candidate.owner, recentSince, limit],
-                )
-              ).rows.map((row) => sessionOf(row as AgentSessionRow))
-            : undefined
-        result = {
-          kind: 'new',
-          record: await insertSession(client, {
-            ...candidate,
-            projectId: projectId ?? candidate.projectId,
-          }),
-          ...(recentSessions ? { recentSessions } : {}),
-        }
-      }
-
       await client.query('COMMIT')
-      return result
+      const row = result.rows[0] as AgentSessionRow | undefined
+      return row ? sessionOf(row) : null
     } catch (error) {
       await client.query('ROLLBACK')
       throw error
@@ -226,8 +165,8 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
 
     try {
       await client.query('BEGIN')
-      // All starts for one owner must serialize with unaddressed inference, whose
-      // decision observes the complete active set rather than one name.
+      // Same-owner named starts share one world so resume/fork/ambiguity decisions
+      // cannot observe and mutate different snapshots.
       // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: one owner's session-start world
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
         `agent-session:${candidate.owner}`,
@@ -236,6 +175,10 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
       const matches = await client.query(
         `SELECT ${COLUMNS} FROM agent_sessions
           WHERE owner = $1 AND name = $2 AND last_seen_at >= $3
+            AND NOT EXISTS (
+              SELECT 1 FROM agent_session_cleanup_markers marker
+               WHERE marker.owner = agent_sessions.owner AND marker.session_id = agent_sessions.id
+            )
           ORDER BY last_seen_at DESC, id DESC LIMIT $4`,
         [candidate.owner, candidate.name, retainedSince, limit + 1],
       )
@@ -248,7 +191,22 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
           matches: rows.slice(0, limit).map(sessionOf),
         }
       } else {
-        const match = rows[0]
+        let match: AgentSessionRow | undefined = rows[0]
+
+        if (match) {
+          await lockSession(client, candidate.owner, match.id)
+          const guarded = await client.query(
+            `SELECT ${COLUMNS} FROM agent_sessions
+              WHERE owner = $1 AND id = $2
+                AND NOT EXISTS (
+                  SELECT 1 FROM agent_session_cleanup_markers marker
+                   WHERE marker.owner = agent_sessions.owner
+                     AND marker.session_id = agent_sessions.id
+                )`,
+            [candidate.owner, match.id],
+          )
+          match = guarded.rows[0] as AgentSessionRow | undefined
+        }
 
         if (!match) {
           result = {
@@ -307,6 +265,10 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
     const result = await ctx.required.query(
       `SELECT ${COLUMNS} FROM agent_sessions
         WHERE owner = $1 AND last_seen_at >= $2
+          AND NOT EXISTS (
+            SELECT 1 FROM agent_session_cleanup_markers marker
+             WHERE marker.owner = agent_sessions.owner AND marker.session_id = agent_sessions.id
+          )
         ORDER BY last_seen_at DESC, id DESC LIMIT $3`,
       [owner, since, limit],
     )
@@ -318,6 +280,7 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
 
     try {
       await client.query('BEGIN')
+      await lockSession(client, owner, id)
       const selected = await client.query(
         // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: one agent session row, no tier below it
         `SELECT ${COLUMNS} FROM agent_sessions WHERE owner = $1 AND id = $2 FOR UPDATE`,

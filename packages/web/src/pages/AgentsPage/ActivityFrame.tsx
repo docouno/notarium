@@ -157,6 +157,7 @@ export const ActivityFrame = () => {
           agents={filterAgents}
           onAgent={(agent) => applyFilter({ agent })}
           onQuery={setQuery}
+          onTool={(tool) => applyFilter({ tool })}
         />
       ),
     },
@@ -171,6 +172,9 @@ export const ActivityFrame = () => {
           state={state}
           onSelect={selectDiagnostic}
           onRetry={() => void loadAggregates()}
+          onProblem={(tool) =>
+            applyFilter({ group: 'none', show: 'all', tool, q: null, outcome: 'errors' })
+          }
         />
       ),
     },

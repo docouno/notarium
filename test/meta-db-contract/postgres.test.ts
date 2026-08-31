@@ -3,6 +3,7 @@ import { expect, it } from 'vitest'
 
 import type { RevisionInput } from '@notarium/core'
 
+import { createAgentCallsFacet } from '../../packages/server/src/services/metaDb/drivers/pg/agentCalls'
 import {
   lockRevisionKeys,
   REVISION_LOCK_STRIPE_MASK,
@@ -12,6 +13,7 @@ import { describeAbilityAvailabilityContract } from './abilityAvailabilityContra
 import { describeAbilityCreateContract } from './abilityCreateContract'
 import { describeAbilityPlacementContract } from './abilityPlacementContract'
 import { describeAbilityPreferencesContract } from './abilityPreferencesContract'
+import { describeAgentCallsContract } from './agentCallsContract'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
 import { describeCausalMetadataContract } from './causalMetadataContract'
@@ -416,6 +418,192 @@ describePostgres('live Postgres driver', SUITE, () => {
   describeAgentSessionsContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('agent_sessions_contract')
     return { persistence: testSchema.db.sessions, teardown: testSchema.teardown }
+  })
+
+  describeAgentCallsContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('agent_calls_contract')
+    let db = testSchema.db
+    const facets = () => ({
+      calls: db.agentCalls,
+      sessions: db.sessions,
+      audit: db.sessionAudit,
+      retrievals: db.retrievalLog,
+      revisions: db.revisions,
+    })
+
+    return {
+      ...facets(),
+      restart: async () => {
+        await db.close()
+        db = new PgMetaDb(testSchema.scopedUrl)
+        return facets()
+      },
+      teardown: async () => {
+        if (db !== testSchema.db) {
+          await db.close()
+        }
+        await testSchema.teardown()
+      },
+    }
+  })
+
+  it('re-reads a retention marker after the guard before completing human cleanup', async () => {
+    const testSchema = await createPostgresTestSchema('agent_cleanup_reason_race')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    let releaseSelection!: () => void
+    let reportSelection!: () => void
+    const selectionReleased = new Promise<void>((resolve) => {
+      releaseSelection = resolve
+    })
+    const selectionReported = new Promise<void>((resolve) => {
+      reportSelection = resolve
+    })
+    const query = pool.query.bind(pool)
+    const intercepted = new Proxy(pool, {
+      get: (target, property) => {
+        if (property === 'query') {
+          return async (...args: Parameters<typeof query>) => {
+            const result = await query(...args)
+
+            if (String(args[0]).includes('WHERE cleanup_pending = true')) {
+              reportSelection()
+              await selectionReleased
+            }
+
+            return result
+          }
+        }
+        const value = Reflect.get(target, property, target) as unknown
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    }) as pg.Pool
+    const staleWorker = createAgentCallsFacet({
+      ensureInit: async () => {},
+      close: async () => {},
+      required: intercepted,
+    })
+    const at = '2026-01-01T00:00:00.000Z'
+    const sessionId = 'ses_reason_race'
+    const callId = 'call_reasonrace1'
+
+    try {
+      await testSchema.db.sessions.insert({
+        id: sessionId,
+        owner: 'alice',
+        name: 'Reason race',
+        named: true,
+        parentId: null,
+        createdAt: at,
+        lastSeenAt: at,
+        calls: 1,
+        role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
+        projectId: null,
+      })
+      await testSchema.db.agentCalls.admit({
+        id: callId,
+        owner: 'alice',
+        principal: 'pat:alice:cli',
+        agent: 'CLI',
+        transport: 'mcp',
+        requestId: null,
+        tool: 'start_session',
+        effect: 'mutation',
+        domain: 'session',
+        startedAt: at,
+        inputBytes: 2,
+        inputShape: {},
+        targetSummary: {},
+        fingerprint: callId,
+        projectionVersion: 1,
+        redacted: false,
+        truncated: false,
+      })
+      await testSchema.db.agentCalls.bind('alice', callId, {
+        id: sessionId,
+        name: 'Reason race',
+        attach: 'declared',
+      })
+      await testSchema.db.agentCalls.finalize('alice', callId, {
+        finishedAt: at,
+        durationMs: 0,
+        outcome: 'success',
+        reasonCode: null,
+        outputBytes: 2,
+        issueSummary: null,
+        resultSummary: { 'session.state': 'new' },
+        fingerprint: callId,
+        redacted: false,
+        truncated: false,
+        detailCaptureFailed: false,
+      })
+      for (const queryText of ['legacy-one', 'legacy-two']) {
+        await testSchema.db.retrievalLog.append({
+          owner: 'alice',
+          principal: 'pat:alice:legacy',
+          agent: 'Legacy',
+          sessionId,
+          sessionName: 'Reason race',
+          sessionAttach: 'declared',
+          tool: 'search',
+          query: queryText,
+          project: null,
+          classFilter: null,
+          resultCount: 0,
+          topScore: null,
+          hits: [],
+          createdAt: at,
+        })
+      }
+      await testSchema.db.agentCalls.expireSession({
+        owner: 'alice',
+        sessionId,
+        expiredBefore: '2026-02-01T00:00:00.000Z',
+        acceptedAt: '2026-02-01T00:00:00.000Z',
+        batchSize: 0,
+      })
+      const stale = staleWorker.resumeCleanup(1)
+      await selectionReported
+      await testSchema.db.agentCalls.deleteSession({
+        owner: 'alice',
+        sessionId,
+        activeSince: '2026-02-01T00:00:00.000Z',
+        confirmActive: true,
+        acceptedAt: '2026-02-02T00:00:00.000Z',
+        batchSize: 0,
+      })
+      releaseSelection()
+      await stale
+      const marker = await pool.query(
+        `SELECT reason, cleanup_pending FROM agent_session_cleanup_markers
+          WHERE owner = $1 AND session_id = $2`,
+        ['alice', sessionId],
+      )
+      const legacy = await pool.query(
+        `SELECT query FROM agent_retrievals WHERE owner = $1 AND session_id = $2 ORDER BY query`,
+        ['alice', sessionId],
+      )
+
+      expect(marker.rows).toEqual([{ reason: 'human-delete', cleanup_pending: true }])
+      expect(legacy.rows).toHaveLength(1)
+      await expect(testSchema.db.agentCalls.resumeCleanup(10)).resolves.toMatchObject({
+        completedOwners: ['alice'],
+        pending: false,
+      })
+      expect(
+        (
+          await pool.query('SELECT 1 FROM agent_retrievals WHERE owner = $1 AND session_id = $2', [
+            'alice',
+            sessionId,
+          ])
+        ).rows,
+      ).toEqual([])
+    } finally {
+      releaseSelection?.()
+      await pool.end()
+      await testSchema.teardown()
+    }
   })
 
   describeFavoritesContract('Postgres', async () => {

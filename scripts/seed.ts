@@ -84,6 +84,7 @@ import {
   SYSTEM_PRINCIPAL,
 } from '@notarium/server'
 
+import { TRACE_TOOL_POLICY } from '../packages/server/src/services/agentCalls/traceProjectors'
 import { buildCasesWorld, listCases } from '../test/cases'
 import type { AgentRoleTargetDecl, CaseWorld, ContextSetAttachDecl, UserDecl } from '../test/cases'
 import { applyAgentAbilityPreferences } from '../test/cases/applyAbilityPreferences'
@@ -94,7 +95,7 @@ import { normDate } from '../test/cases/generators'
 import { personalSpaceForPlacement } from '../test/cases/personalSpaceSeam'
 import { resolveAvailabilityDecl } from '../test/cases/resolveAvailability'
 import { materializeRevisionState } from '../test/cases/revisionStates'
-import { agentSessionId } from '../test/cases/sessionIds'
+import { agentCallId, agentSessionId } from '../test/cases/sessionIds'
 import { seedDurableImports } from './seedDurableImports'
 import { applySeedExternalRewrites, identityClaimRewrite } from './seedExternalRewrites'
 import { applySeedExternalSources } from './seedExternalSources'
@@ -1165,6 +1166,94 @@ const run = async (): Promise<void> => {
     agentSessions++
   }
 
+  let agentCalls = 0
+
+  if (world.agentTelemetryDetailed) {
+    const config = await metaDb.agentCalls.config()
+    await metaDb.agentCalls.patchConfig({
+      expectedVersionToken: config.versionToken,
+      detailedEnabled: true,
+      updatedAt: nowIso,
+    })
+  }
+  for (const declaration of world.agentCalls ?? []) {
+    const sessionDeclaration = declaration.sessionRef
+      ? sessionByRef.get(declaration.sessionRef)
+      : undefined
+
+    if (declaration.sessionRef && !sessionDeclaration) {
+      throw new Error(`agent call references unknown session: ${declaration.sessionRef}`)
+    }
+    const owner = declaration.owner
+      ? asUser(declaration.owner)
+      : sessionDeclaration?.owner
+        ? asUser(sessionDeclaration.owner)
+        : primary.username
+    const id = agentCallId(declaration.ref)
+    const startedAt = daysAgoIso(declaration.daysAgo)
+    const durationMs = declaration.durationMs ?? 12
+    const finishedAt = new Date(Date.parse(startedAt) + durationMs).toISOString()
+    const policy = Object.hasOwn(TRACE_TOOL_POLICY, declaration.tool)
+      ? TRACE_TOOL_POLICY[declaration.tool as keyof typeof TRACE_TOOL_POLICY]
+      : null
+
+    if (policy && (declaration.effect !== policy.effect || declaration.domain !== policy.domain)) {
+      throw new Error(
+        `agent call ${declaration.ref} declares ${declaration.effect}/${declaration.domain}; ` +
+          `${declaration.tool} emits ${policy.effect}/${policy.domain}`,
+      )
+    }
+    await metaDb.agentCalls.admit({
+      id,
+      owner,
+      principal: remapPrincipal(declaration.principal) ?? declaration.principal,
+      agent: declaration.agent ?? null,
+      transport: 'mcp',
+      requestId: null,
+      tool: declaration.tool,
+      effect: policy?.effect ?? declaration.effect,
+      domain: policy?.domain ?? declaration.domain,
+      startedAt,
+      inputBytes: 0,
+      inputShape: [],
+      targetSummary: declaration.target ?? null,
+      fingerprint: declaration.fingerprint ?? id.slice(5),
+      projectionVersion: 1,
+      redacted: declaration.redacted ?? false,
+      truncated: declaration.truncated ?? false,
+    })
+    if (sessionDeclaration) {
+      await metaDb.agentCalls.bind(owner, id, {
+        id: agentSessionId(sessionDeclaration.ref),
+        name: sessionDeclaration.name,
+        attach: declaration.sessionAttach ?? 'declared',
+      })
+    }
+    if (declaration.detailed) {
+      await metaDb.agentCalls.appendDetail({
+        owner,
+        id,
+        payload: declaration.detailed,
+        createdAt: finishedAt,
+        expiresAt: new Date(Date.parse(finishedAt) + 30 * 86_400_000).toISOString(),
+      })
+    }
+    await metaDb.agentCalls.finalize(owner, id, {
+      finishedAt,
+      durationMs,
+      outcome: declaration.outcome,
+      reasonCode: declaration.reasonCode ?? null,
+      outputBytes: 0,
+      issueSummary: declaration.issues ?? null,
+      resultSummary: declaration.result ?? null,
+      fingerprint: declaration.fingerprint ?? id.slice(5),
+      redacted: declaration.redacted ?? false,
+      truncated: declaration.truncated ?? false,
+      detailCaptureFailed: declaration.detailCaptureFailed ?? false,
+    })
+    agentCalls++
+  }
+
   // 4. Replay the timeline. Group by space and replay each space's events in date
   //    order (they arrive globally sorted, so per-space order is preserved). The
   //    journal is per-space and there is no cross-space ordering requirement, so
@@ -1227,9 +1316,15 @@ const run = async (): Promise<void> => {
       const declaredSession = e.agentAudit?.sessionRef
         ? sessionByRef.get(e.agentAudit.sessionRef)
         : undefined
+      const declaredCall = e.agentAudit?.callRef
+        ? world.agentCalls?.find((candidate) => candidate.ref === e.agentAudit?.callRef)
+        : undefined
 
       if (e.agentAudit?.sessionRef && !declaredSession) {
         throw new Error(`agent write references unknown session: ${e.agentAudit.sessionRef}`)
+      }
+      if (e.agentAudit?.callRef && !declaredCall) {
+        throw new Error(`agent write references unknown call: ${e.agentAudit.callRef}`)
       }
       const auditOwner = e.agentAudit
         ? resolveSeedAgentActivityOwner({
@@ -1244,6 +1339,7 @@ const run = async (): Promise<void> => {
         ? {
             owner: auditOwner,
             agent: e.agentAudit?.agent ?? null,
+            ...(e.agentAudit?.callRef ? { agentCallId: agentCallId(e.agentAudit.callRef) } : {}),
             ...(declaredSession && e.agentAudit?.sessionRef
               ? {
                   session: {
@@ -1764,6 +1860,7 @@ const run = async (): Promise<void> => {
       sessionId: r.sessionRef ? agentSessionId(r.sessionRef) : null,
       sessionName: declaredSession?.name ?? null,
       sessionAttach: r.sessionRef ? (r.sessionAttach ?? 'declared') : null,
+      agentCallId: r.callRef ? agentCallId(r.callRef) : null,
       tool: r.tool,
       query,
       project: r.project ?? null,
@@ -1774,6 +1871,41 @@ const run = async (): Promise<void> => {
       createdAt: new Date(nowMs - r.daysAgo * 86_400_000).toISOString(),
     })
     retrievals++
+  }
+
+  let agentCleanupMarkers = 0
+
+  for (const marker of world.agentCleanupMarkers ?? []) {
+    const session = sessionByRef.get(marker.sessionRef)
+
+    if (!session) {
+      throw new Error(`agent cleanup marker references unknown session: ${marker.sessionRef}`)
+    }
+    const owner = marker.owner
+      ? asUser(marker.owner)
+      : session.owner
+        ? asUser(session.owner)
+        : primary.username
+
+    for (const operation of marker.operations) {
+      const common = {
+        owner,
+        sessionId: agentSessionId(marker.sessionRef),
+        acceptedAt: nowIso,
+        batchSize: operation.cleanup === 'pending' ? 0 : 10_000,
+      }
+
+      if (operation.reason === 'retention') {
+        await metaDb.agentCalls.expireSession({ ...common, expiredBefore: nowIso })
+      } else {
+        await metaDb.agentCalls.deleteSession({
+          ...common,
+          activeSince: nowIso,
+          confirmActive: true,
+        })
+      }
+    }
+    agentCleanupMarkers++
   }
 
   // 6. Durable jobs (#105) + their artifacts. Runs AFTER the replay so a seeded export
@@ -1995,6 +2127,8 @@ const run = async (): Promise<void> => {
           connectedApps,
           pendingOAuthClients,
           agentSessions,
+          agentCalls,
+          agentCleanupMarkers,
           agentRoles: appliedRoles.length,
           agentSkills: appliedSkills.length,
           agentAbilityPreferences,

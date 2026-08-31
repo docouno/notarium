@@ -35,6 +35,7 @@ import {
 } from '../../../../services/mcp/descriptions'
 import { createGateway, type McpGateway, type ToolResult } from '../../../../services/mcp/gateway'
 import type {
+  AgentCallTracePersistence,
   AgentDeltaCursorsPersistence,
   AgentSessionsPersistence,
   ContextOrderPersistence,
@@ -65,6 +66,7 @@ export type McpOptions = {
   /** Absent ⇒ no retrieval audit capture (P5 honest degradation).
    *  canon: docs/projects.md#activity-auditing-agent-work-243-321-mem-audita */
   retrievalLog?: RetrievalLogPersistence
+  agentCalls?: AgentCallTracePersistence
   projects?: ProjectsPersistence
   /** Absent on a host without a meta-DB / marker FS ⇒ container-reorg tools off (P5). */
   folders?: FolderIdentityPersistence
@@ -104,6 +106,9 @@ type RegisterGatewayTool = (
 
 const MODERN_PROTOCOL_VERSION = '2026-07-28'
 const SUBSCRIPTIONS_LISTEN_METHOD = 'subscriptions/listen'
+const AGENT_TRACE_MAINTENANCE_MS = 60_000
+const AGENT_TRACE_MAINTENANCE_BATCH = 500
+const AGENT_TRACE_CLEANUP_CONTINUE_MS = 1_000
 
 const publishableSchema = (
   runtime: z.ZodTypeAny,
@@ -138,6 +143,7 @@ export const buildServer = (
   gateway: McpGateway,
   principal: Principal,
   mutationGate?: MutationGate,
+  callMeta?: { requestId?: string | number },
 ): McpServer => {
   const server = new McpServer(SERVER_INFO, {
     instructions: SERVER_INSTRUCTIONS,
@@ -173,7 +179,7 @@ export const buildServer = (
         annotations: t.annotations,
       },
       async (args: unknown) => {
-        const call = () => gateway.callTool(principal, t.name, args)
+        const call = () => gateway.callTool(principal, t.name, args, callMeta)
 
         return mutationGate ? mutationGate.run(call) : call()
       },
@@ -181,6 +187,30 @@ export const buildServer = (
   }
 
   return server
+}
+
+const toolCallEnvelopeOf = (
+  body: unknown,
+): { id?: string | number; name: string; args: unknown } | null => {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return null
+  }
+  const message = body as Record<string, unknown>
+
+  if (message.method !== 'tools/call' || !message.params || typeof message.params !== 'object') {
+    return null
+  }
+  const params = message.params as Record<string, unknown>
+
+  if (typeof params.name !== 'string') {
+    return null
+  }
+  const id = message.id
+  return {
+    ...(typeof id === 'string' || typeof id === 'number' ? { id } : {}),
+    name: params.name,
+    args: params.arguments ?? {},
+  }
 }
 
 const modernSubscriptionId = (
@@ -215,6 +245,7 @@ export const registerMcp = async (
     agentDeltaCursors,
     gatewayState,
     retrievalLog,
+    agentCalls,
     projects,
     folders,
     contextSets,
@@ -241,6 +272,7 @@ export const registerMcp = async (
     agentDeltaCursors,
     gatewayState,
     retrievalLog,
+    agentCalls,
     projects,
     folders,
     contextSets,
@@ -253,6 +285,65 @@ export const registerMcp = async (
     viewProjectionAdapters,
     runMutation: mutationGate ? (task) => mutationGate.run(task) : undefined,
   })
+
+  if (agentCalls) {
+    const startedAt = new Date().toISOString()
+
+    try {
+      await agentCalls.recoverInterrupted(startedAt, startedAt)
+    } catch (error) {
+      console.error('[mcp] agent trace recovery ->', (error as Error)?.message)
+    }
+
+    let maintenanceTail = Promise.resolve()
+    let continuationTimer: ReturnType<typeof setTimeout> | undefined
+
+    const maintain = (cleanupOnly = false): void => {
+      maintenanceTail = maintenanceTail
+        .then(async () => {
+          let cleanupPending = false
+
+          const task = async () => {
+            const now = new Date().toISOString()
+            const maintainedOwners = cleanupOnly
+              ? []
+              : await agentCalls.maintain({
+                  now,
+                  batchSize: AGENT_TRACE_MAINTENANCE_BATCH,
+                })
+            const cleanup = await agentCalls.resumeCleanup(AGENT_TRACE_MAINTENANCE_BATCH)
+            const changed = new Set([...maintainedOwners, ...cleanup.completedOwners])
+            cleanupPending = cleanup.pending
+
+            for (const owner of changed) {
+              auth.notifyAgentSessionsChanged(owner)
+            }
+          }
+
+          await (mutationGate ? mutationGate.run(task) : task())
+
+          if (cleanupPending && continuationTimer == null) {
+            continuationTimer = setTimeout(() => {
+              continuationTimer = undefined
+              maintain(true)
+            }, AGENT_TRACE_CLEANUP_CONTINUE_MS)
+            continuationTimer.unref()
+          }
+        })
+        .catch((error) => {
+          console.error('[mcp] agent trace maintenance ->', (error as Error)?.message)
+        })
+    }
+    const maintenanceTimer = setInterval(maintain, AGENT_TRACE_MAINTENANCE_MS)
+    maintenanceTimer.unref()
+    app.addHook('preClose', async () => {
+      clearInterval(maintenanceTimer)
+      if (continuationTimer != null) {
+        clearTimeout(continuationTimer)
+      }
+      await maintenanceTail
+    })
+  }
 
   /** 401 carrying the RFC 9728 WWW-Authenticate challenge when the OAuth facade is on. */
   const challenge401 = (req: FastifyRequest, reply: FastifyReply) => {
@@ -315,13 +406,41 @@ export const registerMcp = async (
         }
       }
 
+      const toolCall = toolCallEnvelopeOf(req.body)
+      const visible = toolCall
+        ? gateway.listTools(principal).find((tool) => tool.name === toolCall.name)
+        : undefined
+      const validVisible = visible ? visible.input.safeParse(toolCall!.args).success : false
+
+      // The SDK validates registered input and hides unauthorized tools before its
+      // callback. Route only those terminal cases through the gateway here so the
+      // authenticated envelope still receives one durable trace row without making
+      // hidden tools visible in tools/list.
+      if (toolCall && !validVisible) {
+        const execute = () =>
+          gateway.callTool(principal, toolCall.name, toolCall.args, { requestId: toolCall.id })
+        const result = await (mutationGate ? mutationGate.run(execute) : execute())
+
+        if (!visible) {
+          return reply.send({
+            jsonrpc: '2.0',
+            id: toolCall.id ?? null,
+            error: { code: -32602, message: `Tool ${toolCall.name} not found` },
+          })
+        }
+
+        return reply.send({ jsonrpc: '2.0', id: toolCall.id ?? null, result })
+      }
+
       // Both transports write directly to the Node response. Once hijacked,
       // every unexpected throw must be handled here or the agent hangs.
       reply.hijack()
       hijacked = true
 
       if (legacy) {
-        const server = buildServer(gateway, principal, mutationGate)
+        const server = buildServer(gateway, principal, mutationGate, {
+          requestId: toolCall?.id,
+        })
         const transport = new NodeStreamableHTTPServerTransport({
           sessionIdGenerator: undefined, // stateless: one pair per request
           enableJsonResponse: true,
@@ -337,11 +456,14 @@ export const registerMcp = async (
         return
       }
 
-      const handler = createMcpHandler(() => buildServer(gateway, principal, mutationGate), {
-        legacy: 'reject',
-        responseMode: 'auto',
-        onerror: (err) => console.error('[mcp] handler ->', err.message),
-      })
+      const handler = createMcpHandler(
+        () => buildServer(gateway, principal, mutationGate, { requestId: toolCall?.id }),
+        {
+          legacy: 'reject',
+          responseMode: 'auto',
+          onerror: (err) => console.error('[mcp] handler ->', err.message),
+        },
+      )
       const handleModern = toNodeHandler(handler, {
         onerror: (err) => console.error('[mcp] adapter ->', err.message),
       })

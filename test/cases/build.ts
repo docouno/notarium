@@ -3,6 +3,8 @@ import { getCase } from './registry'
 import { makeRng } from './rng'
 import type {
   AgentAbilityPreferenceDecl,
+  AgentCallDecl,
+  AgentCleanupMarkerDecl,
   AgentDeltaCursorDecl,
   AgentRoleDecl,
   AgentSessionDecl,
@@ -133,6 +135,9 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
   const favorites = new Map<string, FavoriteDecl>()
   const retrievals: RetrievalDecl[] = []
   const agentSessions: AgentSessionDecl[] = []
+  const agentCalls: AgentCallDecl[] = []
+  const agentCleanupMarkers: AgentCleanupMarkerDecl[] = []
+  let agentTelemetryDetailed = false
   const agentRoles = new Map<string, AgentRoleDecl>()
   const agentSkills = new Map<string, AgentSkillDecl>()
   const agentAbilityPreferences = new Map<string, AgentAbilityPreferenceDecl>()
@@ -334,6 +339,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
       retrievals.push({
         ...r,
         ...(r.sessionRef ? { sessionRef: `${name}:${r.sessionRef}` } : {}),
+        ...(r.callRef ? { callRef: `${name}:${r.callRef}` } : {}),
         hits: r.hits?.map((h) => ({ ...h, note: `${name}:${h.note}` })),
       })
     }
@@ -346,6 +352,20 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
         ...(session.parentRef ? { parentRef: `${name}:${session.parentRef}` } : {}),
       })
     }
+    for (const call of world.agentCalls ?? []) {
+      agentCalls.push({
+        ...call,
+        ref: `${name}:${call.ref}`,
+        ...(call.sessionRef ? { sessionRef: `${name}:${call.sessionRef}` } : {}),
+      })
+    }
+    for (const marker of world.agentCleanupMarkers ?? []) {
+      agentCleanupMarkers.push({
+        ...marker,
+        sessionRef: `${name}:${marker.sessionRef}`,
+      })
+    }
+    agentTelemetryDetailed ||= world.agentTelemetryDetailed === true
     for (const role of world.agentRoles ?? []) {
       const target = role.target
       const key =
@@ -474,6 +494,9 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     favorites: favorites.size ? [...favorites.values()] : undefined,
     ...(retrievals.length ? { retrievals } : {}),
     ...(agentSessions.length ? { agentSessions } : {}),
+    ...(agentCalls.length ? { agentCalls } : {}),
+    ...(agentCleanupMarkers.length ? { agentCleanupMarkers } : {}),
+    ...(agentTelemetryDetailed ? { agentTelemetryDetailed: true } : {}),
     ...(agentRoles.size ? { agentRoles: [...agentRoles.values()] } : {}),
     ...(agentSkills.size ? { agentSkills: [...agentSkills.values()] } : {}),
     ...(agentAbilityPreferences.size

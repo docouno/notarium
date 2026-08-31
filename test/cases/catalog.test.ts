@@ -16,7 +16,7 @@ import { buildCasesWorld, buildCaseWorld, DEFAULT_NOW, mergeWorlds } from './bui
 import { normDate } from './generators'
 import { CASES, getCase, listCases } from './registry'
 import { materializeRevisionState } from './revisionStates'
-import { agentSessionId } from './sessionIds'
+import { agentCallId, agentSessionId } from './sessionIds'
 import { caseToFixture } from './toFixture'
 import type { AgentRoleTargetDecl, CaseWorld } from './types'
 
@@ -508,6 +508,38 @@ describe('seed catalog (#175)', () => {
     ).toBe(true)
   })
 
+  it('agent-telemetry-detailed is a review matrix, not a two-call smoke fixture', () => {
+    const world = buildCaseWorld('agent-telemetry-detailed', { now: DEFAULT_NOW })
+    const calls = world.agentCalls ?? []
+
+    expect(world.agentTelemetryDetailed).toBe(true)
+    expect(world.agentSessions).toHaveLength(12)
+    expect(calls).toHaveLength(22)
+    expect(new Set(calls.map((call) => call.outcome))).toEqual(
+      new Set(['success', 'invalid_arguments', 'denied', 'tool_error', 'internal_error']),
+    )
+    expect(new Set(calls.map((call) => call.effect))).toEqual(
+      new Set(['read', 'mutation', 'control']),
+    )
+    expect(calls.filter((call) => call.detailed)).toHaveLength(14)
+    expect(calls.filter((call) => !call.detailed)).toHaveLength(8)
+    expect(calls.filter((call) => call.fingerprint === 'seed-invalid-search-query')).toHaveLength(3)
+    expect(calls.filter((call) => call.detailCaptureFailed)).toHaveLength(1)
+    expect(calls.some((call) => !call.sessionRef)).toBe(true)
+    expect(calls.some((call) => call.owner === 'bob')).toBe(true)
+    expect(world.agentCleanupMarkers).toHaveLength(2)
+
+    const fixture = caseToFixture(world)
+    expect(fixture.agentCalls).toHaveLength(22)
+    expect(fixture.agentCallDetails).toHaveLength(14)
+    expect(fixture.agentCleanupMarkers).toHaveLength(2)
+    expect(
+      fixture.spaces
+        .flatMap((space) => space.activity ?? [])
+        .filter((event) => event.agent?.agentCallId === agentCallId('review-root-move')),
+    ).toHaveLength(2)
+  })
+
   it('agent-roles keeps catalog-only, owned-idle, and owned-active states distinct', () => {
     const world = buildCaseWorld('agent-roles', { now: DEFAULT_NOW })
 
@@ -994,6 +1026,9 @@ describe('seed catalog (#175)', () => {
     favorites: true,
     retrievals: true,
     agentSessions: true,
+    agentCalls: true,
+    agentCleanupMarkers: true,
+    agentTelemetryDetailed: true,
     agentRoles: true,
     agentSkills: true,
     agentAbilityPreferences: true,

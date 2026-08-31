@@ -68,3 +68,23 @@ describe('pollJobToTerminal', () => {
     await expect(outcome).resolves.toMatchObject({ name: 'AbortError' })
   })
 })
+
+describe('agent session deletion transport', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('preserves the server distinction between deleting and complete', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response('{"status":"deleting"}', {
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+        }),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.agentSessionDelete('ses_example0000')).resolves.toBe('deleting')
+    await expect(api.agentSessionDelete('ses_example0000', true)).resolves.toBe('complete')
+  })
+})

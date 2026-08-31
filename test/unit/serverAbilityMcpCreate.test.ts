@@ -369,15 +369,25 @@ describe('production MCP ability create — real FS + SQLite', () => {
         headers: { cookie },
       })
       expect(activity.statusCode).toBe(200)
-      expect(activity.json().events).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            type: 'write',
-            noteId: operation.note_id,
-            principal: expect.stringMatching(/^pat:alice:/),
-          }),
-        ]),
+      const createCall = activity
+        .json()
+        .events.find(
+          (event: { type: string; tool?: string }) =>
+            event.type === 'call' && event.tool === 'create_ability',
+        ) as { id: string; principal: string } | undefined
+      expect(createCall).toEqual(
+        expect.objectContaining({ principal: expect.stringMatching(/^pat:alice:/) }),
       )
+
+      const detail = await app!.inject({
+        method: 'GET',
+        url: `/api/me/agent-calls/${createCall!.id}`,
+        headers: { cookie },
+      })
+      expect(detail.statusCode).toBe(200)
+      expect(detail.json()).toMatchObject({
+        links: { revisions: [expect.objectContaining({ noteId: operation.note_id })] },
+      })
     } finally {
       raw.close()
     }

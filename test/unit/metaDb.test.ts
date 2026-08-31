@@ -2301,12 +2301,13 @@ describe('SqliteMetaDb', () => {
       const a = await db.retrievalLog.append(
         ret({ query: 'tie-a', createdAt: '2026-07-04T00:00:00.000Z' }),
       )
+      expect(a).not.toBeNull()
       await db.retrievalLog.append(ret({ query: 'tie-b', createdAt: '2026-07-04T00:00:00.000Z' }))
       const tieNext = await db.retrievalLog.history({
         owner: 'alice',
         offset: 0,
         limit: 1,
-        before: { at: '2026-07-04T00:00:00.000Z', id: String(Number(a.id) + 1) },
+        before: { at: '2026-07-04T00:00:00.000Z', id: String(Number(a!.id) + 1) },
       })
       expect(tieNext.items.map((i) => i.query)).toEqual(['tie-a'])
     })

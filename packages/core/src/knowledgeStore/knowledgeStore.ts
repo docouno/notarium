@@ -837,6 +837,8 @@ export type AgentSessionAttribution = {
 export type AgentWriteAttribution = {
   owner: string
   agent: string | null
+  /** Transport-neutral identity of the operation that produced this revision. */
+  agentCallId?: string
   session?: AgentSessionAttribution
 }
 
