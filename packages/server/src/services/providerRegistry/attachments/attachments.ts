@@ -6,7 +6,6 @@ import {
   type ProviderAttachmentListItem,
   type ProviderAttachmentView,
   type ProviderDisclosureSnapshot,
-  type ProviderResource,
   type ProviderTargetKind,
 } from '@notarium/contract'
 import { freshNoteId } from '@notarium/core'
@@ -66,8 +65,10 @@ export const providerDisclosureOf = (
     targetSpace,
     resourceOwner: resource.owner,
     baseUrl: resource.baseUrl,
-    purposes: [...resource.purposes],
-    models: resource.models.map((model) => ({ ...model })),
+    models: resource.models.map(({ name, capabilities }) => ({
+      name,
+      capabilities: [...capabilities],
+    })),
     allowPrivateNetwork: resource.allowPrivateNetwork,
     headerNames: [...headerNames].sort(),
   }
@@ -81,7 +82,7 @@ const sameDisclosure = (
 type ProviderAttachmentProjector = (
   record: ProviderResourceRecord,
   viewerOwner: string,
-) => ProviderResource
+) => ProviderAttachmentView['resource']
 
 type ProviderAttachmentListProjector = (
   record: ProviderResourceRecord,

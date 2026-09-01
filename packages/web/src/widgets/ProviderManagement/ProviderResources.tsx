@@ -1,22 +1,38 @@
-import { type FormEvent, useEffect, useMemo, useState } from 'react'
+import {
+  type Dispatch,
+  type FormEvent,
+  type SetStateAction,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import type {
   CredentialListItem,
-  ProviderModel,
+  ModelCapability,
+  ProviderModelWrite,
   ProviderResource,
   ProviderResourceCreateRequest,
   ProviderResourceHeaderPatch,
   ProviderResourceListItem,
   ProviderResourcePatchRequest,
-  Purpose,
   Wire,
 } from '@notarium/contract'
-import { MODEL_STATUS, PROVIDER_STATUS, PURPOSE, WIRE } from '@notarium/contract/enums'
+import { MODEL_CAPABILITY, PROVIDER_STATUS, WIRE } from '@notarium/contract/enums'
 import { Button } from '../../core/Button'
 import { Checkbox } from '../../core/Checkbox'
 import { useDialog } from '../../core/Dialog'
 import { DisclosureCard } from '../../core/DisclosureCard'
 import { EmptyState } from '../../core/EmptyState'
-import { IconEdit, IconLink, IconPlus, IconRefresh, IconTrash } from '../../core/Icons'
+import {
+  IconEdit,
+  IconLink,
+  IconPlus,
+  IconRefresh,
+  IconStar,
+  IconStarFilled,
+  IconTrash,
+} from '../../core/Icons'
 import { Notice } from '../../core/Notice'
 import { Select } from '../../core/Select'
 import { SettingsSection } from '../../core/SettingsSection'
@@ -39,9 +55,8 @@ type ResourceDraft = {
   wire: Wire
   baseUrl: string
   allowPrivateNetwork: boolean
-  purposes: Purpose[]
-  modelNames: string
-  defaultModel: string
+  models: ModelDraft[]
+  defaultModelKey: string | null
   credentialId: string
   firstByteTimeoutMs: string
   callTimeoutMs: string
@@ -49,7 +64,10 @@ type ResourceDraft = {
   headers: HeaderDraft[]
 }
 
+type ModelDraft = ProviderModelWrite & { key: string }
+
 let nextHeaderKey = 0
+let nextModelKey = 0
 const headerRow = (name = '', originalName: string | null = null): HeaderDraft => ({
   key: `header-${++nextHeaderKey}`,
   originalName,
@@ -58,36 +76,85 @@ const headerRow = (name = '', originalName: string | null = null): HeaderDraft =
   remove: false,
 })
 
-const modelsOf = (value: string, current: ProviderModel[] = []): ProviderModel[] => {
-  const existing = new Map(current.map((model) => [model.name, model]))
+const capabilityOrder = [MODEL_CAPABILITY.completion, MODEL_CAPABILITY.embedding] as const
+const canonicalCapabilities = (capabilities: readonly ModelCapability[]): ModelCapability[] =>
+  capabilityOrder.filter((capability) => capabilities.includes(capability))
 
-  return [
-    ...new Set(
-      value
-        .split(/\r?\n/u)
-        .map((name) => name.trim())
-        .filter(Boolean),
-    ),
-  ].map((name) => existing.get(name) ?? { name, dimensions: null, status: MODEL_STATUS.available })
+const modelRow = (model?: ProviderModelWrite): ModelDraft => ({
+  key: `model-${++nextModelKey}`,
+  name: model?.name ?? '',
+  capabilities: canonicalCapabilities(model?.capabilities ?? [MODEL_CAPABILITY.completion]),
+})
+
+const modelsOf = (draft: ResourceDraft): ProviderModelWrite[] =>
+  draft.models.map(({ name, capabilities }) => ({
+    name,
+    capabilities: canonicalCapabilities(capabilities),
+  }))
+
+const defaultModelOf = (draft: ResourceDraft): string | null =>
+  draft.models.find((model) => model.key === draft.defaultModelKey)?.name ?? null
+
+const modelDraftError = (draft: ResourceDraft): string | null => {
+  const models = modelsOf(draft)
+
+  if (models.some(({ name }) => name.trim().length === 0)) {
+    return 'Every model name must contain a non-whitespace character.'
+  }
+  if (new Set(models.map(({ name }) => name)).size !== models.length) {
+    return 'Model names must be unique exactly as entered.'
+  }
+  if (models.some(({ capabilities }) => capabilities.length === 0)) {
+    return 'Every model needs at least one capability.'
+  }
+  if (draft.defaultModelKey && defaultModelOf(draft) === null) {
+    return 'The default must name one exact model row.'
+  }
+
+  return null
 }
+
+const comparableDraft = (draft: ResourceDraft) => ({
+  ...draft,
+  models: modelsOf(draft),
+  defaultModel: defaultModelOf(draft),
+  defaultModelKey: undefined,
+  headers: draft.headers.map(({ name, originalName, remove, value }) => ({
+    name,
+    originalName,
+    remove,
+    value,
+  })),
+})
+const sameJson = (left: unknown, right: unknown): boolean =>
+  JSON.stringify(left) === JSON.stringify(right)
+
+const authoredModelsOf = (resource: ProviderResource): ProviderModelWrite[] =>
+  resource.models.map(({ name, capabilities }) => ({
+    name,
+    capabilities: canonicalCapabilities(capabilities),
+  }))
 
 const timeoutOf = (value: string): number | null => (value.trim() ? Number(value) : null)
 
-const draftOf = (resource?: ProviderResource): ResourceDraft => ({
-  name: resource?.name ?? '',
-  wire: resource?.wire ?? WIRE.openaiCompatible,
-  baseUrl: resource?.baseUrl ?? 'https://openrouter.ai/api/v1',
-  allowPrivateNetwork: resource?.allowPrivateNetwork ?? false,
-  purposes: resource?.purposes ?? [PURPOSE.chat],
-  modelNames: resource?.models.map((model) => model.name).join('\n') ?? '',
-  defaultModel: resource?.defaultModel ?? '',
-  credentialId: resource?.credentialId ?? '',
-  firstByteTimeoutMs:
-    resource?.firstByteTimeoutMs == null ? '' : String(resource.firstByteTimeoutMs),
-  callTimeoutMs: resource?.callTimeoutMs == null ? '' : String(resource.callTimeoutMs),
-  disabled: resource?.disabledAt != null,
-  headers: resource?.headerNames?.map((name) => headerRow(name, name)) ?? [],
-})
+const draftOf = (resource?: ProviderResource): ResourceDraft => {
+  const models = resource?.models.map((model) => modelRow(model)) ?? []
+
+  return {
+    name: resource?.name ?? '',
+    wire: resource?.wire ?? WIRE.openaiCompatible,
+    baseUrl: resource?.baseUrl ?? 'https://openrouter.ai/api/v1',
+    allowPrivateNetwork: resource?.allowPrivateNetwork ?? false,
+    models,
+    defaultModelKey: models.find((model) => model.name === resource?.defaultModel)?.key ?? null,
+    credentialId: resource?.credentialId ?? '',
+    firstByteTimeoutMs:
+      resource?.firstByteTimeoutMs == null ? '' : String(resource.firstByteTimeoutMs),
+    callTimeoutMs: resource?.callTimeoutMs == null ? '' : String(resource.callTimeoutMs),
+    disabled: resource?.disabledAt != null,
+    headers: resource?.headerNames?.map((name) => headerRow(name, name)) ?? [],
+  }
+}
 
 export const providerHeaderPatchOf = (headers: HeaderDraft[]): ProviderResourceHeaderPatch => {
   const patch: ProviderResourceHeaderPatch = {}
@@ -119,9 +186,8 @@ const createInput = (draft: ResourceDraft): ProviderResourceCreateRequest => ({
       .map((header) => [header.name.trim(), header.value]),
   ),
   allowPrivateNetwork: draft.allowPrivateNetwork,
-  purposes: draft.purposes,
-  models: modelsOf(draft.modelNames),
-  defaultModel: draft.defaultModel.trim() || null,
+  models: modelsOf(draft),
+  defaultModel: defaultModelOf(draft),
   credentialId: draft.credentialId || null,
   firstByteTimeoutMs: timeoutOf(draft.firstByteTimeoutMs),
   callTimeoutMs: timeoutOf(draft.callTimeoutMs),
@@ -132,7 +198,7 @@ export const providerResourcePatchOf = (
   draft: ResourceDraft,
 ): ProviderResourcePatchRequest => {
   const patch: ProviderResourcePatchRequest = {}
-  const models = modelsOf(draft.modelNames, current.models)
+  const models = modelsOf(draft)
   const headers = providerHeaderPatchOf(draft.headers)
   const firstByteTimeoutMs = timeoutOf(draft.firstByteTimeoutMs)
   const callTimeoutMs = timeoutOf(draft.callTimeoutMs)
@@ -149,14 +215,13 @@ export const providerResourcePatchOf = (
   if (draft.allowPrivateNetwork !== current.allowPrivateNetwork) {
     patch.allowPrivateNetwork = draft.allowPrivateNetwork
   }
-  if (JSON.stringify(draft.purposes) !== JSON.stringify(current.purposes)) {
-    patch.purposes = draft.purposes
-  }
-  if (JSON.stringify(models) !== JSON.stringify(current.models)) {
+  if (JSON.stringify(models) !== JSON.stringify(authoredModelsOf(current))) {
     patch.models = models
   }
-  if ((draft.defaultModel.trim() || null) !== current.defaultModel) {
-    patch.defaultModel = draft.defaultModel.trim() || null
+  const defaultModel = defaultModelOf(draft)
+
+  if (defaultModel !== current.defaultModel) {
+    patch.defaultModel = defaultModel
   }
   if ((draft.credentialId || null) !== (current.credentialId ?? null)) {
     patch.credentialId = draft.credentialId || null
@@ -186,18 +251,18 @@ const recipientOf = (baseUrl: string): string => {
 }
 
 const resourceAdvancedSummary = (draft: ResourceDraft): string => {
-  const purposes = draft.purposes.length
-    ? draft.purposes
-        .map((purpose) => (purpose === PURPOSE.embedding ? 'Embeddings' : 'Chat'))
-        .join(' + ')
-    : 'No purpose'
+  const capabilities = capabilityOrder.filter((capability) =>
+    draft.models.some((model) => model.capabilities.includes(capability)),
+  )
+  const modelSummary = `${draft.models.length} model${draft.models.length === 1 ? '' : 's'}`
+  const capabilitySummary = capabilities.length ? capabilities.join(' + ') : 'no capabilities'
   const network = draft.allowPrivateNetwork ? 'private opt-in' : 'external only'
   const timeouts =
     draft.firstByteTimeoutMs || draft.callTimeoutMs ? 'custom timeouts' : 'automatic timeouts'
   const headers = draft.headers.length
     ? `${draft.headers.length} custom header${draft.headers.length === 1 ? '' : 's'}`
     : 'no custom headers'
-  return `${purposes} · ${network} · ${timeouts} · ${headers}${draft.disabled ? ' · disabled' : ''}`
+  return `${modelSummary}, ${capabilitySummary} · ${network} · ${timeouts} · ${headers}${draft.disabled ? ' · disabled' : ''}`
 }
 
 const ResourceFields = ({
@@ -205,6 +270,7 @@ const ResourceFields = ({
   setDraft,
   credentials,
   creating,
+  disabled,
   advancedOpen,
   onAdvancedToggle,
   credentialsNextCursor,
@@ -213,9 +279,10 @@ const ResourceFields = ({
   onLoadMoreCredentials,
 }: {
   draft: ResourceDraft
-  setDraft: (next: ResourceDraft) => void
+  setDraft: Dispatch<SetStateAction<ResourceDraft>>
   credentials: CredentialListItem[]
   creating: boolean
+  disabled: boolean
   advancedOpen: boolean
   onAdvancedToggle: (open: boolean) => void
   credentialsNextCursor: string | null
@@ -223,12 +290,57 @@ const ResourceFields = ({
   credentialContinuationError: string | null
   onLoadMoreCredentials: () => Promise<void>
 }) => {
-  const setPurpose = (purpose: Purpose, checked: boolean) => {
-    const purposes = checked
-      ? [...new Set([...draft.purposes, purpose])]
-      : draft.purposes.filter((candidate) => candidate !== purpose)
-    setDraft({ ...draft, purposes })
+  const addModel = () => setDraft({ ...draft, models: [...draft.models, modelRow()] })
+
+  const changeModel = (key: string, change: Partial<ProviderModelWrite>) => {
+    setDraft({
+      ...draft,
+      models: draft.models.map((model) => {
+        if (model.key !== key) {
+          return model
+        }
+        const next = { ...model, ...change }
+
+        return { ...next, capabilities: canonicalCapabilities(next.capabilities) }
+      }),
+    })
   }
+
+  const setCapability = (key: string, capability: ModelCapability, checked: boolean) => {
+    const model = draft.models.find((candidate) => candidate.key === key)
+
+    if (!model) {
+      return
+    }
+    changeModel(key, {
+      capabilities: checked
+        ? [...model.capabilities, capability]
+        : model.capabilities.filter((candidate) => candidate !== capability),
+    })
+  }
+
+  const removeModel = (key: string) => {
+    setDraft({
+      ...draft,
+      models: draft.models.filter((model) => model.key !== key),
+      defaultModelKey: key === draft.defaultModelKey ? null : draft.defaultModelKey,
+    })
+  }
+
+  const toggleDefaultModel = (key: string) =>
+    setDraft((current) => {
+      const model = current.models.find((candidate) => candidate.key === key)
+
+      if (!model?.name.length) {
+        return current
+      }
+
+      return {
+        ...current,
+        defaultModelKey: current.defaultModelKey === key ? null : key,
+      }
+    })
+
   const addHeader = () => setDraft({ ...draft, headers: [...draft.headers, headerRow()] })
   const changeHeader = (key: string, change: Partial<HeaderDraft>) =>
     setDraft({
@@ -246,6 +358,7 @@ const ResourceFields = ({
           <input
             value={draft.name}
             required
+            disabled={disabled}
             data-testid="provider-name"
             onChange={(event) => setDraft({ ...draft, name: event.target.value })}
           />
@@ -254,6 +367,7 @@ const ResourceFields = ({
           <span>Wire protocol</span>
           <Select<Wire>
             value={draft.wire}
+            disabled={disabled}
             aria-label="Provider wire protocol"
             data-testid="provider-wire"
             options={[
@@ -268,6 +382,7 @@ const ResourceFields = ({
           <input
             value={draft.baseUrl}
             required
+            disabled={disabled}
             spellCheck={false}
             data-testid="provider-base-url"
             onChange={(event) => setDraft({ ...draft, baseUrl: event.target.value })}
@@ -277,6 +392,7 @@ const ResourceFields = ({
           <span>Credential</span>
           <Select
             value={draft.credentialId}
+            disabled={disabled}
             aria-label="Provider credential"
             data-testid="provider-credential"
             options={[
@@ -303,7 +419,7 @@ const ResourceFields = ({
           {credentialsNextCursor && (
             <Button
               type="button"
-              disabled={loadingMoreCredentials}
+              disabled={disabled || loadingMoreCredentials}
               data-testid="provider-credential-load-more"
               onClick={() => void onLoadMoreCredentials()}
             >
@@ -311,15 +427,94 @@ const ResourceFields = ({
             </Button>
           )}
         </div>
-        <label className={`${styles.field} ${styles.wide}`}>
-          <span>Models — one name per line</span>
-          <textarea
-            rows={4}
-            value={draft.modelNames}
-            data-testid="provider-models"
-            onChange={(event) => setDraft({ ...draft, modelNames: event.target.value })}
-          />
-        </label>
+        <div className={`${styles.field} ${styles.wide}`}>
+          <div className={styles.inline}>
+            <strong>Models</strong>
+            <Button
+              type="button"
+              disabled={disabled}
+              data-testid="provider-model-add"
+              onClick={addModel}
+            >
+              <IconPlus size={13} /> Add model
+            </Button>
+          </div>
+          {draft.models.length === 0 ? (
+            <p className={styles.hint}>
+              No models configured. Add one when this resource is ready.
+            </p>
+          ) : (
+            <div className={styles.modelList} data-testid="provider-models">
+              {draft.models.map((model, index) => {
+                const isDefault = draft.defaultModelKey === model.key
+
+                return (
+                  <div className={styles.modelRow} key={model.key} data-testid="provider-model-row">
+                    <label className={styles.field}>
+                      <span>Model {index + 1}</span>
+                      <input
+                        aria-label={`Model ${index + 1} name`}
+                        value={model.name}
+                        disabled={disabled}
+                        spellCheck={false}
+                        onChange={(event) => changeModel(model.key, { name: event.target.value })}
+                      />
+                    </label>
+                    <div
+                      className={styles.modelCapabilities}
+                      role="group"
+                      aria-label={`Model ${index + 1} capabilities`}
+                    >
+                      <Checkbox
+                        checked={model.capabilities.includes(MODEL_CAPABILITY.completion)}
+                        disabled={disabled}
+                        label="Completion"
+                        onChange={(checked) =>
+                          setCapability(model.key, MODEL_CAPABILITY.completion, checked)
+                        }
+                      />
+                      <Checkbox
+                        checked={model.capabilities.includes(MODEL_CAPABILITY.embedding)}
+                        disabled={disabled}
+                        label="Embedding"
+                        onChange={(checked) =>
+                          setCapability(model.key, MODEL_CAPABILITY.embedding, checked)
+                        }
+                      />
+                    </div>
+                    <div className={styles.modelActions}>
+                      <Button
+                        icon
+                        type="button"
+                        variant="ghost"
+                        active={isDefault}
+                        disabled={disabled || model.name.length === 0}
+                        aria-pressed={isDefault}
+                        data-testid="provider-model-default"
+                        title={
+                          isDefault ? 'Clear default model' : `Use model ${index + 1} as default`
+                        }
+                        onClick={() => toggleDefaultModel(model.key)}
+                      >
+                        {isDefault ? <IconStarFilled size={14} /> : <IconStar size={14} />}
+                      </Button>
+                      <Button
+                        icon
+                        type="button"
+                        variant="ghost"
+                        disabled={disabled}
+                        title={`Remove model ${index + 1}`}
+                        onClick={() => removeModel(model.key)}
+                      >
+                        <IconTrash size={13} />
+                      </Button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </div>
       </div>
       <DisclosureCard
         header={
@@ -335,33 +530,11 @@ const ResourceFields = ({
       >
         <div className={styles.disclosureBody} data-testid="provider-advanced-content">
           <div className={styles.grid}>
-            <div className={`${styles.field} ${styles.wide}`}>
-              <span>Purposes</span>
-              <div className={styles.inline}>
-                <Checkbox
-                  checked={draft.purposes.includes(PURPOSE.chat)}
-                  label="Chat"
-                  onChange={(checked) => setPurpose(PURPOSE.chat, checked)}
-                />
-                <Checkbox
-                  checked={draft.purposes.includes(PURPOSE.embedding)}
-                  label="Embeddings"
-                  onChange={(checked) => setPurpose(PURPOSE.embedding, checked)}
-                />
-              </div>
-            </div>
-            <label className={styles.field}>
-              <span>Default model</span>
-              <input
-                value={draft.defaultModel}
-                placeholder="must be listed above"
-                onChange={(event) => setDraft({ ...draft, defaultModel: event.target.value })}
-              />
-            </label>
             <div className={styles.field}>
               <span>Private network</span>
               <Switch
                 checked={draft.allowPrivateNetwork}
+                disabled={disabled}
                 label="Allow this exact private origin"
                 data-testid="provider-private-opt-in"
                 onChange={(allowPrivateNetwork) => setDraft({ ...draft, allowPrivateNetwork })}
@@ -376,6 +549,7 @@ const ResourceFields = ({
               <input
                 type="number"
                 min="100"
+                disabled={disabled}
                 value={draft.firstByteTimeoutMs}
                 placeholder="automatic"
                 onChange={(event) => setDraft({ ...draft, firstByteTimeoutMs: event.target.value })}
@@ -386,6 +560,7 @@ const ResourceFields = ({
               <input
                 type="number"
                 min="100"
+                disabled={disabled}
                 value={draft.callTimeoutMs}
                 placeholder="automatic"
                 onChange={(event) => setDraft({ ...draft, callTimeoutMs: event.target.value })}
@@ -396,6 +571,7 @@ const ResourceFields = ({
                 <span>Availability</span>
                 <Switch
                   checked={!draft.disabled}
+                  disabled={disabled}
                   label={draft.disabled ? 'Disabled' : 'Enabled'}
                   onChange={(enabled) => setDraft({ ...draft, disabled: !enabled })}
                 />
@@ -405,7 +581,7 @@ const ResourceFields = ({
           <div className={styles.stack}>
             <div className={styles.inline}>
               <strong>Custom headers</strong>
-              <Button type="button" onClick={addHeader}>
+              <Button type="button" disabled={disabled} onClick={addHeader}>
                 <IconPlus size={13} /> Add header
               </Button>
             </div>
@@ -419,7 +595,7 @@ const ResourceFields = ({
                     <span>Header name</span>
                     <input
                       value={header.name}
-                      disabled={header.originalName != null}
+                      disabled={disabled || header.originalName != null}
                       onChange={(event) => changeHeader(header.key, { name: event.target.value })}
                     />
                   </label>
@@ -428,13 +604,14 @@ const ResourceFields = ({
                     <input
                       type="password"
                       value={header.value}
-                      disabled={header.remove}
+                      disabled={disabled || header.remove}
                       autoComplete="new-password"
                       onChange={(event) => changeHeader(header.key, { value: event.target.value })}
                     />
                   </label>
                   <Checkbox
                     checked={header.remove}
+                    disabled={disabled}
                     label={header.originalName ? 'Remove' : 'Discard'}
                     onChange={(remove) => changeHeader(header.key, { remove })}
                   />
@@ -494,10 +671,31 @@ export const ProviderResources = ({
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [checksOpen, setChecksOpen] = useState(false)
   const [sharingOpen, setSharingOpen] = useState(false)
+  const selectedId = useRef<string | null>(null)
+  const selectedBaseline = useRef<ProviderResource | null>(null)
+  const hydrateNextSelected = useRef(false)
 
   useEffect(() => {
     if (selected) {
-      setDraft(draftOf(selected.resource))
+      const sameResource = selectedId.current === selected.resource.id
+      setDraft((current) => {
+        const dirty =
+          sameResource && selectedBaseline.current
+            ? Object.keys(providerResourcePatchOf(selectedBaseline.current, current)).length > 0
+            : false
+
+        if (sameResource && dirty && !hydrateNextSelected.current) {
+          return current
+        }
+        hydrateNextSelected.current = false
+        return draftOf(selected.resource)
+      })
+      selectedId.current = selected.resource.id
+      selectedBaseline.current = selected.resource
+    } else {
+      selectedId.current = null
+      selectedBaseline.current = null
+      hydrateNextSelected.current = false
     }
   }, [selected])
   useEffect(() => {
@@ -507,13 +705,22 @@ export const ProviderResources = ({
   }, [spaces, targetSpace])
 
   const selectedOwner = selected?.resource.owner.mine ?? false
+  const authoredDirty = Boolean(
+    selected && Object.keys(providerResourcePatchOf(selected.resource, draft)).length > 0,
+  )
+  const creatingDirty = !sameJson(comparableDraft(draft), comparableDraft(draftOf()))
+  const draftError = modelDraftError(draft)
   const statuses = useMemo(
     () =>
       selected
-        ? selected.resource.purposes.map((purpose) => ({
-            purpose,
-            check: selected.resource.lastCheck[purpose],
-          }))
+        ? capabilityOrder
+            .filter((capability) =>
+              selected.resource.models.some((model) => model.capabilities.includes(capability)),
+            )
+            .map((capability) => ({
+              capability,
+              check: selected.resource.lastCheck[capability],
+            }))
         : [],
     [selected],
   )
@@ -549,15 +756,41 @@ export const ProviderResources = ({
     }
     setBusy(true)
     try {
+      hydrateNextSelected.current = true
       await onPatch(selected.resource.id, patch)
       setAdvancedOpen(false)
       setChecksOpen(false)
       setSharingOpen(false)
       setActionError(null)
     } catch (cause) {
+      hydrateNextSelected.current = false
       setActionError(errorText(cause))
     } finally {
       setBusy(false)
+    }
+  }
+
+  const confirmDiscard = (dirty: boolean) =>
+    dirty
+      ? confirm({
+          title: 'Discard unsaved provider changes?',
+          message: 'The authored model mapping and other unsaved fields will be lost.',
+          confirmLabel: 'Discard',
+          danger: true,
+        })
+      : Promise.resolve(true)
+
+  const closeEdit = async () => {
+    if (await confirmDiscard(authoredDirty)) {
+      onClose()
+    }
+  }
+
+  const cancelCreate = async () => {
+    if (await confirmDiscard(creatingDirty)) {
+      setCreating(false)
+      setAdvancedOpen(false)
+      setDraft(draftOf())
     }
   }
 
@@ -572,21 +805,24 @@ export const ProviderResources = ({
     if (!ok) {
       return
     }
+    setBusy(true)
     try {
       await onDelete(resource.id)
       setActionError(null)
     } catch (cause) {
       setActionError(errorText(cause))
+    } finally {
+      setBusy(false)
     }
   }
 
-  const validate = async (purpose: Purpose) => {
+  const validate = async (capability: ModelCapability) => {
     if (!selected) {
       return
     }
     setBusy(true)
     try {
-      const result = await onValidate(selected.resource.id, purpose)
+      const result = await onValidate(selected.resource.id, capability)
       setMessage({
         area: 'checks',
         text: result.saved
@@ -618,11 +854,25 @@ export const ProviderResources = ({
   }
 
   const select = async (id: string) => {
+    const switching = creating || selected?.resource.id !== id
+    const localDirty = creating ? creatingDirty : authoredDirty
+
+    if (switching && !(await confirmDiscard(localDirty))) {
+      return
+    }
+    setCreating(false)
+    setAdvancedOpen(false)
+    setChecksOpen(false)
+    setSharingOpen(false)
+    setMessage(null)
     setActionError(null)
+    setBusy(true)
     try {
       await onSelect(id)
     } catch (cause) {
       setActionError(errorText(cause))
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -673,6 +923,7 @@ export const ProviderResources = ({
               setDraft={setDraft}
               credentials={credentials}
               creating
+              disabled={busy}
               advancedOpen={advancedOpen}
               onAdvancedToggle={setAdvancedOpen}
               credentialsNextCursor={credentialsNextCursor}
@@ -682,23 +933,14 @@ export const ProviderResources = ({
             />
             {actionError && <p className={styles.error}>{actionError}</p>}
             <div className={styles.actions}>
-              <Button
-                type="button"
-                onClick={() => {
-                  setCreating(false)
-                  setAdvancedOpen(false)
-                }}
-              >
+              <Button type="button" disabled={busy} onClick={() => void cancelCreate()}>
                 Cancel
               </Button>
-              <Button
-                type="submit"
-                variant="primary"
-                disabled={busy || draft.purposes.length === 0}
-              >
+              <Button type="submit" variant="primary" disabled={busy || draftError !== null}>
                 Create
               </Button>
             </div>
+            {draftError && <p className={styles.error}>{draftError}</p>}
           </form>
         )}
         {selected && selectedOwner && (
@@ -713,6 +955,7 @@ export const ProviderResources = ({
               setDraft={setDraft}
               credentials={credentials}
               creating={false}
+              disabled={busy}
               advancedOpen={advancedOpen}
               onAdvancedToggle={setAdvancedOpen}
               credentialsNextCursor={credentialsNextCursor}
@@ -728,18 +971,18 @@ export const ProviderResources = ({
               </ul>
             )}
             {actionError && <p className={styles.error}>{actionError}</p>}
+            {authoredDirty && (
+              <Notice variant="warning">Save changes first to Validate or Share.</Notice>
+            )}
             <div className={styles.actions}>
-              <Button type="button" onClick={onClose}>
+              <Button type="button" disabled={busy} onClick={() => void closeEdit()}>
                 Close
               </Button>
-              <Button
-                type="submit"
-                variant="primary"
-                disabled={busy || draft.purposes.length === 0}
-              >
+              <Button type="submit" variant="primary" disabled={busy || draftError !== null}>
                 Save
               </Button>
             </div>
+            {draftError && <p className={styles.error}>{draftError}</p>}
             <DisclosureCard
               header={
                 <>
@@ -748,11 +991,11 @@ export const ProviderResources = ({
                     {statuses.length
                       ? statuses
                           .map(
-                            ({ purpose, check }) =>
-                              `${purpose} ${check?.status ?? PROVIDER_STATUS.unverified}`,
+                            ({ capability, check }) =>
+                              `${capability} ${check?.status ?? PROVIDER_STATUS.unverified}`,
                           )
                           .join(' · ')
-                      : 'No configured purposes'}
+                      : 'No configured capabilities'}
                   </span>
                 </>
               }
@@ -764,9 +1007,9 @@ export const ProviderResources = ({
               <div className={styles.disclosureBody}>
                 {message?.area === 'checks' && <Notice>{message.text}</Notice>}
                 <div className={styles.statusList} data-testid="provider-statuses">
-                  {statuses.map(({ purpose, check }) => (
-                    <div className={styles.statusRow} key={purpose}>
-                      <strong>{purpose}</strong>
+                  {statuses.map(({ capability, check }) => (
+                    <div className={styles.statusRow} key={capability}>
+                      <strong>{capability}</strong>
                       <span>
                         {check?.status ?? PROVIDER_STATUS.unverified}
                         {check?.diagnostic ? ` — ${check.diagnostic}` : ''}
@@ -776,7 +1019,12 @@ export const ProviderResources = ({
                           ? ' — reachability checked; credentials were not verified'
                           : ''}
                       </span>
-                      <Button type="button" disabled={busy} onClick={() => void validate(purpose)}>
+                      <Button
+                        type="button"
+                        disabled={busy || authoredDirty}
+                        title={authoredDirty ? 'Save changes first' : undefined}
+                        onClick={() => void validate(capability)}
+                      >
                         <IconRefresh size={13} /> Validate
                       </Button>
                     </div>
@@ -807,6 +1055,7 @@ export const ProviderResources = ({
                     <span>Target Space</span>
                     <Select
                       value={targetSpace}
+                      disabled={busy}
                       aria-label="Target Space"
                       options={spaces.map((space) => ({
                         value: space.id,
@@ -819,7 +1068,8 @@ export const ProviderResources = ({
                     <span>Offer</span>
                     <Button
                       type="button"
-                      disabled={busy || !targetSpace}
+                      disabled={busy || !targetSpace || authoredDirty}
+                      title={authoredDirty ? 'Save changes first' : undefined}
                       onClick={() => void offer()}
                     >
                       <IconLink size={13} /> Ask for consent
@@ -848,82 +1098,80 @@ export const ProviderResources = ({
           />
         )}
         {entries && entries.length > 0 && (
-          <table className={styles.table} data-testid="provider-list">
-            <thead>
-              <tr>
-                <th>Provider</th>
-                <th>Wire</th>
-                <th>Purposes</th>
-                <th>Models</th>
-                <th>Status</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {entries.map(({ resource, owned, unusableBecause, statusState }) => (
-                <tr key={resource.id} data-testid="provider-row">
-                  <td className={styles.cellName}>
-                    {resource.name}
-                    <div className={styles.cellSub}>
-                      {owned ? resource.baseUrl : `Owned by ${authorLabel(resource.owner).text}`}
-                      {!owned && (
-                        <span data-testid="provider-foreign-safe-details">
-                          {' '}
-                          · {resource.hasCredentials
-                            ? 'credential configured'
-                            : 'no credential'} ·{' '}
-                          {resource.addressIsPrivate ? 'private network' : 'external service'}
-                        </span>
-                      )}
-                    </div>
-                  </td>
-                  <td>
-                    <span className={styles.badge}>{resource.wire}</span>
-                  </td>
-                  <td>{resource.purposes.join(', ')}</td>
-                  <td>{resource.modelCount}</td>
-                  <td>
-                    {statusState === 'checking'
-                      ? 'Checking…'
-                      : statusState === 'error'
-                        ? 'Status unavailable'
-                        : (unusableBecause ?? (resource.disabledAt ? 'disabled' : 'available'))}
-                  </td>
-                  <td className={styles.cellActions}>
-                    {owned && (
-                      <Button
-                        icon
-                        variant="ghost"
-                        disabled={selectingId === resource.id}
-                        aria-busy={selectingId === resource.id}
-                        title={`Edit ${resource.name}`}
-                        onClick={() => {
-                          setAdvancedOpen(false)
-                          setChecksOpen(false)
-                          setSharingOpen(false)
-                          setMessage(null)
-                          setActionError(null)
-                          void select(resource.id)
-                        }}
-                      >
-                        <IconEdit size={14} />
-                      </Button>
-                    )}
-                    {owned && (
-                      <Button
-                        icon
-                        variant="ghost"
-                        title={`Delete ${resource.name}`}
-                        onClick={() => void remove(resource)}
-                      >
-                        <IconTrash size={14} />
-                      </Button>
-                    )}
-                  </td>
+          <div className={styles.tableScroll}>
+            <table className={styles.table} data-testid="provider-list">
+              <thead>
+                <tr>
+                  <th>Provider</th>
+                  <th>Wire</th>
+                  <th>Capabilities</th>
+                  <th>Models</th>
+                  <th>Status</th>
+                  <th />
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {entries.map(({ resource, owned, unusableBecause, statusState }) => (
+                  <tr key={resource.id} data-testid="provider-row">
+                    <td className={styles.cellName}>
+                      {resource.name}
+                      <div className={styles.cellSub}>
+                        {owned ? resource.baseUrl : `Owned by ${authorLabel(resource.owner).text}`}
+                        {!owned && (
+                          <span data-testid="provider-foreign-safe-details">
+                            {' '}
+                            · {resource.hasCredentials
+                              ? 'credential configured'
+                              : 'no credential'}{' '}
+                            · {resource.addressIsPrivate ? 'private network' : 'external service'}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                    <td>
+                      <span className={styles.badge}>{resource.wire}</span>
+                    </td>
+                    <td>{resource.capabilities.join(', ') || 'none'}</td>
+                    <td>{resource.modelCount}</td>
+                    <td>
+                      {statusState === 'checking'
+                        ? 'Checking…'
+                        : statusState === 'error'
+                          ? 'Status unavailable'
+                          : (unusableBecause ?? (resource.disabledAt ? 'disabled' : 'available'))}
+                    </td>
+                    <td className={styles.cellActions}>
+                      {owned && (
+                        <Button
+                          icon
+                          variant="ghost"
+                          disabled={busy || selectingId === resource.id}
+                          aria-busy={selectingId === resource.id}
+                          title={`Edit ${resource.name}`}
+                          onClick={() => {
+                            void select(resource.id)
+                          }}
+                        >
+                          <IconEdit size={14} />
+                        </Button>
+                      )}
+                      {owned && (
+                        <Button
+                          icon
+                          variant="ghost"
+                          disabled={busy}
+                          title={`Delete ${resource.name}`}
+                          onClick={() => void remove(resource)}
+                        >
+                          <IconTrash size={14} />
+                        </Button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
         {loading && entries == null && <p className={styles.empty}>Loading providers…</p>}
         {continuationError && <Notice variant="error">{continuationError}</Notice>}

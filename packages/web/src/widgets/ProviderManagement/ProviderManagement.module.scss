@@ -2,6 +2,7 @@
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-width: 0;
 }
 
 .actions,
@@ -23,6 +24,7 @@
   background: var(--bg-list);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
+  container: provider-form / inline-size;
 }
 
 .form-header {
@@ -132,6 +134,40 @@
     border-bottom: 1px solid var(--border);
     vertical-align: middle;
   }
+}
+
+.table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.model-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.model-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 12px;
+  align-items: end;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+
+.model-capabilities,
+.model-actions {
+  display: flex;
+  align-items: center;
+  min-height: 32px;
+}
+
+.model-capabilities {
+  gap: 12px;
+}
+
+.model-actions {
+  gap: 2px;
 }
 
 .cell-name {
@@ -307,5 +343,15 @@
   .header-row,
   .status-row {
     grid-template-columns: 1fr;
+  }
+}
+
+@container provider-form (max-width: 520px) {
+  .model-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .model-row > .field {
+    grid-column: 1 / -1;
   }
 }

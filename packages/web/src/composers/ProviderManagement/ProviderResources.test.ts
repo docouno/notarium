@@ -10,6 +10,7 @@ import type {
 } from '@notarium/contract'
 
 import type * as ApiModule from '../../services/api'
+import { ApiError } from '../../services/api'
 import type * as WidgetModule from '../../widgets/ProviderManagement'
 
 const harness = vi.hoisted(() => ({
@@ -53,7 +54,7 @@ const resource = (id: string): ProviderResourceListItem => ({
   owner: { kind: 'user', name: 'alice', mine: true },
   baseUrl: 'https://provider.example/v1',
   addressIsPrivate: false,
-  purposes: ['chat'],
+  capabilities: ['completion'],
   modelCount: 1,
   hasCredentials: true,
   disabledAt: null,
@@ -72,7 +73,14 @@ const foreignResource = (id: string): ProviderResourceListItem => {
 const detail = (id: string): ProviderResourceResponse => ({
   resource: {
     ...resource(id),
-    models: [{ name: 'model', dimensions: null, status: 'available' }],
+    models: [
+      {
+        name: 'model',
+        capabilities: ['completion'],
+        dimensions: null,
+        statusByCapability: { completion: 'available' },
+      },
+    ],
     defaultModel: 'model',
     credentialId: 'credential-1',
     consentEpoch: 1,
@@ -612,7 +620,6 @@ describe('ProviderResources composer', () => {
         baseUrl: 'https://provider.example/v1',
         headers: {},
         allowPrivateNetwork: false,
-        purposes: ['chat'],
         models: [],
         defaultModel: null,
         credentialId: null,
@@ -643,7 +650,6 @@ describe('ProviderResources composer', () => {
         baseUrl: 'https://provider.example/v1',
         headers: {},
         allowPrivateNetwork: false,
-        purposes: ['chat'],
         models: [],
         defaultModel: null,
         credentialId: 'credential-disabled',
@@ -694,10 +700,40 @@ describe('ProviderResources composer', () => {
     expect(harness.api.providerResourcesGet).toHaveBeenCalledOnce()
   })
 
+  it('closes and removes a selected resource when Patch reports it disappeared', async () => {
+    const missing = new ApiError('missing')
+    missing.status = 404
+    harness.api.providerResourceGet.mockResolvedValue(detail('1'))
+    harness.api.providerResourcePatch.mockRejectedValue(missing)
+    await mount()
+    await act(async () => harness.props!.onSelect('1'))
+
+    await act(async () => harness.props!.onPatch('1', { name: 'Too late' }))
+
+    expect(harness.props?.selected).toBeNull()
+    expect(harness.props?.entries?.some(({ resource: item }) => item.id === '1')).toBe(false)
+    expect(harness.props?.detailError).toBe('This provider resource no longer exists.')
+  })
+
+  it('treats Delete not-found as an honest disappearance', async () => {
+    const missing = new ApiError('missing')
+    missing.status = 404
+    harness.api.providerResourceGet.mockResolvedValue(detail('1'))
+    harness.api.providerResourceDelete.mockRejectedValue(missing)
+    await mount()
+    await act(async () => harness.props!.onSelect('1'))
+
+    await act(async () => harness.props!.onDelete('1'))
+
+    expect(harness.props?.selected).toBeNull()
+    expect(harness.props?.entries?.some(({ resource: item }) => item.id === '1')).toBe(false)
+    expect(harness.props?.detailError).toBe('This provider resource no longer exists.')
+  })
+
   it('refreshes effective status after Validate without closing detail', async () => {
     const validated = detail('1')
     harness.api.providerValidate.mockResolvedValue({
-      purpose: 'chat',
+      capability: 'completion',
       result: {
         status: 'not-configured',
         checkedAt: '2026-08-30T00:00:00.000Z',
@@ -714,7 +750,7 @@ describe('ProviderResources composer', () => {
     await mount()
 
     await act(async () => {
-      await harness.props!.onValidate('1', 'chat')
+      await harness.props!.onValidate('1', 'completion')
     })
 
     expect(harness.props?.selected?.resource.id).toBe('1')

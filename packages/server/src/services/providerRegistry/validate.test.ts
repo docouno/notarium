@@ -35,6 +35,16 @@ const json = (response: Parameters<RequestListener>[1], status: number, body: un
   response.end(JSON.stringify(body))
 }
 
+const bodyOf = async (request: Parameters<RequestListener>[0]): Promise<string> => {
+  const chunks: Buffer[] = []
+
+  for await (const chunk of request) {
+    chunks.push(Buffer.from(chunk))
+  }
+
+  return Buffer.concat(chunks).toString('utf8')
+}
+
 const deferred = () => {
   let resolve!: () => void
   const promise = new Promise<void>((done) => {
@@ -110,11 +120,11 @@ describe('provider validate facade', () => {
       wire: 'openai-compatible',
       baseUrl: `http://provider.test:${port}/api/v1`,
       allowPrivateNetwork: true,
-      purposes: ['chat'],
+      models: [{ name: 'local/model', capabilities: ['completion'] }],
       ...over,
     })
 
-  it('records one outcome per purpose and materializes the measured width', async () => {
+  it('records one outcome per capability and materializes the measured width', async () => {
     const port = await listen((request, response) => {
       if (request.url === '/api/v1/embeddings') {
         json(response, 200, { data: [{ embedding: Array.from({ length: 1024 }, () => 0.1) }] })
@@ -127,33 +137,156 @@ describe('provider validate facade', () => {
     const { resource } = await registry.createResource(
       'alice',
       resourceInput(port, {
-        purposes: ['chat', 'embedding'],
-        models: [{ name: 'local/model', dimensions: null, status: MODEL_STATUS.available }],
+        models: [{ name: 'local/model', capabilities: ['completion', 'embedding'] }],
         credentialId: credential.id,
       }),
     )
-    const validate = (purpose: 'chat' | 'embedding') =>
+    const validate = (capability: 'completion' | 'embedding') =>
       registry.validateResource({
         owner: 'alice',
         principal: 'user:alice',
         agent: null,
         admin: false,
         resourceId: resource.id,
-        purpose,
+        capability,
         signal: AbortSignal.timeout(5_000),
       })
 
-    await expect(validate('chat')).resolves.toMatchObject({
+    await expect(validate('completion')).resolves.toMatchObject({
       saved: true,
       result: { status: PROVIDER_STATUS.ready, credentialProven: true },
     })
     await expect(validate('embedding')).resolves.toMatchObject({ saved: true })
     await expect(db.providerResources.get(resource.id)).resolves.toMatchObject({
       lastCheck: {
-        chat: { status: PROVIDER_STATUS.ready, checkedAt: '2026-08-24T09:00:00.000Z' },
+        completion: { status: PROVIDER_STATUS.ready, checkedAt: '2026-08-24T09:00:00.000Z' },
         embedding: { status: PROVIDER_STATUS.ready },
       },
-      models: [{ name: 'local/model', dimensions: 1024, status: MODEL_STATUS.available }],
+      models: [
+        {
+          name: 'local/model',
+          capabilities: ['completion', 'embedding'],
+          dimensions: 1024,
+          statusByCapability: {
+            completion: MODEL_STATUS.available,
+            embedding: MODEL_STATUS.available,
+          },
+        },
+      ],
+    })
+  })
+
+  it('selects a capable default or the first capable row and sends the exact name', async () => {
+    const seen: Array<{ path: string; model: string }> = []
+    const port = await listen(async (request, response) => {
+      const body = JSON.parse(await bodyOf(request)) as { model: string }
+      seen.push({ path: request.url ?? '', model: body.model })
+      if (request.url === '/api/v1/embeddings') {
+        json(response, 200, { data: [{ embedding: [0.1, 0.2] }] })
+        return
+      }
+      json(response, 200, { choices: [{ message: { content: 'ok' }, finish_reason: 'length' }] })
+    })
+    const registry = registryFor(port)
+    const { resource } = await registry.createResource(
+      'alice',
+      resourceInput(port, {
+        models: [
+          { name: ' completion ', capabilities: ['completion'] },
+          { name: 'embed\tmodel', capabilities: ['embedding'] },
+        ],
+        defaultModel: ' completion ',
+      }),
+    )
+    const validate = (capability: 'completion' | 'embedding') =>
+      registry.validateResource({
+        owner: 'alice',
+        principal: 'user:alice',
+        agent: null,
+        admin: false,
+        resourceId: resource.id,
+        capability,
+        signal: AbortSignal.timeout(5_000),
+      })
+
+    await validate('embedding')
+    await validate('completion')
+    expect(seen).toEqual([
+      { path: '/api/v1/embeddings', model: 'embed\tmodel' },
+      { path: '/api/v1/chat/completions', model: ' completion ' },
+    ])
+  })
+
+  it('marks only the failed capability on a multi-capability model', async () => {
+    let available = false
+    const port = await listen((request, response) => {
+      if (!available) {
+        json(response, 404, { error: { message: 'No endpoints found for multi' } })
+        return
+      }
+      if (request.url === '/api/v1/embeddings') {
+        json(response, 200, { data: [{ embedding: [0.1, 0.2] }] })
+        return
+      }
+      json(response, 200, { choices: [{ message: { content: 'ok' }, finish_reason: 'length' }] })
+    })
+    const registry = registryFor(port)
+    const { resource } = await registry.createResource(
+      'alice',
+      resourceInput(port, {
+        models: [{ name: 'multi', capabilities: ['completion', 'embedding'] }],
+      }),
+    )
+
+    await expect(
+      registry.validateResource({
+        owner: 'alice',
+        principal: 'user:alice',
+        agent: null,
+        admin: false,
+        resourceId: resource.id,
+        capability: 'embedding',
+        signal: AbortSignal.timeout(5_000),
+      }),
+    ).resolves.toMatchObject({ result: { status: PROVIDER_STATUS.notConfigured } })
+    await expect(db.providerResources.get(resource.id)).resolves.toMatchObject({
+      models: [
+        {
+          statusByCapability: {
+            completion: MODEL_STATUS.available,
+            embedding: MODEL_STATUS.unavailable,
+          },
+        },
+      ],
+      lastCheck: { embedding: { status: PROVIDER_STATUS.notConfigured } },
+    })
+
+    available = true
+    await expect(
+      registry.validateResource({
+        owner: 'alice',
+        principal: 'user:alice',
+        agent: null,
+        admin: false,
+        resourceId: resource.id,
+        capability: 'embedding',
+        signal: AbortSignal.timeout(5_000),
+      }),
+    ).resolves.toMatchObject({
+      saved: true,
+      result: { status: PROVIDER_STATUS.ready },
+    })
+    await expect(db.providerResources.get(resource.id)).resolves.toMatchObject({
+      models: [
+        {
+          dimensions: 2,
+          statusByCapability: {
+            completion: MODEL_STATUS.available,
+            embedding: MODEL_STATUS.available,
+          },
+        },
+      ],
+      lastCheck: { embedding: { status: PROVIDER_STATUS.ready } },
     })
   })
 
@@ -165,7 +298,7 @@ describe('provider validate facade', () => {
     const { resource } = await registry.createResource(
       'alice',
       resourceInput(port, {
-        models: [{ name: 'local/model', dimensions: null, status: MODEL_STATUS.available }],
+        models: [{ name: 'local/model', capabilities: ['completion'] }],
       }),
     )
     const checkpointStarted = deferred()
@@ -181,7 +314,7 @@ describe('provider validate facade', () => {
       agent: null,
       admin: false,
       resourceId: resource.id,
-      purpose: 'chat',
+      capability: 'completion',
       signal: AbortSignal.timeout(5_000),
     })
     await new Promise((resolve) => setTimeout(resolve, 50))
@@ -204,7 +337,7 @@ describe('provider validate facade', () => {
     const { resource } = await registry.createResource(
       'alice',
       resourceInput(port, {
-        models: [{ name: 'local/model', dimensions: null, status: MODEL_STATUS.available }],
+        models: [{ name: 'local/model', capabilities: ['completion'] }],
         credentialId: credential.id,
       }),
     )
@@ -215,7 +348,7 @@ describe('provider validate facade', () => {
         agent: null,
         admin: false,
         resourceId: resource.id,
-        purpose: 'chat',
+        capability: 'completion',
         signal: AbortSignal.timeout(5_000),
       })
 
@@ -242,7 +375,7 @@ describe('provider validate facade', () => {
     const { resource } = await registry.createResource(
       'alice',
       resourceInput(port, {
-        models: [{ name: 'local/model', dimensions: null, status: MODEL_STATUS.available }],
+        models: [{ name: 'local/model', capabilities: ['completion'] }],
       }),
     )
     await registry.updateResource('alice', resource.id, { disabled: true })
@@ -253,7 +386,7 @@ describe('provider validate facade', () => {
         agent: null,
         admin: false,
         resourceId: resource.id,
-        purpose: 'chat',
+        capability: 'completion',
         signal: AbortSignal.timeout(5_000),
       })
 
@@ -282,7 +415,7 @@ describe('provider validate facade', () => {
       'alice',
       resourceInput(port, {
         headers: { 'x-title': 'notarium' },
-        models: [{ name: 'local/model', dimensions: null, status: MODEL_STATUS.available }],
+        models: [{ name: 'local/model', capabilities: ['completion'] }],
       }),
     )
     const record = await db.providerResources.get(resource.id)
@@ -307,7 +440,7 @@ describe('provider validate facade', () => {
         agent: null,
         admin: false,
         resourceId: resource.id,
-        purpose: 'chat',
+        capability: 'completion',
         signal: AbortSignal.timeout(5_000),
       }),
     ).resolves.toMatchObject({ result: { status: PROVIDER_STATUS.secretUnreadable } })
@@ -327,7 +460,7 @@ describe('provider validate facade', () => {
     const { resource } = await registry.createResource(
       'alice',
       resourceInput(port, {
-        models: [{ name: 'local/model', dimensions: null, status: MODEL_STATUS.available }],
+        models: [{ name: 'local/model', capabilities: ['completion'] }],
         credentialId: credential.id,
       }),
     )
@@ -337,7 +470,7 @@ describe('provider validate facade', () => {
       agent: null,
       admin: false,
       resourceId: resource.id,
-      purpose: 'chat',
+      capability: 'completion',
       signal: AbortSignal.timeout(5_000),
     })
     await inFlight.promise
@@ -364,7 +497,7 @@ describe('provider validate facade', () => {
     const { resource } = await registry.createResource(
       'alice',
       resourceInput(port, {
-        models: [{ name: 'local/model', dimensions: null, status: MODEL_STATUS.available }],
+        models: [{ name: 'local/model', capabilities: ['completion'] }],
         credentialId: credential.id,
       }),
     )
@@ -383,7 +516,7 @@ describe('provider validate facade', () => {
       agent: null,
       admin: false,
       resourceId: resource.id,
-      purpose: 'chat',
+      capability: 'completion',
       signal: AbortSignal.timeout(5_000),
     })
 
@@ -407,7 +540,7 @@ describe('provider validate facade', () => {
     const { resource } = await registry.createResource(
       'alice',
       resourceInput(port, {
-        models: [{ name: 'local/model', dimensions: null, status: MODEL_STATUS.available }],
+        models: [{ name: 'local/model', capabilities: ['completion'] }],
       }),
     )
     await registry.validateResource({
@@ -416,19 +549,19 @@ describe('provider validate facade', () => {
       agent: null,
       admin: false,
       resourceId: resource.id,
-      purpose: 'chat',
+      capability: 'completion',
       signal: AbortSignal.timeout(5_000),
     })
     const record = (await db.providerResources.get(resource.id))!
 
-    expect(registry.resourceToWire(record, { owner: 'alice' }).lastCheck.chat).toMatchObject({
+    expect(registry.resourceToWire(record, { owner: 'alice' }).lastCheck.completion).toMatchObject({
       status: PROVIDER_STATUS.unreachable,
       diagnostic: expect.stringContaining('ECONNREFUSED'),
     })
     expect(
-      registry.resourceToWire(record, { owner: 'bob', admin: true }).lastCheck.chat,
+      registry.resourceToWire(record, { owner: 'bob', admin: true }).lastCheck.completion,
     ).toMatchObject({ diagnostic: expect.stringContaining('ECONNREFUSED') })
-    expect(registry.resourceToWire(record, { owner: 'bob' }).lastCheck.chat).toEqual({
+    expect(registry.resourceToWire(record, { owner: 'bob' }).lastCheck.completion).toEqual({
       status: PROVIDER_STATUS.unreachable,
       checkedAt: '2026-08-24T09:00:00.000Z',
       diagnostic: null,
@@ -449,14 +582,14 @@ describe('provider validate facade', () => {
       resourceInput(port, {
         baseUrl: 'https://openrouter.ai/api/v1',
         allowPrivateNetwork: false,
-        models: [{ name: 'openai/gpt-4.1-nano', dimensions: null, status: MODEL_STATUS.available }],
+        models: [{ name: 'openai/gpt-4.1-nano', capabilities: ['completion'] }],
       }),
     )
     const record = (await db.providerResources.get(resource.id))!
     const withCheck = {
       ...record,
       lastCheck: {
-        chat: {
+        completion: {
           status: PROVIDER_STATUS.credentialRejected,
           checkedAt: '2026-08-24T09:00:00.000Z',
           diagnostic: 'No auth credentials found',
@@ -468,14 +601,18 @@ describe('provider validate facade', () => {
     // The status survives at full resolution — a public address is collapsed by
     // nothing. The provider's sentence is a different question and travels only to
     // the owner: it is prose about the OWNER's account, not about the address.
-    expect(registry.resourceToWire(withCheck, { owner: 'alice' }).lastCheck.chat).toMatchObject({
+    expect(
+      registry.resourceToWire(withCheck, { owner: 'alice' }).lastCheck.completion,
+    ).toMatchObject({
       status: PROVIDER_STATUS.credentialRejected,
       diagnostic: 'No auth credentials found',
     })
-    expect(registry.resourceToWire(withCheck, { owner: 'bob' }).lastCheck.chat).toMatchObject({
-      status: PROVIDER_STATUS.credentialRejected,
-      diagnostic: null,
-    })
+    expect(registry.resourceToWire(withCheck, { owner: 'bob' }).lastCheck.completion).toMatchObject(
+      {
+        status: PROVIDER_STATUS.credentialRejected,
+        diagnostic: null,
+      },
+    )
     expect(
       registry.resourceToWire(
         {
@@ -483,7 +620,7 @@ describe('provider validate facade', () => {
           allowPrivateNetwork: true,
           baseUrl: `http://provider.test:${port}/api/v1`,
           lastCheck: {
-            chat: {
+            completion: {
               status: PROVIDER_STATUS.disabled,
               checkedAt: '2026-08-24T09:00:00.000Z',
               diagnostic: null,
@@ -492,12 +629,14 @@ describe('provider validate facade', () => {
           },
         },
         { owner: 'bob' },
-      ).lastCheck.chat,
+      ).lastCheck.completion,
     ).toMatchObject({ status: PROVIDER_STATUS.disabled })
   })
 
-  it('answers nothing for a foreign resource and refuses an undeclared purpose', async () => {
+  it('refuses foreign or undeclared capabilities before admission, intent and network', async () => {
+    let requests = 0
     const port = await listen((_request, response) => {
+      requests += 1
       json(response, 200, { choices: [{ message: { content: 'ok' }, finish_reason: 'length' }] })
     })
     const registry = registryFor(port)
@@ -510,10 +649,23 @@ describe('provider validate facade', () => {
         agent: null,
         admin: true,
         resourceId: resource.id,
-        purpose: 'chat',
+        capability: 'completion',
         signal: AbortSignal.timeout(5_000),
       }),
     ).resolves.toBeNull()
+    for (let index = 0; index < 20; index += 1) {
+      await expect(
+        registry.validateResource({
+          owner: 'alice',
+          principal: 'user:alice',
+          agent: null,
+          admin: false,
+          resourceId: resource.id,
+          capability: 'embedding',
+          signal: AbortSignal.timeout(5_000),
+        }),
+      ).rejects.toMatchObject({ code: 'PROVIDER_VALIDATION' })
+    }
     await expect(
       registry.validateResource({
         owner: 'alice',
@@ -521,9 +673,11 @@ describe('provider validate facade', () => {
         agent: null,
         admin: false,
         resourceId: resource.id,
-        purpose: 'embedding',
+        capability: 'completion',
         signal: AbortSignal.timeout(5_000),
       }),
-    ).rejects.toMatchObject({ code: 'PROVIDER_VALIDATION' })
+    ).resolves.toMatchObject({ saved: true, result: { status: PROVIDER_STATUS.ready } })
+    expect(requests).toBe(1)
+    expect(await db.providerCallLog.listForOwner('alice')).toHaveLength(1)
   })
 })

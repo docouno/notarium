@@ -3,6 +3,7 @@ import type {
   CredentialListItem,
   CredentialPatchRequest,
   CredentialResponse,
+  ModelCapability,
   ProviderAttachmentListItem,
   ProviderAttachmentView,
   ProviderResourceCreateRequest,
@@ -12,7 +13,6 @@ import type {
   ProviderRetargetRequest,
   ProviderStatus,
   ProviderValidateResponse,
-  Purpose,
   Space,
 } from '@notarium/contract'
 
@@ -87,7 +87,7 @@ export type ProviderResourcesProps = {
   onCreate: (input: ProviderResourceCreateRequest) => Promise<void>
   onPatch: (id: string, input: ProviderResourcePatchRequest) => Promise<void>
   onDelete: (id: string) => Promise<void>
-  onValidate: (id: string, purpose: Purpose) => Promise<ProviderValidateResponse>
+  onValidate: (id: string, capability: ModelCapability) => Promise<ProviderValidateResponse>
   onOffer: (resourceId: string, targetId: string) => Promise<void>
   onClose: () => void
 }

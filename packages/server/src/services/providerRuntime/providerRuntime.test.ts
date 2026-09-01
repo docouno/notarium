@@ -65,9 +65,9 @@ it('aborts an in-flight transport stage when the process runtime closes', async 
       firstByteTimeoutMs: null,
       callTimeoutMs: null,
     },
-    operation: { kind: PROVIDER_CALL_KIND.models },
+    operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
     retryMode: PROVIDER_RETRY_MODE.none,
-    call: CALL,
+    call: { ...CALL, rateLimit: { ...CALL.rateLimit, inputUpperBound: 1 } },
     signal: new AbortController().signal,
   })
 

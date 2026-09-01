@@ -165,7 +165,9 @@ because no supported deployment has ever had a subset of them.
   keyring, without a phase or candidate column.
 - `credentials` and `provider_resources` are owner state; `provider_attachments`
   binds a resource to a Space. Credential secrets and resource header values are
-  reversible envelopes and the database stores no plaintext copy.
+  reversible envelopes and the database stores no plaintext copy. The resource
+  `models` JSON holds exact authored names/capabilities plus system-owned dimensions
+  and capability-scoped status; there is no resource-level `purposes` column.
 - A resource may omit its credential, but a present reference is
   `ON DELETE RESTRICT`; deleting a resource cascades its attachments.
   `target_space` stays a plain, non-null indexed column, because a foreign key to
@@ -185,11 +187,17 @@ one epoch, and a credential mutation serializes at its own epoch — call-affect
 fields bump it and reset every referencing resource's `last_check` in the same
 credential→resource transaction, while origin and injection also bump the separate
 consent epoch. A `validate` outcome is written the same way rather than by a short
-`UPDATE`, since `last_check` is a per-purpose collection the owner edits
-concurrently, and its condition spans both the resource epoch and the referenced
+`UPDATE`, since `last_check` is a per-capability collection and model measurements
+are field deltas merged into the transaction-current row. Its condition spans both
+the resource epoch and the referenced
 credential's, because a secret rotation moves no resource field yet must invalidate
 a check in flight. Complete keyring-loss recovery is one transaction over both
 ciphertext carriers and rolls the whole change back rather than landing half of it.
+
+Providers were not present in the published `v0.1.0` baseline. The corrected
+`0005_provider_contour` is therefore the only supported `v0.1.0 → current` carrier;
+there is no `0006` compatibility migration. A development database that applied an
+older `0005` checksum is refused and must be reset.
 
 The journal carries no prompt or response column: it is an audit of who called
 what, not a second store of user content. `delivery_state` is three-valued — the

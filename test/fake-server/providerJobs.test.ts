@@ -145,8 +145,7 @@ const setup = async (
       baseUrl: `http://provider.test:${port}/api/v1`,
       allowPrivateNetwork: true,
       credentialId,
-      purposes: ['chat'],
-      models: [{ name: 'local/model', dimensions: null, status: 'available' }],
+      models: [{ name: 'local/model', capabilities: ['completion'] }],
     },
   })
   expect(resourceResponse.statusCode).toBe(200)

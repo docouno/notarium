@@ -113,7 +113,7 @@ export const TOOL_META = {
   },
   whoami: {
     description:
-      'Who am I and what am I allowed to do. Returns your principal id, your access ceiling (read or write), the project workspaces you belong to, `capabilities` — what this host engine supports (`vector` = semantic search, not just keyword; `trash` = delete is recoverable; `revisions` = history/provenance/delta are available) — and `hasModel`, whether you currently have an effective model resource. Use when unsure about your access or model availability, and read these declarations instead of probing.',
+      'Who am I and what am I allowed to do. Returns your principal id, your access ceiling (read or write), the project workspaces you belong to, `capabilities` — what this host engine supports (`vector` = semantic search, not just keyword; `trash` = delete is recoverable; `revisions` = history/provenance/delta are available) — and `hasModel`, whether you currently have an effective available model/capability pair. Empty and all-unavailable resources return false. Use when unsure about your access or model availability, and read these declarations instead of probing.',
     annotations: {
       title: 'Who am I',
       readOnlyHint: true,

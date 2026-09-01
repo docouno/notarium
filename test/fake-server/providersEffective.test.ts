@@ -71,8 +71,7 @@ describe('provider effective list', () => {
         name: 'Main resource',
         wire: 'openai-compatible',
         baseUrl: 'https://openrouter.ai/api/v1',
-        purposes: ['chat'],
-        models: [{ name: 'gpt-4o-mini', dimensions: null, status: 'available' }],
+        models: [{ name: 'gpt-4o-mini', capabilities: ['completion'] }],
         headers: { 'X-Tenant-Internal': 'acme' },
         ...payload,
       },
@@ -287,14 +286,14 @@ describe('provider effective list', () => {
     // exactly the case where the verbatim body used to travel.
     await providers.providerResources.recordLastCheck({
       resourceId: id,
-      purpose: 'chat',
+      capability: 'completion',
       lastCheck: {
         status: 'quota-exhausted',
         checkedAt: '2026-08-25T00:00:00.000Z',
         diagnostic: 'This request needs more credits: org-acme has 0.02 remaining',
         credentialProven: true,
       },
-      model: null,
+      measurement: null,
       expectedRuntimeEpoch: 0,
       expectedCredentialId: null,
       expectedCredentialRuntimeEpoch: null,
@@ -306,7 +305,7 @@ describe('provider effective list', () => {
       headers: { cookie: alice },
     })
     expect(mine.json().resource.lastCheck).toMatchObject({
-      chat: {
+      completion: {
         status: 'quota-exhausted',
         diagnostic: 'This request needs more credits: org-acme has 0.02 remaining',
       },
@@ -355,8 +354,7 @@ describe('provider effective list', () => {
         name: 'Host resource',
         wire: 'openai-compatible',
         baseUrl: 'https://openrouter.ai/api/v1',
-        purposes: ['chat'],
-        models: [],
+        models: [{ name: 'gpt-4o-mini', capabilities: ['completion'] }],
       },
     })
     expect(created.statusCode).toBe(200)
@@ -372,8 +370,14 @@ describe('provider effective list', () => {
         baseUrl: 'https://openrouter.ai/api/v1',
         headers: {},
         allowPrivateNetwork: false,
-        purposes: ['chat'],
-        models: [],
+        models: [
+          {
+            name: 'gpt-4o-mini',
+            capabilities: ['completion'],
+            dimensions: null,
+            statusByCapability: { completion: 'available' },
+          },
+        ],
         defaultModel: null,
         credentialId: null,
         consentEpoch: 0,

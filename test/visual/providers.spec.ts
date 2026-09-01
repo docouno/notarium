@@ -23,21 +23,35 @@ const addResource = async (page: Page) => {
       name: 'Primary model',
       wire: 'openai-compatible',
       baseUrl: 'https://openrouter.ai/api/v1',
-      purposes: ['chat'],
-      models: [{ name: 'openai/gpt-5', dimensions: null, status: 'available' }],
+      models: [
+        { name: 'openai/gpt-5', capabilities: ['completion'] },
+        { name: 'text-embedding-3-small', capabilities: ['embedding'] },
+      ],
+      defaultModel: 'openai/gpt-5',
     },
   })
   expect(response.ok()).toBe(true)
 }
 
 for (const theme of ['dark', 'light'] as const) {
-  test(`provider resource disclosure form — ${theme}`, async ({ page }) => {
+  test(`populated provider resource form — ${theme}`, async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 })
     await page.addInitScript((value) => localStorage.setItem('bm-theme', value), theme)
+    await addResource(page)
     await page.goto('/settings/providers')
-    await page.getByTestId('provider-new').click()
+    await page.getByRole('button', { name: 'Edit Primary model' }).click()
     await expect(page.getByTestId('provider-disclosure')).toBeVisible()
     await visualScreenshot(page, `provider-resource-form-${theme}`)
+  })
+
+  test(`populated provider resource form narrow — ${theme}`, async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.addInitScript((value) => localStorage.setItem('bm-theme', value), theme)
+    await addResource(page)
+    await page.goto('/settings/providers')
+    await page.getByRole('button', { name: 'Edit Primary model' }).click()
+    await expect(page.getByTestId('provider-models')).toBeVisible()
+    await visualScreenshot(page, `provider-resource-form-narrow-${theme}`)
   })
 
   test(`provider credential setup form — ${theme}`, async ({ page }) => {
@@ -76,6 +90,9 @@ for (const theme of ['dark', 'light'] as const) {
     await expect(page.getByTestId('provider-advanced-content')).toHaveCount(0)
     await expect(page.getByTestId('provider-checks')).toBeVisible()
     await expect(page.getByTestId('provider-sharing')).toBeVisible()
+    await page.getByTestId('provider-checks-toggle').click()
+    await page.getByRole('textbox', { name: 'Model 1 name' }).fill('dirty-openai/gpt-5')
+    await expect(page.getByText('Save changes first to Validate or Share.')).toBeVisible()
     await visualScreenshot(page, `provider-resource-tasks-${theme}`)
   })
 }

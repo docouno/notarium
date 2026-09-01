@@ -48,8 +48,10 @@ The surface splits into three route classes (#16):
   outbound call. It is owner-only for the same reason — the call spends the owner's
   credential — and it is declared `self:manage` rather than checked: `manage` is
   above any token's ceiling, so the route is session-only by construction. Its
-  outcome is per PURPOSE, not per resource: one address can serve chat and refuse
-  embeddings. The outcome is stored only if the resource and credential runtime
+  request is exactly `{ capability: 'completion' | 'embedding' }`; resource-level
+  purposes and the legacy `chat` value do not exist. Public model writes contain
+  only `{ name, capabilities }`, while responses add system-owned dimensions and
+  capability-scoped status. The outcome is stored only if the resource and credential runtime
   epochs it was taken under are both unchanged, and it is projected on READ by two
   independent rules: the provider's own sentence reaches the owner and a host admin
   only — it is prose about the OWNER's account, not about the address — and on a

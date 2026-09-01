@@ -638,11 +638,17 @@ export type ProviderResourceSeedDecl = {
   baseUrl: string
   headers?: Record<string, string>
   allowPrivateNetwork?: boolean
-  purposes: Array<'chat' | 'embedding'>
   models?: Array<{
     name: string
-    dimensions: number | null
-    status: 'available' | 'model-unavailable'
+    capabilities: Array<'completion' | 'embedding'>
+  }>
+  /** Seed-only system facts, applied after the authored resource through the same
+   * transaction-current delta writer as provider validation. */
+  measurements?: Array<{
+    modelName: string
+    capability: 'completion' | 'embedding'
+    status?: 'available' | 'model-unavailable'
+    dimensions?: number
   }>
   defaultModel?: string | null
   credential?: string | null

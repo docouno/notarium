@@ -12,7 +12,7 @@ import type {
   ProviderResourcesPersistence,
 } from '../../types'
 import { PROVIDER_PERSISTENCE_ERROR, providerPersistenceError } from '../../types'
-import { mergedProviderModels } from '../providerModels'
+import { applyProviderModelMeasurement, mergedProviderModels } from '../providerModels'
 import type { SqliteDriverCtx } from './context'
 import { transitionProviderAttachments } from './providerAttachments'
 
@@ -96,7 +96,6 @@ const insertValues = (record: ProviderResourceRecord): Array<string | number | n
   record.baseUrl,
   JSON.stringify(record.headers),
   record.allowPrivateNetwork ? 1 : 0,
-  JSON.stringify(record.purposes),
   JSON.stringify(record.models),
   record.defaultModel,
   record.credentialId,
@@ -129,10 +128,10 @@ export const createProviderResourcesFacet = (
       credentialFor(ctx, record)
       db.prepare(
         `INSERT INTO provider_resources
-          (id, owner, name, wire, base_url, headers, allow_private_network, purposes,
+          (id, owner, name, wire, base_url, headers, allow_private_network,
            models, default_model, credential_id, consent_epoch, runtime_epoch, disabled_at,
            last_check, first_byte_timeout_ms, call_timeout_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(...insertValues(record))
       db.exec('COMMIT')
     } catch (error) {
@@ -140,13 +139,7 @@ export const createProviderResourcesFacet = (
       throw error
     }
   },
-  replaceIfRuntimeEpoch: async (
-    record,
-    ciphertext,
-    expectedRuntimeEpoch,
-    expectedCredentialId,
-    preserveModels = false,
-  ) => {
+  replaceIfRuntimeEpoch: async (record, ciphertext, expectedRuntimeEpoch, expectedCredentialId) => {
     await ctx.ensureInit()
     const db = ctx.required
     db.exec('BEGIN IMMEDIATE')
@@ -172,14 +165,14 @@ export const createProviderResourcesFacet = (
       credentialFor(ctx, record)
       const stored = {
         ...record,
-        models: preserveModels ? current.models : record.models,
+        models: mergedProviderModels(current.models, record.models),
         lastCheck:
           record.runtimeEpoch === expectedRuntimeEpoch ? current.lastCheck : record.lastCheck,
       }
       db.prepare(
         `UPDATE provider_resources SET
            owner = ?, name = ?, wire = ?, base_url = ?, headers = ?,
-           allow_private_network = ?, purposes = ?, models = ?, default_model = ?,
+           allow_private_network = ?, models = ?, default_model = ?,
            credential_id = ?, consent_epoch = ?, runtime_epoch = ?, disabled_at = ?,
            last_check = ?, first_byte_timeout_ms = ?, call_timeout_ms = ?
          WHERE id = ? AND runtime_epoch = ?`,
@@ -311,31 +304,6 @@ export const createProviderResourcesFacet = (
     await ctx.ensureInit()
     ctx.required.prepare('DELETE FROM provider_resources WHERE id = ?').run(id)
   },
-  materializeModel: async (id, model) => {
-    await ctx.ensureInit()
-    const db = ctx.required
-    db.exec('BEGIN IMMEDIATE')
-    try {
-      const row = db.prepare('SELECT * FROM provider_resources WHERE id = ?').get(id) as
-        ProviderResourceRow | undefined
-
-      if (!row) {
-        db.exec('COMMIT')
-        return null
-      }
-      const record = providerResourceOfRow(row)
-      const models = mergedProviderModels(record.models, model)
-      db.prepare('UPDATE provider_resources SET models = ? WHERE id = ?').run(
-        JSON.stringify(models),
-        id,
-      )
-      db.exec('COMMIT')
-      return { ...record, models }
-    } catch (error) {
-      db.exec('ROLLBACK')
-      throw error
-    }
-  },
   recordLastCheck: async (input) => {
     await ctx.ensureInit()
     const db = ctx.required
@@ -364,8 +332,13 @@ export const createProviderResourcesFacet = (
         db.exec('COMMIT')
         return { status: 'stale', record }
       }
-      const lastCheck = { ...record.lastCheck, [input.purpose]: input.lastCheck }
-      const models = input.model ? mergedProviderModels(record.models, input.model) : record.models
+      const lastCheck = { ...record.lastCheck, [input.capability]: input.lastCheck }
+      const models = input.measurement
+        ? applyProviderModelMeasurement(record.models, {
+            ...input.measurement,
+            capability: input.capability,
+          })
+        : record.models
       db.prepare('UPDATE provider_resources SET last_check = ?, models = ? WHERE id = ?').run(
         JSON.stringify(lastCheck),
         JSON.stringify(models),

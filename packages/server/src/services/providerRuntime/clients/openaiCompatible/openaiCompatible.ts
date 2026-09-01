@@ -3,13 +3,7 @@ import type { ProviderOpenAiUsage } from '@notarium/contract'
 import { type ProviderTransport } from '../../transport/transport'
 import type { ProviderTransportResponse } from '../../transport/types'
 import { PROVIDER_CALL_KIND, PROVIDER_TOKEN_LIMIT_FIELD } from '../../types'
-import type {
-  ProviderCallResult,
-  ProviderChatResult,
-  ProviderEmbeddingResult,
-  ProviderKeyResult,
-  ProviderModelsResult,
-} from '../../types'
+import type { ProviderCallResult, ProviderChatResult, ProviderEmbeddingResult } from '../../types'
 import {
   bodyText,
   endpointAt,
@@ -17,7 +11,6 @@ import {
   jsonObject,
   openAiUsage,
   ProviderLineDecoder,
-  providerModelName,
 } from '../helpers'
 import type { ProviderClientFailure, ProviderClientOutcome, ProviderClientRequest } from '../types'
 
@@ -128,44 +121,6 @@ const embeddingsOf = (
   }
 }
 
-const modelsOf = (value: Record<string, unknown>): Parsed<ProviderModelsResult> => {
-  if (value.data === null) {
-    return { ok: true, value: { kind: PROVIDER_CALL_KIND.models, models: [] } }
-  }
-  if (!Array.isArray(value.data)) {
-    return { ok: false }
-  }
-  const models = value.data.flatMap((item) => {
-    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
-      return []
-    }
-    const name = providerModelName(
-      (item as Record<string, unknown>).id ?? (item as Record<string, unknown>).name,
-    )
-    return name ? [name] : []
-  })
-
-  return { ok: true, value: { kind: PROVIDER_CALL_KIND.models, models } }
-}
-
-/** `data.limit_remaining` is the only field this contour reads; anything else the
- *  vendor ships stays out of the process. */
-const keyOf = (value: Record<string, unknown>): Parsed<ProviderKeyResult> => {
-  const data = value.data
-
-  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
-    return { ok: false }
-  }
-
-  return {
-    ok: true,
-    value: {
-      kind: PROVIDER_CALL_KIND.key,
-      limitRemaining: finiteNumber((data as Record<string, unknown>).limit_remaining),
-    },
-  }
-}
-
 const nonStream = async (
   response: ProviderTransportResponse,
   request: ProviderClientRequest,
@@ -180,12 +135,8 @@ const nonStream = async (
 
   if (request.operation.kind === PROVIDER_CALL_KIND.chat) {
     result = chatOf(parsed)
-  } else if (request.operation.kind === PROVIDER_CALL_KIND.embedding) {
-    result = embeddingsOf(parsed, request.operation.input.length)
-  } else if (request.operation.kind === PROVIDER_CALL_KIND.key) {
-    result = keyOf(parsed)
   } else {
-    result = modelsOf(parsed)
+    result = embeddingsOf(parsed, request.operation.input.length)
   }
 
   return result.ok ? { ok: true, result: result.value } : malformed(response, raw)
@@ -305,13 +256,7 @@ export const callOpenAiCompatible = (
   const origin = new URL(endpoint.baseUrl).origin
   const target = endpointAt(
     endpoint.baseUrl,
-    operation.kind === PROVIDER_CALL_KIND.chat
-      ? 'chat/completions'
-      : operation.kind === PROVIDER_CALL_KIND.embedding
-        ? 'embeddings'
-        : operation.kind === PROVIDER_CALL_KIND.key
-          ? 'key'
-          : 'models',
+    operation.kind === PROVIDER_CALL_KIND.chat ? 'chat/completions' : 'embeddings',
   )
   const stream = operation.kind === PROVIDER_CALL_KIND.chat && operation.stream
   const payload =
@@ -324,13 +269,11 @@ export const callOpenAiCompatible = (
             operation.maxOutputTokens,
           ...(stream ? { stream_options: { include_usage: true } } : {}),
         }
-      : operation.kind === PROVIDER_CALL_KIND.embedding
-        ? {
-            model: operation.model,
-            input: operation.input,
-            ...(operation.dimensions == null ? {} : { dimensions: operation.dimensions }),
-          }
-        : null
+      : {
+          model: operation.model,
+          input: operation.input,
+          ...(operation.dimensions == null ? {} : { dimensions: operation.dimensions }),
+        }
 
   return transport.request(
     {
@@ -338,13 +281,13 @@ export const callOpenAiCompatible = (
       target,
       trustedOrigin: origin,
       allowPrivateNetwork: endpoint.allowPrivateNetwork,
-      method: payload ? 'POST' : 'GET',
+      method: 'POST',
       headers: {
         accept: stream ? 'text/event-stream' : 'application/json',
-        ...(payload ? { 'content-type': 'application/json' } : {}),
+        'content-type': 'application/json',
         ...Object.fromEntries(endpoint.headers),
       },
-      ...(payload ? { body: JSON.stringify(payload) } : {}),
+      body: JSON.stringify(payload),
       stream,
       firstByteTimeoutMs: endpoint.firstByteTimeoutMs,
       callTimeoutMs: endpoint.callTimeoutMs,

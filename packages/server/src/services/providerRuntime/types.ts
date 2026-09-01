@@ -3,8 +3,6 @@ import type { ProviderUsage, Wire } from '@notarium/contract'
 export const PROVIDER_CALL_KIND = {
   chat: 'chat',
   embedding: 'embedding',
-  models: 'models',
-  key: 'key',
 } as const
 
 export type ProviderCallKind = (typeof PROVIDER_CALL_KIND)[keyof typeof PROVIDER_CALL_KIND]
@@ -60,18 +58,7 @@ export type ProviderEmbeddingCall = {
   dimensions?: number | null
 }
 
-export type ProviderModelsCall = {
-  kind: typeof PROVIDER_CALL_KIND.models
-}
-
-/** OpenRouter's key introspection: proves endpoint AND credential without paying
- *  for inference. Measured byte-for-byte — `GET /models` proves neither. */
-export type ProviderKeyCall = {
-  kind: typeof PROVIDER_CALL_KIND.key
-}
-
-export type ProviderOperation =
-  ProviderChatCall | ProviderEmbeddingCall | ProviderModelsCall | ProviderKeyCall
+export type ProviderOperation = ProviderChatCall | ProviderEmbeddingCall
 
 export type ProviderChatResult = {
   kind: typeof PROVIDER_CALL_KIND.chat
@@ -86,18 +73,7 @@ export type ProviderEmbeddingResult = {
   usage: ProviderUsage | null
 }
 
-export type ProviderModelsResult = {
-  kind: typeof PROVIDER_CALL_KIND.models
-  models: string[]
-}
-
-export type ProviderKeyResult = {
-  kind: typeof PROVIDER_CALL_KIND.key
-  limitRemaining: number | null
-}
-
-export type ProviderCallResult =
-  ProviderChatResult | ProviderEmbeddingResult | ProviderModelsResult | ProviderKeyResult
+export type ProviderCallResult = ProviderChatResult | ProviderEmbeddingResult
 
 export type ProviderTextChunk = {
   text: string

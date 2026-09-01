@@ -27,8 +27,14 @@ const resource: ProviderResource = {
   headerNames: ['x-change', 'x-keep', 'x-remove'],
   addressIsPrivate: false,
   allowPrivateNetwork: false,
-  purposes: ['chat'],
-  models: [{ name: 'openai/gpt-5', dimensions: null, status: 'available' }],
+  models: [
+    {
+      name: 'openai/gpt-5',
+      capabilities: ['completion'],
+      dimensions: null,
+      statusByCapability: { completion: 'available' },
+    },
+  ],
   defaultModel: 'openai/gpt-5',
   credentialId: credential.id,
   hasCredentials: true,
@@ -77,9 +83,8 @@ describe('provider management form projections', () => {
         wire: resource.wire,
         baseUrl: resource.baseUrl!,
         allowPrivateNetwork: false,
-        purposes: ['chat'],
-        modelNames: 'openai/gpt-5',
-        defaultModel: 'openai/gpt-5',
+        models: [{ key: 'model-1', name: 'openai/gpt-5', capabilities: ['completion'] }],
+        defaultModelKey: 'model-1',
         credentialId: credential.id,
         firstByteTimeoutMs: '',
         callTimeoutMs: '',
@@ -89,12 +94,31 @@ describe('provider management form projections', () => {
     ).toEqual({ headers: { 'x-change': 'new', 'x-remove': null, 'X-New': 'added' } })
   })
 
-  it('bounds and flattens provider-controlled names before consent rendering', () => {
-    const hostile = `<strong>trusted</strong>\n${'x'.repeat(160)}`
-    const label = providerDisclosureLabel(hostile)
+  it('encodes exact model identities reversibly without truncation or collapse', () => {
+    const encoded = providerDisclosureLabel(' model\témodel"\\')
 
-    expect(label).not.toContain('\n')
-    expect(label.length).toBeLessThanOrEqual(120)
-    expect(label.endsWith('…')).toBe(true)
+    expect(encoded).toContain('\\u{20}model\\u{9}\\u{E9}model')
+    expect(encoded).toContain('\\"')
+    expect(encoded).toContain('\\\\')
+    expect(providerDisclosureLabel(' model')).not.toBe(providerDisclosureLabel('model'))
+    expect(providerDisclosureLabel('x'.repeat(512))).toHaveLength(514)
+    const corpus = [
+      'model',
+      ' model',
+      'model ',
+      'model  variant',
+      'model\tvariant',
+      'model\\tvariant',
+      'model\u00a0variant',
+      'model\u200bvariant',
+      'model\u202evariant',
+      'mödél',
+      'model"variant',
+      'model\\variant',
+    ]
+    const encodedCorpus = corpus.map(providerDisclosureLabel)
+
+    expect(new Set(encodedCorpus).size).toBe(corpus.length)
+    expect(encodedCorpus.every((value) => /^[\u0020-\u007e]+$/u.test(value))).toBe(true)
   })
 })

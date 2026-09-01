@@ -81,8 +81,7 @@ const createResource = (
       wire: 'openai-compatible',
       baseUrl: `http://provider.test:${port}/api/v1`,
       allowPrivateNetwork: true,
-      purposes: ['chat'],
-      models: [{ name: 'local/model', dimensions: null, status: 'available' }],
+      models: [{ name: 'local/model', capabilities: ['completion'] }],
       ...over,
     },
   })
@@ -117,7 +116,7 @@ describe('provider validate REST surface', () => {
     const call = fetch(`http://127.0.0.1:${apiPort}/api/providers/resources/${id}/validate`, {
       method: 'POST',
       headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ purpose: 'chat' }),
+      body: JSON.stringify({ capability: 'completion' }),
       signal: controller.signal,
     }).catch((error: unknown) => error)
 
@@ -145,23 +144,23 @@ describe('provider validate REST surface', () => {
       method: 'POST',
       url: `/api/providers/resources/${id}/validate`,
       headers: { cookie },
-      payload: { purpose: 'chat' },
+      payload: { capability: 'completion' },
     })
 
     expect(seen).toEqual(['POST /api/v1/chat/completions'])
     expect(validated.statusCode).toBe(200)
     expect(validated.json()).toMatchObject({
-      purpose: 'chat',
+      capability: 'completion',
       saved: true,
       result: { status: 'ready', credentialProven: true, diagnostic: null },
-      resource: { lastCheck: { chat: { status: 'ready' } } },
+      resource: { lastCheck: { completion: { status: 'ready' } } },
     })
     const reread = await app.inject({
       method: 'GET',
       url: `/api/providers/resources/${id}`,
       headers: { cookie },
     })
-    expect(reread.json().resource.lastCheck.chat).toMatchObject({ status: 'ready' })
+    expect(reread.json().resource.lastCheck.completion).toMatchObject({ status: 'ready' })
   })
 
   it('classifies a corrupted credential as a class, not as a raw 4xx', async () => {
@@ -175,7 +174,7 @@ describe('provider validate REST surface', () => {
       method: 'POST',
       url: `/api/providers/resources/${id}/validate`,
       headers: { cookie },
-      payload: { purpose: 'chat' },
+      payload: { capability: 'completion' },
     })
 
     expect(validated.statusCode).toBe(200)
@@ -203,7 +202,7 @@ describe('provider validate REST surface', () => {
         method: 'POST',
         url: `/api/providers/resources/${id}/validate`,
         headers: { cookie },
-        payload: { purpose: 'chat' },
+        payload: { capability: 'completion' },
       })
 
     await validate()
@@ -271,7 +270,7 @@ describe('provider validate REST surface', () => {
         method: 'POST',
         url: `/api/providers/resources/${resourceId}/validate`,
         headers: { cookie },
-        payload: { purpose: 'chat' },
+        payload: { capability: 'completion' },
         signal,
       })
 
@@ -347,9 +346,8 @@ describe('provider validate REST surface', () => {
         wire: 'openai-compatible',
         baseUrl: `http://provider.test:${port}/api/v1`,
         allowPrivateNetwork: true,
-        purposes: ['chat'],
         credentialId: credential.json().credential.id,
-        models: [{ name: 'local/model', dimensions: null, status: 'available' }],
+        models: [{ name: 'local/model', capabilities: ['completion'] }],
       },
     })
     const id = created.json().resource.id as string
@@ -357,7 +355,7 @@ describe('provider validate REST surface', () => {
       method: 'POST',
       url: `/api/providers/resources/${id}/validate`,
       headers: { cookie },
-      payload: { purpose: 'chat' },
+      payload: { capability: 'completion' },
     })
 
     expect(validated.statusCode).toBe(200)
@@ -373,7 +371,7 @@ describe('provider validate REST surface', () => {
     })
     expect(reread.body).not.toContain(secret)
     expect(reread.body).not.toContain(JSON.stringify(secret).slice(1, -1))
-    expect(reread.json().resource.lastCheck.chat.diagnostic.length).toBeLessThanOrEqual(512)
+    expect(reread.json().resource.lastCheck.completion.diagnostic.length).toBeLessThanOrEqual(512)
   })
 
   it('is unreachable to a write PAT and to a host admin who is not the owner', async () => {
@@ -399,7 +397,7 @@ describe('provider validate REST surface', () => {
       method: 'POST',
       url: `/api/providers/resources/${id}/validate`,
       headers: { authorization: `Bearer ${pat.json().token}` },
-      payload: { purpose: 'chat' },
+      payload: { capability: 'completion' },
     })
     expect(byToken.statusCode).toBe(404)
 
@@ -407,7 +405,7 @@ describe('provider validate REST surface', () => {
       method: 'POST',
       url: `/api/providers/resources/${id}/validate`,
       headers: { cookie: await login(app, 'bob', 'bob-password-01') },
-      payload: { purpose: 'chat' },
+      payload: { capability: 'completion' },
     })
     expect(byAdmin.statusCode).toBe(404)
     expect(requests).toBe(0)
@@ -423,7 +421,7 @@ describe('provider validate REST surface', () => {
     const cookie = await login(app, 'alice', 'alice-password-1')
     const id = (await createResource(app, cookie, port)).json().resource.id as string
 
-    for (const payload of [{ purpose: 'embedding' }, { purpose: 'nonsense' }, {}]) {
+    for (const payload of [{ capability: 'embedding' }, { capability: 'nonsense' }, {}]) {
       const response = await app.inject({
         method: 'POST',
         url: `/api/providers/resources/${id}/validate`,
@@ -464,7 +462,7 @@ describe('provider validate REST surface', () => {
         method: 'POST',
         url: `/api/providers/resources/${id}/validate`,
         headers: { cookie },
-        payload: { purpose: 'chat' },
+        payload: { capability: 'completion' },
       })
 
     for (let index = 0; index < 20; index += 1) {
@@ -498,7 +496,7 @@ describe('provider validate REST surface', () => {
       method: 'POST',
       url: `/api/providers/resources/${id}/validate`,
       headers: { cookie },
-      payload: { purpose: 'chat' },
+      payload: { capability: 'completion' },
     })
 
     expect(validated.statusCode).toBe(200)

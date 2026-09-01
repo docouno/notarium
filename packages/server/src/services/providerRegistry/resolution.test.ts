@@ -108,8 +108,7 @@ describe('provider resolution', () => {
           name: 'Main',
           wire: 'openai-compatible',
           baseUrl: 'https://openrouter.ai/api/v1',
-          purposes: ['chat'],
-          models: [{ name: 'gpt-4o-mini', dimensions: null, status: 'available' }],
+          models: [{ name: 'gpt-4o-mini', capabilities: ['completion'] }],
           ...over,
         }),
       )
@@ -321,14 +320,14 @@ describe('provider resolution', () => {
     await attach(resource.id)
     await db.providerResources.recordLastCheck({
       resourceId: resource.id,
-      purpose: 'chat',
+      capability: 'completion',
       lastCheck: {
         status: PROVIDER_STATUS.quotaExhausted,
         checkedAt: NOW,
         diagnostic: null,
         credentialProven: true,
       },
-      model: null,
+      measurement: null,
       expectedRuntimeEpoch: 0,
       expectedCredentialId: null,
       expectedCredentialRuntimeEpoch: null,
@@ -684,8 +683,14 @@ describe('provider resolution', () => {
           baseUrl: 'https://provider.example/v1',
           headers: {},
           allowPrivateNetwork: false,
-          purposes: ['chat'],
-          models: [],
+          models: [
+            {
+              name: 'model-a',
+              capabilities: ['completion'],
+              dimensions: null,
+              statusByCapability: { completion: 'available' },
+            },
+          ],
           defaultModel: null,
           credentialId: null,
           consentEpoch: 0,
@@ -770,8 +775,14 @@ describe('provider record invalidity', () => {
     baseUrl: 'https://openrouter.ai/api/v1',
     headers: {} as Record<string, string>,
     allowPrivateNetwork: false,
-    purposes: ['chat' as const],
-    models: [],
+    models: [
+      {
+        name: 'model-a',
+        capabilities: ['completion' as const],
+        dimensions: null,
+        statusByCapability: { completion: 'available' as const },
+      },
+    ],
     defaultModel: null,
     credentialId: null as string | null,
     consentEpoch: 0,

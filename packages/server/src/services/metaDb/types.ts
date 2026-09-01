@@ -11,6 +11,7 @@ import type {
   AttachmentState,
   CredentialInjection,
   CredentialKind,
+  ModelCapability,
   ProviderCallOutcome,
   ProviderDeliveryState,
   ProviderDisclosureSnapshot,
@@ -18,7 +19,6 @@ import type {
   ProviderModel,
   ProviderTargetKind,
   ProviderUsage,
-  Purpose,
   Wire,
 } from '@notarium/contract'
 import type {
@@ -162,32 +162,35 @@ export type ProviderResourceRecord = {
   /** Canonical header name → reversible envelope ciphertext. */
   headers: Record<string, string>
   allowPrivateNetwork: boolean
-  purposes: Purpose[]
   models: ProviderModel[]
   defaultModel: string | null
   credentialId: string | null
   consentEpoch: number
   runtimeEpoch: number
   disabledAt: string | null
-  lastCheck: Partial<Record<Purpose, ProviderLastCheck>>
+  lastCheck: Partial<Record<ModelCapability, ProviderLastCheck>>
   /** Null selects the address-derived profile after pinned DNS resolution. */
   firstByteTimeoutMs: number | null
   /** Null selects the address-derived profile after pinned DNS resolution. */
   callTimeoutMs: number | null
 }
 
-/** Conditional write of a `validate` outcome. `lastCheck` is per-purpose, so the
+/** Conditional write of a `validate` outcome. `lastCheck` is per-capability, so the
  *  write is a serialized read-modify-write of the JSON column, not a blind UPDATE
  *  that would drop the sibling purpose. The condition spans TWO rows because the
  *  credential is a different table: a secret rotation moves no resource field, yet
  *  it must invalidate an in-flight check. */
 export type ProviderLastCheckWrite = {
   resourceId: string
-  purpose: Purpose
+  capability: ModelCapability
   lastCheck: ProviderLastCheck
-  /** Measured model facts, materialized in the SAME conditional transaction — a
-   *  stale outcome must not leave its measurement behind. */
-  model: ProviderModel | null
+  /** Field delta for one exact model×capability pair. Applied to the transaction-current
+   *  row so a sibling validation or authored write cannot be overwritten. */
+  measurement: {
+    modelName: string
+    status?: ProviderModel['statusByCapability'][ModelCapability]
+    dimensions?: number
+  } | null
   expectedRuntimeEpoch: number
   expectedCredentialId: string | null
   expectedCredentialRuntimeEpoch: number | null
@@ -205,7 +208,6 @@ export type ProviderResourcesPersistence = {
     ciphertext: CiphertextWrite | null,
     expectedRuntimeEpoch: number,
     expectedCredentialId: string | null,
-    preserveModels?: boolean,
   ): Promise<
     | { status: 'replaced'; record: ProviderResourceRecord }
     | { status: 'conflict'; record: ProviderResourceRecord }
@@ -228,8 +230,6 @@ export type ProviderResourcesPersistence = {
   list(): Promise<ProviderResourceRecord[]>
   listForOwner(owner: string): Promise<ProviderResourceRecord[]>
   delete(id: string): Promise<void>
-  /** Serialized read-modify-write. System materialization does not bump runtimeEpoch. */
-  materializeModel(id: string, model: ProviderModel): Promise<ProviderResourceRecord | null>
   recordLastCheck(input: ProviderLastCheckWrite): Promise<ProviderLastCheckResult>
 }
 

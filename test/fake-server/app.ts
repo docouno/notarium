@@ -1243,6 +1243,38 @@ export const createApp = async (
         return record ? { id: record.id, space: record.space } : null
       },
       overrideResource: (record) => providerPersistence.injectProviderResource(record),
+      recordMeasurement: async (input) => {
+        const current = await providerPersistence.providerResources.get(input.resourceId)
+
+        if (!current) {
+          throw new Error(`seeded provider resource disappeared: ${input.resourceId}`)
+        }
+        const result = await providerPersistence.providerResources.recordLastCheck({
+          resourceId: input.resourceId,
+          capability: input.capability,
+          lastCheck: {
+            status: input.status === 'model-unavailable' ? 'not-configured' : 'ready',
+            checkedAt: fx.now || '2026-01-01T00:00:00.000Z',
+            diagnostic: null,
+            credentialProven: false,
+          },
+          measurement: {
+            modelName: input.modelName,
+            ...(input.status === undefined ? {} : { status: input.status }),
+            ...(input.dimensions === undefined ? {} : { dimensions: input.dimensions }),
+          },
+          expectedRuntimeEpoch: current.runtimeEpoch,
+          expectedCredentialId: current.credentialId,
+          expectedCredentialRuntimeEpoch: current.credentialId
+            ? ((await providerPersistence.credentials.get(current.credentialId))?.runtimeEpoch ??
+              null)
+            : null,
+        })
+
+        if (result.status !== 'recorded') {
+          throw new Error(`provider seed measurement was not recorded: ${input.resourceId}`)
+        }
+      },
       overrideAttachment: (record) => providerPersistence.injectProviderAttachment(record),
     })
   }

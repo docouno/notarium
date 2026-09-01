@@ -12,10 +12,9 @@ import { enumValues } from '../../libs/enumValues'
 import { CredentialSchema } from './credentials'
 import {
   ProviderInventoryPageFields,
-  ProviderModelSchema,
+  ProviderModelWriteSchema,
   ProviderResourceListItemSchema,
   ProviderResourceSchema,
-  PurposeSchema,
 } from './providers'
 
 export const ProviderAttachmentStateSchema = z.enum(enumValues(ATTACHMENT_STATE))
@@ -31,8 +30,7 @@ export const ProviderDisclosureSnapshotSchema = z
     targetSpace: z.string(),
     resourceOwner: z.string(),
     baseUrl: z.string(),
-    purposes: z.array(PurposeSchema),
-    models: z.array(ProviderModelSchema),
+    models: z.array(ProviderModelWriteSchema),
     allowPrivateNetwork: z.boolean(),
     headerNames: z.array(z.string()),
   })
@@ -77,10 +75,14 @@ export const ProviderAttachmentDiffSchema = z
   })
   .strict()
 
+export const ProviderAttachmentResourceSummarySchema = ProviderResourceListItemSchema.omit({
+  baseUrl: true,
+})
+
 export const ProviderAttachmentViewSchema = z
   .object({
     attachment: ProviderAttachmentSchema,
-    resource: ProviderResourceSchema,
+    resource: ProviderAttachmentResourceSummarySchema,
     /** The current pair the manager was shown and may conditionally accept. The
      *  epochs on `attachment` are the previously accepted pair (or null for a new
      *  offer), so overloading them would erase the automaton's stored state. */
@@ -104,7 +106,7 @@ export const ProviderAttachmentListRecordSchema = ProviderAttachmentSchema.pick(
 export const ProviderAttachmentListItemSchema = z
   .object({
     attachment: ProviderAttachmentListRecordSchema,
-    resource: ProviderResourceListItemSchema.omit({ baseUrl: true }),
+    resource: ProviderAttachmentResourceSummarySchema,
   })
   .strict()
 

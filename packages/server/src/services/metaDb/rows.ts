@@ -1,5 +1,6 @@
 // Row↔record mappers shared by the SQLite and Postgres driver twins.
 
+import { ProviderLastChecksSchema, ProviderModelsSchema } from '@notarium/contract'
 import {
   AGENT_SESSION_ATTACH,
   REVISION_INTEGRITY,
@@ -48,6 +49,19 @@ const jsonOf = <T>(raw: string | null | undefined, fallback: T): T => {
   }
 }
 
+const providerModelsOf = (
+  raw: string,
+  defaultModel: string | null,
+): ProviderResourceRecord['models'] => {
+  const models = ProviderModelsSchema.parse(JSON.parse(raw))
+
+  if (defaultModel !== null && !models.some(({ name }) => name === defaultModel)) {
+    throw new Error('provider default model must name one exact stored model')
+  }
+
+  return models
+}
+
 // ── provider facet rows ──────────────────────────────────────────────
 
 export type CredentialRow = {
@@ -88,7 +102,6 @@ export type ProviderResourceRow = {
   base_url: string
   headers: string
   allow_private_network: number | boolean
-  purposes: string
   models: string
   default_model: string | null
   credential_id: string | null
@@ -100,25 +113,37 @@ export type ProviderResourceRow = {
   call_timeout_ms: number | string | null
 }
 
-export const providerResourceOfRow = (row: ProviderResourceRow): ProviderResourceRecord => ({
-  id: row.id,
-  owner: row.owner,
-  name: row.name,
-  wire: row.wire,
-  baseUrl: row.base_url,
-  headers: jsonOf(row.headers, {}),
-  allowPrivateNetwork: Boolean(row.allow_private_network),
-  purposes: jsonOf(row.purposes, []),
-  models: jsonOf(row.models, []),
-  defaultModel: row.default_model,
-  credentialId: row.credential_id,
-  consentEpoch: Number(row.consent_epoch),
-  runtimeEpoch: Number(row.runtime_epoch),
-  disabledAt: row.disabled_at,
-  lastCheck: jsonOf(row.last_check, {}),
-  firstByteTimeoutMs: row.first_byte_timeout_ms == null ? null : Number(row.first_byte_timeout_ms),
-  callTimeoutMs: row.call_timeout_ms == null ? null : Number(row.call_timeout_ms),
-})
+export const providerResourceOfRow = (row: ProviderResourceRow): ProviderResourceRecord => {
+  const models = providerModelsOf(row.models, row.default_model)
+  const lastCheck = ProviderLastChecksSchema.parse(JSON.parse(row.last_check))
+  const configuredCapabilities = new Set(models.flatMap(({ capabilities }) => capabilities))
+
+  for (const capability of Object.keys(lastCheck)) {
+    if (!configuredCapabilities.has(capability as keyof typeof lastCheck)) {
+      throw new Error('provider last check requires a configured model capability')
+    }
+  }
+
+  return {
+    id: row.id,
+    owner: row.owner,
+    name: row.name,
+    wire: row.wire,
+    baseUrl: row.base_url,
+    headers: jsonOf(row.headers, {}),
+    allowPrivateNetwork: Boolean(row.allow_private_network),
+    models,
+    defaultModel: row.default_model,
+    credentialId: row.credential_id,
+    consentEpoch: Number(row.consent_epoch),
+    runtimeEpoch: Number(row.runtime_epoch),
+    disabledAt: row.disabled_at,
+    lastCheck,
+    firstByteTimeoutMs:
+      row.first_byte_timeout_ms == null ? null : Number(row.first_byte_timeout_ms),
+    callTimeoutMs: row.call_timeout_ms == null ? null : Number(row.call_timeout_ms),
+  }
+}
 
 export type ProviderAttachmentRow = {
   id: string

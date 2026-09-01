@@ -312,7 +312,7 @@ export const providersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) =>
           agent: req.principal.label ?? null,
           admin: req.principal.admin,
           resourceId: id,
-          purpose: body.data.purpose,
+          capability: body.data.capability,
           signal: abort.signal,
         })
 

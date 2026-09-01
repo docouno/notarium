@@ -104,7 +104,7 @@
 /* Narrow viewport: drop the tab rail above the panel. */
 @media (max-width: 720px) {
   .body {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     gap: 20px;
   }
 

@@ -17,8 +17,14 @@ it('serializes a late provider offer behind the same Space purge boundary', asyn
       baseUrl: 'https://provider.example/v1',
       headers: {},
       allowPrivateNetwork: false,
-      purposes: ['chat'],
-      models: [],
+      models: [
+        {
+          name: 'model-a',
+          capabilities: ['completion'],
+          dimensions: null,
+          statusByCapability: { completion: 'available' },
+        },
+      ],
       defaultModel: null,
       credentialId: null,
       consentEpoch: 0,

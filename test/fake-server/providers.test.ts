@@ -48,7 +48,7 @@ describe('provider resource REST surface', () => {
         name: 'Main resource',
         wire: 'openai-compatible',
         baseUrl: 'https://openrouter.ai/api/v1',
-        purposes: ['chat'],
+        models: [{ name: 'gpt-4o-mini', capabilities: ['completion'] }],
         headers: { 'X-Api-Key': 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz' },
         ...payload,
       },
@@ -292,7 +292,7 @@ describe('provider resource REST surface', () => {
     expect(listed.json()).toMatchObject({
       total: 1,
       nextCursor: null,
-      items: [{ modelCount: 0 }],
+      items: [{ modelCount: 1 }],
     })
     expect(listed.json().items[0]).not.toHaveProperty('headerNames')
     expect(listed.body).not.toContain('sk-ant-api03')
@@ -442,7 +442,7 @@ describe('provider resource REST surface', () => {
           method: 'POST',
           url: '/api/providers/resources/missing/validate',
           headers: { cookie },
-          payload: { purpose: 'chat' },
+          payload: { capability: 'completion' },
         }),
         disabled.inject({
           method: 'DELETE',

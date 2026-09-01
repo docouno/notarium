@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   CredentialListItem,
+  ModelCapability,
   ProviderEffectiveEntry,
   ProviderResource,
   ProviderResourceCreateRequest,
@@ -8,10 +9,10 @@ import type {
   ProviderResourcePatchRequest,
   ProviderResourceResponse,
   ProviderStatus,
-  Purpose,
 } from '@notarium/contract'
+import { HTTP_STATUS } from '@notarium/contract/http'
 import { errorText } from '../../libs/errors'
-import { api } from '../../services/api'
+import { api, ApiError } from '../../services/api'
 import {
   type ProviderResourceListEntry,
   ProviderResources as ProviderResourcesWidget,
@@ -57,7 +58,9 @@ export const ProviderResources = () => {
     owner: resource.owner,
     ...(resource.baseUrl === undefined ? {} : { baseUrl: resource.baseUrl }),
     addressIsPrivate: resource.addressIsPrivate,
-    purposes: resource.purposes,
+    capabilities: ['completion', 'embedding'].filter((capability) =>
+      resource.models.some((model) => model.capabilities.includes(capability as ModelCapability)),
+    ) as ModelCapability[],
     modelCount: resource.models.length,
     hasCredentials: resource.hasCredentials,
     disabledAt: resource.disabledAt,
@@ -425,7 +428,14 @@ export const ProviderResources = () => {
       }
     } catch (cause) {
       if (request === detailRequest.current) {
-        setDetailError(errorText(cause))
+        if (cause instanceof ApiError && cause.status === HTTP_STATUS.NOT_FOUND) {
+          setSelected(null)
+          setOwned((current) => current?.filter((resource) => resource.id !== id) ?? [])
+          setEffective((current) => current?.filter((entry) => entry.resource.id !== id) ?? [])
+          setDetailError('This provider resource no longer exists.')
+        } else {
+          setDetailError(errorText(cause))
+        }
       }
     } finally {
       if (request === detailRequest.current) {
@@ -442,15 +452,34 @@ export const ProviderResources = () => {
   }
 
   const patch = async (id: string, input: ProviderResourcePatchRequest) => {
-    const patched = await api.providerResourcePatch(id, input)
-    upsertOwned(listItemOf(patched.resource))
-    await refreshEffective(id)
-    setSelected(null)
+    try {
+      const patched = await api.providerResourcePatch(id, input)
+      upsertOwned(listItemOf(patched.resource))
+      await refreshEffective(id)
+      setSelected(patched)
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === HTTP_STATUS.NOT_FOUND) {
+        setSelected(null)
+        setOwned((current) => current?.filter((resource) => resource.id !== id) ?? [])
+        setEffective((current) => current?.filter((entry) => entry.resource.id !== id) ?? [])
+        setDetailError('This provider resource no longer exists.')
+        return
+      }
+      throw cause
+    }
   }
 
   const remove = async (id: string) => {
-    await api.providerResourceDelete(id)
-    setSelected(null)
+    try {
+      await api.providerResourceDelete(id)
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === HTTP_STATUS.NOT_FOUND) {
+        setDetailError('This provider resource no longer exists.')
+      } else {
+        throw cause
+      }
+    }
+    setSelected((current) => (current?.resource.id === id ? null : current))
     setOwned((current) => current?.filter((resource) => resource.id !== id) ?? [])
     setEffective((current) => current?.filter((entry) => entry.resource.id !== id) ?? [])
     setOwnedStatusById((current) => {
@@ -463,12 +492,22 @@ export const ProviderResources = () => {
     setResourceStatus(id, null)
   }
 
-  const validate = async (id: string, purpose: Purpose) => {
-    const result = await api.providerValidate(id, { purpose })
-    setSelected({ resource: result.resource, warnings: [] })
-    upsertOwned(listItemOf(result.resource))
-    await refreshEffective(id)
-    return result
+  const validate = async (id: string, capability: ModelCapability) => {
+    try {
+      const result = await api.providerValidate(id, { capability })
+      setSelected({ resource: result.resource, warnings: [] })
+      upsertOwned(listItemOf(result.resource))
+      await refreshEffective(id)
+      return result
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === HTTP_STATUS.NOT_FOUND) {
+        setSelected(null)
+        setOwned((current) => current?.filter((resource) => resource.id !== id) ?? [])
+        setEffective((current) => current?.filter((entry) => entry.resource.id !== id) ?? [])
+        throw new Error('This provider resource no longer exists.')
+      }
+      throw cause
+    }
   }
 
   const offer = async (resourceId: string, targetId: string) => {

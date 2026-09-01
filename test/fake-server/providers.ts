@@ -13,7 +13,10 @@ import type {
   ProviderRetargetResult,
 } from '@notarium/server'
 import { PROVIDER_PERSISTENCE_ERROR, providerPersistenceError } from '@notarium/server'
-import { mergedProviderModels } from '../../packages/server/src/services/metaDb/drivers/providerModels'
+import {
+  applyProviderModelMeasurement,
+  mergedProviderModels,
+} from '../../packages/server/src/services/metaDb/drivers/providerModels'
 import {
   providerCiphertextBatch,
   providerCiphertextCounts,
@@ -48,8 +51,11 @@ const copyCredential = (record: CredentialRecord): CredentialRecord => ({
 const copyResource = (record: ProviderResourceRecord): ProviderResourceRecord => ({
   ...record,
   headers: { ...record.headers },
-  purposes: [...record.purposes],
-  models: record.models.map((model) => ({ ...model })),
+  models: record.models.map((model) => ({
+    ...model,
+    capabilities: [...model.capabilities],
+    statusByCapability: { ...model.statusByCapability },
+  })),
   lastCheck: { ...record.lastCheck },
 })
 
@@ -58,8 +64,10 @@ const copyAttachment = (record: ProviderAttachmentRecord): ProviderAttachmentRec
   disclosure: record.disclosure
     ? {
         ...record.disclosure,
-        purposes: [...record.disclosure.purposes],
-        models: record.disclosure.models.map((model) => ({ ...model })),
+        models: record.disclosure.models.map((model) => ({
+          ...model,
+          capabilities: [...model.capabilities],
+        })),
         headerNames: [...record.disclosure.headerNames],
       }
     : null,
@@ -306,13 +314,7 @@ export const createInMemoryProviderPersistence = (options: {
         }
         resourceRows.set(record.id, copyResource(record))
       }),
-    replaceIfRuntimeEpoch: (
-      record,
-      ciphertext,
-      expectedRuntimeEpoch,
-      expectedCredentialId,
-      preserveModels = false,
-    ) =>
+    replaceIfRuntimeEpoch: (record, ciphertext, expectedRuntimeEpoch, expectedCredentialId) =>
       coordinator.run(() => {
         assertCiphertext(Object.values(record.headers), ciphertext)
         validateResource(record)
@@ -329,7 +331,7 @@ export const createInMemoryProviderPersistence = (options: {
         }
         const stored = copyResource({
           ...record,
-          models: preserveModels ? current.models : record.models,
+          models: mergedProviderModels(current.models, record.models),
           lastCheck:
             record.runtimeEpoch === expectedRuntimeEpoch ? current.lastCheck : record.lastCheck,
         })
@@ -440,17 +442,6 @@ export const createInMemoryProviderPersistence = (options: {
           }
         }
       }),
-    materializeModel: (id, model) =>
-      coordinator.run(() => {
-        const record = resourceRows.get(id)
-
-        if (!record) {
-          return null
-        }
-        const updated = { ...record, models: mergedProviderModels(record.models, model) }
-        resourceRows.set(id, updated)
-        return copyResource(updated)
-      }),
     recordLastCheck: (input) =>
       coordinator.run(() => {
         const record = resourceRows.get(input.resourceId)
@@ -471,8 +462,13 @@ export const createInMemoryProviderPersistence = (options: {
         }
         const updated = {
           ...record,
-          lastCheck: { ...record.lastCheck, [input.purpose]: input.lastCheck },
-          models: input.model ? mergedProviderModels(record.models, input.model) : record.models,
+          lastCheck: { ...record.lastCheck, [input.capability]: input.lastCheck },
+          models: input.measurement
+            ? applyProviderModelMeasurement(record.models, {
+                ...input.measurement,
+                capability: input.capability,
+              })
+            : record.models,
         }
         resourceRows.set(input.resourceId, copyResource(updated))
         return { status: 'recorded' as const, record: copyResource(updated) }

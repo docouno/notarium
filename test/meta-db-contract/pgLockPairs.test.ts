@@ -373,7 +373,6 @@ const seed = async (db: MetaDb): Promise<void> => {
       baseUrl: 'https://provider.example/v1',
       headers: {},
       allowPrivateNetwork: false,
-      purposes: ['chat'],
       models: [],
       defaultModel: null,
       credentialId: 'provider-credential-probe',

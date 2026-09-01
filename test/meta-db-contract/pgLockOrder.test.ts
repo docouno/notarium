@@ -625,7 +625,7 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
       await run('pgMetaDb.grantMemberToActiveSpace', () =>
         db.grantMemberToActiveSpace('alpha', 'al', 'writer', AT),
       )
-      // A non-empty selection on purpose: an empty one never reads the project rows,
+      // A non-empty selection on capability: an empty one never reads the project rows,
       // so it would never enter L4f and the order this transaction shares with the
       // whole-space purge would go unobserved. A registry note for the same reason —
       // a `null` one never enters L3n, and the lifecycle fence above tier 4 would be
@@ -1021,8 +1021,14 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
         baseUrl: 'https://provider.example/v1',
         headers: { 'x-title': `v1.${providerKey.keyId}.YWJj` },
         allowPrivateNetwork: false,
-        purposes: ['chat' as const],
-        models: [],
+        models: [
+          {
+            name: 'model-a',
+            capabilities: ['completion' as const],
+            dimensions: null,
+            statusByCapability: { completion: 'available' as const },
+          },
+        ],
         defaultModel: null,
         credentialId: providerCredential.id,
         consentEpoch: 0,
@@ -1054,24 +1060,17 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
           providerCredential.id,
         ),
       )
-      await run('providerResources.materializeModel', () =>
-        db.providerResources.materializeModel(providerResource.id, {
-          name: 'model-a',
-          dimensions: null,
-          status: 'available',
-        }),
-      )
       await run('providerResources.recordLastCheck', () =>
         db.providerResources.recordLastCheck({
           resourceId: providerResource.id,
-          purpose: 'chat',
+          capability: 'completion',
           lastCheck: {
             status: 'ready',
             checkedAt: AT,
             diagnostic: null,
             credentialProven: true,
           },
-          model: { name: 'model-a', dimensions: null, status: 'available' },
+          measurement: { modelName: 'model-a', status: 'available' },
           expectedRuntimeEpoch: 0,
           expectedCredentialId: providerCredential.id,
           expectedCredentialRuntimeEpoch: 1,

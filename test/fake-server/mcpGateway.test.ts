@@ -2005,11 +2005,32 @@ describe('whoami', () => {
   it('derives hasModel from the principal effective list', async () => {
     await app.close()
     let teamId = ''
+    let setAvailability!: (
+      resourceId: string,
+      status: 'available' | 'model-unavailable',
+    ) => Promise<void>
     app = await createApp(
       { ...fixture(), capabilities: { providers: true } },
       {
-        onProviderPersistence: (_providers, idOf) => {
+        onProviderPersistence: (providers, idOf) => {
           teamId = idOf('team')
+          setAvailability = async (resourceId, status) => {
+            const current = (await providers.providerResources.get(resourceId))!
+            await providers.providerResources.recordLastCheck({
+              resourceId,
+              capability: 'completion',
+              lastCheck: {
+                status: status === 'available' ? 'ready' : 'not-configured',
+                checkedAt: '2026-08-31T00:00:00.000Z',
+                diagnostic: null,
+                credentialProven: false,
+              },
+              measurement: { modelName: 'gpt-4o-mini', status },
+              expectedRuntimeEpoch: current.runtimeEpoch,
+              expectedCredentialId: current.credentialId,
+              expectedCredentialRuntimeEpoch: null,
+            })
+          }
         },
       },
     )
@@ -2034,8 +2055,7 @@ describe('whoami', () => {
           wire: 'openai-compatible',
           baseUrl: 'https://openrouter.ai/api/v1',
           credentialId,
-          purposes: ['chat'],
-          models: [{ name: 'gpt-4o-mini', dimensions: null, status: 'available' }],
+          models: [{ name: 'gpt-4o-mini', capabilities: ['completion'] }],
         },
       })
       expect(response.statusCode).toBe(200)
@@ -2044,7 +2064,25 @@ describe('whoami', () => {
 
     expect(structured(await whoami()).hasModel).toBe(false)
 
+    const empty = await app.inject({
+      method: 'POST',
+      url: '/api/providers/resources',
+      headers: { cookie: alice },
+      payload: {
+        name: 'Empty',
+        wire: 'openai-compatible',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        models: [],
+      },
+    })
+    expect(empty.statusCode).toBe(200)
+    expect(structured(await whoami()).hasModel).toBe(false)
+
     const usable = await createResource(alice, 'Usable')
+    expect(structured(await whoami()).hasModel).toBe(true)
+    await setAvailability(usable, 'model-unavailable')
+    expect(structured(await whoami()).hasModel).toBe(false)
+    await setAvailability(usable, 'available')
     expect(structured(await whoami()).hasModel).toBe(true)
 
     const disabledResource = await app.inject({

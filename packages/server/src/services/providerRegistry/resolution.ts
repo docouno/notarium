@@ -6,6 +6,7 @@
 import {
   ATTACHMENT_STATE,
   type AttachmentState,
+  MODEL_STATUS,
   PROVIDER_LIST_PAGE_SIZE,
   PROVIDER_STATUS,
 } from '@notarium/contract'
@@ -110,6 +111,15 @@ export const providerRecordInvalidity = (input: {
   }
   if (input.ownerDisabled) {
     return PROVIDER_STATUS.ownerDisabled
+  }
+  if (
+    !record.models.some((model) =>
+      model.capabilities.some(
+        (capability) => model.statusByCapability[capability] === MODEL_STATUS.available,
+      ),
+    )
+  ) {
+    return PROVIDER_STATUS.notConfigured
   }
 
   return null

@@ -64,8 +64,33 @@ default owns that choice.
 Effective lists retain accepted-but-unusable resources with one closed reason
 instead of silently dropping them: `disabled`, `credential-disabled`,
 `secret-unreadable`, `credential-origin-mismatch`, `owner-disabled`,
-`space-archived`, or `attachment-not-active`. A never-accepted `pending` offer is
-visible only on the consent surface.
+`space-archived`, `attachment-not-active`, or `not-configured`. The last state means
+that no exact model/capability pair is currently available. A never-accepted
+`pending` offer is visible only on the consent surface.
+
+## Model capabilities
+
+Every model row is authored as an exact provider address plus one or both supported
+capabilities: `completion` and `embedding`. Model names are not labels: leading and
+trailing spaces, repeated spaces, tabs, case and Unicode code points are preserved
+verbatim. A blank-only name is refused, but validation never trims or normalizes a
+legal name.
+
+The stored row adds system-owned facts: embedding dimensions and availability per
+capability. A failed embedding check on a multi-capability model therefore does not
+change completion availability. One nullable resource default remains; selection
+uses it only when it carries the requested capability, otherwise the first capable
+row in authored order. Empty resources are legal owner-managed drafts.
+
+Settings edits this mapping as responsive model rows built from the shared form,
+checkbox, button and icon controls. Each row keeps its exact name, capability ticks,
+reversible default star and remove action together; it reflows instead of introducing
+a second table mini-system. Validate and Share are disabled while authored changes
+are unsaved. Switching rows, closing an editor or canceling a dirty create asks before
+discarding; deleting the selected resource uses its destructive confirmation, while
+deleting another row does not close the current editor. A same-id runtime refresh
+preserves a draft only when it was already dirty against the previous saved baseline.
+Route changes and browser reload are not guarded by this local editor contract.
 
 ## Credentials
 
@@ -134,12 +159,22 @@ the resource must separately opt in to private networking.
 
 ## Validation, calls and limits
 
-“Check connection” performs a real minimal call appropriate to the resource wire
-and purpose. Results are classes such as `credential-rejected`,
+“Check connection” selects an exact capable model before admission and performs a
+real minimal completion or embedding call on both OpenAI-compatible and Ollama
+wires. Credential-inventory shortcuts do not prove a model capability. A capability
+with no model is refused before admission, call-log intent, DNS or transport.
+Results are classes such as `credential-rejected`,
 `parameters-rejected`, `provider-rate-limited`, `model-unavailable` or
 `unreachable`, not raw provider bodies. A result is written only if both the
 resource and credential runtime epochs are still the snapshots that were called;
-a stale result is audited but does not overwrite current health.
+a stale result does not overwrite current health. The measurement write merges one
+exact model/capability field delta into the transaction-current row, so parallel
+checks and a concurrent Settings save do not erase sibling status or dimensions.
+
+Scoped execution requires the requested exact model/capability pair to be available.
+After a limiter wait and before call intent, the registry rereads that same pair.
+This catches a system health change even when resource epochs did not move; another
+available model cannot make the requested unavailable model callable.
 
 The executor supports OpenAI-compatible SSE/JSON and native Ollama NDJSON/JSON,
 streaming text, usage accounting and end-to-end cancellation. An intent row is
@@ -162,11 +197,17 @@ numeric limits do not isolate them.
 
 ## Consent lifecycle
 
-Acceptance stores the disclosed target Space, resource owner, origin, purposes,
-models, private-network flag and header names together with the resource and
+Acceptance stores the disclosed target Space, resource owner, origin, authored
+model/capability mapping, private-network flag and header names together with the resource and
 credential consent epochs. A later recipient-affecting mutation changes the current
 epochs and moves an active attachment to `awaiting-reconsent`; the manager sees a
 bounded literal diff before accepting again.
+
+Model identities in consent use a reversible ASCII representation. Printable ASCII
+other than quote/backslash is literal; quote and backslash are escaped; spaces,
+controls, non-ASCII and bidi/default-ignorable code points are written as
+`\u{UPPERCASE_HEX}`. The representation is not truncated or whitespace-collapsed,
+and changed-set comparison uses the raw structured snapshot.
 
 Removing the resource owner from the target Space atomically removes attachments
 for that owner's resources. Removing an unrelated member does not. Archiving a

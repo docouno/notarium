@@ -85,7 +85,7 @@ describe('provider scope call', () => {
     rmSync(root, { recursive: true, force: true })
   })
 
-  it.each(['resource', 'credential', 'resolution-read'] as const)(
+  it.each(['resource', 'credential', 'resolution-read', 'model-status'] as const)(
     'rechecks the captured %s state after preparation and before intent/send',
     async (changed) => {
       let requests = 0
@@ -133,8 +133,10 @@ describe('provider scope call', () => {
           baseUrl: `${origin}/api/v1`,
           allowPrivateNetwork: true,
           credentialId: credential.id,
-          purposes: ['chat'],
-          models: [{ name: 'local/model', dimensions: null, status: MODEL_STATUS.available }],
+          models: [
+            { name: 'local/model', capabilities: ['completion'] },
+            { name: 'other/model', capabilities: ['completion'] },
+          ],
         }),
       )
       await db.offerProviderAttachment(
@@ -191,17 +193,35 @@ describe('provider scope call', () => {
         await registry.updateCredential('alice', credential.id, { rpm: 2 })
       } else if (changed === 'resource') {
         await registry.updateResource('alice', resource.id, { callTimeoutMs: 1_000 })
-      } else {
+      } else if (changed === 'resolution-read') {
         db.providerAttachments.listForSpaces = async () => {
           throw new Error('meta db unavailable')
         }
+      } else {
+        await db.providerResources.recordLastCheck({
+          resourceId: resource.id,
+          capability: 'completion',
+          lastCheck: {
+            status: 'not-configured',
+            checkedAt: NOW,
+            diagnostic: null,
+            credentialProven: true,
+          },
+          measurement: { modelName: 'local/model', status: MODEL_STATUS.unavailable },
+          expectedRuntimeEpoch: 0,
+          expectedCredentialId: credential.id,
+          expectedCredentialRuntimeEpoch: 0,
+        })
       }
       releaseDecrypt.resolve()
 
       await expect(calling).rejects.toMatchObject({
-        code: PROVIDER_CALL_ERROR.policyDenied,
+        code:
+          changed === 'model-status'
+            ? PROVIDER_CALL_ERROR.modelUnavailable
+            : PROVIDER_CALL_ERROR.policyDenied,
         deliveryState: 'not-sent',
-        retrySafe: true,
+        ...(changed === 'model-status' ? {} : { retrySafe: true }),
       })
       expect(requests).toBe(0)
       expect(await db.providerCallLog.listForOwner('alice')).toEqual([])

@@ -27,12 +27,12 @@ export const CREDENTIAL_REFERENCE_KIND = {
 export type CredentialReferenceKind =
   (typeof CREDENTIAL_REFERENCE_KIND)[keyof typeof CREDENTIAL_REFERENCE_KIND]
 
-export const PURPOSE = {
-  chat: 'chat',
+export const MODEL_CAPABILITY = {
+  completion: 'completion',
   embedding: 'embedding',
 } as const
 
-export type Purpose = (typeof PURPOSE)[keyof typeof PURPOSE]
+export type ModelCapability = (typeof MODEL_CAPABILITY)[keyof typeof MODEL_CAPABILITY]
 
 export const PROVIDER_STATUS = {
   notConfigured: 'not-configured',
@@ -135,7 +135,7 @@ export const PROVIDER_LIMIT = {
   headerValue: 8 * 1024,
   models: 512,
   modelName: 512,
-  purposes: 2,
+  capabilities: 2,
   name: 200,
   baseUrl: 2048,
   diagnostic: 512,

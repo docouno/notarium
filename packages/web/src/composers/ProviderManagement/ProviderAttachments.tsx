@@ -95,17 +95,7 @@ export const ProviderAttachments = () => {
       createdAt: view.attachment.createdAt,
       expiresAt: view.attachment.expiresAt,
     },
-    resource: {
-      id: view.resource.id,
-      name: view.resource.name,
-      wire: view.resource.wire,
-      owner: view.resource.owner,
-      addressIsPrivate: view.resource.addressIsPrivate,
-      purposes: view.resource.purposes,
-      modelCount: view.resource.models.length,
-      hasCredentials: view.resource.hasCredentials,
-      disabledAt: view.resource.disabledAt,
-    },
+    resource: { ...view.resource, capabilities: [...view.resource.capabilities] },
   })
 
   const replaceView = (view: ProviderAttachmentView) => {

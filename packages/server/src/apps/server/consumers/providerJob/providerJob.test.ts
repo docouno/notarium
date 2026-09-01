@@ -186,12 +186,14 @@ describe('provider durable-job adapter', () => {
 
   it('does not couple the adapter to a provider wire', async () => {
     const executeForScope = vi.fn(async () => ({
-      kind: 'models' as const,
-      models: [WIRE.ollama],
+      kind: 'chat' as const,
+      text: WIRE.ollama,
+      finishReason: null,
+      usage: null,
     }))
 
     await expect(runProviderJobCall(context(), { executeForScope }, call)).resolves.toMatchObject({
-      models: [WIRE.ollama],
+      text: WIRE.ollama,
     })
   })
 })

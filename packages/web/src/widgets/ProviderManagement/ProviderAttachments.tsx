@@ -12,32 +12,41 @@ import { errorText } from '../../libs/errors'
 import type { ProviderAttachmentsProps } from './types'
 import styles from './ProviderManagement.module.scss'
 
-const DISPLAY_LIMIT = 120
-
-/** Provider discovery names are hostile durable input. React escapes markup, but
- *  the consent sentence also needs bounded, single-line labels so an addressee
- *  cannot visually impersonate the surrounding UI or drown the actual recipient. */
+/** Reversible ASCII representation of one exact provider model address. Spaces,
+ * bidi controls and every non-ASCII code point stay visible and unambiguous. */
 export const providerDisclosureLabel = (value: string): string => {
-  /* eslint-disable no-control-regex -- provider labels are hostile wire text */
-  const clean = value
-    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu, ' ')
-    .replace(/\s+/gu, ' ')
-    .trim()
-  /* eslint-enable no-control-regex */
+  let encoded = '"'
 
-  return clean.length > DISPLAY_LIMIT ? `${clean.slice(0, DISPLAY_LIMIT - 1)}…` : clean
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)!
+
+    if (character === '"') {
+      encoded += '\\"'
+    } else if (character === '\\') {
+      encoded += '\\\\'
+    } else if (codePoint >= 0x21 && codePoint <= 0x7e) {
+      encoded += character
+    } else {
+      encoded += `\\u{${codePoint.toString(16).toUpperCase()}}`
+    }
+  }
+
+  return `${encoded}"`
 }
 
-const listText = (values: string[]): string =>
-  values.length ? values.map(providerDisclosureLabel).join(', ') : 'none'
+const listText = (values: string[]): string => (values.length ? values.join(', ') : 'none')
+const modelText = (snapshot: ProviderDisclosureSnapshot): string =>
+  snapshot.models.length
+    ? snapshot.models
+        .map((model) => `${providerDisclosureLabel(model.name)} [${model.capabilities.join(', ')}]`)
+        .join(', ')
+    : 'none'
 
 const disclosureRows = (snapshot: ProviderDisclosureSnapshot) =>
   [
     ['Recipient', snapshot.baseUrl],
     ['Resource owner', snapshot.resourceOwner],
     ['What may leave', 'note content, agent memory, owner profile, role prompts'],
-    ['Purposes', listText(snapshot.purposes)],
-    ['Models', listText(snapshot.models.map((model) => model.name))],
     ['Header names', listText(snapshot.headerNames)],
     ['Private network opt-in', snapshot.allowPrivateNetwork ? 'yes' : 'no'],
   ] as const
@@ -46,10 +55,8 @@ const diffValue = (snapshot: ProviderDisclosureSnapshot, key: string): string =>
   switch (key) {
     case 'baseUrl':
       return snapshot.baseUrl
-    case 'purposes':
-      return listText(snapshot.purposes)
     case 'models':
-      return listText(snapshot.models.map((model) => model.name))
+      return modelText(snapshot)
     case 'headerNames':
       return listText(snapshot.headerNames)
     case 'allowPrivateNetwork':
@@ -61,7 +68,6 @@ const diffValue = (snapshot: ProviderDisclosureSnapshot, key: string): string =>
 
 const DIFF_FIELDS = [
   ['Recipient', 'baseUrl'],
-  ['Purposes', 'purposes'],
   ['Models', 'models'],
   ['Header names', 'headerNames'],
   ['Private network opt-in', 'allowPrivateNetwork'],
@@ -241,7 +247,11 @@ const AttachmentDetail = ({
   const headingId = `${id}-heading`
   const canAccept = attachment.state !== ATTACHMENT_STATE.active
   const changedFields = diff.before
-    ? DIFF_FIELDS.filter(([, key]) => diffValue(diff.before!, key) !== diffValue(diff.after, key))
+    ? DIFF_FIELDS.filter(([, key]) =>
+        key === 'models'
+          ? JSON.stringify(diff.before!.models) !== JSON.stringify(diff.after.models)
+          : diffValue(diff.before!, key) !== diffValue(diff.after, key),
+      )
     : []
 
   useEffect(() => {
@@ -281,6 +291,25 @@ const AttachmentDetail = ({
           </div>
         ))}
       </dl>
+      <div data-testid="provider-disclosure-models">
+        <strong>Models</strong>
+        {currentDisclosure.models.length === 0 ? (
+          <p className={styles.meta}>none</p>
+        ) : (
+          <ul className={styles.warningList}>
+            {currentDisclosure.models.map((model, index) => (
+              <li key={`${index}:${model.name}`}>
+                <code dir="ltr">{providerDisclosureLabel(model.name)}</code>{' '}
+                {model.capabilities.map((capability) => (
+                  <span className={styles.badge} key={capability}>
+                    {capability}
+                  </span>
+                ))}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
       {attachment.state === ATTACHMENT_STATE.awaitingReconsent && !diff.changed && (
         <Notice variant="warning">
           The record changed, but the information disclosed here did not.

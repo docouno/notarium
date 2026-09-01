@@ -98,6 +98,14 @@ const listen = async (handler: RequestListener): Promise<number> => {
   return (server.address() as AddressInfo).port
 }
 
+const deferred = <T = void>() => {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((yes) => {
+    resolve = yes
+  })
+  return { promise, resolve }
+}
+
 const bodyOf = async (request: Parameters<RequestListener>[0]): Promise<string> => {
   const chunks: Buffer[] = []
 
@@ -152,12 +160,16 @@ describe('provider executor', () => {
     const port = await listen((_request, response) => {
       requests += 1
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ data: [] }))
+      response.end(JSON.stringify({ data: [{ embedding: [0.1] }] }))
     })
     const subject = runtime(port)
     const limited = {
       endpoint: endpoint(port, WIRE.openaiCompatible),
-      operation: { kind: PROVIDER_CALL_KIND.models } as const,
+      operation: {
+        kind: PROVIDER_CALL_KIND.embedding,
+        model: 'test-model',
+        input: ['test'],
+      } as const,
       retryMode: PROVIDER_RETRY_MODE.none,
       call: { ...CALL, rateLimit: { ...CALL.rateLimit, rpm: 1 } },
     }
@@ -338,12 +350,16 @@ describe('provider executor', () => {
     const port = await listen((_request, response) => {
       requests += 1
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ data: [] }))
+      response.end(JSON.stringify({ data: [{ embedding: [0.1] }] }))
     })
     const subject = runtime(port)
     const limited = {
       endpoint: { ...endpoint(port, WIRE.openaiCompatible), firstByteTimeoutMs: 100 },
-      operation: { kind: PROVIDER_CALL_KIND.models } as const,
+      operation: {
+        kind: PROVIDER_CALL_KIND.embedding,
+        model: 'test-model',
+        input: ['test'],
+      } as const,
       retryMode: PROVIDER_RETRY_MODE.none,
       call: { ...CALL, rateLimit: { ...CALL.rateLimit, rpm: 1 } },
     }
@@ -360,13 +376,13 @@ describe('provider executor', () => {
     const port = await listen((_request, response) => {
       requests += 1
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ data: [] }))
+      response.end(JSON.stringify({ data: [{ embedding: [0.1] }] }))
     })
 
     await expect(
       runtime(port).execute({
         endpoint: endpoint(port, WIRE.openaiCompatible),
-        operation: { kind: PROVIDER_CALL_KIND.models },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         retryMode: PROVIDER_RETRY_MODE.none,
         call: CALL,
         signal: new AbortController().signal,
@@ -378,6 +394,56 @@ describe('provider executor', () => {
     })
     expect(requests).toBe(0)
     expect(journal.rows).toHaveLength(0)
+  })
+
+  it('rechecks captured liveness after a real concurrency wait', async () => {
+    let requests = 0
+    let pairAvailable = true
+    const firstArrived = deferred()
+    const releaseFirst = deferred()
+    const port = await listen(async (_request, response) => {
+      requests += 1
+      if (requests === 1) {
+        firstArrived.resolve()
+        await releaseFirst.promise
+      }
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ data: [{ embedding: [0.1] }] }))
+    })
+    const subject = new ProviderRuntime({
+      privateOrigins: new Set([`http://provider.test:${port}`]),
+      callLog: journal,
+      transport: {
+        lookup: async () => [{ address: '127.0.0.1', family: 4 }],
+        limits: { concurrentPerPrincipal: 1, queuedPerPrincipal: 1 },
+      },
+    })
+    const request = {
+      endpoint: endpoint(port, WIRE.openaiCompatible),
+      operation: {
+        kind: PROVIDER_CALL_KIND.embedding,
+        model: 'test-model',
+        input: ['test'],
+      } as const,
+      retryMode: PROVIDER_RETRY_MODE.none,
+      call: CALL,
+      signal: AbortSignal.timeout(5_000),
+    }
+    const active = subject.execute({ ...request, beforeSend: async () => true })
+    await firstArrived.promise
+    const queued = subject.execute({ ...request, beforeSend: async () => pairAvailable })
+
+    pairAvailable = false
+    releaseFirst.resolve()
+
+    await expect(active).resolves.toMatchObject({ kind: PROVIDER_CALL_KIND.embedding })
+    await expect(queued).rejects.toMatchObject({
+      code: PROVIDER_CALL_ERROR.canceled,
+      deliveryState: PROVIDER_DELIVERY_STATE.notSent,
+    })
+    expect(requests).toBe(1)
+    expect(journal.rows).toHaveLength(1)
+    subject.close()
   })
 
   it('charges observed tokens above reserve before admitting the next call', async () => {
@@ -563,7 +629,7 @@ describe('provider executor', () => {
     expect(chunks).toEqual(['one', ' two'])
   })
 
-  it('normalizes Ollama non-stream chat, embedding, and discovery', async () => {
+  it('normalizes Ollama non-stream chat and embedding', async () => {
     const payloads = new Map<string, Record<string, unknown>>()
     const port = await listen(async (request, response) => {
       if (request.method === 'POST') {
@@ -593,8 +659,6 @@ describe('provider executor', () => {
             prompt_eval_count: 4,
           }),
         )
-      } else {
-        response.end(JSON.stringify({ models: [{ model: 'local-a' }, { name: 'local-b' }] }))
       }
     })
     const subject = runtime(port)
@@ -635,9 +699,6 @@ describe('provider executor', () => {
         [0.3, 0.4],
       ],
     })
-    await expect(
-      subject.execute({ ...common, operation: { kind: PROVIDER_CALL_KIND.models } }),
-    ).resolves.toEqual({ kind: PROVIDER_CALL_KIND.models, models: ['local-a', 'local-b'] })
     expect(payloads.get('/api/chat')).toMatchObject({ options: { num_predict: 9 } })
     expect(payloads.get('/api/chat')).not.toHaveProperty('max_completion_tokens')
     expect(payloads.get('/api/embed')).toMatchObject({ input: ['a', 'b'], dimensions: 2 })
@@ -715,7 +776,7 @@ describe('provider executor', () => {
     const controller = new AbortController()
     const call = subject.execute({
       endpoint: endpoint(port, WIRE.openaiCompatible),
-      operation: { kind: PROVIDER_CALL_KIND.models },
+      operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
       retryMode: PROVIDER_RETRY_MODE.interactive,
       call: CALL,
       signal: controller.signal,
@@ -752,7 +813,7 @@ describe('provider executor', () => {
           return
         }
         response.writeHead(200, { 'content-type': 'application/json' })
-        response.end('{"data":null}')
+        response.end('{"data":[{"embedding":[0.1]}]}')
       })
       const subject =
         expectedDelay === null
@@ -767,12 +828,12 @@ describe('provider executor', () => {
       await expect(
         subject.execute({
           endpoint: endpoint(port, WIRE.openaiCompatible),
-          operation: { kind: PROVIDER_CALL_KIND.models },
+          operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
           retryMode: PROVIDER_RETRY_MODE.interactive,
           call: CALL,
           signal: new AbortController().signal,
         }),
-      ).resolves.toEqual({ kind: PROVIDER_CALL_KIND.models, models: [] })
+      ).resolves.toEqual({ kind: PROVIDER_CALL_KIND.embedding, embeddings: [[0.1]], usage: null })
       expect(hits).toBe(2)
       expect(delays).toEqual(expectedDelay === null ? [] : [expectedDelay])
     }
@@ -849,7 +910,7 @@ describe('provider executor', () => {
       await expect(
         runtime(port).execute({
           endpoint: endpoint(port, WIRE.openaiCompatible),
-          operation: { kind: PROVIDER_CALL_KIND.models },
+          operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
           retryMode: PROVIDER_RETRY_MODE.none,
           call: CALL,
           signal: new AbortController().signal,
@@ -879,7 +940,7 @@ describe('provider executor', () => {
           firstByteTimeoutMs: null,
           callTimeoutMs: null,
         },
-        operation: { kind: PROVIDER_CALL_KIND.models },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         retryMode: PROVIDER_RETRY_MODE.none,
         call: CALL,
         signal: new AbortController().signal,
@@ -899,7 +960,7 @@ describe('provider executor', () => {
     await expect(
       runtime(port).execute({
         endpoint: { ...endpoint(port, WIRE.openaiCompatible), callTimeoutMs: 30 },
-        operation: { kind: PROVIDER_CALL_KIND.models },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         retryMode: PROVIDER_RETRY_MODE.interactive,
         call: CALL,
         signal: new AbortController().signal,
@@ -930,7 +991,7 @@ describe('provider executor', () => {
           firstByteTimeoutMs: null,
           callTimeoutMs: null,
         },
-        operation: { kind: PROVIDER_CALL_KIND.models },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         retryMode: PROVIDER_RETRY_MODE.none,
         call: CALL,
         signal: new AbortController().signal,
@@ -961,7 +1022,7 @@ describe('provider executor', () => {
 
     const responsePort = await listen((_request, response) => {
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end('{"data":null}')
+      response.end('{"data":[{"embedding":[0.1]}]}')
     })
     const responseRuntime = new ProviderRuntime({
       privateOrigins: new Set([`http://provider.test:${responsePort}`]),
@@ -974,7 +1035,7 @@ describe('provider executor', () => {
     await expect(
       responseRuntime.execute({
         endpoint: endpoint(responsePort, WIRE.openaiCompatible),
-        operation: { kind: PROVIDER_CALL_KIND.models },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         retryMode: PROVIDER_RETRY_MODE.none,
         call: CALL,
         signal: new AbortController().signal,
@@ -1067,7 +1128,7 @@ describe('provider executor', () => {
     try {
       await runtime(port).execute({
         endpoint: target,
-        operation: { kind: PROVIDER_CALL_KIND.models },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         retryMode: PROVIDER_RETRY_MODE.none,
         call: CALL,
         signal: new AbortController().signal,
@@ -1089,11 +1150,6 @@ describe('provider executor', () => {
     const authorization = `Bearer ${secret}`
     const custom = 'custom-private-value'
     const port = await listen(async (request, response) => {
-      if (request.url === '/v1/models') {
-        response.writeHead(200, { 'content-type': 'application/json' })
-        response.end(JSON.stringify({ data: [{ id: `model-${secret}` }] }))
-        return
-      }
       const payload = JSON.parse(await bodyOf(request)) as { stream?: boolean }
 
       if (!payload.stream) {
@@ -1145,10 +1201,6 @@ describe('provider executor', () => {
         maxOutputTokens: 16,
       },
     })
-    const models = await subject.execute({
-      ...base,
-      operation: { kind: PROVIDER_CALL_KIND.models },
-    })
     const chunks: string[] = []
     const streamed = await subject.execute({
       ...base,
@@ -1164,7 +1216,7 @@ describe('provider executor', () => {
       },
     })
 
-    for (const value of [nonStream, models, streamed, chunks]) {
+    for (const value of [nonStream, streamed, chunks]) {
       expect(JSON.stringify(value)).not.toContain(secret)
       expect(JSON.stringify(value)).not.toContain(custom)
     }
@@ -1173,39 +1225,8 @@ describe('provider executor', () => {
       finishReason: '[redacted]',
       usage: { costDetails: { 'cost-[redacted]': 1 } },
     })
-    expect(models).toEqual({ kind: PROVIDER_CALL_KIND.models, models: ['model-[redacted]'] })
     expect(streamed).toMatchObject({ text: 'prefix [redacted] suffix' })
     expect(chunks.join('')).toBe('prefix [redacted] suffix')
-  })
-
-  it('accepts OpenAI data:null discovery and sanitizes hostile model names', async () => {
-    let nullCase = true
-    const port = await listen((_request, response) => {
-      response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(
-        nullCase
-          ? '{"data":null}'
-          : JSON.stringify({ data: [{ id: `model\r\nspoof-${'x'.repeat(10_000)}` }] }),
-      )
-      nullCase = false
-    })
-    const subject = runtime(port)
-    const call = () =>
-      subject.execute({
-        endpoint: endpoint(port, WIRE.openaiCompatible),
-        operation: { kind: PROVIDER_CALL_KIND.models },
-        retryMode: PROVIDER_RETRY_MODE.none,
-        call: CALL,
-        signal: new AbortController().signal,
-      })
-
-    await expect(call()).resolves.toEqual({ kind: PROVIDER_CALL_KIND.models, models: [] })
-    const result = await call()
-    expect(result.kind).toBe(PROVIDER_CALL_KIND.models)
-    if (result.kind === PROVIDER_CALL_KIND.models) {
-      expect(result.models[0]).not.toMatch(/[\r\n]/u)
-      expect(result.models[0].length).toBeLessThanOrEqual(512)
-    }
   })
 
   it('classifies Ollama pre-stream 404 before entering the NDJSON parser', async () => {
@@ -1254,7 +1275,7 @@ describe('provider executor', () => {
         code: PROVIDER_CALL_ERROR.malformedResponse,
       },
       {
-        operation: { kind: PROVIDER_CALL_KIND.models },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         body: '{"error":"runtime failed"}',
         code: PROVIDER_CALL_ERROR.fallback,
       },
@@ -1423,7 +1444,7 @@ describe('provider call journal', () => {
     await expect(
       runtime(port).execute({
         endpoint: endpoint(port, WIRE.openaiCompatible),
-        operation: { kind: PROVIDER_CALL_KIND.key },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         retryMode: PROVIDER_RETRY_MODE.none,
         call: CALL,
         signal: new AbortController().signal,
@@ -1459,7 +1480,7 @@ describe('provider call journal', () => {
           firstByteTimeoutMs: null,
           callTimeoutMs: null,
         },
-        operation: { kind: PROVIDER_CALL_KIND.models },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         retryMode: PROVIDER_RETRY_MODE.none,
         call: CALL,
         signal: new AbortController().signal,
@@ -1533,7 +1554,7 @@ describe('provider call journal', () => {
     const port = await listen((_request, response) => {
       requests += 1
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ data: [] }))
+      response.end(JSON.stringify({ data: [{ embedding: [0.1] }] }))
     })
     const refusing = new ProviderRuntime({
       privateOrigins: new Set([`http://provider.test:${port}`]),
@@ -1549,7 +1570,7 @@ describe('provider call journal', () => {
     await expect(
       refusing.execute({
         endpoint: endpoint(port, WIRE.openaiCompatible),
-        operation: { kind: PROVIDER_CALL_KIND.models },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         retryMode: PROVIDER_RETRY_MODE.none,
         call: CALL,
         signal: new AbortController().signal,
@@ -1564,7 +1585,7 @@ describe('provider call journal', () => {
     const port = await listen((_request, response) => {
       requests += 1
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ data: [] }))
+      response.end(JSON.stringify({ data: [{ embedding: [0.1] }] }))
     })
     journal.refuseWith({
       id: 'call-earlier',
@@ -1589,7 +1610,7 @@ describe('provider call journal', () => {
     await expect(
       runtime(port).execute({
         endpoint: endpoint(port, WIRE.openaiCompatible),
-        operation: { kind: PROVIDER_CALL_KIND.models },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         retryMode: PROVIDER_RETRY_MODE.none,
         call: { ...CALL, job: { jobId: 'job-1', jobCallKey: 'embed' } },
         signal: new AbortController().signal,
@@ -1606,7 +1627,7 @@ describe('provider call journal', () => {
   it('reports a blocked resend by the class the previous attempt carried', async () => {
     const port = await listen((_request, response) => {
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ data: [] }))
+      response.end(JSON.stringify({ data: [{ embedding: [0.1] }] }))
     })
     const previous = {
       id: 'call-earlier',
@@ -1629,7 +1650,7 @@ describe('provider call journal', () => {
     const resend = () =>
       runtime(port).execute({
         endpoint: endpoint(port, WIRE.openaiCompatible),
-        operation: { kind: PROVIDER_CALL_KIND.models },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         retryMode: PROVIDER_RETRY_MODE.none,
         call: { ...CALL, job: { jobId: 'job-1', jobCallKey: 'embed' } },
         signal: new AbortController().signal,
@@ -1703,7 +1724,7 @@ describe('provider call journal', () => {
     })
     const call = stalled.execute({
       endpoint: endpoint(11434, WIRE.ollama),
-      operation: { kind: PROVIDER_CALL_KIND.models },
+      operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
       retryMode: PROVIDER_RETRY_MODE.none,
       call: { ...CALL, job: { jobId: 'job-1', jobCallKey: 'discover' } },
       signal: controller.signal,
@@ -1721,7 +1742,7 @@ describe('provider call journal', () => {
   it('keeps the answer when the journal cannot close the row it opened', async () => {
     const port = await listen((_request, response) => {
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ data: [{ id: 'model-a' }] }))
+      response.end(JSON.stringify({ data: [{ embedding: [0.1] }] }))
     })
     let intents = 0
     const unclosable = new ProviderRuntime({
@@ -1744,12 +1765,12 @@ describe('provider call journal', () => {
     await expect(
       unclosable.execute({
         endpoint: endpoint(port, WIRE.openaiCompatible),
-        operation: { kind: PROVIDER_CALL_KIND.models },
+        operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
         retryMode: PROVIDER_RETRY_MODE.none,
         call: CALL,
         signal: new AbortController().signal,
       }),
-    ).resolves.toMatchObject({ kind: PROVIDER_CALL_KIND.models })
+    ).resolves.toMatchObject({ kind: PROVIDER_CALL_KIND.embedding, embeddings: [[0.1]] })
 
     expect(intents).toBe(1)
     expect(journal.rows[0].outcome).toBeUndefined()
@@ -1759,7 +1780,7 @@ describe('provider call journal', () => {
     const entered: string[] = []
     const port = await listen((_request, response) => {
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ data: [] }))
+      response.end(JSON.stringify({ data: [{ embedding: [0.1] }] }))
     })
     const gated = new ProviderRuntime({
       privateOrigins: new Set([`http://provider.test:${port}`]),
@@ -1777,7 +1798,7 @@ describe('provider call journal', () => {
 
     await gated.execute({
       endpoint: endpoint(port, WIRE.openaiCompatible),
-      operation: { kind: PROVIDER_CALL_KIND.models },
+      operation: { kind: PROVIDER_CALL_KIND.embedding, model: 'test-model', input: ['test'] },
       retryMode: PROVIDER_RETRY_MODE.none,
       call: CALL,
       signal: new AbortController().signal,

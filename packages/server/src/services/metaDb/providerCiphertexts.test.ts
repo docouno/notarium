@@ -100,8 +100,14 @@ it('rolls the complete provider recovery back when a late credential delete fail
         baseUrl: 'https://provider.example/v1',
         headers: { 'x-title': ciphertext(`header-${suffix}`) },
         allowPrivateNetwork: false,
-        purposes: ['chat'],
-        models: [],
+        models: [
+          {
+            name: 'model-a',
+            capabilities: ['completion'],
+            dimensions: null,
+            statusByCapability: { completion: 'available' },
+          },
+        ],
         defaultModel: null,
         credentialId: `credential-${suffix}`,
         consentEpoch: 0,

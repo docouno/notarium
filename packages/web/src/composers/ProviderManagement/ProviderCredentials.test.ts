@@ -68,7 +68,7 @@ const resource = (id: string): ProviderResourceListItem => ({
   owner: { kind: 'user', name: 'alice', mine: true },
   baseUrl: `https://provider.example/${id}`,
   addressIsPrivate: false,
-  purposes: ['chat'],
+  capabilities: ['completion'],
   modelCount: 1,
   hasCredentials: true,
   disabledAt: null,

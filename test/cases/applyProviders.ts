@@ -20,6 +20,13 @@ export type ApplyProviderSeedOptions = {
   resolveProject: (space: string, path: string) => Promise<{ id: string; space: string } | null>
   /** Seed-only escape hatch for states every product persistence write rejects. */
   overrideResource: (record: ProviderResourceRecord) => void | Promise<void>
+  recordMeasurement: (input: {
+    resourceId: string
+    modelName: string
+    capability: 'completion' | 'embedding'
+    status?: 'available' | 'model-unavailable'
+    dimensions?: number
+  }) => void | Promise<void>
   /** Seed-only escape hatch for a pending offer close to expiry. */
   overrideAttachment: (record: ProviderAttachmentRecord) => void | Promise<void>
 }
@@ -86,7 +93,6 @@ export const applyProviderSeed = async (
       baseUrl: declaration.baseUrl,
       headers: declaration.headers ?? {},
       allowPrivateNetwork: declaration.allowPrivateNetwork ?? false,
-      purposes: declaration.purposes,
       models: declaration.models ?? [],
       defaultModel: declaration.defaultModel ?? null,
       credentialId,
@@ -94,6 +100,10 @@ export const applyProviderSeed = async (
       callTimeoutMs: declaration.callTimeoutMs ?? null,
     }
     const created = await options.registry.createResource(owner, input)
+
+    for (const measurement of declaration.measurements ?? []) {
+      await options.recordMeasurement({ resourceId: created.resource.id, ...measurement })
+    }
 
     if (declaration.disabled) {
       await options.registry.updateResource(owner, created.resource.id, { disabled: true })

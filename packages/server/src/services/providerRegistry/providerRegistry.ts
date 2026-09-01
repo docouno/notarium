@@ -14,7 +14,9 @@ import {
   type CredentialResponse,
   DEFAULT_CREDENTIAL_HEADER,
   looksLikeSecret,
+  MODEL_CAPABILITY,
   MODEL_STATUS,
+  type ModelCapability,
   PROVIDER_CALL_ERROR,
   PROVIDER_DELIVERY_STATE,
   PROVIDER_STATUS,
@@ -23,6 +25,8 @@ import {
   type ProviderAttachmentListItem,
   type ProviderAttachmentView,
   type ProviderModel,
+  type ProviderModelWrite,
+  ProviderModelWriteSchema,
   type ProviderResource,
   type ProviderResourceCreateRequest,
   type ProviderResourceHeaderPatch,
@@ -34,8 +38,6 @@ import {
   type ProviderStatus,
   type ProviderValidateResponse,
   providerVendorOf,
-  PURPOSE,
-  type Purpose,
 } from '@notarium/contract'
 import { freshNoteId } from '@notarium/core'
 
@@ -107,6 +109,52 @@ const DENIED_HEADER = new Set([
 const fails = (message: string): never => {
   throw Object.assign(new Error(message), { code: 'PROVIDER_VALIDATION' })
 }
+
+const MODEL_CAPABILITY_ORDER: Readonly<Record<ModelCapability, number>> = {
+  [MODEL_CAPABILITY.completion]: 0,
+  [MODEL_CAPABILITY.embedding]: 1,
+}
+
+const canonicalProviderModelWrites = (
+  models: readonly ProviderModelWrite[],
+): ProviderModelWrite[] => {
+  const parsed = models.map((model) => {
+    const result = ProviderModelWriteSchema.safeParse(model)
+
+    if (!result.success) {
+      return fails(result.error.issues[0]?.message ?? 'invalid provider model')
+    }
+
+    return {
+      name: result.data.name,
+      capabilities: [...result.data.capabilities].sort(
+        (left, right) => MODEL_CAPABILITY_ORDER[left] - MODEL_CAPABILITY_ORDER[right],
+      ),
+    }
+  })
+
+  if (new Set(parsed.map(({ name }) => name)).size !== parsed.length) {
+    fails('provider model names must be unique')
+  }
+
+  return parsed
+}
+
+const authoredProviderModels = (models: readonly ProviderModel[]): ProviderModelWrite[] =>
+  canonicalProviderModelWrites(models.map(({ name, capabilities }) => ({ name, capabilities })))
+
+const freshProviderModels = (models: readonly ProviderModelWrite[]): ProviderModel[] =>
+  models.map((model) => ({
+    ...model,
+    capabilities: [...model.capabilities],
+    dimensions: null,
+    statusByCapability: Object.fromEntries(
+      model.capabilities.map((capability) => [capability, MODEL_STATUS.available]),
+    ),
+  }))
+
+const sameJson = (left: unknown, right: unknown): boolean =>
+  JSON.stringify(left) === JSON.stringify(right)
 
 const canonicalBaseUrl = (raw: string): { baseUrl: string; origin: string } => {
   if (CONTROL.test(raw)) {
@@ -330,6 +378,13 @@ export class ProviderRegistry {
     this.mutationGate = options.mutationGate
     this.authMode = options.authMode ?? AUTH_MODE.password
     this.now = options.now ?? (() => new Date())
+    const projectAttachmentResource = (record: ProviderResourceRecord, viewerOwner: string) => {
+      const summary = this.resourceListItemToWire(record, { owner: viewerOwner })
+
+      delete summary.baseUrl
+
+      return summary
+    }
     this.attachmentService = new ProviderAttachmentsService({
       attachments: options.attachments,
       lifecycle: options.attachmentLifecycle,
@@ -337,15 +392,8 @@ export class ProviderRegistry {
       credentials: options.credentials,
       spaces: options.spaces,
       projects: options.projects,
-      projectResource: (record, viewerOwner) =>
-        this.resourceToWire(record, { owner: viewerOwner, consentManager: true }),
-      projectResourceListItem: (record, viewerOwner) => {
-        const item = this.resourceListItemToWire(record, {
-          owner: viewerOwner,
-        })
-        delete item.baseUrl
-        return item
-      },
+      projectResource: projectAttachmentResource,
+      projectResourceListItem: projectAttachmentResource,
       now: this.now,
     })
   }
@@ -593,8 +641,7 @@ export class ProviderRegistry {
           ? applyHeaderPatch(plaintextHeaders, patch.headers)
           : plaintextHeaders,
         allowPrivateNetwork: patch.allowPrivateNetwork ?? current.allowPrivateNetwork,
-        purposes: patch.purposes ?? current.purposes,
-        models: patch.models ?? current.models,
+        models: patch.models ?? authoredProviderModels(current.models),
         defaultModel: patch.defaultModel !== undefined ? patch.defaultModel : current.defaultModel,
         credentialId: patch.credentialId !== undefined ? patch.credentialId : current.credentialId,
         firstByteTimeoutMs:
@@ -605,20 +652,43 @@ export class ProviderRegistry {
           patch.callTimeoutMs !== undefined ? patch.callTimeoutMs : current.callTimeoutMs,
       }
       const prepared = await this.prepareResource(id, owner, merged)
-      // Consent fails closed by OPERATION, not by an open-ended field subset. A
-      // route save changes the object of consent unless it is one of the two named
-      // inert operations currently expressible on this DTO: rename or toggle.
-      const consentChanged = Object.keys(patch).some((key) => key !== 'name' && key !== 'disabled')
-      const callChanged = Object.keys(patch).some((key) => key !== 'name')
-      prepared.record.consentEpoch = current.consentEpoch + (consentChanged ? 1 : 0)
-      prepared.record.runtimeEpoch = current.runtimeEpoch + (callChanged ? 1 : 0)
-      prepared.record.lastCheck = callChanged ? {} : current.lastCheck
-      prepared.record.disabledAt =
+      const nameChanged = prepared.record.name !== current.name
+      const disabledAt =
         patch.disabled === undefined
           ? current.disabledAt
           : patch.disabled
-            ? this.now().toISOString()
+            ? (current.disabledAt ?? this.now().toISOString())
             : null
+      const disabledChanged = disabledAt !== current.disabledAt
+      const callConfigChanged =
+        prepared.record.wire !== current.wire ||
+        prepared.record.baseUrl !== current.baseUrl ||
+        !sameJson(
+          Object.entries(merged.headers).sort(([left], [right]) => left.localeCompare(right)),
+          Object.entries(plaintextHeaders).sort(([left], [right]) => left.localeCompare(right)),
+        ) ||
+        prepared.record.allowPrivateNetwork !== current.allowPrivateNetwork ||
+        !sameJson(
+          authoredProviderModels(prepared.record.models),
+          authoredProviderModels(current.models),
+        ) ||
+        prepared.record.defaultModel !== current.defaultModel ||
+        prepared.record.credentialId !== current.credentialId ||
+        prepared.record.firstByteTimeoutMs !== current.firstByteTimeoutMs ||
+        prepared.record.callTimeoutMs !== current.callTimeoutMs
+
+      if (!nameChanged && !disabledChanged && !callConfigChanged) {
+        return {
+          resource: this.resourceToWire(current, { owner }),
+          warnings: prepared.warnings,
+        }
+      }
+      const consentChanged = callConfigChanged
+      const callChanged = callConfigChanged || disabledChanged
+      prepared.record.consentEpoch = current.consentEpoch + (consentChanged ? 1 : 0)
+      prepared.record.runtimeEpoch = current.runtimeEpoch + (callChanged ? 1 : 0)
+      prepared.record.lastCheck = callChanged ? {} : current.lastCheck
+      prepared.record.disabledAt = disabledAt
       let replaced: Awaited<ReturnType<ProviderResourcesPersistence['replaceIfRuntimeEpoch']>>
 
       try {
@@ -627,7 +697,6 @@ export class ProviderRegistry {
           prepared.ciphertext,
           current.runtimeEpoch,
           current.credentialId,
-          patch.models === undefined,
         )
       } catch (error) {
         if (this.isStaleCiphertextKey(error)) {
@@ -688,6 +757,9 @@ export class ProviderRegistry {
     viewer: ProviderResourceViewer = {},
   ): ProviderResourceListItem {
     const resource = this.resourceToWire(record, viewer)
+    const capabilities = [MODEL_CAPABILITY.completion, MODEL_CAPABILITY.embedding].filter(
+      (capability) => record.models.some((model) => model.capabilities.includes(capability)),
+    )
 
     return {
       id: resource.id,
@@ -696,7 +768,7 @@ export class ProviderRegistry {
       owner: resource.owner,
       ...(resource.baseUrl === undefined ? {} : { baseUrl: resource.baseUrl }),
       addressIsPrivate: resource.addressIsPrivate,
-      purposes: resource.purposes,
+      capabilities,
       modelCount: resource.models.length,
       hasCredentials: resource.hasCredentials,
       disabledAt: resource.disabledAt,
@@ -736,8 +808,11 @@ export class ProviderRegistry {
           }
         : {}),
       addressIsPrivate,
-      purposes: [...record.purposes],
-      models: record.models.map((model) => ({ ...model })),
+      models: record.models.map((model) => ({
+        ...model,
+        capabilities: [...model.capabilities],
+        statusByCapability: { ...model.statusByCapability },
+      })),
       defaultModel: record.defaultModel,
       // An owner-management detail. A host admin does not get it either: the
       // credential belongs to its owner, admin or not.
@@ -807,28 +882,27 @@ export class ProviderRegistry {
     }
     const initial = await this.requireCallableScopeResource(input.space, input.resourceId)
     const { record, credential } = initial
-    let purpose: Purpose
+    let capability: ModelCapability
     let modelName: string
 
     if (input.operation.kind === PROVIDER_CALL_KIND.chat) {
-      purpose = PURPOSE.chat
+      capability = MODEL_CAPABILITY.completion
       modelName = input.operation.model
     } else if (input.operation.kind === PROVIDER_CALL_KIND.embedding) {
-      purpose = PURPOSE.embedding
+      capability = MODEL_CAPABILITY.embedding
       modelName = input.operation.model
     } else {
       throw new ProviderCallError(PROVIDER_CALL_ERROR.invalidRequest, {
         deliveryState: PROVIDER_DELIVERY_STATE.notSent,
       })
     }
-    if (!record.purposes.includes(purpose)) {
-      throw new ProviderCallError(PROVIDER_CALL_ERROR.invalidRequest, {
-        deliveryState: PROVIDER_DELIVERY_STATE.notSent,
-      })
-    }
     const model = record.models.find((candidate) => candidate.name === modelName)
 
-    if (!model || model.status !== MODEL_STATUS.available) {
+    if (
+      !model ||
+      !model.capabilities.includes(capability) ||
+      model.statusByCapability[capability] !== MODEL_STATUS.available
+    ) {
       throw new ProviderCallError(PROVIDER_CALL_ERROR.modelUnavailable, {
         deliveryState: PROVIDER_DELIVERY_STATE.notSent,
       })
@@ -884,6 +958,17 @@ export class ProviderRegistry {
           (current.credential?.runtimeEpoch ?? null) !== snapshot.credentialRuntimeEpoch
         ) {
           throw this.scopePolicyDenied()
+        }
+        const currentModel = current.record.models.find((candidate) => candidate.name === modelName)
+
+        if (
+          !currentModel ||
+          !currentModel.capabilities.includes(capability) ||
+          currentModel.statusByCapability[capability] !== MODEL_STATUS.available
+        ) {
+          throw new ProviderCallError(PROVIDER_CALL_ERROR.modelUnavailable, {
+            deliveryState: PROVIDER_DELIVERY_STATE.notSent,
+          })
         }
 
         return true
@@ -1188,7 +1273,7 @@ export class ProviderRegistry {
     agent: string | null
     admin: boolean
     resourceId: string
-    purpose: Purpose
+    capability: ModelCapability
     signal: AbortSignal
   }): Promise<ProviderValidateResponse | null> {
     const record = await this.resources.get(input.resourceId)
@@ -1196,8 +1281,10 @@ export class ProviderRegistry {
     if (!record || record.owner !== input.owner || !this.runtime) {
       return null
     }
-    if (!record.purposes.includes(input.purpose)) {
-      fails('provider resource does not declare this purpose')
+    const model = this.probedModel(record, input.capability)
+
+    if (!model) {
+      return fails('provider resource has no model with this capability')
     }
     // Admission first, before anything that can persist. A locally decided outcome
     // opens no socket but still writes a row, and an uncapped loop of those writes
@@ -1213,6 +1300,7 @@ export class ProviderRegistry {
     }
     const probe = await this.probeResource(record, credential, {
       ...input,
+      model: model.name,
       beforeSend: async () => {
         const currentResource = await this.resources.get(record.id)
 
@@ -1227,7 +1315,14 @@ export class ProviderRegistry {
           ? await this.credentials.get(snapshot.expectedCredentialId)
           : null
 
-        return (currentCredential?.runtimeEpoch ?? null) === snapshot.expectedCredentialRuntimeEpoch
+        const currentModel = currentResource.models.find(
+          (candidate) => candidate.name === model.name,
+        )
+
+        return (
+          (currentCredential?.runtimeEpoch ?? null) === snapshot.expectedCredentialRuntimeEpoch &&
+          currentModel?.capabilities.includes(input.capability) === true
+        )
       },
     })
     const result = {
@@ -1239,9 +1334,9 @@ export class ProviderRegistry {
     const write = () =>
       this.resources.recordLastCheck({
         resourceId: record.id,
-        purpose: input.purpose,
+        capability: input.capability,
         lastCheck: result,
-        model: this.measuredModel(record, probe),
+        measurement: this.measurementOf(probe, input.capability),
         ...snapshot,
       })
     // Being outside the mutation barrier is a licence to hold no admission during
@@ -1252,36 +1347,47 @@ export class ProviderRegistry {
     const stored = written.status === 'missing' ? record : written.record
 
     return {
-      purpose: input.purpose,
+      capability: input.capability,
       result,
       saved: written.status === 'recorded',
       resource: this.resourceToWire(stored, { owner: input.owner, admin: input.admin }),
     }
   }
 
-  /** The model the probe names. `defaultModel` first, then the head of the allowlist
-   *  — a purpose with no model at all is a configuration fact, not a call. */
-  private probedModelName(record: ProviderResourceRecord): string | null {
-    if (record.defaultModel && record.models.some((model) => model.name === record.defaultModel)) {
-      return record.defaultModel
+  /** A capable default first, then the first capable authored row. Availability is
+   * intentionally ignored: validate is how an unavailable pair becomes available. */
+  private probedModel(
+    record: ProviderResourceRecord,
+    capability: ModelCapability,
+  ): ProviderModel | null {
+    const capable = record.models.filter((model) => model.capabilities.includes(capability))
+
+    if (record.defaultModel) {
+      const selected = capable.find((model) => model.name === record.defaultModel)
+
+      if (selected) {
+        return selected
+      }
     }
 
-    return record.models[0]?.name ?? null
+    return capable[0] ?? null
   }
 
-  private measuredModel(
-    record: ProviderResourceRecord,
+  private measurementOf(
     probe: ProviderProbeOutcome,
-  ): ProviderModel | null {
+    capability: ModelCapability,
+  ): {
+    modelName: string
+    status?: (typeof MODEL_STATUS)[keyof typeof MODEL_STATUS]
+    dimensions?: number
+  } | null {
     if (!probe.model) {
       return null
     }
-    const current = record.models.find((model) => model.name === probe.model)
 
     if (probe.modelUnavailable) {
       return {
-        name: probe.model,
-        dimensions: current?.dimensions ?? null,
+        modelName: probe.model,
         status: MODEL_STATUS.unavailable,
       }
     }
@@ -1290,11 +1396,11 @@ export class ProviderRegistry {
     }
 
     return {
-      name: probe.model,
-      // The response width is authoritative: an oversized `dimensions` is clamped
-      // by the provider rather than refused, so only the answer measures it.
-      dimensions: probe.dimensions ?? current?.dimensions ?? null,
+      modelName: probe.model,
       status: MODEL_STATUS.available,
+      ...(capability === MODEL_CAPABILITY.embedding && probe.dimensions !== null
+        ? { dimensions: probe.dimensions }
+        : {}),
     }
   }
 
@@ -1306,7 +1412,8 @@ export class ProviderRegistry {
       owner: string
       principal: string
       agent: string | null
-      purpose: Purpose
+      capability: ModelCapability
+      model: string
       signal: AbortSignal
       beforeSend: () => Promise<boolean>
     },
@@ -1343,7 +1450,6 @@ export class ProviderRegistry {
       // to a real address unauthenticated, which is worse than not going at all.
       return refuse(PROVIDER_STATUS.secretUnreadable)
     }
-    const model = this.probedModelName(record)
     const outcome = await this.runtime!.validate({
       endpoint: {
         principalId: `user:${input.owner}`,
@@ -1372,14 +1478,13 @@ export class ProviderRegistry {
           outputTokenBudget: 0,
         },
       },
-      purpose: input.purpose,
-      vendor: providerVendorOf(origin),
-      model,
+      capability: input.capability,
+      model: input.model,
       signal: input.signal,
       beforeSend: input.beforeSend,
     })
 
-    return { ...outcome, model }
+    return { ...outcome, model: input.model }
   }
 
   private async callHeaders(
@@ -1423,11 +1528,6 @@ export class ProviderRegistry {
     }
 
     return { headers, sensitiveValues }
-  }
-
-  async materializeModel(id: string, model: ProviderModel) {
-    const task = () => this.resources.materializeModel(id, model)
-    return this.mutationGate ? this.mutationGate.run(task) : task()
   }
 
   private credentialToWire(record: CredentialRecord): Credential {
@@ -1531,18 +1631,13 @@ export class ProviderRegistry {
       headerEntries.map(([name], index) => [name, encrypted[index].ciphertext]),
     )
     const ciphertext = encrypted[0] ?? null
-    const models = input.models.map((model) => ({
-      ...model,
-      status: model.status ?? MODEL_STATUS.available,
-    }))
-    const uniqueModels = new Set(models.map((model) => model.name))
+    const authoredModels = canonicalProviderModelWrites(input.models)
+    const modelNames = new Set(authoredModels.map((model) => model.name))
 
-    if (uniqueModels.size !== models.length) {
-      fails('provider model names must be unique')
-    }
-    if (input.defaultModel && !uniqueModels.has(input.defaultModel)) {
+    if (input.defaultModel && !modelNames.has(input.defaultModel)) {
       fails('provider defaultModel must name a listed model')
     }
+    const models = freshProviderModels(authoredModels)
     const record: ProviderResourceRecord = {
       id,
       owner,
@@ -1551,7 +1646,6 @@ export class ProviderRegistry {
       baseUrl,
       headers: encryptedHeaders,
       allowPrivateNetwork: input.allowPrivateNetwork,
-      purposes: [...input.purposes],
       models,
       defaultModel: input.defaultModel,
       credentialId: input.credentialId,

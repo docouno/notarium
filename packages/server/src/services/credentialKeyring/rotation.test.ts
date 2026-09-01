@@ -90,8 +90,14 @@ describe('credential master-key rotation', () => {
         baseUrl: 'https://provider.example/v1',
         headers,
         allowPrivateNetwork: false,
-        purposes: ['chat'],
-        models: [],
+        models: [
+          {
+            name: 'model-a',
+            capabilities: ['completion'],
+            dimensions: null,
+            statusByCapability: { completion: 'available' },
+          },
+        ],
         defaultModel: null,
         credentialId: 'credential-a',
         consentEpoch: 7,

@@ -65,9 +65,94 @@ describe('provider registry', () => {
       wire: 'openai-compatible',
       baseUrl: 'https://openrouter.ai/api/v1',
       headers: {},
-      purposes: ['chat'],
+      models: [{ name: 'gpt-4o-mini', capabilities: ['completion'] }],
       ...over,
     })
+
+  it('canonicalizes capability order without changing exact model identities or epochs', async () => {
+    const created = await registry.createResource(
+      'alice',
+      resourceInput({
+        models: [
+          { name: ' model ', capabilities: ['embedding', 'completion'] },
+          { name: 'model\tvariant', capabilities: ['completion'] },
+        ],
+        defaultModel: ' model ',
+      }),
+    )
+    await db.providerResources.recordLastCheck({
+      resourceId: created.resource.id,
+      capability: 'embedding',
+      lastCheck: {
+        status: 'ready',
+        checkedAt: '2026-08-31T00:00:00.000Z',
+        diagnostic: null,
+        credentialProven: true,
+      },
+      measurement: {
+        modelName: ' model ',
+        status: MODEL_STATUS.available,
+        dimensions: 1536,
+      },
+      expectedRuntimeEpoch: 0,
+      expectedCredentialId: null,
+      expectedCredentialRuntimeEpoch: null,
+    })
+    await db.spaces.upsert({
+      id: 'space-main',
+      slug: 'main',
+      displayName: 'Main',
+      notesDir: 'main',
+      aliases: [],
+      createdAt: '2026-08-31T00:00:00.000Z',
+      archivedAt: null,
+      archivedBy: null,
+    })
+    await db.auth.createUser({
+      username: 'alice',
+      displayName: 'Alice',
+      passwordHash: null,
+      admin: false,
+      disabledAt: null,
+      createdAt: '2026-08-31T00:00:00.000Z',
+      personalSpace: null,
+    })
+    await db.auth.upsertMember('space-main', 'alice', 'owner', '2026-08-31T00:00:00.000Z')
+    const offered = await registry.offerAttachment({
+      owner: 'alice',
+      resourceId: created.resource.id,
+      targetKind: 'space',
+      targetId: 'space-main',
+    })
+
+    expect(offered.status).toBe('offered')
+    if (offered.status !== 'offered') {
+      return
+    }
+    await registry.acceptAttachment(
+      offered.view.attachment.id,
+      offered.view.currentEpochs,
+      'alice',
+      'alice',
+    )
+    const before = await db.providerResources.get(created.resource.id)
+    const attachmentBefore = await db.providerAttachments.get(offered.view.attachment.id)
+    const updated = await registry.updateResource('alice', created.resource.id, {
+      models: [
+        { name: ' model ', capabilities: ['completion', 'embedding'] },
+        { name: 'model\tvariant', capabilities: ['completion'] },
+      ],
+      defaultModel: ' model ',
+    })
+    const after = await db.providerResources.get(created.resource.id)
+    const attachmentAfter = await db.providerAttachments.get(offered.view.attachment.id)
+
+    expect(created.resource.models.map(({ name }) => name)).toEqual([' model ', 'model\tvariant'])
+    expect(created.resource.models[0].capabilities).toEqual(['completion', 'embedding'])
+    expect(updated?.resource.defaultModel).toBe(' model ')
+    expect(after).toEqual(before)
+    expect(attachmentAfter).toEqual(attachmentBefore)
+  })
 
   it('keeps automatic timeout profiles distinct from explicit overrides', async () => {
     const created = await registry.createResource('alice', resourceInput())
@@ -251,7 +336,7 @@ describe('provider registry', () => {
           ...current,
           runtimeEpoch: current.runtimeEpoch + 1,
           lastCheck: {
-            chat: {
+            completion: {
               status: PROVIDER_STATUS.ready,
               checkedAt,
               diagnostic: null,
@@ -300,7 +385,7 @@ describe('provider registry', () => {
         ...current,
         runtimeEpoch: current.runtimeEpoch + 1,
         lastCheck: {
-          chat: {
+          completion: {
             status: PROVIDER_STATUS.ready,
             checkedAt: '2026-08-24T00:00:00.000Z',
             diagnostic: null,
@@ -472,14 +557,14 @@ describe('provider registry', () => {
     const created = await registry.createResource('alice', resourceInput())
     const stored = await db.providerResources.recordLastCheck({
       resourceId: created.resource.id,
-      purpose: 'chat',
+      capability: 'completion',
       lastCheck: {
         status: 'quota-exhausted',
         checkedAt: '2026-08-30T00:00:00.000Z',
         diagnostic: 'organization ACME has 7 credits',
         credentialProven: true,
       },
-      model: null,
+      measurement: null,
       expectedRuntimeEpoch: 0,
       expectedCredentialId: null,
       expectedCredentialRuntimeEpoch: null,
@@ -496,8 +581,8 @@ describe('provider registry', () => {
     const admin = registry.resourceToWire(stored.record, { owner: 'bob', admin: true })
 
     expect(manager.baseUrl).toBe('https://openrouter.ai/api/v1')
-    expect(manager.lastCheck.chat?.diagnostic).toBeNull()
-    expect(admin.lastCheck.chat?.diagnostic).toBe('organization ACME has 7 credits')
+    expect(manager.lastCheck.completion?.diagnostic).toBeNull()
+    expect(admin.lastCheck.completion?.diagnostic).toBe('organization ACME has 7 credits')
   })
 
   it('derives embedder identity from model semantics, not the resource row id', () => {
@@ -512,18 +597,17 @@ describe('provider registry', () => {
     )
   })
 
-  it('keeps two models with different dimensions and no speculative fields', async () => {
+  it('keeps authored model capabilities separate from runtime facts', async () => {
     const created = await registry.createResource(
       'alice',
       resourceInput({
-        purposes: ['embedding'],
         models: [
-          { name: 'embed-small', dimensions: 768, status: MODEL_STATUS.available },
-          { name: 'embed-large', dimensions: 1536, status: MODEL_STATUS.available },
+          { name: 'embed-small', capabilities: ['embedding'] },
+          { name: 'embed-large', capabilities: ['embedding'] },
         ],
       }),
     )
-    expect(created.resource.models.map((model) => model.dimensions)).toEqual([768, 1536])
+    expect(created.resource.models.map((model) => model.dimensions)).toEqual([null, null])
     expect(
       created.resource.models.some((model) => 'quantization' in model || 'kind' in model),
     ).toBe(false)
@@ -535,11 +619,9 @@ describe('provider registry', () => {
         name: 'Too many models',
         wire: 'openai-compatible',
         baseUrl: 'https://provider.example/v1',
-        purposes: ['chat'],
         models: Array.from({ length: 513 }, (_, index) => ({
           name: `model-${index}`,
-          dimensions: null,
-          status: MODEL_STATUS.available,
+          capabilities: ['completion'],
         })),
       }).success,
     ).toBe(false)
@@ -548,8 +630,7 @@ describe('provider registry', () => {
         name: 'Oversized model',
         wire: 'openai-compatible',
         baseUrl: 'https://provider.example/v1',
-        purposes: ['chat'],
-        models: [{ name: 'x'.repeat(513), dimensions: null, status: MODEL_STATUS.available }],
+        models: [{ name: 'x'.repeat(513), capabilities: ['completion'] }],
       }).success,
     ).toBe(false)
   })

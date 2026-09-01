@@ -2,10 +2,10 @@ import { createServer, type RequestListener, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  MODEL_CAPABILITY,
   PROVIDER_CALL_OUTCOME,
   PROVIDER_DELIVERY_STATE,
   PROVIDER_STATUS,
-  PURPOSE,
   WIRE,
 } from '@notarium/contract'
 
@@ -123,35 +123,38 @@ afterEach(async () => {
 })
 
 describe('provider validate probe', () => {
-  it('proves an openrouter key without paying for inference', async () => {
+  it('probes the exact completion model on openrouter', async () => {
     const seen: string[] = []
-    const port = await listen((request, response) => {
+    let payload: Record<string, unknown> = {}
+    const port = await listen(async (request, response) => {
       seen.push(`${request.method} ${request.url}`)
-      json(response, 200, { data: { limit_remaining: 6.21 } })
+      payload = JSON.parse(await bodyOf(request)) as Record<string, unknown>
+      json(response, 200, {
+        choices: [{ message: { content: 'ok' }, finish_reason: 'length' }],
+      })
     })
     const outcome = await runtime(port).validate('alice', {
       endpoint: endpoint(port, WIRE.openaiCompatible),
-      purpose: PURPOSE.chat,
-      vendor: 'openrouter',
+      capability: MODEL_CAPABILITY.completion,
       call: CALL,
       model: 'openai/gpt-4.1-nano',
       signal: AbortSignal.timeout(5_000),
     })
 
-    expect(seen).toEqual(['GET /api/v1/key'])
+    expect(seen).toEqual(['POST /api/v1/chat/completions'])
+    expect(payload).toMatchObject({ model: 'openai/gpt-4.1-nano' })
     expect(outcome).toMatchObject({ status: PROVIDER_STATUS.ready, credentialProven: true })
   })
 
-  it('classifies a corrupted openrouter key rather than reporting a 4xx', async () => {
+  it('classifies a rejected completion call rather than reporting a 4xx', async () => {
     const port = await listen((_request, response) => {
       json(response, 401, { error: { message: 'No auth credentials found' } })
     })
     const outcome = await runtime(port).validate('alice', {
       endpoint: endpoint(port, WIRE.openaiCompatible),
-      purpose: PURPOSE.chat,
-      vendor: 'openrouter',
+      capability: MODEL_CAPABILITY.completion,
       call: CALL,
-      model: null,
+      model: 'openai/gpt-4.1-nano',
       signal: AbortSignal.timeout(5_000),
     })
 
@@ -173,8 +176,7 @@ describe('provider validate probe', () => {
     })
     const outcome = await runtime(port).validate('alice', {
       endpoint: endpoint(port, WIRE.openaiCompatible),
-      purpose: PURPOSE.chat,
-      vendor: 'generic',
+      capability: MODEL_CAPABILITY.completion,
       call: CALL,
       model: 'local/model',
       signal: AbortSignal.timeout(5_000),
@@ -199,8 +201,7 @@ describe('provider validate probe', () => {
     })
     const outcome = await runtime(port).validate('alice', {
       endpoint: endpoint(port, WIRE.openaiCompatible),
-      purpose: PURPOSE.chat,
-      vendor: 'generic',
+      capability: MODEL_CAPABILITY.completion,
       call: CALL,
       model: 'local/model',
       signal: AbortSignal.timeout(5_000),
@@ -220,8 +221,7 @@ describe('provider validate probe', () => {
     const subject = runtime(port)
     const outcome = await subject.validate('alice', {
       endpoint: endpoint(port, WIRE.openaiCompatible),
-      purpose: PURPOSE.chat,
-      vendor: 'generic',
+      capability: MODEL_CAPABILITY.completion,
       call: CALL,
       model: 'local/model',
       signal: AbortSignal.timeout(5_000),
@@ -246,8 +246,7 @@ describe('provider validate probe', () => {
     })
     const outcome = await runtime(port).validate('alice', {
       endpoint: endpoint(port, WIRE.openaiCompatible),
-      purpose: PURPOSE.embedding,
-      vendor: 'openrouter',
+      capability: MODEL_CAPABILITY.embedding,
       call: CALL,
       model: 'embed/model',
       signal: AbortSignal.timeout(5_000),
@@ -259,22 +258,28 @@ describe('provider validate probe', () => {
     expect(outcome).toMatchObject({ status: PROVIDER_STATUS.ready, dimensions: 768 })
   })
 
-  it('checks ollama reachability only, and says so even with an arbitrary bearer', async () => {
+  it('probes the exact ollama completion model', async () => {
     const seen: string[] = []
-    const port = await listen((request, response) => {
+    let payload: Record<string, unknown> = {}
+    const port = await listen(async (request, response) => {
       seen.push(`${request.method} ${request.url}`)
-      json(response, 200, { models: [{ model: 'qwen' }] })
+      payload = JSON.parse(await bodyOf(request)) as Record<string, unknown>
+      json(response, 200, {
+        message: { content: 'ok' },
+        done: true,
+        done_reason: 'length',
+      })
     })
     const outcome = await runtime(port).validate('alice', {
       endpoint: endpoint(port, WIRE.ollama),
-      purpose: PURPOSE.chat,
-      vendor: 'generic',
+      capability: MODEL_CAPABILITY.completion,
       call: CALL,
       model: 'qwen',
       signal: AbortSignal.timeout(5_000),
     })
 
-    expect(seen).toEqual(['GET /api/tags'])
+    expect(seen).toEqual(['POST /api/chat'])
+    expect(payload).toMatchObject({ model: 'qwen' })
     expect(outcome).toMatchObject({ status: PROVIDER_STATUS.ready, credentialProven: false })
   })
 
@@ -286,8 +291,7 @@ describe('provider validate probe', () => {
     })
     const outcome = await runtime(port).validate('alice', {
       endpoint: endpoint(port, WIRE.ollama),
-      purpose: PURPOSE.embedding,
-      vendor: 'generic',
+      capability: MODEL_CAPABILITY.embedding,
       call: CALL,
       model: 'embeddinggemma',
       signal: AbortSignal.timeout(5_000),
@@ -307,8 +311,7 @@ describe('provider validate probe', () => {
     })
     const outcome = await runtime(port).validate('alice', {
       endpoint: endpoint(port, WIRE.openaiCompatible),
-      purpose: PURPOSE.chat,
-      vendor: 'generic',
+      capability: MODEL_CAPABILITY.completion,
       call: CALL,
       model: 'openai/ghost',
       signal: AbortSignal.timeout(5_000),
@@ -320,25 +323,6 @@ describe('provider validate probe', () => {
     })
   })
 
-  it('answers not-configured without a socket when no model serves the purpose', async () => {
-    let requests = 0
-    const port = await listen((_request, response) => {
-      requests += 1
-      json(response, 200, {})
-    })
-    const outcome = await runtime(port).validate('alice', {
-      endpoint: endpoint(port, WIRE.openaiCompatible),
-      purpose: PURPOSE.embedding,
-      vendor: 'openrouter',
-      call: CALL,
-      model: null,
-      signal: AbortSignal.timeout(5_000),
-    })
-
-    expect(requests).toBe(0)
-    expect(outcome).toMatchObject({ status: PROVIDER_STATUS.notConfigured })
-  })
-
   it('keeps the credential out of the diagnostic it persists', async () => {
     const port = await listen((_request, response) => {
       json(response, 403, {
@@ -347,8 +331,7 @@ describe('provider validate probe', () => {
     })
     const outcome = await runtime(port).validate('alice', {
       endpoint: endpoint(port, WIRE.openaiCompatible),
-      purpose: PURPOSE.chat,
-      vendor: 'generic',
+      capability: MODEL_CAPABILITY.completion,
       call: CALL,
       model: 'local/model',
       signal: AbortSignal.timeout(5_000),
@@ -361,16 +344,17 @@ describe('provider validate probe', () => {
   it('refuses the twenty-first call in the window regardless of any user limit', async () => {
     let at = 1_700_000_000_000
     const port = await listen((_request, response) => {
-      json(response, 200, { data: { limit_remaining: 1 } })
+      json(response, 200, {
+        choices: [{ message: { content: 'ok' }, finish_reason: 'length' }],
+      })
     })
     const subject = runtime(port, () => at)
     const call = () =>
       subject.validate('alice', {
         endpoint: endpoint(port, WIRE.openaiCompatible),
-        purpose: PURPOSE.chat,
-        vendor: 'openrouter',
+        capability: MODEL_CAPABILITY.completion,
         call: CALL,
-        model: null,
+        model: 'openai/gpt-4.1-nano',
         signal: AbortSignal.timeout(5_000),
       })
 
@@ -382,10 +366,9 @@ describe('provider validate probe', () => {
     await expect(
       subject.validate('bob', {
         endpoint: endpoint(port, WIRE.openaiCompatible),
-        purpose: PURPOSE.chat,
-        vendor: 'openrouter',
+        capability: MODEL_CAPABILITY.completion,
         call: CALL,
-        model: null,
+        model: 'openai/gpt-4.1-nano',
         signal: AbortSignal.timeout(5_000),
       }),
     ).resolves.toMatchObject({ status: PROVIDER_STATUS.ready })

@@ -22,6 +22,22 @@ import { providerDisclosureOf } from '../../packages/server/src/services/provide
 const KEY = { keyId: 'ck_111111111111111111111111', generation: 1 }
 const ciphertext = (field: string) => `v1.${KEY.keyId}.${Buffer.from(field).toString('base64url')}`
 
+const fullModel = (
+  name: string,
+  ...capabilities: Array<'completion' | 'embedding'>
+): ProviderResourceRecord['models'][number] => {
+  const selected = capabilities.length ? capabilities : ['completion' as const]
+
+  return {
+    name,
+    capabilities: selected,
+    dimensions: null,
+    statusByCapability: Object.fromEntries(
+      selected.map((capability) => [capability, MODEL_STATUS.available]),
+    ),
+  }
+}
+
 const credential = (over: Partial<CredentialRecord> = {}): CredentialRecord => ({
   id: 'credential-a',
   owner: 'alice',
@@ -46,8 +62,7 @@ const resource = (over: Partial<ProviderResourceRecord> = {}): ProviderResourceR
   baseUrl: 'https://provider.example/v1',
   headers: { 'x-title': ciphertext('header') },
   allowPrivateNetwork: false,
-  purposes: ['chat'],
-  models: [],
+  models: [fullModel('model-a')],
   defaultModel: null,
   credentialId: 'credential-a',
   consentEpoch: 0,
@@ -372,33 +387,61 @@ export const describeProviderFacetsContract = (
       }
     })
 
-    it('keeps model materialization serialized without changing runtimeEpoch', async () => {
+    it('merges concurrent capability measurements without changing runtimeEpoch', async () => {
       const subject = await setup(factory)
 
       try {
         await subject.credentials.create(credential(), KEY)
-        await subject.resources.create(resource({ headers: {} }), null)
+        await subject.resources.create(
+          resource({ headers: {}, models: [fullModel('multi', 'completion', 'embedding')] }),
+          null,
+        )
         await expect(subject.resources.get('resource-a')).resolves.toMatchObject({
           firstByteTimeoutMs: null,
           callTimeoutMs: null,
         })
+        const check = {
+          status: 'ready' as const,
+          checkedAt: '2026-08-24T00:00:00.000Z',
+          diagnostic: null,
+          credentialProven: true,
+        }
         const [first, second] = await Promise.all([
-          subject.resources.materializeModel('resource-a', {
-            name: 'chat-a',
-            dimensions: null,
-            status: MODEL_STATUS.available,
+          subject.resources.recordLastCheck({
+            resourceId: 'resource-a',
+            capability: 'completion',
+            lastCheck: check,
+            measurement: { modelName: 'multi', status: MODEL_STATUS.available },
+            expectedRuntimeEpoch: 0,
+            expectedCredentialId: 'credential-a',
+            expectedCredentialRuntimeEpoch: 0,
           }),
-          subject.resources.materializeModel('resource-a', {
-            name: 'embed-a',
-            dimensions: 768,
-            status: MODEL_STATUS.available,
+          subject.resources.recordLastCheck({
+            resourceId: 'resource-a',
+            capability: 'embedding',
+            lastCheck: check,
+            measurement: {
+              modelName: 'multi',
+              status: MODEL_STATUS.available,
+              dimensions: 768,
+            },
+            expectedRuntimeEpoch: 0,
+            expectedCredentialId: 'credential-a',
+            expectedCredentialRuntimeEpoch: 0,
           }),
         ])
-        expect(first).not.toBeNull()
-        expect(second).not.toBeNull()
-        expect(
-          (await subject.resources.get('resource-a'))?.models.map((model) => model.name).sort(),
-        ).toEqual(['chat-a', 'embed-a'])
+        expect(first.status).toBe('recorded')
+        expect(second.status).toBe('recorded')
+        expect(await subject.resources.get('resource-a')).toMatchObject({
+          models: [
+            {
+              name: 'multi',
+              dimensions: 768,
+              statusByCapability: { completion: 'available', embedding: 'available' },
+            },
+          ],
+          lastCheck: { completion: { status: 'ready' }, embedding: { status: 'ready' } },
+        })
         expect((await subject.resources.get('resource-a'))?.runtimeEpoch).toBe(0)
       } finally {
         await subject.teardown?.()
@@ -435,7 +478,7 @@ export const describeProviderFacetsContract = (
       }
     })
 
-    it('preserves a concurrently materialized model under an authored non-model patch', async () => {
+    it('preserves a concurrent measurement under an authored non-model patch', async () => {
       const subject = await setup(factory)
 
       try {
@@ -443,16 +486,29 @@ export const describeProviderFacetsContract = (
         await subject.resources.create(
           resource({
             headers: {},
-            models: [{ name: 'model-a', dimensions: null, status: MODEL_STATUS.available }],
+            models: [fullModel('model-a', 'embedding')],
           }),
           null,
         )
         const stale = (await subject.resources.get('resource-a'))!
 
-        await subject.resources.materializeModel('resource-a', {
-          name: 'model-a',
-          dimensions: 1536,
-          status: MODEL_STATUS.unavailable,
+        await subject.resources.recordLastCheck({
+          resourceId: 'resource-a',
+          capability: 'embedding',
+          lastCheck: {
+            status: 'not-configured',
+            checkedAt: '2026-08-24T00:00:00.000Z',
+            diagnostic: null,
+            credentialProven: false,
+          },
+          measurement: {
+            modelName: 'model-a',
+            dimensions: 1536,
+            status: MODEL_STATUS.unavailable,
+          },
+          expectedRuntimeEpoch: 0,
+          expectedCredentialId: 'credential-a',
+          expectedCredentialRuntimeEpoch: 0,
         })
         await expect(
           subject.resources.replaceIfRuntimeEpoch(
@@ -460,13 +516,18 @@ export const describeProviderFacetsContract = (
             null,
             stale.runtimeEpoch,
             stale.credentialId,
-            true,
           ),
         ).resolves.toMatchObject({
           status: 'replaced',
           record: {
             name: 'Renamed',
-            models: [{ name: 'model-a', dimensions: 1536, status: MODEL_STATUS.unavailable }],
+            models: [
+              {
+                name: 'model-a',
+                dimensions: 1536,
+                statusByCapability: { embedding: MODEL_STATUS.unavailable },
+              },
+            ],
           },
         })
       } finally {
@@ -482,7 +543,7 @@ export const describeProviderFacetsContract = (
         await subject.resources.create(
           resource({
             lastCheck: {
-              chat: {
+              completion: {
                 status: 'ready',
                 checkedAt: '2026-08-24T00:00:00.000Z',
                 diagnostic: null,
@@ -547,29 +608,28 @@ export const describeProviderFacetsContract = (
       }
     })
 
-    it('records a validate outcome per purpose and materializes its model at once', async () => {
+    it('records a validate outcome per capability and applies its field delta at once', async () => {
       const subject = await setup(factory)
 
       try {
         await subject.credentials.create(credential(), KEY)
         await subject.resources.create(
           resource({
-            purposes: ['chat', 'embedding'],
-            models: [{ name: 'embed-1', dimensions: null, status: MODEL_STATUS.available }],
+            models: [fullModel('multi-1', 'completion', 'embedding')],
           }),
           KEY,
         )
         await expect(
           subject.resources.recordLastCheck({
             resourceId: 'resource-a',
-            purpose: 'chat',
+            capability: 'completion',
             lastCheck: {
               status: 'ready',
               checkedAt: '2026-08-24T00:00:00.000Z',
               diagnostic: null,
               credentialProven: true,
             },
-            model: null,
+            measurement: null,
             expectedRuntimeEpoch: 0,
             expectedCredentialId: 'credential-a',
             expectedCredentialRuntimeEpoch: 0,
@@ -578,27 +638,31 @@ export const describeProviderFacetsContract = (
         await expect(
           subject.resources.recordLastCheck({
             resourceId: 'resource-a',
-            purpose: 'embedding',
+            capability: 'embedding',
             lastCheck: {
               status: 'unreachable',
               checkedAt: '2026-08-24T00:01:00.000Z',
               diagnostic: 'no embedding endpoint',
               credentialProven: false,
             },
-            model: { name: 'embed-1', dimensions: 768, status: MODEL_STATUS.available },
+            measurement: {
+              modelName: 'multi-1',
+              dimensions: 768,
+              status: MODEL_STATUS.available,
+            },
             expectedRuntimeEpoch: 0,
             expectedCredentialId: 'credential-a',
             expectedCredentialRuntimeEpoch: 0,
           }),
         ).resolves.toMatchObject({ status: 'recorded' })
-        // The sibling purpose survives: the column is a collection, and a blind
+        // The sibling capability survives: the column is a collection, and a blind
         // UPDATE of it would drop the other outcome.
         await expect(subject.resources.get('resource-a')).resolves.toMatchObject({
           lastCheck: {
-            chat: { status: 'ready', credentialProven: true },
+            completion: { status: 'ready', credentialProven: true },
             embedding: { status: 'unreachable', diagnostic: 'no embedding endpoint' },
           },
-          models: [{ name: 'embed-1', dimensions: 768 }],
+          models: [{ name: 'multi-1', dimensions: 768 }],
         })
       } finally {
         await subject.teardown?.()
@@ -633,9 +697,13 @@ export const describeProviderFacetsContract = (
         await expect(
           subject.resources.recordLastCheck({
             resourceId: 'resource-a',
-            purpose: 'chat',
+            capability: 'embedding',
             lastCheck: outcome,
-            model: { name: 'ghost', dimensions: 4, status: MODEL_STATUS.available },
+            measurement: {
+              modelName: 'ghost',
+              dimensions: 4,
+              status: MODEL_STATUS.available,
+            },
             expectedRuntimeEpoch: 0,
             expectedCredentialId: 'credential-a',
             expectedCredentialRuntimeEpoch: 0,
@@ -649,9 +717,9 @@ export const describeProviderFacetsContract = (
         await expect(
           subject.resources.recordLastCheck({
             resourceId: 'resource-a',
-            purpose: 'chat',
+            capability: 'completion',
             lastCheck: outcome,
-            model: null,
+            measurement: null,
             expectedRuntimeEpoch: 1,
             expectedCredentialId: 'credential-a',
             expectedCredentialRuntimeEpoch: 1,
@@ -660,9 +728,9 @@ export const describeProviderFacetsContract = (
         await expect(
           subject.resources.recordLastCheck({
             resourceId: 'missing-resource',
-            purpose: 'chat',
+            capability: 'completion',
             lastCheck: outcome,
-            model: null,
+            measurement: null,
             expectedRuntimeEpoch: 0,
             expectedCredentialId: null,
             expectedCredentialRuntimeEpoch: null,
@@ -999,21 +1067,16 @@ export const describeProviderFacetsContract = (
           },
           providerDisclosureOf,
         )
-        await subject.resources.materializeModel('resource-a', {
-          name: 'model-a',
-          dimensions: null,
-          status: MODEL_STATUS.available,
-        })
         await subject.resources.recordLastCheck({
           resourceId: 'resource-a',
-          purpose: 'chat',
+          capability: 'completion',
           lastCheck: {
             status: 'ready',
             checkedAt: '2026-08-24T00:01:00.000Z',
             diagnostic: null,
             credentialProven: true,
           },
-          model: null,
+          measurement: { modelName: 'model-a', status: MODEL_STATUS.available },
           expectedRuntimeEpoch: 0,
           expectedCredentialId: 'credential-a',
           expectedCredentialRuntimeEpoch: 0,
@@ -1087,7 +1150,7 @@ export const describeProviderFacetsContract = (
             id: 'resource-a',
             name: 'A',
             lastCheck: {
-              chat: {
+              completion: {
                 status: 'ready',
                 checkedAt: '2026-08-24T00:00:00.000Z',
                 diagnostic: null,
@@ -1099,7 +1162,7 @@ export const describeProviderFacetsContract = (
             id: 'resource-b',
             name: 'B',
             lastCheck: {
-              chat: {
+              completion: {
                 status: 'ready',
                 checkedAt: '2026-08-24T00:00:00.000Z',
                 diagnostic: null,

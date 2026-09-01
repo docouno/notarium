@@ -14,7 +14,7 @@ import type {
   ProviderResourcesPersistence,
 } from '../../types'
 import { PROVIDER_PERSISTENCE_ERROR, providerPersistenceError } from '../../types'
-import { mergedProviderModels } from '../providerModels'
+import { applyProviderModelMeasurement, mergedProviderModels } from '../providerModels'
 import type { PgDriverCtx } from './context'
 import {
   lockProviderCredentialRows,
@@ -104,7 +104,6 @@ const valuesOf = (record: ProviderResourceRecord): unknown[] => [
   record.baseUrl,
   JSON.stringify(record.headers),
   record.allowPrivateNetwork,
-  JSON.stringify(record.purposes),
   JSON.stringify(record.models),
   record.defaultModel,
   record.credentialId,
@@ -138,11 +137,11 @@ export const createProviderResourcesFacet = (ctx: PgDriverCtx): ProviderResource
       await credentialFor(client, record)
       await client.query(
         `INSERT INTO provider_resources
-          (id, owner, name, wire, base_url, headers, allow_private_network, purposes,
+          (id, owner, name, wire, base_url, headers, allow_private_network,
            models, default_model, credential_id, consent_epoch, runtime_epoch, disabled_at,
            last_check, first_byte_timeout_ms, call_timeout_ms)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                 $15, $16, $17)`,
+                 $15, $16)`,
         valuesOf(record),
       )
       await client.query('COMMIT')
@@ -153,13 +152,7 @@ export const createProviderResourcesFacet = (ctx: PgDriverCtx): ProviderResource
       client.release()
     }
   },
-  replaceIfRuntimeEpoch: async (
-    record,
-    ciphertext,
-    expectedRuntimeEpoch,
-    expectedCredentialId,
-    preserveModels = false,
-  ) => {
+  replaceIfRuntimeEpoch: async (record, ciphertext, expectedRuntimeEpoch, expectedCredentialId) => {
     await ctx.ensureInit()
     const client = await ctx.required.connect()
 
@@ -192,18 +185,18 @@ export const createProviderResourcesFacet = (ctx: PgDriverCtx): ProviderResource
       await credentialFor(client, record)
       const stored = {
         ...record,
-        models: preserveModels ? current.models : record.models,
+        models: mergedProviderModels(current.models, record.models),
         lastCheck:
           record.runtimeEpoch === expectedRuntimeEpoch ? current.lastCheck : record.lastCheck,
       }
       const result = await client.query(
         `UPDATE provider_resources SET
            owner = $2, name = $3, wire = $4, base_url = $5, headers = $6,
-           allow_private_network = $7, purposes = $8, models = $9, default_model = $10,
-           credential_id = $11, consent_epoch = $12, runtime_epoch = $13,
-           disabled_at = $14, last_check = $15, first_byte_timeout_ms = $16,
-           call_timeout_ms = $17
-         WHERE id = $1 AND runtime_epoch = $18
+           allow_private_network = $7, models = $8, default_model = $9,
+           credential_id = $10, consent_epoch = $11, runtime_epoch = $12,
+           disabled_at = $13, last_check = $14, first_byte_timeout_ms = $15,
+           call_timeout_ms = $16
+         WHERE id = $1 AND runtime_epoch = $17
          RETURNING *`,
         [...valuesOf(stored), expectedRuntimeEpoch],
       )
@@ -336,35 +329,6 @@ export const createProviderResourcesFacet = (ctx: PgDriverCtx): ProviderResource
       client.release()
     }
   },
-  materializeModel: async (id, model) => {
-    await ctx.ensureInit()
-    const client = await ctx.required.connect()
-
-    try {
-      await client.query('BEGIN')
-      await lockProviderResourceRows(client, [id])
-      const result = await client.query('SELECT * FROM provider_resources WHERE id = $1', [id])
-      const row = result.rows[0] as ProviderResourceRow | undefined
-
-      if (!row) {
-        await client.query('COMMIT')
-        return null
-      }
-      const record = providerResourceOfRow(row)
-      const models = mergedProviderModels(record.models, model)
-      await client.query('UPDATE provider_resources SET models = $2 WHERE id = $1', [
-        id,
-        JSON.stringify(models),
-      ])
-      await client.query('COMMIT')
-      return { ...record, models }
-    } catch (error) {
-      await client.query('ROLLBACK')
-      throw error
-    } finally {
-      client.release()
-    }
-  },
   recordLastCheck: async (input) => {
     await ctx.ensureInit()
     const client = await ctx.required.connect()
@@ -402,8 +366,13 @@ export const createProviderResourcesFacet = (ctx: PgDriverCtx): ProviderResource
         await client.query('COMMIT')
         return { status: 'stale', record }
       }
-      const lastCheck = { ...record.lastCheck, [input.purpose]: input.lastCheck }
-      const models = input.model ? mergedProviderModels(record.models, input.model) : record.models
+      const lastCheck = { ...record.lastCheck, [input.capability]: input.lastCheck }
+      const models = input.measurement
+        ? applyProviderModelMeasurement(record.models, {
+            ...input.measurement,
+            capability: input.capability,
+          })
+        : record.models
       await client.query(
         'UPDATE provider_resources SET last_check = $2, models = $3 WHERE id = $1',
         [input.resourceId, JSON.stringify(lastCheck), JSON.stringify(models)],

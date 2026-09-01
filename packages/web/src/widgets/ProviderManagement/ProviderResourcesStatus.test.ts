@@ -26,7 +26,7 @@ const props = (
         owner: { kind: 'user', name: 'alice', mine: true },
         baseUrl: 'https://provider.example/v1',
         addressIsPrivate: false,
-        purposes: ['chat'],
+        capabilities: ['completion'],
         modelCount: 1,
         hasCredentials: true,
         disabledAt: null,

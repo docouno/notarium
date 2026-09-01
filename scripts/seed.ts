@@ -676,6 +676,37 @@ const run = async (): Promise<void> => {
       overrideResource: (record) => {
         providerSeedOverrides.resources.push(record)
       },
+      recordMeasurement: async (input) => {
+        const current = await metaDb.providerResources.get(input.resourceId)
+
+        if (!current) {
+          throw new Error(`seeded provider resource disappeared: ${input.resourceId}`)
+        }
+        const result = await metaDb.providerResources.recordLastCheck({
+          resourceId: input.resourceId,
+          capability: input.capability,
+          lastCheck: {
+            status: input.status === 'model-unavailable' ? 'not-configured' : 'ready',
+            checkedAt: nowIso,
+            diagnostic: null,
+            credentialProven: false,
+          },
+          measurement: {
+            modelName: input.modelName,
+            ...(input.status === undefined ? {} : { status: input.status }),
+            ...(input.dimensions === undefined ? {} : { dimensions: input.dimensions }),
+          },
+          expectedRuntimeEpoch: current.runtimeEpoch,
+          expectedCredentialId: current.credentialId,
+          expectedCredentialRuntimeEpoch: current.credentialId
+            ? ((await metaDb.credentials.get(current.credentialId))?.runtimeEpoch ?? null)
+            : null,
+        })
+
+        if (result.status !== 'recorded') {
+          throw new Error(`provider seed measurement was not recorded: ${input.resourceId}`)
+        }
+      },
       overrideAttachment: (record) => {
         providerSeedOverrides.attachments.push(record)
       },

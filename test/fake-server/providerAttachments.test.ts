@@ -102,8 +102,7 @@ describe('provider attachment lifecycle REST surface', () => {
         wire: 'openai-compatible',
         baseUrl: input.baseUrl ?? 'https://openrouter.ai/api/v1',
         credentialId: input.credentialId ?? null,
-        purposes: ['chat'],
-        models: [{ name: 'gpt-4o-mini', dimensions: null, status: 'available' }],
+        models: [{ name: 'gpt-4o-mini', capabilities: ['completion'] }],
       },
     })
     expect(response.statusCode).toBe(200)
@@ -518,9 +517,11 @@ describe('provider attachment lifecycle REST surface', () => {
     const bob = await login('bob', 'bob-password-01')
     const models = Array.from({ length: 200 }, (_, index) => ({
       name: `model-${String(index).padStart(3, '0')}`,
+      capabilities: ['completion' as const],
       dimensions: null,
-      status: 'available' as const,
+      statusByCapability: { completion: 'available' as const },
     }))
+    const authoredModels = models.map(({ name, capabilities }) => ({ name, capabilities }))
 
     for (let index = 0; index < 101; index += 1) {
       const suffix = String(index).padStart(3, '0')
@@ -532,7 +533,6 @@ describe('provider attachment lifecycle REST surface', () => {
         baseUrl: 'https://provider.example/v1',
         headers: {},
         allowPrivateNetwork: false,
-        purposes: ['chat'],
         models,
         defaultModel: null,
         credentialId: null,
@@ -556,8 +556,7 @@ describe('provider attachment lifecycle REST surface', () => {
           targetSpace: spaceId,
           resourceOwner: 'alice',
           baseUrl: 'https://provider.example/v1',
-          purposes: ['chat'],
-          models,
+          models: authoredModels,
           allowPrivateNetwork: false,
           headerNames: [],
         },

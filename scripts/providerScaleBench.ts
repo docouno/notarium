@@ -106,11 +106,11 @@ const seed = (path: string, records: number): void => {
   )
   const insertResource = db.prepare(
     `INSERT INTO provider_resources
-      (id, owner, name, wire, base_url, headers, allow_private_network, purposes,
+      (id, owner, name, wire, base_url, headers, allow_private_network,
        models, default_model, credential_id, consent_epoch, runtime_epoch, disabled_at,
        last_check, first_byte_timeout_ms, call_timeout_ms)
      VALUES (?, 'scale-owner', ?, 'openai-compatible', 'https://provider.example/v1', ?,
-       0, '["chat"]', '[]', NULL, ?, 0, 0, NULL, '{}', NULL, NULL)`,
+       0, '[{"name":"scale-model","capabilities":["completion"],"dimensions":null,"statusByCapability":{"completion":"available"}}]', NULL, ?, 0, 0, NULL, '{}', NULL, NULL)`,
   )
   const insertAttachment = db.prepare(
     `INSERT INTO provider_attachments
@@ -180,8 +180,7 @@ const seed = (path: string, records: number): void => {
           targetSpace: 'space-main',
           resourceOwner: 'scale-owner',
           baseUrl: 'https://provider.example/v1',
-          purposes: ['chat'],
-          models: [],
+          models: [{ name: 'scale-model', capabilities: ['completion'] }],
           allowPrivateNetwork: false,
           headerNames: ['authorization', 'x-scale-key'],
         }),

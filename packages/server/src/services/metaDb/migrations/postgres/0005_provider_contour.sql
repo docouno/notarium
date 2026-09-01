@@ -48,7 +48,6 @@ CREATE TABLE provider_resources (
   base_url TEXT NOT NULL,
   headers TEXT NOT NULL DEFAULT '{}',
   allow_private_network BOOLEAN NOT NULL DEFAULT FALSE,
-  purposes TEXT NOT NULL DEFAULT '[]',
   models TEXT NOT NULL DEFAULT '[]',
   default_model TEXT,
   credential_id TEXT,

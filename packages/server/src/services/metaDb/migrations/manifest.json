@@ -39,7 +39,7 @@
     {
       "version": 5,
       "name": "provider_contour",
-      "checksum": "sha256:258a1fa1e3538675665f2fa3cc5e38e82aef064fc894a3b6d8461e6d2a2f9d12",
+      "checksum": "sha256:2bc4c488f28e55d779615475c5b1f32302e98bad8ae2c810ef01a1f5bf237e3c",
       "sqlite": "sqlite/0005_provider_contour.sql",
       "postgres": "postgres/0005_provider_contour.sql"
     },

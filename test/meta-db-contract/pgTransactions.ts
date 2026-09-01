@@ -73,7 +73,6 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   // The resource delete enters L5a through the attachment FK cascade. As with the
   // import-path cascade below, the live observer sees only the explicit parent DML.
   { id: 'providerResources.delete', levels: ['L5r', 'L5a'] },
-  { id: 'providerResources.materializeModel', levels: ['L5r'] },
   // The conditional validate write reads the referenced credential row under the
   // same fence, so it enters L5c before L5r like every other two-facet member.
   { id: 'providerResources.recordLastCheck', levels: ['L5c', 'L5r'] },

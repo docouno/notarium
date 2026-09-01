@@ -1,12 +1,11 @@
 import {
+  MODEL_CAPABILITY,
+  type ModelCapability,
   PROVIDER_CALL_ERROR,
   PROVIDER_STATUS,
   PROVIDER_VALIDATE_EMBEDDING_INPUT,
   type ProviderCallErrorCode,
   type ProviderStatus,
-  type ProviderVendor,
-  PURPOSE,
-  type Purpose,
   WIRE,
 } from '@notarium/contract'
 
@@ -26,10 +25,9 @@ export type ProviderValidateInput = {
   endpoint: ProviderEndpoint
   /** Who is charged for the probe and what it addresses — the journal writes it. */
   call: ProviderCallContext
-  purpose: Purpose
-  vendor: ProviderVendor
-  /** The model the probe names; null when the resource lists none. */
-  model: string | null
+  capability: ModelCapability
+  /** Exact capable model selected before runtime admission. */
+  model: string
   signal: AbortSignal
   beforeSend?: () => Promise<boolean>
 }
@@ -106,23 +104,10 @@ const tokenBudgetOf = (
   return { inputUpperBound: 0, outputTokenBudget: 0 }
 }
 
-/** There is no single `validate`: each wire × purpose has its own way, and the
- *  table is measured rather than read off vendor docs. `GET /models` is absent on
- *  purpose — three responses (no key, valid key, corrupted key) were byte-identical
- *  at both OpenRouter and Jan, so it proves nothing about the credential. */
-const operationOf = (input: ProviderValidateInput): ProviderOperation | 'needs-model' => {
-  if (input.purpose === PURPOSE.embedding) {
-    return input.model ? embeddingProbe(input.model) : 'needs-model'
-  }
-  if (input.endpoint.wire === WIRE.ollama) {
-    return { kind: PROVIDER_CALL_KIND.models }
-  }
-  if (input.vendor === 'openrouter') {
-    return { kind: PROVIDER_CALL_KIND.key }
-  }
-
-  return input.model ? chatProbe(input.model, PROVIDER_TOKEN_LIMIT_FIELD.maxTokens) : 'needs-model'
-}
+const operationOf = (input: ProviderValidateInput): ProviderOperation =>
+  input.capability === MODEL_CAPABILITY.embedding
+    ? embeddingProbe(input.model)
+    : chatProbe(input.model, PROVIDER_TOKEN_LIMIT_FIELD.maxTokens)
 
 const succeeded = (
   result: ProviderCallResult,
@@ -154,16 +139,6 @@ export const probeProvider = async (
 ): Promise<ProviderValidateOutcome> => {
   const credentialProven = input.endpoint.wire !== WIRE.ollama
   const operation = operationOf(input)
-
-  if (operation === 'needs-model') {
-    return {
-      status: PROVIDER_STATUS.notConfigured,
-      diagnostic: null,
-      credentialProven: false,
-      dimensions: null,
-      modelUnavailable: false,
-    }
-  }
   const call = (shape: ProviderOperation): Promise<ProviderCallResult> =>
     execute({
       endpoint: input.endpoint,
@@ -192,7 +167,7 @@ export const probeProvider = async (
     if (
       error.code !== PROVIDER_CALL_ERROR.parametersRejected ||
       operation.kind !== PROVIDER_CALL_KIND.chat ||
-      !input.model
+      input.capability !== MODEL_CAPABILITY.completion
     ) {
       return failed(error)
     }

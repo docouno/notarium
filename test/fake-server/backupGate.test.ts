@@ -97,8 +97,7 @@ describe('online-backup HTTP mutation lifecycle', () => {
         wire: 'openai-compatible',
         baseUrl: `http://provider.test:${port}/api/v1`,
         allowPrivateNetwork: true,
-        purposes: ['chat'],
-        models: [{ name: 'local/model', dimensions: null, status: 'available' }],
+        models: [{ name: 'local/model', capabilities: ['completion'] }],
       },
     })
     expect(created.statusCode).toBe(200)
@@ -106,9 +105,9 @@ describe('online-backup HTTP mutation lifecycle', () => {
 
     const validating = app.inject({
       method: 'POST',
-      url: `/api/providers/resources/${id}/validate?purpose=chat`,
+      url: `/api/providers/resources/${id}/validate`,
       headers: { cookie },
-      payload: { purpose: 'chat' },
+      payload: { capability: 'completion' },
     })
     await providerReached.promise
     // The provider is still thinking, and a checkpoint sails through: this is the

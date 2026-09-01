@@ -1,7 +1,10 @@
 import { WorldBuilder } from '../generators'
 import type { CaseSpec, ProviderSeedDecl } from '../types'
 
-const model = (name: string) => ({ name, dimensions: null, status: 'available' as const })
+const model = (name: string, ...capabilities: Array<'completion' | 'embedding'>) => ({
+  name,
+  capabilities: capabilities.length ? capabilities : ['completion' as const],
+})
 
 const enabledProviders = (): ProviderSeedDecl => ({
   enabled: true,
@@ -51,7 +54,6 @@ const enabledProviders = (): ProviderSeedDecl => ({
       name: 'Primary',
       wire: 'openai-compatible',
       baseUrl: 'https://provider.example/v1',
-      purposes: ['chat'],
       models: [model('seed-chat-primary')],
       defaultModel: 'seed-chat-primary',
       credential: 'shared',
@@ -62,8 +64,15 @@ const enabledProviders = (): ProviderSeedDecl => ({
       name: 'Secondary',
       wire: 'openai-compatible',
       baseUrl: 'https://provider.example/v1',
-      purposes: ['embedding'],
-      models: [{ ...model('seed-embed'), dimensions: 1536 }],
+      models: [model('seed-embed', 'embedding')],
+      measurements: [
+        {
+          modelName: 'seed-embed',
+          capability: 'embedding',
+          status: 'available',
+          dimensions: 1536,
+        },
+      ],
       defaultModel: 'seed-embed',
       credential: 'shared',
     },
@@ -74,8 +83,7 @@ const enabledProviders = (): ProviderSeedDecl => ({
       wire: 'ollama',
       baseUrl: 'http://host.docker.internal:11434',
       allowPrivateNetwork: true,
-      purposes: ['chat', 'embedding'],
-      models: [model('qwen3:8b')],
+      models: [model('qwen3:8b', 'completion', 'embedding')],
       defaultModel: 'qwen3:8b',
     },
     {
@@ -84,7 +92,6 @@ const enabledProviders = (): ProviderSeedDecl => ({
       name: 'Credential disabled',
       wire: 'openai-compatible',
       baseUrl: 'https://disabled.example/v1',
-      purposes: ['chat'],
       models: [model('seed-disabled')],
       credential: 'disabled',
     },
@@ -95,7 +102,6 @@ const enabledProviders = (): ProviderSeedDecl => ({
       wire: 'openai-compatible',
       baseUrl: 'https://matched.example/v1',
       mismatchedBaseUrl: 'https://other.example/v1',
-      purposes: ['chat'],
       models: [model('seed-mismatch')],
       credential: 'mismatch',
     },
@@ -107,7 +113,6 @@ const enabledProviders = (): ProviderSeedDecl => ({
       baseUrl: 'https://headers.example/v1',
       headers: { 'x-seed-private': 'seed-provider-header-value' },
       unreadableHeaders: true,
-      purposes: ['chat'],
       models: [model('seed-unreadable')],
     },
     {
@@ -116,7 +121,6 @@ const enabledProviders = (): ProviderSeedDecl => ({
       name: 'Changed after acceptance',
       wire: 'openai-compatible',
       baseUrl: 'https://reconsent.example/v1',
-      purposes: ['chat'],
       models: [model('seed-reconsent')],
     },
     {
@@ -125,7 +129,6 @@ const enabledProviders = (): ProviderSeedDecl => ({
       name: 'Offer near expiry',
       wire: 'openai-compatible',
       baseUrl: 'https://pending.example/v1',
-      purposes: ['chat'],
       models: [model('seed-pending')],
     },
     {
@@ -134,7 +137,6 @@ const enabledProviders = (): ProviderSeedDecl => ({
       name: 'Deactivated owner resource',
       wire: 'openai-compatible',
       baseUrl: 'https://disabled-owner.example/v1',
-      purposes: ['chat'],
       models: [model('seed-owner-disabled')],
     },
     {
@@ -143,7 +145,6 @@ const enabledProviders = (): ProviderSeedDecl => ({
       name: 'Archived Space resource',
       wire: 'openai-compatible',
       baseUrl: 'https://archived.example/v1',
-      purposes: ['chat'],
       models: [model('seed-archived')],
     },
   ],
@@ -257,7 +258,6 @@ export const providersDisabled: CaseSpec = {
             name: 'Preserved while disabled',
             wire: 'openai-compatible',
             baseUrl: 'https://preserved.example/v1',
-            purposes: ['chat'],
             models: [model('seed-preserved')],
             credential: 'preserved',
           },

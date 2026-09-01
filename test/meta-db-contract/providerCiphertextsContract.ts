@@ -68,7 +68,6 @@ export const describeProviderCiphertextsContract = (
               'x-b': ciphertext(FIRST.keyId, 'header-b'),
             },
             allowPrivateNetwork: false,
-            purposes: ['chat'],
             models: [],
             defaultModel: null,
             credentialId: 'credential-a',

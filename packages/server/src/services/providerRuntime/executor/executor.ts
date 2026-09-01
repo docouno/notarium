@@ -161,10 +161,7 @@ const blockedOutcome = (record: ProviderCallLogRecord, now: Date): ProviderCallE
     : outcome
 }
 
-const usageOf = (result: ProviderCallResult): ProviderUsage | null =>
-  result.kind === PROVIDER_CALL_KIND.chat || result.kind === PROVIDER_CALL_KIND.embedding
-    ? result.usage
-    : null
+const usageOf = (result: ProviderCallResult): ProviderUsage | null => result.usage
 
 const observedTokensOf = (usage: ProviderUsage | null): number | null => {
   if (!usage) {
@@ -271,18 +268,6 @@ const safeResult = (
           : sanitizeProviderText(result.finishReason, headers, sensitiveValues).slice(0, 128),
       usage: safeUsage(result.usage, headers, sensitiveValues),
     }
-  }
-  if (result.kind === PROVIDER_CALL_KIND.models) {
-    return {
-      ...result,
-      models: result.models.flatMap((model) => {
-        const safe = sanitizeProviderText(model, headers, sensitiveValues)
-        return safe ? [safe] : []
-      }),
-    }
-  }
-  if (result.kind === PROVIDER_CALL_KIND.key) {
-    return result
   }
 
   return { ...result, usage: safeUsage(result.usage, headers, sensitiveValues) }

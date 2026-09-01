@@ -24,12 +24,10 @@ const createResource = async (
       name: input.name,
       wire: 'openai-compatible',
       baseUrl: input.baseUrl ?? 'https://provider.example/v1',
-      purposes: ['chat'],
       models: [
         {
           name: `<img src=x onerror=alert(1)> ${'very-long-model-name-'.repeat(8)}`,
-          dimensions: null,
-          status: 'available',
+          capabilities: ['completion'],
         },
       ],
       defaultModel: null,
@@ -106,7 +104,9 @@ test('credentials stay write-only and a refused delete explains every reference'
   await expect(page.locator('body')).not.toContainText('browser-proof-secret-value')
 })
 
-test('resource save closes the editor and returns to the refreshed table', async ({ page }) => {
+test('resource save keeps the clean editor available for validation and sharing', async ({
+  page,
+}) => {
   await createResource(page.request, { name: 'Editable provider', credentialId: null })
   await page.goto('/settings/providers')
   await expect(page.getByTestId('provider-list')).toBeVisible()
@@ -120,6 +120,8 @@ test('resource save closes the editor and returns to the refreshed table', async
   await expect(page.getByTestId('provider-private-opt-in')).toBeVisible()
   await page.getByTestId('provider-name').fill('Provider renamed')
   await page.getByRole('button', { name: 'Save' }).click()
+  await expect(page.getByTestId('provider-edit-form')).toBeVisible()
+  await page.getByRole('button', { name: 'Close' }).click()
   await expect(page.getByTestId('provider-edit-form')).toHaveCount(0)
   await expect(page.getByTestId('provider-list')).toContainText('Provider renamed')
   await page.getByRole('button', { name: 'Edit Provider renamed' }).click()
@@ -129,6 +131,49 @@ test('resource save closes the editor and returns to the refreshed table', async
   await page.getByRole('dialog').getByRole('button', { name: 'Delete' }).click()
   await expect(page.getByTestId('provider-row')).toHaveCount(0)
   await expect(page.getByText('No model providers yet')).toBeVisible()
+})
+
+test('model capability rows preserve exact ids and guard local dirty transitions', async ({
+  page,
+}) => {
+  await page.goto('/settings/providers')
+  await page.getByTestId('provider-new').click()
+  await page.getByTestId('provider-name').fill('Exact model mapping')
+  await page.getByTestId('provider-model-add').click()
+  await page.getByTestId('provider-model-add').click()
+  const rows = page.getByTestId('provider-model-row')
+
+  await rows.nth(0).getByRole('textbox', { name: 'Model 1 name' }).fill(' model ')
+  const initialDefaultButton = rows.nth(0).getByTestId('provider-model-default')
+  await expect(initialDefaultButton).toHaveAttribute('aria-pressed', 'false')
+  await initialDefaultButton.click()
+  await expect(initialDefaultButton).toHaveAttribute('aria-pressed', 'true')
+  await rows.nth(1).getByRole('textbox', { name: 'Model 2 name' }).fill('model\tvariant')
+  await rows.nth(1).getByText('Completion', { exact: true }).click()
+  await rows.nth(1).getByText('Embedding', { exact: true }).click()
+  await page.getByRole('button', { name: 'Create' }).click()
+  await page.getByRole('button', { name: 'Edit Exact model mapping' }).click()
+
+  await expect(page.getByRole('textbox', { name: 'Model 1 name' })).toHaveValue(' model ')
+  await expect(page.getByRole('textbox', { name: 'Model 2 name' })).toHaveValue('model\tvariant')
+  const defaultButton = rows.nth(0).getByTestId('provider-model-default')
+  await expect(defaultButton).toHaveAttribute('aria-pressed', 'true')
+  await defaultButton.click()
+  await expect(defaultButton).toHaveAttribute('aria-pressed', 'false')
+  await defaultButton.click()
+  await expect(page.getByTestId('provider-edit-form').getByRole('radio')).toHaveCount(0)
+  await page.getByTestId('provider-checks-toggle').click()
+  await expect(page.getByRole('button', { name: 'Validate' })).toHaveCount(2)
+  await page.getByRole('textbox', { name: 'Model 1 name' }).fill(' dirty model ')
+  await expect(page.getByText('Save changes first to Validate or Share.')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Validate' }).first()).toBeDisabled()
+
+  await page.getByRole('button', { name: 'Close' }).click()
+  await page.getByRole('dialog').getByRole('button', { name: 'Cancel' }).click()
+  await expect(page.getByRole('textbox', { name: 'Model 1 name' })).toHaveValue(' dirty model ')
+  await page.getByRole('button', { name: 'Close' }).click()
+  await page.getByRole('dialog').getByRole('button', { name: 'Discard' }).click()
+  await expect(page.getByTestId('provider-edit-form')).toHaveCount(0)
 })
 
 test('resource disclosure precedes save and a Space owner accepts a literal safe diff', async ({
@@ -170,7 +215,7 @@ test('resource disclosure precedes save and a Space owner accepts a literal safe
   await expect(detail).not.toContainText('header-secret-value')
   await expect(detail).not.toContainText('browser-proof-secret-value')
   await expect(card.locator('img')).toHaveCount(0)
-  await expect(detail).toContainText('<img src=x onerror=alert(1)>')
+  await expect(detail).toContainText('<img\\u{20}src=x\\u{20}onerror=alert(1)>')
   await detail.getByTestId('provider-attachment-accept').click()
   await expect(card).toContainText('active')
 

@@ -1,10 +1,10 @@
 import {
   AUTH_MODE,
   type AuthMode,
+  type ModelCapability,
   PROVIDER_STATUS,
   type ProviderLastCheck,
   type ProviderStatus,
-  type Purpose,
 } from '@notarium/contract'
 
 /** Statuses derived from what the ADDRESS answered. Everything else in the
@@ -54,17 +54,17 @@ const withoutDiagnostic = (check: ProviderLastCheck): ProviderLastCheck =>
  *  address-derived statuses is about a private address's state and applies on top.
  *  canon: #387 design/10 · design/11 */
 export const projectProviderLastCheck = (
-  lastCheck: Partial<Record<Purpose, ProviderLastCheck>>,
+  lastCheck: Partial<Record<ModelCapability, ProviderLastCheck>>,
   context: ProviderDisclosureContext,
-): Partial<Record<Purpose, ProviderLastCheck>> => {
+): Partial<Record<ModelCapability, ProviderLastCheck>> => {
   if (context.canReadDiagnostic) {
     return { ...lastCheck }
   }
   const collapse = coarsensProviderDisclosure(context)
 
   return Object.fromEntries(
-    Object.entries(lastCheck).map(([purpose, check]) => [
-      purpose,
+    Object.entries(lastCheck).map(([capability, check]) => [
+      capability,
       withoutDiagnostic(collapse ? collapsed(check) : check),
     ]),
   )

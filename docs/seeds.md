@@ -641,8 +641,10 @@ required to match its directory.
   `restore`→`store.restoreFromTrash` (an honest `kind:'restore'` revision), an
   `externalRewrite`→a same-size/mtime direct markdown write after the timeline, an
   `archived` space→`manager.archive` after the seed (moves to Trash→Spaces, data intact).
-  Provider declarations mint the canonical credential keyring before the first
-  ciphertext, then run through `ProviderRegistry` and production persistence. The two
+  Provider declarations keep authored model/capability rows separate from optional
+  runtime measurements. They mint the canonical credential keyring before the first
+  ciphertext, run authored rows through `ProviderRegistry`, and apply dimensions/status
+  through the transaction-current production delta writer. The two
   deliberately impossible product states (origin mismatch and a carrier naming a lost
   key) are applied after the normal write through a backend-specific raw transaction;
   SQLite and PostgreSQL receive the same final record.
@@ -675,7 +677,7 @@ required to match its directory.
   ("the fake does not express Enable/Disable"), and it was the reason no browser gate
   could START from a disabled ability — it could only click one off. Proven end to end
   in `test/fake-server/seedCatalog.test.ts`.
-  Provider declarations use the same shared applier. The fake mints a temporary
+  Provider declarations use the same authored/measurement applier. The fake mints a temporary
   filesystem keyring through `CredentialKeyringService`, stores real envelopes in its
   strict in-memory persistence, applies the named raw corruptions only after a valid
   create, and archives target Spaces through the real `SpaceManager` lifecycle.
