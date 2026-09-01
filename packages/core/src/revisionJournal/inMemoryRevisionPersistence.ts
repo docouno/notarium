@@ -13,6 +13,12 @@
 import {
   type ActivityDayCount,
   type ActivityNoteCount,
+  type ActivityNoteGroupCount,
+  type ActivityProjectionGcMaintenance,
+  type ActivityProjectionLease,
+  type ActivityProjectionMaintenance,
+  type ActivityProjectionPreparation,
+  activityProjectionStale,
   type AuthorFilter,
   isRevisionRestorable,
   type Revision,
@@ -61,6 +67,12 @@ export const matchesAuthor = (principal: string | null, f: AuthorFilter): boolea
   return f.exact.includes(principal) || f.prefixes.some((p) => principal.startsWith(p))
 }
 
+const revisionIdCompare = (left: string, right: string): number => {
+  const a = BigInt(left)
+  const b = BigInt(right)
+  return a < b ? -1 : a > b ? 1 : 0
+}
+
 export class InMemoryRevisionPersistence implements RevisionPersistence {
   private revisions: Revision[] = []
   private blobs = new Map<string, RevisionBlob>()
@@ -71,6 +83,7 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
   /** Revision ids served as a gap. Ids come from one monotonic counter, so they
    *  are unique without a space key and are never reused after a purge. */
   private quarantined = new Set<string>()
+  private activityGeneration = new Map<string, number>()
   private nextId = 1
 
   /** Whether this row's payload can still be believed — the twin of the drivers'
@@ -102,6 +115,30 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
   }
 
   async init(): Promise<void> {}
+
+  async prepareActivityProjection(space: string): Promise<ActivityProjectionPreparation> {
+    const generation = String(this.activityGeneration.get(space) ?? 1)
+    const through = this.revisions
+      .filter((revision) => revision.space === space)
+      .reduce<string | null>(
+        (latest, revision) =>
+          latest == null || BigInt(revision.id) > BigInt(latest) ? revision.id : latest,
+        null,
+      )
+
+    return {
+      state: 'ready' as const,
+      lease: { through, activeGeneration: generation, sourceGeneration: generation },
+    }
+  }
+
+  async maintainActivityProjection(): Promise<ActivityProjectionMaintenance> {
+    return { state: 'ready' as const, processed: 0, published: false }
+  }
+
+  async maintainActivityProjectionGc(): Promise<ActivityProjectionGcMaintenance> {
+    return { deleted: 0, pending: false }
+  }
 
   protectFromPurge(space: string, noteIds: readonly string[]): void {
     for (const noteId of new Set(noteIds)) {
@@ -333,6 +370,7 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
         this.blobs.delete(r.contentHash)
       }
     }
+    this.activityGeneration.set(space, (this.activityGeneration.get(space) ?? 1) + 1)
 
     return [...ids]
   }
@@ -364,6 +402,7 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
       purgedNotes: new Set(this.purgedNotes),
       purgePins: new Map(this.purgePins),
       quarantined: new Set(this.quarantined),
+      activityGeneration: new Map(this.activityGeneration),
       nextId: this.nextId,
     }
   }
@@ -382,6 +421,7 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
     this.purgedNotes = new Set(snapshot.purgedNotes)
     this.purgePins = new Map(snapshot.purgePins)
     this.quarantined = new Set(snapshot.quarantined)
+    this.activityGeneration = new Map(snapshot.activityGeneration)
     this.nextId = snapshot.nextId
   }
 
@@ -487,6 +527,11 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
       limit,
       excludeClasses = [],
       author,
+      viewerAuthor,
+      noteId,
+      through,
+      activityLease,
+      afterId,
     }: {
       from?: string
       to?: string
@@ -494,11 +539,23 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
       limit: number
       excludeClasses?: readonly string[]
       author?: AuthorFilter
+      viewerAuthor?: AuthorFilter
+      noteId?: string
+      through?: string
+      activityLease?: ActivityProjectionLease
+      afterId?: string
     },
-  ): Promise<{ items: Revision[]; total: number }> {
+  ): Promise<{
+    items: Revision[]
+    total: number
+    through: string | null
+    nextAfterId: string | null
+    activityLease?: ActivityProjectionLease
+    hasOtherAuthors?: boolean
+  }> {
     const fromT = from == null ? -Infinity : Date.parse(from)
     const toT = to == null ? Infinity : Date.parse(to)
-    const matched = this.revisions.filter((r) => {
+    const base = this.revisions.filter((r) => {
       if (r.space !== space) {
         return false
       }
@@ -508,15 +565,207 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
       if (!this.classAllows(r, excludeClasses)) {
         return false
       }
-      if (!this.authorAllows(r, author)) {
+      const t = Date.parse(r.createdAt)
+      return t >= fromT && t < toT && (noteId == null || r.noteId === noteId)
+    })
+    const authored = base.filter((r) => this.authorAllows(r, author))
+    const needsProjection = noteId != null || (from == null && to == null)
+    const preparation = needsProjection ? await this.prepareActivityProjection(space) : undefined
+    const currentLease = preparation?.state === 'ready' ? preparation.lease : undefined
+
+    if (
+      activityLease &&
+      (activityLease.activeGeneration !== currentLease?.activeGeneration ||
+        activityLease.sourceGeneration !== currentLease.sourceGeneration ||
+        (activityLease.through != null &&
+          (currentLease.through == null ||
+            revisionIdCompare(activityLease.through, currentLease.through) > 0)))
+    ) {
+      throw activityProjectionStale()
+    }
+    const resolvedThrough =
+      activityLease?.through ??
+      currentLease?.through ??
+      through ??
+      authored.reduce<string | null>(
+        (max, row) => (max == null || revisionIdCompare(row.id, max) > 0 ? row.id : max),
+        null,
+      )
+    const cut =
+      resolvedThrough == null
+        ? []
+        : authored.filter((row) => revisionIdCompare(row.id, resolvedThrough) <= 0)
+    const sorted = cut.sort((a, b) => revisionIdCompare(b.id, a.id))
+    const after =
+      afterId == null ? sorted : sorted.filter((row) => revisionIdCompare(row.id, afterId) < 0)
+    const start = afterId == null ? offset : 0
+    const page = after.slice(start, start + limit + 1)
+    const items = page.slice(0, limit)
+    const hasMore = page.length > limit
+    const result: {
+      items: Revision[]
+      total: number
+      through: string | null
+      nextAfterId: string | null
+      activityLease?: ActivityProjectionLease
+      hasOtherAuthors?: boolean
+    } = {
+      items: items.map(this.serve),
+      total: sorted.length,
+      through: resolvedThrough,
+      nextAfterId: hasMore ? (items.at(-1)?.id ?? null) : null,
+      ...(currentLease ? { activityLease: { ...currentLease, through: resolvedThrough } } : {}),
+    }
+
+    if (viewerAuthor) {
+      result.hasOtherAuthors = base.some(
+        (row) =>
+          !this.isGap(row) &&
+          (resolvedThrough == null || revisionIdCompare(row.id, resolvedThrough) <= 0) &&
+          !matchesAuthor(row.principal, viewerAuthor),
+      )
+    }
+
+    return result
+  }
+
+  async activityGroupsByNote(
+    space: string,
+    {
+      from,
+      to,
+      excludeClasses = [],
+      author,
+      viewerAuthor,
+      through,
+      activityLease,
+    }: {
+      from?: string
+      to?: string
+      excludeClasses?: readonly string[]
+      author?: AuthorFilter
+      viewerAuthor?: AuthorFilter
+      through?: string
+      activityLease?: ActivityProjectionLease
+    },
+  ): Promise<{
+    items: ActivityNoteGroupCount[]
+    through: string | null
+    activityLease: ActivityProjectionLease
+    hasOtherAuthors?: boolean
+  }> {
+    const fromT = from == null ? -Infinity : Date.parse(from)
+    const toT = to == null ? Infinity : Date.parse(to)
+    const base = this.revisions.filter((row) => {
+      if (
+        row.space !== space ||
+        !this.countsAsActivity(row) ||
+        !this.classAllows(row, excludeClasses)
+      ) {
         return false
       }
-      const t = Date.parse(r.createdAt)
-      return t >= fromT && t < toT
+      const at = Date.parse(row.createdAt)
+      return at >= fromT && at < toT
     })
-    // Append order IS id order — newest first.
-    const sorted = matched.sort((a, b) => Number(b.id) - Number(a.id))
-    return { items: sorted.slice(offset, offset + limit).map(this.serve), total: sorted.length }
+    const authored = base.filter((row) => this.authorAllows(row, author))
+    const preparation = await this.prepareActivityProjection(space)
+
+    if (preparation.state !== 'ready') {
+      throw new Error('in-memory Activity projection must be ready')
+    }
+    const currentLease = preparation.lease
+
+    if (
+      activityLease &&
+      (activityLease.activeGeneration !== currentLease.activeGeneration ||
+        activityLease.sourceGeneration !== currentLease.sourceGeneration ||
+        (activityLease.through != null &&
+          (currentLease.through == null ||
+            revisionIdCompare(activityLease.through, currentLease.through) > 0)))
+    ) {
+      throw activityProjectionStale()
+    }
+    const resolvedThrough =
+      activityLease?.through ??
+      currentLease.through ??
+      through ??
+      authored.reduce<string | null>(
+        (max, row) => (max == null || revisionIdCompare(row.id, max) > 0 ? row.id : max),
+        null,
+      )
+    const byNote = new Map<
+      string,
+      {
+        count: number
+        charsAdded: number
+        charsRemoved: number
+        knownAdded: boolean
+        knownRemoved: boolean
+        last: Revision
+      }
+    >()
+
+    if (resolvedThrough != null) {
+      for (const row of authored) {
+        if (revisionIdCompare(row.id, resolvedThrough) > 0) {
+          continue
+        }
+        const current = byNote.get(row.noteId)
+        const trusted = !this.isGap(row)
+
+        if (!current) {
+          byNote.set(row.noteId, {
+            count: 1,
+            charsAdded: trusted ? (row.charsAdded ?? 0) : 0,
+            charsRemoved: trusted ? (row.charsRemoved ?? 0) : 0,
+            knownAdded: trusted && row.charsAdded != null,
+            knownRemoved: trusted && row.charsRemoved != null,
+            last: row,
+          })
+          continue
+        }
+        current.count++
+        if (trusted && row.charsAdded != null) {
+          current.charsAdded += row.charsAdded
+          current.knownAdded = true
+        }
+        if (trusted && row.charsRemoved != null) {
+          current.charsRemoved += row.charsRemoved
+          current.knownRemoved = true
+        }
+        if (revisionIdCompare(row.id, current.last.id) > 0) {
+          current.last = row
+        }
+      }
+    }
+    const result: {
+      items: ActivityNoteGroupCount[]
+      through: string | null
+      activityLease: ActivityProjectionLease
+      hasOtherAuthors?: boolean
+    } = {
+      items: [...byNote].map(([noteId, value]) => ({
+        noteId,
+        count: String(value.count),
+        charsAdded: value.knownAdded ? String(value.charsAdded) : null,
+        charsRemoved: value.knownRemoved ? String(value.charsRemoved) : null,
+        lastSourceOrdinal: value.last.id,
+        lastEvent: this.serve(value.last),
+      })),
+      through: resolvedThrough,
+      activityLease: { ...currentLease, through: resolvedThrough },
+    }
+
+    if (viewerAuthor) {
+      result.hasOtherAuthors = base.some(
+        (row) =>
+          !this.isGap(row) &&
+          (resolvedThrough == null || revisionIdCompare(row.id, resolvedThrough) <= 0) &&
+          !matchesAuthor(row.principal, viewerAuthor),
+      )
+    }
+
+    return result
   }
 
   async activityByNote(
@@ -606,8 +855,20 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
    *  closure, and nothing here can compute it. The caller names the rows; this
    *  class only owes them the same effective-field semantics the drivers give. */
   quarantineForTest(revisionIds: readonly string[]): void {
+    const changedSpaces = new Set<string>()
+
     for (const id of revisionIds) {
-      this.quarantined.add(id)
+      if (!this.quarantined.has(id)) {
+        const revision = this.revisions.find((row) => row.id === id)
+
+        if (revision) {
+          changedSpaces.add(revision.space)
+        }
+        this.quarantined.add(id)
+      }
+    }
+    for (const space of changedSpaces) {
+      this.activityGeneration.set(space, (this.activityGeneration.get(space) ?? 1) + 1)
     }
   }
 
@@ -617,6 +878,7 @@ export class InMemoryRevisionPersistence implements RevisionPersistence {
     this.blobs.clear()
     this.purgedNotes.clear()
     this.quarantined.clear()
+    this.activityGeneration.clear()
     this.purgePins.clear()
     this.nextId = 1
   }

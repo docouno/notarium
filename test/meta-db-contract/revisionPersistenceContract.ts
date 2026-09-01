@@ -767,6 +767,8 @@ export const describeRevisionPersistenceContract = (
       })
       expect(events.items.map((item) => item.id)).toEqual([edited.id])
       expect(events.total).toBe(2)
+      expect(events.through).toBe(edited.id)
+      expect(events.nextAfterId).toBe(edited.id)
       expect(events.items.map((item) => item.id)).not.toContain(baseline.id)
       expect(events.items.map((item) => item.id)).not.toContain(deleted.id)
 
@@ -784,7 +786,135 @@ export const describeRevisionPersistenceContract = (
           limit: 10,
           author: { exact: [], prefixes: [] },
         }),
-      ).toEqual({ items: [], total: 0 })
+      ).toEqual({
+        items: [],
+        total: 0,
+        through: deleted.id,
+        nextAfterId: null,
+        activityLease: {
+          through: deleted.id,
+          activeGeneration: '1',
+          sourceGeneration: '1',
+        },
+      })
+
+      const groups = await persistence.activityGroupsByNote('space-a', {
+        ...range,
+        viewerAuthor: author,
+      })
+
+      expect(groups.through).toBe(deleted.id)
+      expect(groups.hasOtherAuthors).toBe(true)
+      expect(groups.items.sort((a, b) => a.noteId.localeCompare(b.noteId))).toEqual([
+        expect.objectContaining({
+          noteId: 'mine',
+          count: '2',
+          charsAdded: '10',
+          charsRemoved: '0',
+          lastEvent: expect.objectContaining({ id: edited.id, principal: 'pat:alice:token-1' }),
+        }),
+        expect.objectContaining({
+          noteId: 'theirs',
+          count: '1',
+          lastEvent: expect.objectContaining({ id: deleted.id, kind: 'delete' }),
+        }),
+      ])
+
+      const secondPage = await persistence.activityEvents('space-a', {
+        ...range,
+        offset: 0,
+        limit: 1,
+        author,
+        through: events.through!,
+        afterId: events.nextAfterId!,
+      })
+
+      expect(secondPage.items.map((item) => item.id)).toEqual([created.id])
+      expect(secondPage.nextAfterId).toBeNull()
+    })
+
+    it('serves current and historical unbounded Activity from one stable projection lease', async () => {
+      expect(await persistence.prepareActivityProjection('space-a')).toEqual({
+        state: 'ready',
+        lease: { through: null, activeGeneration: '1', sourceGeneration: '1' },
+      })
+      const baseline = await persistence.append(
+        revision({
+          noteId: 'hot-note',
+          entryRole: 'baseline',
+          principal: 'user:alice',
+          contentHash: 'baseline',
+        }),
+        'baseline',
+      )
+      const afterBaseline = await persistence.activityGroupsByNote('space-a', {})
+
+      expect(afterBaseline.items).toEqual([])
+      expect(afterBaseline.activityLease).toEqual({
+        through: baseline.id,
+        activeGeneration: '1',
+        sourceGeneration: '1',
+      })
+      const first = await persistence.append(
+        revision({
+          noteId: 'hot-note',
+          entryRole: 'change',
+          principal: 'user:alice',
+          contentHash: 'first',
+          charsAdded: 4,
+          charsRemoved: 1,
+        }),
+        'first',
+      )
+      const cut = await persistence.activityGroupsByNote('space-a', {
+        viewerAuthor: { exact: ['user:alice'], prefixes: [] },
+      })
+
+      expect(cut.activityLease.through).toBe(first.id)
+      expect(cut.hasOtherAuthors).toBe(false)
+      expect(cut.items).toEqual([
+        expect.objectContaining({
+          noteId: 'hot-note',
+          count: '1',
+          charsAdded: '4',
+          charsRemoved: '1',
+          lastSourceOrdinal: first.id,
+        }),
+      ])
+      const second = await persistence.append(
+        revision({
+          noteId: 'hot-note',
+          entryRole: 'change',
+          principal: null,
+          contentHash: 'second',
+          charsAdded: 2,
+          charsRemoved: 0,
+        }),
+        'second',
+      )
+      const historical = await persistence.activityGroupsByNote('space-a', {
+        activityLease: cut.activityLease,
+        viewerAuthor: { exact: ['user:alice'], prefixes: [] },
+      })
+
+      expect(historical.activityLease).toEqual(cut.activityLease)
+      expect(historical.items).toEqual(cut.items)
+      expect(historical.hasOtherAuthors).toBe(false)
+      const current = await persistence.activityGroupsByNote('space-a', {
+        viewerAuthor: { exact: ['user:alice'], prefixes: [] },
+      })
+
+      expect(current.activityLease.through).toBe(second.id)
+      expect(current.hasOtherAuthors).toBe(true)
+      expect(current.items).toEqual([
+        expect.objectContaining({
+          noteId: 'hot-note',
+          count: '2',
+          charsAdded: '6',
+          charsRemoved: '1',
+          lastSourceOrdinal: second.id,
+        }),
+      ])
     })
 
     it('reports latest timestamps and distinct non-empty historical names by space', async () => {

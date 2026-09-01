@@ -12,6 +12,8 @@ import { parseAppPath } from '../../libs/routing/routePaths'
 import type { GraphView } from '../../libs/wire'
 import { api } from '../../services/api'
 import { CHANGED_COALESCE_MS, useSync } from '../SyncProvider'
+import type { ActivityGroup } from './activityPreferences'
+import type { DashboardActivityFeed } from './useDashboardActivityFeed'
 
 // The dashboard's read-model bundle (#33/#216): every surface (Activity heatmap +
 // feed, the Projects list, the Health queue) plus the pill metrics read from ONE
@@ -23,7 +25,6 @@ import { CHANGED_COALESCE_MS, useSync } from '../SyncProvider'
 
 /** East-of-UTC minutes — the viewer's tz, so a day is counted by THEIR clock. */
 export const TZ = -new Date().getTimezoneOffset()
-const RECENT_LIMIT = 12
 
 export type DashData = {
   activity: ActivityResponse | null
@@ -50,6 +51,13 @@ export type DashboardContext = DashData & {
   space: string
   openNote: (id: string) => void
   scope: ActivityScope
+  activityScopeCommitted: boolean
+  activityCanScope: boolean
+  preferredScope: ActivityScope
+  setPreferredScope: (scope: ActivityScope) => void
+  group: ActivityGroup
+  setGroup: (group: ActivityGroup) => void
+  feed: DashboardActivityFeed
 }
 
 /** A surface reads its data off the Outlet context the layout supplies. */
@@ -57,6 +65,31 @@ export const useDashboardContext = (): DashboardContext => useOutletContext<Dash
 
 /** The Activity surface's author lens (#218): whose activity the heatmap + feed show. */
 export type ActivityScope = 'all' | 'mine'
+
+export const dashboardSpaceIntent = (
+  ambientSpace: string,
+  pathname: string,
+): { space: string; inSync: boolean } => {
+  const parsed = parseAppPath(pathname)
+  const space = 'space' in parsed && parsed.space ? parsed.space : ambientSpace
+
+  return { space, inSync: space === ambientSpace }
+}
+
+export const dashboardSpaceTarget = (
+  ambientSpace: string,
+  pathname: string,
+  transition: { target: string; beforeNavigation: boolean } | null,
+): { space: string; providersInSync: boolean } => {
+  const route = dashboardSpaceIntent(ambientSpace, pathname)
+  const transitionApplies =
+    transition != null && (transition.beforeNavigation || route.space === transition.target)
+
+  return {
+    space: transitionApplies ? transition.target : route.space,
+    providersInSync: route.inSync && !transitionApplies,
+  }
+}
 
 /** The heatmap aggregate + standing feed under an author scope (#218). For the
  *  default 'all' it hands back the layout bundle's space-wide data verbatim — ZERO
@@ -92,13 +125,7 @@ export const useAuthorScopedActivity = (
   const load = useCallback(async () => {
     const seq = ++reqSeq.current
     // null = this channel FAILED (transient 5xx / drop); resolved value = its data.
-    const [activity, recent] = await Promise.all([
-      api.activityGet(space, { tz: TZ, author: 'mine' }).catch(() => null),
-      api
-        .activityEventsGet(space, { limit: RECENT_LIMIT, author: 'mine' })
-        .then((r) => r.events)
-        .catch(() => null),
-    ])
+    const activity = await api.activityGet(space, { tz: TZ, author: 'mine' }).catch(() => null)
 
     if (reqSeq.current !== seq) {
       return
@@ -117,8 +144,7 @@ export const useAuthorScopedActivity = (
           hasOtherAuthors: false,
           ...defaultActivityWindow(Date.now()),
         }
-      const recentOut = recent ?? (warm ? prev.recent : [])
-      return { space, activity: activityOut, recent: recentOut, loading: false }
+      return { space, activity: activityOut, recent: [], loading: false }
     })
   }, [space])
 
@@ -216,12 +242,8 @@ export const useDashboardData = (space: string): DashData => {
 
   const loadActivity = useCallback(async () => {
     const seq = ++activityReqSeq.current
-    const [activity, recent, projects, tags] = await Promise.all([
+    const [activity, projects, tags] = await Promise.all([
       api.activityGet(space, { tz: TZ }).catch(() => null),
-      api
-        .activityEventsGet(space, { limit: RECENT_LIMIT })
-        .then((r) => r.events)
-        .catch(() => []),
       api
         .activityProjectsGet(space)
         .then((r) => r.projects)
@@ -247,7 +269,7 @@ export const useDashboardData = (space: string): DashData => {
           activityResolved: true,
           graph: sameSpace ? prev.data.graph : null,
           health: sameSpace ? prev.data.health : null,
-          recent,
+          recent: [],
           projects,
           tags,
           loading: !graphResolved,
@@ -342,16 +364,9 @@ export const useDashboardData = (space: string): DashData => {
   // Show the loaded bundle ONLY for the space it belongs to; any other space is still
   // loading → the blank bundle (skeleton), never another space's data.
   //
-  // AND only when the ambient `space` already matches the URL. On a space switch the URL
-  // flips instantly but SpaceProvider's `active` (→ `space`) trails it by one post-paint
-  // effect; in that single lag frame `space` is still the OLD slug and `loaded` still
-  // holds the old data — without this guard the heatmap would flash the previous space's
-  // grid for ~1 frame (skeleton → OLD-real → skeleton → new-real) before settling. The
-  // dashboard is always at `/s/<space>`, so the URL always names the intended space; a
-  // mismatch means we're mid-switch → hold the skeleton. Once `active` catches up they
-  // agree again (and stay agreed in steady state, so this never adds a spurious skeleton).
-  const parsed = parseAppPath(location.pathname)
-  const urlSpace = 'space' in parsed ? parsed.space : null
-  const inSync = urlSpace == null || urlSpace === space
+  // AND only when the supplied `space` matches the URL. DashboardLayout normally passes
+  // the URL intent immediately; the guard remains fail-closed for direct hook callers that
+  // still hold SpaceProvider's old slug during its one post-paint catch-up effect.
+  const { inSync } = dashboardSpaceIntent(space, location.pathname)
   return loaded.space === space && inSync ? loaded.data : EMPTY_DASH
 }

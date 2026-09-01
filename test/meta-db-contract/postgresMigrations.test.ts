@@ -116,6 +116,377 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
     }
   })
 
+  it('orders post-carrier revisions by the trigger tail instead of raw id allocation', async () => {
+    const testSchema = await createSchema('activity_commit_order')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const first = await pool.connect()
+    const second = await pool.connect()
+
+    try {
+      await testSchema.db.revisions.init()
+      await first.query('BEGIN')
+      const reserved = await first.query(
+        `SELECT nextval(pg_get_serial_sequence('note_revisions', 'id')) AS id`,
+      )
+      const firstId = String(reserved.rows[0].id)
+
+      await second.query('BEGIN')
+      const committedFirst = await second.query(
+        `INSERT INTO note_revisions
+          (note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+           chars_added, chars_removed, integrity)
+         VALUES
+          ('second-note', 'space-a', 'write', 'origin', 'user:bob', 'Second', 'user-doc', '[]',
+           '2026-08-01T00:00:01.000Z', 2, 0, 'trusted')
+         RETURNING id`,
+      )
+      await second.query('COMMIT')
+
+      await first.query(
+        `INSERT INTO note_revisions
+          (id, note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+           chars_added, chars_removed, integrity)
+         VALUES
+          ($1, 'first-note', 'space-a', 'write', 'origin', 'user:alice', 'First', 'user-doc', '[]',
+           '2026-08-01T00:00:00.000Z', 1, 0, 'trusted')`,
+        [firstId],
+      )
+      await first.query('COMMIT')
+
+      expect(BigInt(committedFirst.rows[0].id)).toBeGreaterThan(BigInt(firstId))
+      expect(
+        await testSchema.admin.query(
+          `SELECT source_ordinal::text, revision_id::text
+             FROM ${identifierOf(testSchema)}.activity_revision_order
+            WHERE space = 'space-a' ORDER BY source_ordinal`,
+        ),
+      ).toMatchObject({
+        rows: [
+          { source_ordinal: '1', revision_id: String(committedFirst.rows[0].id) },
+          { source_ordinal: '2', revision_id: firstId },
+        ],
+      })
+      expect(
+        await testSchema.admin.query(
+          `SELECT note_id, source_ordinal::text
+             FROM ${identifierOf(testSchema)}.activity_note_actor_heads
+            WHERE space = 'space-a' ORDER BY note_id`,
+        ),
+      ).toMatchObject({
+        rows: [
+          { note_id: 'first-note', source_ordinal: '2' },
+          { note_id: 'second-note', source_ordinal: '1' },
+        ],
+      })
+      const groups = await testSchema.db.revisions.activityGroupsByNote('space-a', {})
+
+      expect(
+        groups.items.map(({ noteId, lastSourceOrdinal, lastEvent }) => ({
+          noteId,
+          lastSourceOrdinal,
+          revisionId: lastEvent.id,
+        })),
+      ).toEqual([
+        { noteId: 'first-note', lastSourceOrdinal: '2', revisionId: firstId },
+        {
+          noteId: 'second-note',
+          lastSourceOrdinal: '1',
+          revisionId: String(committedFirst.rows[0].id),
+        },
+      ])
+      const historicalEvents = await testSchema.db.revisions.activityEvents('space-a', {
+        offset: 0,
+        limit: 10,
+        activityLease: { ...groups.activityLease, through: '1' },
+      })
+
+      expect(historicalEvents.items.map((row) => row.noteId)).toEqual(['second-note'])
+    } finally {
+      await first.query('ROLLBACK').catch(() => {})
+      await second.query('ROLLBACK').catch(() => {})
+      first.release()
+      second.release()
+      await pool.end()
+    }
+  })
+
+  it('rolls back every fresh PostgreSQL Activity effect when the trigger tail fails', async () => {
+    const testSchema = await createSchema('activity_trigger_rollback')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await testSchema.db.revisions.init()
+      await client.query(
+        `INSERT INTO note_revisions
+          (note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+           chars_added, chars_removed, integrity)
+         VALUES
+          ('fresh-note', 'fresh', 'write', 'baseline', 'user:alice', 'Fresh', 'user-doc', '[]',
+           '2026-08-01T00:00:00.000Z', 1, 0, 'trusted')`,
+      )
+      await client.query(`
+        CREATE FUNCTION fail_activity_state()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'injected Activity state failure';
+        END;
+        $$;
+        CREATE TRIGGER fail_activity_state
+        BEFORE INSERT ON activity_note_actor_states
+        FOR EACH ROW EXECUTE FUNCTION fail_activity_state();
+      `)
+
+      await expect(
+        client.query(
+          `INSERT INTO note_revisions
+            (note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+             chars_added, chars_removed, integrity)
+           VALUES
+            ('fresh-note', 'fresh', 'write', 'change', 'user:alice', 'Fresh', 'user-doc', '[]',
+             '2026-08-01T01:00:00.000Z', 1, 0, 'trusted')`,
+        ),
+      ).rejects.toThrow(/injected Activity state failure/)
+      expect(await client.query('SELECT COUNT(*)::int AS n FROM note_revisions')).toMatchObject({
+        rows: [{ n: 1 }],
+      })
+      expect(
+        await client.query('SELECT COUNT(*)::int AS n FROM activity_revision_order'),
+      ).toMatchObject({ rows: [{ n: 1 }] })
+      expect(
+        await client.query('SELECT COUNT(*)::int AS n FROM activity_note_actor_states'),
+      ).toMatchObject({ rows: [{ n: 0 }] })
+      expect(
+        await client.query(
+          `SELECT next_source_ordinal::text, active_through::text
+             FROM activity_projection_status WHERE space = 'fresh'`,
+        ),
+      ).toMatchObject({ rows: [{ next_source_ordinal: '1', active_through: '1' }] })
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('rejects rehoming a PostgreSQL revision without changing the journal, order, or status', async () => {
+    const testSchema = await createSchema('activity_space_immutable')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await testSchema.db.revisions.init()
+      const inserted = await client.query(
+        `INSERT INTO note_revisions
+          (note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+           chars_added, chars_removed, integrity)
+         VALUES
+          ('alpha-note', 'alpha', 'write', 'change', 'user:alice', 'Alpha', 'user-doc', '[]',
+           '2026-08-01T00:00:00.000Z', 3, 1, 'trusted')
+         RETURNING id`,
+      )
+      const snapshot = async () => ({
+        journal: (
+          await client.query(
+            'SELECT id::text, note_id, space, integrity FROM note_revisions ORDER BY id',
+          )
+        ).rows,
+        order: (
+          await client.query(
+            `SELECT space, source_ordinal::text, revision_id::text
+               FROM activity_revision_order ORDER BY space, source_ordinal`,
+          )
+        ).rows,
+        status: (await client.query('SELECT * FROM activity_projection_status ORDER BY space'))
+          .rows,
+      })
+      const before = await snapshot()
+
+      await expect(
+        client.query("UPDATE note_revisions SET space = 'beta' WHERE id = $1", [
+          inserted.rows[0].id,
+        ]),
+      ).rejects.toThrow(/note revision space is immutable/)
+      expect(await snapshot()).toEqual(before)
+
+      // A semantic rewrite may still include the unchanged Space explicitly.
+      await expect(
+        client.query(
+          `UPDATE note_revisions
+              SET space = 'alpha', integrity = 'quarantined'
+            WHERE id = $1`,
+          [inserted.rows[0].id],
+        ),
+      ).resolves.toBeDefined()
+      expect(
+        await client.query(
+          `SELECT state, active_generation, build_generation, source_generation::text
+             FROM activity_projection_status WHERE space = 'alpha'`,
+        ),
+      ).toMatchObject({
+        rows: [
+          {
+            state: 'rebuilding',
+            active_generation: null,
+            build_generation: null,
+            source_generation: '2',
+          },
+        ],
+      })
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('lazily rebuilds one upgraded Activity space and leaves siblings uninitialized', async () => {
+    const testSchema = await createSchema('activity_upgrade_rebuild')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(client, migrations.slice(0, 7))
+      await client.query(
+        `INSERT INTO note_revisions
+          (note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+           chars_added, chars_removed, integrity)
+         VALUES
+          ('alpha-note', 'alpha', 'external', 'baseline', 'user:alice', 'Alpha', 'user-doc', '[]',
+           '2026-08-01T00:00:00.000Z', 10, 0, 'trusted'),
+          ('alpha-note', 'alpha', 'write', 'change', 'user:alice', 'Alpha', 'user-doc', '[]',
+           '2026-08-01T01:00:00.000Z', 3, 1, 'trusted'),
+          ('beta-note', 'beta', 'write', 'origin', 'user:bob', 'Beta', 'user-doc', '[]',
+           '2026-08-01T02:00:00.000Z', 4, 0, 'trusted')`,
+      )
+      await runPgMigrations(client, migrations)
+      expect(
+        await client.query('SELECT COUNT(*)::int AS n FROM activity_projection_status'),
+      ).toMatchObject({ rows: [{ n: 0 }] })
+
+      expect(await testSchema.db.revisions.prepareActivityProjection('alpha')).toEqual({
+        state: 'rebuilding',
+      })
+      expect(await testSchema.db.revisions.maintainActivityProjection('alpha')).toMatchObject({
+        state: 'ready',
+        processed: 2,
+        published: true,
+      })
+      expect(await testSchema.db.revisions.prepareActivityProjection('alpha')).toEqual({
+        state: 'ready',
+        lease: { through: '2', activeGeneration: '1', sourceGeneration: '1' },
+      })
+      expect(
+        await client.query(
+          `SELECT space, state, active_generation::text, active_through::text
+             FROM activity_projection_status ORDER BY space`,
+        ),
+      ).toMatchObject({
+        rows: [{ space: 'alpha', state: 'ready', active_generation: '1', active_through: '2' }],
+      })
+      expect(
+        await client.query(
+          `SELECT note_id, event_count::text, chars_added_sum::text, chars_removed_sum::text
+             FROM activity_note_actor_states WHERE space = 'alpha'`,
+        ),
+      ).toMatchObject({
+        rows: [
+          {
+            note_id: 'alpha-note',
+            event_count: '1',
+            chars_added_sum: '3',
+            chars_removed_sum: '1',
+          },
+        ],
+      })
+
+      await client.query(
+        `UPDATE note_revisions SET integrity = 'quarantined'
+          WHERE space = 'alpha' AND entry_role = 'change'`,
+      )
+      expect(await testSchema.db.revisions.prepareActivityProjection('alpha')).toEqual({
+        state: 'rebuilding',
+      })
+      expect(await testSchema.db.revisions.maintainActivityProjection('alpha')).toMatchObject({
+        state: 'ready',
+        processed: 2,
+        published: true,
+      })
+      expect(await testSchema.db.revisions.prepareActivityProjection('alpha')).toEqual({
+        state: 'ready',
+        lease: { through: '2', activeGeneration: '2', sourceGeneration: '2' },
+      })
+      while ((await testSchema.db.revisions.maintainActivityProjectionGc('alpha')).pending) {
+        // Bounded GC is deliberately resumable; this tiny fixture drains in a few units.
+      }
+      expect(
+        await client.query(
+          `SELECT generation::text, actor_kind, event_count::text
+             FROM activity_note_actor_states WHERE space = 'alpha'`,
+        ),
+      ).toMatchObject({ rows: [{ generation: '2', actor_kind: 'gap', event_count: '1' }] })
+      expect(
+        await client.query('SELECT COUNT(*)::int AS n FROM activity_projection_gc'),
+      ).toMatchObject({ rows: [{ n: 0 }] })
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('does not let stale PostgreSQL maintenance recreate Activity rows after Space purge', async () => {
+    const testSchema = await createSchema('activity_purge_fence')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await testSchema.db.revisions.init()
+      await client.query(
+        `INSERT INTO note_revisions
+          (note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+           chars_added, chars_removed, integrity)
+         VALUES
+          ('purged-note', 'purged', 'write', 'change', 'user:alice', 'Purged', 'user-doc', '[]',
+           '2026-08-01T00:00:00.000Z', 1, 0, 'trusted')`,
+      )
+      await testSchema.db.purgeSpace('purged')
+
+      await expect(testSchema.db.revisions.prepareActivityProjection('purged')).rejects.toThrow(
+        /activity projection target was permanently purged/,
+      )
+      await expect(testSchema.db.revisions.maintainActivityProjection('purged')).rejects.toThrow(
+        /activity projection target was permanently purged/,
+      )
+
+      for (const table of [
+        'note_revisions',
+        'activity_projection_status',
+        'activity_revision_order',
+        'activity_note_actor_states',
+        'activity_note_actor_heads',
+        'activity_projection_gc',
+      ]) {
+        expect(
+          await client.query(`SELECT COUNT(*)::int AS n FROM ${table} WHERE space = $1`, [
+            'purged',
+          ]),
+        ).toMatchObject({
+          rows: [{ n: 0 }],
+        })
+      }
+      expect(
+        await client.query(
+          `SELECT kind, entity_id, space FROM revision_purge_fences
+            WHERE kind = 'space' AND entity_id = $1`,
+          ['purged'],
+        ),
+      ).toMatchObject({
+        rows: [{ kind: 'space', entity_id: 'purged', space: 'purged' }],
+      })
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
   it('matches the normalized pre-cut catalog plus the approved deltas', async () => {
     const testSchema = await createSchema('migration_golden')
     const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })

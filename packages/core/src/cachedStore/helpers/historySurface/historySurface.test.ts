@@ -150,6 +150,7 @@ const makeHost = (opts: {
     endBulk: async () => {
       calls.endBulk++
     },
+    activityProjection: () => ({ notes: new Map(), locationThrough: 'test:0' }),
   }
   return { host, trash: new HistorySurface(host), calls }
 }

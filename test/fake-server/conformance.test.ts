@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { beforeEach, describe, expect, it } from 'vitest'
 import {
   ActivityEventsResponseSchema,
+  ActivityGroupsResponseSchema,
   ActivityProjectsResponseSchema,
   ActivityResponseSchema,
   BucketsResponseSchema,
@@ -1144,8 +1145,36 @@ describe('activity (#33)', () => {
     expect(r.events.some((e: { title: string }) => e.title === 'Secret')).toBe(false)
     // Newest first: Jun 12 deleted is the last seeded → first out.
     expect(r.events[0]).toMatchObject({ kind: 'deleted', title: 'Gamma' })
+    expect(r.scopeGate).toMatchObject({
+      hasOtherAuthors: expect.any(Boolean),
+      through: r.through,
+      activityVersion: r.activityVersion,
+    })
     const beta = r.events.find((e: { title: string }) => e.title === 'Beta')
     expect(beta).toMatchObject({ kind: 'edited', charsAdded: 12, charsRemoved: 3 })
+  })
+
+  it('GET /activity standing modes expose an explicit empty projection lease', async () => {
+    const empty = await createApp({
+      now: '2026-06-25T12:00:00.000Z',
+      spaces: [{ slug: 'main', displayName: 'Main', notes: [], activity: [] }],
+    })
+    const groups = (
+      await empty.inject({ method: 'GET', url: '/api/s/main/activity/groups?by=note' })
+    ).json()
+    const events = (
+      await empty.inject({ method: 'GET', url: '/api/s/main/activity/events' })
+    ).json()
+
+    for (const response of [groups, events]) {
+      expect(response).toMatchObject({
+        through: null,
+        activityVersion: expect.any(String),
+        nextCursor: null,
+        scopeGate: { hasOtherAuthors: false, through: null },
+      })
+      expect(response.scopeGate.activityVersion).toBe(response.activityVersion)
+    }
   })
 
   it('GET /activity/events?from&to — day drill windows to one local day', async () => {
@@ -1154,6 +1183,176 @@ describe('activity (#33)', () => {
     )
     expect(r.total).toBe(2) // Alpha created + Alpha edited
     expect(r.events.every((e: { title: string }) => e.title === 'Alpha')).toBe(true)
+  })
+
+  it('GET /activity/groups — groups before limit, folds current folders, and pages exact details', async () => {
+    const note = (title: string, filePath: string) => ({
+      title,
+      filePath,
+      modifiedAt: '2026-06-10T00:00:00.000Z',
+      createdAt: '2026-06-10T00:00:00.000Z',
+      tags: [] as string[],
+      content: `# ${title}`,
+    })
+    const activity = [
+      ...Array.from({ length: 10 }, (_, index) => ({
+        date: `2026-06-10T10:${String(index).padStart(2, '0')}:00.000Z`,
+        kind: index === 0 ? ('created' as const) : ('edited' as const),
+        noteId: 'fake-work-hot',
+        title: 'Hot',
+        charsAdded: 2,
+        charsRemoved: 1,
+      })),
+      {
+        date: '2026-06-10T09:00:00.000Z',
+        kind: 'edited' as const,
+        noteId: 'fake-work-peer',
+        title: 'Peer',
+      },
+      {
+        date: '2026-06-10T08:00:00.000Z',
+        kind: 'edited' as const,
+        noteId: 'fake-root',
+        title: 'Root',
+      },
+      { date: '2026-06-10T07:00:00.000Z', kind: 'deleted' as const, noteId: 'gone', title: 'Gone' },
+    ]
+    const grouped = await createApp({
+      now: '2026-06-25T12:00:00.000Z',
+      spaces: [
+        {
+          slug: 'main',
+          displayName: 'Main',
+          notes: [
+            note('Hot', 'work/hot.md'),
+            note('Peer', 'work/peer.md'),
+            note('Root', 'root.md'),
+          ],
+          activity,
+        },
+      ],
+    })
+    const noteGroups = (
+      await grouped.inject({ method: 'GET', url: '/api/s/main/activity/groups?by=note&limit=4' })
+    ).json()
+
+    expect(ActivityGroupsResponseSchema.safeParse(noteGroups).success).toBe(true)
+    expect(noteGroups.itemType).toBe('note')
+    expect(noteGroups.total).toBe(4)
+    expect(noteGroups.scopeGate).toMatchObject({
+      hasOtherAuthors: false,
+      through: noteGroups.through,
+      activityVersion: noteGroups.activityVersion,
+    })
+    expect(
+      noteGroups.items.find((item: { noteId: string }) => item.noteId === 'fake-work-hot'),
+    ).toMatchObject({
+      count: '10',
+      charsAdded: '20',
+      charsRemoved: '10',
+      location: { kind: 'folder', path: 'work' },
+    })
+    const folderGroups = (
+      await grouped.inject({ method: 'GET', url: '/api/s/main/activity/groups?by=folder&limit=4' })
+    ).json()
+
+    expect(ActivityGroupsResponseSchema.safeParse(folderGroups).success).toBe(true)
+    expect(
+      folderGroups.items.map((item: { location: { kind: string } }) => item.location.kind).sort(),
+    ).toEqual(['folder', 'root', 'unavailable'])
+    const nestedUrl = new URLSearchParams({
+      by: 'folder',
+      location: 'folder',
+      path: 'work',
+      through: folderGroups.through,
+      activityVersion: folderGroups.activityVersion,
+      locationThrough: folderGroups.locationThrough,
+      limit: '10',
+    })
+    const nested = (
+      await grouped.inject({ method: 'GET', url: `/api/s/main/activity/groups?${nestedUrl}` })
+    ).json()
+
+    expect(nested.itemType).toBe('note')
+    expect(nested.items.map((item: { noteId: string }) => item.noteId).sort()).toEqual([
+      'fake-work-hot',
+      'fake-work-peer',
+    ])
+    const firstDetail = (
+      await grouped.inject({
+        method: 'GET',
+        url: `/api/s/main/activity/events?noteId=fake-work-hot&through=${noteGroups.through}&activityVersion=${encodeURIComponent(noteGroups.activityVersion)}&locationThrough=${encodeURIComponent(noteGroups.locationThrough)}&limit=3`,
+      })
+    ).json()
+
+    expect(firstDetail.events).toHaveLength(3)
+    expect(firstDetail.nextCursor).toBeTruthy()
+    const secondDetail = (
+      await grouped.inject({
+        method: 'GET',
+        url: `/api/s/main/activity/events?noteId=fake-work-hot&through=${noteGroups.through}&activityVersion=${encodeURIComponent(noteGroups.activityVersion)}&locationThrough=${encodeURIComponent(noteGroups.locationThrough)}&limit=3&cursor=${encodeURIComponent(firstDetail.nextCursor)}`,
+      })
+    ).json()
+    const ids = [...firstDetail.events, ...secondDetail.events].map(
+      (event: { revisionId: string }) => event.revisionId,
+    )
+
+    expect(new Set(ids).size).toBe(ids.length)
+  })
+
+  it('GET /activity/groups — a pure move makes the location cut retryable-stale', async () => {
+    const moved = await createApp({
+      now: '2026-06-25T12:00:00.000Z',
+      spaces: [
+        {
+          slug: 'main',
+          displayName: 'Main',
+          notes: [
+            {
+              title: 'Moving',
+              filePath: 'before/moving.md',
+              modifiedAt: '2026-06-10T00:00:00.000Z',
+              createdAt: '2026-06-10T00:00:00.000Z',
+              tags: [],
+              content: '# Moving',
+            },
+          ],
+          activity: [
+            {
+              date: '2026-06-10T10:00:00.000Z',
+              kind: 'edited',
+              noteId: 'fake-before-moving',
+              title: 'Moving',
+            },
+          ],
+        },
+      ],
+    })
+    const overview = (
+      await moved.inject({ method: 'GET', url: '/api/s/main/activity/groups?by=folder' })
+    ).json()
+    const move = await moved.inject({
+      method: 'POST',
+      url: '/api/move',
+      payload: { id: 'fake-before-moving', destinationPath: 'after/Moving.md' },
+    })
+
+    expect(move.statusCode).toBe(200)
+    const query = new URLSearchParams({
+      by: 'folder',
+      location: 'folder',
+      path: 'before',
+      through: overview.through,
+      activityVersion: overview.activityVersion,
+      locationThrough: overview.locationThrough,
+    })
+    const stale = await moved.inject({
+      method: 'GET',
+      url: `/api/s/main/activity/groups?${query}`,
+    })
+
+    expect(stale.statusCode).toBe(409)
+    expect(stale.json()).toMatchObject({ reason: 'activity_location_stale' })
   })
 
   it('GET /activity + /events?author=mine — server scopes to the viewer (#218)', async () => {

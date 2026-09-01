@@ -561,6 +561,13 @@ export class PgMetaDb implements MetaDb {
       const hashes = (hashesRes.rows as Array<{ h: string }>).map(({ h }) => h)
       await lockRevisionKeys(client, 'blob', hashes)
       await client.query('DELETE FROM revision_heads WHERE space = $1', [spaceId])
+      // Generation GC locks its queue row before touching states/heads. Purge must
+      // take the same row order or the pair closes a queue↔state deadlock cycle.
+      await client.query('DELETE FROM activity_projection_gc WHERE space = $1', [spaceId])
+      await client.query('DELETE FROM activity_note_actor_states WHERE space = $1', [spaceId])
+      await client.query('DELETE FROM activity_note_actor_heads WHERE space = $1', [spaceId])
+      await client.query('DELETE FROM activity_revision_order WHERE space = $1', [spaceId])
+      await client.query('DELETE FROM activity_projection_status WHERE space = $1', [spaceId])
       await client.query('DELETE FROM note_revisions WHERE space = $1', [spaceId])
       for (const h of hashes) {
         const used = await client.query(

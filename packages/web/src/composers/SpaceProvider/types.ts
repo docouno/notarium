@@ -3,6 +3,9 @@ import type { PatchSpaceRequest, Space } from '@notarium/contract'
 export type SpaceContextValue = {
   /** The active space slug — every space-scoped api call threads it. */
   space: string
+  /** Explicit switch intent committed before navigation. Once navigation was invoked,
+   *  it applies only while the route still names the target. */
+  spaceTransition: { target: string; beforeNavigation: boolean } | null
   /** All spaces this host serves, in display order — the personal domain is
    *  filtered OUT (management surfaces must not list it as a workspace). */
   spaces: Space[]

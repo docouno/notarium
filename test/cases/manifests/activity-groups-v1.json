@@ -1,0 +1,65 @@
+{
+  "version": "activity-groups-v1",
+  "seed": 41420260830,
+  "variants": {
+    "base": {
+      "liveNotes": 4096,
+      "activeNotes": 4000,
+      "folders": 512,
+      "sourceBytes": 25165824,
+      "revisions": 200000
+    },
+    "revision-10x": {
+      "liveNotes": 4096,
+      "activeNotes": 4000,
+      "folders": 512,
+      "sourceBytes": 25165824,
+      "revisions": 2000000
+    },
+    "breadth-10x": {
+      "liveNotes": 40960,
+      "activeNotes": 40000,
+      "folders": 5120,
+      "sourceBytes": 251658240,
+      "revisions": 2000000
+    }
+  },
+  "hotNotes": {
+    "count": 2,
+    "revisionPercent": 80
+  },
+  "principals": {
+    "viewerUserPercent": 40,
+    "viewerAgentPercent": 20,
+    "otherUserPercent": 20,
+    "otherAgentPercent": 10,
+    "trustedExternalPercent": 8,
+    "gapPercent": 2
+  },
+  "locations": {
+    "rootPercent": 2,
+    "unavailablePercent": 2,
+    "movedPercent": 5
+  },
+  "churnUnknownPercent": 5,
+  "firstRoleCohort": {
+    "baselinePercentOfActiveNotes": 10,
+    "baseBaselineNotes": 400,
+    "breadthBaselineNotes": 4000
+  },
+  "state": {
+    "blobBytes": 256,
+    "stateFormat": "markdown-v2",
+    "sqliteBatchRows": 10000
+  },
+  "titleBytes": {
+    "32": 80,
+    "96": 15,
+    "240": 5
+  },
+  "tagJsonBytes": {
+    "2": 80,
+    "32": 15,
+    "128": 5
+  }
+}

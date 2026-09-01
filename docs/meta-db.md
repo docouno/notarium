@@ -21,6 +21,7 @@ sqlite/0003_causal_identity.sql
 sqlite/0004_import_reservations.sql
 sqlite/0005_provider_contour.sql
 sqlite/0006_agent_call_trace.sql
+sqlite/0007_activity_projection.sql
 postgres/0000_baseline.sql
 postgres/0001_revision_history.sql
 postgres/0002_agent_state.sql
@@ -28,10 +29,11 @@ postgres/0003_causal_identity.sql
 postgres/0004_import_reservations.sql
 postgres/0005_provider_contour.sql
 postgres/0006_agent_call_trace.sql
+postgres/0007_activity_projection.sql
 ```
 
 `0000_baseline` is the published `v0.1.0` support floor. Its bytes and pair
-checksum are immutable. The six later carriers are the supported transition
+checksum are immutable. The seven later carriers are the supported transition
 from that baseline to the current schema; development-only predecessor ladders
 are not accepted prefixes.
 
@@ -230,6 +232,55 @@ background worker accepts one session batch on the 60-second discovery tick. A p
 continues after one-second event-loop yields, one fixed batch per turn, until physical cleanup is
 complete. It never performs a grouped whole-`agent_calls` scan, a multi-session SQLite cleanup
 transaction, or an hours-long interval-only cleanup on request traffic.
+### `0007_activity_projection`
+
+The Activity carrier is O(schema): it creates empty status, commit-order,
+cumulative-state, bucket-head and generation-GC tables plus database triggers. It
+does not enumerate journal rows, discover Spaces or create status rows. The first
+prepare/append initializes exactly one Space. Existing history freezes an indexed
+legacy revision boundary and rebuilds; an empty or genuinely fresh Space is ready.
+
+Every post-carrier revision, including a baseline or gap, receives one per-Space
+`source_ordinal` in the journal transaction. PostgreSQL serializes only this trigger
+tail on the status row, so a lower raw id committed later receives a higher source
+ordinal. A ready qualifying append also writes an immutable cumulative actor/class
+state and advances its bounded head. The same trigger covers ordinary append,
+restore/ability terminal writers, prepared INSERT and COPY; no application helper
+writes the projection.
+
+Rebuild consumes legacy rows then the order ledger in bounded set-oriented batches.
+For file-backed SQLite, one narrow Activity worker owns a second WAL connection and
+executes the scheduler-permitted rebuild/GC unit; the safe interactive source batch is
+ten rows, GC deletes ten rows per unit, and WAL checkpoints stay off the main event
+loop. The same worker serves unbounded standing Activity reads. It is not a generic SQL executor: bounded reads,
+scheduler priority, readiness and route composition stay in the main process.
+In-memory SQLite uses the local reference path; PostgreSQL remains async in-process.
+The Node worker lifecycle, IPC DTO and connection/checkpoint adapter are deliberately
+disposable once the canonical Go `ActivityReader` owns this path; source ordering,
+generation/lease semantics and cross-language fixtures remain the cutover contract.
+
+PostgreSQL progress uses ten-row batches but does not hold the status-row allocator
+lock while deriving/inserting cumulative states. It reads one generation/cursor
+snapshot, performs the batch, then conditionally advances that exact generation's
+cursor; concurrent append can allocate and commit a later source ordinal meanwhile.
+The turn does hold the shared revision-Space lifecycle fence, which is compatible
+with append but exclusive against Space purge: a batch committed before purge is
+swept by it, while a turn admitted after purge sees the durable fence and cannot
+recreate projection metadata.
+Initialization and final publication still take the status row, and publication still
+enters the exclusive revision-Space fence before the final source recheck.
+
+Final catch-up and pointer publication run under `BEGIN IMMEDIATE` (SQLite) or the
+exclusive revision-Space advisory fence (PostgreSQL). Publication and source restart
+only enqueue inert generations. Scheduler-paced GC deletes bounded state then head
+batches and is crash-resumable; it never runs an unbounded delete in the publication
+transaction. Rekey, quarantine, origin demotion and permanent note purge invalidate
+the source generation fail-closed. A committed revision's Space is immutable in both
+dialects; a cross-Space update is rejected atomically before the journal, source order
+or projection status can diverge. PostgreSQL Space purge removes the generation-GC
+queue before states/heads, matching the GC transaction's row order and preventing a
+queue↔state deadlock. Space purge explicitly removes every projection, order and GC
+row before deleting journal truth.
 
 ## Lock and lifecycle invariants
 

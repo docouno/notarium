@@ -540,6 +540,69 @@ describePostgres('Postgres deadlock probes', PROBE_SUITE, () => {
     })
   }
 
+  it('orders generation GC ahead of whole-Space projection cleanup', async () => {
+    const testSchema = await createPostgresTestSchema('lock_pairs_activity_gc')
+    const db = testSchema.db
+    const blocker = new pg.Pool({ connectionString: testSchema.scopedUrl })
+
+    try {
+      await seed(db)
+      await blocker.query(
+        `INSERT INTO activity_note_actor_states (
+           space, generation, source_ordinal, revision_id, note_id,
+           actor_kind, actor_key, class_key, event_count,
+           chars_added_sum, chars_added_known, chars_removed_sum, chars_removed_known
+         )
+         SELECT space, 99, source_ordinal, revision_id, note_id,
+                actor_kind, actor_key, class_key, event_count,
+                chars_added_sum, chars_added_known, chars_removed_sum, chars_removed_known
+           FROM activity_note_actor_states WHERE space = $1 AND generation = 1`,
+        [SPACE],
+      )
+      await blocker.query(
+        `INSERT INTO activity_note_actor_heads (
+           space, generation, note_id, actor_kind, actor_key, class_key,
+           source_ordinal, revision_id
+         )
+         SELECT space, 99, note_id, actor_kind, actor_key, class_key,
+                source_ordinal, revision_id
+           FROM activity_note_actor_heads WHERE space = $1 AND generation = 1`,
+        [SPACE],
+      )
+      await blocker.query(
+        `INSERT INTO activity_projection_gc (space, generation, phase, updated_at)
+         VALUES ($1, 99, 'states', $2)`,
+        [SPACE, AT],
+      )
+      const held = await blocker.connect()
+
+      await held.query('BEGIN')
+      await held.query(
+        'SELECT generation FROM activity_projection_gc WHERE space = $1 FOR UPDATE',
+        [SPACE],
+      )
+      const gc = db.revisions.maintainActivityProjectionGc(SPACE).then(
+        () => null,
+        (error: unknown) => error,
+      )
+
+      await requireWaiters(testSchema.admin, testSchema.schema, 1)
+      const purge = db.purgeSpace(SPACE).then(
+        () => null,
+        (error: unknown) => error,
+      )
+
+      await requireWaiters(testSchema.admin, testSchema.schema, 2)
+      await held.query('COMMIT')
+      held.release()
+
+      expect((await Promise.all([gc, purge])).map(deadlockOf).filter(Boolean)).toEqual([])
+    } finally {
+      await blocker.end().catch(() => {})
+      await testSchema.teardown()
+    }
+  })
+
   it('settles a claim in one space against a purge of another holding the same set row', async () => {
     const testSchema = await createPostgresTestSchema('lock_pairs_cross')
     const db = testSchema.db

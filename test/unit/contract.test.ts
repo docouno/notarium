@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
   ActivityEventsQuerySchema,
+  ActivityEventsResponseSchema,
+  ActivityGroupsQuerySchema,
+  ActivityGroupsResponseSchema,
   AddAgentRoleRequestSchema,
   AddAgentRoleResponseSchema,
   AddAgentSkillRequestSchema,
@@ -360,6 +363,170 @@ describe('zod 4 migration boundaries', () => {
       expect(recall.error.issues).toContainEqual(
         expect.objectContaining({ code: 'too_big', maximum: Number.MAX_SAFE_INTEGER }),
       )
+    }
+  })
+
+  it('pins Activity group locations and cursor/cut combinations', () => {
+    expect(ActivityGroupsQuerySchema.parse({})).toMatchObject({ by: 'note', limit: 12 })
+    expect(ActivityGroupsQuerySchema.safeParse({ by: 'folder', location: 'folder' }).success).toBe(
+      false,
+    )
+    expect(
+      ActivityGroupsQuerySchema.safeParse({
+        by: 'folder',
+        location: 'folder',
+        path: 'work',
+        through: '10',
+        activityVersion: 'activity-v1',
+        locationThrough: 'locations-1',
+      }).success,
+    ).toBe(true)
+    expect(
+      ActivityGroupsQuerySchema.safeParse({
+        by: 'folder',
+        cursor: 'opaque',
+        through: '10',
+        activityVersion: 'activity-v1',
+        locationThrough: 'locations-1',
+      }).success,
+    ).toBe(true)
+    expect(ActivityEventsQuerySchema.safeParse({ cursor: 'opaque', offset: 0 }).success).toBe(false)
+  })
+
+  it('keeps grouped cumulative counters exact beyond MAX_SAFE_INTEGER', () => {
+    const base = {
+      itemType: 'note' as const,
+      items: [
+        {
+          type: 'note' as const,
+          noteId: 'note-a',
+          title: 'A',
+          location: { kind: 'root' as const },
+          count: '9007199254740993',
+          charsAdded: '9007199254740995',
+          charsRemoved: null,
+          lastEvent: {
+            revisionId: '9007199254740997',
+            noteId: 'note-a',
+            kind: 'edited' as const,
+            title: 'A',
+            path: '',
+            at: '2026-08-30T00:00:00.000Z',
+            principal: null,
+            author: null,
+            charsAdded: null,
+            charsRemoved: null,
+          },
+        },
+      ],
+      total: 1,
+      through: '9007199254740997',
+      activityVersion: 'opaque',
+      locationThrough: 'locations-1',
+      nextCursor: null,
+    }
+
+    expect(ActivityGroupsResponseSchema.safeParse(base).success).toBe(true)
+    expect(
+      ActivityGroupsResponseSchema.safeParse({
+        ...base,
+        items: [{ ...base.items[0], count: Number(base.items[0].count) }],
+      }).success,
+    ).toBe(false)
+  })
+
+  it('binds a grouped scope gate to the exact response snapshot', () => {
+    const response = {
+      itemType: 'folder' as const,
+      items: [],
+      total: 0,
+      through: '10',
+      activityVersion: 'activity-v1',
+      locationThrough: 'locations-1',
+      nextCursor: null,
+      scopeGate: {
+        hasOtherAuthors: true,
+        through: '10',
+        activityVersion: 'activity-v1',
+      },
+    }
+
+    expect(ActivityGroupsResponseSchema.safeParse(response).success).toBe(true)
+    expect(
+      ActivityGroupsResponseSchema.safeParse({
+        ...response,
+        scopeGate: { ...response.scopeGate, through: '9' },
+      }).success,
+    ).toBe(false)
+    expect(
+      ActivityGroupsResponseSchema.safeParse({
+        ...response,
+        scopeGate: { ...response.scopeGate, activityVersion: 'activity-v2' },
+      }).success,
+    ).toBe(false)
+  })
+
+  it('keeps the nullable Activity cut executable and uniquely empty', () => {
+    const emptyGroups = {
+      itemType: 'folder' as const,
+      items: [],
+      total: 0,
+      through: null,
+      activityVersion: 'activity-v1',
+      locationThrough: 'locations-1',
+      nextCursor: null,
+      scopeGate: { hasOtherAuthors: false, through: null, activityVersion: 'activity-v1' },
+    }
+    const emptyEvents = {
+      events: [],
+      total: 0,
+      through: null,
+      activityVersion: 'activity-v1',
+      nextCursor: null,
+      scopeGate: { hasOtherAuthors: false, through: null, activityVersion: 'activity-v1' },
+    }
+
+    expect(ActivityGroupsResponseSchema.safeParse(emptyGroups).success).toBe(true)
+    expect(ActivityEventsResponseSchema.safeParse(emptyEvents).success).toBe(true)
+    for (const mutation of [
+      { ...emptyGroups, total: 1 },
+      { ...emptyGroups, nextCursor: 'cursor' },
+      {
+        ...emptyGroups,
+        scopeGate: { ...emptyGroups.scopeGate, hasOtherAuthors: true },
+      },
+      { ...emptyGroups, activityVersion: '' },
+      { ...emptyGroups, locationThrough: '' },
+    ]) {
+      expect(ActivityGroupsResponseSchema.safeParse(mutation).success).toBe(false)
+    }
+    for (const mutation of [
+      { ...emptyEvents, total: 1 },
+      {
+        ...emptyEvents,
+        events: [
+          {
+            revisionId: '1',
+            noteId: 'note-1',
+            kind: 'edited' as const,
+            title: 'Impossible event',
+            path: '',
+            at: '2026-08-31T00:00:00.000Z',
+            principal: null,
+            author: null,
+            charsAdded: null,
+            charsRemoved: null,
+          },
+        ],
+      },
+      { ...emptyEvents, nextCursor: 'cursor' },
+      {
+        ...emptyEvents,
+        scopeGate: { ...emptyEvents.scopeGate, hasOtherAuthors: true },
+      },
+      { ...emptyEvents, activityVersion: '' },
+    ]) {
+      expect(ActivityEventsResponseSchema.safeParse(mutation).success).toBe(false)
     }
   })
 

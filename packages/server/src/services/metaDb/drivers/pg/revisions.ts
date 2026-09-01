@@ -1,4 +1,7 @@
 import {
+  type ActivityLastEvent,
+  type ActivityNoteGroupCount,
+  type ActivityProjectionLease,
   AGENT_SESSION_ATTACH,
   type AuthorFilter,
   CAUSAL_BARRIER_KIND,
@@ -6,6 +9,8 @@ import {
   LOGICAL_NOTE_STATE_FORMAT,
   type Revision,
   REVISION_INTEGRITY,
+  REVISION_UNAVAILABLE_REASON,
+  REVISION_UNAVAILABLE_TITLE,
   type RevisionBlob,
   revisionGapOf,
   RevisionHeadConflictError,
@@ -22,6 +27,12 @@ import {
   QUARANTINED,
   TRUSTED_ONLY,
 } from '../../revisionProjection'
+import {
+  maintainPgActivityProjection,
+  maintainPgActivityProjectionGc,
+  pgActivityProjectionLease,
+  preparePgActivityProjection,
+} from './activityProjection'
 import { lockCausalBarriers } from './causalBarriers'
 import type { PgDriverCtx } from './context'
 import { lockRevisionWideScan } from './lockOrder'
@@ -59,6 +70,17 @@ type RevisionRow = {
 type RevisionDeltaRow = RevisionRow & {
   contract_max: string | number | null
   contract_total: string | number
+}
+
+type ActivityGroupRow = RevisionRow & {
+  group_count: string | number
+  chars_added_sum: string | number
+  chars_removed_sum: string | number
+  chars_added_known: string | number
+  chars_removed_known: string | number
+  contract_through: string | number | null
+  contract_has_other: boolean | null
+  last_source_ordinal?: string | number
 }
 
 /** The ONE place a stored row becomes a served row — the SQLite twin's rule: a
@@ -112,6 +134,32 @@ const rawRevisionOfRow = (r: RevisionRow): Revision => ({
   charsRemoved: r.chars_removed == null ? null : Number(r.chars_removed),
 })
 
+const activityLastOfRow = (row: RevisionRow): ActivityLastEvent =>
+  row.integrity === REVISION_INTEGRITY.quarantined
+    ? {
+        id: String(row.id),
+        noteId: row.note_id,
+        kind: row.kind as Revision['kind'],
+        entryRole: row.entry_role as Revision['entryRole'],
+        principal: null,
+        title: REVISION_UNAVAILABLE_TITLE,
+        createdAt: row.created_at,
+        charsAdded: null,
+        charsRemoved: null,
+        unavailableReason: REVISION_UNAVAILABLE_REASON.identityConflict,
+      }
+    : {
+        id: String(row.id),
+        noteId: row.note_id,
+        kind: row.kind as Revision['kind'],
+        entryRole: row.entry_role as Revision['entryRole'],
+        principal: row.principal,
+        title: row.title,
+        createdAt: row.created_at,
+        charsAdded: row.chars_added == null ? null : Number(row.chars_added),
+        charsRemoved: row.chars_removed == null ? null : Number(row.chars_removed),
+      }
+
 /** Author-scope predicate as `$n` SQL, appending its binds to `params`.
  *  Usernames carry no LIKE wildcard, so prefix matches need no ESCAPE. */
 const authorClausePg = (author: AuthorFilter | undefined, params: unknown[]): string => {
@@ -144,8 +192,172 @@ const classFilterPg = (excludeClasses: readonly string[], params: unknown[]): st
     }),
   )
 
+const otherAuthorPg = (viewer: AuthorFilter, params: unknown[]): string => {
+  const parts: string[] = []
+
+  if (viewer.exact.length) {
+    const placeholders = viewer.exact.map((value) => {
+      params.push(value)
+      return `$${params.length}`
+    })
+    parts.push(`principal IN (${placeholders.join(',')})`)
+  }
+  for (const prefix of viewer.prefixes) {
+    params.push(`${prefix}%`)
+    parts.push(`principal LIKE $${params.length}`)
+  }
+
+  return `${TRUSTED_ONLY} AND NOT COALESCE((${parts.length ? parts.join(' OR ') : 'FALSE'}), FALSE)`
+}
+
+const projectionActorMatchPg = (
+  author: AuthorFilter,
+  params: unknown[],
+  alias = 'states',
+): string => {
+  const parts: string[] = []
+
+  if (author.exact.length) {
+    const placeholders = author.exact.map((value) => {
+      params.push(value)
+      return `$${params.length}`
+    })
+    parts.push(`${alias}.actor_key IN (${placeholders.join(',')})`)
+  }
+  for (const prefix of author.prefixes) {
+    params.push(`${prefix}%`)
+    parts.push(`${alias}.actor_key LIKE $${params.length}`)
+  }
+
+  return parts.length ? parts.join(' OR ') : 'FALSE'
+}
+
+const activityEventsFromProjection = async (
+  ctx: PgDriverCtx,
+  space: string,
+  opts: {
+    from?: string
+    to?: string
+    offset: number
+    limit: number
+    excludeClasses: readonly string[]
+    author?: AuthorFilter
+    viewerAuthor?: AuthorFilter
+    noteId?: string
+    activityLease?: ActivityProjectionLease
+    afterId?: string
+  },
+) => {
+  const client = await ctx.required.connect()
+
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    const lease = await pgActivityProjectionLease(client, space, opts.activityLease)
+
+    if (lease.through == null) {
+      await client.query('COMMIT')
+      return {
+        items: [],
+        total: 0,
+        through: null,
+        nextAfterId: null,
+        activityLease: lease,
+        ...(opts.viewerAuthor ? { hasOtherAuthors: false } : {}),
+      }
+    }
+    const params: unknown[] = [space, lease.through]
+    const where = [notSyntheticBaselineClause]
+
+    if (opts.from != null) {
+      params.push(opts.from)
+      where.push(`revisions.created_at >= $${params.length}`)
+    }
+    if (opts.to != null) {
+      params.push(opts.to)
+      where.push(`revisions.created_at < $${params.length}`)
+    }
+    if (opts.noteId != null) {
+      params.push(opts.noteId)
+      where.push(`revisions.note_id = $${params.length}`)
+    }
+    if (opts.excludeClasses.length) {
+      where.push(classFilterPg(opts.excludeClasses, params).replace(/^ AND /, ''))
+    }
+    if (opts.author) {
+      where.push(authorClausePg(opts.author, params).replace(/^ AND /, ''))
+    }
+    const gate = opts.viewerAuthor ? `BOOL_OR(${otherAuthorPg(opts.viewerAuthor, params)})` : 'NULL'
+    let pageWhere = ''
+
+    if (opts.afterId != null) {
+      params.push(opts.afterId)
+      pageWhere = `WHERE id < $${params.length}::bigint`
+    }
+    params.push(opts.limit + 1)
+    const limitParam = `$${params.length}`
+    params.push(opts.afterId == null ? opts.offset : 0)
+    const offsetParam = `$${params.length}`
+    const result = await client.query(
+      `WITH ordered AS (
+         SELECT revisions.*, COALESCE(ordered.source_ordinal, revisions.id) AS source_ordinal
+           FROM note_revisions AS revisions
+           JOIN activity_projection_status AS status ON status.space = revisions.space
+           LEFT JOIN activity_revision_order AS ordered ON ordered.revision_id = revisions.id
+          WHERE revisions.space = $1
+            AND (
+              (ordered.source_ordinal IS NOT NULL AND ordered.source_ordinal <= $2::bigint)
+              OR (ordered.source_ordinal IS NULL
+                  AND revisions.id <= status.legacy_through_revision_id
+                  AND revisions.id <= $2::bigint)
+            )
+       ),
+       filtered AS (
+         SELECT revisions.* FROM ordered AS revisions WHERE ${where.join(' AND ')}
+       ),
+       aggregate AS (
+         SELECT COUNT(*) AS contract_total, ${gate} AS contract_has_other FROM filtered
+       ),
+       page AS (
+         SELECT * FROM filtered ${pageWhere}
+          ORDER BY id DESC LIMIT ${limitParam} OFFSET ${offsetParam}
+       )
+       SELECT page.*, aggregate.contract_total, aggregate.contract_has_other
+         FROM aggregate LEFT JOIN page ON TRUE ORDER BY page.id DESC`,
+      params,
+    )
+    const rows = result.rows as Array<
+      RevisionRow & {
+        id: string | number | null
+        contract_total: string | number
+        contract_has_other: boolean | null
+      }
+    >
+    const meta = rows[0]
+    const page = rows.filter((row): row is typeof row & RevisionRow => row.id != null)
+    const items = page.slice(0, opts.limit)
+
+    await client.query('COMMIT')
+    return {
+      items: items.map(revisionOfRow),
+      total: Number(meta?.contract_total ?? 0),
+      through: lease.through,
+      nextAfterId: page.length > opts.limit ? String(items.at(-1)!.id) : null,
+      activityLease: lease,
+      ...(opts.viewerAuthor ? { hasOtherAuthors: meta?.contract_has_other === true } : {}),
+    }
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
 export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => ({
   init: () => ctx.ensureInit(),
+  prepareActivityProjection: (space) => preparePgActivityProjection(ctx, space),
+  maintainActivityProjection: (space) => maintainPgActivityProjection(ctx, space),
+  maintainActivityProjectionGc: (space) => maintainPgActivityProjectionGc(ctx, space),
   append: async (rev: RevisionInput, content: RevisionBlob | null) => {
     await ctx.ensureInit()
     const client = await ctx.required.connect()
@@ -403,8 +615,39 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       unavailable: Number(r.unavailable),
     }))
   },
-  activityEvents: async (space, { from, to, offset, limit, excludeClasses = [], author }) => {
+  activityEvents: async (
+    space,
+    {
+      from,
+      to,
+      offset,
+      limit,
+      excludeClasses = [],
+      author,
+      viewerAuthor,
+      noteId,
+      through,
+      activityLease,
+      afterId,
+    },
+  ) => {
     await ctx.ensureInit()
+    const needsProjection = noteId != null || (from == null && to == null)
+
+    if (needsProjection) {
+      return activityEventsFromProjection(ctx, space, {
+        from,
+        to,
+        offset,
+        limit,
+        excludeClasses,
+        author,
+        viewerAuthor,
+        noteId,
+        activityLease,
+        afterId,
+      })
+    }
     const where = ['space = $1', notSyntheticBaselineClause]
     const params: unknown[] = [space]
 
@@ -416,6 +659,10 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       params.push(to)
       where.push(`created_at < $${params.length}`)
     }
+    if (noteId != null) {
+      params.push(noteId)
+      where.push(`note_id = $${params.length}`)
+    }
     if (excludeClasses.length) {
       where.push(classFilterPg(excludeClasses, params).replace(/^ AND /, ''))
     }
@@ -425,21 +672,274 @@ export const createRevisionsFacet = (ctx: PgDriverCtx): RevisionPersistence => (
       where.push(authorClausePg(author, params).replace(/^ AND /, ''))
     }
     const whereSql = where.join(' AND ')
-    const totalParams = [...params]
-    params.push(limit)
-    const limitParam = `$${params.length}`
-    params.push(offset)
-    const offsetParam = `$${params.length}`
-    const [rows, agg] = await Promise.all([
-      ctx.required.query(
-        `SELECT * FROM note_revisions WHERE ${whereSql} ORDER BY id DESC LIMIT ${limitParam} OFFSET ${offsetParam}`,
-        params,
-      ),
-      ctx.required.query(`SELECT COUNT(*) AS n FROM note_revisions WHERE ${whereSql}`, totalParams),
-    ])
+    const aggregateParams = [...params]
+    let aggregateWhere = whereSql
+
+    if (through != null) {
+      aggregateParams.push(through)
+      aggregateWhere += ` AND id <= $${aggregateParams.length}`
+    }
+    const gate = viewerAuthor ? `BOOL_OR(${otherAuthorPg(viewerAuthor, aggregateParams)})` : 'NULL'
+    const aggregateResult = await ctx.required.query(
+      `SELECT COUNT(*) AS n, MAX(id) AS max_id, ${gate} AS has_other
+         FROM note_revisions WHERE ${aggregateWhere}`,
+      aggregateParams,
+    )
+    const aggregate = aggregateResult.rows[0] as {
+      n: string | number
+      max_id: string | number | null
+      has_other: boolean | null
+    }
+    const resolvedThrough = through ?? (aggregate.max_id == null ? null : String(aggregate.max_id))
+
+    if (resolvedThrough == null) {
+      return {
+        items: [],
+        total: 0,
+        through: null,
+        nextAfterId: null,
+        ...(viewerAuthor ? { hasOtherAuthors: false } : {}),
+      }
+    }
+    const pageParams = [...params]
+    pageParams.push(resolvedThrough)
+    let pageWhere = `${whereSql} AND id <= $${pageParams.length}`
+
+    if (afterId != null) {
+      pageParams.push(afterId)
+      pageWhere += ` AND id < $${pageParams.length}`
+    }
+    pageParams.push(limit + 1)
+    const limitParam = `$${pageParams.length}`
+    pageParams.push(afterId == null ? offset : 0)
+    const offsetParam = `$${pageParams.length}`
+    const rows = await ctx.required.query(
+      `SELECT * FROM note_revisions WHERE ${pageWhere}
+        ORDER BY id DESC LIMIT ${limitParam} OFFSET ${offsetParam}`,
+      pageParams,
+    )
+    const page = (rows.rows as RevisionRow[]).slice(0, limit)
+
     return {
-      items: (rows.rows as RevisionRow[]).map(revisionOfRow),
-      total: Number((agg.rows[0] as { n: string | number }).n),
+      items: page.map(revisionOfRow),
+      total: Number(aggregate.n),
+      through: resolvedThrough,
+      nextAfterId: rows.rows.length > limit ? String(page.at(-1)!.id) : null,
+      ...(viewerAuthor ? { hasOtherAuthors: aggregate.has_other === true } : {}),
+    }
+  },
+  activityGroupsByNote: async (
+    space,
+    { from, to, excludeClasses = [], author, viewerAuthor, activityLease },
+  ) => {
+    await ctx.ensureInit()
+    const client = await ctx.required.connect()
+
+    try {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
+      const lease = await pgActivityProjectionLease(client, space, activityLease)
+
+      if (lease.through == null) {
+        await client.query('COMMIT')
+        return {
+          items: [],
+          through: null,
+          activityLease: lease,
+          ...(viewerAuthor ? { hasOtherAuthors: false } : {}),
+        }
+      }
+      let rows: Array<ActivityGroupRow & { id: string | number | null }>
+
+      if (from != null || to != null) {
+        const params: unknown[] = [space, lease.through]
+        const where = [notSyntheticBaselineClause]
+
+        if (from != null) {
+          params.push(from)
+          where.push(`revisions.created_at >= $${params.length}`)
+        }
+        if (to != null) {
+          params.push(to)
+          where.push(`revisions.created_at < $${params.length}`)
+        }
+        if (excludeClasses.length) {
+          where.push(classFilterPg(excludeClasses, params).replace(/^ AND /, ''))
+        }
+        if (author) {
+          where.push(authorClausePg(author, params).replace(/^ AND /, ''))
+        }
+        const gate = viewerAuthor ? `BOOL_OR(${otherAuthorPg(viewerAuthor, params)})` : 'NULL'
+        const result = await client.query(
+          `WITH ordered AS (
+             SELECT revisions.*, COALESCE(ordered.source_ordinal, revisions.id) AS source_ordinal
+               FROM note_revisions AS revisions
+               JOIN activity_projection_status AS status ON status.space = revisions.space
+               LEFT JOIN activity_revision_order AS ordered ON ordered.revision_id = revisions.id
+              WHERE revisions.space = $1
+                AND (
+                  (ordered.source_ordinal IS NOT NULL AND ordered.source_ordinal <= $2::bigint)
+                  OR (ordered.source_ordinal IS NULL
+                      AND revisions.id <= status.legacy_through_revision_id
+                      AND revisions.id <= $2::bigint)
+                )
+                AND ${where.join(' AND ')}
+           ),
+           grouped AS (
+             SELECT note_id,
+                    MAX(source_ordinal) AS last_source_ordinal,
+                    COUNT(*) AS group_count,
+                    SUM(CASE WHEN ${TRUSTED_ONLY} AND chars_added IS NOT NULL THEN chars_added ELSE 0 END)
+                      AS chars_added_sum,
+                    SUM(CASE WHEN ${TRUSTED_ONLY} AND chars_removed IS NOT NULL THEN chars_removed ELSE 0 END)
+                      AS chars_removed_sum,
+                    MAX(CASE WHEN ${TRUSTED_ONLY} AND chars_added IS NOT NULL THEN 1 ELSE 0 END)
+                      AS chars_added_known,
+                    MAX(CASE WHEN ${TRUSTED_ONLY} AND chars_removed IS NOT NULL THEN 1 ELSE 0 END)
+                      AS chars_removed_known,
+                    ${gate} AS group_has_other
+               FROM ordered GROUP BY note_id
+           ),
+           meta AS (
+             SELECT BOOL_OR(group_has_other) AS contract_has_other FROM grouped
+           )
+           SELECT latest.*,
+                  grouped.group_count,
+                  grouped.chars_added_sum,
+                  grouped.chars_removed_sum,
+                  grouped.chars_added_known,
+                  grouped.chars_removed_known,
+                  grouped.last_source_ordinal,
+                  $2::bigint AS contract_through,
+                  meta.contract_has_other
+             FROM meta
+             LEFT JOIN grouped ON TRUE
+             LEFT JOIN ordered AS latest
+               ON latest.note_id = grouped.note_id
+              AND latest.source_ordinal = grouped.last_source_ordinal
+            ORDER BY grouped.last_source_ordinal DESC`,
+          params,
+        )
+        rows = result.rows as Array<ActivityGroupRow & { id: string | number | null }>
+      } else {
+        const statusResult = await client.query(
+          'SELECT active_generation FROM activity_projection_status WHERE space = $1',
+          [space],
+        )
+        const generation = statusResult.rows[0].active_generation as string | number
+        const params: unknown[] = [space, generation]
+        let stateJoin = 'states.source_ordinal = heads.source_ordinal'
+
+        if (activityLease) {
+          params.push(lease.through)
+          stateJoin = `states.source_ordinal = (
+            SELECT MAX(seek.source_ordinal)
+              FROM activity_note_actor_states AS seek
+             WHERE seek.space = heads.space
+               AND seek.generation = heads.generation
+               AND seek.note_id = heads.note_id
+               AND seek.actor_kind = heads.actor_kind
+               AND seek.actor_key = heads.actor_key
+               AND seek.class_key = heads.class_key
+               AND seek.source_ordinal <= $${params.length}::bigint
+          )`
+        }
+        const classClause = excludeClasses.length
+          ? `AND (states.actor_kind = 'gap' OR states.class_key NOT IN (${excludeClasses
+              .map((value) => {
+                params.push(value)
+                return `$${params.length}`
+              })
+              .join(',')}))`
+          : ''
+        const authorClause = author
+          ? `WHERE visible.actor_kind = 'principal' AND (${projectionActorMatchPg(
+              author,
+              params,
+              'visible',
+            )})`
+          : ''
+        const gate = viewerAuthor
+          ? `BOOL_OR(
+               visible.actor_kind = 'external'
+               OR (visible.actor_kind = 'principal'
+                   AND NOT (${projectionActorMatchPg(viewerAuthor, params, 'visible')}))
+             )`
+          : 'BOOL_OR(NULL)'
+        params.push(lease.through)
+        const contractCut = `$${params.length}::bigint`
+        const result = await client.query(
+          `WITH bucket_states AS (
+             SELECT states.*
+               FROM activity_note_actor_heads AS heads
+               JOIN activity_note_actor_states AS states
+                 ON states.space = heads.space
+                AND states.generation = heads.generation
+                AND ${stateJoin}
+              WHERE heads.space = $1 AND heads.generation = $2::bigint
+           ),
+           visible AS (
+             SELECT states.* FROM bucket_states AS states WHERE TRUE ${classClause}
+           ),
+           selected AS (
+             SELECT visible.* FROM visible ${authorClause}
+           ),
+           grouped AS (
+             SELECT note_id,
+                    MAX(source_ordinal) AS last_source_ordinal,
+                    SUM(event_count) AS group_count,
+                    SUM(chars_added_sum) AS chars_added_sum,
+                    SUM(chars_added_known) AS chars_added_known,
+                    SUM(chars_removed_sum) AS chars_removed_sum,
+                    SUM(chars_removed_known) AS chars_removed_known
+               FROM selected GROUP BY note_id
+           ),
+           meta AS (
+             SELECT ${gate} AS contract_has_other FROM visible
+           )
+           SELECT revisions.*,
+                  grouped.group_count,
+                  grouped.chars_added_sum,
+                  grouped.chars_removed_sum,
+                  grouped.chars_added_known,
+                  grouped.chars_removed_known,
+                  grouped.last_source_ordinal,
+                  ${contractCut} AS contract_through,
+                  meta.contract_has_other
+             FROM meta
+             LEFT JOIN grouped ON TRUE
+             LEFT JOIN selected AS latest
+               ON latest.note_id = grouped.note_id
+              AND latest.source_ordinal = grouped.last_source_ordinal
+             LEFT JOIN note_revisions AS revisions ON revisions.id = latest.revision_id
+            ORDER BY grouped.last_source_ordinal DESC`,
+          params,
+        )
+        rows = result.rows as Array<ActivityGroupRow & { id: string | number | null }>
+      }
+      const meta = rows[0]
+      const items: ActivityNoteGroupCount[] = rows
+        .filter((row): row is ActivityGroupRow => row.id != null)
+        .map((row) => ({
+          noteId: row.note_id,
+          count: String(row.group_count),
+          charsAdded: Number(row.chars_added_known) > 0 ? String(row.chars_added_sum) : null,
+          charsRemoved: Number(row.chars_removed_known) > 0 ? String(row.chars_removed_sum) : null,
+          lastSourceOrdinal: String(row.last_source_ordinal),
+          lastEvent: activityLastOfRow(row),
+        }))
+
+      await client.query('COMMIT')
+      return {
+        items,
+        through: lease.through,
+        activityLease: lease,
+        ...(viewerAuthor ? { hasOtherAuthors: meta?.contract_has_other === true } : {}),
+      }
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
     }
   },
   activityByNote: async (space, { from, to, excludeClasses = [] }) => {

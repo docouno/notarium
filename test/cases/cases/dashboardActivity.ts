@@ -3,19 +3,17 @@ import type { CaseSpec } from '../types'
 
 const PRINCIPALS = ['user:sergey', 'user:alex']
 
-/** A multi-week backdated history with created→edited chains, two authors and a
- *  few deletes, across two marked projects — the case for the #216 dashboard tabs
- *  (Activity / Projects / Hygiene) and the #218 "mine vs all" heatmap toggle,
- *  which only show anything when the journal has real dated history by author.
- *  Hygiene has grist too: broken wiki-links (ghosts) and orphan notes. */
+/** Dashboard Activity's deterministic hot-note/folder hierarchy plus a broader
+ * multi-week background corpus for Projects and Hygiene. */
 export const dashboardActivity: CaseSpec = {
   name: 'dashboard-activity',
   description:
-    'Multi-week dated history, two authors, projects and broken links — the dashboard tabs + mine/all heatmap (#216/#218).',
+    'Hot-note grouping, folder/root/unavailable states, shared/solo authors, projects and broken links.',
   axes: ['activity', 'history', 'graph'],
   build: ({ rng, scale, now }) => {
     const b = new WorldBuilder(now)
     b.space({ slug: 'main', displayName: 'Main' })
+    b.space({ slug: 'solo', displayName: 'Solo' })
     b.project({ space: 'main', path: 'alpha', displayName: 'Project Alpha' })
     b.project({ space: 'main', path: 'beta', displayName: 'Project Beta' })
 
@@ -25,6 +23,76 @@ export const dashboardActivity: CaseSpec = {
     b.user({ username: 'alex', password: 'seed-pass', displayName: 'Alex' })
     b.member({ space: 'main', username: 'sergey', role: 'owner' })
     b.member({ space: 'main', username: 'alex', role: 'writer' })
+    b.member({ space: 'solo', username: 'sergey', role: 'owner' })
+
+    b.note({
+      space: 'main',
+      path: 'alpha/hot-note.md',
+      title: 'Hot note',
+      content: '# Hot note\n\nRepeated edits must collapse into one group.',
+      created: daysBefore(now, 14, 10),
+      edits: Array.from({ length: 50 }, (_, index) => daysBefore(now, 2, 10, index)),
+      principal: 'user:sergey',
+    })
+    b.note({
+      space: 'main',
+      path: 'alpha/peer-note.md',
+      title: 'Peer note',
+      created: daysBefore(now, 4, 11),
+      edits: [daysBefore(now, 1, 9)],
+      principal: 'user:alex',
+    })
+    b.note({
+      space: 'main',
+      path: 'workspace-root.md',
+      title: 'Workspace root note',
+      created: daysBefore(now, 5, 12),
+      principal: 'user:sergey',
+    })
+    b.note({
+      space: 'main',
+      path: 'Workspace root/literal-folder.md',
+      title: 'Literal Workspace root folder',
+      created: daysBefore(now, 6, 12),
+      principal: 'user:sergey',
+    })
+    b.note({
+      space: 'main',
+      path: 'No current folder/literal-folder.md',
+      title: 'Literal No current folder',
+      created: daysBefore(now, 7, 12),
+      principal: 'user:alex',
+    })
+    b.note({
+      space: 'main',
+      path: 'retired/no-current-folder.md',
+      title: 'No current folder note',
+      created: daysBefore(now, 8, 10),
+      deletedAt: daysBefore(now, 1, 12),
+      principal: 'user:alex',
+    })
+    const moved = b.note({
+      space: 'main',
+      path: 'alpha/moved-from.md',
+      title: 'Moved without activity',
+      created: daysBefore(now, 9, 10),
+      principal: 'user:sergey',
+    })
+    b.event({
+      op: 'edit',
+      date: daysBefore(now, 1, 13),
+      space: 'main',
+      noteId: moved,
+      path: 'beta/moved-to.md',
+      principal: 'user:sergey',
+    })
+    b.note({
+      space: 'solo',
+      path: 'only-mine.md',
+      title: 'Only mine',
+      created: daysBefore(now, 3, 10),
+      principal: 'user:sergey',
+    })
 
     const weeks = 8
     const perWeek = Math.max(1, Math.round(6 * scale))

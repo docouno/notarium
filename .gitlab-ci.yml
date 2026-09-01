@@ -299,6 +299,36 @@ extended:postgres:
       '
     - npm run test:pg
 
+# #414's corpus/latency/recovery benchmark is intentionally an on-demand load acceptance:
+# unlike the ordinary PG contracts it owns two resource-capped app/DB containers,
+# materializes the pinned pre tree, and runs the 2M-depth/breadth variants. It must not
+# extend every main/release pipeline or occupy the shared heavy slot without an operator.
+# The CI adapter delegates all mechanics and the verdict to the same Make target used locally.
+extended:activity-groups:
+  stage: extended
+  extends: [.dind, .heavy]
+  rules:
+    - when: manual
+      allow_failure: true
+  # The complete profile has exceeded thirty minutes on the reference runner. Keep a
+  # finite load-test ceiling; each child phase still fails independently after eight.
+  timeout: 1h
+  # The gate archives its immutable main@4d824c3 comparison tree. A shallow
+  # default-branch/tag checkout eventually drops that object and would fail before
+  # measurement, so this lane owns the same full-history requirement as release.
+  variables:
+    GIT_DEPTH: 0
+  script:
+    # docker:27-cli is Alpine and does not ship the shell declared by the Makefile.
+    - apk add --no-cache bash git make nodejs-current
+    - make activity-groups-gate ACTIVITY_GROUPS_GATE_MODE=full
+  artifacts:
+    when: always
+    expire_in: 7 days
+    access: developer
+    paths:
+      - test-results/activity-groups-gate/full/report.json
+
 # The pinned Playwright image IS the job image: the runner pulls it to its host once and
 # reuses it, and the render matches the baselines because the browser, fonts and system
 # libraries are the ones the image ships.

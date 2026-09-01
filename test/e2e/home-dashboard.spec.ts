@@ -81,6 +81,29 @@ const FIXTURE = {
         { date: TWO_AGO, kind: 'edited', title: 'Secret', class: 'agent-memory' },
       ],
     },
+    {
+      slug: 'solo',
+      displayName: 'Solo',
+      notes: [
+        {
+          title: 'Solo note',
+          filePath: 'solo.md',
+          modifiedAt: TODAY,
+          createdAt: TODAY,
+          tags: [],
+          content: '# Solo note\n\nOnly this Space carries this note.',
+        },
+      ],
+      activity: [
+        {
+          date: TODAY,
+          kind: 'created',
+          title: 'Solo note',
+          principal: 'ui',
+          noteId: 'fake-solo',
+        },
+      ],
+    },
   ],
 }
 
@@ -118,12 +141,13 @@ test('Home dashboard: pills, activity surface, day-drill, health/projects surfac
   await expect(activeCells.first()).toBeVisible()
   expect(await activeCells.count()).toBeGreaterThanOrEqual(1)
 
-  // The standing "what changed" feed shows events; the hidden-class "Secret" never
-  // appears.
+  // The standing feed starts in Note mode: Alpha's two events occupy one row, and
+  // the hidden-class "Secret" never appears.
   const feed = page.getByTestId('activity-feed')
   await expect(feed).toBeVisible()
   await expect(feed.getByText('Secret')).toHaveCount(0)
-  const feedRows = feed.getByTestId('dashboard-activity-row')
+  const feedRows = feed.getByTestId('dashboard-activity-note-group')
+  await expect(feedRows).toHaveCount(3)
   const timeline = feedRows.first().locator('..')
   const [timelineBox, firstMarkerBox, lastMarkerBox, endpoints] = await Promise.all([
     timeline.boundingBox(),
@@ -141,11 +165,13 @@ test('Home dashboard: pills, activity surface, day-drill, health/projects surfac
   expect(lineBottom).toBeGreaterThan(lastMarkerBox?.y ?? Number.POSITIVE_INFINITY)
   expect(lineBottom).toBeLessThan((lastMarkerBox?.y ?? 0) + (lastMarkerBox?.height ?? 0))
   await expect(feed.getByText('Alpha').first()).toBeVisible()
-  // #217 gitlab-style: each event is a two-line entry — the metadata line shows the
-  // kind + churn, and line one carries the note's location as a clickable folder
-  // breadcrumb (Alpha lives in notes/, so the crumb links that folder's Files view).
+  // The aggregate row owns the full-window count/churn. Disclosure then renders the
+  // existing raw EventRow contract, including actor and current folder breadcrumb.
   await expect(feed.getByText('+12 −0')).toBeVisible()
+  await expect(feedRows.filter({ hasText: 'Alpha' })).toContainText('2 changes')
+  await feed.getByRole('button', { name: 'Expand changes for Alpha' }).press('Enter')
   const agentEvent = feed.getByTestId('dashboard-activity-row').filter({ hasText: '+12 −0' })
+  await expect(agentEvent).toBeVisible()
   expect(
     await agentEvent
       .locator('[data-timeline-slot]')
@@ -156,6 +182,18 @@ test('Home dashboard: pills, activity surface, day-drill, health/projects surfac
   const folderCrumb = feed.getByRole('link', { name: 'notes' }).first()
   await expect(folderCrumb).toBeVisible()
   await expect(folderCrumb).toHaveAttribute('href', /\/s\/main\/files\/notes$/)
+
+  // Folder mode builds folder → note → events and keeps multiple disclosures open.
+  await feed.getByRole('button', { name: 'Folder', exact: true }).click()
+  const folderGroup = feed
+    .getByTestId('dashboard-activity-folder-group')
+    .filter({ hasText: 'notes' })
+  await expect(folderGroup).toBeVisible()
+  await feed.getByRole('button', { name: /Expand notes in Folder · notes/ }).press('Enter')
+  await expect(
+    feed.getByTestId('dashboard-activity-note-group').filter({ hasText: 'Alpha' }),
+  ).toBeVisible()
+  await feed.getByRole('button', { name: 'Note', exact: true }).click()
 
   // Day-drill: click an active cell → the feed scopes to that day with a header.
   await activeCells.first().click()
@@ -208,6 +246,189 @@ test('Home dashboard: canonical dashboard URLs redirect to the home surface', as
   await page.goto('/s/main/dashboard/activity')
   await expect(page).toHaveURL(/\/s\/main$/)
   await expect(page.getByTestId('dash-pill-activity')).toHaveAttribute('aria-current', 'page')
+})
+
+test('Home dashboard: a Space switch never paints the previous Dashboard under the target URL', async ({
+  page,
+  baseURL,
+}) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  await page.goto('/s/main')
+  const dash = page.getByTestId('home-dashboard')
+  await expect(dash).toContainText('3 notes')
+  await page.getByTestId('space-switcher').click()
+
+  await page.evaluate(() => {
+    type Sample = {
+      path: string
+      marker: string | null
+      visible: boolean
+      sourceVisible: boolean
+      switcher: string | null
+    }
+    type Probe = { samples: Sample[]; stop: () => void }
+    const probeWindow = window as Window & { __notariumSpaceProbe?: Probe }
+    const samples: Sample[] = []
+    let running = true
+
+    const tick = () => {
+      const currentDash = document.querySelector('[data-testid="home-dashboard"]')
+      const rect = currentDash?.getBoundingClientRect()
+      const style = currentDash ? getComputedStyle(currentDash) : null
+      const text = currentDash?.textContent?.replace(/\s+/g, ' ').trim() ?? ''
+
+      samples.push({
+        path: location.pathname,
+        marker: document.documentElement.dataset.notariumSpaceTransition ?? null,
+        visible: Boolean(
+          currentDash &&
+          style &&
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          style.opacity !== '0' &&
+          rect &&
+          rect.width > 0 &&
+          rect.height > 0,
+        ),
+        sourceVisible: text.includes('3 notes'),
+        switcher:
+          document
+            .querySelector('[data-testid="space-switcher"]')
+            ?.textContent?.replace(/\s+/g, ' ')
+            .trim() ?? null,
+      })
+      if (running) {
+        requestAnimationFrame(tick)
+      }
+    }
+
+    probeWindow.__notariumSpaceProbe = {
+      samples,
+      stop: () => {
+        running = false
+      },
+    }
+    requestAnimationFrame(tick)
+  })
+
+  await page.getByRole('menuitemradio', { name: 'Solo' }).click()
+  await expect(page).toHaveURL(/\/s\/solo$/)
+  await expect(page.getByTestId('space-switcher')).toContainText('Solo')
+  await expect(dash).toContainText('1 note')
+
+  const probe = await page.evaluate(() => {
+    type Sample = {
+      path: string
+      marker: string | null
+      visible: boolean
+      sourceVisible: boolean
+      switcher: string | null
+    }
+    type Probe = { samples: Sample[]; stop: () => void }
+    const probeWindow = window as Window & { __notariumSpaceProbe?: Probe }
+    const current = probeWindow.__notariumSpaceProbe
+
+    current?.stop()
+    const targetFrames = current?.samples.filter((sample) => sample.path === '/s/solo') ?? []
+
+    return {
+      targetFrames: targetFrames.length,
+      hiddenFrames: targetFrames.filter((sample) => !sample.visible).length,
+      staleSourceFrames: targetFrames.filter(
+        (sample) => sample.visible && (sample.sourceVisible || sample.switcher === 'Main'),
+      ).length,
+      marker: document.documentElement.dataset.notariumSpaceTransition ?? null,
+    }
+  })
+
+  expect(probe.targetFrames).toBeGreaterThan(0)
+  expect(probe.hiddenFrames).toBeGreaterThan(0)
+  expect(probe.staleSourceFrames).toBe(0)
+  expect(probe.marker).toBeNull()
+})
+
+test('Home dashboard: a cold projection rebuild is explicit and Retry rejoins it', async ({
+  page,
+  baseURL,
+}) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  let rebuilding = true
+
+  await page.route('**/api/s/main/activity/groups?**', async (route) => {
+    if (rebuilding) {
+      rebuilding = false
+      await route.fulfill({
+        status: 503,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          error: 'activity summary is rebuilding',
+          reason: 'activity_projection_rebuilding',
+        }),
+      })
+      return
+    }
+    await route.continue()
+  })
+  await page.goto('/')
+  const feed = page.getByTestId('activity-feed')
+
+  await expect(feed).toContainText('Rebuilding activity summary…')
+  await expect(page.getByTestId('activity-heatmap')).toBeVisible()
+  await feed.getByRole('button', { name: 'Retry' }).click()
+  await expect(feed.getByTestId('dashboard-activity-note-group').first()).toBeVisible()
+  await expect(feed).not.toContainText('Rebuilding activity summary…')
+})
+
+test('Home dashboard: a pure move refreshes open Note and Folder detail branches', async ({
+  page,
+  baseURL,
+}) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  let bravoDetailRequests = 0
+
+  page.on('request', (request) => {
+    const url = new URL(request.url())
+
+    if (
+      url.pathname.endsWith('/activity/events') &&
+      url.searchParams.get('noteId') === 'fake-notes-bravo'
+    ) {
+      bravoDetailRequests++
+    }
+  })
+  await page.goto('/')
+  const feed = page.getByTestId('activity-feed')
+
+  await feed.getByRole('button', { name: 'Folder', exact: true }).click()
+  await feed.getByRole('button', { name: /Expand notes in Folder · notes/ }).press('Enter')
+  await feed.getByRole('button', { name: /Expand changes for Bravo/ }).press('Enter')
+  await expect(
+    feed.getByTestId('dashboard-activity-row').filter({ hasText: 'Bravo' }),
+  ).toBeVisible()
+  expect(bravoDetailRequests).toBe(1)
+
+  const firstMove = await page.request.post(`${baseURL}/api/move`, {
+    data: { id: 'fake-notes-alpha', destinationPath: 'elsewhere/Alpha.md' },
+  })
+  expect(firstMove.ok()).toBeTruthy()
+  await expect.poll(() => bravoDetailRequests).toBeGreaterThanOrEqual(2)
+  await expect(feed.getByRole('button', { name: /Collapse changes for Bravo/ })).toHaveAttribute(
+    'aria-expanded',
+    'true',
+  )
+
+  await feed.getByRole('button', { name: 'Note', exact: true }).click()
+  await feed.getByRole('button', { name: /Expand changes for Alpha/ }).press('Enter')
+  await expect(feed.getByRole('link', { name: 'elsewhere' }).first()).toBeVisible()
+  const secondMove = await page.request.post(`${baseURL}/api/move`, {
+    data: { id: 'fake-notes-alpha', destinationPath: 'final/Alpha.md' },
+  })
+  expect(secondMove.ok()).toBeTruthy()
+  await expect(feed.getByRole('link', { name: 'final' }).first()).toBeVisible()
+  await expect(feed.getByRole('button', { name: /Collapse changes for Alpha/ })).toHaveAttribute(
+    'aria-expanded',
+    'true',
+  )
 })
 
 test('Home dashboard: data loads once — switching pills does not refetch', async ({

@@ -1,5 +1,15 @@
 import { ErrorResponseSchema, OkResponseSchema } from './schemas/rest/_shared'
 import {
+  ActivityEventsQuerySchema,
+  ActivityEventsResponseSchema,
+  ActivityGroupsQuerySchema,
+  ActivityGroupsResponseSchema,
+  ActivityProjectsQuerySchema,
+  ActivityProjectsResponseSchema,
+  ActivityQuerySchema,
+  ActivityResponseSchema,
+} from './schemas/rest/activity'
+import {
   AbilitySaveRequestSchema,
   AbilitySaveResponseSchema,
   AgentAbilityDetailResponseSchema,
@@ -243,6 +253,19 @@ export const contract = {
     conflict: FieldSchemaConflictResponseSchema,
   },
   graph: { response: GraphResponseSchema },
+  activity: { request: ActivityQuerySchema, response: ActivityResponseSchema },
+  activityEvents: {
+    request: ActivityEventsQuerySchema,
+    response: ActivityEventsResponseSchema,
+  },
+  activityGroups: {
+    request: ActivityGroupsQuerySchema,
+    response: ActivityGroupsResponseSchema,
+  },
+  activityProjects: {
+    request: ActivityProjectsQuerySchema,
+    response: ActivityProjectsResponseSchema,
+  },
   note: { response: NoteDetailResponseSchema },
   noteViews: { request: ViewManifestQuerySchema, response: ViewManifestResponseSchema },
   viewWindow: { request: ViewWindowRequestSchema, response: ViewWindowResponseSchema },

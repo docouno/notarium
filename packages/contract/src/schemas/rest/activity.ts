@@ -1,5 +1,9 @@
 import { z } from 'zod'
-import { ACTIVITY_EVENT_KIND } from '../../consts/activity'
+import {
+  ACTIVITY_EVENT_KIND,
+  ACTIVITY_GROUP_BY,
+  ACTIVITY_LOCATION_KIND,
+} from '../../consts/activity'
 import { enumValues } from '../../libs/enumValues'
 import { AuthorSchema, RevisionUnavailableReasonSchema } from '../primitives'
 
@@ -66,21 +70,85 @@ export const ActivityResponseSchema = z.object({
  *  about what the journal records. */
 export const ActivityEventKindSchema = z.enum(enumValues(ACTIVITY_EVENT_KIND))
 
+const ActivityVersionSchema = z.string().min(1).max(2048)
+const ActivityLocationThroughSchema = z.string().min(1).max(256)
+const ActivityCursorSchema = z.string().min(1).max(2048)
+
 /** GET /api/s/<slug>/activity/events query: a window over the space's revision
  *  events, newest first. `from`/`to` (ISO, half-open) bound it — the standing
  *  "what changed" feed omits them (latest N), the heatmap's day-drill passes the
  *  clicked day's [start, end) in the user's tz (converted to UTC client-side).
  *  Windowed from day one (headroom + the day-drill paginates). */
-export const ActivityEventsQuerySchema = z.object({
-  from: z.string().optional(),
-  to: z.string().optional(),
-  offset: z.coerce.number().int().min(0).default(0),
-  limit: z.coerce.number().int().min(1).max(200).default(50),
-  /** Author scope — same lens as the heatmap's `author` (see ActivityQuery).
-   *  Keeps the feed + day-drill in sync with a "mine"-scoped heatmap: clicking a
-   *  "mine" day must not surface someone else's edits. */
-  author: z.enum(['mine']).optional(),
-})
+export const ActivityEventsQuerySchema = z
+  .object({
+    from: z.string().optional(),
+    to: z.string().optional(),
+    offset: z.coerce.number().int().min(0).optional(),
+    limit: z.coerce.number().int().min(1).max(200).default(50),
+    /** Author scope — same lens as the heatmap's `author` (see ActivityQuery).
+     *  Keeps the feed + day-drill in sync with a "mine"-scoped heatmap: clicking a
+     *  "mine" day must not surface someone else's edits. */
+    author: z.enum(['mine']).optional(),
+    noteId: z.string().min(1).optional(),
+    through: z
+      .string()
+      .regex(/^[1-9]\d*$/)
+      .optional(),
+    activityVersion: ActivityVersionSchema.optional(),
+    locationThrough: ActivityLocationThroughSchema.optional(),
+    cursor: ActivityCursorSchema.optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.cursor && value.offset !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['cursor'],
+        message: 'cursor and offset are mutually exclusive',
+      })
+    }
+    const bounded = value.from !== undefined || value.to !== undefined
+    const detail = value.noteId !== undefined
+    const boundedRaw = bounded && !detail
+
+    if ((value.through === undefined) !== (value.activityVersion === undefined)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['activityVersion'],
+        message: 'through and activityVersion must be supplied together',
+      })
+    }
+    if (boundedRaw && (value.through || value.locationThrough || value.cursor)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['from'],
+        message: 'bounded raw events do not accept grouped snapshot fields',
+      })
+    }
+    if (
+      detail &&
+      (!value.through || !value.activityVersion || !value.locationThrough || value.offset != null)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['noteId'],
+        message: 'grouped detail requires through, activityVersion and locationThrough',
+      })
+    }
+    if (!detail && !bounded && value.locationThrough) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['locationThrough'],
+        message: 'standing events do not accept locationThrough',
+      })
+    }
+    if (value.cursor && (!value.through || !value.activityVersion)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['cursor'],
+        message: 'cursor requires through and activityVersion',
+      })
+    }
+  })
 
 /** One "what changed" event: a journal revision resolved for the dashboard.
  *  `noteId` addresses the note (open it / the registry resolves a deleted one in
@@ -107,10 +175,223 @@ export const ActivityEventSchema = z.object({
   unavailableReason: RevisionUnavailableReasonSchema.optional(),
 })
 
-export const ActivityEventsResponseSchema = z.object({
-  events: z.array(ActivityEventSchema),
-  total: z.number(),
+export const ActivityScopeGateSchema = z
+  .object({
+    hasOtherAuthors: z.boolean(),
+    through: z
+      .string()
+      .regex(/^[1-9]\d*$/)
+      .nullable(),
+    activityVersion: ActivityVersionSchema,
+  })
+  .superRefine((value, ctx) => {
+    if (value.through === null && value.hasOtherAuthors) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['hasOtherAuthors'],
+        message: 'an empty Activity snapshot cannot contain other authors',
+      })
+    }
+  })
+
+export const ActivityEventsResponseSchema = z
+  .object({
+    events: z.array(ActivityEventSchema),
+    total: z.number(),
+    through: z
+      .string()
+      .regex(/^[1-9]\d*$/)
+      .nullable()
+      .optional(),
+    activityVersion: ActivityVersionSchema.optional(),
+    nextCursor: ActivityCursorSchema.nullable().optional(),
+    scopeGate: ActivityScopeGateSchema.optional(),
+  })
+  .superRefine((value, ctx) => {
+    const snapshot = value.activityVersion !== undefined
+
+    if (
+      snapshot !== (value.through !== undefined) ||
+      snapshot !== (value.nextCursor !== undefined)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['activityVersion'],
+        message: 'standing/detail responses require through, activityVersion and nextCursor',
+      })
+    }
+    if (
+      value.scopeGate &&
+      (value.scopeGate.through !== value.through ||
+        value.scopeGate.activityVersion !== value.activityVersion)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['scopeGate'],
+        message: 'scopeGate must identify the response snapshot',
+      })
+    }
+    if (
+      snapshot &&
+      value.through === null &&
+      (value.events.length !== 0 ||
+        value.total !== 0 ||
+        value.nextCursor !== null ||
+        value.scopeGate?.hasOtherAuthors === true)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['through'],
+        message: 'an empty Activity snapshot cannot contain events, cursors or other authors',
+      })
+    }
+  })
+
+export const ActivityLocationSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal(ACTIVITY_LOCATION_KIND.folder), path: z.string().min(1) }),
+  z.object({ kind: z.literal(ACTIVITY_LOCATION_KIND.root) }),
+  z.object({ kind: z.literal(ACTIVITY_LOCATION_KIND.unavailable) }),
+])
+
+export const ActivityGroupsQuerySchema = z
+  .object({
+    by: z.enum(enumValues(ACTIVITY_GROUP_BY)).default(ACTIVITY_GROUP_BY.note),
+    from: z.string().optional(),
+    to: z.string().optional(),
+    author: z.enum(['mine']).optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(12),
+    cursor: z.string().min(1).max(2048).optional(),
+    through: z
+      .string()
+      .regex(/^[1-9]\d*$/)
+      .optional(),
+    activityVersion: ActivityVersionSchema.optional(),
+    locationThrough: ActivityLocationThroughSchema.optional(),
+    location: z.enum(enumValues(ACTIVITY_LOCATION_KIND)).optional(),
+    path: z.string().min(1).optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.location && value.by !== ACTIVITY_GROUP_BY.folder) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['location'],
+        message: 'location is only valid with by=folder',
+      })
+    }
+    if (value.location === ACTIVITY_LOCATION_KIND.folder && !value.path) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['path'],
+        message: 'path is required for location=folder',
+      })
+    }
+    if (value.location !== ACTIVITY_LOCATION_KIND.folder && value.path) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['path'],
+        message: 'path is only valid for location=folder',
+      })
+    }
+    if (value.cursor && (!value.through || !value.locationThrough)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['cursor'],
+        message: 'cursor requires through, activityVersion and locationThrough',
+      })
+    }
+    if ((value.through === undefined) !== (value.activityVersion === undefined)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['activityVersion'],
+        message: 'through and activityVersion must be supplied together',
+      })
+    }
+    if (value.cursor && !value.activityVersion) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['cursor'],
+        message: 'cursor requires activityVersion',
+      })
+    }
+    if (value.location && (!value.through || !value.activityVersion || !value.locationThrough)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['location'],
+        message: 'location detail requires through, activityVersion and locationThrough',
+      })
+    }
+  })
+
+export const ActivityNoteGroupSchema = z.object({
+  type: z.literal(ACTIVITY_GROUP_BY.note),
+  noteId: z.string(),
+  title: z.string(),
+  location: ActivityLocationSchema,
+  count: z.string().regex(/^\d+$/),
+  charsAdded: z.string().regex(/^\d+$/).nullable(),
+  charsRemoved: z.string().regex(/^\d+$/).nullable(),
+  lastEvent: ActivityEventSchema,
 })
+
+export const ActivityFolderGroupSchema = z.object({
+  type: z.literal(ACTIVITY_GROUP_BY.folder),
+  location: ActivityLocationSchema,
+  noteCount: z.number().int().nonnegative(),
+  eventCount: z.string().regex(/^\d+$/),
+  charsAdded: z.string().regex(/^\d+$/).nullable(),
+  charsRemoved: z.string().regex(/^\d+$/).nullable(),
+  lastAt: z.string(),
+})
+
+const ActivityGroupsResponseBaseSchema = z.object({
+  total: z.number().int().nonnegative(),
+  through: z
+    .string()
+    .regex(/^[1-9]\d*$/)
+    .nullable(),
+  activityVersion: ActivityVersionSchema,
+  scopeGate: ActivityScopeGateSchema.optional(),
+  locationThrough: ActivityLocationThroughSchema,
+  nextCursor: ActivityCursorSchema.nullable(),
+})
+
+export const ActivityGroupsResponseSchema = z
+  .discriminatedUnion('itemType', [
+    ActivityGroupsResponseBaseSchema.extend({
+      itemType: z.literal(ACTIVITY_GROUP_BY.note),
+      items: z.array(ActivityNoteGroupSchema),
+    }),
+    ActivityGroupsResponseBaseSchema.extend({
+      itemType: z.literal(ACTIVITY_GROUP_BY.folder),
+      items: z.array(ActivityFolderGroupSchema),
+    }),
+  ])
+  .superRefine((value, ctx) => {
+    if (
+      value.scopeGate &&
+      (value.scopeGate.through !== value.through ||
+        value.scopeGate.activityVersion !== value.activityVersion)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['scopeGate'],
+        message: 'scopeGate must identify the response snapshot',
+      })
+    }
+    if (
+      value.through === null &&
+      (value.items.length !== 0 ||
+        value.total !== 0 ||
+        value.nextCursor !== null ||
+        value.scopeGate?.hasOtherAuthors === true)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['through'],
+        message: 'an empty Activity snapshot cannot contain groups, cursors or other authors',
+      })
+    }
+  })
 
 /** GET /api/s/<slug>/activity/projects query: rank the space's projects by recent
  *  activity. `from`/`to` (ISO) bound the window; default server-side to a
@@ -151,6 +432,18 @@ export type ActivityEventsQuery = z.infer<typeof ActivityEventsQuerySchema>
 export type ActivityEvent = z.infer<typeof ActivityEventSchema>
 
 export type ActivityEventsResponse = z.infer<typeof ActivityEventsResponseSchema>
+
+export type ActivityScopeGate = z.infer<typeof ActivityScopeGateSchema>
+
+export type ActivityLocation = z.infer<typeof ActivityLocationSchema>
+
+export type ActivityGroupsQuery = z.infer<typeof ActivityGroupsQuerySchema>
+
+export type ActivityNoteGroup = z.infer<typeof ActivityNoteGroupSchema>
+
+export type ActivityFolderGroup = z.infer<typeof ActivityFolderGroupSchema>
+
+export type ActivityGroupsResponse = z.infer<typeof ActivityGroupsResponseSchema>
 
 export type ActivityProjectsQuery = z.infer<typeof ActivityProjectsQuerySchema>
 

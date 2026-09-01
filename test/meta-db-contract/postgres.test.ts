@@ -673,6 +673,43 @@ describePostgres('live Postgres driver', SUITE, () => {
     }
   })
 
+  it('keeps bounded raw events available while every grouped Postgres read rebuilds', async () => {
+    const testSchema = await createPostgresTestSchema('activity_rebuilding_boundary')
+
+    try {
+      const stored = await testSchema.db.revisions.append(revision('note-a'), 'a')
+
+      await testSchema.admin.query(
+        `UPDATE "${testSchema.schema.replaceAll('"', '""')}".note_revisions
+            SET integrity = 'quarantined' WHERE id = $1`,
+        [stored.id],
+      )
+      await expect(
+        testSchema.db.revisions.activityGroupsByNote('space-a', {
+          from: '2026-06-11T00:00:00.000Z',
+          to: '2026-06-13T00:00:00.000Z',
+        }),
+      ).rejects.toMatchObject({ reason: 'activity_projection_rebuilding', isUnavailable: true })
+      const bounded = await testSchema.db.revisions.activityEvents('space-a', {
+        from: '2026-06-11T00:00:00.000Z',
+        to: '2026-06-13T00:00:00.000Z',
+        offset: 0,
+        limit: 10,
+      })
+
+      expect(bounded.total).toBe(1)
+      expect(bounded).not.toHaveProperty('activityLease')
+      expect(await testSchema.db.revisions.prepareActivityProjection('space-a')).toEqual({
+        state: 'rebuilding',
+      })
+      await expect(
+        testSchema.db.revisions.maintainActivityProjection('space-a'),
+      ).resolves.toMatchObject({ state: 'ready', published: true })
+    } finally {
+      await testSchema.teardown()
+    }
+  })
+
   // Two pools onto ONE schema: the arbitration contract is about independent
   // sessions racing for an id, so a single connection would prove nothing.
   describeIdentityPersistenceContract('Postgres', async () => {

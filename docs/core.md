@@ -18,6 +18,27 @@ The decorator **equips** a "bare" engine with capabilities it lacks: identity ([
 
 Capabilities (`StoreCapabilities`) degrade honestly ([P5](architecture.md#p5)): without a meta-DB, identity and the journal run in-memory (history for the process lifetime); without a vector channel, search falls back to FTS — an optional capability, not an error.
 
+Dashboard Activity grouping uses one scope-aware current-meta projection from this
+layer rather than joining each group through transport code. The projection maps a
+visible note id to its current title and typed folder/root location, and carries an
+opaque process epoch plus `NotesMap.locationVersion` cut. That version advances on
+insert/delete, class transition, and path change, but not on a body/timestamp-only
+write. Group details can therefore retain unaffected revision slices while every
+current-path breadcrumb fails closed and reloads after a move; a process restart also
+invalidates an old location cut.
+
+`RevisionJournal` also owns one Activity projection maintenance loop per composed
+Space. `CachedStore` starts it without adding it to the notes boot barrier. Every
+rebuild and GC unit waits for the shared `BackgroundScheduler`; a grouped query
+starts or joins the same loop after later invalidation. A published generation emits
+one graph-neutral empty `changed` event so standing Activity refetches automatically.
+For a file-backed SQLite meta-DB, one narrow worker connection executes the permitted
+rebuild/GC unit and unbounded standing Activity reads; scheduling, readiness and
+current-location composition remain on the main process. The continuously interactive
+rebuild and GC write unit is ten rows. In-memory SQLite stays local and PostgreSQL stays
+async in-process. Stopping a store aborts a parked turn and joins any in-flight bounded
+unit; closing the meta-DB then drains and terminates its Activity worker.
+
 ## Phased boot (#60) <a id="phased-boot"></a>
 
 A cold start must not hang the surfaces. Boot is phased — `cold → notes → graph → ready`:

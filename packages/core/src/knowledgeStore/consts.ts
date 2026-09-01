@@ -40,6 +40,11 @@ export const STORE_ERROR_REASON = {
   revisionContentUnreadable: 'revision_content_unreadable',
   noteNotInTrash: 'note_not_in_trash',
   revisionsUnavailable: 'revisions_unavailable',
+  activityCutInvalid: 'activity_cut_invalid',
+  activityLocationStale: 'activity_location_stale',
+  activityProjectionInvalid: 'activity_projection_invalid',
+  activityProjectionStale: 'activity_projection_stale',
+  activityProjectionRebuilding: 'activity_projection_rebuilding',
   memoryConvergenceExhausted: 'memory_convergence_exhausted',
   /** A reference write lost a race with an identity settlement — retryable (#327). */
   referenceIdentityConflict: 'reference_identity_conflict',

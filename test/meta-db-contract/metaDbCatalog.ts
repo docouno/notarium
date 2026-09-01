@@ -392,6 +392,166 @@ export const splitProviderContour = (
     .sort(),
 })
 
+const activityProjectionTables = (postgres: boolean): CatalogTable[] => {
+  const integer = postgres ? 'bigint' : 'integer'
+  const column = (
+    name: string,
+    type = 'text',
+    notNull = true,
+    primaryKeyPosition = 0,
+  ): CatalogColumn => ({ name, type, notNull, defaultValue: null, primaryKeyPosition })
+  const index = (columns: string[], unique: boolean, name: string | null = null): CatalogIndex => ({
+    name: postgres ? null : name,
+    unique,
+    columns: columns.map((columnName) => ({ name: columnName, descending: false })),
+    predicate: null,
+  })
+  const actorCheck = postgres
+    ? "actor_kind = any (array['principal'::text, 'external'::text, 'gap'::text])"
+    : "actor_kind in ('principal', 'external', 'gap')"
+  const pk = (sqlite: number, pg: number): number => (postgres ? pg : sqlite)
+
+  return [
+    {
+      name: 'activity_note_actor_heads',
+      columns: [
+        column('space', 'text', true, pk(1, 0)),
+        column('generation', integer, true, pk(2, 1)),
+        column('note_id', 'text', true, pk(3, 2)),
+        column('actor_kind', 'text', true, pk(4, 3)),
+        column('actor_key', 'text', true, pk(5, 4)),
+        column('class_key', 'text', true, pk(6, 5)),
+        column('source_ordinal', integer),
+        column('revision_id', integer),
+      ],
+      checks: [actorCheck],
+      foreignKeys: [],
+      indexes: [
+        index(
+          [
+            'space',
+            'generation',
+            'actor_kind',
+            'actor_key',
+            'class_key',
+            'note_id',
+            'source_ordinal',
+            'revision_id',
+          ],
+          false,
+          'idx_activity_heads_space_generation',
+        ),
+        index(['space', 'generation', 'note_id', 'actor_kind', 'actor_key', 'class_key'], true),
+      ],
+    },
+    {
+      name: 'activity_note_actor_states',
+      columns: [
+        column('space', 'text', true, pk(1, 0)),
+        column('generation', integer, true, pk(2, 1)),
+        column('source_ordinal', integer, true, pk(3, 2)),
+        column('revision_id', integer),
+        column('note_id'),
+        column('actor_kind'),
+        column('actor_key'),
+        column('class_key'),
+        column('event_count', integer),
+        column('chars_added_sum', integer),
+        column('chars_added_known', integer),
+        column('chars_removed_sum', integer),
+        column('chars_removed_known', integer),
+      ],
+      checks: [actorCheck, 'chars_added_known >= 0', 'chars_removed_known >= 0', 'event_count > 0'],
+      foreignKeys: [],
+      indexes: [
+        index(
+          [
+            'space',
+            'generation',
+            'note_id',
+            'actor_kind',
+            'actor_key',
+            'class_key',
+            'source_ordinal',
+          ],
+          false,
+          'idx_activity_states_bucket_source',
+        ),
+        index(['space', 'generation', 'revision_id'], true),
+        index(['space', 'generation', 'source_ordinal'], true),
+      ],
+    },
+    {
+      name: 'activity_projection_gc',
+      columns: [
+        column('space', 'text', true, pk(1, 0)),
+        column('generation', integer, true, pk(2, 1)),
+        column('phase'),
+        column('updated_at'),
+      ],
+      checks: [
+        postgres
+          ? "phase = any (array['states'::text, 'heads'::text])"
+          : "phase in ('states', 'heads')",
+      ],
+      foreignKeys: [],
+      indexes: [index(['space', 'generation'], true)],
+    },
+    {
+      name: 'activity_projection_status',
+      columns: [
+        column('space', 'text', postgres, pk(1, 0)),
+        column('state'),
+        column('legacy_through_revision_id', integer, false),
+        column('next_source_ordinal', integer),
+        column('generation_counter', integer),
+        column('active_generation', integer, false),
+        column('active_through', integer, false),
+        column('build_generation', integer, false),
+        column('rebuild_cursor', integer, false),
+        column('rebuild_target', integer, false),
+        column('source_generation', integer),
+        column('build_source_generation', integer, false),
+        column('last_error_code', 'text', false),
+        column('updated_at'),
+      ],
+      checks: (postgres
+        ? [
+            'generation_counter > 0',
+            'next_source_ordinal >= 0',
+            'source_generation > 0',
+            "state = 'ready'::text and active_generation is not null and build_generation is null or state = 'rebuilding'::text",
+            "state = any (array['ready'::text, 'rebuilding'::text])",
+          ]
+        : [
+            "(state = 'ready' and active_generation is not null and build_generation is null) or state = 'rebuilding'",
+            'generation_counter > 0',
+            'next_source_ordinal >= 0',
+            'source_generation > 0',
+            "state in ('ready', 'rebuilding')",
+          ]
+      ).sort(),
+      foreignKeys: [],
+      indexes: [index(['space'], true)],
+    },
+    {
+      name: 'activity_revision_order',
+      columns: [
+        column('space', 'text', true, pk(1, 0)),
+        column('source_ordinal', integer, true, pk(2, 1)),
+        column('revision_id', integer),
+      ],
+      checks: [],
+      foreignKeys: [],
+      indexes: [
+        index(['space', 'revision_id'], false, 'idx_activity_revision_order_space_revision'),
+        index(['revision_id'], true),
+        index(['space', 'source_ordinal'], true),
+      ],
+    },
+  ]
+}
+
 export const approvedTargetCatalog = (golden: MetaDbCatalog): MetaDbCatalog => {
   const target = structuredClone(golden)
   target.tables = target.tables.filter((table) => table.name !== 'mcp_bookmarks')
@@ -434,6 +594,9 @@ export const approvedTargetCatalog = (golden: MetaDbCatalog): MetaDbCatalog => {
   placement.checks = placement.checks.filter(
     (check) => !check.includes('registry_note_id') && !check.includes('manifest_note_id'),
   )
+
+  target.tables.push(...activityProjectionTables(postgres))
+  target.tables.sort((left, right) => left.name.localeCompare(right.name))
 
   return target
 }

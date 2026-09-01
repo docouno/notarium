@@ -8,6 +8,11 @@
 import { aggregateGraphHealth, shapeGraph } from '../graph'
 import { type AdoptResult, IdentityRegistry } from '../identity'
 import type {
+  ActivityCurrentNote,
+  ActivityCurrentProjection,
+  ActivityGroupCursor,
+  ActivityGroupsResult,
+  ActivityLocation,
   AgentWriteAttribution,
   ExportEntry,
   Graph,
@@ -269,6 +274,7 @@ export class CachedStore implements KnowledgeStore {
   ) => Promise<void>
   private readonly pollIntervalMs: number
   private readonly now: () => Date
+  private readonly activityLocationEpoch: string
   /** This store's space. The journal/CAS tables are SHARED across spaces (partitioned by a `space`
    *  column), so a trash op by raw note-id must verify the tombstone's `space` matches — else a
    *  caller could restore/purge another space's note. */
@@ -391,6 +397,7 @@ export class CachedStore implements KnowledgeStore {
 
   private started = false
   private stopped = false
+  private activityProjectionStopped: Promise<void> = Promise.resolve()
   private polling = false
   private bootTask: Promise<void> = Promise.resolve()
   private pollDone: Promise<void> = Promise.resolve()
@@ -525,9 +532,16 @@ export class CachedStore implements KnowledgeStore {
     this.journal = new RevisionJournal({
       persistence: revisionPersistence ?? new InMemoryRevisionPersistence(),
       space: this.space,
+      scheduler,
+      onActivityProjectionReady: () => {
+        if (!this.stopped) {
+          this.emit({ type: 'changed', upserts: [], removed: [], graphChanged: false })
+        }
+      },
       now,
     })
     this.pollIntervalMs = pollIntervalMs
+    this.activityLocationEpoch = `${now().getTime().toString(36)}-${Math.random().toString(36).slice(2)}`
     this.readBody = readBody
     this.readBodyIdentityClaims = readBodyIdentityClaims
     this.snap = new Snapshot(
@@ -592,6 +606,7 @@ export class CachedStore implements KnowledgeStore {
         reresolveGhostsFromIndex: () => this.snap.reresolveGhosts(this.snap.buildIndex()),
         beginBulk: () => this.beginBulk(),
         endBulk: () => this.endBulk(),
+        activityProjection: (scope) => this.activityProjectionNow(scope),
       },
       this.trashMutations,
     )
@@ -654,6 +669,9 @@ export class CachedStore implements KnowledgeStore {
     this.now = now
     this.resetBarrier()
     this.resetMutationBarrier()
+    void this.journal.prepareActivityProjection().catch((error) => {
+      console.error('[journal] Activity projection preparation failed:', (error as Error).message)
+    })
   }
 
   /** Pull the latest folder path-history from the server registry into the cached
@@ -963,6 +981,7 @@ export class CachedStore implements KnowledgeStore {
 
   stop(): void {
     this.stopped = true
+    this.activityProjectionStopped = this.journal.stopActivityProjection()
     // A recoverable causal operation deliberately keeps projection admission
     // closed while this process can still serve. Process shutdown itself ends
     // serving; release those process-local leases so settle can drain. Durable
@@ -1025,7 +1044,11 @@ export class CachedStore implements KnowledgeStore {
     // released by that checkpoint may have just enqueued its journal append.
     await Promise.resolve(this.innerStopped).catch(() => {})
     await this.drainExternalTasks()
-    await Promise.all([this.identity.flush().catch(() => {}), this.journal.drain().catch(() => {})])
+    await Promise.all([
+      this.identity.flush().catch(() => {}),
+      this.journal.drain().catch(() => {}),
+      this.activityProjectionStopped,
+    ])
   }
 
   /** Force file-truth reconciliation and settle every meta-DB write caused by
@@ -3548,12 +3571,63 @@ export class CachedStore implements KnowledgeStore {
     limit: number
     scope?: ReadScope
     author?: AuthorFilter
+    viewerAuthor?: AuthorFilter
+    noteId?: string
+    through?: string
+    activityVersion?: string
+    afterId?: string
   }) {
     return this.readIdentitySurface(() => this.trash.activityEvents(opts))
   }
 
+  activityGroups(opts: {
+    by: 'note' | 'folder'
+    from?: string
+    to?: string
+    limit: number
+    cursor?: ActivityGroupCursor
+    through?: string
+    activityVersion?: string
+    locationThrough?: string
+    location?: ActivityLocation
+    scope?: ReadScope
+    author?: AuthorFilter
+    viewerAuthor?: AuthorFilter
+  }): Promise<ActivityGroupsResult> {
+    return this.readIdentitySurface(() => this.trash.activityGroups(opts))
+  }
+
+  activityProjection(opts?: { scope?: ReadScope }): Promise<ActivityCurrentProjection> {
+    return this.readIdentitySurface(async () =>
+      this.activityProjectionNow(opts?.scope ?? READ_SCOPE.user),
+    )
+  }
+
   activityByNote(opts: { from: string; to: string; scope?: ReadScope }) {
     return this.readIdentitySurface(() => this.trash.activityByNote(opts))
+  }
+
+  private activityProjectionNow(scope: ReadScope): ActivityCurrentProjection {
+    const admitted = classesForScope(scope)
+    const notes = new Map<string, ActivityCurrentNote>()
+
+    for (const [noteId, meta] of this.snap.notes) {
+      if (!admitted.has(meta.class ?? DEFAULT_NOTE_CLASS)) {
+        continue
+      }
+      const path = directoryOf(meta.filePath)
+
+      notes.set(noteId, {
+        noteId,
+        title: meta.title,
+        location: path ? { kind: 'folder', path } : { kind: 'root' },
+      })
+    }
+
+    return {
+      notes,
+      locationThrough: `v1:${this.activityLocationEpoch}:${this.snap.notes.locationVersion}`,
+    }
   }
 
   restore(input: RestoreInput) {

@@ -1,7 +1,7 @@
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
+import { DatabaseSync, constants as sqlite } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -13,6 +13,7 @@ import {
   type MetaMigration,
   runSqliteMigrations,
 } from '../../packages/server/src/services/metaDb/migrations'
+import { SqliteMetaDb } from '../../packages/server/src/services/metaDb/sqliteMetaDb'
 import {
   approvedTargetCatalog,
   type MetaDbCatalog,
@@ -84,6 +85,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
       { version: 4, name: 'import_reservations' },
       { version: 5, name: 'provider_contour' },
       { version: 6, name: 'agent_call_trace' },
+      { version: 7, name: 'activity_projection' },
     ])
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
@@ -124,8 +126,9 @@ describe('meta-DB migration assets and SQLite runner', () => {
     // keyring's single-active partial, eight lookup/page keys across the facets, plus
     // the journal's owner and retention indexes. Every primary/UNIQUE autoindex stays
     // excluded by the query above, the journal's send-fence key among them. Agent
-    // trace then adds four tables and seventeen named indexes.
-    expect(counts).toEqual({ index: 92, table: 52, trigger: 31 })
+    // trace then adds four tables and seventeen named indexes. Activity adds five
+    // tables, three named indexes and five triggers.
+    expect(counts).toEqual({ index: 95, table: 57, trigger: 36 })
     expect(
       db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'meta_schema'").get(),
     ).toBeUndefined()
@@ -153,6 +156,361 @@ describe('meta-DB migration assets and SQLite runner', () => {
     const live = splitProviderContour(withoutAgentCallTrace(sqliteMetaDbCatalog(db)))
     expect(live.contour).toEqual(PROVIDER_CONTOUR_TABLES)
     expect(live.published).toEqual(approvedTargetCatalog(sqliteGolden))
+  })
+
+  it('installs the Activity carrier without reading or initializing existing journal spaces', () => {
+    const db = database()
+    runSqliteMigrations(db, migrations.slice(0, 7))
+    const append = db.prepare(
+      `INSERT INTO note_revisions
+        (note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+         chars_added, chars_removed, integrity)
+       VALUES (?, ?, 'write', ?, 'user:alice', ?, 'user-doc', '[]', ?, 1, 0, 'trusted')`,
+    )
+
+    append.run('alpha-note', 'alpha', 'origin', 'Alpha', '2026-08-01T00:00:00.000Z')
+    append.run('beta-note', 'beta', 'origin', 'Beta', '2026-08-01T00:00:00.000Z')
+    let journalReads = 0
+
+    db.setAuthorizer((actionCode, table) => {
+      if (actionCode === sqlite.SQLITE_READ && table === 'note_revisions') {
+        journalReads += 1
+      }
+
+      return sqlite.SQLITE_OK
+    })
+    try {
+      db.exec(migrations[7]!.sqlite)
+    } finally {
+      db.setAuthorizer(null)
+    }
+
+    expect(journalReads).toBe(0)
+    expect(db.prepare('SELECT COUNT(*) AS n FROM activity_projection_status').get()).toEqual({
+      n: 0,
+    })
+  })
+
+  it('atomically advances the fresh Activity order, state and head and invalidates on rewrite', () => {
+    const db = database()
+    runSqliteMigrations(db)
+    const append = db.prepare(
+      `INSERT INTO note_revisions
+        (note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+         chars_added, chars_removed, integrity)
+       VALUES (?, 'fresh', 'write', ?, ?, 'Fresh', 'user-doc', '[]', ?, ?, ?, 'trusted')`,
+    )
+
+    const baseline = append.run(
+      'fresh-note',
+      'baseline',
+      'user:alice',
+      '2026-08-01T00:00:00.000Z',
+      10,
+      0,
+    )
+    const change = append.run(
+      'fresh-note',
+      'change',
+      'user:alice',
+      '2026-08-01T01:00:00.000Z',
+      3,
+      1,
+    )
+
+    expect(
+      db
+        .prepare(
+          `SELECT state, active_generation, active_through, next_source_ordinal
+             FROM activity_projection_status WHERE space = 'fresh'`,
+        )
+        .get(),
+    ).toEqual({
+      state: 'ready',
+      active_generation: 1,
+      active_through: 2,
+      next_source_ordinal: 2,
+    })
+    expect(
+      db
+        .prepare(
+          `SELECT source_ordinal, revision_id FROM activity_revision_order
+            WHERE space = 'fresh' ORDER BY source_ordinal`,
+        )
+        .all(),
+    ).toEqual([
+      { source_ordinal: 1, revision_id: baseline.lastInsertRowid },
+      { source_ordinal: 2, revision_id: change.lastInsertRowid },
+    ])
+    expect(
+      db
+        .prepare(
+          `SELECT event_count, chars_added_sum, chars_added_known,
+                  chars_removed_sum, chars_removed_known
+             FROM activity_note_actor_states WHERE space = 'fresh'`,
+        )
+        .all(),
+    ).toEqual([
+      {
+        event_count: 1,
+        chars_added_sum: 3,
+        chars_added_known: 1,
+        chars_removed_sum: 1,
+        chars_removed_known: 1,
+      },
+    ])
+
+    db.prepare('UPDATE note_revisions SET integrity = ? WHERE id = ?').run(
+      'quarantined',
+      change.lastInsertRowid,
+    )
+    expect(
+      db
+        .prepare(
+          `SELECT state, active_generation, build_generation, source_generation
+             FROM activity_projection_status WHERE space = 'fresh'`,
+        )
+        .get(),
+    ).toEqual({
+      state: 'rebuilding',
+      active_generation: null,
+      build_generation: null,
+      source_generation: 2,
+    })
+    expect(db.prepare('SELECT space, generation, phase FROM activity_projection_gc').all()).toEqual(
+      [{ space: 'fresh', generation: 1, phase: 'states' }],
+    )
+  })
+
+  it('rejects rehoming a revision without changing the journal, order, or status', () => {
+    const db = database()
+    runSqliteMigrations(db)
+    const inserted = db
+      .prepare(
+        `INSERT INTO note_revisions
+          (note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+           chars_added, chars_removed, integrity)
+         VALUES
+          ('alpha-note', 'alpha', 'write', 'change', 'user:alice', 'Alpha', 'user-doc', '[]',
+           '2026-08-01T00:00:00.000Z', 3, 1, 'trusted')`,
+      )
+      .run()
+    const snapshot = () => ({
+      journal: db
+        .prepare('SELECT id, note_id, space, integrity FROM note_revisions ORDER BY id')
+        .all(),
+      order: db
+        .prepare(
+          'SELECT space, source_ordinal, revision_id FROM activity_revision_order ORDER BY space, source_ordinal',
+        )
+        .all(),
+      status: db.prepare('SELECT * FROM activity_projection_status ORDER BY space').all(),
+    })
+    const before = snapshot()
+
+    expect(() =>
+      db
+        .prepare("UPDATE note_revisions SET space = 'beta' WHERE id = ?")
+        .run(inserted.lastInsertRowid),
+    ).toThrow(/note revision space is immutable/)
+    expect(snapshot()).toEqual(before)
+
+    // Writers that redundantly include the unchanged Space still retain the
+    // semantic-rewrite path and invalidate the active generation as before.
+    expect(() =>
+      db
+        .prepare(
+          "UPDATE note_revisions SET space = 'alpha', integrity = 'quarantined' WHERE id = ?",
+        )
+        .run(inserted.lastInsertRowid),
+    ).not.toThrow()
+    expect(
+      db
+        .prepare(
+          `SELECT state, active_generation, build_generation, source_generation
+             FROM activity_projection_status WHERE space = 'alpha'`,
+        )
+        .get(),
+    ).toEqual({
+      state: 'rebuilding',
+      active_generation: null,
+      build_generation: null,
+      source_generation: 2,
+    })
+  })
+
+  it('rolls back every fresh Activity effect when the projection trigger tail fails', () => {
+    const db = database()
+    runSqliteMigrations(db)
+    const append = db.prepare(
+      `INSERT INTO note_revisions
+        (note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+         chars_added, chars_removed, integrity)
+       VALUES ('fresh-note', 'fresh', 'write', ?, 'user:alice', 'Fresh', 'user-doc', '[]',
+               ?, 1, 0, 'trusted')`,
+    )
+
+    append.run('baseline', '2026-08-01T00:00:00.000Z')
+    db.exec(`
+      CREATE TRIGGER fail_activity_state
+      BEFORE INSERT ON activity_note_actor_states
+      BEGIN
+        SELECT RAISE(ABORT, 'injected Activity state failure');
+      END;
+    `)
+
+    expect(() => append.run('change', '2026-08-01T01:00:00.000Z')).toThrow(
+      /injected Activity state failure/,
+    )
+    expect(db.prepare('SELECT COUNT(*) AS n FROM note_revisions').get()).toEqual({ n: 1 })
+    expect(db.prepare('SELECT COUNT(*) AS n FROM activity_revision_order').get()).toEqual({ n: 1 })
+    expect(db.prepare('SELECT COUNT(*) AS n FROM activity_note_actor_states').get()).toEqual({
+      n: 0,
+    })
+    expect(
+      db
+        .prepare(
+          `SELECT next_source_ordinal, active_through
+             FROM activity_projection_status WHERE space = 'fresh'`,
+        )
+        .get(),
+    ).toEqual({ next_source_ordinal: 1, active_through: 1 })
+  })
+
+  it('lazily rebuilds exactly one upgraded Activity space and publishes its generation', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'notarium-activity-rebuild-'))
+    directories.push(directory)
+    const path = join(directory, 'meta.sqlite')
+    const legacy = new DatabaseSync(path)
+
+    runSqliteMigrations(legacy, migrations.slice(0, 7))
+    legacy.exec(`
+      INSERT INTO note_revisions
+        (note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+         chars_added, chars_removed, integrity)
+      VALUES
+        ('alpha-note', 'alpha', 'external', 'baseline', 'user:alice', 'Alpha', 'user-doc', '[]',
+         '2026-08-01T00:00:00.000Z', 10, 0, 'trusted'),
+        ('alpha-note', 'alpha', 'write', 'change', 'user:alice', 'Alpha', 'user-doc', '[]',
+         '2026-08-01T01:00:00.000Z', 3, 1, 'trusted'),
+        ('beta-note', 'beta', 'write', 'origin', 'user:bob', 'Beta', 'user-doc', '[]',
+         '2026-08-01T02:00:00.000Z', 4, 0, 'trusted');
+    `)
+    legacy.close()
+
+    const meta = new SqliteMetaDb(path)
+
+    try {
+      expect(await meta.revisions.prepareActivityProjection('alpha')).toEqual({
+        state: 'rebuilding',
+      })
+      const sabotage = new DatabaseSync(path)
+
+      sabotage.exec(`
+        INSERT INTO activity_note_actor_states
+          (space, generation, source_ordinal, revision_id, note_id,
+           actor_kind, actor_key, class_key, event_count,
+           chars_added_sum, chars_added_known, chars_removed_sum, chars_removed_known)
+        VALUES
+          ('alpha', 1, 2, 2, 'alpha-note', 'principal', 'user:alice', 'user-doc',
+           1, 3, 1, 1, 1);
+      `)
+      await expect(meta.revisions.maintainActivityProjection('alpha')).rejects.toThrow(/UNIQUE/)
+      expect(
+        sabotage
+          .prepare('SELECT state, last_error_code FROM activity_projection_status WHERE space = ?')
+          .get('alpha'),
+      ).toEqual({ state: 'rebuilding', last_error_code: 'rebuild_failed' })
+      sabotage.prepare('DELETE FROM activity_note_actor_states WHERE space = ?').run('alpha')
+      sabotage.close()
+      expect(await meta.revisions.maintainActivityProjection('alpha')).toMatchObject({
+        state: 'ready',
+        processed: 2,
+        published: true,
+      })
+      expect(await meta.revisions.prepareActivityProjection('alpha')).toEqual({
+        state: 'ready',
+        lease: { through: '2', activeGeneration: '1', sourceGeneration: '1' },
+      })
+    } finally {
+      await meta.close()
+    }
+
+    const inspected = new DatabaseSync(path)
+    databases.push(inspected)
+    expect(
+      inspected
+        .prepare(
+          `SELECT space, state, active_generation, active_through
+             FROM activity_projection_status ORDER BY space`,
+        )
+        .all(),
+    ).toEqual([{ space: 'alpha', state: 'ready', active_generation: 1, active_through: 2 }])
+    expect(
+      inspected
+        .prepare(
+          `SELECT note_id, event_count, chars_added_sum, chars_removed_sum
+             FROM activity_note_actor_states WHERE space = 'alpha'`,
+        )
+        .all(),
+    ).toEqual([{ note_id: 'alpha-note', event_count: 1, chars_added_sum: 3, chars_removed_sum: 1 }])
+  })
+
+  it('does not let stale SQLite maintenance recreate Activity rows after Space purge', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'notarium-activity-purge-fence-'))
+    directories.push(directory)
+    const path = join(directory, 'meta.sqlite')
+    const seeded = new DatabaseSync(path)
+
+    runSqliteMigrations(seeded)
+    seeded.exec(`
+      INSERT INTO note_revisions
+        (note_id, space, kind, entry_role, principal, title, class, tags, created_at,
+         chars_added, chars_removed, integrity)
+      VALUES
+        ('purged-note', 'purged', 'write', 'change', 'user:alice', 'Purged', 'user-doc', '[]',
+         '2026-08-01T00:00:00.000Z', 1, 0, 'trusted');
+    `)
+    seeded.close()
+    const meta = new SqliteMetaDb(path)
+
+    try {
+      await meta.revisions.init()
+      await meta.purgeSpace('purged')
+
+      await expect(meta.revisions.prepareActivityProjection('purged')).rejects.toThrow(
+        /activity projection target was permanently purged/,
+      )
+      await expect(meta.revisions.maintainActivityProjection('purged')).rejects.toThrow(
+        /activity projection target was permanently purged/,
+      )
+    } finally {
+      await meta.close()
+    }
+
+    const inspected = new DatabaseSync(path)
+    databases.push(inspected)
+    for (const table of [
+      'note_revisions',
+      'activity_projection_status',
+      'activity_revision_order',
+      'activity_note_actor_states',
+      'activity_note_actor_heads',
+      'activity_projection_gc',
+    ]) {
+      expect(
+        inspected.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE space = ?`).get('purged'),
+      ).toEqual({
+        n: 0,
+      })
+    }
+    expect(
+      inspected
+        .prepare(
+          "SELECT kind, entity_id, space FROM revision_purge_fences WHERE kind = 'space' AND entity_id = ?",
+        )
+        .get('purged'),
+    ).toEqual({ kind: 'space', entity_id: 'purged', space: 'purged' })
   })
 
   it('requires both identities on every placement trail row', () => {

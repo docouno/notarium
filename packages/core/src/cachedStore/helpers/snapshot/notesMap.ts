@@ -50,12 +50,19 @@ export class NotesMap extends VersionedMap<string, NoteMeta> {
    *  a rename move neither counter; their stale LIVE answers are repaired once at
    *  the bracket's close. */
   retractions = 0
+  /** Current Activity membership changes only when a note appears, disappears,
+   * changes class, or moves. Body/timestamp writes leave this cut stable. */
+  locationVersion = 0
 
   private readonly idsByPath = new Map<string, string[]>()
   private readonly idsBySourceLocator = new Map<string, string[]>()
 
   set(id: string, meta: NoteMeta): this {
     const prior = this.get(id)
+
+    if (!prior || prior.filePath !== meta.filePath || prior.class !== meta.class) {
+      this.locationVersion++
+    }
 
     if (!prior || !sameResolveInput(prior, meta)) {
       this.resolveVersion++
@@ -97,6 +104,7 @@ export class NotesMap extends VersionedMap<string, NoteMeta> {
     const prior = this.get(id)
 
     if (prior) {
+      this.locationVersion++
       this.resolveVersion++
       this.retractions++
       this.unbind(prior.filePath, id)
@@ -110,6 +118,7 @@ export class NotesMap extends VersionedMap<string, NoteMeta> {
 
   clear(): void {
     if (this.size) {
+      this.locationVersion++
       this.resolveVersion++
       this.retractions++
     }

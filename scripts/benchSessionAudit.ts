@@ -542,6 +542,7 @@ const recordingSqliteAudit = (
   })
   return createSqliteSessionAuditFacet({
     ensureInit: async () => {},
+    checkpointWal: async () => {},
     close: async () => {},
     required: recording,
   })
@@ -567,7 +568,12 @@ const createSqliteDriver = (): Driver => {
   mkdirSync(root, { recursive: true })
   const db = new DatabaseSync(path)
   runSqliteMigrations(db)
-  const ctx = { ensureInit: async () => {}, close: async () => {}, required: db }
+  const ctx = {
+    ensureInit: async () => {},
+    checkpointWal: async () => {},
+    close: async () => {},
+    required: db,
+  }
   const audit = createSqliteSessionAuditFacet(ctx)
   const retrievals = createSqliteRetrievalLogFacet(ctx)
   const calls = createSqliteAgentCallsFacet(ctx)

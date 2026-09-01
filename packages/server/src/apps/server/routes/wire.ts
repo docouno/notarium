@@ -44,6 +44,7 @@ const skillFrontmatter = (body: {
     ? undefined
     : [frontmatterScalarEntry('description', body.description)]
 import type {
+  ActivityLastEvent,
   ConflictNote,
   Graph,
   GraphHealth,
@@ -314,7 +315,7 @@ export const revisionDetailToWire = (
 
 /** The dashboard "what changed" display kind derived from a journal revision.
  *  canon: docs/dashboard.md#activity-source-the-revision-journal-12 */
-const activityEventKindOf = (r: Revision): ActivityEventKind =>
+const activityEventKindOf = (r: ActivityLastEvent): ActivityEventKind =>
   r.unavailableReason
     ? ACTIVITY_EVENT_KIND.unavailable
     : r.kind === REVISION_KIND.delete
@@ -328,7 +329,9 @@ const activityEventKindOf = (r: Revision): ActivityEventKind =>
 /** One activity event, minus `author` (filled at the route, redacting a foreign
  *  agent's key id) and `path` (journal rows carry no filePath — the route joins
  *  it from the read-model). */
-export const activityEventToWire = (r: Revision): Omit<WireActivityEvent, 'author' | 'path'> => ({
+export const activityEventToWire = (
+  r: ActivityLastEvent,
+): Omit<WireActivityEvent, 'author' | 'path'> => ({
   revisionId: r.id,
   noteId: r.noteId,
   kind: activityEventKindOf(r),

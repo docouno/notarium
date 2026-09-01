@@ -9,3 +9,19 @@ export const ACTIVITY_EVENT_KIND = {
 } as const
 
 export type ActivityEventKind = (typeof ACTIVITY_EVENT_KIND)[keyof typeof ACTIVITY_EVENT_KIND]
+
+export const ACTIVITY_GROUP_BY = {
+  note: 'note',
+  folder: 'folder',
+} as const
+
+export type ActivityGroupBy = (typeof ACTIVITY_GROUP_BY)[keyof typeof ACTIVITY_GROUP_BY]
+
+export const ACTIVITY_LOCATION_KIND = {
+  folder: 'folder',
+  root: 'root',
+  unavailable: 'unavailable',
+} as const
+
+export type ActivityLocationKind =
+  (typeof ACTIVITY_LOCATION_KIND)[keyof typeof ACTIVITY_LOCATION_KIND]

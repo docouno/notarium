@@ -1151,6 +1151,20 @@ describe('seed catalog (#175)', () => {
       expect(recovered).toContain('restored')
     })
 
+    it('dashboard-activity: a pure move updates the final path without inventing a row', () => {
+      const fixture = caseToFixture(buildCaseWorld('dashboard-activity', { scale: 0.1 }))
+      const main = fixture.spaces.find((space) => space.slug === 'main')!
+      const moved = main.notes.find((note) => note.title === 'Moved without activity')
+      const movedRows = (main.activity ?? []).filter(
+        (row) => row.title === 'Moved without activity',
+      )
+      const hotRows = (main.activity ?? []).filter((row) => row.title === 'Hot note')
+
+      expect(moved?.filePath).toBe('beta/moved-to.md')
+      expect(movedRows).toHaveLength(1)
+      expect(hotRows).toHaveLength(51)
+    })
+
     it('multi-space: agent-memory notes carry class + summary into the snapshot', () => {
       const fx = caseToFixture(buildCaseWorld('multi-space', {}))
       const home = fx.spaces.find((s) => s.slug === 'home')!

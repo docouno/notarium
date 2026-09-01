@@ -1,5 +1,10 @@
 import type { IdentityRegistry } from '../../../identity'
-import type { WriteInput, WriteResult } from '../../../knowledgeStore'
+import type {
+  ActivityCurrentProjection,
+  ReadScope,
+  WriteInput,
+  WriteResult,
+} from '../../../knowledgeStore'
 import type { RevisionJournal } from '../../../revisionJournal'
 
 /** What the trash/history surface needs from the read-model that owns it. Narrow
@@ -26,4 +31,5 @@ export type HistoryHost = {
   /** Enter/leave a bulk-write bracket — batch undelete coalesces like an import. */
   beginBulk: () => void
   endBulk: () => Promise<void>
+  activityProjection: (scope: ReadScope) => ActivityCurrentProjection
 }

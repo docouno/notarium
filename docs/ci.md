@@ -15,6 +15,7 @@ logic belongs in a repo script.
 | `lean` | `lean:static`, `lean:unit`, `lean:build` | every push and merge request |
 | `lean` | `lean:release-preflight` | a release tag only — answers in seconds whether this ref can publish at all |
 | `extended` | `extended:unit`, `extended:postgres`, `extended:e2e`, `extended:visual` | a release or rehearsal tag, the default branch, on demand elsewhere |
+| `extended` | `extended:activity-groups` | manual and non-blocking on every pipeline; an on-demand load acceptance, never part of regular checkup |
 | `extended` | `checkup:compare` | manual on a `ci/*` rehearsal tag; byte-identical subjects, legacy/candidate orchestration inside one runner |
 | `verify` | `visual:gate`, `visual:accept`, `verify:backup-smoke`, `verify:release-smoke` | with the extended lane |
 | `release` | `release:rc` | manual; the default branch or a `-rc.N` tag |
@@ -105,6 +106,93 @@ memory report also carries exact cold single-flight and warm-mutation counter de
 while the runtime report owns the HTTP/vector/adjacency-completion latency proof.
 CI always supplies `CI_COMMIT_SHA`. Locally, the target infers `HEAD` only from a clean checkout;
 a dirty tree must name its frozen identity explicitly or the target refuses before building.
+
+**`extended:activity-groups` is a manual thin adapter over `make activity-groups-gate`.**
+It does not inherit the extended event rules and is not part of `make checkup`: the
+2M-depth/breadth contour is an on-demand load acceptance, not a tax on every main or
+release pipeline. Its manual rule is non-blocking, so merely leaving the button unused
+does not keep a pipeline open.
+The Alpine `docker:27-cli` job installs `bash` alongside Git, Make and Node because
+the repository Makefile explicitly declares `SHELL := /bin/bash`; without that
+runtime prerequisite the adapter exits before the gate can create a report.
+The gate runner itself joins a private corpus network, so it cannot inherit the
+GitLab job container's service-network DNS. In the remote-dind path the driver maps
+the TLS name `docker` to the nested container's host gateway and mounts the shared
+client certificate directory; this lets its resource/provenance probes address the
+same daemon without weakening TLS verification.
+The complete profile exceeded thirty minutes on the reference runner. Its temporary
+manual adapter therefore has a one-hour outer ceiling, while each child phase retains
+an eight-minute ceiling so one broken corpus cannot monopolize the shared heavy resource
+group for the whole window.
+The target materializes the pinned `main@4d824c3` baseline, builds the exact candidate,
+starts resource-capped app/PostgreSQL containers, and delegates corpus generation,
+current/historical Note/Folder × Everyone/Mine cycles, existing-surface/append pairing,
+rebuild liveness, storage/cardinality and negative controls to the repository runner.
+
+Grouped latency is measured through the production Fastify → CachedStore →
+HistorySurface → journal/driver chain, including current-location composition and a
+real location-churn turn; benchmark-only folder folding is not an accepted substitute.
+Each of the three latency cycles starts a fresh process over a fresh SQLite file copy
+or PostgreSQL dump restore, so a previous matrix cell cannot donate database/cache state.
+The same cycle runs a 50 ms event-loop heartbeat around the complete production route,
+including cold worker startup, main-thread current-location joining, Note sorting,
+Folder folding, warm reads and location churn; a fast wall response cannot therefore
+hide a perceptible synchronous Dashboard stall. The heartbeat owns every measured
+production call and reports the exact 24 historical or 25 current turns; a report that
+samples only an idle tail fails even when its delay counters are zero. The full gate
+also requires every turn to observe the live timer handle before invoking the route;
+a timer created lazily inside the final stop/tail cannot produce an accepted report. The full gate
+caps one timer delay at 100 ms and cumulative debt at 25 ms per production turn,
+calibrated above the accepted
+10k worker envelope (27–42 ms max, roughly 15 ms debt per ready read) but below the
+rejected repeated 180–250 ms main-thread stall class. Smoke prints those crossings as
+diagnostics without claiming the resource-qualified verdict.
+The 2M depth and breadth shapes remain the SQLite read/storage acceptance corpora —
+the contour whose synchronous event-loop regression motivated the gate. PostgreSQL
+keeps the 200k base read matrix plus its live async contracts, producer contention and
+liveness evidence; replaying the two SQLite-specific 2M scale axes there adds runtime,
+not a distinct invariant. Derived projections are materialized offline through the
+same production set-oriented batch functions at 100k rows per transaction; using the
+interactive ten-row scheduler for snapshot construction would add hundreds of
+thousands of irrelevant IPC turns. The real ten-row worker remains mandatory in the
+liveness phase.
+Deep read corpora omit revision blobs because Activity is structurally required to
+perform zero body reads; exact source-byte breadth remains represented by the generated
+file corpus, while the bounded producer profile still exercises real blob-backed writes.
+
+Producer and liveness evidence use bounded, purpose-shaped corpora instead of replaying
+all 2M rows through the interactive append path: producer amplification runs 10k
+revisions over 4k active notes in both dialects plus PostgreSQL contention, while
+liveness rebuilds 10k revisions over 10k notes through the real production scheduler.
+Fresh-ready cardinality requires a head for every non-baseline origin note; baseline-only
+notes intentionally have no Activity head until a later change makes them visible.
+These exact profiles are recorded in the report and fail closed on drift. This keeps
+the original 2M read-regression proof while bounding a task pipeline rather than
+silently holding the heavy runner for hours.
+SQLite and PostgreSQL dialect lanes execute sequentially. Running them together made
+one dialect's corpus construction contaminate the other's event-loop heartbeat; the
+gate prefers an isolated measurement and relies on the hard runtime ceilings instead.
+
+The liveness phase measures 90 seconds at the production 50 ms scheduler pace, then
+fast-forwards the same batch-10 maintenance calls under named per-phase heartbeat and
+foreground probes. Near-publication invalidation, connection/worker restart,
+replacement publication, abandoned-generation GC and ready reads each own block,
+latency and append evidence; GC batch time is a gated report field rather than a
+discarded diagnostic. The final generation must match raw event/note cardinality. Any
+missing phase/proof is a failed report, not a boolean filled in by the evaluator.
+
+`smoke` mode uses small production-shaped corpora and is diagnostic; only `full` accepts
+the pinned 200k/2M/40k-note manifest and claims the 2 vCPU/2 GiB result. Smoke still
+fails when any named phase records an event-loop block of one second, because that
+invalidates the liveness observation on every host. Uncapped work-unit and grouped
+latency tails of one second are printed as explicit smoke warnings; the
+resource-qualified `full` evaluator owns their pass/fail verdict. A Docker daemon
+that cannot apply those cgroups fails before measurement rather than emitting a report
+with invented resource metadata: the runner inspects its own and PostgreSQL's actual
+Docker image ids plus `HostConfig.NanoCpus/Memory`, and the report carries those observed
+facts. Under dind the target builds a runner image and moves
+the pre-tree archive, scripts and final report through `docker cp`, because the daemon
+cannot bind-mount the job checkout.
 
 **Coverage has two GitLab surfaces, both produced by that same unit run.** The job's
 `coverage:` regex reads only Vitest's `Lines` summary, which feeds the job/MR percentage

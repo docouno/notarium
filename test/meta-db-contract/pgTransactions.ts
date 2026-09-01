@@ -180,6 +180,16 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   },
 
   // Revisions.
+  { id: 'activityProjection.preparePgActivityProjection', levels: ['L3s', 'L3t'] },
+  {
+    id: 'activityProjection.maintainPgActivityProjectionProgressBatch',
+    levels: ['L3s', 'L3t'],
+  },
+  {
+    id: 'activityProjection.maintainPgActivityProjectionFinalBatch',
+    levels: ['L3s', 'L3t'],
+  },
+  { id: 'activityProjection.maintainPgActivityProjectionGc', levels: ['L3t'] },
   { id: 'revisions.append', levels: ['L3t', 'L3s', 'L3n', 'L3b', 'L3t'], exempt: 'append-cas' },
   { id: 'restoreOperations.accept', levels: ['L3n'] },
   {

@@ -1,5 +1,11 @@
 import { isImportNoteSourceLocator } from '../../../importer'
 import type {
+  ActivityFolderGroup,
+  ActivityGroupCursor,
+  ActivityGroupsResult,
+  ActivityLocation,
+  ActivityNoteGroup,
+  ActivityScopeGate,
   BatchFailure,
   NoteClass,
   NoteContent,
@@ -10,6 +16,7 @@ import type {
   WriteResult,
 } from '../../../knowledgeStore'
 import {
+  activityLocationStale,
   noteNotInTrash,
   READ_SCOPE,
   revisionHasNoContent,
@@ -38,6 +45,27 @@ import type { HistoryHost } from './types'
 /** Scan window for the "select all N" trash sweeps (restore/purge): the count is
  *  stable while paging — nothing is erased until the sweep completes. */
 const PAGE = 500
+
+const compareRevisionIds = (left: string, right: string): number => {
+  const a = BigInt(left)
+  const b = BigInt(right)
+  return a < b ? -1 : a > b ? 1 : 0
+}
+
+const locationKey = (location: ActivityLocation): string =>
+  location.kind === 'folder' ? `folder:${location.path}` : location.kind
+
+const sameLocation = (left: ActivityLocation, right: ActivityLocation): boolean =>
+  locationKey(left) === locationKey(right)
+
+const afterCursor = (
+  sourceOrdinal: string,
+  key: string,
+  cursor: ActivityGroupCursor | undefined,
+): boolean =>
+  cursor == null ||
+  compareRevisionIds(sourceOrdinal, cursor.sourceOrdinal) < 0 ||
+  (sourceOrdinal === cursor.sourceOrdinal && key > cursor.key)
 /** The history + trash surface of the read-model: revision reads, the space activity
  *  feed, restore/purge, and the deleted-note banner — all class-scoped at the read-model
  *  chokepoint. Trash is a VIEW over the journal (a note is trashed when its newest revision is a
@@ -124,7 +152,19 @@ export class HistorySurface {
     scope?: ReadScope
     /** Author scope, same opaque predicate as activity. Absent = every author. */
     author?: AuthorFilter
-  }): Promise<{ items: Revision[]; total: number }> {
+    viewerAuthor?: AuthorFilter
+    noteId?: string
+    through?: string
+    activityVersion?: string
+    afterId?: string
+  }): Promise<{
+    items: Revision[]
+    total: number
+    through: string | null
+    nextAfterId: string | null
+    activityVersion?: string
+    scopeGate?: ActivityScopeGate
+  }> {
     return this.host.journal.activityEvents({
       from: opts.from,
       to: opts.to,
@@ -132,7 +172,158 @@ export class HistorySurface {
       limit: opts.limit,
       excludeClasses: this.hiddenClassesFor(opts.scope ?? READ_SCOPE.user),
       author: opts.author,
+      viewerAuthor: opts.viewerAuthor,
+      noteId: opts.noteId,
+      through: opts.through,
+      activityVersion: opts.activityVersion,
+      afterId: opts.afterId,
     })
+  }
+
+  async activityGroups(opts: {
+    by: 'note' | 'folder'
+    from?: string
+    to?: string
+    limit: number
+    cursor?: ActivityGroupCursor
+    through?: string
+    activityVersion?: string
+    locationThrough?: string
+    location?: ActivityLocation
+    scope?: ReadScope
+    author?: AuthorFilter
+    viewerAuthor?: AuthorFilter
+  }): Promise<ActivityGroupsResult> {
+    const scope = opts.scope ?? READ_SCOPE.user
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const projection = this.host.activityProjection(scope)
+
+      if (opts.locationThrough != null && opts.locationThrough !== projection.locationThrough) {
+        throw activityLocationStale()
+      }
+      const result = await this.host.journal.activityGroupsByNote({
+        from: opts.from,
+        to: opts.to,
+        excludeClasses: this.hiddenClassesFor(scope),
+        author: opts.author,
+        viewerAuthor: opts.viewerAuthor,
+        through: opts.through,
+        activityVersion: opts.activityVersion,
+      })
+      const settled = this.host.activityProjection(scope)
+
+      if (projection.locationThrough !== settled.locationThrough) {
+        if (opts.locationThrough != null || attempt === 1) {
+          throw activityLocationStale()
+        }
+        continue
+      }
+      const notes = result.items.map<ActivityNoteGroup>((row) => {
+        const current = projection.notes.get(row.noteId)
+        const unavailable = row.lastEvent.unavailableReason != null
+        const location: ActivityLocation = unavailable
+          ? { kind: 'unavailable' }
+          : (current?.location ?? { kind: 'unavailable' })
+
+        return {
+          ...row,
+          type: 'note',
+          title: current?.title ?? row.lastEvent.title,
+          location,
+        }
+      })
+      const common = {
+        through: result.through,
+        activityVersion: result.activityVersion,
+        ...(result.scopeGate ? { scopeGate: result.scopeGate } : {}),
+        locationThrough: projection.locationThrough,
+      }
+
+      if (opts.by === 'note' || opts.location) {
+        const selected = opts.location
+          ? notes.filter((note) => sameLocation(note.location, opts.location!))
+          : notes
+        const sorted = selected.sort(
+          (left, right) =>
+            compareRevisionIds(right.lastSourceOrdinal, left.lastSourceOrdinal) ||
+            left.noteId.localeCompare(right.noteId),
+        )
+        const available = sorted.filter((note) =>
+          afterCursor(note.lastSourceOrdinal, note.noteId, opts.cursor),
+        )
+        const page = available.slice(0, opts.limit)
+        const boundary = page.at(-1)
+
+        return {
+          itemType: 'note',
+          items: page,
+          total: sorted.length,
+          ...common,
+          nextCursor:
+            available.length > page.length && boundary
+              ? { sourceOrdinal: boundary.lastSourceOrdinal, key: boundary.noteId }
+              : null,
+        }
+      }
+      const folders = new Map<string, ActivityFolderGroup>()
+
+      for (const note of notes) {
+        const key = locationKey(note.location)
+        const current = folders.get(key)
+
+        if (!current) {
+          folders.set(key, {
+            type: 'folder',
+            location: note.location,
+            noteCount: 1,
+            eventCount: note.count,
+            charsAdded: note.charsAdded,
+            charsRemoved: note.charsRemoved,
+            lastAt: note.lastEvent.createdAt,
+            lastSourceOrdinal: note.lastSourceOrdinal,
+          })
+          continue
+        }
+        current.noteCount++
+        current.eventCount = String(BigInt(current.eventCount) + BigInt(note.count))
+        if (note.charsAdded != null) {
+          current.charsAdded = String(BigInt(current.charsAdded ?? 0) + BigInt(note.charsAdded))
+        }
+        if (note.charsRemoved != null) {
+          current.charsRemoved = String(
+            BigInt(current.charsRemoved ?? 0) + BigInt(note.charsRemoved),
+          )
+        }
+        if (compareRevisionIds(note.lastSourceOrdinal, current.lastSourceOrdinal) > 0) {
+          current.lastSourceOrdinal = note.lastSourceOrdinal
+          current.lastAt = note.lastEvent.createdAt
+        }
+      }
+      const sorted = [...folders.values()].sort(
+        (left, right) =>
+          compareRevisionIds(right.lastSourceOrdinal, left.lastSourceOrdinal) ||
+          locationKey(left.location).localeCompare(locationKey(right.location)),
+      )
+      const available = sorted.filter((folder) =>
+        afterCursor(folder.lastSourceOrdinal, locationKey(folder.location), opts.cursor),
+      )
+      const page = available.slice(0, opts.limit)
+      const boundary = page.at(-1)
+
+      return {
+        itemType: 'folder',
+        items: page,
+        total: sorted.length,
+        ...common,
+        nextCursor:
+          available.length > page.length && boundary
+            ? { sourceOrdinal: boundary.lastSourceOrdinal, key: locationKey(boundary.location) }
+            : null,
+      }
+    }
+
+    throw activityLocationStale()
   }
 
   /** Per-note activity counts — the dashboard's "active projects" block joins

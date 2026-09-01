@@ -15,6 +15,10 @@
   container-type: inline-size;
 }
 
+:global(html[data-notarium-space-transition='true']) .dash {
+  visibility: hidden;
+}
+
 /* ── header ──────────────────────────────────────────────────────────────── */
 .head {
   display: flex;
@@ -412,6 +416,48 @@ $dows: 30px;
   display: flex;
   align-items: center;
   justify-content: center;
+}
+.feed-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  container-type: inline-size;
+  .feed-title {
+    margin: 0;
+  }
+}
+.feed-notice {
+  margin-bottom: 10px;
+  button {
+    margin-left: 6px;
+  }
+}
+.branch-status {
+  margin: 6px 0 8px 28px;
+  color: var(--text-dim);
+  font-size: 12px;
+  button {
+    margin-left: 6px;
+  }
+}
+.load-older {
+  margin: 6px 0 4px 28px;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 12px;
+  &:hover {
+    text-decoration: underline;
+  }
+}
+@container (max-width: 540px) {
+  .feed-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
 }
 .feed-clear {
   margin-left: auto;

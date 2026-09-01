@@ -37,6 +37,10 @@ import {
 
 import { abilityPackageOfLocator } from '../../packages/server/src/services/metaDb/abilityAddress'
 import {
+  maintainPgActivityProjectionFinalBatch,
+  maintainPgActivityProjectionProgressBatch,
+} from '../../packages/server/src/services/metaDb/drivers/pg/activityProjection'
+import {
   LOCK_LEVEL_OF_TABLE,
   LOCK_LEVEL_REQUIRES,
   LOCK_LEVELS,
@@ -1327,6 +1331,26 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
 
       // ── revisions ──────────────────────────────────────────────────────────
       await run('revisions.append', () => db.revisions.append(revision('note-a'), 'body'))
+      await run('activityProjection.preparePgActivityProjection', () =>
+        db.revisions.prepareActivityProjection('activity-space'),
+      )
+      const activityPool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+      const activityClient = await activityPool.connect()
+
+      try {
+        await run('activityProjection.maintainPgActivityProjectionProgressBatch', () =>
+          maintainPgActivityProjectionProgressBatch(activityClient, 'activity-space'),
+        )
+        await run('activityProjection.maintainPgActivityProjectionFinalBatch', () =>
+          maintainPgActivityProjectionFinalBatch(activityClient, 'activity-space'),
+        )
+      } finally {
+        activityClient.release()
+        await activityPool.end()
+      }
+      await run('activityProjection.maintainPgActivityProjectionGc', () =>
+        db.revisions.maintainActivityProjectionGc('activity-space'),
+      )
       const accepted = {
         id: 'operation-probe',
         space: 'alpha',

@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
 import { useLocation, useNavigate } from 'react-router'
 import type { PatchSpaceRequest, Space } from '@notarium/contract'
 import { SPACE_ROLE } from '@notarium/contract/enums'
@@ -38,6 +39,10 @@ export const useSpaceState = (): SpaceContextValue | null => {
     const fromUrl = parseAppPath(window.location.pathname)
     return ('space' in fromUrl && fromUrl.space) || remembered() || personalSlug || ''
   })
+  const [spaceTransition, setSpaceTransition] = useState<{
+    target: string
+    beforeNavigation: boolean
+  } | null>(null)
   const activeRef = useRef(active)
   activeRef.current = active
   const spacesRef = useRef(spaces)
@@ -121,10 +126,58 @@ export const useSpaceState = (): SpaceContextValue | null => {
     }
   }, [location.pathname, location.search, spaces, navigate])
 
+  useEffect(() => {
+    if (!spaceTransition) {
+      return
+    }
+    const parsed = parseAppPath(location.pathname)
+    const routeSpace = 'space' in parsed ? parsed.space : null
+
+    if (routeSpace === spaceTransition.target && active === spaceTransition.target) {
+      setSpaceTransition(null)
+      return
+    }
+    // `navigate()` schedules the router update. Keep the pre-navigation phase until
+    // that update is observable; ending it in `switchSpace`'s call stack briefly
+    // restores the source Space under the target URL. Once the route arrives, the
+    // transition remains active while the ambient providers catch up.
+    if (routeSpace === spaceTransition.target && spaceTransition.beforeNavigation) {
+      setSpaceTransition({ ...spaceTransition, beforeNavigation: false })
+      return
+    }
+    if (!spaceTransition.beforeNavigation) {
+      setSpaceTransition(null)
+    }
+  }, [active, location.pathname, spaceTransition])
+
+  useLayoutEffect(() => {
+    if (!spaceTransition) {
+      delete document.documentElement.dataset.notariumSpaceTransition
+    }
+  }, [spaceTransition])
+
   const switchSpace = useCallback(
     (slug: string) => {
       remember(slug)
-      navigate(spaceRoute(slug))
+      const parsed = parseAppPath(window.location.pathname)
+
+      if ('space' in parsed && parsed.space === slug && activeRef.current === slug) {
+        return
+      }
+      document.documentElement.dataset.notariumSpaceTransition = 'true'
+      // Blank route-scoped consumers before history changes. Provider activation
+      // follows from the URL effect; keeping it out of this flush avoids a suspended
+      // provider subtree retaining the old Space under the new URL.
+      flushSync(() => {
+        setSpaceTransition({ target: slug, beforeNavigation: true })
+      })
+      try {
+        navigate(spaceRoute(slug))
+      } catch (error) {
+        setSpaceTransition((current) => (current?.target === slug ? null : current))
+        delete document.documentElement.dataset.notariumSpaceTransition
+        throw error
+      }
     },
     [navigate],
   )
@@ -285,6 +338,7 @@ export const useSpaceState = (): SpaceContextValue | null => {
   const value = useMemo<SpaceContextValue>(
     () => ({
       space: active,
+      spaceTransition,
       spaces: visibleSpaces,
       personalSpace,
       capabilities,
@@ -302,6 +356,7 @@ export const useSpaceState = (): SpaceContextValue | null => {
     }),
     [
       active,
+      spaceTransition,
       visibleSpaces,
       personalSpace,
       capabilities,

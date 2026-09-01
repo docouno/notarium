@@ -49,6 +49,13 @@
       "checksum": "sha256:21f90a6dd11ddb5adae1216f7acd35c79fab4a37ad6f1e25cfbac8e773c4599f",
       "sqlite": "sqlite/0006_agent_call_trace.sql",
       "postgres": "postgres/0006_agent_call_trace.sql"
+    },
+    {
+      "version": 7,
+      "name": "activity_projection",
+      "checksum": "sha256:bcd704ab7cede2cb6daf0502255289ae9b2632a8fd9e58f719ff3a0fa49a970c",
+      "sqlite": "sqlite/0007_activity_projection.sql",
+      "postgres": "postgres/0007_activity_projection.sql"
     }
   ]
 }

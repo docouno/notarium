@@ -34,7 +34,12 @@ vi.mock('react-router', () => ({
   useOutletContext: vi.fn(),
 }))
 
-import { type DashData, useDashboardData } from './useDashboardData'
+import {
+  dashboardSpaceIntent,
+  dashboardSpaceTarget,
+  type DashData,
+  useDashboardData,
+} from './useDashboardData'
 
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
@@ -96,6 +101,32 @@ describe('useDashboardData freshness lanes', () => {
   }
   const emit = (type: string) => emitMany([type])
 
+  it('makes the route Space authoritative before the ambient provider catches up', () => {
+    expect(dashboardSpaceIntent('alpha', '/s/beta')).toEqual({ space: 'beta', inSync: false })
+    expect(dashboardSpaceIntent('beta', '/s/beta/dashboard/health')).toEqual({
+      space: 'beta',
+      inSync: true,
+    })
+    expect(
+      dashboardSpaceTarget('alpha', '/s/alpha', {
+        target: 'beta',
+        beforeNavigation: true,
+      }),
+    ).toEqual({ space: 'beta', providersInSync: false })
+    expect(
+      dashboardSpaceTarget('alpha', '/s/beta', {
+        target: 'beta',
+        beforeNavigation: false,
+      }),
+    ).toEqual({ space: 'beta', providersInSync: false })
+    expect(
+      dashboardSpaceTarget('alpha', '/s/alpha', {
+        target: 'beta',
+        beforeNavigation: false,
+      }),
+    ).toEqual({ space: 'alpha', providersInSync: true })
+  })
+
   beforeEach(async () => {
     vi.useFakeTimers()
     harness.listeners.clear()
@@ -125,7 +156,7 @@ describe('useDashboardData freshness lanes', () => {
     await settle()
 
     expect(harness.api.activityGet).toHaveBeenCalledTimes(2)
-    expect(harness.api.activityEventsGet).toHaveBeenCalledTimes(2)
+    expect(harness.api.activityEventsGet).not.toHaveBeenCalled()
     expect(harness.api.activityProjectsGet).toHaveBeenCalledTimes(2)
     expect(harness.api.tagsGet).toHaveBeenCalledTimes(2)
     expect(harness.api.graphGet).toHaveBeenCalledOnce()
@@ -139,7 +170,7 @@ describe('useDashboardData freshness lanes', () => {
     expect(harness.api.graphGet).toHaveBeenCalledTimes(2)
     expect(harness.api.graphHealthGet).toHaveBeenCalledTimes(2)
     expect(harness.api.activityGet).toHaveBeenCalledOnce()
-    expect(harness.api.activityEventsGet).toHaveBeenCalledOnce()
+    expect(harness.api.activityEventsGet).not.toHaveBeenCalled()
     expect(harness.api.activityProjectsGet).toHaveBeenCalledOnce()
     expect(harness.api.tagsGet).toHaveBeenCalledOnce()
   })

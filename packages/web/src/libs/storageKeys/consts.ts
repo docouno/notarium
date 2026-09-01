@@ -45,6 +45,12 @@ export const STORAGE_KEYS = {
   /** Feed grouping mode. */
   feedGroup: 'bm-feed-group',
 
+  // ── Dashboard Activity prefs ───────────────────────────────────────────────
+  /** Dashboard Activity grouping: note, folder, or raw none. */
+  dashboardActivityGroup: 'bm-dashboard-activity-group',
+  /** Preferred Dashboard Activity author scope: all or mine. */
+  dashboardActivityScope: 'bm-dashboard-activity-scope',
+
   // ── Explorer prefs (NotesProvider) ──
   /** Shared file/memory/favorites sort field. */
   explorerSort: 'bm-explorer-sort',

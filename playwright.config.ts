@@ -15,6 +15,7 @@ import { VISUAL_SNAPSHOT_PATH_TEMPLATE } from './scripts/visualBaseline.mjs'
 // chromium project ignores them (its fake boots mode 'none' and can't switch).
 const AUTH_SPECS = [
   '**/e2e/auth.spec.ts',
+  '**/e2e/dashboard-activity-auth.spec.ts',
   '**/e2e/agent-context.spec.ts',
   '**/e2e/agent-activity.spec.ts',
   '**/e2e/agent-roles.spec.ts',

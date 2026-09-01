@@ -7,6 +7,7 @@
 // canon: docs/note-history.md#model · docs/architecture.md#p2
 
 import type { AgentWriteAttribution, RevisionKind, RevisionPersistence } from '../knowledgeStore'
+import type { BackgroundGate } from '../libs/backgroundScheduler'
 import type { DocumentState, LogicalNoteState } from '../libs/markdown'
 
 export type JournalRecordInput = {
@@ -57,5 +58,7 @@ export type JournalRecordInput = {
 export type JournalOptions = {
   persistence: RevisionPersistence
   space: string
+  scheduler?: BackgroundGate
+  onActivityProjectionReady?: () => void
   now?: () => Date
 }

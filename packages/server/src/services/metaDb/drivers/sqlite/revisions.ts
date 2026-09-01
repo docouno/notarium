@@ -1,10 +1,15 @@
 import {
+  type ActivityLastEvent,
+  type ActivityNoteGroupCount,
+  type ActivityProjectionLease,
   AGENT_SESSION_ATTACH,
   type AuthorFilter,
   DOCUMENT_STATE_FORMAT,
   LOGICAL_NOTE_STATE_FORMAT,
   type Revision,
   REVISION_INTEGRITY,
+  REVISION_UNAVAILABLE_REASON,
+  REVISION_UNAVAILABLE_TITLE,
   type RevisionBlob,
   revisionGapOf,
   RevisionHeadConflictError,
@@ -20,7 +25,13 @@ import {
   QUARANTINED,
   TRUSTED_ONLY,
 } from '../../revisionProjection'
-import type { SqliteDriverCtx } from './context'
+import {
+  maintainSqliteActivityProjection,
+  maintainSqliteActivityProjectionGc,
+  prepareSqliteActivityProjection,
+  sqliteActivityProjectionLease,
+} from './activityProjection'
+import { readSqliteBigInts, type SqliteDriverCtx } from './context'
 
 type RevisionRow = {
   id: number | bigint
@@ -49,6 +60,17 @@ type RevisionRow = {
   chars_removed: number | bigint | null
   integrity: string | null
   entry_role: string
+}
+
+type ActivityGroupRow = RevisionRow & {
+  group_count: number | bigint
+  chars_added_sum: number | bigint
+  chars_removed_sum: number | bigint
+  chars_added_known: number | bigint
+  chars_removed_known: number | bigint
+  contract_through: number | bigint | null
+  contract_has_other: number | bigint | null
+  last_source_ordinal?: number | bigint
 }
 
 /** The ONE place a stored row becomes a served row. A contaminated chain is
@@ -103,6 +125,32 @@ const rawRevisionOfRow = (r: RevisionRow): Revision => ({
   charsRemoved: r.chars_removed == null ? null : Number(r.chars_removed),
 })
 
+const activityLastOfRow = (row: RevisionRow): ActivityLastEvent =>
+  row.integrity === REVISION_INTEGRITY.quarantined
+    ? {
+        id: String(row.id),
+        noteId: row.note_id,
+        kind: row.kind as Revision['kind'],
+        entryRole: row.entry_role as Revision['entryRole'],
+        principal: null,
+        title: REVISION_UNAVAILABLE_TITLE,
+        createdAt: row.created_at,
+        charsAdded: null,
+        charsRemoved: null,
+        unavailableReason: REVISION_UNAVAILABLE_REASON.identityConflict,
+      }
+    : {
+        id: String(row.id),
+        noteId: row.note_id,
+        kind: row.kind as Revision['kind'],
+        entryRole: row.entry_role as Revision['entryRole'],
+        principal: row.principal,
+        title: row.title,
+        createdAt: row.created_at,
+        charsAdded: row.chars_added == null ? null : Number(row.chars_added),
+        charsRemoved: row.chars_removed == null ? null : Number(row.chars_removed),
+      }
+
 /** Author-scope predicate as `?` SQL. A present-but-empty filter matches nothing,
  *  not everything — `effectiveAuthorClause` encodes that. Usernames carry no LIKE
  *  wildcard, so no ESCAPE is needed. */
@@ -131,8 +179,193 @@ const authorClauseSqlite = (author?: AuthorFilter): { clause: string; params: st
 const classFilterSqlite = (excludeClasses: readonly string[]): string =>
   effectiveClassClause(excludeClasses.map(() => '?'))
 
+const otherAuthorSqlite = (viewer: AuthorFilter, params: string[]): string => {
+  const parts: string[] = []
+
+  if (viewer.exact.length) {
+    parts.push(`principal IN (${viewer.exact.map(() => '?').join(',')})`)
+    // The principal vocabulary has a fixed handful of viewer aliases.
+    // eslint-disable-next-line no-restricted-syntax
+    params.push(...viewer.exact)
+  }
+  for (const prefix of viewer.prefixes) {
+    parts.push('principal LIKE ?')
+    params.push(`${prefix}%`)
+  }
+
+  return `${TRUSTED_ONLY} AND NOT COALESCE((${parts.length ? parts.join(' OR ') : 'FALSE'}), FALSE)`
+}
+
+const projectionActorMatchSqlite = (
+  author: AuthorFilter,
+  params: string[],
+  alias = 'states',
+): string => {
+  const parts: string[] = []
+
+  if (author.exact.length) {
+    parts.push(`${alias}.actor_key IN (${author.exact.map(() => '?').join(',')})`)
+    // The viewer owns a fixed handful of principal aliases.
+    // eslint-disable-next-line no-restricted-syntax
+    params.push(...author.exact)
+  }
+  for (const prefix of author.prefixes) {
+    parts.push(`${alias}.actor_key LIKE ?`)
+    params.push(`${prefix}%`)
+  }
+
+  return parts.length ? parts.join(' OR ') : 'FALSE'
+}
+
+const activityEventsFromProjection = (
+  ctx: SqliteDriverCtx,
+  space: string,
+  opts: {
+    from?: string
+    to?: string
+    offset: number
+    limit: number
+    excludeClasses: readonly string[]
+    author?: AuthorFilter
+    viewerAuthor?: AuthorFilter
+    noteId?: string
+    activityLease?: ActivityProjectionLease
+    afterId?: string
+  },
+) => {
+  const db = ctx.required
+  db.exec('BEGIN')
+
+  try {
+    const lease = sqliteActivityProjectionLease(ctx, space, opts.activityLease)
+
+    if (lease.through == null) {
+      db.exec('COMMIT')
+      return {
+        items: [],
+        total: 0,
+        through: null,
+        nextAfterId: null,
+        activityLease: lease,
+        ...(opts.viewerAuthor ? { hasOtherAuthors: false } : {}),
+      }
+    }
+    const where = [notSyntheticBaselineClause]
+    const params: Array<string | number> = [space, lease.through, lease.through]
+
+    if (opts.from != null) {
+      where.push('revisions.created_at >= ?')
+      params.push(opts.from)
+    }
+    if (opts.to != null) {
+      where.push('revisions.created_at < ?')
+      params.push(opts.to)
+    }
+    if (opts.noteId != null) {
+      where.push('revisions.note_id = ?')
+      params.push(opts.noteId)
+    }
+    if (opts.excludeClasses.length) {
+      where.push(classFilterSqlite(opts.excludeClasses).replace(/^ AND /, ''))
+      // The class registry is a fixed enum, not a corpus-sized input.
+      // eslint-disable-next-line no-restricted-syntax
+      params.push(...opts.excludeClasses)
+    }
+    if (opts.author) {
+      const clause = authorClauseSqlite(opts.author)
+      where.push(clause.clause.replace(/^ AND /, ''))
+      // The principal vocabulary has a fixed handful of viewer aliases.
+      // eslint-disable-next-line no-restricted-syntax
+      params.push(...clause.params)
+    }
+    const gateParams: string[] = []
+    const gate = opts.viewerAuthor
+      ? `MAX(CASE WHEN ${otherAuthorSqlite(opts.viewerAuthor, gateParams)} THEN 1 ELSE 0 END)`
+      : 'NULL'
+    // Gate binds occur in aggregate, before the page binds below.
+    // eslint-disable-next-line no-restricted-syntax
+    params.push(...gateParams)
+    const pageWhere: string[] = []
+
+    if (opts.afterId != null) {
+      pageWhere.push('id < ?')
+      params.push(opts.afterId)
+    }
+    params.push(opts.limit + 1, opts.afterId == null ? opts.offset : 0)
+    const rows = readSqliteBigInts(
+      db.prepare(
+        `WITH ordered AS (
+           SELECT revisions.*, COALESCE(ordered.source_ordinal, revisions.id) AS source_ordinal
+             FROM note_revisions AS revisions
+             JOIN activity_projection_status AS status ON status.space = revisions.space
+             LEFT JOIN activity_revision_order AS ordered ON ordered.revision_id = revisions.id
+            WHERE revisions.space = ?
+              AND (
+                (ordered.source_ordinal IS NOT NULL AND ordered.source_ordinal <= ?)
+                OR (ordered.source_ordinal IS NULL
+                    AND revisions.id <= status.legacy_through_revision_id
+                    AND revisions.id <= ?)
+              )
+         ),
+         filtered AS (
+           SELECT revisions.* FROM ordered AS revisions WHERE ${where.join(' AND ')}
+         ),
+         aggregate AS (
+           SELECT COUNT(*) AS contract_total, ${gate} AS contract_has_other FROM filtered
+         ),
+         page AS (
+           SELECT * FROM filtered
+            ${pageWhere.length ? `WHERE ${pageWhere.join(' AND ')}` : ''}
+            ORDER BY id DESC LIMIT ? OFFSET ?
+         )
+         SELECT page.*, aggregate.contract_total, aggregate.contract_has_other
+           FROM aggregate LEFT JOIN page ON TRUE ORDER BY page.id DESC`,
+      ),
+    ).all(...params) as Array<
+      RevisionRow & {
+        id: number | bigint | null
+        contract_total: number | bigint
+        contract_has_other: number | bigint | null
+      }
+    >
+    const meta = rows[0]
+    const page = rows.filter((row): row is typeof row & RevisionRow => row.id != null)
+    const items = page.slice(0, opts.limit)
+
+    db.exec('COMMIT')
+    return {
+      items: items.map(revisionOfRow),
+      total: Number(meta?.contract_total ?? 0),
+      through: lease.through,
+      nextAfterId: page.length > opts.limit ? String(items.at(-1)!.id) : null,
+      activityLease: lease,
+      ...(opts.viewerAuthor ? { hasOtherAuthors: Number(meta?.contract_has_other) === 1 } : {}),
+    }
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
+}
+
 export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence => ({
   init: () => ctx.ensureInit(),
+  prepareActivityProjection: (space) => prepareSqliteActivityProjection(ctx, space),
+  maintainActivityProjection: async (space) => {
+    await ctx.ensureInit()
+    const worker = ctx.activityWorker?.()
+
+    return worker
+      ? worker.maintainActivityProjection(space)
+      : maintainSqliteActivityProjection(ctx, space)
+  },
+  maintainActivityProjectionGc: async (space) => {
+    await ctx.ensureInit()
+    const worker = ctx.activityWorker?.()
+
+    return worker
+      ? worker.maintainActivityProjectionGc(space)
+      : maintainSqliteActivityProjectionGc(ctx, space)
+  },
   append: async (rev: RevisionInput, content: RevisionBlob | null) => {
     await ctx.ensureInit()
     const db = ctx.required
@@ -336,8 +569,56 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       unavailable: r.unavailable,
     }))
   },
-  activityEvents: async (space, { from, to, offset, limit, excludeClasses = [], author }) => {
+  activityEvents: async (
+    space,
+    {
+      from,
+      to,
+      offset,
+      limit,
+      excludeClasses = [],
+      author,
+      viewerAuthor,
+      noteId,
+      through,
+      activityLease,
+      afterId,
+    },
+  ) => {
     await ctx.ensureInit()
+    const needsProjection = noteId != null || (from == null && to == null)
+    const worker = from == null && to == null && noteId == null ? ctx.activityWorker?.() : null
+
+    if (worker) {
+      return worker.activityEvents(space, {
+        from,
+        to,
+        offset,
+        limit,
+        excludeClasses,
+        author,
+        viewerAuthor,
+        noteId,
+        through,
+        activityLease,
+        afterId,
+      })
+    }
+
+    if (needsProjection) {
+      return activityEventsFromProjection(ctx, space, {
+        from,
+        to,
+        offset,
+        limit,
+        excludeClasses,
+        author,
+        viewerAuthor,
+        noteId,
+        activityLease,
+        afterId,
+      })
+    }
     const db = ctx.required
     const where = ['space = ?', notSyntheticBaselineClause]
     const args: string[] = [space]
@@ -349,6 +630,10 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
     if (to != null) {
       where.push('created_at < ?')
       args.push(to)
+    }
+    if (noteId != null) {
+      where.push('note_id = ?')
+      args.push(noteId)
     }
     if (excludeClasses.length) {
       where.push(classFilterSqlite(excludeClasses).replace(/^ AND /, ''))
@@ -365,17 +650,303 @@ export const createRevisionsFacet = (ctx: SqliteDriverCtx): RevisionPersistence 
       args.push(...au.params)
     }
     const whereSql = where.join(' AND ')
-    const items = (
-      db
-        .prepare(`SELECT * FROM note_revisions WHERE ${whereSql} ORDER BY id DESC LIMIT ? OFFSET ?`)
-        .all(...args, limit, offset) as RevisionRow[]
-    ).map(revisionOfRow)
-    const total = (
-      db.prepare(`SELECT COUNT(*) AS n FROM note_revisions WHERE ${whereSql}`).get(...args) as {
-        n: number
+    const aggregateWhere = through == null ? whereSql : `${whereSql} AND id <= ?`
+    const aggregateArgs = through == null ? [...args] : [...args, through]
+    const gateParams: string[] = []
+    const gate = viewerAuthor
+      ? `MAX(CASE WHEN ${otherAuthorSqlite(viewerAuthor, gateParams)} THEN 1 ELSE 0 END)`
+      : 'NULL'
+    const aggregate = readSqliteBigInts(
+      db.prepare(
+        `SELECT COUNT(*) AS n, MAX(id) AS max_id, ${gate} AS has_other
+           FROM note_revisions WHERE ${aggregateWhere}`,
+      ),
+    ).get(...gateParams, ...aggregateArgs) as {
+      n: number | bigint
+      max_id: number | bigint | null
+      has_other: number | bigint | null
+    }
+    const resolvedThrough = through ?? (aggregate.max_id == null ? null : String(aggregate.max_id))
+
+    if (resolvedThrough == null) {
+      return {
+        items: [],
+        total: 0,
+        through: null,
+        nextAfterId: null,
+        ...(viewerAuthor ? { hasOtherAuthors: false } : {}),
       }
-    ).n
-    return { items, total }
+    }
+    const pageWhere = [`${whereSql}`, 'id <= ?']
+    const pageArgs: Array<string | number> = [...args, resolvedThrough]
+
+    if (afterId != null) {
+      pageWhere.push('id < ?')
+      pageArgs.push(afterId)
+    }
+    const rows = readSqliteBigInts(
+      db.prepare(
+        `SELECT * FROM note_revisions WHERE ${pageWhere.join(' AND ')} ORDER BY id DESC LIMIT ? OFFSET ?`,
+      ),
+    ).all(...pageArgs, limit + 1, afterId == null ? offset : 0) as RevisionRow[]
+    const page = rows.slice(0, limit)
+
+    return {
+      items: page.map(revisionOfRow),
+      total: Number(aggregate.n),
+      through: resolvedThrough,
+      nextAfterId: rows.length > limit ? String(page.at(-1)!.id) : null,
+      ...(viewerAuthor ? { hasOtherAuthors: Number(aggregate.has_other) === 1 } : {}),
+    }
+  },
+  activityGroupsByNote: async (
+    space,
+    { from, to, excludeClasses = [], author, viewerAuthor, activityLease },
+  ) => {
+    await ctx.ensureInit()
+    const worker = from == null && to == null ? ctx.activityWorker?.() : null
+
+    if (worker) {
+      return worker.activityGroupsByNote(space, {
+        from,
+        to,
+        excludeClasses,
+        author,
+        viewerAuthor,
+        activityLease,
+      })
+    }
+    const db = ctx.required
+    db.exec('BEGIN')
+
+    try {
+      const lease = sqliteActivityProjectionLease(ctx, space, activityLease)
+
+      if (lease.through == null) {
+        db.exec('COMMIT')
+        return {
+          items: [],
+          through: null,
+          activityLease: lease,
+          ...(viewerAuthor ? { hasOtherAuthors: false } : {}),
+        }
+      }
+      let rows: Array<ActivityGroupRow & { id: number | bigint | null }>
+
+      if (from != null || to != null) {
+        const where = [notSyntheticBaselineClause]
+        const params: Array<string | null> = [space, lease.through, lease.through]
+
+        if (from != null) {
+          where.push('revisions.created_at >= ?')
+          params.push(from)
+        }
+        if (to != null) {
+          where.push('revisions.created_at < ?')
+          params.push(to)
+        }
+        if (excludeClasses.length) {
+          where.push(classFilterSqlite(excludeClasses).replace(/^ AND /, ''))
+          // The class registry is a fixed enum, not a corpus-sized input.
+          // eslint-disable-next-line no-restricted-syntax
+          params.push(...excludeClasses)
+        }
+        if (author) {
+          const clause = authorClauseSqlite(author)
+          where.push(clause.clause.replace(/^ AND /, ''))
+          // The principal vocabulary has a fixed handful of viewer aliases.
+          // eslint-disable-next-line no-restricted-syntax
+          params.push(...clause.params)
+        }
+        const gateParams: string[] = []
+        const gate = viewerAuthor
+          ? `MAX(CASE WHEN ${otherAuthorSqlite(viewerAuthor, gateParams)} THEN 1 ELSE 0 END)`
+          : 'MAX(NULL)'
+
+        rows = readSqliteBigInts(
+          db.prepare(
+            `WITH ordered AS (
+               SELECT revisions.*, COALESCE(ordered.source_ordinal, revisions.id) AS source_ordinal
+                 FROM note_revisions AS revisions
+                 JOIN activity_projection_status AS status ON status.space = revisions.space
+                 LEFT JOIN activity_revision_order AS ordered ON ordered.revision_id = revisions.id
+                WHERE revisions.space = ?
+                  AND (
+                    (ordered.source_ordinal IS NOT NULL AND ordered.source_ordinal <= ?)
+                    OR (ordered.source_ordinal IS NULL
+                        AND revisions.id <= status.legacy_through_revision_id
+                        AND revisions.id <= ?)
+                  )
+                  AND ${where.join(' AND ')}
+             ),
+             grouped AS (
+               SELECT note_id,
+                      MAX(source_ordinal) AS last_source_ordinal,
+                      COUNT(*) AS group_count,
+                      SUM(CASE WHEN ${TRUSTED_ONLY} AND chars_added IS NOT NULL THEN chars_added ELSE 0 END)
+                        AS chars_added_sum,
+                      SUM(CASE WHEN ${TRUSTED_ONLY} AND chars_removed IS NOT NULL THEN chars_removed ELSE 0 END)
+                        AS chars_removed_sum,
+                      MAX(CASE WHEN ${TRUSTED_ONLY} AND chars_added IS NOT NULL THEN 1 ELSE 0 END)
+                        AS chars_added_known,
+                      MAX(CASE WHEN ${TRUSTED_ONLY} AND chars_removed IS NOT NULL THEN 1 ELSE 0 END)
+                        AS chars_removed_known,
+                      ${gate} AS group_has_other
+                 FROM ordered GROUP BY note_id
+             ),
+             meta AS (
+               SELECT MAX(group_has_other) AS contract_has_other FROM grouped
+             )
+             SELECT latest.*,
+                    grouped.group_count,
+                    grouped.chars_added_sum,
+                    grouped.chars_removed_sum,
+                    grouped.chars_added_known,
+                    grouped.chars_removed_known,
+                    grouped.last_source_ordinal,
+                    ? AS contract_through,
+                    meta.contract_has_other
+               FROM meta
+               LEFT JOIN grouped ON TRUE
+               LEFT JOIN ordered AS latest
+                 ON latest.note_id = grouped.note_id
+                AND latest.source_ordinal = grouped.last_source_ordinal
+              ORDER BY grouped.last_source_ordinal DESC`,
+          ),
+        ).all(...params, ...gateParams, lease.through) as Array<
+          ActivityGroupRow & { id: number | bigint | null }
+        >
+      } else {
+        const status = readSqliteBigInts(
+          db.prepare('SELECT active_generation FROM activity_projection_status WHERE space = ?'),
+        ).get(space) as { active_generation: number | bigint }
+        const stateParams: Array<string | number> = activityLease
+          ? [lease.through, space, String(status.active_generation)]
+          : [space, String(status.active_generation)]
+        const stateJoin = activityLease
+          ? `states.source_ordinal = (
+               SELECT MAX(seek.source_ordinal)
+                 FROM activity_note_actor_states AS seek
+                WHERE seek.space = heads.space
+                  AND seek.generation = heads.generation
+                  AND seek.note_id = heads.note_id
+                  AND seek.actor_kind = heads.actor_kind
+                  AND seek.actor_key = heads.actor_key
+                  AND seek.class_key = heads.class_key
+                  AND seek.source_ordinal <= ?
+             )`
+          : 'states.source_ordinal = heads.source_ordinal'
+
+        const classParams: string[] = []
+        const classClause = excludeClasses.length
+          ? `AND (states.actor_kind = 'gap' OR states.class_key NOT IN (${excludeClasses
+              .map(() => '?')
+              .join(',')}))`
+          : ''
+        // The class registry is a fixed enum, not a corpus-sized input.
+        // eslint-disable-next-line no-restricted-syntax
+        classParams.push(...excludeClasses)
+        const authorParams: string[] = []
+        const authorClause = author
+          ? `WHERE visible.actor_kind = 'principal' AND (${projectionActorMatchSqlite(
+              author,
+              authorParams,
+              'visible',
+            )})`
+          : ''
+        const gateParams: string[] = []
+        const gate = viewerAuthor
+          ? `MAX(CASE
+               WHEN visible.actor_kind = 'external' THEN 1
+               WHEN visible.actor_kind = 'principal'
+                AND NOT (${projectionActorMatchSqlite(viewerAuthor, gateParams, 'visible')}) THEN 1
+               ELSE 0
+             END)`
+          : 'MAX(NULL)'
+
+        rows = readSqliteBigInts(
+          db.prepare(
+            `WITH bucket_states AS (
+               SELECT states.*
+                 FROM activity_note_actor_heads AS heads
+                 JOIN activity_note_actor_states AS states
+                   ON states.space = heads.space
+                  AND states.generation = heads.generation
+                  AND ${stateJoin}
+                WHERE heads.space = ? AND heads.generation = ?
+             ),
+             visible AS (
+               SELECT states.* FROM bucket_states AS states WHERE TRUE ${classClause}
+             ),
+             selected AS (
+               SELECT visible.* FROM visible ${authorClause}
+             ),
+             ranked AS (
+               SELECT selected.*,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY note_id ORDER BY source_ordinal DESC
+                      ) AS note_rank
+                 FROM selected
+             ),
+             grouped AS (
+               SELECT note_id,
+                      MAX(source_ordinal) AS last_source_ordinal,
+                      MAX(CASE WHEN note_rank = 1 THEN revision_id END) AS last_revision_id,
+                      SUM(event_count) AS group_count,
+                      SUM(chars_added_sum) AS chars_added_sum,
+                      SUM(chars_added_known) AS chars_added_known,
+                      SUM(chars_removed_sum) AS chars_removed_sum,
+                      SUM(chars_removed_known) AS chars_removed_known
+                 FROM ranked GROUP BY note_id
+             ),
+             meta AS (
+               SELECT ${gate} AS contract_has_other FROM visible
+             )
+             SELECT revisions.*,
+                    grouped.group_count,
+                    grouped.chars_added_sum,
+                    grouped.chars_removed_sum,
+                    grouped.chars_added_known,
+                    grouped.chars_removed_known,
+                    grouped.last_source_ordinal,
+                    ? AS contract_through,
+                    meta.contract_has_other
+               FROM meta
+               LEFT JOIN grouped ON TRUE
+               LEFT JOIN note_revisions AS revisions ON revisions.id = grouped.last_revision_id
+              ORDER BY grouped.last_source_ordinal DESC`,
+          ),
+        ).all(
+          ...stateParams,
+          ...classParams,
+          ...authorParams,
+          ...gateParams,
+          lease.through,
+        ) as Array<ActivityGroupRow & { id: number | bigint | null }>
+      }
+      const meta = rows[0]
+      const items: ActivityNoteGroupCount[] = rows
+        .filter((row): row is ActivityGroupRow => row.id != null)
+        .map((row) => ({
+          noteId: row.note_id,
+          count: String(row.group_count),
+          charsAdded: Number(row.chars_added_known) > 0 ? String(row.chars_added_sum) : null,
+          charsRemoved: Number(row.chars_removed_known) > 0 ? String(row.chars_removed_sum) : null,
+          lastSourceOrdinal: String(row.last_source_ordinal),
+          lastEvent: activityLastOfRow(row),
+        }))
+
+      db.exec('COMMIT')
+      return {
+        items,
+        through: lease.through,
+        activityLease: lease,
+        ...(viewerAuthor ? { hasOtherAuthors: Number(meta?.contract_has_other) === 1 } : {}),
+      }
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
+    }
   },
   activityByNote: async (space, { from, to, excludeClasses = [] }) => {
     await ctx.ensureInit()

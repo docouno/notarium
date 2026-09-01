@@ -4,8 +4,16 @@
 // history, not the note. canon: docs/note-history.md#model · docs/architecture.md#p2
 
 import {
+  activityCutInvalid,
   type ActivityDayCount,
   type ActivityNoteCount,
+  type ActivityNoteGroupCount,
+  activityProjectionInvalid,
+  type ActivityProjectionLease,
+  type ActivityProjectionPreparation,
+  activityProjectionRebuilding,
+  activityProjectionStale,
+  type ActivityScopeGate,
   type AuthorFilter,
   type Revision,
   REVISION_ENTRY_ROLE,
@@ -33,10 +41,33 @@ import {
   parseLogicalNoteState,
 } from '../libs/markdown'
 import { documentStateSourceByteLength } from '../libs/markdown/documentState/codec'
+import { decodeActivityVersion, encodeActivityVersion } from './helpers'
 import type { JournalOptions, JournalRecordInput } from './types'
 
 const sameTags = (a: readonly string[], b: readonly string[]) =>
   a.length === b.length && a.every((t, i) => t === b[i])
+
+const ACTIVITY_MAINTENANCE_PACE_MS = 50
+
+const awaitActivityPace = (signal: AbortSignal): Promise<void> =>
+  new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve()
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }
+
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ACTIVITY_MAINTENANCE_PACE_MS)
+
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 
 const stateBlob = (input: JournalRecordInput): RevisionBlob | null =>
   input.documentState != null
@@ -68,15 +99,110 @@ export class RevisionJournal {
   private readonly persistence: RevisionPersistence
   private readonly space: string
   private readonly now: () => Date
+  private readonly scheduler: JournalOptions['scheduler']
+  private readonly onActivityProjectionReady: JournalOptions['onActivityProjectionReady']
   private initPromise: Promise<void> | null = null
+  private activityMaintenance: Promise<void> | null = null
+  /** A prepare call can observe rebuilding while the single-flight loop is still
+   * draining an older generation. Keep that wake-up outside the loop-local phase:
+   * otherwise the GC loop can finish and drop the only request to rebuild. */
+  private activityRebuildRequested = false
+  private readonly activityMaintenanceAbort = new AbortController()
   /** Per-note append chains (same shape as the store's write serialization):
    *  latestFor → dedup → append must never interleave for one note. */
   private chains = new Map<string, Promise<void>>()
 
-  constructor({ persistence, space, now = () => new Date() }: JournalOptions) {
+  constructor({
+    persistence,
+    space,
+    scheduler,
+    onActivityProjectionReady,
+    now = () => new Date(),
+  }: JournalOptions) {
     this.persistence = persistence
     this.space = space
+    this.scheduler = scheduler
+    this.onActivityProjectionReady = onActivityProjectionReady
     this.now = now
+  }
+
+  /** Initialize one space's derived Activity carrier and start/join its bounded
+   * maintenance loop. The caller never waits for the rebuild itself. */
+  async prepareActivityProjection(): Promise<ActivityProjectionPreparation> {
+    await this.ensureInit()
+    const preparation = await this.persistence.prepareActivityProjection(this.space)
+
+    if (preparation.state === 'rebuilding') {
+      this.activityRebuildRequested = true
+    }
+    this.startActivityMaintenance()
+    return preparation
+  }
+
+  async stopActivityProjection(): Promise<void> {
+    this.activityMaintenanceAbort.abort()
+    await this.activityMaintenance?.catch(() => {})
+  }
+
+  private startActivityMaintenance(): void {
+    if (this.activityMaintenance || this.activityMaintenanceAbort.signal.aborted) {
+      return
+    }
+    const run = this.runActivityMaintenance()
+    this.activityMaintenance = run
+    void run
+      .catch((error) => {
+        console.error('[journal] Activity projection maintenance failed:', (error as Error).message)
+      })
+      .finally(() => {
+        if (this.activityMaintenance === run) {
+          this.activityMaintenance = null
+          if (this.activityRebuildRequested && !this.activityMaintenanceAbort.signal.aborted) {
+            this.startActivityMaintenance()
+          }
+        }
+      })
+  }
+
+  private async runActivityMaintenance(): Promise<void> {
+    const signal = this.activityMaintenanceAbort.signal
+    let ready = false
+
+    while (!signal.aborted) {
+      await awaitActivityPace(signal)
+      if (signal.aborted) {
+        return
+      }
+      if (this.scheduler) {
+        await this.scheduler.awaitTurn(signal)
+      } else {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      }
+      if (signal.aborted) {
+        return
+      }
+      if (this.activityRebuildRequested) {
+        ready = false
+        this.activityRebuildRequested = false
+      }
+      if (!ready) {
+        const projection = await this.persistence.maintainActivityProjection(this.space)
+
+        if (projection.published) {
+          this.onActivityProjectionReady?.()
+        }
+        if (projection.state === 'rebuilding') {
+          continue
+        }
+        ready = true
+        continue
+      }
+      const gc = await this.persistence.maintainActivityProjectionGc(this.space)
+
+      if (!gc.pending) {
+        return
+      }
+    }
   }
 
   /** Queue one state for the journal. Resolves when the append settled (tests
@@ -147,9 +273,136 @@ export class RevisionJournal {
     limit: number
     excludeClasses?: readonly string[]
     author?: AuthorFilter
-  }): Promise<{ items: Revision[]; total: number }> {
+    viewerAuthor?: AuthorFilter
+    noteId?: string
+    through?: string
+    activityVersion?: string
+    afterId?: string
+  }): Promise<{
+    items: Revision[]
+    total: number
+    through: string | null
+    nextAfterId: string | null
+    activityVersion?: string
+    scopeGate?: ActivityScopeGate
+  }> {
     await this.ensureInit()
-    return this.persistence.activityEvents(this.space, opts)
+    const needsProjection = opts.noteId != null || (opts.from == null && opts.to == null)
+
+    if (!needsProjection) {
+      return this.persistence.activityEvents(this.space, opts)
+    }
+    const activityLease = this.requestedActivityLease(opts.through, opts.activityVersion)
+    const preparation = await this.prepareActivityProjection()
+
+    if (preparation.state === 'rebuilding') {
+      throw activityProjectionRebuilding()
+    }
+    const result = await this.persistence.activityEvents(this.space, { ...opts, activityLease })
+
+    if (!result.activityLease) {
+      throw activityProjectionRebuilding()
+    }
+    this.assertReturnedActivityLease(activityLease, result.activityLease)
+    const activityVersion = encodeActivityVersion(this.space, result.activityLease)
+
+    return {
+      items: result.items,
+      total: result.total,
+      through: result.activityLease.through,
+      nextAfterId: result.nextAfterId,
+      activityVersion,
+      ...(result.hasOtherAuthors === undefined
+        ? {}
+        : {
+            scopeGate: {
+              hasOtherAuthors: result.hasOtherAuthors,
+              through: result.activityLease.through,
+              activityVersion,
+            },
+          }),
+    }
+  }
+
+  async activityGroupsByNote(opts: {
+    from?: string
+    to?: string
+    excludeClasses?: readonly string[]
+    author?: AuthorFilter
+    viewerAuthor?: AuthorFilter
+    through?: string
+    activityVersion?: string
+  }): Promise<{
+    items: ActivityNoteGroupCount[]
+    through: string | null
+    activityVersion: string
+    scopeGate?: ActivityScopeGate
+  }> {
+    await this.ensureInit()
+    const activityLease = this.requestedActivityLease(opts.through, opts.activityVersion)
+    const preparation = await this.prepareActivityProjection()
+
+    if (preparation.state === 'rebuilding') {
+      throw activityProjectionRebuilding()
+    }
+    const result = await this.persistence.activityGroupsByNote(this.space, {
+      ...opts,
+      activityLease,
+    })
+
+    this.assertReturnedActivityLease(activityLease, result.activityLease)
+    const activityVersion = encodeActivityVersion(this.space, result.activityLease)
+
+    return {
+      items: result.items,
+      through: result.activityLease.through,
+      activityVersion,
+      ...(result.hasOtherAuthors === undefined
+        ? {}
+        : {
+            scopeGate: {
+              hasOtherAuthors: result.hasOtherAuthors,
+              through: result.activityLease.through,
+              activityVersion,
+            },
+          }),
+    }
+  }
+
+  private requestedActivityLease(
+    through: string | undefined,
+    activityVersion: string | undefined,
+  ): ActivityProjectionLease | undefined {
+    if ((through == null) !== (activityVersion == null)) {
+      throw activityProjectionInvalid()
+    }
+    if (through == null || activityVersion == null) {
+      return undefined
+    }
+    if (!/^[1-9]\d*$/.test(through)) {
+      throw activityCutInvalid(through)
+    }
+    const payload = decodeActivityVersion(this.space, activityVersion)
+
+    return {
+      through,
+      activeGeneration: payload.activeGeneration,
+      sourceGeneration: payload.sourceGeneration,
+    }
+  }
+
+  private assertReturnedActivityLease(
+    requested: ActivityProjectionLease | undefined,
+    returned: ActivityProjectionLease,
+  ): void {
+    if (
+      requested &&
+      (requested.through !== returned.through ||
+        requested.activeGeneration !== returned.activeGeneration ||
+        requested.sourceGeneration !== returned.sourceGeneration)
+    ) {
+      throw activityProjectionStale()
+    }
   }
 
   /** Per-note activity counts for THIS journal's space — what the dashboard's

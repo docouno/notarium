@@ -170,6 +170,103 @@ export type ActivityNoteCount = {
   lastAt: string
 }
 
+export type ActivityLastEvent = Pick<
+  Revision,
+  | 'id'
+  | 'noteId'
+  | 'kind'
+  | 'entryRole'
+  | 'principal'
+  | 'title'
+  | 'createdAt'
+  | 'charsAdded'
+  | 'charsRemoved'
+  | 'unavailableReason'
+>
+
+export type ActivityNoteGroupCount = {
+  noteId: string
+  count: string
+  charsAdded: string | null
+  charsRemoved: string | null
+  lastSourceOrdinal: string
+  lastEvent: ActivityLastEvent
+}
+
+export type ActivityProjectionLease = {
+  /** Commit-ordered source cut. Null is reserved for a ready journal with no rows. */
+  through: string | null
+  activeGeneration: string
+  sourceGeneration: string
+}
+
+export type ActivityProjectionPreparation =
+  { state: 'ready'; lease: ActivityProjectionLease } | { state: 'rebuilding' }
+
+export type ActivityProjectionMaintenance = {
+  state: 'ready' | 'rebuilding'
+  processed: number
+  published: boolean
+}
+
+export type ActivityProjectionGcMaintenance = {
+  deleted: number
+  pending: boolean
+}
+
+export type ActivityScopeGate = {
+  hasOtherAuthors: boolean
+  through: string | null
+  activityVersion: string
+}
+
+export type ActivityLocation =
+  { kind: 'folder'; path: string } | { kind: 'root' } | { kind: 'unavailable' }
+
+export type ActivityCurrentNote = {
+  noteId: string
+  title: string
+  location: Exclude<ActivityLocation, { kind: 'unavailable' }>
+}
+
+export type ActivityCurrentProjection = {
+  notes: ReadonlyMap<string, ActivityCurrentNote>
+  locationThrough: string
+}
+
+export type ActivityNoteGroup = ActivityNoteGroupCount & {
+  type: 'note'
+  title: string
+  location: ActivityLocation
+}
+
+export type ActivityFolderGroup = {
+  type: 'folder'
+  location: ActivityLocation
+  noteCount: number
+  eventCount: string
+  charsAdded: string | null
+  charsRemoved: string | null
+  lastAt: string
+  lastSourceOrdinal: string
+}
+
+export type ActivityGroupCursor = {
+  sourceOrdinal: string
+  key: string
+}
+
+export type ActivityGroupsResult = {
+  itemType: 'note' | 'folder'
+  items: ActivityNoteGroup[] | ActivityFolderGroup[]
+  total: number
+  through: string | null
+  activityVersion: string
+  scopeGate?: ActivityScopeGate
+  locationThrough: string
+  nextCursor: ActivityGroupCursor | null
+}
+
 /** A principal-column predicate for author-scoped activity: a revision qualifies when its
  *  `principal` matches one of `exact` or starts with one of `prefixes` (null never matches).
  *  A dumb string match — the journal knows nothing about principal ownership, so the caller
@@ -235,6 +332,12 @@ export const revisionGapOf = (row: Revision): Revision => ({
  *  twin for hosts without a meta-DB (history for the process lifetime). */
 export type RevisionPersistence = {
   init(): Promise<void>
+  /** Initialize exactly one space's derived Activity carrier without scanning any sibling space. */
+  prepareActivityProjection(space: string): Promise<ActivityProjectionPreparation>
+  /** Apply at most one dialect-bounded rebuild unit and publish only under the writer fence. */
+  maintainActivityProjection(space: string): Promise<ActivityProjectionMaintenance>
+  /** Delete at most one bounded state/head batch from an inert projection generation. */
+  maintainActivityProjectionGc(space: string): Promise<ActivityProjectionGcMaintenance>
   /** Append one revision, storing `content` content-addressed by contentHash. Returns it with its id. */
   append(rev: RevisionInput, content: RevisionBlob | null): Promise<Revision>
   /** A note's timeline window, newest first, with the total before slicing. Note-addressed reads
@@ -312,8 +415,38 @@ export type RevisionPersistence = {
       limit: number
       excludeClasses?: readonly string[]
       author?: AuthorFilter
+      viewerAuthor?: AuthorFilter
+      noteId?: string
+      through?: string
+      activityLease?: ActivityProjectionLease
+      afterId?: string
     },
-  ): Promise<{ items: Revision[]; total: number }>
+  ): Promise<{
+    items: Revision[]
+    total: number
+    through: string | null
+    nextAfterId: string | null
+    activityLease?: ActivityProjectionLease
+    hasOtherAuthors?: boolean
+  }>
+  /** Set-oriented note summaries used by both Note and Folder dashboard modes. */
+  activityGroupsByNote(
+    space: string,
+    opts: {
+      from?: string
+      to?: string
+      excludeClasses?: readonly string[]
+      author?: AuthorFilter
+      viewerAuthor?: AuthorFilter
+      through?: string
+      activityLease?: ActivityProjectionLease
+    },
+  ): Promise<{
+    items: ActivityNoteGroupCount[]
+    through: string | null
+    activityLease: ActivityProjectionLease
+    hasOtherAuthors?: boolean
+  }>
   /** Per-note activity counts, GROUP BY note_id — same exclusions as activityByDay. */
   activityByNote(
     space: string,
@@ -1320,7 +1453,34 @@ export type KnowledgeStore = {
     limit: number
     scope?: ReadScope
     author?: AuthorFilter
-  }): Promise<{ items: Revision[]; total: number }>
+    viewerAuthor?: AuthorFilter
+    noteId?: string
+    through?: string
+    activityVersion?: string
+    afterId?: string
+  }): Promise<{
+    items: Revision[]
+    total: number
+    through: string | null
+    nextAfterId: string | null
+    activityVersion?: string
+    scopeGate?: ActivityScopeGate
+  }>
+  activityGroups?(opts: {
+    by: 'note' | 'folder'
+    from?: string
+    to?: string
+    limit: number
+    cursor?: ActivityGroupCursor
+    through?: string
+    activityVersion?: string
+    locationThrough?: string
+    location?: ActivityLocation
+    scope?: ReadScope
+    author?: AuthorFilter
+    viewerAuthor?: AuthorFilter
+  }): Promise<ActivityGroupsResult>
+  activityProjection?(opts?: { scope?: ReadScope }): Promise<ActivityCurrentProjection>
   activityByNote?(opts: {
     from: string
     to: string

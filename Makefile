@@ -110,7 +110,7 @@ SOURCE_COPY_TAR_EXCLUDES := \
 
 .DEFAULT_GOAL := help
 .PHONY: help prepare deps deps-vector doctor dev up start down stop restart logs ps sh \
-        checkup audit-runtime test-coverage test-pg test-browser import-bench provider-scale-gate bench-fields-snapshot write-perf-gate graph-revision-gate bench-session-audit backup restore backup-smoke seed seed-list \
+        checkup audit-runtime test-coverage test-pg test-browser import-bench provider-scale-gate bench-fields-snapshot write-perf-gate graph-revision-gate activity-groups-gate bench-session-audit backup restore backup-smoke seed seed-list \
         footage demo-shots demo-preview demo-plates image release release-rc release-smoke save clean
 
 help: ## List available targets
@@ -488,6 +488,21 @@ graph-revision-gate: ## Run the #410 production-shaped graph revision + memory g
 	  docker cp "$(GRAPH_REVISION_RUNNER_CONTAINER):/tmp/graph-revision-runtime.json" \
 	    "$(GRAPH_REVISION_OUTPUT_DIR)/runtime.json"; \
 	  docker rm -f "$(GRAPH_REVISION_RUNNER_CONTAINER)" >/dev/null
+
+# --- Activity projection production gate -----------------------------------
+ACTIVITY_GROUPS_GATE_MODE ?= full
+ACTIVITY_GROUPS_GATE_DIALECTS ?= sqlite
+ACTIVITY_GROUPS_GATE_OUTPUT ?= test-results/activity-groups-gate/$(ACTIVITY_GROUPS_GATE_MODE)
+ACTIVITY_GROUPS_GATE_NODE_IMAGE ?= $(NODE_TEST_IMAGE)
+ACTIVITY_GROUPS_GATE_PG_IMAGE ?= postgres:16-alpine
+
+activity-groups-gate: ## Run the #414 production Activity projection gate (MODE=full|smoke)
+	@ACTIVITY_GROUPS_GATE_MODE="$(ACTIVITY_GROUPS_GATE_MODE)" \
+	  ACTIVITY_GROUPS_GATE_DIALECTS="$(ACTIVITY_GROUPS_GATE_DIALECTS)" \
+	  ACTIVITY_GROUPS_GATE_OUTPUT="$(ACTIVITY_GROUPS_GATE_OUTPUT)" \
+	  ACTIVITY_GROUPS_GATE_NODE_IMAGE="$(ACTIVITY_GROUPS_GATE_NODE_IMAGE)" \
+	  ACTIVITY_GROUPS_GATE_PG_IMAGE="$(ACTIVITY_GROUPS_GATE_PG_IMAGE)" \
+	  node scripts/activityGroupsGateDriver.mjs
 
 # --- session activity read-model benchmark ----------------------------------
 BENCH_PHASE ?= pre

@@ -343,6 +343,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
 
   for (const e of sorted) {
     const cur = notes.get(e.noteId)
+    const previousModifiedAt = cur?.modifiedAt
     // The body this revision REPLACES, in journal form — the chain parent's
     // normalised content, which is what the churn counters are measured against
     // (`create` has no parent, so ''). Normalised with the PARENT's title, before
@@ -437,6 +438,13 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     }
     const title = cur?.title ?? (e.op === 'create' ? e.title : e.noteId)
     const state = notes.get(e.noteId)
+
+    if (e.op === 'edit' && state && before === journalState(state)) {
+      if (previousModifiedAt) {
+        state.modifiedAt = previousModifiedAt
+      }
+      continue
+    }
     const cls = state?.class
     const rows = activityBySpace.get(e.space) ?? []
     rows.push({

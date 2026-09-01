@@ -89,6 +89,11 @@ export const LOCK_LEVEL_OF_TABLE: Readonly<Record<string, LockLevel>> = {
   note_revisions: 'L3t',
   revision_blobs: 'L3t',
   revision_purge_fences: 'L3t',
+  activity_projection_status: 'L3t',
+  activity_revision_order: 'L3t',
+  activity_note_actor_states: 'L3t',
+  activity_note_actor_heads: 'L3t',
+  activity_projection_gc: 'L3t',
   folders: 'L4f',
   ability_availability: 'L4a',
   ability_project_bindings: 'L4a',
@@ -1307,4 +1312,45 @@ export const lockRevisionChainRowsOfNote = async (
   const ids = rows.map((row) => row.id)
 
   return { lock: hold('L3t', ids, ids, 'range'), rows }
+}
+
+/** L3t — the per-space Activity projection tail. Append triggers, initialization
+ * and final publication serialize on this row. Ordinary progress builds from a
+ * non-locking snapshot and conditionally updates this exact row only after its
+ * state batch, so it cannot hold commit-order allocation across set-oriented work. */
+export const lockActivityProjectionStatus = async <T>(
+  client: PoolClient,
+  space: string,
+): Promise<{ lock: LockHold; row: T | undefined }> => {
+  const result = await client.query(
+    'SELECT * FROM activity_projection_status WHERE space = $1 FOR UPDATE',
+    [space],
+  )
+
+  return {
+    lock: hold('L3t', [space], result.rows.length ? [space] : []),
+    row: result.rows[0] as T | undefined,
+  }
+}
+
+/** L3t — one durable inert-generation queue row, in generation order. */
+export const lockActivityProjectionGcRow = async <T extends { generation: unknown }>(
+  client: PoolClient,
+  space: string,
+): Promise<{ lock: LockHold; row: T | undefined }> => {
+  const result = await client.query(
+    `SELECT generation, phase FROM activity_projection_gc
+      WHERE space = $1 ORDER BY generation LIMIT 1 FOR UPDATE`,
+    [space],
+  )
+  const row = result.rows[0] as T | undefined
+
+  return {
+    lock: hold(
+      'L3t',
+      row ? [`${space}:${String(row.generation)}`] : [],
+      row ? [`${space}:${String(row.generation)}`] : [],
+    ),
+    row,
+  }
 }

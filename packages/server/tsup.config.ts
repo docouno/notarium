@@ -36,11 +36,10 @@ export default defineConfig({
   // (`docker compose exec notarium admin …`),
   // or a lost admin password is unrecoverable exactly where it matters most:
   // the dockerized deploy has neither tsx nor the TS sources.
-  // The embed-pool worker is its OWN entry → dist/embedWorker.js, a sibling of
-  // dist/main.js. createEmbedPool resolves it by location (new URL('./embedWorker.js',
-  // import.meta.url)) so the same code path serves the bundled runtime and the tsx
-  // dev/test run (where it loads the .ts). The engine is inlined into it (noExternal);
-  // @huggingface/transformers stays external, loaded from the runtime node_modules.
+  // Workers are their OWN entries, siblings of dist/main.js. Their clients resolve
+  // them by location so the same code path serves the bundled runtime and the tsx
+  // dev/test run (where it loads the adjacent .ts source). Workspace packages are
+  // inlined into every entry; native/runtime dependencies stay external.
   entry: {
     main: 'src/apps/server/main.ts',
     admin: 'src/apps/server/commands/admin/main.ts',
@@ -48,6 +47,8 @@ export default defineConfig({
     restore: 'src/apps/server/commands/restore/main.ts',
     version: 'src/apps/server/commands/version/main.ts',
     embedWorker: '../engine/src/libs/embedding/embedWorker.ts',
+    activityProjectionWorker:
+      'src/services/metaDb/drivers/sqlite/activityWorker/activityWorkerThread.ts',
   },
   // Inline build identity — buildInfo.ts reads these, falling back to
   // package.json/git only when absent (the unbundled dev run).

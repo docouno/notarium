@@ -1,5 +1,8 @@
 import type {
   ActivityEventsResponse,
+  ActivityGroupBy,
+  ActivityGroupsResponse,
+  ActivityLocationKind,
   ActivityProjectsResponse,
   ActivityResponse,
   GraphHealth,
@@ -44,7 +47,18 @@ export const graphApi = {
    *  the standing feed omits them (latest N). */
   activityEventsGet: (
     space: string,
-    params: { from?: string; to?: string; offset?: number; limit?: number; author?: 'mine' } = {},
+    params: {
+      from?: string
+      to?: string
+      offset?: number
+      limit?: number
+      author?: 'mine'
+      noteId?: string
+      through?: string
+      activityVersion?: string
+      locationThrough?: string
+      cursor?: string
+    } = {},
   ) => {
     const q = new URLSearchParams()
 
@@ -54,7 +68,7 @@ export const graphApi = {
     if (params.to) {
       q.set(QUERY_KEY.to, params.to)
     }
-    if (params.offset) {
+    if (params.offset !== undefined) {
       q.set(QUERY_KEY.offset, String(params.offset))
     }
     if (params.limit !== undefined) {
@@ -64,8 +78,74 @@ export const graphApi = {
     if (params.author) {
       q.set(QUERY_KEY.author, params.author)
     }
+    if (params.noteId) {
+      q.set(QUERY_KEY.noteId, params.noteId)
+    }
+    if (params.through) {
+      q.set(QUERY_KEY.through, params.through)
+    }
+    if (params.activityVersion) {
+      q.set(QUERY_KEY.activityVersion, params.activityVersion)
+    }
+    if (params.locationThrough) {
+      q.set(QUERY_KEY.locationThrough, params.locationThrough)
+    }
+    if (params.cursor) {
+      q.set(QUERY_KEY.cursor, params.cursor)
+    }
     const s = q.toString()
     return req<ActivityEventsResponse>(`${sp(space)}/activity/events${s ? `?${s}` : ''}`)
+  },
+  activityGroupsGet: (
+    space: string,
+    params: {
+      by: ActivityGroupBy
+      from?: string
+      to?: string
+      author?: 'mine'
+      limit?: number
+      cursor?: string
+      through?: string
+      activityVersion?: string
+      locationThrough?: string
+      location?: ActivityLocationKind
+      path?: string
+    },
+  ) => {
+    const q = new URLSearchParams([[QUERY_KEY.by, params.by]])
+
+    if (params.from) {
+      q.set(QUERY_KEY.from, params.from)
+    }
+    if (params.to) {
+      q.set(QUERY_KEY.to, params.to)
+    }
+    if (params.author) {
+      q.set(QUERY_KEY.author, params.author)
+    }
+    if (params.limit !== undefined) {
+      q.set(QUERY_KEY.limit, String(params.limit))
+    }
+    if (params.cursor) {
+      q.set(QUERY_KEY.cursor, params.cursor)
+    }
+    if (params.through) {
+      q.set(QUERY_KEY.through, params.through)
+    }
+    if (params.activityVersion) {
+      q.set(QUERY_KEY.activityVersion, params.activityVersion)
+    }
+    if (params.locationThrough) {
+      q.set(QUERY_KEY.locationThrough, params.locationThrough)
+    }
+    if (params.location) {
+      q.set(QUERY_KEY.location, params.location)
+    }
+    if (params.path) {
+      q.set(QUERY_KEY.path, params.path)
+    }
+
+    return req<ActivityGroupsResponse>(`${sp(space)}/activity/groups?${q.toString()}`)
   },
   /** Projects ranked by recent activity (#33) — the dashboard shows the block only
    *  when ≥2 come back (gate). Server defaults the window to ~90 days. */

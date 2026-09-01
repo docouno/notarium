@@ -5,7 +5,7 @@
 // A mismatch fails to compile via the `Assert` below.
 // canon: docs/contract.md#wire-consts
 import type { QueryKey } from '../consts/queryKeys'
-import type { ActivityQuery } from './rest/activity'
+import type { ActivityEventsQuery, ActivityGroupsQuery, ActivityQuery } from './rest/activity'
 import type { AgentAuditQuery } from './rest/agent/audit'
 import type { AgentSessionEventsQuery, AgentSessionsQuery } from './rest/agent/sessions'
 import type { BucketsQuery, FieldsQuery, NotesQuery } from './rest/notes'
@@ -19,6 +19,8 @@ type WireQueryKey =
   | keyof BucketsQuery
   | keyof FieldsQuery
   | keyof ActivityQuery
+  | keyof ActivityEventsQuery
+  | keyof ActivityGroupsQuery
   | keyof AgentAuditQuery
   | keyof AgentSessionsQuery
   | keyof AgentSessionEventsQuery

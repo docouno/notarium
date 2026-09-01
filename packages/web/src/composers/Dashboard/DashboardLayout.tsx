@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Link, Outlet, useLocation } from 'react-router'
 import {
   IconBrain,
@@ -15,8 +15,23 @@ import { useNotes } from '../NotesProvider'
 import { useProjects } from '../ProjectsProvider'
 import { useSpace } from '../SpaceProvider'
 import { Splash } from '../Splash'
+import {
+  activityScopeChrome,
+  type ActivityScopeChrome,
+  effectiveActivityScope,
+  readActivityGroup,
+  readActivityScope,
+  writeActivityGroup,
+  writeActivityScope,
+} from './activityPreferences'
 import { type DashboardTab, DashboardTabs } from './DashboardTabs'
-import { type ActivityScope, type DashboardContext, useDashboardData } from './useDashboardData'
+import { useDashboardActivityFeed } from './useDashboardActivityFeed'
+import {
+  type ActivityScope,
+  type DashboardContext,
+  dashboardSpaceTarget,
+  useDashboardData,
+} from './useDashboardData'
 import styles from './Dashboard.module.scss'
 
 // The dashboard shell (#33/#216): the space home (`/s/<space>`) and its deep
@@ -29,11 +44,16 @@ import styles from './Dashboard.module.scss'
 // the friendly Splash CTA rather than a grid of zeros.
 
 export const DashboardLayout = () => {
-  const { space } = useSpace()
-  const { tree, openNote } = useNotes()
-  const { projects: allProjects } = useProjects()
-  const data = useDashboardData(space)
+  const { space: ambientSpace, spaceTransition } = useSpace()
   const location = useLocation()
+  const target = dashboardSpaceTarget(ambientSpace, location.pathname, spaceTransition)
+  const space = target.space
+  const providersInSync = target.providersInSync
+  const { tree: ambientTree, openNote } = useNotes()
+  const { projects: ambientProjects } = useProjects()
+  const tree = providersInSync ? ambientTree : null
+  const allProjects = providersInSync ? ambientProjects : null
+  const data = useDashboardData(space)
   // Orphan count for the Health pill (a hook — must run before the Splash early
   // return). Count-only (no title sort), memoised on the graph.
   const orphanCount = useMemo(() => orphanCountOf(data.graph), [data.graph])
@@ -49,11 +69,36 @@ export const DashboardLayout = () => {
   // honest server signal) — a solo space, or one nobody else has touched, has nothing
   // to distinguish, so the scope is forced 'all' and no toggle shows. Unknown until the
   // aggregate loads (→ no toggle yet; the reserved row height keeps it from jumping in).
-  // A space switch resets the choice.
-  const [scope, setScope] = useState<ActivityScope>('all')
-  useEffect(() => setScope('all'), [space])
-  const canScope = data.activity?.hasOtherAuthors ?? false
-  const effScope: ActivityScope = canScope ? scope : 'all'
+  const [preferredScope, setPreferredScopeState] = useState<ActivityScope>(readActivityScope)
+  const [group, setGroupState] = useState(readActivityGroup)
+  const feed = useDashboardActivityFeed(space, group, preferredScope)
+  const settledScopeChrome = useRef<ActivityScopeChrome | null>(null)
+  const scopeChrome = activityScopeChrome(
+    space,
+    { resolved: feed.gateResolved, canScope: feed.canScope, scope: feed.scope },
+    settledScopeChrome.current,
+  )
+
+  useLayoutEffect(() => {
+    // Cache the unresolved Space sentinel too. Otherwise A(shared) → B(pending) →
+    // A(pending) can resurrect A's old toggle after the intervening Space boundary.
+    // A layout effect records only a committed boundary before paint; an aborted
+    // concurrent render cannot poison the cache. Within one Space the helper returns
+    // the resolved object itself, so Group transitions still keep stable chrome.
+    settledScopeChrome.current = scopeChrome
+  }, [scopeChrome])
+  const canScope = scopeChrome.canScope
+  const effScope = effectiveActivityScope(preferredScope, scopeChrome)
+
+  const setPreferredScope = (next: ActivityScope) => {
+    setPreferredScopeState(next)
+    writeActivityScope(next)
+  }
+
+  const setGroup = (next: typeof group) => {
+    setGroupState(next)
+    writeActivityGroup(next)
+  }
 
   // A brand-new, note-less base keeps the friendly Splash CTA (create your first
   // note) rather than a barren dashboard. After all hooks (rules-of-hooks) + only
@@ -109,7 +154,19 @@ export const DashboardLayout = () => {
     },
   ]
 
-  const ctx: DashboardContext = { ...data, space, openNote, scope: effScope }
+  const ctx: DashboardContext = {
+    ...data,
+    space,
+    openNote,
+    scope: effScope,
+    activityScopeCommitted: scopeChrome.committed,
+    activityCanScope: canScope,
+    preferredScope,
+    setPreferredScope,
+    group,
+    setGroup,
+    feed,
+  }
 
   return (
     <div className={styles.dash} data-testid="home-dashboard">
@@ -140,7 +197,7 @@ export const DashboardLayout = () => {
           <div className={styles.refToggle}>
             <Segmented
               value={effScope}
-              onChange={setScope}
+              onChange={setPreferredScope}
               ariaLabel="Activity author scope"
               options={[
                 {

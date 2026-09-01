@@ -11,6 +11,10 @@ import { createAbilityAvailabilityFacet } from './drivers/sqlite/abilityAvailabi
 import { createAbilityCreateFacet } from './drivers/sqlite/abilityCreate'
 import { createAbilityPlacementFacet } from './drivers/sqlite/abilityPlacement'
 import { createAbilityPreferencesFacet } from './drivers/sqlite/abilityPreferences'
+import {
+  createSqliteActivityWorker,
+  type SqliteActivityWorkerClient,
+} from './drivers/sqlite/activityWorker'
 import { createAgentCallsFacet } from './drivers/sqlite/agentCalls'
 import { createAgentDeltaCursorsFacet } from './drivers/sqlite/agentDeltaCursors'
 import { createAuthFacet } from './drivers/sqlite/auth'
@@ -71,20 +75,31 @@ import type {
  *  64 pages ≈ 256 KiB at the 4 KiB default. */
 const META_RECLAIM_MIN_FREE_PAGES = 64
 
+export type SqliteMetaDbOptions = {
+  /** Benchmark/build seam: production resolves its bundled sibling; source tests
+   * normally resolve the TS worker beside the client. */
+  activityWorkerEntry?: URL
+}
+
 export class SqliteMetaDb implements MetaDb {
   private db: DatabaseSync | null = null
   private initPromise: Promise<void> | null = null
+  private activityWorkerClient: SqliteActivityWorkerClient | null = null
   private readonly path: string
+  private readonly activityWorkerEntry: URL | undefined
   private readonly ctx: SqliteDriverCtx = ((self: SqliteMetaDb): SqliteDriverCtx => ({
     ensureInit: () => self.ensureInit(),
+    checkpointWal: async () => {},
+    activityWorker: () => self.activityWorker(),
     close: () => self.close(),
     get required() {
       return self.required
     },
   }))(this)
 
-  constructor(path: string) {
+  constructor(path: string, options: SqliteMetaDbOptions = {}) {
     this.path = path
+    this.activityWorkerEntry = options.activityWorkerEntry
   }
 
   /** Lazy single-flight init: the first call validates and advances the schema. */
@@ -155,10 +170,44 @@ export class SqliteMetaDb implements MetaDb {
     return this.db
   }
 
+  private activityWorker(): SqliteActivityWorkerClient | null {
+    if (this.path === IN_MEMORY_DB) {
+      return null
+    }
+    if (!this.activityWorkerClient) {
+      const worker = createSqliteActivityWorker(this.path, this.activityWorkerEntry)
+      this.activityWorkerClient = worker
+      void worker.dead.then(() => {
+        if (this.activityWorkerClient === worker) {
+          this.activityWorkerClient = null
+        }
+      })
+    }
+
+    return this.activityWorkerClient
+  }
+
   async close(): Promise<void> {
-    this.db?.close()
+    const errors: unknown[] = []
+    const activityWorker = this.activityWorkerClient
+    this.activityWorkerClient = null
+
+    try {
+      await activityWorker?.close()
+    } catch (error) {
+      errors.push(error)
+    }
+    try {
+      this.db?.close()
+    } catch (error) {
+      errors.push(error)
+    }
     this.db = null
     this.initPromise = null
+
+    if (errors.length) {
+      throw new AggregateError(errors, 'failed to close SQLite meta database')
+    }
   }
 
   // ── identity facet ──────────────────────────────────────────────────
@@ -435,6 +484,11 @@ export class SqliteMetaDb implements MetaDb {
           .all(spaceId) as Array<{ h: string }>
       ).map((r) => r.h)
       db.prepare('DELETE FROM revision_heads WHERE space = ?').run(spaceId)
+      db.prepare('DELETE FROM activity_note_actor_states WHERE space = ?').run(spaceId)
+      db.prepare('DELETE FROM activity_note_actor_heads WHERE space = ?').run(spaceId)
+      db.prepare('DELETE FROM activity_revision_order WHERE space = ?').run(spaceId)
+      db.prepare('DELETE FROM activity_projection_gc WHERE space = ?').run(spaceId)
+      db.prepare('DELETE FROM activity_projection_status WHERE space = ?').run(spaceId)
       db.prepare('DELETE FROM note_revisions WHERE space = ?').run(spaceId)
       const stillUsed = db.prepare('SELECT 1 FROM note_revisions WHERE content_hash = ? LIMIT 1')
       const dropBlob = db.prepare('DELETE FROM revision_blobs WHERE hash = ?')

@@ -178,3 +178,38 @@ export const revisionsUnavailable = (): StoreError => {
   err.reason = STORE_ERROR_REASON.revisionsUnavailable
   return err
 }
+
+export const activityCutInvalid = (cut: string): StoreError => {
+  const err = new StoreError(`activity source cut is invalid: ${cut}`)
+  err.isToolError = true
+  err.reason = STORE_ERROR_REASON.activityCutInvalid
+  return err
+}
+
+export const activityLocationStale = (): StoreError => {
+  const err = new StoreError('activity location cut is stale; reload the grouped overview')
+  err.isConflict = true
+  err.reason = STORE_ERROR_REASON.activityLocationStale
+  return err
+}
+
+export const activityProjectionInvalid = (): StoreError => {
+  const err = new StoreError('activity projection snapshot is invalid')
+  err.isToolError = true
+  err.reason = STORE_ERROR_REASON.activityProjectionInvalid
+  return err
+}
+
+export const activityProjectionStale = (): StoreError => {
+  const err = new StoreError('activity projection changed; reload the Activity overview')
+  err.isConflict = true
+  err.reason = STORE_ERROR_REASON.activityProjectionStale
+  return err
+}
+
+export const activityProjectionRebuilding = (): StoreError => {
+  const err = new StoreError('activity summary is rebuilding')
+  err.isUnavailable = true
+  err.reason = STORE_ERROR_REASON.activityProjectionRebuilding
+  return err
+}

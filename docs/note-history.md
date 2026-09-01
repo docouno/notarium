@@ -89,6 +89,39 @@ selected tombstone under the same driver lock as append, so restore-first makes 
 skip and purge-first makes restore terminally fail. Schema evolution and the strict
 terminal transaction are described in [meta-db.md](meta-db.md).
 
+## Activity source order and projection
+
+Raw revision ids identify events, but PostgreSQL allocation order is not cross-note
+commit order. The database append trigger therefore gives every post-carrier row a
+per-Space source ordinal under a short status-row tail lock. Existing committed rows
+form a frozen legacy segment whose ordinal is their id. Activity cuts, rebuild cursor
+and grouped ordering use this source stream; raw detail rows remain ordered and
+addressed by revision id.
+
+All-time grouped reads use a rebuildable cumulative actor/class projection. Each
+qualifying source row stores an immutable cumulative bucket state; one bounded head
+points at the latest state. A historical cut seeks the latest state in each bucket at
+or before the requested source ordinal. Folder/title membership is deliberately not
+copied: the read-model joins current visible metadata under a separate location cut.
+The journal remains the only historical truth.
+
+Every ready grouped/standing snapshot carries an opaque `activityVersion`: strict
+base64url JSON binding the Space, active generation and source generation. It is a
+consistency identity, not a capability, MAC or authorization token. `through` is a
+decimal source ordinal and is null only for a ready journal with no rows. A first
+baseline advances it without creating a group. Semantic rewrites change the model
+lease and return `409 activity_projection_stale` to an older caller; rebuild returns
+retryable `503 activity_projection_rebuilding` rather than partial counts.
+
+File-backed SQLite runs rebuild/GC and unbounded standing Note/Folder/None reads on
+one dedicated Activity worker connection. The main process still owns scheduler
+priority, readiness, authorization and current-location joins; bounded day/detail/raw
+reads remain on their existing path. This is a containment boundary for synchronous
+`node:sqlite`, not another source of truth: the worker consumes the same durable
+source-order/generation protocol, uses ten-row interactive rebuild/GC write units and
+can be restarted from the persisted cursor. In-memory SQLite remains the local reference
+implementation; PostgreSQL remains bounded and in-process.
+
 ## Strict restore
 
 Restore is a persisted idempotent operation, not a best-effort `write()` wrapper. It

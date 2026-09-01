@@ -2,6 +2,9 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { expect, it } from 'vitest'
+
+import type { RevisionInput } from '@notarium/core'
 
 import { SqliteMetaDb } from '../../packages/server/src/services/metaDb/sqliteMetaDb'
 import { describeAbilityAvailabilityContract } from './abilityAvailabilityContract'
@@ -222,6 +225,67 @@ describeRevisionPersistenceContract('SQLite', async () => {
   }
 })
 
+it('keeps bounded raw events available while every grouped SQLite read rebuilds', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'notarium-activity-rebuilding-'))
+  const path = join(dir, 'meta.sqlite')
+  const db = new SqliteMetaDb(path)
+  const revision: RevisionInput = {
+    noteId: 'note-a',
+    space: 'space-a',
+    baseRevisionId: null,
+    theirRevisionId: null,
+    sourceRevisionId: null,
+    kind: 'write',
+    entryRole: 'origin',
+    principal: 'user:alice',
+    contentHash: 'hash-a',
+    title: 'A',
+    class: 'user-doc',
+    slug: null,
+    tags: [],
+    createdAt: '2026-08-30T00:00:00.000Z',
+    charsAdded: 1,
+    charsRemoved: 0,
+  }
+
+  try {
+    const stored = await db.revisions.append(revision, 'a')
+    const raw = new DatabaseSync(path)
+
+    try {
+      raw.prepare("UPDATE note_revisions SET integrity = 'quarantined' WHERE id = ?").run(stored.id)
+    } finally {
+      raw.close()
+    }
+
+    await expect(
+      db.revisions.activityGroupsByNote('space-a', {
+        from: '2026-08-29T00:00:00.000Z',
+        to: '2026-08-31T00:00:00.000Z',
+      }),
+    ).rejects.toMatchObject({ reason: 'activity_projection_rebuilding', isUnavailable: true })
+    const bounded = await db.revisions.activityEvents('space-a', {
+      from: '2026-08-29T00:00:00.000Z',
+      to: '2026-08-31T00:00:00.000Z',
+      offset: 0,
+      limit: 10,
+    })
+
+    expect(bounded.total).toBe(1)
+    expect(bounded).not.toHaveProperty('activityLease')
+    expect(await db.revisions.prepareActivityProjection('space-a')).toEqual({
+      state: 'rebuilding',
+    })
+    await expect(db.revisions.maintainActivityProjection('space-a')).resolves.toMatchObject({
+      state: 'ready',
+      published: true,
+    })
+  } finally {
+    await db.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 describeCausalMetadataContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
   return {
@@ -354,5 +418,61 @@ describeLegacyNameAliasesContract('SQLite', async () => {
       await beta.close()
       rmSync(dir, { recursive: true, force: true })
     },
+  }
+})
+
+it('serves cumulative Activity integers above Number.MAX_SAFE_INTEGER as exact decimals', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'notarium-activity-bigint-'))
+  const path = join(dir, 'meta.sqlite')
+  const db = new SqliteMetaDb(path)
+  const exact = 9_007_199_254_740_993n
+
+  try {
+    await db.revisions.append(
+      {
+        noteId: 'note-bigint',
+        space: 'alpha',
+        baseRevisionId: null,
+        theirRevisionId: null,
+        sourceRevisionId: null,
+        kind: 'write',
+        entryRole: 'origin',
+        principal: 'user:viewer',
+        contentHash: null,
+        title: 'BigInt Activity',
+        class: 'user-doc',
+        slug: null,
+        tags: [],
+        createdAt: '2026-08-31T00:00:00.000Z',
+        charsAdded: 1,
+        charsRemoved: 0,
+      },
+      null,
+    )
+    const raw = new DatabaseSync(path)
+
+    try {
+      raw
+        .prepare(
+          `UPDATE activity_note_actor_states
+              SET event_count = ?, chars_added_sum = ?, chars_added_known = 1
+            WHERE space = 'alpha'`,
+        )
+        .run(exact, exact)
+    } finally {
+      raw.close()
+    }
+    const result = await db.revisions.activityGroupsByNote('alpha', {})
+
+    expect(result.items).toHaveLength(1)
+    expect(result.items[0]).toMatchObject({
+      noteId: 'note-bigint',
+      count: String(exact),
+      charsAdded: String(exact),
+      lastSourceOrdinal: '1',
+    })
+  } finally {
+    await db.close()
+    rmSync(dir, { recursive: true, force: true })
   }
 })
