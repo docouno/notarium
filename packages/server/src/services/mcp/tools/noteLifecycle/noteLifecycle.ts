@@ -9,7 +9,9 @@ import {
 } from '@notarium/contract/tools'
 import {
   applyEdit,
+  directoryOf,
   editNote,
+  isFolderPageOf,
   parseViewDocument,
   patchViewConfig,
   sameViewCarriers,
@@ -17,8 +19,10 @@ import {
 
 import { safeRelAddress } from '../../../../libs/relPath'
 import { prepareFieldWrite } from '../../../fields'
+import { claimFolderIdentity, folderPageNoteOf, rehomeFolderPagePin } from '../../../projects'
 import { type Handler, ToolFailure } from '../../gateway'
 import { dedupedWrite, wireSpace, writeEcho, type WriteRun } from '../../helpers/dedup'
+import { reservedFolderPageError, resolvesToFolderPage } from '../../helpers/folderPage'
 import { mcpNoteMutationOptions, openMcpNoteDoor } from '../../helpers/noteDoor'
 import { notePath, projectLabelForNote } from '../../helpers/projectAddressing'
 import { writeAttributionOf } from '../../helpers/writeAttribution'
@@ -230,20 +234,86 @@ export const handleMoveNote: Handler = async (ctx, rawArgs) => {
   }
   const base = current.includes('/') ? current.slice(current.lastIndexOf('/') + 1) : current
   const dest = folder ? `${folder}/${base}` : base
+  // Moving a page re-homes a folder's cover, so this is the LAST door to the reserved
+  // basename: the file keeps its name, which is what makes the destination's page out
+  // of it. The move itself stays legal — a plain `mv` on disk does the same thing and
+  // the read surface reports the result honestly. What the pre-check buys is the ANSWER
+  // on a collision: the store refuses a taken destination with a bare
+  // `# Move Failed: a note already lives at the destination`, which names neither the
+  // page nor a way forward. This is the same refusal the create door gives, before any
+  // mutation. A racing create between here and the move still gets the store's raw
+  // refusal — honest, just terser — and nothing is written either way: the id is minted
+  // in the move's `finalize`, which a refused move never reaches.
+  const isPage = isFolderPageOf(current, note.class)
+  const rehomed = isPage && folder !== directoryOf(current)
+
+  if (rehomed && (await folderPageNoteOf(hit.store, folder))) {
+    throw new ToolFailure(
+      `\`${folder || '(root)'}\` already has a Folder page — read it with get_note and change ` +
+        'it with edit_note, or move this page somewhere without one.',
+    )
+  }
   // Renames the file + UPDATEs the row in place; a no-op move (already at dest)
   // is a silent success. canon: docs/core.md#identity
-  await hit.store.move({ id: noteId, destinationPath: dest }, mcpNoteMutationOptions)
+  // The destination folder now has an authored cover, which is the condition that mints
+  // its id and pins it into an active project — so the move ADOPTS it, exactly as a
+  // create would. Only on a REAL re-homing: a move to where the page already sits must
+  // stay the no-op the tool promises, or repeating it would quietly undo a deliberate
+  // manual unpin.
+  const adopt =
+    rehomed && ctx.projects && ctx.folders
+      ? {
+          store: hit.store,
+          projects: ctx.projects,
+          folders: ctx.folders,
+          markerStore: ctx.markerStore,
+          now: ctx.now,
+          attribution: writeAttributionOf(ctx),
+          onPostPrimaryError: (error: unknown) =>
+            console.error('[mcp] folder page adoption failed ->', (error as Error)?.message),
+        }
+      : undefined
+  const moved = await hit.store.move(
+    { id: noteId, destinationPath: dest },
+    {
+      ...mcpNoteMutationOptions,
+      // The id is minted inside the move's own claim, but AFTER the move: `finalize` is
+      // the only hook where both halves of the precondition hold. A marker write is
+      // metadata for a folder that already exists — it never provisions one — and the
+      // destination folder may not exist until this very move creates it. `prepare`
+      // would therefore mint nothing for a new folder, and would leave a row behind for
+      // one that never received the note if anything later in the move refused.
+      ...(adopt
+        ? { finalize: () => claimFolderIdentity(adopt, { space: hit.space, folderPath: folder }) }
+        : {}),
+    },
+  )
+  const landed = moved.filePath ?? dest
+
+  if (adopt) {
+    // One decision for both ends: the tag says "this note is that project's overview", and
+    // a move can make that false as easily as true. It rewrites the moved note's OWN tags,
+    // so it cannot nest inside that note's mutation claim — post-primary and best-effort,
+    // the same boundary the create door draws around its auto-pin.
+    await rehomeFolderPagePin(adopt, {
+      space: hit.space,
+      from: directoryOf(current),
+      to: folder,
+      noteId,
+    })
+  }
   const personal = await ctx.personalSpace()
-  // hit.space is the opaque id; wire label + project labeller take the slug.
-  // `dest` is the authoritative new path (no re-read needed).
+  // hit.space is the opaque id; wire label + project labeller take the slug. The path
+  // comes from the store's own answer — it is the authority on where the note ended up;
+  // `dest` is only the fallback for a store that does not report one.
   const spaceSlug = ctx.spaces.slugOf(hit.space) ?? hit.space
   const projectHandle = projectLabelForNote(
     spaceSlug,
-    dest,
+    landed,
     note.class,
     await ctx.projectsInSpace(hit.space),
   )
-  const path = notePath(dest)
+  const path = notePath(landed)
   const structured: Record<string, unknown> = {
     noteId,
     ...(hit.space === personal ? {} : { space: spaceSlug }),
@@ -271,6 +341,20 @@ export const handleRenameNote: Handler = async (ctx, rawArgs) => {
   const projectsHere = await ctx.projectsInSpace(hit.space)
   const labelFor = (filePath: string | null | undefined) =>
     projectLabelForNote(spaceSlug, filePath, note.class, projectsHere)
+
+  // A rename recomputes the storage path from the new title, so it is a door to a
+  // folder page: an ordinary note retitled `Index` would BECOME its folder's cover,
+  // with no folder identity minted and no active-project pin. A note that is already a
+  // page keeps renaming freely — the engine pins its basename. Asked of user-docs only:
+  // a hidden-class note lives in a dot-namespaced mount, where `index.md` is somebody's
+  // memory category and no folder's cover.
+  if (
+    !isFolderPageOf(note.filePath, note.class) &&
+    (note.class ?? NOTE_CLASS.userDoc) === NOTE_CLASS.userDoc &&
+    resolvesToFolderPage(title)
+  ) {
+    throw reservedFolderPageError('rename')
+  }
 
   // No-op: title unchanged. Skip the write to avoid an empty alias / needless revision.
   if (note.title === title) {

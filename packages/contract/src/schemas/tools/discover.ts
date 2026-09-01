@@ -7,7 +7,7 @@ import {
 } from '../primitives'
 import { fieldFilterQueryFields } from '../rest/notes'
 import { locationFields, sessionField } from './_fields'
-import { FolderEntrySchema, ProjectHandleSchema } from './primitives'
+import { FolderEntrySchema, FolderPageSlotSchema, ProjectHandleSchema } from './primitives'
 
 /** Tool `list_notes`: `ls` a folder — its direct notes + subfolders, paginated.
  *  canon: docs/mcp-gateway.md#tools */
@@ -39,11 +39,15 @@ export const ListNotesItemSchema = z.object({
 })
 
 /** list_notes' payload: `items` (direct notes, title-ordered) + `folders` (direct
- *  subfolders) + `total` (direct-note count before the page slice). */
+ *  subfolders) + `total` (direct-note count before the page slice) + `folderPage`
+ *  (the listed folder's cover, present or missing — never an item, never in
+ *  `total`, and identical on every page of a filtered/paged listing).
+ *  Absent entirely when the listed path holds no folder at all. */
 export const ListNotesOutputSchema = z.object({
   items: z.array(ListNotesItemSchema),
   folders: z.array(FolderEntrySchema),
   total: z.number().int(),
+  folderPage: FolderPageSlotSchema.optional(),
   nextCursor: z.string().optional(),
 })
 

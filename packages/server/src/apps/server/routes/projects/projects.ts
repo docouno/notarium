@@ -15,11 +15,12 @@ import {
   RemoveResponseSchema,
 } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
-import { decodeAbilityLocator, folderPageFilePath } from '@notarium/core'
+import { decodeAbilityLocator } from '@notarium/core'
 
 import { withAuthors } from '../../../../libs/authors'
 import { safeRelAddress, safeRelPath } from '../../../../libs/relPath'
 import {
+  folderPageNoteOf,
   markFolderAsProject,
   projectSummaryOf,
   renameProjectSlug,
@@ -111,8 +112,7 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
         throw err
       }
     }
-    const pageFile = folderPageFilePath(safe)
-    const page = (await store.list()).find((note) => note.id && note.filePath === pageFile)
+    const page = await folderPageNoteOf(store, safe)
     let openTransition!: (created: boolean) => void
     const transition = new Promise<boolean>((resolve) => {
       openTransition = resolve
@@ -141,7 +141,7 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
       if (pinOutcome && !pinOutcome.ok) {
         req.log.error(
           { err: pinOutcome.error, noteId: page?.id },
-          '[projects] project overview auto-pin cleanup failed after mark error',
+          '[projects] project folder-page auto-pin cleanup failed after mark error',
         )
       }
       throw err
@@ -152,7 +152,7 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
     if (pinOutcome && !pinOutcome.ok) {
       req.log.error(
         { err: pinOutcome.error, noteId: page?.id },
-        '[projects] project overview auto-pin failed after mark',
+        '[projects] project folder-page auto-pin failed after mark',
       )
     }
 

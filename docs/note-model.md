@@ -472,7 +472,11 @@ the read-model's path fence and any capability-backed boot heal, so no two of th
 different destination for one write. Its rungs, in order: an explicit `fileName`
 (import #11, a folder page's `index`), else the title's slug, else — when the title has
 no letters at all (emoji, punctuation) — an id-derived handle, which is why the id is
-settled BEFORE the path is predicted for such a create.
+settled BEFORE the path is predicted for such a create. Because the formula resolves the
+title too, `index` is reserved at the RESOLVED basename on the agent surface: a folder
+page is an ordinary `user-doc` note whose name gives it a structural role, so it may be
+minted only through its own lifecycle, never by naming a note `Index`
+([folder-page.md](folder-page.md#agent-surface-mcp-415)).
 
 A TITLE-derived name is clipped to a UTF-8 BYTE budget (a limit in characters would
 pass a CJK title that `ENAMETOOLONG`s), set at what genuinely does not fit rather than

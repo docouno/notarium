@@ -225,7 +225,7 @@ describe('context order (#210)', () => {
     expect(profile.alwaysLoad.map((n) => n.noteId)).toEqual(['c1', 'c2', 'h2', 'h1'])
   })
 
-  it('keeps the overview marker when an ordered set wins dedup against a loose pin', async () => {
+  it('keeps the folder-page marker when an ordered set wins dedup against a loose pin', async () => {
     const cookie = await loginCookie('sam', 'sam-password-1')
     const setId = await makeSet(cookie, 'conventions', 'Canon', [['conventions', 'c1']])
     expect((await send('PUT', `/api/me/context-sets/${setId}`, cookie)).statusCode).toBe(200)
@@ -253,10 +253,10 @@ describe('context order (#210)', () => {
     expect(
       (
         ctx.sets as Array<{
-          items: Array<{ noteId: string; folderOverview?: true }>
+          items: Array<{ noteId: string; folderPage?: true }>
         }>
       )[0].items,
-    ).toEqual([expect.objectContaining({ noteId: 'c1', folderOverview: true })])
+    ).toEqual([expect.objectContaining({ noteId: 'c1', folderPage: true })])
   })
 
   it('reorders the ITEMS inside a set (a home-space write) — the item order follows on the wire', async () => {

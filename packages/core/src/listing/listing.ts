@@ -15,8 +15,9 @@ import type {
 } from '../knowledgeStore'
 import { BUCKET_GRAN, DATE_FIELD, DEPTH, NOTE_SORT, SORT_DIR } from '../knowledgeStore'
 import { compileFieldFilterEvaluator, FIELD_MATCH_STATE } from '../libs/fields'
-import { directoryOf, isFolderPageNote } from '../libs/path'
+import { directoryOf } from '../libs/path'
 import { buildTagFacet, matchesTags } from '../libs/tags'
+import { isFolderPageOf } from '../visibility'
 import type {
   BucketCounts,
   NotesWindow,
@@ -261,7 +262,7 @@ export const treeSummary = (
   let pages = 0
 
   for (const n of notes) {
-    if (isFolderPageNote(n.filePath)) {
+    if (isFolderPageOf(n.filePath, n.class)) {
       if (n.id) {
         pageOf.set(directoryOf(n.filePath), n.id)
       }
@@ -348,7 +349,7 @@ export const treeChildren = (
   const pageOf = new Map<string, string>()
 
   for (const n of notes) {
-    if (isFolderPageNote(n.filePath)) {
+    if (isFolderPageOf(n.filePath, n.class)) {
       if (n.id) {
         pageOf.set(directoryOf(n.filePath), n.id)
       }

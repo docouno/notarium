@@ -465,9 +465,9 @@ move-failure and identity rules survived the engine swap, the pruning rule did n
 6. **A folder gets a LAZY stable identity on its first rename/move (#100 phase 3).** A
    plain folder has no id until it needs one; the first `/move-folder` mints a
    stable folder-id and records the OLD path in the folder's **path-history**
-   (`recordFolderRename`). (Creating a folder PAGE is the OTHER lazy-mint trigger —
-   `ensureFolderIdentity`, #212, so the durable `/folder/<id>` is addressable; see
-   [folder-page.md](folder-page.md).) Identity lives SERVER-side: a `.notariummeta` marker
+   (`recordFolderRename`). (Creating a folder PAGE mints one too —
+   `ensureFolderIdentity`, #212, so the durable `/folder/<id>` is addressable — as do favoriting a
+   folder and marking it a project; see [folder-page.md](folder-page.md).) Identity lives SERVER-side: a `.notariummeta` marker
    (the same dotfile as a project, now carrying `type: 'folder'` + `pathAliases`,
    so it travels with the folder and survives a re-clone) + a row in the shared
    `folders` meta-DB table (a project is a `type='project'` row of the SAME table).

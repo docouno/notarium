@@ -5,11 +5,19 @@ import {
   type AgentSession,
   type DeltaEntry,
   type FolderEntry,
+  type PresentFolderPage,
   type RecentAgentSession,
   type StartSessionInput,
   type UseRoleOutput,
 } from '@notarium/contract/tools'
-import { buildMemoryIndex, isPathUnder, READ_SCOPE, treeChildren } from '@notarium/core'
+import {
+  buildMemoryIndex,
+  folderPageFilePath,
+  isFolderPageOf,
+  isPathUnder,
+  READ_SCOPE,
+  treeChildren,
+} from '@notarium/core'
 
 import { AGENT_SESSION_IDLE_MS, type StartAgentSessionRequest } from '../../../agentSessions'
 import { can, type Principal } from '../../../authz'
@@ -139,6 +147,9 @@ const buildProjectBundle = async (
   index: { noteCount: number; folders: FolderEntry[] }
   delta: { changes: DeltaEntry[]; total: number; truncated?: boolean }
   knownValues: { categories: string[]; tags: string[] }
+  /** The project root's page, only when it EXISTS (see the schema: bootstrap never
+   *  reports a missing one). */
+  folderPage?: PresentFolderPage
   /** The folder list hit INDEX_FOLDERS_LIMIT; folded into the top-level `truncated`. */
   indexTruncated: boolean
 }> => {
@@ -173,9 +184,31 @@ const buildProjectBundle = async (
   const folders: FolderEntry[] = childFolders
     .slice(0, INDEX_FOLDERS_LIMIT)
     .map((f) => ({ path: f.path, name: sanitizeText(f.name), count: f.count }))
-  const index = { noteCount: visible.length, folders }
+  // Folder pages are covers, not contents: `folders[].count` never counted them and
+  // `list_notes.total` no longer does either, so the one number left on the old side
+  // would have contradicted both of its neighbours inside this very response.
+  const index = {
+    noteCount: visible.filter((m) => !isFolderPageOf(m.filePath, m.class)).length,
+    folders,
+  }
 
   const indexTruncated = childFolders.length > INDEX_FOLDERS_LIMIT
+  // The project root's authored page, if the project has one. A project IS an
+  // identified folder, so its own id is the folder id — no registry lookup. Only the
+  // marker travels: the body still arrives through the ordinary always-load pin, so a
+  // manual unpin keeps working and an unpinned page costs no startup tokens.
+  const rootPage = allInSpace.find(
+    (m) => m.filePath === folderPageFilePath(hinted.path) && isFolderPageOf(m.filePath, m.class),
+  )
+  const folderPage: PresentFolderPage | undefined = rootPage?.id
+    ? {
+        status: 'present',
+        folderPath: hinted.path,
+        folderId: hinted.id,
+        noteId: rootPage.id,
+        title: sanitizeText(rootPage.title),
+      }
+    : undefined
 
   // Journal-backed; a bare engine without it degrades to an empty delta (P5).
   const cursorKey = hinted.id
@@ -243,6 +276,7 @@ const buildProjectBundle = async (
     index,
     delta: { changes, total, ...(truncated ? { truncated: true } : {}) },
     knownValues,
+    ...(folderPage ? { folderPage } : {}),
     indexTruncated,
   }
 }
@@ -512,6 +546,7 @@ export const handleStartSession: Handler = async (ctx, rawArgs) => {
           project: {
             index: bundle.index,
             alwaysLoad: projectAlwaysLoad ?? [],
+            ...(bundle.folderPage ? { folderPage: bundle.folderPage } : {}),
             delta: bundle.delta,
             knownValues: bundle.knownValues,
           },

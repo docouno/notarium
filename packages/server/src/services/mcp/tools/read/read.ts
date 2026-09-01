@@ -3,6 +3,7 @@
 import { NOTE_CLASS, NOTE_SORT, parseFieldFilter, VIEW_AGENT_ROW_MAX } from '@notarium/contract'
 import {
   type FolderEntry,
+  type FolderPageSlot,
   type GetNoteInput,
   type GetNoteView,
   type ListNotesInput,
@@ -17,12 +18,17 @@ import {
 } from '@notarium/contract/tools'
 import {
   createReaderRegistry,
+  directoryOf,
+  folderPageFilePath,
   FrontmatterLimitError,
   type Graph,
+  isFolderPageNote,
+  isFolderPageOf,
   isPathUnder,
   listHeadings,
   memoryDirOf,
   type NoteClass,
+  type NoteMeta,
   parseBodyFrontmatterBlock,
   parseViewDocument,
   queryNotes,
@@ -34,18 +40,22 @@ import {
 } from '@notarium/core'
 
 import { safeRelAddress } from '../../../../libs/relPath'
+import { can } from '../../../authz'
 import { fieldDayFilterError } from '../../../fields'
 import { type ProjectRecord } from '../../../metaDb'
+import { folderExists } from '../../../projects'
 import { type SpaceStore } from '../../../spaces'
 import { ViewExecutionService } from '../../../views/execution'
 import { VIEW_SOURCE_REGISTRY } from '../../../views/registry'
 import { viewCacheScope } from '../../../views/sourceRegistry'
 import { projectReaderView } from '../../../views/viewProjection'
 import { type Handler, ToolFailure } from '../../gateway'
+import { folderPageMarker } from '../../helpers/folderPage'
 import { openMcpNoteDoor } from '../../helpers/noteDoor'
 import { handleOf, notePath, projectLabelForNote } from '../../helpers/projectAddressing'
 import { projectProvenance } from '../../helpers/provenance'
 import {
+  type CreateUnavailable,
   renderListNotes,
   renderNote,
   renderRecentActivity,
@@ -355,6 +365,11 @@ export const handleGetNote: Handler = async (ctx, rawArgs) => {
     await ctx.projectsInSpace(hit.space),
   )
   const path = notePath(note.filePath)
+  // A page is an ordinary note everywhere except in what it MEANS: `class`/`path`
+  // cannot say "this note is the body of its folder", so the role rides explicitly.
+  const folderPage = isFolderPageOf(note.filePath, note.class)
+    ? await folderPageMarker(ctx, hit.space, directoryOf(note.filePath as string))
+    : undefined
   // Detailed also surfaces the heading outline (valid replaceSection targets); the shared
   // body-frontmatter reader keeps rule-fenced prose visible to both operations.
   // and graph edges. agent-memory notes aren't graph nodes → empty links, honest.
@@ -385,6 +400,7 @@ export const handleGetNote: Handler = async (ctx, rawArgs) => {
     ...(projectHandle ? { project: projectHandle } : {}),
     ...(path ? { path } : {}),
     ...(note.class ? { class: note.class } : {}),
+    ...(folderPage ? { folderPage } : {}),
     // CachedStore is CAS-capable and always answers a token; '' only on a bare
     // engine that would not be on this surface.
     versionToken: note.versionToken ?? '',
@@ -516,9 +532,10 @@ export const handleListNotes: Handler = async (ctx, rawArgs) => {
   let space: string
   let base = '' // project root (space-relative); '' = personal domain / root project
   let handle: string | undefined
+  let rec: ProjectRecord | undefined
 
   if (project) {
-    const rec = await ctx.resolveProject(project)
+    rec = await ctx.resolveProject(project)
     space = rec.space
     base = rec.path
     handle = handleOf(rec, ctx.spaces.slugOf(rec.space) ?? rec.space)
@@ -567,7 +584,15 @@ export const handleListNotes: Handler = async (ctx, rawArgs) => {
   const store = await ctx.spaces.store(space)
   const spaceNotes = (await store.list({ scope: READ_SCOPE.user })).filter((m) => m.id != null)
   const dirs = store.listDirs ? await store.listDirs() : []
-  const direct = queryNotes(spaceNotes, {
+  // The folder's PAGE is its cover, not one of its children: it is lifted out of the
+  // population BEFORE any tag/field filter, cursor or `total`, so the slot below reads
+  // the same on every page of a filtered listing — and never doubles as an item.
+  // canon: docs/folder-page.md#model
+  const pageNote = spaceNotes.find(
+    (m) => m.filePath === folderPageFilePath(folder) && isFolderPageOf(m.filePath, m.class),
+  )
+  const contentNotes = spaceNotes.filter((m) => !isFolderPageNote(m.filePath))
+  const direct = queryNotes(contentNotes, {
     sort: NOTE_SORT.title,
     offset: 0,
     folder,
@@ -602,9 +627,93 @@ export const handleListNotes: Handler = async (ctx, rawArgs) => {
     .map((f) => ({ path: f.path, name: sanitizeText(f.name), count: f.count }))
 
   const nextCursor = offset + limit < total ? String(offset + limit) : undefined
-  const structured = { items, folders, total, ...(nextCursor ? { nextCursor } : {}) }
-  const markdown = renderListNotes(items, folders, total, folder)
+  const folderPage = await folderPageSlot(ctx, {
+    space,
+    store,
+    folder,
+    base,
+    handle,
+    rec,
+    pageNote,
+    seen: { notes: spaceNotes, dirs },
+  })
+  const structured = {
+    items,
+    folders,
+    total,
+    ...(folderPage ? { folderPage } : {}),
+    ...(nextCursor ? { nextCursor } : {}),
+  }
+  // Why the slot carries no action, when it carries none: prose must not tell an owner
+  // browsing their own personal domain that creating a page is beyond them.
+  const unavailable: CreateUnavailable | undefined =
+    folderPage?.status === 'missing' && !folderPage.createWith
+      ? can(ctx.principal, 'space:write', { space })
+        ? 'unaddressed'
+        : 'no-write'
+      : undefined
+  const markdown = renderListNotes(items, folders, total, folder, folderPage, unavailable)
   return { markdown, structured }
+}
+
+/** The listed folder's page slot — present, missing, or ABSENT when no such folder
+ *  exists. A path nobody ever created must not read as "a folder still lacking its
+ *  page": that would invent a folder to author into. The listing itself keeps its
+ *  existing behaviour on a ghost path (an empty listing, not a new error) — the slot
+ *  is simply not published. */
+const folderPageSlot = async (
+  ctx: Parameters<Handler>[0],
+  input: {
+    space: string
+    store: SpaceStore
+    folder: string
+    base: string
+    handle?: string
+    rec?: ProjectRecord
+    pageNote?: { id?: string | null; title: string }
+    /** What this listing already read, so the common case costs no second scan. */
+    seen: { notes: readonly NoteMeta[]; dirs: readonly string[] }
+  },
+): Promise<FolderPageSlot | undefined> => {
+  const { space, store, folder, base, handle, rec, pageNote, seen } = input
+
+  // The resolved base (project root / personal domain root) exists by construction.
+  // Below it, answer from the snapshot this call already loaded whenever that is
+  // enough: its user-scope notes are a SUBSET of the shared predicate's population and
+  // `dirs` is the same list, so a hit here is a hit there — it can only save the second
+  // full read, never disagree with it. A miss falls through to the shared helper, the
+  // only one that also sees a folder carrying nothing but hidden-class content.
+  const seenHere =
+    folder === base ||
+    seen.dirs.includes(folder) ||
+    seen.notes.some((note) => isPathUnder(note.filePath, folder))
+
+  if (!seenHere && !(await folderExists(store, folder))) {
+    return undefined
+  }
+  const marker = await folderPageMarker(ctx, space, folder)
+
+  if (pageNote?.id) {
+    return {
+      status: 'present',
+      ...marker,
+      noteId: pageNote.id,
+      title: sanitizeText(pageNote.title),
+    }
+  }
+  // The create action is offered only where it is actually expressible: this listing
+  // was addressed through a project handle AND the credential may write there. It is
+  // a convenience, never authority — create re-resolves all of it.
+  const writable = Boolean(rec && handle) && can(ctx.principal, 'space:write', { space })
+  const createWith = writable
+    ? {
+        project: handle!,
+        ...(folder === rec!.path ? {} : { path: folder }),
+        folderPage: true as const,
+      }
+    : undefined
+
+  return { status: 'missing', ...marker, ...(createWith ? { createWith } : {}) }
 }
 
 export const handleRecentActivity: Handler = async (ctx, rawArgs) => {

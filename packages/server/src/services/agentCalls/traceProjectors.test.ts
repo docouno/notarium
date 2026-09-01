@@ -46,6 +46,26 @@ describe('agent call trace projections', () => {
     expect(edit.compact).toMatchObject({ ref: 'note-a', contentBytes: secret.length })
   })
 
+  it('keeps a folder-page create distinguishable from an ordinary one', () => {
+    const page = traceInputOf(
+      'create_note',
+      { project: 'acme', path: 'docs', folderPage: true, body: '# Docs' },
+      true,
+    )
+    const ordinary = traceInputOf(
+      'create_note',
+      { project: 'acme', path: 'docs', body: '# Docs' },
+      true,
+    )
+
+    // Both calls title through the body, so neither sends a `title` argument: without the
+    // selector they project to the same row, and the one door that mints a folder identity
+    // and can add an active project's always-load body reads as an ordinary create.
+    expect(page.compact).toMatchObject({ project: 'acme', path: 'docs', folderPage: true })
+    expect(ordinary.compact).not.toHaveProperty('folderPage')
+    expect(page.compact).not.toEqual(ordinary.compact)
+  })
+
   it('normalizes invalid shape/issues without retaining arbitrary values or messages', () => {
     const secret = 'INVALID_VALUE_MUST_NOT_SURVIVE'
     const shape = inputShapeOf(

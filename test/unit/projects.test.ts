@@ -761,6 +761,36 @@ describe('markFolderAsProject (#13)', () => {
     },
   )
 
+  it('adopts a folder identity that already sits on the SPACE ROOT', async () => {
+    const projects = new InMemoryProjects()
+    const folders = new InMemoryFolders(projects)
+    // A registry-only host (no marker store): the id can only come from the folder row.
+    // Writing a page at the root identifies it, so the root arrives at the mark already
+    // carrying an identity, exactly like any other folder.
+    const folderId = await ensureFolderIdentity(
+      { projects, folders, now },
+      {
+        space: 's',
+        folderPath: '',
+      },
+    )
+    expect(folderId).toMatch(/^[A-Za-z0-9_-]{12}$/)
+
+    const rec = await markFolderAsProject(
+      { projects, folders, now },
+      { space: 's', folderPath: '', displayName: 'Root' },
+    )
+
+    // The mark must FLIP that row rather than mint a second one for the same
+    // (space, path): a real driver refuses the duplicate on its shared unique index, and
+    // the boot scan that would prune a stale folder row needs a marker store — which a
+    // host taking this branch does not have — so the space could never be marked again.
+    // `''` is falsy, which is how the root slipped out of the adoption.
+    expect(rec.id).toBe(folderId)
+    expect(await folders.byPath('s', '')).toBeNull()
+    expect((await projects.listForSpace('s')).map((p) => p.id)).toEqual([folderId])
+  })
+
   itAnchoredMarkerWrite(
     'is idempotent: a re-mark reuses the marker id+createdAt, no duplicate',
     async () => {
@@ -882,7 +912,7 @@ describe('markFolderAsProject (#13)', () => {
   )
 })
 
-describe('ensureFolderIdentity (#212 — the page-create lazy-mint path)', () => {
+describe('ensureFolderIdentity (#212 — the shared lazy-mint path)', () => {
   const deps = () => {
     const projects = new InMemoryProjects()
     const folders = new InMemoryFolders(projects)
@@ -900,6 +930,21 @@ describe('ensureFolderIdentity (#212 — the page-create lazy-mint path)', () =>
       expect(await d.folders.byPath('s', 'docs')).toMatchObject({ id, path: 'docs' })
       const onDisk = parseMarker(readFileSync(join(dir, 'docs', '.notariummeta'), 'utf8'))
       expect(onDisk).toMatchObject({ id, type: 'folder' })
+    },
+  )
+
+  itAnchoredMarkerWrite(
+    'mints NOTHING for a folder that does not exist yet — the marker cannot create one',
+    async () => {
+      const d = deps()
+
+      // The reason a page move mints its destination's id from the move's `finalize`
+      // rather than its `prepare`: a marker is metadata ABOUT a folder and never
+      // provisions one, so before the mutation lands there may be no folder to mark.
+      await expect(
+        ensureFolderIdentity(d, { space: 's', folderPath: 'not-yet' }),
+      ).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await d.folders.byPath('s', 'not-yet')).toBeNull()
     },
   )
 

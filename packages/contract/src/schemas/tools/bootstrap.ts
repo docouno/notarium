@@ -13,6 +13,7 @@ import { NextAbilityActionSchema, RuntimeAbilitySummarySchema } from './abilitie
 import {
   CapabilitiesSchema,
   FolderEntrySchema,
+  PresentFolderPageSchema,
   ProjectHandleSchema,
   ProjectSummarySchema,
   RESPONSE_FORMAT,
@@ -161,6 +162,11 @@ export const StartSessionOutputSchema = z.object({
       /** The curated always-load notes of THIS project (user-docs tagged
        *  `always-load`) — the per-project axis vs the personal `profile.alwaysLoad`. */
       alwaysLoad: z.array(z.object({ noteId: z.string(), title: z.string() })),
+      /** The project root's authored Folder page, when it EXISTS. Deliberately
+       *  present-only: a missing page is a capability discovered by listing the
+       *  folder, never a startup to-do. Being marked here does not load the body —
+       *  that stays the `alwaysLoad` pin's job. */
+      folderPage: PresentFolderPageSchema.optional(),
       delta: DeltaSchema,
       /** The vocabulary already in use here (so an agent reuses terms, not coins
        *  synonyms): `categories` from agent-memory, `tags` from frontmatter. */

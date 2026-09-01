@@ -86,6 +86,53 @@ export const CapabilitiesSchema = z.object({
   revisions: z.boolean(),
 })
 
+/** The structural role marker a note carries when it IS its folder's page — the
+ *  authored landing note of `folderPath` (stored as that folder's reserved
+ *  `index.md`). `folderId` rides only when the folder actually has a registry
+ *  identity; a page in a never-identified folder is still honestly a page.
+ *  canon: docs/folder-page.md#model */
+export const FolderPageMarkerSchema = z.object({
+  folderPath: z.string(),
+  folderId: z.string().optional(),
+})
+
+/** The exact `create_note` arguments that would author this folder's missing page.
+ *  Server-derived, so a model never builds a folder address itself — but NOT a
+ *  capability token: every create re-resolves project, path, access and folder
+ *  existence from scratch. */
+export const FolderPageCreateActionSchema = z.object({
+  project: ProjectHandleSchema,
+  /** Omitted for the project root — `create_note` reads an absent `path` as "the
+   *  project root", and an empty string is not that. */
+  path: z.string().optional(),
+  folderPage: z.literal(true),
+})
+
+/** The listed folder HAS an authored page: read it by `noteId` with get_note. Its
+ *  storage path is deliberately not repeated — `folderPath` identifies the
+ *  structural owner and the note is addressed by id. */
+export const PresentFolderPageSchema = FolderPageMarkerSchema.extend({
+  status: z.literal('present'),
+  noteId: z.string(),
+  title: z.string(),
+})
+
+/** The listed folder has NO page. This is a capability, not a task: author one only
+ *  when the user asked for folder-level content. `createWith` rides only when this
+ *  credential could actually express the create. */
+export const MissingFolderPageSchema = FolderPageMarkerSchema.extend({
+  status: z.literal('missing'),
+  createWith: FolderPageCreateActionSchema.optional(),
+})
+
+/** `list_notes`' folder-page slot: the ONE structural projection of the listed
+ *  folder's cover note. It is never one of `items` and never counted in `total`.
+ *  canon: docs/mcp-gateway.md#tools */
+export const FolderPageSlotSchema = z.discriminatedUnion('status', [
+  PresentFolderPageSchema,
+  MissingFolderPageSchema,
+])
+
 /** One folder in a directory listing (shared by `list_notes` and `start_session`'s
  *  compact index). `path` is SPACE-relative — feed it back verbatim (never
  *  hand-built) into list_notes / move / create; `count` is the whole-subtree note
@@ -107,6 +154,16 @@ export type WriteResult = z.infer<typeof WriteResultSchema>
 export type Capabilities = z.infer<typeof CapabilitiesSchema>
 
 export type FolderEntry = z.infer<typeof FolderEntrySchema>
+
+export type FolderPageMarker = z.infer<typeof FolderPageMarkerSchema>
+
+export type FolderPageCreateAction = z.infer<typeof FolderPageCreateActionSchema>
+
+export type PresentFolderPage = z.infer<typeof PresentFolderPageSchema>
+
+export type MissingFolderPage = z.infer<typeof MissingFolderPageSchema>
+
+export type FolderPageSlot = z.infer<typeof FolderPageSlotSchema>
 
 export type { ProjectStatus } from '../../consts/primitives'
 export { RESPONSE_FORMAT }

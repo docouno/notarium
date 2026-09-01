@@ -47,6 +47,15 @@ const fixture = (): Fixture => ({
           filePath: 'handbook/index.md',
           content: 'how this folder fits together',
         },
+        // A HIDDEN class sitting on the reserved basename: a memory category that slugs
+        // to `index`. It is nobody's cover, and the audit page must not label it as one.
+        {
+          id: 'conv-memory-index',
+          title: 'index',
+          class: 'agent-memory',
+          filePath: '.notarium/memory/index.md',
+          content: 'remembered, not authored',
+        },
       ],
     },
     {
@@ -59,6 +68,15 @@ const fixture = (): Fixture => ({
           class: 'user-doc',
           filePath: 'web/app.md',
           content: 'the app',
+        },
+        // A cover mallory CAN read: the folder-page role has to survive the projection
+        // built for a reader outside the set's home space.
+        {
+          id: 'prod-overview',
+          title: 'Guides',
+          class: 'user-doc',
+          filePath: 'guides/index.md',
+          content: 'what lives under guides',
         },
       ],
     },
@@ -286,7 +304,7 @@ describe('context sets (#209)', () => {
     expect(always).toContain('conv-b')
   })
 
-  it('marks a readable folder overview carried by a context set', async () => {
+  it('marks a readable folder page carried by a context set', async () => {
     const cookie = await loginCookie('sam', 'sam-password-1')
     const setId = await makeSet(cookie, 'conventions', 'Overview', [
       ['conventions', 'conv-overview'],
@@ -299,10 +317,146 @@ describe('context sets (#209)', () => {
     const ctx = await getJson(`/api/s/product/projects/${PROJECT}/agent-context`, cookie)
     const item = (
       ctx.sets as Array<{
-        items: Array<{ noteId: string; folderOverview?: true }>
+        items: Array<{ noteId: string; folderPage?: true }>
       }>
     )[0].items[0]
-    expect(item).toMatchObject({ noteId: 'conv-overview', folderOverview: true })
+    expect(item).toMatchObject({ noteId: 'conv-overview', folderPage: true })
+  })
+
+  it('names the folder-page role on the audit page too, and stays silent on a degraded row', async () => {
+    const sam = await loginCookie('sam', 'sam-password-1')
+    const setId = await makeSet(sam, 'product', 'Paged covers', [
+      ['conventions', 'conv-overview'],
+      ['product', 'prod-overview'],
+      ['conventions', 'conv-memory-index'],
+    ])
+    const page = await app.inject({
+      method: 'GET',
+      url: `/api/s/product/context-sets/${setId}/items?offset=0&limit=3`,
+      headers: { cookie: sam },
+    })
+
+    expect(page.statusCode).toBe(200)
+    // The audit page is the SECOND source of rows for one expanded set. If it stayed
+    // silent, the same cover would be chipped above the curation stop and plain below it.
+    expect(page.json()).toEqual({
+      total: 3,
+      items: [
+        {
+          sourceIndex: 0,
+          noteId: 'conv-overview',
+          title: 'Conventions',
+          space: 'conventions',
+          folderPage: true,
+        },
+        {
+          sourceIndex: 1,
+          noteId: 'prod-overview',
+          title: 'Guides',
+          space: 'product',
+          folderPage: true,
+        },
+        // The reserved basename inside a hidden mount is a memory category, not a cover —
+        // the same question the MCP marker asks, answered by the same predicate.
+        {
+          sourceIndex: 2,
+          noteId: 'conv-memory-index',
+          title: 'index',
+          space: 'conventions',
+        },
+      ],
+    })
+
+    // …and a row the reader cannot reach says nothing about its role either way.
+    const mallory = await loginCookie('mallory', 'mallory-password-1')
+    const degraded = await app.inject({
+      method: 'GET',
+      url: `/api/s/product/context-sets/${setId}/items?offset=0&limit=1`,
+      headers: { cookie: mallory },
+    })
+
+    expect(degraded.json()).toEqual({
+      total: 3,
+      items: [{ sourceIndex: 0, noteId: 'conv-overview', title: null, space: null }],
+    })
+  })
+
+  it('answers the folder-page question on the audit page without body facts too', async () => {
+    await app.close()
+    let factlessReads = 0
+
+    app = await createApp(fixture(), {
+      configureWorld: ({ slug, store }) => {
+        if (slug !== 'conventions') {
+          return
+        }
+        // A host whose fact accelerator is absent — or whose scan ended in `error`, where
+        // CachedStore.noteFacts answers `{}` — sends EVERY reachable row down the live-read
+        // fallback. That is the configuration in which an unmarked audit page would come
+        // back silently, so the fallback answers the same question as the fast path.
+        vi.spyOn(store, 'noteFacts').mockImplementation(async () => {
+          factlessReads += 1
+          return {}
+        })
+      },
+    })
+    port = await listen(app)
+
+    const sam = await loginCookie('sam', 'sam-password-1')
+    const setId = await makeSet(sam, 'product', 'Factless', [
+      ['conventions', 'conv-overview'],
+      ['conventions', 'conv-memory-index'],
+    ])
+    const page = await app.inject({
+      method: 'GET',
+      url: `/api/s/product/context-sets/${setId}/items?offset=0&limit=2`,
+      headers: { cookie: sam },
+    })
+
+    expect(page.statusCode).toBe(200)
+    expect(page.json()).toEqual({
+      total: 2,
+      items: [
+        {
+          sourceIndex: 0,
+          noteId: 'conv-overview',
+          title: 'Conventions',
+          space: 'conventions',
+          folderPage: true,
+        },
+        { sourceIndex: 1, noteId: 'conv-memory-index', title: 'index', space: 'conventions' },
+      ],
+    })
+    // The rows above are what the FAST path would answer too, so assert the stand was
+    // actually factless. Without this the test would quietly degrade into a duplicate of
+    // its neighbour the day the stub stops binding the store the route reads.
+    expect(factlessReads).toBeGreaterThan(0)
+  })
+
+  it('keeps the folder-page role in the projection built for a reader outside the set home', async () => {
+    const sam = await loginCookie('sam', 'sam-password-1')
+    const setId = await makeSet(sam, 'conventions', 'Covers', [
+      ['conventions', 'conv-overview'],
+      ['product', 'prod-overview'],
+    ])
+    await send('PUT', `/api/s/product/projects/${PROJECT}/context-sets/${setId}`, sam)
+
+    const mallory = await loginCookie('mallory', 'mallory-password-1')
+    const ctx = await getJson(`/api/s/product/projects/${PROJECT}/agent-context`, mallory)
+    const set = (
+      ctx.sets as Array<{
+        homeSpace: string
+        items: Array<{ noteId: string; folderPage?: true; sourceIndex?: number }>
+      }>
+    )[0]
+
+    // The hidden-home branch rebuilds every row field by field instead of spreading it, so
+    // the role has to be carried deliberately. The raw coordinate must NOT be.
+    expect(set.homeSpace).toBe('')
+    expect(set.items).toEqual([
+      expect.objectContaining({ noteId: 'prod-overview', folderPage: true }),
+    ])
+    expect(set.items[0].sourceIndex).toBeUndefined()
   })
 
   it('DEGRADES per reader without exposing raw coordinates from the hidden home', async () => {

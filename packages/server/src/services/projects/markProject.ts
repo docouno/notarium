@@ -70,9 +70,10 @@ const markFolderInner = async (
   const markerReuseId = marker?.id && !owner ? marker.id : undefined
   // A plain folder-identity already at this path: ADOPT its id so the mark flips that
   // row in place (ON CONFLICT(id)→'project'); minting a second row would collide on
-  // the shared UNIQUE(space,path) → 500.
-  const folderRow =
-    !markerReuseId && folders && folderPath ? await folders.byPath(space, folderPath) : null
+  // the shared UNIQUE(space,path) → 500. The space ROOT is such a path like any other —
+  // `''` is falsy, and excluding it here is what made marking the root a permanent 500
+  // once anything had identified it (a page written at the root does exactly that).
+  const folderRow = !markerReuseId && folders ? await folders.byPath(space, folderPath) : null
   const reuseId = markerReuseId ?? folderRow?.id
   const id = reuseId ?? freshNoteId()
   const displayName = input.displayName?.trim() || lastSegment(folderPath) || space

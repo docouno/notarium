@@ -8487,3 +8487,1215 @@ describe('simultaneous idempotencyKey (#341)', () => {
     expect(await bodyOf(bearer, structured(a).noteId as string)).toBe('once\n\nonce')
   })
 })
+
+// #415: a folder's authored page is the folder's COVER, and MCP says so structurally.
+// The pain these prove: before this, `index` arrived as an ordinary item, so an agent
+// browsing a folder could neither tell the cover from a child nor learn that a folder
+// still has none — and it authored a duplicate summary note instead.
+describe('folder page projection (#415)', () => {
+  const createPage = (
+    folderPath: string,
+    bearer: string,
+    body: Record<string, unknown> = {},
+    space = 'team',
+  ) =>
+    app.inject({
+      method: 'POST',
+      url: `/api/s/${space}/folders/page`,
+      headers: { authorization: `Bearer ${bearer}` },
+      payload: { folderPath, ...body },
+    })
+
+  const slotOf = async (
+    args: Record<string, unknown>,
+    bearer: string,
+  ): Promise<Record<string, unknown> | undefined> =>
+    structured(await callTool(port, 'list_notes', args, bearer)).folderPage as
+      Record<string, unknown> | undefined
+
+  it('reports an existing page as a slot, never as one of the folder items', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const child = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', title: 'Doc One', body: 'in docs', path: 'docs' },
+        bearer,
+      ),
+    )
+    const page = await createPage('docs', bearer, { content: '# Docs\n\nSection cover.' })
+    expect(page.statusCode).toBe(201)
+    const pageNoteId = page.json().pageNoteId as string
+
+    const listed = structured(
+      await callTool(port, 'list_notes', { project: 'team', path: 'docs' }, bearer),
+    )
+    const items = listed.items as Array<{ noteId: string }>
+
+    expect(listed.folderPage).toEqual({
+      status: 'present',
+      folderPath: 'docs',
+      folderId: page.json().folderId,
+      noteId: pageNoteId,
+      title: 'Docs',
+    })
+    // The cover is not a child: neither in the window nor in the honest population count.
+    expect(items.map((i) => i.noteId)).toEqual([child.noteId])
+    expect(listed.total).toBe(1)
+    expect(
+      text(await callTool(port, 'list_notes', { project: 'team', path: 'docs' }, bearer)),
+    ).toContain('Folder page: **Docs**')
+  })
+
+  it('offers the exact create action for a page-less folder, and no ghost identity for it', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await callTool(
+      port,
+      'create_note',
+      { project: 'team', title: 'Lone', body: 'x', path: 'research' },
+      bearer,
+    )
+
+    expect(await slotOf({ project: 'team', path: 'research' }, bearer)).toEqual({
+      status: 'missing',
+      folderPath: 'research',
+      createWith: { project: 'team', path: 'research', folderPage: true },
+    })
+    // The PROSE half of the same contract, and the half that costs more when it slips:
+    // a text-only client sees only this, and the one thing standing between "the agent
+    // browsed a folder" and "the agent authored a page nobody asked for" is the warning.
+    const prose = text(
+      await callTool(port, 'list_notes', { project: 'team', path: 'research' }, bearer),
+    )
+    expect(prose).toContain('Create only if the user explicitly asked')
+    expect(prose).toContain('Pass createWith unchanged to create_note')
+    // Parsed, not matched as a substring: the contract is the ACTION, not the order the
+    // server happened to serialise its keys in.
+    const action = /createWith: (\{.*\})/.exec(prose)?.[1]
+    expect(action && JSON.parse(action)).toEqual({
+      project: 'team',
+      path: 'research',
+      folderPage: true,
+    })
+    // Reading a folder must not mint its identity — the page create is the trigger.
+    const folders = (
+      await app.inject({
+        method: 'GET',
+        url: '/api/s/team/tree',
+        headers: { authorization: `Bearer ${bearer}` },
+      })
+    ).json().folders as Array<{ path: string; id?: string }>
+    expect(folders.find((f) => f.path === 'research')?.id).toBeUndefined()
+  })
+
+  it('keeps a marked folder’s id in the missing slot, and omits `path` for the project root', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await callTool(
+      port,
+      'create_note',
+      { project: 'team', title: 'Sub', body: 'x', path: 'guides' },
+      bearer,
+    )
+    const marked = await app.inject({
+      method: 'POST',
+      url: '/api/s/team/projects',
+      headers: { authorization: `Bearer ${bearer}` },
+      payload: { folderPath: 'guides', displayName: 'Guides' },
+    })
+    expect(marked.statusCode).toBe(201)
+
+    expect(await slotOf({ project: 'team/guides' }, bearer)).toEqual({
+      status: 'missing',
+      folderPath: 'guides',
+      folderId: marked.json().id,
+      // The project root is addressed by omitting `path` — an empty string is not that.
+      createWith: { project: 'team/guides', folderPage: true },
+    })
+  })
+
+  it('holds the slot steady across item filters and pagination', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+
+    for (const title of ['One', 'Two', 'Three']) {
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', title, body: 'x', path: 'docs', tags: ['keep'] },
+        bearer,
+      )
+    }
+    const page = await createPage('docs', bearer)
+    const expected = {
+      status: 'present',
+      folderPath: 'docs',
+      folderId: page.json().folderId,
+      noteId: page.json().pageNoteId,
+      title: 'docs',
+    }
+
+    // A filter that no page metadata could satisfy still leaves the slot untouched.
+    expect(await slotOf({ project: 'team', path: 'docs', tag: 'keep' }, bearer)).toEqual(expected)
+    const first = structured(
+      await callTool(port, 'list_notes', { project: 'team', path: 'docs', limit: 2 }, bearer),
+    )
+    expect(first.folderPage).toEqual(expected)
+    expect(first.total).toBe(3)
+    const second = structured(
+      await callTool(
+        port,
+        'list_notes',
+        { project: 'team', path: 'docs', limit: 2, cursor: first.nextCursor },
+        bearer,
+      ),
+    )
+    expect(second.folderPage).toEqual(expected)
+  })
+
+  it('says present in prose for a folder holding ONLY its page', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await callTool(
+      port,
+      'create_note',
+      { project: 'team', title: 'Seed', body: 'x', path: 'solo' },
+      bearer,
+    )
+    const seed = structured(
+      await callTool(port, 'list_notes', { project: 'team', path: 'solo' }, bearer),
+    )
+    await callTool(
+      port,
+      'delete_note',
+      { ref: (seed.items as Array<{ noteId: string }>)[0].noteId },
+      bearer,
+    )
+    expect((await createPage('solo', bearer)).statusCode).toBe(201)
+
+    const listed = await callTool(port, 'list_notes', { project: 'team', path: 'solo' }, bearer)
+    expect(structured(listed).items).toEqual([])
+    expect(structured(listed).total).toBe(0)
+    // The old early return would have said "Nothing in `solo`" while the structured
+    // slot said present — the exact parity break the text mirror exists to prevent.
+    expect(text(listed)).toContain('Folder page:')
+    expect(text(listed)).not.toContain('Nothing in')
+    // ...and it still ANSWERS `ls`: the slot describes the cover, not the contents, so
+    // dropping the contents line here would be the same silence in the other direction.
+    expect(text(listed)).toContain('No other notes in')
+  })
+
+  it('publishes no slot for a folder that does not exist, and still lists it as empty', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const listed = await callTool(port, 'list_notes', { project: 'team', path: 'ghost' }, bearer)
+
+    expect(isError(listed)).toBe(false)
+    expect(structured(listed)).toEqual({ items: [], folders: [], total: 0 })
+    expect(text(listed)).toContain('Nothing in')
+  })
+
+  it('never promises a create the caller could not perform', async () => {
+    const writer = await patFor('alice', 'alice-password-1', 'write')
+    await callTool(
+      port,
+      'create_note',
+      { project: 'team', title: 'Readable', body: 'x', path: 'docs' },
+      writer,
+    )
+    const reader = await patFor('bob', 'bob-password-01', 'read')
+
+    expect(await slotOf({ project: 'team', path: 'docs' }, reader)).toEqual({
+      status: 'missing',
+      folderPath: 'docs',
+    })
+    // This caller genuinely cannot write here, so the prose says exactly that — the
+    // sentence an owner browsing their own domain must NOT be given.
+    expect(
+      text(await callTool(port, 'list_notes', { project: 'team', path: 'docs' }, reader)),
+    ).toContain('not available to you')
+  })
+
+  it('reports a page in an unidentified folder honestly, without an id', async () => {
+    // A page can arrive without the registry ever hearing about its folder — a file-first
+    // `mv`, an external editor, a restored backup. `present` is still the truth; the id
+    // is simply absent rather than invented.
+    const custom = fixture()
+    const team = (custom.spaces as Array<{ slug: string; notes: unknown[] }>).find(
+      (sp) => sp.slug === 'team',
+    )
+    team?.notes.push({
+      title: 'Orphan',
+      filePath: 'orphan/index.md',
+      content: '# Orphan\n\narrived from disk.',
+    })
+    expect(
+      (
+        await fetch(`http://127.0.0.1:${port}/api/__test/reset`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ fixture: custom }),
+        })
+      ).status,
+    ).toBe(200)
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const slot = await slotOf({ project: 'team', path: 'orphan' }, bearer)
+
+    expect(slot).toMatchObject({ status: 'present', folderPath: 'orphan', title: 'Orphan' })
+    expect(slot?.folderId).toBeUndefined()
+  })
+
+  it('marks the page in get_note and leaves ordinary notes unmarked', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const ordinary = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', title: 'Plain', body: 'x', path: 'docs' },
+        bearer,
+      ),
+    )
+    const page = await createPage('docs', bearer)
+    const marker = { folderPath: 'docs', folderId: page.json().folderId }
+
+    expect(
+      structured(await callTool(port, 'get_note', { ref: page.json().pageNoteId }, bearer))
+        .folderPage,
+    ).toEqual(marker)
+    expect(
+      structured(
+        await callTool(
+          port,
+          'get_note',
+          { ref: page.json().pageNoteId, responseFormat: 'concise' },
+          bearer,
+        ),
+      ).folderPage,
+    ).toEqual(marker)
+    expect(
+      structured(await callTool(port, 'get_note', { ref: ordinary.noteId }, bearer)).folderPage,
+    ).toBeUndefined()
+  })
+
+  it('start_session reports a present root page quietly — and never a missing one', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+
+    const before = structured(await callTool(port, 'start_session', { project: 'team' }, bearer))
+    expect((before.project as Record<string, unknown>).folderPage).toBeUndefined()
+
+    const page = await createPage('', bearer)
+    expect(page.statusCode).toBe(201)
+    const pageNoteId = page.json().pageNoteId as string
+
+    const after = structured(await callTool(port, 'start_session', { project: 'team' }, bearer))
+    const project = after.project as Record<string, unknown>
+    expect(project.folderPage).toEqual({
+      status: 'present',
+      folderPath: '',
+      folderId: page.json().folderId,
+      noteId: pageNoteId,
+      title: 'team',
+    })
+    // The root page of an ACTIVE project is auto-pinned, so its body rides always-load.
+    expect((project.alwaysLoad as Array<{ noteId: string }>).map((n) => n.noteId)).toContain(
+      pageNoteId,
+    )
+
+    // A manual unpin drops the body from the bootstrap, but the structural marker stays.
+    const unpinned = await app.inject({
+      method: 'PUT',
+      url: '/api/note/pin',
+      headers: { authorization: `Bearer ${bearer}` },
+      payload: { id: pageNoteId, pinned: false },
+    })
+    expect(unpinned.statusCode).toBe(200)
+    const quiet = structured(await callTool(port, 'start_session', { project: 'team' }, bearer))
+    const quietProject = quiet.project as Record<string, unknown>
+    expect((quietProject.folderPage as Record<string, unknown>).noteId).toBe(pageNoteId)
+    expect(
+      (quietProject.alwaysLoad as Array<{ noteId: string }>).map((n) => n.noteId),
+    ).not.toContain(pageNoteId)
+    // The marker earns a line in PROSE too, and this is the state it exists for: the
+    // page is present but pinned nowhere, so no always-load row mentions it. A
+    // text-only client that never reads structuredContent would otherwise not learn
+    // the project HAS a page.
+    expect(text(await callTool(port, 'start_session', { project: 'team' }, bearer))).toContain(
+      'Folder page:',
+    )
+  })
+
+  it('still answers `ls` for an existing folder that is empty', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const made = await app.inject({
+      method: 'POST',
+      url: '/api/s/team/folders',
+      headers: { authorization: `Bearer ${bearer}` },
+      payload: { path: 'hollow' },
+    })
+    expect(made.statusCode).toBe(200)
+
+    const listed = await callTool(port, 'list_notes', { project: 'team', path: 'hollow' }, bearer)
+    expect(structured(listed)).toMatchObject({ items: [], folders: [], total: 0 })
+    // The slot is the folder's COVER, not an answer about its contents. Without the
+    // emptiness line the reply is a bare create-suggestion — and a folder that does
+    // not exist at all would read as the more informative of the two.
+    expect(text(listed)).toContain('Folder page is missing')
+    expect(text(listed)).toContain('Nothing in')
+  })
+
+  it('does not tell an owner that authoring a page is beyond them', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const listed = await callTool(port, 'list_notes', {}, bearer)
+    const slot = structured(listed).folderPage as Record<string, unknown> | undefined
+
+    // The action stays project-scoped, so this listing carries none...
+    expect(slot).toMatchObject({ status: 'missing' })
+    expect(slot?.createWith).toBeUndefined()
+    // ...but alice writes in her own personal domain perfectly well — that is exactly
+    // what this branch tests — so "not available to you" would be a plain untruth. (In
+    // production its root is auto-marked a project and the action is expressible through
+    // that handle; the fixture leaves it unmarked, which is the harder case.)
+    expect(text(listed)).not.toContain('not available to you')
+    // The other branch names the SHAPE of a call that can express the action, without
+    // promising that any project actually covers this folder.
+    expect(text(listed)).toContain('A project-scoped listing of the same folder offers one')
+  })
+
+  it('reports the project root’s own page as a slot', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const made = (await createPage('', bearer)).json() as { pageNoteId: string; folderId: string }
+    const listed = await callTool(port, 'list_notes', { project: 'team' }, bearer)
+
+    // A project IS an identified folder, so the root slot carries the project's own id
+    // and omits `path` — the branch every other present-assert reached only nested.
+    expect(structured(listed).folderPage).toEqual({
+      status: 'present',
+      folderPath: '',
+      folderId: made.folderId,
+      noteId: made.pageNoteId,
+      title: 'team',
+    })
+    expect(
+      (structured(listed).items as Array<{ noteId: string }>).map((i) => i.noteId),
+    ).not.toContain(made.pageNoteId)
+  })
+
+  it('leaves a hidden-class note out of the folder-page role', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    // A memory CATEGORY slugs into the file name, so `index` puts this note on the
+    // reserved basename — in production under the hidden `.notarium/memory` mount, in
+    // this fake at the space root, since the fake does not prefix mounts. Either way it
+    // is no folder's cover, and the class is the only thing that says so.
+    const memory = structured(
+      await callTool(
+        port,
+        'remember_about_user',
+        { observation: 'nothing to do with folders', category: 'index' },
+        bearer,
+      ),
+    )
+    const read = structured(
+      await callTool(port, 'get_note', { ref: memory.noteId as string }, bearer),
+    )
+
+    expect(read.class).toBe('agent-memory')
+    expect(read.folderPage).toBeUndefined()
+    // And the reserved-name guard does not fire on it either: renaming somebody's
+    // memory is not an attempt to author a folder page.
+    const renamed = await callTool(
+      port,
+      'rename_note',
+      { ref: memory.noteId as string, title: 'Index' },
+      bearer,
+    )
+    expect(isError(renamed)).toBe(false)
+  })
+
+  it('does not reserve the page name against a note that could never become one', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    // The branch the class gate actually opened: a hidden-class note that does NOT sit
+    // on the reserved basename. The basename-only guard refused this rename to protect a
+    // page it could never become — a memory note is named after its category, not its
+    // title, and lives in a mount that is no folder.
+    const memory = structured(
+      await callTool(
+        port,
+        'remember_about_user',
+        { observation: 'unrelated to folders', category: 'habits' },
+        bearer,
+      ),
+    )
+    const renamed = await callTool(
+      port,
+      'rename_note',
+      { ref: memory.noteId as string, title: 'Index' },
+      bearer,
+    )
+
+    expect(isError(renamed)).toBe(false)
+    expect(
+      structured(await callTool(port, 'get_note', { ref: memory.noteId as string }, bearer))
+        .folderPage,
+    ).toBeUndefined()
+  })
+
+  it('says the role in get_note prose, not only in structuredContent', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await callTool(
+      port,
+      'create_note',
+      { project: 'team', title: 'Seed', body: 'x', path: 'docs' },
+      bearer,
+    )
+    const created = await createPage('docs', bearer)
+    expect(created.statusCode).toBe(201)
+    const made = created.json() as { pageNoteId: string }
+    const read = await callTool(port, 'get_note', { ref: made.pageNoteId }, bearer)
+
+    // The flow sends an agent from a present slot straight here. A text-only client that
+    // never reads structuredContent would otherwise be told the role by `list_notes` and
+    // then handed the page as if it were any other note.
+    expect(text(read)).toContain('Folder page of `docs`')
+    const ordinary = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team', title: 'Plain', body: 'x', path: 'docs' },
+        bearer,
+      ),
+    )
+    expect(
+      text(await callTool(port, 'get_note', { ref: ordinary.noteId as string }, bearer)),
+    ).not.toContain('Folder page of')
+
+    // The two states this line has not been seen in: the concise format, which an agent
+    // asks for when it wants the gist, and the ROOT page, whose folder has no path to
+    // print.
+    expect(
+      text(
+        await callTool(
+          port,
+          'get_note',
+          { ref: made.pageNoteId, responseFormat: 'concise' },
+          bearer,
+        ),
+      ),
+    ).toContain('Folder page of `docs`')
+    const rootPage = await createPage('', bearer)
+    expect(rootPage.statusCode).toBe(201)
+    const root = rootPage.json() as { pageNoteId: string }
+    expect(text(await callTool(port, 'get_note', { ref: root.pageNoteId }, bearer))).toContain(
+      'Folder page of the root',
+    )
+  })
+
+  it('counts the page as a cover in the bootstrap index, not as a note', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const before = (
+      (
+        structured(await callTool(port, 'start_session', { project: 'team' }, bearer))
+          .project as Record<string, unknown>
+      ).index as { noteCount: number }
+    ).noteCount
+    expect((await createPage('', bearer)).statusCode).toBe(201)
+    const after = (
+      (
+        structured(await callTool(port, 'start_session', { project: 'team' }, bearer))
+          .project as Record<string, unknown>
+      ).index as { noteCount: number }
+    ).noteCount
+
+    // `folders[].count` never counted covers and `list_notes.total` no longer does;
+    // this number used to be the last one contradicting both of its neighbours. The
+    // lower bound matters: `after === before` would also hold if the filter swallowed
+    // every note.
+    expect(before).toBeGreaterThan(0)
+    expect(after).toBe(before)
+  })
+})
+
+// #415 V2: the ONE agent door to a folder page, and every other door to its reserved
+// basename closed. The lifecycle (identity, collision, auto-pin) is the REST route's,
+// shared — not a second implementation that drifts.
+describe('folder page semantic create (#415)', () => {
+  const create = (args: Record<string, unknown>, bearer: string) =>
+    callTool(port, 'create_note', { project: 'team', ...args }, bearer)
+
+  it('materializes the page through the shared lifecycle, then reads and edits as an ordinary note', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await create({ title: 'Seed', body: 'x', path: 'docs' }, bearer)
+    const missing = structured(
+      await callTool(port, 'list_notes', { project: 'team', path: 'docs' }, bearer),
+    ).folderPage as { createWith: Record<string, unknown> }
+
+    const created = structured(
+      await create({ ...missing.createWith, body: '# Docs\n\nThe section cover.' }, bearer),
+    )
+    expect(created.path).toBe('docs/index')
+    expect(created.title).toBe('Docs')
+    expect(created.folderPage).toEqual({
+      folderPath: 'docs',
+      folderId: expect.stringMatching(/^[A-Za-z0-9_-]{12}$/),
+    })
+
+    // Read it back and change it with the ordinary tools — no bespoke page channel.
+    const read = structured(await callTool(port, 'get_note', { ref: created.noteId }, bearer))
+    expect(read.folderPage).toEqual(created.folderPage)
+    const edited = await callTool(
+      port,
+      'edit_note',
+      {
+        ref: created.noteId,
+        operation: 'append',
+        content: 'More.',
+        versionToken: read.versionToken,
+      },
+      bearer,
+    )
+    expect(isError(edited)).toBe(false)
+    // The reserved basename survives the edit — a page does not drift to `<title>.md`.
+    expect(structured(await callTool(port, 'get_note', { ref: created.noteId }, bearer)).path).toBe(
+      'docs/index',
+    )
+  })
+
+  it('mints the folder identity and pins an active project’s root page', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const created = structured(
+      await create({ folderPage: true, body: '# Team\n\nRoot cover.' }, bearer),
+    )
+
+    expect((created.folderPage as { folderPath: string }).folderPath).toBe('')
+    const session = structured(await callTool(port, 'start_session', { project: 'team' }, bearer))
+    const project = session.project as Record<string, unknown>
+    expect((project.alwaysLoad as Array<{ noteId: string }>).map((n) => n.noteId)).toContain(
+      created.noteId,
+    )
+  })
+
+  it('refuses a second page, a ghost folder and a path outside the project — before any write', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await create({ title: 'Seed', body: 'x', path: 'docs' }, bearer)
+    expect(isError(await create({ folderPage: true, path: 'docs', body: '# One' }, bearer))).toBe(
+      false,
+    )
+
+    const second = await create({ folderPage: true, path: 'docs', body: '# Two' }, bearer)
+    expect(isError(second)).toBe(true)
+    expect(text(second)).toContain('already has a page')
+
+    const ghost = await create({ folderPage: true, path: 'nowhere', body: '# Ghost' }, bearer)
+    expect(isError(ghost)).toBe(true)
+    expect(text(ghost)).toContain('no such folder')
+    // A refused create materialises NOTHING: no directory in the tree...
+    const folders = (
+      await app.inject({
+        method: 'GET',
+        url: '/api/s/team/tree',
+        headers: { authorization: `Bearer ${bearer}` },
+      })
+    ).json().folders as Array<{ path: string }>
+    expect(folders.some((f) => f.path === 'nowhere')).toBe(false)
+    // ...and no folder for the slot to describe, which is the same predicate the
+    // refusal used — so a second attempt still refuses rather than finding its own
+    // leftovers.
+    expect(
+      structured(await callTool(port, 'list_notes', { project: 'team', path: 'nowhere' }, bearer))
+        .folderPage,
+    ).toBeUndefined()
+
+    const outside = await create({ folderPage: true, path: '../escape', body: '# Out' }, bearer)
+    expect(isError(outside)).toBe(true)
+  })
+
+  it('leaves an ordinary create’s echo free of the folder role', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const created = await create({ title: 'Plain', body: 'x', path: 'docs' }, bearer)
+    const made = structured(created)
+
+    // The marker means "this note IS a cover". An ordinary note in the same folder is
+    // not one, and the echo must not suggest otherwise. Assert the create SUCCEEDED
+    // first: `structured` answers `{}` on a failure, and an absent marker would then
+    // prove nothing at all.
+    expect(isError(created)).toBe(false)
+    expect(made.noteId).toBeTruthy()
+    expect(made.folderPage).toBeUndefined()
+  })
+
+  it('refuses `fileName` beside the selector — a page’s storage name is not the model’s to pick', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const refused = await create({ folderPage: true, fileName: 'cover', body: '# Docs' }, bearer)
+
+    expect(isError(refused)).toBe(true)
+    expect(text(refused)).toContain('`fileName` cannot be combined')
+  })
+
+  it('closes every other door to the reserved basename, raw or title-derived', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await create({ title: 'Seed', body: 'x', path: 'docs' }, bearer)
+
+    for (const args of [
+      { fileName: 'index', title: 'Anything', body: 'x', path: 'docs' },
+      { title: 'Index', body: 'x', path: 'docs' },
+      { title: 'index', body: 'x', path: 'docs' },
+      { title: 'INDEX', body: 'x', path: 'docs' },
+      { body: '# Index\n\nbody-first title', path: 'docs' },
+    ]) {
+      const refused = await create(args, bearer)
+
+      expect(isError(refused)).toBe(true)
+      expect(text(refused)).toContain('reserved for the Folder page')
+    }
+    // Nothing landed: the folder still has no page and no identity was minted.
+    expect(
+      structured(await callTool(port, 'list_notes', { project: 'team', path: 'docs' }, bearer))
+        .folderPage,
+    ).toMatchObject({ status: 'missing' })
+
+    // `index.md` slugs to `index-md`, which is NOT the page — an ordinary success, and
+    // it has to LAND there: a guard reading the raw input would have refused it, and a
+    // guard reading the wrong basename would have made it the cover.
+    const sheet = await create(
+      { fileName: 'index.md', title: 'Sheet', body: 'x', path: 'docs' },
+      bearer,
+    )
+    expect(isError(sheet)).toBe(false)
+    expect(structured(sheet).path).toBe('docs/index-md')
+    expect(
+      structured(await callTool(port, 'list_notes', { project: 'team', path: 'docs' }, bearer))
+        .folderPage,
+    ).toMatchObject({ status: 'missing' })
+  })
+
+  it('fails only the offending batch item and never takes a semantic selector', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const batch = structured(
+      await callTool(
+        port,
+        'create_notes',
+        {
+          project: 'team',
+          notes: [
+            { title: 'Index', body: 'x', path: 'batch' },
+            { title: 'Sibling', body: 'y', path: 'batch' },
+          ],
+        },
+        bearer,
+      ),
+    )
+    const results = batch.results as Array<{ ok: boolean; error?: string }>
+
+    expect(results[0].ok).toBe(false)
+    expect(results[0].error).toContain('reserved for the Folder page')
+    expect(results[1].ok).toBe(true)
+
+    // The selector is not part of the batch contract at all (closed argument objects).
+    const rejected = await callTool(
+      port,
+      'create_notes',
+      { project: 'team', notes: [{ title: 'Cover', body: 'z', folderPage: true }] },
+      bearer,
+    )
+    expect(isError(rejected)).toBe(true)
+  })
+
+  it('tells a rename to pick another title, not to go create a page', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const note = structured(await create({ title: 'Plain', body: 'x', path: 'docs' }, bearer))
+    const refused = await callTool(
+      port,
+      'rename_note',
+      { ref: note.noteId as string, title: 'Index' },
+      bearer,
+    )
+
+    // The caller asked to RENAME. Answering "call create_note with folderPage.createWith"
+    // reads as an instruction to author a page nobody asked for — the one thing the rest
+    // of this contract spends its words preventing.
+    expect(isError(refused)).toBe(true)
+    expect(text(refused)).toContain('Pick another title')
+    expect(text(refused)).not.toContain('folderPage.createWith')
+  })
+
+  it('refuses a rename onto the reserved basename, but renames the page itself freely', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const ordinary = structured(await create({ title: 'Plain', body: 'x', path: 'docs' }, bearer))
+    const page = structured(
+      await create({ folderPage: true, path: 'docs', body: '# Docs' }, bearer),
+    )
+
+    const refused = await callTool(
+      port,
+      'rename_note',
+      { ref: ordinary.noteId, title: 'Index' },
+      bearer,
+    )
+    expect(isError(refused)).toBe(true)
+    expect(text(refused)).toContain('reserved for the Folder page')
+    expect(
+      structured(await callTool(port, 'get_note', { ref: ordinary.noteId }, bearer)).path,
+    ).toBe('docs/plain')
+
+    const renamed = await callTool(
+      port,
+      'rename_note',
+      { ref: page.noteId, title: 'Section Cover' },
+      bearer,
+    )
+    expect(isError(renamed)).toBe(false)
+    expect(structured(renamed).path).toBe('docs/index')
+  })
+
+  it('leaves no identity behind when the write is refused mid-flight', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await create({ title: 'Seed', body: 'x', path: 'links' }, bearer)
+    // An unresolvable inline link fails the create BEFORE materialization, so the
+    // folder must not be left carrying a freshly minted identity for no page.
+    const refused = await create(
+      {
+        folderPage: true,
+        path: 'links',
+        body: '# Links',
+        links: [{ to: 'no-such-note-id', relation: 'based_on' }],
+      },
+      bearer,
+    )
+
+    expect(isError(refused)).toBe(true)
+    expect(
+      structured(await callTool(port, 'list_notes', { project: 'team', path: 'links' }, bearer))
+        .folderPage,
+    ).toEqual({
+      status: 'missing',
+      folderPath: 'links',
+      createWith: { project: 'team', path: 'links', folderPage: true },
+    })
+  })
+
+  it('collapses a retried semantic create and never doubles the page', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await create({ title: 'Seed', body: 'x', path: 'docs' }, bearer)
+    const first = structured(
+      await create(
+        { folderPage: true, path: 'docs', body: '# Docs', idempotencyKey: 'page-1' },
+        bearer,
+      ),
+    )
+    const replay = structured(
+      await create(
+        { folderPage: true, path: 'docs', body: '# Docs', idempotencyKey: 'page-1' },
+        bearer,
+      ),
+    )
+
+    expect(replay.noteId).toBe(first.noteId)
+    expect(replay.outcome).toBe('skipped')
+    // The marker is durable state, so a replay still answers with the folder identity.
+    expect(replay.folderPage).toEqual(first.folderPage)
+    expect(replay.title).toBe(first.title)
+    // And the echo describes the note that was STORED. Replaying the key with a
+    // different title must not report a name the page does not have.
+    const renamedReplay = structured(
+      await create(
+        { folderPage: true, path: 'docs', body: '# Something Else', idempotencyKey: 'page-1' },
+        bearer,
+      ),
+    )
+    expect(renamedReplay.noteId).toBe(first.noteId)
+    expect(renamedReplay.title).toBe(first.title)
+    // Discriminating: BOTH replay branches open with "Idempotency key already used", so
+    // the assertion has to reach the half that names the page it actually found.
+    expect(
+      text(
+        await create(
+          { folderPage: true, path: 'docs', body: '# Docs', idempotencyKey: 'page-1' },
+          bearer,
+        ),
+      ),
+    ).toContain('The Folder page for `docs` is note')
+  })
+
+  it('lets one of two simultaneous semantic creates win, honestly', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await create({ title: 'Seed', body: 'x', path: 'docs' }, bearer)
+    const [a, b] = await Promise.all([
+      create({ folderPage: true, path: 'docs', body: '# A' }, bearer),
+      create({ folderPage: true, path: 'docs', body: '# B' }, bearer),
+    ])
+    const outcomes = [a, b].map(isError)
+
+    expect(outcomes.filter(Boolean)).toHaveLength(1)
+    expect(text([a, b][outcomes.indexOf(true)])).toContain('already has a page')
+  })
+
+  it('carries the caller’s tags through the shared lifecycle, always-load exactly once', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const made = structured(
+      await create(
+        { folderPage: true, body: '# Team', tags: ['always-load', 'always-load', 'guide'] },
+        bearer,
+      ),
+    )
+    const read = structured(
+      await callTool(port, 'get_note', { ref: made.noteId as string }, bearer),
+    )
+
+    // The root page of an ACTIVE project is auto-tagged; an author who ALSO asked for
+    // the tag must not end up pinned twice, since `normTags` does not deduplicate. The
+    // comparison is exact because that is how the pin channel adds and removes this one
+    // string — tags elsewhere fold case, so a differently-cased variant stays the
+    // author's own tag and only the exact one pins.
+    expect((read.frontmatter as { tags: string[] }).tags).toEqual(['always-load', 'guide'])
+  })
+
+  it('composes the page path under a NON-root project, in either grammar', async () => {
+    const custom = fixture()
+    custom.projects = [
+      ...(custom.projects ?? []),
+      { space: 'team', path: 'billing', slug: 'billing', displayName: 'Billing' },
+    ]
+    expect(
+      (
+        await fetch(`http://127.0.0.1:${port}/api/__test/reset`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ fixture: custom }),
+        })
+      ).status,
+    ).toBe(200)
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const seed = (path: string) =>
+      callTool(
+        port,
+        'create_note',
+        { project: 'team/billing', title: 'Seed', body: 'x', path },
+        bearer,
+      )
+    expect(isError(await seed('docs'))).toBe(false)
+    expect(isError(await seed('notes'))).toBe(false)
+
+    // Project-relative `docs` and the exact space-relative path list_notes prints are
+    // the same folder. Every present-assert so far used a ROOT project, where the two
+    // grammars collapse and this composition is never exercised.
+    const relative = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team/billing', path: 'docs', folderPage: true, body: '# Docs' },
+        bearer,
+      ),
+    )
+    expect(relative.path).toBe('billing/docs/index')
+    expect(relative.folderPage).toMatchObject({ folderPath: 'billing/docs' })
+
+    const exact = structured(
+      await callTool(
+        port,
+        'create_note',
+        { project: 'team/billing', path: 'billing/notes', folderPage: true, body: '# Notes' },
+        bearer,
+      ),
+    )
+    expect(exact.path).toBe('billing/notes/index')
+    expect(exact.folderPage).toMatchObject({ folderPath: 'billing/notes' })
+  })
+
+  it('does not claim a Folder page on a key an ordinary create already spent', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const ordinary = structured(
+      await create({ title: 'Unrelated', body: 'x', path: 'docs', idempotencyKey: 'k' }, bearer),
+    )
+    const replay = await create(
+      { folderPage: true, path: 'docs', body: '# Docs', idempotencyKey: 'k' },
+      bearer,
+    )
+
+    // The dedup key is scoped by tool + project, not by what was asked, so this echo
+    // names somebody else's note and NO page was written. Claiming the folder role
+    // here would hand the agent a marker for a page that does not exist.
+    expect(structured(replay).noteId).toBe(ordinary.noteId)
+    expect(structured(replay).outcome).toBe('skipped')
+    expect(structured(replay).folderPage).toBeUndefined()
+    // Nor the title that was asked for: it belongs to the page that was never written,
+    // and stamping it on would rename a stranger's note in the agent's model of things.
+    expect(structured(replay).title).toBeUndefined()
+    expect(text(replay)).toContain('no Folder page was created')
+    expect(
+      structured(await callTool(port, 'list_notes', { project: 'team', path: 'docs' }, bearer))
+        .folderPage,
+    ).toMatchObject({ status: 'missing' })
+  })
+
+  it('closes the move door: no landing on an existing page, and the folder it lands in adopts it', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await create({ title: 'Seed', body: 'x', path: 'docs' }, bearer)
+    await create({ title: 'Seed', body: 'x', path: 'guides' }, bearer)
+    await create({ title: 'Seed', body: 'x', path: 'links' }, bearer)
+    const page = structured(
+      await create({ folderPage: true, path: 'docs', body: '# Docs' }, bearer),
+    )
+    expect(
+      isError(await create({ folderPage: true, path: 'guides', body: '# Guides' }, bearer)),
+    ).toBe(false)
+
+    // Moving a page KEEPS its reserved basename, so it would become the destination's
+    // cover. Onto a folder that already has one the store refuses the destination
+    // anyway; what this guard buys is the answer — the create door's wording, naming
+    // the folder and the way forward, instead of a bare `# Move Failed`.
+    const onto = await callTool(
+      port,
+      'move_note',
+      { ref: page.noteId as string, toFolder: 'guides' },
+      bearer,
+    )
+    expect(isError(onto)).toBe(true)
+    expect(text(onto)).toContain('already has a Folder page')
+
+    // Into a page-less folder the move stands — a page with no folder identity is a
+    // legal file-first state — and the destination adopts it through the same lifecycle
+    // the create door runs: its id is minted, and the slot says present.
+    const moved = await callTool(
+      port,
+      'move_note',
+      { ref: page.noteId as string, toFolder: 'links' },
+      bearer,
+    )
+    expect(isError(moved)).toBe(false)
+    expect(structured(moved).path).toBe('links/index')
+    const landed = structured(
+      await callTool(port, 'list_notes', { project: 'team', path: 'links' }, bearer),
+    ).folderPage as Record<string, unknown>
+    expect(landed).toMatchObject({ status: 'present', folderPath: 'links', noteId: page.noteId })
+    expect(landed.folderId).toBeTruthy()
+    // And the folder it left is honestly page-less again.
+    expect(
+      structured(await callTool(port, 'list_notes', { project: 'team', path: 'docs' }, bearer))
+        .folderPage,
+    ).toMatchObject({ status: 'missing' })
+  })
+
+  it('pins a page that is moved into an active project’s root', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await create({ title: 'Seed', body: 'x', path: 'docs' }, bearer)
+    const page = structured(
+      await create({ folderPage: true, path: 'docs', body: '# Docs' }, bearer),
+    )
+    const read = structured(
+      await callTool(port, 'get_note', { ref: page.noteId as string }, bearer),
+    )
+    // A nested folder is not a project, so nothing pinned it on create.
+    expect((read.frontmatter as { tags?: string[] }).tags ?? []).not.toContain('always-load')
+
+    expect(
+      isError(
+        await callTool(port, 'move_note', { ref: page.noteId as string, toFolder: '' }, bearer),
+      ),
+    ).toBe(false)
+
+    // Landing in the ACTIVE project's root is the same condition a first page save
+    // meets, so adoption pins it — the second half of the lifecycle, not just the id.
+    const moved = structured(
+      await callTool(port, 'get_note', { ref: page.noteId as string }, bearer),
+    )
+    expect((moved.frontmatter as { tags?: string[] }).tags ?? []).toContain('always-load')
+    const project = structured(await callTool(port, 'start_session', { project: 'team' }, bearer))
+      .project as Record<string, unknown>
+    expect((project.folderPage as Record<string, unknown>).noteId).toBe(page.noteId)
+    expect((project.alwaysLoad as Array<{ noteId: string }>).map((n) => n.noteId)).toContain(
+      page.noteId,
+    )
+  })
+
+  it('releases the pin when a page leaves an active project’s root', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await create({ title: 'Seed', body: 'x', path: 'docs' }, bearer)
+    const page = structured(await create({ folderPage: true, body: '# Team' }, bearer))
+    const pinned = structured(
+      await callTool(port, 'get_note', { ref: page.noteId as string }, bearer),
+    )
+    expect((pinned.frontmatter as { tags?: string[] }).tags ?? []).toContain('always-load')
+
+    // The tag says "this note is that project's overview". A move out of the root makes
+    // that false, so leaving it would keep the project loading a body that now describes
+    // a different folder — and a new root page would give it two covers at once.
+    expect(
+      isError(
+        await callTool(port, 'move_note', { ref: page.noteId as string, toFolder: 'docs' }, bearer),
+      ),
+    ).toBe(false)
+    const moved = structured(
+      await callTool(port, 'get_note', { ref: page.noteId as string }, bearer),
+    )
+    expect((moved.frontmatter as { tags?: string[] }).tags ?? []).not.toContain('always-load')
+    const project = structured(await callTool(port, 'start_session', { project: 'team' }, bearer))
+      .project as Record<string, unknown>
+    expect((project.alwaysLoad as Array<{ noteId: string }>).map((n) => n.noteId)).not.toContain(
+      page.noteId,
+    )
+    expect(project.folderPage).toBeUndefined()
+  })
+
+  it('pins on ARRIVAL, even for a page a human had unpinned elsewhere', async () => {
+    const custom = fixture()
+    custom.projects = [
+      ...(custom.projects ?? []),
+      { space: 'team', path: 'billing', slug: 'billing', displayName: 'Billing' },
+    ]
+    expect(
+      (
+        await fetch(`http://127.0.0.1:${port}/api/__test/reset`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ fixture: custom }),
+        })
+      ).status,
+    ).toBe(200)
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await callTool(
+      port,
+      'create_note',
+      { project: 'team/billing', title: 'Seed', body: 'x' },
+      bearer,
+    )
+    const page = structured(await create({ folderPage: true, body: '# Team' }, bearer))
+    const unpin = await app.inject({
+      method: 'PUT',
+      url: '/api/note/pin',
+      headers: { authorization: `Bearer ${bearer}` },
+      payload: { id: page.noteId as string, pinned: false },
+    })
+    expect(unpin.statusCode).toBe(200)
+
+    // Landing in an active project's root makes the page THAT project's overview,
+    // whatever the last one thought of it — the same reason `unmark → mark` re-pins a
+    // page a human had unpinned. Deciding by "did the two ends differ" instead would
+    // leave Billing showing a cover whose body it never loads.
+    expect(
+      isError(
+        await callTool(
+          port,
+          'move_note',
+          { ref: page.noteId as string, toFolder: 'billing' },
+          bearer,
+        ),
+      ),
+    ).toBe(false)
+    const moved = structured(
+      await callTool(port, 'get_note', { ref: page.noteId as string }, bearer),
+    )
+    expect((moved.frontmatter as { tags?: string[] }).tags ?? []).toContain('always-load')
+    const billing = structured(
+      await callTool(port, 'start_session', { project: 'team/billing' }, bearer),
+    ).project as Record<string, unknown>
+    expect((billing.alwaysLoad as Array<{ noteId: string }>).map((n) => n.noteId)).toContain(
+      page.noteId,
+    )
+  })
+
+  it('keeps a pinned page pinned across two active roots, and leaves the source honest', async () => {
+    const custom = fixture()
+    custom.projects = [
+      ...(custom.projects ?? []),
+      { space: 'team', path: 'billing', slug: 'billing', displayName: 'Billing' },
+    ]
+    expect(
+      (
+        await fetch(`http://127.0.0.1:${port}/api/__test/reset`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ fixture: custom }),
+        })
+      ).status,
+    ).toBe(200)
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await callTool(
+      port,
+      'create_note',
+      { project: 'team/billing', title: 'Seed', body: 'x' },
+      bearer,
+    )
+    const page = structured(await create({ folderPage: true, body: '# Team' }, bearer))
+
+    // The branch the rule's own reasoning rests on: arrival decides, so a page that is
+    // already pinned and arrives at another active root comes out still pinned. What this
+    // catches is an inversion of that priority — reading the source first would unpin a
+    // page leaving `team`. It does NOT witness the no-op itself: a write that stopped
+    // short-circuiting would produce the same tags and pass here. That guard lives at the
+    // store, in cachedStoreMutations' `skips a no-op write`.
+    expect(
+      isError(
+        await callTool(
+          port,
+          'move_note',
+          { ref: page.noteId as string, toFolder: 'billing' },
+          bearer,
+        ),
+      ),
+    ).toBe(false)
+    const moved = structured(
+      await callTool(port, 'get_note', { ref: page.noteId as string }, bearer),
+    )
+    expect((moved.frontmatter as { tags?: string[] }).tags ?? []).toContain('always-load')
+    // And the root it left no longer calls it a cover — the slot is the honest half here,
+    // since `team` is a ROOT project and its always-load scan still reaches the subtree.
+    expect(
+      structured(await callTool(port, 'list_notes', { project: 'team' }, bearer)).folderPage,
+    ).toMatchObject({ status: 'missing' })
+  })
+
+  it('adopts a folder the move itself brings into existence', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    await create({ title: 'Seed', body: 'x', path: 'docs' }, bearer)
+    const page = structured(
+      await create({ folderPage: true, path: 'docs', body: '# Docs' }, bearer),
+    )
+
+    // move_note creates a missing destination folder, so the folder a page lands in can
+    // be one that did not exist a moment ago. Its identity is minted from the move's
+    // `finalize` for exactly this reason: a marker is metadata about a folder that
+    // EXISTS, and before the move this one did not.
+    expect(
+      isError(
+        await callTool(
+          port,
+          'move_note',
+          { ref: page.noteId as string, toFolder: 'archive/2026' },
+          bearer,
+        ),
+      ),
+    ).toBe(false)
+    const slot = structured(
+      await callTool(port, 'list_notes', { project: 'team', path: 'archive/2026' }, bearer),
+    ).folderPage as Record<string, unknown>
+
+    expect(slot).toMatchObject({ status: 'present', folderPath: 'archive/2026' })
+    expect(slot.folderId).toBeTruthy()
+  })
+
+  it('keeps a move to where the page already sits a no-op', async () => {
+    const bearer = await patFor('alice', 'alice-password-1', 'write')
+    const page = structured(await create({ folderPage: true, body: '# Team' }, bearer))
+    // Positive control: the root page of an active project IS pinned to begin with, so
+    // the assertion below is about the unpin surviving, not about a pin that never was.
+    const before = structured(
+      await callTool(port, 'get_note', { ref: page.noteId as string }, bearer),
+    )
+    expect((before.frontmatter as { tags?: string[] }).tags ?? []).toContain('always-load')
+    const unpin = await app.inject({
+      method: 'PUT',
+      url: '/api/note/pin',
+      headers: { authorization: `Bearer ${bearer}` },
+      payload: { id: page.noteId as string, pinned: false },
+    })
+    expect(unpin.statusCode).toBe(200)
+
+    // Re-homing is what makes a folder adopt a page. A move to the folder the page is
+    // ALREADY in re-homes nothing, and the tool promises repeating it does nothing —
+    // so it must not quietly restore the pin a human deliberately removed.
+    expect(
+      isError(
+        await callTool(port, 'move_note', { ref: page.noteId as string, toFolder: '' }, bearer),
+      ),
+    ).toBe(false)
+    const read = structured(
+      await callTool(port, 'get_note', { ref: page.noteId as string }, bearer),
+    )
+    expect((read.frontmatter as { tags?: string[] }).tags ?? []).not.toContain('always-load')
+  })
+})

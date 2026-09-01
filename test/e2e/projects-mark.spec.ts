@@ -77,7 +77,7 @@ test('create a new empty project from the + menu — it shows as an empty projec
   await expect(page).toHaveURL(/\/n\/.+\/roadmap$/)
   await page.getByRole('button', { name: 'More actions' }).click()
   await expect(
-    page.getByRole('menuitem', { name: 'Unpin folder overview from agent context' }),
+    page.getByRole('menuitem', { name: 'Unpin folder page from agent context' }),
   ).toBeVisible()
 
   // One source of truth — the space-management Projects list shows it too.

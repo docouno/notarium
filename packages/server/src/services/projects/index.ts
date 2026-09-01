@@ -39,6 +39,16 @@ export {
   type FinalizeFolderMoveDeps,
   type RecordFolderRenameDeps,
 } from './folderIdentity'
+export {
+  claimFolderIdentity,
+  folderExists,
+  folderPageNoteOf,
+  materializeFolderPage,
+  rehomeFolderPagePin,
+  type FolderPageAuthoredNote,
+  type MaterializeFolderPageDeps,
+  type MaterializeFolderPageResult,
+} from './folderPage'
 export { acquireMarkPrefixLock, withMarkLock } from './markLock'
 export {
   markFolderAsProject,

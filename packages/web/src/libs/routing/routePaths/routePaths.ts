@@ -161,8 +161,9 @@ export const filesRoute = (space: string): string => `${spaceRoute(space)}/${SEG
 /** The durable PAGE address of a folder (#212): `/folder/<id>` — space-free, the
  *  registry resolves it (like `/n/<id>`). It survives a folder rename/move, so it's
  *  the permalink to link a section by; the resolver redirects to the folder's
- *  current `/files/<path>`. Only an IDENTIFIED folder has an id (page-bearing or
- *  moved); a plain folder is addressed by its path (`folderRoute`). */
+ *  current `/files/<path>`. Only an IDENTIFIED folder has an id (a page, a move, a
+ *  favorite or a project mark gives it one); a never-identified folder is addressed by its
+ *  path (`folderRoute`). */
 export const folderPageRoute = (id: string): string => `${FOLDER_PREFIX}/${encodeURIComponent(id)}`
 
 /** The page href of a folder — the ONE rule every folder→page link shares

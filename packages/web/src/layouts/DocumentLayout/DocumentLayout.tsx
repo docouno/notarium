@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useMemo, useRef, useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router'
 import { NOTE_CLASS } from '@notarium/contract/enums'
-import { isFolderPageNote, type ParsedViewBlock, parseViewDocument } from '@notarium/core'
+import { isFolderPageOf, type ParsedViewBlock, parseViewDocument } from '@notarium/core'
 import { useChrome } from '../../composers/ChromeProvider'
 import { useEditing } from '../../composers/EditingProvider'
 import { useFavorites } from '../../composers/FavoritesProvider'
@@ -237,7 +237,7 @@ export const DocumentLayout = () => {
     void favorites.toggleNote({ id: note.id }).catch((e) => toast.error((e as Error).message))
   }
   const notePinned = isPinned(note?.frontmatter)
-  const folderOverview = !!note?.filePath && isFolderPageNote(note.filePath)
+  const folderPage = isFolderPageOf(note?.filePath, note?.class)
   const pinnable =
     canWriteDocument &&
     canPinNote({
@@ -523,10 +523,10 @@ export const DocumentLayout = () => {
             ...(pinnable
               ? [
                   {
-                    label: folderOverview
+                    label: folderPage
                       ? notePinned
-                        ? 'Unpin folder overview from agent context'
-                        : 'Pin folder overview to agent context'
+                        ? 'Unpin folder page from agent context'
+                        : 'Pin folder page to agent context'
                       : notePinned
                         ? 'Unpin from agent context'
                         : 'Pin to agent context',

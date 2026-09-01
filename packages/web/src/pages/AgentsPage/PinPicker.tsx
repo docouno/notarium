@@ -1,7 +1,7 @@
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import type { ContextSet } from '@notarium/contract'
-import { NOTE_SORT } from '@notarium/contract/enums'
-import { directoryOf, isFolderPageNote } from '@notarium/core'
+import { NOTE_SORT, type NoteClass } from '@notarium/contract/enums'
+import { directoryOf, isFolderPageOf } from '@notarium/core'
 import { Button } from '../../core/Button'
 import { Checkbox } from '../../core/Checkbox'
 import { ContextMenu, type MenuItem } from '../../core/ContextMenu'
@@ -130,6 +130,9 @@ export const PinPicker = ({
     id: string
     title: string
     filePath?: string
+    // Carried so the row can ask the shared question rather than guess by name: a
+    // reserved basename in a hidden mount is nobody's folder page.
+    class?: NoteClass
   }> | null>(null)
   const [q, setQ] = useState('')
   const [failed, setFailed] = useState(false)
@@ -173,7 +176,14 @@ export const PinPicker = ({
       .then((page) => {
         if (live) {
           setFailed(false)
-          setNotes(page.notes.map((n) => ({ id: n.id, title: n.title, filePath: n.filePath })))
+          setNotes(
+            page.notes.map((n) => ({
+              id: n.id,
+              title: n.title,
+              filePath: n.filePath,
+              class: n.class,
+            })),
+          )
         }
       })
       .catch(() => live && setFailed(true))
@@ -366,8 +376,8 @@ export const PinPicker = ({
               ) : (
                 candidates.map((n) => {
                   const on = checked.has(n.id)
-                  const folderOverview = !!n.filePath && isFolderPageNote(n.filePath)
-                  const folderPath = folderOverview
+                  const folderPage = isFolderPageOf(n.filePath, n.class)
+                  const folderPath = folderPage
                     ? directoryOf(n.filePath!) || 'workspace root'
                     : null
                   const title = n.title || 'Untitled'
@@ -377,15 +387,13 @@ export const PinPicker = ({
                         className={cx(styles.pickerRow, on && styles.pickerRowChecked)}
                         checked={on}
                         onChange={() => toggle(n)}
-                        aria-label={
-                          folderOverview ? `${title} · Folder overview · ${folderPath}` : title
-                        }
+                        aria-label={folderPage ? `${title} · Folder page · ${folderPath}` : title}
                         label={
                           <span className={styles.pickerItemText}>
                             <span className={styles.pickerItemTitle}>{title}</span>
-                            {folderOverview ? (
+                            {folderPage ? (
                               <span className={styles.pickerItemPath}>
-                                Folder overview · {folderPath}
+                                Folder page · {folderPath}
                               </span>
                             ) : n.filePath ? (
                               <span className={styles.pickerItemPath}>

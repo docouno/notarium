@@ -44,11 +44,11 @@ test('folder page shows a direct children summary under the page body', async ({
   const editor = page.locator('.cm-content')
   await expect(editor).toContainText('# demo')
   await expect(page.getByRole('button', { name: 'Save' })).toBeDisabled()
-  await editor.fill('# demo\n\nFolder overview.')
+  await editor.fill('# demo\n\nThe folder body.')
   await expect(page.getByRole('button', { name: 'Save' })).toBeEnabled()
   await page.getByRole('button', { name: 'Save' }).click()
   await expect(page).toHaveURL(/\/n\/.+\/demo$/)
-  await expect(page.locator('.doc .markdown')).toContainText('Folder overview.')
+  await expect(page.locator('.doc .markdown')).toContainText('The folder body.')
   const savedSummary = page.getByTestId('folder-children-summary')
   await expect(savedSummary).toBeVisible()
 

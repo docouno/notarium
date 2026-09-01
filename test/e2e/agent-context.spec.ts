@@ -398,21 +398,19 @@ test('a note’s ⋮ menu offers «Pin to agent context» where a pin has a targ
   await expect(page.getByRole('menuitem', { name: 'Unpin from agent context' })).toBeVisible()
 })
 
-test('folder overview actions and picker rows name the note boundary explicitly', async ({
-  page,
-}) => {
+test('folder page actions and picker rows name the note boundary explicitly', async ({ page }) => {
   await login(page, 'sam', 'sam-password-1')
 
   await page.goto('/n/fake-project-overview')
   await expect(page.getByRole('heading', { name: 'Docs overview' })).toBeVisible()
   await page.getByRole('button', { name: 'More actions' }).click()
   await expect(
-    page.getByRole('menuitem', { name: 'Unpin folder overview from agent context' }),
+    page.getByRole('menuitem', { name: 'Unpin folder page from agent context' }),
   ).toBeVisible()
-  await page.getByRole('menuitem', { name: 'Unpin folder overview from agent context' }).click()
+  await page.getByRole('menuitem', { name: 'Unpin folder page from agent context' }).click()
   await page.getByRole('button', { name: 'More actions' }).click()
   await expect(
-    page.getByRole('menuitem', { name: 'Pin folder overview to agent context' }),
+    page.getByRole('menuitem', { name: 'Pin folder page to agent context' }),
   ).toBeVisible()
 
   await page.goto('/agents/context/personal')
@@ -420,21 +418,21 @@ test('folder overview actions and picker rows name the note boundary explicitly'
   await page.getByPlaceholder('Search notes…').fill('Overview')
   const root = page
     .getByTestId('pin-picker-item')
-    .filter({ hasText: 'Folder overview · workspace root' })
-  const nested = page.getByTestId('pin-picker-item').filter({ hasText: 'Folder overview · guides' })
+    .filter({ hasText: 'Folder page · workspace root' })
+  const nested = page.getByTestId('pin-picker-item').filter({ hasText: 'Folder page · guides' })
   await expect(root).toBeVisible()
   await expect(nested).toBeVisible()
   await expect(
-    root.getByRole('checkbox', { name: 'Overview · Folder overview · workspace root' }),
+    root.getByRole('checkbox', { name: 'Overview · Folder page · workspace root' }),
   ).toBeVisible()
   await expect(
-    nested.getByRole('checkbox', { name: 'Overview · Folder overview · guides' }),
+    nested.getByRole('checkbox', { name: 'Overview · Folder page · guides' }),
   ).toBeVisible()
   await expect(root).not.toContainText('index')
   await expect(nested).not.toContainText('index')
 })
 
-test('direct pins and context-set items keep the title and show a Folder overview chip', async ({
+test('direct pins and context-set items keep the title and show a Folder page chip', async ({
   page,
 }) => {
   await page.setViewportSize({ width: 820, height: 900 })
@@ -460,11 +458,11 @@ test('direct pins and context-set items keep the title and show a Folder overvie
   await setRow.getByTestId('context-set-row-row').click()
   const item = page.getByTestId('context-set-item').filter({ hasText: 'Overview' })
   await expect(item).toContainText('Overview')
-  await expect(item).toContainText('Folder overview')
+  await expect(item).toContainText('Folder page')
   const badgeRow = item.getByTestId('context-item-badges')
   const badgeRowBox = await badgeRow.boundingBox()
   expect(badgeRowBox).not.toBeNull()
-  for (const label of ['Folder overview', 'sam-personal']) {
+  for (const label of ['Folder page', 'sam-personal']) {
     const badge = item.getByText(label, { exact: true })
     await expect(badge).toBeVisible()
     const badgeBox = await badge.boundingBox()
@@ -484,7 +482,7 @@ test('direct pins and context-set items keep the title and show a Folder overvie
     .getByTestId('context-pin-row')
     .filter({ hasText: 'Docs overview' })
   await expect(direct).toContainText('Docs overview')
-  await expect(direct).toContainText('Folder overview')
+  await expect(direct).toContainText('Folder page')
   const directTitle = direct.getByText('Docs overview', { exact: true })
   await expect(directTitle).toBeVisible()
   const titleGeometry = await directTitle.evaluate((element) => ({

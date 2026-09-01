@@ -6,22 +6,11 @@ import {
   CreateFolderRequestSchema,
   MoveFolderRequestSchema,
   MoveResponseSchema,
-  NOTE_CLASS,
   OkResponseSchema,
-  PROJECT_STATUS,
   RemoveResponseSchema,
 } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
-import {
-  deriveNoteTitle,
-  FOLDER_PAGE_BASENAME,
-  folderPageFilePath,
-  isPathUnder,
-  type KnowledgeStore,
-  normTags,
-  STORE_ERROR_REASON,
-  StoreError,
-} from '@notarium/core'
+import { deriveNoteTitle, StoreError } from '@notarium/core'
 
 import { safeRelAddress, safeRelPath } from '../../../../libs/relPath'
 import { prepareFieldWrite } from '../../../../services/fields'
@@ -29,23 +18,13 @@ import {
   acquireMarkPrefixLock,
   ensureFolderIdentity,
   finalizeFolderMove,
+  folderExists,
+  folderPageNoteOf,
   lastSegment,
+  materializeFolderPage,
 } from '../../../../services/projects'
-import { ALWAYS_LOAD_TAG, setNotePinned } from '../../../../services/spaces'
 import { type ApiRouteCtx, authz, missing, notFound, s } from '../_shared'
 import { moveFolderToDomain } from '../wire'
-
-const folderExistsIn = async (store: KnowledgeStore, path: string): Promise<boolean> => {
-  if (path === '') {
-    return true
-  }
-  const [notes, dirs] = await Promise.all([
-    store.list(),
-    store.listDirs ? store.listDirs() : Promise.resolve<string[]>([]),
-  ])
-
-  return dirs.includes(path) || notes.some((note) => isPathUnder(note.filePath, path))
-}
 
 export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   const { spaceStoreFor, projects, folders, markerStore, spaces, principalId, fieldSchemaStore } =
@@ -75,7 +54,7 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
           ? (await projects.listForSpace(req.spaceId)).some((project) => project.path === path)
           : false
 
-        if (!registered && !(await folderExistsIn(store, path))) {
+        if (!registered && !(await folderExists(store, path))) {
           const err = new StoreError('# Move Failed: folder not found')
           err.isToolError = true
           throw err
@@ -128,7 +107,7 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     if (!store.makeDir || !store.listDirs) {
       return notFound(reply)
     }
-    if (await folderExistsIn(store, path)) {
+    if (await folderExists(store, path)) {
       return reply
         .code(HTTP_STATUS.CONFLICT)
         .send({ error: 'a folder with that name already exists' })
@@ -140,7 +119,7 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         // The fast check above keeps the common 409 cheap; this one is the
         // linearization check after waiting behind a move/create of the path.
         prepare: async () => {
-          if (await folderExistsIn(store, path)) {
+          if (await folderExists(store, path)) {
             throw collision
           }
         },
@@ -245,9 +224,10 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   })
 
   // Create a folder's PAGE: mint the folder's lazy identity then write its `index.md` body note.
-  // Minting a page is the ONE identity trigger besides move — a marker lands only where a page
-  // exists, never on a plain browse. The page is an ordinary note; only its reserved basename
-  // hides it from the folder's children.
+  // Minting is lazy, never on a plain browse — but this is not its only trigger, and a marker is
+  // not evidence of a page: a move, a favorite and a project mark each mint one too, and they share
+  // the same file (canon: docs/folder-page.md#model). The page is an ordinary note; only its
+  // reserved basename hides it from the folder's children.
   app.post(s('/folders/page'), { config: authz('space:write', 'space') }, async (req, reply) => {
     const body = CreateFolderPageRequestSchema.safeParse(req.body)
 
@@ -268,17 +248,15 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     }
     const store = await spaceStoreFor(req)
     const space = req.spaceId
-    // Folder must exist (note-backed or explicit empty dir); root ('') always does. No minting a ghost.
-    const folderExists = await folderExistsIn(store, folderPath)
 
-    if (!folderExists) {
+    // State refusals stay AHEAD of the request-shape guard, as they always have:
+    // the shared operation re-checks both authoritatively (that is the race
+    // backstop), but the answer a caller gets for a missing folder or an existing
+    // page must not change because the write moved behind one interface.
+    if (!(await folderExists(store, folderPath))) {
       return notFound(reply)
     }
-    const pageFile = folderPageFilePath(folderPath)
-    const notes = await store.list()
-    const already = notes.find((n) => n.filePath === pageFile)
-
-    if (already) {
+    if (await folderPageNoteOf(store, folderPath)) {
       return reply.code(HTTP_STATUS.CONFLICT).send({ error: 'this folder already has a page' })
     }
     const name = lastSegment(folderPath) || spaces.slugOf(space) || 'index'
@@ -289,95 +267,49 @@ export const foldersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     if (hasAuthoredTitleInput && !deriveNoteTitle(body.data.content ?? '', body.data.title)) {
       return missing(reply, 'title')
     }
-    // The create's own refusal is the race backstop behind the existence pre-check above.
-    // `targetClass:'user-doc'` is hard-wired: a page is shared knowledge, never memory.
-    // canon: docs/note-model.md#note-classes
-    const title = body.data.title ?? (body.data.content === undefined ? name : '')
-    const content = body.data.content ?? `# ${body.data.title ?? name}\n`
-    const activeAtSnapshot = (await projects.listForSpace(space)).some(
-      (project) => project.path === folderPath && project.status === PROJECT_STATUS.active,
-    )
-    const authoredTags = normTags(body.data.tags) ?? []
-    const tags = activeAtSnapshot
-      ? [
-          ...authoredTags.filter((tag, index) =>
-            tag === ALWAYS_LOAD_TAG ? authoredTags.indexOf(tag) === index : true,
-          ),
-          ...(authoredTags.includes(ALWAYS_LOAD_TAG) ? [] : [ALWAYS_LOAD_TAG]),
-        ]
-      : body.data.tags
     const hasFields = Object.getOwnPropertyNames(body.data.fields ?? {}).length > 0
     const fieldsUnquoted = hasFields
       ? await prepareFieldWrite(fieldSchemaStore, space, body.data.fields!)
       : undefined
-    let folderId = ''
-    let r
-    const folderMissing = new Error('folder disappeared before page creation')
-
-    try {
-      r = await store.write(
-        {
-          title,
-          content,
-          directory: folderPath || undefined,
+    // The page lifecycle itself — folder existence, identity minting, collision and
+    // the active-project auto-pin — is shared with the agent's semantic create.
+    const materialized = await materializeFolderPage(
+      {
+        store,
+        projects,
+        folders,
+        markerStore,
+        now: () => new Date(),
+        attribution: { principal: principalId(req) },
+        onPostPrimaryError: (err) =>
+          req.log.error({ err }, '[folders] folder page auto-pin failed after page create'),
+      },
+      {
+        space,
+        folderPath,
+        note: {
+          title: body.data.title ?? (body.data.content === undefined ? name : ''),
+          content: body.data.content ?? `# ${body.data.title ?? name}\n`,
           noteType: body.data.noteType,
-          tags,
+          tags: body.data.tags,
           fields: body.data.fields,
           ...(fieldsUnquoted ? { fieldsUnquoted } : {}),
           slug: body.data.slug,
           createdAt: body.data.createdAt ? new Date(body.data.createdAt).toISOString() : undefined,
-          fileName: FOLDER_PAGE_BASENAME,
-          targetClass: NOTE_CLASS.userDoc,
-          principal: principalId(req),
         },
-        {
-          // Identity/marker creation is part of the page's path mutation: a
-          // concurrent folder delete/move cannot clean a freshly-created row
-          // after this request has established it. Keep it before the file
-          // write so a registry failure cannot leave a successfully-written
-          // page behind a failed response (the route's prior semantics).
-          prepare: async () => {
-            if (!(await folderExistsIn(store, folderPath))) {
-              throw folderMissing
-            }
-            folderId = await ensureFolderIdentity(
-              { projects, folders, markerStore, now: () => new Date() },
-              { space, folderPath },
-            )
-          },
-        },
-      )
-    } catch (err) {
-      if (err === folderMissing) {
-        return notFound(reply)
-      }
-      // Race backstop: two concurrent creates both snapshot an empty folder; the loser's write throws
-      // note_already_exists — surface the SAME 409 as the pre-check, not the mapper's generic 400.
-      if ((err as { reason?: string }).reason === STORE_ERROR_REASON.noteAlreadyExists) {
-        return reply.code(HTTP_STATUS.CONFLICT).send({ error: 'this folder already has a page' })
-      }
-      throw err
-    }
+      },
+    )
 
-    if (!activeAtSnapshot && r.id) {
-      const activeAfterCreate = (await projects.listForSpace(space)).some(
-        (project) => project.path === folderPath && project.status === PROJECT_STATUS.active,
-      )
-
-      if (activeAfterCreate) {
-        await setNotePinned(store, r.id, true, principalId(req)).catch((err) =>
-          req.log.error(
-            { err, noteId: r.id },
-            '[folders] project overview auto-pin failed after page create',
-          ),
-        )
-      }
+    if (!materialized.ok) {
+      return materialized.reason === 'no-such-folder'
+        ? notFound(reply)
+        : reply.code(HTTP_STATUS.CONFLICT).send({ error: 'this folder already has a page' })
     }
 
     return reply.code(HTTP_STATUS.CREATED).send(
       CreateFolderPageResponseSchema.parse({
-        folderId,
-        pageNoteId: r.id ?? '',
+        folderId: materialized.folderId,
+        pageNoteId: materialized.noteId,
         path: folderPath,
       }),
     )

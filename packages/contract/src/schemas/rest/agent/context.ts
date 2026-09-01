@@ -23,8 +23,9 @@ export const ContextPinSchema = PinnedNoteSchema.extend({
   loaded: z.boolean(),
   tokens: z.number(),
   /** Derived from the access-resolved storage path. `true` means this one note is a
-   *  folder's `index.md` overview; it never means the folder contents are included. */
-  folderOverview: z.literal(true).optional(),
+   *  folder's PAGE (its authored cover, stored as `index.md`); it never means the
+   *  folder contents are included. canon: docs/folder-page.md#model */
+  folderPage: z.literal(true).optional(),
   /** Home space slug — present ONLY for a CROSS-SPACE pin, resolved per-reader
    *  with honest degradation if unreachable (like a set ref).
    *  Absent for a same-space pin (the location-bound `always-load` tag). Drives the
@@ -55,7 +56,15 @@ const ContextSetPageItemBaseSchema = z.object({
 })
 
 export const ContextSetPageItemSchema = z.union([
-  ContextSetPageItemBaseSchema.extend({ space: z.string(), title: z.string() }),
+  ContextSetPageItemBaseSchema.extend({
+    space: z.string(),
+    title: z.string(),
+    /** Same role marker the weighed preview carries, so one expanded set does not answer
+     *  the folder-page question twice — with a chip above the curation stop and silence
+     *  below it. Only the reachable variant has it: a degraded row states nothing about a
+     *  note the reader cannot read. canon: docs/folder-page.md#model */
+    folderPage: z.literal(true).optional(),
+  }),
   ContextSetPageItemBaseSchema.extend({ space: z.null(), title: z.null() }),
 ])
 

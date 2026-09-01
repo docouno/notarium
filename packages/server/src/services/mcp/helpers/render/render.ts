@@ -3,9 +3,12 @@ import {
   type AgentSession,
   type DeltaEntry,
   type FolderEntry,
+  type FolderPageMarker,
+  type FolderPageSlot,
   type ListNotesItem,
   type NextAbilityAction,
   type NoteLink,
+  type PresentFolderPage,
   type ProjectSummary,
   type Provenance,
   type RecentActivityItem,
@@ -37,6 +40,7 @@ type SessionStructured = {
   project?: {
     index: { noteCount: number; folders: FolderEntry[] }
     alwaysLoad: Array<{ noteId: string; title: string }>
+    folderPage?: PresentFolderPage
     delta: { changes: DeltaEntry[]; total: number; truncated?: boolean }
     knownValues?: { categories: string[]; tags: string[] }
   }
@@ -120,6 +124,16 @@ export const renderSession = (
       '',
       `**\`${project}\`:** ${idx.noteCount} note${idx.noteCount === 1 ? '' : 's'}${folderTail} (enumerate with list_notes)`,
     )
+    if (s.project.folderPage) {
+      // Mirrors the structured marker for a text-only client. It earns its line in the
+      // state the marker exists FOR: a page that is present but not pinned rides in no
+      // always-load list, so without this the bootstrap simply would not mention it.
+      const page = s.project.folderPage
+      lines.push(
+        '',
+        `**Folder page:** ${page.title} \`${page.noteId}\` — the authored cover of \`${project}\`. Read it with get_note.`,
+      )
+    }
     if (s.project.alwaysLoad.length) {
       lines.push('', `**Always-load notes in \`${project}\`:**`)
       for (const a of s.project.alwaysLoad) {
@@ -256,12 +270,20 @@ export const renderNote = (
     versionToken: string
     unsafeFrontmatterKeysOmitted?: number
     provenance?: Provenance
+    folderPage?: FolderPageMarker
     outline?: Array<{ level: number; title: string }>
     links?: { outgoing: NoteLink[]; incoming: NoteLink[] }
   },
   format: 'concise' | 'detailed',
 ): string => {
   const where = whereLabel(note)
+  // The third mirror of the structural marker. `list_notes` and `start_session` both say
+  // the role in prose; without this the ONE step the flow sends an agent to next — read
+  // the page you were just told about — is the step where a text-only client stops being
+  // told what it is holding.
+  const role = note.folderPage
+    ? `\n\n_The Folder page of ${note.folderPage.folderPath ? `\`${note.folderPage.folderPath}\`` : 'the root'} — this note IS that folder's cover._`
+    : ''
   const unsafeFrontmatterWarning = note.unsafeFrontmatterKeysOmitted
     ? `_${note.unsafeFrontmatterKeysOmitted} unsafe frontmatter ${note.unsafeFrontmatterKeysOmitted === 1 ? 'key was' : 'keys were'} omitted from the agent view._`
     : ''
@@ -269,9 +291,9 @@ export const renderNote = (
   if (format === RESPONSE_FORMAT.concise) {
     const firstPara = note.content.split('\n\n')[0]?.trim() ?? ''
     const brief = firstPara.length > 500 ? `${firstPara.slice(0, 500)}…` : firstPara
-    return `# ${note.title}${where}\n\n${brief}${unsafeFrontmatterWarning ? `\n\n${unsafeFrontmatterWarning}` : ''}`
+    return `# ${note.title}${where}${role}\n\n${brief}${unsafeFrontmatterWarning ? `\n\n${unsafeFrontmatterWarning}` : ''}`
   }
-  const parts = [`# ${note.title}${where}\n\n${note.content}`]
+  const parts = [`# ${note.title}${where}${role}\n\n${note.content}`]
 
   if (note.unsafeFrontmatterKeysOmitted) {
     parts.push(unsafeFrontmatterWarning)
@@ -301,17 +323,72 @@ export const renderNote = (
   return parts.join('\n\n')
 }
 
-/** The list_notes (ls) rendering: subfolders, then notes. */
+/** Why a missing slot carries no create action. Server-internal on purpose: the slot on
+ *  the wire has no reason vocabulary, and this only chooses between two sentences —
+ *  "you may not write here" and "this call cannot express the action", which used to
+ *  share one, untrue in the second case. */
+export type CreateUnavailable = 'no-write' | 'unaddressed'
+
+/** The folder-page slot in prose — the exact mirror of the structured slot, so a
+ *  text-only client reads the same folder state (and the same create action) a
+ *  structured one does. The missing branch says capability, not instruction:
+ *  an agent that browses a folder has not been asked to author its page. */
+const folderPageLines = (
+  slot: FolderPageSlot,
+  where: string,
+  unavailable?: CreateUnavailable,
+): string[] => {
+  if (slot.status === 'present') {
+    return [
+      `Folder page: **${slot.title}** \`${slot.noteId}\` — the authored cover of ${where}. Read it with get_note.`,
+    ]
+  }
+  if (!slot.createWith) {
+    // Two different facts used to share one sentence, and one of them was a lie: a
+    // listing of the personal domain carries no project handle to build the action
+    // FROM, while its owner may create pages there perfectly well. Only the caller who
+    // actually cannot write is told so — and the other branch points at the shape of the
+    // call that CAN express it without promising that a project covers this folder.
+    return [
+      unavailable === 'unaddressed'
+        ? `Folder page is missing for ${where}; this listing carries no create action. A project-scoped listing of the same folder offers one, where the folder belongs to a project.`
+        : `Folder page is missing for ${where}; creating one is not available to you here.`,
+    ]
+  }
+
+  return [
+    `Folder page is missing for ${where}.`,
+    'Create only if the user explicitly asked for folder-level authored content.',
+    `createWith: ${JSON.stringify(slot.createWith)}`,
+    'Pass createWith unchanged to create_note and add body.',
+  ]
+}
+
+/** The list_notes (ls) rendering: the folder's own page, then subfolders, then notes. */
 export const renderListNotes = (
   items: ListNotesItem[],
   folders: FolderEntry[],
   total: number,
   folder: string,
+  folderPage?: FolderPageSlot,
+  unavailable?: CreateUnavailable,
 ): string => {
   const where = folder ? `\`${folder}\`` : 'the root'
+  // The slot outlives an empty listing: a folder holding ONLY its `index.md` is
+  // exactly the case the early return used to report as "Nothing in …", which would
+  // have contradicted a `present` structured slot on the first non-trivial folder.
+  const pageLines = folderPage ? folderPageLines(folderPage, where, unavailable) : []
 
   if (!items.length && !folders.length) {
-    return `Nothing in ${where}.`
+    // The slot does not ANSWER `ls`: a page is the folder's cover, not its content, and
+    // a missing one is not content either. Both statements travel together, or a text
+    // client cannot tell an empty folder from one whose contents it was never told —
+    // and a folder that does not exist at all would read as the more informative of
+    // the two, since only IT still got a plain "Nothing in".
+    const empty =
+      folderPage?.status === 'present' ? `No other notes in ${where}.` : `Nothing in ${where}.`
+
+    return [...pageLines, empty].join('\n')
   }
   const lines: string[] = []
 
@@ -323,7 +400,8 @@ export const renderListNotes = (
   }
   const more =
     items.length < total ? ` (showing ${items.length} of ${total} notes — page with cursor)` : ''
-  return `Contents of ${where}${more}:\n${lines.join('\n')}`
+  const body = `Contents of ${where}${more}:\n${lines.join('\n')}`
+  return pageLines.length ? `${pageLines.join('\n')}\n\n${body}` : body
 }
 
 /** recent_activity rendering, newest-first. */

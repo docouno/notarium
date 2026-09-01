@@ -149,7 +149,7 @@ export const agentContext: CaseSpec = {
 
     // The project's folder page is an ordinary same-space pin (#311). It makes the
     // exact boundary visible in the reader action, picker and Context row: unpin it
-    // in the reader, then find it again as "Folder overview · product" in the picker.
+    // in the reader, then find it again as "Folder page · product" in the picker.
     b.note({
       space: 'atlas',
       path: 'product/index.md',

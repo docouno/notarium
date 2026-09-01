@@ -307,6 +307,10 @@ const scopeNoteReader = (deps: ScopeResolveDeps, principal: Principal) => {
           title: fact.title,
           spaceSlug: deps.spaces.slugOf(access.space) ?? access.space,
           filePath: access.filePath,
+          // The class travels because a reserved basename alone does not make a folder
+          // page: hidden classes have their own dot-namespaced mounts. The body-fact
+          // accelerator carries the same mount-materialized class the meta row does.
+          class: fact.noteClass,
         }
       }
     }
@@ -322,6 +326,7 @@ const scopeNoteReader = (deps: ScopeResolveDeps, principal: Principal) => {
       title: hit.note.title ?? '',
       spaceSlug: deps.spaces.slugOf(hit.space) ?? hit.space,
       filePath: hit.note.filePath ?? '',
+      class: hit.note.class,
     }
   }
 }

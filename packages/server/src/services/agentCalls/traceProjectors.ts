@@ -144,8 +144,14 @@ export const TRACE_TOOL_POLICY = {
   create_note: policy(
     AGENT_CALL_EFFECT.mutation,
     'note',
-    ['project', 'title', 'path', 'type'],
-    ['project', 'title', 'path', 'type', 'tags'],
+    // `folderPage` is a boolean selector, not content, and it is the difference between an
+    // ordinary create and the create door that mints a folder identity, pins the reserved
+    // basename and may add an active project's always-load body. Both doors accept their
+    // title through the body's `# Heading` instead of the `title` argument, and WITHOUT this
+    // selector both would project the same `{project, path, bodyBytes}` row (`body` is
+    // required, and this policy records its size, never its text).
+    ['project', 'title', 'path', 'type', 'folderPage'],
+    ['project', 'title', 'path', 'type', 'tags', 'folderPage'],
     ['noteId'],
     ['body'],
   ),

@@ -104,7 +104,7 @@ export const PinRow = ({
         <span className={styles.itemTitle}>
           <span className={styles.itemName}>{pin.title}</span>
           <span className={styles.itemBadges} data-testid="context-item-badges">
-            {pin.folderOverview && <Chip>Folder overview</Chip>}
+            {pin.folderPage && <Chip>Folder page</Chip>}
             {pin.space && <Chip>{pin.space}</Chip>}
             {pin.loaded === false && <StatusBadge state="trimmed" />}
           </span>
@@ -145,7 +145,7 @@ export const SetItemRow = ({
       <span className={styles.itemTitle}>
         <span className={styles.itemName}>{item.title ?? 'Unavailable note'}</span>
         <span className={styles.itemBadges} data-testid="context-item-badges">
-          {item.folderOverview && <Chip>Folder overview</Chip>}
+          {item.folderPage && <Chip>Folder page</Chip>}
           {item.space && <Chip>{item.space}</Chip>}
           {item.loaded === false && <StatusBadge state="trimmed" />}
         </span>
@@ -245,7 +245,7 @@ export const SetRow = ({
         order: item.sourceIndex,
         ...(unavailable
           ? {
-              folderOverview: undefined,
+              folderPage: undefined,
               loaded: undefined,
               space: null,
               title: null,

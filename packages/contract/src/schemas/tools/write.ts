@@ -11,7 +11,12 @@ import {
 } from '../primitives'
 import { ViewConfigPatchPublishedSchema, ViewConfigPatchSchema } from '../rest/views'
 import { McpFieldPatchPublishedSchema, McpFieldPatchSchema, sessionField } from './_fields'
-import { ProjectHandleSchema, RefSchema } from './primitives'
+import {
+  FolderPageMarkerSchema,
+  ProjectHandleSchema,
+  RefSchema,
+  WriteResultSchema,
+} from './primitives'
 
 /** CAS + idempotency mixin for the create/edit tools (`link` takes neither —
  *  idempotent by construction). canon: docs/contract.md#cas */
@@ -64,16 +69,25 @@ export const CreateNoteInputSchema = z
     links: z.array(InlineLinkSchema).optional(),
     createdAt: IsoTimestampSchema.optional(),
     fileName: DurableScalarSchema.optional(),
+    /** Author this note as the FOLDER PAGE of `path` (the folder's authored cover,
+     *  stored as its reserved `index.md`) instead of an ordinary note. Take it from
+     *  a `list_notes` `folderPage.createWith` — never hand-built — and pass no
+     *  `fileName` with it: the page's storage name is fixed.
+     *  canon: docs/folder-page.md#model */
+    folderPage: z.literal(true).optional(),
     ...casFields,
   })
   .strict()
 
 /** One note in a `create_notes` batch: create_note's fields minus `project`
- *  (hoisted to the batch) and `versionToken` (a create is additive). */
+ *  (hoisted to the batch), `versionToken` (a create is additive) and `folderPage`
+ *  (one folder has ONE page — a semantic create is a single, deliberate act, not a
+ *  batch item). */
 export const CreateNoteItemSchema = CreateNoteInputSchema.omit({
   project: true,
   session: true,
   versionToken: true,
+  folderPage: true,
 }).strict()
 
 /** Tool `create_notes`: best-effort batch create in one project (per-item
@@ -105,6 +119,13 @@ export const BatchCreateResultSchema = z.object({
 
 export const CreateNotesOutputSchema = z.object({
   results: z.array(BatchCreateResultSchema),
+})
+
+/** `create_note`'s result: the shared write echo, plus the folder-page marker when
+ *  this call authored a folder's cover. Only the semantic create can emit it, so it
+ *  rides here rather than on the write result every tool shares. */
+export const CreateNoteOutputSchema = WriteResultSchema.extend({
+  folderPage: FolderPageMarkerSchema.optional(),
 })
 
 /** One link in a `link_many` batch: `from` + a target (`to` XOR `toTitle`) +
@@ -215,6 +236,8 @@ export type CreateNotesInput = z.infer<typeof CreateNotesInputSchema>
 export type BatchCreateResult = z.infer<typeof BatchCreateResultSchema>
 
 export type CreateNotesOutput = z.infer<typeof CreateNotesOutputSchema>
+
+export type CreateNoteOutput = z.infer<typeof CreateNoteOutputSchema>
 
 export type LinkItem = z.infer<typeof LinkItemSchema>
 

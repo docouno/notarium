@@ -542,8 +542,8 @@ export type ProjectRecord = {
   createdAt: string
 }
 
-/** A plain identified folder — a folder given a stable id lazily (on first
- *  rename/move) so `[[oldpath/note]]` + old URLs resolve, WITHOUT being a project
+/** A plain identified folder — a folder given a stable id lazily (a move, a page, a
+ *  favorite) so `[[oldpath/note]]` + old URLs resolve, WITHOUT being a project
  *  (no handle, memory, or agent semantics). `type='folder'` rows of the shared
  *  `folders` table. */
 export type FolderRecord = {

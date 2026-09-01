@@ -53,6 +53,13 @@ const fixture = (): Fixture => ({
           content: 'child',
         },
         {
+          id: 'wobble-child',
+          title: 'Wobble child',
+          class: 'user-doc',
+          filePath: 'wobble/child.md',
+          content: 'child',
+        },
+        {
           id: 'failure-overview',
           title: 'Failure overview',
           class: 'user-doc',
@@ -204,7 +211,7 @@ beforeEach(async () => {
     await app.inject({ method: 'GET', url: '/api/spaces', headers: { cookie } })
   ).json().spaces as Array<{ id: string; slug: string }>
   teamId = spaces.find((s) => s.slug === 'team')!.id
-  for (const folder of ['docs', 'race', 'between', 'snapshot', 'failure']) {
+  for (const folder of ['docs', 'race', 'between', 'snapshot', 'failure', 'wobble']) {
     markerStore.seedFolder(teamId, folder)
   }
 })
@@ -295,7 +302,7 @@ describe('project overview auto-pin lifecycle (#311)', () => {
     })
     expect(context.statusCode).toBe(200)
     expect(context.json().pins).toEqual([
-      expect.objectContaining({ noteId: pageNoteId, folderOverview: true }),
+      expect.objectContaining({ noteId: pageNoteId, folderPage: true }),
     ])
     const session = await startSession(bearer, 'team/roadmap')
     expect(
@@ -552,6 +559,116 @@ describe('project overview auto-pin lifecycle (#311)', () => {
     expect((await readNote(cookie, created.json().pageNoteId)).json().frontmatter.tags).toContain(
       'always-load',
     )
+  })
+
+  it('marks the space root even after a page has identified it', async () => {
+    const cookie = await loginCookie()
+    // Writing a page at the root mints a plain folder-identity there, exactly as it does
+    // for any other folder.
+    const page = await app.inject({
+      method: 'POST',
+      url: '/api/s/team/folders/page',
+      headers: { cookie },
+      payload: { folderPath: '', content: '# Team\n\nThe root cover.' },
+    })
+    expect(page.statusCode).toBe(201)
+
+    // Marking that root then has to ADOPT that row, like every other path. Skipping the
+    // adoption because `''` is falsy made the mark collide on UNIQUE(space, path) and
+    // answer with a raw constraint error, and keep answering it: the boot scan that
+    // prunes a folder row whose marker vanished needs a marker store, which the host
+    // hitting this branch does not have. The toggle in Workspace settings is the human's
+    // only way in.
+    const rootFolderId = page.json().folderId as string
+    expect(rootFolderId).toBeTruthy()
+
+    const marked = await mark(cookie, { folderPath: '', displayName: 'Team Root' })
+    expect(marked.statusCode).toBe(201)
+    // What THIS stand proves is the marker-backed path end to end: a root that a page
+    // identified is marked, and the mark reuses that id rather than minting a second.
+    // It does not prove the adoption RULE — a marker store is present here, so the id
+    // arrives from the marker before the registry row is ever consulted. The rule, and
+    // the raw UNIQUE 500 that skipping it caused on a registry-only host, are pinned by
+    // `markFolderAsProject … SPACE ROOT` in test/unit/projects.test.ts.
+    expect(marked.json()).toMatchObject({ id: rootFolderId, path: '', status: 'active' })
+  })
+
+  it('mints the identity of a folder that a page MOVE brings into existence', async () => {
+    const cookie = await loginCookie()
+    const bearer = await patFor(cookie)
+    const page = await createPage(cookie, 'docs')
+    expect(page.statusCode).toBe(201)
+    const pageNoteId = page.json().pageNoteId as string
+
+    // The destination does not exist yet — move_note creates it. A marker is metadata
+    // ABOUT an existing folder and never provisions one, which this stand's marker store
+    // models by refusing a folder it has never seen. So the id can only be minted from
+    // the move's `finalize`: mint it before the move and the marker write fails, the
+    // best-effort catch swallows it, and the folder silently gets no identity at all.
+    const moved = await callTool(bearer, 'move_note', {
+      ref: pageNoteId,
+      toFolder: 'archive/2026',
+    })
+    expect(moved.result?.isError ?? false).toBe(false)
+
+    const tree = await app.inject({
+      method: 'GET',
+      url: '/api/s/team/tree',
+      headers: { cookie },
+    })
+    expect(tree.statusCode).toBe(200)
+    const landed = (tree.json().folders as Array<{ path: string; id?: string }>).find(
+      (f) => f.path === 'archive/2026',
+    )
+    expect(landed?.id).toBeTruthy()
+  })
+
+  it('keeps a successful page create successful when its post-primary auto-pin fails', async () => {
+    const cookie = await loginCookie()
+    let openEntered!: () => void
+    const entered = new Promise<void>((resolve) => {
+      openEntered = resolve
+    })
+    let openRelease!: () => void
+    const release = new Promise<void>((resolve) => {
+      openRelease = resolve
+    })
+    const write = teamStore.write.bind(teamStore)
+    const mutateTags = teamStore.mutateTags.bind(teamStore)
+    let held = true
+
+    teamStore.write = async (input, opts) => {
+      if (held && input.fileName === 'index' && !input.originalId) {
+        held = false
+        openEntered()
+        await release
+      }
+
+      return write(input, opts)
+    }
+
+    // The project appears AFTER the pre-write snapshot, so the pin is the post-primary
+    // reconciliation — the one branch where a page create touches mutateTags at all.
+    // The injection is armed only once the mark itself is done, so what fails is
+    // unambiguously the page's own reconciliation.
+    const page = createPage(cookie, 'wobble')
+    await entered
+    const marked = await mark(cookie, { folderPath: 'wobble', displayName: 'Wobble' })
+
+    teamStore.mutateTags = async () => {
+      throw new Error('injected auto-pin failure')
+    }
+    openRelease()
+    const created = await page
+
+    // The page is the PRIMARY mutation: a failed metadata step is logged, never rolled
+    // back onto a page that already exists on disk.
+    expect(marked.statusCode).toBe(201)
+    expect(created.statusCode).toBe(201)
+    teamStore.mutateTags = mutateTags
+    expect(
+      (await readNote(cookie, created.json().pageNoteId)).json().frontmatter.tags ?? [],
+    ).not.toContain('always-load')
   })
 
   it('keeps a successful mark successful when the post-primary auto-pin fails', async () => {

@@ -842,6 +842,63 @@ describe('the Context constructor and the role an address names (#309)', () => {
     expect(headerOf(mount, 'context-set-row', 'Paged set')).toContain('1 of 3')
   })
 
+  it('takes the folder-page role from the tail, and drops it when the tail blanks the row', async () => {
+    harness.search = new URLSearchParams()
+    harness.api.meAgentContextGet.mockResolvedValue({
+      ...previewAnswer(),
+      sets: [
+        {
+          id: 'set-paged',
+          name: 'Paged set',
+          homeSpace: 'main',
+          order: 0,
+          items: [
+            {
+              noteId: 'preview-cover',
+              title: 'Preview cover',
+              tokens: 100,
+              loaded: true,
+              order: 0,
+              sourceIndex: 0,
+              space: 'main',
+              folderPage: true,
+            },
+          ],
+          itemsLoaded: 1,
+          itemsTotal: 3,
+          itemsCursor: 1,
+          trimmed: true,
+        },
+      ],
+    })
+    harness.api.contextSetItemsGet.mockResolvedValue({
+      total: 3,
+      // The reader lost access to the preview's own row between the two calls…
+      items: [
+        { sourceIndex: 0, noteId: 'preview-cover', title: null, space: null },
+        // …and a cover the preview never reached arrives with its role attached.
+        {
+          sourceIndex: 2,
+          noteId: 'tail-cover',
+          title: 'Tail cover',
+          space: 'main',
+          folderPage: true,
+        },
+      ],
+    })
+    const mount = await render()
+
+    await expandRows(mount)
+    await act(async () => {})
+    const text = textOf(mount, 'context-personal-pins')
+
+    expect(text).toContain('Tail cover')
+    expect(text).toContain('Unavailable note')
+    // Exactly one chip: the blanked row must not keep claiming a role for a note the
+    // reader can no longer reach, and the tail-only cover must not lose one.
+    expect(text.match(/Folder page/g)).toHaveLength(1)
+  })
+
   it('keeps cached set pages on unrelated SSE and invalidates only a referenced note', async () => {
     harness.search = new URLSearchParams()
     harness.api.meAgentContextGet.mockResolvedValue({

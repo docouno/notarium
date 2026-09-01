@@ -16,9 +16,10 @@ import type { MarkerStore } from './markerStore'
 import { withMarkLock } from './markLock'
 import { writeMarkerFor } from './markProject'
 
-/** Ensure a folder has a stable identity and return its id — the page-create
- *  trigger that lazily mints a folder id. Idempotent + serialized per (space, path).
- */
+/** Ensure a folder has a stable identity and return its id. One of several lazy-mint
+ *  callers (page create, page arrival, folder move/rename, favorite) — see its call sites
+ *  rather than assuming; project marking mints its own. Idempotent + serialized per
+ *  (space, path). */
 export const ensureFolderIdentity = (
   deps: RecordFolderRenameDeps,
   input: { space: string; folderPath: string },

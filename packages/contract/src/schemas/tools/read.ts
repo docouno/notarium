@@ -9,6 +9,7 @@ import {
 import { ViewManifestItemSchema, ViewRowSchema } from '../rest/views'
 import { locationFields, sessionField } from './_fields'
 import {
+  FolderPageMarkerSchema,
   ProjectHandleSchema,
   ProvenanceSchema,
   RefSchema,
@@ -97,6 +98,9 @@ export const GetNoteOutputSchema = z.object({
   unsafeFrontmatterKeysOmitted: z.number().int().positive().optional(),
   ...locationFields,
   class: NoteClassSchema.optional(),
+  /** Present when this note IS its folder's page — the structural role a bare
+   *  `class`/`path` cannot express. canon: docs/folder-page.md#model */
+  folderPage: FolderPageMarkerSchema.optional(),
   versionToken: z.string(),
   provenance: ProvenanceSchema.optional(),
   outline: z.array(OutlineEntrySchema).optional(),

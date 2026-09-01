@@ -482,7 +482,7 @@ export const contextSetViewOf = (set: CuratedSet): ContextSetView => {
           // `item.order` aliases the raw source coordinate. A reader outside the
           // set's home receives only a dense order over rows they can already see.
           order,
-          ...(item.folderOverview ? { folderOverview: true as const } : {}),
+          ...(item.folderPage ? { folderPage: true as const } : {}),
         })),
       }
 }

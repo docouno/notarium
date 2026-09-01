@@ -19,7 +19,7 @@ import {
   RoleContextQuerySchema,
 } from '@notarium/contract'
 import { HTTP_STATUS, REQUEST_TIMING_HEADER } from '@notarium/contract/http'
-import { decodeAbilityLocator, freshNoteId } from '@notarium/core'
+import { decodeAbilityLocator, freshNoteId, isFolderPageOf } from '@notarium/core'
 
 import { can } from '../../../../services/authz'
 import type { ContextSetItemRef, ContextSetRecord } from '../../../../services/metaDb'
@@ -293,6 +293,9 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
               noteId: item.noteId,
               title: fact.title,
               space: spaces.slugOf(access.space) ?? access.space,
+              ...(isFolderPageOf(access.filePath, fact.noteClass)
+                ? { folderPage: true as const }
+                : {}),
             }
           }
           const live = await readNoteAccess(
@@ -306,6 +309,9 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
             noteId: live?.noteId ?? item.noteId,
             title: live ? (live.note.title ?? '') : null,
             space: live ? (spaces.slugOf(live.space) ?? live.space) : null,
+            ...(live && isFolderPageOf(live.note.filePath, live.note.class)
+              ? { folderPage: true as const }
+              : {}),
           }
         }),
       )

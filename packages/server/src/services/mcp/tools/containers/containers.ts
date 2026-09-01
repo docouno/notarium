@@ -5,24 +5,20 @@ import {
   type RenameFolderInput,
   type RenameProjectInput,
 } from '@notarium/contract/tools'
-import { isPathUnder, type KnowledgeStore, READ_SCOPE } from '@notarium/core'
+import { READ_SCOPE } from '@notarium/core'
 
 import { safeRelAddress, safeRelPath } from '../../../../libs/relPath'
 import { can } from '../../../authz'
-import { ensureFolderIdentity, finalizeFolderMove, renameProjectSlug } from '../../../projects'
+import {
+  ensureFolderIdentity,
+  finalizeFolderMove,
+  folderExists,
+  renameProjectSlug,
+} from '../../../projects'
 import { type Ctx, type Handler, type Rendered, ToolFailure } from '../../gateway'
 import { wireSpace } from '../../helpers/dedup'
 import { handleOf } from '../../helpers/projectAddressing'
 import { sanitizeText } from '../../sanitize'
-
-const folderExistsIn = async (store: KnowledgeStore, path: string): Promise<boolean> => {
-  const [notes, dirs] = await Promise.all([
-    store.list({ scope: READ_SCOPE.all }),
-    store.listDirs?.() ?? Promise.resolve<string[]>([]),
-  ])
-
-  return dirs.includes(path) || notes.some((note) => isPathUnder(note.filePath, path))
-}
 
 /** Shared folder move/rename orchestration for move_folder / rename_folder.
  *  `src`/`dest` are space-relative, already safeRelPath-normalised and non-root —
@@ -74,7 +70,7 @@ const reorgFolder = async (
         ? (await ctx.projects.listForSpace(space)).some((project) => project.path === opts.src)
         : false
 
-      if (!registered && !(await folderExistsIn(spaceStore, opts.src))) {
+      if (!registered && !(await folderExists(spaceStore, opts.src))) {
         throw new ToolFailure('no such folder, or you do not have access to it')
       }
       if (ctx.projects && ctx.folders) {

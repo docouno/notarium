@@ -421,6 +421,19 @@ describe('agent-context pult (#165): preview', () => {
     // Two user-docs live under docs/ → the auto index reports the subtree count.
     expect(ctx.index.noteCount).toBe(2)
     expect(typeof ctx.index.folderCount).toBe('number')
+
+    // A cover is not one of them. This number is the pult's promise to show exactly what
+    // the agent loads, so it has to answer the way `start_session` does — otherwise the
+    // two halves of one claim disagree by the number of pages in the subtree.
+    const page = await app.inject({
+      method: 'POST',
+      url: '/api/s/main/folders/page',
+      headers: { cookie },
+      payload: { folderPath: 'docs' },
+    })
+    expect(page.statusCode).toBe(201)
+    const withPage = await getJson('/api/s/main/projects/proj-main-docs/agent-context', cookie)
+    expect(withPage.index.noteCount).toBe(2)
   })
 
   it('a token narrowed away from personal gets the project axis but no embedded personal background (#395)', async () => {

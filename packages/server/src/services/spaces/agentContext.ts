@@ -3,11 +3,11 @@
 // EXACTLY what the agent will load, not a parallel re-derivation.
 // canon: docs/projects.md#init-context-curation-165-a-idinit-context-curationa
 
-import { CONTEXT_ENTRY_KIND, NOTE_CLASS } from '@notarium/contract'
+import { CONTEXT_ENTRY_KIND, NOTE_CLASS, type NoteClass } from '@notarium/contract'
 import {
   basenameOf,
   estimateTokens,
-  isFolderPageNote,
+  isFolderPageOf,
   isPathUnder,
   type KnowledgeStore,
   memoryDirOf,
@@ -37,7 +37,7 @@ export type WeighedPin = {
   title: string
   tokens: number
   space?: string
-  folderOverview?: true
+  folderPage?: true
 }
 /** A pin with the curation verdict: `loaded=false` = still pinned but over the scope's
  *  single token budget (the pult dims it, the agent won't load it). `order` = 0-based
@@ -101,6 +101,9 @@ type ResolvedContextNote = {
   title: string
   spaceSlug: string
   filePath: string
+  /** Needed to answer the folder-page question: the reserved basename alone does not
+   *  make a cover, and a hidden class carrying it is nobody's folder page. */
+  class?: NoteClass
 }
 
 /** Flatten one curated layer into the exact note refs sent to an agent, preserving the
@@ -148,7 +151,7 @@ export const resolveContextSets = async (
             title: note.title,
             tokens: note.tokens ?? estimateTokens(note.content ?? ''),
             space: note.spaceSlug,
-            ...(isFolderPageNote(note.filePath) ? { folderOverview: true as const } : {}),
+            ...(isFolderPageOf(note.filePath, note.class) ? { folderPage: true as const } : {}),
           }
         }),
       )
@@ -181,7 +184,7 @@ export const resolveScopePins = async (
         title: note.title,
         tokens: note.tokens ?? estimateTokens(note.content ?? ''),
         space: note.spaceSlug,
-        ...(isFolderPageNote(note.filePath) ? { folderOverview: true as const } : {}),
+        ...(isFolderPageOf(note.filePath, note.class) ? { folderPage: true as const } : {}),
       }
     }),
   )
@@ -214,8 +217,8 @@ export const weighAlwaysLoad = async (
         noteId: note?.id ?? (m.id as string),
         title: fact?.title ?? note?.title ?? m.title,
         tokens: fact?.bodyTokens ?? estimateTokens(note!.content),
-        ...(isFolderPageNote(note?.filePath ?? m.filePath)
-          ? { folderOverview: true as const }
+        ...(isFolderPageOf(note?.filePath ?? m.filePath, m.class)
+          ? { folderPage: true as const }
           : {}),
       }
     }),
@@ -300,7 +303,7 @@ const rawSetItem =
       title: note.title,
       tokens: note.tokens ?? estimateTokens(note.content ?? ''),
       space: note.spaceSlug,
-      ...(isFolderPageNote(note.filePath) ? { folderOverview: true as const } : {}),
+      ...(isFolderPageOf(note.filePath, note.class) ? { folderPage: true as const } : {}),
     }
   }
 
@@ -547,7 +550,7 @@ const rebucket = (
       loaded: e.loaded,
       order: pinPos.get(e.noteId) ?? 0,
       ...(e.space ? { space: e.space } : {}),
-      ...(e.folderOverview ? { folderOverview: true as const } : {}),
+      ...(e.folderPage ? { folderPage: true as const } : {}),
     }))
   const setGroupIndex = new Map(
     groups
@@ -567,7 +570,7 @@ const rebucket = (
         loaded: e.loaded,
         order: e.sourceIndex ?? 0,
         sourceIndex: e.sourceIndex ?? 0,
-        ...(e.folderOverview ? { folderOverview: true as const } : {}),
+        ...(e.folderPage ? { folderPage: true as const } : {}),
       }))
     const represented = new Set(rows.map((row) => row.sourceIndex))
     let itemsCursor = 0
@@ -787,7 +790,13 @@ export const projectIndexSummary = async (
   const visible = projectPath ? all.filter((m) => isPathUnder(m.filePath, projectPath)) : all
   const dirs = store.listDirs ? await store.listDirs() : []
   const childFolders = treeChildren(all, dirs, { path: projectPath, offset: 0, limit: 0 }).folders
-  return { noteCount: visible.length, folderCount: childFolders.length }
+  // Covers are not contents, and this number is the pult's promise to show EXACTLY what
+  // the agent loads — `start_session` stopped counting them, so this has to as well or
+  // the two halves of one claim disagree by the number of pages in the subtree.
+  return {
+    noteCount: visible.filter((m) => !isFolderPageOf(m.filePath, m.class)).length,
+    folderCount: childFolders.length,
+  }
 }
 
 type PinMutationStore = Pick<SpaceStore, 'mutateTags' | 'read'>

@@ -1,4 +1,5 @@
 export {
+  type CreateUnavailable,
   renderListNotes,
   renderNote,
   renderRecentActivity,

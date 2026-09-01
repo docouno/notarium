@@ -35,8 +35,8 @@ test('breadcrumb folder segments link to their page; the current leaf stays plai
 })
 
 test('an identified folder crumb uses its durable /folder/<id>', async ({ page }) => {
-  // Give `demo` a page — that mints its folder-identity (the only way a plain
-  // folder gets an id, #212). The crumb must then prefer the durable permalink.
+  // Give `demo` a page — one of the acts that mint a folder-identity (#212). The
+  // crumb must then prefer the durable permalink.
   const created = await page.request.post('/api/s/main/folders/page', {
     data: { folderPath: 'demo', content: '# demo\n\nOverview.' },
   })

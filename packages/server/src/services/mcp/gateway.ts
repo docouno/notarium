@@ -102,7 +102,7 @@ export type GatewayDeps = {
   /** The project registry. Absent (meta-DB-less host) → no projects exist
    *  (honest degradation). */
   projects?: ProjectsPersistence
-  /** Folder path-history, lazily minted on a folder's first rename so
+  /** Folder path-history; the identity behind it is minted lazily (a move, a page, a favorite) so
    *  `[[oldpath/note]]` keeps resolving. Absent → move/rename still works, only the
    *  path-history isn't recorded. */
   folders?: FolderIdentityPersistence

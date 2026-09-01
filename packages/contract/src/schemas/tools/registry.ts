@@ -55,6 +55,7 @@ import {
 } from './roles'
 import {
   CreateNoteInputSchema,
+  CreateNoteOutputSchema,
   CreateNotesInputSchema,
   CreateNotesOutputSchema,
   EditNoteInputSchema,
@@ -91,7 +92,7 @@ export const tools = {
   },
   recall: { input: RecallInputSchema, output: RecallOutputSchema },
   remember_about_user: { input: RememberAboutUserInputSchema, output: WriteResultSchema },
-  create_note: { input: CreateNoteInputSchema, output: WriteResultSchema },
+  create_note: { input: CreateNoteInputSchema, output: CreateNoteOutputSchema },
   remember_about_project: { input: RememberAboutProjectInputSchema, output: WriteResultSchema },
   edit_note: {
     input: EditNoteInputSchema,

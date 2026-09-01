@@ -30,6 +30,16 @@ const fixture = (): Fixture => ({
           content: 'lock it down',
         },
         {
+          // A HIDDEN class sitting on the reserved basename: a memory category that
+          // slugs to `index`. It is not any folder's cover, and the pult must not
+          // label it as one.
+          id: 'conv-memory-index',
+          title: 'index',
+          class: 'agent-memory',
+          filePath: '.notarium/memory/index.md',
+          content: 'remembered, not authored',
+        },
+        {
           id: 'conv-overview',
           title: 'Conventions',
           class: 'user-doc',
@@ -181,7 +191,7 @@ describe('scope pins (#209)', () => {
     expect(sec?.loaded).toBe(true)
     // The cross-space pin carries its HOME space (the UI shows a chip); a same-space pin wouldn't.
     expect(sec?.space).toBe('conventions')
-    expect(sec).not.toHaveProperty('folderOverview')
+    expect(sec).not.toHaveProperty('folderPage')
 
     // start_session(project) folds the loaded pin into project.alwaysLoad (one curation).
     const ss = await startSession(bearer, { project: 'product/web' })
@@ -205,13 +215,13 @@ describe('scope pins (#209)', () => {
 
     const ctx = await getJson(`/api/s/product/projects/${PROJECT}/agent-context`, cookie)
     expect(
-      (ctx.pins as Array<PinWire & { folderOverview?: true }>).find(
+      (ctx.pins as Array<PinWire & { folderPage?: true }>).find(
         (pin) => pin.noteId === 'conv-overview',
       ),
     ).toMatchObject({
       noteId: 'conv-overview',
       space: 'conventions',
-      folderOverview: true,
+      folderPage: true,
     })
 
     const ss = await startSession(bearer, { project: 'product/web' })
@@ -219,6 +229,27 @@ describe('scope pins (#209)', () => {
       (note) => note.noteId === 'conv-overview',
     )
     expect(overview).toEqual({ noteId: 'conv-overview', title: 'Conventions' })
+  })
+
+  it('does not classify a hidden-class note that merely carries the reserved basename', async () => {
+    const cookie = await loginCookie('sam', 'sam-password-1')
+    expect(
+      (
+        await send('PUT', `/api/s/product/projects/${PROJECT}/context-pins`, cookie, {
+          space: 'conventions',
+          noteId: 'conv-memory-index',
+        })
+      ).statusCode,
+    ).toBe(200)
+
+    // `index.md` inside a hidden mount is a memory category, not a folder page — the
+    // same question the MCP marker asks, answered by the same predicate.
+    const ctx = await getJson(`/api/s/product/projects/${PROJECT}/agent-context`, cookie)
+    const pinned = (ctx.pins as Array<PinWire & { folderPage?: true }>).find(
+      (pin) => pin.noteId === 'conv-memory-index',
+    )
+    expect(pinned).toBeDefined()
+    expect(pinned).not.toHaveProperty('folderPage')
   })
 
   it('DEGRADES per reader: a project member who cannot reach the note’s home space never sees the pin', async () => {

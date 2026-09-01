@@ -29,7 +29,6 @@ import {
   directoryOf,
   DOCUMENT_ROLE,
   FOLDER_PAGE_BASENAME,
-  folderPageFilePath,
   isFolderPageNote,
   normalizeNoteType,
   normalizeWikilinkTarget,
@@ -45,7 +44,7 @@ import { redactsKeyId, withAuthors } from '../../../../libs/authors'
 import { safeRelAddress } from '../../../../libs/relPath'
 import { can } from '../../../../services/authz'
 import { prepareFieldWrite } from '../../../../services/fields'
-import { lastSegment } from '../../../../services/projects'
+import { folderPageNoteOf, lastSegment } from '../../../../services/projects'
 import { RoleDependencyConflictError } from '../../../../services/roles'
 import { setNoteFields, setNoteMuted, setNotePinned } from '../../../../services/spaces'
 import { type ApiRouteCtx, authz, missing, notFound, s } from '../_shared'
@@ -147,8 +146,7 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       return notFound(reply)
     }
     const store = await spaces.store(space)
-    const pageFile = folderPageFilePath(found.path)
-    const page = (await store.list()).find((n) => n.filePath === pageFile)
+    const page = await folderPageNoteOf(store, found.path)
     const name = project
       ? project.displayName
       : lastSegment(found.path) || spaces.slugOf(space) || ''

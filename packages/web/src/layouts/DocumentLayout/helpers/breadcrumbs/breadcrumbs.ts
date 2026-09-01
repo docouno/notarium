@@ -1,5 +1,5 @@
 import { ABILITY_KIND, NOTE_CLASS } from '@notarium/contract/enums'
-import { isFolderPageNote } from '@notarium/core'
+import { isFolderPageOf } from '@notarium/core'
 import {
   agentRolesRoute,
   agentSkillsRoute,
@@ -43,7 +43,7 @@ export const buildTrail = ({
   // FOLDER, not the reserved "index" leaf (the same hide-the-index principle that
   // keeps it out of the folder's children). The note's title is the folder's name,
   // so the trail still reads as the section.
-  const isFolderPage = !!note?.filePath && isFolderPageNote(note.filePath)
+  const isFolderPage = isFolderPageOf(note?.filePath, note?.class)
   const breadcrumb = note?.filePath
     ? note.filePath
         .replace(/\.md$/, '')

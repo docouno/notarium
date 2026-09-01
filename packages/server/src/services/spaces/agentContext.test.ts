@@ -103,7 +103,7 @@ describe('agent-context identity producers', () => {
     })
 
     await expect(resolveScopePins(['provisional-id'], read)).resolves.toEqual([
-      expect.objectContaining({ noteId: 'durable-id', folderOverview: true }),
+      expect.objectContaining({ noteId: 'durable-id', folderPage: true }),
     ])
     const [resolved] = await resolveContextSets(
       [
@@ -118,7 +118,7 @@ describe('agent-context identity producers', () => {
       read,
     )
     expect(resolved.items).toEqual([
-      expect.objectContaining({ noteId: 'durable-id', folderOverview: true }),
+      expect.objectContaining({ noteId: 'durable-id', folderPage: true }),
     ])
   })
 
@@ -446,7 +446,7 @@ describe('curatePersonalScope (#208/#209)', () => {
     expect(r.loadedTokens).toBe(20)
   })
 
-  it('keeps a folder-overview marker when an ordered set wins pin/set dedup', async () => {
+  it('keeps a folder-page marker when an ordered set wins pin/set dedup', async () => {
     const markedSet: WeighedSet = {
       id: 'overview-set',
       name: 'Overview set',
@@ -457,7 +457,7 @@ describe('curatePersonalScope (#208/#209)', () => {
           title: 'Product',
           tokens: 10,
           space: 'sp',
-          folderOverview: true,
+          folderPage: true,
         },
       ],
     }
@@ -468,7 +468,7 @@ describe('curatePersonalScope (#208/#209)', () => {
 
     expect(r.pins).toEqual([])
     expect(r.sets[0].items).toEqual([
-      expect.objectContaining({ noteId: 'overview', folderOverview: true }),
+      expect.objectContaining({ noteId: 'overview', folderPage: true }),
     ])
   })
 

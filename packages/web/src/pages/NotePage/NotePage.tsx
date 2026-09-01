@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router'
 import { NOTE_CLASS } from '@notarium/contract/enums'
-import { directoryOf, isFolderPageNote } from '@notarium/core'
+import { directoryOf, isFolderPageOf } from '@notarium/core'
 import { effectiveSlug } from '@notarium/core/slug'
 import { useEditing } from '../../composers/EditingProvider'
 import { useFieldSchemaForSpace } from '../../composers/FieldSchemaProvider'
@@ -193,11 +193,8 @@ export const NotePage = () => {
   }
 
   const folderSummary =
-    note.space &&
-    note.filePath &&
-    (note.class === undefined || note.class === NOTE_CLASS.userDoc) &&
-    isFolderPageNote(note.filePath) ? (
-      <FolderChildrenSummary space={note.space} folderPath={directoryOf(note.filePath)} />
+    note.space && isFolderPageOf(note.filePath, note.class) ? (
+      <FolderChildrenSummary space={note.space} folderPath={directoryOf(note.filePath!)} />
     ) : null
 
   return (
