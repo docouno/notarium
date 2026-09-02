@@ -584,7 +584,7 @@ verify:release-smoke:
     CHECKUP_RESOURCE_PLAN: ci-heavy-tail
     CHECKUP_RESOURCE_LANE: release
   before_script:
-    - apk add --no-cache nodejs npm git
+    - apk add --no-cache nodejs npm git util-linux-misc
     - git config --global --add safe.directory "$CI_PROJECT_DIR"
     - |
       if [ -z "$DOCKERHUB_TOKEN" ]; then
