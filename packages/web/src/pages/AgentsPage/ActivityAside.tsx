@@ -204,6 +204,16 @@ export const ActivityDiagnostics = ({
 
   return (
     <AsideSections testId="activity-diagnostics">
+      {failed && (
+        <AsideSection heading="Live updates">
+          <div className={styles.diagnosticsError} data-testid="activity-diagnostics-warm-error">
+            <Notice variant="error">Couldn’t refresh retrieval diagnostics.</Notice>
+            <Button variant="ghost" onClick={onRetry}>
+              Retry
+            </Button>
+          </div>
+        </AsideSection>
+      )}
       <AsideSection
         heading="Recurring problems"
         hint="Repeated invalid argument shapes from Compact trace."

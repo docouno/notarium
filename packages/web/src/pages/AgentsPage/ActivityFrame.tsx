@@ -5,7 +5,9 @@ import type {
   AgentRetrievalTool,
   AgentSessionEventAggregates,
 } from '@notarium/contract'
+import { useAgentsExplorer } from '../../composers/AgentsExplorerProvider'
 import { useChrome } from '../../composers/ChromeProvider'
+import { CHANGED_COALESCE_MS } from '../../composers/SyncProvider'
 import type { AsidePanelDef } from '../../core/AsideGroups'
 import { STORAGE_KEYS } from '../../libs/storageKeys'
 import { api } from '../../services/api'
@@ -25,6 +27,7 @@ const ACTIVITY_LAYOUT = [{ panels: ['filters', 'diagnostics'], activeTab: 'filte
 type ActivityFrameContext = {
   state: ActivityState
   searchParams: URLSearchParams
+  sessionsVersion: number
   setState: (patch: ActivityPatch) => void
   setDetailTitle: (title: string | null) => void
 }
@@ -39,60 +42,126 @@ export const ActivityFrame = () => {
   const [searchParams, setSearchParams] = useSearchParams()
   const state = readActivityState(searchParams)
   const { asideOpen } = useChrome()
-  const aggregateAbort = useRef<AbortController | null>(null)
+  const { versions } = useAgentsExplorer()
+  const observedSessionsVersion = useRef(versions.sessions)
+  const [sessionsVersion, setSessionsVersion] = useState(versions.sessions)
+  const sessionsVersionTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const aggregateFlight = useRef<{ version: number; controller: AbortController } | null>(null)
+  const aggregateTrailingVersion = useRef<number | null>(null)
+  const aggregateRequestedVersion = useRef(-1)
+  const aggregateRunner = useRef<(version: number) => void>(() => {})
   const [aggregates, setAggregates] = useState<AgentSessionEventAggregates | null>(null)
   const [aggregateStatus, setAggregateStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>(
     'idle',
   )
-  const aggregateRequestSeq = useRef(0)
   const { setBreadcrumbTail } = useAgentsShell()
   const setDetailTitle = useCallback(
     (title: string | null) => setBreadcrumbTail(title ? { label: title } : null),
     [setBreadcrumbTail],
   )
 
-  const loadAggregates = useCallback(async () => {
-    const seq = ++aggregateRequestSeq.current
-    aggregateAbort.current?.abort()
-    const controller = new AbortController()
-    aggregateAbort.current = controller
-    setAggregateStatus('loading')
-    try {
-      const next = await api.agentSessionEventsGet(
-        'all',
-        { limit: 1, aggregates: '1' },
-        controller.signal,
-      )
-
-      if (seq !== aggregateRequestSeq.current) {
-        return
-      }
-      if (!next.aggregates) {
-        setAggregateStatus('error')
-        return
-      }
-      setAggregates(next.aggregates)
-      setAggregateStatus('ready')
-    } catch {
-      if (seq === aggregateRequestSeq.current && !controller.signal.aborted) {
-        setAggregateStatus('error')
-      }
-    }
-  }, [])
-
   useEffect(() => {
-    if (asideOpen && aggregateStatus === 'idle') {
-      void loadAggregates()
+    if (observedSessionsVersion.current === versions.sessions) {
+      return undefined
     }
-  }, [aggregateStatus, asideOpen, loadAggregates])
+    observedSessionsVersion.current = versions.sessions
+    if (sessionsVersionTimer.current) {
+      return undefined
+    }
+    sessionsVersionTimer.current = setTimeout(() => {
+      sessionsVersionTimer.current = null
+      setSessionsVersion(observedSessionsVersion.current)
+    }, CHANGED_COALESCE_MS)
+
+    return undefined
+  }, [versions.sessions])
 
   useEffect(
     () => () => {
-      aggregateRequestSeq.current += 1
-      aggregateAbort.current?.abort()
+      if (sessionsVersionTimer.current) {
+        clearTimeout(sessionsVersionTimer.current)
+        sessionsVersionTimer.current = null
+      }
     },
     [],
   )
+
+  const startAggregateLoad = useCallback((version: number) => {
+    const controller = new AbortController()
+    aggregateFlight.current = { version, controller }
+    setAggregateStatus('loading')
+    void api
+      .agentSessionEventsGet('all', { limit: 1, aggregates: '1' }, controller.signal)
+      .then((next) => {
+        if (controller.signal.aborted || aggregateRequestedVersion.current > version) {
+          return
+        }
+        if (!next.aggregates) {
+          setAggregateStatus('error')
+          return
+        }
+        setAggregates(next.aggregates)
+        setAggregateStatus('ready')
+      })
+      .catch(() => {
+        if (!controller.signal.aborted && aggregateRequestedVersion.current <= version) {
+          setAggregateStatus('error')
+        }
+      })
+      .finally(() => {
+        if (aggregateFlight.current?.controller !== controller) {
+          return
+        }
+        aggregateFlight.current = null
+        const trailing = aggregateTrailingVersion.current
+        aggregateTrailingVersion.current = null
+
+        if (trailing != null) {
+          aggregateRunner.current(trailing)
+        }
+      })
+  }, [])
+  aggregateRunner.current = startAggregateLoad
+
+  const loadAggregates = useCallback((version: number, force = false) => {
+    if (!force && version <= aggregateRequestedVersion.current) {
+      return
+    }
+    aggregateRequestedVersion.current = Math.max(aggregateRequestedVersion.current, version)
+    const flight = aggregateFlight.current
+
+    if (flight) {
+      if (version > flight.version) {
+        aggregateTrailingVersion.current = Math.max(
+          aggregateTrailingVersion.current ?? version,
+          version,
+        )
+      }
+
+      return
+    }
+
+    aggregateRunner.current(version)
+  }, [])
+
+  useEffect(() => {
+    if (!asideOpen && !aggregates) {
+      return undefined
+    }
+    // A task boundary lets StrictMode discard its rehearsal effect before any
+    // whole-history DB work starts; the real setup schedules the sole request.
+    const timer = setTimeout(() => loadAggregates(sessionsVersion), 0)
+
+    return () => clearTimeout(timer)
+  }, [aggregates, asideOpen, loadAggregates, sessionsVersion])
+
+  useEffect(() => {
+    return () => {
+      aggregateFlight.current?.controller.abort()
+      aggregateFlight.current = null
+      aggregateTrailingVersion.current = null
+    }
+  }, [])
 
   const setState = useCallback(
     (patch: ActivityPatch) => {
@@ -171,7 +240,7 @@ export const ActivityFrame = () => {
           failed={aggregateStatus === 'error'}
           state={state}
           onSelect={selectDiagnostic}
-          onRetry={() => void loadAggregates()}
+          onRetry={() => loadAggregates(sessionsVersion, true)}
           onProblem={(tool) =>
             applyFilter({ group: 'none', show: 'all', tool, q: null, outcome: 'errors' })
           }
@@ -181,7 +250,7 @@ export const ActivityFrame = () => {
   ]
   return (
     <>
-      <Outlet context={{ state, searchParams, setState, setDetailTitle }} />
+      <Outlet context={{ state, searchParams, sessionsVersion, setState, setDetailTitle }} />
       <AgentsPanel
         panels={panels}
         defaultLayout={ACTIVITY_LAYOUT}

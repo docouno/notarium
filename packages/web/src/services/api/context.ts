@@ -90,6 +90,7 @@ export const contextApi = {
    *  gaps and the global retrieval insights kept from the former Audit page. */
   agentSessionsGet: (
     params: { limit?: number; cursor?: string; filter?: 'reads' | 'writes'; aggregates?: '0' } = {},
+    signal?: AbortSignal,
   ) => {
     const q = new URLSearchParams()
 
@@ -106,7 +107,7 @@ export const contextApi = {
       q.set(QUERY_KEY.aggregates, params.aggregates)
     }
     const s = q.toString()
-    return req<AgentSessions>(`/api/me/agent-sessions${s ? `?${s}` : ''}`)
+    return req<AgentSessions>(`/api/me/agent-sessions${s ? `?${s}` : ''}`, { signal })
   },
   agentSessionEventsGet: (
     id: string,

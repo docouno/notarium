@@ -2,6 +2,9 @@ import { buildCaseWorld, caseToFixture } from '../cases'
 import { expect, type Page, test } from './fixtures'
 
 const WORLD = caseToFixture(buildCaseWorld('agent-sessions', { now: '2099-08-05T12:00:00.000Z' }))
+const LIVE_WORLD = caseToFixture(
+  buildCaseWorld('agent-sessions', { now: '2020-08-05T12:00:00.000Z' }),
+)
 const DETAILED_WORLD = caseToFixture(
   buildCaseWorld('agent-telemetry-detailed', { now: '2099-08-05T12:00:00.000Z' }),
 )
@@ -20,6 +23,49 @@ const login = async (page: Page) => {
   await page.getByTestId('auth-password').fill('sergey')
   await page.getByTestId('auth-submit').click()
   await expect(page.getByTestId('auth-login')).not.toBeVisible()
+}
+
+const trackEventSources = async (page: Page) => {
+  await page.addInitScript(() => {
+    const NativeEventSource = window.EventSource
+    const sources: EventSource[] = []
+    Object.defineProperty(window, '__notariumEventSources', {
+      configurable: true,
+      value: sources,
+    })
+    window.EventSource = class extends NativeEventSource {
+      constructor(url: string | URL, eventSourceInitDict?: EventSourceInit) {
+        super(url, eventSourceInitDict)
+        sources.push(this)
+      }
+    }
+  })
+}
+
+const callMcp = async (
+  page: Page,
+  baseURL: string | undefined,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> => {
+  const response = await page.request.post(`${baseURL ?? ''}/mcp`, {
+    headers: {
+      accept: 'application/json, text/event-stream',
+      'content-type': 'application/json',
+    },
+    data: {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name, arguments: args },
+    },
+  })
+  expect(response.ok()).toBe(true)
+  const rpc = (await response.json()) as {
+    result?: { isError?: boolean; structuredContent?: Record<string, unknown> }
+  }
+  expect(rpc.result?.isError).not.toBe(true)
+  return rpc.result?.structuredContent ?? {}
 }
 
 const RETRIEVAL_EVENT = {
@@ -186,8 +232,11 @@ test('Activity opens as a flat URL-restorable stream and keeps Outside explicit'
   expect(Math.abs((panelToggle?.y ?? 0) - (railToggle?.y ?? 1))).toBeLessThan(0.5)
   await expect(page.getByRole('button', { name: 'Load older activity' })).toBeVisible()
   await expect(page.getByTestId('session-write-row')).toHaveCount(50)
+  const requestsBeforeContinuation = eventRequests.length
   await page.getByRole('button', { name: 'Load older activity' }).click()
   await expect(page.getByTestId('session-write-row')).toHaveCount(58)
+  expect(eventRequests).toHaveLength(requestsBeforeContinuation + 1)
+  expect(eventRequests.at(-1)?.searchParams.has('cursor')).toBe(true)
   const unavailable = page
     .getByTestId('session-write-row')
     .filter({ hasText: 'Unavailable revision' })
@@ -213,6 +262,161 @@ test('Activity opens as a flat URL-restorable stream and keeps Outside explicit'
     .getByRole('button', { name: 'All', exact: true })
     .click()
   await expect(page).toHaveURL(/\/agents\/activity$/)
+})
+
+test('@v15 an open Activity window follows one named MCP episode without a reload', async ({
+  page,
+  baseURL,
+}) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: LIVE_WORLD } })
+  await login(page)
+  await page.goto('/agents/activity')
+
+  const stream = page.getByTestId('activity-stream')
+  await expect(stream).toBeVisible()
+  await page.getByRole('button', { name: 'Load older activity' }).click()
+  await expect.poll(() => stream.locator(':scope > li').count()).toBeGreaterThan(50)
+  const rowsBefore = await stream.locator(':scope > li').count()
+  expect(rowsBefore).toBeGreaterThan(50)
+  const metricBefore = await page.getByTestId('agents-tab-activity').textContent()
+  const sessions = page.getByTestId('agents-explorer-sessions')
+  await expect(sessions).toBeVisible()
+  await expect(sessions.getByText('Live Activity proof', { exact: true })).toHaveCount(0)
+
+  const started = await callMcp(page, baseURL, 'start_session', {
+    project: 'main',
+    session: { name: 'Live Activity proof' },
+  })
+  const sessionId = (started.session as { id?: string } | undefined)?.id
+  expect(sessionId).toBeTruthy()
+  await expect(sessions.getByText('Live Activity proof', { exact: true })).toBeVisible()
+  await expect
+    .poll(() => page.getByTestId('agents-tab-activity').textContent())
+    .not.toBe(metricBefore)
+
+  await callMcp(page, baseURL, 'search', {
+    project: 'main',
+    session: sessionId,
+    query: 'live activity delivery proof',
+  })
+  await callMcp(page, baseURL, 'create_note', {
+    project: 'main',
+    session: sessionId,
+    title: 'Live Activity note',
+    body: '# Live Activity note\n\nCreated while Activity stayed open.',
+  })
+
+  await expect(
+    page.getByTestId('agent-call-row').filter({ hasText: 'live activity delivery proof' }),
+  ).toBeVisible()
+  await expect(
+    page.getByTestId('agent-call-row').filter({ hasText: 'Live Activity note' }),
+  ).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Live Activity proof' }).first()).toBeVisible()
+  await expect.poll(() => stream.locator(':scope > li').count()).toBeGreaterThan(50)
+  await expect(page).toHaveURL(/\/agents\/activity$/)
+})
+
+test('@v15 a session revision supersedes Load older without losing requested depth', async ({
+  page,
+  baseURL,
+}) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: LIVE_WORLD } })
+  let releaseOld: (() => void) | undefined
+  let markHeld: (() => void) | undefined
+  let markDone: (() => void) | undefined
+  const oldGate = new Promise<void>((resolve) => {
+    releaseOld = resolve
+  })
+  const oldHeld = new Promise<void>((resolve) => {
+    markHeld = resolve
+  })
+  const oldDone = new Promise<void>((resolve) => {
+    markDone = resolve
+  })
+  let blocked = false
+  await page.route('**/api/me/agent-sessions/all?*', async (route) => {
+    const url = new URL(route.request().url())
+
+    if (url.searchParams.has('cursor') && !blocked) {
+      blocked = true
+      const response = await route.fetch()
+      markHeld?.()
+      await oldGate
+      await route.fulfill({ response }).catch(() => {})
+      markDone?.()
+      return
+    }
+    await route.continue()
+  })
+
+  await login(page)
+  await page.goto('/agents/activity')
+  const stream = page.getByTestId('activity-stream')
+  await expect(stream.locator(':scope > li')).toHaveCount(50)
+  await page.getByRole('button', { name: 'Load older activity' }).click()
+  await oldHeld
+
+  await callMcp(page, baseURL, 'start_session', {
+    project: 'main',
+    session: { name: 'Load older revision winner' },
+  })
+  await expect(page.getByRole('link', { name: 'Load older revision winner' }).first()).toBeVisible()
+  await expect.poll(() => stream.locator(':scope > li').count()).toBeGreaterThan(50)
+  releaseOld?.()
+  await oldDone
+  await page.evaluate(() => new Promise(requestAnimationFrame))
+  await expect(
+    page.getByTestId('agent-call-row').filter({ hasText: 'Load older revision winner' }),
+  ).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Load older activity' })).toHaveCount(0)
+  await page.unrouteAll({ behavior: 'ignoreErrors' })
+})
+
+test('@v15 Activity reconciles committed work after its EventSource reconnects', async ({
+  page,
+  baseURL,
+}) => {
+  await trackEventSources(page)
+  await login(page)
+  await page.goto('/agents/activity')
+  await expect(page.getByTestId('activity-stream')).toBeVisible()
+  await page.waitForFunction(() => {
+    const sources = (window as typeof window & { __notariumEventSources?: readonly EventSource[] })
+      .__notariumEventSources
+    return sources?.some((source) => source.readyState === EventSource.OPEN)
+  })
+  await page.evaluate(() => {
+    const sources = (window as typeof window & { __notariumEventSources?: readonly EventSource[] })
+      .__notariumEventSources
+    const source = [...(sources ?? [])]
+      .reverse()
+      .find((candidate) => candidate.readyState === EventSource.OPEN)
+
+    if (!source) {
+      throw new Error('no open EventSource to disconnect')
+    }
+    source.close()
+    source.dispatchEvent(new Event('error'))
+  })
+  await page.waitForFunction(() => {
+    const sources = (window as typeof window & { __notariumEventSources?: readonly EventSource[] })
+      .__notariumEventSources
+    return !sources?.some((source) => source.readyState === EventSource.OPEN)
+  })
+
+  await callMcp(page, baseURL, 'start_session', {
+    project: 'main',
+    session: { name: 'Activity reconnect proof' },
+  })
+  await expect(page.getByRole('link', { name: 'Activity reconnect proof' }).first()).toBeVisible({
+    timeout: 10_000,
+  })
+  await expect(
+    page.getByTestId('agents-explorer-sessions').getByText('Activity reconnect proof', {
+      exact: true,
+    }),
+  ).toBeVisible()
 })
 
 test('Retry after a failed older page keeps the cached stream and its cursor', async ({ page }) => {
@@ -273,11 +477,25 @@ test('Retry after a failed older page keeps the cached stream and its cursor', a
   await expect(page.getByText('Recovered older activity', { exact: true })).toBeVisible()
   await expect(page.getByTestId('session-write-row')).toHaveCount(59)
   expect(retryAttempts).toBe(2)
+  // Do not let a routed cursor read that is unwinding browser fixture cleanup outlive the test.
+  await page.unrouteAll({ behavior: 'ignoreErrors' })
 })
 
 test('Session grouping filters before pagination and separates nested episode timelines', async ({
   page,
 }) => {
+  const episodeContinuations: URL[] = []
+  page.on('request', (request) => {
+    const url = new URL(request.url())
+
+    if (
+      url.pathname.startsWith('/api/me/agent-sessions/') &&
+      url.pathname !== '/api/me/agent-sessions/all' &&
+      url.searchParams.has('cursor')
+    ) {
+      episodeContinuations.push(url)
+    }
+  })
   await login(page)
   await page.goto('/agents/activity?show=writes')
   const flatHeadingType = await page
@@ -383,8 +601,10 @@ test('Session grouping filters before pagination and separates nested episode ti
   await expect(expandable).toHaveAttribute('data-expanded', 'true')
   await expect(expandable.getByTestId('activity-session-event-timeline')).toBeVisible()
   await expect(archived.getByTestId('session-write-row')).toHaveCount(50)
+  const continuationsBefore = episodeContinuations.length
   await archived.getByRole('button', { name: 'Load older episode activity' }).click()
   await expect(archived.getByTestId('session-write-row')).toHaveCount(54)
+  expect(episodeContinuations).toHaveLength(continuationsBefore + 1)
 
   const readsOverview = page.waitForRequest((request) => {
     const url = new URL(request.url())
@@ -413,6 +633,541 @@ test('Session grouping filters before pagination and separates nested episode ti
   })
   await expect(unaudited).toContainText('no audited activity')
   await expect(unaudited).toHaveCSS('opacity', '1')
+})
+
+test('@v15 grouped and deep episodes refresh live and a confirmed 404 stays terminal', async ({
+  page,
+  baseURL,
+}) => {
+  await login(page)
+  await page.goto('/agents/activity?group=session')
+  await expect(page.getByTestId('activity-session-list')).toBeVisible()
+
+  const started = await callMcp(page, baseURL, 'start_session', {
+    project: 'main',
+    session: { name: 'Live grouped proof' },
+  })
+  const sessionId = (started.session as { id?: string } | undefined)?.id
+  expect(sessionId).toBeTruthy()
+  const row = page.getByTestId('activity-session-row').filter({ hasText: 'Live grouped proof' })
+  await expect(row).toBeVisible()
+  await row.getByText('Live grouped proof', { exact: true }).click()
+  await expect(row).toHaveAttribute('data-expanded', 'true')
+
+  await callMcp(page, baseURL, 'search', {
+    project: 'main',
+    session: sessionId,
+    query: 'grouped live refresh proof',
+  })
+  await expect(row).toHaveAttribute('data-expanded', 'true')
+  await expect(
+    row.getByTestId('agent-call-row').filter({ hasText: 'grouped live refresh proof' }),
+  ).toBeVisible()
+
+  await page.goto(`/agents/activity/${sessionId}`)
+  await expect(page.getByTestId('agent-activity-episode')).toBeVisible()
+  await callMcp(page, baseURL, 'create_note', {
+    project: 'main',
+    session: sessionId,
+    title: 'Deep live Activity note',
+    body: '# Deep live Activity note\n\nThe permalink stayed open.',
+  })
+  await expect(
+    page.getByTestId('agent-call-row').filter({ hasText: 'Deep live Activity note' }),
+  ).toBeVisible()
+
+  const removed = await page.request.delete(
+    `${baseURL}/api/me/agent-sessions/${sessionId}?confirmActive=true`,
+  )
+  expect(removed.ok()).toBe(true)
+  await expect(page.getByTestId('activity-episode-not-found')).toContainText(
+    'This activity episode no longer exists.',
+  )
+  await expect(page).toHaveURL(new RegExp(`/agents/activity/${sessionId}$`))
+})
+
+test('@v15 grouped and deep continuations keep N+1 intent across a revision', async ({
+  page,
+  baseURL,
+}) => {
+  await login(page)
+  const overview = (await (await page.request.get('/api/me/agent-sessions')).json()) as {
+    sessions: Array<{ id: string; name: string }>
+  }
+  const archived = overview.sessions.find((session) => session.name === 'expired retention probe')
+  expect(archived).toBeDefined()
+  const id = archived!.id
+  let blocker: { held: Promise<void>; release: () => void; markHeld: () => void } | null = null
+
+  const armCursorBlock = () => {
+    let release: (() => void) | undefined
+    let markHeld: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const held = new Promise<void>((resolve) => {
+      markHeld = resolve
+    })
+    blocker = { held, release: () => release?.(), markHeld: () => markHeld?.() }
+    return { held, gate, release: () => release?.() }
+  }
+  let activeGate: Promise<void> | null = null
+  await page.route(`**/api/me/agent-sessions/${id}?*`, async (route) => {
+    const url = new URL(route.request().url())
+
+    if (url.searchParams.has('cursor') && blocker) {
+      const current = blocker
+      blocker = null
+      const response = await route.fetch()
+      current.markHeld()
+      await activeGate
+      await route.fulfill({ response }).catch(() => {})
+      return
+    }
+    await route.continue()
+  })
+
+  await page.goto('/agents/activity?group=session')
+  const row = page.getByTestId('activity-session-row').filter({ hasText: archived!.name })
+  await row.getByText(archived!.name, { exact: true }).click()
+  await expect(row.getByTestId('session-write-row')).toHaveCount(50)
+  const groupedBlock = armCursorBlock()
+  activeGate = groupedBlock.gate
+  await row.getByRole('button', { name: 'Load older episode activity' }).click()
+  await groupedBlock.held
+  await callMcp(page, baseURL, 'start_session', {
+    project: 'main',
+    session: { name: 'Grouped continuation revision' },
+  })
+  await expect(row.getByTestId('session-write-row')).toHaveCount(54)
+  await expect(row).toHaveAttribute('data-expanded', 'true')
+  groupedBlock.release()
+
+  await page.getByRole('link', { name: archived!.name, exact: true }).click()
+  const deep = page.getByTestId('agent-activity-episode')
+  await expect(deep.getByTestId('session-write-row')).toHaveCount(50)
+  const deepBlock = armCursorBlock()
+  activeGate = deepBlock.gate
+  await deep.getByRole('button', { name: 'Load older activity' }).click()
+  await deepBlock.held
+  await callMcp(page, baseURL, 'start_session', {
+    project: 'main',
+    session: { name: 'Deep continuation revision' },
+  })
+  await expect(deep.getByTestId('session-write-row')).toHaveCount(54)
+  deepBlock.release()
+  await expect(page).toHaveURL(new RegExp(`/agents/activity/${id}$`))
+  await page.unrouteAll({ behavior: 'ignoreErrors' })
+})
+
+test('@v15 grouped live revalidation caps concurrency and commits only the newest queue', async ({
+  page,
+}) => {
+  await trackEventSources(page)
+  await login(page)
+  const sourceOverview = (await (
+    await page.request.get('/api/me/agent-sessions?limit=30&aggregates=0')
+  ).json()) as {
+    sessions: Array<
+      Record<string, unknown> & { id: string; name: string; reads: number; writes: number }
+    >
+    [key: string]: unknown
+  }
+  const template = sourceOverview.sessions.find(
+    (session) => session.name === 'expired retention probe',
+  )
+  expect(template).toBeDefined()
+  const sourceEpisode = (await (
+    await page.request.get(`/api/me/agent-sessions/${template!.id}?limit=50`)
+  ).json()) as {
+    events: Array<Record<string, unknown> & { id: string; type: string }>
+    target: Record<string, unknown>
+    [key: string]: unknown
+  }
+  const templateEvent = sourceEpisode.events.find((event) => event.type === 'write')
+  expect(templateEvent).toBeDefined()
+  const fakeSessions = Array.from({ length: 12 }, (_, index) => ({
+    ...template,
+    id: `perf-episode-${index}`,
+    name: `Perf episode ${index}`,
+  }))
+  let phase: 'initial' | 'old' | 'newest' = 'initial'
+  let active = 0
+  let maxActive = 0
+  let refreshRequests = 0
+  let releaseRefreshes: (() => void) | undefined
+  const refreshGate = new Promise<void>((resolve) => {
+    releaseRefreshes = resolve
+  })
+
+  const episodePayload = (id: string, requestPhase: typeof phase) => {
+    const name = fakeSessions.find((session) => session.id === id)!.name
+
+    return {
+      ...sourceEpisode,
+      target: { ...sourceEpisode.target, id, name },
+      events: [
+        {
+          ...templateEvent,
+          id: `${requestPhase}-${id}`,
+          noteId: `${requestPhase}-${id}`,
+          sessionId: id,
+          sessionName: name,
+          title: `${requestPhase} ${name}`,
+        },
+      ],
+      total: 1,
+      hasMore: false,
+      nextCursor: null,
+      aggregates: null,
+    }
+  }
+
+  await page.route('**/api/me/agent-sessions?*', async (route) => {
+    const url = new URL(route.request().url())
+
+    if (url.searchParams.get('limit') === '30' && url.searchParams.get('aggregates') === '0') {
+      await route.fulfill({
+        json: {
+          ...sourceOverview,
+          sessions: fakeSessions,
+          outside: null,
+          total: fakeSessions.length,
+          active: 0,
+          hasMore: false,
+          nextCursor: null,
+          aggregates: null,
+        },
+      })
+      return
+    }
+    await route.continue()
+  })
+  await page.route('**/api/me/agent-sessions/perf-episode-*?*', async (route) => {
+    const id = new URL(route.request().url()).pathname.split('/').at(-1)!
+    const requestPhase = phase
+
+    if (requestPhase === 'initial') {
+      await route.fulfill({ json: episodePayload(id, requestPhase) })
+      return
+    }
+    refreshRequests += 1
+    active += 1
+    maxActive = Math.max(maxActive, active)
+    try {
+      await refreshGate
+      await route.fulfill({ json: episodePayload(id, requestPhase) }).catch(() => {})
+    } finally {
+      active -= 1
+    }
+  })
+
+  await page.goto('/agents/activity?group=session')
+  const rows = page.getByTestId('activity-session-row')
+  await expect(rows).toHaveCount(12)
+  for (let index = 0; index < 12; index += 1) {
+    const row = rows.filter({
+      has: page.getByText(`Perf episode ${index}`, { exact: true }),
+    })
+    await row.getByText(`Perf episode ${index}`, { exact: true }).click()
+    await expect(row).toContainText(`initial Perf episode ${index}`)
+  }
+  await page.waitForFunction(() => {
+    const sources = (window as typeof window & { __notariumEventSources?: readonly EventSource[] })
+      .__notariumEventSources
+    return sources?.some((source) => source.readyState === EventSource.OPEN)
+  })
+  const dispatchRevision = async () => {
+    await page.evaluate(() => {
+      const sources = (
+        window as typeof window & { __notariumEventSources?: readonly EventSource[] }
+      ).__notariumEventSources
+      const source = [...(sources ?? [])]
+        .reverse()
+        .find((candidate) => candidate.readyState === EventSource.OPEN)
+
+      if (!source) {
+        throw new Error('no open EventSource for the Activity performance gate')
+      }
+      source.dispatchEvent(new Event('agent-sessions'))
+    })
+  }
+  const overviewRefresh = () =>
+    page.waitForResponse((response) => {
+      const url = new URL(response.url())
+      return (
+        url.pathname === '/api/me/agent-sessions' &&
+        url.searchParams.get('limit') === '30' &&
+        url.searchParams.get('aggregates') === '0'
+      )
+    })
+
+  phase = 'old'
+  const firstOverview = overviewRefresh()
+  await dispatchRevision()
+  await firstOverview
+  await expect.poll(() => refreshRequests).toBe(4)
+  expect(active).toBe(4)
+  expect(maxActive).toBe(4)
+
+  phase = 'newest'
+  const secondOverview = overviewRefresh()
+  await dispatchRevision()
+  await secondOverview
+  releaseRefreshes?.()
+
+  await expect.poll(() => refreshRequests).toBe(16)
+  await expect.poll(() => active).toBe(0)
+  expect(maxActive).toBe(4)
+  for (let index = 0; index < 12; index += 1) {
+    const row = rows.filter({
+      has: page.getByText(`Perf episode ${index}`, { exact: true }),
+    })
+    await expect(row).toHaveAttribute('data-expanded', 'true')
+    await expect(row).toContainText(`newest Perf episode ${index}`)
+    await expect(row).not.toContainText(`old Perf episode ${index}`)
+  }
+  await page.unrouteAll({ behavior: 'ignoreErrors' })
+})
+
+test('@v15 leaving grouped Activity aborts its expanded episode request', async ({ page }) => {
+  await page.addInitScript(() => {
+    const tracked = window as typeof window & {
+      __task398EpisodeSignals?: Array<{ aborted: boolean; url: string }>
+    }
+    const nativeFetch = window.fetch
+    tracked.__task398EpisodeSignals = []
+    window.fetch = (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), location.href)
+
+      if (url.pathname.startsWith('/api/me/agent-sessions/') && init?.signal) {
+        const entry = { aborted: init.signal.aborted, url: url.pathname }
+        init.signal.addEventListener('abort', () => {
+          entry.aborted = true
+        })
+        tracked.__task398EpisodeSignals?.push(entry)
+      }
+
+      return nativeFetch(input, init)
+    }
+  })
+  await login(page)
+  const overview = (await (await page.request.get('/api/me/agent-sessions')).json()) as {
+    sessions: Array<{ id: string; name: string }>
+  }
+  const archived = overview.sessions.find((session) => session.name === 'expired retention probe')
+  expect(archived).toBeDefined()
+  let release: (() => void) | undefined
+  let markHeld: (() => void) | undefined
+  let markDone: (() => void) | undefined
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const held = new Promise<void>((resolve) => {
+    markHeld = resolve
+  })
+  const done = new Promise<void>((resolve) => {
+    markDone = resolve
+  })
+  let first = true
+  await page.route(`**/api/me/agent-sessions/${archived!.id}?*`, async (route) => {
+    const url = new URL(route.request().url())
+
+    if (first && !url.searchParams.has('cursor')) {
+      first = false
+      markHeld?.()
+      await gate
+      try {
+        await route.continue()
+      } catch {
+        /* The page-side AbortSignal is the assertion; the routed socket may still unwind. */
+      } finally {
+        markDone?.()
+      }
+
+      return
+    }
+    await route.continue()
+  })
+
+  await page.goto('/agents/activity?group=session')
+  const row = page.getByTestId('activity-session-row').filter({ hasText: archived!.name })
+  await row.getByText(archived!.name, { exact: true }).click()
+  await held
+  await page.getByRole('link', { name: archived!.name, exact: true }).click()
+  await expect(page.getByTestId('agent-activity-episode')).toBeVisible()
+  expect(
+    await page.evaluate((sessionId) => {
+      const tracked = window as typeof window & {
+        __task398EpisodeSignals?: Array<{ aborted: boolean; url: string }>
+      }
+      return tracked.__task398EpisodeSignals
+        ?.filter((entry) => entry.url.endsWith(`/${sessionId}`))
+        .map((entry) => entry.aborted)
+    }, archived!.id),
+  ).toEqual([true, false])
+  release?.()
+  await done
+  await page.unrouteAll({ behavior: 'ignoreErrors' })
+})
+
+test('@v15 a stale overview cannot resurrect a confirmed local deletion', async ({
+  page,
+  baseURL,
+}) => {
+  let release: (() => void) | undefined
+  let markHeld: (() => void) | undefined
+  let markDone: (() => void) | undefined
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const firstHeld = new Promise<void>((resolve) => {
+    markHeld = resolve
+  })
+  const allDone = new Promise<void>((resolve) => {
+    markDone = resolve
+  })
+  let hold = false
+  let held = 0
+  let completed = 0
+  let expectedCompletions = 0
+  await page.route('**/api/me/agent-sessions?*', async (route) => {
+    const url = new URL(route.request().url())
+
+    if (!hold || url.searchParams.get('limit') !== '30') {
+      await route.continue()
+      return
+    }
+    const response = await route.fetch()
+    held += 1
+    markHeld?.()
+    await gate
+    await route.fulfill({ response }).catch(() => {})
+    completed += 1
+    if (completed === expectedCompletions) {
+      markDone?.()
+    }
+  })
+
+  await login(page)
+  await page.goto('/agents/activity?group=session')
+  const archived = page
+    .getByTestId('activity-session-row')
+    .filter({ hasText: 'expired retention probe' })
+  await expect(archived).toBeVisible()
+  hold = true
+  await callMcp(page, baseURL, 'start_session', {
+    project: 'main',
+    session: { name: 'Delete race trigger' },
+  })
+  await firstHeld
+  await expect.poll(() => held).toBeGreaterThanOrEqual(2)
+
+  await archived.getByRole('button', { name: 'More actions' }).click()
+  await page.getByRole('menuitem', { name: 'Delete session' }).click()
+  await page.getByRole('dialog').getByRole('button', { name: 'Delete' }).click()
+  await expect(archived).toHaveCount(0)
+
+  expectedCompletions = held
+  hold = false
+  release?.()
+  await allDone
+  await page.evaluate(() => new Promise(requestAnimationFrame))
+  expect(
+    await page
+      .getByTestId('activity-session-list')
+      .getByText('expired retention probe', { exact: true })
+      .count(),
+  ).toBe(0)
+  await page.unrouteAll({ behavior: 'ignoreErrors' })
+})
+
+test('@v15 a displaced expanded episode stays latent and revalidates once on re-entry', async ({
+  page,
+  baseURL,
+}) => {
+  let hiddenId: string | null = null
+  let hideEpisode = false
+  let episodeRequests = 0
+  page.on('request', (request) => {
+    if (hiddenId && new URL(request.url()).pathname === `/api/me/agent-sessions/${hiddenId}`) {
+      episodeRequests += 1
+    }
+  })
+  await page.route('**/api/me/agent-sessions?*', async (route) => {
+    const response = await route.fetch()
+    const body = (await response.json()) as {
+      sessions: Array<{ id: string }>
+      total: number
+      [key: string]: unknown
+    }
+
+    if (!hideEpisode || !hiddenId) {
+      await route.fulfill({ response, json: body })
+      return
+    }
+    await route.fulfill({
+      response,
+      json: {
+        ...body,
+        sessions: body.sessions.filter((session) => session.id !== hiddenId),
+        total: Math.max(0, body.total - 1),
+      },
+    })
+  })
+
+  await login(page)
+  await page.goto('/agents/activity?group=session')
+  const started = await callMcp(page, baseURL, 'start_session', {
+    project: 'main',
+    session: { name: 'Latent episode proof' },
+  })
+  hiddenId = (started.session as { id?: string } | undefined)?.id ?? null
+  expect(hiddenId).toBeTruthy()
+  const row = page.getByTestId('activity-session-row').filter({ hasText: 'Latent episode proof' })
+  await expect(row).toBeVisible()
+  await row.getByText('Latent episode proof', { exact: true }).click()
+  await expect(row).toHaveAttribute('data-expanded', 'true')
+  await expect.poll(() => episodeRequests).toBe(1)
+
+  hideEpisode = true
+  const hiddenOverview = page.waitForResponse((response) => {
+    const url = new URL(response.url())
+    return url.pathname === '/api/me/agent-sessions' && url.searchParams.get('limit') === '30'
+  })
+  await callMcp(page, baseURL, 'search', {
+    project: 'main',
+    session: hiddenId,
+    query: 'first hidden revision',
+  })
+  await hiddenOverview
+  await expect(row).toHaveCount(0)
+  const requestsAfterDisplacement = episodeRequests
+
+  const stillHiddenOverview = page.waitForResponse((response) => {
+    const url = new URL(response.url())
+    return url.pathname === '/api/me/agent-sessions' && url.searchParams.get('limit') === '30'
+  })
+  await callMcp(page, baseURL, 'search', {
+    project: 'main',
+    session: hiddenId,
+    query: 'second hidden revision',
+  })
+  await stillHiddenOverview
+  expect(episodeRequests).toBe(requestsAfterDisplacement)
+
+  hideEpisode = false
+  await callMcp(page, baseURL, 'search', {
+    project: 'main',
+    session: hiddenId,
+    query: 'visible newest revision',
+  })
+  await expect(row).toBeVisible()
+  await expect(row).toHaveAttribute('data-expanded', 'true')
+  await expect.poll(() => episodeRequests).toBe(requestsAfterDisplacement + 1)
+  await expect(
+    row.getByTestId('agent-call-row').filter({ hasText: 'visible newest revision' }),
+  ).toBeVisible()
 })
 
 test('expandable feed rows keep their primary text selectable', async ({ page }) => {
@@ -764,6 +1519,7 @@ test('Diagnostics opts in once and narrows the stream with one URL write', async
   await login(page)
   await page.goto('/agents/activity?show=writes&group=session')
   await expect(page.getByTestId('activity-session-list')).toBeVisible()
+  await expect(page.getByRole('button', { name: /Sergey · Sync: Synced/ })).toBeVisible()
   expect(eventRequests).toEqual([])
   await expect(page.getByText('Blind spots')).toHaveCount(0)
 
@@ -910,10 +1666,15 @@ test('Diagnostics opts in once and narrows the stream with one URL write', async
   await expect(page).toHaveURL(
     /\/agents\/activity\?show=reads&tool=search&q=legacy\+rollout\+guide$/,
   )
+  const aggregateRequestsBeforeReopen = eventRequests.filter(
+    (url) => url.searchParams.get('aggregates') === '1',
+  ).length
   await page.getByRole('button', { name: 'Close activity panels' }).click()
   await page.getByRole('button', { name: 'Open activity panels' }).click()
   await expect(page.getByTestId('aside-tab-diagnostics')).toHaveAttribute('aria-selected', 'true')
-  expect(eventRequests.filter((url) => url.searchParams.get('aggregates') === '1')).toHaveLength(1)
+  expect(eventRequests.filter((url) => url.searchParams.get('aggregates') === '1')).toHaveLength(
+    aggregateRequestsBeforeReopen,
+  )
 
   const overviewRight = await page
     .getByTestId('agents-activity')
@@ -932,7 +1693,9 @@ test('Diagnostics opts in once and narrows the stream with one URL write', async
     .click()
   await expect(page.getByTestId('agents-activity')).toBeVisible()
   await expect(page.getByTestId('aside-tab-diagnostics')).toHaveAttribute('aria-selected', 'true')
-  expect(eventRequests.filter((url) => url.searchParams.get('aggregates') === '1')).toHaveLength(1)
+  expect(eventRequests.filter((url) => url.searchParams.get('aggregates') === '1')).toHaveLength(
+    aggregateRequestsBeforeReopen,
+  )
 
   const finalClearResponse = page.waitForResponse((response) => {
     const url = new URL(response.url())

@@ -34,14 +34,27 @@ import { useActivityFrame } from './ActivityFrame'
 import { type ActivityGroup, type ActivityOutcome, type ActivityShow } from './activityState'
 import { ActivityListSkeleton, SessionListSkeleton } from './AuditSkeletons'
 import { countLabel } from './consts'
+import {
+  collectActivityWindow,
+  continueActivityWindow,
+  flattenActivityWindow,
+} from './helpers/activityWindow'
 import styles from './ActivityPage.module.scss'
 
 type EpisodeState = {
   data: AgentSessionEvents | null
+  committedDepth: number
+  requestedDepth: number
+  version: number
   loading: boolean
   loadingMore: boolean
   failed: boolean
+  failedOperation: 'refresh' | 'continuation'
 }
+
+// One expanded overview can expose 31 timelines. Revision-driven revalidation
+// shares a small browser/server budget; direct user continuation remains immediate.
+const EPISODE_REFRESH_CONCURRENCY = 4
 
 const sessionCounts = (session: AgentSessionSummary): string => {
   if (session.reads + session.writes === 0) {
@@ -221,7 +234,7 @@ const relevantCount = (
   show === 'reads' ? item.reads : show === 'writes' ? item.writes : item.reads + item.writes
 
 export const ActivityPage = () => {
-  const { searchParams, setState, state } = useActivityFrame()
+  const { searchParams, sessionsVersion, setState, state } = useActivityFrame()
   const [stream, setStream] = useState<AgentSessionEvents | null>(null)
   const [overview, setOverview] = useState<AgentSessions | null>(null)
   const [loading, setLoading] = useState(true)
@@ -229,194 +242,723 @@ export const ActivityPage = () => {
   const [failed, setFailed] = useState(false)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set())
   const [episodes, setEpisodes] = useState<Record<string, EpisodeState>>({})
+  const streamRef = useRef(stream)
+  streamRef.current = stream
+  const overviewRef = useRef(overview)
+  overviewRef.current = overview
   const requestSeq = useRef(0)
+  const requestAbort = useRef<AbortController | null>(null)
+  const streamDepth = useRef({ committed: 0, requested: 1 })
+  const overviewDepth = useRef({ committed: 0, requested: 1 })
+  const streamFailedOperation = useRef<'refresh' | 'continuation'>('refresh')
+  const overviewFailedOperation = useRef<'refresh' | 'continuation'>('refresh')
+  const observedSessionsVersion = useRef(sessionsVersion)
+  const latestSessionsVersion = useRef(sessionsVersion)
+  latestSessionsVersion.current = sessionsVersion
   const episodeRequestSeq = useRef(0)
-  const episodeRequests = useRef(new Map<string, number>())
+  const episodeRequests = useRef(
+    new Map<string, { seq: number; version: number; depth: number; controller: AbortController }>(),
+  )
+  const episodeRefreshQueue = useRef(new Map<string, { version: number; depth: number }>())
+  const activeQueuedEpisodeIds = useRef(new Set<string>())
+  const visibleEpisodeIds = useRef(new Set<string>())
+  const episodeQueueEpoch = useRef(0)
+  const pumpEpisodeRefreshes = useRef<() => void>(() => {})
+  const episodesRef = useRef(episodes)
+  episodesRef.current = episodes
 
-  const clearEpisodes = useCallback(() => {
+  const abortEpisodeRequests = useCallback(() => {
+    episodeQueueEpoch.current += 1
+    episodeRefreshQueue.current.clear()
+    activeQueuedEpisodeIds.current.clear()
     episodeRequestSeq.current += 1
+    for (const request of episodeRequests.current.values()) {
+      request.controller.abort()
+    }
     episodeRequests.current.clear()
-    setExpandedIds(new Set())
-    setEpisodes({})
   }, [])
 
-  const loadStream = useCallback(
-    async (cursor?: string) => {
-      const seq = ++requestSeq.current
+  const clearEpisodes = useCallback(() => {
+    abortEpisodeRequests()
+    visibleEpisodeIds.current.clear()
+    setExpandedIds(new Set())
+    episodesRef.current = {}
+    setEpisodes({})
+  }, [abortEpisodeRequests])
 
-      if (cursor) {
-        setLoadingMore(true)
-      } else {
-        setLoading(true)
+  const dropEpisode = useCallback((id: string) => {
+    episodeRefreshQueue.current.delete(id)
+    episodeRequests.current.get(id)?.controller.abort()
+    episodeRequests.current.delete(id)
+    setExpandedIds((previous) => {
+      const next = new Set(previous)
+      next.delete(id)
+      return next
+    })
+    setEpisodes((previous) => {
+      const next = { ...previous }
+      delete next[id]
+      episodesRef.current = next
+      return next
+    })
+  }, [])
+
+  useEffect(() => () => abortEpisodeRequests(), [abortEpisodeRequests])
+
+  const refreshStream = useCallback(async () => {
+    const seq = ++requestSeq.current
+    requestAbort.current?.abort()
+    const controller = new AbortController()
+    requestAbort.current = controller
+    const requestedDepth = streamDepth.current.requested
+
+    setLoading(true)
+    setLoadingMore(requestedDepth > streamDepth.current.committed)
+    setFailed(false)
+    streamFailedOperation.current = 'refresh'
+    try {
+      const window = await collectActivityWindow(
+        (cursor) =>
+          api.agentSessionEventsGet(
+            'all',
+            {
+              limit: 50,
+              cursor,
+              filter: state.show === 'all' ? undefined : state.show,
+              agent: state.agent ?? undefined,
+              tool: state.tool ?? undefined,
+              q: state.q ?? undefined,
+              outcome: state.outcome === 'all' ? undefined : state.outcome,
+            },
+            controller.signal,
+          ),
+        {
+          requestedDepth,
+          cursorOf: (page) => page.nextCursor,
+          current: () => seq === requestSeq.current && !controller.signal.aborted,
+        },
+      )
+
+      if (!window) {
+        return
       }
-      setFailed(false)
-      try {
-        const next = await api.agentSessionEventsGet('all', {
-          limit: 50,
+      streamDepth.current = { committed: window.depth, requested: window.depth }
+      const nextStream = {
+        ...window.first,
+        events: flattenActivityWindow(
+          window.pages,
+          (page) => page.events,
+          (event) => `${event.type}:${event.id}`,
+        ),
+        hasMore: window.last.hasMore && window.nextCursor != null,
+        nextCursor: window.nextCursor,
+      }
+      streamRef.current = nextStream
+      setStream(nextStream)
+    } catch {
+      if (seq === requestSeq.current && !controller.signal.aborted) {
+        setFailed(true)
+      }
+    } finally {
+      if (seq === requestSeq.current) {
+        setLoading(false)
+        setLoadingMore(false)
+      }
+    }
+  }, [state.agent, state.outcome, state.q, state.show, state.tool])
+
+  const refreshOverview = useCallback(async () => {
+    const seq = ++requestSeq.current
+    requestAbort.current?.abort()
+    const controller = new AbortController()
+    requestAbort.current = controller
+    const requestedDepth = overviewDepth.current.requested
+
+    setLoading(true)
+    setLoadingMore(requestedDepth > overviewDepth.current.committed)
+    setFailed(false)
+    overviewFailedOperation.current = 'refresh'
+    try {
+      const window = await collectActivityWindow(
+        (cursor) =>
+          api.agentSessionsGet(
+            {
+              limit: 30,
+              cursor,
+              filter: state.show === 'all' ? undefined : state.show,
+              aggregates: '0',
+            },
+            controller.signal,
+          ),
+        {
+          requestedDepth,
+          cursorOf: (page) => page.nextCursor,
+          current: () => seq === requestSeq.current && !controller.signal.aborted,
+        },
+      )
+
+      if (!window) {
+        return
+      }
+      overviewDepth.current = { committed: window.depth, requested: window.depth }
+      const nextOverview = {
+        ...window.first,
+        sessions: flattenActivityWindow(
+          window.pages,
+          (page) => page.sessions,
+          (session) => session.id,
+        ),
+        hasMore: window.last.hasMore && window.nextCursor != null,
+        nextCursor: window.nextCursor,
+      }
+      overviewRef.current = nextOverview
+      setOverview(nextOverview)
+    } catch {
+      if (seq === requestSeq.current && !controller.signal.aborted) {
+        setFailed(true)
+      }
+    } finally {
+      if (seq === requestSeq.current) {
+        setLoading(false)
+        setLoadingMore(false)
+      }
+    }
+  }, [state.show])
+
+  const continueStream = useCallback(async () => {
+    const previous = streamRef.current
+    const cursor = previous?.nextCursor
+
+    if (!previous || !cursor) {
+      return
+    }
+    const seq = ++requestSeq.current
+    requestAbort.current?.abort()
+    const controller = new AbortController()
+    requestAbort.current = controller
+    const committedDepth = streamDepth.current.committed
+
+    setLoading(true)
+    setLoadingMore(true)
+    setFailed(false)
+    streamFailedOperation.current = 'continuation'
+    try {
+      const continuation = await continueActivityWindow(
+        (nextCursor) =>
+          api.agentSessionEventsGet(
+            'all',
+            {
+              limit: 50,
+              cursor: nextCursor,
+              filter: state.show === 'all' ? undefined : state.show,
+              agent: state.agent ?? undefined,
+              tool: state.tool ?? undefined,
+              q: state.q ?? undefined,
+              outcome: state.outcome === 'all' ? undefined : state.outcome,
+            },
+            controller.signal,
+          ),
+        {
           cursor,
-          filter: state.show === 'all' ? undefined : state.show,
-          agent: state.agent ?? undefined,
-          tool: state.tool ?? undefined,
-          q: state.q ?? undefined,
-          outcome: state.outcome === 'all' ? undefined : state.outcome,
-        })
+          cursorOf: (page) => page.nextCursor,
+          current: () => seq === requestSeq.current && !controller.signal.aborted,
+        },
+      )
 
-        if (seq !== requestSeq.current) {
-          return
-        }
-        setStream((prev) =>
-          cursor && prev ? { ...next, events: [...prev.events, ...next.events] } : next,
-        )
-      } catch {
-        if (seq === requestSeq.current) {
-          setFailed(true)
-        }
-      } finally {
-        if (seq === requestSeq.current) {
-          setLoading(false)
-          setLoadingMore(false)
-        }
+      if (!continuation) {
+        return
       }
-    },
-    [state.agent, state.outcome, state.q, state.show, state.tool],
-  )
-
-  const loadOverview = useCallback(
-    async (cursor?: string) => {
-      const seq = ++requestSeq.current
-
-      if (cursor) {
-        setLoadingMore(true)
-      } else {
-        setLoading(true)
+      const nextDepth = committedDepth + 1
+      const nextStream = {
+        ...previous,
+        events: flattenActivityWindow(
+          [previous, continuation.page],
+          (page) => page.events,
+          (event) => `${event.type}:${event.id}`,
+        ),
+        hasMore: continuation.page.hasMore && continuation.nextCursor != null,
+        nextCursor: continuation.nextCursor,
       }
-      setFailed(false)
-      try {
-        const next = await api.agentSessionsGet({
-          limit: 30,
+      streamDepth.current = { committed: nextDepth, requested: nextDepth }
+      streamRef.current = nextStream
+      setStream(nextStream)
+    } catch {
+      if (seq === requestSeq.current && !controller.signal.aborted) {
+        setFailed(true)
+      }
+    } finally {
+      if (seq === requestSeq.current) {
+        setLoading(false)
+        setLoadingMore(false)
+      }
+    }
+  }, [state.agent, state.outcome, state.q, state.show, state.tool])
+
+  const continueOverview = useCallback(async () => {
+    const previous = overviewRef.current
+    const cursor = previous?.nextCursor
+
+    if (!previous || !cursor) {
+      return
+    }
+    const seq = ++requestSeq.current
+    requestAbort.current?.abort()
+    const controller = new AbortController()
+    requestAbort.current = controller
+    const committedDepth = overviewDepth.current.committed
+
+    setLoading(true)
+    setLoadingMore(true)
+    setFailed(false)
+    overviewFailedOperation.current = 'continuation'
+    try {
+      const continuation = await continueActivityWindow(
+        (nextCursor) =>
+          api.agentSessionsGet(
+            {
+              limit: 30,
+              cursor: nextCursor,
+              filter: state.show === 'all' ? undefined : state.show,
+              aggregates: '0',
+            },
+            controller.signal,
+          ),
+        {
           cursor,
-          filter: state.show === 'all' ? undefined : state.show,
-          aggregates: '0',
-        })
+          cursorOf: (page) => page.nextCursor,
+          current: () => seq === requestSeq.current && !controller.signal.aborted,
+        },
+      )
 
-        if (seq !== requestSeq.current) {
-          return
-        }
-        setOverview((prev) =>
-          cursor && prev ? { ...next, sessions: [...prev.sessions, ...next.sessions] } : next,
-        )
-      } catch {
-        if (seq === requestSeq.current) {
-          setFailed(true)
-        }
-      } finally {
-        if (seq === requestSeq.current) {
-          setLoading(false)
-          setLoadingMore(false)
-        }
+      if (!continuation) {
+        return
       }
-    },
-    [state.show],
-  )
+      const nextDepth = committedDepth + 1
+      const nextOverview = {
+        ...previous,
+        sessions: flattenActivityWindow(
+          [previous, continuation.page],
+          (page) => page.sessions,
+          (session) => session.id,
+        ),
+        hasMore: continuation.page.hasMore && continuation.nextCursor != null,
+        nextCursor: continuation.nextCursor,
+      }
+      overviewDepth.current = { committed: nextDepth, requested: nextDepth }
+      overviewRef.current = nextOverview
+      setOverview(nextOverview)
+    } catch {
+      if (seq === requestSeq.current && !controller.signal.aborted) {
+        setFailed(true)
+      }
+    } finally {
+      if (seq === requestSeq.current) {
+        setLoading(false)
+        setLoadingMore(false)
+      }
+    }
+  }, [state.show])
 
   useEffect(() => {
     if (state.group !== 'none') {
       return undefined
     }
+    observedSessionsVersion.current = latestSessionsVersion.current
     requestSeq.current += 1
+    requestAbort.current?.abort()
+    streamDepth.current = { committed: 0, requested: 1 }
+    streamFailedOperation.current = 'refresh'
+    clearEpisodes()
+    streamRef.current = null
     setStream(null)
     setLoading(true)
-    void loadStream()
+    void refreshStream()
     return () => {
       requestSeq.current += 1
+      requestAbort.current?.abort()
     }
-  }, [loadStream, state.group])
+  }, [clearEpisodes, refreshStream, state.group])
 
   useEffect(() => {
     if (state.group !== 'session') {
       return undefined
     }
+    observedSessionsVersion.current = latestSessionsVersion.current
     requestSeq.current += 1
+    requestAbort.current?.abort()
+    overviewDepth.current = { committed: 0, requested: 1 }
+    overviewFailedOperation.current = 'refresh'
     clearEpisodes()
+    overviewRef.current = null
     setOverview(null)
     setLoading(true)
-    void loadOverview()
+    void refreshOverview()
     return () => {
       requestSeq.current += 1
+      requestAbort.current?.abort()
     }
-  }, [clearEpisodes, loadOverview, state.group])
+  }, [clearEpisodes, refreshOverview, state.group])
 
-  const loadEpisode = useCallback(
-    async (id: string, cursor?: string) => {
+  const refreshEpisode = useCallback(
+    async (id: string, version: number, requestedDepth?: number) => {
+      const previousState = episodesRef.current[id]
+      const wantedDepth = requestedDepth ?? previousState?.requestedDepth ?? 1
+      const currentRequest = episodeRequests.current.get(id)
+
+      if (
+        currentRequest &&
+        currentRequest.version >= version &&
+        currentRequest.depth >= wantedDepth
+      ) {
+        return
+      }
+      currentRequest?.controller.abort()
       const seq = ++episodeRequestSeq.current
-      episodeRequests.current.set(id, seq)
-      setEpisodes((previous) => ({
-        ...previous,
-        [id]: {
-          data: cursor ? (previous[id]?.data ?? null) : null,
-          loading: !cursor,
-          loadingMore: !!cursor,
-          failed: false,
-        },
-      }))
+      const controller = new AbortController()
+      episodeRequests.current.set(id, { seq, version, depth: wantedDepth, controller })
+      setEpisodes((previous) => {
+        const next = {
+          ...previous,
+          [id]: {
+            data: previous[id]?.data ?? null,
+            committedDepth: previous[id]?.committedDepth ?? 0,
+            requestedDepth: wantedDepth,
+            version: previous[id]?.version ?? -1,
+            loading: true,
+            loadingMore: wantedDepth > (previous[id]?.committedDepth ?? 0),
+            failed: false,
+            failedOperation: 'refresh' as const,
+          },
+        }
+        episodesRef.current = next
+        return next
+      })
       try {
-        const next = await api.agentSessionEventsGet(id, {
-          limit: 50,
-          cursor,
-          filter: state.show === 'all' ? undefined : state.show,
-          tool: state.tool ?? undefined,
-          outcome: state.outcome === 'all' ? undefined : state.outcome,
-        })
+        const window = await collectActivityWindow(
+          (cursor) =>
+            api.agentSessionEventsGet(
+              id,
+              {
+                limit: 50,
+                cursor,
+                filter: state.show === 'all' ? undefined : state.show,
+                tool: state.tool ?? undefined,
+                outcome: state.outcome === 'all' ? undefined : state.outcome,
+              },
+              controller.signal,
+            ),
+          {
+            requestedDepth: wantedDepth,
+            cursorOf: (page) => page.nextCursor,
+            current: () =>
+              episodeRequests.current.get(id)?.seq === seq && !controller.signal.aborted,
+          },
+        )
 
-        if (episodeRequests.current.get(id) !== seq) {
+        if (!window) {
           return
         }
         setEpisodes((previous) => {
-          const current = previous[id]
-          const data =
-            cursor && current?.data
-              ? { ...next, events: [...current.data.events, ...next.events] }
-              : next
-
-          return {
-            ...previous,
-            [id]: { data, loading: false, loadingMore: false, failed: false },
-          }
-        })
-      } catch {
-        if (episodeRequests.current.get(id) === seq) {
-          setEpisodes((previous) => ({
+          const next = {
             ...previous,
             [id]: {
-              data: previous[id]?.data ?? null,
+              data: {
+                ...window.first,
+                events: flattenActivityWindow(
+                  window.pages,
+                  (page) => page.events,
+                  (event) => `${event.type}:${event.id}`,
+                ),
+                hasMore: window.last.hasMore && window.nextCursor != null,
+                nextCursor: window.nextCursor,
+              },
+              committedDepth: window.depth,
+              requestedDepth: window.depth,
+              version,
               loading: false,
               loadingMore: false,
-              failed: true,
+              failed: false,
+              failedOperation: 'refresh' as const,
             },
-          }))
+          }
+          episodesRef.current = next
+          return next
+        })
+      } catch (error) {
+        if (episodeRequests.current.get(id)?.seq === seq && !controller.signal.aborted) {
+          if (error instanceof ApiError && error.status === HTTP_STATUS.NOT_FOUND) {
+            dropEpisode(id)
+            return
+          }
+          setEpisodes((previous) => {
+            const next = {
+              ...previous,
+              [id]: {
+                data: previous[id]?.data ?? null,
+                committedDepth: previous[id]?.committedDepth ?? 0,
+                requestedDepth: wantedDepth,
+                version: previous[id]?.version ?? -1,
+                loading: false,
+                loadingMore: false,
+                failed: true,
+                failedOperation: 'refresh' as const,
+              },
+            }
+            episodesRef.current = next
+            return next
+          })
+        }
+      } finally {
+        if (episodeRequests.current.get(id)?.seq === seq) {
+          episodeRequests.current.delete(id)
         }
       }
     },
-    [state.outcome, state.show, state.tool],
+    [dropEpisode, state.outcome, state.show, state.tool],
   )
+
+  const continueEpisode = useCallback(
+    async (id: string, version: number, requestedDepth: number) => {
+      const previousState = episodesRef.current[id]
+      const previous = previousState?.data
+      const cursor = previous?.nextCursor
+
+      if (!previousState || !previous || !cursor) {
+        return
+      }
+      episodeRefreshQueue.current.delete(id)
+      const currentRequest = episodeRequests.current.get(id)
+      currentRequest?.controller.abort()
+      const seq = ++episodeRequestSeq.current
+      const controller = new AbortController()
+      episodeRequests.current.set(id, { seq, version, depth: requestedDepth, controller })
+      setEpisodes((current) => {
+        const next = {
+          ...current,
+          [id]: {
+            ...current[id],
+            requestedDepth,
+            loading: true,
+            loadingMore: true,
+            failed: false,
+            failedOperation: 'continuation' as const,
+          },
+        }
+        episodesRef.current = next
+        return next
+      })
+      try {
+        const continuation = await continueActivityWindow(
+          (nextCursor) =>
+            api.agentSessionEventsGet(
+              id,
+              {
+                limit: 50,
+                cursor: nextCursor,
+                filter: state.show === 'all' ? undefined : state.show,
+                tool: state.tool ?? undefined,
+                outcome: state.outcome === 'all' ? undefined : state.outcome,
+              },
+              controller.signal,
+            ),
+          {
+            cursor,
+            cursorOf: (page) => page.nextCursor,
+            current: () =>
+              episodeRequests.current.get(id)?.seq === seq && !controller.signal.aborted,
+          },
+        )
+
+        if (!continuation) {
+          return
+        }
+        const nextDepth = previousState.committedDepth + 1
+        setEpisodes((current) => {
+          const next = {
+            ...current,
+            [id]: {
+              data: {
+                ...previous,
+                events: flattenActivityWindow(
+                  [previous, continuation.page],
+                  (page) => page.events,
+                  (event) => `${event.type}:${event.id}`,
+                ),
+                hasMore: continuation.page.hasMore && continuation.nextCursor != null,
+                nextCursor: continuation.nextCursor,
+              },
+              committedDepth: nextDepth,
+              requestedDepth: nextDepth,
+              version,
+              loading: false,
+              loadingMore: false,
+              failed: false,
+              failedOperation: 'continuation' as const,
+            },
+          }
+          episodesRef.current = next
+          return next
+        })
+      } catch (error) {
+        if (episodeRequests.current.get(id)?.seq === seq && !controller.signal.aborted) {
+          if (error instanceof ApiError && error.status === HTTP_STATUS.NOT_FOUND) {
+            dropEpisode(id)
+            return
+          }
+          setEpisodes((current) => {
+            const next = {
+              ...current,
+              [id]: {
+                data: current[id]?.data ?? previous,
+                committedDepth: current[id]?.committedDepth ?? previousState.committedDepth,
+                requestedDepth,
+                version: current[id]?.version ?? previousState.version,
+                loading: false,
+                loadingMore: false,
+                failed: true,
+                failedOperation: 'continuation' as const,
+              },
+            }
+            episodesRef.current = next
+            return next
+          })
+        }
+      } finally {
+        if (episodeRequests.current.get(id)?.seq === seq) {
+          episodeRequests.current.delete(id)
+        }
+      }
+    },
+    [dropEpisode, state.outcome, state.show, state.tool],
+  )
+
+  const runEpisodeRefreshQueue = useCallback(() => {
+    while (activeQueuedEpisodeIds.current.size < EPISODE_REFRESH_CONCURRENCY) {
+      let candidate: [string, { version: number; depth: number }] | null = null
+
+      for (const entry of episodeRefreshQueue.current) {
+        const [id] = entry
+
+        if (!visibleEpisodeIds.current.has(id)) {
+          episodeRefreshQueue.current.delete(id)
+          continue
+        }
+        if (!activeQueuedEpisodeIds.current.has(id)) {
+          candidate = entry
+          break
+        }
+      }
+      if (!candidate) {
+        return
+      }
+      const [id, request] = candidate
+      const epoch = episodeQueueEpoch.current
+      episodeRefreshQueue.current.delete(id)
+      activeQueuedEpisodeIds.current.add(id)
+      void refreshEpisode(id, request.version, request.depth).finally(() => {
+        if (episodeQueueEpoch.current !== epoch) {
+          return
+        }
+        activeQueuedEpisodeIds.current.delete(id)
+        pumpEpisodeRefreshes.current()
+      })
+    }
+  }, [refreshEpisode])
+  pumpEpisodeRefreshes.current = runEpisodeRefreshQueue
+
+  const enqueueEpisodeRefresh = useCallback((id: string, version: number, depth: number) => {
+    const queued = episodeRefreshQueue.current.get(id)
+
+    if (!queued || queued.version < version || queued.depth < depth) {
+      episodeRefreshQueue.current.set(id, {
+        version: Math.max(queued?.version ?? -1, version),
+        depth: Math.max(queued?.depth ?? 1, depth),
+      })
+    }
+    const active = episodeRequests.current.get(id)
+
+    if (active && (active.version < version || active.depth < depth)) {
+      active.controller.abort()
+    }
+    pumpEpisodeRefreshes.current()
+  }, [])
 
   const toggleEpisode = (id: string, open: boolean) => {
     if (!open) {
-      episodeRequests.current.delete(id)
-      setExpandedIds((previous) => {
-        const next = new Set(previous)
-        next.delete(id)
-        return next
-      })
-      setEpisodes((previous) => {
-        const next = { ...previous }
-        delete next[id]
-        return next
-      })
+      dropEpisode(id)
       return
     }
     setExpandedIds((previous) => new Set(previous).add(id))
-    void loadEpisode(id)
+  }
+
+  useEffect(() => {
+    if (state.group !== 'session' || !overview) {
+      return
+    }
+    const visible = new Set(overview.sessions.map((session) => session.id))
+
+    if (overview.outside) {
+      visible.add('outside')
+    }
+    visibleEpisodeIds.current = visible
+    for (const id of episodeRefreshQueue.current.keys()) {
+      if (!visible.has(id)) {
+        episodeRefreshQueue.current.delete(id)
+      }
+    }
+    for (const id of activeQueuedEpisodeIds.current) {
+      if (!visible.has(id)) {
+        episodeRequests.current.get(id)?.controller.abort()
+      }
+    }
+    for (const id of expandedIds) {
+      if (visible.has(id) && (episodesRef.current[id]?.version ?? -1) < sessionsVersion) {
+        enqueueEpisodeRefresh(id, sessionsVersion, episodesRef.current[id]?.requestedDepth ?? 1)
+      }
+    }
+  }, [enqueueEpisodeRefresh, expandedIds, overview, sessionsVersion, state.group])
+
+  useEffect(() => {
+    if (observedSessionsVersion.current === sessionsVersion) {
+      return
+    }
+    observedSessionsVersion.current = sessionsVersion
+    void (state.group === 'session' ? refreshOverview() : refreshStream())
+  }, [refreshOverview, refreshStream, sessionsVersion, state.group])
+
+  const loadOlderStream = () => {
+    streamDepth.current.requested =
+      Math.max(streamDepth.current.committed, streamDepth.current.requested) + 1
+    void continueStream()
+  }
+
+  const loadOlderOverview = () => {
+    overviewDepth.current.requested =
+      Math.max(overviewDepth.current.committed, overviewDepth.current.requested) + 1
+    void continueOverview()
+  }
+
+  const loadOlderEpisode = (id: string) => {
+    const current = episodesRef.current[id]
+    const requestedDepth = Math.max(current?.committedDepth ?? 0, current?.requestedDepth ?? 1) + 1
+    const next = {
+      ...(current ?? {
+        data: null,
+        committedDepth: 0,
+        version: -1,
+        loading: false,
+        loadingMore: false,
+        failed: false,
+        failedOperation: 'refresh' as const,
+      }),
+      requestedDepth,
+    }
+    episodesRef.current = { ...episodesRef.current, [id]: next }
+    setEpisodes(episodesRef.current)
+    episodeRefreshQueue.current.delete(id)
+    void (current?.version === sessionsVersion
+      ? continueEpisode(id, sessionsVersion, requestedDepth)
+      : refreshEpisode(id, sessionsVersion, requestedDepth))
   }
 
   const changeGroup = (group: ActivityGroup) => {
@@ -451,17 +993,25 @@ export const ActivityPage = () => {
         : episode?.target.kind === 'session' && episode.target.id === id
           ? episode
           : null
-    const retryEpisode = () => void loadEpisode(id, matchingEpisode?.nextCursor ?? undefined)
+
+    const retryEpisode = () => {
+      const requestedDepth = episodeState?.requestedDepth ?? 1
+
+      void (episodeState?.failedOperation === 'continuation' &&
+      episodeState.version === sessionsVersion
+        ? continueEpisode(id, sessionsVersion, requestedDepth)
+        : refreshEpisode(id, sessionsVersion, requestedDepth))
+    }
 
     return (
       <div className={styles.sessionCardBody} data-testid="activity-session-events">
-        {!episodeState || episodeState.loading ? (
+        {!episodeState || (episodeState.loading && !episodeState.data) ? (
           <ActivityListSkeleton rows={4} />
         ) : matchingEpisode ? (
           <>
             {episodeState.failed && (
               <Notice variant="error" className={styles.loadError}>
-                <span>Couldn’t load older episode activity.</span>
+                <span>Couldn’t refresh this episode.</span>
                 <Button variant="ghost" onClick={retryEpisode}>
                   Retry
                 </Button>
@@ -485,7 +1035,7 @@ export const ActivityPage = () => {
                 <Button
                   variant="ghost"
                   disabled={episodeState.loadingMore}
-                  onClick={() => void loadEpisode(id, matchingEpisode.nextCursor as string)}
+                  onClick={() => loadOlderEpisode(id)}
                 >
                   {episodeState.loadingMore ? 'Loading…' : 'Load older episode activity'}
                 </Button>
@@ -528,8 +1078,12 @@ export const ActivityPage = () => {
               variant="ghost"
               onClick={() =>
                 void (state.group === 'session'
-                  ? loadOverview(overview?.nextCursor ?? undefined)
-                  : loadStream(stream?.nextCursor ?? undefined))
+                  ? overviewFailedOperation.current === 'continuation'
+                    ? continueOverview()
+                    : refreshOverview()
+                  : streamFailedOperation.current === 'continuation'
+                    ? continueStream()
+                    : refreshStream())
               }
             >
               Retry
@@ -602,11 +1156,7 @@ export const ActivityPage = () => {
                 </ActivityTimeline>
                 {stream.hasMore && stream.nextCursor && (
                   <div className={styles.loadMore}>
-                    <Button
-                      variant="ghost"
-                      disabled={loadingMore}
-                      onClick={() => void loadStream(stream.nextCursor ?? undefined)}
-                    >
+                    <Button variant="ghost" disabled={loadingMore} onClick={loadOlderStream}>
                       {loadingMore ? 'Loading…' : 'Load older activity'}
                     </Button>
                   </div>
@@ -752,6 +1302,10 @@ export const ActivityPage = () => {
                               id={session.id}
                               name={session.name}
                               onDeleted={() => {
+                                requestSeq.current += 1
+                                requestAbort.current?.abort()
+                                setLoading(false)
+                                setLoadingMore(false)
                                 setOverview((current) =>
                                   current
                                     ? {
@@ -767,7 +1321,7 @@ export const ActivityPage = () => {
                                       }
                                     : current,
                                 )
-                                toggleEpisode(session.id, false)
+                                dropEpisode(session.id)
                               }}
                             />
                           }
@@ -779,11 +1333,7 @@ export const ActivityPage = () => {
                 </div>
                 {overview.hasMore && overview.nextCursor && (
                   <div className={styles.loadMore}>
-                    <Button
-                      variant="ghost"
-                      disabled={loadingMore}
-                      onClick={() => void loadOverview(overview.nextCursor ?? undefined)}
-                    >
+                    <Button variant="ghost" disabled={loadingMore} onClick={loadOlderOverview}>
                       {loadingMore ? 'Loading…' : 'Load older sessions'}
                     </Button>
                   </div>

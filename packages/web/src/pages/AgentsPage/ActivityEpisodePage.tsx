@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router'
 import type { AgentSessionEvents, AgentSessionTarget } from '@notarium/contract'
+import { HTTP_STATUS } from '@notarium/contract/http'
 import { ActivityTimeline } from '../../core/ActivityTimeline'
 import { Button } from '../../core/Button'
 import { EmptyState } from '../../core/EmptyState'
@@ -8,12 +9,17 @@ import { IconHistory } from '../../core/Icons'
 import { Notice } from '../../core/Notice'
 import { Segmented } from '../../core/Segmented'
 import { agentActivityRoute } from '../../libs/routing/routePaths'
-import { api } from '../../services/api'
+import { api, ApiError } from '../../services/api'
 import { ActivityEventRow } from './ActivityEventRows'
 import { useActivityFrame } from './ActivityFrame'
 import { type ActivityShow } from './activityState'
 import { ActivityListSkeleton } from './AuditSkeletons'
 import { countLabel } from './consts'
+import {
+  collectActivityWindow,
+  continueActivityWindow,
+  flattenActivityWindow,
+} from './helpers/activityWindow'
 import styles from './ActivityPage.module.scss'
 
 const targetTitle = (target: AgentSessionTarget): string =>
@@ -25,61 +31,199 @@ const targetTitle = (target: AgentSessionTarget): string =>
 
 export const ActivityEpisodePage = () => {
   const { id = '' } = useParams<{ id: string }>()
-  const { searchParams, setDetailTitle, setState, state } = useActivityFrame()
+  const { searchParams, sessionsVersion, setDetailTitle, setState, state } = useActivityFrame()
   const [data, setData] = useState<AgentSessionEvents | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [failed, setFailed] = useState(false)
+  const [notFound, setNotFound] = useState(false)
+  const dataRef = useRef(data)
+  dataRef.current = data
   const requestSeq = useRef(0)
+  const requestAbort = useRef<AbortController | null>(null)
+  const depth = useRef({ committed: 0, requested: 1 })
+  const failedOperation = useRef<'refresh' | 'continuation'>('refresh')
+  const terminalNotFound = useRef(false)
+  const observedSessionsVersion = useRef(sessionsVersion)
+  const latestSessionsVersion = useRef(sessionsVersion)
+  latestSessionsVersion.current = sessionsVersion
 
-  const load = useCallback(
-    async (cursor?: string) => {
-      const seq = ++requestSeq.current
+  const refresh = useCallback(async () => {
+    const seq = ++requestSeq.current
+    requestAbort.current?.abort()
+    const controller = new AbortController()
+    requestAbort.current = controller
+    const requestedDepth = depth.current.requested
 
-      if (cursor) {
-        setLoadingMore(true)
-      } else {
-        setLoading(true)
+    setLoading(true)
+    setLoadingMore(requestedDepth > depth.current.committed)
+    setFailed(false)
+    failedOperation.current = 'refresh'
+    try {
+      const window = await collectActivityWindow(
+        (cursor) =>
+          api.agentSessionEventsGet(
+            id,
+            {
+              limit: 50,
+              cursor,
+              filter: state.show === 'all' ? undefined : state.show,
+              agent: state.agent ?? undefined,
+              tool: state.tool ?? undefined,
+              q: state.q ?? undefined,
+              outcome: state.outcome === 'all' ? undefined : state.outcome,
+            },
+            controller.signal,
+          ),
+        {
+          requestedDepth,
+          cursorOf: (page) => page.nextCursor,
+          current: () => seq === requestSeq.current && !controller.signal.aborted,
+        },
+      )
+
+      if (!window) {
+        return
       }
-      setFailed(false)
-      try {
-        const next = await api.agentSessionEventsGet(id, {
-          limit: 50,
-          cursor,
-          filter: state.show === 'all' ? undefined : state.show,
-          agent: state.agent ?? undefined,
-          tool: state.tool ?? undefined,
-          q: state.q ?? undefined,
-          outcome: state.outcome === 'all' ? undefined : state.outcome,
-        })
-
-        if (seq !== requestSeq.current) {
+      depth.current = { committed: window.depth, requested: window.depth }
+      const nextData = {
+        ...window.first,
+        events: flattenActivityWindow(
+          window.pages,
+          (page) => page.events,
+          (event) => `${event.type}:${event.id}`,
+        ),
+        hasMore: window.last.hasMore && window.nextCursor != null,
+        nextCursor: window.nextCursor,
+      }
+      dataRef.current = nextData
+      setData(nextData)
+    } catch (error) {
+      if (seq === requestSeq.current && !controller.signal.aborted) {
+        if (error instanceof ApiError && error.status === HTTP_STATUS.NOT_FOUND) {
+          depth.current = { committed: 0, requested: 1 }
+          terminalNotFound.current = true
+          dataRef.current = null
+          setData(null)
+          setNotFound(true)
           return
         }
-        setData((prev) =>
-          cursor && prev ? { ...next, events: [...prev.events, ...next.events] } : next,
-        )
-      } catch {
-        if (seq === requestSeq.current) {
-          setFailed(true)
-        }
-      } finally {
-        if (seq === requestSeq.current) {
-          setLoading(false)
-          setLoadingMore(false)
-        }
+        setFailed(true)
       }
-    },
-    [id, state.agent, state.outcome, state.q, state.show, state.tool],
-  )
+    } finally {
+      if (seq === requestSeq.current) {
+        setLoading(false)
+        setLoadingMore(false)
+      }
+    }
+  }, [id, state.agent, state.outcome, state.q, state.show, state.tool])
+
+  const continueWindow = useCallback(async () => {
+    const previous = dataRef.current
+    const cursor = previous?.nextCursor
+
+    if (!previous || !cursor) {
+      return
+    }
+    const seq = ++requestSeq.current
+    requestAbort.current?.abort()
+    const controller = new AbortController()
+    requestAbort.current = controller
+    const committedDepth = depth.current.committed
+
+    setLoading(true)
+    setLoadingMore(true)
+    setFailed(false)
+    failedOperation.current = 'continuation'
+    try {
+      const continuation = await continueActivityWindow(
+        (nextCursor) =>
+          api.agentSessionEventsGet(
+            id,
+            {
+              limit: 50,
+              cursor: nextCursor,
+              filter: state.show === 'all' ? undefined : state.show,
+              agent: state.agent ?? undefined,
+              tool: state.tool ?? undefined,
+              q: state.q ?? undefined,
+              outcome: state.outcome === 'all' ? undefined : state.outcome,
+            },
+            controller.signal,
+          ),
+        {
+          cursor,
+          cursorOf: (page) => page.nextCursor,
+          current: () => seq === requestSeq.current && !controller.signal.aborted,
+        },
+      )
+
+      if (!continuation) {
+        return
+      }
+      const nextDepth = committedDepth + 1
+      const nextData = {
+        ...previous,
+        events: flattenActivityWindow(
+          [previous, continuation.page],
+          (page) => page.events,
+          (event) => `${event.type}:${event.id}`,
+        ),
+        hasMore: continuation.page.hasMore && continuation.nextCursor != null,
+        nextCursor: continuation.nextCursor,
+      }
+      depth.current = { committed: nextDepth, requested: nextDepth }
+      dataRef.current = nextData
+      setData(nextData)
+    } catch (error) {
+      if (seq === requestSeq.current && !controller.signal.aborted) {
+        if (error instanceof ApiError && error.status === HTTP_STATUS.NOT_FOUND) {
+          depth.current = { committed: 0, requested: 1 }
+          terminalNotFound.current = true
+          dataRef.current = null
+          setData(null)
+          setNotFound(true)
+          return
+        }
+        setFailed(true)
+      }
+    } finally {
+      if (seq === requestSeq.current) {
+        setLoading(false)
+        setLoadingMore(false)
+      }
+    }
+  }, [id, state.agent, state.outcome, state.q, state.show, state.tool])
 
   useEffect(() => {
+    observedSessionsVersion.current = latestSessionsVersion.current
+    depth.current = { committed: 0, requested: 1 }
+    failedOperation.current = 'refresh'
+    terminalNotFound.current = false
+    dataRef.current = null
     setData(null)
-    void load()
+    setNotFound(false)
+    void refresh()
     return () => {
       requestSeq.current += 1
+      requestAbort.current?.abort()
     }
-  }, [load])
+  }, [refresh])
+
+  useEffect(() => {
+    if (observedSessionsVersion.current === sessionsVersion) {
+      return
+    }
+    observedSessionsVersion.current = sessionsVersion
+    if (!terminalNotFound.current) {
+      void refresh()
+    }
+  }, [refresh, sessionsVersion])
+
+  const loadOlder = () => {
+    depth.current.requested = Math.max(depth.current.committed, depth.current.requested) + 1
+    void continueWindow()
+  }
 
   const target = data?.target
   const title = target ? targetTitle(target) : 'Activity'
@@ -132,14 +276,27 @@ export const ActivityEpisodePage = () => {
           )}
         </header>
 
-        {failed && (
+        {notFound ? (
+          <Notice
+            variant="error"
+            className={styles.loadError}
+            data-testid="activity-episode-not-found"
+          >
+            This activity episode no longer exists.
+          </Notice>
+        ) : failed ? (
           <Notice variant="error" className={styles.loadError} data-testid="activity-episode-error">
             <span>Couldn’t load this activity episode.</span>
-            <Button variant="ghost" onClick={() => void load(data?.nextCursor ?? undefined)}>
+            <Button
+              variant="ghost"
+              onClick={() =>
+                void (failedOperation.current === 'continuation' ? continueWindow() : refresh())
+              }
+            >
               Retry
             </Button>
           </Notice>
-        )}
+        ) : null}
 
         <div className={styles.controls}>
           <Segmented<ActivityShow>
@@ -157,7 +314,7 @@ export const ActivityEpisodePage = () => {
           )}
         </div>
 
-        {loading && !data ? (
+        {loading && !data && !notFound ? (
           <ActivityListSkeleton />
         ) : data?.events.length ? (
           <>
@@ -168,17 +325,13 @@ export const ActivityEpisodePage = () => {
             </ActivityTimeline>
             {data.hasMore && data.nextCursor && (
               <div className={styles.loadMore}>
-                <Button
-                  variant="ghost"
-                  disabled={loadingMore}
-                  onClick={() => void load(data.nextCursor ?? undefined)}
-                >
+                <Button variant="ghost" disabled={loadingMore} onClick={loadOlder}>
                   {loadingMore ? 'Loading…' : 'Load older activity'}
                 </Button>
               </div>
             )}
           </>
-        ) : failed ? null : (
+        ) : failed || notFound ? null : (
           <EmptyState
             variant="bare"
             icon={<IconHistory size={20} />}
