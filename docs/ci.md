@@ -12,12 +12,13 @@ logic belongs in a repo script.
 
 | Lane | Jobs | Runs |
 | --- | --- | --- |
-| `lean` | `lean:static`, `lean:unit`, `lean:build` | every push and merge request |
+| `lean` | `lean:static`, `lean:unit`, `lean:build` | every push, merge request and meaningful tag; unit is the canonical lean coverage + JUnit producer |
 | `lean` | `lean:release-preflight` | a release tag only — answers in seconds whether this ref can publish at all |
-| `extended` | `extended:unit`, `extended:postgres`, `extended:e2e`, `extended:visual` | a release or rehearsal tag, the default branch, on demand elsewhere |
+| `extended` | `extended:unit`, `extended:postgres+visual`, `extended:postgres+visual:gate`, `extended:e2e` | a release or rehearsal tag, the default branch, on demand elsewhere |
 | `extended` | `extended:activity-groups` | manual and non-blocking on every pipeline; an on-demand load acceptance, never part of regular checkup |
 | `extended` | `checkup:compare` | manual on a `ci/*` rehearsal tag; byte-identical subjects, legacy/candidate orchestration inside one runner |
-| `verify` | `visual:gate`, `visual:accept`, `verify:backup-smoke`, `verify:release-smoke` | with the extended lane |
+| `verify` | `visual:gate`, `verify:backup-smoke`, `verify:release-smoke` | with the extended lane |
+| `verify` | `visual:accept` | manual on the protected default branch only |
 | `release` | `release:rc` | manual; the default branch or a `-rc.N` tag |
 | `release` | `release:publish` | manual; a `vX.Y.Z` tag only |
 | `deploy` | — | declared and empty, on purpose |
@@ -27,6 +28,13 @@ lint error would mean the tests never run, and a type error would only surface o
 next push — the serial fix-push-discover loop the split exists to kill. Jobs that
 should report together sit together; stages separate only real dependencies: the code
 is green, *then* the built image proves itself, *then* anything is published.
+
+**Static checks share one job and one install, but keep separate verdicts.** The
+repo-owned `check:static` runner starts format, canon, meta-migrations, lint and
+typecheck together, prefixes their output, waits for every sibling after an ordinary
+failure and writes `test-results/checkup-static.json` in declaration order. The YAML
+only selects that preset and publishes its compact report; it does not duplicate the
+subprocess graph.
 
 **`lean:build` proves more than "it compiles".** The job is one `npm run build`, and the web
 workspace's build script runs `scripts/checkWebBundleBudget.mjs` after Vite, so a generated JS
@@ -68,21 +76,18 @@ click silently cost forty minutes of a serialised runner would make the button m
 something other than what it says — a rehearsal is an explicit, named, disposable
 act instead.
 
-**The full dependency profile is not optional in the extended lane.** Since the
-license corpus validates the complete production tree, `test/release/licenseCorpus.test.ts`
-cannot run on a lean install: it reads manifests that only arrive with the embedder
-carrier, so its gate stays closed there. The vec0 suites, by contrast, moved back into
-the lean lane in #317 — a gate closed on every lean run is a gate that reports on `main`
-instead of on the change (#274 reached `main` that way). What the lean lane still cannot
-answer is the complete license corpus, the live-Postgres dialect contracts behind
-`extended:postgres`, and the production-shaped graph-revision contour below. `deps:lean` and
-`deps:full` are npm scripts precisely so the Makefile, this pipeline and the future
-public gate cannot drift apart on what "install" means.
+**The full dependency profile is not optional, but it is not a reason to repeat the
+ordinary corpus.** Lean coverage runs every Vitest file once and is the comparable
+MR/main metric. Exactly two cases need the embedder carrier manifests: the native license
+corpus and the CPU-only provider assertion. `extended:unit` builds the full production/test
+image and runs only those cases before graph-revision. The vec0 suites remain in lean as
+they have since #317. `deps:lean` and `deps:full` are npm scripts precisely so the Makefile,
+this pipeline and a future public gate cannot drift apart on what "install" means.
 The full script is also the single CPU-only install contract: it disables
 onnxruntime-node's default CUDA/TensorRT postinstall download, which the product cannot
 use and which would otherwise add a second package host to the extended gate.
 
-**`extended:unit` calls one graph-revision command after the coverage suite.**
+**`extended:unit` calls one graph-revision command after the two full-only cases.**
 `make graph-revision-gate` owns the full #410 contour: it builds traceable runtime and
 runner images from the same tree, seeds the neutral 1357-note / ≥20.3 MiB corpus into an
 isolated volume, requires effective vector + graph channels, performs one warm mutation
@@ -92,7 +97,7 @@ observed in the shared volume; it does not restate the generator's expected size
 non-wire observer on the concrete production engine records successful adjacency generations:
 the named source→target edge must be absent in the warm generation and present in a later
 generation after graph-enabled search. Search ranking and REST/MCP contracts are not used as
-the completion signal. The job's `node:24-alpine` image runs the repo-owned coverage,
+the completion signal. The job's `node:24-alpine` image runs the repo-owned full-deps,
 profile and graph scripts; YAML adds the Docker client plugins plus `bash` + `make`, then
 invokes that command. Image lifecycle, exact OCI identity, cleanup, thresholds, reports
 and the compact e5 test tier stay in the repo target/scripts. Its model cache is an ephemeral writable tmpfs;
@@ -101,6 +106,9 @@ different scenario and is not changed or reused. Both graph-revision reports are
 disposable job evidence under `test-results/graph-revision/`, not committed baselines.
 The dind daemon cannot mount the job checkout, so runner inputs and both JSON reports
 cross the Docker API with `docker cp`; the target never bind-mounts a client path. The
+job-owned BuildKit builder and every graph seed/runtime/runner container receive the
+dynamically resolved lane-A cpuset explicitly: tasksetting the Docker client does not
+constrain work created by the sibling daemon.
 memory report also carries exact cold single-flight and warm-mutation counter deltas
 (`metadataRows`, body reads, parser calls, hit/miss/join, retries/fallback and entries),
 while the runtime report owns the HTTP/vector/adjacency-completion latency proof.
@@ -194,24 +202,68 @@ facts. Under dind the target builds a runner image and moves
 the pre-tree archive, scripts and final report through `docker cp`, because the daemon
 cannot bind-mount the job checkout.
 
-**Coverage has two GitLab surfaces, both produced by that same unit run.** The job's
+**Lean coverage has three GitLab surfaces, all produced by the existing `lean:unit`
+job.** Its
 `coverage:` regex reads only Vitest's `Lines` summary, which feeds the job/MR percentage
-and coverage history. The runner also copies `coverage/cobertura-coverage.xml` out of the
-stopped Docker container before cleanup and publishes it `when: always` as both a
+and coverage history. It publishes `coverage/cobertura-coverage.xml` `when: always` as both a
 downloadable artifact and `artifacts:reports:coverage_report`, which feeds changed-line
-annotations. One does not substitute for the other. `reportOnFailure` keeps diagnostic
-XML on a red suite; the adapter then returns the original test exit rather than laundering
-it into artifact success. Before publication, a strict parser from the exact test image
-rejects truncated/malformed XML and non-repository-relative class filenames. The XML
-contract is capped at GitLab's 10 MiB limit.
+annotations, plus `test-results/vitest-junit.xml`, which feeds the MR test count and test
+summary. None substitutes for another. `reportOnFailure` keeps diagnostic XML on a red
+suite; a repo validator rejects missing/truncated reports and non-repository-relative
+Cobertura filenames before a green job can publish them. The coverage XML stays capped at
+GitLab's 10 MiB limit.
 
-**The extended unit profile is repo-owned and bounded.** The committed tuple is CPU
-ceiling 4 / Vitest workers 4 / coverage processing 4. `scripts/checkup/profile.mjs`
-applies an exact Linux affinity for canonical evidence, prints requested/effective values,
-never scales up on extra nested-Docker CPUs, and coherently clamps on smaller runtimes.
-The coverage adapter resolves that tuple once in the job runtime, passes its effective
-CPU/workers/processing values into the test container and requires affinity there. The
-YAML does not restate those numbers.
+**Resource topology is repo-owned and bounded across the whole project.** GitLab
+`resource_group` is the reservation boundary the Docker executor does not provide:
+`notarium-ci-lane-a` and `notarium-ci-lane-b` reserve logical halves rather than named
+hardware positions. A job from another branch, tag, merge request or main pipeline waits
+for the matching half instead of applying the same relative slice over work already
+there. The groups remain independent, so two disjoint jobs can still fill the runner's
+complete allowed cpuset.
+
+Lean coverage owns the first half. Static first owns the second, then build reuses it
+through a same-stage readiness edge. Once build releases lane B,
+`extended:postgres+visual` owns that group as one GitLab job and splits the half again:
+PostgreSQL gets its first quarter and visual its second. Keeping both children in one job
+is load-bearing: two jobs cannot atomically share one resource-group lease, while
+serializing them would add the visual wall to the critical path. E2E then reuses the
+complete second half. The full-only image/graph job waits for lean coverage and reuses
+the first half; backup, release smoke and either publication job follow there.
+`scripts/checkup/profile.mjs` applies exact Linux affinity before installs and final
+commands and prints requested/effective values. Plans contain fractional shares, not a
+reference machine size: 4/8/16 allowed CPUs map halves to 2/4/8 and quarters to 1/2/4;
+non-zero or sparse affinity lists are sliced by position. Only an actually impossible
+layout is refused (the combined quartered wave needs at least four CPUs). Dind builds
+cannot inherit that taskset, so every automatic image lane creates a disposable Buildx
+`docker-container` builder with `cpuset-cpus` equal to the resolved lane and selects it
+explicitly through `BUILDX_BUILDER`; `default-load` keeps the existing local-image
+contract. GitLab dind supplies its endpoint and client certificates through
+`DOCKER_HOST`/`DOCKER_TLS_*`, which Buildx refuses to persist directly in a builder, so
+the helper first snapshots that endpoint into a distinct job-owned Docker context and
+passes the context to `buildx create`. Builder and context are removed together. The
+builder image is digest-pinned in the repo helper rather than following Buildx's mutable
+`buildx-stable-1` default. Repo-created runtime containers receive the same cpuset at
+`docker run/create`.
+The GitLab-owned PostgreSQL service itself remains outside child-process affinity, but
+its owning job is inside the logical lane-B reservation. Runner work from other projects
+remains outside this repository's authority.
+The second wave is a resource dependency, not a test dependency: it prevents the two
+Playwright contours and both PG processes from fighting over a saturated host while
+still reporting all extended verdicts in one pipeline.
+
+**Parallelism follows isolation boundaries, not individual test files.** Fake E2E runs
+two existing Playwright projects at once while every project keeps `workers: 1` and
+`fullyParallel: false`; real E2E and visual stay at one worker, and retry-passes remain
+red. `extended:postgres+visual` pays one install, waits for its PostgreSQL service without
+holding visual back, and records both child outcomes in
+`test-results/ci-extended-wave1.json`. PostgreSQL creates a sibling database for the
+lock-pairs contour, then runs the four contract files serially beside the serial
+lock-pairs file. `test-results/postgres-lanes.json` records both database names, counts,
+walls and exits; either PG lane or the visual producer makes the aggregate red without
+hiding the other result. The wave job itself stays green once those artifacts are
+durable — GitLab cannot pass artifacts from a failed producer to the visual approval
+flow. `extended:postgres+visual:gate` immediately reads the aggregate and carries its PG/infra
+failure; `visual:gate` independently carries pixel, report and retry failures.
 
 **`checkup:compare` is measurement, not another implementation of the gate.** Historical
 trees are retained as negative controls because their export, timing, worker and browser
@@ -241,6 +293,11 @@ it tags them run-uniquely rather than leaving them untagged, is in
 [dev-environment.md](dev-environment.md). The job installs `nodejs make bash`: `bash` is not
 incidental — the Makefile declares `SHELL := /bin/bash`, which the `docker:27-cli` image does
 not carry. There is no `after_script`, because the target hands its own images back.
+Once `extended:unit` releases project-global lane A, backup may start while independent
+PostgreSQL/browser work is still finishing on lane B;
+`verify:release-smoke` follows backup on the same slice. Neither publishes. The public
+release jobs deliberately have no bypassing `needs`, so their later stage still waits
+for every verify verdict.
 
 **The shipped image carries no fixture entrypoint.** What the drill has to prove is that a
 REAL half-finished durable import survives the archive — an upload staged under the stable
@@ -399,14 +456,15 @@ variable precedence makes dotenv unsuitable as an authority:
   With stable diffs on an established base, the review explicitly carries their old
   accepted digests; otherwise no candidate is published.
 
-`extended:visual` succeeds even when the pixels differ, and `visual:gate` carries the
+The visual child of `extended:postgres+visual` keeps its producer result green when only the
+pixels differ, and `visual:gate` carries the
 verdict. That is not laxity — it is the only arrangement GitLab allows: an
 `environment:url` from a dotenv report is applied only to a job that *succeeded*, a
 failed job hands its artefacts to nothing downstream, and `needs:` on a failed job
 skips the dependant. "The failing job produces the review link" is not expressible.
 
 The gate exists only in the pipelines where the comparison ran, and only speaks when it
-actually reported. Both halves are deliberate: it carries `needs: extended:visual`, so a
+actually reported. Both halves are deliberate: it carries `needs: extended:postgres+visual`, so a
 comparison that died before writing its handoff skips the gate rather than letting it
 read a missing report as "nothing moved" (that failure is already red through the
 comparison itself); and it carries the extended lane's own events as rules, so a merge
@@ -416,13 +474,18 @@ runs where nothing had been compared at all.
 
 ### Accepting a change
 
-1. The pipeline runs `extended:visual`. It pulls the canonical set, compares, and — if
+Only a protected default-branch pipeline may move the baseline channel. Rehearsal,
+release and ordinary refs compare against it and carry the red gate, but they never
+offer `visual:accept`: an unprotected ref has no writer credential or candidate, so such
+a button would be both powerless and misleading.
+
+1. The default-branch pipeline runs the visual child of `extended:postgres+visual`. It pulls the canonical set, compares, and — if
    anything moved — uploads a candidate plus a review page.
 2. `visual:gate` is red, names the count, and prints the review page's **bucket path**.
 3. Open that page out of the bucket by hand (download `index.html`, open it locally —
    the images inside are presigned and load for seven days).
 4. If the new rendering is correct, run **`visual:accept`** in that pipeline. It reads
-   the exact producer identity from `extended:visual`'s fixed artifact, verifies the immutable
+   the exact producer identity from `extended:postgres+visual`'s fixed artifact, verifies the immutable
    pointer and snapshot, then moves the channel. No render, no recompute.
 
 The first run uses exactly the same flow. With no `main` channel, `pull` materializes
@@ -518,6 +581,12 @@ that are runner configuration rather than job configuration:
 Only lanes that **build images** use dind. The browser lanes run in the pinned
 Playwright image as the job image, so the runner pulls it to its host once and reuses
 it; inside dind those 2.3 GB would be re-pulled on every run and thrown away.
+Automatic dind lanes create a job-named Docker context plus Buildx builder on their
+resolved cpuset and remove both in `after_script`. The context materializes the existing
+TLS endpoint for Buildx; it does not introduce another daemon or credential source. This
+is a resource boundary, not another cache: each dind daemon is already job-scoped, and
+the builder exists only so build steps cannot escape the resource-group half through the
+daemon service.
 
 **The build directory belongs to the runner slot, not to the job.** Whatever a job leaves
 behind there is inherited by the next job on that slot, and the lanes here do not agree
@@ -527,7 +596,11 @@ repository outright — `detected dubious ownership` — so the lanes that read 
 declare `safe.directory`, and `lean` hands ownership back when it is done. Skip either
 half and a release lane's outcome depends on which slot it happened to land on.
 
-Heavy lanes carry `resource_group: heavy` so they serialise. Each one builds
-multi-gigabyte images; running the executor's full concurrency of them at once peaks
-at tens of gigabytes of transient layers, which is worth bounding on any runner whose
-disk is shared with something else.
+Every automatic CPU-heavy job carries one of the two project-global resource groups.
+Image-heavy dind work (`extended:unit`, backup smoke, release smoke and publication)
+shares logical lane A and therefore remains serial across every pipeline. Static/build,
+the combined PostgreSQL+visual wave and E2E share lane B in dependency order. The repo
+profile maps both lanes onto the complete cpuset actually granted to the job; group names
+never encode hardware ids. The legacy `heavy` group remains only for explicitly launched
+diagnostic/load jobs whose operator already owns the decision to spend the entire host;
+they are not part of an automatic gate.

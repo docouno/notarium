@@ -4,6 +4,12 @@ import { defineConfig } from 'vitest/config'
 import { resolveCheckupProfile } from './scripts/checkup/profile.mjs'
 
 const checkupProfile = resolveCheckupProfile()
+const CI_REPORTS = process.env.CI
+  ? {
+      outputFile: { junit: 'test-results/vitest-junit.xml' },
+      reporters: ['default', './test/skipSummary.ts', 'junit'],
+    }
+  : { reporters: ['default', './test/skipSummary.ts'] }
 
 // Unit layer (Layer 2 of the test strategy): pure functions tested
 // against the spec, not the implementation. No React/DOM here — these are
@@ -26,7 +32,7 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     // The default reporter counts skips; this one names the gate behind each.
-    reporters: ['default', './test/skipSummary.ts'],
+    ...CI_REPORTS,
     maxWorkers: checkupProfile.effective.vitestWorkers,
     minWorkers: checkupProfile.effective.vitestWorkers,
     fileParallelism: checkupProfile.effective.fileParallelism,
@@ -60,7 +66,7 @@ export default defineConfig({
       //
       // The Postgres driver half is excluded for the same reason one step further out:
       // NOTHING in this run can execute it. Its contracts live in `npm run test:pg`
-      // against a live database (CI's own `extended:postgres` job), which this run skips
+      // against a live database (CI's PostgreSQL child in `extended:postgres+visual`), which this run skips
       // wholesale, so every function in that subtree is a structural zero rather than a
       // gap someone could close. Counting them made the server threshold measure how
       // much Postgres code exists instead of how well the code under test is covered —

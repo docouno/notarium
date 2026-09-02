@@ -11,7 +11,7 @@ import { positiveInteger, sessionIdFor } from './contract.mjs'
 import { cleanupHeavyResources } from './heavy.mjs'
 import { acquireHeavyLease } from './lease.mjs'
 import { phaseOwnershipIncompleteErrors, runPhase } from './process.mjs'
-import { resolveCheckupProfile } from './profile.mjs'
+import { resolveCheckupProfile, resolveResourceAllocation } from './profile.mjs'
 import {
   environmentEvidence,
   finishCheckupReport,
@@ -236,21 +236,49 @@ const driverDigest = async () => {
   return hash.digest('hex')
 }
 
+const STATIC_CORRECTNESS_PHASES = Object.freeze([
+  { name: 'format', command: 'npm', args: ['run', 'format:check'] },
+  { name: 'canon', command: 'npm', args: ['run', 'canon:check'] },
+  { name: 'meta-migrations', command: 'npm', args: ['run', 'meta-migrations:check'] },
+  { name: 'runtime-audit', command: 'npm', args: ['run', 'audit:runtime'] },
+  { name: 'lint', command: 'npm', args: ['run', 'lint'] },
+  { name: 'typecheck', command: 'npm', args: ['run', 'typecheck'] },
+])
+
+export const staticPhasePlan = ({ preset = 'checkup', profiled = true } = {}) => {
+  if (!['checkup', 'ci-lean'].includes(preset)) {
+    throw new Error(`unknown static phase preset ${JSON.stringify(preset)}`)
+  }
+  const resource = profiled ? { resource: { plan: 'local-static', lane: 'static' } } : {}
+  const correctness = STATIC_CORRECTNESS_PHASES.filter(
+    (phase) => preset === 'checkup' || phase.name !== 'runtime-audit',
+  ).map((phase) => ({
+    ...phase,
+    parallelGroup: 'static-correctness',
+    ...resource,
+  }))
+
+  return preset === 'ci-lean'
+    ? correctness
+    : [
+        {
+          name: 'dependencies',
+          command: 'npm',
+          args: ['run', 'deps:lean'],
+          resource: { plan: 'local-static', lane: 'static' },
+        },
+        {
+          name: 'write-performance',
+          command: 'make',
+          args: ['--no-print-directory', 'write-perf-gate'],
+          resource: { plan: 'local-static', lane: 'write-performance' },
+        },
+        ...correctness,
+      ]
+}
+
 export const phasePlan = (mode, sessionId) => {
-  const staticPhases = [
-    { name: 'dependencies', command: 'npm', args: ['run', 'deps:lean'] },
-    { name: 'format', command: 'npm', args: ['run', 'format:check'] },
-    { name: 'canon', command: 'npm', args: ['run', 'canon:check'] },
-    {
-      name: 'write-performance',
-      command: 'make',
-      args: ['--no-print-directory', 'write-perf-gate'],
-    },
-    { name: 'meta-migrations', command: 'npm', args: ['run', 'meta-migrations:check'] },
-    { name: 'runtime-audit', command: 'npm', args: ['run', 'audit:runtime'] },
-    { name: 'lint', command: 'npm', args: ['run', 'lint'] },
-    { name: 'typecheck', command: 'npm', args: ['run', 'typecheck'] },
-  ]
+  const staticPhases = staticPhasePlan()
 
   if (mode === 'legacy') {
     return {
@@ -292,6 +320,7 @@ export const phasePlan = (mode, sessionId) => {
         command: process.execPath,
         args: ['scripts/checkup/heavy.mjs', 'coverage'],
         daemonWork: true,
+        resource: { plan: 'local-isolated', lane: 'coverage' },
       },
       {
         name: 'postgres',
@@ -299,6 +328,7 @@ export const phasePlan = (mode, sessionId) => {
         args: ['scripts/checkup/heavy.mjs', 'postgres'],
         daemonWork: true,
         parallelGroup: 'postgres-browser',
+        resource: { plan: 'local-heavy', lane: 'postgres' },
       },
       {
         name: 'browser',
@@ -306,6 +336,7 @@ export const phasePlan = (mode, sessionId) => {
         args: ['scripts/checkup/heavy.mjs', 'browser'],
         daemonWork: true,
         parallelGroup: 'postgres-browser',
+        resource: { plan: 'local-heavy', lane: 'browser' },
       },
       {
         name: 'backup-smoke',
@@ -492,11 +523,6 @@ const runCheckupSession = async (options, lifecycle) => {
       const plan = (options.planFactory ?? phasePlan)(options.mode, sessionId)
       const phaseEnvironment = {
         ...sessionEnvironment,
-        CHECKUP_CPU_CEILING: String(report.profile.effective.cpu),
-        CHECKUP_VITEST_WORKERS: String(report.profile.effective.vitestWorkers),
-        CHECKUP_COVERAGE_CONCURRENCY: String(
-          report.profile.effective.coverageProcessingConcurrency,
-        ),
         CHECKUP_SAMPLE_INTERVAL_MS: String(samplerIntervalMs),
         CHECKUP_SESSION_ID: sessionId,
         CHECKUP_SUBJECT_DIGEST: snapshot.sourceDigest,
@@ -522,6 +548,21 @@ const runCheckupSession = async (options, lifecycle) => {
         )
 
       const runPhaseResult = async (phase) => {
+        const runnable = phase.resource
+          ? {
+              ...phase,
+              command: process.execPath,
+              args: [
+                'scripts/checkup/profile.mjs',
+                '--plan',
+                phase.resource.plan,
+                '--lane',
+                phase.resource.lane,
+                phase.command,
+                ...(phase.args ?? []),
+              ],
+            }
+          : phase
         let activeChild = null
         let phaseRegistration = { status: 'fulfilled', error: null }
         let phaseBegun = false
@@ -547,7 +588,7 @@ const runCheckupSession = async (options, lifecycle) => {
           }
           try {
             result = await (options.phaseRunner ?? runPhase)({
-              ...phase,
+              ...runnable,
               cwd: workRoot,
               env: phaseEnvironment,
               samplerIntervalMs,
@@ -605,6 +646,12 @@ const runCheckupSession = async (options, lifecycle) => {
               capability: 'unavailable',
               reason: 'docker-daemon-work-not-attributable-to-client-process-tree',
             }
+          }
+          if (result && phase.resource) {
+            result.resource = resolveResourceAllocation({
+              ...phase.resource,
+              availableCpu: report.environment.availableParallelism,
+            })
           }
           try {
             if (!result) {
@@ -718,8 +765,24 @@ const runCheckupSession = async (options, lifecycle) => {
         return passed
       }
 
-      for (const phase of plan.static) {
-        if (!(await execute(phase))) {
+      for (let index = 0; index < plan.static.length;) {
+        const phase = plan.static[index]
+        const group = phase.parallelGroup
+
+        if (!group) {
+          index += 1
+          if (!(await execute(phase))) {
+            break execution
+          }
+          continue
+        }
+        const phases = []
+
+        while (index < plan.static.length && plan.static[index].parallelGroup === group) {
+          phases.push(plan.static[index])
+          index += 1
+        }
+        if (!(await executeParallel(phases))) {
           break execution
         }
       }

@@ -25,6 +25,10 @@ const smokeEnv = (extra: Record<string, string>): NodeJS.ProcessEnv => ({
   ...process.env,
   BACKUP_SMOKE_IMAGE: 'fake-smoke-image',
   BACKUP_SMOKE_FIXTURE_IMAGE: 'fake-fixture-image',
+  // Keep the harness on the same command shape as the exact-affinity CI carrier.
+  // Otherwise the fake can accept a command production never emits and hide a drift
+  // in resource propagation until the full coverage job.
+  CHECKUP_CPUSET: '0-3',
   ...extra,
 })
 
@@ -47,6 +51,22 @@ const waitForFile = async (path: string): Promise<void> => {
   throw new Error(`timed out waiting for ${path}`)
 }
 
+const waitForFileOrExit = async (
+  path: string,
+  closed: Promise<{ code: number | null; signal: NodeJS.Signals | null }>,
+): Promise<void> => {
+  const first = await Promise.race([
+    waitForFile(path).then(() => ({ kind: 'ready' }) as const),
+    closed.then((result) => ({ kind: 'exit', result }) as const),
+  ])
+
+  if (first.kind === 'exit') {
+    throw new Error(
+      `backup smoke exited before readiness (code=${String(first.result.code)}, signal=${String(first.result.signal)})`,
+    )
+  }
+}
+
 describe('backup smoke interruption', () => {
   it.each(SIGNALS)(
     'removes its exact containers and volumes before preserving $signal',
@@ -65,7 +85,7 @@ describe('backup smoke interruption', () => {
         `#!/bin/sh
 printf '%s\\n' "$*" >> "$DOCKER_LOG"
 case "$*" in
-  "run --rm fake-smoke-image --help")
+  "run --cpuset-cpus 0-3 --rm fake-smoke-image --help")
     printf 'backup verify\\n'
     ;;
   "volume create notarium-backup-source-"*)
@@ -102,7 +122,7 @@ exit 0
         },
       )
 
-      await waitForFile(ready)
+      await waitForFileOrExit(ready, closed)
       child.kill(signal)
       let timeout: ReturnType<typeof setTimeout>
       const result = await Promise.race([
@@ -121,6 +141,7 @@ exit 0
       expect(result).toEqual({ code, signal: null })
       await expect(stat(lateResource)).rejects.toMatchObject({ code: 'ENOENT' })
       expect(await workdirsIn(driverTmp)).toEqual([])
+      expect(calls).toMatch(/^run --cpuset-cpus 0-3 --rm fake-smoke-image --help$/m)
       // Anchored: unanchored, every one of these is also satisfied by the
       // `volume rm -f …` lines below, and dropping a container from cleanup stays green.
       expect(calls).toMatch(/^rm -f notarium-backup-source-\d+-\d+$/m)
@@ -152,7 +173,7 @@ exit 0
         `#!/bin/sh
 printf '%s\\n' "$*" >> "$DOCKER_LOG"
 case "$*" in
-  "run --rm fake-smoke-image --help")
+  "run --cpuset-cpus 0-3 --rm fake-smoke-image --help")
     printf 'invalid help\\n'
     ;;
   "rm -f notarium-backup-source-"*)
@@ -188,7 +209,7 @@ exit 0
         },
       )
 
-      await waitForFile(ready)
+      await waitForFileOrExit(ready, closed)
       child.kill(signal)
       let timeout: ReturnType<typeof setTimeout>
       const result = await Promise.race([

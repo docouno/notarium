@@ -1,4 +1,5 @@
 import { buildCaseWorld, caseToFixture } from '../cases'
+import { installControlledEventSource } from './controlledEventSource'
 import { expect, type Page, test } from './fixtures'
 
 const WORLD = caseToFixture(buildCaseWorld('agent-sessions', { now: '2099-08-05T12:00:00.000Z' }))
@@ -40,6 +41,14 @@ const trackEventSources = async (page: Page) => {
       }
     }
   })
+}
+
+// The queue test dispatches exact revisions itself. A native EventSource would also
+// receive fixture/login activity from the fake server, turning a synthetic schedule
+// into a race with unrelated real frames. Keep the reconnect test on the native tracker
+// above; only the scheduler proof gets this controlled event source.
+const controlEventSources = async (page: Page) => {
+  await page.addInitScript(installControlledEventSource)
 }
 
 const callMcp = async (
@@ -763,7 +772,7 @@ test('@v15 grouped and deep continuations keep N+1 intent across a revision', as
 test('@v15 grouped live revalidation caps concurrency and commits only the newest queue', async ({
   page,
 }) => {
-  await trackEventSources(page)
+  await controlEventSources(page)
   await login(page)
   const sourceOverview = (await (
     await page.request.get('/api/me/agent-sessions?limit=30&aggregates=0')
@@ -1028,6 +1037,7 @@ test('@v15 a stale overview cannot resurrect a confirmed local deletion', async 
     markDone = resolve
   })
   let hold = false
+  let started = 0
   let held = 0
   let completed = 0
   let expectedCompletions = 0
@@ -1038,6 +1048,7 @@ test('@v15 a stale overview cannot resurrect a confirmed local deletion', async 
       await route.continue()
       return
     }
+    started += 1
     const response = await route.fetch()
     held += 1
     markHeld?.()
@@ -1062,14 +1073,16 @@ test('@v15 a stale overview cannot resurrect a confirmed local deletion', async 
   })
   await firstHeld
   await expect.poll(() => held).toBeGreaterThanOrEqual(2)
+  await expect.poll(() => held).toBe(started)
 
   await archived.getByRole('button', { name: 'More actions' }).click()
   await page.getByRole('menuitem', { name: 'Delete session' }).click()
   await page.getByRole('dialog').getByRole('button', { name: 'Delete' }).click()
   await expect(archived).toHaveCount(0)
 
-  expectedCompletions = held
+  await expect.poll(() => held).toBe(started)
   hold = false
+  expectedCompletions = held
   release?.()
   await allDone
   await page.evaluate(() => new Promise(requestAnimationFrame))

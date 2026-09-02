@@ -220,6 +220,49 @@ describe('checkup session driver', () => {
     expect(report.measurement.phaseWallMs - report.measurement.executionWallMs).toBeGreaterThan(150)
   })
 
+  it('runs one declared static group concurrently before acquiring the heavy lease', async () => {
+    const { root, snapshot } = await fixture()
+    const output = join(root, 'test-results/checkup')
+    let leaseCreatedAt = 0
+    const result = await runCheckup({
+      command: 'run',
+      mode: 'legacy',
+      subjectRoot: root,
+      outputDir: output,
+      snapshotFactory: ownedSnapshotFactory(snapshot),
+      leaseFactory: async () => {
+        leaseCreatedAt = Date.now()
+        return fakeLease()
+      },
+      planFactory: () => ({
+        static: [
+          {
+            name: 'left-static',
+            command: process.execPath,
+            args: ['-e', 'setTimeout(() => {}, 250)'],
+            parallelGroup: 'static-pair',
+          },
+          {
+            name: 'right-static',
+            command: process.execPath,
+            args: ['-e', 'setTimeout(() => {}, 250)'],
+            parallelGroup: 'static-pair',
+          },
+        ],
+        heavy: [],
+      }),
+    })
+    const report = JSON.parse(await readFile(result.reportPath, 'utf8'))
+
+    expect(result.exitCode).toBe(0)
+    expect(leaseCreatedAt).toBeGreaterThan(0)
+    expect(report.phases.map((phase: { name: string }) => phase.name)).toEqual([
+      'left-static',
+      'right-static',
+    ])
+    expect(report.measurement.phaseWallMs - report.measurement.executionWallMs).toBeGreaterThan(150)
+  })
+
   it('returns red when lease cleanup fails after otherwise green work', async () => {
     const { root, snapshot } = await fixture()
     const result = await runCheckup({

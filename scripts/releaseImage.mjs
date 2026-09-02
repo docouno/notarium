@@ -86,8 +86,22 @@ const gitOk = (...args) => {
   }
 }
 
+const dockerResourceArgs = (args) => {
+  const cpuSet = process.env.CHECKUP_CPUSET
+
+  if (!cpuSet || !['run', 'create'].includes(args[0])) {
+    return args
+  }
+  if (!/^\d+(?:[-,]\d+)*$/u.test(cpuSet)) {
+    die(`invalid CHECKUP_CPUSET=${JSON.stringify(cpuSet)}`)
+  }
+
+  return [args[0], '--cpuset-cpus', cpuSet, ...args.slice(1)]
+}
+
 const docker = (args, { input, quiet } = {}) => {
-  const result = spawnSync('docker', args, {
+  const resolvedArgs = dockerResourceArgs(args)
+  const result = spawnSync('docker', resolvedArgs, {
     cwd: root,
     encoding: 'utf8',
     input,
@@ -95,7 +109,7 @@ const docker = (args, { input, quiet } = {}) => {
   })
 
   if (result.error) {
-    die(`docker ${args[0]} could not run: ${result.error.message}`)
+    die(`docker ${resolvedArgs[0]} could not run: ${result.error.message}`)
   }
 
   return {

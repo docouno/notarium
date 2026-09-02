@@ -39,6 +39,11 @@ const PORT = Number(process.env.E2E_PORT || 8788)
 const AUTH_PORT = PORT + 1
 const PROVIDERS_PORT = PORT + 2
 const PREBUILT = process.env.PLAYWRIGHT_PREBUILT === '1'
+const WORKERS = Number(process.env.CHECKUP_PLAYWRIGHT_WORKERS ?? '1')
+
+if (!Number.isSafeInteger(WORKERS) || WORKERS < 1) {
+  throw new Error(`CHECKUP_PLAYWRIGHT_WORKERS must be a positive integer, got ${WORKERS}`)
+}
 const PREBUILT_CHECK = PREBUILT ? 'node scripts/checkup/browserArtifact.mjs verify && ' : ''
 const BUILD = PREBUILT ? '' : 'VITE_PWA=off npm run build && '
 // Node 24.15–24.18 has an upstream Maglev concurrency crash under CPU pressure.
@@ -66,11 +71,11 @@ export default defineConfig({
   // The production-stack restore proof has its own server and config. A CLI path
   // of `test/e2e` also prefix-matches `test/e2e-real`, so fence it explicitly.
   testIgnore: REAL_STACK_SPECS,
-  // Serial: the fake backend is one shared in-memory store, re-seeded before each
-  // test (see test/e2e/fixtures.ts). Parallel workers would mutate it under each
-  // other. The suite is small, so serial is cheap.
+  // Serial inside each project: its fake backend is one shared in-memory store,
+  // re-seeded before every test. Projects own distinct servers/ports, so two projects
+  // may run together while project-level workers=1 prevents intra-store races.
   fullyParallel: false,
-  workers: 1,
+  workers: WORKERS,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   failOnFlakyTests: true,
@@ -83,6 +88,7 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
+      workers: 1,
       use: { ...devices['Desktop Chrome'] },
       // Project-level filters replace the top-level filter, so repeat the
       // production-stack fence beside the auth split.
@@ -92,11 +98,13 @@ export default defineConfig({
     // the login gate + the personal layer (a signed-in user's profile/memory).
     {
       name: 'chromium-auth',
+      workers: 1,
       use: { ...devices['Desktop Chrome'], baseURL: `http://localhost:${AUTH_PORT}` },
       testMatch: AUTH_SPECS,
     },
     {
       name: 'chromium-providers',
+      workers: 1,
       use: { ...devices['Desktop Chrome'], baseURL: `http://localhost:${PROVIDERS_PORT}` },
       testMatch: PROVIDER_SPECS,
     },

@@ -565,7 +565,7 @@ export const visualGateSummary = (handoff) => {
   if (failures) {
     lines.push(
       `visual: ${failures} non-pixel failure(s) — broken/skipped tests or invalid report evidence.`,
-      "visual: read extended:visual's log; accepting a baseline cannot fix these.",
+      "visual: read extended:postgres+visual's log; accepting a baseline cannot fix these.",
     )
   }
   if (flakes) {
@@ -1217,12 +1217,16 @@ const accept = async ({ handoff = HANDOFF_FILE }) => {
 // The verify job reads the fixed artifact, not dotenv variables: GitLab lets manual,
 // project and pipeline variables override dotenv, so environment counts are useful UI
 // metadata but cannot be the authority for a red/green decision.
-const gate = async ({ handoff = HANDOFF_FILE }) => {
+export const gate = async ({ handoff = HANDOFF_FILE, ifPresent = false }) => {
   let evidence
 
   try {
     evidence = await readVisualHandoff(handoff)
   } catch (error) {
+    if (ifPresent && error.message === `no visual handoff at ${handoff}`) {
+      say('visual: producer handoff absent — no visual verdict')
+      return
+    }
     die(error.message)
   }
   const summary = visualGateSummary(evidence)
@@ -1300,7 +1304,7 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
   if (command === 'verdict') {
     await verdict(options)
   } else if (command === 'gate') {
-    await gate(options)
+    await gate({ ...options, ifPresent: options['if-present'] === true })
   } else if (command === 'pull') {
     await pull()
   } else if (command === 'publish') {

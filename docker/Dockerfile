@@ -68,6 +68,10 @@ COPY packages/engine-memory/package.json packages/engine-memory/
 COPY packages/engine-vector/package.json packages/engine-vector/
 COPY packages/server/package.json packages/server/
 COPY packages/web/package.json packages/web/
+# The canonical dependency scripts run postdeps:lean/full after npm ci. This producer
+# must therefore join the manifest-only cache prefix; copying it only with the later
+# source tree makes a clean image build fail after the expensive install completes.
+COPY scripts/checkup/depsFreshness.mjs scripts/checkup/
 # The pinned base ships an npm below the floor package.json declares, and .npmrc — kept
 # in the COPY above for exactly this reason — makes that a refusal rather than a warning
 # (engine-strict), so `npm run deps:full` below cannot run until the declared npm is
@@ -178,7 +182,12 @@ RUN set -eu; \
   npm cache clean --force; \
   npm -v
 
-RUN npm run deps:full -- --omit=dev && npm cache clean --force
+# `deps:full` owns the canonical install flags and its post-hook. Pass omit as npm
+# config so the hook can identify this intentionally dev-less runtime install. The
+# bind mount makes the hook available for this RUN without publishing tooling source
+# in the runtime filesystem or an image layer.
+RUN --mount=type=bind,source=scripts/checkup/depsFreshness.mjs,target=/app/scripts/checkup/depsFreshness.mjs,ro \
+  NOTARIUM_DEPS_INSTALL_KIND=runtime npm run deps:full --omit=dev && npm cache clean --force
 
 # The bundled server + the built SPA. No .env — config comes from the environment.
 COPY --from=builder /app/packages/server/dist ./packages/server/dist

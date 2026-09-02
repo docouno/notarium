@@ -23,6 +23,7 @@ describe('browser runtime stability', () => {
       makefile,
       rawPipeline,
       ciDocs,
+      ciVisual,
       visualSpec,
       providerVisualSpec,
       visualScreenshotHelper,
@@ -39,6 +40,7 @@ describe('browser runtime stability', () => {
       readFile(join(repo, 'Makefile'), 'utf8'),
       readFile(join(repo, '.gitlab-ci.yml'), 'utf8'),
       readFile(join(repo, 'docs/ci.md'), 'utf8'),
+      readFile(join(repo, 'scripts/checkup/ciVisual.mjs'), 'utf8'),
       readFile(join(repo, 'test/visual/visual.spec.ts'), 'utf8'),
       readFile(join(repo, 'test/visual/providers.spec.ts'), 'utf8'),
       readFile(join(repo, 'test/visual/screenshot.ts'), 'utf8'),
@@ -72,6 +74,9 @@ describe('browser runtime stability', () => {
     expect(serverScripts.build).toBe('node --no-maglev ../../node_modules/tsup/dist/cli-default.js')
     expect(fakeConfig.match(/node --no-maglev --import tsx/gu)).toHaveLength(1)
     expect(fakeConfig.match(/\$\{TSX\}/gu)).toHaveLength(3)
+    expect(fakeConfig).toContain('workers: WORKERS')
+    expect(fakeConfig.match(/workers: 1,/gu)).toHaveLength(3)
+    expect(fakeConfig).toContain('fullyParallel: false')
     expect(fakeConfig).toContain('pathTemplate: VISUAL_SNAPSHOT_PATH_TEMPLATE')
     expect(fakeConfig).not.toContain('{projectName}')
     expect(realConfig).toContain('node --no-maglev --import tsx')
@@ -90,7 +95,9 @@ describe('browser runtime stability', () => {
     expect(heavy.match(/'--no-maglev'/gu)).toHaveLength(2)
     expect(makefile).toContain('--no-maglev node_modules/@playwright/test/cli.js')
 
-    expect((pipeline['extended:visual']?.script ?? []).join('\n')).toContain(stablePlaywright)
+    expect(ciVisual).toContain("const PLAYWRIGHT = 'node_modules/@playwright/test/cli.js'")
+    expect(ciVisual).toContain("'--no-maglev', PLAYWRIGHT")
+    expect(visualSpec).toContain('/^\\/assets\\/EditorBody-[^/]+[.]js$/u')
     expect(pipeline['extended:visual-bootstrap']).toBeUndefined()
     expect(rawPipeline).not.toContain('--bootstrap')
     expect(ciDocs).not.toContain('visual-bootstrap')
@@ -100,27 +107,24 @@ describe('browser runtime stability', () => {
     expect(visualScreenshotHelper.match(/[.]toHaveScreenshot\(/gu)).toHaveLength(1)
     expect(visualScreenshotHelper).toContain("type: 'visual-cell', description: name")
 
-    const comparison = (pipeline['extended:visual']?.script ?? []).join('\n')
+    const comparison = ciVisual
     const acceptance = (pipeline['visual:accept']?.script ?? []).join('\n')
     const gate = (pipeline['visual:gate']?.script ?? []).join('\n')
     const acceptNeed = pipeline['visual:accept']?.needs?.[0]
     const gateNeed = pipeline['visual:gate']?.needs?.[0]
 
-    expect(comparison).toContain(
-      'candidate="$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA-$CI_PIPELINE_ID-$CI_JOB_ID"',
-    )
-    expect(comparison).toContain('--pipeline "$CI_PIPELINE_ID" --job "$CI_JOB_ID"')
-    expect(comparison).toContain(
-      'VISUAL_S3_KEY_ID="$VISUAL_S3_READ_KEY_ID" VISUAL_S3_SECRET="$VISUAL_S3_READ_SECRET"',
-    )
-    expect(comparison).toContain('node scripts/visualBaseline.mjs verdict')
-    expect(acceptNeed).toEqual({ job: 'extended:visual', artifacts: true })
-    expect(gateNeed).toEqual({ job: 'extended:visual', artifacts: true })
-    expect(pipeline['extended:visual']?.artifacts?.paths).toContain('visual-handoff.json')
+    expect(comparison).toContain('env.VISUAL_S3_READ_KEY_ID')
+    expect(comparison).toContain('env.VISUAL_S3_WRITE_KEY_ID')
+    expect(comparison).toContain("[VISUAL_BASELINE, 'verdict']")
+    expect(comparison).toContain("required(env, 'CI_PIPELINE_ID')")
+    expect(comparison).toContain("required(env, 'CI_JOB_ID')")
+    expect(acceptNeed).toEqual({ job: 'extended:postgres+visual', artifacts: true })
+    expect(gateNeed).toEqual({ job: 'extended:postgres+visual', artifacts: true })
+    expect(pipeline['extended:postgres+visual']?.artifacts?.paths).toContain('visual-handoff.json')
     expect(pipeline['visual:accept']?.variables).not.toHaveProperty('VISUAL_CANDIDATE')
     expect(pipeline['visual:accept']?.resource_group).toBe('visual-baseline-accept')
     expect(acceptance.trim()).toBe('node scripts/visualBaseline.mjs accept')
-    expect(gate.trim()).toBe('node scripts/visualBaseline.mjs gate')
+    expect(gate.trim()).toBe('node scripts/visualBaseline.mjs gate --if-present')
 
     const publishSource = visualProtocol.slice(
       visualProtocol.indexOf('const publish ='),

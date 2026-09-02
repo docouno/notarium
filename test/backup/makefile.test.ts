@@ -496,9 +496,12 @@ describe('CI adapter for backup-smoke', () => {
     // client image does not carry; without it the target dies before its first line.
     expect(script).toContain('apk add --no-cache nodejs make bash')
     expect(script).toContain('make backup-smoke')
-    // The adapter must not restate the builds, the image addressing or the cleanup.
+    // The adapter must not restate target builds, image addressing or runtime cleanup.
+    // Its only after-script responsibility is the dind builder resource it created.
     expect(script).not.toContain('docker build')
     expect(JSON.stringify(job)).not.toContain('BACKUP_SMOKE_IMAGE')
-    expect(job.after_script).toBeUndefined()
+    expect(job.after_script).toEqual([
+      'node scripts/checkup/ciDockerBuilder.mjs remove --name "notarium-ci-$CI_JOB_ID" || true',
+    ])
   })
 })

@@ -52,6 +52,7 @@ const password = 'backup-smoke-password'
 const username = 'backup-owner'
 const activeDockerChildren = new Map()
 const checkupSession = process.env.CHECKUP_SESSION_ID
+const checkupCpuSet = process.env.CHECKUP_CPUSET
 let interruptedSignal = null
 let cleanupPromise = null
 let cleanupPassPromise = null
@@ -62,17 +63,26 @@ const spawnDocker = (args, options, { allowInterrupted = false } = {}) => {
   if (interruptedSignal && !allowInterrupted) {
     throw new Error(`backup smoke interrupted by ${interruptedSignal}`)
   }
+  const ownsContainer = args[0] === 'run' || args[0] === 'create'
+
+  if (checkupCpuSet && !/^\d+(?:[-,]\d+)*$/u.test(checkupCpuSet)) {
+    throw new Error(`invalid CHECKUP_CPUSET=${JSON.stringify(checkupCpuSet)}`)
+  }
+  const resourceArgs =
+    checkupCpuSet && ownsContainer
+      ? [args[0], '--cpuset-cpus', checkupCpuSet, ...args.slice(1)]
+      : args
   const labelledArgs =
-    checkupSession && (args[0] === 'run' || args[0] === 'create')
+    checkupSession && ownsContainer
       ? [
-          args[0],
+          resourceArgs[0],
           '--label',
           'notarium.checkup.runner=true',
           '--label',
           `notarium.checkup.session=${checkupSession}`,
-          ...args.slice(1),
+          ...resourceArgs.slice(1),
         ]
-      : args
+      : resourceArgs
   const child = spawn('docker', labelledArgs, options)
   const done = new Promise((resolve) => {
     const untrack = () => {

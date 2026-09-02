@@ -7,7 +7,7 @@ production packages and the optional vector native stack. First-party code is un
 the root LICENSE / NOTICE / COMMERCIAL-LICENSE.md. Browser-bundle notices live
 in packages/web/public/licenses/THIRD_PARTY_NOTICES.txt.
 
-211 components.
+212 components.
 
 | Package | Version | License |
 | --- | --- | --- |
@@ -98,8 +98,8 @@ in packages/web/public/licenses/THIRD_PARTY_NOTICES.txt.
 | fast-fifo | 1.3.2 | MIT |
 | fast-json-stringify | 7.0.1 | MIT |
 | fast-querystring | 1.1.2 | MIT |
-| fast-uri | 3.1.5 | BSD-3-Clause |
-| fast-uri | 4.1.2 | BSD-3-Clause |
+| fast-uri | 3.1.7 | BSD-3-Clause |
+| fast-uri | 4.1.4 | BSD-3-Clause |
 | fastify | 5.10.0 | MIT |
 | fastify-plugin | 6.0.0 | MIT |
 | fastq | 1.20.1 | ISC |
@@ -6370,7 +6370,7 @@ DEALINGS IN THE SOFTWARE.
 
 ---
 
-## fast-uri  3.1.5  —  BSD-3-Clause
+## fast-uri  3.1.7  —  BSD-3-Clause
 Vincent Le Goff <vince.legoff@gmail.com> (https://github.com/zekth) · https://github.com/fastify/fast-uri
 
 ### LICENSE
@@ -6410,7 +6410,7 @@ The complete list of contributors can be found at:
 
 ---
 
-## fast-uri  4.1.2  —  BSD-3-Clause
+## fast-uri  4.1.4  —  BSD-3-Clause
 Vincent Le Goff <vince.legoff@gmail.com> (https://github.com/zekth) · https://github.com/fastify/fast-uri
 
 ### LICENSE

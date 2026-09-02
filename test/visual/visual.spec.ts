@@ -188,9 +188,25 @@ for (const theme of ['dark', 'light'] as const) {
       test(`rail ${c.rail} · aside ${c.aside}${w}`, async ({ page }) => {
         await apply(page, { theme, ...c })
         await page.goto('/n/fake-demo-titanium')
+        await expect(page.getByRole('button', { name: 'Edit' })).toBeVisible()
+        if (c.aside === 'open') {
+          // Editing does not own the local graph's boot. Let the already-visible
+          // inspector reach the same settled canvas boundary as note-read before
+          // asking React to load and mount the editor beside it.
+          await expect(page.locator('aside canvas')).toBeVisible()
+          await settleGraph(page)
+        }
+        const editorModule = page.waitForResponse((response) => {
+          const path = new URL(response.url()).pathname
+
+          return /^\/assets\/EditorBody-[^/]+[.]js$/u.test(path) && response.ok()
+        })
+
         await page.getByRole('button', { name: 'Edit' }).click()
+        await editorModule
         // #156: the title is the document's leading `# H1`, edited inline — the editor
-        // surface (no separate title field) is the readiness signal for the shot.
+        // surface (no separate title field) is the readiness signal for the shot. Observe
+        // its lazy module first so a busy runner cannot spend the assertion budget on I/O.
         await expect(page.locator('.cm-content')).toBeVisible()
         await shot(page, `note-edit-${c.rail}-${c.aside}${w}-${theme}`)
       })
@@ -293,18 +309,32 @@ for (const theme of ['dark', 'light'] as const) {
     test('context menu — note', async ({ page }) => {
       await apply(page, { theme, rail: 'open' })
       await page.goto('/')
-      await page
-        .locator('[data-testid="tree-note"][data-id="fake-demo-carbon"]')
-        .click({ button: 'right' })
+      const note = page.locator('[data-testid="tree-note"][data-id="fake-demo-carbon"]')
+
+      await note.click({ button: 'right' })
       await expect(page.getByRole('menu')).toBeVisible()
+      // The menu is the state this cell owns. A right-click leaves the pointer on the
+      // row and makes its label alternate between --text and the persistent context
+      // target's --text-dim depending on screenshot timing. Move to inert chrome and
+      // observe the actual hover boundary before capturing pixels.
+      await page.mouse.move(W - 1, H - 1)
+      await expect.poll(() => note.evaluate((row) => row.matches(':hover'))).toBe(false)
       await shot(page, `context-menu-note-${theme}`)
     })
 
     test('context menu — folder', async ({ page }) => {
       await apply(page, { theme, rail: 'open' })
       await page.goto('/')
-      await page.getByText('demo', { exact: true }).click({ button: 'right' })
+      const folder = page.locator('[data-testid="tree-folder"][data-path="demo"]')
+
+      await folder.getByText('demo', { exact: true }).click({ button: 'right' })
       await expect(page.getByRole('menu')).toBeVisible()
+      // Right-click leaves the pointer on the row while its go-to-page glyph is in an
+      // 80ms hover transition. The menu state is what this cell owns; park the pointer
+      // off every interactive surface and observe the glyph's product state instead of
+      // racing a mid-transition opacity into the pixels.
+      await page.mouse.move(W - 1, H - 1)
+      await expect(folder.getByTestId('folder-open-page').locator('svg')).toHaveCSS('opacity', '0')
       await shot(page, `context-menu-folder-${theme}`)
     })
 

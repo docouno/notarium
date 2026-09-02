@@ -1190,6 +1190,7 @@ test('@v24 a restored unavailable target blocks the global Save shortcut', async
 
   expect(createCalls).toBe(0)
   await expect(page).toHaveURL(draftUrl)
+  await page.unrouteAll({ behavior: 'wait' })
 })
 
 test('@v25 a restored stale Projects target blocks the global Save shortcut', async ({ page }) => {
@@ -1241,6 +1242,7 @@ test('@v25 a restored stale Projects target blocks the global Save shortcut', as
 
   expect(createCalls).toBe(0)
   await expect(page).toHaveURL(draftUrl)
+  await page.unrouteAll({ behavior: 'wait' })
 })
 
 test('@v14 a truncated library remains honest and keeps routed catalog cards', async ({
@@ -1686,19 +1688,29 @@ test('Role library pagination appends a cursor page without leaking cursor into 
   page,
 }) => {
   await login(page)
+  // This case owns the pagination trigger. Leaving the viewport observer live
+  // races its automatic load against the explicit first-page assertions below.
+  await page.addInitScript(() => {
+    Object.defineProperty(IntersectionObserver.prototype, 'observe', {
+      configurable: true,
+      value: () => {},
+    })
+  })
   let complete: Record<string, unknown> | null = null
+  let continuationRequests = 0
 
   await page.route('**/api/me/agent-roles*', async (route) => {
     const url = new URL(route.request().url())
 
-    // The section's own pill reads the same endpoint with `limit=1` — an unfiltered
-    // count, not this list. Rewriting that answer too would hand the continuation a
-    // one-row world and prove nothing about paging.
-    if (url.searchParams.get('limit') === '1') {
+    // The section pill and Agents explorer read the same endpoint with their own
+    // limits. Only the library's 24-row request belongs to this oracle; rewriting a
+    // sibling surface can overwrite `complete` while its request is still in flight.
+    if (url.searchParams.get('limit') !== '24') {
       await route.fallback()
       return
     }
     if (url.searchParams.get('cursor') === 'browser-next' && complete) {
+      continuationRequests++
       const items = complete.items as unknown[]
       await route.fulfill({
         json: { ...complete, items: items.slice(1), nextCursor: null },
@@ -1720,9 +1732,18 @@ test('Role library pagination appends a cursor page without leaking cursor into 
     .locator('main.main')
     .getByTestId('agents-roles')
     .locator('article[data-testid^="ability-"]')
+  const loadMore = page
+    .getByTestId('agents-roles')
+    .getByRole('button', { name: 'Load more', exact: true })
+
+  await expect(cards).toHaveCount(1)
+  await expect(loadMore).toBeVisible()
+  await loadMore.click()
   await expect.poll(() => cards.count()).toBeGreaterThan(1)
-  await expect(page.getByRole('button', { name: 'Load more' })).toHaveCount(0)
+  await expect(loadMore).toHaveCount(0)
+  expect(continuationRequests).toBe(1)
   expect(new URL(page.url()).searchParams.has('cursor')).toBe(false)
+  await page.unrouteAll({ behavior: 'wait' })
 })
 
 test('The library aside uses the system modal behavior on a narrow viewport', async ({ page }) => {

@@ -2832,25 +2832,34 @@ describe('role catalog and owned libraries', () => {
     const name = 'near-limit'
     const revision = `sha256:${'a'.repeat(64)}`
     let source = ''
+    let lower = 15_500
+    let upper = 16_383
 
-    for (let padding = 15_500; padding < 16_384; padding++) {
+    // Manifest validity is monotonic by padding length. Binary search preserves the
+    // exact source-valid/rewrite-invalid boundary without hundreds of 16 KiB YAML parses.
+    while (lower <= upper) {
+      const padding = Math.floor((lower + upper) / 2)
       const candidate = `---\nname: ${name}\ndescription: Near limit.\nmetadata:\n  notarium.kind: role\n  notarium.source: catalog\n  notarium.package-id: ${packageDirectoryOf(name)}\n  padding: ${'x'.repeat(padding)}\n---\n`
 
       try {
         parseSkillFile(candidate, name)
-        parseSkillFile(withCatalogProvenance(candidate, packageDirectoryOf(name), revision), name)
       } catch {
-        try {
-          parseSkillFile(candidate, name)
-          source = candidate
-          break
-        } catch {
-          // The source itself crossed the bound; keep searching is pointless.
-          break
-        }
+        upper = padding - 1
+        continue
+      }
+      try {
+        parseSkillFile(withCatalogProvenance(candidate, packageDirectoryOf(name), revision), name)
+        lower = padding + 1
+      } catch {
+        source = candidate
+        upper = padding - 1
       }
     }
     expect(source).not.toBe('')
+    expect(() => parseSkillFile(source, name)).not.toThrow()
+    expect(() =>
+      parseSkillFile(withCatalogProvenance(source, packageDirectoryOf(name), revision), name),
+    ).toThrow(/frontmatter is too large/u)
     const roles = createRolesService({
       catalog: async () => [
         {

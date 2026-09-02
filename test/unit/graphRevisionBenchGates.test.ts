@@ -234,6 +234,12 @@ describe('graph revision dind adapter', () => {
     expect(target).toContain(':/tmp/graph-revision-memory.json')
     expect(target).toContain(':/tmp/graph-revision-runtime.json')
     expect(target).toContain('GRAPH_REVISION_CORPUS_REPORT=/benchmark-data/')
+    expect(makefile).toContain(
+      'GRAPH_REVISION_DOCKER_CPU_ARGS = $(if $(strip $(CHECKUP_CPUSET)),--cpuset-cpus "$(CHECKUP_CPUSET)")',
+    )
+    expect(
+      target.match(/docker (?:run|create) \$\(GRAPH_REVISION_DOCKER_CPU_ARGS\)/gu),
+    ).toHaveLength(6)
     expect(pipeline).toContain('make graph-revision-gate GRAPH_REVISION_COMMIT="$CI_COMMIT_SHA"')
   })
 })

@@ -15,6 +15,7 @@ import {
   blocksCandidate,
   candidatePointer,
   flags,
+  gate,
   manifestDigest,
   mergeCells,
   normalizeReportedCells,
@@ -89,6 +90,14 @@ describe('command-line flags', () => {
 
   it('returns nothing for no arguments', () => {
     expect(flags([])).toEqual({})
+  })
+})
+
+describe('optional visual gate evidence', () => {
+  it('stays neutral only when the producer handoff is absent', async () => {
+    await expect(
+      gate({ handoff: 'test-results/definitely-absent-visual-handoff.json', ifPresent: true }),
+    ).resolves.toBeUndefined()
   })
 })
 

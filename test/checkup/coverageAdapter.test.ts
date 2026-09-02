@@ -1,15 +1,11 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { parse } from 'yaml'
-import {
-  COVERAGE_REPORT_PATH,
-  coverageProfileArgs,
-  runCiCoverage,
-  validateCobertura,
-} from '../../scripts/checkup/ciCoverage.mjs'
+import { COVERAGE_REPORT_PATH, validateCobertura } from '../../scripts/checkup/ciCoverage.mjs'
+import { JUNIT_REPORT_PATH, validateJunit } from '../../scripts/checkup/ciReports.mjs'
 import { resolveCheckupProfile } from '../../scripts/checkup/profile.mjs'
 import vitestConfig from '../../vitest.config'
 
@@ -27,45 +23,8 @@ const cobertura = (filename = 'packages/core/src/example.ts') => `<?xml version=
 </coverage>
 `
 
-const fakeDocker = async (root: string, { testExit = 0, xml = cobertura() } = {}) => {
-  const bin = join(root, 'docker')
-  const report = join(root, 'fake-report.xml')
-  await writeFile(report, xml)
-  await writeFile(
-    bin,
-    `#!/bin/sh
-set -eu
-printf '%s\n' "$*" >> ${JSON.stringify(join(root, 'docker.calls'))}
-case "\${1:-}" in
-  create) exit 0 ;;
-  start)
-    printf '%s\n' 'Lines        : 89.71% ( 71603/79812 )'
-    exit ${testExit}
-    ;;
-  cp)
-    case "\${2:-}" in
-      */notarium-ci-coverage-support-*/docker)
-        test "\${3:-}" = 'runner:/app'
-        test -f "$2/Dockerfile.dockerignore"
-        test "$(find "$2" -mindepth 1 -maxdepth 1 -print | wc -l)" -eq 1
-        ;;
-      *:/app/coverage/cobertura-coverage.xml) cp ${JSON.stringify(report)} "$3" ;;
-      *:/app/node_modules/saxes) cp -R ${JSON.stringify(join(repo, 'node_modules/saxes'))} "$3" ;;
-      *:/app/node_modules/xmlchars) cp -R ${JSON.stringify(join(repo, 'node_modules/xmlchars'))} "$3" ;;
-    esac
-    exit 0
-    ;;
-esac
-exit 2
-`,
-  )
-  await chmod(bin, 0o755)
-
-  return bin
-}
-
 describe('GitLab coverage adapter', () => {
-  it('declares percentage and Cobertura as separate surfaces over one repo command', async () => {
+  it('declares percentage, Cobertura and JUnit over the one lean coverage command', async () => {
     const pipeline = parse(await readFile(join(repo, '.gitlab-ci.yml'), 'utf8')) as Record<
       string,
       {
@@ -76,27 +35,28 @@ describe('GitLab coverage adapter', () => {
         artifacts?: {
           when?: string
           paths?: string[]
-          reports?: { coverage_report?: { coverage_format?: string; path?: string } }
+          reports?: {
+            junit?: string
+            coverage_report?: { coverage_format?: string; path?: string }
+          }
         }
       }
     >
-    const job = pipeline['extended:unit']!
+    const job = pipeline['lean:unit']!
     const script = (job.script ?? []).join('\n')
     const regex = new RegExp(job.coverage!.slice(1, -1), 'm')
     const matched = regex.exec('Lines        : 89.71% ( 71603/79812 )')?.[0]
 
-    expect(job.image).toBe('node:24-alpine')
-    expect(script).toContain('docker-cli-buildx')
-    expect(script).toContain('docker-cli-compose')
-    expect(script).not.toMatch(/apk add[^\n]*\bnodejs\b/u)
-    expect(script.match(/ciCoverage[.]mjs/gu)).toHaveLength(1)
-    expect(script).not.toContain('docker start --attach')
+    expect(pipeline['.lean']?.image).toBe('node:24')
+    expect(script).toContain('npm run test:coverage')
+    expect(script).toContain('scripts/checkup/ciReports.mjs')
     expect(matched?.match(/[0-9]+(?:\.[0-9]+)?/u)?.[0]).toBe('89.71')
     expect(regex.test('Statements   : 99.9%')).toBe(false)
     expect(job.artifacts).toMatchObject({
       when: 'always',
-      paths: [COVERAGE_REPORT_PATH],
+      paths: [JUNIT_REPORT_PATH, COVERAGE_REPORT_PATH],
       reports: {
+        junit: JUNIT_REPORT_PATH,
         coverage_report: { coverage_format: 'cobertura', path: COVERAGE_REPORT_PATH },
       },
     })
@@ -128,81 +88,22 @@ describe('GitLab coverage adapter', () => {
     )
   })
 
-  it('passes one resolved effective tuple into the coverage container and requires affinity', () => {
-    const profile = resolveCheckupProfile({ env: {}, availableCpu: 2 })
-
-    expect(coverageProfileArgs(profile)).toEqual([
-      '--env',
-      'CHECKUP_CPU_CEILING=2',
-      '--env',
-      'CHECKUP_VITEST_WORKERS=2',
-      '--env',
-      'CHECKUP_COVERAGE_CONCURRENCY=2',
-      '--env',
-      'CHECKUP_REQUIRE_AFFINITY=1',
-    ])
-  })
-
   it('keeps visual retry-pass red through the artifact-owned gate', async () => {
-    const source = await readFile(join(repo, '.gitlab-ci.yml'), 'utf8')
+    const [source, comparison] = await Promise.all([
+      readFile(join(repo, '.gitlab-ci.yml'), 'utf8'),
+      readFile(join(repo, 'scripts/checkup/ciVisual.mjs'), 'utf8'),
+    ])
     const pipeline = parse(source) as Record<string, { script?: string[] }>
-    const comparison = (pipeline['extended:visual']?.script ?? []).join('\n')
     const gate = (pipeline['visual:gate']?.script ?? []).join('\n')
 
     expect(gate).toContain('node scripts/visualBaseline.mjs gate')
+    expect(gate).toContain('node scripts/visualBaseline.mjs gate --if-present')
     expect(source).toContain('visual-handoff.json')
-    expect(comparison).toContain(
-      'if [ -n "${VISUAL_S3_WRITE_KEY_ID:-}" ] && [ -n "${VISUAL_S3_WRITE_SECRET:-}" ]; then',
-    )
-    expect(comparison).toContain('node scripts/visualBaseline.mjs verdict')
-    expect(comparison).not.toContain('if [ -n "$VISUAL_S3_WRITE_KEY_ID" ]')
-  })
-
-  it('preserves the original red exit after extracting a valid report', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'notarium-ci-coverage-red-'))
-    roots.push(root)
-    await mkdir(join(root, 'scripts'))
-    await Promise.all([
-      writeFile(join(root, 'Makefile'), 'fixture'),
-      writeFile(join(root, 'README.md'), 'fixture'),
-    ])
-    const docker = await fakeDocker(root, { testExit: 7 })
-    const old = process.env.CHECKUP_DOCKER_BIN
-    process.env.CHECKUP_DOCKER_BIN = docker
-
-    try {
-      const profile = resolveCheckupProfile({ env: {}, availableCpu: 2 })
-      const result = await runCiCoverage({
-        image: 'image',
-        container: 'runner',
-        cwd: root,
-        profile,
-      })
-
-      expect(result.exitCode).toBe(7)
-      expect(result.report).toMatchObject({ classCount: 1 })
-      const calls = await readFile(join(root, 'docker.calls'), 'utf8')
-
-      expect(calls).toContain(
-        'create --name runner --env CHECKUP_CPU_CEILING=2 --env CHECKUP_VITEST_WORKERS=2 --env CHECKUP_COVERAGE_CONCURRENCY=2 --env CHECKUP_REQUIRE_AFFINITY=1',
-      )
-      expect(
-        calls.split('\n').filter((call) => call.includes('/notarium-ci-coverage-support-')),
-      ).toEqual([
-        expect.stringMatching(
-          /^cp \/tmp\/notarium-ci-coverage-support-[^/]+\/docker runner:\/app$/u,
-        ),
-      ])
-      await expect(readFile(join(root, COVERAGE_REPORT_PATH), 'utf8')).resolves.toContain(
-        'packages/core/src/example.ts',
-      )
-    } finally {
-      if (old === undefined) {
-        delete process.env.CHECKUP_DOCKER_BIN
-      } else {
-        process.env.CHECKUP_DOCKER_BIN = old
-      }
-    }
+    expect(comparison).toContain('env.CI_COMMIT_BRANCH === env.CI_DEFAULT_BRANCH')
+    expect(comparison).toContain('env.VISUAL_S3_WRITE_KEY_ID')
+    expect(comparison).toContain('env.VISUAL_S3_WRITE_SECRET')
+    expect(comparison).toContain("[VISUAL_BASELINE, 'verdict']")
+    expect(comparison).not.toContain('VISUAL_CANDIDATE')
   })
 
   it('rejects non-relative Cobertura class filenames', async () => {
@@ -214,33 +115,32 @@ describe('GitLab coverage adapter', () => {
     await expect(validateCobertura(invalid)).rejects.toThrow(/not repository-relative/u)
   })
 
+  it('requires a well-formed, non-empty JUnit testsuites report', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'notarium-ci-junit-'))
+    roots.push(root)
+    const valid = join(root, 'valid.xml')
+    const invalid = join(root, 'invalid.xml')
+    const truncated = join(root, 'truncated.xml')
+    await writeFile(valid, '<testsuites tests="1"><testsuite name="unit" /></testsuites>')
+    await writeFile(invalid, '<testsuite />')
+    await writeFile(truncated, '<testsuites tests="1"><testsuite name="unit">')
+
+    await expect(validateJunit(valid)).resolves.toMatchObject({
+      bytes: expect.any(Number),
+      suites: 1,
+      tests: 1,
+    })
+    await expect(validateJunit(invalid)).rejects.toThrow(/testsuites root.*positive test count/u)
+    await expect(validateJunit(truncated)).rejects.toThrow(/not well-formed XML/u)
+    expect(JUNIT_REPORT_PATH).toBe('test-results/vitest-junit.xml')
+  })
+
   it('fails a green run when Cobertura is truncated', async () => {
     const root = await mkdtemp(join(tmpdir(), 'notarium-ci-coverage-truncated-'))
     roots.push(root)
-    await mkdir(join(root, 'scripts'))
-    await Promise.all([
-      writeFile(join(root, 'Makefile'), 'fixture'),
-      writeFile(join(root, 'README.md'), 'fixture'),
-    ])
-    const xml = cobertura().replace('</coverage>\n', '')
-    const docker = await fakeDocker(root, { xml })
-    const old = process.env.CHECKUP_DOCKER_BIN
-    process.env.CHECKUP_DOCKER_BIN = docker
+    const invalid = join(root, 'truncated.xml')
+    await writeFile(invalid, cobertura().replace('</coverage>\n', ''))
 
-    try {
-      const result = await runCiCoverage({ image: 'image', container: 'runner', cwd: root })
-
-      expect(result.exitCode).toBe(2)
-      expect(result.report).toBeNull()
-      expect(result.reportError).toMatchObject({
-        message: expect.stringMatching(/not well-formed XML.*unclosed tag/u),
-      })
-    } finally {
-      if (old === undefined) {
-        delete process.env.CHECKUP_DOCKER_BIN
-      } else {
-        process.env.CHECKUP_DOCKER_BIN = old
-      }
-    }
+    await expect(validateCobertura(invalid)).rejects.toThrow(/not well-formed XML.*unclosed tag/u)
   })
 })

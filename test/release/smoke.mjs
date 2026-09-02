@@ -95,7 +95,19 @@ const run = (command, args, { allowFailure = false, env } = {}) =>
     })
   })
 
-const docker = (args, options) => run('docker', args, options)
+const docker = (args, options) => {
+  const cpuSet = process.env.CHECKUP_CPUSET
+
+  if (cpuSet && !/^\d+(?:[-,]\d+)*$/u.test(cpuSet)) {
+    throw new Error(`invalid CHECKUP_CPUSET=${JSON.stringify(cpuSet)}`)
+  }
+  const resolved =
+    cpuSet && (args[0] === 'run' || args[0] === 'create')
+      ? [args[0], '--cpuset-cpus', cpuSet, ...args.slice(1)]
+      : args
+
+  return run('docker', resolved, options)
+}
 
 const releaseImage = (args, options) => run('node', ['scripts/releaseImage.mjs', ...args], options)
 

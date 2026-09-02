@@ -46,6 +46,19 @@ describe('checkup entrypoint adapter', () => {
     expect(dockerIgnore).toMatch(/^backups$/mu)
   })
 
+  it('delegates standalone coverage support to the repo-owned carrier', async () => {
+    const makefile = await readFile(resolve(repo, 'Makefile'), 'utf8')
+    const start = makefile.indexOf('\ntest-coverage:') + 1
+    const target = makefile.slice(start, makefile.indexOf('\n# --- live database', start))
+
+    expect(target).toContain('docker create --name $(CHECKUP_RUNNER_CONTAINER)')
+    expect(target).toContain('node scripts/checkup/containerSupport.mjs copy')
+    expect(target).toContain('docker start --attach $(CHECKUP_RUNNER_CONTAINER)')
+    expect(target).not.toContain('src=$(CURDIR)/Makefile')
+    expect(target).not.toContain('src=$(CURDIR)/scripts')
+    expect(target).not.toContain('src=$(CURDIR)/README.md')
+  })
+
   it('models normalized legacy orchestration without changing subject bytes', () => {
     const legacy = phasePlan('legacy', 'session')
     const candidate = phasePlan('candidate', 'session')
@@ -76,6 +89,7 @@ describe('checkup entrypoint adapter', () => {
         command: process.execPath,
         args: ['scripts/checkup/heavy.mjs', 'coverage'],
         daemonWork: true,
+        resource: { plan: 'local-isolated', lane: 'coverage' },
       },
       {
         name: 'postgres',
@@ -83,6 +97,7 @@ describe('checkup entrypoint adapter', () => {
         args: ['scripts/checkup/heavy.mjs', 'postgres'],
         daemonWork: true,
         parallelGroup: 'postgres-browser',
+        resource: { plan: 'local-heavy', lane: 'postgres' },
       },
     ])
     expect(phasePlan('candidate', 'session').heavy[2]).toEqual({
@@ -91,6 +106,7 @@ describe('checkup entrypoint adapter', () => {
       args: ['scripts/checkup/heavy.mjs', 'browser'],
       daemonWork: true,
       parallelGroup: 'postgres-browser',
+      resource: { plan: 'local-heavy', lane: 'browser' },
     })
   })
 })

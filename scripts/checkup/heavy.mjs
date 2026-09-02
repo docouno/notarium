@@ -5,6 +5,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { mkdir, readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { copyContainerSupport } from './containerSupport.mjs'
 import { positiveInteger } from './contract.mjs'
 
 const LABELS = (sessionId) => [
@@ -74,10 +75,22 @@ export const containerProfileArgs = (env = process.env) => {
     CHECKUP_CPU_CEILING: required('CHECKUP_CPU_CEILING'),
     CHECKUP_VITEST_WORKERS: required('CHECKUP_VITEST_WORKERS'),
     CHECKUP_COVERAGE_CONCURRENCY: required('CHECKUP_COVERAGE_CONCURRENCY'),
+    CHECKUP_PLAYWRIGHT_WORKERS: required('CHECKUP_PLAYWRIGHT_WORKERS'),
+  }
+  const cpuSet = env.CHECKUP_CPUSET
+
+  if (cpuSet && !/^\d+(?:[-,]\d+)*$/u.test(cpuSet)) {
+    throw new Error(
+      `canonical heavy phase received invalid CHECKUP_CPUSET=${JSON.stringify(cpuSet)}`,
+    )
   }
 
   return [
+    ...(cpuSet ? ['--cpuset-cpus', cpuSet] : []),
     ...Object.entries(values).flatMap(([name, value]) => ['-e', `${name}=${value}`]),
+    ...['CHECKUP_RESOURCE_PLAN', 'CHECKUP_RESOURCE_LANE', 'CHECKUP_PROFILE_RESOLVED'].flatMap(
+      (name) => (env[name] ? ['-e', `${name}=${env[name]}`] : []),
+    ),
     '-e',
     'CHECKUP_REQUIRE_AFFINITY=1',
   ]
@@ -107,18 +120,6 @@ const writeEvidence = (env, name, value) => {
 
   mkdirSync(directory, { recursive: true })
   writeFileSync(join(directory, `evidence-${name}.json`), `${JSON.stringify(value, null, 2)}\n`)
-}
-
-const copyTooling = (container, env = process.env) => {
-  const root = sourceRoot(env)
-
-  for (const [input, target] of [
-    [join(root, 'Makefile'), '/app/Makefile'],
-    [`${join(root, 'scripts')}/.`, '/app/scripts'],
-    [join(root, 'README.md'), '/app/README.md'],
-  ]) {
-    docker(['cp', input, `${container}:${target}`])
-  }
 }
 
 const resourceContract = {
@@ -318,7 +319,7 @@ export const runCoverageArtifact = async (env = process.env) => {
     owned.push(
       captureHeavyResourceOwnership({ kind: 'container', name: names.coverage }, names.sessionId),
     )
-    copyTooling(names.coverage, env)
+    await copyContainerSupport({ container: names.coverage, sourceRoot: source, docker })
     const test = docker(['start', '--attach', names.coverage], { allowFailure: true })
     const copied = docker(['cp', `${names.coverage}:/app/coverage/.`, coverageArtifacts], {
       allowFailure: true,
@@ -376,8 +377,10 @@ const waitForPostgres = (name) => {
   throw new Error('checkup PostgreSQL service did not become healthy')
 }
 
-export const runPostgresFromCoverage = (env = process.env) => {
+export const runPostgresFromCoverage = async (env = process.env) => {
   const names = heavyResourceNames(env)
+  const artifacts = resolve(env.CHECKUP_ARTIFACT_DIR || 'test-results/checkup-artifacts')
+  const lanesArtifact = resolve(artifacts, 'postgres-lanes.json')
   const owned = []
 
   assertResourcesFree([
@@ -402,6 +405,7 @@ export const runPostgresFromCoverage = (env = process.env) => {
       '--name',
       names.postgres,
       ...LABELS(names.sessionId),
+      ...(env.CHECKUP_CPUSET ? ['--cpuset-cpus', env.CHECKUP_CPUSET] : []),
       '--network',
       names.network,
       '--network-alias',
@@ -442,7 +446,7 @@ export const runPostgresFromCoverage = (env = process.env) => {
       'npm',
       names.image,
       'run',
-      'test:pg',
+      'test:pg:lanes',
     ])
     owned.push(
       captureHeavyResourceOwnership(
@@ -450,22 +454,41 @@ export const runPostgresFromCoverage = (env = process.env) => {
         names.sessionId,
       ),
     )
-    copyTooling(names.postgresRunner, env)
+    await copyContainerSupport({
+      container: names.postgresRunner,
+      sourceRoot: sourceRoot(env),
+      docker,
+    })
     const test = docker(['start', '--attach', names.postgresRunner], { allowFailure: true })
+    await mkdir(artifacts, { recursive: true })
+    const copied = docker(
+      ['cp', `${names.postgresRunner}:/app/test-results/postgres-lanes.json`, lanesArtifact],
+      { allowFailure: true, stdio: 'pipe' },
+    )
 
     writeEvidence(env, 'postgres', {
       sourceCopies: 0,
       dependencyInstalls: 0,
       builds: 0,
-      postgresRuns: 1,
+      postgresRuns: 2,
+      databases: 2,
       reusedImage: names.image,
+      lanesReportCopied: copied.status === 0,
     })
+    if (copied.status !== 0) {
+      console.error(
+        `checkup PostgreSQL lane report extraction failed: ${copied.stderr || copied.status}`,
+      )
+    }
 
     if (test.signal) {
       return { exitCode: null, signal: test.signal }
     }
 
-    return { exitCode: test.status ?? 1, signal: null }
+    return {
+      exitCode: test.status === 0 && copied.status !== 0 ? 2 : (test.status ?? 1),
+      signal: null,
+    }
   } finally {
     cleanupHeavyResourceClaims([...owned].reverse(), phaseCleanupTimeout(env))
   }
@@ -579,6 +602,7 @@ npm run deps:lean`
       '--name',
       names.browserDeps,
       ...LABELS(names.sessionId),
+      ...containerProfileArgs(env),
       '--mount',
       `type=volume,src=${names.browserVolume},dst=/app`,
       '--workdir',
@@ -603,6 +627,7 @@ npm run deps:lean`
       '--name',
       names.browserBuild,
       ...LABELS(names.sessionId),
+      ...containerProfileArgs(env),
       '--mount',
       `type=volume,src=${names.browserVolume},dst=/app`,
       '--workdir',
@@ -633,6 +658,7 @@ npm run deps:lean`
       '--name',
       names.browserTests,
       ...LABELS(names.sessionId),
+      ...containerProfileArgs(env),
       '--mount',
       `type=volume,src=${names.browserVolume},dst=/app`,
       '--workdir',
@@ -714,6 +740,7 @@ npm run deps:lean`
       '--name',
       names.browserVisual,
       ...LABELS(names.sessionId),
+      ...containerProfileArgs(env),
       '--mount',
       `type=volume,src=${names.browserVolume},dst=/app`,
       '--workdir',
@@ -727,6 +754,8 @@ npm run deps:lean`
       '-e',
       'PLAYWRIGHT_PREBUILT=1',
       '-e',
+      'CHECKUP_PLAYWRIGHT_WORKERS=1',
+      '-e',
       `CHECKUP_SUBJECT_DIGEST=${env.CHECKUP_SUBJECT_DIGEST}`,
       '-e',
       `CHECKUP_PLAYWRIGHT_IMAGE=${playwrightImage}`,
@@ -737,6 +766,7 @@ npm run deps:lean`
       PLAYWRIGHT_CLI,
       'test',
       'test/visual',
+      '--workers=1',
     ])
     const browserVisual = capture('container', names.browserVisual)
     const visual = docker(['start', '--attach', names.browserVisual], { allowFailure: true })
@@ -824,7 +854,7 @@ const main = async () => {
     command === 'coverage'
       ? await runCoverageArtifact()
       : command === 'postgres'
-        ? runPostgresFromCoverage()
+        ? await runPostgresFromCoverage()
         : command === 'browser'
           ? await runBrowserWorkspace()
           : command === 'cleanup'

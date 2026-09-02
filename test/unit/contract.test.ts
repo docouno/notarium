@@ -393,6 +393,155 @@ describe('zod 4 migration boundaries', () => {
     expect(ActivityEventsQuerySchema.safeParse({ cursor: 'opaque', offset: 0 }).success).toBe(false)
   })
 
+  it('rejects incomplete Activity event and group snapshot coordinates', () => {
+    const cases = [
+      {
+        name: 'events through without version',
+        schema: ActivityEventsQuerySchema,
+        input: { through: '10' },
+        path: ['activityVersion'],
+        message: 'through and activityVersion must be supplied together',
+      },
+      {
+        name: 'bounded raw events with snapshot coordinates',
+        schema: ActivityEventsQuerySchema,
+        input: { from: '2026-09-01T00:00:00.000Z', through: '10', activityVersion: 'v1' },
+        path: ['from'],
+        message: 'bounded raw events do not accept grouped snapshot fields',
+      },
+      {
+        name: 'bounded raw events with a location cut',
+        schema: ActivityEventsQuerySchema,
+        input: { from: '2026-09-01T00:00:00.000Z', locationThrough: 'locations-1' },
+        path: ['from'],
+        message: 'bounded raw events do not accept grouped snapshot fields',
+      },
+      {
+        name: 'bounded raw events with a cursor',
+        schema: ActivityEventsQuerySchema,
+        input: { from: '2026-09-01T00:00:00.000Z', cursor: 'opaque' },
+        path: ['from'],
+        message: 'bounded raw events do not accept grouped snapshot fields',
+      },
+      {
+        name: 'note detail without a complete cut',
+        schema: ActivityEventsQuerySchema,
+        input: { noteId: 'note-1' },
+        path: ['noteId'],
+        message: 'grouped detail requires through, activityVersion and locationThrough',
+      },
+      {
+        name: 'note detail without an activity version',
+        schema: ActivityEventsQuerySchema,
+        input: { noteId: 'note-1', through: '10' },
+        path: ['noteId'],
+        message: 'grouped detail requires through, activityVersion and locationThrough',
+      },
+      {
+        name: 'note detail without a location cut',
+        schema: ActivityEventsQuerySchema,
+        input: { noteId: 'note-1', through: '10', activityVersion: 'v1' },
+        path: ['noteId'],
+        message: 'grouped detail requires through, activityVersion and locationThrough',
+      },
+      {
+        name: 'note detail with an offset',
+        schema: ActivityEventsQuerySchema,
+        input: {
+          noteId: 'note-1',
+          through: '10',
+          activityVersion: 'v1',
+          locationThrough: 'locations-1',
+          offset: 0,
+        },
+        path: ['noteId'],
+        message: 'grouped detail requires through, activityVersion and locationThrough',
+      },
+      {
+        name: 'standing events with a location cut',
+        schema: ActivityEventsQuerySchema,
+        input: { locationThrough: 'locations-1' },
+        path: ['locationThrough'],
+        message: 'standing events do not accept locationThrough',
+      },
+      {
+        name: 'events cursor without an activity version',
+        schema: ActivityEventsQuerySchema,
+        input: { cursor: 'opaque', through: '10' },
+        path: ['cursor'],
+        message: 'cursor requires through and activityVersion',
+      },
+      {
+        name: 'event response without matching snapshot coordinates',
+        schema: ActivityEventsResponseSchema,
+        input: { events: [], total: 0, activityVersion: 'v1' },
+        path: ['activityVersion'],
+        message: 'standing/detail responses require through, activityVersion and nextCursor',
+      },
+      {
+        name: 'location on note groups',
+        schema: ActivityGroupsQuerySchema,
+        input: {
+          location: 'root',
+          through: '10',
+          activityVersion: 'v1',
+          locationThrough: 'locations-1',
+        },
+        path: ['location'],
+        message: 'location is only valid with by=folder',
+      },
+      {
+        name: 'path without a folder location',
+        schema: ActivityGroupsQuerySchema,
+        input: { by: 'folder', path: 'work' },
+        path: ['path'],
+        message: 'path is only valid for location=folder',
+      },
+      {
+        name: 'cursor without a stable cut',
+        schema: ActivityGroupsQuerySchema,
+        input: { by: 'folder', cursor: 'opaque' },
+        path: ['cursor'],
+        message: 'cursor requires through, activityVersion and locationThrough',
+      },
+      {
+        name: 'groups through without version',
+        schema: ActivityGroupsQuerySchema,
+        input: { by: 'folder', through: '10' },
+        path: ['activityVersion'],
+        message: 'through and activityVersion must be supplied together',
+      },
+      {
+        name: 'cursor without activity version',
+        schema: ActivityGroupsQuerySchema,
+        input: {
+          by: 'folder',
+          cursor: 'opaque',
+          through: '10',
+          locationThrough: 'locations-1',
+        },
+        path: ['cursor'],
+        message: 'cursor requires activityVersion',
+      },
+      {
+        name: 'location detail without a stable cut',
+        schema: ActivityGroupsQuerySchema,
+        input: { by: 'folder', location: 'root' },
+        path: ['location'],
+        message: 'location detail requires through, activityVersion and locationThrough',
+      },
+    ]
+
+    for (const { name, schema, input, path, message } of cases) {
+      const result = schema.safeParse(input)
+
+      expect(result.success, name).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues, name).toContainEqual(expect.objectContaining({ path, message }))
+      }
+    }
+  })
+
   it('keeps grouped cumulative counters exact beyond MAX_SAFE_INTEGER', () => {
     const base = {
       itemType: 'note' as const,

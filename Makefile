@@ -161,20 +161,12 @@ migration-check:
 	  exit 2; \
 	fi
 
-# The freshness probe checks workspace LINKS, not the lockfile — a full `npm ci` on
-# every `make dev` would cost a minute for nothing. The price is that a dependency
-# added to a manifest is invisible to it, so a checkout that installed before the
-# change keeps a tree without the new package and this target cheerfully reports ok.
-# `sqlite-vec` is therefore probed by name (#317): it arrived as a new @notarium/engine
-# dependency, and a checkout that silently lacks it closes the vec0 gate and skips 47
-# suites under a message that blames the platform. Probe the package the gate actually
-# loads, not the manifest — a hoisted tree is what the gate sees.
+# A successful canonical install records a fingerprint of the lockfile, npm config and
+# every workspace manifest inside node_modules. The check is millisecond-cheap, but a
+# dependency addition can no longer hide behind otherwise-valid workspace links. The
+# small tree probes remain as damage/moved-worktree guards, not freshness sentinels.
 deps: ## Install npm dependencies for this checkout (embedder excluded) when missing or stale
-	@if node -e 'const fs = require("fs"); const path = require("path"); const root = process.cwd(); const packages = ["contract", "core", "desktop", "engine", "engine-memory", "server", "web"]; const bin = path.join(root, "node_modules", ".bin", "tsc"); if (!fs.existsSync(bin)) process.exit(1); for (const pkg of packages) { const link = path.join(root, "node_modules", "@notarium", pkg); const expected = path.join(root, "packages", pkg); if (!fs.existsSync(link) || fs.realpathSync(link) !== expected) process.exit(1); } const cli = path.join(root, "node_modules", "notarium"); if (!fs.existsSync(cli) || fs.realpathSync(cli) !== path.join(root, "packages", "cli")) process.exit(1); if (!fs.existsSync(path.join(root, "node_modules", "sqlite-vec", "package.json"))) process.exit(1);' 2>/dev/null; then \
-	  echo "deps: node_modules ok"; \
-	else \
-	  npm run deps:lean; \
-	fi
+	@node scripts/checkup/depsFreshness.mjs check || npm run deps:lean
 
 deps-vector: ## Install deps INCLUDING the optional CPU embedder (~360MB) — for embedding work and the license corpus
 	npm run deps:full
@@ -219,10 +211,9 @@ sh: ## Open a shell inside the notarium container
 # untouched. Makefile, README.md and all of scripts/ bar the SPA size gate are test
 # inputs excluded from the production image context (the backup suite drives the real
 # Makefile, the release and seed tests import scripts/*.mjs, the preview suite reads the
-# README's banner copy), so mount only those read-only — the bind over /app/scripts
-# covers that one gate script the image does carry. The CI job hands the same three over
-# with `docker cp` because under dind the daemon cannot see this checkout — keep the two
-# lists in step.
+# README's banner copy, and adapter tests inspect Dockerfile plus its active ignore). One
+# repo-owned support manifest stages them into every test container; Make, the full
+# checkup and CI must not grow separate copy lists.
 test-coverage: ## Build and run full coverage (including native vector tests) in Docker
 	@set -eu; \
 	  cleanup() { \
@@ -232,13 +223,13 @@ test-coverage: ## Build and run full coverage (including native vector tests) in
 	  trap cleanup EXIT INT TERM; \
 	  cleanup; \
 	  docker build --target test -t $(CHECKUP_IMAGE) -f docker/Dockerfile .; \
-	  docker run --rm --name $(CHECKUP_RUNNER_CONTAINER) \
-	    --mount "type=bind,src=$(CURDIR)/Makefile,dst=/app/Makefile,readonly" \
-	    --mount "type=bind,src=$(CURDIR)/scripts,dst=/app/scripts,readonly" \
-	    --mount "type=bind,src=$(CURDIR)/README.md,dst=/app/README.md,readonly" \
+	  docker create --name $(CHECKUP_RUNNER_CONTAINER) \
 	    -e CHECKUP_CPU_CEILING -e CHECKUP_VITEST_WORKERS \
 	    -e CHECKUP_COVERAGE_CONCURRENCY -e CHECKUP_REQUIRE_AFFINITY=1 \
-	    --entrypoint npm "$(CHECKUP_IMAGE)" run test:coverage
+	    --entrypoint npm "$(CHECKUP_IMAGE)" run test:coverage >/dev/null; \
+	  node scripts/checkup/containerSupport.mjs copy \
+	    --container $(CHECKUP_RUNNER_CONTAINER) --source-root "$(CURDIR)"; \
+	  docker start --attach $(CHECKUP_RUNNER_CONTAINER)
 
 # --- live database contracts -----------------------------------------------
 # Keep the database off the host network: Vitest runs in the test container on
@@ -284,7 +275,7 @@ test-pg: ## Run meta-DB contracts/migrations against ephemeral live Postgres
 	    -e CHECKUP_CPU_CEILING -e CHECKUP_VITEST_WORKERS \
 	    -e CHECKUP_COVERAGE_CONCURRENCY -e CHECKUP_REQUIRE_AFFINITY=1 \
 	    -e TEST_PG_URL=postgres://notarium:notarium@postgres:5432/notarium_test \
-	    --entrypoint npm "$(NODE_TEST_IMAGE)" run test:pg
+	    --entrypoint npm "$(NODE_TEST_IMAGE)" run test:pg:lanes
 
 # --- import scale bench -----------------------------------------------------
 # The #302 scale artifact: 10 000 Markdown members through the production
@@ -401,6 +392,10 @@ GRAPH_REVISION_SEED_CONTAINER ?= $(TEST_COMPOSE_PROJECT)-graph-seed
 GRAPH_REVISION_RUNNER_CONTAINER ?= $(TEST_COMPOSE_PROJECT)-graph-runner
 GRAPH_REVISION_VOLUME ?= $(TEST_COMPOSE_PROJECT)-graph-data
 GRAPH_REVISION_NETWORK ?= $(TEST_COMPOSE_PROJECT)-graph-net
+# A taskset on the Docker client cannot constrain containers created by dind. CI's
+# resolved lane is therefore repeated at the actual Docker resource boundary. Empty
+# locally means the standalone target keeps its existing all-host behaviour.
+GRAPH_REVISION_DOCKER_CPU_ARGS = $(if $(strip $(CHECKUP_CPUSET)),--cpuset-cpus "$(CHECKUP_CPUSET)")
 
 graph-revision-gate: ## Run the #410 production-shaped graph revision + memory gates
 	@set -euo pipefail; \
@@ -425,20 +420,20 @@ graph-revision-gate: ## Run the #410 production-shaped graph revision + memory g
 	    -f docker/Dockerfile .; \
 	  docker volume create "$(GRAPH_REVISION_VOLUME)" >/dev/null; \
 	  docker network create "$(GRAPH_REVISION_NETWORK)" >/dev/null; \
-	  tar -cf - scripts test | docker run --rm -i --name "$(GRAPH_REVISION_SEED_CONTAINER)" \
+	  tar -cf - scripts test | docker run $(GRAPH_REVISION_DOCKER_CPU_ARGS) --rm -i --name "$(GRAPH_REVISION_SEED_CONTAINER)" \
 	    --mount "type=volume,src=$(GRAPH_REVISION_VOLUME),dst=/data" \
 	    --workdir /app -e DATA_DIR=/data -e CASE=graph-revision \
 	    -e SEED_USER=admin -e SEED_PASSWORD=admin \
 	    --entrypoint sh "$(GRAPH_REVISION_RUNNER_IMAGE)" -c 'tar -C /app -xf -; npm run seed'; \
-	  tar -cf - scripts test | docker run --rm -i --name "$(GRAPH_REVISION_SEED_CONTAINER)" \
+	  tar -cf - scripts test | docker run $(GRAPH_REVISION_DOCKER_CPU_ARGS) --rm -i --name "$(GRAPH_REVISION_SEED_CONTAINER)" \
 	    --mount "type=volume,src=$(GRAPH_REVISION_VOLUME),dst=/data" \
 	    --workdir /app -e GRAPH_REVISION_NOTES_DIR=/data/spaces/graph-revision \
 	    -e GRAPH_REVISION_CORPUS_OUTPUT=/data/graph-revision-corpus.json \
 	    --entrypoint sh "$(GRAPH_REVISION_RUNNER_IMAGE)" -c 'tar -C /app -xf -; npm run bench:graph-revision-corpus'; \
-	  docker run --rm \
+	  docker run $(GRAPH_REVISION_DOCKER_CPU_ARGS) --rm \
 	    --mount "type=volume,src=$(GRAPH_REVISION_VOLUME),dst=/data" \
 	    --entrypoint chown "$(GRAPH_REVISION_RUNNER_IMAGE)" -R node:node /data; \
-	  docker create --name "$(GRAPH_REVISION_RUNNER_CONTAINER)" \
+	  docker create $(GRAPH_REVISION_DOCKER_CPU_ARGS) --name "$(GRAPH_REVISION_RUNNER_CONTAINER)" \
 	    --workdir /app -e GRAPH_REVISION_MEMORY_OUTPUT=/tmp/graph-revision-memory.json \
 	    --entrypoint npm "$(GRAPH_REVISION_RUNNER_IMAGE)" run bench:graph-revision-memory >/dev/null; \
 	  docker cp ./scripts/. "$(GRAPH_REVISION_RUNNER_CONTAINER):/app/scripts"; \
@@ -446,7 +441,7 @@ graph-revision-gate: ## Run the #410 production-shaped graph revision + memory g
 	  docker cp "$(GRAPH_REVISION_RUNNER_CONTAINER):/tmp/graph-revision-memory.json" \
 	    "$(GRAPH_REVISION_OUTPUT_DIR)/memory.json"; \
 	  docker rm -f "$(GRAPH_REVISION_RUNNER_CONTAINER)" >/dev/null; \
-	  docker run -d --name "$(GRAPH_REVISION_CONTAINER)" \
+	  docker run $(GRAPH_REVISION_DOCKER_CPU_ARGS) -d --name "$(GRAPH_REVISION_CONTAINER)" \
 	    --network "$(GRAPH_REVISION_NETWORK)" --network-alias notarium \
 	    --mount "type=volume,src=$(GRAPH_REVISION_VOLUME),dst=/data" \
 	    --mount "type=tmpfs,dst=/app/node_modules/@huggingface/transformers/.cache,tmpfs-mode=1777" \
@@ -470,7 +465,7 @@ graph-revision-gate: ## Run the #410 production-shaped graph revision + memory g
 	  image="$$(docker inspect --format '{{.Image}}' "$(GRAPH_REVISION_CONTAINER)")"; \
 	  revision="$$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$(GRAPH_REVISION_CONTAINER)")"; \
 	  test "$$revision" = "$(GRAPH_REVISION_COMMIT)" || { echo "graph revision OCI revision mismatch: $$revision" >&2; exit 1; }; \
-	  docker create --name "$(GRAPH_REVISION_RUNNER_CONTAINER)" \
+	  docker create $(GRAPH_REVISION_DOCKER_CPU_ARGS) --name "$(GRAPH_REVISION_RUNNER_CONTAINER)" \
 	    --network "$(GRAPH_REVISION_NETWORK)" \
 	    --mount "type=volume,src=$(GRAPH_REVISION_VOLUME),dst=/benchmark-data,readonly" \
 	    --workdir /app -e BASE_URL=http://notarium:3000 \

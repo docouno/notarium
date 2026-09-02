@@ -34,8 +34,11 @@ Makefile
 docker/*
 !docker/notarium-cli
 scripts
-# …except the SPA size gate, which hangs off the web workspace's own build script:
-# without it in the context the builder's `npm run build` cannot complete at all.
+# …except the two scripts invoked by manifest hooks inside the image build: the
+# dependency freshness recorder runs before the source COPY, while the SPA size gate
+# hangs off the web workspace's build script. Without either file the manifest-only
+# cache prefix or the later `npm run build` cannot complete.
+!scripts/checkup/depsFreshness.mjs
 !scripts/checkWebBundleBudget.mjs
 README.md
 # Keep LICENSE / NOTICE / COMMERCIAL-LICENSE.md / THIRD_PARTY_NOTICES.md in the

@@ -12,6 +12,7 @@ import {
 } from '../../scripts/checkup/heavy.mjs'
 
 const roots: string[] = []
+const FAKE_DOCKER_TIMEOUT_MS = 10_000
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
@@ -109,7 +110,7 @@ exit 0
           CHECKUP_SESSION_ID: 'session',
           CHECKUP_IMAGE: 'notarium-checkup:session',
           CHECKUP_RUNNER_CONTAINER: 'notarium-checkup-session-runner',
-          CHECKUP_DOCKER_CLEANUP_MS: '100',
+          CHECKUP_DOCKER_CLEANUP_MS: String(FAKE_DOCKER_TIMEOUT_MS),
         }),
       ).toThrow(/still exists after cleanup/u)
     } finally {
@@ -150,7 +151,7 @@ exit 1
           CHECKUP_SESSION_ID: 'session',
           CHECKUP_IMAGE: 'notarium-checkup:session',
           CHECKUP_RUNNER_CONTAINER: 'notarium-checkup-session-runner',
-          CHECKUP_DOCKER_CLEANUP_MS: '100',
+          CHECKUP_DOCKER_CLEANUP_MS: String(FAKE_DOCKER_TIMEOUT_MS),
         }),
       ).not.toThrow()
     } finally {
@@ -193,7 +194,7 @@ printf '%s\\n' "$*" >> ${JSON.stringify(removals)}
           CHECKUP_SESSION_ID: 'session',
           CHECKUP_IMAGE: 'notarium-checkup:session',
           CHECKUP_RUNNER_CONTAINER: 'notarium-checkup-session-runner',
-          CHECKUP_DOCKER_CLEANUP_MS: '100',
+          CHECKUP_DOCKER_CLEANUP_MS: String(FAKE_DOCKER_TIMEOUT_MS),
         }),
       ).toThrow(/belongs to session other/u)
       await expect(readFile(removals, 'utf8')).rejects.toThrow(/ENOENT/u)
@@ -248,7 +249,7 @@ printf '%s\n' "$*" >> ${JSON.stringify(removals)}
           CHECKUP_SESSION_ID: 'session',
           CHECKUP_IMAGE: 'notarium-checkup:session',
           CHECKUP_RUNNER_CONTAINER: 'notarium-checkup-session-runner',
-          CHECKUP_DOCKER_CLEANUP_MS: '100',
+          CHECKUP_DOCKER_CLEANUP_MS: String(FAKE_DOCKER_TIMEOUT_MS),
         }),
       ).toThrow(/belongs to session foreign and was left untouched/u)
       await expect(readFile(removals, 'utf8')).rejects.toThrow(/ENOENT/u)
@@ -295,10 +296,10 @@ printf '%s\n' "$*" >> ${JSON.stringify(removals)}
       const claim = captureHeavyResourceOwnership(
         { kind: 'container', name: 'runner' },
         'session',
-        100,
+        FAKE_DOCKER_TIMEOUT_MS,
       )
 
-      expect(() => cleanupHeavyResourceClaims([claim], 100)).toThrow(
+      expect(() => cleanupHeavyResourceClaims([claim], FAKE_DOCKER_TIMEOUT_MS)).toThrow(
         /was replaced during cleanup and was left untouched/u,
       )
       await expect(readFile(removals, 'utf8')).resolves.toBe('container rm --force owned-id\n')
@@ -342,10 +343,10 @@ printf '%s\n' "$*" >> ${JSON.stringify(removals)}
       const claim = captureHeavyResourceOwnership(
         { kind: 'volume', name: 'workspace' },
         'session',
-        100,
+        FAKE_DOCKER_TIMEOUT_MS,
       )
 
-      expect(() => cleanupHeavyResourceClaims([claim], 100)).toThrow(
+      expect(() => cleanupHeavyResourceClaims([claim], FAKE_DOCKER_TIMEOUT_MS)).toThrow(
         /belongs to session foreign and was left untouched/u,
       )
       await expect(readFile(removals, 'utf8')).rejects.toThrow(/ENOENT/u)
@@ -364,6 +365,7 @@ printf '%s\n' "$*" >> ${JSON.stringify(removals)}
         CHECKUP_CPU_CEILING: '2',
         CHECKUP_VITEST_WORKERS: '2',
         CHECKUP_COVERAGE_CONCURRENCY: '1',
+        CHECKUP_PLAYWRIGHT_WORKERS: '1',
       }),
     ).toEqual([
       '-e',
@@ -372,6 +374,39 @@ printf '%s\n' "$*" >> ${JSON.stringify(removals)}
       'CHECKUP_VITEST_WORKERS=2',
       '-e',
       'CHECKUP_COVERAGE_CONCURRENCY=1',
+      '-e',
+      'CHECKUP_PLAYWRIGHT_WORKERS=1',
+      '-e',
+      'CHECKUP_REQUIRE_AFFINITY=1',
+    ])
+    expect(
+      containerProfileArgs({
+        CHECKUP_CPU_CEILING: '2',
+        CHECKUP_VITEST_WORKERS: '2',
+        CHECKUP_COVERAGE_CONCURRENCY: '2',
+        CHECKUP_PLAYWRIGHT_WORKERS: '2',
+        CHECKUP_CPUSET: '4,5',
+        CHECKUP_RESOURCE_PLAN: 'local-heavy',
+        CHECKUP_RESOURCE_LANE: 'postgres',
+        CHECKUP_PROFILE_RESOLVED: '1',
+      }),
+    ).toEqual([
+      '--cpuset-cpus',
+      '4,5',
+      '-e',
+      'CHECKUP_CPU_CEILING=2',
+      '-e',
+      'CHECKUP_VITEST_WORKERS=2',
+      '-e',
+      'CHECKUP_COVERAGE_CONCURRENCY=2',
+      '-e',
+      'CHECKUP_PLAYWRIGHT_WORKERS=2',
+      '-e',
+      'CHECKUP_RESOURCE_PLAN=local-heavy',
+      '-e',
+      'CHECKUP_RESOURCE_LANE=postgres',
+      '-e',
+      'CHECKUP_PROFILE_RESOLVED=1',
       '-e',
       'CHECKUP_REQUIRE_AFFINITY=1',
     ])
