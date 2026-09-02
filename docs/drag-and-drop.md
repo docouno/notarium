@@ -251,6 +251,14 @@ icon, permanent Move action, select or field.
   cache → it refreshed the old folder, never the new one, and the note vanished from its tree
   until reload. The backend is always the single source of truth (moves apply serially server-
   side; last one wins), so every client converges to the same final folder.
+- **Held folder windows keep stable ids unique (#346).** Those old/new listings still settle
+  independently. Every accepted listing therefore replaces its own window and prunes the ids it
+  contains from every other held window in the **same** cache commit. A destination response can
+  no longer render a moved note beside its stale source row (or give React two equal row keys)
+  while the source response is pending. The checkpoint stays incremental: a source-first response
+  may briefly hide the row, but one slow/failed folder never blocks the other authoritative windows.
+  Unchanged sibling arrays retain their references, and the checkpoint adds neither a request nor
+  an extra React state commit.
 
 ## 6b. Right-click context menu & inline rename (issue #15)
 

@@ -114,6 +114,21 @@ const listing = (folder: string): TreeChildrenView => ({
   total: 1,
 })
 
+const folderListing = (...notes: NoteView[]): TreeChildrenView => ({
+  folders: [],
+  notes,
+  total: notes.length,
+})
+
+const movedNote = (folder: string): NoteView => ({
+  id: 'moved',
+  title: 'Moved note',
+  filePath: `${folder}/moved.md`,
+  class: 'user-doc',
+  modifiedAt: null,
+  createdAt: null,
+})
+
 const orderListing = (folder: string, order: readonly string[]): TreeChildrenView => {
   const rows: Record<string, NoteView> = {
     alpha: {
@@ -518,6 +533,47 @@ describe('useNotesState interleavings', () => {
         ?.map((note) => note.id)
         .sort(),
     ).toEqual(['id-from', 'id-to'])
+  })
+
+  it('publishes a destination listing without duplicating its ids across held folders', async () => {
+    harness.api.treeChildrenGet.mockImplementation(async (_space: string, folder: string) =>
+      folder === 'from' ? folderListing(movedNote('from')) : folderListing(),
+    )
+    render()
+    await settle()
+
+    await act(async () => {
+      state.ensureFolder('from')
+      state.ensureFolder('to')
+      await Promise.resolve()
+    })
+
+    expect(state.notesIn('from')?.map((note) => note.id)).toEqual(['moved'])
+    expect(state.notesIn('to')).toEqual([])
+
+    const from = deferred<TreeChildrenView>()
+    const to = deferred<TreeChildrenView>()
+
+    harness.api.treeChildrenGet.mockImplementation((_space: string, folder: string) =>
+      folder === 'from' ? from.promise : to.promise,
+    )
+    let refresh!: Promise<void>
+
+    await act(async () => {
+      refresh = state.refreshFolders(['from', 'to'])
+      await Promise.resolve()
+    })
+    await act(async () => to.resolve(folderListing(movedNote('to'))))
+
+    const membership = ['from', 'to'].flatMap((folder) => state.notesIn(folder) ?? [])
+
+    expect(membership.filter((note) => note.id === 'moved')).toHaveLength(1)
+    expect(state.notesIn('to')?.map((note) => note.id)).toEqual(['moved'])
+
+    await act(async () => from.resolve(folderListing()))
+    await refresh
+    expect(state.notesIn('from')).toEqual([])
+    expect(state.notesIn('to')?.map((note) => note.id)).toEqual(['moved'])
   })
 
   it('reorders every held folder immediately and reconciles with the same server query', async () => {

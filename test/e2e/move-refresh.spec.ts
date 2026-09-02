@@ -239,7 +239,7 @@ test('re-throwing a note while its first move is still pending is not blocked (#
   await expect.poll(() => folderOfRow(page, noteId!)).toBe('f3')
 })
 
-test('another client sees the move over SSE — converges without a reload (#94 multi-client)', async ({
+test('another client never publishes a duplicate while an external move converges (#346)', async ({
   page,
   baseURL,
 }) => {
@@ -259,18 +259,73 @@ test('another client sees the move over SSE — converges without a reload (#94 
   await observer.goto('/s/main')
   await expect(observer.locator('[data-testid="tree-note"]')).toHaveCount(15)
 
+  const consoleErrors: string[] = []
+  const childrenPaths: string[] = []
+
+  observer.on('console', (message) => {
+    if (message.type() === 'error') {
+      consoleErrors.push(message.text())
+    }
+  })
+  observer.on('request', (request) => {
+    const url = new URL(request.url())
+
+    if (url.pathname.endsWith('/tree/children')) {
+      childrenPaths.push(url.searchParams.get('path') ?? '')
+    }
+  })
+
   const noteId = await idOf(actor, 'f1-note-1')
   const toF2 = await idOf(actor, 'f2-note-1')
   // Both clients agree it starts in f1.
   expect(await folderOfRow(observer, noteId!)).toBe('f1')
 
+  let releaseSource!: () => void
+  let reportSourceHeld!: () => void
+  const sourceGate = new Promise<void>((resolve) => {
+    releaseSource = resolve
+  })
+  const sourceHeld = new Promise<void>((resolve) => {
+    reportSourceHeld = resolve
+  })
+  let holdSource = false
+
+  await observer.route('**/tree/children**', async (route) => {
+    const url = new URL(route.request().url())
+
+    if (holdSource && url.searchParams.get('path') === 'f1') {
+      reportSourceHeld()
+      await sourceGate
+    }
+    await route.continue()
+  })
+  const baseline = childrenPaths.length
+  holdSource = true
+  const destinationResponse = observer.waitForResponse((response) => {
+    const url = new URL(response.url())
+
+    return url.pathname.endsWith('/tree/children') && url.searchParams.get('path') === 'f2'
+  })
+
   await dragNoteOnto(actor, noteId!, toF2!)
 
-  // The observer converges to f2 purely from the SSE `changed` event (coalesced
-  // ~1s) — no reload, no duplicate, still 15 rows.
+  // Hold the stale source window while the authoritative destination window
+  // lands. The old per-folder commit rendered the same stable id in BOTH windows
+  // at this exact point, producing React's duplicate-key warning until f1 landed.
+  try {
+    await Promise.all([sourceHeld, destinationResponse])
+    await expect(observer.locator(`[data-testid="tree-note"][data-id="${noteId}"]`)).toHaveCount(1)
+    await expect.poll(() => folderOfRow(observer, noteId!)).toBe('f2')
+    expect(consoleErrors.filter((message) => message.includes('same key'))).toEqual([])
+  } finally {
+    releaseSource()
+  }
+
+  // The observer then converges fully from the same narrow f1 + f2 refresh.
   await expect.poll(() => folderOfRow(observer, noteId!), { timeout: 8000 }).toBe('f2')
   await expect(observer.locator('[data-testid="tree-note"]')).toHaveCount(15)
   await expect(observer.locator(`[data-testid="tree-note"][data-id="${noteId}"]`)).toHaveCount(1)
+  expect(new Set(childrenPaths.slice(baseline))).toEqual(new Set(['f1', 'f2']))
 
   await observer.close()
 })

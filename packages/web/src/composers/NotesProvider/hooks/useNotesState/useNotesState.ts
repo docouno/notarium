@@ -26,6 +26,7 @@ import type {
   NotesContextValue,
   ReaderMode,
 } from '../../types'
+import { replaceFolderWindow } from './folderWindows'
 import {
   beginHeldWindowReconciliation,
   isLatestRequest,
@@ -106,6 +107,7 @@ export const useNotesState = (): NotesContextValue => {
   const removedSeenIdsRef = useRef(new Map<string, number>())
   const treeRef = useRef(tree)
   const folderNotesRef = useRef(folderNotes)
+  const folderByNoteIdRef = useRef(new Map<string, string>())
   const explorerSortRef = useRef(explorerSort)
   const explorerSortDirRef = useRef(explorerSortDir)
   const activeIdRef = useRef<string | null>(null)
@@ -208,6 +210,7 @@ export const useNotesState = (): NotesContextValue => {
 
       for (const id of removed) {
         removedSeenIdsRef.current.set(id, removalEpoch)
+        folderByNoteIdRef.current.delete(id)
       }
       const nextSeen = removeSeenIds(seenRef.current, ids)
       const nextFolders = new Map(folderNotesRef.current)
@@ -310,13 +313,26 @@ export const useNotesState = (): NotesContextValue => {
         )
 
         const nextSeen = replaceSeenFolder(observation.seen, previous, observation.accepted)
-        const nextFolders = new Map(folderNotesRef.current).set(folder, observation.accepted)
+        const replacement = replaceFolderWindow(
+          folderNotesRef.current,
+          folderByNoteIdRef.current,
+          folder,
+          observation.accepted,
+        )
 
         // Refs move with the accepted authoritative response, before React's
         // render, so a same-tick wikilink click cannot use an id this empty
         // folder response just proved was deleted.
+        for (const removed of replacement.membership.remove) {
+          if (folderByNoteIdRef.current.get(removed.id) === removed.folder) {
+            folderByNoteIdRef.current.delete(removed.id)
+          }
+        }
+        for (const upserted of replacement.membership.upsert) {
+          folderByNoteIdRef.current.set(upserted.id, upserted.folder)
+        }
         commitSeen(nextSeen)
-        commitFolderNotes(nextFolders)
+        commitFolderNotes(replacement.windows)
 
         return 'settled'
       } catch {
@@ -514,6 +530,9 @@ export const useNotesState = (): NotesContextValue => {
         merged.push(moved)
         merged.sort(comparatorFor(explorerSortRef.current, explorerSortDirRef.current))
         nextFolders.set(toFolder, merged)
+        folderByNoteIdRef.current.set(id, toFolder)
+      } else {
+        folderByNoteIdRef.current.delete(id)
       }
 
       commitFolderNotes(nextFolders)
@@ -923,6 +942,7 @@ export const useNotesState = (): NotesContextValue => {
     treeFailedRef.current = false
     folderLoadSeq.current = new Map()
     foldersInFlight.current.clear()
+    folderByNoteIdRef.current = new Map()
     setTree(null)
     setTreeLoaded(false)
     commitFolderNotes(new Map())
