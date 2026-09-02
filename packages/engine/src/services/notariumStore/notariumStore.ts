@@ -1106,7 +1106,7 @@ export class NotariumStore implements KnowledgeStore {
       // keyed vectors stale; ladder steps are additive and rowid-preserving (see
       // IndexMigration), so they ride along untouched. This flag gates whether
       // setupVectorSchema wipes+re-embeds.
-      const notesRebuilt = plan.teardown
+      let notesRebuilt = plan.teardown
 
       if (plan.teardown) {
         await this.sql.exec(TEARDOWN)
@@ -1116,22 +1116,18 @@ export class NotariumStore implements KnowledgeStore {
       // makes the invariant local.
       const startVersion = plan.teardown ? 0 : plan.fromVersion
 
-      // Apply the missing ladder steps in order, EACH in its own transaction that
-      // also stamps the version (the meta-DB runner's shape). SQLite DDL is
-      // transactional, so a crash mid-step rolls the WHOLE step back and the next
-      // boot re-applies it — an `ALTER … ADD COLUMN` (no IF NOT EXISTS) never sticks
-      // half-applied to wedge the boot. Step 0 recreates the (fresh/post-teardown)
-      // baseline via CREATE IF NOT EXISTS; later steps are additive ALTERs.
-      for (let v = startVersion; v < target; v++) {
-        await this.sql.exec('BEGIN')
-        try {
-          await this.sql.exec(this.migrations[v].sql)
-          await this.setMeta(INDEX_VERSION_KEY, String(v + 1))
-          await this.sql.exec('COMMIT')
-        } catch (err) {
-          await this.sql.exec('ROLLBACK').catch(() => {})
-          throw err
-        }
+      try {
+        await this.applyIndexMigrations(startVersion, target)
+      } catch (err) {
+        // An older binary can leave behind a table it never knew to tear down. A
+        // later non-idempotent ALTER then cannot distinguish that legitimate
+        // downgrade residue from corruption. The whole DB is derived (P2), so one
+        // current teardown + replay is the fail-safe boundary; a second failure is
+        // terminal rather than an unbounded rebuild loop.
+        console.error('[notarium] index migration failed; rebuilding derived index:', err)
+        await this.sql.exec(TEARDOWN)
+        await this.applyIndexMigrations(0, target)
+        notesRebuilt = true
       }
       // Retire the pre-ladder version row once adopted, so the meta table keeps a
       // single source of version truth (no-op when it was never there).
@@ -1194,6 +1190,24 @@ export class NotariumStore implements KnowledgeStore {
       }
     })()
     return this.ready
+  }
+
+  /** Apply the missing ladder steps in order, EACH in its own transaction that also
+   *  stamps the version (the meta-DB runner's shape). SQLite DDL is transactional,
+   *  so a crash mid-step rolls the WHOLE step back and a retry never meets its own
+   *  half-applied, non-idempotent ALTER. */
+  private async applyIndexMigrations(fromVersion: number, target: number): Promise<void> {
+    for (let v = fromVersion; v < target; v++) {
+      await this.sql.exec('BEGIN')
+      try {
+        await this.sql.exec(this.migrations[v].sql)
+        await this.setMeta(INDEX_VERSION_KEY, String(v + 1))
+        await this.sql.exec('COMMIT')
+      } catch (err) {
+        await this.sql.exec('ROLLBACK').catch(() => {})
+        throw err
+      }
+    }
   }
 
   // ── vector channel (#81) ─────────────────────────────────────────────────────

@@ -8,13 +8,13 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { claudeConversationSourceLocator } from '@notarium/core'
 
 import type { Embedder } from '../../libs/embedding'
 import { createLocalFsFiles } from '../../libs/files'
-import { createNodeSqliteDriver } from '../../libs/sql'
+import { createNodeSqliteDriver, type SqlDriver } from '../../libs/sql'
 import { createNotariumStore } from './createNotariumStore'
 import { NotariumStore } from './notariumStore'
 import {
@@ -165,6 +165,134 @@ const hasColumn = (db: ReturnType<typeof createNodeSqliteDriver>, table: string,
     .all<{ name: string }>(`PRAGMA table_info(${table})`)
     .then((rows) => rows.some((r) => r.name === col))
 
+// Frozen from the published v0.1.0 tag. That binary knew the first three ladder
+// steps and therefore could not name document_proofs in its teardown. Replaying
+// this exact boundary keeps the downgrade regression tied to a state users can
+// really produce rather than to a synthetic version-stamp mismatch.
+const RELEASED_V0_1_INDEX_SCHEMA_VERSION = 3
+const RELEASED_V0_1_INDEX_TEARDOWN = `
+DROP TRIGGER IF EXISTS notes_vec_ad;
+DROP TRIGGER IF EXISTS notes_fingerprint_ad;
+DROP TRIGGER IF EXISTS notes_ai;
+DROP TRIGGER IF EXISTS notes_ad;
+DROP TRIGGER IF EXISTS notes_au;
+DROP TABLE IF EXISTS file_fingerprints;
+DROP TABLE IF EXISTS notes_fts;
+DROP TABLE IF EXISTS notes;
+DROP TABLE IF EXISTS meta;
+`
+
+const downgradeIndexToReleasedV0_1 = async (db: SqlDriver): Promise<void> => {
+  await db.exec(RELEASED_V0_1_INDEX_TEARDOWN)
+  for (let v = 0; v < RELEASED_V0_1_INDEX_SCHEMA_VERSION; v++) {
+    await db.exec('BEGIN')
+    try {
+      await db.exec(INDEX_MIGRATIONS[v].sql)
+      await db.run(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`, [
+        INDEX_VERSION_KEY,
+        String(v + 1),
+      ])
+      await db.exec('COMMIT')
+    } catch (err) {
+      await db.exec('ROLLBACK').catch(() => {})
+      throw err
+    }
+  }
+}
+
+const recoveryDiagnostics = (spy: ReturnType<typeof vi.spyOn>) =>
+  spy.mock.calls.filter(
+    ([message]) => message === '[notarium] index migration failed; rebuilding derived index:',
+  )
+
+describe('index migration self-heal', () => {
+  let notesDir: string
+  let indexDbDir: string
+  let indexDb: string
+
+  beforeEach(() => {
+    notesDir = mkdtempSync(join(tmpdir(), 'notarium-278-notes-'))
+    indexDbDir = mkdtempSync(join(tmpdir(), 'notarium-278-db-'))
+    indexDb = join(indexDbDir, 'index.db')
+  })
+  afterEach(() => {
+    rmSync(notesDir, { recursive: true, force: true })
+    rmSync(indexDbDir, { recursive: true, force: true })
+    vi.restoreAllMocks()
+  })
+
+  it('heals the released v0.1.0 downgrade orphan and keeps one ready store', async () => {
+    let store = new NotariumStore({
+      mounts: [userMount(notesDir)],
+      sql: createNodeSqliteDriver(indexDb),
+    })
+    const path = await writePath(store, { title: 'Survivor', content: 'File truth.' })
+    await store.stop()
+
+    const old = createNodeSqliteDriver(indexDb)
+    expect(await hasColumn(old, 'document_proofs', 'context_json')).toBe(true)
+    await downgradeIndexToReleasedV0_1(old)
+    expect(await indexVersion(old)).toBe(String(RELEASED_V0_1_INDEX_SCHEMA_VERSION))
+    // The shipped old teardown could not remove this future table.
+    expect(await hasColumn(old, 'document_proofs', 'context_json')).toBe(true)
+    await old.close()
+
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {})
+    store = new NotariumStore({
+      mounts: [userMount(notesDir)],
+      sql: createNodeSqliteDriver(indexDb),
+    })
+    const first = await store.list()
+    const second = await store.list()
+    expect(first.map((note) => note.filePath)).toContain(path)
+    expect(second).toEqual(first)
+    expect(recoveryDiagnostics(diagnostic)).toHaveLength(1)
+    expect(recoveryDiagnostics(diagnostic)[0]?.[1]).toMatchObject({
+      message: 'duplicate column name: context_json',
+    })
+    await store.stop()
+
+    const after = createNodeSqliteDriver(indexDb)
+    expect(await indexVersion(after)).toBe(String(INDEX_SCHEMA_VERSION))
+    expect(await hasColumn(after, 'document_proofs', 'context_json')).toBe(true)
+    await after.close()
+  })
+
+  it('retries a failed step once, preserves its rollback, and exposes the retry failure', async () => {
+    const brokenStep: IndexMigration = {
+      sql: `ALTER TABLE notes ADD COLUMN future_col TEXT; SELECT no_such_column`,
+    }
+    const baseSql = createNodeSqliteDriver(indexDb)
+    let brokenAttempts = 0
+    const sql: SqlDriver = {
+      ...baseSql,
+      exec: async (statement) => {
+        if (statement === brokenStep.sql) {
+          brokenAttempts++
+        }
+        await baseSql.exec(statement)
+      },
+    }
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const store = new NotariumStore({
+      mounts: [userMount(notesDir)],
+      sql,
+      migrations: [...INDEX_MIGRATIONS, brokenStep],
+    })
+
+    await expect(store.list()).rejects.toThrow('no such column: no_such_column')
+    await expect(store.list()).rejects.toThrow('no such column: no_such_column')
+    expect(brokenAttempts).toBe(2)
+    expect(recoveryDiagnostics(diagnostic)).toHaveLength(1)
+    await store.stop()
+
+    const after = createNodeSqliteDriver(indexDb)
+    expect(await indexVersion(after)).toBe(String(INDEX_MIGRATIONS.length))
+    expect(await hasColumn(after, 'notes', 'future_col')).toBe(false)
+    await after.close()
+  })
+})
+
 describeVector('index migration preserves vectors', () => {
   let notesDir: string
   let indexDb: string
@@ -274,6 +402,46 @@ describeVector('index migration preserves vectors', () => {
     await store.whenVectorsSettled()
     expect(emb.textCount).toBeGreaterThan(embeddedOnce) // teardown → full re-embed
     await store.stop()
+  })
+
+  it('rebuilds stale rowid-keyed vectors while healing a downgrade orphan', async () => {
+    const emb = countingEmbedder()
+    let store = createNotariumStore({ notesDir, indexDb, embedder: emb.embedder })
+    const path = await writePath(store, { title: 'Vector survivor', content: 'File truth.' })
+    await store.whenVectorsSettled()
+    const embeddedOnce = emb.textCount
+    expect(embeddedOnce).toBeGreaterThan(0)
+    await store.stop()
+
+    const old = createNodeSqliteDriver(indexDb, { vec: true })
+    await downgradeIndexToReleasedV0_1(old)
+    expect(await hasColumn(old, 'document_proofs', 'context_json')).toBe(true)
+    expect(
+      (await old.get<{ n: number }>(`SELECT count(*) AS n FROM note_vectors`))?.n,
+    ).toBeGreaterThan(0)
+    await old.close()
+
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {})
+    store = createNotariumStore({ notesDir, indexDb, embedder: emb.embedder })
+    const listed = await store.list()
+    await store.whenVectorsSettled()
+    expect(listed.map((note) => note.filePath)).toContain(path)
+    expect(emb.textCount).toBeGreaterThan(embeddedOnce)
+    const embeddedAfterRecovery = emb.textCount
+    await store.list()
+    await store.whenVectorsSettled()
+    expect(emb.textCount).toBe(embeddedAfterRecovery)
+    expect(recoveryDiagnostics(diagnostic)).toHaveLength(1)
+    await store.stop()
+
+    const after = createNodeSqliteDriver(indexDb, { vec: true })
+    const row = await after.get<{ content_hash: string; embedded_hash: string }>(
+      `SELECT content_hash, embedded_hash FROM notes WHERE path = ?`,
+      [path],
+    )
+    expect(row?.embedded_hash).toBe(row?.content_hash)
+    expect(await indexVersion(after)).toBe(String(INDEX_SCHEMA_VERSION))
+    await after.close()
   })
 
   it('applies the shipped fingerprint-table step without re-embedding', async () => {
@@ -387,12 +555,9 @@ describeVector('index migration preserves vectors', () => {
     await after.close()
   })
 
-  it('applies an appended additive step through ensureReady, crash-safely, without re-embedding', async () => {
-    // Drive the REAL boot path (ensureReady's apply-loop) through an appended step —
-    // inject a synthetic two-step ladder rooted at the frozen baseline. This is the
-    // core promise end-to-end: an ADD COLUMN bumps the version but keeps rowids, so the
-    // note is NOT re-embedded. Plus crash-safety: a step that fails mid-way rolls back
-    // whole (no half-applied, non-idempotent ALTER wedging the next boot).
+  it('applies an appended additive step through ensureReady without re-embedding', async () => {
+    // Drive the REAL boot path (ensureReady's apply-loop) through an appended step.
+    // An ADD COLUMN bumps the version but keeps rowids, so the note is NOT re-embedded.
     const baseline = [...INDEX_MIGRATIONS]
     const emb = countingEmbedder()
 
@@ -409,27 +574,7 @@ describeVector('index migration preserves vectors', () => {
     expect(embeddedOnce).toBeGreaterThan(0)
     await store.stop()
 
-    // Boot 2 — a step whose SQL fails AFTER the ALTER: the transaction must roll the
-    // whole step back. Version stays 1, the column is gone, the boot throws (no silent
-    // partial state that a re-run would trip over with "duplicate column").
-    const brokenStep: IndexMigration = {
-      sql: `ALTER TABLE notes ADD COLUMN future_col TEXT; SELECT no_such_column`,
-    }
-    store = new NotariumStore({
-      mounts: [userMount(notesDir)],
-      sql: createNodeSqliteDriver(indexDb, { vec: true }),
-      embedder: emb.embedder,
-      migrations: [...baseline, brokenStep],
-    })
-    await expect(store.list()).rejects.toThrow()
-    await store.stop()
-
-    let d = createNodeSqliteDriver(indexDb, { vec: true })
-    expect(await indexVersion(d)).toBe(String(baseline.length))
-    expect(await hasColumn(d, 'notes', 'future_col')).toBe(false) // the ALTER was undone
-    await d.close()
-
-    // Boot 3 — the good appended step applies: version → 2, column present, and the
+    // Boot 2 — the good appended step applies: version advances, column is present, and the
     // note rides its preserved rowid → NO re-embed.
     const goodStep: IndexMigration = { sql: `ALTER TABLE notes ADD COLUMN future_col TEXT` }
     store = new NotariumStore({
@@ -443,7 +588,7 @@ describeVector('index migration preserves vectors', () => {
     expect(emb.textCount).toBe(embeddedOnce) // ← the fix: an additive step re-embeds nothing
     await store.stop()
 
-    d = createNodeSqliteDriver(indexDb, { vec: true })
+    const d = createNodeSqliteDriver(indexDb, { vec: true })
     expect(await indexVersion(d)).toBe(String(baseline.length + 1))
     expect(await hasColumn(d, 'notes', 'future_col')).toBe(true)
     const row = await d.get<{ content_hash: string; embedded_hash: string }>(
