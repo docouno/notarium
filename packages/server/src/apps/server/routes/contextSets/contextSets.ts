@@ -645,7 +645,7 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
       if (!proj || proj.space !== req.spaceId) {
         return notFound(reply)
       }
-      await contextSets.detach(p.id ?? '', 'project', proj.id)
+      await contextSets.detach(p.id ?? '', 'project', proj.id, proj.space)
       return OkResponseSchema.parse({ ok: true })
     },
   )
@@ -709,7 +709,7 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
       }
       const requestedId = p.noteId ?? ''
       const live = await readNoteAccess(ctx.storeAccess, req.principal, requestedId, 'note:read')
-      await scopePins.removePin('project', proj.id, live?.noteId ?? requestedId)
+      await scopePins.removePin('project', proj.id, proj.space, live?.noteId ?? requestedId)
       return OkResponseSchema.parse({ ok: true })
     },
   )
@@ -922,7 +922,8 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
       if (!canWriteRole(req, role)) {
         return reply.code(HTTP_STATUS.FORBIDDEN).send({ error: 'forbidden' })
       }
-      await contextSets.detach(p.id ?? '', CONTEXT_KIND.role, roleContextTargetOf(role).id)
+      const target = roleContextTargetOf(role)
+      await contextSets.detach(p.id ?? '', CONTEXT_KIND.role, target.id, target.space)
       return OkResponseSchema.parse({ ok: true })
     },
   )
@@ -991,9 +992,11 @@ export const contextSetsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) 
       }
       const requestedId = p.noteId ?? ''
       const live = await readNoteAccess(ctx.storeAccess, req.principal, requestedId, 'note:read')
+      const target = roleContextTargetOf(role)
       await scopePins.removePin(
         CONTEXT_KIND.role,
-        roleContextTargetOf(role).id,
+        target.id,
+        target.space,
         live?.noteId ?? requestedId,
       )
       return OkResponseSchema.parse({ ok: true })

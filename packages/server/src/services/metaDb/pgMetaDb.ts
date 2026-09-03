@@ -78,11 +78,17 @@ import type {
   SpaceRole,
 } from './types'
 
+export type PgMetaDbOptions = {
+  /** Test/benchmark seam over application statements; migration/schema-pin SQL is excluded. */
+  observeStatement?: (sql: string) => void
+}
+
 export class PgMetaDb implements MetaDb {
   private pool: pg.Pool | null = null
   private initPromise: Promise<void> | null = null
   private closePromise: Promise<void> | null = null
   private readonly url: string
+  private readonly observeStatement: ((sql: string) => void) | undefined
   private readonly ctx: PgDriverCtx = ((self: PgMetaDb): PgDriverCtx => ({
     ensureInit: () => self.ensureInit(),
     close: () => self.close(),
@@ -91,8 +97,9 @@ export class PgMetaDb implements MetaDb {
     },
   }))(this)
 
-  constructor(url: string) {
+  constructor(url: string, options: PgMetaDbOptions = {}) {
     this.url = url
+    this.observeStatement = options.observeStatement
   }
 
   private ensureInit(): Promise<void> {
@@ -136,6 +143,25 @@ export class PgMetaDb implements MetaDb {
                 throw new Error(
                   `meta database application connection could not pin PostgreSQL schema ${schema}`,
                 )
+              }
+              if (this.observeStatement) {
+                const query = poolClient.query.bind(poolClient)
+
+                poolClient.query = ((...args: unknown[]) => {
+                  const input = args[0]
+                  const sql =
+                    typeof input === 'string'
+                      ? input
+                      : typeof input === 'object' && input !== null && 'text' in input
+                        ? String((input as { text: unknown }).text)
+                        : ''
+
+                  if (sql) {
+                    this.observeStatement?.(sql)
+                  }
+
+                  return Reflect.apply(query, poolClient, args)
+                }) as typeof poolClient.query
               }
             },
           })

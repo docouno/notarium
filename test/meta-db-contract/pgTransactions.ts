@@ -138,8 +138,17 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
   { id: 'contextSets.addItems', levels: ['L1', 'L2c'] },
   { id: 'contextSets.removeItem', levels: ['L1', 'L2c'] },
   { id: 'contextSets.reorderItems', levels: ['L1', 'L2c'] },
-  { id: 'contextSets.deleteSet', levels: ['L2b', 'L2c'] },
+  { id: 'contextSets.attach', levels: ['L2b'] },
+  { id: 'contextSets.detach', levels: ['L2b'] },
+  {
+    id: 'contextSets.deleteSet',
+    levels: ['L2b', 'L2c'],
+    sweeps: {
+      L2b: 'deleting a set removes every attachment of that set and has no Role package key',
+    },
+  },
   { id: 'scopePins.addPin', levels: ['L1', 'L2d'] },
+  { id: 'scopePins.removePin', levels: ['L2d'] },
   { id: 'contextOrder.setOrder', levels: ['L1', 'L2d', 'L2e', 'L2f'] },
   // Changing where a Role belongs rewrites every durable pointer at its old
   // placement. It never touches identity: the notes it re-targets are named by rows
@@ -233,6 +242,7 @@ export const PG_TRANSACTIONS: readonly PgTransaction[] = [
     ],
     exempt: 'wide-scan',
     sweeps: {
+      L2b: 'every attachment whose target lived in this Space, deleted by target_space without one Role package key',
       L2d: 'every pin whose SCOPE lived in this Space, deleted by `target_space`. A whole Space is not a target: the level is keyed by the (kind, id) a pin hangs on, and a purge holds the Space row and the tier-3 stripes instead — which is what a pin writer waits behind.',
       L4p: 'every override of this Space, by `space_id`, for every owner and every package at once — the same sweep `purgeNotes` makes for one note, with the same missing key.',
     },

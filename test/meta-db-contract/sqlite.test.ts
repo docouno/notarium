@@ -10,6 +10,7 @@ import { SqliteMetaDb } from '../../packages/server/src/services/metaDb/sqliteMe
 import { describeAbilityAvailabilityContract } from './abilityAvailabilityContract'
 import { describeAbilityCreateContract } from './abilityCreateContract'
 import { describeAbilityPlacementContract } from './abilityPlacementContract'
+import { describeAbilityPlacementCostContract } from './abilityPlacementCostContract'
 import { describeAbilityPreferencesContract } from './abilityPreferencesContract'
 import { describeAgentCallsContract } from './agentCallsContract'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
@@ -362,6 +363,138 @@ describeAbilityPlacementContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
   return { db, teardown: () => db.close() }
 })
+
+describeAbilityPlacementCostContract(
+  'SQLite',
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'notarium-ability-placement-cost-'))
+    const path = join(dir, 'meta.sqlite')
+    const statements: string[] = []
+    const db = new SqliteMetaDb(path, { observeStatement: (sql) => statements.push(sql) })
+    await db.abilityPlacement.resolveMovedOwnedRoleLocator('init')
+    const observer = new DatabaseSync(path)
+
+    observer.exec('CREATE TABLE pointer_audit (table_name TEXT NOT NULL)')
+    for (const table of [
+      'context_set_attachments',
+      'context_scope_pins',
+      'context_order',
+      'ability_preferences',
+      'agent_sessions',
+    ]) {
+      for (const event of ['INSERT', 'UPDATE', 'DELETE']) {
+        observer.exec(
+          `CREATE TRIGGER audit_${table}_${event.toLowerCase()}
+             AFTER ${event} ON ${table}
+             BEGIN INSERT INTO pointer_audit(table_name) VALUES ('${table}'); END`,
+        )
+      }
+    }
+    await db.spaces.upsert({
+      id: 'space-main',
+      slug: 'space-main',
+      displayName: 'Space main',
+      notesDir: '/space-main',
+      aliases: [],
+      createdAt: '2026-09-02T00:00:00.000Z',
+      archivedAt: null,
+      archivedBy: null,
+    })
+    await db.identity.claimMany([
+      {
+        id: 'PinnedNote01',
+        legacyNameAliases: [],
+        filePath: 'pinned.md',
+        space: 'space-main',
+        createdAt: '2026-09-02T00:00:00.000Z',
+        materialized: true,
+        deletedAt: null,
+      },
+    ])
+    await db.contextSets.createSet({
+      id: 'set-cost',
+      homeSpace: 'space-main',
+      name: 'Cost set',
+      items: [],
+      createdAt: '2026-09-02T00:00:00.000Z',
+    })
+    await db.sessions.insert({
+      id: 'session-cost',
+      owner: 'user:cost',
+      name: 'cost',
+      named: true,
+      parentId: null,
+      createdAt: '2026-09-02T00:00:00.000Z',
+      lastSeenAt: '2026-09-02T00:00:00.000Z',
+      calls: 1,
+      role: null,
+      roleLocator: null,
+      roleContextProjectId: null,
+      projectId: null,
+    })
+    observer.exec('DELETE FROM pointer_audit')
+    statements.length = 0
+
+    return {
+      abilityPlacement: db.abilityPlacement,
+      contextSets: db.contextSets,
+      scopePins: db.scopePins,
+      contextOrder: db.contextOrder,
+      sessions: db.sessions,
+      seedUnrelatedTrail: async (count) => {
+        const insert = observer.prepare(
+          `INSERT INTO ability_placement_trail
+             (from_locator, to_locator, space_id, registry_note_id, manifest_note_id)
+           VALUES (?, ?, 'space-main', 'RegistryNote1', 'ManifestNote1')`,
+        )
+
+        for (let index = 0; index < count; index += 1) {
+          insert.run(`unrelated-${index}`, `destination-${index}`)
+        }
+      },
+      seedSourceRows: async (count) => {
+        const insert = observer.prepare(
+          `INSERT INTO context_order
+             (target_kind, target_id, target_space, entry_kind, entry_ref, rank)
+           VALUES ('role', 'project:project-a:AbCdefGhij_1', 'space-main', 'set', ?, ?)`,
+        )
+
+        for (let index = 0; index < count; index += 1) {
+          insert.run(`set-source-${index}`, index)
+        }
+      },
+      explainExactLookup: async (locator) =>
+        observer
+          .prepare(
+            `EXPLAIN QUERY PLAN
+             SELECT to_locator, registry_note_id, manifest_note_id
+               FROM ability_placement_trail WHERE from_locator = ?`,
+          )
+          .all(locator)
+          .map((row) => (row as { detail: string }).detail)
+          .join('\n'),
+      resetPointerAudit: async () => observer.exec('DELETE FROM pointer_audit'),
+      resetStatementAudit: () => {
+        statements.length = 0
+      },
+      statementAudit: () => [...statements],
+      pointerDmlCount: async () =>
+        Number(
+          (
+            observer.prepare('SELECT COUNT(*) AS count FROM pointer_audit').get() as {
+              count: number
+            }
+          ).count,
+        ),
+      teardown: async () => {
+        observer.close()
+        await db.close()
+        rmSync(dir, { recursive: true, force: true })
+      },
+    }
+  },
+  /sqlite_autoindex_ability_placement_trail_1/i,
+)
 
 // Two connections onto ONE file database: ':memory:' would give each handle its
 // own private table and the arbitration contract would prove nothing.

@@ -110,7 +110,7 @@ SOURCE_COPY_TAR_EXCLUDES := \
 
 .DEFAULT_GOAL := help
 .PHONY: help prepare deps deps-vector doctor dev up start down stop restart logs ps sh \
-        checkup audit-runtime test-coverage test-pg test-browser import-bench provider-scale-gate bench-fields-snapshot write-perf-gate graph-revision-gate activity-groups-gate bench-session-audit backup restore backup-smoke seed seed-list \
+        checkup audit-runtime test-coverage test-pg test-browser import-bench provider-scale-gate bench-fields-snapshot write-perf-gate graph-revision-gate activity-groups-gate bench-session-audit ability-placement-gate backup restore backup-smoke seed seed-list \
         footage demo-shots demo-preview demo-plates image release release-rc release-smoke save clean
 
 help: ## List available targets
@@ -554,6 +554,88 @@ bench-session-audit: ## Benchmark the session activity read-model on SQLite and 
 	    -e BENCH_BASELINE_TREE="$$baseline_tree" \
 	    -e BENCH_NODE_IMAGE="$(NODE_TEST_IMAGE)" -e BENCH_PG_IMAGE=postgres:16-alpine \
 	    --entrypoint npx "$(NODE_TEST_IMAGE)" tsx scripts/benchSessionAudit.ts
+
+# --- owned Role placement benchmark ---------------------------------------
+ABILITY_PLACEMENT_BASE_COMMIT ?= f4da0374d96ac575669323aab8cbd9f85c726bcc
+ABILITY_PLACEMENT_PHASE ?= pre
+ABILITY_PLACEMENT_BUILD_TIME ?= 2026-09-02T00:00:00Z
+ABILITY_PLACEMENT_NOW ?= 2026-09-02T00:00:00.000Z
+ABILITY_PLACEMENT_OUTPUT_DIR ?= $(CURDIR)/test-results/ability-placement
+ABILITY_PLACEMENT_RUNTIME_IMAGE ?= notarium-ability-placement-runtime:$(TEST_COMPOSE_PROJECT)-$(ABILITY_PLACEMENT_PHASE)
+ABILITY_PLACEMENT_BUILDER_IMAGE ?= notarium-ability-placement-builder:$(TEST_COMPOSE_PROJECT)-$(ABILITY_PLACEMENT_PHASE)
+ABILITY_PLACEMENT_CONTAINER ?= $(TEST_COMPOSE_PROJECT)-ability-placement-$(ABILITY_PLACEMENT_PHASE)
+ABILITY_PLACEMENT_VOLUME ?= $(TEST_COMPOSE_PROJECT)-ability-placement-data-$(ABILITY_PLACEMENT_PHASE)
+
+ability-placement-gate: ## Benchmark idempotent Role placement: ABILITY_PLACEMENT_PHASE=pre|post
+	@set -eu; \
+	  phase="$(ABILITY_PLACEMENT_PHASE)"; \
+	  case "$$phase" in pre|post) ;; *) echo 'ABILITY_PLACEMENT_PHASE must be pre or post' >&2; exit 2 ;; esac; \
+	  source_dir=""; \
+	  fixture_dir=""; \
+	  cleanup() { \
+	    docker rm -f "$(ABILITY_PLACEMENT_CONTAINER)" >/dev/null 2>&1 || true; \
+	    docker volume rm -f "$(ABILITY_PLACEMENT_VOLUME)" >/dev/null 2>&1 || true; \
+	    docker image rm "$(ABILITY_PLACEMENT_RUNTIME_IMAGE)" "$(ABILITY_PLACEMENT_BUILDER_IMAGE)" >/dev/null 2>&1 || true; \
+	    if [ -n "$$source_dir" ] && [ "$$source_dir" != "$(CURDIR)" ]; then rm -rf "$$source_dir"; fi; \
+	    if [ -n "$$fixture_dir" ] && [ "$$fixture_dir" != "$(CURDIR)" ]; then rm -rf "$$fixture_dir"; fi; \
+	  }; \
+	  trap cleanup EXIT INT TERM; \
+	  cleanup; \
+	  if [ "$$phase" = pre ]; then \
+	    commit="$(ABILITY_PLACEMENT_BASE_COMMIT)"; \
+	    source_dir="$$(mktemp -d)"; \
+	    git archive "$$commit" | tar -x -C "$$source_dir"; \
+	    cp scripts/abilityPlacementBench.ts scripts/abilityPlacementBenchGates.ts "$$source_dir/scripts/"; \
+	  else \
+	    test -z "$$(git status --porcelain)" || { echo 'post ability-placement gate requires a clean checkpoint commit' >&2; exit 2; }; \
+	    commit="$$(git rev-parse HEAD)"; \
+	    source_dir="$(CURDIR)"; \
+	  fi; \
+	  fixture_dir="$$(mktemp -d)"; \
+	  git archive "$(ABILITY_PLACEMENT_BASE_COMMIT)" test/cases | tar -x -C "$$fixture_dir"; \
+	  cp test/cases/applyAgentRoleMoves.ts test/cases/applyContextDeclarations.ts "$$fixture_dir/test/cases/"; \
+	  built_at="$(ABILITY_PLACEMENT_BUILD_TIME)"; \
+	  case_source_hash="$$(sha256sum "$$fixture_dir/test/cases/cases/agentRoles.ts" | cut -d ' ' -f 1)"; \
+	  mkdir -p "$(ABILITY_PLACEMENT_OUTPUT_DIR)"; \
+	  docker build -f "$$source_dir/docker/Dockerfile" --target runtime -t "$(ABILITY_PLACEMENT_RUNTIME_IMAGE)" \
+	    --build-arg GIT_SHA="$$commit" --build-arg GIT_REVISION="$$commit" \
+	    --build-arg BUILD_TIME="$$built_at" "$$source_dir"; \
+	  docker build -f "$$source_dir/docker/Dockerfile" --target builder -t "$(ABILITY_PLACEMENT_BUILDER_IMAGE)" \
+	    --build-arg GIT_SHA="$$commit" --build-arg BUILD_TIME="$$built_at" "$$source_dir"; \
+	  docker volume create "$(ABILITY_PLACEMENT_VOLUME)" >/dev/null; \
+	  docker run --rm --mount "type=volume,src=$(ABILITY_PLACEMENT_VOLUME),dst=/data" \
+	    --entrypoint chown "$(ABILITY_PLACEMENT_BUILDER_IMAGE)" -R node:node /data; \
+	  docker run --rm --name "$(ABILITY_PLACEMENT_CONTAINER)-seed" \
+	    --user node \
+	    --mount "type=volume,src=$(ABILITY_PLACEMENT_VOLUME),dst=/data" \
+	    --mount "type=bind,src=$$source_dir/scripts,dst=/app/scripts,readonly" \
+	    --mount "type=bind,src=$$fixture_dir/test,dst=/app/test,readonly" \
+	    --workdir /app -e HOME=/tmp -e DATA_DIR=/data -e VECTOR_SEARCH=off \
+	    -e CASE=agent-roles -e NOW="$(ABILITY_PLACEMENT_NOW)" -e SCALE=1 \
+	    -e SEED=ability-placement -e SEED_USER=admin -e SEED_PASSWORD=admin \
+	    --entrypoint npx "$(ABILITY_PLACEMENT_BUILDER_IMAGE)" tsx scripts/seed.ts >/dev/null; \
+	  docker run -d --name "$(ABILITY_PLACEMENT_CONTAINER)" \
+	    --mount "type=volume,src=$(ABILITY_PLACEMENT_VOLUME),dst=/data" \
+	    -p 127.0.0.1::3000 -e PORT=3000 -e DATA_DIR=/data -e VECTOR_SEARCH=off \
+	    "$(ABILITY_PLACEMENT_RUNTIME_IMAGE)" >/dev/null; \
+	  healthy=0; \
+	  for _ in $$(seq 1 90); do \
+	    state="$$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$(ABILITY_PLACEMENT_CONTAINER)")"; \
+	    if [ "$$state" = healthy ]; then healthy=1; break; fi; \
+	    if [ "$$state" = unhealthy ]; then docker logs "$(ABILITY_PLACEMENT_CONTAINER)"; exit 1; fi; \
+	    sleep 1; \
+	  done; \
+	  if [ "$$healthy" != 1 ]; then docker logs "$(ABILITY_PLACEMENT_CONTAINER)"; echo 'ability-placement server did not become healthy' >&2; exit 1; fi; \
+	  port="$$(docker port "$(ABILITY_PLACEMENT_CONTAINER)" 3000/tcp | sed -n '1s/.*://p')"; \
+	  image="$$(docker inspect --format '{{.Image}}' "$(ABILITY_PLACEMENT_CONTAINER)")"; \
+	  BASE_URL="http://127.0.0.1:$$port" BENCH_PHASE="$$phase" BENCH_COMMIT="$$commit" \
+	    BENCH_IMAGE="$$image" BENCH_CONTAINER="$(ABILITY_PLACEMENT_CONTAINER)" \
+	    BENCH_OUTPUT="$(ABILITY_PLACEMENT_OUTPUT_DIR)/$$phase.json" \
+	    BENCH_BASELINE="$(if $(filter post,$(ABILITY_PLACEMENT_PHASE)),$(ABILITY_PLACEMENT_OUTPUT_DIR)/pre.json,)" \
+	    BENCH_USER=admin BENCH_PASSWORD=admin BENCH_CASE_SOURCE_HASH="$$case_source_hash" \
+	    CASE=agent-roles NOW="$(ABILITY_PLACEMENT_NOW)" \
+	    SCALE=1 SEED=ability-placement WARMUPS=5 MEASURED=30 \
+	    npx tsx scripts/abilityPlacementBench.ts
 
 # The pinned Playwright container owns browsers/fonts/system libraries. A clean
 # source snapshot (including external baselines, excluding host deps/state) is

@@ -1,3 +1,4 @@
+import type { OwnedAbilityLocator } from '@notarium/contract'
 import { parseAbilityLocator, serializeAbilityLocator } from '@notarium/core'
 import type {
   AgentSessionNamedStart,
@@ -18,6 +19,17 @@ type AgentSessionLifecycleView = {
 export class InMemoryAgentSessions implements AgentSessionsPersistence {
   private readonly records = new Map<string, AgentSessionRecord>()
   private lifecycleView?: AgentSessionLifecycleView
+  private resolveRoleLocator = (
+    locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
+  ): Extract<OwnedAbilityLocator, { kind: 'role' }> => locator
+
+  setRoleLocatorResolver(
+    resolve: (
+      locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
+    ) => Extract<OwnedAbilityLocator, { kind: 'role' }>,
+  ) {
+    this.resolveRoleLocator = resolve
+  }
 
   attachLifecycle(view: AgentSessionLifecycleView): void {
     this.lifecycleView = view
@@ -191,12 +203,16 @@ export class InMemoryAgentSessions implements AgentSessionsPersistence {
     if (!record || record.owner !== owner) {
       return null
     }
+    const locator =
+      role.locator.source === 'owned' && role.locator.kind === 'role'
+        ? this.resolveRoleLocator(role.locator)
+        : role.locator
     const changed =
       record.role !== role.name ||
-      JSON.stringify(record.roleLocator) !== JSON.stringify(role.locator) ||
+      JSON.stringify(record.roleLocator) !== JSON.stringify(locator) ||
       record.roleContextProjectId !== role.contextProjectId
     record.role = role.name
-    record.roleLocator = role.locator
+    record.roleLocator = locator
     record.roleContextProjectId = role.contextProjectId
     return { record: clone(record), changed }
   }

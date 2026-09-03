@@ -302,14 +302,22 @@ not introduce hidden edges that contradict it.
   provide typed refusal and purge deletes the child rows itself.
 - A binding may reference `folders`: the parent is ordered above the ability
   child, and the writer already holds those project rows.
-- Ability preference writes and placement moves serialize on a package key,
-  because a range rewrite cannot lock an owner row that does not exist yet.
-  Scope-pin moves use the analogous target key.
-- Two placement consumers still have no shared arbitration key. A concurrent
-  `contextSets.attach` can commit the target id a Role has just left because it
-  remains a helper-less autocommit statement; `agent_sessions.role_locator` is
-  outside the ladder, so an exact resume with a stale address fails closed. These
-  are current concurrency gaps, not compatibility paths in the migration ladder.
+- An Owned Role locator is the placement authority. The existing
+  `<scope>:<encoded-owner>:<package-id>` context target remains the compatible
+  storage/wire projection; one pure adapter owns both directions and Project reverse
+  projection requires `target_space`. Placement trail rows are one-hop, primary-key
+  lookups bound to registry and manifest identity. Exact record/cancel replay returns
+  before pointer DML; contradictory destination or identity evidence fails closed.
+- Role attachment, pin, and order writers serialize with placement moves on the
+  immutable package key at L2b/L2d/L2e, then resolve the one-hop trail through one
+  exact post-lock PK read and write only the live compatible target. The read is a
+  separate statement deliberately: under `READ COMMITTED`, a statement that waited
+  on the advisory would otherwise keep its pre-wait snapshot. Non-Role writers keep
+  their prior statement shape. Ability preferences use the same package invariant at
+  L4p. `sessions.setRole` takes the session row first, resolves the stale locator with
+  the same fresh exact read, and compares the resolved locator before reporting a
+  change; the placement move rewrites the same row, so either commit order converges
+  idempotently on the live locator.
 - The provider contour follows tier 4, opening with the instance-global
   `secret_keyring` fence and continuing credentials → resources → attachments →
   call journal. Every ciphertext writer enters the keyring fence first, and a

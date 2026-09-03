@@ -3,6 +3,7 @@ import type {
   ContextOrderPersistence,
   ContextOrderRecord,
   ContextSetTargetKind,
+  RoleContextTargetAddress,
 } from '@notarium/server'
 
 /** In-memory twin of the context-order facet (#210) for the fake server — mirrors the
@@ -10,6 +11,11 @@ import type {
  *  REPLACES the scope's whole order with dense ranks (0-based). */
 export class InMemoryContextOrder implements ContextOrderPersistence {
   private rows: ContextOrderRecord[] = []
+  private resolveRoleTarget = (target: RoleContextTargetAddress) => target
+
+  setRoleTargetResolver(resolve: (target: RoleContextTargetAddress) => RoleContextTargetAddress) {
+    this.resolveRoleTarget = resolve
+  }
 
   clear(): void {
     this.rows = []
@@ -31,6 +37,11 @@ export class InMemoryContextOrder implements ContextOrderPersistence {
     targetSpace: string,
     entries: ReadonlyArray<{ entryKind: ContextOrderEntryKind; entryRef: string }>,
   ): Promise<void> {
+    if (targetKind === 'role') {
+      const live = this.resolveRoleTarget({ targetId, targetSpace })
+      targetId = live.targetId
+      targetSpace = live.targetSpace
+    }
     this.rows = this.rows.filter((r) => !(r.targetKind === targetKind && r.targetId === targetId))
     // Dedup by (entryKind, entryRef) — the real drivers share that PK, so a duplicate would be
     // a 500 there; drop it here too for parity.

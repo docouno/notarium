@@ -18,6 +18,22 @@ import {
   enterIdentityTierForReferences,
   resolveLiveIdentityForWrite,
 } from './liveIdentity'
+import { resolveLiveRoleTargetForWrite } from './liveRoleTarget'
+
+const ROLE_TARGET = 'role'
+
+const attach = (db: SqliteDriverCtx['required'], r: ContextSetAttachmentRecord) =>
+  db
+    .prepare(
+      `INSERT INTO context_set_attachments
+        (set_id, target_kind, target_id, target_space, created_at, home_space)
+       SELECT ?, ?, ?, ?, ?, home_space FROM context_sets WHERE id = ?
+         ON CONFLICT(set_id, target_kind, target_id) DO UPDATE SET
+           target_space = excluded.target_space,
+           created_at = excluded.created_at,
+           home_space = excluded.home_space`,
+    )
+    .run(r.setId, r.targetKind, r.targetId, r.targetSpace, r.createdAt, r.setId)
 
 export const createContextSetsFacet = (ctx: SqliteDriverCtx): ContextSetsPersistence => ({
   createSet: async (r: ContextSetRecord) => {
@@ -216,25 +232,55 @@ export const createContextSetsFacet = (ctx: SqliteDriverCtx): ContextSetsPersist
   },
   attach: async (r: ContextSetAttachmentRecord) => {
     await ctx.ensureInit()
-    ctx.required
-      .prepare(
-        `INSERT INTO context_set_attachments
-          (set_id, target_kind, target_id, target_space, created_at, home_space)
-         SELECT ?, ?, ?, ?, ?, home_space FROM context_sets WHERE id = ?
-           ON CONFLICT(set_id, target_kind, target_id) DO UPDATE SET
-             target_space = excluded.target_space,
-             created_at = excluded.created_at,
-             home_space = excluded.home_space`,
-      )
-      .run(r.setId, r.targetKind, r.targetId, r.targetSpace, r.createdAt, r.setId)
+    if (r.targetKind !== ROLE_TARGET) {
+      attach(ctx.required, r)
+      return
+    }
+    ctx.required.exec('BEGIN IMMEDIATE')
+    try {
+      const live = resolveLiveRoleTargetForWrite(ctx.required, {
+        targetId: r.targetId,
+        targetSpace: r.targetSpace,
+      })
+      attach(ctx.required, {
+        ...r,
+        targetId: live.target.targetId,
+        targetSpace: live.target.targetSpace,
+      })
+      ctx.required.exec('COMMIT')
+    } catch (error) {
+      ctx.required.exec('ROLLBACK')
+      throw error
+    }
   },
-  detach: async (setId: string, targetKind: ContextSetTargetKind, targetId: string) => {
+  detach: async (
+    setId: string,
+    targetKind: ContextSetTargetKind,
+    targetId: string,
+    targetSpace: string,
+  ) => {
     await ctx.ensureInit()
-    ctx.required
-      .prepare(
-        'DELETE FROM context_set_attachments WHERE set_id = ? AND target_kind = ? AND target_id = ?',
-      )
-      .run(setId, targetKind, targetId)
+    if (targetKind !== ROLE_TARGET) {
+      ctx.required
+        .prepare(
+          'DELETE FROM context_set_attachments WHERE set_id = ? AND target_kind = ? AND target_id = ?',
+        )
+        .run(setId, targetKind, targetId)
+      return
+    }
+    ctx.required.exec('BEGIN IMMEDIATE')
+    try {
+      const live = resolveLiveRoleTargetForWrite(ctx.required, { targetId, targetSpace })
+      ctx.required
+        .prepare(
+          'DELETE FROM context_set_attachments WHERE set_id = ? AND target_kind = ? AND target_id = ?',
+        )
+        .run(setId, targetKind, live.target.targetId)
+      ctx.required.exec('COMMIT')
+    } catch (error) {
+      ctx.required.exec('ROLLBACK')
+      throw error
+    }
   },
   attachmentsForSet: async (setId: string) => {
     await ctx.ensureInit()

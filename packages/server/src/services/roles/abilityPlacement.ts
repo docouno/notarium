@@ -18,7 +18,7 @@ export const createInMemoryAbilityPlacement = (facets: {
   resolveMovedOwnedRoleLocator: async (fromLocator) =>
     facets.abilityPreferences.movedPlacement(fromLocator),
   moveOwnedRolePlacement: async (move: OwnedRolePlacementMove) => {
-    facets.abilityPreferences.moveLocator(
+    return facets.abilityPreferences.moveLocator(
       move.fromLocator,
       move.toLocator,
       move.registryNoteId,

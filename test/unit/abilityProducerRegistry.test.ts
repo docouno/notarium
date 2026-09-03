@@ -235,7 +235,7 @@ const RULES: readonly SpellingRule[] = [
   },
   {
     rule: 'which address does this placement answer to',
-    producer: 'ownedRoleLocator / ownedSkillLocator (server/services/roles/roles.ts)',
+    producer: 'ownedRoleLocator / ownedSkillLocator (server/services/roles/locator.ts)',
     find: addressedLocatorLiterals,
     secondSpelling: `
       const target = {
@@ -261,8 +261,10 @@ const RULES: readonly SpellingRule[] = [
         'the same, for the skill arm',
       'packages/core/src/libs/abilityLocator/abilityLocator.ts#serializeAbilityLocator':
         'the canonical serializer: every field is read off the locator it was handed, in a fixed order for cache keys — it re-states an address, it cannot invent one',
-      'packages/server/src/services/roles/roles.ts#ownedRoleLocator': 'the producer, role arm',
-      'packages/server/src/services/roles/roles.ts#ownedSkillLocator': 'the producer, skill arm',
+      'packages/server/src/services/roles/locator.ts#ownedRoleLocator': 'the producer, role arm',
+      'packages/server/src/services/roles/locator.ts#ownedSkillLocator': 'the producer, skill arm',
+      'packages/server/src/services/metaDb/abilityAddress.ts#ownedRoleLocatorOfContextTarget':
+        'the canonical reverse projection of a persisted context target; it validates the reconstructed locator by projecting it back before returning it',
       'packages/server/src/services/abilities/helpers/create/creator.ts#createDurably':
         'durable operation evidence snapshots the already service-minted placement beside kind/package identity; it never constructs a public locator',
     },
@@ -391,6 +393,8 @@ const CALL_REGISTERS: readonly CallRegister[] = [
         'the shared authoring capture resolves placement authority for get/save/edit/remove and version forks without loading unrelated detail projections',
       'packages/server/src/services/abilities/abilities.ts#setEnabled':
         'the human owner-preference door accepts a readable package but still binds the preference write to its exact live identity',
+      'test/cases/applyAgentRoleMoves.ts#applyAgentRoleMoves':
+        'the shared seed applier captures the declared source before publishing the same move through every runtime',
     },
   },
   {
@@ -498,6 +502,8 @@ const CALL_REGISTERS: readonly CallRegister[] = [
       'packages/server/src/services/abilities/abilities.ts#applyAvailability':
         'Space reach mutation',
       'packages/server/src/services/abilities/abilities.ts#setHome': 'the direct Role home move',
+      'test/cases/applyAgentRoleMoves.ts#applyAgentRoleMoves':
+        'the shared seed applier uses the same proven Personal classification when replaying declarative moves',
       'packages/server/src/services/abilities/abilities.ts#save': 'compound Save home transition',
       'packages/server/src/services/abilities/abilities.ts#edit': 'MCP edit home transition',
       'packages/server/src/services/abilities/abilities.ts#removeOwnedPackage':

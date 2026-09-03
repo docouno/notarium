@@ -162,7 +162,7 @@ describe('a promotion the host could not confirm', () => {
     expect(JSON.stringify(errorLog?.mock.calls)).not.toContain('[api]')
   })
 
-  it('keeps the failure typed and the new home addressable when it does not', async () => {
+  it('keeps the failure typed and makes the stale retry terminal when it does not', async () => {
     const host = await boot()
     const locator = await projectRoleOf(host, 'review')
 
@@ -194,13 +194,21 @@ describe('a promotion the host could not confirm', () => {
     // half-landed promotion is nowhere at all.
     expect(body.error).not.toContain('the projection barrier timed out')
     expect(JSON.stringify(errorLog?.mock.calls)).toContain('the projection barrier timed out')
-    // Nothing is rolled back for a barrier that ran after the commit, so the placement
-    // the caller named is not a home this role has any more — and asking again at that
-    // address is not a second promotion.
+    // Nothing is rolled back for a barrier that ran after the commit. The stale
+    // placement therefore resolves through the durable move trail, and the retry is
+    // the ordinary terminal success with the address the role now has.
     barrier.unanswerableAt = null
 
     const again = await promote(host, locator)
 
-    expect(again.statusCode).not.toBe(200)
+    expect(again.statusCode, again.body).toBe(200)
+    expect(again.json()).toMatchObject({
+      locator: {
+        source: 'owned',
+        kind: 'role',
+        packageId: locator.packageId,
+        location: { scope: 'space', spaceId: locator.location.spaceId },
+      },
+    })
   })
 })

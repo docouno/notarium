@@ -64,10 +64,6 @@ const hash32 = (value: string): number => {
   return hash
 }
 
-/** The per-scope advisory key: same hash, same input (`kind:id`). */
-const scopeLockKey = (targetKind: string, targetId: string): number =>
-  hash32(`${targetKind}:${targetId}`)
-
 type Probe = { id: string; run: (db: MetaDb) => Promise<unknown> }
 
 /** The transactions that touch more than one tier — the only ones a lock order can be
@@ -194,10 +190,18 @@ const PROBES: readonly Probe[] = [
     id: 'abilityPlacement.moveOwnedRolePlacement',
     run: (db) =>
       db.abilityPlacement.moveOwnedRolePlacement({
-        fromTargetId: `project:${PROJECT}:${PACKAGE}`,
-        toTargetId: `space:${SPACE}:${PACKAGE}`,
-        fromLocator: `owned:role:project:${SPACE}:${PROJECT}:${PACKAGE}`,
-        toLocator: `owned:role:space:${SPACE}:${PACKAGE}`,
+        fromLocator: serializeAbilityLocator({
+          source: 'owned',
+          kind: 'role',
+          packageId: PACKAGE,
+          location: { scope: 'project', spaceId: SPACE, projectId: PROJECT },
+        }),
+        toLocator: serializeAbilityLocator({
+          source: 'owned',
+          kind: 'role',
+          packageId: PACKAGE,
+          location: { scope: 'space', spaceId: SPACE },
+        }),
         registryNoteId: NOTE,
         manifestNoteId: NOTE,
         trail: 'record',
@@ -820,8 +824,6 @@ describePostgres('Postgres deadlock probes', PROBE_SUITE, () => {
         )
       const moving = db.abilityPlacement
         .moveOwnedRolePlacement({
-          fromTargetId: `project:${PROJECT}:${PACKAGE}`,
-          toTargetId: `space:${SPACE}:${PACKAGE}`,
           fromLocator,
           toLocator,
           registryNoteId: NOTE,
@@ -890,12 +892,15 @@ describePostgres('Postgres deadlock probes', PROBE_SUITE, () => {
         held.release()
       }
       await held.query('BEGIN')
-      // The L2d key, spelled the way `lockScopePinTargets` spells it: the namespace of
-      // the pin advisory and the 32-bit hash of `kind:id`, sorted by the helper, so the
-      // source target is the one the move takes first.
-      await held.query('SELECT pg_advisory_xact_lock($1, $2)', [
-        0x7363_5069,
-        scopeLockKey('role', fromTargetId),
+      const fromLocator = serializeAbilityLocator({
+        source: 'owned',
+        kind: 'role',
+        packageId: PACKAGE,
+        location: { scope: 'project', spaceId: SPACE, projectId: PROJECT },
+      })
+      await held.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
+        'notarium:role-scope-pin',
+        abilityPackageOfLocator(fromLocator),
       ])
 
       const pinning = db.scopePins
@@ -913,14 +918,7 @@ describePostgres('Postgres deadlock probes', PROBE_SUITE, () => {
         )
       const moving = db.abilityPlacement
         .moveOwnedRolePlacement({
-          fromTargetId,
-          toTargetId,
-          fromLocator: serializeAbilityLocator({
-            source: 'owned',
-            kind: 'role',
-            packageId: PACKAGE,
-            location: { scope: 'project', spaceId: SPACE, projectId: PROJECT },
-          }),
+          fromLocator,
           toLocator: serializeAbilityLocator({
             source: 'owned',
             kind: 'role',
@@ -952,6 +950,202 @@ describePostgres('Postgres deadlock probes', PROBE_SUITE, () => {
       await testSchema.teardown()
     }
   })
+
+  it('serializes a context-set attachment against the placement move package stripe', async () => {
+    const testSchema = await createPostgresTestSchema('lock_pairs_attachments')
+    const db = testSchema.db
+    const gate = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const fromTargetId = `project:${PROJECT}:${PACKAGE}`
+    const toTargetId = `space:${SPACE}:${PACKAGE}`
+    const fromLocator = serializeAbilityLocator({
+      source: 'owned',
+      kind: 'role',
+      packageId: PACKAGE,
+      location: { scope: 'project', spaceId: SPACE, projectId: PROJECT },
+    })
+    const toLocator = serializeAbilityLocator({
+      source: 'owned',
+      kind: 'role',
+      packageId: PACKAGE,
+      location: { scope: 'space', spaceId: SPACE },
+    })
+
+    let release = async (): Promise<void> => {}
+
+    try {
+      await seed(db)
+      await db.contextSets.createSet({
+        id: 'set-placement',
+        homeSpace: SPACE,
+        name: 'Placement',
+        items: [],
+        createdAt: AT,
+      })
+      const held = await gate.connect()
+
+      release = async () => {
+        release = async () => {}
+        await held.query('COMMIT').catch(() => {})
+        held.release()
+      }
+      await held.query('BEGIN')
+      await held.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
+        'notarium:role-context-target',
+        abilityPackageOfLocator(fromLocator),
+      ])
+      const attaching = db.contextSets
+        .attach({
+          setId: 'set-placement',
+          targetKind: 'role',
+          targetId: fromTargetId,
+          targetSpace: SPACE,
+          createdAt: AT,
+        })
+        .then(
+          () => null,
+          (error: unknown) => error,
+        )
+      const moving = db.abilityPlacement
+        .moveOwnedRolePlacement({
+          fromLocator,
+          toLocator,
+          registryNoteId: NOTE,
+          manifestNoteId: NOTE,
+          trail: 'record',
+        })
+        .then(
+          () => null,
+          (error: unknown) => error,
+        )
+
+      await requireWaiters(testSchema.admin, testSchema.schema, 2)
+      await release()
+      expect([await attaching, await moving].map(deadlockOf).filter(Boolean)).toEqual([])
+      expect((await db.contextSets.setsForTarget('role', toTargetId)).map((set) => set.id)).toEqual(
+        ['set-placement'],
+      )
+      expect(await db.contextSets.setsForTarget('role', fromTargetId)).toEqual([])
+    } finally {
+      await release()
+      await gate.end().catch(() => {})
+      await testSchema.teardown()
+    }
+  })
+
+  it.each(['attachment', 'pin', 'order', 'replay'] as const)(
+    'resolves a move-first stale %s after the package lock wait',
+    async (operation) => {
+      const testSchema = await createPostgresTestSchema(`lock_pairs_move_first_${operation}`)
+      const db = testSchema.db
+      const gate = new pg.Pool({ connectionString: testSchema.scopedUrl })
+      const fromTargetId = `project:${PROJECT}:${PACKAGE}`
+      const toTargetId = `space:${SPACE}:${PACKAGE}`
+      const fromLocator = serializeAbilityLocator({
+        source: 'owned',
+        kind: 'role',
+        packageId: PACKAGE,
+        location: { scope: 'project', spaceId: SPACE, projectId: PROJECT },
+      })
+      const toLocator = serializeAbilityLocator({
+        source: 'owned',
+        kind: 'role',
+        packageId: PACKAGE,
+        location: { scope: 'space', spaceId: SPACE },
+      })
+      const move = {
+        fromLocator,
+        toLocator,
+        registryNoteId: NOTE,
+        manifestNoteId: NOTE,
+        trail: 'record' as const,
+      }
+      const blockerNamespace =
+        operation === 'pin'
+          ? 'notarium:role-context-order'
+          : operation === 'order'
+            ? 'notarium:ability-preferences'
+            : 'notarium:role-scope-pin'
+
+      let release = async (): Promise<void> => {}
+
+      try {
+        await seed(db)
+        const held = await gate.connect()
+
+        release = async () => {
+          release = async () => {}
+          await held.query('COMMIT').catch(() => {})
+          held.release()
+        }
+        await held.query('BEGIN')
+        await held.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
+          blockerNamespace,
+          abilityPackageOfLocator(fromLocator),
+        ])
+        // The move owns every earlier package level before it parks here. A stale
+        // writer started NOW queues behind the move, so its trail read must use a new
+        // post-wait statement snapshot or it will acknowledge the abandoned target.
+        const moving = db.abilityPlacement.moveOwnedRolePlacement(move)
+
+        await requireWaiters(testSchema.admin, testSchema.schema, 1)
+        const late =
+          operation === 'attachment'
+            ? db.contextSets.attach({
+                setId: 'set-1',
+                targetKind: 'role',
+                targetId: fromTargetId,
+                targetSpace: SPACE,
+                createdAt: AT,
+              })
+            : operation === 'pin'
+              ? db.scopePins.addPin({
+                  targetKind: 'role',
+                  targetId: fromTargetId,
+                  targetSpace: SPACE,
+                  noteSpace: SPACE,
+                  noteId: NOTE,
+                  createdAt: AT,
+                })
+              : operation === 'order'
+                ? db.contextOrder.setOrder('role', fromTargetId, SPACE, [
+                    { entryKind: 'set', entryRef: 'set-1' },
+                  ])
+                : db.abilityPlacement.moveOwnedRolePlacement(move)
+
+        await requireWaiters(testSchema.admin, testSchema.schema, 2)
+        await release()
+        await expect(moving).resolves.toBe('applied')
+        if (operation === 'replay') {
+          await expect(late).resolves.toBe('replayed')
+        } else {
+          await expect(late).resolves.toBeUndefined()
+        }
+
+        if (operation === 'attachment') {
+          expect(
+            (await db.contextSets.setsForTarget('role', toTargetId)).map((set) => set.id),
+          ).toEqual(['set-1'])
+          expect(await db.contextSets.setsForTarget('role', fromTargetId)).toEqual([])
+        } else if (operation === 'pin') {
+          expect(
+            (await db.scopePins.pinsForTarget('role', toTargetId)).map((pin) => pin.noteId),
+          ).toEqual([NOTE])
+          expect(await db.scopePins.pinsForTarget('role', fromTargetId)).toEqual([])
+        } else if (operation === 'order') {
+          expect(
+            (await db.contextOrder.orderForTarget('role', toTargetId)).map(
+              (entry) => entry.entryRef,
+            ),
+          ).toEqual(['set-1'])
+          expect(await db.contextOrder.orderForTarget('role', fromTargetId)).toEqual([])
+        }
+      } finally {
+        await release()
+        await gate.end().catch(() => {})
+        await testSchema.teardown()
+      }
+    },
+  )
 
   it('serializes two re-claims of one logical job call so only one may send', async () => {
     const testSchema = await createPostgresTestSchema('lock_pairs_call_log')

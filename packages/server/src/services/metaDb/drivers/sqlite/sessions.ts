@@ -1,10 +1,12 @@
 import { parseAbilityLocator, serializeAbilityLocator } from '@notarium/core'
+import { roleContextTargetOfLocator } from '../../abilityAddress'
 import type {
   AgentSessionNamedStart,
   AgentSessionRecord,
   AgentSessionsPersistence,
 } from '../../types'
 import type { SqliteDriverCtx } from './context'
+import { resolveLiveRoleTargetForWrite } from './liveRoleTarget'
 
 type AgentSessionRow = {
   id: string
@@ -245,9 +247,14 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
         ctx.required.exec('COMMIT')
         return null
       }
+      const roleLocator =
+        role.locator.source === 'owned' && role.locator.kind === 'role'
+          ? resolveLiveRoleTargetForWrite(ctx.required, roleContextTargetOfLocator(role.locator))
+              .locator
+          : role.locator
       const changed =
         before.role !== role.name ||
-        before.role_locator !== serializeAbilityLocator(role.locator) ||
+        before.role_locator !== serializeAbilityLocator(roleLocator) ||
         before.role_context_project_id !== role.contextProjectId
       const row = changed
         ? (ctx.required
@@ -258,7 +265,7 @@ export const createSessionsFacet = (ctx: SqliteDriverCtx): AgentSessionsPersiste
             )
             .get(
               role.name,
-              serializeAbilityLocator(role.locator),
+              serializeAbilityLocator(roleLocator),
               role.contextProjectId,
               owner,
               id,

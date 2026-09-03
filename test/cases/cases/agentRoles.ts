@@ -120,6 +120,18 @@ export const agentRoles: CaseSpec = {
       title: 'Research source map',
       created: daysBefore(now, 2),
     })
+    const placementSentinelContext = b.note({
+      space: 'team',
+      path: 'gamma/placement-sentinel.md',
+      title: 'Placement sentinel context',
+      created: daysBefore(now, 1.8),
+    })
+    const fieldGuideContext = b.note({
+      space: 'team',
+      path: 'other/field-guide-context.md',
+      title: 'Field guide carried context',
+      created: daysBefore(now, 1.7),
+    })
     const largeResearchPrelude = b.note({
       space: 'team',
       path: 'other/large-research-prelude.md',
@@ -174,6 +186,13 @@ export const agentRoles: CaseSpec = {
       description: 'Work this project surface without a shared default behind it.',
       instructions: '# Field guide\n\nWork the project surface from what it actually owns.',
       target: { kind: 'project', space: 'team', path: 'other' },
+    })
+    b.agentRole({
+      source: 'custom',
+      name: 'placement-sentinel',
+      description: 'A pre-moved role proving seeded placement trail and carried state.',
+      instructions: '# Placement sentinel\n\nKeep the seeded state through promotion.',
+      target: { kind: 'project', space: 'team', path: 'gamma' },
     })
     // The V18 state a copy used to stand in for: one role, needed in two of the five
     // Team projects. Its reach is narrowed, so it is the only Space role a
@@ -352,6 +371,44 @@ export const agentRoles: CaseSpec = {
         { kind: 'pin', note: oversizedResearch },
       ],
     })
+    const placementSentinel = {
+      kind: 'role' as const,
+      name: 'placement-sentinel',
+      target: { kind: 'project' as const, space: 'team', path: 'gamma' },
+    }
+    b.scopePin({ note: placementSentinelContext, attach: placementSentinel })
+    b.contextSet({
+      homeSpace: 'team',
+      name: 'Placement sentinel set',
+      items: [placementSentinelContext],
+      attach: [placementSentinel],
+    })
+    b.contextOrderFor({
+      scope: placementSentinel,
+      entries: [
+        { kind: 'pin', note: placementSentinelContext },
+        { kind: 'set', name: 'Placement sentinel set' },
+      ],
+    })
+    const fieldGuideTarget = {
+      kind: 'role' as const,
+      name: 'field-guide',
+      target: { kind: 'project' as const, space: 'team', path: 'other' },
+    }
+    b.scopePin({ note: fieldGuideContext, attach: fieldGuideTarget })
+    b.contextSet({
+      homeSpace: 'team',
+      name: 'Field guide carry set',
+      items: [fieldGuideContext],
+      attach: [fieldGuideTarget],
+    })
+    b.contextOrderFor({
+      scope: fieldGuideTarget,
+      entries: [
+        { kind: 'pin', note: fieldGuideContext },
+        { kind: 'set', name: 'Field guide carry set' },
+      ],
+    })
     b.scopePin({
       note: workResearch,
       attach: {
@@ -372,6 +429,16 @@ export const agentRoles: CaseSpec = {
       ability: { source: 'system', kind: 'role', name: 'research' },
       enabled: false,
     })
+    b.agentAbilityPreference({
+      user: 'maya',
+      ability: {
+        source: 'owned',
+        kind: 'role',
+        name: 'placement-sentinel',
+        target: { kind: 'project', space: 'team', path: 'gamma' },
+      },
+      enabled: false,
+    })
     b.agentSession({
       ref: 'maya-research',
       owner: 'maya',
@@ -380,6 +447,31 @@ export const agentRoles: CaseSpec = {
       lastSeenDaysAgo: 0.01,
       calls: 4,
       role: 'research',
+    })
+    b.agentSession({
+      ref: 'maya-placement-sentinel',
+      owner: 'robin',
+      name: 'placement sentinel session',
+      createdDaysAgo: 0.08,
+      lastSeenDaysAgo: 10,
+      calls: 2,
+      role: 'placement-sentinel',
+      project: { space: 'team', path: 'gamma' },
+    })
+    b.agentSession({
+      ref: 'maya-field-guide',
+      owner: 'robin',
+      name: 'field guide session',
+      createdDaysAgo: 0.07,
+      lastSeenDaysAgo: 9,
+      calls: 2,
+      role: 'field-guide',
+      project: { space: 'team', path: 'other' },
+    })
+    b.agentRoleMove({
+      name: 'placement-sentinel',
+      from: { kind: 'project', space: 'team', path: 'gamma' },
+      to: { kind: 'space', space: 'team' },
     })
 
     return b.build()

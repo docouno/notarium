@@ -1,4 +1,5 @@
 import type { Request } from '@playwright/test'
+import { encodeAbilityLocator } from '@notarium/core'
 import { buildCaseWorld, caseToFixture } from '../cases'
 import { expect, type Locator, type Page, test } from './fixtures'
 
@@ -1469,6 +1470,23 @@ test('@v18 a project-only role changes what it belongs to, in the editor', async
   await expect(guide).toContainText('Team')
   await expect(guide).not.toContainText('Version ·')
   await guide.click()
+  const inventory = await (await page.request.get('/api/me/agent-roles?limit=100')).json()
+  const fieldGuide = inventory.items.find((item: { name: string }) => item.name === 'field-guide')
+  const oldRef = encodeAbilityLocator(fieldGuide.locator)
+  const other = inventory.projects.find(
+    (project: { handle: string }) => project.handle === 'team/other',
+  )
+  const seededContext = await (
+    await page.request.get(
+      `/api/me/agent-roles/${encodeURIComponent(oldRef)}/context?project=${encodeURIComponent(other.id)}`,
+    )
+  ).json()
+  expect(seededContext.role.pins).toEqual(
+    expect.arrayContaining([expect.objectContaining({ title: 'Field guide carried context' })]),
+  )
+  expect(seededContext.role.sets).toEqual(
+    expect.arrayContaining([expect.objectContaining({ name: 'Field guide carry set' })]),
+  )
   const detail = page.getByTestId('agent-ability-detail')
   await expect(detail).toContainText('Work the project surface')
   await openAbilityPanel(page)
@@ -1481,6 +1499,9 @@ test('@v18 a project-only role changes what it belongs to, in the editor', async
   // The kebab's whole item set, so a placement command has nowhere to hide in it:
   // Add version is a Space base's action and Edit is the topbar's own button.
   await expect(page.getByRole('menuitem')).toHaveText(['Configure context', 'Disable', 'Delete'])
+  await page.getByRole('menuitem', { name: 'Disable' }).click()
+  await page.getByTestId('ability-detail-menu').click()
+  await expect(page.getByRole('menuitem', { name: 'Enable' })).toBeVisible()
   await page.keyboard.press('Escape')
 
   // One question, still live after publication: the whole Space, or the projects it
@@ -1524,6 +1545,35 @@ test('@v18 a project-only role changes what it belongs to, in the editor', async
   await openAbilityPanel(page)
   await expect(page.getByTestId('ability-settings')).toContainText('Team')
   await expect(detail).toContainText('Work the project surface')
+  const movedInventory = await (await page.request.get('/api/me/agent-roles?limit=100')).json()
+  const movedFieldGuide = movedInventory.items.find(
+    (item: { name: string }) => item.name === 'field-guide',
+  )
+  const currentRef = encodeAbilityLocator(movedFieldGuide.locator)
+
+  await page.reload()
+  await expect(detail).toContainText('Work the project surface')
+  await page.getByTestId('ability-detail-menu').click()
+  await expect(page.getByRole('menuitem', { name: 'Enable' })).toBeVisible()
+  await page.keyboard.press('Escape')
+  const carriedContext = await (
+    await page.request.get(
+      `/api/me/agent-roles/${encodeURIComponent(currentRef)}/context?project=${encodeURIComponent(other.id)}`,
+    )
+  ).json()
+  expect(carriedContext.role.pins).toEqual(
+    expect.arrayContaining([expect.objectContaining({ title: 'Field guide carried context' })]),
+  )
+  expect(carriedContext.role.sets).toEqual(
+    expect.arrayContaining([expect.objectContaining({ name: 'Field guide carry set' })]),
+  )
+  for (const ref of [oldRef, currentRef]) {
+    const replay = await page.request.put(
+      `/api/me/agent-abilities/${encodeURIComponent(ref)}/home`,
+      { data: { scope: 'space' } },
+    )
+    expect(replay.status()).toBe(200)
+  }
 
   // The mirror of the same rule, now that it belongs to the whole Space: looking at
   // the project list and coming back leaves the answer — and the Save button — where

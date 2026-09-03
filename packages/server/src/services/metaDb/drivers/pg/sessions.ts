@@ -1,7 +1,7 @@
 import type pg from 'pg'
 
 import { parseAbilityLocator, serializeAbilityLocator } from '@notarium/core'
-
+import { resolveLiveRoleContextTarget, roleContextTargetOfLocator } from '../../abilityAddress'
 import type {
   AgentSessionNamedStart,
   AgentSessionRecord,
@@ -292,20 +292,59 @@ export const createSessionsFacet = (ctx: PgDriverCtx): AgentSessionsPersistence 
         await client.query('COMMIT')
         return null
       }
+      const requestedRoleLocator = serializeAbilityLocator(role.locator)
+      let resolvedRoleLocator = requestedRoleLocator
+
+      if (role.locator.source === 'owned' && role.locator.kind === 'role') {
+        // A session row is the guard for this mutation, but a placement move may have
+        // committed before the guard was acquired. Use a fresh post-guard statement,
+        // then compare the LIVE locator so a stale repeat stays an observable no-op.
+        const trail = await client.query(
+          `SELECT to_locator, registry_note_id, manifest_note_id
+             FROM ability_placement_trail WHERE from_locator = $1`,
+          [requestedRoleLocator],
+        )
+        const evidence = trail.rows[0] as
+          | {
+              to_locator: string
+              registry_note_id: string
+              manifest_note_id: string
+            }
+          | undefined
+        const live = resolveLiveRoleContextTarget(
+          roleContextTargetOfLocator(role.locator),
+          evidence
+            ? {
+                toLocator: evidence.to_locator,
+                registryNoteId: evidence.registry_note_id,
+                manifestNoteId: evidence.manifest_note_id,
+              }
+            : null,
+        )
+        resolvedRoleLocator = serializeAbilityLocator(live.locator)
+      }
       const changed =
         before.role !== role.name ||
-        before.role_locator !== serializeAbilityLocator(role.locator) ||
+        before.role_locator !== resolvedRoleLocator ||
         before.role_context_project_id !== role.contextProjectId
       const row = changed
         ? ((
             await client.query(
               `UPDATE agent_sessions
-                  SET role = $1, role_locator = $2, role_context_project_id = $3
+                  SET role = $1,
+                      role_locator = $2,
+                      role_context_project_id = $3
                 WHERE owner = $4 AND id = $5 RETURNING ${COLUMNS}`,
-              [role.name, serializeAbilityLocator(role.locator), role.contextProjectId, owner, id],
+              [role.name, resolvedRoleLocator, role.contextProjectId, owner, id],
             )
           ).rows[0] as AgentSessionRow)
         : before
+
+      if (role.locator.source === 'owned' && role.locator.kind === 'role') {
+        if (resolvedRoleLocator !== row.role_locator) {
+          throw new Error('invalid Owned Role placement trail destination')
+        }
+      }
       await client.query('COMMIT')
       return { record: sessionOf(row), changed }
     } catch (error) {

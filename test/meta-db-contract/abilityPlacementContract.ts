@@ -36,8 +36,6 @@ const FROM_TARGET = `project:project-a:${PACKAGE_ID}`
 const TO_TARGET = `space:space-main:${PACKAGE_ID}`
 
 const move = {
-  fromTargetId: FROM_TARGET,
-  toTargetId: TO_TARGET,
   fromLocator: serializeAbilityLocator(projectLocator),
   toLocator: serializeAbilityLocator(spaceLocator),
   registryNoteId: REGISTRY_NOTE_ID,
@@ -49,8 +47,6 @@ const move = {
  *  backwards. It records a hop like any other move, because the package really did
  *  take the address it is going to and the spelling it leaves has to forward there. */
 const reverseMove = {
-  fromTargetId: TO_TARGET,
-  toTargetId: FROM_TARGET,
   fromLocator: serializeAbilityLocator(spaceLocator),
   toLocator: serializeAbilityLocator(projectLocator),
   registryNoteId: REGISTRY_NOTE_ID,
@@ -89,11 +85,11 @@ export type AbilityPlacementHost = {
   abilityPlacement: AbilityPlacementPersistence
   spaces: Pick<SpacesPersistence, 'upsert'>
   projects: Pick<ProjectsPersistence, 'upsert'>
-  contextSets: Pick<ContextSetsPersistence, 'createSet' | 'attach' | 'setsForTarget'>
-  scopePins: Pick<ScopePinsPersistence, 'addPin' | 'pinsForTarget'>
+  contextSets: Pick<ContextSetsPersistence, 'createSet' | 'attach' | 'detach' | 'setsForTarget'>
+  scopePins: Pick<ScopePinsPersistence, 'addPin' | 'removePin' | 'pinsForTarget'>
   contextOrder: Pick<ContextOrderPersistence, 'setOrder' | 'orderForTarget'>
   abilityPreferences: Pick<AbilityPreferencesPersistence, 'setEnabled' | 'isEnabled' | 'disabled'>
-  sessions: Pick<AgentSessionsPersistence, 'insert' | 'listRecent'>
+  sessions: Pick<AgentSessionsPersistence, 'insert' | 'listRecent' | 'setRole'>
 }
 
 /** Promoting a project version to the Space base changes the role's ADDRESS, and
@@ -295,7 +291,7 @@ export const describeAbilityPlacementContract = (
     })
 
     it('leaves pointer tables empty when the old placement holds nothing', async () => {
-      await expect(db.abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBeUndefined()
+      await expect(db.abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBe('applied')
       await expect(db.contextSets.setsForTarget('role', TO_TARGET)).resolves.toEqual([])
       await expect(db.scopePins.pinsForTarget('role', TO_TARGET)).resolves.toEqual([])
     })
@@ -377,15 +373,13 @@ export const describeAbilityPlacementContract = (
       await db.abilityPlacement.moveOwnedRolePlacement(move)
       await expect(
         db.abilityPlacement.moveOwnedRolePlacement({
-          fromTargetId: TO_TARGET,
-          toTargetId: FROM_TARGET,
           fromLocator: move.toLocator,
           toLocator: move.fromLocator,
           registryNoteId: REGISTRY_NOTE_ID,
           manifestNoteId: MANIFEST_NOTE_ID,
           trail: 'record',
         }),
-      ).resolves.toBeUndefined()
+      ).resolves.toBe('applied')
 
       await db.abilityPreferences.setEnabled(
         'user:alice',
@@ -406,6 +400,141 @@ export const describeAbilityPlacementContract = (
       await expect(bothSpellings(db.abilityPreferences, 'user:alice')).resolves.toEqual(
         BOTH_DISABLED,
       )
+    })
+
+    it('replays record before pointer DML and preserves the carried state', async () => {
+      await db.scopePins.addPin({
+        targetKind: 'role',
+        targetId: FROM_TARGET,
+        targetSpace: 'space-main',
+        noteSpace: 'space-main',
+        noteId: 'PinnedNote01',
+        createdAt: '2026-08-17T00:00:00Z',
+      })
+      await db.abilityPreferences.setEnabled(
+        'user:alice',
+        { locator: projectLocator, registryNoteId: REGISTRY_NOTE_ID },
+        false,
+        '2026-08-17T00:00:00Z',
+      )
+
+      await expect(db.abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBe('applied')
+      await expect(db.abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBe('replayed')
+
+      await expect(db.scopePins.pinsForTarget('role', TO_TARGET)).resolves.toMatchObject([
+        { noteId: 'PinnedNote01' },
+      ])
+      await expect(db.scopePins.pinsForTarget('role', FROM_TARGET)).resolves.toEqual([])
+      await expect(db.abilityPreferences.isEnabled('user:alice', spaceLocator)).resolves.toBe(false)
+    })
+
+    it('replays an already-cancelled hop without moving pointers again', async () => {
+      await db.scopePins.addPin({
+        targetKind: 'role',
+        targetId: FROM_TARGET,
+        targetSpace: 'space-main',
+        noteSpace: 'space-main',
+        noteId: 'PinnedNote01',
+        createdAt: '2026-08-17T00:00:00Z',
+      })
+
+      await expect(db.abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBe('applied')
+      await expect(db.abilityPlacement.moveOwnedRolePlacement(cancelMove)).resolves.toBe('applied')
+      await expect(db.abilityPlacement.moveOwnedRolePlacement(cancelMove)).resolves.toBe('replayed')
+
+      await expect(db.scopePins.pinsForTarget('role', FROM_TARGET)).resolves.toMatchObject([
+        { noteId: 'PinnedNote01' },
+      ])
+      await expect(db.scopePins.pinsForTarget('role', TO_TARGET)).resolves.toEqual([])
+    })
+
+    it('refuses a replay whose package identity differs', async () => {
+      await expect(db.abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBe('applied')
+      await expect(
+        db.abilityPlacement.moveOwnedRolePlacement({
+          ...move,
+          registryNoteId: 'OtherNote001',
+        }),
+      ).rejects.toThrow(/conflicts/)
+    })
+
+    it('applies stale context and session writers only at the live placement', async () => {
+      await expect(db.abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBe('applied')
+      await db.contextSets.createSet({
+        id: 'set-stale',
+        homeSpace: 'space-main',
+        name: 'Stale writer',
+        items: [],
+        createdAt: '2026-08-17T00:00:00Z',
+      })
+      await db.contextSets.attach({
+        setId: 'set-stale',
+        targetKind: 'role',
+        targetId: FROM_TARGET,
+        targetSpace: 'space-main',
+        createdAt: '2026-08-17T00:00:00Z',
+      })
+      await expect(db.contextSets.setsForTarget('role', TO_TARGET)).resolves.toMatchObject([
+        { id: 'set-stale' },
+      ])
+      await db.contextSets.detach('set-stale', 'role', FROM_TARGET, 'space-main')
+      await expect(db.contextSets.setsForTarget('role', TO_TARGET)).resolves.toEqual([])
+
+      await db.scopePins.addPin({
+        targetKind: 'role',
+        targetId: FROM_TARGET,
+        targetSpace: 'space-main',
+        noteSpace: 'space-main',
+        noteId: 'PinnedNote01',
+        createdAt: '2026-08-17T00:00:00Z',
+      })
+      await expect(db.scopePins.pinsForTarget('role', TO_TARGET)).resolves.toHaveLength(1)
+      await db.scopePins.removePin('role', FROM_TARGET, 'space-main', 'PinnedNote01')
+      await expect(db.scopePins.pinsForTarget('role', TO_TARGET)).resolves.toEqual([])
+
+      await db.contextOrder.setOrder('role', FROM_TARGET, 'space-main', [
+        { entryKind: 'set', entryRef: 'set-stale' },
+      ])
+      await expect(db.contextOrder.orderForTarget('role', TO_TARGET)).resolves.toMatchObject([
+        { entryKind: 'set', entryRef: 'set-stale' },
+      ])
+
+      await db.sessions.insert({
+        id: 'session-stale',
+        owner: 'user:alice',
+        name: 'stale',
+        named: true,
+        parentId: null,
+        createdAt: '2026-08-17T00:00:00Z',
+        lastSeenAt: '2026-08-17T00:00:00Z',
+        calls: 1,
+        role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
+        projectId: null,
+      })
+      await expect(
+        db.sessions.setRole('user:alice', 'session-stale', {
+          name: 'review',
+          locator: projectLocator,
+          contextProjectId: 'project-a',
+        }),
+      ).resolves.toMatchObject({ changed: true, record: { roleLocator: spaceLocator } })
+      // The stale spelling resolves before equality is decided. PostgreSQL used to
+      // compare first and reported every repeat as a fresh activation even though the
+      // UPDATE stored the same current locator as SQLite and the in-memory twin.
+      await expect(
+        db.sessions.setRole('user:alice', 'session-stale', {
+          name: 'review',
+          locator: projectLocator,
+          contextProjectId: 'project-a',
+        }),
+      ).resolves.toMatchObject({ changed: false, record: { roleLocator: spaceLocator } })
+      await expect(
+        db.sessions.listRecent('user:alice', '2026-08-16T00:00:00Z', 5),
+      ).resolves.toMatchObject([
+        expect.objectContaining({ id: 'session-stale', roleLocator: spaceLocator }),
+      ])
     })
 
     it('lets the destination be reused after a promotion was undone by hand', async () => {
@@ -493,7 +622,7 @@ export const describeAbilityPlacementPreferencesOnlyContract = (
       await disable(abilityPreferences, 'user:alice', projectLocator)
       await disable(abilityPreferences, 'user:bob', projectLocator)
 
-      await expect(abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBeUndefined()
+      await expect(abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBe('applied')
 
       // The `disabled` bit is keyed by the whole locator, placement included, and the
       // move carries no owner — so a rewrite that misses it silently RE-ENABLES a role
@@ -550,7 +679,7 @@ export const describeAbilityPlacementPreferencesOnlyContract = (
     it('applies a disable written at the address the move has already left', async () => {
       const { abilityPlacement, abilityPreferences } = await factory()
 
-      await expect(abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBeUndefined()
+      await expect(abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBe('applied')
       await disable(abilityPreferences, 'user:alice', projectLocator)
 
       await expect(abilityPreferences.isEnabled('user:alice', spaceLocator)).resolves.toBe(false)
@@ -592,32 +721,24 @@ export const describeAbilityPlacementPreferencesOnlyContract = (
       // (`DELETE FROM ability_preferences WHERE locator = ?` before the UPDATE).
       await disable(abilityPreferences, 'user:alice', spaceLocator)
 
-      await expect(abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBeUndefined()
+      await expect(abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBe('applied')
 
       await expect(abilityPreferences.isEnabled('user:alice', spaceLocator)).resolves.toBe(true)
       await expect(abilityPreferences.isEnabled('user:alice', projectLocator)).resolves.toBe(true)
       await expect(bothSpellings(abilityPreferences, 'user:alice')).resolves.toEqual(new Set())
     })
 
-    it('runs a second time without pretending the repeat costs nothing', async () => {
+    it('replays without clearing the destination preference', async () => {
       const { abilityPlacement, abilityPreferences } = await factory()
 
       await disable(abilityPreferences, 'user:alice', projectLocator)
 
-      await expect(abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBeUndefined()
-      await expect(abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBeUndefined()
+      await expect(abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBe('applied')
+      await expect(abilityPlacement.moveOwnedRolePlacement(move)).resolves.toBe('replayed')
 
-      // The second run finds nothing at the source and a row at the destination, so
-      // the clearing rule above applies to it — and the owner's disabled bit is gone.
-      // This move is NOT idempotent on the preference table, in any implementation of
-      // the port: the drivers delete the destination row inside the same transaction.
-      // Nothing retries it either — `RolesService.moveRolePlacement` puts the package
-      // BACK when the rewrite fails, so a redo starts at the source with its row still
-      // there. Written down because the arm this replaced claimed idempotency and
-      // observed only a resolving promise, which nothing could ever contradict.
-      await expect(abilityPreferences.isEnabled('user:alice', spaceLocator)).resolves.toBe(true)
-      await expect(abilityPreferences.isEnabled('user:alice', projectLocator)).resolves.toBe(true)
-      await expect(bothSpellings(abilityPreferences, 'user:alice')).resolves.toEqual(new Set())
+      await expect(abilityPreferences.isEnabled('user:alice', spaceLocator)).resolves.toBe(false)
+      await expect(abilityPreferences.isEnabled('user:alice', projectLocator)).resolves.toBe(false)
+      await expect(bothSpellings(abilityPreferences, 'user:alice')).resolves.toEqual(BOTH_DISABLED)
     })
   })
 }

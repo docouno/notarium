@@ -12,6 +12,7 @@ import { PgMetaDb } from '../../packages/server/src/services/metaDb/pgMetaDb'
 import { describeAbilityAvailabilityContract } from './abilityAvailabilityContract'
 import { describeAbilityCreateContract } from './abilityCreateContract'
 import { describeAbilityPlacementContract } from './abilityPlacementContract'
+import { describeAbilityPlacementCostContract } from './abilityPlacementCostContract'
 import { describeAbilityPreferencesContract } from './abilityPreferencesContract'
 import { describeAgentCallsContract } from './agentCallsContract'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
@@ -324,6 +325,139 @@ describePostgres('live Postgres driver', SUITE, () => {
     return { db: testSchema.db, teardown: testSchema.teardown }
   })
 
+  describeAbilityPlacementCostContract(
+    'Postgres',
+    async () => {
+      const statements: string[] = []
+      const testSchema = await createPostgresTestSchema('ability_placement_cost', {
+        observeStatement: (sql) => statements.push(sql),
+      })
+      await testSchema.db.abilityPlacement.resolveMovedOwnedRoleLocator('init')
+      const observer = new pg.Pool({ connectionString: testSchema.scopedUrl })
+
+      await observer.query(`
+        CREATE TABLE pointer_audit (table_name TEXT NOT NULL);
+        CREATE FUNCTION audit_pointer_dml() RETURNS trigger LANGUAGE plpgsql AS $$
+          BEGIN
+            INSERT INTO pointer_audit(table_name) VALUES (TG_TABLE_NAME);
+            RETURN COALESCE(NEW, OLD);
+          END
+        $$;
+      `)
+      for (const table of [
+        'context_set_attachments',
+        'context_scope_pins',
+        'context_order',
+        'ability_preferences',
+        'agent_sessions',
+      ]) {
+        await observer.query(
+          `CREATE TRIGGER audit_${table}
+             AFTER INSERT OR UPDATE OR DELETE ON ${table}
+             FOR EACH ROW EXECUTE FUNCTION audit_pointer_dml()`,
+        )
+      }
+      await testSchema.db.spaces.upsert({
+        id: 'space-main',
+        slug: 'space-main',
+        displayName: 'Space main',
+        notesDir: '/space-main',
+        aliases: [],
+        createdAt: '2026-09-02T00:00:00.000Z',
+        archivedAt: null,
+        archivedBy: null,
+      })
+      await testSchema.db.identity.claimMany([
+        {
+          id: 'PinnedNote01',
+          legacyNameAliases: [],
+          filePath: 'pinned.md',
+          space: 'space-main',
+          createdAt: '2026-09-02T00:00:00.000Z',
+          materialized: true,
+          deletedAt: null,
+        },
+      ])
+      await testSchema.db.contextSets.createSet({
+        id: 'set-cost',
+        homeSpace: 'space-main',
+        name: 'Cost set',
+        items: [],
+        createdAt: '2026-09-02T00:00:00.000Z',
+      })
+      await testSchema.db.sessions.insert({
+        id: 'session-cost',
+        owner: 'user:cost',
+        name: 'cost',
+        named: true,
+        parentId: null,
+        createdAt: '2026-09-02T00:00:00.000Z',
+        lastSeenAt: '2026-09-02T00:00:00.000Z',
+        calls: 1,
+        role: null,
+        roleLocator: null,
+        roleContextProjectId: null,
+        projectId: null,
+      })
+      await observer.query('DELETE FROM pointer_audit')
+      statements.length = 0
+
+      return {
+        abilityPlacement: testSchema.db.abilityPlacement,
+        contextSets: testSchema.db.contextSets,
+        scopePins: testSchema.db.scopePins,
+        contextOrder: testSchema.db.contextOrder,
+        sessions: testSchema.db.sessions,
+        seedUnrelatedTrail: async (count) => {
+          await observer.query(
+            `INSERT INTO ability_placement_trail
+               (from_locator, to_locator, space_id, registry_note_id, manifest_note_id)
+             SELECT 'unrelated-' || value, 'destination-' || value,
+                    'space-main', 'RegistryNote1', 'ManifestNote1'
+               FROM generate_series(1, $1) AS value`,
+            [count],
+          )
+        },
+        seedSourceRows: async (count) => {
+          await observer.query(
+            `INSERT INTO context_order
+               (target_kind, target_id, target_space, entry_kind, entry_ref, rank)
+             SELECT 'role', 'project:project-a:AbCdefGhij_1', 'space-main',
+                    'set', 'set-source-' || value, value - 1
+               FROM generate_series(1, $1) AS value`,
+            [count],
+          )
+        },
+        explainExactLookup: async (locator) => {
+          const result = await observer.query(
+            `EXPLAIN (FORMAT JSON)
+             SELECT to_locator, registry_note_id, manifest_note_id
+               FROM ability_placement_trail WHERE from_locator = ANY($1::text[])`,
+            [[locator]],
+          )
+
+          return JSON.stringify(result.rows[0]['QUERY PLAN'])
+        },
+        resetPointerAudit: async () => {
+          await observer.query('DELETE FROM pointer_audit')
+        },
+        resetStatementAudit: () => {
+          statements.length = 0
+        },
+        statementAudit: () => [...statements],
+        pointerDmlCount: async () =>
+          Number(
+            (await observer.query('SELECT COUNT(*) AS count FROM pointer_audit')).rows[0].count,
+          ),
+        teardown: async () => {
+          await observer.end()
+          await testSchema.teardown()
+        },
+      }
+    },
+    /ability_placement_trail_pkey/i,
+  )
+
   describeImportReservationsContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('import_reservations')
 
@@ -348,7 +482,7 @@ describePostgres('live Postgres driver', SUITE, () => {
 
   it('round-trips a role target through all three reusable context facets', async () => {
     const testSchema = await createPostgresTestSchema('role_context_facets')
-    const target = 'project:project%3Aone:research'
+    const target = 'project:project%3Aone:AbCdefGhij_1'
 
     try {
       await testSchema.db.contextSets.createSet({

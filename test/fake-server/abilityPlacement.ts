@@ -1,4 +1,5 @@
 import type { AbilityPlacementPersistence, OwnedRolePlacementMove } from '@notarium/server'
+import { ownedRolePlacementAddresses } from '@notarium/server'
 import type { InMemoryAbilityPreferences } from './abilityPreferences'
 import type { InMemoryAgentSessions } from './agentSessions'
 import type { InMemoryContextOrder } from './contextOrder'
@@ -17,20 +18,41 @@ export const createInMemoryAbilityPlacement = (facets: {
   contextOrder: InMemoryContextOrder
   abilityPreferences: InMemoryAbilityPreferences
   agentSessions: InMemoryAgentSessions
-}): AbilityPlacementPersistence => ({
-  resolveMovedOwnedRoleLocator: async (fromLocator) =>
-    facets.abilityPreferences.movedPlacement(fromLocator),
-  moveOwnedRolePlacement: async (move: OwnedRolePlacementMove) => {
-    facets.contextSets.moveRoleTarget(move.fromTargetId, move.toTargetId)
-    facets.scopePins.moveRoleTarget(move.fromTargetId, move.toTargetId)
-    facets.contextOrder.moveRoleTarget(move.fromTargetId, move.toTargetId)
-    facets.abilityPreferences.moveLocator(
-      move.fromLocator,
-      move.toLocator,
-      move.registryNoteId,
-      move.manifestNoteId,
-      move.trail,
-    )
-    facets.agentSessions.moveRoleLocator(move.fromLocator, move.toLocator)
-  },
-})
+}): AbilityPlacementPersistence => {
+  facets.contextSets.setRoleTargetResolver((target) =>
+    facets.abilityPreferences.liveRoleTarget(target),
+  )
+  facets.scopePins.setRoleTargetResolver((target) =>
+    facets.abilityPreferences.liveRoleTarget(target),
+  )
+  facets.contextOrder.setRoleTargetResolver((target) =>
+    facets.abilityPreferences.liveRoleTarget(target),
+  )
+  facets.agentSessions.setRoleLocatorResolver((locator) =>
+    facets.abilityPreferences.liveRoleLocator(locator),
+  )
+
+  return {
+    resolveMovedOwnedRoleLocator: async (fromLocator) =>
+      facets.abilityPreferences.movedPlacement(fromLocator),
+    moveOwnedRolePlacement: async (move: OwnedRolePlacementMove) => {
+      const address = ownedRolePlacementAddresses(move.fromLocator, move.toLocator)
+      const result = facets.abilityPreferences.moveLocator(
+        move.fromLocator,
+        move.toLocator,
+        move.registryNoteId,
+        move.manifestNoteId,
+        move.trail,
+      )
+
+      if (result === 'replayed') {
+        return result
+      }
+      facets.contextSets.moveRoleTarget(address.fromTarget.targetId, address.toTarget.targetId)
+      facets.scopePins.moveRoleTarget(address.fromTarget.targetId, address.toTarget.targetId)
+      facets.contextOrder.moveRoleTarget(address.fromTarget.targetId, address.toTarget.targetId)
+      facets.agentSessions.moveRoleLocator(move.fromLocator, move.toLocator)
+      return result
+    },
+  }
+}

@@ -4,6 +4,7 @@ import type {
   AgentCleanupMarkerDecl,
   AgentDeltaCursorDecl,
   AgentRoleDecl,
+  AgentRoleMoveDecl,
   AgentSessionDecl,
   AgentSkillDecl,
   AgentWriteAuditDecl,
@@ -205,6 +206,7 @@ export class WorldBuilder {
   private readonly agentCleanupMarkers: AgentCleanupMarkerDecl[] = []
   private agentTelemetryDetailed = false
   private readonly agentRoles: AgentRoleDecl[] = []
+  private readonly agentRoleMoves: AgentRoleMoveDecl[] = []
   private readonly agentSkills: AgentSkillDecl[] = []
   private readonly agentAbilityPreferences: AgentAbilityPreferenceDecl[] = []
   private readonly agentDeltaCursors: AgentDeltaCursorDecl[] = []
@@ -384,6 +386,11 @@ export class WorldBuilder {
     return this
   }
 
+  agentRoleMove(decl: AgentRoleMoveDecl): this {
+    this.agentRoleMoves.push(decl)
+    return this
+  }
+
   /** Declare one Owned Skill package. */
   agentSkill(decl: AgentSkillDecl): this {
     this.agentSkills.push(decl)
@@ -478,6 +485,7 @@ export class WorldBuilder {
       ...(this.agentCleanupMarkers.length ? { agentCleanupMarkers: this.agentCleanupMarkers } : {}),
       ...(this.agentTelemetryDetailed ? { agentTelemetryDetailed: true } : {}),
       ...(this.agentRoles.length ? { agentRoles: this.agentRoles } : {}),
+      ...(this.agentRoleMoves.length ? { agentRoleMoves: this.agentRoleMoves } : {}),
       ...(this.agentSkills.length ? { agentSkills: this.agentSkills } : {}),
       ...(this.agentAbilityPreferences.length
         ? { agentAbilityPreferences: this.agentAbilityPreferences }

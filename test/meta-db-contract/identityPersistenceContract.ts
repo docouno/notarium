@@ -698,7 +698,7 @@ export const describeIdentityPersistenceContract = (
       ).toEqual(['pinned'])
 
       // The same entry with its membership gone is stale, not a conflict either.
-      await alphaDb.scopePins.removePin('project', 'scope-1', 'pinned')
+      await alphaDb.scopePins.removePin('project', 'scope-1', 'alpha', 'pinned')
       await expect(
         alphaDb.contextOrder.setOrder('project', 'scope-1', 'alpha', [
           { entryKind: 'pin', entryRef: 'pinned' },

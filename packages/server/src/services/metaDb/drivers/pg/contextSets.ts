@@ -14,7 +14,25 @@ import type {
 } from '../../types'
 import type { PgDriverCtx } from './context'
 import { enterIdentityTierForReferences } from './liveIdentity'
-import { lockContextSetRow } from './lockOrder'
+import { lockContextSetRow, lockLiveRoleContextTarget } from './lockOrder'
+
+const ROLE_TARGET = 'role'
+
+const attach = async (
+  db: Pick<PgDriverCtx['required'], 'query'>,
+  r: ContextSetAttachmentRecord,
+) => {
+  await db.query(
+    `INSERT INTO context_set_attachments
+      (set_id, target_kind, target_id, target_space, created_at, home_space)
+     SELECT $1, $2, $3, $4, $5, home_space FROM context_sets WHERE id = $1
+       ON CONFLICT (set_id, target_kind, target_id) DO UPDATE SET
+         target_space = EXCLUDED.target_space,
+         created_at = EXCLUDED.created_at,
+         home_space = EXCLUDED.home_space`,
+    [r.setId, r.targetKind, r.targetId, r.targetSpace, r.createdAt],
+  )
+}
 
 export const createContextSetsFacet = (ctx: PgDriverCtx): ContextSetsPersistence => ({
   createSet: async (r: ContextSetRecord) => {
@@ -230,23 +248,61 @@ export const createContextSetsFacet = (ctx: PgDriverCtx): ContextSetsPersistence
   },
   attach: async (r: ContextSetAttachmentRecord) => {
     await ctx.ensureInit()
-    await ctx.required.query(
-      `INSERT INTO context_set_attachments
-        (set_id, target_kind, target_id, target_space, created_at, home_space)
-       SELECT $1, $2, $3, $4, $5, home_space FROM context_sets WHERE id = $1
-         ON CONFLICT (set_id, target_kind, target_id) DO UPDATE SET
-           target_space = EXCLUDED.target_space,
-           created_at = EXCLUDED.created_at,
-           home_space = EXCLUDED.home_space`,
-      [r.setId, r.targetKind, r.targetId, r.targetSpace, r.createdAt],
-    )
+    if (r.targetKind !== ROLE_TARGET) {
+      await attach(ctx.required, r)
+      return
+    }
+    const client = await ctx.required.connect()
+
+    try {
+      await client.query('BEGIN')
+      const { live } = await lockLiveRoleContextTarget(client, {
+        targetId: r.targetId,
+        targetSpace: r.targetSpace,
+      })
+      await attach(client, {
+        ...r,
+        targetId: live.target.targetId,
+        targetSpace: live.target.targetSpace,
+      })
+      await client.query('COMMIT')
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
   },
-  detach: async (setId: string, targetKind: ContextSetTargetKind, targetId: string) => {
+  detach: async (
+    setId: string,
+    targetKind: ContextSetTargetKind,
+    targetId: string,
+    targetSpace: string,
+  ) => {
     await ctx.ensureInit()
-    await ctx.required.query(
-      'DELETE FROM context_set_attachments WHERE set_id = $1 AND target_kind = $2 AND target_id = $3',
-      [setId, targetKind, targetId],
-    )
+    if (targetKind !== ROLE_TARGET) {
+      await ctx.required.query(
+        'DELETE FROM context_set_attachments WHERE set_id = $1 AND target_kind = $2 AND target_id = $3',
+        [setId, targetKind, targetId],
+      )
+      return
+    }
+    const client = await ctx.required.connect()
+
+    try {
+      await client.query('BEGIN')
+      const { live } = await lockLiveRoleContextTarget(client, { targetId, targetSpace })
+      await client.query(
+        'DELETE FROM context_set_attachments WHERE set_id = $1 AND target_kind = $2 AND target_id = $3',
+        [setId, targetKind, live.target.targetId],
+      )
+      await client.query('COMMIT')
+    } catch (error) {
+      await client.query('ROLLBACK')
+      throw error
+    } finally {
+      client.release()
+    }
   },
   attachmentsForSet: async (setId: string) => {
     await ctx.ensureInit()

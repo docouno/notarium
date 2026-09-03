@@ -52,6 +52,7 @@ export type PostgresTestSchema = {
  * required, safe for concurrent Vitest workers. */
 export const createPostgresTestSchema = async (
   prefix = 'meta_contract',
+  options: { observeStatement?: (sql: string) => void } = {},
 ): Promise<PostgresTestSchema> => {
   if (!testPgUrl) {
     throw new Error('TEST_PG_URL is required for the live Postgres suite')
@@ -73,7 +74,7 @@ export const createPostgresTestSchema = async (
   // Unique per schema so failure/retry tests can prove that no old pool remains.
   parsed.searchParams.set('application_name', schema)
   const scopedUrl = parsed.toString()
-  const db = new PgMetaDb(scopedUrl)
+  const db = new PgMetaDb(scopedUrl, options)
   let closed = false
 
   return {

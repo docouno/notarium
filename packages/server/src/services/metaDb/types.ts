@@ -759,14 +759,9 @@ export type AbilityCreatePersistence = {
 
 // ── owned ability placement ──────────────────────────────────────────
 
-/** One promotion of an owned Role from its project version to the Space base,
- *  addressed the two ways the meta-DB stores that placement. Both are opaque
- *  strings here: the context target id `${scope}:${ownerId}:${packageId}` and the
- *  serialized `AbilityLocator`. The DOMAIN owns their grammar — persistence only
- *  rewrites the rows that point at the old address. */
+/** One promotion of an owned Role from its project version to the Space base.
+ *  Locators are the authority; persistence derives compatible context target ids. */
 export type OwnedRolePlacementMove = {
-  fromTargetId: string
-  toTargetId: string
   fromLocator: string
   toLocator: string
   /** Stable identity projected for the package before its physical move. A locator is
@@ -810,7 +805,7 @@ export type AbilityPlacementPersistence = {
   /** Exact recorded authority for an address the package left. `null` means NO ROW;
    * a returned row with invalid/legacy evidence still tombstones the source address. */
   resolveMovedOwnedRoleLocator(fromLocator: string): Promise<OwnedRolePlacementTrail | null>
-  moveOwnedRolePlacement(move: OwnedRolePlacementMove): Promise<void>
+  moveOwnedRolePlacement(move: OwnedRolePlacementMove): Promise<'applied' | 'replayed'>
 }
 
 // ── owner ability preferences ────────────────────────────────────────
@@ -959,7 +954,12 @@ export type ContextSetsPersistence = {
   reorderItems(id: string, refs: readonly ContextSetItemRef[]): Promise<ContextSetRecord | null>
   deleteSet(id: string): Promise<void>
   attach(record: ContextSetAttachmentRecord): Promise<void>
-  detach(setId: string, targetKind: ContextSetTargetKind, targetId: string): Promise<void>
+  detach(
+    setId: string,
+    targetKind: ContextSetTargetKind,
+    targetId: string,
+    targetSpace: string,
+  ): Promise<void>
   attachmentsForSet(setId: string): Promise<ContextSetAttachmentRecord[]>
   setsForTarget(targetKind: ContextSetTargetKind, targetId: string): Promise<ContextSetRecord[]>
 }
@@ -987,7 +987,12 @@ export type ScopePinRecord = {
 export type ScopePinsPersistence = {
   /** Idempotent — re-pinning refreshes, never duplicates. */
   addPin(record: ScopePinRecord): Promise<void>
-  removePin(targetKind: ContextSetTargetKind, targetId: string, noteId: string): Promise<void>
+  removePin(
+    targetKind: ContextSetTargetKind,
+    targetId: string,
+    targetSpace: string,
+    noteId: string,
+  ): Promise<void>
   pinsForTarget(targetKind: ContextSetTargetKind, targetId: string): Promise<ScopePinRecord[]>
 }
 

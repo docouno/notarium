@@ -624,12 +624,11 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     status: p.status,
   }))
 
-  // NB `world.contextSets` AND `world.scopePins` (#209) are NOT projected: the fixture's
-  // note snapshots carry no stable ids to reference (the engine mints them on load), so
-  // a set's item refs / a loose cross-space pin can't be resolved here. Like space-archive,
-  // context-set + scope-pin seeding is a real-stand concern (scripts/seed.ts, which has the
-  // logical→real id map); the fake e2e drives both surfaces through their REST API instead.
-  // See docs/seeds.md.
+  const contextNoteRefs = Object.fromEntries(
+    [...notes.entries()].flatMap(([logicalId, note]) =>
+      note.deleted ? [] : [[logicalId, { space: note.space, noteId: note.id }]],
+    ),
+  )
 
   const personalSpaceByUser = new Map(
     world.spaces.flatMap((space) => (space.personalFor ? [[space.personalFor, space.slug]] : [])),
@@ -762,7 +761,12 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     ),
     agentTelemetryDetailed: world.agentTelemetryDetailed,
     agentRoles: world.agentRoles,
+    agentRoleMoves: world.agentRoleMoves,
     agentSkills: world.agentSkills,
+    contextSets: world.contextSets,
+    scopePins: world.scopePins,
+    contextOrder: world.contextOrder,
+    contextNoteRefs,
     // Carried verbatim, like the package declarations beside it: a preference row
     // addresses a package by the NAME the case wrote and the placement it asked for,
     // and the exact id it resolves to is minted by the applier at publish time.

@@ -1,10 +1,15 @@
-import { abilitySpaceOfLocator } from '../../abilityAddress'
+import {
+  abilitySpaceOfLocator,
+  classifyOwnedRolePlacementMove,
+  ownedRolePlacementAddresses,
+} from '../../abilityAddress'
 import type { AbilityPlacementPersistence, OwnedRolePlacementMove } from '../../types'
 import type { PgDriverCtx } from './context'
 import {
   lockAbilityPreferencePackages,
-  lockContextOrderScopes,
-  lockScopePinTargets,
+  lockRoleContextOrderPackages,
+  lockRoleContextTargets,
+  lockRoleScopePinTargets,
 } from './lockOrder'
 
 const ROLE_TARGET = 'role'
@@ -40,6 +45,20 @@ export const createAbilityPlacementFacet = (ctx: PgDriverCtx): AbilityPlacementP
 
     try {
       await client.query('BEGIN')
+      const address = ownedRolePlacementAddresses(move.fromLocator, move.toLocator)
+      const placement = await lockRoleContextTargets(client, [move.fromLocator, move.toLocator])
+      const classification = classifyOwnedRolePlacementMove({
+        ...move,
+        fromTrail: placement.trails.get(move.fromLocator) ?? null,
+        toTrail: placement.trails.get(move.toLocator) ?? null,
+      })
+
+      if (classification === 'replay') {
+        await client.query('COMMIT')
+        return 'replayed'
+      }
+      const fromTargetId = address.fromTarget.targetId
+      const toTargetId = address.toTarget.targetId
       // The statements are ordered by the level of the table they TARGET —
       // L2b attachments, L2d pins, L2e advisory, L2f order, L4p preferences — and the
       // one unlevelled table (`agent_sessions`) comes last. See `lockOrder`: a
@@ -53,11 +72,11 @@ export const createAbilityPlacementFacet = (ctx: PgDriverCtx): AbilityPlacementP
       // legitimate. The destination belongs to the package being moved either way.
       await client.query(
         'DELETE FROM context_set_attachments WHERE target_kind = $1 AND target_id = $2',
-        [ROLE_TARGET, move.toTargetId],
+        [ROLE_TARGET, toTargetId],
       )
       await client.query(
         'UPDATE context_set_attachments SET target_id = $1 WHERE target_kind = $2 AND target_id = $3',
-        [move.toTargetId, ROLE_TARGET, move.fromTargetId],
+        [toTargetId, ROLE_TARGET, fromTargetId],
       )
 
       // The pins are re-addressed by RANGE, so this is the same shape as L4p below:
@@ -66,32 +85,26 @@ export const createAbilityPlacementFacet = (ctx: PgDriverCtx): AbilityPlacementP
       // COMMITTED the two pass through each other unless both name the TARGET. Both
       // targets, because a pin may arrive at either address while the move runs, and
       // sorted inside the helper so two mirrored moves cannot deadlock.
-      await lockScopePinTargets(client, [
-        { targetKind: ROLE_TARGET, targetId: move.fromTargetId },
-        { targetKind: ROLE_TARGET, targetId: move.toTargetId },
-      ])
+      await lockRoleScopePinTargets(client, [move.fromLocator, move.toLocator])
       await client.query(
         'DELETE FROM context_scope_pins WHERE target_kind = $1 AND target_id = $2',
-        [ROLE_TARGET, move.toTargetId],
+        [ROLE_TARGET, toTargetId],
       )
       await client.query(
         'UPDATE context_scope_pins SET target_id = $1 WHERE target_kind = $2 AND target_id = $3',
-        [move.toTargetId, ROLE_TARGET, move.fromTargetId],
+        [toTargetId, ROLE_TARGET, fromTargetId],
       )
 
       // The order overlay is rewritten by primary key on both sides, so it needs the
       // per-scope advisory of BOTH scopes — the level L2f cannot be entered without.
-      await lockContextOrderScopes(client, [
-        { targetKind: ROLE_TARGET, targetId: move.fromTargetId },
-        { targetKind: ROLE_TARGET, targetId: move.toTargetId },
-      ])
+      await lockRoleContextOrderPackages(client, [move.fromLocator, move.toLocator])
       await client.query('DELETE FROM context_order WHERE target_kind = $1 AND target_id = $2', [
         ROLE_TARGET,
-        move.toTargetId,
+        toTargetId,
       ])
       await client.query(
         'UPDATE context_order SET target_id = $1 WHERE target_kind = $2 AND target_id = $3',
-        [move.toTargetId, ROLE_TARGET, move.fromTargetId],
+        [toTargetId, ROLE_TARGET, fromTargetId],
       )
 
       // The owner's sparse `disabled` bit is keyed by the WHOLE locator, placement
@@ -167,6 +180,7 @@ export const createAbilityPlacementFacet = (ctx: PgDriverCtx): AbilityPlacementP
         move.fromLocator,
       ])
       await client.query('COMMIT')
+      return 'applied'
     } catch (error) {
       await client.query('ROLLBACK')
       throw error

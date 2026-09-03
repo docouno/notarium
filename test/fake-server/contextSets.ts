@@ -5,6 +5,7 @@ import type {
   ContextSetRecord,
   ContextSetsPersistence,
   ContextSetTargetKind,
+  RoleContextTargetAddress,
 } from '@notarium/server'
 
 /** In-memory twin of the context-sets facet (#209) for the fake server — mirrors the
@@ -12,6 +13,11 @@ import type {
 export class InMemoryContextSets implements ContextSetsPersistence {
   private sets = new Map<string, ContextSetRecord>()
   private attachments: ContextSetAttachmentRecord[] = []
+  private resolveRoleTarget = (target: RoleContextTargetAddress) => target
+
+  setRoleTargetResolver(resolve: (target: RoleContextTargetAddress) => RoleContextTargetAddress) {
+    this.resolveRoleTarget = resolve
+  }
 
   clear(): void {
     this.sets.clear()
@@ -130,6 +136,11 @@ export class InMemoryContextSets implements ContextSetsPersistence {
   }
 
   async attach(record: ContextSetAttachmentRecord): Promise<void> {
+    const live =
+      record.targetKind === 'role'
+        ? this.resolveRoleTarget({ targetId: record.targetId, targetSpace: record.targetSpace })
+        : { targetId: record.targetId, targetSpace: record.targetSpace }
+    record = { ...record, targetId: live.targetId, targetSpace: live.targetSpace }
     const i = this.attachments.findIndex(
       (a) =>
         a.setId === record.setId &&
@@ -144,7 +155,15 @@ export class InMemoryContextSets implements ContextSetsPersistence {
     }
   }
 
-  async detach(setId: string, targetKind: ContextSetTargetKind, targetId: string): Promise<void> {
+  async detach(
+    setId: string,
+    targetKind: ContextSetTargetKind,
+    targetId: string,
+    targetSpace: string,
+  ): Promise<void> {
+    if (targetKind === 'role') {
+      targetId = this.resolveRoleTarget({ targetId, targetSpace }).targetId
+    }
     this.attachments = this.attachments.filter(
       (a) => !(a.setId === setId && a.targetKind === targetKind && a.targetId === targetId),
     )

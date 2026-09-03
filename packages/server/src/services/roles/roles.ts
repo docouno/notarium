@@ -35,7 +35,6 @@ import type {
 import { InMemoryAbilityAvailability } from './abilityAvailability'
 import { createInMemoryAbilityPlacement } from './abilityPlacement'
 import { InMemoryAbilityPreferences } from './abilityPreferences'
-import { roleContextTargetIdOf } from './context'
 import {
   AbilityUnavailableError,
   CatalogRoleNotFoundError,
@@ -57,6 +56,7 @@ import {
   type SkillPackage,
   validateSkillPackage,
 } from './library'
+import { ownedRoleLocator, ownedSkillLocator } from './locator'
 import {
   authoredSkillFile,
   bundledAbilityIdentityOf,
@@ -137,34 +137,6 @@ const abilityAvailabilityOf = (
 const availabilityCovers = (availability: AbilityAvailability, projectId: string): boolean =>
   availability.mode === ABILITY_AVAILABILITY_MODE.allProjects ||
   availability.projectIds.includes(projectId)
-
-/** A placement, as the ADDRESS a client will send back. The inverse direction of the
- *  locator seam, and it belongs to the service for the same reason the seam does:
- *  spelled out at each door instead, it became eight copies — three of them
- *  dereferencing `projectId!` — and the first shape change caught two of them. */
-export const ownedRoleLocator = (
-  location: RoleLocation,
-  packageId: string,
-): Extract<OwnedAbilityLocator, { kind: 'role' }> => ({
-  source: 'owned',
-  kind: 'role',
-  packageId,
-  location:
-    location.scope === ROLE_SCOPE.project
-      ? { scope: ROLE_SCOPE.project, spaceId: location.space, projectId: location.projectId! }
-      : { scope: location.scope, spaceId: location.space },
-})
-
-/** The same, for a skill — which has no project placement to spell. */
-export const ownedSkillLocator = (
-  location: SkillHomeLocation,
-  packageId: string,
-): Extract<OwnedAbilityLocator, { kind: 'skill' }> => ({
-  source: 'owned',
-  kind: 'skill',
-  packageId,
-  location: { scope: location.scope, spaceId: location.space },
-})
 
 /** Does this ability's reach cover that project — the whole rule, including the
  *  asymmetric default an absent row carries per KIND. Exported because the transport
@@ -2676,8 +2648,6 @@ export const createRolesService = ({
 
         return abilityPlacement
           .moveOwnedRolePlacement({
-            fromTargetId: roleContextTargetIdOf(forward ? from : to, locator.packageId),
-            toTargetId: roleContextTargetIdOf(forward ? to : from, locator.packageId),
             fromLocator: serializeAbilityLocator(forward ? locator : moved),
             toLocator: serializeAbilityLocator(forward ? moved : locator),
             registryNoteId: snapshot.registryNoteId,
@@ -2809,8 +2779,6 @@ export const createRolesService = ({
             },
             finalize: async (snapshot) => {
               await abilityPlacement.moveOwnedRolePlacement({
-                fromTargetId: roleContextTargetIdOf(from, locator.packageId),
-                toTargetId: roleContextTargetIdOf(to, locator.packageId),
                 fromLocator: serializeAbilityLocator(locator),
                 toLocator: serializeAbilityLocator(moved),
                 registryNoteId: snapshot.registryNoteId,

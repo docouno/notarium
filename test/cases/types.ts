@@ -257,6 +257,12 @@ export type AgentCustomRoleDecl = AgentRoleStateDecl & {
 
 export type AgentRoleDecl = AgentCatalogRoleDecl | AgentCustomRoleDecl
 
+export type AgentRoleMoveDecl = {
+  name: string
+  from: Extract<AgentRoleTargetDecl, { kind: 'project' }>
+  to: Extract<AgentRoleTargetDecl, { kind: 'space' }>
+}
+
 export type AgentSkillHomeDecl =
   { kind: 'personal'; user?: string } | { kind: 'space'; space: string }
 
@@ -720,6 +726,8 @@ export type CaseWorld = {
   agentTelemetryDetailed?: boolean
   /** Owned Role packages: authored here, or forked from a Catalog template. */
   agentRoles?: AgentRoleDecl[]
+  /** Declarative project→Space moves, applied after every carried-state prerequisite. */
+  agentRoleMoves?: AgentRoleMoveDecl[]
   /** Owned Skill packages at a Personal or Space home: authored, forked from a
    *  Catalog template, or a role's supporting package mutated in place. */
   agentSkills?: AgentSkillDecl[]

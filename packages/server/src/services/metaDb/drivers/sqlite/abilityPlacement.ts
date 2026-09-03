@@ -1,4 +1,8 @@
-import { abilitySpaceOfLocator } from '../../abilityAddress'
+import {
+  abilitySpaceOfLocator,
+  classifyOwnedRolePlacementMove,
+  ownedRolePlacementAddresses,
+} from '../../abilityAddress'
 import type { AbilityPlacementPersistence, OwnedRolePlacementMove } from '../../types'
 import type { SqliteDriverCtx } from './context'
 
@@ -35,6 +39,42 @@ export const createAbilityPlacementFacet = (ctx: SqliteDriverCtx): AbilityPlacem
 
     db.exec('BEGIN IMMEDIATE')
     try {
+      const address = ownedRolePlacementAddresses(move.fromLocator, move.toLocator)
+      const trailRows = db
+        .prepare(
+          `SELECT from_locator, to_locator, registry_note_id, manifest_note_id
+             FROM ability_placement_trail
+            WHERE from_locator IN (?, ?)`,
+        )
+        .all(move.fromLocator, move.toLocator) as Array<{
+        from_locator: string
+        to_locator: string
+        registry_note_id: string
+        manifest_note_id: string
+      }>
+      const trail = new Map(
+        trailRows.map((row) => [
+          row.from_locator,
+          {
+            toLocator: row.to_locator,
+            registryNoteId: row.registry_note_id,
+            manifestNoteId: row.manifest_note_id,
+          },
+        ]),
+      )
+      const classification = classifyOwnedRolePlacementMove({
+        ...move,
+        fromTrail: trail.get(move.fromLocator) ?? null,
+        toTrail: trail.get(move.toLocator) ?? null,
+      })
+
+      if (classification === 'replay') {
+        db.exec('COMMIT')
+        return 'replayed'
+      }
+      const fromTargetId = address.fromTarget.targetId
+      const toTargetId = address.toTarget.targetId
+
       // Each pair is delete-then-update, and the delete is not defensive noise: every
       // one of these tables is keyed by the target/locator this move rewrites onto, so
       // a leftover row at the destination (a promotion undone by hand and redone)
@@ -42,27 +82,27 @@ export const createAbilityPlacementFacet = (ctx: SqliteDriverCtx): AbilityPlacem
       // legitimate. The destination belongs to the package being moved either way.
       db.prepare('DELETE FROM context_set_attachments WHERE target_kind = ? AND target_id = ?').run(
         ROLE_TARGET,
-        move.toTargetId,
+        toTargetId,
       )
       db.prepare(
         'UPDATE context_set_attachments SET target_id = ? WHERE target_kind = ? AND target_id = ?',
-      ).run(move.toTargetId, ROLE_TARGET, move.fromTargetId)
+      ).run(toTargetId, ROLE_TARGET, fromTargetId)
 
       db.prepare('DELETE FROM context_scope_pins WHERE target_kind = ? AND target_id = ?').run(
         ROLE_TARGET,
-        move.toTargetId,
+        toTargetId,
       )
       db.prepare(
         'UPDATE context_scope_pins SET target_id = ? WHERE target_kind = ? AND target_id = ?',
-      ).run(move.toTargetId, ROLE_TARGET, move.fromTargetId)
+      ).run(toTargetId, ROLE_TARGET, fromTargetId)
 
       db.prepare('DELETE FROM context_order WHERE target_kind = ? AND target_id = ?').run(
         ROLE_TARGET,
-        move.toTargetId,
+        toTargetId,
       )
       db.prepare(
         'UPDATE context_order SET target_id = ? WHERE target_kind = ? AND target_id = ?',
-      ).run(move.toTargetId, ROLE_TARGET, move.fromTargetId)
+      ).run(toTargetId, ROLE_TARGET, fromTargetId)
 
       // The owner's sparse `disabled` bit is keyed by the WHOLE locator, placement
       // included, so it follows the address like the pointers above. Its lifecycle
@@ -118,6 +158,7 @@ export const createAbilityPlacementFacet = (ctx: SqliteDriverCtx): AbilityPlacem
         move.fromLocator,
       )
       db.exec('COMMIT')
+      return 'applied'
     } catch (error) {
       db.exec('ROLLBACK')
       throw error

@@ -67,6 +67,7 @@ import {
   ProviderRegistry,
   ProviderRuntime,
   type ProviderRuntimeOptions,
+  roleContextTargetOf,
   type RoleLocation,
   runProviderJobCall,
   type SkillHomeLocation,
@@ -80,17 +81,24 @@ import {
   TerminalJobError,
 } from '@notarium/server'
 import { applyAgentAbilityPreferences } from '../cases/applyAbilityPreferences'
+import { applyAgentRoleMoves } from '../cases/applyAgentRoleMoves'
 import { applyAgentRoleDeclarations } from '../cases/applyAgentRoles'
 import { applyAgentSkillDeclarations } from '../cases/applyAgentSkills'
+import { applyContextDeclarations } from '../cases/applyContextDeclarations'
 import { applyProviderSeed } from '../cases/applyProviders'
 import { personalSpaceForPlacement } from '../cases/personalSpaceSeam'
 import { resolveAvailabilityDecl } from '../cases/resolveAvailability'
 import type {
   AgentAbilityPreferenceDecl,
   AgentRoleDecl,
+  AgentRoleMoveDecl,
   AgentRoleTargetDecl,
   AgentSkillDecl,
+  ContextOrderDecl,
+  ContextSetAttachDecl,
+  ContextSetDecl,
   ProviderSeedDecl,
+  ScopePinDecl,
 } from '../cases/types'
 import { createInMemoryAbilityPlacement } from './abilityPlacement'
 import { InMemoryAbilityPreferences } from './abilityPreferences'
@@ -234,7 +242,12 @@ export type Fixture = {
   }>
   agentTelemetryDetailed?: boolean
   agentRoles?: AgentRoleDecl[]
+  agentRoleMoves?: AgentRoleMoveDecl[]
   agentSkills?: AgentSkillDecl[]
+  contextSets?: ContextSetDecl[]
+  scopePins?: ScopePinDecl[]
+  contextOrder?: ContextOrderDecl[]
+  contextNoteRefs?: Record<string, { space: string; noteId: string }>
   /** Owner Enable/Disable overrides, applied AFTER the packages above so each row can
    *  name the exact placement that published it. Sparse like the durable facet: a row
    *  exists only where a declaration asked for one, and absence already means enabled. */
@@ -793,7 +806,6 @@ export const createApp = async (
       },
     })
   }
-  await seedContextSetFacet()
   const roleLibrary = createStoreRoleLibrary(
     async (space) => manager.store(space),
     // Read per call: a reset swaps the whole world, and with it the bound a fixture
@@ -949,7 +961,7 @@ export const createApp = async (
     },
   }
 
-  const seedAgentPackages = async (fx: Fixture): Promise<void> => {
+  const seedAgentPackages = async (fx: Fixture) => {
     const resolveRoleTarget = async (target: AgentRoleTargetDecl) => {
       if (target.kind === 'personal') {
         const user = target.user
@@ -1088,8 +1100,11 @@ export const createApp = async (
       setEnabled: (owner, target, enabled) =>
         abilityPreferences.setEnabled(owner, target, enabled, updatedAt),
     })
+
+    return { appliedRoles, personalSpaceIds, resolveRoleTarget }
   }
-  await seedAgentPackages(fixture)
+  let seededPackages = await seedAgentPackages(fixture)
+
   const seedAgentSessions = async (fx: Fixture): Promise<void> => {
     const records = await Promise.all(
       (fx.agentSessions ?? []).map(async (record) => {
@@ -1122,6 +1137,83 @@ export const createApp = async (
     agentSessions.seed(records)
   }
   await seedAgentSessions(fixture)
+  const seedSharedContext = async (fx: Fixture) => {
+    const resolveTarget = async (declaration: ContextSetAttachDecl) => {
+      if (declaration.kind === 'personal') {
+        const user = fx.auth?.users.find((candidate) => candidate.username === declaration.user)
+        const personal = user?.personalSpace
+        return personal
+          ? {
+              targetKind: 'personal' as const,
+              targetId: idOf(personal),
+              targetSpace: idOf(personal),
+            }
+          : null
+      }
+      if (declaration.kind === 'project') {
+        const location = await seededPackages.resolveRoleTarget({
+          kind: 'project',
+          space: declaration.space,
+          path: declaration.path,
+        })
+        return location.projectId
+          ? {
+              targetKind: 'project' as const,
+              targetId: location.projectId,
+              targetSpace: location.space,
+            }
+          : null
+      }
+      const location = await seededPackages.resolveRoleTarget(declaration.target)
+      const published = seededPackages.appliedRoles.find(
+        (candidate) =>
+          candidate.declaration.name === declaration.name &&
+          candidate.location.scope === location.scope &&
+          candidate.location.space === location.space &&
+          candidate.location.projectId === location.projectId,
+      )
+
+      if (!published) {
+        throw new Error(`fixture role context references unpublished role ${declaration.name}`)
+      }
+      const resolved = await roles.addressedRoleAt(
+        ownedRoleLocator(location, published.packageId),
+        SYSTEM_PRINCIPAL,
+        personalSpaceForPlacement(seededPackages.personalSpaceIds, location.space),
+      )
+
+      if (!resolved) {
+        throw new Error(`fixture role context cannot resolve ${declaration.name}`)
+      }
+      const target = roleContextTargetOf(resolved)
+      return { targetKind: 'role' as const, targetId: target.id, targetSpace: target.space }
+    }
+
+    await applyContextDeclarations({
+      contextSets: fx.contextSets ?? [],
+      scopePins: fx.scopePins ?? [],
+      contextOrder: fx.contextOrder ?? [],
+      persistence: { contextSets, scopePins, contextOrder },
+      resolveHomeSpace: (slug) => idOf(slug),
+      resolveTarget,
+      resolveNote: (logicalId) => {
+        const note = fx.contextNoteRefs?.[logicalId]
+        return note ? { space: idOf(note.space), noteId: note.noteId } : null
+      },
+      freshId: freshNoteId,
+      createdAt: fx.now ?? new Date().toISOString(),
+    })
+    await seedContextSetFacet()
+  }
+  await seedSharedContext(fixture)
+  await applyAgentRoleMoves({
+    declarations: fixture.agentRoleMoves ?? [],
+    roles,
+    publishedRoles: seededPackages.appliedRoles,
+    resolvePlacement: seededPackages.resolveRoleTarget,
+    personalSpaceFor: (location) =>
+      personalSpaceForPlacement(seededPackages.personalSpaceIds, location.space),
+  })
   agentCalls.seed(
     fixture.agentCalls ?? [],
     fixture.agentCallDetails ?? [],
@@ -1633,8 +1725,20 @@ export const createApp = async (
     projects.seed(projectRecords(next, idOf))
     abilityAvailability.clearAll()
     abilityPreferences.clear()
-    await seedAgentPackages(next)
+    contextSets.clear()
+    scopePins.clear()
+    contextOrder.clear()
+    seededPackages = await seedAgentPackages(next)
     await seedAgentSessions(next)
+    await seedSharedContext(next)
+    await applyAgentRoleMoves({
+      declarations: next.agentRoleMoves ?? [],
+      roles,
+      publishedRoles: seededPackages.appliedRoles,
+      resolvePlacement: seededPackages.resolveRoleTarget,
+      personalSpaceFor: (location) =>
+        personalSpaceForPlacement(seededPackages.personalSpaceIds, location.space),
+    })
     agentCalls.seed(
       next.agentCalls ?? [],
       next.agentCallDetails ?? [],
@@ -1642,10 +1746,6 @@ export const createApp = async (
     )
     await seedAgentCleanup(next)
     favorites.clear()
-    contextSets.clear()
-    scopePins.clear()
-    contextOrder.clear()
-    await seedContextSetFacet()
     providerPersistence.clear()
     providerCallLog.clear()
     await seedProviders(next)

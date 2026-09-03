@@ -71,7 +71,93 @@ describe('agent-roles real seed', () => {
       )
 
       expect(stdout).toContain('"ok": true')
-      expect(stdout).toContain('"scopePins": 8')
+      expect(stdout).toContain('"scopePins": 10')
+      expect(stdout).toContain('"agentRoleMoves": 1')
+      const db = new DatabaseSync(join(dataDir, 'meta.db'), { readOnly: true })
+
+      try {
+        const rows = db
+          .prepare(
+            `SELECT from_locator, to_locator, registry_note_id, manifest_note_id
+               FROM ability_placement_trail`,
+          )
+          .all() as Array<{
+          from_locator: string
+          to_locator: string
+          registry_note_id: string
+          manifest_note_id: string
+        }>
+        expect(rows).toHaveLength(1)
+        const from = parseAbilityLocator(rows[0].from_locator)
+        const to = parseAbilityLocator(rows[0].to_locator)
+
+        if (
+          from?.source !== 'owned' ||
+          from.kind !== 'role' ||
+          from.location.scope !== 'project' ||
+          to?.source !== 'owned' ||
+          to.kind !== 'role' ||
+          to.location.scope !== 'space'
+        ) {
+          throw new Error('seeded placement trail does not carry one Project→Space Role move')
+        }
+
+        expect(from).toMatchObject({
+          source: 'owned',
+          kind: 'role',
+          location: { scope: 'project' },
+        })
+        expect(to).toMatchObject({
+          source: 'owned',
+          kind: 'role',
+          packageId: from.packageId,
+          location: { scope: 'space', spaceId: from.location.spaceId },
+        })
+        expect(rows[0].registry_note_id).toBe(rows[0].manifest_note_id)
+        const targetId = `space:${encodeURIComponent(to.location.spaceId)}:${to.packageId}`
+        const sourceId = `project:${encodeURIComponent(from.location.projectId)}:${from.packageId}`
+
+        for (const table of ['context_set_attachments', 'context_scope_pins', 'context_order']) {
+          expect(
+            Number(
+              (
+                db
+                  .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE target_id = ?`)
+                  .get(targetId) as { count: number }
+              ).count,
+            ),
+          ).toBeGreaterThan(0)
+          expect(
+            Number(
+              (
+                db
+                  .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE target_id = ?`)
+                  .get(sourceId) as { count: number }
+              ).count,
+            ),
+          ).toBe(0)
+        }
+        expect(
+          Number(
+            (
+              db
+                .prepare('SELECT COUNT(*) AS count FROM ability_preferences WHERE locator = ?')
+                .get(rows[0].to_locator) as { count: number }
+            ).count,
+          ),
+        ).toBe(1)
+        expect(
+          Number(
+            (
+              db
+                .prepare('SELECT COUNT(*) AS count FROM agent_sessions WHERE role_locator = ?')
+                .get(rows[0].to_locator) as { count: number }
+            ).count,
+          ),
+        ).toBeGreaterThan(0)
+      } finally {
+        db.close()
+      }
       const memoryRoot = join(dataDir, 'spaces', 'main', '.notarium', 'memory')
       const memoryFiles = (await readdir(memoryRoot, { recursive: true })).filter((entry) =>
         entry.endsWith('.md'),

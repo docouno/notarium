@@ -628,7 +628,7 @@ describe('SqliteMetaDb', () => {
       await db.contextSets.attach({
         setId: 'cs1',
         targetKind: 'role',
-        targetId: 'project:proj-x:research',
+        targetId: 'project:proj-x:AbCdefGhij_1',
         targetSpace: 'spc-proj',
         createdAt: 'x',
       })
@@ -639,7 +639,9 @@ describe('SqliteMetaDb', () => {
         'cs1',
       ])
       expect(
-        (await db.contextSets.setsForTarget('role', 'project:proj-x:research')).map((s) => s.id),
+        (await db.contextSets.setsForTarget('role', 'project:proj-x:AbCdefGhij_1')).map(
+          (s) => s.id,
+        ),
       ).toEqual(['cs1'])
       expect(await db.contextSets.attachmentsForSet('cs1')).toHaveLength(3)
 
@@ -652,7 +654,7 @@ describe('SqliteMetaDb', () => {
         createdAt: 'y',
       })
       expect(await db.contextSets.attachmentsForSet('cs1')).toHaveLength(3)
-      await db.contextSets.detach('cs1', 'project', 'proj-x')
+      await db.contextSets.detach('cs1', 'project', 'proj-x', 's1')
       expect(await db.contextSets.setsForTarget('project', 'proj-x')).toEqual([])
 
       // delete cascades the remaining attachment.
@@ -731,7 +733,7 @@ describe('SqliteMetaDb', () => {
       await db.contextOrder.setOrder('project', 'proj-x', 'spc-proj', [
         { entryKind: 'pin', entryRef: 'n9' },
       ])
-      await db.contextOrder.setOrder('role', 'project:proj-x:research', 'spc-proj', [
+      await db.contextOrder.setOrder('role', 'project:proj-x:AbCdefGhij_1', 'spc-proj', [
         { entryKind: 'set', entryRef: 'role-set' },
       ])
 
@@ -745,7 +747,7 @@ describe('SqliteMetaDb', () => {
         (await db.contextOrder.orderForTarget('project', 'proj-x')).map((r) => r.entryRef),
       ).toEqual(['n9'])
       expect(
-        (await db.contextOrder.orderForTarget('role', 'project:proj-x:research')).map(
+        (await db.contextOrder.orderForTarget('role', 'project:proj-x:AbCdefGhij_1')).map(
           (r) => r.entryRef,
         ),
       ).toEqual(['role-set'])
@@ -822,7 +824,7 @@ describe('SqliteMetaDb', () => {
       })
       await db.scopePins.addPin({
         targetKind: 'role',
-        targetId: 'project:proj-x:research',
+        targetId: 'project:proj-x:AbCdefGhij_1',
         targetSpace: 'spc-proj',
         noteSpace: 'spc-b',
         noteId: 'n-role',
@@ -836,7 +838,9 @@ describe('SqliteMetaDb', () => {
         'n1',
       ])
       expect(
-        (await db.scopePins.pinsForTarget('role', 'project:proj-x:research')).map((p) => p.noteId),
+        (await db.scopePins.pinsForTarget('role', 'project:proj-x:AbCdefGhij_1')).map(
+          (p) => p.noteId,
+        ),
       ).toEqual(['n-role'])
       expect((await db.scopePins.pinsForTarget('personal', 'spc-me'))[0].noteSpace).toBe('spc-a')
 
@@ -854,7 +858,7 @@ describe('SqliteMetaDb', () => {
       expect(after.find((p) => p.noteId === 'n1')?.noteSpace).toBe('spc-a2')
 
       // Remove is by (scope, note); the same note in ANOTHER scope is untouched.
-      await db.scopePins.removePin('personal', 'spc-me', 'n1')
+      await db.scopePins.removePin('personal', 'spc-me', 'spc-me', 'n1')
       expect((await db.scopePins.pinsForTarget('personal', 'spc-me')).map((p) => p.noteId)).toEqual(
         ['n2'],
       )
@@ -862,7 +866,9 @@ describe('SqliteMetaDb', () => {
         'n1',
       ])
       expect(
-        (await db.scopePins.pinsForTarget('role', 'project:proj-x:research')).map((p) => p.noteId),
+        (await db.scopePins.pinsForTarget('role', 'project:proj-x:AbCdefGhij_1')).map(
+          (p) => p.noteId,
+        ),
       ).toEqual(['n-role'])
     })
   })

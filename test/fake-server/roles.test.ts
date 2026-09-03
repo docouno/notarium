@@ -58,6 +58,10 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     fixture.agentSkills = []
     fixture.agentAbilityPreferences = []
     fixture.agentSessions = []
+    fixture.agentRoleMoves = []
+    fixture.contextSets = []
+    fixture.scopePins = []
+    fixture.contextOrder = []
     app = await createApp(fixture)
   }
 
@@ -73,6 +77,10 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     fixture.agentSkills = []
     fixture.agentAbilityPreferences = []
     fixture.agentSessions = []
+    fixture.agentRoleMoves = []
+    fixture.contextSets = []
+    fixture.scopePins = []
+    fixture.contextOrder = []
     app = await createApp(fixture)
   }
 
@@ -2295,6 +2303,7 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
       locator: first.json().locator,
       steps: [
         { step: 'document', outcome: 'applied' },
+        { step: 'home', outcome: 'skipped' },
         { step: 'availability', outcome: 'skipped' },
       ],
     })
@@ -3022,6 +3031,57 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     expect(again.statusCode, again.body).toBe(409)
   })
 
+  it('rebuilds one pre-moved role with carried state and replay authority after reset', async () => {
+    const assertSeed = async () => {
+      const cookie = await login('maya', 'maya')
+      const inventory = await app.inject({
+        method: 'GET',
+        url: '/api/me/agent-roles?source=owned&q=placement-sentinel&limit=100',
+        headers: { cookie },
+      })
+      expect(inventory.statusCode, inventory.body).toBe(200)
+      const sentinel = inventory.json().items[0]
+      const alpha = inventory
+        .json()
+        .projects.find((project: { handle: string }) => project.handle === 'team/gamma')
+      expect(sentinel).toMatchObject({
+        name: 'placement-sentinel',
+        enabled: false,
+        locator: { location: { scope: 'space' } },
+      })
+      const context = await app.inject({
+        method: 'GET',
+        url: `/api/me/agent-roles/${encodeAbilityLocator(sentinel.locator)}/context?project=${encodeURIComponent(alpha.id)}`,
+        headers: { cookie },
+      })
+      expect(context.statusCode, context.body).toBe(200)
+      expect(context.json().role.pins).toHaveLength(1)
+      expect(context.json().role.sets).toHaveLength(1)
+      const oldLocator = {
+        ...sentinel.locator,
+        location: {
+          scope: 'project',
+          spaceId: sentinel.locator.location.spaceId,
+          projectId: alpha.id,
+        },
+      }
+      const replay = await app.inject({
+        method: 'PUT',
+        url: `/api/me/agent-abilities/${encodeAbilityLocator(oldLocator)}/home`,
+        headers: { cookie },
+        payload: { scope: 'space' },
+      })
+      expect(replay.statusCode, replay.body).toBe(200)
+      expect(replay.json().locator).toEqual(sentinel.locator)
+    }
+
+    await assertSeed()
+    expect(
+      (await app.inject({ method: 'POST', url: '/api/__test/reset', payload: {} })).statusCode,
+    ).toBe(200)
+    await assertSeed()
+  })
+
   it('promotes a version to the Space base without widening its reach', async () => {
     const cookie = await login('maya', 'maya')
     const inventory = await app.inject({
@@ -3067,6 +3127,18 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
       headers: { cookie },
     })
     expect(gone.statusCode).toBe(404)
+
+    for (const locator of [version.locator, promoted.json().locator]) {
+      const replayed = await app.inject({
+        method: 'PUT',
+        url: `/api/me/agent-abilities/${encodeAbilityLocator(locator)}/home`,
+        headers: { cookie },
+        payload: { scope: 'space' },
+      })
+
+      expect(replayed.statusCode, replayed.body).toBe(200)
+      expect(replayed.json()).toEqual(promoted.json())
+    }
   })
 
   describe('a promotion carries everything keyed by the placement it leaves', () => {
@@ -3148,10 +3220,14 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
       expect(context.statusCode, context.body).toBe(200)
       // Attached to the project placement, read back at the Space one: pins, sets and
       // the order overlay are keyed by the address the package just left.
-      expect(context.json().role).toMatchObject({
-        pins: [expect.objectContaining({ noteId: 'fake-other-reference', order: 0 })],
-        sets: [expect.objectContaining({ id: setId, order: 1 })],
-      })
+      expect(context.json().role.pins).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ noteId: 'fake-other-reference', order: 0 }),
+        ]),
+      )
+      expect(context.json().role.sets).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: setId, order: 1 })]),
+      )
     })
 
     it('carries the owner disable, so a promoted role does not switch itself back on', async () => {

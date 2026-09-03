@@ -1,15 +1,30 @@
-import type { ContextSetTargetKind, ScopePinRecord, ScopePinsPersistence } from '@notarium/server'
+import type {
+  ContextSetTargetKind,
+  RoleContextTargetAddress,
+  ScopePinRecord,
+  ScopePinsPersistence,
+} from '@notarium/server'
 
 /** In-memory twin of the scope-pins facet (#209) for the fake server — mirrors the
  *  sqlite/pg drivers: keyed by (scope, note) so re-pinning upserts, never duplicates. */
 export class InMemoryScopePins implements ScopePinsPersistence {
   private pins: ScopePinRecord[] = []
+  private resolveRoleTarget = (target: RoleContextTargetAddress) => target
+
+  setRoleTargetResolver(resolve: (target: RoleContextTargetAddress) => RoleContextTargetAddress) {
+    this.resolveRoleTarget = resolve
+  }
 
   clear(): void {
     this.pins = []
   }
 
   async addPin(record: ScopePinRecord): Promise<void> {
+    const live =
+      record.targetKind === 'role'
+        ? this.resolveRoleTarget({ targetId: record.targetId, targetSpace: record.targetSpace })
+        : { targetId: record.targetId, targetSpace: record.targetSpace }
+    record = { ...record, targetId: live.targetId, targetSpace: live.targetSpace }
     const i = this.pins.findIndex(
       (p) =>
         p.targetKind === record.targetKind &&
@@ -27,8 +42,12 @@ export class InMemoryScopePins implements ScopePinsPersistence {
   async removePin(
     targetKind: ContextSetTargetKind,
     targetId: string,
+    targetSpace: string,
     noteId: string,
   ): Promise<void> {
+    if (targetKind === 'role') {
+      targetId = this.resolveRoleTarget({ targetId, targetSpace }).targetId
+    }
     this.pins = this.pins.filter(
       (p) => !(p.targetKind === targetKind && p.targetId === targetId && p.noteId === noteId),
     )

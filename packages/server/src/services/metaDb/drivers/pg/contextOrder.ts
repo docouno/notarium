@@ -1,9 +1,22 @@
+import { serializeAbilityLocator } from '@notarium/core'
 import { referenceIdentityConflict } from '../../identityRefs'
-import { contextOrderOfRow, type ContextOrderRow, dedupOrderEntries } from '../../rows'
+import {
+  contextOrderOfRow,
+  type ContextOrderRow,
+  dedupOrderEntries,
+  type ScopePinRow,
+} from '../../rows'
 import type { ContextOrderPersistence, ContextSetTargetKind } from '../../types'
 import type { PgDriverCtx } from './context'
 import { enterIdentityTierForReferences } from './liveIdentity'
-import { lockContextOrderScopes, lockScopePinsInScope } from './lockOrder'
+import {
+  lockContextOrderScopes,
+  lockLiveRoleScopePinsInScope,
+  lockRoleContextOrderPackages,
+  lockScopePinsInScope,
+} from './lockOrder'
+
+const ROLE_TARGET = 'role'
 
 export const createContextOrderFacet = (ctx: PgDriverCtx): ContextOrderPersistence => ({
   orderForTarget: async (targetKind: ContextSetTargetKind, targetId: string) => {
@@ -32,7 +45,23 @@ export const createContextOrderFacet = (ctx: PgDriverCtx): ContextOrderPersisten
       // The membership rows (tier 2d) come BEFORE the scope advisory (tier 2e), and
       // they are what carries each entry's home space: a scope's space says nothing
       // about where a pinned note lives.
-      const { rows: pins } = await lockScopePinsInScope(client, targetKind, targetId, pinRefs)
+      let liveTargetId = targetId
+      let liveTargetSpace = targetSpace
+      let pins: ScopePinRow[]
+
+      if (targetKind === ROLE_TARGET) {
+        const locked = await lockLiveRoleScopePinsInScope(
+          client,
+          { targetId, targetSpace },
+          pinRefs,
+        )
+        liveTargetId = locked.live.target.targetId
+        liveTargetSpace = locked.live.target.targetSpace
+        pins = locked.rows
+        await lockRoleContextOrderPackages(client, [serializeAbilityLocator(locked.live.locator)])
+      } else {
+        pins = (await lockScopePinsInScope(client, targetKind, targetId, pinRefs)).rows
+      }
       const spaceOfPin = new Map(pins.map((pin) => [pin.note_id, pin.note_space]))
       const canonical = entries.map((entry) => {
         if (entry.entryKind !== 'pin') {
@@ -51,18 +80,20 @@ export const createContextOrderFacet = (ctx: PgDriverCtx): ContextOrderPersisten
         return entry
       })
 
-      await lockContextOrderScopes(client, [{ targetKind, targetId }])
+      if (targetKind !== ROLE_TARGET) {
+        await lockContextOrderScopes(client, [{ targetKind, targetId }])
+      }
       const rows = dedupOrderEntries(canonical)
 
       await client.query('DELETE FROM context_order WHERE target_kind = $1 AND target_id = $2', [
         targetKind,
-        targetId,
+        liveTargetId,
       ])
       for (let rank = 0; rank < rows.length; rank++) {
         const e = rows[rank]
         await client.query(
           'INSERT INTO context_order (target_kind, target_id, target_space, entry_kind, entry_ref, rank) VALUES ($1, $2, $3, $4, $5, $6)',
-          [targetKind, targetId, targetSpace, e.entryKind, e.entryRef, rank],
+          [targetKind, liveTargetId, liveTargetSpace, e.entryKind, e.entryRef, rank],
         )
       }
       await client.query('COMMIT')

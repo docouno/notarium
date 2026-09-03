@@ -277,27 +277,8 @@ const transactionBodies = (): Map<string, string> => {
   return bodies
 }
 
-/** The levels nothing enters, and the reason each is allowed to have no entry.
- *
- *  `L2b` (`context_set_attachments`), and the two halves of that have to be told apart
- *  because only one of them is inherited. The LEVEL is: `git show main:…/lockOrder.ts`
- *  has it, has the table map and has no `hold('L2b'` either. The RACE is not — its
- *  second writer, `abilityPlacement.moveOwnedRolePlacement`, exists only on this
- *  branch, and it is the same shape as the one closed at `L2d` and `L4p`:
- *  `contextSets.attach` INSERTs a row keyed by the very `(target_kind, target_id)` the
- *  move rewrites by range, the two share no row and therefore no lock, and under READ
- *  COMMITTED the attachment lands on a target id the role has just left.
- *
- *  Left open deliberately and not by inheritance: `attach` is a single autocommit
- *  statement today, so closing it means making it a registered transaction — a change
- *  inside the context-sets contour, not this one. That is why it is written down here
- *  instead of being assumed away, and why `L2b` is NOT in
- *  `LEVELS_NO_STATEMENT_CAN_ENTER`: adding it there would demand a helper of a
- *  transaction whose counterpart cannot take one.
- *
- *  Checked as an EQUALITY, not as an allowance: the day `L2b` gets its helper this
- *  line has to go, or the test says so. */
-const LEVELS_WITHOUT_HELPER: readonly LockLevel[] = ['L2b']
+/** Every current lock level has an explicit helper entry. */
+const LEVELS_WITHOUT_HELPER: readonly LockLevel[] = []
 
 const levelIndex = (level: LockLevel): number => LOCK_LEVELS.indexOf(level)
 

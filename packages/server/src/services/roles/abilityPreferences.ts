@@ -1,3 +1,4 @@
+import type { OwnedAbilityLocator } from '@notarium/contract'
 import { serializeAbilityLocator } from '@notarium/core'
 
 import {
@@ -6,6 +7,11 @@ import {
   type AbilityPreferenceTarget,
   abilitySpaceOfLocator,
   abilityTargetPurgedError,
+  classifyOwnedRolePlacementMove,
+  ownedRoleLocatorOfContextTarget,
+  resolveLiveRoleContextTarget,
+  type RoleContextTargetAddress,
+  roleContextTargetOfLocator,
 } from '../metaDb'
 
 /** The row as the durable table keeps it: presence IS the disabled bit, and the two
@@ -98,6 +104,30 @@ export class InMemoryAbilityPreferences implements AbilityPreferencesPersistence
       : null
   }
 
+  liveRoleTarget(target: RoleContextTargetAddress): RoleContextTargetAddress {
+    const locator = ownedRoleLocatorOfContextTarget(target)
+
+    if (!locator) {
+      throw new Error('invalid Owned Role context target projection')
+    }
+
+    return resolveLiveRoleContextTarget(
+      target,
+      this.movedPlacement(serializeAbilityLocator(locator)),
+    ).target
+  }
+
+  liveRoleLocator(
+    locator: Extract<OwnedAbilityLocator, { kind: 'role' }>,
+  ): Extract<OwnedAbilityLocator, { kind: 'role' }> {
+    const target = roleContextTargetOfLocator(locator)
+
+    return resolveLiveRoleContextTarget(
+      target,
+      this.movedPlacement(serializeAbilityLocator(locator)),
+    ).locator
+  }
+
   private noteKey(spaceId: string, registryNoteId: string): string {
     return `${spaceId}\0${registryNoteId}`
   }
@@ -186,7 +216,20 @@ export class InMemoryAbilityPreferences implements AbilityPreferencesPersistence
     registryNoteId: string,
     manifestNoteId: string,
     trail: 'record' | 'cancel',
-  ): void {
+  ): 'applied' | 'replayed' {
+    const classification = classifyOwnedRolePlacementMove({
+      fromLocator,
+      toLocator,
+      registryNoteId,
+      manifestNoteId,
+      trail,
+      fromTrail: this.movedPlacement(fromLocator),
+      toTrail: this.movedPlacement(toLocator),
+    })
+
+    if (classification === 'replay') {
+      return 'replayed'
+    }
     const carried: Array<[string, PreferenceRow]> = []
 
     for (const [key, row] of [...this.records]) {
@@ -231,6 +274,8 @@ export class InMemoryAbilityPreferences implements AbilityPreferencesPersistence
         manifestNoteId,
       })
     }
+
+    return 'applied'
   }
 
   /** One or more registry notes are gone for good in this Space. */

@@ -2,7 +2,7 @@ import { Buffer } from 'node:buffer'
 import { describe, expect, it, vi } from 'vitest'
 
 import { ABILITY_KIND, AbilityHealthSchema, type OwnedAbilityLocator } from '@notarium/contract'
-import { exactOwnerObservation, serializeAbilityLocator } from '@notarium/core'
+import { exactOwnerObservation, parseAbilityLocator, serializeAbilityLocator } from '@notarium/core'
 
 import { clientFailureOf } from '../packages/server/src/libs/clientFailure'
 import { type Principal, SYSTEM_PRINCIPAL } from '../packages/server/src/services/authz'
@@ -254,7 +254,7 @@ describe('role catalog and owned libraries', () => {
             registryNoteId: 'RegistryNote1',
             manifestNoteId: 'ManifestNote1',
           }),
-          moveOwnedRolePlacement: async () => {},
+          moveOwnedRolePlacement: async () => 'applied',
         },
       })
 
@@ -312,7 +312,7 @@ describe('role catalog and owned libraries', () => {
       },
       abilityPlacement: {
         resolveMovedOwnedRoleLocator: async () => recorded,
-        moveOwnedRolePlacement: async () => {},
+        moveOwnedRolePlacement: async () => 'applied',
       },
     })
 
@@ -395,7 +395,7 @@ describe('role catalog and owned libraries', () => {
             registryNoteId: 'OriginalRegistry',
             manifestNoteId: recordedManifestNoteId,
           }),
-          moveOwnedRolePlacement: async () => {},
+          moveOwnedRolePlacement: async () => 'applied',
         },
       })
 
@@ -437,7 +437,7 @@ describe('role catalog and owned libraries', () => {
           registryNoteId: 'OriginalRegistry',
           manifestNoteId: 'OriginalRegistry',
         }),
-        moveOwnedRolePlacement: async () => {},
+        moveOwnedRolePlacement: async () => 'applied',
       },
     })
 
@@ -483,7 +483,7 @@ describe('role catalog and owned libraries', () => {
         // First selection says source. Its under-lease recheck sees the move; the
         // second selection and recheck agree on target.
         resolveMovedOwnedRoleLocator: async () => (++authorityReads === 1 ? null : hop),
-        moveOwnedRolePlacement: async () => {},
+        moveOwnedRolePlacement: async () => 'applied',
       },
     })
 
@@ -4490,6 +4490,7 @@ describe('role catalog and owned libraries', () => {
         registryNoteId: move.registryNoteId,
         manifestNoteId: move.manifestNoteId,
       }
+      return 'applied' as const
     })
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),
@@ -4839,7 +4840,9 @@ describe('role catalog and owned libraries', () => {
         // Only the reverse hop is refused — the one whose destination is the project
         // — so the forward move commits all three effects first.
         moveOwnedRolePlacement: async (move) => {
-          if (move.toTargetId.startsWith('project:')) {
+          const destination = parseAbilityLocator(move.toLocator)
+
+          if (destination?.source === 'owned' && destination.location.scope === 'project') {
             throw new Error('meta-DB is unavailable')
           }
 
@@ -5056,7 +5059,7 @@ describe('role catalog and owned libraries', () => {
       abilityAvailability: availability,
       abilityPlacement: {
         resolveMovedOwnedRoleLocator: async () => null,
-        moveOwnedRolePlacement: async () => {},
+        moveOwnedRolePlacement: async () => 'applied',
       },
     })
 
@@ -5093,7 +5096,7 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('promotes a version with its address, its state and a reach that does not widen', async () => {
-    const moveOwnedRolePlacement = vi.fn(async () => {})
+    const moveOwnedRolePlacement = vi.fn(async () => 'applied' as const)
     const library = writableLibrary(createInMemoryRoleLibrary())
     const availability = new InMemoryAbilityAvailability()
     const reachWrites: unknown[][] = []
@@ -5139,8 +5142,6 @@ describe('role catalog and owned libraries', () => {
     // Placement is part of the address, so the rows keyed by it move in one call.
     expect(moveOwnedRolePlacement).toHaveBeenCalledWith(
       expect.objectContaining({
-        fromTargetId: `project:project-web:${version.packageId}`,
-        toTargetId: `space:shared:${version.packageId}`,
         fromLocator: expect.stringContaining('project'),
         toLocator: expect.stringContaining('space'),
         registryNoteId: version.packageId,
@@ -5276,7 +5277,7 @@ describe('role catalog and owned libraries', () => {
   })
 
   it('refuses to promote onto an occupied name before anything moves', async () => {
-    const moveOwnedRolePlacement = vi.fn(async () => {})
+    const moveOwnedRolePlacement = vi.fn(async () => 'applied' as const)
     const library = writableLibrary(createInMemoryRoleLibrary())
     const roles = createRolesService({
       ...inMemoryAbilityPersistence(),

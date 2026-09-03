@@ -2,6 +2,7 @@ import { CONTEXT_KIND } from '@notarium/contract'
 import { isGeneratedNoteId, type NoteClass } from '@notarium/core'
 
 import type { Principal } from '../authz'
+import { roleContextTargetOfLocator } from '../metaDb'
 import type {
   ContextOrderPersistence,
   ContextSetsPersistence,
@@ -15,6 +16,7 @@ import {
   weighScopeOrder,
   weighScopePins,
 } from '../storeAccess'
+import { ownedRoleLocator } from './locator'
 import type { ResolvedOwnedRole, RoleLocation } from './types'
 
 export type RoleContextTarget = {
@@ -30,23 +32,16 @@ export type ParsedRoleContextTarget = {
   packageId: string
 }
 
-const roleOwnerId = (location: RoleLocation): string => {
-  if (location.scope === 'project') {
-    if (!location.projectId) {
-      throw new Error('project role location requires projectId')
-    }
-
-    return location.projectId
-  }
-
-  return location.space
-}
-
 /** The ONE spelling of a role context target id. Placement is part of the address —
  * which is exactly why promoting a project version to the Space base has to MOVE the
  * rows keyed by it instead of assuming they follow the package. */
-export const roleContextTargetIdOf = (location: RoleLocation, packageId: string): string =>
-  `${location.scope}:${encodeURIComponent(roleOwnerId(location))}:${packageId}`
+export const roleContextTargetIdOf = (location: RoleLocation, packageId: string): string => {
+  if (location.scope === 'project' && !location.projectId) {
+    throw new Error('project role location requires projectId')
+  }
+
+  return roleContextTargetOfLocator(ownedRoleLocator(location, packageId)).targetId
+}
 
 /** Stable identity of one owned Agent Role placement. Scope + stable space/project id
  * + immutable package id survives role-name, handle and project-path changes while

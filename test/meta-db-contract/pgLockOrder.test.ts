@@ -33,6 +33,7 @@ import {
   INSTALLATION_GENERATION_PHASE,
   RESTORE_OPERATION_PHASE,
   type RevisionInput,
+  serializeAbilityLocator,
 } from '@notarium/core'
 
 import { abilityPackageOfLocator } from '../../packages/server/src/services/metaDb/abilityAddress'
@@ -1278,6 +1279,32 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
       await run('contextSets.removeItem', () =>
         db.contextSets.removeItem('set-1', { space: 'alpha', noteId: 'note-a' }),
       )
+      const roleTarget = 'project:project-alpha:AbCdefGhij_1'
+      await run('contextSets.attach', () =>
+        db.contextSets.attach({
+          setId: 'set-1',
+          targetKind: 'role',
+          targetId: roleTarget,
+          targetSpace: 'alpha',
+          createdAt: AT,
+        }),
+      )
+      await run('contextSets.detach', () =>
+        db.contextSets.detach('set-1', 'role', roleTarget, 'alpha'),
+      )
+      await run('scopePins.addPin', () =>
+        db.scopePins.addPin({
+          targetKind: 'role',
+          targetId: roleTarget,
+          targetSpace: 'alpha',
+          noteSpace: 'alpha',
+          noteId: 'note-a',
+          createdAt: AT,
+        }),
+      )
+      await run('scopePins.removePin', () =>
+        db.scopePins.removePin('role', roleTarget, 'alpha', 'note-a'),
+      )
       await run('scopePins.addPin', () =>
         db.scopePins.addPin({
           targetKind: 'project',
@@ -1316,10 +1343,18 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
       )
       await run('abilityPlacement.moveOwnedRolePlacement', () =>
         db.abilityPlacement.moveOwnedRolePlacement({
-          fromTargetId: 'project:project-alpha:AbCdefGhij_1',
-          toTargetId: 'space:alpha:AbCdefGhij_1',
-          fromLocator: 'owned:role:project:alpha:project-alpha:AbCdefGhij_1',
-          toLocator: 'owned:role:space:alpha:AbCdefGhij_1',
+          fromLocator: serializeAbilityLocator({
+            source: 'owned',
+            kind: 'role',
+            packageId: 'AbCdefGhij_1',
+            location: { scope: 'project', spaceId: 'alpha', projectId: 'project-alpha' },
+          }),
+          toLocator: serializeAbilityLocator({
+            source: 'owned',
+            kind: 'role',
+            packageId: 'AbCdefGhij_1',
+            location: { scope: 'space', spaceId: 'alpha' },
+          }),
           registryNoteId: 'note-a',
           manifestNoteId: 'note-a',
           trail: 'record',

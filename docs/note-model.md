@@ -158,10 +158,10 @@ that later occupies it cannot become the version. The second is not a command at
 reaches, and covering anything other than exactly its own project is something only a Space home can
 do — so a project role given a wider reach relocates on the way through the document's ordinary save.
 Up is the ONE direction the model has. The request carries a single destination (`{ scope: 'space' }`,
-so no other target is expressible), and the service — not the route — refuses everything else, from
-one reading of the locator: a placement that is not a project one has nothing above it, and a
-personal space has no Space root to be lifted into, because there Personal and the Space root are
-one directory. There is no Space → project and no
+so no other target is expressible). First application requires a Project Role; the exact recorded
+old Project locator and its current Space locator are terminal replay spellings of that same move.
+A Personal placement still has no Space root to be lifted into, because there Personal and the
+Space root are one directory. There is no Space → project and no
 project → project relocation, and a skill, having no project placement, has nothing to relocate. It
 is refused before anything moves when the destination name is taken, which is exactly the case of a
 version whose base carries that name above it: a base and its version may share a name only while
@@ -178,6 +178,14 @@ Space root with an absent reach row, which READS as all-projects. A failed reloc
 what a role applies to any more than a successful one may. Personal ↔ Space is deliberately not offered: it is a move between spaces, which the note
 engine has no operation for. When it arrives it must also carry the availability row and re-ask the
 reach, since project ids do not survive the crossing.
+
+The locator is the authority for that transition; context target ids are compatible projections,
+not a second placement model. Repeating the same committed record or compensation is a successful
+no-op, identity-bound by both registry and manifest note ids. `PUT …/home` therefore returns the
+current Space locator/reach/note for either the recorded old Project locator or the current Space
+locator; combined Save/Edit reports the home step as skipped and does not repeat availability or
+pointer writes. A stale context/session writer resolves the same one-hop trail under its mutation
+fence and lands only at the live placement. No operation walks a trail chain or falls back by name.
 
 Role health is a fact about a (role, project) pair, not about a role: an attachment that a Space
 skill's availability withholds from project B leaves the role healthy in A and unhealthy in B, and

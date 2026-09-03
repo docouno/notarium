@@ -38,8 +38,17 @@ import type { PoolClient } from 'pg'
 // canon: docs/core.md#identity · docs/note-history.md
 
 import { type ABILITY_AVAILABILITY_MODE } from '@notarium/contract'
+import { parseAbilityLocator, serializeAbilityLocator } from '@notarium/core'
 
-import { abilityPackageOfLocator } from '../../abilityAddress'
+import {
+  abilityPackageOfLocator,
+  type LiveRoleContextTarget,
+  ownedRoleLocatorOfContextTarget,
+  type OwnedRolePlacementTrailEvidence,
+  resolveLiveRoleContextTarget,
+  type RoleContextTargetAddress,
+  roleContextTargetOfLocator,
+} from '../../abilityAddress'
 import type { ChainRow } from '../../revisionQuarantine'
 import type { ContextOrderRow, ContextSetRow, ScopePinRow } from '../../rows'
 
@@ -163,6 +172,7 @@ export const LOCK_LEVEL_REQUIRES: Readonly<Partial<Record<LockLevel, LockLevel>>
  *  reason — the exemption is a fact about that transaction, not a hole in the rule. */
 export const LEVELS_NO_STATEMENT_CAN_ENTER: readonly LockLevel[] = [
   'L0j',
+  'L2b',
   'L2d',
   'L2e',
   'L3m',
@@ -200,6 +210,10 @@ const CONTEXT_ORDER_LOCK_NS = 0x6374_4f72 // 'ctOr'
  *  one that takes the pin lock alone must not be excluded by a reorder. */
 const SCOPE_PIN_LOCK_NS = 0x7363_5069 // 'scPi'
 
+const ROLE_CONTEXT_TARGET_LOCK_NS = 'notarium:role-context-target'
+const ROLE_SCOPE_PIN_LOCK_NS = 'notarium:role-scope-pin'
+const ROLE_CONTEXT_ORDER_LOCK_NS = 'notarium:role-context-order'
+
 const hash32 = (s: string): number => {
   let h = 0
 
@@ -236,6 +250,140 @@ const takeScopeAdvisoryLocks = async (
   for (const key of keys) {
     await client.query('SELECT pg_advisory_xact_lock($1, $2)', [namespace, key])
   }
+}
+
+const lockRoleTargetEvidence = async (
+  client: PoolClient,
+  namespace: string,
+  locators: readonly string[],
+): Promise<{
+  packages: string[]
+  trails: ReadonlyMap<string, OwnedRolePlacementTrailEvidence>
+}> => {
+  const packages = [...new Set(locators.map(abilityPackageOfLocator))].sort()
+  const trails = new Map<string, OwnedRolePlacementTrailEvidence>()
+
+  for (const packageKey of packages) {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
+      namespace,
+      packageKey,
+    ])
+  }
+  // READ COMMITTED fixes one snapshot per statement. Reading the trail in the same
+  // statement that waits on the advisory would therefore resume with evidence from
+  // BEFORE the move commit it just waited for. This exact post-lock query is a second
+  // statement on purpose: it owns the fresh snapshot that makes forwarding live.
+  const result = await client.query(
+    `SELECT from_locator, to_locator, registry_note_id, manifest_note_id
+       FROM ability_placement_trail
+      WHERE from_locator = ANY($1::text[])`,
+    [[...new Set(locators)]],
+  )
+
+  for (const row of result.rows as Array<{
+    from_locator: string
+    to_locator: string
+    registry_note_id: string
+    manifest_note_id: string
+  }>) {
+    trails.set(row.from_locator, {
+      toLocator: row.to_locator,
+      registryNoteId: row.registry_note_id,
+      manifestNoteId: row.manifest_note_id,
+    })
+  }
+
+  return { packages, trails }
+}
+
+const roleContextKeys = (
+  locators: readonly string[],
+  trails: ReadonlyMap<string, OwnedRolePlacementTrailEvidence>,
+): string[] => {
+  const keys = new Set<string>()
+
+  for (const serialized of locators) {
+    const locator = parseAbilityLocator(serialized)
+
+    if (locator?.source !== 'owned' || locator.kind !== 'role') {
+      continue
+    }
+    const target = roleContextTargetOfLocator(locator)
+    keys.add(`role:${target.targetId}`)
+    keys.add(
+      `role:${resolveLiveRoleContextTarget(target, trails.get(serialized) ?? null).target.targetId}`,
+    )
+  }
+
+  return [...keys].sort()
+}
+
+/** L2b — package-invariant Role target arbitration plus exact one-hop evidence. */
+export const lockRoleContextTargets = async (client: PoolClient, locators: readonly string[]) => {
+  const evidence = await lockRoleTargetEvidence(client, ROLE_CONTEXT_TARGET_LOCK_NS, locators)
+  const keys = roleContextKeys(locators, evidence.trails)
+
+  return { lock: hold('L2b', keys, keys), trails: evidence.trails }
+}
+
+export const lockLiveRoleContextTarget = async (
+  client: PoolClient,
+  target: RoleContextTargetAddress,
+): Promise<{ lock: LockHold; live: LiveRoleContextTarget }> => {
+  const locator = ownedRoleLocatorOfContextTarget(target)
+
+  if (!locator) {
+    throw new Error('invalid Owned Role context target projection')
+  }
+  const serialized = serializeAbilityLocator(locator)
+  const locked = await lockRoleContextTargets(client, [serialized])
+
+  return {
+    lock: locked.lock,
+    live: resolveLiveRoleContextTarget(target, locked.trails.get(serialized) ?? null),
+  }
+}
+
+export const lockRoleScopePinTargets = async (client: PoolClient, locators: readonly string[]) => {
+  const evidence = await lockRoleTargetEvidence(client, ROLE_SCOPE_PIN_LOCK_NS, locators)
+  const keys = roleContextKeys(locators, evidence.trails)
+
+  return { lock: hold('L2d', keys, keys), trails: evidence.trails }
+}
+
+export const lockLiveRoleScopePinTarget = async (
+  client: PoolClient,
+  target: RoleContextTargetAddress,
+): Promise<{ lock: LockHold; live: LiveRoleContextTarget }> => {
+  const locator = ownedRoleLocatorOfContextTarget(target)
+
+  if (!locator) {
+    throw new Error('invalid Owned Role context target projection')
+  }
+  const serialized = serializeAbilityLocator(locator)
+  const locked = await lockRoleScopePinTargets(client, [serialized])
+
+  return {
+    lock: locked.lock,
+    live: resolveLiveRoleContextTarget(target, locked.trails.get(serialized) ?? null),
+  }
+}
+
+export const lockRoleContextOrderPackages = async (
+  client: PoolClient,
+  locators: readonly string[],
+): Promise<{ lock: LockHold }> => {
+  const packages = [...new Set(locators.map(abilityPackageOfLocator))].sort()
+
+  for (const packageKey of packages) {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
+      ROLE_CONTEXT_ORDER_LOCK_NS,
+      packageKey,
+    ])
+  }
+  const keys = roleContextKeys(locators, new Map())
+
+  return { lock: hold('L2e', keys, keys) }
 }
 
 const SECRET_KEYRING_LOCK_NS = 0x7365_634b // 'secK'
@@ -1162,6 +1310,35 @@ export const lockScopePinsInScope = async (
   const rows = res.rows as ScopePinRow[]
 
   return { lock: hold('L2d', ids, [...new Set(rows.map((row) => row.note_id))]), rows }
+}
+
+export const lockLiveRoleScopePinsInScope = async (
+  client: PoolClient,
+  target: RoleContextTargetAddress,
+  noteIds: readonly string[],
+): Promise<{ lock: LockHold; live: LiveRoleContextTarget; rows: ScopePinRow[] }> => {
+  const locator = ownedRoleLocatorOfContextTarget(target)
+
+  if (!locator) {
+    throw new Error('invalid Owned Role context target projection')
+  }
+  const serialized = serializeAbilityLocator(locator)
+  const locked = await lockRoleScopePinTargets(client, [serialized])
+  const live = resolveLiveRoleContextTarget(target, locked.trails.get(serialized) ?? null)
+  const ids = [...new Set(noteIds)].sort()
+
+  if (!ids.length) {
+    return { lock: locked.lock, live, rows: [] }
+  }
+  const result = await client.query(
+    `SELECT target_kind, target_id, target_space, note_space, note_id, created_at
+       FROM context_scope_pins
+      WHERE target_kind = 'role' AND target_id = $1 AND note_id = ANY($2)
+      ORDER BY note_id FOR UPDATE`,
+    [live.target.targetId, ids],
+  )
+
+  return { lock: locked.lock, live, rows: result.rows as ScopePinRow[] }
 }
 
 // ── L2e · per-scope order advisory ───────────────────────────────────────────

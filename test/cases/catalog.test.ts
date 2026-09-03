@@ -571,6 +571,11 @@ describe('seed catalog (#175)', () => {
         name: 'field-guide',
         target: { kind: 'project', space: 'team', path: 'other' },
       }),
+      expect.objectContaining({
+        source: 'custom',
+        name: 'placement-sentinel',
+        target: { kind: 'project', space: 'team', path: 'gamma' },
+      }),
       // The V18 state a copy used to stand in for: one Space role, narrowed to two
       // of the five Team projects.
       expect.objectContaining({
@@ -604,6 +609,13 @@ describe('seed catalog (#175)', () => {
     expect(world.agentSessions).toContainEqual(
       expect.objectContaining({ owner: 'maya', role: 'research' }),
     )
+    expect(world.agentRoleMoves).toEqual([
+      {
+        name: 'placement-sentinel',
+        from: { kind: 'project', space: 'team', path: 'gamma' },
+        to: { kind: 'space', space: 'team' },
+      },
+    ])
     expect(world.agentSkills).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -679,6 +691,8 @@ describe('seed catalog (#175)', () => {
     )
     expect(fixture.agentRoles).toEqual(world.agentRoles)
     expect(fixture.agentSkills).toEqual(world.agentSkills)
+    expect(fixture.contextSets).toEqual(world.contextSets)
+    expect(fixture.contextNoteRefs).toBeDefined()
     expect(fixture.agentSessions?.find((session) => session.owner === 'maya')?.role).toBe(
       'research',
     )
@@ -1030,6 +1044,7 @@ describe('seed catalog (#175)', () => {
     agentCleanupMarkers: true,
     agentTelemetryDetailed: true,
     agentRoles: true,
+    agentRoleMoves: true,
     agentSkills: true,
     agentAbilityPreferences: true,
     agentDeltaCursors: true,

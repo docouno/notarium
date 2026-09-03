@@ -88,8 +88,10 @@ import { TRACE_TOOL_POLICY } from '../packages/server/src/services/agentCalls/tr
 import { buildCasesWorld, listCases } from '../test/cases'
 import type { AgentRoleTargetDecl, CaseWorld, ContextSetAttachDecl, UserDecl } from '../test/cases'
 import { applyAgentAbilityPreferences } from '../test/cases/applyAbilityPreferences'
+import { applyAgentRoleMoves } from '../test/cases/applyAgentRoleMoves'
 import { applyAgentRoleDeclarations } from '../test/cases/applyAgentRoles'
 import { applyAgentSkillDeclarations } from '../test/cases/applyAgentSkills'
+import { applyContextDeclarations } from '../test/cases/applyContextDeclarations'
 import { applyProviderSeed } from '../test/cases/applyProviders'
 import { normDate } from '../test/cases/generators'
 import { personalSpaceForPlacement } from '../test/cases/personalSpaceSeam'
@@ -1645,75 +1647,30 @@ const run = async (): Promise<void> => {
     agentDeltaCursors++
   }
 
-  // 5. Context sets (#209): named cross-space collections attached to scopes. Applied
-  //    AFTER the timeline so each item's LOGICAL note id resolves to its real id + space
-  //    via `live`. Real-stand only (the fake fixture has no stable note ids to reference).
-  let contextSets = 0
-  // Set NAME → its minted id (#210): the order seed (5d) references sets by name (ids are
-  // minted here). Seed set names are unique per case, so a flat name map suffices.
-  const setIdByName = new Map<string, string>()
-
-  for (const set of world.contextSets ?? []) {
-    const homeSpace = idOf.get(set.homeSpace)
-
-    if (!homeSpace) {
-      throw new Error(`context set references unknown home space: ${set.homeSpace}`)
-    }
-    const items = set.items.flatMap((logicalId) => {
+  // 5. Shared context declarations run after packages, preferences, sessions and the
+  // note timeline, so both seed hosts build identical carried rows before a move.
+  const appliedContext = await applyContextDeclarations({
+    contextSets: world.contextSets ?? [],
+    scopePins: world.scopePins ?? [],
+    contextOrder: world.contextOrder ?? [],
+    persistence: {
+      contextSets: metaDb.contextSets,
+      scopePins: metaDb.scopePins,
+      contextOrder: metaDb.contextOrder,
+    },
+    resolveHomeSpace: (slug) => idOf.get(slug) ?? null,
+    resolveTarget: resolveContextTarget,
+    resolveNote: (logicalId) => {
       const note = live.get(logicalId)
-
-      if (!note) {
-        return []
-      }
-      const space = idOf.get(note.spaceSlug)
-      return space ? [{ space, noteId: note.id }] : []
-    })
-    const setId = freshNoteId()
-    setIdByName.set(set.name, setId)
-    await metaDb.contextSets.createSet({
-      id: setId,
-      homeSpace,
-      name: set.name,
-      items,
-      createdAt: t,
-    })
-    contextSets++
-    for (const a of set.attach ?? []) {
-      const target = await resolveContextTarget(a)
-
-      if (target) {
-        await metaDb.contextSets.attach({ setId, ...target, createdAt: t })
-      }
-    }
-  }
-
-  // 5b. Loose cross-space pins (#209): individual notes pinned into a scope from another
-  //     space — the sibling of a set. Same logical→real resolution via `live`/`idOf`.
-  let scopePins = 0
-
-  for (const pin of world.scopePins ?? []) {
-    const note = live.get(pin.note)
-
-    if (!note) {
-      continue
-    }
-    const noteSpace = idOf.get(note.spaceSlug)
-
-    if (!noteSpace) {
-      continue
-    }
-    const target = await resolveContextTarget(pin.attach)
-
-    if (target) {
-      await metaDb.scopePins.addPin({
-        ...target,
-        noteSpace,
-        noteId: note.id,
-        createdAt: t,
-      })
-      scopePins++
-    }
-  }
+      const space = note ? idOf.get(note.spaceSlug) : undefined
+      return note && space ? { space, noteId: note.id } : null
+    },
+    freshId: freshNoteId,
+    createdAt: t,
+  })
+  const contextSets = appliedContext.contextSets
+  let scopePins = appliedContext.scopePins
+  const contextOrders = appliedContext.contextOrders
 
   for (const skill of appliedSkills) {
     for (const attach of skill.declaration.pins ?? []) {
@@ -1730,47 +1687,15 @@ const run = async (): Promise<void> => {
       }
     }
   }
-
-  // 5b-order. Context order (#210): the user's per-scope pin+set order (order = load
-  //     priority). Resolved AFTER sets/pins exist — a `pin` entry maps its logical note id
-  //     to the real id; a `set` entry maps its name to the id minted in 5. The scope target
-  //     resolves exactly like a set attachment (personal → space id, project → project id).
-  let contextOrders = 0
-
-  for (const ord of world.contextOrder ?? []) {
-    const target = await resolveContextTarget(ord.scope)
-
-    if (!target) {
-      continue
-    }
-    const entries: Array<{ entryKind: 'pin' | 'set'; entryRef: string }> = []
-
-    for (const e of ord.entries) {
-      if (e.kind === 'set') {
-        const setId = setIdByName.get(e.name)
-
-        if (setId) {
-          entries.push({ entryKind: 'set', entryRef: setId })
-        }
-      } else {
-        const note = live.get(e.note)
-
-        if (note) {
-          entries.push({ entryKind: 'pin', entryRef: note.id })
-        }
-      }
-    }
-    if (entries.length === 0) {
-      continue
-    }
-    await metaDb.contextOrder.setOrder(
-      target.targetKind,
-      target.targetId,
-      target.targetSpace,
-      entries,
-    )
-    contextOrders++
-  }
+  const agentRoleMoves = (
+    await applyAgentRoleMoves({
+      declarations: world.agentRoleMoves ?? [],
+      roles: roleService,
+      publishedRoles: appliedRoles,
+      resolvePlacement: resolveRoleTarget,
+      personalSpaceFor: (location) => personalSpaceForPlacement(personalSpaceIds, location.space),
+    })
+  ).length
 
   // 5c. Favorites (#42/#245): star the declared notes/folders/projects so the
   //     merged Files section's favorites lens has real data — the rail Files↔Favorites
@@ -2163,6 +2088,7 @@ const run = async (): Promise<void> => {
           agentRoles: appliedRoles.length,
           agentSkills: appliedSkills.length,
           agentAbilityPreferences,
+          agentRoleMoves,
           agentDeltaCursors,
           favorites,
           retrievals,

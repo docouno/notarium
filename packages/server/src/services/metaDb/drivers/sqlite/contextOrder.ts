@@ -3,6 +3,9 @@ import { contextOrderOfRow, type ContextOrderRow, dedupOrderEntries } from '../.
 import type { ContextOrderPersistence, ContextSetTargetKind } from '../../types'
 import type { SqliteDriverCtx } from './context'
 import { isRetiredIdentity, resolveLiveIdentityForWrite } from './liveIdentity'
+import { resolveLiveRoleTargetForWrite } from './liveRoleTarget'
+
+const ROLE_TARGET = 'role'
 
 export const createContextOrderFacet = (ctx: SqliteDriverCtx): ContextOrderPersistence => ({
   orderForTarget: async (targetKind: ContextSetTargetKind, targetId: string) => {
@@ -24,6 +27,10 @@ export const createContextOrderFacet = (ctx: SqliteDriverCtx): ContextOrderPersi
     const db = ctx.required
     db.exec('BEGIN IMMEDIATE')
     try {
+      const live =
+        targetKind === ROLE_TARGET
+          ? resolveLiveRoleTargetForWrite(db, { targetId, targetSpace }).target
+          : { targetId, targetSpace }
       const membership = db.prepare(
         'SELECT note_space FROM context_scope_pins WHERE target_kind = ? AND target_id = ? AND note_id = ?',
       )
@@ -31,7 +38,7 @@ export const createContextOrderFacet = (ctx: SqliteDriverCtx): ContextOrderPersi
         if (e.entryKind !== 'pin') {
           return e
         }
-        const pin = membership.get(targetKind, targetId, e.entryRef) as
+        const pin = membership.get(targetKind, live.targetId, e.entryRef) as
           { note_space: string } | undefined
 
         if (pin) {
@@ -48,13 +55,13 @@ export const createContextOrderFacet = (ctx: SqliteDriverCtx): ContextOrderPersi
 
       db.prepare('DELETE FROM context_order WHERE target_kind = ? AND target_id = ?').run(
         targetKind,
-        targetId,
+        live.targetId,
       )
       const ins = db.prepare(
         'INSERT INTO context_order (target_kind, target_id, target_space, entry_kind, entry_ref, rank) VALUES (?, ?, ?, ?, ?, ?)',
       )
       rows.forEach((e, rank) =>
-        ins.run(targetKind, targetId, targetSpace, e.entryKind, e.entryRef, rank),
+        ins.run(targetKind, live.targetId, live.targetSpace, e.entryKind, e.entryRef, rank),
       )
       db.exec('COMMIT')
     } catch (e) {

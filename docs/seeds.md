@@ -190,7 +190,7 @@ thresholds.
 | `agent-context` | pins + personal/project memory + projects of varying density (#165), including the pinned `product/index.md` **Folder page #311**; **heavy pins over budget + a `Budget Lab` space for all token-budget cases #208** (fits / squeeze / no-pins / set-trim — nesting the personal set into project Q's budget; `squeeze` lands the cut on a heavy pin and `set-trim` lands it INSIDE the cross-space set, the one state where a trimmed set item and a trimmed pin are under one caption); **cross-space context set #209** (`Frontend Canon` in the `Conventions` space, connected to project Product OS + personal) **+ cross-space loose pin #209** (`Security Baseline` from `Conventions`, pinned directly into Product OS + personal) — both resolve cross-space; **retrieval audit #243** (search/recall/get_note history: hits + a recurrent vocabulary-mismatch miss + frequent queries) | agent-memory, agent-audit, structure, note-classes, scale |
 | `agent-sessions` | Activity: active fork siblings, a sticky project hint, exact call vs audited read/write counts, declared/inferred attachment, `Outside sessions`, an archived snapshot whose lifecycle row was GC'd, a mixed history longer than one 50-row page, an equal-timestamp read/write cursor boundary, hostile and max-length unbroken labels, owner isolation, distinct root/fork/owner delta positions, and an owner whose Agent facet runs five labels long — past the compact ceiling that facet used to carry, kept as a real-stand state (see below) | agent-sessions, agent-audit, auth, history |
 | `agent-telemetry-detailed` | Full session review corpus with Detailed enabled: Compact-vs-Detailed calls, every real producer outcome/effect/domain, recurring validation failures, linked retrievals and multi-revision mutations, Outside, complete/partial/archived and cross-owner episodes, plus durable retention→human pending and human-cleanup-complete marker states | agent-sessions, agent-audit, auth, history |
-| `agent-roles` | five principals keep the boundary visible: Fresh is catalog-only; Bob owns an idle Personal fork; the default stand owner Sergey owns a Personal `release-reviewer` with distinct Base/Role pins plus editable Personal and Main-project Memory rows; Maya owns switchable Personal `research`/`grooming` presets plus same-name Research Space + two Project role forks. Its skill library has Personal and Space homes, `coder` bound to Team Alpha/Beta but not Gamma, an all-projects skill, a direct catalog fork with provenance, an exact-linked rename, a custom exact link, duplicate names, and a deleted package retained as a broken role reference. A long Custom role preserves authored body and carries one legacy malformed attachment for preserve-vs-detach editing; another owned role remains in Personal Trash. Robin can inspect the Team home read-only. Base Personal/Project pins remain visible, each role placement has a distinct pin, the Team Project role adds a set plus an oversized tail that trims under the shared `Role → Project → Personal` budget, and an active episode rehydrates `research` | agent-roles, agent-sessions, agent-memory, auth, structure, scale |
+| `agent-roles` | five principals keep the boundary visible: Fresh is catalog-only; Bob owns an idle Personal fork; the default stand owner Sergey owns a Personal `release-reviewer`; Maya owns Personal/Space/Project forks. Shared context declarations seed exact pins/sets/order in both fake and real hosts. `placement-sentinel` starts as a disabled Project role with context and session state, then a declarative project→Space move runs last, leaving a non-empty identity-bound trail and all state at the compatible Space target. `field-guide` stays Project-only with non-empty context for the browser move/reload/retry journey. The skill library retains the availability, provenance, rename, malformed/deleted and duplicate-name states described below. | agent-roles, agent-sessions, agent-memory, auth, structure, scale |
 | `agent-abilities-rich` | the same axis at VOLUME on the default login, where `agent-roles` proves boundaries with one placement each: Personal, Space and three Project role groups populated at once, BOTH inventories past the library/explorer page sizes, a title long enough to force truncation everywhere it is listed, one display name deliberately held at two placements, a `launch-review` Space role narrowed to two of the Space's projects with its own version in one of them, a version whose base was never created, and a Space skill fleet whose availability differs per project (all / one / several). It seeds project and personal Catalog dependencies at their real homes, exact-linked rename, malformed and deleted attachment health, plus the RC package-delete boundaries: both Markdown and non-Markdown auxiliaries make agent `delete_ability` refuse and preserve the package, while the unchanged human multi-file door can remove the Markdown package into Trash. `agent-created-oversized-proof` is published through the durable agent creator with PAT/session provenance, exceeds 64k characters, and is pinned by its real note id into Web; it simultaneously proves Activity attribution, fail-closed `use_skill` and generic MCP context filtering. Most of its projects hold no ability at all, and that is deliberate: the library aside's Project facet has no pagination and no scroller of its own, so the LENGTH of that facet is the state — long enough that the aside's own scroller is the one that moves. Counts are derived from `buildCasesWorld`, never pinned in prose. | agent-roles, agent-memory, agent-audit, structure, auth, scale |
 | `agent-abilities-sparse` | the other end of the same axis: a first-run stand with System and Catalog plus exactly one Owned skill and no Owned role at all — the empty groups, the single-row group and the skeleton geometry that a fully populated stand can never show | agent-roles, structure, auth |
 | `context-open` | production-shaped #394/#399 performance stand: 1100-note project + 2700-note personal corpus, one editable Custom Project Role in `context-lab/product`, linked graph/activity, 90 × ~6.5 KB project-memory categories (`SCALE=.045` → 4; `1` → 90; `3` → 270), 8 personal categories, 12 × ~13.7 KB always-load pins and a profile note; SCALE changes only the project-memory count | agent-memory, agent-roles, activity, graph, note-classes, scale, structure |
@@ -277,6 +277,26 @@ parse, zero body reads, and metadata-only hits in both consumers. Reports live u
 The bare command infers `HEAD` only for a clean checkout. A dirty working tree fails closed unless
 the caller supplies its frozen tree/checkpoint identity explicitly, so local reports cannot label
 uncommitted contents as the current commit.
+
+`make ability-placement-gate ABILITY_PLACEMENT_PHASE=pre|post` owns the Role-placement A/B contour.
+The pre phase builds the frozen source named by `ABILITY_PLACEMENT_BASE_COMMIT`; both phases seed
+fresh isolated volumes from one frozen base `agent-roles` fixture—the current seed runner receives
+only the two compatibility appliers it imports, never a different logical case—and run the same
+external harness (5 warmups + 30 measured samples). Reports under
+`test-results/ability-placement/` bind source/OCI identity, Node/npm, the exact frozen case-source hash,
+CASE/NOW/SCALE/SEED, the complete observed projects/roles/sets logical-world hash and a harness hash
+that includes its Make lifecycle. Each sample creates a fresh Project Role, measures non-empty Role
+set/pin/order/disable setup separately, moves it, repeats the old-locator Home request while an
+independent heartbeat runs, then removes the live package. Post requires heartbeat overlap with the
+Home route's private server interval; the frozen base predates that header and records its explicit
+client-interval fallback. A stationarity gate keeps
+the second half from hiding monotonic world growth. The pre report requires the known replay 404;
+post requires 200 and carried state. Fixed p95/max thresholds cover Role setup, first move and
+unchanged Project set/pin controls; exact SQLite/PostgreSQL contracts separately prove the actual
+primary-key one-hop plan, one post-lock trail statement per Role mutation, unchanged non-Role/read
+shape, set-oriented 0/1000-row first apply and zero pointer DML on replay. Post refuses a dirty tree
+so its commit names the built source. The trap removes the invocation's containers, volume and both
+image tags.
 
 `context-open` is also the production-shaped Ability mutation stand. After seeding and starting it,
 `BENCH_PHASE=pre BENCH_COMMIT=<frozen-commit> BENCH_IMAGE=<image-id>
@@ -586,6 +606,14 @@ the same journaled directory operation, so the role is absent from inventory and
 `wrong-kind` attachment health — and resolves against a Personal or Space role declared earlier in
 the same Space.
 
+`agentRoleMoves` names one already-declared exact Project Role and its Space destination. Both hosts
+use the same `applyAgentRoleMoves` helper and production `RolesService.moveRolePlacement`. The
+partial order is packages/preferences/sessions → shared context sets/pins/order → moves → serving;
+reset repeats the same order. `agent-roles` contains one pre-moved sentinel and one unmoved browser
+candidate. `test/cases/agentRolesRealSeed.test.ts` reads the durable trail identities plus all five
+carried pointer families; the fake role suite repeats the old-locator Home call before and after
+reset.
+
 `agentAbilityPreferences` declares the owner Enable/Disable overrides. Each row names an owner and
 one ability: a System package by manifest name, an Owned one by the placement that published it.
 Catalog packages cannot be activated and are refused. The facet is sparse in the product and in the
@@ -736,17 +764,11 @@ required to match its directory.
 - **The `attachment` / `derived` / `encrypted` classes are not seeded** — these are
   engine mounts for derived/encrypted data, not user content (a future iteration if
   needed). What is seeded: `user-doc` / `agent-memory` / `profile` / `skill`.
-- **The generic fake projection does not express context sets (#209), cross-space loose pins (#209), and order (#210).**
-  The fake's snapshot carries no stable note-id that a set item / scope pin / order entry
-  refers to — so `world.contextSets`, `world.scopePins`, and `world.contextOrder` are
-  projected only by the REAL applier (`scripts/seed.ts`, which has a logical→real map;
-  order references pins by logical note-id and sets by NAME, and is resolved after the
-  sets are created). A test that needs a large prebuilt set may opt into the fake app's
-  injected `contextSets` + reset-aware `seedContextSets` seam; it runs after live identities
-  and projects exist and uses the in-memory engine's exact raw-file accessor for real
-  `CachedStore.noteFacts`. Generic `toFixture` remains unchanged. All three surfaces are exercised through the fake's REST instead, by
-  the conformance suite under `test/fake-server/`
-  (`contextSets.test.ts`, `scopePins.test.ts`, `contextOrder.test.ts`).
+- **Context sets (#209), cross-space loose pins (#209), and order (#210) share one declaration applier.**
+  `caseToFixture` carries the final logical→physical note-id map alongside the declarations;
+  the real host supplies its replayed-note map. Both call `applyContextDeclarations` only after
+  live notes, projects, role packages, preferences and sessions exist. The optional fake
+  `seedContextSets` hook remains for bespoke test-only fixtures and runs at the same late boundary.
 - **Scope order (#210) = `b.contextOrderFor({scope, entries})`** — `entries` in the
   desired order (`{kind:'pin', note:<logical id>}` / `{kind:'set', name:<set name>}`),
   pins and sets at the same rank (a set can be placed above a pin). A partial order is

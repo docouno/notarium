@@ -62,6 +62,7 @@ import {
   PatsResponseSchema,
   ProfilePutRequestSchema,
   ProfileResponseSchema,
+  REQUEST_TIMING_HEADER,
   type RoleInventoryEntry,
   SetAbilityHomeRequestSchema,
   SetAbilityHomeResponseSchema,
@@ -844,7 +845,16 @@ export const meRoutes = async (
 
   app.put(
     '/api/me/agent-abilities/:locator/home',
-    { config: authz('self:manage', 'host') },
+    {
+      config: authz('self:manage', 'host'),
+      onRequest: async (_req, reply) => {
+        reply.header(REQUEST_TIMING_HEADER.STARTED_AT, performance.timeOrigin + performance.now())
+      },
+      onSend: async (_req, reply, payload) => {
+        reply.header(REQUEST_TIMING_HEADER.ENDED_AT, performance.timeOrigin + performance.now())
+        return payload
+      },
+    },
     async (req, reply) => {
       if (!abilities) {
         throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
@@ -1062,6 +1072,7 @@ export const meRoutes = async (
         (req.params as { id?: string }).id ?? '',
         CONTEXT_KIND.personal,
         slug,
+        slug,
       )
     }
 
@@ -1110,7 +1121,7 @@ export const meRoutes = async (
       if (slug) {
         const requestedId = (req.params as { noteId?: string }).noteId ?? ''
         const live = await readNoteAccess(storeAccess, req.principal, requestedId, 'note:read')
-        await scopePins.removePin(CONTEXT_KIND.personal, slug, live?.noteId ?? requestedId)
+        await scopePins.removePin(CONTEXT_KIND.personal, slug, slug, live?.noteId ?? requestedId)
       }
 
       return OkResponseSchema.parse({ ok: true })

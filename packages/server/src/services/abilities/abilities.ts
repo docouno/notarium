@@ -587,16 +587,36 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
   }
 
   const setHome: AbilitiesService['setHome'] = async (principal, locator) => {
-    const target = await withOwnedAuthoringTarget(principal, locator, async ({ authority }) =>
-      authority.locator.kind === ABILITY_KIND.role ? authority : null,
+    const target = await withOwnedAuthoringTarget(
+      principal,
+      locator,
+      async ({ snapshot, context }) =>
+        snapshot.locator.kind === ABILITY_KIND.role ? { snapshot, context } : null,
     )
 
-    if (!target || target.locator.kind !== ABILITY_KIND.role) {
+    if (!target || target.snapshot.locator.kind !== ABILITY_KIND.role) {
       throw new AbilityUnavailableError('no such Owned Role')
+    }
+    if (target.snapshot.locator.location.scope === ROLE_SCOPE.space) {
+      const state = await roles.readOwnedAbilityMetadataState(
+        target.context,
+        principal,
+        target.snapshot,
+      )
+
+      if (!state?.availability) {
+        throw new AbilityUnavailableError('no such Owned Role')
+      }
+
+      return {
+        locator: target.snapshot.locator,
+        availability: state.availability,
+        noteId: target.snapshot.registryNoteId,
+      }
     }
     const moved = await roles.moveRolePlacement(
       principal,
-      target as OwnedAbilityTarget & {
+      target.snapshot as OwnedAbilityTarget & {
         locator: Extract<OwnedAbilityTarget['locator'], { kind: 'role' }>
       },
       await placement.personalSpaceFor(principal),
@@ -693,6 +713,15 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
     ]
     let currentLocator = locator
     let currentTarget = resolved.authority
+
+    if (
+      requestedLocator.kind === ABILITY_KIND.role &&
+      requestedLocator.location.scope === ROLE_SCOPE.project &&
+      currentLocator.kind === ABILITY_KIND.role &&
+      currentLocator.location.scope === ROLE_SCOPE.space
+    ) {
+      steps.push({ step: ABILITY_SAVE_STEP.home, outcome: ABILITY_SAVE_OUTCOME.skipped })
+    }
 
     if (
       currentLocator.kind === ABILITY_KIND.role &&

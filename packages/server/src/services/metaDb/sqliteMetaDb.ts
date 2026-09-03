@@ -79,6 +79,8 @@ export type SqliteMetaDbOptions = {
   /** Benchmark/build seam: production resolves its bundled sibling; source tests
    * normally resolve the TS worker beside the client. */
   activityWorkerEntry?: URL
+  /** Test/benchmark seam over application statements; migration/boot SQL is excluded. */
+  observeStatement?: (sql: string) => void
 }
 
 export class SqliteMetaDb implements MetaDb {
@@ -87,6 +89,7 @@ export class SqliteMetaDb implements MetaDb {
   private activityWorkerClient: SqliteActivityWorkerClient | null = null
   private readonly path: string
   private readonly activityWorkerEntry: URL | undefined
+  private readonly observeStatement: ((sql: string) => void) | undefined
   private readonly ctx: SqliteDriverCtx = ((self: SqliteMetaDb): SqliteDriverCtx => ({
     ensureInit: () => self.ensureInit(),
     checkpointWal: async () => {},
@@ -100,6 +103,7 @@ export class SqliteMetaDb implements MetaDb {
   constructor(path: string, options: SqliteMetaDbOptions = {}) {
     this.path = path
     this.activityWorkerEntry = options.activityWorkerEntry
+    this.observeStatement = options.observeStatement
   }
 
   /** Lazy single-flight init: the first call validates and advances the schema. */
@@ -143,6 +147,30 @@ export class SqliteMetaDb implements MetaDb {
           console.log(
             `[notarium] meta index reclaim: freelist ${freeBefore} → ${freeAfter} pages returned to the OS`,
           )
+        }
+        if (this.observeStatement) {
+          const db = this.db
+          const observe = this.observeStatement
+
+          this.db = new Proxy(db, {
+            get(target, property) {
+              if (property === 'prepare') {
+                return (sql: string) => {
+                  observe(sql)
+                  return target.prepare(sql)
+                }
+              }
+              if (property === 'exec') {
+                return (sql: string) => {
+                  observe(sql)
+                  return target.exec(sql)
+                }
+              }
+              const value = Reflect.get(target, property, target) as unknown
+
+              return typeof value === 'function' ? value.bind(target) : value
+            },
+          })
         }
       })
       const attempt = this.initPromise

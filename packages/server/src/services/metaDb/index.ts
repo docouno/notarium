@@ -31,7 +31,19 @@ export {
 export { spaceLifecycleHasEnded } from './abilityLifecycle'
 // What a durable ability ADDRESS is asked outside the facet that stores it: the
 // package it names, and the Space that package lives in.
-export { abilityPackageOfLocator, abilitySpaceOfLocator } from './abilityAddress'
+export {
+  abilityPackageOfLocator,
+  abilitySpaceOfLocator,
+  classifyOwnedRolePlacementMove,
+  ownedRoleLocatorOfContextTarget,
+  ownedRolePlacementAddresses,
+  resolveLiveRoleContextTarget,
+  roleContextTargetOfLocator,
+  type OwnedRolePlacementAddresses,
+  type OwnedRolePlacementTrailEvidence,
+  type LiveRoleContextTarget,
+  type RoleContextTargetAddress,
+} from './abilityAddress'
 export {
   ABILITY_CREATE_PHASE,
   ABILITY_TARGET_PURGED,

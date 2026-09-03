@@ -7,6 +7,7 @@ import type {
   AgentCleanupMarkerDecl,
   AgentDeltaCursorDecl,
   AgentRoleDecl,
+  AgentRoleMoveDecl,
   AgentSessionDecl,
   AgentSkillDecl,
   CaseEvent,
@@ -139,6 +140,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
   const agentCleanupMarkers: AgentCleanupMarkerDecl[] = []
   let agentTelemetryDetailed = false
   const agentRoles = new Map<string, AgentRoleDecl>()
+  const agentRoleMoves: AgentRoleMoveDecl[] = []
   const agentSkills = new Map<string, AgentSkillDecl>()
   const agentAbilityPreferences = new Map<string, AgentAbilityPreferenceDecl>()
   const agentDeltaCursors: AgentDeltaCursorDecl[] = []
@@ -421,6 +423,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
         agentAbilityPreferences.set(key, preference)
       }
     }
+    agentRoleMoves.push(...(world.agentRoleMoves ?? []))
     // Cursor declarations reference both a session and a journalled note by logical
     // id; namespace both exactly like their source declarations.
     for (const cursor of world.agentDeltaCursors ?? []) {
@@ -498,6 +501,7 @@ export const mergeWorlds = (parts: Array<{ name: string; world: CaseWorld }>): C
     ...(agentCleanupMarkers.length ? { agentCleanupMarkers } : {}),
     ...(agentTelemetryDetailed ? { agentTelemetryDetailed: true } : {}),
     ...(agentRoles.size ? { agentRoles: [...agentRoles.values()] } : {}),
+    ...(agentRoleMoves.length ? { agentRoleMoves } : {}),
     ...(agentSkills.size ? { agentSkills: [...agentSkills.values()] } : {}),
     ...(agentAbilityPreferences.size
       ? { agentAbilityPreferences: [...agentAbilityPreferences.values()] }
