@@ -51,6 +51,18 @@ export type FrontmatterEntry = { key: string | null; lines: string[] }
  *  continue to use the public `created:` convention. */
 export const CREATED_FALLBACK_FRONTMATTER_KEY = 'notarium-created'
 
+/** A public/authored creation-date scalar in the canonical UTC form shared by
+ * storage readers and optimistic write projections. Import source parsers keep
+ * their wider vocabularies (for example numeric epochs) outside this rule. */
+export const normalizeAuthoredDate = (value: unknown): string | null => {
+  if (typeof value !== 'string' || !value.trim()) {
+    return null
+  }
+  const parsed = new Date(value.trim())
+
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString()
+}
+
 export type FrontmatterBlock = {
   entries: FrontmatterEntry[]
   /** Offset just past the closing delimiter line — where the body starts. */

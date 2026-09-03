@@ -3,7 +3,7 @@
 // derivation. This seam is where an idless external file or a copied frontmatter
 // claim can otherwise make graph and direct reads disagree.
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -14,6 +14,7 @@ import {
   type IdentityPersistence,
   type IdentityRecord,
   InMemoryRestoreOperationPersistence,
+  InMemoryRevisionPersistence,
   InMemorySpaceLifecyclePersistence,
 } from '@notarium/core'
 import { createNotariumStore } from '@notarium/engine'
@@ -25,6 +26,482 @@ import { InMemoryIdentity } from '../fake-server/identity'
 describe('CachedStore(NotariumStore) — authoritative link identities', () => {
   const persistedIdentity = (records: IdentityRecord[]): IdentityPersistence =>
     new InMemoryIdentity(records)
+
+  it('adopts an externally authored creation date before publishing the changed snapshot', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'notarium-cached-external-created-'))
+    const initialCreatedAt = '2025-01-02T03:04:05.000Z'
+    const externalCreatedAt = '2024-02-03T04:05:06.000Z'
+    const filePath = join(root, 'dated.md')
+    const noteFile = (createdAt: string) =>
+      `---\nnotarium-id: external-date-id\ntitle: Dated\ncreated: ${createdAt}\n---\n\nbody`
+
+    writeFileSync(filePath, noteFile(initialCreatedAt))
+    const identityPersistence = new InMemoryIdentity([])
+    const revisionPersistence = new InMemoryRevisionPersistence()
+    const inner = createNotariumStore({ notesDir: root, spaceId: 'main' })
+    const store = new CachedStore({
+      inner,
+      identityPersistence,
+      revisionPersistence,
+      space: 'main',
+      pollIntervalMs: 0,
+      readBody: async (path) => readFileSync(join(root, path), 'utf8'),
+    })
+    const publishedDates: Array<string | null | undefined> = []
+
+    try {
+      await store.start()
+      expect((await store.list())[0]?.createdAt).toBe(initialCreatedAt)
+      await expect(identityPersistence.findById!('external-date-id')).resolves.toMatchObject({
+        createdAt: initialCreatedAt,
+      })
+      store.subscribe((event) => {
+        if (event.type === 'changed') {
+          publishedDates.push(identityPersistence.rows.get('external-date-id')?.createdAt)
+        }
+      })
+
+      writeFileSync(filePath, noteFile(externalCreatedAt))
+      await store.checkpoint()
+
+      await expect(store.read('external-date-id')).resolves.toMatchObject({
+        createdAt: externalCreatedAt,
+      })
+      expect((await store.list())[0]?.createdAt).toBe(externalCreatedAt)
+      await expect(identityPersistence.findById!('external-date-id')).resolves.toMatchObject({
+        createdAt: externalCreatedAt,
+      })
+      // Same-day date-only external edits keep the established topology: the
+      // journal's precise-modified refresh is the one frame; date reconciliation
+      // itself does not add another generic event.
+      expect(publishedDates).toHaveLength(1)
+      expect(publishedDates.every((createdAt) => createdAt === externalCreatedAt)).toBe(true)
+      expect(
+        (await store.revisions('external-date-id', { offset: 0, limit: 10 })).items.map(
+          ({ kind }) => kind,
+        ),
+      ).toEqual(['external'])
+
+      const uiCreatedAt = '2023-03-04T05:06:07.000Z'
+      const beforeUiEdit = await store.read('external-date-id')
+
+      await store.write({
+        originalId: 'external-date-id',
+        title: 'Dated',
+        content: 'body',
+        versionToken: beforeUiEdit.versionToken,
+        createdAt: uiCreatedAt,
+      })
+      expect((await store.list())[0]?.createdAt).toBe(uiCreatedAt)
+      await expect(identityPersistence.findById!('external-date-id')).resolves.toMatchObject({
+        createdAt: uiCreatedAt,
+      })
+      const revisionKindsAfterUi = (
+        await store.revisions('external-date-id', { offset: 0, limit: 10 })
+      ).items.map(({ kind }) => kind)
+
+      expect(revisionKindsAfterUi).toEqual(['write', 'external'])
+
+      publishedDates.length = 0
+      await store.checkpoint()
+      expect((await store.list())[0]?.createdAt).toBe(uiCreatedAt)
+      expect(publishedDates).toEqual([])
+      expect(
+        (await store.revisions('external-date-id', { offset: 0, limit: 10 })).items.map(
+          ({ kind }) => kind,
+        ),
+      ).toEqual(revisionKindsAfterUi)
+    } finally {
+      store.stop()
+      await store.settle()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('repairs an externally authored date through an exact direct read', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'notarium-cached-external-created-read-'))
+    const initialCreatedAt = '2025-01-02T03:04:05.000Z'
+    const externalCreatedAt = '2024-02-03T04:05:06.000Z'
+    const filePath = join(root, 'dated.md')
+    const noteFile = (createdAt: string) =>
+      `---\nnotarium-id: direct-date-id\ntitle: Dated\ncreated: ${createdAt}\n---\n\nbody`
+
+    writeFileSync(filePath, noteFile(initialCreatedAt))
+    const identityPersistence = new InMemoryIdentity([])
+    const store = new CachedStore({
+      inner: createNotariumStore({ notesDir: root, spaceId: 'main' }),
+      identityPersistence,
+      space: 'main',
+      pollIntervalMs: 0,
+      readBody: async (path) => readFileSync(join(root, path), 'utf8'),
+    })
+    const changed: string[][] = []
+
+    try {
+      await store.start()
+      store.subscribe((event) => {
+        if (event.type === 'changed') {
+          changed.push(event.upserts)
+        }
+      })
+
+      writeFileSync(filePath, noteFile(externalCreatedAt))
+      await expect(store.read('direct-date-id')).resolves.toMatchObject({
+        createdAt: externalCreatedAt,
+      })
+
+      expect((await store.list())[0]?.createdAt).toBe(externalCreatedAt)
+      expect(identityPersistence.rows.get('direct-date-id')?.createdAt).toBe(externalCreatedAt)
+      expect(changed).toEqual([['direct-date-id']])
+    } finally {
+      store.stop()
+      await store.settle()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('publishes a direct date repair after identity persistence recovers', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'notarium-cached-external-created-read-retry-'))
+    const initialCreatedAt = '2025-01-02T03:04:05.000Z'
+    const externalCreatedAt = '2024-02-03T04:05:06.000Z'
+    const filePath = join(root, 'dated.md')
+    const noteFile = (createdAt: string) =>
+      `---\nnotarium-id: direct-date-retry-id\ntitle: Dated\ncreated: ${createdAt}\n---\n\nbody`
+
+    writeFileSync(filePath, noteFile(initialCreatedAt))
+    const identityPersistence = new InMemoryIdentity([])
+    const store = new CachedStore({
+      inner: createNotariumStore({ notesDir: root, spaceId: 'main' }),
+      identityPersistence,
+      space: 'main',
+      pollIntervalMs: 0,
+      readBody: async (path) => readFileSync(join(root, path), 'utf8'),
+    })
+    const changed: string[][] = []
+
+    try {
+      await store.start()
+      const claimMany = identityPersistence.claimMany.bind(identityPersistence)
+      let rejectExternalDate = true
+
+      identityPersistence.claimMany = async (records) => {
+        if (
+          rejectExternalDate &&
+          records.some(
+            (record) =>
+              record.id === 'direct-date-retry-id' && record.createdAt === externalCreatedAt,
+          )
+        ) {
+          throw new Error('injected authored-date persistence failure')
+        }
+
+        return claimMany(records)
+      }
+      store.subscribe((event) => {
+        if (event.type === 'changed') {
+          changed.push(event.upserts)
+        }
+      })
+
+      writeFileSync(filePath, noteFile(externalCreatedAt))
+      await expect(store.read('direct-date-retry-id')).rejects.toThrow(
+        'injected authored-date persistence failure',
+      )
+      expect(changed).toEqual([])
+
+      rejectExternalDate = false
+      expect((await store.list())[0]?.createdAt).toBe(externalCreatedAt)
+      expect(identityPersistence.rows.get('direct-date-retry-id')?.createdAt).toBe(
+        externalCreatedAt,
+      )
+      expect(changed).toEqual([['direct-date-retry-id']])
+    } finally {
+      store.stop()
+      await store.settle()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the existing generic and journal frames fresh across a modified-day change', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'notarium-cached-external-created-day-'))
+    const initialCreatedAt = '2025-01-02T03:04:05.000Z'
+    const externalCreatedAt = '2024-02-03T04:05:06.000Z'
+    const filePath = join(root, 'dated.md')
+    const noteFile = (createdAt: string) =>
+      `---\nnotarium-id: external-date-day-id\ntitle: Dated\ncreated: ${createdAt}\n---\n\nbody`
+
+    writeFileSync(filePath, noteFile(initialCreatedAt))
+    utimesSync(filePath, new Date('2026-08-30T10:00:00.000Z'), new Date('2026-08-30T10:00:00.000Z'))
+    const identityPersistence = new InMemoryIdentity([])
+    const revisionPersistence = new InMemoryRevisionPersistence()
+    const store = new CachedStore({
+      inner: createNotariumStore({ notesDir: root, spaceId: 'main' }),
+      identityPersistence,
+      revisionPersistence,
+      space: 'main',
+      pollIntervalMs: 0,
+      readBody: async (path) => readFileSync(join(root, path), 'utf8'),
+    })
+    const publishedDates: Array<string | null | undefined> = []
+
+    try {
+      await store.start()
+      store.subscribe((event) => {
+        if (event.type === 'changed') {
+          publishedDates.push(identityPersistence.rows.get('external-date-day-id')?.createdAt)
+        }
+      })
+
+      writeFileSync(filePath, noteFile(externalCreatedAt))
+      utimesSync(
+        filePath,
+        new Date('2026-08-31T10:00:00.000Z'),
+        new Date('2026-08-31T10:00:00.000Z'),
+      )
+      await store.checkpoint()
+
+      expect((await store.list())[0]?.createdAt).toBe(externalCreatedAt)
+      expect(publishedDates).toEqual([externalCreatedAt, externalCreatedAt])
+      expect(
+        (await store.revisions('external-date-day-id', { offset: 0, limit: 10 })).items.map(
+          ({ kind }) => kind,
+        ),
+      ).toEqual(['external'])
+    } finally {
+      store.stop()
+      await store.settle()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the delta unpublished and retryable when authored-date persistence fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'notarium-cached-external-created-retry-'))
+    const initialCreatedAt = '2025-01-02T03:04:05.000Z'
+    const externalCreatedAt = '2024-02-03T04:05:06.000Z'
+    const filePath = join(root, 'dated.md')
+    const noteFile = (createdAt: string) =>
+      `---\nnotarium-id: retry-date-id\ntitle: Dated\ncreated: ${createdAt}\n---\n\nbody`
+
+    writeFileSync(filePath, noteFile(initialCreatedAt))
+    const identityPersistence = new InMemoryIdentity([])
+    const store = new CachedStore({
+      inner: createNotariumStore({ notesDir: root, spaceId: 'main' }),
+      identityPersistence,
+      space: 'main',
+      pollIntervalMs: 0,
+      readBody: async (path) => readFileSync(join(root, path), 'utf8'),
+    })
+    const changed: string[][] = []
+
+    try {
+      await store.start()
+      const claimMany = identityPersistence.claimMany.bind(identityPersistence)
+      let rejectExternalDate = true
+
+      identityPersistence.claimMany = async (records) => {
+        if (
+          rejectExternalDate &&
+          records.some(
+            (record) => record.id === 'retry-date-id' && record.createdAt === externalCreatedAt,
+          )
+        ) {
+          throw new Error('injected authored-date persistence failure')
+        }
+
+        return claimMany(records)
+      }
+      store.subscribe((event) => {
+        if (event.type === 'changed') {
+          changed.push(event.upserts)
+        }
+      })
+
+      writeFileSync(filePath, noteFile(externalCreatedAt))
+      await expect(store.checkpoint()).rejects.toThrow('injected authored-date persistence failure')
+      expect(identityPersistence.rows.get('retry-date-id')?.createdAt).toBe(initialCreatedAt)
+      expect(changed).toEqual([])
+
+      rejectExternalDate = false
+      await store.checkpoint()
+      expect((await store.list())[0]?.createdAt).toBe(externalCreatedAt)
+      expect(identityPersistence.rows.get('retry-date-id')?.createdAt).toBe(externalCreatedAt)
+      expect(changed.length).toBeGreaterThan(0)
+    } finally {
+      store.stop()
+      await store.settle()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['without a raw capability', 'absent'],
+    ['after a one-shot raw null', 'null'],
+    ['after a one-shot raw error', 'error'],
+  ] as const)('adopts an offline authored date on boot %s', async (_label, rawMode) => {
+    const root = mkdtempSync(join(tmpdir(), 'notarium-cached-offline-created-'))
+    const initialCreatedAt = '2025-01-02T03:04:05.000Z'
+    const externalCreatedAt = '2024-02-03T04:05:06.000Z'
+    const filePath = join(root, 'dated.md')
+    const identityPersistence = new InMemoryIdentity([
+      {
+        id: 'offline-date-id',
+        legacyNameAliases: [],
+        filePath: 'dated.md',
+        space: 'main',
+        createdAt: initialCreatedAt,
+        materialized: true,
+        deletedAt: null,
+      },
+    ])
+
+    writeFileSync(
+      filePath,
+      `---\nnotarium-id: offline-date-id\ntitle: Dated\ncreated: ${externalCreatedAt}\n---\n\nbody`,
+    )
+    let rawReads = 0
+
+    const readBody =
+      rawMode === 'absent'
+        ? undefined
+        : async (path: string) => {
+            rawReads++
+            if (rawReads === 1) {
+              if (rawMode === 'error') {
+                throw new Error('injected raw read failure')
+              }
+
+              return null
+            }
+
+            return readFileSync(join(root, path), 'utf8')
+          }
+    const store = new CachedStore({
+      inner: createNotariumStore({ notesDir: root, spaceId: 'main' }),
+      identityPersistence,
+      space: 'main',
+      pollIntervalMs: 0,
+      ...(readBody ? { readBody } : {}),
+    })
+
+    try {
+      await store.start()
+      if (rawMode !== 'absent') {
+        expect(rawReads).toBe(1)
+      }
+      expect((await store.list())[0]?.createdAt).toBe(externalCreatedAt)
+      await expect(identityPersistence.findById!('offline-date-id')).resolves.toMatchObject({
+        createdAt: externalCreatedAt,
+      })
+    } finally {
+      store.stop()
+      await store.settle()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['without a raw capability', 'absent'],
+    ['after a one-shot raw null', 'null'],
+    ['after a one-shot raw error', 'error'],
+  ] as const)('adopts a live authored date %s', async (_label, rawMode) => {
+    const root = mkdtempSync(join(tmpdir(), 'notarium-cached-live-created-'))
+    const initialCreatedAt = '2025-01-02T03:04:05.000Z'
+    const externalCreatedAt = '2024-02-03T04:05:06.000Z'
+    const filePath = join(root, 'dated.md')
+    const noteFile = (createdAt: string) =>
+      `---\nnotarium-id: live-date-id\ntitle: Dated\ncreated: ${createdAt}\n---\n\nbody`
+
+    writeFileSync(filePath, noteFile(initialCreatedAt))
+    const identityPersistence = new InMemoryIdentity([])
+    let failNextRawRead = false
+    let failedRawReads = 0
+
+    const readBody =
+      rawMode === 'absent'
+        ? undefined
+        : async (path: string) => {
+            if (failNextRawRead) {
+              failNextRawRead = false
+              failedRawReads++
+              if (rawMode === 'error') {
+                throw new Error('injected raw read failure')
+              }
+
+              return null
+            }
+
+            return readFileSync(join(root, path), 'utf8')
+          }
+    const store = new CachedStore({
+      inner: createNotariumStore({ notesDir: root, spaceId: 'main' }),
+      identityPersistence,
+      space: 'main',
+      pollIntervalMs: 0,
+      ...(readBody ? { readBody } : {}),
+    })
+
+    try {
+      await store.start()
+      failNextRawRead = rawMode !== 'absent'
+      writeFileSync(filePath, noteFile(externalCreatedAt))
+      await store.checkpoint()
+
+      if (rawMode !== 'absent') {
+        expect(failedRawReads).toBe(1)
+        expect(failNextRawRead).toBe(false)
+      }
+      expect((await store.list())[0]?.createdAt).toBe(externalCreatedAt)
+      expect(identityPersistence.rows.get('live-date-id')?.createdAt).toBe(externalCreatedAt)
+    } finally {
+      store.stop()
+      await store.settle()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['an absent public date', 'title: Dated'],
+    ['an invalid public date', 'title: Dated\ncreated: someday'],
+    ['the reserved resolved-date key', 'title: Dated\nnotarium-created: 2024-02-03T04:05:06.000Z'],
+  ])('keeps the first-seen date for %s', async (_label, authoredFrontmatter) => {
+    const root = mkdtempSync(join(tmpdir(), 'notarium-cached-pinned-created-'))
+    const initialCreatedAt = '2025-01-02T03:04:05.000Z'
+    const identityPersistence = new InMemoryIdentity([
+      {
+        id: 'pinned-date-id',
+        legacyNameAliases: [],
+        filePath: 'dated.md',
+        space: 'main',
+        createdAt: initialCreatedAt,
+        materialized: true,
+        deletedAt: null,
+      },
+    ])
+
+    writeFileSync(
+      join(root, 'dated.md'),
+      `---\nnotarium-id: pinned-date-id\n${authoredFrontmatter}\n---\n\nbody`,
+    )
+    const store = new CachedStore({
+      inner: createNotariumStore({ notesDir: root, spaceId: 'main' }),
+      identityPersistence,
+      space: 'main',
+      pollIntervalMs: 0,
+      readBody: async (path) => readFileSync(join(root, path), 'utf8'),
+    })
+
+    try {
+      await store.start()
+      expect((await store.list())[0]?.createdAt).toBe(initialCreatedAt)
+      await expect(identityPersistence.findById!('pinned-date-id')).resolves.toMatchObject({
+        createdAt: initialCreatedAt,
+      })
+    } finally {
+      store.stop()
+      await store.settle()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 
   it('persists exact legacy basename evidence before a path-changing move', async () => {
     const root = mkdtempSync(join(tmpdir(), 'notarium-cached-legacy-alias-'))

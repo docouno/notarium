@@ -20,12 +20,25 @@ import {
   frontmatterValue,
   isDurableFrontmatter,
   isWithinFrontmatterByteCap,
+  normalizeAuthoredDate,
   parseBodyFrontmatterBlock,
   parseFrontmatterBlock,
   stripFrontmatter,
   unquoteScalar,
 } from './frontmatter'
 import { FrontmatterGeometryError } from './frontmatterGeometryError'
+
+describe('normalizeAuthoredDate', () => {
+  it.each([
+    [' 2026-08-29T10:00:00+03:00 ', '2026-08-29T07:00:00.000Z'],
+    ['2026-08-29', '2026-08-29T00:00:00.000Z'],
+    ['', null],
+    ['someday', null],
+    [undefined, null],
+  ])('normalizes %j to the shared storage projection', (input, expected) => {
+    expect(normalizeAuthoredDate(input)).toBe(expected)
+  })
+})
 
 describe('frontmatterTags', () => {
   it('reads a block list', () => {

@@ -13,8 +13,8 @@ import type { CaseSpec } from '../types'
 export const externalEdits: CaseSpec = {
   name: 'external-edits',
   description:
-    'A same-size, mtime-preserving external file edit that changes body search text and moves a wikilink edge (#267).',
-  axes: ['search', 'graph', 'content'],
+    'Same-size, mtime-preserving external file edits that change body/search/graph and the authored creation date.',
+  axes: ['search', 'graph', 'content', 'activity'],
   build: ({ now }) => {
     const b = new WorldBuilder(now)
     b.space({ slug: 'main', displayName: 'Main' })
@@ -49,6 +49,22 @@ export const externalEdits: CaseSpec = {
         { from: 'stale-token', to: 'fresh-token' },
         { from: '[[Target A]]', to: '[[Target B]]' },
       ],
+    })
+    const initialCreatedAt = daysBefore(now, 6)
+    const externalCreatedAt = daysBefore(now, 16)
+    const dateProbe = b.note({
+      space: 'main',
+      path: 'external/date-probe.md',
+      title: 'External date probe',
+      content: '# External date probe\n\nThe authored date changes only in the file frontmatter.',
+      created: initialCreatedAt,
+      principal: 'user:sergey',
+    })
+
+    b.externalRewrite({
+      note: dateProbe,
+      projection: 'createdAt',
+      replacements: [{ from: initialCreatedAt, to: externalCreatedAt }],
     })
     // A file a converter led with a UTF-8 mark. Saving this note must not quietly drop
     // that byte — the mark belongs to the file, not to anything Notarium projects.

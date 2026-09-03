@@ -408,11 +408,13 @@ export type DurableImportDecl = {
  *  UTF-8 byte length, so size + mtime are deliberately unchanged.
  *
  *  `note` is the logical handle returned by WorldBuilder.note(). The fake
- *  projection applies the same replacements to its final snapshot so both stands
- *  show the same content, while only the real applier exercises filesystem
- *  reconciliation. */
+ *  projection applies the replacements to the declared logical projection so
+ *  both stands show the same end state, while only the real applier exercises
+ *  filesystem reconciliation. */
 export type ExternalRewriteDecl = {
   note: string
+  /** The fake has no file bytes, so name the projection those bytes change. */
+  projection?: 'content' | 'createdAt'
   replacements: Array<{ from: string; to: string }>
 }
 

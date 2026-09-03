@@ -1328,12 +1328,32 @@ describe('seed catalog (#175)', () => {
       const fx = caseToFixture(buildCaseWorld('external-edits', { now: DEFAULT_NOW }))
       const main = fx.spaces.find((s) => s.slug === 'main')!
       const probe = main.notes.find((n) => n.title === 'External edit probe')!
+      const dateProbe = main.notes.find((n) => n.title === 'External date probe')!
+      const declaredDateRewrite = buildCaseWorld('external-edits', {
+        now: DEFAULT_NOW,
+      }).externalRewrites?.find(({ projection }) => projection === 'createdAt')
 
       expect(probe.content).toContain('fresh-token')
       expect(probe.content).toContain('[[Target B]]')
       expect(probe.content).not.toContain('stale-token')
       expect(probe.content).not.toContain('[[Target A]]')
       expect(main.activity?.filter((a) => a.title === probe.title)).toHaveLength(1)
+      expect(dateProbe.createdAt).toBe(declaredDateRewrite?.replacements[0]?.to)
+      expect(main.activity?.filter((a) => a.title === dateProbe.title)).toHaveLength(1)
+    })
+
+    it('refuses an external rewrite whose fake creation-date projection is invalid', () => {
+      const world = buildCaseWorld('external-edits', { now: DEFAULT_NOW })
+      const rewrite = world.externalRewrites?.find(({ projection }) => projection === 'createdAt')
+
+      if (!rewrite) {
+        throw new Error('external date rewrite is missing')
+      }
+      rewrite.replacements[0].to = 'x'.repeat(rewrite.replacements[0].from.length)
+
+      expect(() => caseToFixture(world)).toThrow(
+        'external rewrite projects an invalid createdAt for note',
+      )
     })
   })
 })

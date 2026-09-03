@@ -93,6 +93,7 @@ import {
   mutedFrontmatter,
   nextAliasesMulti,
   normAliases,
+  normalizeAuthoredDate,
   normalizeNoteType,
   normalizeWikilinkTarget,
   normTags,
@@ -406,17 +407,9 @@ const withIndexedTypedChannels = (
   return next?.length ? next : undefined
 }
 
-const frontmatterDate = (value: unknown): string | null => {
-  if (typeof value !== 'string' || !value.trim()) {
-    return null
-  }
-  const date = new Date(value.trim())
-  return Number.isNaN(date.getTime()) ? null : date.toISOString()
-}
-
 const carriedCreated = (carried: readonly FrontmatterEntry[] | undefined) => {
-  const authored = carriedField(carried, 'created', frontmatterDate)
-  const fallback = carriedField(carried, CREATED_FALLBACK_FRONTMATTER_KEY, frontmatterDate)
+  const authored = carriedField(carried, 'created', normalizeAuthoredDate)
+  const fallback = carriedField(carried, CREATED_FALLBACK_FRONTMATTER_KEY, normalizeAuthoredDate)
 
   return {
     present: authored.present || fallback.present,
@@ -577,7 +570,8 @@ export class InMemoryStore implements KnowledgeStore {
       // the last readable owner without rewriting the source state on ingress.
       const hasYamlNodeReferences = frontmatterHasYamlNodeReferences(parsedCarried)
       const importedCarried = parsedCarried?.map(cloneEntry)
-      const explicitCreatedAt = n.createdAt == null ? n.createdAt : frontmatterDate(n.createdAt)
+      const explicitCreatedAt =
+        n.createdAt == null ? n.createdAt : normalizeAuthoredDate(n.createdAt)
       // Explicit snapshot fields model the serializer's final typed puts/drops.
       // `tags`/`aliases`/`slug` project onto metadata fields of the note's own, so a
       // snapshot value takes their raw shadow OUT — leaving it would let a later
@@ -1532,7 +1526,7 @@ export class InMemoryStore implements KnowledgeStore {
       carried: ReturnType<typeof carriedTyped>,
     ): string | null =>
       createdAt !== undefined
-        ? (frontmatterDate(createdAt) ?? prev)
+        ? (normalizeAuthoredDate(createdAt) ?? prev)
         : carried.createdAt.present
           ? (carried.createdAt.value ?? prev)
           : prev

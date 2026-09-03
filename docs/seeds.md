@@ -116,7 +116,7 @@ the stand.
 | `graph` | hubs/orphans/ghost-by-refcount/former-name/cross-folder communities (#38/#202) | graph, identity |
 | `graph-load` | scalable linked communities: 300 nodes / ~900 links per scale unit; `SCALE=10` reproduces the 3k/9k cold-enrichment workload (#195/#284) | graph, scale |
 | `search-corpus` | a spotlight corpus: same-named notes, content/path-match, tag case-fold (#188/#204) | search, content |
-| `external-edits` | writers that are not us: a same-size, mtime-preserving rewrite whose search marker + graph edge must self-heal on boot/poll (#267), plus exact whole-file shapes — a byte-order-marked file, stable rule-led prose and a full CRLF storage form for byte-preserving saves | search, graph, content |
+| `external-edits` | writers that are not us: same-size, mtime-preserving rewrites whose search marker + graph edge and authored creation date must self-heal on boot/poll, plus exact whole-file shapes — a byte-order-marked file, stable rule-led prose and a full CRLF storage form for byte-preserving saves | search, graph, content, activity |
 | `identity-collision` | one `notarium-id` planted in two spaces on disk: the arbiter must leave a single durable owner and re-mint the loser on the next boot (#327) | identity, structure, history |
 | `legacy-slug-links` | notes moved from old ASCII-only filenames onto Unicode paths: one unique legacy link survives delete/restore, while a two-owner old basename remains a ghost | identity, graph, search, history, trash, structure |
 | `name-collisions` | the states that flow from "a title picks the file name": a folder primed for the refusal dialog, an already-uniquified `Retro`/`Retro 2`/`Retro 3` family, the same title in two folders, and a folder page whose reserved `index.md` deliberately does not collide — [note-model.md](note-model.md#create-collisions) | identity, structure |
@@ -399,14 +399,22 @@ unchanged. The seed process has watch/poll disabled and stops immediately afterw
 so the production server started by `make seed` has to repair list/search/graph through
 the real external-change reconciliation path.
 
+The same case writes `External date probe` once with an authored `created:` and then
+replaces that ISO instant with another equal-length instant through the same physical
+seam. `ExternalRewriteDecl.projection` names `createdAt` for the file-less fake, so its
+final snapshot carries the same date while the real stand still has to reconcile raw
+bytes into detail, Feed ordering/buckets and durable identity. Static boot reconciliation
+adds no activity row. A later physical edit made while the server is live is what the
+journal observes and exposes on Activity surfaces.
+
 Exact timestamp restoration uses POSIX `touch -r` without a shell because Node's
 floating-point `utimes` loses sub-microsecond precision. The current `make seed`,
 `npm run seed`, and helper test execute this script on the development host, so POSIX
 coreutils are an explicit requirement of it (any ordinary Linux or macOS toolchain
 provides them).
 
-The fake projection applies the same replacements to its final snapshot so both
-stands display the same final content; it does not pretend to exercise a filesystem
+The fake projection applies each rewrite to its declared final snapshot projection so
+both stands display the same content and date; it does not pretend to exercise a filesystem
 watcher or add an authored activity row. Targeted engine tests cover all three real
 recovery routes: LocalFS change-token, exact watcher-path forcing, and a missed event
 recovered by the persisted bounded integrity sweep.

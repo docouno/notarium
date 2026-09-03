@@ -38,6 +38,7 @@ import {
   mutedFrontmatter,
   nextPhysicalLineSpan,
   normAliases,
+  normalizeAuthoredDate,
   normTags,
   NOTE_ID_FRONTMATTER_KEY,
   noteTypeFrontmatter,
@@ -52,17 +53,6 @@ import {
   viewTypeFrontmatter,
   yamlNodeReferenceWriteError,
 } from '@notarium/core'
-
-/** A frontmatter date → ISO-8601 UTC, or null when absent/unparseable. The file
- *  is the creation date's source of truth (#11 import / round-trip): a `created:`
- *  claim overrides the filesystem birthtime in the index. */
-const fmDate = (v: unknown): string | null => {
-  if (typeof v !== 'string' || !v.trim()) {
-    return null
-  }
-  const d = new Date(v.trim())
-  return Number.isNaN(d.getTime()) ? null : d.toISOString()
-}
 
 export type ParsedNote = {
   /** frontmatter `title` → first `# heading` → filename sans .md. */
@@ -235,7 +225,9 @@ export const parseNoteFile = (raw: string, path: string): ParsedNote => {
     slug: fmSlug || null,
     idClaim: typeof claim === 'string' && isValidNoteId(claim) ? claim : null,
     sourceLocator: isImportNoteSourceLocator(sourceLocator) ? sourceLocator : null,
-    createdAt: fmDate(frontmatter.created) ?? fmDate(frontmatter[CREATED_FALLBACK_FRONTMATTER_KEY]),
+    createdAt:
+      normalizeAuthoredDate(frontmatter.created) ??
+      normalizeAuthoredDate(frontmatter[CREATED_FALLBACK_FRONTMATTER_KEY]),
     frontmatter,
     frontmatterEntries: entries,
     get fields(): string {
@@ -676,7 +668,9 @@ export const serializeNoteFile = ({
   const entries = existingEntries
   const incomingCreated = frontmatter && frontmatterEntryOf(frontmatter, 'created')
   const preserveUnreadableCreated = Boolean(
-    createdAt && incomingCreated && fmDate(frontmatterEntryValue(incomingCreated)) === null,
+    createdAt &&
+    incomingCreated &&
+    normalizeAuthoredDate(frontmatterEntryValue(incomingCreated)) === null,
   )
   // Positions are tombstoned instead of repeatedly splicing/scanning the array.
   // A large imported block may contain tens of thousands of distinct authored

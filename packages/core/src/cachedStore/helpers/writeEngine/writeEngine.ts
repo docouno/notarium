@@ -47,6 +47,7 @@ import {
   FrontmatterLimitError,
   isDurableFrontmatter,
   type LogicalNoteState,
+  normalizeAuthoredDate,
   parseBodyFrontmatterBlock,
   promoteBodyTitle,
   stripFrontmatter,
@@ -81,17 +82,6 @@ import { TRASH_MUTATION_PREFIX, trashMutationPath } from '../../consts'
 import { exactDocumentState, exactLogicalState, exactVersionToken } from '../exactNoteState'
 import { supportsExactIdentityAddress } from '../innerIdentity'
 import type { WriteHost } from './types'
-
-/** Normalise an authored createdAt to the canonical ISO instant the engine
- *  indexes, or undefined when absent/unparseable. Undefined means "leave the existing
- *  date alone" — the three-state carry-forward the lax MCP create channel needs. */
-const normAuthoredDate = (v?: string): string | undefined => {
-  if (!v) {
-    return undefined
-  }
-  const t = Date.parse(v)
-  return Number.isNaN(t) ? undefined : new Date(t).toISOString()
-}
 
 /** The optimistic mirror of the serializer's `drop`: a typed channel that CLEARS its
  *  key takes it out of the file outright, so it has to leave every list of the
@@ -1050,8 +1040,15 @@ export class WriteEngine {
         capturedLegacyNameAliases = record.legacyNameAliases
       }
     }
+    const authoredCreatedAt = normalizeAuthoredDate(input.createdAt)
+    const authoredDateIdentityUpdate = Boolean(
+      input.originalId &&
+      authoredCreatedAt &&
+      this.host.identity.recordFor(id)?.createdAt !== authoredCreatedAt,
+    )
+    const ownsIdentityPublication = !input.originalId || authoredDateIdentityUpdate
     const releaseGraphTransition = this.host.beginGraphTransition()
-    const releaseIdentityPublication = !input.originalId
+    const releaseIdentityPublication = ownsIdentityPublication
       ? this.host.beginIdentityPublication()
       : undefined
     let identityPublicationPending = false
@@ -1080,22 +1077,24 @@ export class WriteEngine {
       )
       restoreResult = result
       restoreVersionToken = result.versionToken
-      const publishAfterIdentityFlush = !input.originalId && !this.host.isBulkActive()
+      const publishAfterIdentityFlush = ownsIdentityPublication && !this.host.isBulkActive()
 
       let writeEffect = NO_WRITE_SNAPSHOT_EFFECT
 
       const publishWrite = async () => {
         const aliasesBefore = this.host.snap.notes.get(id)?.legacyNameAliases
 
+        if (ownsIdentityPublication) {
+          // Register the durable cut before the synchronous registry/snapshot
+          // mutation. Authored date updates need the same ordering as creates:
+          // their changed frame must not expose B while persistence still says A.
+          this.host.markIdentityPublicationPending()
+          identityPublicationPending = true
+        }
         this.host.afterNotesReady(() => {
           writeEffect = this.applyWrite(input, result, id, originalPath, false, removed)
         })
-        if (!input.originalId) {
-          // The lease was closed before inner.write. Register its durable cut
-          // immediately after the synchronous registry/snapshot patch, before
-          // any later await can let a reader or retry timer observe the new axis.
-          this.host.markIdentityPublicationPending()
-          identityPublicationPending = true
+        if (ownsIdentityPublication) {
           if (this.host.isBulkActive()) {
             // Bulk durability is coalesced. Releasing the producer lease lets an
             // interactive read force the pending revision durable mid-import;
@@ -1232,12 +1231,10 @@ export class WriteEngine {
       if (delayPublication) {
         await publishWrite()
       }
-      // Flush a fresh id before answering: a create's id may be resolved in the very next request,
-      // but global id→space resolution reads the meta-DB, not this write-behind registry, so a read
-      // that beat the flush would 404 a note that exists. Updates skip it (already durable). Bulk
-      // import skips the per-note flush (a starvation source) — the bulk controller's
-      // broadcast flushes the registry before each coalesced `changed` instead, so
-      // durability tracks visibility.
+      // Flush a fresh id or authored date before answering/publishing. Bulk
+      // import skips the per-note flush (a starvation source) — the bulk
+      // controller's broadcast flushes the registry before each coalesced
+      // `changed` instead, so durability tracks visibility.
       if (publishAfterIdentityFlush) {
         await this.host.flushIdentityPublication()
         if (result.filePath) {
@@ -1310,7 +1307,7 @@ export class WriteEngine {
         this.host.reconcileSoon()
       }
       if (identityPublicationPending) {
-        // A stand-in for the id set as it was BEFORE this create — reconstructed
+        // A stand-in for the id set as it was BEFORE this identity publication — reconstructed
         // here rather than copied up front, because "up front" meant copying the
         // whole corpus on every successful write to serve a branch only a failure
         // reaches. It is NOT that set: the map moved under it while this write was
@@ -2213,11 +2210,11 @@ export class WriteEngine {
     // Authored date edit: when the write SETS `createdAt`, reset the
     // registry's pinned date too — else adoptMeta would read the stale first-seen
     // value back over the engine's fresh one on the next poll/restart (the registry
-    // is the Feed-date authority for a bare engine). Normalised first (normAuthoredDate)
+    // is the Feed-date authority for a bare engine). Normalised first
     // so a lax-channel garbage value can't poison the snapshot/registry while the
     // engine rejects it. No-op for an import re-stamping the same value, or an
     // identity-capable inner engine (unknown id).
-    const authoredCreatedAt = normAuthoredDate(input.createdAt)
+    const authoredCreatedAt = normalizeAuthoredDate(input.createdAt) ?? undefined
 
     if (authoredCreatedAt) {
       this.host.identity.setCreatedAt(id, authoredCreatedAt)

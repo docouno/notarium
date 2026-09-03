@@ -86,10 +86,16 @@ export const isoToDateInput = (iso: string | null | undefined): string => {
   const day = String(d.getDate()).padStart(2, '0')
   return `${y}-${m}-${day}`
 }
-const dateInputToIso = (day: string): string => {
+export const dateInputToIso = (day: string): string => {
   const [y, m, d] = day.split('-').map(Number)
   return new Date(y, m - 1, d).toISOString()
 }
+
+export const createdAtPatch = (
+  createdSeed: string,
+  createdDate: string,
+): Pick<SaveInput, 'createdAt'> =>
+  createdDate && createdDate !== createdSeed ? { createdAt: dateInputToIso(createdDate) } : {}
 
 /** What "Belongs to" ANSWERS, as one comparable value. The fields behind it are not
  *  independent — a project list means nothing under "the whole Space" — so dirty is
@@ -388,9 +394,7 @@ export function useNoteDraft(initialDraft: Draft | null) {
       // AND a day is set — so a normal save never restamps `created`, and clearing the
       // field is a no-op (there's no "reset to birthtime" channel in scope). Built as
       // the picked day's LOCAL midnight ISO instant.
-      ...(createdDate && createdDate !== createdSeed
-        ? { createdAt: dateInputToIso(createdDate) }
-        : {}),
+      ...createdAtPatch(createdSeed, createdDate),
     }
   }
 

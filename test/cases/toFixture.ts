@@ -12,6 +12,7 @@ import {
   logicalNoteState,
   nextAliasesMulti,
   normAliases,
+  normalizeAuthoredDate,
   parseFrontmatterLines,
   slugify,
   stripFrontmatter,
@@ -528,18 +529,31 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     if (!note) {
       throw new Error(`external rewrite references unknown note ${rewrite.note}`)
     }
+    let projected = rewrite.projection === 'createdAt' ? note.createdAt : note.content
+
     for (const { from, to } of rewrite.replacements) {
       if (Buffer.byteLength(from, 'utf8') !== Buffer.byteLength(to, 'utf8')) {
         throw new Error(`external rewrite changes byte length for note ${rewrite.note}`)
       }
-      const parts = note.content.split(from)
+      const parts = projected.split(from)
 
       if (parts.length !== 2) {
         throw new Error(
-          `external rewrite expected one occurrence of "${from}" in note ${rewrite.note}`,
+          `external rewrite expected one occurrence of "${from}" in ` +
+            `${rewrite.projection ?? 'content'} for note ${rewrite.note}`,
         )
       }
-      note.content = `${parts[0]}${to}${parts[1]}`
+      projected = `${parts[0]}${to}${parts[1]}`
+    }
+    if (rewrite.projection === 'createdAt') {
+      const createdAt = normalizeAuthoredDate(projected)
+
+      if (!createdAt) {
+        throw new Error(`external rewrite projects an invalid createdAt for note ${rewrite.note}`)
+      }
+      note.createdAt = createdAt
+    } else {
+      note.content = projected
     }
   }
 

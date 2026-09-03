@@ -59,11 +59,14 @@ import {
   decodeWikilinkIdentity,
   type DocumentState,
   encodeWikilinkIdentity,
+  frontmatterEntryOf,
+  frontmatterEntryValue,
   FrontmatterLimitError,
-  frontmatterValue,
   isWikilinkIdentityTarget,
   type LogicalNoteState,
+  normalizeAuthoredDate,
   normalizeWikilinkTarget,
+  parseFrontmatterBlock,
 } from '../libs/markdown'
 import { MutationCoordinator } from '../libs/mutationCoordinator'
 import { directoryOf, isPathUnder, legacyNoteNameAlias } from '../libs/path'
@@ -131,6 +134,10 @@ type ReadAttempt = { kind: 'complete'; content: NoteContent } | { kind: 'expand'
 type ReadEffects = {
   rekeyed: Array<[string, string]>
   changedIds: Set<string>
+  /** Exact authored-date repairs. Direct reads publish these themselves; poll
+   * keeps them out of its generic frame so the existing journal owner refreshes
+   * same-day date-only edits. */
+  authoredDateChangedIds: Set<string>
 }
 
 type ExactNoteTarget = {
@@ -147,6 +154,7 @@ const exactObservedMeta = (note: NoteContent, fallback: NoteMeta): NoteMeta => (
   // Presence and absence are both projections of the exact state. Assigning
   // undefined deliberately clears a slug sampled by an earlier delta.
   slug: note.slug,
+  createdAt: note.createdAt ?? fallback.createdAt ?? null,
 })
 
 const sameLegacyAliases = (
@@ -157,6 +165,23 @@ const sameLegacyAliases = (
   const b = right ?? []
 
   return a.length === b.length && a.every((alias, index) => alias === b[index])
+}
+
+/** Compare instants without paying Date allocation on the overwhelmingly common
+ * canonical-equal inventory row. Normalization is only the mismatch slow path. */
+const authoredDateDiffers = (
+  candidate: string | null | undefined,
+  current: string | null | undefined,
+): boolean => {
+  if (!candidate || candidate === current) {
+    return false
+  }
+  const normalizedCandidate = normalizeAuthoredDate(candidate)
+
+  return Boolean(
+    normalizedCandidate &&
+    normalizedCandidate !== (normalizeAuthoredDate(current) ?? current ?? null),
+  )
 }
 
 /** Claims whose arbitration/convergence has not completed, keyed by storage path. */
@@ -1182,18 +1207,39 @@ export class CachedStore implements KnowledgeStore {
     if (generation !== this.bootGeneration || this.stopped) {
       return false
     }
+    const engineDateCandidates = new Set<string>()
+
     for (const meta of full) {
       const adopted = this.adoptMeta(meta)
       const prev = this.snap.notes.get(adopted.id)
+      const pinnedCreatedAt = prev?.createdAt ?? adopted.createdAt ?? null
+
+      if (authoredDateDiffers(meta.createdAt, pinnedCreatedAt)) {
+        engineDateCandidates.add(meta.filePath)
+      }
       this.snap.notes.set(adopted.id, {
         ...adopted,
-        createdAt: adopted.createdAt ?? prev?.createdAt ?? null,
+        createdAt: pinnedCreatedAt,
       })
     }
     // Reconcile frontmatter id claims before admitting mutations. A phase-1
     // reader may have seen a temporary id; rekeySnapshot records its stable
     // successor so an already-queued mutation follows the durable identity.
-    await this.sweepFileIds([...this.snap.notes.values()].map((m) => m.filePath))
+    const identitySweep = await this.sweepFileIds(
+      [...this.snap.notes.values()].map((m) => m.filePath),
+    )
+    const dateCandidates = new Set(identitySweep.authoredDateCandidates)
+
+    for (const path of engineDateCandidates) {
+      if (identitySweep.unresolvedPaths.has(path)) {
+        dateCandidates.add(path)
+      }
+    }
+    await this.reconcileAuthoredDateCandidates(dateCandidates, {
+      rekeyed: [],
+      changedIds: new Set(),
+      authoredDateChangedIds: new Set(),
+    })
     await this.captureLegacyInventoryEvidence()
 
     if (generation !== this.bootGeneration || this.stopped) {
@@ -1379,12 +1425,14 @@ export class CachedStore implements KnowledgeStore {
   private async sweepFileIds(paths: readonly string[]): Promise<{
     unresolvedPaths: Set<string>
     rekeyed: Array<[string, string]>
+    authoredDateCandidates: Set<string>
   }> {
     const unresolvedPaths = new Set(paths)
     const rekeyed: Array<[string, string]> = []
+    const authoredDateCandidates = new Set<string>()
 
     if (!this.readBody || !paths.length) {
-      return { unresolvedPaths, rekeyed }
+      return { unresolvedPaths, rekeyed, authoredDateCandidates }
     }
     let identityPublicationPending = false
     const CHUNK = 64
@@ -1408,9 +1456,17 @@ export class CachedStore implements KnowledgeStore {
           continue
         }
         let claim: string | null
+        let authoredCreatedAt: string | null
 
         try {
-          claim = frontmatterValue(raw, NOTE_ID_FRONTMATTER_KEY)
+          const block = parseFrontmatterBlock(raw)
+          const claimEntry = block && frontmatterEntryOf(block.entries, NOTE_ID_FRONTMATTER_KEY)
+          const createdEntry = block && frontmatterEntryOf(block.entries, 'created')
+          const claimValue = claimEntry && frontmatterEntryValue(claimEntry)
+          const createdValue = createdEntry && frontmatterEntryValue(createdEntry)
+
+          claim = typeof claimValue === 'string' && claimValue ? claimValue : null
+          authoredCreatedAt = normalizeAuthoredDate(createdValue)
         } catch (err) {
           if (err instanceof FrontmatterLimitError) {
             continue
@@ -1454,6 +1510,20 @@ export class CachedStore implements KnowledgeStore {
             )
           }
         }
+        if (authoredCreatedAt) {
+          const settledId = this.identity.idFor(path) ?? this.snap.notes.idsAt(path)[0]
+          const currentCreatedAt = settledId
+            ? (this.snap.notes.get(settledId)?.createdAt ??
+              this.identity.recordFor(settledId)?.createdAt ??
+              null)
+            : null
+
+          if (authoredDateDiffers(authoredCreatedAt, currentCreatedAt)) {
+            // Raw bytes are only a cheap candidate. The caller obtains one
+            // coherent exact note observation before applying this date.
+            authoredDateCandidates.add(path)
+          }
+        }
         this.seedEagerNoteFacts(path, raw)
       }
     }
@@ -1461,7 +1531,25 @@ export class CachedStore implements KnowledgeStore {
       await this.flushIdentityPublication()
     }
 
-    return { unresolvedPaths, rekeyed }
+    return { unresolvedPaths, rekeyed, authoredDateCandidates }
+  }
+
+  /** Turn the bounded raw/metadata candidate set into proof-bearing exact reads.
+   * finalizeRead applies only a valid public `created:` after final identity
+   * settlement; boot discards the buffered read effects and publishes its usual
+   * all-notes state later. */
+  private async reconcileAuthoredDateCandidates(
+    paths: ReadonlySet<string>,
+    effects: ReadEffects,
+  ): Promise<void> {
+    for (const filePath of paths) {
+      const noteId = this.identity.idFor(filePath) ?? this.snap.notes.idsAt(filePath)[0]
+
+      if (!noteId) {
+        continue
+      }
+      await this.readClaimed(noteId, { background: true }, effects, true)
+    }
   }
 
   /** The ONE road from an observed frontmatter claim to a published identity:
@@ -2728,7 +2816,13 @@ export class CachedStore implements KnowledgeStore {
       // A direct read owns its event publication. Keep every snapshot side-effect
       // buffered until the identity flush below succeeds; callers such as poll()
       // pass their own accumulator and publish at their wider checkpoint.
-      const readEffects = effects ?? { rekeyed: [], changedIds: new Set<string>() }
+      const readEffects =
+        effects ??
+        ({
+          rekeyed: [],
+          changedIds: new Set<string>(),
+          authoredDateChangedIds: new Set<string>(),
+        } satisfies ReadEffects)
       const mayRekey =
         !effects &&
         !this.inner.capabilities.identity &&
@@ -2757,7 +2851,11 @@ export class CachedStore implements KnowledgeStore {
         // The snapshot already carries the new axis, but no client has heard it.
         // Retain the pre-read population so the first later successful flush emits
         // one broad repair; never announce an id its global route cannot resolve.
-        if (readEffects.rekeyed.length > 0 || readEffects.changedIds.size > 0) {
+        if (
+          readEffects.rekeyed.length > 0 ||
+          readEffects.changedIds.size > 0 ||
+          readEffects.authoredDateChangedIds.size > 0
+        ) {
           const before = identityBefore ?? new Set(this.snap.notes.keys())
 
           this.pendingIdentityChangeBefore ??= before
@@ -2894,6 +2992,27 @@ export class CachedStore implements KnowledgeStore {
     } else if (!sourceId) {
       sourceId = id
     }
+    if (allowSideEffects && sourceId && detail.filePath) {
+      const live = this.snap.notes.get(sourceId)
+      const authoredCreatedAt = normalizeAuthoredDate(detail.frontmatter?.created)
+
+      if (
+        live &&
+        live.filePath === detail.filePath &&
+        authoredCreatedAt &&
+        live.createdAt !== authoredCreatedAt
+      ) {
+        // The exact note is the proof; raw bytes and engine metadata only chose
+        // this rare read. Mark durability before changing either authority so a
+        // concurrent public surface must flush or fail instead of serving B over
+        // a registry that still says A. Missing/invalid public `created:` is not
+        // a CLEAR and the reserved fallback is deliberately ignored here.
+        this.markIdentityPublicationPending()
+        this.identity.setCreatedAt(sourceId, authoredCreatedAt)
+        this.snap.notes.set(sourceId, { ...live, createdAt: authoredCreatedAt })
+        effects?.authoredDateChangedIds.add(sourceId)
+      }
+    }
     if (
       allowSideEffects &&
       sourceId &&
@@ -2936,6 +3055,7 @@ export class CachedStore implements KnowledgeStore {
       ...new Set([
         ...effects.rekeyed.map(([, newId]) => newId),
         ...[...effects.changedIds].map((id) => this.canonicalMutationId(id)),
+        ...[...effects.authoredDateChangedIds].map((id) => this.canonicalMutationId(id)),
       ]),
     ].filter((id) => this.snap.notes.has(id))
     const removed = [...rekeyedRemoved]
@@ -4044,28 +4164,45 @@ export class CachedStore implements KnowledgeStore {
           // changed paths; quiet polls never re-read the compatibility corpus.
           await this.captureLegacyInventoryEvidence(new Set(result.sweepPaths))
 
-          // Only now, with this delta's identities settled, may the cursor move.
-          // Advancing it earlier loses the delta outright when the flush or the
-          // sweep throws: `changes()` would never offer these paths again, and an
-          // external file carrying a durable claim would keep serving under the
-          // provisional id it was minted with. canon: docs/core.md#identity
-          this.cursor = delta.cursor
-          this.lastPollAt = this.iso()
-
           const identityResolutions: Promise<void>[] = []
-          const readEffects: ReadEffects = { rekeyed: [], changedIds: new Set() }
+          const readEffects: ReadEffects = {
+            rekeyed: [],
+            changedIds: new Set(),
+            authoredDateChangedIds: new Set(),
+          }
+          const dateCandidates = new Set(identitySweep.authoredDateCandidates)
+
+          // Engine metadata is only a fallback hint: after an inode/index rebuild
+          // an undated note may legitimately carry a new birthtime. A successful
+          // raw read that found no differing public `created:` rules that hint out;
+          // absent/failed raw capability takes the bounded exact path below.
+          for (const path of result.engineDateCandidatePaths) {
+            if (identitySweep.unresolvedPaths.has(path)) {
+              dateCandidates.add(path)
+            }
+          }
 
           for (const observation of result.externalObservations) {
+            const authoredDateUnchecked = dateCandidates.delete(observation.filePath)
             const { identityResolution } = await this.admitExternalObservation(
               observation,
               identitySweep.unresolvedPaths.has(observation.filePath),
               readEffects,
+              authoredDateUnchecked,
             )
 
             if (identityResolution) {
               identityResolutions.push(identityResolution)
             }
           }
+          await this.reconcileAuthoredDateCandidates(dateCandidates, readEffects)
+
+          // Only now, with this delta's identities and any authored-date reset
+          // durably settled, may the cursor move. Advancing it earlier loses the
+          // delta outright when proof or persistence fails: `changes()` would
+          // never offer these paths again. canon: docs/core.md#identity
+          this.cursor = delta.cursor
+          this.lastPollAt = this.iso()
           const legacyAliasesChanged = legacyAliasesBefore !== this.legacyAliasContextVersion
           const rederiveSources =
             directoriesChanged || aliasesChanged || legacyAliasesChanged
@@ -4163,6 +4300,7 @@ export class CachedStore implements KnowledgeStore {
     externalObservations: ExternalObservation[]
     newlyAdded: string[]
     rederiveSources: string[]
+    engineDateCandidatePaths: string[]
   } {
     const upserted = new Set<string>()
     const removed: string[] = []
@@ -4171,11 +4309,19 @@ export class CachedStore implements KnowledgeStore {
     const externalObservations: ExternalObservation[] = []
     const newlyAdded = new Set<string>()
     const rederiveSources = new Set<string>()
+    const engineDateCandidatePaths = new Set<string>()
 
     const inventory = new Map<string, NoteMeta & { id: string }>()
 
     for (const m of delta.inventory) {
       const adopted = this.adoptMeta(m)
+      const pinnedCreatedAt =
+        this.snap.notes.get(adopted.id)?.createdAt ?? adopted.createdAt ?? null
+
+      if (authoredDateDiffers(m.createdAt, pinnedCreatedAt)) {
+        engineDateCandidatePaths.add(m.filePath)
+        sweepPaths.add(m.filePath)
+      }
       inventory.set(adopted.id, adopted)
     }
     for (const [id, meta] of [...this.snap.notes]) {
@@ -4338,6 +4484,7 @@ export class CachedStore implements KnowledgeStore {
         externalObservations,
         newlyAdded: [...newlyAdded],
         rederiveSources: [...rederiveSources],
+        engineDateCandidatePaths: [...engineDateCandidatePaths],
       }
     }
 
@@ -4350,6 +4497,7 @@ export class CachedStore implements KnowledgeStore {
       externalObservations,
       newlyAdded: [...newlyAdded],
       rederiveSources: [...rederiveSources],
+      engineDateCandidatePaths: [...engineDateCandidatePaths],
     }
   }
 
@@ -4357,6 +4505,7 @@ export class CachedStore implements KnowledgeStore {
     observation: ExternalObservation,
     identityUnchecked = false,
     readEffects?: ReadEffects,
+    authoredDateUnchecked = false,
   ): Promise<ExternalAdmission> {
     let title = observation.title
     let content = observation.content
@@ -4372,11 +4521,12 @@ export class CachedStore implements KnowledgeStore {
     const unresolvedId = this.canonicalMutationId(observation.noteId)
 
     if (
-      !this.inner.capabilities.identity &&
-      (observation.requiresExactState ||
-        identityUnchecked ||
-        (unresolvedId === observation.noteId &&
-          this.identity.recordFor(unresolvedId)?.materialized !== true))
+      authoredDateUnchecked ||
+      (!this.inner.capabilities.identity &&
+        (observation.requiresExactState ||
+          identityUnchecked ||
+          (unresolvedId === observation.noteId &&
+            this.identity.recordFor(unresolvedId)?.materialized !== true)))
     ) {
       try {
         const detail = await this.readClaimed(
@@ -4394,7 +4544,14 @@ export class CachedStore implements KnowledgeStore {
         logicalState = exactLogicalState(detail)
         documentState = exactDocumentState(detail)
         exactMeta = exactObservedMeta(detail, observation.meta)
-      } catch {
+      } catch (error) {
+        // A differing authored-date candidate cannot publish against the pinned
+        // snapshot. Keep the cursor behind it so proof/persistence retries the
+        // same transition; ordinary identity/body gaps retain their background
+        // recovery path.
+        if (authoredDateUnchecked) {
+          throw error
+        }
         identityUnresolved = true
       }
     }

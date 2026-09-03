@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { changedFields, fieldsWithPending } from './useNoteDraft'
+import {
+  changedFields,
+  createdAtPatch,
+  dateInputToIso,
+  fieldsWithPending,
+  isoToDateInput,
+} from './useNoteDraft'
 
 describe('editor field patch', () => {
   it('sends only changed values and expresses removal as null', () => {
@@ -36,5 +42,22 @@ describe('editor field patch', () => {
     expect(changedFields({ reviewers: ['ann'] }, fields)).toEqual({
       reviewers: ['ann', 'bo'],
     })
+  })
+})
+
+describe('editor authored creation date payload', () => {
+  it('shows the stored instant as its local calendar day', () => {
+    const instant = new Date(2024, 0, 2, 12, 30).toISOString()
+
+    expect(isoToDateInput(instant)).toBe('2024-01-02')
+  })
+
+  it('sends local midnight only for a changed non-empty day', () => {
+    expect(createdAtPatch('2024-01-02', '2024-01-02')).toEqual({})
+    expect(createdAtPatch('2024-01-02', '')).toEqual({})
+    expect(createdAtPatch('2024-01-02', '2024-01-03')).toEqual({
+      createdAt: dateInputToIso('2024-01-03'),
+    })
+    expect(dateInputToIso('2024-01-03')).toBe(new Date(2024, 0, 3).toISOString())
   })
 })
