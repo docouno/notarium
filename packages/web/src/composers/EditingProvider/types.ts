@@ -36,6 +36,12 @@ export type EditingContextValue = {
   editor: NoteDraftEditor
   saving: boolean
   startSession: (adapter: EditingSessionAdapter) => void
+  /** Register the one standard-document reader capture that must run while its
+   * DOM is still live, immediately before startEdit creates the draft. */
+  registerBeforeStartEdit: (capture: () => void) => () => void
+  /** Register the matching editor capture before common Cancel cleanup drops
+   * the live CodeMirror subtree. */
+  registerBeforeCancelEdit: (capture: () => void) => () => void
   startNew: (directory?: unknown) => Promise<void>
   startEdit: () => void
   startFolderPageEdit: (folderPath: string, title: string) => Promise<void>

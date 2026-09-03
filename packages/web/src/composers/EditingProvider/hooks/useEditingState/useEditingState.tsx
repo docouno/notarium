@@ -103,6 +103,8 @@ export const useEditingState = (): EditingContextValue => {
   const bypassRef = useRef(false)
   const sessionRef = useRef<(EditingSessionAdapter & { routeKey: string }) | null>(null)
   const versionTokenRef = useRef<string | undefined>(undefined)
+  const beforeStartEditRef = useRef<(() => void) | null>(null)
+  const beforeCancelEditRef = useRef<(() => void) | null>(null)
   const sessionSaveAvailable = sessionRef.current?.canSave?.(editor) ?? true
   const exposedEditor = sessionSaveAvailable ? editor : { ...editor, canSave: false }
   editorRef.current = exposedEditor
@@ -128,6 +130,26 @@ export const useEditingState = (): EditingContextValue => {
     },
     [location.key, setDraft],
   )
+
+  const registerBeforeStartEdit = useCallback((capture: () => void) => {
+    beforeStartEditRef.current = capture
+
+    return () => {
+      if (beforeStartEditRef.current === capture) {
+        beforeStartEditRef.current = null
+      }
+    }
+  }, [])
+
+  const registerBeforeCancelEdit = useCallback((capture: () => void) => {
+    beforeCancelEditRef.current = capture
+
+    return () => {
+      if (beforeCancelEditRef.current === capture) {
+        beforeCancelEditRef.current = null
+      }
+    }
+  }, [])
 
   // Any router navigation while dirty is intercepted here (the other half of
   // the hybrid guard — non-navigation actions go through ensureCanLeaveDraft).
@@ -307,6 +329,7 @@ export const useEditingState = (): EditingContextValue => {
     if (!note || !canWriteOpenNote) {
       return
     }
+    beforeStartEditRef.current?.()
     versionTokenRef.current = note.versionToken
     sessionRef.current = null
     const documentTitle =
@@ -766,6 +789,7 @@ export const useEditingState = (): EditingContextValue => {
   // resurrect the form the user just dismissed (setDraft(null) first, so the
   // clean-up navigation isn't itself guarded).
   const cancelEdit = useCallback(() => {
+    beforeCancelEditRef.current?.()
     const session = sessionRef.current
     session?.onDiscard?.()
     clearSession()
@@ -887,6 +911,8 @@ export const useEditingState = (): EditingContextValue => {
     editor: exposedEditor,
     saving,
     startSession,
+    registerBeforeStartEdit,
+    registerBeforeCancelEdit,
     startNew,
     startEdit,
     startFolderPageEdit,

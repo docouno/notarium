@@ -39,6 +39,7 @@ import { useEditing } from '../EditingProvider'
 import { useSpace } from '../SpaceProvider'
 import { useSpotlight } from '../SpotlightProvider'
 import { Cheatsheet } from './Cheatsheet'
+import { editingSaveAction } from './helpers/editingSaveAction'
 
 // HotkeysProvider (#30) — the ONE keyboard dispatcher. It resolves (active preset +
 // user overrides) into a single keymap and is the sole owner of the global keydown
@@ -148,6 +149,10 @@ export const HotkeysProvider = ({ children }: { children: ReactNode }) => {
   handlersRef.current = handlers
   const editingRef = useRef(editing)
   editingRef.current = editing
+  // React cannot publish `saving=true` between two shortcuts dispatched in the
+  // same task. This action-local latch closes that event-time gap; saveDraft's
+  // internal conflict/uniquify recursion remains untouched.
+  const saveActionInFlightRef = useRef(false)
 
   // ── Global dispatcher: capture phase on window, so a focused editor/input can't
   // swallow a shortcut before it reaches us (the layout-agnostic Cmd+P pattern from
@@ -264,9 +269,21 @@ export const HotkeysProvider = ({ children }: { children: ReactNode }) => {
         // focused text edit and an uncommitted list token from this key event.
         queueMicrotask(() => {
           const current = editingRef.current
+          const decision = editingSaveAction({
+            active: current.isEditing,
+            saving: current.saving || saveActionInFlightRef.current,
+            canSave: current.editor.canSave,
+            isNew: current.draft?.isNew ?? true,
+            dirty: current.editor.dirty,
+          })
 
-          if (current.isEditing && current.editor.canSave && !current.saving) {
-            void current.saveDraft(current.editor.buildPayload())
+          if (decision === 'save') {
+            saveActionInFlightRef.current = true
+            void current
+              .saveDraft(current.editor.buildPayload())
+              .finally(() => (saveActionInFlightRef.current = false))
+          } else if (decision === 'finish') {
+            current.cancelEdit()
           }
         })
 

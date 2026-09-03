@@ -1,9 +1,18 @@
+import type { Page } from '@playwright/test'
 import { expect, openSpotlight, test, waitForAppReady } from './fixtures'
 
 // Global hotkeys (#30): the central dispatcher + the `?` cheat sheet + the Settings
 // editor (preset + per-action rebind). Single keys fire only outside text fields;
 // `g`-sequences navigate; modifier chords work anywhere; the editor's formatting
 // keymap is built from the same map. Runs against the fake backend (space `main`).
+
+const EXISTING_NOTE = 'fake-demo-carbon'
+
+const openExistingEditor = async (page: Page) => {
+  await page.goto(`/n/${EXISTING_NOTE}`)
+  await page.getByRole('button', { name: 'Edit' }).click()
+  await expect(page.locator('.cm-content')).toBeVisible()
+}
 
 test('? opens the cheat sheet, Escape closes it', async ({ page }) => {
   await page.goto('/')
@@ -140,4 +149,135 @@ test('Settings → Keyboard: recording adds a binding that applies live', async 
   const before = await html.getAttribute('data-theme')
   await page.keyboard.press('y')
   await expect(html).not.toHaveAttribute('data-theme', before || 'dark')
+})
+
+for (const chord of ['Control+s', 'Control+Enter']) {
+  test(`${chord} finishes a clean existing editor without a mutation`, async ({ page }) => {
+    const before = await (await page.request.get(`/api/note?id=${EXISTING_NOTE}`)).json()
+    const writes: string[] = []
+    page.on('request', (request) => {
+      if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/note') {
+        writes.push(request.url())
+      }
+    })
+    await openExistingEditor(page)
+    await page.keyboard.press(chord)
+    await expect(page.locator('.cm-content')).toHaveCount(0)
+    const after = await (await page.request.get(`/api/note?id=${EXISTING_NOTE}`)).json()
+
+    expect(writes).toHaveLength(0)
+    expect(after).toEqual(before)
+  })
+}
+
+test('a custom editing.save binding has the same clean-finish semantics', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      'bm-hotkey-overrides',
+      JSON.stringify({
+        'editing.save': [[{ code: 'KeyK', mod: true, shift: true }]],
+      }),
+    )
+  })
+  await openExistingEditor(page)
+  await page.keyboard.press('Control+Shift+k')
+  await expect(page.locator('.cm-content')).toHaveCount(0)
+})
+
+test('Save keeps a clean not-saveable new draft open', async ({ page }) => {
+  await page.goto('/s/main?new=1')
+  await expect(page.locator('.cm-content')).toBeVisible()
+  await page.keyboard.press('Control+s')
+  await expect(page.locator('.cm-content')).toBeVisible()
+  await expect(page).toHaveURL(/\?new=1$/)
+})
+
+test('Save creates a valid new draft through the same action', async ({ page }) => {
+  const writes: string[] = []
+  page.on('request', (request) => {
+    if (
+      request.method() === 'POST' &&
+      ['/api/note', '/api/s/main/notes'].includes(new URL(request.url()).pathname)
+    ) {
+      writes.push(request.url())
+    }
+  })
+  await page.goto('/s/main?new=1')
+  const editor = page.locator('.cm-content')
+  await expect(editor).toBeVisible()
+  await editor.fill('# Saved from the action\n\nA valid new document.')
+  await page.keyboard.press('Control+s')
+
+  await expect(page.getByRole('heading', { name: 'Saved from the action', level: 1 })).toBeVisible()
+  expect(writes).toHaveLength(1)
+})
+
+test('Save preserves a dirty existing draft whose document is invalid', async ({ page }) => {
+  const writes: string[] = []
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/note') {
+      writes.push(request.url())
+    }
+  })
+  await openExistingEditor(page)
+  const editor = page.locator('.cm-content')
+  await editor.fill('## No document title\n\nKeep this invalid draft.')
+  await expect(page.getByRole('button', { name: 'Save' })).toBeDisabled()
+  await page.keyboard.press('Control+s')
+
+  await expect(editor).toContainText('Keep this invalid draft.')
+  expect(writes).toHaveLength(0)
+})
+
+test('Save keeps a clean virtual folder page open without materializing it', async ({ page }) => {
+  const writes: string[] = []
+  page.on('request', (request) => {
+    const path = new URL(request.url()).pathname
+
+    if (request.method() === 'POST' && (path === '/api/note' || path.endsWith('/folders/page'))) {
+      writes.push(request.url())
+    }
+  })
+  await page.goto('/')
+  const demo = page.locator('[data-testid="tree-folder"][data-path="demo"]')
+  await demo.click({ button: 'right' })
+  await page.getByRole('menuitem', { name: 'Open page' }).click()
+  await expect(page.getByTestId('virtual-folder-page')).toBeVisible()
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  const editor = page.locator('.cm-content')
+  await expect(editor).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Save' })).toBeDisabled()
+  await page.keyboard.press('Control+s')
+
+  await expect(editor).toBeVisible()
+  await expect(page).toHaveURL(/\/s\/main\/files\/demo$/)
+  expect(writes).toHaveLength(0)
+})
+
+test('two Save actions in the same task produce one existing-note write', async ({ page }) => {
+  const writes: string[] = []
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/note') {
+      writes.push(request.url())
+    }
+  })
+  await openExistingEditor(page)
+  await page.locator('.cm-content').press('ControlOrMeta+End')
+  await page.keyboard.insertText('\nSave once')
+  await page.evaluate(() => {
+    const save = () =>
+      window.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 's',
+          code: 'KeyS',
+          ctrlKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      )
+    save()
+    save()
+  })
+  await expect(page.locator('.cm-content')).toHaveCount(0)
+  expect(writes).toHaveLength(1)
 })

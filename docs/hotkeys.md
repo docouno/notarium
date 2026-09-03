@@ -27,6 +27,18 @@ Sequences (`g`, then a key) hold the prefix for ~1.2 s; single keys and sequence
 
 **Zonal priority (like `editorTextFocus` in VS Code).** The same chord can mean different things in different zones — and the focused zone wins. While focus is **in the editor**, its chords (the `editor` context) take priority: the global dispatcher fully yields them to CodeMirror, even if the same chord is bound to a global action. Example: `Cmd/Ctrl+D` = multi-cursor when you are typing in the editor, and "new note" anywhere else. This lets the user reuse a chord the editor has "taken" for a global action without losing the editor behavior.
 
+**Save is an action, not a chord (#299).** Every binding resolved to `editing.save` — the two defaults, a preset, or a custom override — runs the same decision after event-time field/list input has settled:
+
+| Current editing session | Save action |
+| --- | --- |
+| saveable (including a valid new draft) | run the existing save/create/publish path exactly once |
+| existing and clean, even if the external target became unavailable | finish through common cleanup; no write and no toast |
+| new/virtual and not saveable | remain open |
+| dirty and not saveable/read-only | remain open; preserve authored state |
+| already saving | ignore the repeat |
+
+The branch checks `canSave`, `isNew`, and `dirty` independently; `canSave=false` alone never means clean. Button enablement is unchanged. Dialog ownership and the action-map browser-default suppression above still win before this decision.
+
 ## Default layout (the Notarium preset, web-native)
 
 A web app must not intercept critical browser `Cmd/Ctrl` combos (`Cmd+T/N/W/L/R/S/F`), so the default is single keys + `g` sequences (Linear/GitHub style).

@@ -284,6 +284,7 @@ export const NoteReader = ({
       <MarkdownDocument
         rootRef={ref}
         className={cx('markdown', workspace && styles.workspaceBody)}
+        data-document-position-root={workspace ? undefined : 'true'}
         onClick={onClick}
         html={html}
         viewBlocks={rendered.views?.blocks}

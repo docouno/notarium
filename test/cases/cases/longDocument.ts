@@ -2,6 +2,46 @@ import { composeNote, CORPUS } from '../corpus'
 import { daysBefore, WorldBuilder } from '../generators'
 import type { CaseSpec } from '../types'
 
+export const POSITION_SENTINEL = {
+  structuredQuarter: 'POSITION-STRUCTURED-QUARTER',
+  structuredThreeQuarters: 'POSITION-STRUCTURED-THREE-QUARTERS',
+  flatFirst: 'POSITION-FLAT-FIRST',
+  flatSecond: 'POSITION-FLAT-SECOND',
+} as const
+
+const positionParagraphs = (count: number, sentinels: ReadonlyMap<number, string>): string[] =>
+  Array.from(
+    { length: count },
+    (_, index) =>
+      sentinels.get(index) ?? `Position witness paragraph ${String(index + 1).padStart(3, '0')}.`,
+  )
+
+const structuredPositionDocument = [
+  '# Structured position witness',
+  '',
+  '## One stable ATX section',
+  '',
+  ...positionParagraphs(
+    420,
+    new Map([
+      [104, POSITION_SENTINEL.structuredQuarter],
+      [314, POSITION_SENTINEL.structuredThreeQuarters],
+    ]),
+  ).flatMap((line) => [line, '']),
+].join('\n')
+
+const flatPositionDocument = [
+  '# Flat position witness',
+  '',
+  ...positionParagraphs(
+    420,
+    new Map([
+      [83, POSITION_SENTINEL.flatFirst],
+      [335, POSITION_SENTINEL.flatSecond],
+    ]),
+  ).flatMap((line) => [line, '']),
+].join('\n')
+
 // One very LONG note that stitches the whole content corpus into a single page — the
 // case for reading typography S/M/L/XL (#27/#189), the document outline, long-scroll
 // virtualization and the history-diff surface at length. Also the honest perf note:
@@ -9,8 +49,8 @@ import type { CaseSpec } from '../types'
 export const longDocument: CaseSpec = {
   name: 'long-document',
   description:
-    'One long note stitching the entire content corpus — reading-size S/M/L/XL, outline, long-scroll and the diff surface at length (#27/#189/#203).',
-  axes: ['content', 'scale', 'history'],
+    'A rich long note plus structured and flat semantic-position witnesses for reader/editor round-trips at scale.',
+  axes: ['content', 'editor', 'scale', 'history'],
   build: ({ now }) => {
     const b = new WorldBuilder(now)
     b.space({ slug: 'reader-cases', displayName: 'Reader Cases' })
@@ -24,6 +64,26 @@ export const longDocument: CaseSpec = {
       created: daysBefore(now, 20, 9),
       // A couple of edits so the same long note has a revision chain for the diff view.
       edits: [daysBefore(now, 12, 11), daysBefore(now, 4, 15)],
+      principal: 'user:sergey',
+    })
+
+    b.note({
+      space: 'reader-cases',
+      path: 'reading/structured-position-witness.md',
+      title: 'Structured position witness',
+      content: structuredPositionDocument,
+      tags: ['reading', 'position'],
+      created: daysBefore(now, 18, 10),
+      principal: 'user:sergey',
+    })
+
+    b.note({
+      space: 'reader-cases',
+      path: 'reading/flat-position-witness.md',
+      title: 'Flat position witness',
+      content: flatPositionDocument,
+      tags: ['reading', 'position'],
+      created: daysBefore(now, 17, 10),
       principal: 'user:sergey',
     })
 

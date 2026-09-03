@@ -8,6 +8,7 @@
 
 export type Axis =
   | 'content'
+  | 'editor'
   | 'structure'
   | 'folder-page'
   | 'activity'
@@ -45,6 +46,12 @@ export const AXES: readonly AxisInfo[] = [
     title: 'Content / markdown render',
     surfaces: ['reader', 'editor-preview', 'history-diff', 'settings-sample'],
     refs: ['#235', '#236', '#237', '#117', 'reading-typography.md'],
+  },
+  {
+    axis: 'editor',
+    title: 'Editor lifecycle / semantic position',
+    surfaces: ['reader-editor-position', 'source-editor', 'wysiwym-editor', 'save-action'],
+    refs: ['#299', 'editor.md', 'hotkeys.md'],
   },
   {
     axis: 'structure',

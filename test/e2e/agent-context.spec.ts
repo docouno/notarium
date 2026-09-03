@@ -1033,6 +1033,27 @@ test('Memory read and edit keep the Agents shell and originating project scope',
   await expect(page.getByLabel('Breadcrumb')).toContainText('Agents/Context/Memory/deploy-memory')
 })
 
+test('clean Save closes an existing Memory editor without a mutation', async ({ page }) => {
+  await login(page, 'sam', 'sam-password-1')
+  const memoryId = 'fake-project-memory'
+  const before = await (await page.request.get(`/api/note?id=${memoryId}`)).json()
+  const writes: string[] = []
+  page.on('request', (request) => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/note') {
+      writes.push(request.url())
+    }
+  })
+  await page.goto(`/m/${memoryId}/deploy-memory?context=docs`)
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await page.keyboard.press('Control+s')
+  await expect(page.locator('.cm-content')).toHaveCount(0)
+  await expect(page.getByText('Deploys need two approvals.')).toBeVisible()
+  const after = await (await page.request.get(`/api/note?id=${memoryId}`)).json()
+
+  expect(writes).toHaveLength(0)
+  expect(after).toEqual(before)
+})
+
 test('@spa-load-size agent-memory read defers the discovered editor JavaScript until Edit', async ({
   page,
   browser,

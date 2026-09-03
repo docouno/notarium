@@ -52,6 +52,7 @@ import { Breadcrumbs } from '../Breadcrumbs'
 import { PageFrame, TopbarActionSeparator } from '../PageFrame'
 import { FEED_LAYOUT } from './consts'
 import { buildTrail } from './helpers/breadcrumbs'
+import { DocumentPositionBridge } from './helpers/documentPosition'
 import { useEditorPreview } from './hooks/useEditorPreview'
 import { useNoteHistory } from './hooks/useNoteHistory'
 import styles from './DocumentLayout.module.scss'
@@ -90,6 +91,8 @@ export const DocumentLayout = () => {
     editor,
     saving,
     startEdit,
+    registerBeforeStartEdit,
+    registerBeforeCancelEdit,
     startFolderPageEdit,
     saveDraft,
     cancelEdit,
@@ -177,6 +180,19 @@ export const DocumentLayout = () => {
     )
   }, [note?.content, note?.id, note?.versionToken, reading])
   const parsedPath = parseAppPath(location.pathname)
+  const routeNoteId = parsedPath.kind === 'note' ? parsedPath.id : null
+  const documentPositionNote = useMemo(
+    () => (note?.id ? { id: note.id, body: note.content, versionToken: note.versionToken } : null),
+    [note?.content, note?.id, note?.versionToken],
+  )
+  const standardPositionReader = Boolean(
+    reading &&
+    note &&
+    !workspaceReader &&
+    !historySel &&
+    note.class !== NOTE_CLASS.agentMemory &&
+    note.class !== NOTE_CLASS.skill,
+  )
   const virtualFolderPath = parsedPath.kind === 'files' ? parsedPath.path : null
   const virtualFolder =
     !isEditing && virtualFolderPath
@@ -456,51 +472,71 @@ export const DocumentLayout = () => {
             : undefined
         }
       >
-        {/* No global error banner here anymore (#65): list-load failures show in
-            the sidebar (where the list lives), note-open failures as a state
-            screen on NotePage, and action failures as toasts. */}
-        {/* The editing surface follows the global Source/WYSIWYM setting (#116, #180);
-            the Edit/Preview button in the topbar flips raw↔rendered within it. */}
-        {isEditing && draft && (
-          <Suspense fallback={<EditorLoadingSkeleton />}>
-            <EditorBody
-              key={editorKey}
-              editor={editor}
-              preview={editorPreview}
-              mode={editorMode === 'wysiwym' ? 'wysiwym' : 'source'}
-              focus={focusMode}
-              typewriter={typewriter}
-              onSetFocus={setFocusMode}
-              onToggleFocus={toggleFocus}
-              onToggleTypewriter={toggleTypewriter}
-              editorKeys={editorBindings(resolved)}
-              renderViewBlock={renderDraftViewBlock}
-              viewPresentation={viewPresentation}
-              shouldAutoFocus={shouldAutoFocusEditor}
-            />
-          </Suspense>
-        )}
+        <DocumentPositionBridge
+          note={documentPositionNote}
+          routeNoteId={routeNoteId}
+          standardReader={standardPositionReader}
+          isEditing={isEditing}
+          saving={saving}
+          preview={editorPreview}
+          typewriter={typewriter}
+          draftContent={draft?.content ?? null}
+          registerBeforeStartEdit={registerBeforeStartEdit}
+          registerBeforeCancelEdit={registerBeforeCancelEdit}
+        >
+          {({ initialSelection, onEditorView, onEditorUpdate }) => (
+            <>
+              {/* No global error banner here anymore (#65): list-load failures show in
+                  the sidebar (where the list lives), note-open failures as a state
+                  screen on NotePage, and action failures as toasts. */}
+              {/* The editing surface follows the global Source/WYSIWYM setting (#116, #180);
+                  the Edit/Preview button in the topbar flips raw↔rendered within it. */}
+              {isEditing && draft && (
+                <Suspense fallback={<EditorLoadingSkeleton />}>
+                  <EditorBody
+                    key={editorKey}
+                    editor={editor}
+                    preview={editorPreview}
+                    mode={editorMode === 'wysiwym' ? 'wysiwym' : 'source'}
+                    focus={focusMode}
+                    typewriter={typewriter}
+                    onSetFocus={setFocusMode}
+                    onToggleFocus={toggleFocus}
+                    onToggleTypewriter={toggleTypewriter}
+                    editorKeys={editorBindings(resolved)}
+                    renderViewBlock={renderDraftViewBlock}
+                    viewPresentation={viewPresentation}
+                    shouldAutoFocus={shouldAutoFocusEditor}
+                    initialSelection={initialSelection}
+                    onEditorView={onEditorView}
+                    onEditorUpdate={onEditorUpdate}
+                  />
+                </Suspense>
+              )}
 
-        {!isEditing && historySel && historySource && (
-          <RevisionView
-            key={historySel.revision.revisionId}
-            source={historySource}
-            revision={historySel.revision}
-            isLatest={historySel.isLatest}
-            restorable={canWriteDocument}
-            onBack={() => setHistorySel(null)}
-            onRestored={() => {
-              setHistorySel(null)
-              // Back to the reader (now the restored, live content) and force
-              // the timeline to refetch so the new 'Restored' row shows up — the
-              // server has already committed it, so this never races the append.
-              setHistoryRefresh((n) => n + 1)
-              void reloadNote()
-            }}
-          />
-        )}
+              {!isEditing && historySel && historySource && (
+                <RevisionView
+                  key={historySel.revision.revisionId}
+                  source={historySource}
+                  revision={historySel.revision}
+                  isLatest={historySel.isLatest}
+                  restorable={canWriteDocument}
+                  onBack={() => setHistorySel(null)}
+                  onRestored={() => {
+                    setHistorySel(null)
+                    // Back to the reader (now the restored, live content) and force
+                    // the timeline to refetch so the new 'Restored' row shows up — the
+                    // server has already committed it, so this never races the append.
+                    setHistoryRefresh((n) => n + 1)
+                    void reloadNote()
+                  }}
+                />
+              )}
 
-        {!isEditing && !historySel && <Outlet />}
+              {!isEditing && !historySel && <Outlet />}
+            </>
+          )}
+        </DocumentPositionBridge>
       </PageFrame>
 
       {actionMenu && (

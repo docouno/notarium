@@ -63,6 +63,7 @@ test('board uses workspace geometry, adaptive columns and optimistic DnD without
   const workspace = page.locator('[data-view-presentation="workspace"]')
 
   await expect(workspace).toBeVisible()
+  await expect(page.locator('[data-document-position-root]')).toHaveCount(0)
   await expect(page.getByRole('tab', { name: 'Tasks' })).toHaveAttribute('aria-selected', 'true')
   await expect(page.getByRole('tab', { name: 'Later reader' })).toHaveAttribute(
     'aria-selected',

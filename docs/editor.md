@@ -49,6 +49,20 @@ Final render: markers hidden, tables as a grid, images as previews. The third mo
 - **View blocks follow that same split.** Source/WYSIWYM always edits the raw `nota` fence. Preview mounts the same inline view runtime as the current reader, but a draft is read-only and has no saved-note mutation target. Revision and deleted-note surfaces deliberately show frozen raw source rather than executing today's corpus against historical configuration.
 - **The agent sees the same body.** An MCP agent reads and writes the same markdown as a human (P4) — the writing mode has nothing to do with it, it is purely client-side.
 
+## Reader/editor position transfer (#299)
+
+An ordinary document reader and the Source/WYSIWYM editor share one semantic position across an Edit session. Entering Edit places both the caret and the editor viewport near the upper visible reader content. Cancel, a clean Save action, and a successful authored Save return the reader to the editor viewport's upper visible source position; the caret is only a fallback when editor geometry is unavailable (including Preview). A wheel scroll therefore wins over a caret that was left behind.
+
+The transfer does not copy `scrollTop`: rendered Markdown and source have different geometry. When rendered and source ATX heading topology agrees, the bridge carries heading ordinal plus progress inside that section. Flat documents, content before the first heading, and Setext/HTML/media/topology mismatches use whole-document progress. The title projected into the editor is excluded from body heading ordinals through the same `promoteBodyTitle` split used by the write path.
+
+Position intent is local, note-id scoped, and one-shot. The reader is measured synchronously before the common `startEdit` seam unmounts it; the editor freezes visible-top before exit or on Save's `saving` edge. A same-note canonical slug replacement may consume the pending restore, while a different note, document surface, or edit generation discards it. Once placement settles, resize, late media, and manual scroll never reapply it. Workspace readers/boards, Memory, Ability authoring, reload, cross-route persistence, and exact block/source mapping have no position contract.
+
+## Save action lifecycle (#299)
+
+The keyboard **Save action** finishes a clean existing editing session without writing. It uses the common Cancel/cleanup lifecycle, silently: no mutation, discard dialog, or “nothing to save” toast. This applies to existing ordinary notes, materialized folder pages, Memory notes, and owned Abilities that already use `EditingProvider`.
+
+The decision is action-level and ordered: a saveable draft uses the existing save path exactly once; otherwise a new session or any dirty draft remains open; only an existing clean session finishes. Thus a valid new note/Ability still creates or publishes, an invalid new or virtual-folder draft is preserved, and a dirty invalid/unavailable/read-only draft is never mistaken for “nothing to save.” The Save button stays disabled for a clean draft; this finish behavior belongs only to the keyboard action and all of its preset/custom bindings.
+
 ## Routed Role and Skill authoring (#309)
 
 Owned Roles and Skills use the same global editing lifecycle as notes: one `EditingProvider`

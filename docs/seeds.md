@@ -161,7 +161,7 @@ counters stops distinguishing a re-derived row from an adopted one.
 | Case | About | Axes |
 |---|---|---|
 | `reader-showcase` | a note for EVERY markdown feature, assembled from the corpus | content, note-classes |
-| `long-document` | the entire corpus as one long note — reading-size/outline/scroll/diff (#27/#189) | content, scale, history |
+| `long-document` | the rich whole-corpus note plus deterministic structured and flat ≥400-line position witnesses — reading-size/outline/scroll/diff and semantic reader↔editor transfer (#27/#189/#299) | content, scale, history |
 
 **Public demo (#256)** — the one case whose output is a published artifact:
 
@@ -208,7 +208,7 @@ Normally each applier derives a note's physical identity for itself — the fake
 
 ## Axes and coverage
 
-22 axes (`axes.ts`): `content`, `structure`, `folder-page`, `activity`, `history`,
+23 axes (`axes.ts`): `content`, `editor`, `structure`, `folder-page`, `activity`, `history`,
 `trash`, `identity`, `search`, `graph`, `agent-memory`, `agent-audit`,
 `agent-sessions`, `agent-roles`, `note-classes`, `import`, `jobs`, `scale`, `auth`,
 `fields`, `views`, `favorites`, `providers`. Each is tied to surfaces + canon docs.

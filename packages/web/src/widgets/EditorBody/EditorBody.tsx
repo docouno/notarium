@@ -1,4 +1,4 @@
-import { type EditorView } from '@codemirror/view'
+import { type EditorView, type ViewUpdate } from '@codemirror/view'
 import {
   type ReactNode,
   useCallback,
@@ -132,6 +132,9 @@ export const EditorBody = ({
   renderViewBlock,
   viewPresentation,
   shouldAutoFocus,
+  initialSelection,
+  onEditorView,
+  onEditorUpdate,
 }: {
   editor: EditorBodyBinding
   preview: boolean
@@ -151,6 +154,11 @@ export const EditorBody = ({
   /** Resolve-time focus ownership for a lazy first mount. If the user moved focus
    *  into live metadata while code was pending, the editor must not steal it. */
   shouldAutoFocus?: () => boolean
+  /** Existing documents may receive a semantic source position from the reader.
+   * New documents keep their title-end default. */
+  initialSelection?: number
+  onEditorView?: (view: EditorView | null) => void
+  onEditorUpdate?: (view: EditorView, update: ViewUpdate) => void
 }) => {
   const viewRef = useRef<EditorView | null>(null)
   const [stats, setStats] = useState<EditorStatsReport>(() => ({
@@ -245,15 +253,17 @@ export const EditorBody = ({
               typewriter={typewriter}
               // A new note opens on its title line ('# '); land the caret after it
               // so the first keystroke types the title (#156).
-              cursor={editor.isNew ? 'end' : 'start'}
+              cursor={editor.isNew ? 'end' : (initialSelection ?? 'start')}
               onReady={registerContent}
               onChange={editor.onContentChange}
               onView={(view) => {
                 viewRef.current = view
+                onEditorView?.(view)
                 if (view && shouldAutoFocus?.()) {
                   view.focus()
                 }
               }}
+              onUpdate={(view, update) => onEditorUpdate?.(view, update)}
               onStats={setStats}
               onToggleFocus={onToggleFocus}
               onToggleTypewriter={onToggleTypewriter}

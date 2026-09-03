@@ -947,6 +947,91 @@ test('@v16 the global aside stays user-controlled across read, edit and sections
   await expect(page.getByTestId('ability-settings')).toBeVisible()
 })
 
+test('@v29 clean Save closes an existing owned Ability without a mutation', async ({ page }) => {
+  await login(page, 'maya')
+  await page.goto('/agents/abilities/roles')
+  await page.getByTestId('ability-owned-release-captain').click()
+  const writes: string[] = []
+
+  const captureWrite = (request: Request) => {
+    const path = new URL(request.url()).pathname
+
+    if (
+      (request.method() === 'POST' && path === '/api/note') ||
+      (request.method() === 'PUT' && /\/api\/me\/agent-abilities\/[^/]+\/save$/.test(path))
+    ) {
+      writes.push(`${request.method()} ${path}`)
+    }
+  }
+  page.on('request', captureWrite)
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await page.keyboard.press('Control+s')
+  await expect(page.getByRole('button', { name: 'Edit', exact: true })).toBeVisible()
+  page.off('request', captureWrite)
+  expect(writes).toHaveLength(0)
+})
+
+test('@v29 Save action keeps the existing dirty Ability save lifecycle', async ({ page }) => {
+  await login(page, 'maya')
+  await page.goto('/agents/abilities/skills')
+  await page.getByTestId('ability-owned-meeting-brief').click()
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await openAbilityPanel(page)
+  await page
+    .getByTestId('ability-description')
+    .fill('Coordinates one release through the shared Save action.')
+  await expect(page.getByTestId('ability-save')).toBeEnabled()
+  const writes: Array<{ path: string; body: unknown }> = []
+
+  const captureWrite = (request: Request) => {
+    const path = new URL(request.url()).pathname
+
+    if (request.method() === 'PUT' && /\/api\/me\/agent-abilities\/[^/]+\/save$/.test(path)) {
+      writes.push({ path, body: request.postDataJSON() })
+    }
+  }
+  page.on('request', captureWrite)
+  const saved = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'PUT' &&
+      /\/api\/me\/agent-abilities\/[^/]+\/save$/.test(new URL(response.url()).pathname),
+  )
+  await page.keyboard.press('Control+s')
+
+  const savedResponse = await saved
+  expect(savedResponse.status()).toBe(200)
+  await expect.poll(() => writes.length).toBe(1)
+  expect(writes[0]?.body).toMatchObject({
+    description: 'Coordinates one release through the shared Save action.',
+  })
+  const reread = await page.request.get(savedResponse.url().replace(/\/save$/, ''))
+  expect(reread.status()).toBe(200)
+  expect((await reread.json()).ability).toMatchObject({
+    description: 'Coordinates one release through the shared Save action.',
+  })
+  await expect(page.locator('.cm-content')).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Edit', exact: true })).toBeVisible()
+  page.off('request', captureWrite)
+})
+
+test('@v29 Save action publishes a valid new Ability exactly once', async ({ page }) => {
+  await login(page, 'maya')
+  await page.goto('/agents/abilities/roles')
+  await page.getByTestId('role-create').click()
+  await setAbilityInstructions(page, '# Save action role\n\nPublish through the shared action.')
+  let writes = 0
+
+  await page.route('**/api/me/agent-roles/custom', async (route) => {
+    writes++
+    await route.continue()
+  })
+  await page.keyboard.press('Control+s')
+
+  await expect(page).toHaveURL(/\/agents\/abilities\/roles\/owned\//)
+  await expect(page.getByTestId('agent-ability-detail')).toContainText('Save action role')
+  expect(writes).toBe(1)
+})
+
 test('@spa-load-size ability detail and a fresh draft request the same discovered editor JavaScript', async ({
   page,
   browser,

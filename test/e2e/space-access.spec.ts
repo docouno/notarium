@@ -205,6 +205,40 @@ test('the members list badge tracks a live role change, no reload (#111 grant-si
   await expect(bobRow).toContainText('Reader') // the badge tracked it — no reload
 })
 
+test('Save action preserves a dirty draft after a live read-only downgrade', async ({
+  page,
+  request,
+  baseURL,
+}) => {
+  await page.goto('/')
+  await login(page, 'bob', 'bob-password-01')
+  await treeNote(page, 'Main Note').click()
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  const editor = page.locator('.cm-content')
+  await editor.press('ControlOrMeta+End')
+  await page.keyboard.insertText('\nKeep this downgraded draft.')
+  const writes: string[] = []
+  page.on('request', (outgoing) => {
+    if (outgoing.method() === 'POST' && new URL(outgoing.url()).pathname === '/api/note') {
+      writes.push(outgoing.url())
+    }
+  })
+
+  await request.post(`${baseURL}/api/auth/login`, {
+    data: { username: 'root', password: 'root-password-1' },
+  })
+  const demoted = await request.put(`${baseURL}/api/s/main/members/bob`, {
+    data: { role: 'reader' },
+  })
+  expect(demoted.ok()).toBeTruthy()
+  await expect(page.getByRole('button', { name: 'Save', exact: true })).toHaveCount(0)
+  await page.keyboard.press('Control+s')
+
+  await expect(editor).toContainText('Keep this downgraded draft.')
+  await expect(page.getByText('You have read-only access to this space.')).toBeVisible()
+  expect(writes).toHaveLength(0)
+})
+
 // A change to SOMEONE ELSE must reflect live for a bystander viewer — this is the
 // space-level `members` broadcast, distinct from the addressed `access` nudge.
 // Three shapes (remove / role-change / add) so a partial revert of

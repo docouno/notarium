@@ -10,6 +10,7 @@ import {
   type KeyBinding,
   keymap,
   rectangularSelection,
+  type ViewUpdate,
 } from '@codemirror/view'
 import { useEffect, useRef } from 'react'
 import { cx } from '../../../libs/cx/cx'
@@ -40,6 +41,9 @@ type CodeEditorProps = {
   onReady?: (getValue: (() => string) | null) => void
   onChange?: () => void
   onView?: (view: EditorView | null) => void
+  /** Geometry/source observer for the owning document bridge. It never moves
+   * scroll itself and is notified only from CodeMirror's existing update seam. */
+  onUpdate?: (view: EditorView, update: ViewUpdate) => void
   /** Word/char/reading-time metrics for the status bar, recomputed on edits and
    *  selection changes. */
   onStats?: (stats: EditorStatsReport) => void
@@ -52,7 +56,7 @@ type CodeEditorProps = {
    *  document; 'end' lands after the seeded text — used for a NEW note (#156), whose
    *  document opens on its title line (`# `), so the user types the title straight
    *  away instead of clicking past the heading marker. */
-  cursor?: 'start' | 'end'
+  cursor?: 'start' | 'end' | number
   /** Resolved editor-context bindings (#30) — the host passes the active keymap so
    *  formatting + writing-aid toggles follow the user's preset/overrides. Read once at
    *  mount (the editor remounts per draft); omit to use the web-native defaults. */
@@ -70,6 +74,7 @@ export const CodeEditor = ({
   onReady,
   onChange,
   onView,
+  onUpdate,
   onStats,
   onToggleFocus,
   onToggleTypewriter,
@@ -84,6 +89,8 @@ export const CodeEditor = ({
   onChangeRef.current = onChange
   const onStatsRef = useRef(onStats)
   onStatsRef.current = onStats
+  const onUpdateRef = useRef(onUpdate)
+  onUpdateRef.current = onUpdate
   // Latest hotkey handlers, read by the mount-built keymap (which captures once).
   const toggleRef = useRef({ onToggleFocus, onToggleTypewriter })
   toggleRef.current = { onToggleFocus, onToggleTypewriter }
@@ -144,7 +151,12 @@ export const CodeEditor = ({
       parent: host.current ?? undefined,
       state: EditorState.create({
         doc: value || '',
-        selection: cursor === 'end' ? { anchor: (value || '').length } : undefined,
+        selection:
+          cursor === 'end'
+            ? { anchor: (value || '').length }
+            : typeof cursor === 'number'
+              ? { anchor: Math.max(0, Math.min((value || '').length, cursor)) }
+              : undefined,
         extensions: [
           history(),
           // Multiple selections: allow the state to hold them, draw the extra
@@ -210,6 +222,7 @@ export const CodeEditor = ({
           // slash/format tooltips at the first/last line (see chromeInset.ts).
           chromeInsetScroll,
           EditorView.updateListener.of((u) => {
+            onUpdateRef.current?.(u.view, u)
             if (u.docChanged) {
               onChangeRef.current?.()
             }
