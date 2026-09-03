@@ -195,8 +195,12 @@ export const DashboardLayout = () => {
         </Link>
         {view === 'activity' && canScope && (
           <div className={styles.refToggle}>
+            {/* The segment reflects the CLICK, not the last resolved gate: the toggle
+                exists only while `canScope`, and every resolve publishes exactly
+                `canScope ? preferredScope : 'all'`, so the label is honest whenever
+                the control is. Data still waits for the gate (`ctx.scope` below). */}
             <Segmented
-              value={effScope}
+              value={preferredScope}
               onChange={setPreferredScope}
               ariaLabel="Activity author scope"
               options={[

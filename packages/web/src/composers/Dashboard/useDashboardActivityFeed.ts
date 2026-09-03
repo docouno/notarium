@@ -8,6 +8,9 @@ import type { ActivityGroup } from './activityPreferences'
 import type { ActivityScope } from './useDashboardData'
 
 const OVERVIEW_LIMIT = 12
+/** How long a rebuild episode may pass as an ordinary load before the surface
+ *  explains it. Owner decision: a short rebuild is just a skeleton. */
+export const REBUILD_NOTICE_DELAY_MS = 5_000
 
 export type ActivityOverview =
   | { kind: 'events'; response: ActivityEventsResponse }
@@ -22,7 +25,13 @@ export type ActivityFeedGate = {
 type FeedState = {
   space: string | null
   group: ActivityGroup
+  /** The scope the published data belongs to — `canScope ? preferredScope : 'all'`. */
   scope: ActivityScope
+  /** The scope the slice was built FOR. Part of the slice key (with space and
+   *  group), and deliberately not `scope`: a solo Space with a stored Mine publishes
+   *  `scope: 'all'` forever, so an effective key would never match and the feed
+   *  would skeleton for good. */
+  preferredScope: ActivityScope
   overview: ActivityOverview | null
   gate: ActivityFeedGate | null
   gateResolved: boolean
@@ -34,7 +43,10 @@ type FeedState = {
   error: string | null
 }
 
-export type DashboardActivityFeed = Omit<FeedState, 'space'> & {
+export type DashboardActivityFeed = Omit<FeedState, 'space' | 'preferredScope'> & {
+  /** The current rebuild episode has outlasted `REBUILD_NOTICE_DELAY_MS`: the
+   *  surface explains the skeleton with one calm status line. */
+  rebuildingProlonged: boolean
   recover: (rebuilding: boolean) => void
   retry: () => void
 }
@@ -43,6 +55,7 @@ const EMPTY: FeedState = {
   space: null,
   group: 'note',
   scope: 'all',
+  preferredScope: 'all',
   overview: null,
   gate: null,
   gateResolved: false,
@@ -54,9 +67,28 @@ const EMPTY: FeedState = {
   error: null,
 }
 
-const errorText = (error: unknown): string =>
+// The slice key. A state built for another Space, Group OR preferred scope is
+// reset as a whole (invalidation and rebuild latches carry over within a Space).
+// Keying the scope here is what makes a scope click honest end to end: the
+// previous scope's rows can neither render under the new label nor be retained by
+// the warm-failure path, and every derived gate — day, branches, heatmap — closes
+// until the new slice publishes. The chrome cannot flicker in that window: an
+// unresolved gate keeps the previous chrome by identity.
+const sameSlice = (
+  state: FeedState,
+  space: string,
+  group: ActivityGroup,
+  preferredScope: ActivityScope,
+): boolean =>
+  state.space === space && state.group === group && state.preferredScope === preferredScope
+
+// A typed rebuild is a STATE, not a failure: it never becomes error text. The
+// `rebuilding` bit carries it, and the projection's own `changed` frame — emitted
+// on publication and already reloading this hook — clears it. No polling: a poll
+// during a rebuild would block on the projection's busy timeout and answer 500.
+const failureText = (error: unknown): string | null =>
   isActivityProjectionRebuilding(error)
-    ? 'Rebuilding activity summary…'
+    ? null
     : error instanceof Error
       ? error.message
       : 'Activity could not be loaded'
@@ -131,9 +163,9 @@ export const useDashboardActivityFeed = (
       const invalidated = current.space === space && current.invalidated
 
       return {
-        ...(current.space === space && current.group === group
+        ...(sameSlice(current, space, group, preferredScope)
           ? current
-          : { ...EMPTY, group, space, invalidated, rebuilding }),
+          : { ...EMPTY, group, space, preferredScope, invalidated, rebuilding }),
         loading: true,
         error: null,
       }
@@ -162,30 +194,31 @@ export const useDashboardActivityFeed = (
             ...EMPTY,
             space,
             group,
+            preferredScope,
             loading: true,
             invalidated: true,
             rebuilding,
-            error: errorText(error),
+            error: failureText(error),
           }
         }
         const invalidated = current.space === space && current.invalidated
         const warm =
           !invalidated &&
-          current.space === space &&
-          current.group === group &&
+          sameSlice(current, space, group, preferredScope) &&
           current.overview != null
         const rebuilding = current.space === space && current.rebuilding
 
         return warm
-          ? { ...current, loading: false, stale: true, error: errorText(error) }
+          ? { ...current, loading: false, stale: true, error: failureText(error) }
           : {
               ...EMPTY,
               space,
               group,
+              preferredScope,
               loading: invalidated,
               invalidated,
               rebuilding,
-              error: errorText(error),
+              error: failureText(error),
             }
       })
       return
@@ -201,6 +234,7 @@ export const useDashboardActivityFeed = (
           ...EMPTY,
           space,
           group,
+          preferredScope,
           loading: true,
           invalidated: true,
           rebuilding: current.space === space && current.rebuilding,
@@ -230,7 +264,7 @@ export const useDashboardActivityFeed = (
       if (!mine?.ok) {
         invalidated = requiresActivitySnapshotRecovery(mine?.error)
         rebuilding = isActivityProjectionRebuilding(mine?.error)
-        error = errorText(mine?.error)
+        error = failureText(mine?.error)
         overview = null
       } else {
         if (!overviewMatchesGate(mine.overview, settledGate)) {
@@ -264,7 +298,7 @@ export const useDashboardActivityFeed = (
             }
             invalidated = requiresActivitySnapshotRecovery(mineError)
             rebuilding = isActivityProjectionRebuilding(mineError)
-            error = errorText(mineError)
+            error = failureText(mineError)
             overview = null
           }
         } else {
@@ -280,6 +314,7 @@ export const useDashboardActivityFeed = (
         ...EMPTY,
         space,
         group,
+        preferredScope,
         loading: true,
         invalidated: true,
         rebuilding,
@@ -290,8 +325,7 @@ export const useDashboardActivityFeed = (
     setState((current) => {
       const warmMine =
         effectiveScope === 'mine' &&
-        current.space === space &&
-        current.group === group &&
+        sameSlice(current, space, group, preferredScope) &&
         current.scope === 'mine' &&
         current.overview != null &&
         overviewMatchesGate(current.overview, settledGate)
@@ -303,6 +337,7 @@ export const useDashboardActivityFeed = (
         space,
         group,
         scope: effectiveScope,
+        preferredScope,
         overview: finalOverview,
         gate: settledGate,
         gateResolved: true,
@@ -340,15 +375,15 @@ export const useDashboardActivityFeed = (
     }
   }, [load, subscribe])
 
-  const current =
-    state.space === space && state.group === group
-      ? state
-      : {
-          ...EMPTY,
-          group,
-          invalidated: state.space === space && state.invalidated,
-          rebuilding: state.space === space && state.rebuilding,
-        }
+  const current = sameSlice(state, space, group, preferredScope)
+    ? state
+    : {
+        ...EMPTY,
+        group,
+        preferredScope,
+        invalidated: state.space === space && state.invalidated,
+        rebuilding: state.space === space && state.rebuilding,
+      }
 
   const retry = useCallback(() => void load(), [load])
   const recover = useCallback(
@@ -357,15 +392,46 @@ export const useDashboardActivityFeed = (
         ...EMPTY,
         space,
         group,
+        preferredScope,
         loading: true,
         invalidated: true,
         rebuilding,
-        error: rebuilding ? 'Rebuilding activity summary…' : null,
+        error: null,
       })
       void load()
     },
-    [group, load, space],
+    [group, load, preferredScope, space],
   )
 
-  return { ...current, recover, retry }
+  // The rebuild threshold belongs to the EPISODE, not to a request. The bit stays
+  // true across coalesced `changed` reloads and Group changes within a Space (the
+  // slice resets carry it) and clears only when a slice publishes, so the timer is
+  // armed once per false → true edge and never re-armed by a reload. It lives here
+  // rather than in the surface because this hook is owned by the layout and
+  // survives every pill switch, while the Activity surface unmounts on each one.
+  const { rebuilding } = current
+  const [prolonged, setProlonged] = useState(false)
+
+  useEffect(() => {
+    if (!rebuilding) {
+      setProlonged(false)
+      return
+    }
+    const timer = setTimeout(() => setProlonged(true), REBUILD_NOTICE_DELAY_MS)
+
+    return () => clearTimeout(timer)
+  }, [rebuilding])
+
+  return {
+    ...current,
+    // Derived from the bit, not merely latched by the timer, so the episode ends in
+    // the very commit that publishes rows instead of one passive-effect frame later.
+    // Whether the line is SHOWN is the surface's call, not this hook's: the rebuild
+    // latch survives an ordinary failure of the next reload, and only the surface
+    // knows whether that failure has a notice of its own in the lane the reader is
+    // looking at.
+    rebuildingProlonged: rebuilding && prolonged,
+    recover,
+    retry,
+  }
 }

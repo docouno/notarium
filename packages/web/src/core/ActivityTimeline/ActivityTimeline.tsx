@@ -14,6 +14,7 @@ export const ActivityTimeline = ({
   testId,
   ariaHidden,
   spine = true,
+  skeleton,
 }: {
   as?: TimelineElement
   children: ReactNode
@@ -22,6 +23,10 @@ export const ActivityTimeline = ({
   ariaHidden?: boolean
   /** Nested rows may share the parent timeline's continuous spine. */
   spine?: boolean
+  /** A placeholder timeline drawn before data exists: marked `data-skeleton`, the
+   *  same attribute the heatmap's skeleton cells carry, so one selector finds
+   *  every skeleton on a surface. */
+  skeleton?: boolean
 }) => (
   <Tag
     className={cx(
@@ -31,6 +36,7 @@ export const ActivityTimeline = ({
       className,
     )}
     data-testid={testId}
+    data-skeleton={skeleton || undefined}
     aria-hidden={ariaHidden}
   >
     {children}

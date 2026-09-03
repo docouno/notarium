@@ -162,6 +162,106 @@ test('saved Folder + Mine waits for the gate and survives reload and Space switc
   ).toHaveAttribute('aria-pressed', 'true')
 })
 
+test('the author segment paints the click and never labels the other scope', async ({ page }) => {
+  // Note rows tell the scopes apart ('Bob main' exists only under Everyone), and
+  // the stored Mine from beforeEach is cleared so the journey starts on Everyone.
+  await page.addInitScript(() => {
+    localStorage.setItem('bm-dashboard-activity-group', 'note')
+    localStorage.removeItem('bm-dashboard-activity-scope')
+  })
+  await page.goto('/')
+  await page.getByTestId('auth-username').fill('alice')
+  await page.getByTestId('auth-password').fill('alice-password-1')
+  await page.getByTestId('auth-submit').click()
+
+  const feed = page.getByTestId('activity-feed')
+  const rows = feed.getByTestId('dashboard-activity-note-group')
+  const scopeControl = page.getByRole('group', { name: 'Activity author scope' })
+
+  await expect(rows).toHaveCount(2)
+  await expect(scopeControl.getByRole('button', { name: 'Everyone' })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+
+  // One rAF probe samples the control's presence, its pressed segment and the row
+  // set together, so a label and the rows it stands over are read in one frame.
+  await page.evaluate(() => {
+    type Sample = { control: boolean; mine: boolean; everyone: boolean; rows: number; bob: boolean }
+    type Probe = { samples: Sample[]; stop: () => void }
+    const probeWindow = window as Window & { __notariumScopeProbe?: Probe }
+    const samples: Sample[] = []
+    let running = true
+
+    const tick = () => {
+      const control = document.querySelector('[role="group"][aria-label="Activity author scope"]')
+      const pressed = (label: string) =>
+        [...(control?.querySelectorAll('button') ?? [])].some(
+          (button) =>
+            button.textContent?.trim() === label && button.getAttribute('aria-pressed') === 'true',
+        )
+      const rowNodes = [
+        ...document.querySelectorAll('[data-testid="dashboard-activity-note-group"]'),
+      ]
+
+      samples.push({
+        control: control != null,
+        mine: pressed('Mine'),
+        everyone: pressed('Everyone'),
+        rows: rowNodes.length,
+        bob: rowNodes.some((node) => node.textContent?.includes('Bob main')),
+      })
+      if (running) {
+        requestAnimationFrame(tick)
+      }
+    }
+
+    probeWindow.__notariumScopeProbe = {
+      samples,
+      stop: () => {
+        running = false
+      },
+    }
+    requestAnimationFrame(tick)
+  })
+
+  await scopeControl.getByRole('button', { name: 'Mine' }).click()
+  await expect(rows).toHaveCount(1)
+  await expect(rows).toContainText('Mine main')
+  await scopeControl.getByRole('button', { name: 'Everyone' }).click()
+  await expect(rows).toHaveCount(2)
+
+  const samples = await page.evaluate(() => {
+    type Sample = { control: boolean; mine: boolean; everyone: boolean; rows: number; bob: boolean }
+    type Probe = { samples: Sample[]; stop: () => void }
+    const probe = (window as Window & { __notariumScopeProbe?: Probe }).__notariumScopeProbe
+
+    probe?.stop()
+    return probe?.samples ?? []
+  })
+  const firstMine = samples.findIndex((sample) => sample.mine)
+  const backToEveryone = samples.findIndex((sample, index) => index > firstMine && sample.everyone)
+
+  expect(firstMine).toBeGreaterThan(0)
+  expect(backToEveryone).toBeGreaterThan(firstMine)
+  // Immediacy, and the half a lag would break: no painted frame ever carried the
+  // Everyone label over an already reset feed. Bound to the resolved gate instead of
+  // the click, the segment would show exactly that — Everyone pressed above zero
+  // rows — for the whole round trip.
+  expect(
+    samples.slice(0, backToEveryone).filter((sample) => sample.rows === 0 && sample.everyone),
+  ).toHaveLength(0)
+  // The control never vanished or flickered through either reset window.
+  expect(samples.filter((sample) => !sample.control)).toHaveLength(0)
+  expect(samples.filter((sample) => sample.mine === sample.everyone)).toHaveLength(0)
+  // Under the Mine label no frame ever showed Bob's row; under the Everyone label
+  // no frame ever showed a row set that was Mine's alone.
+  expect(samples.slice(firstMine, backToEveryone).filter((sample) => sample.bob)).toHaveLength(0)
+  expect(
+    samples.slice(backToEveryone).filter((sample) => sample.rows > 0 && !sample.bob),
+  ).toHaveLength(0)
+})
+
 test('saved None owns the standing gate without a hidden grouped request', async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem('bm-dashboard-activity-group', 'none')

@@ -119,7 +119,8 @@ export const ActivitySurface = () => {
             <ActivityFeed
               space={space}
               overview={feed.overview}
-              loading={feed.loading || !feed.gateResolved}
+              invalidated={feed.invalidated}
+              rebuildingProlonged={feed.rebuildingProlonged}
               error={feed.error}
               stale={feed.stale}
               onRetry={feed.retry}

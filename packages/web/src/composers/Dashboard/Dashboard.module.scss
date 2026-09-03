@@ -502,6 +502,16 @@ $dows: 30px;
     text-decoration: underline;
   }
 }
+/* A folder group row's subject is the folder itself, so its own segment keeps the
+   row's voice while the `Folder · ` qualifier and the parent segments read as
+   context — the same hierarchy a note row has, where the title is bright and the
+   breadcrumb above it is dim. */
+.folder-qualifier {
+  color: var(--text-dim);
+}
+.event-crumb-subject {
+  color: var(--text);
+}
 .event-sep {
   flex: none;
   margin: 0 6px;

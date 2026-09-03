@@ -141,6 +141,115 @@ describe('useDashboardDayActivity', () => {
     expect(harness.api.activityGroupsGet).toHaveBeenCalledTimes(7)
   })
 
+  it('retains the loaded day across a source-cut advance and swaps the refetch in place', async () => {
+    const first = deferred<ActivityGroupsResponse>()
+    const second = deferred<ActivityGroupsResponse>()
+
+    harness.api.activityGroupsGet
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+    render()
+    await settle()
+    first.resolve(dayGroups(1))
+    await settle()
+    expect(state.overview?.response.total).toBe(1)
+
+    props = { ...props, gate: { ...props.gate!, through: '11' } }
+    render()
+    await settle()
+
+    expect(state.overview?.response.total).toBe(1)
+    expect(state.error).toBeNull()
+    expect(state.recovery).toBeNull()
+    expect(harness.api.activityGroupsGet).toHaveBeenCalledTimes(2)
+
+    second.resolve(dayGroups(2))
+    await settle()
+    expect(state.overview?.response.total).toBe(2)
+  })
+
+  it('returns the cached day on reopen before the refetch lands', async () => {
+    harness.api.activityGroupsGet
+      .mockResolvedValueOnce(dayGroups(1))
+      .mockReturnValueOnce(new Promise<ActivityGroupsResponse>(() => undefined))
+    render()
+    await settle()
+    expect(state.overview?.response.total).toBe(1)
+
+    props = { ...props, day: null }
+    render()
+    await settle()
+    expect(state.overview).toBeNull()
+
+    props = { ...props, day: '2026-08-30' }
+    render()
+
+    expect(state.overview?.response.total).toBe(1)
+    await settle()
+    expect(harness.api.activityGroupsGet).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not republish the pre-recovery day when a matching gate returns after a null gate', async () => {
+    const replacement = deferred<ActivityGroupsResponse>()
+
+    harness.api.activityGroupsGet
+      .mockResolvedValueOnce(dayGroups(1))
+      .mockReturnValueOnce(replacement.promise)
+    render()
+    await settle()
+    expect(state.overview?.response.total).toBe(1)
+    const gate = props.gate!
+
+    props = { ...props, gate: null }
+    render()
+    await settle()
+    expect(state.overview).toBeNull()
+
+    props = { ...props, gate: { ...gate } }
+    render()
+    await settle()
+
+    expect(state.overview).toBeNull()
+    expect(harness.api.activityGroupsGet).toHaveBeenCalledTimes(2)
+
+    replacement.resolve(dayGroups(2))
+    await settle()
+    expect(state.overview?.response.total).toBe(2)
+  })
+
+  it('never retains a failure across a source-cut advance', async () => {
+    harness.api.activityGroupsGet
+      .mockRejectedValueOnce(new Error('day failure'))
+      .mockReturnValueOnce(new Promise<ActivityGroupsResponse>(() => undefined))
+    render()
+    await settle()
+    expect(state.error).toBe('day failure')
+
+    props = { ...props, gate: { ...props.gate!, through: '11' } }
+    render()
+    await settle()
+
+    expect(state.error).toBeNull()
+    expect(state.overview).toBeNull()
+  })
+
+  it('ends retention on a failed refetch and shows the failure', async () => {
+    harness.api.activityGroupsGet
+      .mockResolvedValueOnce(dayGroups(1))
+      .mockRejectedValueOnce(new Error('refetch failure'))
+    render()
+    await settle()
+    expect(state.overview?.response.total).toBe(1)
+
+    props = { ...props, gate: { ...props.gate!, through: '11' } }
+    render()
+    await settle()
+
+    expect(state.overview).toBeNull()
+    expect(state.error).toBe('refetch failure')
+    expect(state.recovery).toBeNull()
+  })
+
   it('ignores a late response after the identity moves to another Space', async () => {
     const oldRequest = deferred<ActivityGroupsResponse>()
     const currentRequest = deferred<ActivityGroupsResponse>()

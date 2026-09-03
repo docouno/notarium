@@ -1,3 +1,4 @@
+import { installControlledEventSource } from './controlledEventSource'
 import { expect, test } from './fixtures'
 
 // #33 / #216 — the Home dashboard. The stat row is now a PILL TAB-BAR (#216): the
@@ -179,7 +180,9 @@ test('Home dashboard: pills, activity surface, day-drill, health/projects surfac
   ).toEqual(['action', 'actor', 'outcome'])
   await expect(agentEvent.locator('[data-timeline-slot="actor"]')).toContainText('alice’s agent')
   await expect(agentEvent.locator('[data-timeline-slot="actor"] svg')).toBeVisible()
-  const folderCrumb = feed.getByRole('link', { name: 'notes' }).first()
+  // Scoped to the raw event row on purpose: the Note group row above it now draws
+  // the same breadcrumb, so an unscoped locator would stop proving the EventRow.
+  const folderCrumb = agentEvent.getByRole('link', { name: 'notes' })
   await expect(folderCrumb).toBeVisible()
   await expect(folderCrumb).toHaveAttribute('href', /\/s\/main\/files\/notes$/)
 
@@ -347,14 +350,20 @@ test('Home dashboard: a Space switch never paints the previous Dashboard under t
   expect(probe.marker).toBeNull()
 })
 
-test('Home dashboard: a cold projection rebuild is explicit and Retry rejoins it', async ({
+test('Home dashboard: a projection rebuild is a state that explains itself and clears itself', async ({
   page,
   baseURL,
 }) => {
   await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  // The fake back end cannot rebuild, so the typed 503 is a one-shot stub. The
+  // controlled EventSource suppresses every real frame: completion below is the
+  // explicit `changed` frame the projection emits on publication, nothing else.
+  await page.addInitScript(installControlledEventSource)
   let rebuilding = true
+  let groupRequests = 0
 
   await page.route('**/api/s/main/activity/groups?**', async (route) => {
+    groupRequests++
     if (rebuilding) {
       rebuilding = false
       await route.fulfill({
@@ -369,14 +378,246 @@ test('Home dashboard: a cold projection rebuild is explicit and Retry rejoins it
     }
     await route.continue()
   })
+  // Bind the first assertions to the 503 itself: a bare skeleton check would also be
+  // satisfied by the cold-start skeleton, before the rebuild was ever discovered.
+  const rebuildAnswered = page.waitForResponse(
+    (response) => response.url().includes('/activity/groups') && response.status() === 503,
+  )
+
+  await page.goto('/')
+  const feed = page.getByTestId('activity-feed')
+  const notice = feed.locator('[role="status"]')
+
+  await rebuildAnswered
+  // First seconds: a skeleton and nothing else — no alert, no button, no text.
+  await expect(feed.locator('[data-skeleton]')).toBeVisible()
+  await expect(feed.getByRole('alert')).toHaveCount(0)
+  await expect(feed.getByRole('button', { name: 'Retry' })).toHaveCount(0)
+  await expect(notice).toHaveCount(0)
+  const requestsBeforeWait = groupRequests
+
+  // Past the threshold: one calm status line, still no alert and no Retry, and the
+  // wait issued no request of its own — there is no cadence to a rebuild.
+  await expect(notice).toHaveText(
+    'Rebuilding the activity summary. This can take a while; the feed will refresh on its own when it’s done.',
+    { timeout: 15_000 },
+  )
+  expect(groupRequests).toBe(requestsBeforeWait)
+  await expect(feed.getByRole('alert')).toHaveCount(0)
+  await expect(feed.getByRole('button', { name: 'Retry' })).toHaveCount(0)
+  await expect(feed.locator('[data-skeleton]')).toBeVisible()
+
+  // Neighbours stay alive: the year keeps its active cells under preferred
+  // Everyone, the Projects and Health pills carry real metrics, the Health surface
+  // renders its queue, and the pill round trip does not re-arm the threshold.
+  await expect(page.getByTestId('heat-cell-active').first()).toBeVisible()
+  await expect(page.getByTestId('activity-heatmap').locator('[data-skeleton]')).toHaveCount(0)
+  await expect(page.getByTestId('dash-pill-projects')).not.toContainText('…')
+  await expect(page.getByTestId('dash-pill-health')).toContainText('1 to fix')
+  await page.getByTestId('dash-pill-health').click()
+  await expect(page.getByTestId('dash-broken-links')).toContainText('Nonexistent')
+  await page.getByTestId('dash-pill-activity').click()
+  await expect(notice).toHaveText(
+    'Rebuilding the activity summary. This can take a while; the feed will refresh on its own when it’s done.',
+    { timeout: 1_000 },
+  )
+
+  // Completion: the projection's own `changed` frame, fed to the same handler the
+  // sync client installs. The surface swaps to rows on its own.
+  await page.waitForFunction(() => {
+    const sources = (window as typeof window & { __notariumEventSources?: readonly EventSource[] })
+      .__notariumEventSources
+    return sources?.some((source) => source.readyState === EventSource.OPEN)
+  })
+  await page.evaluate(() => {
+    const sources = (window as typeof window & { __notariumEventSources?: readonly EventSource[] })
+      .__notariumEventSources
+    const source = [...(sources ?? [])]
+      .reverse()
+      .find((candidate) => candidate.readyState === EventSource.OPEN)
+
+    if (!source) {
+      throw new Error('no open EventSource for the rebuild completion frame')
+    }
+    source.onmessage?.(
+      new MessageEvent('message', {
+        data: JSON.stringify({ type: 'changed', upserts: [], removed: [] }),
+      }),
+    )
+  })
+  await expect(feed.getByTestId('dashboard-activity-note-group').first()).toBeVisible()
+  await expect(notice).toHaveCount(0)
+  await expect(feed).not.toContainText(
+    'Rebuilding the activity summary. This can take a while; the feed will refresh on its own when it’s done.',
+  )
+  await expect(feed.locator('[data-skeleton]')).toHaveCount(0)
+
+  // Note navigation stayed live throughout: the rail opens a note as usual.
+  await page.getByTestId('rail-scroll').getByRole('link', { name: 'Alpha' }).click()
+  await expect(page.getByRole('heading', { name: 'Alpha' })).toBeVisible()
+})
+
+test('Home dashboard: location is a breadcrumb in every Group mode', async ({ page, baseURL }) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
   await page.goto('/')
   const feed = page.getByTestId('activity-feed')
 
-  await expect(feed).toContainText('Rebuilding activity summary…')
-  await expect(page.getByTestId('activity-heatmap')).toBeVisible()
-  await feed.getByRole('button', { name: 'Retry' }).click()
-  await expect(feed.getByTestId('dashboard-activity-note-group').first()).toBeVisible()
-  await expect(feed).not.toContainText('Rebuilding activity summary…')
+  // Group=Note: the note row's own location links into the folder without
+  // expanding the row or opening the note.
+  const alphaRow = feed.getByTestId('dashboard-activity-note-group').filter({ hasText: 'Alpha' })
+  const noteCrumb = alphaRow.getByRole('link', { name: 'notes' })
+
+  await expect(noteCrumb).toHaveAttribute('href', /\/s\/main\/files\/notes$/)
+  await noteCrumb.click()
+  await expect(page).toHaveURL(/\/s\/main\/files\/notes$/)
+  // Back to the dashboard for the Folder half. Nothing is asserted about disclosure
+  // here: the return remounts the surface with an empty open set, so any such check
+  // would pass regardless. "A crumb click does not toggle or open the note" is
+  // proven where it can fail — ActivityFeed.test.ts, same-frame, with the request
+  // counter and the `onOpen` spy.
+  await page.goBack()
+
+  // Group=Folder: the qualifier stays text, the path segments are the links.
+  await feed.getByRole('button', { name: 'Folder', exact: true }).click()
+  const folderRow = feed.getByTestId('dashboard-activity-folder-group').filter({ hasText: 'notes' })
+
+  await expect(folderRow).toContainText('Folder · notes')
+  const folderCrumb = folderRow.getByRole('link', { name: 'notes' })
+
+  await expect(folderCrumb).toHaveAttribute('href', /\/s\/main\/files\/notes$/)
+  await folderCrumb.click()
+  await expect(page).toHaveURL(/\/s\/main\/files\/notes$/)
+})
+
+test('Home dashboard: a body edit updates the open feed in place', async ({ page, baseURL }) => {
+  await page.request.post(`${baseURL}/api/__test/reset`, { data: { fixture: FIXTURE } })
+  // A live body edit of an EXISTING note: its journal append advances only the
+  // source cut. Creating a note instead would move the location generation and
+  // legitimately clear every branch — the symptom this test must not confuse with
+  // the defect. The token is read before the page opens.
+  const bravo = await page.request.get(`${baseURL}/api/note?id=fake-notes-bravo`)
+  expect(bravo.ok()).toBeTruthy()
+  let versionToken = ((await bravo.json()) as { versionToken: string }).versionToken
+  const detailRequests: Record<string, number> = {}
+
+  page.on('request', (request) => {
+    const url = new URL(request.url())
+
+    if (url.pathname.endsWith('/activity/events') && url.searchParams.has('noteId')) {
+      const noteId = url.searchParams.get('noteId')!
+      detailRequests[noteId] = (detailRequests[noteId] ?? 0) + 1
+    }
+  })
+  await page.goto('/')
+  const feed = page.getByTestId('activity-feed')
+  const rows = feed.getByTestId('dashboard-activity-note-group')
+  const bravoRow = rows.filter({ hasText: 'Bravo' })
+
+  await feed.getByRole('button', { name: 'Expand changes for Alpha' }).press('Enter')
+  await feed.getByRole('button', { name: 'Expand changes for Bravo' }).press('Enter')
+  await expect(feed.getByRole('button', { name: 'Collapse changes for Alpha' })).toBeVisible()
+  await expect(feed.getByRole('button', { name: 'Collapse changes for Bravo' })).toBeVisible()
+  await expect(bravoRow).toContainText('1 change')
+  await expect.poll(() => detailRequests['fake-notes-alpha']).toBe(1)
+  await expect.poll(() => detailRequests['fake-notes-bravo']).toBe(1)
+
+  const edit = async (content: string) => {
+    // The journal append is fire-and-forget and the `changed` frame is emitted
+    // before it settles, so the wait is the grouped response that follows the
+    // edit, not a bare poll.
+    const refreshed = page.waitForResponse((response) => {
+      const url = new URL(response.url())
+      return url.pathname.endsWith('/activity/groups') && !url.searchParams.has('location')
+    })
+    const saved = await page.request.post(`${baseURL}/api/note`, {
+      data: { content, originalId: 'fake-notes-bravo', versionToken },
+    })
+
+    expect(saved.ok()).toBeTruthy()
+    versionToken = ((await saved.json()) as { versionToken: string }).versionToken
+    await refreshed
+  }
+
+  const startProbe = () =>
+    page.evaluate(() => {
+      type Sample = { skeleton: boolean; loading: boolean; expanded: number; heading: string }
+      type Probe = { samples: Sample[]; stop: () => void }
+      const probeWindow = window as Window & { __notariumFeedProbe?: Probe }
+      const samples: Sample[] = []
+      let running = true
+
+      const tick = () => {
+        const feedNode = document.querySelector('[data-testid="activity-feed"]')
+
+        samples.push({
+          skeleton: feedNode?.querySelector('[data-skeleton]') != null,
+          loading: feedNode?.textContent?.includes('Loading…') ?? false,
+          expanded: feedNode?.querySelectorAll('[aria-expanded="true"]').length ?? 0,
+          heading: feedNode?.querySelector('h2')?.textContent?.trim() ?? '',
+        })
+        if (running) {
+          requestAnimationFrame(tick)
+        }
+      }
+
+      probeWindow.__notariumFeedProbe = {
+        samples,
+        stop: () => {
+          running = false
+        },
+      }
+      requestAnimationFrame(tick)
+    })
+  const stopProbe = () =>
+    page.evaluate(() => {
+      type Sample = { skeleton: boolean; loading: boolean; expanded: number; heading: string }
+      type Probe = { samples: Sample[]; stop: () => void }
+      const probe = (window as Window & { __notariumFeedProbe?: Probe }).__notariumFeedProbe
+
+      probe?.stop()
+      return probe?.samples ?? []
+    })
+
+  // Standing lane: rows update in place, both branches stay open through every
+  // frame, the untouched branch is not re-requested and the touched one exactly once.
+  await startProbe()
+  await edit('# Bravo\n\nA hub, edited once.')
+  await expect(bravoRow).toContainText('2 changes')
+  await expect.poll(() => detailRequests['fake-notes-bravo']).toBe(2)
+  const standing = await stopProbe()
+
+  expect(standing.length).toBeGreaterThan(0)
+  expect(standing.filter((sample) => sample.skeleton)).toHaveLength(0)
+  expect(standing.filter((sample) => sample.loading)).toHaveLength(0)
+  expect(standing.filter((sample) => sample.expanded < 2)).toHaveLength(0)
+  expect(detailRequests['fake-notes-alpha']).toBe(1)
+  // Re-read after the probe: `expect.poll` above stops at its first match, so only
+  // this second reading proves the edited branch issued exactly ONE refresh and not
+  // a stream of them.
+  expect(detailRequests['fake-notes-bravo']).toBe(2)
+  await expect(feed.getByRole('button', { name: 'Collapse changes for Alpha' })).toHaveAttribute(
+    'aria-expanded',
+    'true',
+  )
+  await expect(feed.getByRole('button', { name: 'Collapse changes for Bravo' })).toHaveAttribute(
+    'aria-expanded',
+    'true',
+  )
+
+  // Day lane: an open day survives the next edit and updates in place. The last
+  // active cell is today — the day the live edits land on (Bravo's seeded event is
+  // two days back, so today's drill starts at the one live change).
+  await page.getByTestId('heat-cell-active').last().click()
+  await expect(feed.getByText(/Changes on \d{4}-\d{2}-\d{2}/)).toBeVisible()
+  await expect(rows.filter({ hasText: 'Bravo' })).toContainText('1 change')
+  await startProbe()
+  await edit('# Bravo\n\nA hub, edited twice.')
+  await expect(rows.filter({ hasText: 'Bravo' })).toContainText('2 changes')
+  const day = await stopProbe()
+
+  expect(day.length).toBeGreaterThan(0)
+  expect(day.filter((sample) => sample.skeleton)).toHaveLength(0)
+  expect(day.filter((sample) => !sample.heading.startsWith('Changes on'))).toHaveLength(0)
 })
 
 test('Home dashboard: a pure move refreshes open Note and Folder detail branches', async ({
@@ -419,12 +660,17 @@ test('Home dashboard: a pure move refreshes open Note and Folder detail branches
 
   await feed.getByRole('button', { name: 'Note', exact: true }).click()
   await feed.getByRole('button', { name: /Expand changes for Alpha/ }).press('Enter')
-  await expect(feed.getByRole('link', { name: 'elsewhere' }).first()).toBeVisible()
+  // The assertion lives on the raw event rows INSIDE the open branch: the Note group
+  // row draws the same breadcrumb now and follows the overview on its own, so an
+  // unscoped locator would pass without the branch ever being refetched.
+  const alphaEvents = feed.getByTestId('dashboard-activity-row')
+
+  await expect(alphaEvents.getByRole('link', { name: 'elsewhere' }).first()).toBeVisible()
   const secondMove = await page.request.post(`${baseURL}/api/move`, {
     data: { id: 'fake-notes-alpha', destinationPath: 'final/Alpha.md' },
   })
   expect(secondMove.ok()).toBeTruthy()
-  await expect(feed.getByRole('link', { name: 'final' }).first()).toBeVisible()
+  await expect(alphaEvents.getByRole('link', { name: 'final' }).first()).toBeVisible()
   await expect(feed.getByRole('button', { name: /Collapse changes for Alpha/ })).toHaveAttribute(
     'aria-expanded',
     'true',
