@@ -11,6 +11,7 @@ import { Button } from '../../core/Button'
 import { IconX } from '../../core/Icons'
 import { StateView } from '../../core/StateView'
 import {
+  abilityDraftOwner,
   type AbilityDraftRecord,
   readAbilityDraft,
   removeAbilityDraft,
@@ -36,7 +37,9 @@ export const AbilityDraftPage = ({ expectedKind }: { expectedKind?: 'roles' | 's
   const kind = expectedKind ?? routeKind ?? 'roles'
   const abilityKind = kind === 'skills' ? 'skill' : 'role'
   const { mode, me } = useAuth()
-  const owner = mode === 'none' ? '@system' : (me?.username ?? '')
+  // The same helper AuthProvider clears by: a draft must survive a rename of the
+  // handle, and the cache of a departed principal must stay reachable by the cleaner.
+  const owner = abilityDraftOwner(mode, me?.id) ?? ''
   const { scope, invalidate } = useAgentsExplorer()
   const { setBreadcrumbTail } = useAgentsShell()
   const { space, spaces, personalSpace } = useSpace()

@@ -13,7 +13,7 @@ export const createInvites = (ctx: AuthCtx) => ({
     if (!rec) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'invalid or expired link')
     }
-    const user = await ctx.activeUser(rec.username)
+    const user = await ctx.activeUserById(rec.userId)
 
     if (!user) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'invalid or expired link')
@@ -34,16 +34,16 @@ export const createInvites = (ctx: AuthCtx) => ({
     if (!(await ctx.db.useOneTime(rec.idHash, ctx.nowIso()))) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'invalid or expired link') // single-use race loser
     }
-    const user = await ctx.activeUser(rec.username)
+    const user = await ctx.activeUserById(rec.userId)
 
     if (!user) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'invalid or expired link')
     }
-    await ctx.db.updateUser(user.username, { passwordHash: await hashPassword(password) })
+    await ctx.db.updateUser(user.id, { passwordHash: await hashPassword(password) })
     if (rec.purpose === TOKEN_PURPOSE.reset) {
-      await ctx.db.deleteSessionsFor(user.username)
+      await ctx.db.deleteSessionsFor(user.id)
     }
 
-    return { me: await ctx.me(user.username), sessionToken: await ctx.createSession(user.username) }
+    return { me: await ctx.me(user.id), sessionToken: await ctx.createSession(user.id) }
   },
 })

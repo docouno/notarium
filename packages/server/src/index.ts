@@ -11,11 +11,20 @@ export {
   mintPatToken,
   parseOAuthAccessToken,
   parseOAuthRefreshToken,
+  mintUserId,
   parsePatToken,
   pkceS256,
   sha256,
   timingSafeEqualHex,
 } from './libs/tokens'
+export {
+  agentPrincipalPrefixes,
+  oauthPrincipalId,
+  parsePrincipalId,
+  patPrincipalId,
+  PRINCIPAL_SCHEME,
+  userPrincipalId,
+} from './libs/principalId'
 export * from './services/auth'
 export * from './services/authz'
 export * from './services/credentialKeyring'

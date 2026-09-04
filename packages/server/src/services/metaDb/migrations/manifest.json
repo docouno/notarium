@@ -56,6 +56,13 @@
       "checksum": "sha256:bcd704ab7cede2cb6daf0502255289ae9b2632a8fd9e58f719ff3a0fa49a970c",
       "sqlite": "sqlite/0007_activity_projection.sql",
       "postgres": "postgres/0007_activity_projection.sql"
+    },
+    {
+      "version": 8,
+      "name": "account_identity",
+      "checksum": "sha256:402c8b1f9d10dc4c051de654f26543ce980083e78186b648623e326ef4886f49",
+      "sqlite": "sqlite/0008_account_identity.sql",
+      "postgres": "postgres/0008_account_identity.sql"
     }
   ]
 }

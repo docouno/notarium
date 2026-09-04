@@ -15,6 +15,15 @@ import {
 } from '../../packages/server/src/services/metaDb/migrations'
 import { SqliteMetaDb } from '../../packages/server/src/services/metaDb/sqliteMetaDb'
 import {
+  accountIdentityRegistry,
+  accountIdentitySeedSql,
+  expectAccountIdentityWorld,
+  expectActivityProjectionState,
+  type LadderReader,
+  usersCarriedColumnsSql,
+} from '../meta-db-contract/accountIdentityLadder'
+import {
+  ACCOUNT_IDENTITY_CANDIDATE_COLUMNS,
   approvedTargetCatalog,
   type MetaDbCatalog,
   PROVIDER_CONTOUR_TABLES,
@@ -86,6 +95,7 @@ describe('meta-DB migration assets and SQLite runner', () => {
       { version: 5, name: 'provider_contour' },
       { version: 6, name: 'agent_call_trace' },
       { version: 7, name: 'activity_projection' },
+      { version: 8, name: 'account_identity' },
     ])
     for (const migration of migrations) {
       expect(migration.checksum).toBe(checksumMigrationPair(migration.sqlite, migration.postgres))
@@ -858,6 +868,107 @@ describe('meta-DB migration assets and SQLite runner', () => {
         .prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'mcp_bookmarks'")
         .get(),
     ).toBeUndefined()
+  })
+
+  const tableCounts = (db: DatabaseSync): Record<string, number> =>
+    Object.fromEntries(
+      (
+        db
+          .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+          .all() as Array<{ name: string }>
+      ).map(({ name }) => [
+        name,
+        (db.prepare(`SELECT COUNT(*) AS n FROM "${name}"`).get() as { n: number }).n,
+      ]),
+    )
+
+  it('moves every user reference onto the stable id and leaves orphans byte-for-byte', async () => {
+    const db = database()
+    const upTo = migrations.findIndex((migration) => migration.name === 'account_identity')
+    runSqliteMigrations(db, migrations.slice(0, upTo))
+    db.exec(accountIdentitySeedSql(false))
+    const read: LadderReader = {
+      one: async (sql) => db.prepare(sql).get(),
+      all: async (sql) => db.prepare(sql).all(),
+    }
+    const triggersBefore = db
+      .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name")
+      .all()
+    const countsBefore = tableCounts(db)
+    // The seed must leave the projection built, or the `rebuilding` assertion at the end
+    // would hold without the carrier having done anything.
+    await expectActivityProjectionState(read, 'ready')
+    const usersBefore = await read.all(usersCarriedColumnsSql)
+
+    runSqliteMigrations(db, migrations)
+
+    // The rebuild of `users` must hand its two lifecycle gates back verbatim, and the
+    // in-place column renames must leave every other trigger body untouched.
+    expect(
+      db.prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name").all(),
+    ).toEqual(triggersBefore)
+    const countsAfter = tableCounts(db)
+    // Beside the ledger row, two counters legitimately move: the idempotency cache is
+    // emptied, and the Activity invalidation that the principal rewrite trips queues a
+    // generation for GC. Every other table keeps every row.
+    expect(countsAfter.mcp_dedup).toBe(0)
+    expect(countsAfter.activity_projection_gc).toBeGreaterThan(countsBefore.activity_projection_gc)
+    expect(countsAfter.meta_migrations).toBe(countsBefore.meta_migrations + 1)
+    for (const table of ['mcp_dedup', 'activity_projection_gc', 'meta_migrations']) {
+      delete countsBefore[table]
+      delete countsAfter[table]
+    }
+    expect(countsAfter).toEqual(countsBefore)
+
+    // `users` is the only table the carrier rebuilds, and everything the INSERT…SELECT
+    // copies has to come back byte-for-byte — not just the three columns read below.
+    expect(await read.all(usersCarriedColumnsSql)).toEqual(usersBefore)
+
+    const users = db
+      .prepare('SELECT username, id, email FROM users ORDER BY username')
+      .all() as Array<{
+      username: string
+      id: string
+      email: string | null
+    }>
+    expect(users.map(({ username }) => username)).toEqual([
+      'alice',
+      'bob',
+      'p1',
+      'p2',
+      'p3',
+      'p4',
+      'p5',
+      'p6',
+    ])
+    for (const user of users) {
+      expect(user.id).toMatch(/^[0-9a-f]{16}$/)
+      expect(user.email).toBeNull()
+    }
+    expect(new Set(users.map(({ id }) => id)).size).toBe(users.length)
+    const id = (username: string): string => users.find((u) => u.username === username)!.id
+    const alice = id('alice')
+    const bob = id('bob')
+
+    await expectAccountIdentityWorld(read, { alice, bob })
+    await expectActivityProjectionState(read, 'rebuilding')
+  })
+
+  it('accounts for every schema column that can carry a user reference', () => {
+    const db = database()
+    runSqliteMigrations(db)
+    const tables = (
+      db
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
+        .all() as Array<{ name: string }>
+    ).map(({ name }) => name)
+    const candidates = tables.flatMap((table) =>
+      (db.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name: string }>)
+        .filter(({ name }) => ACCOUNT_IDENTITY_CANDIDATE_COLUMNS.includes(name))
+        .map(({ name }) => `${table}.${name}`),
+    )
+
+    expect(candidates.sort()).toEqual(accountIdentityRegistry())
   })
 
   it('preserves pre-session audit rows and leaves their new attribution snapshot null', () => {

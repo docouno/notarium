@@ -136,12 +136,12 @@ export const createOAuthFacet = (ctx: PgDriverCtx): OAuthPersistence => ({
     await ctx.ensureInit()
     await ctx.required.query(
       `INSERT INTO oauth_auth_codes
-           (code_hash, client_id, username, redirect_uri, scope, spaces, code_challenge, code_challenge_method, expires_at, used_at, created_at)
+           (code_hash, client_id, user_id, redirect_uri, scope, spaces, code_challenge, code_challenge_method, expires_at, used_at, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
       [
         c.codeHash,
         c.clientId,
-        c.username,
+        c.userId,
         c.redirectUri,
         c.scope,
         c.spaces == null ? null : JSON.stringify(c.spaces),
@@ -161,7 +161,7 @@ export const createOAuthFacet = (ctx: PgDriverCtx): OAuthPersistence => ({
       | {
           code_hash: string
           client_id: string
-          username: string
+          user_id: string
           redirect_uri: string
           scope: string
           spaces: string | null
@@ -180,7 +180,7 @@ export const createOAuthFacet = (ctx: PgDriverCtx): OAuthPersistence => ({
     return {
       codeHash: r.code_hash,
       clientId: r.client_id,
-      username: r.username,
+      userId: r.user_id,
       redirectUri: r.redirect_uri,
       scope: r.scope,
       spaces: r.spaces == null ? null : (JSON.parse(r.spaces) as string[]),
@@ -204,12 +204,12 @@ export const createOAuthFacet = (ctx: PgDriverCtx): OAuthPersistence => ({
     await ctx.ensureInit()
     await ctx.required.query(
       `INSERT INTO oauth_access_tokens
-           (id, token_hash, username, client_id, scope, spaces, expires_at, refresh_id, revoked_at, created_at, last_used_at)
+           (id, token_hash, user_id, client_id, scope, spaces, expires_at, refresh_id, revoked_at, created_at, last_used_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
       [
         t.id,
         t.tokenHash,
-        t.username,
+        t.userId,
         t.clientId,
         t.scope,
         t.spaces == null ? null : JSON.stringify(t.spaces),
@@ -256,12 +256,12 @@ export const createOAuthFacet = (ctx: PgDriverCtx): OAuthPersistence => ({
       [...args, id],
     )
   },
-  listAccessForUser: async (username) => {
+  listAccessForUser: async (userId) => {
     await ctx.ensureInit()
     const rows = (
       await ctx.required.query(
-        'SELECT * FROM oauth_access_tokens WHERE username = $1 AND revoked_at IS NULL ORDER BY created_at',
-        [username],
+        'SELECT * FROM oauth_access_tokens WHERE user_id = $1 AND revoked_at IS NULL ORDER BY created_at',
+        [userId],
       )
     ).rows as OAuthAccessRow[]
     return rows.map(accessOfRow)
@@ -271,12 +271,12 @@ export const createOAuthFacet = (ctx: PgDriverCtx): OAuthPersistence => ({
     await ctx.ensureInit()
     await ctx.required.query(
       `INSERT INTO oauth_refresh_tokens
-           (id, token_hash, username, client_id, scope, spaces, expires_at, rotated_to, revoked_at, created_at)
+           (id, token_hash, user_id, client_id, scope, spaces, expires_at, rotated_to, revoked_at, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
         t.id,
         t.tokenHash,
-        t.username,
+        t.userId,
         t.clientId,
         t.scope,
         t.spaces == null ? null : JSON.stringify(t.spaces),
@@ -330,12 +330,12 @@ export const createOAuthFacet = (ctx: PgDriverCtx): OAuthPersistence => ({
     )
     return (res.rowCount ?? 0) > 0
   },
-  listRefreshForUser: async (username) => {
+  listRefreshForUser: async (userId) => {
     await ctx.ensureInit()
     const rows = (
       await ctx.required.query(
-        'SELECT * FROM oauth_refresh_tokens WHERE username = $1 AND revoked_at IS NULL ORDER BY created_at',
-        [username],
+        'SELECT * FROM oauth_refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL ORDER BY created_at',
+        [userId],
       )
     ).rows as OAuthRefreshRow[]
     return rows.map(refreshOfRow)

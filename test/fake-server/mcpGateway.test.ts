@@ -30,10 +30,13 @@ import {
   SERVER_INSTRUCTIONS,
 } from '../../packages/server/src/services/mcp/descriptions'
 import { InMemoryAgentCalls } from './agentCalls.js'
-import { createApp, type Fixture } from './app.js'
+import { createApp, fakeUserId, type Fixture } from './app.js'
 import { InMemoryProjects } from './projects.js'
 import { InMemoryRetrievalLog } from './retrievalLog.js'
 import { InMemorySessionAudit } from './sessionAudit.js'
+
+/** The fixture account `alice`, keyed the way the store keys it. */
+const ALICE_ID = fakeUserId('alice')
 
 const MARKER = 'zzmarker'
 const identityLink = (id: string, title: string): string =>
@@ -282,7 +285,7 @@ const loginCookie = async (
   const login = await instance.inject({
     method: 'POST',
     url: '/api/auth/login',
-    payload: { username, password },
+    payload: { identifier: username, password },
   })
   expect(login.statusCode).toBe(200)
   return (login.headers['set-cookie'] as string).split(';')[0]
@@ -1207,7 +1210,9 @@ describe('ability authoring vertical', () => {
     expect(history.statusCode).toBe(200)
     expect(history.json()).toMatchObject({
       total: 1,
-      revisions: [{ principal: expect.stringMatching(/^pat:alice:/), kind: 'write' }],
+      revisions: [
+        { principal: expect.stringMatching(new RegExp(`^pat:${ALICE_ID}:`)), kind: 'write' },
+      ],
     })
   })
 
@@ -1980,7 +1985,11 @@ describe('whoami', () => {
     const r = await callTool(port, 'whoami', {}, bearer)
     const s = structured(r)
     expect(s.scope).toBe('write')
-    expect(String(s.principal)).toMatch(/^pat:alice:/)
+    expect(String(s.principal)).toMatch(new RegExp(`^pat:${ALICE_ID}:`))
+    // The principal id carries the stable user id, so the text half names the human —
+    // otherwise the model reads a hex string and cannot say whose workspace it is.
+    expect(text(r)).toContain(`\`pat:${ALICE_ID}:`)
+    expect(text(r)).toContain('(alice) with **write** access')
     // alice-personal has no project row in the fixture → not listed. (Personal CAN
     // hold projects now, #13 2026-06-20 — but only once a folder/root is marked.)
     // One ProjectSummary shape out of every bootstrap tool (#13): id + handle + space.
@@ -3081,11 +3090,11 @@ describe('get_note provenance (#12 → #21 stage 4)', () => {
     expect(prov).toBeDefined()
     // The agent's own token is the attribution — this is what lets a later
     // reader tell an agent-written note from a human-written one.
-    expect(prov?.principal).toMatch(/^pat:alice:/)
+    expect(prov?.principal).toMatch(new RegExp(`^pat:${ALICE_ID}:`))
     expect(prov?.kind).toBe('write')
     expect(typeof prov?.modifiedAt).toBe('string')
     // detailed is get_note's default → the footer renders the attribution.
-    expect(text(r)).toMatch(/last edited by `pat:alice:/)
+    expect(text(r)).toMatch(new RegExp(`last edited by \`pat:${ALICE_ID}:`))
   })
 
   it('distinguishes a human (UI) write from an agent write on the same note', async () => {
@@ -3117,7 +3126,7 @@ describe('get_note provenance (#12 → #21 stage 4)', () => {
 
     const r = await callTool(port, 'get_note', { ref: noteId }, bearer)
     const prov = structured(r).provenance as Prov
-    expect(prov.principal).toBe('user:alice') // the human handle, not the agent token
+    expect(prov.principal).toBe(`user:${ALICE_ID}`) // the human handle, not the agent token
     expect(prov.kind).toBe('write')
   })
 
@@ -4307,7 +4316,7 @@ describe('edit_note (#21 stage 5)', () => {
     expect(prov).toBeDefined()
     // The latest revision is the agent's write, NOT the synthesized external
     // pre-edit baseline (principal null) the journal lays down underneath it.
-    expect(prov?.principal).toMatch(/^pat:alice:/)
+    expect(prov?.principal).toMatch(new RegExp(`^pat:${ALICE_ID}:`))
     expect(prov?.kind).toBe('write')
   })
 
@@ -6325,7 +6334,7 @@ describe('start_session (#21 stage 9)', () => {
     const change = after.project?.delta.changes.find((c) => c.noteId === newId)
     expect(change).toBeDefined()
     expect(change?.kind).toBe('write')
-    expect(change?.principal).toMatch(/^pat:alice:/) // attributed to the agent (#12)
+    expect(change?.principal).toMatch(new RegExp(`^pat:${ALICE_ID}:`)) // attributed to the agent (#12)
     // #102: each delta entry is labelled with its three-state location — team's root
     // project owns the space, so the change carries the project handle, space, and path.
     expect(change?.project).toBe('team')
@@ -7089,7 +7098,7 @@ describe('navigation — list_notes / recent_activity / get_note links (#102 pha
     expect(ids).toContain(b.noteId)
     const newer = items.find((i) => i.noteId === b.noteId)!
     expect(newer.kind).toBe('write')
-    expect(newer.principal).toMatch(/^pat:alice:/)
+    expect(newer.principal).toMatch(new RegExp(`^pat:${ALICE_ID}:`))
     expect(newer.project).toBe('team')
     expect(typeof newer.path).toBe('string')
   })
@@ -7515,7 +7524,7 @@ describe('retrieval audit capture (#243)', () => {
     expect(audit.total).toBe(3)
     expect(audit.hasMore).toBe(false)
     expect(audit.nextCursor).toBeNull()
-    expect(audit.events.every((e) => e.principal.startsWith('pat:alice:'))).toBe(true)
+    expect(audit.events.every((e) => e.principal.startsWith(`pat:${ALICE_ID}:`))).toBe(true)
     expect(audit.events.every((e) => e.agent === 'read-token')).toBe(true)
     const byQuery = new Map(audit.events.map((e) => [e.query, e]))
     expect(byQuery.get(MARKER)?.resultCount).toBeGreaterThan(0)

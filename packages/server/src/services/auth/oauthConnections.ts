@@ -5,11 +5,12 @@
 
 import { HTTP_STATUS } from '@notarium/contract/http'
 
+import { oauthPrincipalId } from '../../libs/principalId'
 import { type AuthCtx, AuthError } from './authService'
 
 export const createOAuthConnections = (ctx: AuthCtx) => ({
   /** Connected-apps list; [] when the host lacks the OAuth facet. */
-  listConnections: async (username: string) => {
+  listConnections: async (userId: string) => {
     if (!ctx.oauthStore) {
       return []
     }
@@ -17,12 +18,12 @@ export const createOAuthConnections = (ctx: AuthCtx) => ({
     // Narrowing stores space ids; wire shows slugs. A space the registry no longer lists drops out.
     const slugs = await ctx.slugById()
     const toSlug = (id: string): string | undefined => (slugs ? slugs.get(id) : id)
-    const allAccess = await ctx.oauthStore.listAccessForUser(username)
+    const allAccess = await ctx.oauthStore.listAccessForUser(userId)
     const liveAccess = allAccess.filter((t) => t.expiresAt > nowStr)
     // Include apps whose access tokens all expired but whose refresh is still live —
     // else a still-reachable app vanishes from the list and becomes unrevokable.
     // Refresh rows carry no lastUsedAt: they contribute presence + createdAt + scope only.
-    const refresh = (await ctx.oauthStore.listRefreshForUser(username)).filter(
+    const refresh = (await ctx.oauthStore.listRefreshForUser(userId)).filter(
       (t) => t.rotatedTo == null && t.expiresAt > nowStr,
     )
     // Source last-used from the max across ALL access rows, expired included: the ~1h
@@ -98,14 +99,14 @@ export const createOAuthConnections = (ctx: AuthCtx) => ({
    *  and drop its live SSE. Reaching refresh directly matters — an app whose access
    *  all expired/were pruned still has a 60-day refresh that would survive a Disconnect.
    *  canon: docs/auth.md#sse-revoke-disconnect */
-  revokeConnection: async (username: string, clientId: string): Promise<void> => {
+  revokeConnection: async (userId: string, clientId: string): Promise<void> => {
     if (!ctx.oauthStore) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
-    const access = (await ctx.oauthStore.listAccessForUser(username)).filter(
+    const access = (await ctx.oauthStore.listAccessForUser(userId)).filter(
       (t) => t.clientId === clientId,
     )
-    const refresh = (await ctx.oauthStore.listRefreshForUser(username)).filter(
+    const refresh = (await ctx.oauthStore.listRefreshForUser(userId)).filter(
       (t) => t.clientId === clientId,
     )
 
@@ -116,7 +117,7 @@ export const createOAuthConnections = (ctx: AuthCtx) => ({
 
     for (const tok of access) {
       await ctx.oauthStore.updateAccess(tok.id, { revokedAt: t })
-      ctx.dropSse((h) => h.principalId === `oauth:${username}:${tok.id}`)
+      ctx.dropSse((h) => h.principalId === oauthPrincipalId(userId, tok.id))
     }
     for (const tok of refresh) {
       await ctx.oauthStore.updateRefresh(tok.id, { revokedAt: t })
@@ -131,17 +132,17 @@ export const createOAuthConnections = (ctx: AuthCtx) => ({
    *  back to all the owner's grants.
    */
   updateConnection: async (
-    username: string,
+    userId: string,
     clientId: string,
     patch: { scope?: 'read' | 'write'; spaces?: string[] | null },
   ): Promise<void> => {
     if (!ctx.oauthStore) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
-    const access = (await ctx.oauthStore.listAccessForUser(username)).filter(
+    const access = (await ctx.oauthStore.listAccessForUser(userId)).filter(
       (t) => t.clientId === clientId,
     )
-    const refresh = (await ctx.oauthStore.listRefreshForUser(username)).filter(
+    const refresh = (await ctx.oauthStore.listRefreshForUser(userId)).filter(
       (t) => t.clientId === clientId,
     )
 
@@ -162,7 +163,7 @@ export const createOAuthConnections = (ctx: AuthCtx) => ({
     }
     for (const tok of access) {
       await ctx.oauthStore.updateAccess(tok.id, dbPatch)
-      ctx.dropSse((h) => h.principalId === `oauth:${username}:${tok.id}`)
+      ctx.dropSse((h) => h.principalId === oauthPrincipalId(userId, tok.id))
     }
     for (const tok of refresh) {
       await ctx.oauthStore.updateRefresh(tok.id, dbPatch)

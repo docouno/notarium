@@ -442,11 +442,19 @@ export const agentContext: CaseSpec = {
     // EXISTS ("Раздутый гайд по деплою"), but the agent that phrases it "deploy prod
     // checklist" keeps coming back empty — a fact that is effectively dead, invisible
     // without this surface. Repeated queries build the "Frequent" + "Blind spots" ranks.
-    // Two agents (a CLI PAT + a connected Claude app) show the "which agent" lens.
     // Two agents with friendly names — a CLI PAT + a connected Claude app (the "which
     // agent" lens; captured at runtime from the live token, supplied directly in the seed).
+    // Both principals RESOLVE to the OWNER account — the brand never survives into the
+    // stored principal, it belongs in `agent`. The connected app keeps the `oauth:<appName>`
+    // shorthand, and only here:
+    // the real applier resolves it against the app declared above into that app's
+    // MINTED access-token principal, so this stand's audit points at a credential that
+    // actually exists in `oauth_access_tokens`. Spelling the owner by hand would look
+    // tidier and quietly break that link. The shorthand is legal in THIS channel only —
+    // it is two segments, and two segments parse nowhere else, so the same string in a
+    // revision principal would read as `system` instead of Sergey's agent.
     const cli = { principal: 'pat:sergey:cli', agent: 'CLI' }
-    const claude = { principal: 'oauth:claude', agent: 'Claude' }
+    const claude = { principal: 'oauth:Claude', agent: 'Claude' }
     // Hits — the agent found what it looked for.
     b.retrieval({
       ...cli,

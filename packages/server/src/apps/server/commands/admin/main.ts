@@ -5,7 +5,7 @@
 import { randomBytes } from 'node:crypto'
 import { createInterface } from 'node:readline'
 
-import { AUTH_MODE, SPACE_ROLE } from '@notarium/contract'
+import { AUTH_MODE, SPACE_ROLE, UsernameSchema } from '@notarium/contract'
 
 import { parseCommandLine, type ParsedCommandLine } from '../../../../libs/commandLine'
 import { loadEnv } from '../../../../libs/env'
@@ -129,8 +129,8 @@ const main = async (): Promise<void> => {
   const auth = createAuthService({
     mode: AUTH_MODE.password,
     persistence: metaDb.auth,
-    removeMemberAndProviderAttachments: (space, username) =>
-      metaDb.removeMemberAndProviderAttachments(space, username),
+    removeMemberAndProviderAttachments: (space, userId) =>
+      metaDb.removeMemberAndProviderAttachments(space, userId),
   })
 
   const credentialRecovery = (): CredentialKeyringService => {
@@ -171,7 +171,7 @@ const main = async (): Promise<void> => {
           ]
             .filter(Boolean)
             .join(', ')
-          console.log(`${u.username}\t${u.displayName}\t[${flags}]`)
+          console.log(`${u.username}\t${u.email ?? '-'}\t${u.displayName}\t[${flags}]`)
         }
         break
       }
@@ -203,6 +203,13 @@ const main = async (): Promise<void> => {
 
         if (rest.length > 1) {
           die('usage: create-admin <username> [--password <pw> | --random] [--display "Name"]')
+        }
+        // The same rule as the REST surface: a handle written past it would be one the
+        // login shape filter refuses.
+        if (!UsernameSchema.safeParse(username).success) {
+          die(
+            `invalid username: ${username} — lowercase letters, digits, dots, underscores and dashes, starting and ending with a letter or digit, at most 32 characters`,
+          )
         }
         if (await metaDb.auth.getUser(username)) {
           die(`user already exists: ${username}`)

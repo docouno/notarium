@@ -403,7 +403,7 @@ describe('space field schema REST surface', () => {
     const login = await app.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username: 'reader', password: 'reader-pass' },
+      payload: { identifier: 'reader', password: 'reader-pass' },
     })
     const cookie = (login.headers['set-cookie'] as string).split(';')[0]
     const current = await app.inject({

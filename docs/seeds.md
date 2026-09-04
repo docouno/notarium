@@ -80,7 +80,7 @@ and for `security` — it parses the sanitized HTML into a live DOM and checks t
 
 | Case | About | Axes |
 |---|---|---|
-| `multi-space` | 3 spaces + a personal domain with memory + **live/archived/shadowed/ambiguous space aliases** + **archived scratch** + a **zero-grant recovery user** + **connected apps with narrowing** + **pending OAuth registration** | structure, agent-memory, auth, note-classes, trash, identity |
+| `multi-space` | 3 spaces + a personal domain with memory + **live/archived/shadowed/ambiguous space aliases** + **archived scratch** + a **zero-grant recovery user** + **connected apps with narrowing** + **pending OAuth registration** + the account-identity states (#421): an owner **with an e-mail** and one **without**, a **renamed account whose personal space followed** (`pavel`, formerly `pasha` — slug `pavel`, alias `pasha`) and a **personal space with a chosen slug** (`nadia` → `nadia-desk`, which a rename leaves alone) | structure, agent-memory, auth, note-classes, trash, identity |
 | `folder-page` | `index.md` pages (nested), children summary, breadcrumbs (#212-214); the **agent-facing states #415** — project roots with and without a page, a research package with sources and none, a package whose page survives an item filter, a task package of artifacts, an ordinary README — so a stand shows `list_notes`' present/missing `folderPage` slot, its create action and the quiet bootstrap | folder-page, structure, content |
 | `note-classes` | one note per class — visibility matrix for user-doc/agent-memory/profile (#78/#74) | note-classes, agent-memory, structure |
 | `explorer-scroll` | a deep tree: a note near the bottom + many collapsible folders above — the explorer scroll-position invariant (#242): a reflow above the open note does not move the scroll | structure, scale |
@@ -527,6 +527,29 @@ needed):
 | `SEED_USER` | `admin` | the init user's login (= content author) |
 | `SEED_PASSWORD` | `admin` | password (or `make seed … PASSWORD=…`) |
 | `SEED_DISPLAY_NAME` | `Admin` | display name |
+| `SEED_EMAIL` | — | optional address; unset keeps the "not set" state |
+
+Accounts are keyed by a stable id the seed mints; a case names people by handle and
+every owner key and attribution the appliers write is translated through that map, so
+the catalog stays readable while the meta-DB holds ids. That includes the owner segment
+of a principal (`user:<handle>`, `pat:<handle>:<keyId>`, `oauth:<handle>:<keyId>`): it
+names the ACCOUNT that holds the credential, and it is the only thing an author label
+resolves from. The agent's brand belongs in the separate `agent` field — a case that
+writes `pat:CLI:…` names no account, so every surface that would say "Sergey's agent"
+falls back to "an agent". The one exception is the retrieval-audit channel, which also
+accepts `oauth:<appName>` for a connected app the case declares: the real applier
+resolves it into that app's MINTED token principal, so the audit points at a credential
+the stand actually issued. It is two segments, so it parses in no other channel — the
+same string in a revision principal reads as `system`. A `UserDecl` may carry an
+`email`; a user without one is a state of its own (the account and admin screens show
+"not set"), so the multi-author cases seed both kinds — and the address signs in
+(`pavel@example.com` / `seed-pass` on `multi-space`, any case; the canonical owner keeps
+the case's `sergey@example.com` under the init user's password unless `SEED_EMAIL`
+overrides the address). A renamed account is
+not a seed operation but a state: the rows it owns are id-keyed, so what shows the old
+handle is only the alias its personal space kept (`pavel`, formerly `pasha`), and a
+personal space with a slug its owner chose (`nadia-desk`) is the one a rename does not
+touch — both live in `multi-space`.
 
 ## Extensibility (contract)
 

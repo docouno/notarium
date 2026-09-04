@@ -554,14 +554,16 @@ describe('provider validate facade', () => {
     })
     const record = (await db.providerResources.get(resource.id))!
 
-    expect(registry.resourceToWire(record, { owner: 'alice' }).lastCheck.completion).toMatchObject({
+    expect(
+      (await registry.resourceToWire(record, { owner: 'alice' })).lastCheck.completion,
+    ).toMatchObject({
       status: PROVIDER_STATUS.unreachable,
       diagnostic: expect.stringContaining('ECONNREFUSED'),
     })
     expect(
-      registry.resourceToWire(record, { owner: 'bob', admin: true }).lastCheck.completion,
+      (await registry.resourceToWire(record, { owner: 'bob', admin: true })).lastCheck.completion,
     ).toMatchObject({ diagnostic: expect.stringContaining('ECONNREFUSED') })
-    expect(registry.resourceToWire(record, { owner: 'bob' }).lastCheck.completion).toEqual({
+    expect((await registry.resourceToWire(record, { owner: 'bob' })).lastCheck.completion).toEqual({
       status: PROVIDER_STATUS.unreachable,
       checkedAt: '2026-08-24T09:00:00.000Z',
       diagnostic: null,
@@ -569,7 +571,7 @@ describe('provider validate facade', () => {
     })
     // Withheld from a stranger, so `policy-denied` cannot be told apart from a
     // failed resolve — that difference is a sharper DNS oracle than timing.
-    expect(registry.resourceToWire(record, {}).credentialId).toBeUndefined()
+    expect((await registry.resourceToWire(record, {})).credentialId).toBeUndefined()
   })
 
   it('leaves a public address in full resolution and a local fact uncoarsened', async () => {
@@ -602,33 +604,35 @@ describe('provider validate facade', () => {
     // nothing. The provider's sentence is a different question and travels only to
     // the owner: it is prose about the OWNER's account, not about the address.
     expect(
-      registry.resourceToWire(withCheck, { owner: 'alice' }).lastCheck.completion,
+      (await registry.resourceToWire(withCheck, { owner: 'alice' })).lastCheck.completion,
     ).toMatchObject({
       status: PROVIDER_STATUS.credentialRejected,
       diagnostic: 'No auth credentials found',
     })
-    expect(registry.resourceToWire(withCheck, { owner: 'bob' }).lastCheck.completion).toMatchObject(
-      {
-        status: PROVIDER_STATUS.credentialRejected,
-        diagnostic: null,
-      },
-    )
     expect(
-      registry.resourceToWire(
-        {
-          ...record,
-          allowPrivateNetwork: true,
-          baseUrl: `http://provider.test:${port}/api/v1`,
-          lastCheck: {
-            completion: {
-              status: PROVIDER_STATUS.disabled,
-              checkedAt: '2026-08-24T09:00:00.000Z',
-              diagnostic: null,
-              credentialProven: false,
+      (await registry.resourceToWire(withCheck, { owner: 'bob' })).lastCheck.completion,
+    ).toMatchObject({
+      status: PROVIDER_STATUS.credentialRejected,
+      diagnostic: null,
+    })
+    expect(
+      (
+        await registry.resourceToWire(
+          {
+            ...record,
+            allowPrivateNetwork: true,
+            baseUrl: `http://provider.test:${port}/api/v1`,
+            lastCheck: {
+              completion: {
+                status: PROVIDER_STATUS.disabled,
+                checkedAt: '2026-08-24T09:00:00.000Z',
+                diagnostic: null,
+                credentialProven: false,
+              },
             },
           },
-        },
-        { owner: 'bob' },
+          { owner: 'bob' },
+        )
       ).lastCheck.completion,
     ).toMatchObject({ status: PROVIDER_STATUS.disabled })
   })

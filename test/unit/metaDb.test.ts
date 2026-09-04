@@ -351,7 +351,9 @@ describe('SqliteMetaDb', () => {
         'shared body',
       )
       await db.auth.createUser({
+        id: 'al',
         username: 'al',
+        email: null,
         displayName: 'Al',
         passwordHash: null,
         admin: false,
@@ -363,7 +365,7 @@ describe('SqliteMetaDb', () => {
       await db.auth.upsertMember(keep, 'al', 'owner', 'x')
       await db.auth.insertPat({
         id: 'p-both',
-        username: 'al',
+        userId: 'al',
         name: 'both',
         secretHash: 'h',
         scope: 'read',
@@ -375,7 +377,7 @@ describe('SqliteMetaDb', () => {
       })
       await db.auth.insertPat({
         id: 'p-only',
-        username: 'al',
+        userId: 'al',
         name: 'only',
         secretHash: 'h',
         scope: 'read',
@@ -1188,8 +1190,11 @@ describe('SqliteMetaDb', () => {
   })
 
   describe('auth facet — personal domain (#21/#13, v7)', () => {
+    // Test accounts key by their handle: the id IS the handle.
     const user = (over: Partial<UserRecord> = {}): UserRecord => ({
+      id: over.username ?? 'alice',
       username: 'alice',
+      email: null,
       displayName: 'Alice',
       passwordHash: null,
       admin: false,

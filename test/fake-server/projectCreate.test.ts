@@ -135,7 +135,7 @@ const loginCookie = async (): Promise<string> => {
   const res = await app.inject({
     method: 'POST',
     url: '/api/auth/login',
-    payload: { username: 'alice', password: 'alice-password-1' },
+    payload: { identifier: 'alice', password: 'alice-password-1' },
   })
   return res.headers['set-cookie'] as string
 }

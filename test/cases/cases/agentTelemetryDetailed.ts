@@ -92,7 +92,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         ...calls,
         {
           ref: 'error-matrix-start',
-          principal: 'pat:Codex:seed',
+          principal: 'pat:sergey:codex',
           agent: 'Codex',
           sessionRef: 'error-matrix',
           tool: 'start_session',
@@ -106,7 +106,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'error-matrix-edit',
-          principal: 'pat:Codex:seed',
+          principal: 'pat:sergey:codex',
           agent: 'Codex',
           sessionRef: 'error-matrix',
           tool: 'edit_note',
@@ -121,7 +121,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'error-matrix-get',
-          principal: 'pat:Cursor:seed',
+          principal: 'pat:sergey:cursor',
           agent: 'Cursor',
           sessionRef: 'error-matrix',
           tool: 'get_note',
@@ -136,7 +136,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'compact-comparison-start',
-          principal: 'pat:CLI:seed',
+          principal: 'pat:sergey:cli',
           agent: 'CLI',
           sessionRef: 'compact-comparison',
           tool: 'start_session',
@@ -149,7 +149,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'compact-comparison-list',
-          principal: 'pat:CLI:seed',
+          principal: 'pat:sergey:cli',
           agent: 'CLI',
           sessionRef: 'compact-comparison',
           tool: 'list_notes',
@@ -162,7 +162,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'review-fork-get',
-          principal: 'oauth:Claude',
+          principal: 'oauth:sergey:claude',
           agent: 'Claude',
           sessionRef: 'review-fork',
           tool: 'get_note',
@@ -176,7 +176,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'automatic-whoami',
-          principal: 'pat:Codex:seed',
+          principal: 'pat:sergey:codex',
           agent: 'Codex',
           sessionRef: 'automatic',
           tool: 'whoami',
@@ -189,7 +189,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'automatic-skill',
-          principal: 'pat:Codex:seed',
+          principal: 'pat:sergey:codex',
           agent: 'Codex',
           sessionRef: 'automatic',
           tool: 'use_skill',
@@ -203,7 +203,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'sleeping-role-denied',
-          principal: 'pat:CLI:seed',
+          principal: 'pat:sergey:cli',
           agent: 'CLI',
           sessionRef: 'sleeping-release',
           tool: 'use_role',
@@ -218,7 +218,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'outside-invalid-repeat-cursor',
-          principal: 'pat:Cursor:seed',
+          principal: 'pat:sergey:cursor',
           agent: 'Cursor',
           tool: 'search',
           effect: 'read',
@@ -232,7 +232,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'outside-invalid-repeat-claude',
-          principal: 'oauth:Claude',
+          principal: 'oauth:sergey:claude',
           agent: 'Claude',
           tool: 'search',
           effect: 'read',
@@ -246,7 +246,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'outside-create-denied',
-          principal: 'pat:Reader:seed',
+          principal: 'pat:sergey:reader',
           agent: 'Reader token',
           tool: 'create_note',
           effect: 'mutation',
@@ -260,7 +260,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'review-root-list-detailed',
-          principal: 'pat:CLI:seed',
+          principal: 'pat:sergey:cli',
           agent: 'CLI',
           sessionRef: 'review-root',
           tool: 'list_notes',
@@ -274,7 +274,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'detail-capture-failed',
-          principal: 'pat:CLI:seed',
+          principal: 'pat:sergey:cli',
           agent: 'CLI',
           sessionRef: 'review-root',
           tool: 'recall',
@@ -303,7 +303,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'cleanup-upgrade-start',
-          principal: 'pat:CLI:seed',
+          principal: 'pat:sergey:cli',
           agent: 'CLI',
           sessionRef: 'cleanup-upgrade-pending',
           tool: 'start_session',
@@ -315,7 +315,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'cleanup-upgrade-read',
-          principal: 'pat:CLI:seed',
+          principal: 'pat:sergey:cli',
           agent: 'CLI',
           sessionRef: 'cleanup-upgrade-pending',
           tool: 'whoami',
@@ -326,7 +326,7 @@ export const agentTelemetryDetailed: CaseSpec = {
         },
         {
           ref: 'cleanup-human-start',
-          principal: 'pat:CLI:seed',
+          principal: 'pat:sergey:cli',
           agent: 'CLI',
           sessionRef: 'cleanup-human-complete',
           tool: 'start_session',
@@ -353,7 +353,7 @@ export const agentTelemetryDetailed: CaseSpec = {
       retrievals: [
         ...(world.retrievals ?? []),
         {
-          principal: 'pat:CLI:seed',
+          principal: 'pat:sergey:cli',
           agent: 'CLI',
           sessionRef: 'cleanup-upgrade-pending',
           sessionAttach: 'declared',

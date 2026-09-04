@@ -14,6 +14,7 @@ import { describeAbilityCreateContract } from './abilityCreateContract'
 import { describeAbilityPlacementContract } from './abilityPlacementContract'
 import { describeAbilityPlacementCostContract } from './abilityPlacementCostContract'
 import { describeAbilityPreferencesContract } from './abilityPreferencesContract'
+import { describeAccountContract } from './accountContract'
 import { describeAgentCallsContract } from './agentCallsContract'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
@@ -478,6 +479,11 @@ describePostgres('live Postgres driver', SUITE, () => {
   describeSpaceLifecycleWriterContract('Postgres', async () => {
     const testSchema = await createPostgresTestSchema('space_lifecycle_writers')
     return { db: testSchema.db, teardown: () => testSchema.teardown() }
+  })
+
+  describeAccountContract('Postgres', async () => {
+    const testSchema = await createPostgresTestSchema('account_contract')
+    return { auth: testSchema.db.auth, teardown: () => testSchema.teardown() }
   })
 
   it('round-trips a role target through all three reusable context facets', async () => {

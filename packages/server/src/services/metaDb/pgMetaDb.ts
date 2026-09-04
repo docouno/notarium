@@ -248,7 +248,7 @@ export class PgMetaDb implements MetaDb {
 
   async grantMemberToActiveSpace(
     spaceId: string,
-    username: string,
+    userId: string,
     role: SpaceRole,
     createdAt: string,
   ): Promise<GrantMemberToActiveSpaceResult> {
@@ -275,9 +275,9 @@ export class PgMetaDb implements MetaDb {
         return { status: 'archived', space }
       }
       await client.query(
-        `INSERT INTO space_members (space, username, role, created_at) VALUES ($1, $2, $3, $4)
-           ON CONFLICT (space, username) DO UPDATE SET role = EXCLUDED.role`,
-        [spaceId, username, role, createdAt],
+        `INSERT INTO space_members (space, user_id, role, created_at) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (space, user_id) DO UPDATE SET role = EXCLUDED.role`,
+        [spaceId, userId, role, createdAt],
       )
       await client.query('COMMIT')
       return { status: 'granted', space }
@@ -419,7 +419,7 @@ export class PgMetaDb implements MetaDb {
     }
   }
 
-  async removeMemberAndProviderAttachments(spaceId: string, username: string): Promise<void> {
+  async removeMemberAndProviderAttachments(spaceId: string, userId: string): Promise<void> {
     await this.ensureInit()
     const client = await this.required.connect()
 
@@ -432,14 +432,14 @@ export class PgMetaDb implements MetaDb {
         await client.query('COMMIT')
         return
       }
-      await lockProviderMembershipRow(client, spaceId, username)
+      await lockProviderMembershipRow(client, spaceId, userId)
       const resourcesResult = await client.query(
         `SELECT DISTINCT resource.id
            FROM provider_resources resource
            JOIN provider_attachments attachment ON attachment.resource_id = resource.id
           WHERE resource.owner = $1 AND attachment.target_space = $2
           ORDER BY resource.id`,
-        [username, spaceId],
+        [userId, spaceId],
       )
       const resourceIds = (resourcesResult.rows as Array<{ id: string }>).map(({ id }) => id)
       await lockProviderResourceRows(client, resourceIds)
@@ -449,7 +449,7 @@ export class PgMetaDb implements MetaDb {
            JOIN provider_resources resource ON resource.id = attachment.resource_id
           WHERE resource.owner = $1 AND attachment.target_space = $2
           ORDER BY attachment.id`,
-        [username, spaceId],
+        [userId, spaceId],
       )
       const attachmentIds = (attachmentsResult.rows as Array<{ id: string }>).map(({ id }) => id)
       await lockProviderAttachmentRows(client, attachmentIds)
@@ -459,9 +459,9 @@ export class PgMetaDb implements MetaDb {
           attachmentIds,
         ])
       }
-      await client.query('DELETE FROM space_members WHERE space = $1 AND username = $2', [
+      await client.query('DELETE FROM space_members WHERE space = $1 AND user_id = $2', [
         spaceId,
-        username,
+        userId,
       ])
       await client.query('COMMIT')
     } catch (error) {

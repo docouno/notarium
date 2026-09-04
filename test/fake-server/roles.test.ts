@@ -94,7 +94,7 @@ describe('role catalog → Add → effective → active walking skeleton', () =>
     const response = await app.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username, password },
+      payload: { identifier: username, password },
     })
     expect(response.statusCode).toBe(200)
     return (response.headers['set-cookie'] as string).split(';')[0]
@@ -3540,7 +3540,7 @@ describe('a workspace wider than one bounded scan', () => {
     const response = await app.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username: 'maya', password: 'maya' },
+      payload: { identifier: 'maya', password: 'maya' },
     })
     expect(response.statusCode).toBe(200)
     cookie = (response.headers['set-cookie'] as string).split(';')[0]

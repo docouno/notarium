@@ -3,15 +3,16 @@
 // canon: docs/auth.md#credentials
 
 import { HTTP_STATUS } from '@notarium/contract/http'
+import { patPrincipalId } from '../../libs/principalId'
 import { mintPatToken, sha256 } from '../../libs/tokens'
 import type { PatRecord } from '../metaDb'
 import { type AuthCtx, AuthError } from './authService'
 
 export const createPats = (ctx: AuthCtx) => ({
-  listPats: async (username: string) => {
+  listPats: async (userId: string) => {
     const slugs = await ctx.slugById()
     const toSlug = (id: string): string | undefined => (slugs ? slugs.get(id) : id)
-    return (await ctx.db.listPats(username))
+    return (await ctx.db.listPats(userId))
       .filter((p) => p.revokedAt == null)
       .map((p) => ({
         id: p.id,
@@ -25,7 +26,7 @@ export const createPats = (ctx: AuthCtx) => ({
   },
 
   createPat: async (
-    username: string,
+    userId: string,
     input: {
       name: string
       scope: 'read' | 'write'
@@ -42,7 +43,7 @@ export const createPats = (ctx: AuthCtx) => ({
     const { id, secret, token } = mintPatToken()
     const rec: PatRecord = {
       id,
-      username,
+      userId,
       name: input.name,
       secretHash: sha256(secret),
       scope: input.scope,
@@ -70,13 +71,13 @@ export const createPats = (ctx: AuthCtx) => ({
   /** Patch a live PAT in place; the secret is never re-minted.
    *  canon: docs/auth.md#sse-revoke-disconnect */
   updatePat: async (
-    username: string,
+    userId: string,
     id: string,
     patch: { name?: string; scope?: 'read' | 'write'; spaces?: string[] | null },
   ): Promise<void> => {
     const pat = await ctx.db.getPat(id)
 
-    if (!pat || pat.username !== username || pat.revokedAt) {
+    if (!pat || pat.userId !== userId || pat.revokedAt) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     const dbPatch: { name?: string; scope?: 'read' | 'write'; spaces?: string[] | null } = {}
@@ -91,16 +92,16 @@ export const createPats = (ctx: AuthCtx) => ({
       dbPatch.spaces = patch.spaces === null ? null : await ctx.slugsToIds(patch.spaces)
     }
     await ctx.db.updatePat(id, dbPatch)
-    ctx.dropSse((h) => h.principalId === `pat:${username}:${id}`)
+    ctx.dropSse((h) => h.principalId === patPrincipalId(userId, id))
   },
 
-  revokePat: async (username: string, id: string): Promise<void> => {
+  revokePat: async (userId: string, id: string): Promise<void> => {
     const pat = await ctx.db.getPat(id)
 
-    if (!pat || pat.username !== username || pat.revokedAt) {
+    if (!pat || pat.userId !== userId || pat.revokedAt) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     await ctx.db.updatePat(id, { revokedAt: ctx.nowIso() })
-    ctx.dropSse((h) => h.principalId === `pat:${username}:${id}`)
+    ctx.dropSse((h) => h.principalId === patPrincipalId(userId, id))
   },
 })

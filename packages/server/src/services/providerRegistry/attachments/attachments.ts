@@ -82,12 +82,17 @@ const sameDisclosure = (
 type ProviderAttachmentProjector = (
   record: ProviderResourceRecord,
   viewerOwner: string,
-) => ProviderAttachmentView['resource']
+) => Promise<ProviderAttachmentView['resource']>
 
+/** `ownerNames` is the owner id → handle map the list resolved ONCE for every row; a
+ *  per-row resolve would turn a page of attachments into a page of directory reads. */
 type ProviderAttachmentListProjector = (
   record: ProviderResourceRecord,
   viewerOwner: string,
-) => ProviderAttachmentListItem['resource']
+  ownerNames: ReadonlyMap<string, string | null>,
+) => Promise<ProviderAttachmentListItem['resource']>
+
+type OwnerNamesResolver = (owners: readonly string[]) => Promise<ReadonlyMap<string, string | null>>
 
 export type ProviderAttachmentsServiceOptions = {
   attachments: ProviderAttachmentsPersistence
@@ -98,6 +103,7 @@ export type ProviderAttachmentsServiceOptions = {
   projects: Pick<ProjectsPersistence, 'getById'>
   projectResource: ProviderAttachmentProjector
   projectResourceListItem: ProviderAttachmentListProjector
+  ownerNamesFor: OwnerNamesResolver
   now?: () => Date
 }
 
@@ -110,6 +116,7 @@ export class ProviderAttachmentsService {
   private readonly projects: Pick<ProjectsPersistence, 'getById'>
   private readonly projectResource: ProviderAttachmentProjector
   private readonly projectResourceListItem: ProviderAttachmentListProjector
+  private readonly ownerNamesFor: OwnerNamesResolver
   private readonly now: () => Date
 
   constructor(options: ProviderAttachmentsServiceOptions) {
@@ -121,6 +128,7 @@ export class ProviderAttachmentsService {
     this.projects = options.projects
     this.projectResource = options.projectResource
     this.projectResourceListItem = options.projectResourceListItem
+    this.ownerNamesFor = options.ownerNamesFor
     this.now = options.now ?? (() => new Date())
   }
 
@@ -167,7 +175,7 @@ export class ProviderAttachmentsService {
 
     return {
       status: result.status,
-      view: this.viewOf(result, input.owner),
+      view: await this.viewOf(result, input.owner),
     }
   }
 
@@ -194,29 +202,32 @@ export class ProviderAttachmentsService {
           (record): record is ProviderResourceRecord => record !== null,
         )
     const resourcesById = new Map(resources.map((record) => [record.id, record]))
-    const items = records.flatMap((record) => {
-      const resource = resourcesById.get(record.resourceId)
+    const ownerNames = await this.ownerNamesFor(resources.map((record) => record.owner))
+    const items = await Promise.all(
+      records.flatMap((record) => {
+        const resource = resourcesById.get(record.resourceId)
 
-      if (!resource) {
-        return []
-      }
+        if (!resource) {
+          return []
+        }
 
-      return [
-        {
-          attachment: {
-            id: record.id,
-            resourceId: record.resourceId,
-            targetKind: record.targetKind,
-            targetId: record.targetId,
-            targetSpace: record.targetSpace,
-            state: record.state,
-            createdAt: record.createdAt,
-            expiresAt: record.expiresAt,
-          },
-          resource: this.projectResourceListItem(resource, viewerOwner),
-        },
-      ]
-    })
+        return [
+          (async () => ({
+            attachment: {
+              id: record.id,
+              resourceId: record.resourceId,
+              targetKind: record.targetKind,
+              targetId: record.targetId,
+              targetSpace: record.targetSpace,
+              state: record.state,
+              createdAt: record.createdAt,
+              expiresAt: record.expiresAt,
+            },
+            resource: await this.projectResourceListItem(resource, viewerOwner, ownerNames),
+          }))(),
+        ]
+      }),
+    )
 
     return { items, total: page.total }
   }
@@ -231,7 +242,7 @@ export class ProviderAttachmentsService {
       return null
     }
     const state = await this.stateOf(record)
-    return state ? this.viewOf(state, viewerOwner) : null
+    return state ? await this.viewOf(state, viewerOwner) : null
   }
 
   async accept(
@@ -263,7 +274,7 @@ export class ProviderAttachmentsService {
       return { status: 'not-found' }
     }
 
-    return { status: result.status, view: this.viewOf(result, viewerOwner) }
+    return { status: result.status, view: await this.viewOf(result, viewerOwner) }
   }
 
   detach(id: string, manager: string | null) {
@@ -285,10 +296,10 @@ export class ProviderAttachmentsService {
     return { record, resource, credential }
   }
 
-  private viewOf(
+  private async viewOf(
     state: ProviderAttachmentTransitionState,
     viewerOwner: string,
-  ): ProviderAttachmentView {
+  ): Promise<ProviderAttachmentView> {
     const currentDisclosure = providerDisclosureOf(
       state.resource,
       state.credential,
@@ -297,7 +308,7 @@ export class ProviderAttachmentsService {
 
     return {
       attachment: state.record,
-      resource: this.projectResource(state.resource, viewerOwner),
+      resource: await this.projectResource(state.resource, viewerOwner),
       currentEpochs: {
         resourceEpoch: state.resource.consentEpoch,
         credentialEpoch: state.credential?.consentEpoch ?? null,

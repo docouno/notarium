@@ -132,7 +132,7 @@ test('a rename from another tab reaches an open tab live — no reload, no false
   // A second session (another tab) renames `scratch` → `crew`. The server broadcasts
   // the named `rename` SSE event to every live viewer of the space.
   const loggedIn = await request.post(`${baseURL}/api/auth/login`, {
-    data: { username: 'root', password: 'root-password-1' },
+    data: { identifier: 'root', password: 'root-password-1' },
   })
   expect(loggedIn.ok()).toBeTruthy()
   const renamed = await request.patch(`${baseURL}/api/s/scratch`, {
@@ -146,6 +146,39 @@ test('a rename from another tab reaches an open tab live — no reload, no false
   await expect(page.getByTestId('space-switcher')).toContainText('Crew')
   // The active space was renamed, NOT lost — the alias-aware classifier must keep the
   // verdict `ok`, so no takeover and the content stays put (the structural fix #123).
+  await expect(page.getByTestId('space-access-lost')).not.toBeVisible()
+})
+
+test('a renamed account’s personal space follows the handle live in an open tab (#421)', async ({
+  page,
+  request,
+  baseURL,
+}) => {
+  await page.goto('/')
+  await login(page, 'root', 'root-password-1')
+  await expect(treeNote(page, 'Main Note')).toBeVisible()
+  // Mint the personal space the product way — the first personal write — and open it.
+  const minted = await page.request.put(`${baseURL}/api/me/profile`, {
+    data: { content: '# Me\n' },
+  })
+  expect(minted.ok()).toBeTruthy()
+  await page.goto('/s/root')
+  await expect(page).toHaveURL(/\/s\/root$/)
+
+  // Another session renames the account. The personal space still wears the slug
+  // derived from the old handle, so it follows — through the same rename sequence
+  // as a manual PATCH, hence the same live `rename` nudge.
+  const loggedIn = await request.post(`${baseURL}/api/auth/login`, {
+    data: { identifier: 'root', password: 'root-password-1' },
+  })
+  expect(loggedIn.ok()).toBeTruthy()
+  const renamed = await request.patch(`${baseURL}/api/me`, { data: { username: 'root.admin' } })
+  expect(renamed.ok()).toBeTruthy()
+  expect(((await renamed.json()) as { personalSpace: string }).personalSpace).toBe('root-admin')
+
+  // The open tab follows without a reload or a relogin: the URL canonicalises and the
+  // space is not reported lost.
+  await expect(page).toHaveURL(/\/s\/root-admin$/)
   await expect(page.getByTestId('space-access-lost')).not.toBeVisible()
 })
 

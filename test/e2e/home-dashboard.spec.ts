@@ -106,6 +106,16 @@ const FIXTURE = {
       ],
     },
   ],
+  // The account behind the agent key above. A principal's second segment is an
+  // opaque user id, so the author label can only be named by resolving it through
+  // the account catalog — declare no account and the very binding this world exists
+  // to show ("that edit was made by alice's agent") degrades to the anonymous
+  // fallback. The catalog is a directory, not a gate: the fake's auth MODE follows
+  // its BOOT fixture, so a world swapped in at runtime still runs unauthenticated.
+  auth: {
+    users: [{ username: 'alice' }],
+    members: [{ space: 'main', username: 'alice', role: 'writer' }],
+  },
 }
 
 test('Home dashboard: pills, activity surface, day-drill, health/projects surfaces', async ({

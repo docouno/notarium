@@ -11,30 +11,31 @@ import styles from './AuthScreens.module.scss'
 // adopts the session and the gate swaps this screen for the app tree.
 export const LoginPage = () => {
   const { refresh } = useAuth()
-  const [username, setUsername] = useState('')
+  const [identifier, setIdentifier] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault()
-    if (busy || !username.trim() || !password) {
+    if (busy || !identifier.trim() || !password) {
       return
     }
     setBusy(true)
     setError(null)
     try {
-      await api.login(username.trim(), password)
+      await api.login(identifier.trim(), password)
       await refresh()
     } catch (err) {
       const status = (err as ApiError).status
       // Deliberately generic on 401 — which half was wrong is exactly what an
-      // enumeration attempt wants to learn.
+      // enumeration attempt wants to learn. An exhausted per-account budget is the
+      // same 401 on purpose; only the per-ip gate says 429.
       setError(
         status === HTTP_STATUS.TOO_MANY_REQUESTS
           ? 'Too many attempts — try again in a minute.'
           : status === HTTP_STATUS.UNAUTHORIZED
-            ? 'Invalid username or password.'
+            ? 'Invalid username, email or password.'
             : errorText(err),
       )
       setBusy(false)
@@ -52,11 +53,11 @@ export const LoginPage = () => {
         </div>
         <div className={styles.form}>
           <label className={styles.field}>
-            <span>Username</span>
+            <span>Username or email</span>
             <input
               data-testid="auth-username"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
+              value={identifier}
+              onChange={(e) => setIdentifier(e.target.value)}
               autoComplete="username"
               autoFocus
               spellCheck={false}
@@ -82,7 +83,7 @@ export const LoginPage = () => {
             variant="primary"
             className={styles.submit}
             data-testid="auth-submit"
-            disabled={busy || !username.trim() || !password}
+            disabled={busy || !identifier.trim() || !password}
           >
             {busy ? 'Signing in…' : 'Sign in'}
           </Button>

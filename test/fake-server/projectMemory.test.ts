@@ -14,7 +14,7 @@ import type { FastifyInstance } from 'fastify'
 import type { AddressInfo } from 'node:net'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { createApp, type Fixture } from './app.js'
+import { createApp, fakeUserId, type Fixture } from './app.js'
 
 const fixture = (): Fixture => ({
   now: '2026-06-14T12:00:00.000Z',
@@ -104,7 +104,7 @@ const loginCookie = async (username: string, password: string): Promise<string> 
   const login = await app.inject({
     method: 'POST',
     url: '/api/auth/login',
-    payload: { username, password },
+    payload: { identifier: username, password },
   })
   expect(login.statusCode).toBe(200)
   return (login.headers['set-cookie'] as string).split(';')[0]
@@ -154,7 +154,7 @@ describe('about-project memory (#13 I5): READ surface', () => {
     expect(cat.category).toBe('deploy')
     expect(cat.summary).toBe('Staging then prod, 2 approvals.')
     // Provenance: an agent (PAT) wrote it — `pat:<user>:<id>`, kind 'write'.
-    expect(cat.principal).toMatch(/^pat:sam:/)
+    expect(cat.principal).toMatch(new RegExp(`^pat:${fakeUserId('sam')}:`))
     expect(cat.kind).toBe('write')
     // …resolved to a display author (#13): sam reads memory written by sam's OWN
     // key, so the key NAME shows and `mine` is true → the UI says "your agent

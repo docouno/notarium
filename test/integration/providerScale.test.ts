@@ -30,8 +30,10 @@ it(
       consentRows: 101,
       consentTotal: 10_000,
       consentLaterRows: 101,
-      consentPortCalls: 3,
-      consentLaterPortCalls: 3,
+      // Three carrier reads plus ONE directory read: the page resolves every owner's
+      // handle in a single batch, never per row.
+      consentPortCalls: 4,
+      consentLaterPortCalls: 4,
       consentMaxHydrated: 101,
       retargetReferences: 10_000,
       retargetAdmissions: 1,

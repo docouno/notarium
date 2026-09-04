@@ -59,7 +59,7 @@ const ownerIsMember = (ctx: SqliteDriverCtx, space: string, owner: string): bool
   owner === '@system' ||
   Boolean(
     ctx.required
-      .prepare('SELECT 1 FROM space_members WHERE space = ? AND username = ?')
+      .prepare('SELECT 1 FROM space_members WHERE space = ? AND user_id = ?')
       .get(space, owner),
   )
 

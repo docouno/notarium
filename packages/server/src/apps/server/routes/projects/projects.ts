@@ -268,7 +268,7 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
         dir: query.dir,
       })
       return ProjectMemoryResponseSchema.parse({
-        categories: await withAuthors(cats, req.principal.username, auth.describeAuthor),
+        categories: await withAuthors(cats, req.principal.userId, auth.describeAuthor),
       })
     },
   )
@@ -426,7 +426,7 @@ export const projectsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
           sets: curated.personal.sets.map(contextSetViewOf),
           memory: await withAuthors(
             curated.personal.memory,
-            req.principal.username,
+            req.principal.userId,
             auth.describeAuthor,
           ),
           loadedTokens: curated.personal.loadedTokens,

@@ -225,6 +225,8 @@ describe('production MCP ability create — real FS + SQLite', () => {
 
   it('publishes one agent-attributed origin and exposes it in session Activity', async () => {
     const { cookie, setup, token } = await setupToken()
+    // Attribution keys the owner by the stable id `me` reports, not by the handle.
+    const aliceId = setup.json().id as string
     const started = await call(token, 'start_session', { session: { name: 'V8 proof' } })
     const session = started.result?.structuredContent?.session as { id: string }
 
@@ -259,7 +261,7 @@ describe('production MCP ability create — real FS + SQLite', () => {
           .all(operation.note_id),
       ).toEqual([
         expect.objectContaining({
-          principal: expect.stringMatching(/^pat:alice:/),
+          principal: expect.stringMatching(new RegExp(`^pat:${aliceId}:`)),
           entry_role: 'origin',
         }),
       ])
@@ -341,8 +343,8 @@ describe('production MCP ability create — real FS + SQLite', () => {
 
       expect(revisions).toEqual([
         expect.objectContaining({
-          principal: expect.stringMatching(/^pat:alice:/),
-          agent_owner: 'alice',
+          principal: expect.stringMatching(new RegExp(`^pat:${aliceId}:`)),
+          agent_owner: aliceId,
           agent_name: 'Codex',
           session_id: session.id,
           session_name: 'V8 proof',
@@ -376,7 +378,9 @@ describe('production MCP ability create — real FS + SQLite', () => {
             event.type === 'call' && event.tool === 'create_ability',
         ) as { id: string; principal: string } | undefined
       expect(createCall).toEqual(
-        expect.objectContaining({ principal: expect.stringMatching(/^pat:alice:/) }),
+        expect.objectContaining({
+          principal: expect.stringMatching(new RegExp(`^pat:${aliceId}:`)),
+        }),
       )
 
       const detail = await app!.inject({

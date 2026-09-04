@@ -85,7 +85,7 @@ describe('online-backup HTTP mutation lifecycle', () => {
     const login = await app.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username: 'alice', password: 'alice-password-1' },
+      payload: { identifier: 'alice', password: 'alice-password-1' },
     })
     const cookie = (login.headers['set-cookie'] as string).split(';')[0]
     const created = await app.inject({

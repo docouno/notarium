@@ -1591,6 +1591,7 @@ describe('role catalog and owned libraries', () => {
     })
     const narrowed = {
       id: 'pat:alice:narrowed',
+      userId: 'alice',
       username: 'alice',
       admin: false,
       scope: 'read' as const,

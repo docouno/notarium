@@ -347,6 +347,7 @@ const productionTraceWriter = (
   })
   const principal = {
     id: `pat:${OWNER}:bench`,
+    userId: OWNER,
     username: OWNER,
     admin: false,
     scope: 'write' as const,

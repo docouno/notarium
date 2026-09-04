@@ -414,30 +414,29 @@ export const lockProviderSpaceRow = async (
 export const lockProviderMembershipRows = async (
   client: PoolClient,
   space: string,
-  usernames: readonly string[],
+  userIds: readonly string[],
 ): Promise<ReadonlySet<string>> => {
-  const keys = [...new Set(usernames.filter((username) => username !== '@system'))].sort()
+  const keys = [...new Set(userIds.filter((userId) => userId !== '@system'))].sort()
 
   if (!keys.length) {
     return new Set()
   }
   const result = await client.query(
-    `SELECT username FROM space_members
-      WHERE space = $1 AND username = ANY($2::text[])
-      ORDER BY username FOR UPDATE`,
+    `SELECT user_id FROM space_members
+      WHERE space = $1 AND user_id = ANY($2::text[])
+      ORDER BY user_id FOR UPDATE`,
     [space, keys],
   )
 
-  return new Set((result.rows as Array<{ username: string }>).map(({ username }) => username))
+  return new Set((result.rows as Array<{ user_id: string }>).map(({ user_id }) => user_id))
 }
 
 export const lockProviderMembershipRow = async (
   client: PoolClient,
   space: string,
-  username: string,
+  userId: string,
 ): Promise<boolean> =>
-  username === '@system' ||
-  (await lockProviderMembershipRows(client, space, [username])).has(username)
+  userId === '@system' || (await lockProviderMembershipRows(client, space, [userId])).has(userId)
 
 /** L5k — the instance-global active-key fence. The advisory covers the empty-table
  *  bootstrap case; row locks then keep every existing generation stable until commit. */

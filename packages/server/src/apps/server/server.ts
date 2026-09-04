@@ -53,6 +53,7 @@ import {
   metaDbTargetOf,
   pruneProviderCallLogRetention,
   type SpaceRecord,
+  type UserRecord,
 } from '../../services/metaDb'
 import { BulkRestoreCoordinator, RestoreCoordinator } from '../../services/noteRestore'
 import {
@@ -74,7 +75,12 @@ import {
   inMemoryAbilityPersistence,
   loadBundledAbilityInventory,
 } from '../../services/roles'
-import { type DiscoveredSpace, SpaceManager } from '../../services/spaces'
+import {
+  type DiscoveredSpace,
+  followPersonalSpaceRename,
+  renameSpace,
+  SpaceManager,
+} from '../../services/spaces'
 import { buildApp, webDist } from './app'
 import {
   createExportHandler,
@@ -352,9 +358,16 @@ export const createServer = async ({
   // derived store may be cold or evicted while restore still needs the authority;
   // both paths receive this same explicit composition instead of rebuilding it.
   const storeCompositions = new NotariumStoreCompositionOwner()
+
   // 'password' without a meta-DB is a boot error, not a degraded mode — accepting
   // logins into a store that forgets them is worse than refusing to start. The
   // OAuth facet joins the SAME service so its tokens validate at one chokepoint.
+  // Bound once the space manager exists (below): a rename is a runtime event, so the
+  // late binding is safe, like `manager` in aliasesForSpace.
+  let personalSpaceFollows: (change: {
+    user: UserRecord
+    previousUsername: string
+  }) => Promise<void> = async () => {}
   const auth = createAuthService({
     mode: authMode ?? AUTH_MODE.password,
     persistence: metaDb?.auth,
@@ -364,8 +377,9 @@ export const createServer = async ({
     aliasesForSpace: (id) => manager.resolvableAliasesOf(id),
     runMutation: (task) => mutationGate.run(task),
     removeMemberAndProviderAttachments: metaDb
-      ? (space, username) => metaDb.removeMemberAndProviderAttachments(space, username)
+      ? (space, userId) => metaDb.removeMemberAndProviderAttachments(space, userId)
       : async () => {},
+    onUsernameChanged: (change) => personalSpaceFollows(change),
   })
   const configBySlug = new Map(spaces.map((s) => [s.slug, s]))
 
@@ -587,6 +601,43 @@ export const createServer = async ({
       })
     },
   })
+
+  // The personal space follows its owner's handle — after the account rename is
+  // durable, never as a reason to roll it back: what fails here is logged, not raised.
+  // canon: docs/spaces.md#model
+  personalSpaceFollows = async (change) => {
+    if (!metaDb) {
+      return
+    }
+    try {
+      const outcome = await followPersonalSpaceRename(
+        {
+          spaces: manager,
+          rename: (input) =>
+            renameSpace(
+              {
+                spaces: manager,
+                spacesPersistence: metaDb.spaces,
+                markerStore,
+                notifyRenamed: (id) => auth.notifySpaceRenamed(id),
+              },
+              input,
+            ),
+        },
+        change,
+      )
+
+      if (outcome === 'renamed') {
+        console.info(
+          `[auth] personal space of ${change.user.id} follows the handle: ${change.previousUsername} → ${change.user.username}`,
+        )
+      }
+    } catch (err) {
+      console.warn(
+        `[auth] personal space of ${change.user.id} keeps its slug after the rename: ${(err as Error).message}`,
+      )
+    }
+  }
   const causalOutboxProjector = metaDb
     ? new CausalOutboxProjector({
         outbox: metaDb.causalOutbox,

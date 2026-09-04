@@ -6,6 +6,7 @@ import { asciiSlug, uniqueSlug } from '@notarium/core'
 
 import type { AuthService } from '../auth'
 import type { Principal } from '../authz'
+import type { UserRecord } from '../metaDb'
 import type { SpaceManager } from './spaceManager'
 
 // The personal-domain pointer (auth.personalSpaceOf) is the stable space id, not the
@@ -13,13 +14,86 @@ import type { SpaceManager } from './spaceManager'
 
 export type PersonalSpaceDeps = { auth: AuthService; spaces: SpaceManager }
 
+/** The account a personal space is minted for: keyed by the stable id, named by the
+ *  handle — the slug is DERIVED from the handle at mint time and only then. */
+export type PersonalSpaceOwner = { id: string; username: string }
+
 /** Self-cap at 32 (SpaceSlug allows 64) to leave headroom for a uniqueness suffix. */
 const SLUG_MAX = 32
 
 /** SpaceSlug-safe slug base from a username; 'user' if it slugifies to empty. */
-const personalSlugBase = (username: string): string => {
+export const personalSlugBase = (username: string): string => {
   const s = asciiSlug(username).slice(0, SLUG_MAX).replace(/-+$/, '')
   return s || 'user'
+}
+
+/** Whether a personal space still wears the slug minted from `previousUsername`: the
+ *  base, or the base plus the `-<n>` suffix uniqueSlug adds on a collision. Anything
+ *  else is a handle the owner chose through the API, and a rename must not overwrite
+ *  a choice: not following is cosmetic, overwriting is a loss. A `-<n>` may itself be
+ *  a choice — accepted, because the mint suffix is the far likelier origin. */
+export const personalSlugFollows = (slug: string, previousUsername: string): boolean => {
+  const base = personalSlugBase(previousUsername)
+
+  if (slug === base) {
+    return true
+  }
+  const suffixed = /^(.*)(-\d+)$/.exec(slug)
+
+  if (!suffixed) {
+    return false
+  }
+  const [, head, suffix] = suffixed
+  // uniqueSlug shortens the base so its `-N` still fits SLUG_MAX, so a handle at the
+  // length boundary is minted onto a TRUNCATED base. Comparing against the full base
+  // alone would read the mint's own output as a handle the owner chose, and the space
+  // would stay behind on the old name forever.
+  const truncated = base.slice(0, SLUG_MAX - suffix.length).replace(/[-_]+$/, '')
+
+  return head === base || head === truncated
+}
+
+export type PersonalSpaceRenameDeps = {
+  spaces: Pick<SpaceManager, 'slugOf' | 'resolveId'>
+  /** The whole rename sequence (registry, index, SSE) — never recordSpaceRename alone. */
+  rename: (input: { id: string; slug: string }) => Promise<{ code: string }>
+}
+
+export type PersonalSpaceRenameOutcome = 'renamed' | 'kept' | 'none'
+
+/** Let the personal space follow its owner's new handle. A separate step AFTER the
+ *  account rename is durable, and never a reason to roll it back. The slug moves only
+ *  while it is still the derived one, and only onto a free handle: a taken target is
+ *  left alone rather than suffixed. The old slug retires into the aliases like any
+ *  rename, so it keeps resolving. */
+export const followPersonalSpaceRename = async (
+  deps: PersonalSpaceRenameDeps,
+  change: { user: UserRecord; previousUsername: string },
+): Promise<PersonalSpaceRenameOutcome> => {
+  const spaceId = change.user.personalSpace
+
+  if (!spaceId) {
+    return 'none'
+  }
+  const current = deps.spaces.slugOf(spaceId)
+
+  if (!current || !personalSlugFollows(current, change.previousUsername)) {
+    return 'kept'
+  }
+  const next = personalSlugBase(change.user.username)
+
+  if (next === current) {
+    return 'kept'
+  }
+  // Free = resolves to nothing, aliases included — the same rule the mint applies.
+  const holder = deps.spaces.resolveId(next)
+
+  if (holder && holder !== spaceId) {
+    return 'kept'
+  }
+  const outcome = await deps.rename({ id: spaceId, slug: next })
+
+  return outcome.code === 'ok' ? 'renamed' : 'kept'
 }
 
 /** A candidate slug free of any live space's current slug or alias. Advisory only —
@@ -68,9 +142,9 @@ const firstSpace = (spaces: SpaceManager): string | null => spaces.list()[0]?.id
  *  deletion) — the caller then mints a fresh one and overwrites the dangling pointer. */
 const resolveExisting = async (
   { auth, spaces }: PersonalSpaceDeps,
-  username: string,
+  owner: PersonalSpaceOwner,
 ): Promise<string | null> => {
-  const existing = await auth.personalSpaceOf(username)
+  const existing = await auth.personalSpaceOf(owner.id)
 
   if (!existing) {
     return null
@@ -78,13 +152,16 @@ const resolveExisting = async (
   if (!spaces.has(existing)) {
     return null
   }
-  await auth.grantOwner(existing, username)
+  await auth.grantOwner(existing, owner.id)
   return existing
 }
 
-const mint = async ({ auth, spaces }: PersonalSpaceDeps, username: string): Promise<string> => {
+const mint = async (
+  { auth, spaces }: PersonalSpaceDeps,
+  owner: PersonalSpaceOwner,
+): Promise<string> => {
   // Re-check inside the serialized section: a concurrent mint may have just provisioned.
-  const again = await resolveExisting({ auth, spaces }, username)
+  const again = await resolveExisting({ auth, spaces }, owner)
 
   if (again) {
     return again
@@ -93,7 +170,7 @@ const mint = async ({ auth, spaces }: PersonalSpaceDeps, username: string): Prom
   const tried = new Set<string>()
 
   for (let attempt = 0; attempt < 10_000; attempt++) {
-    const slug = candidateSlug(spaces, username, tried)
+    const slug = candidateSlug(spaces, owner.username, tried)
     tried.add(slug)
     const id = await tryCreate(spaces, slug)
 
@@ -103,8 +180,8 @@ const mint = async ({ auth, spaces }: PersonalSpaceDeps, username: string): Prom
     // Record the pointer BEFORE the owner grant: a crash before this leaves an
     // unreachable empty space (harmless); recording it first lets a later crash heal
     // via resolveExisting instead of minting a duplicate.
-    await auth.setPersonalSpace(username, id)
-    await auth.grantOwner(id, username)
+    await auth.setPersonalSpace(owner.id, id)
+    await auth.grantOwner(id, owner.id)
     return id
   }
   // Pathological: every candidate lost its create race. Degrade, don't spin.
@@ -124,7 +201,7 @@ export const ensurePersonalSpace = async (
   deps: PersonalSpaceDeps,
   principal: Principal,
 ): Promise<string> => {
-  if (principal.system || !principal.username) {
+  if (principal.system || !principal.userId || !principal.username) {
     const home = firstSpace(deps.spaces)
 
     if (!home) {
@@ -134,7 +211,7 @@ export const ensurePersonalSpace = async (
     return home
   }
 
-  return ensurePersonalSpaceFor(deps, principal.username)
+  return ensurePersonalSpaceFor(deps, { id: principal.userId, username: principal.username })
 }
 
 /** Resolve the personal space WITHOUT minting (read path): a GET surface (memory list,
@@ -144,10 +221,10 @@ export const peekPersonalSpace = async (
   { auth, spaces }: PersonalSpaceDeps,
   principal: Principal,
 ): Promise<string | null> => {
-  if (principal.system || !principal.username) {
+  if (principal.system || !principal.userId) {
     return firstSpace(spaces)
   }
-  const id = await auth.personalSpaceOf(principal.username)
+  const id = await auth.personalSpaceOf(principal.userId)
 
   if (!id || !spaces.has(id)) {
     return null
@@ -162,13 +239,13 @@ export const peekPersonalSpace = async (
   return id
 }
 
-/** ensurePersonalSpace keyed by username — for the auth flow (setup/accept-invite),
+/** ensurePersonalSpace keyed by the account — for the auth flow (setup/accept-invite),
  *  before a Principal is in hand. */
 export const ensurePersonalSpaceFor = async (
   deps: PersonalSpaceDeps,
-  username: string,
+  owner: PersonalSpaceOwner,
 ): Promise<string> => {
-  const existing = await resolveExisting(deps, username)
+  const existing = await resolveExisting(deps, owner)
 
   if (existing) {
     return existing
@@ -184,5 +261,5 @@ export const ensurePersonalSpaceFor = async (
     return fallback
   }
 
-  return serializeMint(() => mint(deps, username))
+  return serializeMint(() => mint(deps, owner))
 }

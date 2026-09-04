@@ -43,7 +43,7 @@ const AUTH_WORLD = {
   auth: {
     users: [
       { username: 'root', password: 'root-password-1', admin: true },
-      { username: 'bob', password: 'bob-password-01' },
+      { username: 'bob', password: 'bob-password-01', email: 'bob@example.com' },
     ],
     members: [
       { space: 'main', username: 'root', role: 'owner' },
@@ -78,7 +78,7 @@ test('an anonymous visit lands on the login screen, not the app', async ({ page 
 test('a wrong password shows the generic error and stays on the gate', async ({ page }) => {
   await page.goto('/')
   await login(page, 'root', 'not-the-password')
-  await expect(page.getByTestId('auth-error')).toHaveText('Invalid username or password.')
+  await expect(page.getByTestId('auth-error')).toHaveText('Invalid username, email or password.')
   await expect(page.getByTestId('auth-login')).toBeVisible()
 })
 
@@ -87,6 +87,41 @@ test('a successful login swaps the gate for the app', async ({ page }) => {
   await login(page, 'root', 'root-password-1')
   await expect(treeNote(page, 'Main Note')).toBeVisible()
   await expect(page.getByTestId('auth-login')).not.toBeVisible()
+})
+
+test('the gate takes the e-mail as well as the handle (#421)', async ({ page }) => {
+  await page.goto('/')
+  // Any case, any spacing: the address is normalised the way it is stored.
+  await login(page, ' Bob@Example.com ', 'bob-password-01')
+  await expect(treeNote(page, 'Main Note')).toBeVisible()
+  await expect(page.getByTestId('auth-login')).not.toBeVisible()
+})
+
+test('an account renames itself under Settings → Account and signs in by the new handle (#421)', async ({
+  page,
+  baseURL,
+}) => {
+  await page.goto('/')
+  await login(page, 'bob', 'bob-password-01')
+  await expect(treeNote(page, 'Main Note')).toBeVisible()
+
+  await page.goto('/settings/account')
+  await page.getByTestId('account-username').fill('bob.smith')
+  await expect(page.getByTestId('account-rename-note')).toBeVisible()
+  await page.getByTestId('account-identity-save').click()
+  await expect(page.getByTestId('account-identity-saved')).toBeVisible()
+  // The session is the same person: `me` carries the new handle without a relogin.
+  const me = await page.request.get(`${baseURL}/api/me`)
+  expect(((await me.json()) as { username: string }).username).toBe('bob.smith')
+
+  // The old handle no longer signs in; the new one and the address still do.
+  await page.request.post(`${baseURL}/api/auth/logout`)
+  await page.goto('/')
+  await expect(page.getByTestId('auth-login')).toBeVisible()
+  await login(page, 'bob', 'bob-password-01')
+  await expect(page.getByTestId('auth-error')).toHaveText('Invalid username, email or password.')
+  await login(page, 'bob.smith', 'bob-password-01')
+  await expect(treeNote(page, 'Main Note')).toBeVisible()
 })
 
 test('the space list is the principal’s grants, not the host’s inventory', async ({ page }) => {

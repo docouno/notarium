@@ -3,7 +3,7 @@ import { createServer, type RequestListener, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { createApp, type Fixture } from './app'
+import { createApp, fakeUserId, type Fixture } from './app'
 import { InMemoryProviderCallLog } from './providerCallLog'
 
 const servers: Server[] = []
@@ -60,7 +60,7 @@ const login = async (instance: FastifyInstance, username: string, password: stri
   const response = await instance.inject({
     method: 'POST',
     url: '/api/auth/login',
-    payload: { username, password },
+    payload: { identifier: username, password },
   })
   expect(response.statusCode).toBe(200)
   return (response.headers['set-cookie'] as string).split(';')[0]
@@ -213,8 +213,8 @@ describe('provider validate REST surface', () => {
     // genre would not have recorded at all: it wrote only after a handler succeeded.
     expect(callLog.snapshot()).toMatchObject([
       {
-        owner: 'alice',
-        principal: 'user:alice',
+        owner: fakeUserId('alice'),
+        principal: `user:${fakeUserId('alice')}`,
         resourceId: id,
         host: `provider.test:${port}`,
         spaces: [],

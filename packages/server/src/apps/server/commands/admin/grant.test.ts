@@ -4,7 +4,9 @@ import type { SpaceRecord, UserRecord } from '../../../../services/metaDb'
 import { grantSpaceMember } from './grant'
 
 const user: UserRecord = {
+  id: 'recovery-id',
   username: 'recovery',
+  email: null,
   displayName: 'Recovery User',
   passwordHash: null,
   admin: false,
@@ -62,7 +64,7 @@ describe('admin grant', () => {
     ).resolves.toBe(record)
     expect(deps.grantMemberToActiveSpace).toHaveBeenCalledWith(
       'space-id',
-      user.username,
+      user.id,
       'reader',
       '2026-08-02T12:00:00.000Z',
     )

@@ -1,14 +1,19 @@
 // Auth service author-view: resolve a journal attribution string to a
-// privacy-filtered Author. canon: docs/auth.md#model
+// privacy-filtered Author. The attribution carries the stable user id; the
+// handle a human sees is resolved HERE, at read time, so a rename relabels
+// all of history at once. canon: docs/auth.md#model
 
 import { AUTHOR_KIND } from '@notarium/contract'
 import type { Author } from '@notarium/contract'
 
+import { parsePrincipalId, PRINCIPAL_SCHEME } from '../../libs/principalId'
 import { type AuthCtx } from './authService'
 
 export const createMeViews = (ctx: AuthCtx) => ({
   /** Attribution string → display-ready Author, privacy-filtered relative to
-   *  `viewer` (requesting username; null in mode 'none'). */
+   *  `viewer` (the requesting user's stable id; null in mode 'none'). An id that no
+   *  longer resolves — an account gone outside the product — renders as a nameless
+   *  author, never as an error: the journal keeps the row, the reader keeps reading. */
   describeAuthor: async (principal: string | null, viewer: string | null): Promise<Author> => {
     if (!principal) {
       return { kind: AUTHOR_KIND.external, name: null, mine: false }
@@ -17,38 +22,33 @@ export const createMeViews = (ctx: AuthCtx) => ({
     if (principal === 'ui') {
       return { kind: AUTHOR_KIND.user, name: null, mine: true }
     }
-    const sep = principal.indexOf(':')
-    const scheme = sep === -1 ? principal : principal.slice(0, sep)
-    const rest = sep === -1 ? '' : principal.slice(sep + 1)
+    const parsed = parsePrincipalId(principal)
 
-    if (scheme === 'user') {
-      const name = rest || null
-      return { kind: AUTHOR_KIND.user, name, mine: name != null && name === viewer }
+    if (!parsed) {
+      return { kind: AUTHOR_KIND.system, name: null, mine: false }
     }
-    if (scheme === 'pat') {
-      // `pat:<owner>:<patId>` — the id is the last segment (no colons in it).
-      const lastColon = rest.lastIndexOf(':')
-      const owner = lastColon === -1 ? rest : rest.slice(0, lastColon)
-      const patId = lastColon === -1 ? '' : rest.slice(lastColon + 1)
-      const mine = owner !== '' && owner === viewer
+    const mine = viewer != null && parsed.userId === viewer
+    // Read the handle only where the answer carries it: since V0 this is a directory
+    // read, and the two branches below that answer from the key's own name never need
+    // it.
+    const ownerName = async (): Promise<string | null> =>
+      (await ctx.db.getUserById(parsed.userId))?.username ?? null
 
+    if (parsed.scheme === PRINCIPAL_SCHEME.user) {
+      return { kind: AUTHOR_KIND.user, name: await ownerName(), mine }
+    }
+    if (parsed.scheme === PRINCIPAL_SCHEME.pat) {
       if (mine) {
-        const pat = patId ? await ctx.db.getPat(patId) : null
+        const pat = await ctx.db.getPat(parsed.keyId as string)
         return { kind: AUTHOR_KIND.agent, name: pat?.name ?? null, mine: true }
       }
 
       // Privacy: another user's key — attribute to the owner, never the key name.
-      return { kind: AUTHOR_KIND.agent, name: owner || null, mine: false }
-    }
-    if (scheme === 'oauth') {
-      // `oauth:<owner>:<tokenId>` — connected app (agent). Token carries no friendly
-      // name → own-token shows generic (null); another user's → owner (privacy).
-      const lastColon = rest.lastIndexOf(':')
-      const owner = lastColon === -1 ? rest : rest.slice(0, lastColon)
-      const mine = owner !== '' && owner === viewer
-      return { kind: AUTHOR_KIND.agent, name: mine ? null : owner || null, mine }
+      return { kind: AUTHOR_KIND.agent, name: await ownerName(), mine: false }
     }
 
-    return { kind: AUTHOR_KIND.system, name: null, mine: false }
+    // `oauth:<owner>:<tokenId>` — connected app (agent). Token carries no friendly
+    // name → own-token shows generic (null); another user's → owner (privacy).
+    return { kind: AUTHOR_KIND.agent, name: mine ? null : await ownerName(), mine }
   },
 })

@@ -28,6 +28,7 @@ import { dirname, join, resolve as resolvePath, sep } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { Client } from 'pg'
 
+import { EmailSchema } from '@notarium/contract'
 import {
   AGENT_MEMORY_MOUNT,
   CachedStore,
@@ -71,6 +72,8 @@ import {
   metaDbTargetOf,
   mintOAuthAccessToken,
   mintOAuthRefreshToken,
+  mintUserId,
+  oauthPrincipalId,
   ownedRoleLocator,
   type ProviderAttachmentRecord,
   ProviderRegistry,
@@ -82,6 +85,7 @@ import {
   SpaceManager,
   type SpaceRecord,
   SYSTEM_PRINCIPAL,
+  userPrincipalId,
 } from '@notarium/server'
 
 import { TRACE_TOOL_POLICY } from '../packages/server/src/services/agentCalls/traceProjectors'
@@ -103,6 +107,7 @@ import { applySeedExternalRewrites, identityClaimRewrite } from './seedExternalR
 import { applySeedExternalSources } from './seedExternalSources'
 import {
   makeOwnerRemap,
+  principalWithIds,
   resolveSeedAgentActivityOwner,
   resolveSeedAgentDeltaCursorOwner,
   shouldAutoGrantSeedOwner,
@@ -292,6 +297,9 @@ const run = async (): Promise<void> => {
   const ownerUser = env('SEED_USER', 'admin')
   const ownerPass = env('SEED_PASSWORD', 'admin')
   const ownerName = env('SEED_DISPLAY_NAME', 'Admin')
+  // Optional: the init user's address. Empty keeps the honest "not set" state, which
+  // is a state of its own the UI has to show.
+  const ownerEmail = env('SEED_EMAIL', '') || undefined
   // The catalog authors primary content as a canonical owner token (`sergey`); the
   // real stand renders it as the configured INIT USER (SEED_USER, default `admin`), so
   // the default login IS the content author and the "mine" heatmap/feed light up out of
@@ -528,10 +536,24 @@ const run = async (): Promise<void> => {
   const users: UserDecl[] = world.auth?.users?.length
     ? world.auth.users.map((u) =>
         u.username === CATALOG_OWNER
-          ? { ...u, username: ownerUser, displayName: ownerName, password: ownerPass }
+          ? {
+              ...u,
+              username: ownerUser,
+              displayName: ownerName,
+              password: ownerPass,
+              ...(ownerEmail ? { email: ownerEmail } : {}),
+            }
           : u,
       )
-    : [{ username: ownerUser, password: ownerPass, displayName: ownerName, admin: true }]
+    : [
+        {
+          username: ownerUser,
+          password: ownerPass,
+          displayName: ownerName,
+          admin: true,
+          ...(ownerEmail ? { email: ownerEmail } : {}),
+        },
+      ]
   const primary = users[0]
   const personalSpaceOf = new Map<string, string>()
 
@@ -556,11 +578,22 @@ const run = async (): Promise<void> => {
   )
 
   const t = nowIso
+  // Cases speak handles; the meta-DB keys every owner and attribution by the stable id
+  // minted here. `userIdOf` is the one seam between the two — an unknown handle (the
+  // `@system` owner, an orphaned attribution) passes through as authored.
+  const userIds = new Map<string, string>()
 
   for (const u of users) {
     const personalSlug = personalSpaceOf.get(u.username)
-    await metaDb.auth.createUser({
+    const id = mintUserId()
+    // The wire schema is the ONE normalizer of an address (trim + lower-case), and the
+    // column is a plain UNIQUE that compares bytes. A seed writing a mixed-case address
+    // — SEED_EMAIL is typed by a human — would be unreachable by login and would not
+    // collide with its own lower-case twin.
+    const written = await metaDb.auth.createUser({
+      id,
       username: u.username,
+      email: u.email ? EmailSchema.parse(u.email) : null,
       displayName: u.displayName || u.username,
       passwordHash: u.password ? await hashPassword(u.password) : null,
       admin: Boolean(u.admin),
@@ -568,14 +601,32 @@ const run = async (): Promise<void> => {
       createdAt: t,
       personalSpace: personalSlug ? (idOf.get(personalSlug) ?? null) : null,
     })
+
+    // createUser reports a duplicate instead of throwing, so an unchecked result would
+    // seed a phantom principal: the id below would key memberships and attribution
+    // rows that no `users` row backs. Loud is the only honest outcome for a stand.
+    if (written.status === 'conflict') {
+      throw new Error(
+        `seed: user "${u.username}" collides on ${written.field} — the catalog and the SEED_USER/SEED_EMAIL overrides disagree`,
+      )
+    }
+    userIds.set(u.username, id)
   }
+  const userIdOf = (username: string): string => userIds.get(username) ?? username
+  /** A catalog owner reference → the stable id (through the init-user remap). */
+  const ownerIdOf = (name: string): string => userIdOf(asUser(name))
+  /** A catalog principal → the stored attribution string (init-user remap, then ids). */
+  const principalIdOf = (principal?: string): string | undefined =>
+    principal === undefined
+      ? undefined
+      : principalWithIds(remapPrincipal(principal) ?? principal, (name) => userIds.get(name))
   const members = (world.auth?.members ?? []).map((m) => ({ ...m, username: asUser(m.username) }))
 
   for (const m of members) {
     const space = idOf.get(m.space)
 
     if (space) {
-      await metaDb.auth.upsertMember(space, m.username, m.role, t)
+      await metaDb.auth.upsertMember(space, userIdOf(m.username), m.role, t)
     }
   }
   // The primary owner reaches every ordinary seeded space so a manual stand stays
@@ -590,7 +641,7 @@ const run = async (): Promise<void> => {
     })
 
     if (autoGrant && !members.some((m) => m.space === slug && m.username === primary.username)) {
-      await metaDb.auth.upsertMember(id, primary.username, 'owner', t)
+      await metaDb.auth.upsertMember(id, userIdOf(primary.username), 'owner', t)
     }
   }
 
@@ -666,7 +717,7 @@ const run = async (): Promise<void> => {
     const applied = await applyProviderSeed({
       declaration: world.providers,
       registry,
-      ownerOf: asUser,
+      ownerOf: ownerIdOf,
       resolveSpace: (slug) => idOf.get(slug) ?? null,
       resolveProject: async (spaceSlug, path) => {
         const space = idOf.get(spaceSlug)
@@ -822,10 +873,11 @@ const run = async (): Promise<void> => {
         fallbackOwner: primary.username,
         asUser,
       })
-      const principalId = remapPrincipal(audit.principal) ?? audit.principal
+      const principalId = principalIdOf(audit.principal) as string
       const principal = {
         ...SYSTEM_PRINCIPAL,
         id: principalId,
+        userId: userIdOf(owner),
         username: owner,
         scope: 'write' as const,
         grants: new Map([[location.space, 'owner' as const]]),
@@ -871,7 +923,7 @@ const run = async (): Promise<void> => {
         attribution: {
           principal: principalId,
           agent: {
-            owner,
+            owner: userIdOf(owner),
             agent: audit.agent ?? null,
             ...(declaredSession && audit.sessionRef
               ? {
@@ -960,7 +1012,7 @@ const run = async (): Promise<void> => {
     publishedRoles: appliedRoles,
     publishedSkills: appliedSkills,
     resolvePlacement: resolveRoleTarget,
-    ownerOf: (preference) => (preference.user ? asUser(preference.user) : primary.username),
+    ownerOf: (preference) => userIdOf(preference.user ? asUser(preference.user) : primary.username),
     setEnabled: (owner, target, enabled) =>
       metaDb.abilityPreferences.setEnabled(owner, target, enabled, t),
   })
@@ -1084,7 +1136,7 @@ const run = async (): Promise<void> => {
     await metaDb.oauth.insertRefresh({
       id: refresh.id,
       tokenHash: sha256(refresh.secret),
-      username: owner,
+      userId: userIdOf(owner),
       clientId,
       scope: app.scope,
       spaces: spaceIds,
@@ -1097,7 +1149,7 @@ const run = async (): Promise<void> => {
     await metaDb.oauth.insertAccess({
       id: access.id,
       tokenHash: sha256(access.secret),
-      username: owner,
+      userId: userIdOf(owner),
       clientId,
       scope: app.scope,
       spaces: spaceIds,
@@ -1107,7 +1159,10 @@ const run = async (): Promise<void> => {
       createdAt,
       lastUsedAt,
     })
-    oauthPrincipals.set(`${owner}\0${app.appName.toLowerCase()}`, `oauth:${owner}:${access.id}`)
+    oauthPrincipals.set(
+      `${owner}\0${app.appName.toLowerCase()}`,
+      oauthPrincipalId(userIdOf(owner), access.id),
+    )
     connectedApps++
   }
 
@@ -1178,7 +1233,7 @@ const run = async (): Promise<void> => {
       : null
     await metaDb.sessions.insert({
       id: agentSessionId(session.ref),
-      owner,
+      owner: userIdOf(owner),
       name: session.name,
       named: session.named ?? true,
       parentId:
@@ -1238,8 +1293,8 @@ const run = async (): Promise<void> => {
     }
     await metaDb.agentCalls.admit({
       id,
-      owner,
-      principal: remapPrincipal(declaration.principal) ?? declaration.principal,
+      owner: userIdOf(owner),
+      principal: principalIdOf(declaration.principal) as string,
       agent: declaration.agent ?? null,
       transport: 'mcp',
       requestId: null,
@@ -1312,7 +1367,7 @@ const run = async (): Promise<void> => {
   let edits = 0
   let deletes = 0
   let restores = 0
-  const ownerKey = `user:${primary.username}`
+  const ownerKey = userPrincipalId(userIdOf(primary.username))
 
   const eventsBySpace = new Map<string, typeof world.events>()
 
@@ -1370,7 +1425,7 @@ const run = async (): Promise<void> => {
         : undefined
       const agent = auditOwner
         ? {
-            owner: auditOwner,
+            owner: userIdOf(auditOwner),
             agent: e.agentAudit?.agent ?? null,
             ...(e.agentAudit?.callRef ? { agentCallId: agentCallId(e.agentAudit.callRef) } : {}),
             ...(declaredSession && e.agentAudit?.sessionRef
@@ -1432,7 +1487,7 @@ const run = async (): Promise<void> => {
           frontmatter: e.frontmatter ? parseFrontmatterLines(e.frontmatter) : undefined,
           sourceLocator: e.sourceLocator,
           createdAt: normDate(e.date),
-          principal: remapPrincipal(e.principal),
+          principal: principalIdOf(e.principal),
           ...(agent ? { agent } : {}),
         })
         await store.settle?.()
@@ -1478,7 +1533,7 @@ const run = async (): Promise<void> => {
             frontmatter: e.frontmatter ? parseFrontmatterLines(e.frontmatter) : undefined,
             originalId: prev.id,
             versionToken: prev.versionToken,
-            principal: remapPrincipal(e.principal),
+            principal: principalIdOf(e.principal),
             ...(agent ? { agent } : {}),
           })
           await store.settle?.()
@@ -1495,7 +1550,7 @@ const run = async (): Promise<void> => {
           edits++
         } else if (e.op === 'delete') {
           await store.remove(prev.id, {
-            principal: remapPrincipal(e.principal),
+            principal: principalIdOf(e.principal),
             ...(agent ? { agent } : {}),
           })
           await store.settle?.()
@@ -1508,7 +1563,7 @@ const run = async (): Promise<void> => {
             throw new Error(`engine has no trash capability (restore of ${e.noteId})`)
           }
           const res = await store.restoreFromTrash(prev.id, {
-            principal: remapPrincipal(e.principal),
+            principal: principalIdOf(e.principal),
           })
           await store.settle?.()
           if (res.versionToken) {
@@ -1557,7 +1612,7 @@ const run = async (): Promise<void> => {
         sourceRevisionId: null,
         kind: declaration.kind ?? 'write',
         entryRole: 'change',
-        principal: remapPrincipal(declaration.principal) ?? null,
+        principal: principalIdOf(declaration.principal) ?? null,
         contentHash: blob == null ? null : await sha256Hex(blob),
         semanticFingerprint: materialized.semanticFingerprint,
         restoreSafety: materialized.restoreSafety,
@@ -1628,7 +1683,7 @@ const run = async (): Promise<void> => {
     })
     await metaDb.agentDeltaCursors.advance(
       {
-        owner,
+        owner: userIdOf(owner),
         ...(cursor.sessionRef
           ? {
               session: {
@@ -1806,11 +1861,10 @@ const run = async (): Promise<void> => {
     const query = r.tool === 'get_note' && hits[0] ? hits[0].noteId : r.query
     const principal = r.principal.startsWith('oauth:')
       ? (oauthPrincipals.get(`${owner}\0${r.principal.slice('oauth:'.length).toLowerCase()}`) ??
-        remapPrincipal(r.principal) ??
-        r.principal)
-      : (remapPrincipal(r.principal) ?? r.principal)
+        (principalIdOf(r.principal) as string))
+      : (principalIdOf(r.principal) as string)
     await metaDb.retrievalLog.append({
-      owner,
+      owner: userIdOf(owner),
       principal,
       agent: r.agent ?? null,
       sessionId: r.sessionRef ? agentSessionId(r.sessionRef) : null,
@@ -1845,7 +1899,7 @@ const run = async (): Promise<void> => {
 
     for (const operation of marker.operations) {
       const common = {
-        owner,
+        owner: userIdOf(owner),
         sessionId: agentSessionId(marker.sessionRef),
         acceptedAt: nowIso,
         batchSize: operation.cleanup === 'pending' ? 0 : 10_000,
@@ -1899,12 +1953,12 @@ const run = async (): Promise<void> => {
     const at = new Date(nowMs - j.daysAgo * 86_400_000).toISOString()
 
     jobClock = new Date(at)
-    const principal = j.owner ? `user:${asUser(j.owner)}` : ownerKey
+    const principal = j.owner ? userPrincipalId(ownerIdOf(j.owner)) : ownerKey
     const rec = await metaDb.jobs.enqueue({
       id: freshNoteId(),
       space: spaceId,
       kind: JOB_KIND_EXPORT,
-      principal: remapPrincipal(principal) ?? principal,
+      principal,
       params: j.params ?? {},
       createdAt: at,
     })

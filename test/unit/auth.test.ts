@@ -14,6 +14,7 @@ import {
   hashPassword,
   mintPatToken,
   parsePatToken,
+  patPrincipalId,
   type Principal,
   sha256,
   type SpaceRecord,
@@ -66,7 +67,9 @@ describe('me: space aliases are wire capabilities, not raw history', () => {
       upsert: async () => {},
     }
     await persistence.createUser({
+      id: 'bob',
       username: 'bob',
+      email: null,
       displayName: 'Bob',
       passwordHash: 'x',
       admin: false,
@@ -86,7 +89,9 @@ describe('me: space aliases are wire capabilities, not raw history', () => {
     })
 
     await expect(auth.me('bob')).resolves.toEqual({
+      id: 'bob',
       username: 'bob',
+      email: null,
       displayName: 'Bob',
       admin: false,
       spaces: [{ slug: 'work', role: 'owner' }],
@@ -97,7 +102,9 @@ describe('me: space aliases are wire capabilities, not raw history', () => {
 
 describe('ensureOwners: a personal domain never gets the admin fan-out (#13 privacy)', () => {
   const mkUser = (username: string, admin: boolean, personalSpace: string | null): UserRecord => ({
+    id: username,
     username,
+    email: null,
     displayName: username,
     passwordHash: 'x',
     admin,
@@ -178,7 +185,9 @@ describe('credential usage persistence', () => {
     const minted = mintPatToken()
     let tracked = 0
     await persistence.createUser({
+      id: 'agent',
       username: 'agent',
+      email: null,
       displayName: 'Agent',
       passwordHash: 'unused',
       admin: false,
@@ -188,7 +197,7 @@ describe('credential usage persistence', () => {
     })
     await persistence.insertPat({
       id: minted.id,
-      username: 'agent',
+      userId: 'agent',
       name: 'test',
       secretHash: sha256(minted.secret),
       scope: 'read',
@@ -220,6 +229,7 @@ describe('credential usage persistence', () => {
 
 const principal = (over: Partial<Principal>): Principal => ({
   id: 'user:t',
+  userId: 't',
   username: 't',
   admin: false,
   scope: 'manage',
@@ -230,10 +240,10 @@ const principal = (over: Partial<Principal>): Principal => ({
 })
 
 describe('can(): scopes(token) ∩ grants(principal), case by case', () => {
-  it('keeps the authless agent owner disjoint from every valid username', () => {
-    expect(agentOwnerOf(principal({ system: true, username: null }))).toBe(AGENT_SYSTEM_OWNER)
-    expect(agentOwnerOf(principal({ username: 'system' }))).toBe('system')
-    expect(AGENT_SYSTEM_OWNER).not.toMatch(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/)
+  it('keeps the authless agent owner disjoint from every user id', () => {
+    expect(agentOwnerOf(principal({ system: true, userId: null }))).toBe(AGENT_SYSTEM_OWNER)
+    expect(agentOwnerOf(principal({ userId: 'system' }))).toBe('system')
+    expect(AGENT_SYSTEM_OWNER).not.toMatch(/^[0-9a-f]{16}$/)
   })
 
   it('system principal short-circuits everything (AUTH_MODE=none)', () => {
@@ -316,7 +326,7 @@ describe('job SSE event is owner-scoped (#105)', () => {
     const got: Record<string, unknown[]> = { ownerMain: [], memberMain: [], ownerOther: [] }
     const mk = (principalId: string, space: string, sink: unknown[]) => ({
       principalId,
-      username: null,
+      userId: null,
       space,
       close: () => {},
       notify: () => {},
@@ -338,9 +348,9 @@ describe('job SSE event is owner-scoped (#105)', () => {
 })
 
 describe('SSE access-loss linearization', () => {
-  const handle = (username: string, space: string, close: () => void, job: () => void) => ({
-    principalId: `user:${username}`,
-    username,
+  const handle = (userId: string, space: string, close: () => void, job: () => void) => ({
+    principalId: `user:${userId}`,
+    userId,
     space,
     close,
     notify: () => {},
@@ -357,7 +367,9 @@ describe('SSE access-loss linearization', () => {
     const job = vi.fn()
 
     await persistence.createUser({
+      id: 'alice',
       username: 'alice',
+      email: null,
       displayName: 'Alice',
       passwordHash: 'x',
       admin: false,
@@ -425,10 +437,10 @@ describe('agent-session SSE event is owner-scoped', () => {
       removeMemberAndProviderAttachments: async () => {},
     })
     const got = { aliceMain: 0, aliceOther: 0, bobMain: 0 }
-    const register = (username: string, space: string, changed: () => void) =>
+    const register = (userId: string, space: string, changed: () => void) =>
       auth.registerSse({
-        principalId: `user:${username}`,
-        username,
+        principalId: `user:${userId}`,
+        userId,
         space,
         close: () => {},
         notify: () => {},
@@ -445,5 +457,109 @@ describe('agent-session SSE event is owner-scoped', () => {
     auth.notifyAgentSessionsChanged('alice')
 
     expect(got).toEqual({ aliceMain: 1, aliceOther: 1, bobMain: 0 })
+  })
+})
+
+describe('revoke = disconnect keys the live socket by the id-formed principal', () => {
+  const setup = async () => {
+    const persistence = new InMemoryAuthPersistence()
+    await persistence.createUser({
+      id: 'alice-id',
+      username: 'alice',
+      email: null,
+      displayName: 'Alice',
+      passwordHash: 'x',
+      admin: false,
+      disabledAt: null,
+      createdAt: '2026-08-30T00:00:00.000Z',
+      personalSpace: null,
+    })
+    await persistence.insertPat({
+      id: 'k1',
+      userId: 'alice-id',
+      name: 'Laptop',
+      secretHash: 'h',
+      scope: 'write',
+      spaces: null,
+      expiresAt: null,
+      lastUsedAt: null,
+      revokedAt: null,
+      createdAt: '2026-08-30T00:00:00.000Z',
+    })
+    const auth = createAuthService({
+      mode: 'password',
+      persistence,
+      removeMemberAndProviderAttachments: async () => {},
+    })
+    const close = vi.fn()
+    auth.registerSse({
+      principalId: patPrincipalId('alice-id', 'k1'),
+      userId: 'alice-id',
+      space: 'main',
+      close,
+      notify: () => {},
+      notifyMembers: () => {},
+      notifyRename: () => {},
+      notifyAgentSessions: () => {},
+      notifyJob: () => {},
+    })
+    return { auth, close }
+  }
+
+  it('a permission change tears the token’s socket down', async () => {
+    const { auth, close } = await setup()
+    await auth.updatePat('alice-id', 'k1', { scope: 'read' })
+    expect(close).toHaveBeenCalledOnce()
+  })
+
+  it('revocation tears the token’s socket down', async () => {
+    const { auth, close } = await setup()
+    await auth.revokePat('alice-id', 'k1')
+    expect(close).toHaveBeenCalledOnce()
+  })
+})
+
+// A handle written past the schema — an admin-CLI account from before the rule — keeps
+// resolving by its exact spelling: the login shape test is case-insensitive, the
+// lookup is not. (The wire's `MeSchema` has always refused such a handle; the CLI now
+// validates, so no new one appears.) canon: docs/auth.md#credentials
+describe('login: a legacy mixed-case handle resolves by its exact spelling', () => {
+  it('signs in `Admin` as `Admin`, and never as `admin`', async () => {
+    const persistence = new InMemoryAuthPersistence()
+    const spaces: SpacesPersistence = {
+      list: async () => [],
+      getById: async () => null,
+      getBySlug: async () => null,
+      upsert: async () => {},
+    }
+    await persistence.createUser({
+      id: 'legacy',
+      username: 'Admin',
+      email: null,
+      displayName: 'Admin',
+      passwordHash: 'plain:admin-password-1',
+      admin: true,
+      disabledAt: null,
+      createdAt: '2026-01-01T00:00:00Z',
+      personalSpace: null,
+    })
+    const auth = createAuthService({
+      mode: 'password',
+      persistence,
+      spaces,
+      passwordVerifier: async (password, encoded) => encoded === `plain:${password}`,
+      removeMemberAndProviderAttachments: (space, userId) =>
+        persistence.removeMember(space, userId),
+    })
+
+    const signedIn = await auth.login({
+      identifier: 'Admin',
+      password: 'admin-password-1',
+      ip: '127.0.0.1',
+    })
+    expect(signedIn.me.id).toBe('legacy')
+    await expect(
+      auth.login({ identifier: 'admin', password: 'admin-password-1', ip: '127.0.0.1' }),
+    ).rejects.toMatchObject({ status: 401 })
   })
 })

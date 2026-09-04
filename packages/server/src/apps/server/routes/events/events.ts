@@ -116,7 +116,7 @@ export const eventsRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       // socket; `acquireEventSubscriptions` observes `tornDown` and rolls back legs.
       unregister = auth.registerSse({
         principalId: req.principal.id,
-        username: req.principal.username,
+        userId: req.principal.userId,
         space,
         spaces: watchedSpaces,
         close: teardown,

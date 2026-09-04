@@ -981,7 +981,7 @@ describe('activity (#33)', () => {
     const login = await a.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username: 'alice', password: 'alice-password-1' },
+      payload: { identifier: 'alice', password: 'alice-password-1' },
     })
     const cookie = (login.headers['set-cookie'] as string).split(';')[0]
     const all = (
@@ -1449,7 +1449,7 @@ describe('activity (#33)', () => {
     const login = await a.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username: 'alice', password: 'alice-password-1' },
+      payload: { identifier: 'alice', password: 'alice-password-1' },
     })
     expect(login.statusCode).toBe(200)
     const cookie = (login.headers['set-cookie'] as string).split(';')[0]

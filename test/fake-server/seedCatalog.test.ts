@@ -260,7 +260,7 @@ describe('seed catalog → fake backend (#175)', () => {
       const login = await app.inject({
         method: 'POST',
         url: '/api/auth/login',
-        payload: { username: 'sergey', password: 'sergey' },
+        payload: { identifier: 'sergey', password: 'sergey' },
       })
       expect(login.statusCode).toBe(200)
       cookie = (login.headers['set-cookie'] as string).split(';')[0]

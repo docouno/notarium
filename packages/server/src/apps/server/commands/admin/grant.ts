@@ -27,7 +27,9 @@ export const grantSpaceMember = async (
   { auth, spaces, grantMemberToActiveSpace, now = () => new Date() }: GrantMemberDeps,
   { username, space, role }: GrantMemberInput,
 ): Promise<SpaceRecord> => {
-  if (!(await auth.getUser(username))) {
+  const user = await auth.getUser(username)
+
+  if (!user) {
     throw new Error(`no such user: ${username}`)
   }
   const record = resolveSpaceRecord(await spaces.list(), space)
@@ -35,7 +37,7 @@ export const grantSpaceMember = async (
   if (!record) {
     throw new Error(`no such space: ${space}`)
   }
-  const result = await grantMemberToActiveSpace(record.id, username, role, now().toISOString())
+  const result = await grantMemberToActiveSpace(record.id, user.id, role, now().toISOString())
 
   if (result.status === 'missing') {
     throw new Error(`no such space: ${space}`)

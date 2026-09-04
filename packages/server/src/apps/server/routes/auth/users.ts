@@ -40,6 +40,6 @@ export const usersRoutes = async (app: FastifyInstance, { auth }: { auth: AuthSe
     const body = UserPatchRequestSchema.parse(req.body ?? {})
     const username = UsernameSchema.parse((req.params as { username: string }).username)
     // patchUser owns the lockout guards (self-disable, last admin).
-    return UserSchema.parse(await auth.patchUser(req.principal.username ?? '', username, body))
+    return UserSchema.parse(await auth.patchUser(req.principal.userId, username, body))
   })
 }

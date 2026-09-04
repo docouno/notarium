@@ -614,7 +614,9 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
       // ── outside the hierarchy, but still transactions ──────────────────────
       await run('auth.createFirstUser', () =>
         db.auth.createFirstUser({
+          id: 'al',
           username: 'al',
+          email: null,
           displayName: 'Al',
           passwordHash: 'hash',
           admin: true,
@@ -990,7 +992,9 @@ describePostgres('Postgres lock order', { timeout: SUITE_TIMEOUT_MS }, () => {
       )
       const providerKey = { keyId: 'ck_222222222222222222222222', generation: 2 }
       await db.auth.createUser({
+        id: 'provider-owner',
         username: 'provider-owner',
+        email: null,
         displayName: 'Provider owner',
         passwordHash: null,
         admin: false,

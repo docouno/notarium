@@ -331,7 +331,7 @@ describe('async export ownership (#105): a job is private to its principal', () 
     const login = await ownApp.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username, password },
+      payload: { identifier: username, password },
     })
     expect(login.statusCode).toBe(200)
     return (login.headers['set-cookie'] as string).split(';')[0]

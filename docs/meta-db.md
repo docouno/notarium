@@ -22,6 +22,7 @@ sqlite/0004_import_reservations.sql
 sqlite/0005_provider_contour.sql
 sqlite/0006_agent_call_trace.sql
 sqlite/0007_activity_projection.sql
+sqlite/0008_account_identity.sql
 postgres/0000_baseline.sql
 postgres/0001_revision_history.sql
 postgres/0002_agent_state.sql
@@ -30,10 +31,11 @@ postgres/0004_import_reservations.sql
 postgres/0005_provider_contour.sql
 postgres/0006_agent_call_trace.sql
 postgres/0007_activity_projection.sql
+postgres/0008_account_identity.sql
 ```
 
 `0000_baseline` is the published `v0.1.0` support floor. Its bytes and pair
-checksum are immutable. The seven later carriers are the supported transition
+checksum are immutable. The eight later carriers are the supported transition
 from that baseline to the current schema; development-only predecessor ladders
 are not accepted prefixes.
 
@@ -289,6 +291,44 @@ or projection status can diverge. PostgreSQL Space purge removes the generation-
 queue before states/heads, matching the GC transaction's row order and preventing a
 queue↔state deadlock. Space purge explicitly removes every projection, order and GC
 row before deleting journal truth.
+
+### `0008_account_identity`
+
+The account carrier gives every user a stable opaque id and moves each carrier
+that keyed a row by username onto it, so a handle becomes a mutable attribute:
+
+- `users` is the only table rebuilt: `id TEXT PRIMARY KEY` (16 lowercase hex,
+  minted once — by `lower(hex(randomblob(8)))` on SQLite and
+  `gen_random_uuid()` on PostgreSQL for existing rows, by the server for new
+  ones), `username` becomes `NOT NULL UNIQUE`, and the optional `email` arrives
+  `UNIQUE` on the same table. That `UNIQUE` compares bytes: the address is
+  lower-cased on the way in by `EmailSchema`, the one normalizer every writer
+  goes through, not by the column. Its two lifecycle triggers
+  are recreated after repopulation, because the `BEFORE INSERT` gate would
+  refuse a user bound to a non-active personal space and abort the ladder.
+- Seven username-keyed columns (`sessions`, `pats`, `space_members`,
+  `one_time_tokens`, `oauth_auth_codes`, `oauth_access_tokens`,
+  `oauth_refresh_tokens`) are renamed in place to `user_id` and backfilled; ten
+  owner columns keep their name because they also hold the `@system` literal;
+  eight principal-string columns and the two `prepared_evidence` JSON documents
+  rewrite the owner segment of `user:` / `pat:` / `oauth:` to the id. A value
+  that resolves to no live user, the `ui` and `@system` literals, and an
+  agent form without a credential tail stay byte-for-byte. `mcp_dedup` is
+  emptied: its scope keys embed the principal string and expire within a day.
+- Rewriting `note_revisions.principal` trips the Activity invalidation trigger
+  on purpose: every initialized Space rebuilds its projection once, with id
+  keys, at the recovery pace documented above. The Activity projection tables
+  and `backup_generation_freeze.owner` (a lease token, not a user) are not
+  touched, and no foreign key onto `users` is introduced.
+- The registry of user-reference columns lives in
+  `test/meta-db-contract/metaDbCatalog.ts`; both ladder suites introspect the
+  live schema against it, so a future carrier that adds an owner column fails
+  until it is listed.
+
+Operationally the carrier is one-way: a backup taken after it does not restore
+into an image without it (the ledger refuses an unknown future migration), so
+take the backup before the upgrade. PostgreSQL 13 or newer is required from
+this carrier on.
 
 ## Lock and lifecycle invariants
 

@@ -165,6 +165,7 @@ const progressOf = (
 
 const recoveryPrincipal = (id: string): Principal => ({
   id,
+  userId: null,
   username: null,
   admin: false,
   scope: 'write',

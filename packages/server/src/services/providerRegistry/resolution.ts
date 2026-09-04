@@ -31,8 +31,9 @@ import { providerCiphertextKeyId } from '../metaDb'
 
 /** The two facts resolution needs about people. Narrowed to what it reads so the
  *  registry never gains the ability to write an account. */
-export type ProviderPrincipalDirectory = Pick<AuthPersistence, 'getUser' | 'grantsFor'> &
-  Partial<Pick<AuthPersistence, 'getUsers' | 'grantsForUsers'>>
+/** Owner keys are stable user ids (or `@system`); the directory answers by id. */
+export type ProviderPrincipalDirectory = Pick<AuthPersistence, 'getUserById' | 'grantsFor'> &
+  Partial<Pick<AuthPersistence, 'getUsersByIds' | 'grantsForUsers'>>
 
 export type ProviderResolutionPorts = {
   resources: Pick<
@@ -274,7 +275,12 @@ const factsOf = async (
   const [credentials, spaces, users, grants] = await Promise.all([
     getMany(credentialIds, ports.credentials.getMany, (id) => ports.credentials.get(id)),
     getMany(targetSpaces, ports.spaces.getMany, (id) => ports.spaces.getById(id)),
-    getMany(owners, ports.directory.getUsers, (owner) => ports.directory.getUser(owner)),
+    getMany(
+      owners,
+      // Wrapped rather than passed: a class-backed directory reads its own state.
+      ports.directory.getUsersByIds ? (ids) => ports.directory.getUsersByIds!(ids) : undefined,
+      (owner) => ports.directory.getUserById(owner),
+    ),
     ports.directory.grantsForUsers
       ? ports.directory.grantsForUsers(attachmentOwners)
       : Promise.all(
@@ -287,7 +293,7 @@ const factsOf = async (
   const grantsByOwner = new Map<string, Set<string>>()
 
   for (const grant of grants) {
-    const owner = 'username' in grant ? grant.username : grant.owner
+    const owner = 'userId' in grant ? grant.userId : grant.owner
     const current = grantsByOwner.get(owner) ?? new Set<string>()
     current.add(grant.space)
     grantsByOwner.set(owner, current)
@@ -296,7 +302,7 @@ const factsOf = async (
   return {
     credentials: mapBy(credentials, (record) => record.id),
     spaces: mapBy(spaces, (record) => record.id),
-    users: mapBy(users, (record) => record.username),
+    users: mapBy(users, (record) => record.id),
     grants: grantsByOwner,
     readableKeyIds,
   }
@@ -447,7 +453,7 @@ export const resolveOwnedMany = async (
   const credentials = await ports.credentials.getMany(credentialIds)
   const credentialsById = mapBy(credentials, (record) => record.id)
   const owner =
-    input.owner === AGENT_SYSTEM_OWNER ? null : await ports.directory.getUser(input.owner)
+    input.owner === AGENT_SYSTEM_OWNER ? null : await ports.directory.getUserById(input.owner)
   const readableKeyIds = await ports.readableKeyIds(requiredKeyIdsOf(records, credentials))
   const ownerDisabled = input.owner !== AGENT_SYSTEM_OWNER && owner?.disabledAt !== null
 

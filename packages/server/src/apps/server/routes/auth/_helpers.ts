@@ -3,8 +3,22 @@
 // canon: docs/auth.md#credentials
 import type { FastifyReply, FastifyRequest } from 'fastify'
 
-import { SESSION_COOKIE } from '../../../../services/auth'
+import { HTTP_STATUS } from '@notarium/contract/http'
+
+import { AuthError, SESSION_COOKIE } from '../../../../services/auth'
 import { type Action, type AuthzConfig } from '../../../../services/authz'
+import type { PersonalSpaceOwner } from '../../../../services/spaces'
+
+/** The password-mode account behind a request — stable id plus the current handle
+ *  the personal-space slug derives from. A 'none'-mode request has no user to
+ *  describe: the same 404 every self-scoped route answered before. */
+export const accountOf = (req: FastifyRequest): PersonalSpaceOwner => {
+  if (!req.principal.userId || !req.principal.username) {
+    throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+  }
+
+  return { id: req.principal.userId, username: req.principal.username }
+}
 
 export const authz = (
   action: Action,

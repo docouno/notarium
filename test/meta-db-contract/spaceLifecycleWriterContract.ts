@@ -29,7 +29,9 @@ export const describeSpaceLifecycleWriterContract = (
         archivedBy: null,
       })
       await target.db.auth.createUser({
+        id: 'owner',
         username: 'owner',
+        email: null,
         displayName: 'Owner',
         passwordHash: null,
         admin: false,
@@ -102,7 +104,7 @@ export const describeSpaceLifecycleWriterContract = (
         () =>
           target.db.auth.insertPat({
             id: 'late-pat',
-            username: 'owner',
+            userId: 'owner',
             name: 'Late',
             secretHash: 'hash',
             scope: 'read',

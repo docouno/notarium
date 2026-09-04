@@ -596,9 +596,158 @@ export const approvedTargetCatalog = (golden: MetaDbCatalog): MetaDbCatalog => {
   )
 
   target.tables.push(...activityProjectionTables(postgres))
+  withAccountIdentity(target, postgres)
   target.tables.sort((left, right) => left.name.localeCompare(right.name))
 
   return target
+}
+
+/** Every column the 0008 carrier moves from a username onto the stable user id, by the
+ *  shape of the value it holds. The registry is the contract: a column that stores a
+ *  user reference must be listed here, and the ladder tests fail on a schema column
+ *  that looks like one but is not. `backup_generation_freeze.owner` is named like an
+ *  owner column and holds a backup lease token — it is listed as the one exclusion so
+ *  a reader does not add it by mistake. */
+export const ACCOUNT_IDENTITY_CARRIERS = {
+  /** Bare user id as a key: the column that was `username` before the carrier. */
+  userId: [
+    'sessions.user_id',
+    'pats.user_id',
+    'space_members.user_id',
+    'one_time_tokens.user_id',
+    'oauth_auth_codes.user_id',
+    'oauth_access_tokens.user_id',
+    'oauth_refresh_tokens.user_id',
+  ],
+  /** Bare user id as the agent owner, or the `@system` literal. */
+  owner: [
+    'agent_sessions.owner',
+    'agent_retrievals.owner',
+    'agent_calls.owner',
+    'agent_session_cleanup_markers.owner',
+    'mcp_delta_owner_cursors.owner',
+    'ability_preferences.owner',
+    'credentials.owner',
+    'provider_resources.owner',
+    'provider_call_log.owner',
+    'note_revisions.agent_owner',
+  ],
+  /** A principal string: `user:<id>` | `pat:<id>:<key>` | `oauth:<id>:<token>` | `ui`. */
+  principal: [
+    'note_revisions.principal',
+    'jobs.principal',
+    'favorites.owner',
+    'agent_retrievals.principal',
+    'agent_calls.principal',
+    'provider_call_log.principal',
+    'spaces.archived_by',
+    'space_lifecycle.changed_by',
+  ],
+  /** A principal that schema introspection cannot see, because it is not a column named
+   *  like a carrier: it sits inside an interpolated string or a JSON document. `path` is
+   *  the path the replay reads the principal back from, and it is absent when the whole
+   *  value is the principal-bearing string. Two of the three are rewritten in place; the
+   *  idempotency cache is not rewritten at all but emptied, which is the third answer to
+   *  the same question and belongs in the same list. Each entry is proven by its own
+   *  selection after the carrier (`accountIdentityLadder.ts`). */
+  composite: [
+    { column: 'mcp_dedup.scope', treatment: 'cleared' },
+    {
+      column: 'restore_operations.prepared_evidence',
+      treatment: 'rewritten',
+      path: ['principalId'],
+    },
+    {
+      column: 'ability_create_operations.prepared_evidence',
+      treatment: 'rewritten',
+      path: ['attribution', 'principal'],
+    },
+  ],
+  /** Not a user reference despite the name: a randomUUID lease token. */
+  excluded: ['backup_generation_freeze.owner'],
+} as const
+
+/** Column names a user reference has travelled under in this schema, or plausibly would.
+ *  The ladder tests introspect both dialects, keep every column whose name is on this
+ *  list and require the result to equal the registry exactly — so a future carrier that
+ *  adds `notes.created_by` or `jobs.actor` fails until that column is accounted for.
+ *
+ *  This is a name gate and nothing more, and its reach is exactly this list: a carrier
+ *  that invents a name outside it (`assignee`, `reviewer`) still passes silently, and a
+ *  principal hidden inside a string or a JSON document is invisible to introspection
+ *  altogether — that class is `composite` above, guarded by its own selections. Widening
+ *  the gate means widening this list.
+ *
+ *  `principal_id` is here because this very schema carried one: `mcp_bookmarks` keyed
+ *  its rows by the principal string (`sqlite/0000_baseline.sql:143`) until `0002`
+ *  retired the table for `mcp_delta_owner_cursors`. */
+export const ACCOUNT_IDENTITY_CANDIDATE_COLUMNS: readonly string[] = [
+  'account',
+  'actor',
+  'agent_owner',
+  'archived_by',
+  'author',
+  'changed_by',
+  'created_by',
+  'member',
+  'owner',
+  'principal',
+  'principal_id',
+  'user',
+  'user_id',
+  'username',
+]
+
+/** The 0008 carrier over the pre-cut golden: `users` gains a stable id primary key and an
+ *  optional unique email while `username` becomes a NOT NULL unique attribute, and the
+ *  seven username-keyed tables carry the same reference under `user_id`. Only column
+ *  names and key positions change; every other table keeps its golden shape because the
+ *  carrier moves values, not columns. */
+const withAccountIdentity = (target: MetaDbCatalog, postgres: boolean): void => {
+  const users = tableOf(target, 'users')
+  const username = users.columns.find((column) => column.name === 'username')!
+  username.notNull = true
+  username.primaryKeyPosition = 0
+  users.columns = [
+    // The PostgreSQL catalog reads key positions off a zero-based int2vector.
+    {
+      name: 'id',
+      type: 'text',
+      notNull: true,
+      defaultValue: null,
+      primaryKeyPosition: postgres ? 0 : 1,
+    },
+    username,
+    { name: 'email', type: 'text', notNull: false, defaultValue: null, primaryKeyPosition: 0 },
+    ...users.columns.filter((column) => column.name !== 'username'),
+  ]
+  users.indexes = ['email', 'id', 'username']
+    .map((column): CatalogIndex => ({
+      name: null,
+      unique: true,
+      columns: [{ name: column, descending: false }],
+      predicate: null,
+    }))
+    .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
+
+  for (const carrier of ACCOUNT_IDENTITY_CARRIERS.userId) {
+    const [tableName] = carrier.split('.')
+    const table = tableOf(target, tableName)
+
+    for (const column of table.columns) {
+      if (column.name === 'username') {
+        column.name = 'user_id'
+      }
+    }
+    for (const index of table.indexes) {
+      for (const column of index.columns) {
+        if (column.name === 'username') {
+          column.name = 'user_id'
+        }
+      }
+    }
+    table.indexes.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
+  }
 }
 
 /** Remove the 0005 trace carrier so the immutable pre-cut golden can keep proving

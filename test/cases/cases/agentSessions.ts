@@ -107,7 +107,7 @@ export const agentSessions: CaseSpec = {
 
     b.agentCall({
       ref: 'review-root-start',
-      principal: 'pat:CLI:seed',
+      principal: 'pat:sergey:cli',
       agent: 'CLI',
       sessionRef: 'review-root',
       tool: 'start_session',
@@ -120,7 +120,7 @@ export const agentSessions: CaseSpec = {
     })
     b.agentCall({
       ref: 'review-root-search',
-      principal: 'pat:CLI:seed',
+      principal: 'pat:sergey:cli',
       agent: 'CLI',
       sessionRef: 'review-root',
       tool: 'search',
@@ -133,7 +133,7 @@ export const agentSessions: CaseSpec = {
     })
     b.agentCall({
       ref: 'review-root-move',
-      principal: 'pat:CLI:seed',
+      principal: 'pat:sergey:cli',
       agent: 'CLI',
       sessionRef: 'review-root',
       tool: 'move_folder',
@@ -146,7 +146,7 @@ export const agentSessions: CaseSpec = {
     })
     b.agentCall({
       ref: 'outside-invalid',
-      principal: 'pat:Codex:seed',
+      principal: 'pat:sergey:codex',
       agent: 'Codex',
       tool: 'search',
       effect: 'read',
@@ -163,7 +163,7 @@ export const agentSessions: CaseSpec = {
       title: 'Migration findings',
       content: '# Migration findings\n\nThe root session recorded its conclusion.',
       created: daysBefore(now, 0.04),
-      principal: 'pat:CLI:seed',
+      principal: 'pat:sergey:cli',
       agentAudit: {
         sessionRef: 'review-root',
         sessionAttach: 'declared',
@@ -176,7 +176,7 @@ export const agentSessions: CaseSpec = {
       space: 'main',
       noteId: rootFindings,
       content: '# Migration findings\n\nThis captured write was quarantined after identity repair.',
-      principal: 'pat:CLI:seed',
+      principal: 'pat:sergey:cli',
       unavailable: true,
       agentAudit: {
         sessionRef: 'review-root',
@@ -203,7 +203,7 @@ export const agentSessions: CaseSpec = {
       title: 'Unbound agent write',
       content: '# Unbound agent write\n\nThis write deliberately has no session.',
       created: daysBefore(now, 0.06),
-      principal: 'pat:CLI:seed',
+      principal: 'pat:sergey:cli',
       agentAudit: { agent: 'CLI' },
     })
     b.note({
@@ -212,7 +212,7 @@ export const agentSessions: CaseSpec = {
       title: 'Archived session write',
       content: '# Archived session write\n\nThe lifecycle row was later collected.',
       created: daysBefore(now, 31.05),
-      principal: 'pat:CLI:seed',
+      principal: 'pat:sergey:cli',
       agentAudit: {
         sessionRef: 'expired',
         sessionAttach: 'declared',
@@ -232,7 +232,7 @@ export const agentSessions: CaseSpec = {
         ...Array.from({ length: 51 }, (_, i) => daysBefore(now, 31.61 - i * 0.01)),
         daysBefore(now, 31.1),
       ],
-      principal: 'pat:CLI:seed',
+      principal: 'pat:sergey:cli',
       agentAudit: {
         sessionRef: 'expired',
         sessionAttach: 'declared',
@@ -249,7 +249,12 @@ export const agentSessions: CaseSpec = {
       agentAudit: { owner: 'bob', sessionRef: 'bob-review', agent: 'Bob CLI' },
     })
 
-    const cli = { principal: 'pat:CLI:seed', agent: 'CLI' }
+    // A principal names the ACCOUNT that holds the credential — the seed rewrites the
+    // handle to that account's stable id, and the author label is resolved from it. The
+    // brand of the tool is a separate field: put "CLI" in the principal and the row has
+    // no resolvable owner left, so every surface that names an author falls back to the
+    // anonymous "an agent".
+    const cli = { principal: 'pat:sergey:cli', agent: 'CLI' }
     b.retrieval({
       ...cli,
       sessionRef: 'review-root',
@@ -279,7 +284,10 @@ export const agentSessions: CaseSpec = {
       daysAgo: 0.012,
     })
     b.retrieval({
-      principal: 'oauth:Claude',
+      // Spelled out rather than through the `oauth:<appName>` connected-app shorthand:
+      // this case declares no connected app, and a two-segment string parses nowhere —
+      // it would read as `system`, without even the agent glyph.
+      principal: 'oauth:sergey:claude',
       agent: 'Claude',
       sessionRef: 'review-fork',
       sessionAttach: 'declared',
@@ -289,7 +297,7 @@ export const agentSessions: CaseSpec = {
       daysAgo: 0.009,
     })
     b.retrieval({
-      principal: 'pat:hostile:seed',
+      principal: 'pat:sergey:hostile',
       agent: '<img src=x onerror=alert(1)>',
       sessionRef: 'hostile-label',
       tool: 'recall',
@@ -329,7 +337,7 @@ export const agentSessions: CaseSpec = {
     // which are counted whole by the assertions around this case.
     b.retrieval({
       owner: 'sergey',
-      principal: 'pat:Codex:seed',
+      principal: 'pat:sergey:codex',
       agent: 'Codex',
       tool: 'search',
       query: 'rollout owner',
@@ -338,7 +346,7 @@ export const agentSessions: CaseSpec = {
     })
     b.retrieval({
       owner: 'sergey',
-      principal: 'pat:Cursor:seed',
+      principal: 'pat:sergey:cursor',
       agent: 'Cursor',
       tool: 'recall',
       query: 'what changed in the migration',

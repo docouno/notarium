@@ -307,7 +307,9 @@ const seed = async (db: MetaDb): Promise<void> => {
     createdAt: AT,
   })
   await db.auth.createUser({
+    id: 'al',
     username: 'al',
+    email: null,
     displayName: 'Al',
     passwordHash: null,
     admin: false,

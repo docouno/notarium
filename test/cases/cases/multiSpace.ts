@@ -30,8 +30,11 @@ export const multiSpace: CaseSpec = {
     b.project({ space: 'work', path: 'product', displayName: 'Product' })
     b.project({ space: 'research', path: 'papers', displayName: 'Papers' })
 
+    // One account with an address and one without: the admin screen and the account
+    // tab render both states, and login by e-mail has a real address to try.
     b.user({
       username: 'sergey',
+      email: 'sergey@example.com',
       password: 'seed-pass',
       displayName: 'Sergey',
       admin: true,
@@ -46,6 +49,27 @@ export const multiSpace: CaseSpec = {
     })
     b.member({ space: 'work', username: 'sergey', role: 'owner' })
     b.member({ space: 'research', username: 'sergey', role: 'owner' })
+
+    // A renamed account (#421): `pavel` used to be `pasha`. Everything it owns is keyed
+    // by the stable id, so nothing recalls the old handle but the personal space's
+    // alias — the slug followed the rename and the old one still resolves.
+    b.space({ slug: 'pavel', displayName: 'Personal', personalFor: 'pavel', aliases: ['pasha'] })
+    b.user({
+      username: 'pavel',
+      email: 'pavel@example.com',
+      password: 'seed-pass',
+      displayName: 'Pavel',
+      personalSpace: 'pavel',
+    })
+    // A personal space whose slug its owner chose: `nadia-desk` is not derived from
+    // `nadia`, so renaming the account leaves it alone.
+    b.space({ slug: 'nadia-desk', displayName: 'Personal', personalFor: 'nadia' })
+    b.user({
+      username: 'nadia',
+      password: 'seed-pass',
+      displayName: 'Nadia',
+      personalSpace: 'nadia-desk',
+    })
 
     // Connected OAuth apps (#181) — so Settings → Connected apps shows real data with
     // per-space narrowing: Claude reaches everything, ChatGPT is narrowed to ONLY

@@ -1,8 +1,10 @@
 import { z } from 'zod'
-import { SpaceRoleSchema, UsernameSchema } from './auth'
+import { EmailSchema, SpaceRoleSchema, UsernameSchema } from './auth'
 
 export const UserSchema = z.object({
   username: UsernameSchema,
+  /** How an admin reaches the person; null when none was given. */
+  email: z.string().nullable(),
   displayName: z.string().min(1),
   admin: z.boolean(),
   disabled: z.boolean(),
@@ -16,6 +18,7 @@ export const UsersResponseSchema = z.object({ users: z.array(UserSchema) })
 
 export const UserCreateRequestSchema = z.object({
   username: UsernameSchema,
+  email: EmailSchema.optional(),
   displayName: z.string().min(1).optional(),
   admin: z.boolean().optional(),
 })
@@ -29,7 +32,12 @@ export const InviteLinkResponseSchema = z.object({
   path: z.string(),
 })
 
+/** The admin's patch. The route is addressed by the CURRENT handle; a `username` here
+ *  renames, and the response carries the new one. `email: null` clears the address.
+ *  A taken handle or address answers 409 (`username_taken` / `email_taken`). */
 export const UserPatchRequestSchema = z.object({
+  username: UsernameSchema.optional(),
+  email: EmailSchema.nullable().optional(),
   displayName: z.string().min(1).optional(),
   admin: z.boolean().optional(),
   /** Disabling kills the user's sessions and SSE channels immediately; their

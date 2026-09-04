@@ -1730,6 +1730,7 @@ describe('RestoreCoordinator eligibility', () => {
     }
     const writer: Principal = {
       id: 'user:bob',
+      userId: 'bob',
       username: 'bob',
       admin: false,
       scope: 'write',

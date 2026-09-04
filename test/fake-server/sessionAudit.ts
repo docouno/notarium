@@ -42,8 +42,11 @@ const byNewest = (left: { at: string; source: number; id: string }, right: typeo
   right.source - left.source ||
   (left.source === 2 ? right.id.localeCompare(left.id) : compareIdDesc(left.id, right.id))
 
-/** Executable in-memory twin used by the full fake-server vertical. SQL parity is
- * pinned separately by the shared SQLite/PostgreSQL persistence contract. */
+/** Executable in-memory twin used by the full fake-server vertical. The shared
+ * SQLite/PostgreSQL persistence contract pins the DRIVERS, not this class — it is not
+ * run against the twin. Only `agentFacet`'s marker rules are pinned here, by
+ * `sessionAuditParity.test.ts`; it drifted once because nothing did. The same two
+ * predicates also gate `overview` and `events`, and those are still unpinned. */
 export class InMemorySessionAudit implements AgentSessionAuditPersistence {
   private writes: AuditWrite[] = []
   private quarantined = new Set<string>()
@@ -140,13 +143,31 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
       current.calls += type === 'call' ? 1 : 0
     }
 
+    // A human deletion hides the reads and writes of the session too, exactly as the
+    // SQL drivers' summary CTE does — and it must, because a delete removes the
+    // lifecycle row and the call rows but never the note revisions the episode wrote.
+    // Without this a session that exists ONLY as an audit group survives its own
+    // deletion and the next overview brings it straight back. (`events` already
+    // filtered this way; only the group roll-up did not.) Retention expiry is a
+    // different reason and deliberately keeps them: it collects the lifecycle row, not
+    // the record of what the agent did.
     for (const retrieval of this.retrievals.snapshot()) {
-      if (retrieval.owner === owner && retrieval.sessionId && retrieval.agentCallId == null) {
+      if (
+        retrieval.owner === owner &&
+        retrieval.sessionId &&
+        retrieval.agentCallId == null &&
+        !this.calls.isHumanDeleted(owner, retrieval.sessionId)
+      ) {
         add(retrieval.sessionId, retrieval.sessionName, retrieval.createdAt, 'read')
       }
     }
     for (const write of this.writes) {
-      if (write.owner === owner && write.sessionId && write.agentCallId == null) {
+      if (
+        write.owner === owner &&
+        write.sessionId &&
+        write.agentCallId == null &&
+        !this.calls.isHumanDeleted(owner, write.sessionId)
+      ) {
         add(write.sessionId, write.sessionName, write.at, 'write')
       }
     }
@@ -424,8 +445,17 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
       }
     }
 
+    // The same marker rules the drivers apply here (`agentFacet`'s CTEs): a session the
+    // human deleted stops contributing its reads and writes, and a call stops on ANY
+    // marker. Retention expiry keeps contributing — it retires the lifecycle row, not
+    // the record of what the agent did. Without this the counts run ahead of the
+    // drivers by exactly the rows of a session whose cleanup is still pending.
     for (const retrieval of this.retrievals.snapshot()) {
-      if (retrieval.owner === owner && retrieval.agentCallId == null) {
+      if (
+        retrieval.owner === owner &&
+        retrieval.agentCallId == null &&
+        !(retrieval.sessionId && this.calls.isHumanDeleted(owner, retrieval.sessionId))
+      ) {
         add(retrieval.agent)
       }
     }
@@ -440,7 +470,11 @@ export class InMemorySessionAudit implements AgentSessionAuditPersistence {
       }
     }
     for (const call of this.calls.snapshot()) {
-      if (call.owner === owner && call.outcome) {
+      if (
+        call.owner === owner &&
+        call.outcome &&
+        !(call.sessionId && this.calls.isHidden(owner, call.sessionId))
+      ) {
         add(call.agent)
       }
     }

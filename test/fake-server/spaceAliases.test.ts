@@ -39,7 +39,7 @@ describe('space alias wire boundary', () => {
     const login = await app.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username: 'bob', password: 'seed-pass' },
+      payload: { identifier: 'bob', password: 'seed-pass' },
     })
     expect(login.statusCode).toBe(200)
     const setCookie = login.headers['set-cookie']

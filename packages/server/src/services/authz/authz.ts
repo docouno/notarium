@@ -24,7 +24,14 @@ export type SpaceRole = 'owner' | 'writer' | 'reader'
 /** The authenticated caller with grants pre-loaded; the P14 principal.
  *  canon: docs/auth.md#credentials */
 export type Principal = {
+  /** The attribution string — `user:<userId>` | `pat:<userId>:<patId>` |
+   *  `oauth:<userId>:<tokenId>` | `ui` — built by the one producer in libs/principalId. */
   id: string
+  /** The stable user id behind a password-mode principal, null for the authless host.
+   *  Every owner key, live-socket match and self-scoped read keys on THIS. */
+  userId: string | null
+  /** The wire handle: display and route addressing only, never a storage key — a
+   *  rename changes it under a live principal. */
   username: string | null
   admin: boolean
   scope: 'read' | 'write' | 'manage'
@@ -45,6 +52,7 @@ export type AuthzConfig =
  *  id stays 'ui' for backward-compatible journal attribution. canon: docs/auth.md#modes */
 export const SYSTEM_PRINCIPAL: Principal = {
   id: 'ui',
+  userId: null,
   username: null,
   admin: true,
   scope: 'manage',
@@ -54,13 +62,13 @@ export const SYSTEM_PRINCIPAL: Principal = {
 }
 
 /** Stable owner key for self-scoped agent state. Password principals use their
- * username; the trusted authless host uses a namespace that cannot be a valid
- * username, so changing AUTH_MODE cannot expose one principal's history to the
+ * stable user id (16 hex); the trusted authless host uses a namespace that cannot
+ * be a user id, so changing AUTH_MODE cannot expose one principal's history to the
  * other. */
 export const AGENT_SYSTEM_OWNER = '@system'
 
-export const agentOwnerOf = (principal: Pick<Principal, 'username' | 'system'>): string | null =>
-  principal.system ? AGENT_SYSTEM_OWNER : principal.username
+export const agentOwnerOf = (principal: Pick<Principal, 'userId' | 'system'>): string | null =>
+  principal.system ? AGENT_SYSTEM_OWNER : principal.userId
 
 const LEVEL = { read: 1, write: 2, manage: 3 } as const
 const ROLE = { reader: 1, writer: 2, owner: 3 } as const

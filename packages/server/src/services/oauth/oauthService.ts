@@ -1,10 +1,11 @@
 import { HTTP_STATUS } from '@notarium/contract/http'
+
+import { oauthPrincipalId } from '../../libs/principalId'
 // OAuth 2.1 authorization server facade — mints MCP connector tokens over the
 // existing principal (Notarium is its own AS; a self-host owns its users).
 // Spec baseline 2025-11-25: RFC 9728 + RFC 8414 metadata, PKCE S256. Client
 // registration is CIMD-first with a DCR (RFC 7591) fallback.
 // canon: docs/mcp-oauth.md#why · docs/mcp-oauth.md#mode-fork
-
 import {
   mintOAuthAccessToken,
   mintOAuthCode,
@@ -379,7 +380,7 @@ export function createOAuthService({ store, now, fetchClientMetadata }: CreateOA
    *  approve to the /token exchange. Returns the plaintext code for the redirect. */
   const issueCode = async (
     params: AuthorizeParams,
-    username: string,
+    userId: string,
     spaces: string[] | null,
   ): Promise<string> => {
     if (!(await store.activateClient(params.clientId, nowIso(), pendingBeforeIso()))) {
@@ -389,7 +390,7 @@ export function createOAuthService({ store, now, fetchClientMetadata }: CreateOA
     const rec: OAuthCodeRecord = {
       codeHash: sha256(code),
       clientId: params.clientId,
-      username,
+      userId,
       redirectUri: params.redirectUri,
       scope: params.scope,
       spaces,
@@ -408,7 +409,7 @@ export function createOAuthService({ store, now, fetchClientMetadata }: CreateOA
    *  written to BOTH rows so it survives rotation — the next family is minted from
    *  the refresh row. */
   const mintTokens = async (
-    username: string,
+    userId: string,
     clientId: string,
     scope: OAuthScope,
     offline: boolean,
@@ -426,7 +427,7 @@ export function createOAuthService({ store, now, fetchClientMetadata }: CreateOA
       await store.insertRefresh({
         id: refresh.id,
         tokenHash: sha256(refresh.secret),
-        username,
+        userId,
         clientId,
         scope,
         spaces,
@@ -439,7 +440,7 @@ export function createOAuthService({ store, now, fetchClientMetadata }: CreateOA
     await store.insertAccess({
       id: access.id,
       tokenHash: sha256(access.secret),
-      username,
+      userId,
       clientId,
       scope,
       spaces,
@@ -497,7 +498,7 @@ export function createOAuthService({ store, now, fetchClientMetadata }: CreateOA
       throw new OAuthError('invalid_grant', 'authorization code already used')
     }
     const { scope, offline, granted } = resolveScope(rec.scope)
-    return mintTokens(rec.username, rec.clientId, scope, offline, granted, rec.spaces)
+    return mintTokens(rec.userId, rec.clientId, scope, offline, granted, rec.spaces)
   }
 
   /** refresh_token grant: verify + rotate. */
@@ -534,7 +535,7 @@ export function createOAuthService({ store, now, fetchClientMetadata }: CreateOA
     // Inherit the narrowing from THIS refresh row — a rotation must not widen
     // the connector back to all spaces (the same rule as scope).
     return mintTokens(
-      rec.username,
+      rec.userId,
       rec.clientId,
       rec.scope,
       true,
@@ -564,7 +565,7 @@ export function createOAuthService({ store, now, fetchClientMetadata }: CreateOA
           await store.updateRefresh(rec.refreshId, { revokedAt: t }).catch(() => {})
         }
 
-        return [`oauth:${rec.username}:${rec.id}`]
+        return [oauthPrincipalId(rec.userId, rec.id)]
       }
 
       return []
@@ -578,7 +579,7 @@ export function createOAuthService({ store, now, fetchClientMetadata }: CreateOA
         if (!rec.revokedAt) {
           await store.updateRefresh(rec.id, { revokedAt: t })
         }
-        const siblings = (await store.listAccessForUser(rec.username)).filter(
+        const siblings = (await store.listAccessForUser(rec.userId)).filter(
           (a) => a.refreshId === rec.id,
         )
         const ids: string[] = []
@@ -587,7 +588,7 @@ export function createOAuthService({ store, now, fetchClientMetadata }: CreateOA
           if (!a.revokedAt) {
             await store.updateAccess(a.id, { revokedAt: t })
           }
-          ids.push(`oauth:${rec.username}:${a.id}`)
+          ids.push(oauthPrincipalId(rec.userId, a.id))
         }
 
         return ids

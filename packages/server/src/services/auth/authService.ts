@@ -12,11 +12,13 @@ import {
   passwordNeedsRehash,
   verifyPassword,
 } from '../../libs/passwords'
+import { oauthPrincipalId, patPrincipalId, userPrincipalId } from '../../libs/principalId'
 import {
   isOneTimeToken,
   isSessionToken,
   mintOneTimeToken,
   mintSessionToken,
+  mintUserId,
   parseOAuthAccessToken,
   parsePatToken,
   sha256,
@@ -33,7 +35,9 @@ import type {
   UserRecord,
 } from '../metaDb'
 import { createCredentials } from './credentials'
+import { createIdentity } from './identity'
 import { createInvites } from './invites'
+import { loginLookupOf } from './loginIdentifier'
 import { createMemberships } from './memberships'
 import { createMeViews } from './meViews'
 import { createOAuthConnections } from './oauthConnections'
@@ -48,7 +52,11 @@ const SESSION_TTL_MS = 30 * 24 * 3600 * 1000
 const SESSION_TOUCH_MS = 3600 * 1000
 const INVITE_TTL_MS = 7 * 24 * 3600 * 1000
 const RESET_TTL_MS = 24 * 3600 * 1000
-// Two-tier login rate limit; both gates close before scrypt.
+// Two-tier login rate limit. The ip gate closes before scrypt; the account gate does
+// NOT — a spent account budget is carried through the verification so that its refusal
+// costs what a wrong pair costs. Refusing it early would answer instantly and without
+// an ip counter entry, which tells an attacker that a handle and an address are one
+// account without a body to read.
 // canon: docs/auth.md#credentials
 const LOGIN_MAX_FAILS = 10
 const LOGIN_MAX_FAILS_PER_IP = 20
@@ -87,7 +95,10 @@ export type Authenticated = {
  *  the notify* methods push named re-sync nudges. canon: docs/auth.md#sse-revoke-disconnect */
 export type SseHandle = {
   principalId: string
-  username: string | null
+  /** The socket's owner by stable id: a rename never detaches a live socket from
+   *  the disable/revoke/nudge matches, and a disabled user's sockets are found by
+   *  the key that outlives the handle. */
+  userId: string | null
   space: string
   /** Active space plus every supplemental store bus owned by this socket. */
   spaces?: ReadonlySet<string>
@@ -103,7 +114,10 @@ export type SseHandle = {
  *  carrying past slugs (`aliases`) so a rename of the active space isn't read as
  *  space-lost. canon: docs/auth.md#wire · docs/auth.md#loss-of-access-at-runtime-explicit-takeover-111 */
 export type MeView = {
+  /** The stable account id — opaque to the client, its key for local per-user state. */
+  id: string
   username: string
+  email: string | null
   displayName: string
   admin: boolean
   spaces: Array<{ slug: string; role: SpaceRole; aliases?: string[] }>
@@ -130,7 +144,11 @@ export type CreateAuthServiceOptions = {
   runMutation?: <T>(task: () => Promise<T>) => Promise<T>
   /** One durable transition: provider rows owned by the departing member leave
    * before the membership row, under the same Space fence. */
-  removeMemberAndProviderAttachments: (space: string, username: string) => Promise<void>
+  removeMemberAndProviderAttachments: (space: string, userId: string) => Promise<void>
+  /** Runs AFTER a rename is durable, for what follows a handle outside the auth
+   *  facet — the personal space whose slug was derived from it. Never rolls the
+   *  rename back: its failure is the composition root's to log. */
+  onUsernameChanged?: (change: { user: UserRecord; previousUsername: string }) => Promise<void>
 }
 
 export type AuthService = ReturnType<typeof createAuthService>
@@ -158,9 +176,10 @@ export type AuthCtx = {
   notifyRenameOf: (space: string) => void
   notifyAgentSessionsOf: (owner: string) => void
   notifyJobOf: (space: string, ownerPrincipalId: string, payload: unknown) => void
-  removeMemberAndProviderAttachments: (space: string, username: string) => Promise<void>
+  removeMemberAndProviderAttachments: (space: string, userId: string) => Promise<void>
+  onUsernameChanged?: CreateAuthServiceOptions['onUsernameChanged']
   registerFail: (key: string) => void
-  failKey: (username: string, ip: string) => string
+  failKey: (userId: string, ip: string) => string
   ipKey: (ip: string) => string
   limited: (key: string, max: number) => boolean
   clientNameOf: (clientId: string) => Promise<string | null>
@@ -171,14 +190,14 @@ export type AuthCtx = {
       | { kind: 'pat'; pat: PatRecord }
       | { kind: 'oauth'; token: OAuthAccessRecord },
   ) => Promise<Principal>
-  createSession: (username: string) => Promise<string>
-  activeUser: (username: string) => Promise<UserRecord | null>
+  createSession: (userId: string) => Promise<string>
+  activeUserById: (userId: string) => Promise<UserRecord | null>
   mintLink: (
-    username: string,
+    userId: string,
     purpose: OneTimeTokenRecord['purpose'],
   ) => Promise<{ token: string; path: string }>
   liveOneTime: (token: string) => Promise<OneTimeTokenRecord | null>
-  me: (username: string, principal?: Principal) => Promise<MeView>
+  me: (userId: string, principal?: Principal) => Promise<MeView>
 }
 
 export function createAuthService({
@@ -191,6 +210,7 @@ export function createAuthService({
   passwordVerifier,
   runMutation,
   removeMemberAndProviderAttachments,
+  onUsernameChanged,
 }: CreateAuthServiceOptions) {
   if (mode === AUTH_MODE.password && !persistence) {
     throw new Error(
@@ -287,7 +307,7 @@ export function createAuthService({
   // that owner receives the nudge and refetches from the owner-gated REST route.
   const notifyAgentSessionsOf = (owner: string) => {
     for (const h of sseHandles) {
-      const matches = owner === '@system' ? h.username === null : h.username === owner
+      const matches = owner === '@system' ? h.userId === null : h.userId === owner
 
       if (!matches) {
         continue
@@ -319,7 +339,12 @@ export function createAuthService({
   // ── login rate limit (in-memory, per process — single-instance invariant) ──
   // canon: docs/auth.md#deployment-the-single-instance-invariant
   const fails = new Map<string, { count: number; resetAt: number }>()
-  const failKey = (username: string, ip: string) => `u:${username}|${ip}`
+  // The account gate keys by the RESOLVED account, so alternating the handle and the
+  // address is one budget, not two. An input that resolves to nobody keys by what was
+  // typed, exactly as an unknown handle always did — rotating those is what the ip
+  // gate bounds.
+  const failKey = (userId: string, ip: string) => `u:${userId}|${ip}`
+  const unknownKey = (typed: string, ip: string) => `x:${typed}|${ip}`
   const ipKey = (ip: string) => `ip:${ip}`
 
   const registerFail = (key: string) => {
@@ -365,11 +390,12 @@ export function createAuthService({
       | { kind: 'pat'; pat: PatRecord }
       | { kind: 'oauth'; token: OAuthAccessRecord },
   ): Promise<Principal> => {
-    const grants = new Map((await db.grantsFor(user.username)).map((g) => [g.space, g.role]))
+    const grants = new Map((await db.grantsFor(user.id)).map((g) => [g.space, g.role]))
 
     if (cred.kind === 'session') {
       return {
-        id: `user:${user.username}`,
+        id: userPrincipalId(user.id),
+        userId: user.id,
         username: user.username,
         admin: user.admin,
         scope: 'manage',
@@ -383,7 +409,8 @@ export function createAuthService({
       // An OAuth connector is an agent like a PAT: its ceiling is the consented read|write,
       // never 'manage'.
       return {
-        id: `oauth:${user.username}:${cred.token.id}`,
+        id: oauthPrincipalId(user.id, cred.token.id),
+        userId: user.id,
         username: user.username,
         admin: user.admin,
         scope: cred.token.scope,
@@ -395,7 +422,8 @@ export function createAuthService({
     }
 
     return {
-      id: `pat:${user.username}:${cred.pat.id}`,
+      id: patPrincipalId(user.id, cred.pat.id),
+      userId: user.id,
       username: user.username,
       admin: user.admin,
       scope: cred.pat.scope,
@@ -406,12 +434,12 @@ export function createAuthService({
     }
   }
 
-  const createSession = async (username: string): Promise<string> => {
+  const createSession = async (userId: string): Promise<string> => {
     const token = mintSessionToken()
     const t = clock()
     await db.insertSession({
       idHash: sha256(token),
-      username,
+      userId,
       createdAt: t.toISOString(),
       lastUsedAt: null,
       expiresAt: new Date(t.getTime() + SESSION_TTL_MS).toISOString(),
@@ -419,22 +447,22 @@ export function createAuthService({
     return token
   }
 
-  const activeUser = async (username: string): Promise<UserRecord | null> => {
-    const user = await db.getUser(username)
+  const activeUserById = async (userId: string): Promise<UserRecord | null> => {
+    const user = await db.getUserById(userId)
     return user && user.disabledAt == null ? user : null
   }
 
   const mintLink = async (
-    username: string,
+    userId: string,
     purpose: OneTimeTokenRecord['purpose'],
   ): Promise<{ token: string; path: string }> => {
     // One outstanding link per user: minting invalidates older ones.
-    await db.deleteOneTimesFor(username)
+    await db.deleteOneTimesFor(userId)
     const token = mintOneTimeToken()
     const t = clock()
     await db.insertOneTime({
       idHash: sha256(token),
-      username,
+      userId,
       purpose,
       expiresAt: new Date(
         t.getTime() + (purpose === TOKEN_PURPOSE.invite ? INVITE_TTL_MS : RESET_TTL_MS),
@@ -459,8 +487,8 @@ export function createAuthService({
     return rec
   }
 
-  const me = async (username: string, principal?: Principal): Promise<MeView> => {
-    const user = await db.getUser(username)
+  const me = async (userId: string, principal?: Principal): Promise<MeView> => {
+    const user = await db.getUserById(userId)
 
     if (!user) {
       throw new AuthError(HTTP_STATUS.UNAUTHORIZED, 'unauthorized')
@@ -470,7 +498,7 @@ export function createAuthService({
     const records = spacesStore ? await spacesStore.list() : null
     const recs = records ? new Map(records.map((s) => [s.id, s])) : null
     const toSlug = (id: string): string | undefined => (recs ? recs.get(id)?.slug : id)
-    const grants = await db.grantsFor(user.username)
+    const grants = await db.grantsFor(user.id)
     // A space-narrowed credential (PAT/OAuth) projects the owner's membership through its
     // own narrowing — the same `can(space:read)` filter /api/spaces already applies, here
     // expressed on the narrowing directly since the owner grant exists by construction. A
@@ -478,7 +506,9 @@ export function createAuthService({
     const narrowedOut = (spaceId: string): boolean =>
       Boolean(principal?.spaces) && !principal!.spaces!.has(spaceId)
     return {
+      id: user.id,
       username: user.username,
+      email: user.email,
       displayName: user.displayName,
       admin: user.admin,
       spaces: grants.flatMap((g) => {
@@ -522,6 +552,7 @@ export function createAuthService({
     notifyAgentSessionsOf,
     notifyJobOf,
     removeMemberAndProviderAttachments,
+    onUsernameChanged,
     registerFail,
     failKey,
     ipKey,
@@ -529,7 +560,7 @@ export function createAuthService({
     clientNameOf,
     principalOf,
     createSession,
-    activeUser,
+    activeUserById,
     mintLink,
     liveOneTime,
     me,
@@ -568,7 +599,7 @@ export function createAuthService({
           if (pat.expiresAt && pat.expiresAt <= nowIso()) {
             return null
           }
-          const user = await activeUser(pat.username)
+          const user = await activeUserById(pat.userId)
 
           if (!user) {
             return null
@@ -591,7 +622,7 @@ export function createAuthService({
           if (tok.expiresAt <= nowIso()) {
             return null
           }
-          const user = await activeUser(tok.username)
+          const user = await activeUserById(tok.userId)
 
           if (!user) {
             return null
@@ -620,7 +651,7 @@ export function createAuthService({
       if (!session || session.expiresAt <= nowIso()) {
         return null
       }
-      const user = await activeUser(session.username)
+      const user = await activeUserById(session.userId)
 
       if (!user) {
         return null
@@ -647,11 +678,14 @@ export function createAuthService({
       spaceSlugs: string[],
     ): Promise<{ me: MeView; sessionToken: string }> => {
       const t = nowIso()
+      const id = mintUserId()
       // The claim IS the guard: createFirstUser inserts only while the users table is empty
       // and reports whether it won, so two concurrent setups can't both mint an admin. The
       // loser gets the same 404 as the closed-setup path.
       const won = await db.createFirstUser({
+        id,
         username: input.username,
+        email: null,
         displayName: input.displayName?.trim() || input.username,
         passwordHash: await hashPassword(input.password),
         admin: true,
@@ -664,32 +698,53 @@ export function createAuthService({
         throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
       }
       for (const slug of spaceSlugs) {
-        await db.upsertMember(slug, input.username, SPACE_ROLE.owner, t)
+        await db.upsertMember(slug, id, SPACE_ROLE.owner, t)
       }
 
-      return { me: await me(input.username), sessionToken: await createSession(input.username) }
+      return { me: await me(id), sessionToken: await createSession(id) }
     },
 
     login: async (input: {
-      username: string
+      identifier: string
       password: string
       ip: string
     }): Promise<{ me: MeView; sessionToken: string }> => {
-      const key = failKey(input.username, input.ip)
+      const invalidCredentials = () =>
+        new AuthError(HTTP_STATUS.UNAUTHORIZED, 'invalid credentials')
+      // 0. The shape filter is free: an input that is neither a handle nor an address
+      //    names no account, so it is refused before any read, hash or counter entry.
+      const lookup = loginLookupOf(input.identifier)
+
+      if (!lookup) {
+        throw invalidCredentials()
+      }
       const ipk = ipKey(input.ip)
 
-      // Both gates close BEFORE any scrypt runs — a rate-limited caller costs
-      // nothing to reject.
-      if (limited(key, LOGIN_MAX_FAILS) || limited(ipk, LOGIN_MAX_FAILS_PER_IP)) {
+      // 1. The ip gate closes before the directory is read — a flood is refused at
+      //    the price of one in-memory counter. It is the ONE gate that answers 429:
+      //    it is not tied to an account, so it tells nothing about one.
+      if (limited(ipk, LOGIN_MAX_FAILS_PER_IP)) {
         throw new AuthError(
           HTTP_STATUS.TOO_MANY_REQUESTS,
           'too many attempts, try later',
           'rate_limited',
         )
       }
-
-      const user = await db.getUser(input.username)
-      // Unknown user and wrong password take the same path and the same time.
+      // 2. One indexed read resolves the handle or the address.
+      const user = await db.getUserByLogin(lookup)
+      // 3. An exhausted ACCOUNT budget answers like a wrong pair: the same code, the
+      //    same body, the same time and the same counter entry. A distinct code would
+      //    reveal that a handle and an address are one account — the linking oracle a
+      //    shared budget would otherwise create — and so would refusing it HERE, before
+      //    the verification: the probe would come back instantly and without touching
+      //    the ip counter, which tells the same thing without reading a body. So the
+      //    spent budget is carried through the verification below instead of skipping
+      //    it. The cost is bounded by the same two ceilings as any wrong pair: the ip
+      //    gate above and LOGIN_MAX_IN_FLIGHT below.
+      const key = user ? failKey(user.id, input.ip) : unknownKey(lookup.key, input.ip)
+      const spent = limited(key, LOGIN_MAX_FAILS)
+      // 4. An unknown account, a wrong password and a spent budget take the same path
+      //    and the same time.
       const hash = user?.passwordHash ?? (await DUMMY_HASH_PROMISE)
 
       if (passwordVerifiesInFlight >= LOGIN_MAX_IN_FLIGHT) {
@@ -708,19 +763,19 @@ export function createAuthService({
         passwordVerifiesInFlight--
       }
 
-      if (!ok || !user || user.disabledAt != null || user.passwordHash == null) {
+      if (spent || !ok || !user || user.disabledAt != null || user.passwordHash == null) {
         registerFail(key)
         registerFail(ipk)
-        throw new AuthError(HTTP_STATUS.UNAUTHORIZED, 'invalid credentials')
+        throw invalidCredentials()
       }
       fails.delete(key)
       if (passwordNeedsRehash(user.passwordHash)) {
         void hashPassword(input.password)
-          .then((h) => db.updateUser(user.username, { passwordHash: h }))
+          .then((h) => db.updateUser(user.id, { passwordHash: h }))
           .catch(() => {})
       }
 
-      return { me: await me(user.username), sessionToken: await createSession(user.username) }
+      return { me: await me(user.id), sessionToken: await createSession(user.id) }
     },
 
     logout: async (cookieToken: string | undefined): Promise<void> => {
@@ -733,6 +788,7 @@ export function createAuthService({
 
     ...createMeViews(ctx),
     ...createPersonalSpace(ctx),
+    ...createIdentity(ctx),
     ...createCredentials(ctx),
     ...createInvites(ctx),
     ...createPats(ctx),

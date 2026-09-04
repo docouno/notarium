@@ -36,7 +36,7 @@ export const MemoryCategorySchema = z.object({
   /** When this category was first created; null = the host cannot know. */
   createdAt: IsoTimestampSchema,
   modifiedAt: IsoTimestampSchema,
-  /** Latest writer ('ui' | 'pat:<user>:<id>' | …) and revision kind; null = no
+  /** Latest writer ('ui' | 'pat:<userId>:<patId>' | …) and revision kind; null = no
    *  journal row for this note. `author` = the privacy-filtered display twin of
    *  `principal`. */
   principal: z.string().nullable(),

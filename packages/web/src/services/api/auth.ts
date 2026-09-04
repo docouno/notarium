@@ -7,8 +7,9 @@ export const authApi = {
   // methods never see a credential beyond the login/setup/invite bodies.
   /** The boot endpoint — the only data route an anonymous client may hit. */
   authSessionGet: () => req<AuthSession>('/api/auth/session'),
-  login: (username: string, password: string) =>
-    req<Me>('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
+  // `identifier` is the handle or the e-mail; the server tells them apart.
+  login: (identifier: string, password: string) =>
+    req<Me>('/api/auth/login', { method: 'POST', body: JSON.stringify({ identifier, password }) }),
   logout: () => req<{ ok: true }>('/api/auth/logout', { method: 'POST' }),
   /** First-run only: mint the host owner. 404 once any user exists. */
   setup: (input: SetupRequest) =>

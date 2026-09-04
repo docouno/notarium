@@ -34,8 +34,8 @@ export const createSse = (ctx: AuthCtx) => ({
    *  which re-asserts the idempotent owner row on every login/accept/touch and would
    *  spam every tab.
    *  canon: docs/auth.md#loss-of-access-at-runtime-explicit-takeover-111 */
-  notifyGrantsChanged: (username: string): void => {
-    ctx.notifySse((h) => h.username === username)
+  notifyGrantsChanged: (userId: string): void => {
+    ctx.notifySse((h) => h.userId === userId)
   },
 
   /** Drop everyone viewing this space FIRST (their EventSource death is the takeover
@@ -53,7 +53,7 @@ export const createSse = (ctx: AuthCtx) => ({
 
     for (const m of members) {
       ctx.notifySse(
-        (h) => h.username === m.username && h.space !== spaceId && h.spaces?.has(spaceId) !== true,
+        (h) => h.userId === m.userId && h.space !== spaceId && h.spaces?.has(spaceId) !== true,
       )
     }
   },
@@ -62,7 +62,7 @@ export const createSse = (ctx: AuthCtx) => ({
     const members = await ctx.db.membersOf(spaceId)
 
     for (const m of members) {
-      ctx.notifySse((h) => h.username === m.username)
+      ctx.notifySse((h) => h.userId === m.userId)
     }
   },
 

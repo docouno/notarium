@@ -109,7 +109,9 @@ describe('provider registry', () => {
       archivedBy: null,
     })
     await db.auth.createUser({
+      id: 'alice',
       username: 'alice',
+      email: null,
       displayName: 'Alice',
       passwordHash: null,
       admin: false,
@@ -574,11 +576,11 @@ describe('provider registry', () => {
     if (stored.status !== 'recorded') {
       return
     }
-    const manager = registry.resourceToWire(stored.record, {
+    const manager = await registry.resourceToWire(stored.record, {
       owner: 'bob',
       consentManager: true,
     })
-    const admin = registry.resourceToWire(stored.record, { owner: 'bob', admin: true })
+    const admin = await registry.resourceToWire(stored.record, { owner: 'bob', admin: true })
 
     expect(manager.baseUrl).toBe('https://openrouter.ai/api/v1')
     expect(manager.lastCheck.completion?.diagnostic).toBeNull()

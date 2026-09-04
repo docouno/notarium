@@ -31,7 +31,7 @@ export const authFlowRoutes = async (
     AuthSessionResponseSchema.parse({
       mode: auth.mode,
       setup: await auth.setupOpen(),
-      me: req.principal.username ? await auth.me(req.principal.username, req.principal) : null,
+      me: req.principal.userId ? await auth.me(req.principal.userId, req.principal) : null,
     }),
   )
 
@@ -51,10 +51,10 @@ export const authFlowRoutes = async (
     // Eager personal-space provision (invariant 1); the catch degrades to the
     // lazy first-touch path.
     // canon: docs/projects.md#personal-domain-as-a-working-space-13-2026-06-20
-    await ensurePersonalSpaceFor({ auth, spaces }, me.username).catch((err) => {
+    await ensurePersonalSpaceFor({ auth, spaces }, me).catch((err) => {
       req.log.error({ err }, 'personal-space provision (setup) failed; will retry lazily')
     })
-    return MeSchema.parse(await auth.me(me.username))
+    return MeSchema.parse(await auth.me(me.id))
   })
 
   app.post('/api/auth/login', PUBLIC, async (req, reply) => {
@@ -98,9 +98,9 @@ export const authFlowRoutes = async (
     setSessionCookie(req, reply, sessionToken)
     // Eager personal-space provision (invariant 1); the catch degrades to the
     // lazy first-touch path.
-    await ensurePersonalSpaceFor({ auth, spaces }, me.username).catch((err) => {
+    await ensurePersonalSpaceFor({ auth, spaces }, me).catch((err) => {
       req.log.error({ err }, 'personal-space provision (accept-invite) failed; will retry lazily')
     })
-    return MeSchema.parse(await auth.me(me.username))
+    return MeSchema.parse(await auth.me(me.id))
   })
 }

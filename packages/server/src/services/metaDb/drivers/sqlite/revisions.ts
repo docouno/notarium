@@ -152,8 +152,9 @@ const activityLastOfRow = (row: RevisionRow): ActivityLastEvent =>
       }
 
 /** Author-scope predicate as `?` SQL. A present-but-empty filter matches nothing,
- *  not everything — `effectiveAuthorClause` encodes that. Usernames carry no LIKE
- *  wildcard, so no ESCAPE is needed. */
+ *  not everything — `effectiveAuthorClause` encodes that. The prefixes carry the
+ *  viewer's stable id — 16 hex, no LIKE wildcard — never a username (which may hold
+ *  `_`), so no ESCAPE is needed. */
 const authorClauseSqlite = (author?: AuthorFilter): { clause: string; params: string[] } => {
   if (!author) {
     return { clause: '', params: [] }

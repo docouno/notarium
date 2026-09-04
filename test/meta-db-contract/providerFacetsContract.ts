@@ -124,7 +124,9 @@ const setup = async (factory: ProviderFacetsContractFactory) => {
     archivedBy: null,
   })
   await subject.auth.createUser({
+    id: 'alice',
     username: 'alice',
+    email: null,
     displayName: 'Alice',
     passwordHash: null,
     admin: false,
@@ -203,7 +205,9 @@ export const describeProviderFacetsContract = (
           )
         }
         await subject.auth.createUser({
+          id: 'expiry-owner',
           username: 'expiry-owner',
+          email: null,
           displayName: 'Expiry Owner',
           passwordHash: null,
           admin: false,
@@ -1272,7 +1276,9 @@ export const describeProviderFacetsContract = (
 
       try {
         await subject.auth.createUser({
+          id: 'bob',
           username: 'bob',
+          email: null,
           displayName: 'Bob',
           passwordHash: null,
           admin: false,

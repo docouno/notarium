@@ -75,6 +75,7 @@ const principal = (
   grants: ReadonlyArray<readonly [string, SpaceRole]>,
 ): Principal => ({
   id: `pat:alice:${scope}:${grants.map(([space]) => space).join('+') || 'none'}`,
+  userId: 'alice',
   username: 'alice',
   admin: false,
   scope,

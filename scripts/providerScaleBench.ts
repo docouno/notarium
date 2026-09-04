@@ -75,6 +75,7 @@ const providerWhoami = (registry: ProviderRegistry) =>
     {
       principal: {
         id: 'user:viewer',
+        userId: 'viewer',
         username: 'viewer',
         admin: false,
         scope: 'manage',
@@ -135,13 +136,14 @@ const seed = (path: string, records: number): void => {
        VALUES ('space-main', 'main', 'main', 'Main', '[]', ?, NULL, NULL)`,
     ).run(OLD)
     db.prepare(
+      // The bench keys its accounts by handle: the id IS the handle here.
       `INSERT INTO users
-        (username, display_name, password_hash, admin, disabled_at, created_at, personal_space)
-       VALUES ('scale-owner', 'Scale Owner', NULL, 0, NULL, ?, NULL),
-              ('viewer', 'Viewer', NULL, 0, NULL, ?, NULL)`,
+        (id, username, email, display_name, password_hash, admin, disabled_at, created_at, personal_space)
+       VALUES ('scale-owner', 'scale-owner', NULL, 'Scale Owner', NULL, 0, NULL, ?, NULL),
+              ('viewer', 'viewer', NULL, 'Viewer', NULL, 0, NULL, ?, NULL)`,
     ).run(OLD, OLD)
     db.prepare(
-      `INSERT INTO space_members (space, username, role, created_at)
+      `INSERT INTO space_members (space, user_id, role, created_at)
        VALUES ('space-main', 'scale-owner', 'writer', ?),
               ('space-main', 'viewer', 'reader', ?)`,
     ).run(OLD, OLD)
@@ -335,7 +337,7 @@ export const runProviderScaleBench = async (records = 10_000): Promise<ProviderS
     const spaces = countedPort(db.spaces, new Set(['getById', 'getMany']), () => (portCalls += 1))
     const directory = countedPort(
       db.auth,
-      new Set(['getUser', 'getUsers', 'grantsFor', 'grantsForUsers']),
+      new Set(['getUserById', 'getUsersByIds', 'grantsFor', 'grantsForUsers']),
       () => (portCalls += 1),
     )
     const keyring = {

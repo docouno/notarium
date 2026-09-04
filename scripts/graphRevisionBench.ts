@@ -83,7 +83,7 @@ const waitForAdjacencyObservation = async (
 const login = await fetch(`${BASE_URL}/api/auth/login`, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ username: 'admin', password: 'admin' }),
+  body: JSON.stringify({ identifier: 'admin', password: 'admin' }),
 })
 
 if (!login.ok) {

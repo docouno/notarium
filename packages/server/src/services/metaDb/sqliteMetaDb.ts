@@ -273,7 +273,7 @@ export class SqliteMetaDb implements MetaDb {
 
   async grantMemberToActiveSpace(
     spaceId: string,
-    username: string,
+    userId: string,
     role: SpaceRole,
     createdAt: string,
   ): Promise<GrantMemberToActiveSpaceResult> {
@@ -297,9 +297,9 @@ export class SqliteMetaDb implements MetaDb {
         return { status: 'archived', space }
       }
       db.prepare(
-        `INSERT INTO space_members (space, username, role, created_at) VALUES (?, ?, ?, ?)
-           ON CONFLICT(space, username) DO UPDATE SET role = excluded.role`,
-      ).run(spaceId, username, role, createdAt)
+        `INSERT INTO space_members (space, user_id, role, created_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT(space, user_id) DO UPDATE SET role = excluded.role`,
+      ).run(spaceId, userId, role, createdAt)
       db.exec('COMMIT')
       return { status: 'granted', space }
     } catch (err) {
@@ -410,7 +410,7 @@ export class SqliteMetaDb implements MetaDb {
     }
   }
 
-  async removeMemberAndProviderAttachments(spaceId: string, username: string): Promise<void> {
+  async removeMemberAndProviderAttachments(spaceId: string, userId: string): Promise<void> {
     await this.ensureInit()
     const db = this.required
     db.exec('BEGIN IMMEDIATE')
@@ -419,11 +419,8 @@ export class SqliteMetaDb implements MetaDb {
         `DELETE FROM provider_attachments
           WHERE target_space = ?
             AND resource_id IN (SELECT id FROM provider_resources WHERE owner = ?)`,
-      ).run(spaceId, username)
-      db.prepare('DELETE FROM space_members WHERE space = ? AND username = ?').run(
-        spaceId,
-        username,
-      )
+      ).run(spaceId, userId)
+      db.prepare('DELETE FROM space_members WHERE space = ? AND user_id = ?').run(spaceId, userId)
       db.exec('COMMIT')
     } catch (error) {
       db.exec('ROLLBACK')

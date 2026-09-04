@@ -130,13 +130,13 @@ export const createOAuthFacet = (ctx: SqliteDriverCtx): OAuthPersistence => ({
     ctx.required
       .prepare(
         `INSERT INTO oauth_auth_codes
-             (code_hash, client_id, username, redirect_uri, scope, spaces, code_challenge, code_challenge_method, expires_at, used_at, created_at)
+             (code_hash, client_id, user_id, redirect_uri, scope, spaces, code_challenge, code_challenge_method, expires_at, used_at, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         c.codeHash,
         c.clientId,
-        c.username,
+        c.userId,
         c.redirectUri,
         c.scope,
         c.spaces == null ? null : JSON.stringify(c.spaces),
@@ -155,7 +155,7 @@ export const createOAuthFacet = (ctx: SqliteDriverCtx): OAuthPersistence => ({
       | {
           code_hash: string
           client_id: string
-          username: string
+          user_id: string
           redirect_uri: string
           scope: string
           spaces: string | null
@@ -174,7 +174,7 @@ export const createOAuthFacet = (ctx: SqliteDriverCtx): OAuthPersistence => ({
     return {
       codeHash: r.code_hash,
       clientId: r.client_id,
-      username: r.username,
+      userId: r.user_id,
       redirectUri: r.redirect_uri,
       scope: r.scope,
       spaces: r.spaces == null ? null : (JSON.parse(r.spaces) as string[]),
@@ -198,13 +198,13 @@ export const createOAuthFacet = (ctx: SqliteDriverCtx): OAuthPersistence => ({
     ctx.required
       .prepare(
         `INSERT INTO oauth_access_tokens
-             (id, token_hash, username, client_id, scope, spaces, expires_at, refresh_id, revoked_at, created_at, last_used_at)
+             (id, token_hash, user_id, client_id, scope, spaces, expires_at, refresh_id, revoked_at, created_at, last_used_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         t.id,
         t.tokenHash,
-        t.username,
+        t.userId,
         t.clientId,
         t.scope,
         t.spaces == null ? null : JSON.stringify(t.spaces),
@@ -249,13 +249,13 @@ export const createOAuthFacet = (ctx: SqliteDriverCtx): OAuthPersistence => ({
       .prepare(`UPDATE oauth_access_tokens SET ${sets.join(', ')} WHERE id = ?`)
       .run(...args, id)
   },
-  listAccessForUser: async (username) => {
+  listAccessForUser: async (userId) => {
     await ctx.ensureInit()
     const rows = ctx.required
       .prepare(
-        'SELECT * FROM oauth_access_tokens WHERE username = ? AND revoked_at IS NULL ORDER BY created_at',
+        'SELECT * FROM oauth_access_tokens WHERE user_id = ? AND revoked_at IS NULL ORDER BY created_at',
       )
-      .all(username) as OAuthAccessRow[]
+      .all(userId) as OAuthAccessRow[]
     return rows.map(accessOfRow)
   },
 
@@ -264,13 +264,13 @@ export const createOAuthFacet = (ctx: SqliteDriverCtx): OAuthPersistence => ({
     ctx.required
       .prepare(
         `INSERT INTO oauth_refresh_tokens
-             (id, token_hash, username, client_id, scope, spaces, expires_at, rotated_to, revoked_at, created_at)
+             (id, token_hash, user_id, client_id, scope, spaces, expires_at, rotated_to, revoked_at, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         t.id,
         t.tokenHash,
-        t.username,
+        t.userId,
         t.clientId,
         t.scope,
         t.spaces == null ? null : JSON.stringify(t.spaces),
@@ -323,13 +323,13 @@ export const createOAuthFacet = (ctx: SqliteDriverCtx): OAuthPersistence => ({
       .run(rotatedAt, id)
     return res.changes > 0
   },
-  listRefreshForUser: async (username) => {
+  listRefreshForUser: async (userId) => {
     await ctx.ensureInit()
     const rows = ctx.required
       .prepare(
-        'SELECT * FROM oauth_refresh_tokens WHERE username = ? AND revoked_at IS NULL ORDER BY created_at',
+        'SELECT * FROM oauth_refresh_tokens WHERE user_id = ? AND revoked_at IS NULL ORDER BY created_at',
       )
-      .all(username) as OAuthRefreshRow[]
+      .all(userId) as OAuthRefreshRow[]
     return rows.map(refreshOfRow)
   },
 

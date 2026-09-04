@@ -2,7 +2,8 @@
 // same interface the SQLite/PG facets implement, so the production
 // AuthService (hashing, sessions, invites, can()-grants) runs UNCHANGED over
 // a world the harness can reset instantly. Deterministic and dependency-free —
-// the executable-spec posture of #18.
+// the executable-spec posture of #18. Users key by their stable id, exactly like
+// the meta-DB after the identity carrier; the handle is a secondary index.
 
 import type {
   AuthPersistence,
@@ -10,14 +11,16 @@ import type {
   OneTimeTokenRecord,
   PatRecord,
   SessionRecord,
+  UserIdentityPatch,
   UserRecord,
+  UserWriteResult,
 } from '@notarium/server'
 
 export class InMemoryAuthPersistence implements AuthPersistence {
-  private users = new Map<string, UserRecord>()
+  private users = new Map<string, UserRecord>() // by stable id
   private sessions = new Map<string, SessionRecord>()
   private pats = new Map<string, PatRecord>()
-  private members = new Map<string, MemberRecord>() // `${space}\0${username}`
+  private members = new Map<string, MemberRecord>() // `${space}\0${userId}`
   private oneTimes = new Map<string, OneTimeTokenRecord>()
 
   clear(): void {
@@ -26,6 +29,38 @@ export class InMemoryAuthPersistence implements AuthPersistence {
     this.pats.clear()
     this.members.clear()
     this.oneTimes.clear()
+  }
+
+  private byUsername(username: string): UserRecord | undefined {
+    for (const user of this.users.values()) {
+      if (user.username === username) {
+        return user
+      }
+    }
+
+    return undefined
+  }
+
+  /** The unique keys ARE the check, mirroring the drivers' UNIQUE constraints: a
+   *  colliding handle or address is the `conflict` outcome, never a thrown error. */
+  private conflictOf(candidate: {
+    id?: string
+    username?: string
+    email?: string | null
+  }): UserWriteResult | null {
+    for (const user of this.users.values()) {
+      if (user.id === candidate.id) {
+        continue
+      }
+      if (candidate.username !== undefined && user.username === candidate.username) {
+        return { status: 'conflict', field: 'username' }
+      }
+      if (candidate.email != null && user.email === candidate.email) {
+        return { status: 'conflict', field: 'email' }
+      }
+    }
+
+    return null
   }
 
   async userCount(): Promise<number> {
@@ -38,33 +73,83 @@ export class InMemoryAuthPersistence implements AuthPersistence {
     if (this.users.size > 0) {
       return false
     }
-    this.users.set(user.username, { ...user })
+    this.users.set(user.id, { ...user })
     return true
   }
-  async createUser(user: UserRecord): Promise<void> {
-    if (this.users.has(user.username)) {
-      throw new Error(`duplicate username ${user.username}`)
+  async createUser(user: UserRecord): Promise<UserWriteResult> {
+    if (this.users.has(user.id)) {
+      throw new Error(`duplicate user id ${user.id}`)
     }
-    this.users.set(user.username, { ...user })
+    const conflict = this.conflictOf(user)
+
+    if (conflict) {
+      return conflict
+    }
+    this.users.set(user.id, { ...user })
+    return { status: 'written' }
   }
   async getUser(username: string): Promise<UserRecord | null> {
-    const u = this.users.get(username)
+    const u = this.byUsername(username)
     return u ? { ...u } : null
+  }
+  async getUserByLogin(login: { username: string; email: string }): Promise<UserRecord | null> {
+    const byHandle = this.byUsername(login.username)
+
+    if (byHandle) {
+      return { ...byHandle }
+    }
+    for (const user of this.users.values()) {
+      if (user.email !== null && user.email === login.email) {
+        return { ...user }
+      }
+    }
+
+    return null
+  }
+  async getUserById(id: string): Promise<UserRecord | null> {
+    const u = this.users.get(id)
+    return u ? { ...u } : null
+  }
+  async getUsersByIds(ids: readonly string[]): Promise<UserRecord[]> {
+    return [...new Set(ids)].flatMap((id) => {
+      const u = this.users.get(id)
+      return u ? [{ ...u }] : []
+    })
   }
   async listUsers(): Promise<UserRecord[]> {
     return [...this.users.values()].map((u) => ({ ...u }))
   }
   async updateUser(
-    username: string,
+    id: string,
     patch: Partial<
       Pick<UserRecord, 'displayName' | 'passwordHash' | 'admin' | 'disabledAt' | 'personalSpace'>
     >,
   ): Promise<void> {
-    const u = this.users.get(username)
+    const u = this.users.get(id)
 
     if (u) {
       Object.assign(u, patch)
     }
+  }
+  async updateUserIdentity(id: string, patch: UserIdentityPatch): Promise<UserWriteResult> {
+    const u = this.users.get(id)
+
+    if (!u) {
+      return { status: 'written' }
+    }
+    const conflict = this.conflictOf({ id, ...patch })
+
+    if (conflict) {
+      return conflict
+    }
+    if (patch.username !== undefined) {
+      u.username = patch.username
+    }
+    if (patch.email !== undefined) {
+      u.email = patch.email
+    }
+
+    return { status: 'written' }
   }
 
   async insertSession(s: SessionRecord): Promise<void> {
@@ -84,9 +169,9 @@ export class InMemoryAuthPersistence implements AuthPersistence {
   async deleteSession(idHash: string): Promise<void> {
     this.sessions.delete(idHash)
   }
-  async deleteSessionsFor(username: string): Promise<void> {
+  async deleteSessionsFor(userId: string): Promise<void> {
     for (const [k, s] of this.sessions) {
-      if (s.username === username) {
+      if (s.userId === userId) {
         this.sessions.delete(k)
       }
     }
@@ -99,9 +184,9 @@ export class InMemoryAuthPersistence implements AuthPersistence {
     const p = this.pats.get(id)
     return p ? { ...p, spaces: p.spaces ? [...p.spaces] : null } : null
   }
-  async listPats(username: string): Promise<PatRecord[]> {
+  async listPats(userId: string): Promise<PatRecord[]> {
     return [...this.pats.values()]
-      .filter((p) => p.username === username)
+      .filter((p) => p.userId === userId)
       .map((p) => ({ ...p, spaces: p.spaces ? [...p.spaces] : null }))
   }
   async updatePat(
@@ -132,42 +217,59 @@ export class InMemoryAuthPersistence implements AuthPersistence {
     }
   }
 
-  private memberKey(space: string, username: string): string {
-    return `${space}\0${username}`
+  private memberKey(space: string, userId: string): string {
+    return `${space}\0${userId}`
   }
-  async grantsFor(username: string): Promise<Array<{ space: string; role: MemberRecord['role'] }>> {
+  async grantsFor(userId: string): Promise<Array<{ space: string; role: MemberRecord['role'] }>> {
     return [...this.members.values()]
-      .filter((m) => m.username === username)
+      .filter((m) => m.userId === userId)
       .map((m) => ({ space: m.space, role: m.role }))
   }
-  async membersOf(
-    space: string,
-  ): Promise<Array<{ username: string; displayName: string; role: MemberRecord['role'] }>> {
+  async grantsForUsers(
+    userIds: readonly string[],
+  ): Promise<Array<{ userId: string; space: string; role: MemberRecord['role'] }>> {
+    const wanted = new Set(userIds)
     return [...this.members.values()]
-      .filter((m) => m.space === space && this.users.has(m.username))
-      .map((m) => ({
-        username: m.username,
-        displayName: this.users.get(m.username)?.displayName ?? m.username,
-        role: m.role,
-      }))
+      .filter((m) => wanted.has(m.userId))
+      .map((m) => ({ userId: m.userId, space: m.space, role: m.role }))
+  }
+  async membersOf(space: string): Promise<
+    Array<{
+      userId: string
+      username: string
+      displayName: string
+      role: MemberRecord['role']
+    }>
+  > {
+    return [...this.members.values()]
+      .filter((m) => m.space === space && this.users.has(m.userId))
+      .map((m) => {
+        const user = this.users.get(m.userId)!
+        return {
+          userId: m.userId,
+          username: user.username,
+          displayName: user.displayName,
+          role: m.role,
+        }
+      })
   }
   async upsertMember(
     space: string,
-    username: string,
+    userId: string,
     role: MemberRecord['role'],
     createdAt: string,
   ): Promise<void> {
-    const key = this.memberKey(space, username)
+    const key = this.memberKey(space, userId)
     const cur = this.members.get(key)
 
     if (cur) {
       cur.role = role
     } else {
-      this.members.set(key, { space, username, role, createdAt })
+      this.members.set(key, { space, userId, role, createdAt })
     }
   }
-  async removeMember(space: string, username: string): Promise<void> {
-    this.members.delete(this.memberKey(space, username))
+  async removeMember(space: string, userId: string): Promise<void> {
+    this.members.delete(this.memberKey(space, userId))
   }
   async spacesWithMembers(): Promise<string[]> {
     return [...new Set([...this.members.values()].map((m) => m.space))]
@@ -189,9 +291,9 @@ export class InMemoryAuthPersistence implements AuthPersistence {
     t.usedAt = usedAt
     return true
   }
-  async deleteOneTimesFor(username: string): Promise<void> {
+  async deleteOneTimesFor(userId: string): Promise<void> {
     for (const [k, t] of this.oneTimes) {
-      if (t.username === username) {
+      if (t.userId === userId) {
         this.oneTimes.delete(k)
       }
     }

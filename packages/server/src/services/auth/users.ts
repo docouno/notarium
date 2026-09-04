@@ -3,11 +3,14 @@
 
 import { TOKEN_PURPOSE } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
+import { mintUserId } from '../../libs/tokens'
 import type { UserRecord } from '../metaDb'
 import { type AuthCtx, AuthError } from './authService'
+import { createIdentity } from './identity'
 
 const userView = (u: UserRecord) => ({
   username: u.username,
+  email: u.email,
   displayName: u.displayName,
   admin: u.admin,
   disabled: u.disabledAt != null,
@@ -18,12 +21,19 @@ const userView = (u: UserRecord) => ({
 export const createUsers = (ctx: AuthCtx) => ({
   listUsers: async () => (await ctx.db.listUsers()).map(userView),
 
-  createUser: async (input: { username: string; displayName?: string; admin?: boolean }) => {
+  createUser: async (input: {
+    username: string
+    email?: string
+    displayName?: string
+    admin?: boolean
+  }) => {
     if (await ctx.db.getUser(input.username)) {
       throw new AuthError(HTTP_STATUS.CONFLICT, 'username is taken', 'username_taken')
     }
-    await ctx.db.createUser({
+    const written = await ctx.db.createUser({
+      id: mintUserId(),
       username: input.username,
+      email: input.email ?? null,
       displayName: input.displayName?.trim() || input.username,
       passwordHash: null,
       admin: Boolean(input.admin),
@@ -31,9 +41,17 @@ export const createUsers = (ctx: AuthCtx) => ({
       createdAt: ctx.nowIso(),
       personalSpace: null,
     })
-    const user = await ctx.db.getUser(input.username)
-    const link = await ctx.mintLink(input.username, TOKEN_PURPOSE.invite)
-    return { user: userView(user as UserRecord), ...link }
+
+    if (written.status === 'conflict') {
+      throw new AuthError(
+        HTTP_STATUS.CONFLICT,
+        `${written.field} is taken`,
+        written.field === 'username' ? 'username_taken' : 'email_taken',
+      )
+    }
+    const user = (await ctx.db.getUser(input.username)) as UserRecord
+    const link = await ctx.mintLink(user.id, TOKEN_PURPOSE.invite)
+    return { user: userView(user), ...link }
   },
 
   /** Mint a fresh credential link for an existing user. canon: docs/auth.md#credentials */
@@ -44,16 +62,25 @@ export const createUsers = (ctx: AuthCtx) => ({
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     const link = await ctx.mintLink(
-      username,
+      user.id,
       user.passwordHash ? TOKEN_PURPOSE.reset : TOKEN_PURPOSE.invite,
     )
     return { user: userView(user), ...link }
   },
 
+  /** `actorUserId` is the admin's own stable id — the self-lockout guard compares
+   *  identities, not handles. `username` in the patch renames; the route is addressed
+   *  by the current handle and the answer carries the new one. */
   patchUser: async (
-    actor: string,
+    actorUserId: string | null,
     username: string,
-    patch: { displayName?: string; admin?: boolean; disabled?: boolean },
+    patch: {
+      username?: string
+      email?: string | null
+      displayName?: string
+      admin?: boolean
+      disabled?: boolean
+    },
   ) => {
     const user = await ctx.db.getUser(username)
 
@@ -61,17 +88,28 @@ export const createUsers = (ctx: AuthCtx) => ({
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     // Self-lockout guards — a host must stay administrable.
-    if (username === actor && patch.disabled === true) {
+    if (user.id === actorUserId && patch.disabled === true) {
       throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'cannot disable yourself', 'self_lockout')
     }
     if (patch.admin === false && user.admin) {
       const admins = (await ctx.db.listUsers()).filter((u) => u.admin && u.disabledAt == null)
 
-      if (admins.length === 1 && admins[0].username === username) {
+      if (admins.length === 1 && admins[0].id === user.id) {
         throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'cannot demote the last admin', 'last_admin')
       }
     }
-    await ctx.db.updateUser(username, {
+    // Identity goes FIRST, because it is the only half that can still be refused: a
+    // taken handle or address answers 409 from inside updateIdentity, and the two
+    // writes share no transaction. Applied the other way round, a refused patch would
+    // leave displayName rewritten — and, on the disable path, sessions already deleted
+    // and the socket already torn down.
+    if (patch.username !== undefined || patch.email !== undefined) {
+      await createIdentity(ctx).updateIdentity(user.id, {
+        ...(patch.username !== undefined ? { username: patch.username } : {}),
+        ...(patch.email !== undefined ? { email: patch.email } : {}),
+      })
+    }
+    await ctx.db.updateUser(user.id, {
       ...(patch.displayName !== undefined ? { displayName: patch.displayName } : {}),
       ...(patch.admin !== undefined ? { admin: patch.admin } : {}),
       ...(patch.disabled !== undefined ? { disabledAt: patch.disabled ? ctx.nowIso() : null } : {}),
@@ -79,11 +117,11 @@ export const createUsers = (ctx: AuthCtx) => ({
     if (patch.disabled === true) {
       // disabledAt is already durable: remove live delivery authority before any
       // cleanup await can expose owner-private frames in the committed-disabled gap.
-      ctx.dropSse((h) => h.username === username)
-      await ctx.db.deleteSessionsFor(username)
-      await ctx.db.deleteOneTimesFor(username)
+      ctx.dropSse((h) => h.userId === user.id)
+      await ctx.db.deleteSessionsFor(user.id)
+      await ctx.db.deleteOneTimesFor(user.id)
     }
 
-    return userView((await ctx.db.getUser(username)) as UserRecord)
+    return userView((await ctx.db.getUserById(user.id)) as UserRecord)
   },
 })

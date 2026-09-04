@@ -637,6 +637,7 @@ export const caseToFixture = (world: CaseWorld): Fixture => {
     ? {
         users: world.auth.users.map((u) => ({
           username: u.username,
+          email: u.email,
           password: u.password,
           displayName: u.displayName,
           admin: u.admin,

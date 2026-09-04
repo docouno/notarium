@@ -174,5 +174,7 @@ export type {
   OwnedRolePlacementMove,
   SpaceRecord,
   SpacesPersistence,
+  UserIdentityPatch,
   UserRecord,
+  UserWriteResult,
 } from './types'

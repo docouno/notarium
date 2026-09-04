@@ -285,10 +285,14 @@ describe('agent-roles real seed', () => {
           (preference) => !preference.enabled,
         )
         expect(disabled.length).toBeGreaterThan(0)
+        // Owner rows key by the stable id the seed minted for the init user.
+        const admin = db.prepare(`SELECT id FROM users WHERE username = 'admin'`).get() as {
+          id: string
+        }
         expect([...written].sort((a, b) => a.name.localeCompare(b.name))).toEqual(
           disabled
             .map((preference) => ({
-              owner: 'admin',
+              owner: admin.id,
               source: preference.ability.source,
               kind: preference.ability.kind,
               name: preference.ability.name,
@@ -424,8 +428,11 @@ describe('agent-roles real seed', () => {
           .all(operation.note_id)
         expect(revision).toEqual([
           expect.objectContaining({
-            principal: 'pat:seed:ability-author',
-            agent_owner: 'admin',
+            // Both columns must name the SAME account: the principal's owner segment
+            // is an id resolved through the account catalog, not a brand — a literal
+            // here would pass while the row rendered as an unnamed agent.
+            principal: `pat:${admin.id}:ability-author`,
+            agent_owner: admin.id,
             agent_name: 'Seed ability author',
             session_name: 'Agent ability authoring',
             session_attach: 'declared',

@@ -375,7 +375,7 @@ describe('OAuth registration guards', () => {
     await store.insertAccess({
       id: 'access',
       tokenHash: 'hash',
-      username: 'alice',
+      userId: 'alice',
       clientId: oldClient.clientId,
       scope: 'read',
       spaces: null,

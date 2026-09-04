@@ -606,7 +606,7 @@ try {
   const targetBase = await startContainer(targetContainer, targetVolume)
   const login = await request(targetBase, '/api/auth/login', {
     method: 'POST',
-    body: { username, password },
+    body: { identifier: username, password },
   })
   const restoredCookie = login.cookie
 

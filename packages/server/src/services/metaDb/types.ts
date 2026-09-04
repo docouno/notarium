@@ -394,7 +394,8 @@ export type ProviderRetargetResult =
 export type ProviderCallLogRecord = {
   id: string
   owner: string
-  /** The full principal id (`user:…` | `pat:…` | `oauth:…`) — the "which agent" lens. */
+  /** The full principal id (`user:<userId>` | `pat:<userId>:<patId>` | `oauth:<userId>:<tokenId>`
+   *  | `ui` in AUTH_MODE=none) — the "which agent" lens. */
   principal: string
   /** Friendly name of the acting agent, snapshotted at write time so token rotation
    *  cannot rewrite history. */
@@ -497,7 +498,10 @@ export type SpaceRecord = {
   createdAt: string
   /** ISO archived-at, else null. */
   archivedAt: string | null
-  /** Actor (`user:`|`pat:`|`ui`), null when active. */
+  /** Actor principal id, null when active. In practice only `user:<userId>` or `ui`:
+   *  archiving is gated by `space:manage`, and a token's scope tops out at `write`, so
+   *  a `pat:`/`oauth:` principal never reaches this write. The carrier translates all
+   *  four forms here anyway — a migration is not the place to bet on a gate. */
   archivedBy: string | null
 }
 
@@ -868,7 +872,7 @@ export type FolderIdentityPersistence = {
 export type FavoriteEntityKind = 'note' | 'folder' | 'project'
 
 export type FavoriteRecord = {
-  /** User-level owner key (`user:<username>`), or `ui` in auth-less mode. */
+  /** User-level owner key (`user:<userId>`), or `ui` in auth-less mode. */
   owner: string
   /** → spaces.id, not the mutable slug. */
   space: string
@@ -1042,10 +1046,12 @@ export type RetrievalTool = 'search' | 'recall' | 'get_note'
  *  address. Only the top few per event are kept. */
 export type RetrievalHit = { noteId: string; title?: string; score?: number; class?: string }
 
-/** One captured retrieval call. `owner` is the username the audit belongs to
- *  (the read filter); `principal` is the full id of the token that made the call
- *  (`pat:<name>:<id>` | `oauth:…`), the "which agent" lens. `query` is the search/recall
- *  text or the get_note ref; `project` the narrowing handle (null = whole-reach fan-out);
+/** One captured retrieval call. `owner` is the stable user id the audit belongs to
+ *  (the read filter); `principal` is the full id of the caller that made it — a token
+ *  (`pat:<userId>:<patId>` | `oauth:<userId>:<tokenId>`) but also `user:<userId>` | `ui`,
+ *  because `/mcp` accepts a cookie session too and runs under AUTH_MODE=none — the
+ *  "which agent" lens. `query` is the search/recall text or the get_note ref;
+ *  `project` the narrowing handle (null = whole-reach fan-out);
  *  `resultCount`/`topScore` carry the zero/low-score MISS signal (topScore null for
  *  recall/get_note and for a zero-result search). */
 export type RetrievalLogRecord = {
@@ -1123,12 +1129,17 @@ export type RetrievalLogPersistence = {
 
 // ── auth facet records ─────────────────────────────────────────────────
 
-/** One user. `username` is the immutable key (the wire's user handle);
+/** One user. `id` is the stable opaque key (16 hex, minted once) every other
+ *  carrier references; `username` is the wire's mutable unique handle — display
+ *  and login resolve only, never a storage key. `email` is optional, stored in
+ *  lower case and unique without regard to case; nothing requires it.
  *  `passwordHash` is scrypt-encoded, null until an invite is accepted (and the
  *  seam an external-identity provider would leave null for good). `disabledAt`
  *  is soft: grants stay, credentials stop validating. */
 export type UserRecord = {
+  id: string
   username: string
+  email: string | null
   displayName: string
   passwordHash: string | null
   admin: boolean
@@ -1146,7 +1157,7 @@ export type UserRecord = {
  *  doesn't leak live cookies. Sliding expiry: reads refresh expiresAt. */
 export type SessionRecord = {
   idHash: string
-  username: string
+  userId: string
   createdAt: string
   lastUsedAt: string | null
   expiresAt: string
@@ -1160,7 +1171,7 @@ export type PatScope = 'read' | 'write'
  *  slugs; a rename leaves a PAT's narrowing intact), null = all the owner's grants. */
 export type PatRecord = {
   id: string
-  username: string
+  userId: string
   name: string
   secretHash: string
   scope: PatScope
@@ -1175,7 +1186,7 @@ export type SpaceRole = 'owner' | 'writer' | 'reader'
 
 export type MemberRecord = {
   space: string
-  username: string
+  userId: string
   role: SpaceRole
   createdAt: string
 }
@@ -1185,12 +1196,22 @@ export type MemberRecord = {
  *  sets the first password, 'reset' replaces a lost one. */
 export type OneTimeTokenRecord = {
   idHash: string
-  username: string
+  userId: string
   purpose: 'invite' | 'reset'
   expiresAt: string
   usedAt: string | null
   createdAt: string
 }
+
+/** The outcome of a write that a UNIQUE key on `users` may refuse. The key IS the
+ *  arbiter of a race between two writers: the loser learns WHICH attribute collided
+ *  instead of surfacing a driver error, and the service maps it to a 409. */
+export type UserWriteResult =
+  { status: 'written' } | { status: 'conflict'; field: 'username' | 'email' }
+
+/** The mutable identity attributes: the handle and the address. `email: null`
+ *  clears; an absent field is left alone. */
+export type UserIdentityPatch = { username?: string; email?: string | null }
 
 /** The auth facet: users, sessions, PATs, memberships, one-time links.
  *  Pure persistence — hashing, expiry decisions and the can() semantics live
@@ -1204,27 +1225,40 @@ export type AuthPersistence = {
    *  one atomic step, closing the setup TOCTOU that a plain userCount()+create
    *  leaves open (two concurrent setups, each seeing zero, minting two admins). */
   createFirstUser(user: UserRecord): Promise<boolean>
-  /** Throws on a duplicate username (the unique key IS the check). */
-  createUser(user: UserRecord): Promise<void>
+  /** A duplicate username or email is the `conflict` outcome (the unique key IS the
+   *  check); any other failure throws. */
+  createUser(user: UserRecord): Promise<UserWriteResult>
+  /** Resolve the wire handle: the one username-addressed read, for routes and login. */
   getUser(username: string): Promise<UserRecord | null>
-  getUsers?(usernames: readonly string[]): Promise<UserRecord[]>
+  /** Resolve a login in ONE indexed read over the two unique keys: the handle as
+   *  typed (case is never folded — a handle written past the schema keeps signing in
+   *  by its exact spelling) OR the address lower-cased. A handle match wins, so a
+   *  legacy `name@host` handle stays reachable even if someone owns that address. */
+  getUserByLogin(login: { username: string; email: string }): Promise<UserRecord | null>
+  getUserById(id: string): Promise<UserRecord | null>
+  getUsersByIds?(ids: readonly string[]): Promise<UserRecord[]>
   listUsers(): Promise<UserRecord[]>
   updateUser(
-    username: string,
+    id: string,
     patch: Partial<
       Pick<UserRecord, 'displayName' | 'passwordHash' | 'admin' | 'disabledAt' | 'personalSpace'>
     >,
   ): Promise<void>
+  /** Rename and/or re-address one account. Only the `users` row changes — every other
+   *  carrier keys the account by id — and a collision on either unique attribute comes
+   *  back as `conflict` rather than a driver error. Writing the current value is a
+   *  no-op success, not a conflict. */
+  updateUserIdentity(id: string, patch: UserIdentityPatch): Promise<UserWriteResult>
 
   insertSession(session: SessionRecord): Promise<void>
   getSession(idHash: string): Promise<SessionRecord | null>
   touchSession(idHash: string, lastUsedAt: string, expiresAt: string): Promise<void>
   deleteSession(idHash: string): Promise<void>
-  deleteSessionsFor(username: string): Promise<void>
+  deleteSessionsFor(userId: string): Promise<void>
 
   insertPat(pat: PatRecord): Promise<void>
   getPat(id: string): Promise<PatRecord | null>
-  listPats(username: string): Promise<PatRecord[]>
+  listPats(userId: string): Promise<PatRecord[]>
   /** Patch the mutable fields of a PAT. `lastUsedAt`/`revokedAt` are the
    *  bookkeeping writes; `scope`/`spaces` make the rights axis mutable —
    *  a post-issuance level/narrowing change, applied verbatim (the service has
@@ -1235,16 +1269,16 @@ export type AuthPersistence = {
     patch: Partial<Pick<PatRecord, 'lastUsedAt' | 'revokedAt' | 'scope' | 'spaces' | 'name'>>,
   ): Promise<void>
 
-  grantsFor(username: string): Promise<Array<{ space: string; role: SpaceRole }>>
+  grantsFor(userId: string): Promise<Array<{ space: string; role: SpaceRole }>>
   grantsForUsers?(
-    usernames: readonly string[],
-  ): Promise<Array<{ username: string; space: string; role: SpaceRole }>>
-  /** Joined with users for the display name — what the members UI lists. */
+    userIds: readonly string[],
+  ): Promise<Array<{ userId: string; space: string; role: SpaceRole }>>
+  /** Joined with users for the handle and display name — what the members UI lists. */
   membersOf(
     space: string,
-  ): Promise<Array<{ username: string; displayName: string; role: SpaceRole }>>
-  upsertMember(space: string, username: string, role: SpaceRole, createdAt: string): Promise<void>
-  removeMember(space: string, username: string): Promise<void>
+  ): Promise<Array<{ userId: string; username: string; displayName: string; role: SpaceRole }>>
+  upsertMember(space: string, userId: string, role: SpaceRole, createdAt: string): Promise<void>
+  removeMember(space: string, userId: string): Promise<void>
   /** Distinct spaces that have at least one member — the boot rule
    *  ("a memberless space gets owner rows for every active admin") diffs
    *  against this. */
@@ -1257,7 +1291,7 @@ export type AuthPersistence = {
   useOneTime(idHash: string, usedAt: string): Promise<boolean>
   /** Invalidate outstanding links when a new one is minted or the user is
    *  disabled. */
-  deleteOneTimesFor(username: string): Promise<void>
+  deleteOneTimesFor(userId: string): Promise<void>
 }
 
 // ── MCP gateway state facet ─────────────────────────────────────
@@ -1700,7 +1734,7 @@ export type OAuthClientRecord = {
 export type OAuthCodeRecord = {
   codeHash: string
   clientId: string
-  username: string
+  userId: string
   redirectUri: string
   scope: string
   /** Per-space narrowing carried from the consent screen to the token
@@ -1723,7 +1757,7 @@ export type OAuthScope = 'read' | 'write'
 export type OAuthAccessRecord = {
   id: string
   tokenHash: string
-  username: string
+  userId: string
   clientId: string
   scope: OAuthScope
   /** Per-space narrowing: JSON-decoded list of stable space ids, null =
@@ -1743,7 +1777,7 @@ export type OAuthAccessRecord = {
 export type OAuthRefreshRecord = {
   id: string
   tokenHash: string
-  username: string
+  userId: string
   clientId: string
   scope: OAuthScope
   /** Per-space narrowing — mirrored from the access token so it survives
@@ -1803,7 +1837,7 @@ export type OAuthPersistence = {
    *  rows being returned to recover a connection's real last-used after its short
    *  access token lapsed; do NOT add an expiry filter here. Also a belt for
    *  cascade revoke. */
-  listAccessForUser(username: string): Promise<OAuthAccessRecord[]>
+  listAccessForUser(userId: string): Promise<OAuthAccessRecord[]>
 
   insertRefresh(token: OAuthRefreshRecord): Promise<void>
   getRefresh(id: string): Promise<OAuthRefreshRecord | null>
@@ -1823,7 +1857,7 @@ export type OAuthPersistence = {
   /** The user's live (non-revoked) refresh tokens — lets the connections view and
    *  revoke reach an app whose short-lived access tokens have all expired/pruned
    *  while its long-lived refresh token is still valid. */
-  listRefreshForUser(username: string): Promise<OAuthRefreshRecord[]>
+  listRefreshForUser(userId: string): Promise<OAuthRefreshRecord[]>
 
   /** Drop expired codes/access/refresh rows older than `beforeIso` — bounds the
    *  tables; the service calls it opportunistically (like dedupPrune). */
@@ -1848,9 +1882,9 @@ export type JobRecord = {
   space: string
   kind: string
   status: JobStatus
-  /** Attribution of who enqueued it (`user:<name>` | `pat:<name>:<id>` | `ui`) —
-   *  the journal/space-archive attribution scheme, reused for the "your
-   *  exports" filter and the download ownership check. */
+  /** Attribution of who enqueued it (`user:<userId>` | `pat:<userId>:<patId>` |
+   *  `oauth:<userId>:<tokenId>` | `ui`) — the journal/space-archive attribution scheme,
+   *  reused for the "your exports" filter and the download ownership check. */
   principal: string
   /** Kind-specific input, JSON-decoded (an export's scope/frontmatter/folder). */
   params: unknown
@@ -2183,12 +2217,12 @@ export type MetaDb = {
    *  and purge cannot interleave between validation and the write. */
   grantMemberToActiveSpace(
     spaceId: string,
-    username: string,
+    userId: string,
     role: SpaceRole,
     createdAt: string,
   ): Promise<GrantMemberToActiveSpaceResult>
   retargetProviderCredential(input: ProviderRetargetInput): Promise<ProviderRetargetResult>
-  removeMemberAndProviderAttachments(spaceId: string, username: string): Promise<void>
+  removeMemberAndProviderAttachments(spaceId: string, userId: string): Promise<void>
   offerProviderAttachment: ProviderAttachmentLifecyclePersistence['offerProviderAttachment']
   acceptProviderAttachment: ProviderAttachmentLifecyclePersistence['acceptProviderAttachment']
   detachProviderAttachment: ProviderAttachmentLifecyclePersistence['detachProviderAttachment']

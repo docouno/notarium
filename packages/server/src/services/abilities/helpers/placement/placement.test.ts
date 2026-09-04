@@ -44,6 +44,7 @@ describe('Ability Personal placement admission', () => {
       } as unknown as RolesService
       const principal: Principal = {
         id: `${scheme}:alice:token`,
+        userId: 'alice',
         username: 'alice',
         admin: false,
         scope: 'write',
@@ -81,6 +82,7 @@ describe('Ability Personal placement admission', () => {
     } as unknown as RolesService
     const principal: Principal = {
       id: 'pat:alice:write',
+      userId: 'alice',
       username: 'alice',
       admin: false,
       scope: 'write',
@@ -121,6 +123,7 @@ describe('Ability Personal placement admission', () => {
     } as unknown as RolesService
     const principal: Principal = {
       id: 'pat:alice:static',
+      userId: 'alice',
       username: 'alice',
       admin: false,
       scope: 'write',
@@ -159,6 +162,7 @@ describe('Ability Personal placement admission', () => {
       const roles = { canAddSkillAt: vi.fn(() => true) } as unknown as RolesService
       const principal: Principal = {
         id: `${scheme}:alice:static`,
+        userId: 'alice',
         username: 'alice',
         admin: false,
         scope: 'write',

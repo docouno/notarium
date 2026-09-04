@@ -111,7 +111,7 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     const deletedBy = detail.deleted
       ? detail.deletedByPrincipal == null
         ? null
-        : await auth.describeAuthor(detail.deletedByPrincipal, req.principal.username)
+        : await auth.describeAuthor(detail.deletedByPrincipal, req.principal.userId)
       : undefined
     return NoteDetailResponseSchema.parse(
       noteDetailToWire(
@@ -474,7 +474,7 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     const revisions = (
       await withAuthors(
         items.map((revision) => revisionToWire(revision, restoreCoordinator != null)),
-        req.principal.username,
+        req.principal.userId,
         auth.describeAuthor,
       )
     ).map(unattributedIfGap)
@@ -500,7 +500,7 @@ export const noteRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
     if (!detail) {
       throw revisionNotFound(revisionId)
     }
-    const author = await auth.describeAuthor(detail.principal, req.principal.username)
+    const author = await auth.describeAuthor(detail.principal, req.principal.userId)
     // Redact a foreign agent's key id (privacy), matching withAuthors.
     return NoteRevisionDetailResponseSchema.parse(
       unattributedIfGap({

@@ -33,7 +33,7 @@ describe('provider resource REST surface', () => {
     const response = await app.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username, password },
+      payload: { identifier: username, password },
     })
     expect(response.statusCode).toBe(200)
     return (response.headers['set-cookie'] as string).split(';')[0]
@@ -403,7 +403,7 @@ describe('provider resource REST surface', () => {
       const loginResponse = await disabled.inject({
         method: 'POST',
         url: '/api/auth/login',
-        payload: { username: 'alice', password: 'alice-password-1' },
+        payload: { identifier: 'alice', password: 'alice-password-1' },
       })
       const cookie = (loginResponse.headers['set-cookie'] as string).split(';')[0]
       const listed = await disabled.inject({

@@ -6,9 +6,16 @@ export type { DiscoveredSpace, SpaceDef, SpaceManagerOptions, SpaceStore } from 
 export {
   ensurePersonalSpace,
   ensurePersonalSpaceFor,
+  followPersonalSpaceRename,
   peekPersonalSpace,
+  personalSlugBase,
+  personalSlugFollows,
   type PersonalSpaceDeps,
+  type PersonalSpaceOwner,
+  type PersonalSpaceRenameDeps,
+  type PersonalSpaceRenameOutcome,
 } from './personalSpace'
+export { renameSpace, type RenameSpaceDeps, type RenameSpaceOutcome } from './renameSpace'
 export {
   ALWAYS_LOAD_TAG,
   listMemoryCategories,

@@ -12,7 +12,10 @@ import { type Principal, SYSTEM_PRINCIPAL } from '../../packages/server/src/serv
 import {
   ensurePersonalSpace,
   ensurePersonalSpaceFor,
+  followPersonalSpaceRename,
   peekPersonalSpace,
+  personalSlugBase,
+  personalSlugFollows,
   SpaceManager,
   type SpaceStore,
 } from '../../packages/server/src/services/spaces'
@@ -56,6 +59,9 @@ const makeManager = (canMint = true) =>
     spaceCreateEnabled: () => canMint,
   })
 
+/** Test accounts key by their handle: the id IS the handle here. */
+const ALICE = { id: 'alice', username: 'alice' }
+
 const makeAuth = async () => {
   const db = new InMemoryAuthPersistence()
   const auth = createAuthService({
@@ -64,7 +70,9 @@ const makeAuth = async () => {
     removeMemberAndProviderAttachments: (space, username) => db.removeMember(space, username),
   })
   await db.createUser({
+    id: 'alice',
     username: 'alice',
+    email: null,
     displayName: 'Alice',
     passwordHash: null,
     admin: false,
@@ -77,6 +85,7 @@ const makeAuth = async () => {
 
 const patPrincipal = (username: string | null): Principal => ({
   id: username ? `pat:${username}:t1` : 'anon',
+  userId: username,
   username,
   admin: false,
   scope: 'write',
@@ -90,14 +99,14 @@ describe('ensurePersonalSpace (#21/#13)', () => {
     const { db, auth } = await makeAuth()
     const spaces = makeManager()
 
-    const slug = await ensurePersonalSpaceFor({ auth, spaces }, 'alice')
+    const slug = await ensurePersonalSpaceFor({ auth, spaces }, ALICE)
     expect(slug).toBe('alice')
     expect(spaces.has('alice')).toBe(true)
     expect(await auth.personalSpaceOf('alice')).toBe('alice')
     expect(await db.grantsFor('alice')).toEqual([{ space: 'alice', role: 'owner' }])
 
     // Second call returns the same slug and does not mint a second space.
-    const again = await ensurePersonalSpaceFor({ auth, spaces }, 'alice')
+    const again = await ensurePersonalSpaceFor({ auth, spaces }, ALICE)
     expect(again).toBe('alice')
     expect(spaces.list().filter((s) => s.slug === 'alice')).toHaveLength(1)
   })
@@ -107,7 +116,7 @@ describe('ensurePersonalSpace (#21/#13)', () => {
     const spaces = makeManager()
     spaces.add({ slug: 'alice', displayName: 'A project named alice' })
 
-    const slug = await ensurePersonalSpaceFor({ auth, spaces }, 'alice')
+    const slug = await ensurePersonalSpaceFor({ auth, spaces }, ALICE)
     expect(slug).toBe('alice-2')
     expect(await auth.personalSpaceOf('alice')).toBe('alice-2')
   })
@@ -120,7 +129,9 @@ describe('ensurePersonalSpace (#21/#13)', () => {
       removeMemberAndProviderAttachments: (space, username) => db.removeMember(space, username),
     })
     await db.createUser({
+      id: 'ann',
       username: 'Ann.O Nymous',
+      email: null,
       displayName: 'Ann',
       passwordHash: null,
       admin: false,
@@ -129,7 +140,10 @@ describe('ensurePersonalSpace (#21/#13)', () => {
       personalSpace: null,
     })
     const spaces = makeManager()
-    const slug = await ensurePersonalSpaceFor({ auth, spaces }, 'Ann.O Nymous')
+    const slug = await ensurePersonalSpaceFor(
+      { auth, spaces },
+      { id: 'ann', username: 'Ann.O Nymous' },
+    )
     expect(slug).toBe('ann-o-nymous')
     expect(spaces.has(slug)).toBe(true)
   })
@@ -161,7 +175,7 @@ describe('ensurePersonalSpace (#21/#13)', () => {
     await expect(ensurePersonalSpace({ auth, spaces: empty }, SYSTEM_PRINCIPAL)).rejects.toThrow(
       /no space available/i,
     )
-    await expect(ensurePersonalSpaceFor({ auth, spaces: empty }, 'alice')).rejects.toThrow(
+    await expect(ensurePersonalSpaceFor({ auth, spaces: empty }, ALICE)).rejects.toThrow(
       /the host has no spaces/i,
     )
     // The read path never throws — it returns null so a GET surface shows an honest empty state.
@@ -172,9 +186,9 @@ describe('ensurePersonalSpace (#21/#13)', () => {
     const { db, auth } = await makeAuth()
     const spaces = makeManager()
     const [a, b, c] = await Promise.all([
-      ensurePersonalSpaceFor({ auth, spaces }, 'alice'),
-      ensurePersonalSpaceFor({ auth, spaces }, 'alice'),
-      ensurePersonalSpaceFor({ auth, spaces }, 'alice'),
+      ensurePersonalSpaceFor({ auth, spaces }, ALICE),
+      ensurePersonalSpaceFor({ auth, spaces }, ALICE),
+      ensurePersonalSpaceFor({ auth, spaces }, ALICE),
     ])
     expect(a).toBe('alice')
     expect(b).toBe('alice')
@@ -195,7 +209,9 @@ describe('ensurePersonalSpace (#21/#13)', () => {
 
     for (const username of ['Bob', 'bob']) {
       await db.createUser({
+        id: username,
         username,
+        email: null,
         displayName: username,
         passwordHash: null,
         admin: false,
@@ -206,8 +222,8 @@ describe('ensurePersonalSpace (#21/#13)', () => {
     }
     const spaces = makeManager()
     const [s1, s2] = await Promise.all([
-      ensurePersonalSpaceFor({ auth, spaces }, 'Bob'),
-      ensurePersonalSpaceFor({ auth, spaces }, 'bob'),
+      ensurePersonalSpaceFor({ auth, spaces }, { id: 'Bob', username: 'Bob' }),
+      ensurePersonalSpaceFor({ auth, spaces }, { id: 'bob', username: 'bob' }),
     ])
     expect(s1).not.toBe(s2) // distinct personal domains
     expect(new Set([s1, s2])).toEqual(new Set(['bob', 'bob-2']))
@@ -228,9 +244,120 @@ describe('ensurePersonalSpace (#21/#13)', () => {
     await auth.setPersonalSpace('alice', 'alice')
     expect(spaces.has('alice')).toBe(false)
 
-    const slug = await ensurePersonalSpaceFor({ auth, spaces }, 'alice')
+    const slug = await ensurePersonalSpaceFor({ auth, spaces }, ALICE)
     expect(slug).toBe('alice') // same slug, not a duplicate
     expect(spaces.has('alice')).toBe(true) // space re-created
     expect(await db.grantsFor('alice')).toEqual([{ space: 'alice', role: 'owner' }]) // ownership re-asserted
+  })
+})
+
+// The slug of a personal space follows its owner's handle only while it is still the
+// derived one — a chosen slug is never overwritten, a taken target is left alone.
+// canon: docs/spaces.md#model
+describe('a personal space follows its owner’s handle by rule', () => {
+  it('derives the base the way the mint does: separators collapse, case is ascii-slugged', () => {
+    expect(personalSlugBase('sergey.padurets')).toBe('sergey-padurets')
+    expect(personalSlugBase('bob..smith')).toBe('bob-smith')
+    expect(personalSlugBase('bob_smith')).toBe('bob_smith')
+  })
+
+  it('recognises the minted slug — the base or the base with the `-<n>` suffix — and nothing else', () => {
+    expect(personalSlugFollows('bob', 'bob')).toBe(true)
+    expect(personalSlugFollows('bob-2', 'bob')).toBe(true)
+    expect(personalSlugFollows('bob-smith', 'bob.smith')).toBe(true)
+    expect(personalSlugFollows('my-notes', 'bob')).toBe(false)
+    expect(personalSlugFollows('bob-notes', 'bob')).toBe(false)
+    expect(personalSlugFollows('bobby', 'bob')).toBe(false)
+  })
+
+  // At the length boundary the mint SHORTENS the base to fit its `-N`, so the rule has
+  // to recognise the truncated form too — otherwise the mint's own output reads as a
+  // slug the owner chose, and the space stays behind on the old handle forever.
+  it('recognises the truncated base the mint produces at the length boundary', () => {
+    const long = 'a'.repeat(32)
+    expect(personalSlugBase(long)).toBe(long)
+    expect(personalSlugFollows(`${'a'.repeat(30)}-2`, long)).toBe(true)
+    expect(personalSlugFollows(`${'a'.repeat(29)}-10`, long)).toBe(true)
+    // Still not a licence to overwrite anything that ends in a number.
+    expect(personalSlugFollows(`${'a'.repeat(20)}-2`, long)).toBe(false)
+    expect(personalSlugFollows('team-notes-2', long)).toBe(false)
+  })
+
+  const user = (username: string, personalSpace: string | null) => ({
+    id: 'u1',
+    username,
+    email: null,
+    displayName: username,
+    passwordHash: null,
+    admin: false,
+    disabledAt: null,
+    createdAt: '2026-01-01T00:00:00Z',
+    personalSpace,
+  })
+
+  const world = (slugs: Record<string, string>) => {
+    const renames: Array<{ id: string; slug: string }> = []
+    const byId = new Map(Object.entries(slugs).map(([slug, id]) => [id, slug]))
+
+    return {
+      renames,
+      deps: {
+        spaces: {
+          slugOf: (id: string) => byId.get(id),
+          resolveId: (slug: string) => slugs[slug] ?? null,
+        },
+        rename: async (input: { id: string; slug: string }) => {
+          renames.push(input)
+          return { code: 'ok' }
+        },
+      },
+    }
+  }
+
+  it('renames the derived slug onto the new handle, and only that', async () => {
+    const w = world({ bob: 'ps' })
+    await expect(
+      followPersonalSpaceRename(w.deps, { user: user('bob.smith', 'ps'), previousUsername: 'bob' }),
+    ).resolves.toBe('renamed')
+    expect(w.renames).toEqual([{ id: 'ps', slug: 'bob-smith' }])
+  })
+
+  it('leaves a chosen slug, a taken target and an account without a personal space alone', async () => {
+    const chosen = world({ 'my-notes': 'ps' })
+    await expect(
+      followPersonalSpaceRename(chosen.deps, {
+        user: user('bob.smith', 'ps'),
+        previousUsername: 'bob',
+      }),
+    ).resolves.toBe('kept')
+    expect(chosen.renames).toEqual([])
+
+    const taken = world({ bob: 'ps', 'bob-smith': 'other' })
+    await expect(
+      followPersonalSpaceRename(taken.deps, {
+        user: user('bob.smith', 'ps'),
+        previousUsername: 'bob',
+      }),
+    ).resolves.toBe('kept')
+    expect(taken.renames).toEqual([])
+
+    const none = world({})
+    await expect(
+      followPersonalSpaceRename(none.deps, {
+        user: user('bob.smith', null),
+        previousUsername: 'bob',
+      }),
+    ).resolves.toBe('none')
+  })
+
+  it('a rename that only changes separators keeps the slug: the base is unchanged', async () => {
+    const w = world({ 'bob-smith': 'ps' })
+    await expect(
+      followPersonalSpaceRename(w.deps, {
+        user: user('bob..smith', 'ps'),
+        previousUsername: 'bob.smith',
+      }),
+    ).resolves.toBe('kept')
+    expect(w.renames).toEqual([])
   })
 })

@@ -17,7 +17,7 @@ export const createMemberships = (ctx: AuthCtx) => ({
       throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'no such user', 'no_such_user')
     }
     const members = await ctx.db.membersOf(space)
-    const current = members.find((m) => m.username === username)
+    const current = members.find((m) => m.userId === user.id)
 
     if (current?.role === SPACE_ROLE.owner && role !== SPACE_ROLE.owner) {
       const owners = members.filter((m) => m.role === SPACE_ROLE.owner)
@@ -26,10 +26,10 @@ export const createMemberships = (ctx: AuthCtx) => ({
         throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'a space needs an owner', 'last_owner')
       }
     }
-    await ctx.db.upsertMember(space, username, role, ctx.nowIso())
+    await ctx.db.upsertMember(space, user.id, role, ctx.nowIso())
     // Match by user, not space: the subject's open stream may be on any space, so
     // nudge all of theirs (they also get the members-list signal below — harmless).
-    ctx.notifySse((h) => h.username === username)
+    ctx.notifySse((h) => h.userId === user.id)
     ctx.notifyMembersOf(space)
     return ctx.db.membersOf(space)
   },
@@ -47,24 +47,24 @@ export const createMemberships = (ctx: AuthCtx) => ({
     ) {
       throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'a space needs an owner', 'last_owner')
     }
-    await ctx.removeMemberAndProviderAttachments(space, username)
+    await ctx.removeMemberAndProviderAttachments(space, current.userId)
     const revokedSocket = (h: SseHandle) =>
-      h.username === username && (h.space === space || h.spaces?.has(space) === true)
+      h.userId === current.userId && (h.space === space || h.spaces?.has(space) === true)
 
     // Put the grant-refresh nudge on every affected socket before closing it. The
     // remaining active-space stream may be valid, but its supplemental authority is not.
     ctx.notifySse(revokedSocket)
     ctx.dropSse(revokedSocket)
     ctx.notifySse(
-      (h) => h.username === username && h.space !== space && h.spaces?.has(space) !== true,
+      (h) => h.userId === current.userId && h.space !== space && h.spaces?.has(space) !== true,
     )
     ctx.notifyMembersOf(space)
     return ctx.db.membersOf(space)
   },
 
   /** Mint the owner row for a runtime-created space. */
-  grantOwner: async (space: string, username: string): Promise<void> => {
-    await ctx.db.upsertMember(space, username, SPACE_ROLE.owner, ctx.nowIso())
+  grantOwner: async (space: string, userId: string): Promise<void> => {
+    await ctx.db.upsertMember(space, userId, SPACE_ROLE.owner, ctx.nowIso())
   },
 
   /** Boot heal: spaces with no members get owner rows for every active admin.
@@ -83,7 +83,7 @@ export const createMemberships = (ctx: AuthCtx) => ({
     }
     const users = await ctx.db.listUsers()
     const personalOwner = new Map(
-      users.filter((u) => u.personalSpace).map((u) => [u.personalSpace as string, u.username]),
+      users.filter((u) => u.personalSpace).map((u) => [u.personalSpace as string, u.id]),
     )
     const admins = users.filter((u) => u.admin && u.disabledAt == null)
     const t = ctx.nowIso()
@@ -96,7 +96,7 @@ export const createMemberships = (ctx: AuthCtx) => ({
         continue
       }
       for (const a of admins) {
-        await ctx.db.upsertMember(slug, a.username, SPACE_ROLE.owner, t)
+        await ctx.db.upsertMember(slug, a.id, SPACE_ROLE.owner, t)
       }
     }
   },

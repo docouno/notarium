@@ -89,7 +89,10 @@ const RETRIEVAL_EVENT = {
   topScore: null,
   hits: [],
   agent: 'CLI',
-  principal: 'pat:CLI:seed',
+  // A hand-built wire frame, so its owner is deliberately nobody — but it keeps the
+  // real SHAPE: the middle segment is an opaque 16-hex account id, never the agent's
+  // brand. The brand lives in `agent` above, which is what this row renders.
+  principal: 'pat:0000000000000000:cli',
   sessionId: null,
   sessionName: null,
   sessionAttach: null,

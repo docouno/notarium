@@ -84,13 +84,19 @@ export const providersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) =>
         after,
         limit: PROVIDER_INVENTORY_FETCH_LIMIT,
       })
-      const items = selected.entries.map((entry) => ({
-        resource: providerRegistry.resourceListItemToWire(entry.record, {
-          owner,
-          admin: req.principal.admin,
-        }),
-        unusableBecause: entry.unusableBecause,
-      }))
+      const ownerNames = await providerRegistry.ownerNamesFor(
+        selected.entries.map((entry) => entry.record.owner),
+      )
+      const items = await Promise.all(
+        selected.entries.map(async (entry) => ({
+          resource: await providerRegistry.resourceListItemToWire(
+            entry.record,
+            { owner, admin: req.principal.admin },
+            ownerNames,
+          ),
+          unusableBecause: entry.unusableBecause,
+        })),
+      )
       const page = providerInventoryPage(items, selected.total, ({ resource }) => [
         resource.name,
         resource.id,
@@ -116,15 +122,17 @@ export const providersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) =>
         resourceId: id,
       })
 
-      return entry
-        ? ProviderEffectiveEntrySchema.parse({
-            resource: providerRegistry.resourceListItemToWire(entry.record, {
-              owner,
-              admin: req.principal.admin,
-            }),
-            unusableBecause: entry.unusableBecause,
-          })
-        : notFound(reply)
+      if (!entry) {
+        return notFound(reply)
+      }
+
+      return ProviderEffectiveEntrySchema.parse({
+        resource: await providerRegistry.resourceListItemToWire(entry.record, {
+          owner,
+          admin: req.principal.admin,
+        }),
+        unusableBecause: entry.unusableBecause,
+      })
     },
   )
 
@@ -206,7 +214,7 @@ export const providersRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) =>
       }
 
       return ProviderResourceResponseSchema.parse({
-        resource: providerRegistry.resourceToWire(resource, {
+        resource: await providerRegistry.resourceToWire(resource, {
           owner,
           admin: req.principal.admin,
         }),

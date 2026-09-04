@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import {
+  abilityDraftOwner,
   type AbilityDraftRecord,
   clearAbilityDrafts,
   readAbilityDraft,
@@ -143,5 +144,23 @@ describe('ability draft session storage', () => {
     clearAbilityDrafts('alice')
     expect(readAbilityDraft('alice', 'draft-b', 'role')).toBeNull()
     expect(readAbilityDraft('bob', 'draft-a', 'role')).not.toBeNull()
+  })
+
+  // The writer and the cleaner must name the same namespace. They drifted apart once —
+  // one moved to the stable id while the other kept the handle — and the drift was
+  // silent: a rename lost the draft, and the cleaner scanned a prefix nobody wrote to.
+  it('names the namespace by the stable account id, so a rename neither loses nor leaks a draft', () => {
+    expect(abilityDraftOwner('password', 'a1b2c3d4e5f60718')).toBe('a1b2c3d4e5f60718')
+    expect(abilityDraftOwner('none', 'a1b2c3d4e5f60718')).toBe('@system')
+    expect(abilityDraftOwner('password', null)).toBeNull()
+    expect(abilityDraftOwner(undefined, undefined)).toBeNull()
+
+    const owner = abilityDraftOwner('password', 'a1b2c3d4e5f60718') as string
+    writeAbilityDraft(record(owner, 'draft-a'))
+    // The handle the account happens to wear today addresses nothing.
+    expect(readAbilityDraft('alice', 'draft-a', 'role')).toBeNull()
+    expect(readAbilityDraft(owner, 'draft-a', 'role')).not.toBeNull()
+    clearAbilityDrafts(owner)
+    expect(readAbilityDraft(owner, 'draft-a', 'role')).toBeNull()
   })
 })

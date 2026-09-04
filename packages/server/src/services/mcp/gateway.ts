@@ -187,7 +187,7 @@ export type Ctx = {
   roles?: RolesService
   abilities?: AbilitiesService
   providerRegistry?: Pick<ProviderRegistry, 'hasUsableForPrincipal'>
-  /** Stable session owner: username in password mode, reserved `@system` in none mode. */
+  /** Stable session owner: the user id in password mode, reserved `@system` in none mode. */
   sessionOwner: string | null
   /** Transport-neutral identity of the admitted agent operation. */
   agentCallId?: string

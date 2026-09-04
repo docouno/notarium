@@ -74,6 +74,7 @@ const documentState = (role: (typeof DOCUMENT_ROLE)[keyof typeof DOCUMENT_ROLE])
 
 const principal = (scope: 'read' | 'write'): Principal => ({
   id: `pat:alice:${scope}`,
+  userId: 'alice',
   username: 'alice',
   admin: false,
   scope,

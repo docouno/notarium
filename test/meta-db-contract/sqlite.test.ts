@@ -12,6 +12,7 @@ import { describeAbilityCreateContract } from './abilityCreateContract'
 import { describeAbilityPlacementContract } from './abilityPlacementContract'
 import { describeAbilityPlacementCostContract } from './abilityPlacementCostContract'
 import { describeAbilityPreferencesContract } from './abilityPreferencesContract'
+import { describeAccountContract } from './accountContract'
 import { describeAgentCallsContract } from './agentCallsContract'
 import { describeAgentDeltaCursorsContract } from './agentDeltaCursorsContract'
 import { describeAgentSessionsContract } from './agentSessionsContract'
@@ -35,6 +36,11 @@ import { describeSpaceLifecycleWriterContract } from './spaceLifecycleWriterCont
 describeGatewayStateContract('SQLite', async () => {
   const db = new SqliteMetaDb(':memory:')
   return { persistence: db.gateway, teardown: () => db.close() }
+})
+
+describeAccountContract('SQLite', async () => {
+  const db = new SqliteMetaDb(':memory:')
+  return { auth: db.auth, teardown: () => db.close() }
 })
 
 describeSecretKeyringContract('SQLite', async () => {

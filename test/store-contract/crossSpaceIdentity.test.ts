@@ -290,6 +290,7 @@ describe('cross-space note-id collision (#327)', () => {
     const access = createStoreAccess(spaces)
     const principal: Principal = {
       id: 'user:alpha',
+      userId: 'alpha',
       username: 'alpha',
       admin: false,
       scope: 'read',
@@ -1152,6 +1153,7 @@ describe('cross-space note-id collision (#327)', () => {
     const access = createStoreAccess(spaces)
     const member = (home: string): Principal => ({
       id: `user:${home}`,
+      userId: home,
       username: home,
       admin: false,
       scope: 'read',

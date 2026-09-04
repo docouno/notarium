@@ -1,6 +1,15 @@
 import { patOfRow, type PatRow, userOfRow, type UserRow } from '../../rows'
-import type { AuthPersistence, SpaceRole, UserRecord } from '../../types'
+import type { AuthPersistence, SpaceRole, UserRecord, UserWriteResult } from '../../types'
 import type { SqliteDriverCtx } from './context'
+
+const USER_COLUMNS =
+  'id, username, email, display_name, password_hash, admin, disabled_at, created_at, personal_space'
+
+/** The UNIQUE on `username` / `email` IS the arbiter: name the attribute that collided. */
+const userConflictOf = (err: unknown): UserWriteResult | null => {
+  const match = /UNIQUE constraint failed: users\.(username|email)/.exec(String(err))
+  return match ? { status: 'conflict', field: match[1] as 'username' | 'email' } : null
+}
 
 export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
   userCount: async () => {
@@ -14,11 +23,13 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
     // atomic — concurrent setups can't both observe zero users.
     const res = ctx.required
       .prepare(
-        `INSERT INTO users (username, display_name, password_hash, admin, disabled_at, created_at, personal_space)
-           SELECT ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM users)`,
+        `INSERT INTO users (${USER_COLUMNS})
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM users)`,
       )
       .run(
+        u.id,
         u.username,
+        u.email,
         u.displayName,
         u.passwordHash,
         u.admin ? 1 : 0,
@@ -30,20 +41,30 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
   },
   createUser: async (u: UserRecord) => {
     await ctx.ensureInit()
-    ctx.required
-      .prepare(
-        `INSERT INTO users (username, display_name, password_hash, admin, disabled_at, created_at, personal_space)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        u.username,
-        u.displayName,
-        u.passwordHash,
-        u.admin ? 1 : 0,
-        u.disabledAt,
-        u.createdAt,
-        u.personalSpace,
-      )
+    try {
+      ctx.required
+        .prepare(`INSERT INTO users (${USER_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(
+          u.id,
+          u.username,
+          u.email,
+          u.displayName,
+          u.passwordHash,
+          u.admin ? 1 : 0,
+          u.disabledAt,
+          u.createdAt,
+          u.personalSpace,
+        )
+    } catch (err) {
+      const conflict = userConflictOf(err)
+
+      if (conflict) {
+        return conflict
+      }
+      throw err
+    }
+
+    return { status: 'written' }
   },
   getUser: async (username: string) => {
     await ctx.ensureInit()
@@ -51,16 +72,29 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
       UserRow | undefined
     return r ? userOfRow(r) : null
   },
-  getUsers: async (usernames) => {
-    if (usernames.length === 0) {
+  getUserByLogin: async (login: { username: string; email: string }) => {
+    await ctx.ensureInit()
+    const r = ctx.required
+      .prepare(
+        'SELECT * FROM users WHERE username = ? OR email = ? ORDER BY CASE WHEN username = ? THEN 0 ELSE 1 END LIMIT 1',
+      )
+      .get(login.username, login.email, login.username) as UserRow | undefined
+    return r ? userOfRow(r) : null
+  },
+  getUserById: async (id: string) => {
+    await ctx.ensureInit()
+    const r = ctx.required.prepare('SELECT * FROM users WHERE id = ?').get(id) as
+      UserRow | undefined
+    return r ? userOfRow(r) : null
+  },
+  getUsersByIds: async (ids) => {
+    if (ids.length === 0) {
       return []
     }
     await ctx.ensureInit()
     const rows = ctx.required
-      .prepare(
-        'SELECT * FROM users WHERE username IN (SELECT value FROM json_each(?)) ORDER BY username',
-      )
-      .all(JSON.stringify([...new Set(usernames)])) as UserRow[]
+      .prepare('SELECT * FROM users WHERE id IN (SELECT value FROM json_each(?)) ORDER BY username')
+      .all(JSON.stringify([...new Set(ids)])) as UserRow[]
     return rows.map(userOfRow)
   },
   listUsers: async () => {
@@ -70,7 +104,7 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
       .all() as UserRow[]
     return rows.map(userOfRow)
   },
-  updateUser: async (username, patch) => {
+  updateUser: async (id, patch) => {
     await ctx.ensureInit()
     const sets: string[] = []
     const args: Array<string | number | null> = []
@@ -98,26 +132,53 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
     if (!sets.length) {
       return
     }
-    ctx.required
-      .prepare(`UPDATE users SET ${sets.join(', ')} WHERE username = ?`)
-      .run(...args, username)
+    ctx.required.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).run(...args, id)
+  },
+  updateUserIdentity: async (id, patch) => {
+    await ctx.ensureInit()
+    const sets: string[] = []
+    const args: Array<string | null> = []
+
+    if (patch.username !== undefined) {
+      sets.push('username = ?')
+      args.push(patch.username)
+    }
+    if (patch.email !== undefined) {
+      sets.push('email = ?')
+      args.push(patch.email)
+    }
+    if (!sets.length) {
+      return { status: 'written' }
+    }
+    try {
+      ctx.required.prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).run(...args, id)
+    } catch (err) {
+      const conflict = userConflictOf(err)
+
+      if (conflict) {
+        return conflict
+      }
+      throw err
+    }
+
+    return { status: 'written' }
   },
 
   insertSession: async (s) => {
     await ctx.ensureInit()
     ctx.required
       .prepare(
-        `INSERT INTO sessions (id_hash, username, created_at, last_used_at, expires_at)
+        `INSERT INTO sessions (id_hash, user_id, created_at, last_used_at, expires_at)
            VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(s.idHash, s.username, s.createdAt, s.lastUsedAt, s.expiresAt)
+      .run(s.idHash, s.userId, s.createdAt, s.lastUsedAt, s.expiresAt)
   },
   getSession: async (idHash) => {
     await ctx.ensureInit()
     const r = ctx.required.prepare('SELECT * FROM sessions WHERE id_hash = ?').get(idHash) as
       | {
           id_hash: string
-          username: string
+          user_id: string
           created_at: string
           last_used_at: string | null
           expires_at: string
@@ -130,7 +191,7 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
 
     return {
       idHash: r.id_hash,
-      username: r.username,
+      userId: r.user_id,
       createdAt: r.created_at,
       lastUsedAt: r.last_used_at,
       expiresAt: r.expires_at,
@@ -146,21 +207,21 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
     await ctx.ensureInit()
     ctx.required.prepare('DELETE FROM sessions WHERE id_hash = ?').run(idHash)
   },
-  deleteSessionsFor: async (username) => {
+  deleteSessionsFor: async (userId) => {
     await ctx.ensureInit()
-    ctx.required.prepare('DELETE FROM sessions WHERE username = ?').run(username)
+    ctx.required.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId)
   },
 
   insertPat: async (p) => {
     await ctx.ensureInit()
     ctx.required
       .prepare(
-        `INSERT INTO pats (id, username, name, secret_hash, scope, spaces, expires_at, last_used_at, revoked_at, created_at)
+        `INSERT INTO pats (id, user_id, name, secret_hash, scope, spaces, expires_at, last_used_at, revoked_at, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         p.id,
-        p.username,
+        p.userId,
         p.name,
         p.secretHash,
         p.scope,
@@ -176,11 +237,11 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
     const r = ctx.required.prepare('SELECT * FROM pats WHERE id = ?').get(id) as PatRow | undefined
     return r ? patOfRow(r) : null
   },
-  listPats: async (username) => {
+  listPats: async (userId) => {
     await ctx.ensureInit()
     const rows = ctx.required
-      .prepare('SELECT * FROM pats WHERE username = ? ORDER BY created_at, id')
-      .all(username) as PatRow[]
+      .prepare('SELECT * FROM pats WHERE user_id = ? ORDER BY created_at, id')
+      .all(userId) as PatRow[]
     return rows.map(patOfRow)
   },
   updatePat: async (id, patch) => {
@@ -214,56 +275,66 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
     ctx.required.prepare(`UPDATE pats SET ${sets.join(', ')} WHERE id = ?`).run(...args, id)
   },
 
-  grantsFor: async (username) => {
+  grantsFor: async (userId) => {
     await ctx.ensureInit()
     const rows = ctx.required
-      .prepare('SELECT space, role FROM space_members WHERE username = ? ORDER BY space')
-      .all(username) as Array<{ space: string; role: SpaceRole }>
+      .prepare('SELECT space, role FROM space_members WHERE user_id = ? ORDER BY space')
+      .all(userId) as Array<{ space: string; role: SpaceRole }>
     return rows.map((r) => ({ space: r.space, role: r.role }))
   },
-  grantsForUsers: async (usernames) => {
-    if (usernames.length === 0) {
+  grantsForUsers: async (userIds) => {
+    if (userIds.length === 0) {
       return []
     }
     await ctx.ensureInit()
     const rows = ctx.required
       .prepare(
-        `SELECT username, space, role FROM space_members
-          WHERE username IN (SELECT value FROM json_each(?))
-          ORDER BY username, space`,
+        `SELECT user_id, space, role FROM space_members
+          WHERE user_id IN (SELECT value FROM json_each(?))
+          ORDER BY user_id, space`,
       )
-      .all(JSON.stringify([...new Set(usernames)])) as Array<{
-      username: string
+      .all(JSON.stringify([...new Set(userIds)])) as Array<{
+      user_id: string
       space: string
       role: SpaceRole
     }>
-    return rows.map((row) => ({ ...row }))
+    return rows.map((row) => ({ userId: row.user_id, space: row.space, role: row.role }))
   },
   membersOf: async (space) => {
     await ctx.ensureInit()
     const rows = ctx.required
       .prepare(
-        `SELECT m.username, m.role, u.display_name FROM space_members m
-           JOIN users u ON u.username = m.username
-           WHERE m.space = ? ORDER BY m.created_at, m.username`,
+        `SELECT m.user_id, m.role, u.username, u.display_name FROM space_members m
+           JOIN users u ON u.id = m.user_id
+           WHERE m.space = ? ORDER BY m.created_at, u.username`,
       )
-      .all(space) as Array<{ username: string; role: SpaceRole; display_name: string }>
-    return rows.map((r) => ({ username: r.username, displayName: r.display_name, role: r.role }))
+      .all(space) as Array<{
+      user_id: string
+      role: SpaceRole
+      username: string
+      display_name: string
+    }>
+    return rows.map((r) => ({
+      userId: r.user_id,
+      username: r.username,
+      displayName: r.display_name,
+      role: r.role,
+    }))
   },
-  upsertMember: async (space, username, role, createdAt) => {
+  upsertMember: async (space, userId, role, createdAt) => {
     await ctx.ensureInit()
     ctx.required
       .prepare(
-        `INSERT INTO space_members (space, username, role, created_at) VALUES (?, ?, ?, ?)
-           ON CONFLICT(space, username) DO UPDATE SET role = excluded.role`,
+        `INSERT INTO space_members (space, user_id, role, created_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT(space, user_id) DO UPDATE SET role = excluded.role`,
       )
-      .run(space, username, role, createdAt)
+      .run(space, userId, role, createdAt)
   },
-  removeMember: async (space, username) => {
+  removeMember: async (space, userId) => {
     await ctx.ensureInit()
     ctx.required
-      .prepare('DELETE FROM space_members WHERE space = ? AND username = ?')
-      .run(space, username)
+      .prepare('DELETE FROM space_members WHERE space = ? AND user_id = ?')
+      .run(space, userId)
   },
   spacesWithMembers: async () => {
     await ctx.ensureInit()
@@ -277,10 +348,10 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
     await ctx.ensureInit()
     ctx.required
       .prepare(
-        `INSERT INTO one_time_tokens (id_hash, username, purpose, expires_at, used_at, created_at)
+        `INSERT INTO one_time_tokens (id_hash, user_id, purpose, expires_at, used_at, created_at)
            VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(t.idHash, t.username, t.purpose, t.expiresAt, t.usedAt, t.createdAt)
+      .run(t.idHash, t.userId, t.purpose, t.expiresAt, t.usedAt, t.createdAt)
   },
   getOneTime: async (idHash) => {
     await ctx.ensureInit()
@@ -289,7 +360,7 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
       .get(idHash) as
       | {
           id_hash: string
-          username: string
+          user_id: string
           purpose: 'invite' | 'reset'
           expires_at: string
           used_at: string | null
@@ -303,7 +374,7 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
 
     return {
       idHash: r.id_hash,
-      username: r.username,
+      userId: r.user_id,
       purpose: r.purpose,
       expiresAt: r.expires_at,
       usedAt: r.used_at,
@@ -317,8 +388,8 @@ export const createAuthFacet = (ctx: SqliteDriverCtx): AuthPersistence => ({
       .run(usedAt, idHash)
     return res.changes > 0
   },
-  deleteOneTimesFor: async (username) => {
+  deleteOneTimesFor: async (userId) => {
     await ctx.ensureInit()
-    ctx.required.prepare('DELETE FROM one_time_tokens WHERE username = ?').run(username)
+    ctx.required.prepare('DELETE FROM one_time_tokens WHERE user_id = ?').run(userId)
   },
 })

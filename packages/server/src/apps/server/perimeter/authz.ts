@@ -119,6 +119,7 @@ export const installAuthz = (
  *  no grants → can() denies everything. */
 const ANONYMOUS: Principal = {
   id: 'anonymous',
+  userId: null,
   username: null,
   admin: false,
   scope: 'read',

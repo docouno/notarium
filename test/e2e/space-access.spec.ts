@@ -168,7 +168,7 @@ test('a newly granted space appears in the switcher live, no reload (#111 grant-
   // A separate admin session grants bob `work`. The server nudges bob's live SSE
   // stream with a named `access` event → the client refetches its grants.
   await request.post(`${baseURL}/api/auth/login`, {
-    data: { username: 'root', password: 'root-password-1' },
+    data: { identifier: 'root', password: 'root-password-1' },
   })
   const granted = await request.put(`${baseURL}/api/s/work/members/bob`, {
     data: { role: 'writer' },
@@ -195,7 +195,7 @@ test('the members list badge tracks a live role change, no reload (#111 grant-si
   // bob's session; the open list must re-fetch so its badge doesn't lag the chrome
   // (the chrome already reacts via canWrite — the list used to read once on open).
   await request.post(`${baseURL}/api/auth/login`, {
-    data: { username: 'root', password: 'root-password-1' },
+    data: { identifier: 'root', password: 'root-password-1' },
   })
   const demoted = await request.put(`${baseURL}/api/s/main/members/bob`, {
     data: { role: 'reader' },
@@ -225,7 +225,7 @@ test('Save action preserves a dirty draft after a live read-only downgrade', asy
   })
 
   await request.post(`${baseURL}/api/auth/login`, {
-    data: { username: 'root', password: 'root-password-1' },
+    data: { identifier: 'root', password: 'root-password-1' },
   })
   const demoted = await request.put(`${baseURL}/api/s/main/members/bob`, {
     data: { role: 'reader' },
@@ -257,7 +257,7 @@ test('the members list reflects another member removed live, no reload (#121-fol
 
   // A separate admin session removes ron — bob's grants are untouched.
   await request.post(`${baseURL}/api/auth/login`, {
-    data: { username: 'root', password: 'root-password-1' },
+    data: { identifier: 'root', password: 'root-password-1' },
   })
   const removed = await request.delete(`${baseURL}/api/s/main/members/ron`)
   expect(removed.ok()).toBeTruthy()
@@ -280,7 +280,7 @@ test("the members list reflects another member's role change live (#121-follow-u
   // A separate admin promotes ron reader→writer — bob (a bystander) sees the badge
   // flip via the `members` broadcast, not his own `access` nudge.
   await request.post(`${baseURL}/api/auth/login`, {
-    data: { username: 'root', password: 'root-password-1' },
+    data: { identifier: 'root', password: 'root-password-1' },
   })
   const promoted = await request.put(`${baseURL}/api/s/main/members/ron`, {
     data: { role: 'writer' },
@@ -305,7 +305,7 @@ test('the members list reflects a newly added member live (#121-follow-up)', asy
 
   // A separate admin adds eve to `main` — she appears in bob's open list live.
   await request.post(`${baseURL}/api/auth/login`, {
-    data: { username: 'root', password: 'root-password-1' },
+    data: { identifier: 'root', password: 'root-password-1' },
   })
   const added = await request.put(`${baseURL}/api/s/main/members/eve`, { data: { role: 'reader' } })
   expect(added.ok()).toBeTruthy()

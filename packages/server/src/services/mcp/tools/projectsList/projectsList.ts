@@ -21,8 +21,13 @@ export const handleWhoami: Handler = async (ctx) => {
   const caps = Object.entries(capabilities)
     .filter(([, on]) => on)
     .map(([k]) => k)
+  // The principal id is opaque (it carries the stable user id, not the handle); the
+  // handle rides beside it so the model can still name the person it works for.
+  const who = ctx.principal.username
+    ? `\`${ctx.principal.id}\` (${sanitizeText(ctx.principal.username)})`
+    : `\`${ctx.principal.id}\``
   const lines = [
-    `You are \`${ctx.principal.id}\` with **${scope}** access.`,
+    `You are ${who} with **${scope}** access.`,
     caps.length ? `Engine capabilities: ${caps.join(', ')}.` : 'Engine capabilities: none.',
     `Model available: ${hasModel ? 'yes' : 'no'}.`,
     '',

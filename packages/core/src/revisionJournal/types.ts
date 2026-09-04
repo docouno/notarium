@@ -13,8 +13,9 @@ import type { DocumentState, LogicalNoteState } from '../libs/markdown'
 export type JournalRecordInput = {
   noteId: string
   kind: Exclude<RevisionKind, 'merge'>
-  /** Server-built attribution id: 'user:<name>' | 'pat:<name>:<id>' (gateway)
-   *  | 'ui' (AUTH_MODE=none) | null (external states have nobody to name). */
+  /** Server-built attribution id: 'user:<userId>' | 'pat:<userId>:<patId>'
+   *  | 'oauth:<userId>:<tokenId>' (gateway) | 'ui' (AUTH_MODE=none)
+   *  | null (external states have nobody to name). */
   principal: string | null
   /** Agent owner + optional session snapshot. External/human states omit it. */
   agent?: AgentWriteAttribution

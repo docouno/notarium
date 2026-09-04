@@ -1,8 +1,37 @@
 import { patOfRow, type PatRow, userOfRow, type UserRow } from '../../rows'
-import type { AuthPersistence, SpaceRole, UserRecord } from '../../types'
+import type { AuthPersistence, SpaceRole, UserRecord, UserWriteResult } from '../../types'
 import type { PgDriverCtx } from './context'
 
 const SETUP_LOCK_KEY = 0x6e74_5365 // 'ntSe'
+
+/** Postgres reports the collision as a unique violation on the named constraint —
+ *  the ANSWER, not a fault: the handle or the address is already somebody's. */
+const UNIQUE_VIOLATION = '23505'
+const USER_UNIQUE_FIELD: Record<string, 'username' | 'email'> = {
+  users_username_key: 'username',
+  users_email_key: 'email',
+}
+
+const userConflictOf = (err: unknown): UserWriteResult | null => {
+  const { code, constraint } = (err ?? {}) as { code?: string; constraint?: string }
+  const field = code === UNIQUE_VIOLATION && constraint ? USER_UNIQUE_FIELD[constraint] : undefined
+  return field ? { status: 'conflict', field } : null
+}
+
+const USER_COLUMNS =
+  'id, username, email, display_name, password_hash, admin, disabled_at, created_at, personal_space'
+
+const userArgs = (u: UserRecord) => [
+  u.id,
+  u.username,
+  u.email,
+  u.displayName,
+  u.passwordHash,
+  u.admin,
+  u.disabledAt,
+  u.createdAt,
+  u.personalSpace,
+]
 
 export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
   userCount: async () => {
@@ -21,17 +50,9 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
       // eslint-disable-next-line no-restricted-syntax -- outside the note-identity hierarchy: first-run setup, no tier below it
       await client.query('SELECT pg_advisory_xact_lock($1)', [SETUP_LOCK_KEY])
       const res = await client.query(
-        `INSERT INTO users (username, display_name, password_hash, admin, disabled_at, created_at, personal_space)
-           SELECT $1, $2, $3, $4, $5, $6, $7 WHERE NOT EXISTS (SELECT 1 FROM users)`,
-        [
-          u.username,
-          u.displayName,
-          u.passwordHash,
-          u.admin,
-          u.disabledAt,
-          u.createdAt,
-          u.personalSpace,
-        ],
+        `INSERT INTO users (${USER_COLUMNS})
+           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 WHERE NOT EXISTS (SELECT 1 FROM users)`,
+        userArgs(u),
       )
       await client.query('COMMIT')
       return (res.rowCount ?? 0) > 0
@@ -44,33 +65,48 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
   },
   createUser: async (u: UserRecord) => {
     await ctx.ensureInit()
-    await ctx.required.query(
-      `INSERT INTO users (username, display_name, password_hash, admin, disabled_at, created_at, personal_space)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [
-        u.username,
-        u.displayName,
-        u.passwordHash,
-        u.admin,
-        u.disabledAt,
-        u.createdAt,
-        u.personalSpace,
-      ],
-    )
+    try {
+      await ctx.required.query(
+        `INSERT INTO users (${USER_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        userArgs(u),
+      )
+    } catch (err) {
+      const conflict = userConflictOf(err)
+
+      if (conflict) {
+        return conflict
+      }
+      throw err
+    }
+
+    return { status: 'written' }
   },
   getUser: async (username: string) => {
     await ctx.ensureInit()
     const res = await ctx.required.query('SELECT * FROM users WHERE username = $1', [username])
     return res.rows[0] ? userOfRow(res.rows[0] as UserRow) : null
   },
-  getUsers: async (usernames) => {
-    if (usernames.length === 0) {
+  getUserByLogin: async (login: { username: string; email: string }) => {
+    await ctx.ensureInit()
+    const res = await ctx.required.query(
+      'SELECT * FROM users WHERE username = $1 OR email = $2 ORDER BY CASE WHEN username = $1 THEN 0 ELSE 1 END LIMIT 1',
+      [login.username, login.email],
+    )
+    return res.rows[0] ? userOfRow(res.rows[0] as UserRow) : null
+  },
+  getUserById: async (id: string) => {
+    await ctx.ensureInit()
+    const res = await ctx.required.query('SELECT * FROM users WHERE id = $1', [id])
+    return res.rows[0] ? userOfRow(res.rows[0] as UserRow) : null
+  },
+  getUsersByIds: async (ids) => {
+    if (ids.length === 0) {
       return []
     }
     await ctx.ensureInit()
     const result = await ctx.required.query(
-      'SELECT * FROM users WHERE username = ANY($1::text[]) ORDER BY username',
-      [[...new Set(usernames)]],
+      'SELECT * FROM users WHERE id = ANY($1::text[]) ORDER BY username',
+      [[...new Set(ids)]],
     )
     return (result.rows as UserRow[]).map(userOfRow)
   },
@@ -79,7 +115,7 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
     const res = await ctx.required.query('SELECT * FROM users ORDER BY created_at, username')
     return (res.rows as UserRow[]).map(userOfRow)
   },
-  updateUser: async (username, patch) => {
+  updateUser: async (id, patch) => {
     await ctx.ensureInit()
     const sets: string[] = []
     const args: Array<string | boolean | null> = []
@@ -107,19 +143,49 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
     if (!sets.length) {
       return
     }
-    args.push(username)
-    await ctx.required.query(
-      `UPDATE users SET ${sets.join(', ')} WHERE username = $${args.length}`,
-      args,
-    )
+    args.push(id)
+    await ctx.required.query(`UPDATE users SET ${sets.join(', ')} WHERE id = $${args.length}`, args)
+  },
+  updateUserIdentity: async (id, patch) => {
+    await ctx.ensureInit()
+    const sets: string[] = []
+    const args: Array<string | null> = []
+
+    if (patch.username !== undefined) {
+      args.push(patch.username)
+      sets.push(`username = $${args.length}`)
+    }
+    if (patch.email !== undefined) {
+      args.push(patch.email)
+      sets.push(`email = $${args.length}`)
+    }
+    if (!sets.length) {
+      return { status: 'written' }
+    }
+    args.push(id)
+    try {
+      await ctx.required.query(
+        `UPDATE users SET ${sets.join(', ')} WHERE id = $${args.length}`,
+        args,
+      )
+    } catch (err) {
+      const conflict = userConflictOf(err)
+
+      if (conflict) {
+        return conflict
+      }
+      throw err
+    }
+
+    return { status: 'written' }
   },
 
   insertSession: async (s) => {
     await ctx.ensureInit()
     await ctx.required.query(
-      `INSERT INTO sessions (id_hash, username, created_at, last_used_at, expires_at)
+      `INSERT INTO sessions (id_hash, user_id, created_at, last_used_at, expires_at)
          VALUES ($1, $2, $3, $4, $5)`,
-      [s.idHash, s.username, s.createdAt, s.lastUsedAt, s.expiresAt],
+      [s.idHash, s.userId, s.createdAt, s.lastUsedAt, s.expiresAt],
     )
   },
   getSession: async (idHash) => {
@@ -128,7 +194,7 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
     const r = res.rows[0] as
       | {
           id_hash: string
-          username: string
+          user_id: string
           created_at: string
           last_used_at: string | null
           expires_at: string
@@ -141,7 +207,7 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
 
     return {
       idHash: r.id_hash,
-      username: r.username,
+      userId: r.user_id,
       createdAt: r.created_at,
       lastUsedAt: r.last_used_at,
       expiresAt: r.expires_at,
@@ -158,19 +224,19 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
     await ctx.ensureInit()
     await ctx.required.query('DELETE FROM sessions WHERE id_hash = $1', [idHash])
   },
-  deleteSessionsFor: async (username) => {
+  deleteSessionsFor: async (userId) => {
     await ctx.ensureInit()
-    await ctx.required.query('DELETE FROM sessions WHERE username = $1', [username])
+    await ctx.required.query('DELETE FROM sessions WHERE user_id = $1', [userId])
   },
 
   insertPat: async (p) => {
     await ctx.ensureInit()
     await ctx.required.query(
-      `INSERT INTO pats (id, username, name, secret_hash, scope, spaces, expires_at, last_used_at, revoked_at, created_at)
+      `INSERT INTO pats (id, user_id, name, secret_hash, scope, spaces, expires_at, last_used_at, revoked_at, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
         p.id,
-        p.username,
+        p.userId,
         p.name,
         p.secretHash,
         p.scope,
@@ -187,11 +253,11 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
     const res = await ctx.required.query('SELECT * FROM pats WHERE id = $1', [id])
     return res.rows[0] ? patOfRow(res.rows[0] as PatRow) : null
   },
-  listPats: async (username) => {
+  listPats: async (userId) => {
     await ctx.ensureInit()
     const res = await ctx.required.query(
-      'SELECT * FROM pats WHERE username = $1 ORDER BY created_at, id',
-      [username],
+      'SELECT * FROM pats WHERE user_id = $1 ORDER BY created_at, id',
+      [userId],
     )
     return (res.rows as PatRow[]).map(patOfRow)
   },
@@ -227,55 +293,67 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
     await ctx.required.query(`UPDATE pats SET ${sets.join(', ')} WHERE id = $${args.length}`, args)
   },
 
-  grantsFor: async (username) => {
+  grantsFor: async (userId) => {
     await ctx.ensureInit()
     const res = await ctx.required.query(
-      'SELECT space, role FROM space_members WHERE username = $1 ORDER BY space',
-      [username],
+      'SELECT space, role FROM space_members WHERE user_id = $1 ORDER BY space',
+      [userId],
     )
     return (res.rows as Array<{ space: string; role: SpaceRole }>).map((r) => ({
       space: r.space,
       role: r.role,
     }))
   },
-  grantsForUsers: async (usernames) => {
-    if (usernames.length === 0) {
+  grantsForUsers: async (userIds) => {
+    if (userIds.length === 0) {
       return []
     }
     await ctx.ensureInit()
     const result = await ctx.required.query(
-      `SELECT username, space, role FROM space_members
-        WHERE username = ANY($1::text[])
-        ORDER BY username, space`,
-      [[...new Set(usernames)]],
+      `SELECT user_id, space, role FROM space_members
+        WHERE user_id = ANY($1::text[])
+        ORDER BY user_id, space`,
+      [[...new Set(userIds)]],
     )
-    return result.rows as Array<{ username: string; space: string; role: SpaceRole }>
+    return (result.rows as Array<{ user_id: string; space: string; role: SpaceRole }>).map(
+      (row) => ({ userId: row.user_id, space: row.space, role: row.role }),
+    )
   },
   membersOf: async (space) => {
     await ctx.ensureInit()
     const res = await ctx.required.query(
-      `SELECT m.username, m.role, u.display_name FROM space_members m
-         JOIN users u ON u.username = m.username
-         WHERE m.space = $1 ORDER BY m.created_at, m.username`,
+      `SELECT m.user_id, m.role, u.username, u.display_name FROM space_members m
+         JOIN users u ON u.id = m.user_id
+         WHERE m.space = $1 ORDER BY m.created_at, u.username`,
       [space],
     )
-    return (res.rows as Array<{ username: string; role: SpaceRole; display_name: string }>).map(
-      (r) => ({ username: r.username, displayName: r.display_name, role: r.role }),
-    )
+    return (
+      res.rows as Array<{
+        user_id: string
+        role: SpaceRole
+        username: string
+        display_name: string
+      }>
+    ).map((r) => ({
+      userId: r.user_id,
+      username: r.username,
+      displayName: r.display_name,
+      role: r.role,
+    }))
   },
-  upsertMember: async (space, username, role, createdAt) => {
+  upsertMember: async (space, userId, role, createdAt) => {
     await ctx.ensureInit()
     await ctx.required.query(
-      `INSERT INTO space_members (space, username, role, created_at) VALUES ($1, $2, $3, $4)
-         ON CONFLICT (space, username) DO UPDATE SET role = EXCLUDED.role`,
-      [space, username, role, createdAt],
+      `INSERT INTO space_members (space, user_id, role, created_at) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (space, user_id) DO UPDATE SET role = EXCLUDED.role`,
+      [space, userId, role, createdAt],
     )
   },
-  removeMember: async (space, username) => {
+  removeMember: async (space, userId) => {
     await ctx.ensureInit()
-    await ctx.required.query('DELETE FROM space_members WHERE space = $1 AND username = $2', [
+    await ctx.required.query('DELETE FROM space_members WHERE space = $1 AND user_id = $2', [
       space,
-      username,
+      userId,
     ])
   },
   spacesWithMembers: async () => {
@@ -287,9 +365,9 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
   insertOneTime: async (t) => {
     await ctx.ensureInit()
     await ctx.required.query(
-      `INSERT INTO one_time_tokens (id_hash, username, purpose, expires_at, used_at, created_at)
+      `INSERT INTO one_time_tokens (id_hash, user_id, purpose, expires_at, used_at, created_at)
          VALUES ($1, $2, $3, $4, $5, $6)`,
-      [t.idHash, t.username, t.purpose, t.expiresAt, t.usedAt, t.createdAt],
+      [t.idHash, t.userId, t.purpose, t.expiresAt, t.usedAt, t.createdAt],
     )
   },
   getOneTime: async (idHash) => {
@@ -300,7 +378,7 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
     const r = res.rows[0] as
       | {
           id_hash: string
-          username: string
+          user_id: string
           purpose: 'invite' | 'reset'
           expires_at: string
           used_at: string | null
@@ -314,7 +392,7 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
 
     return {
       idHash: r.id_hash,
-      username: r.username,
+      userId: r.user_id,
       purpose: r.purpose,
       expiresAt: r.expires_at,
       usedAt: r.used_at,
@@ -329,8 +407,8 @@ export const createAuthFacet = (ctx: PgDriverCtx): AuthPersistence => ({
     )
     return (res.rowCount ?? 0) > 0
   },
-  deleteOneTimesFor: async (username) => {
+  deleteOneTimesFor: async (userId) => {
     await ctx.ensureInit()
-    await ctx.required.query('DELETE FROM one_time_tokens WHERE username = $1', [username])
+    await ctx.required.query('DELETE FROM one_time_tokens WHERE user_id = $1', [userId])
   },
 })

@@ -3,6 +3,7 @@ import {
   ABILITY_AVAILABILITY_MODE,
   ABILITY_KIND,
   ABILITY_SOURCE,
+  AUTH_MODE,
   ROLE_SCOPE,
 } from '@notarium/contract/enums'
 import { isGeneratedNoteId, isSkillName, MAX_SKILL_NAME, MAX_SKILL_TOKEN } from '@notarium/core'
@@ -33,6 +34,15 @@ export type AbilityDraftRecord = {
     projects: string[]
   }
 }
+
+/** The ONE owner of a draft namespace, for the writer and for the cleaner alike: the
+ *  stable account id, never the handle — a rename must neither lose a draft nor leave
+ *  one orphaned under a name nobody clears. `@system` is the lone principal of
+ *  AUTH_MODE=none; a session without an account owns nothing yet. */
+export const abilityDraftOwner = (
+  mode: string | undefined,
+  userId: string | null | undefined,
+): string | null => (mode === AUTH_MODE.none ? '@system' : (userId ?? null))
 
 const ownerPrefix = (owner: string): string =>
   `${STORAGE_KEYS.abilityDraftPrefix}${encodeURIComponent(owner)}:`

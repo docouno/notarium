@@ -2,16 +2,20 @@ import { AUTHOR_KIND } from '@notarium/contract'
 import type { Author } from '@notarium/contract'
 import type { AuthorFilter } from '@notarium/core'
 
+import { agentPrincipalPrefixes, userPrincipalId } from '../principalId'
+
+/** `viewer` is the requesting user's stable id (null in mode 'none'). */
 type Describe = (principal: string | null, viewer: string | null) => Promise<Author>
 
 /** Principal predicate for "my activity": the AuthorFilter twin of describeAuthor's
  *  `mine` test (keep in sync). Prefix (not exact) match on the key id → a since-deleted
- *  PAT's old revisions still count as mine. Usernames are `[a-z0-9-]` (no `:` / LIKE
- *  wildcard), so a prefix matches one owner unambiguously.
+ *  PAT's old revisions still count as mine. The viewer is the stable user id — 16 hex,
+ *  no `:` and no LIKE wildcard — so a prefix matches one owner unambiguously; a
+ *  username (which may carry `_`) never enters a pattern.
  *  canon: docs/auth.md#model */
 export const minePrincipalFilter = (viewer: string | null): AuthorFilter => {
-  const exact = viewer ? ['ui', `user:${viewer}`] : ['ui']
-  const prefixes = viewer ? [`pat:${viewer}:`, `oauth:${viewer}:`] : []
+  const exact = viewer ? ['ui', userPrincipalId(viewer)] : ['ui']
+  const prefixes = viewer ? agentPrincipalPrefixes(viewer) : []
   return { exact, prefixes }
 }
 

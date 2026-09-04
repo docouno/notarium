@@ -76,7 +76,7 @@ const login = async (username: string, password: string): Promise<string> => {
   const res = await app.inject({
     method: 'POST',
     url: '/api/auth/login',
-    payload: { username, password },
+    payload: { identifier: username, password },
   })
   expect(res.statusCode).toBe(200)
   const setCookie = res.headers['set-cookie'] as string
@@ -147,10 +147,10 @@ describe('anonymous: a wall, not a window', () => {
 
   it('login: wrong password and unknown user are the same generic 401', async () => {
     const wrong = await request('POST', '/api/auth/login', {
-      payload: { username: 'alice', password: 'nope-nope-nope' },
+      payload: { identifier: 'alice', password: 'nope-nope-nope' },
     })
     const unknown = await request('POST', '/api/auth/login', {
-      payload: { username: 'nobody', password: 'nope-nope-nope' },
+      payload: { identifier: 'nobody', password: 'nope-nope-nope' },
     })
     expect(wrong.statusCode).toBe(401)
     expect(unknown.statusCode).toBe(401)
@@ -254,13 +254,17 @@ describe('membership: B never sees A, surface by surface (#16 §7 with principal
       cookie: bob,
       payload: { title: 'Attributed', directory: 'work', content: 'by bob' },
     })
+    const bobMe = (await request('GET', '/api/me', { cookie: bob })).json() as { id: string }
     const root = await login('root', 'root-password-1')
     const list = (await request('GET', '/api/s/beta/notes', { cookie: root })).json() as {
       notes: Array<{ id: string; title: string }>
     }
     const fresh = list.notes.find((n) => n.title === 'Attributed')
     const revs = await revisionsOf(fresh!.id, root)
-    expect(revs.revisions[0].principal).toBe('user:bob')
+    // The row keys the writer by stable id — a rename must not orphan history — and the
+    // reader-facing author resolves that id back to the current handle.
+    expect(revs.revisions[0].principal).toBe(`user:${bobMe.id}`)
+    expect(revs.revisions[0].author).toEqual({ kind: 'user', name: 'bob', mine: false })
   })
 })
 
@@ -380,7 +384,7 @@ describe('personal domain refuses a second member (#13: privacy)', () => {
       const res = await pApp.inject({
         method: 'POST',
         url: '/api/auth/login',
-        payload: { username: u, password: p },
+        payload: { identifier: u, password: p },
       })
       expect(res.statusCode).toBe(200)
       return (res.headers['set-cookie'] as string).split(';')[0]
@@ -480,7 +484,9 @@ describe('PATs: scope ∩ grants, narrowed and revocable', () => {
     }
     const fresh = list.notes.find((n) => n.title === 'Agent Wrote')
     const revs = await revisionsOf(fresh!.id, bob)
-    expect(revs.revisions[0].principal).toBe(`pat:bob:${pat.id}`)
+    const bobMe = (await request('GET', '/api/me', { cookie: bob })).json() as { id: string }
+    expect(revs.revisions[0].principal).toBe(`pat:${bobMe.id}:${pat.id}`)
+    expect(revs.revisions[0].author).toEqual({ kind: 'agent', name: 'agent', mine: true })
   })
 
   it('revocation is immediate; a revoked token is anonymous', async () => {
@@ -762,7 +768,7 @@ describe('config carries no host-global default; landing is per-principal (#99)'
     const res = await bare.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username: 'loner', password: 'loner-password-1' },
+      payload: { identifier: 'loner', password: 'loner-password-1' },
     })
     const cookie = (res.headers['set-cookie'] as string).split(';')[0]
     const spaces = await bare.inject({ method: 'GET', url: '/api/spaces', headers: { cookie } })
@@ -817,16 +823,25 @@ describe('session hygiene', () => {
     await login('bob', 'bob-new-password-1')
   })
 
-  it('login rate limit: a hammered username+ip answers 429', async () => {
+  it('login rate limit: a hammered account answers 401 like a wrong pair — 429 is the ip gate’s alone', async () => {
     for (let i = 0; i < 10; i++) {
       await request('POST', '/api/auth/login', {
-        payload: { username: 'bob', password: 'wrong-password' },
+        payload: { identifier: 'bob', password: 'wrong-password' },
       })
     }
+    // The right password is refused with the SAME envelope as a wrong one: an
+    // exhausted account budget is not observable, so it can serve no oracle.
     const res = await request('POST', '/api/auth/login', {
-      payload: { username: 'bob', password: 'bob-password-01' },
+      payload: { identifier: 'bob', password: 'bob-password-01' },
     })
-    expect(res.statusCode).toBe(429)
+    expect(res.statusCode).toBe(401)
+    expect(res.json()).toEqual(
+      (
+        await request('POST', '/api/auth/login', {
+          payload: { identifier: 'rita', password: 'wrong-password' },
+        })
+      ).json(),
+    )
   }, 20_000)
 
   it('amplification gate: varying the username from one ip still caps (pre-auth scrypt DoS)', async () => {
@@ -837,7 +852,7 @@ describe('session hygiene', () => {
 
     for (let i = 0; i < 25; i++) {
       const res = await request('POST', '/api/auth/login', {
-        payload: { username: `ghost-user-${i}`, password: 'whatever-wrong' },
+        payload: { identifier: `ghost-user-${i}`, password: 'whatever-wrong' },
       })
 
       if (res.statusCode === 429) {
@@ -859,7 +874,7 @@ describe('SSE: revoke = disconnect', () => {
     const loginRes = await fetch(`${base}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ username: 'bob', password: 'bob-password-01' }),
+      body: JSON.stringify({ identifier: 'bob', password: 'bob-password-01' }),
     })
     const bobCookie = (loginRes.headers.get('set-cookie') as string).split(';')[0]
 
@@ -871,7 +886,7 @@ describe('SSE: revoke = disconnect', () => {
     const rootRes = await fetch(`${base}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ username: 'root', password: 'root-password-1' }),
+      body: JSON.stringify({ identifier: 'root', password: 'root-password-1' }),
     })
     const rootCookie = (rootRes.headers.get('set-cookie') as string).split(';')[0]
     const removed = await fetch(`${base}/api/s/beta/members/bob`, {
@@ -902,7 +917,7 @@ describe('SSE: revoke = disconnect', () => {
     const aliceCookie = await fetch(`${base}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ username: 'alice', password: 'alice-password-1' }),
+      body: JSON.stringify({ identifier: 'alice', password: 'alice-password-1' }),
     }).then((response) => (response.headers.get('set-cookie') as string).split(';')[0])
     const stream = await fetch(`${base}/api/s/beta/events?watch=alpha`, {
       headers: { cookie: aliceCookie },
@@ -912,7 +927,7 @@ describe('SSE: revoke = disconnect', () => {
     const rootCookie = await fetch(`${base}/api/auth/login`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ username: 'root', password: 'root-password-1' }),
+      body: JSON.stringify({ identifier: 'root', password: 'root-password-1' }),
     }).then((response) => (response.headers.get('set-cookie') as string).split(';')[0])
 
     const removed = await fetch(`${base}/api/s/alpha/members/alice`, {
@@ -963,7 +978,7 @@ describe('SSE: creating a space wakes the creator (#154/#155)', () => {
       const loginRes = await fetch(`${base}/api/auth/login`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ username: 'bob', password: 'bob-password-01' }),
+        body: JSON.stringify({ identifier: 'bob', password: 'bob-password-01' }),
       })
       const bobCookie = (loginRes.headers.get('set-cookie') as string).split(';')[0]
 
@@ -1010,4 +1025,634 @@ describe('SSE: creating a space wakes the creator (#154/#155)', () => {
       await mintable.close()
     }
   }, 20_000)
+})
+
+describe('identity: a mutable handle and an optional address over a stable id', () => {
+  const meOf = async (cookie: string) =>
+    (await request('GET', '/api/me', { cookie })).json() as {
+      id: string
+      username: string
+      email: string | null
+      spaces: Array<{ slug: string; role: string }>
+    }
+
+  it('a rename keeps memberships, tokens and history, and frees the old handle at once', async () => {
+    const bob = await login('bob', 'bob-password-01')
+    const before = await meOf(bob)
+    const pat = (
+      await request('POST', '/api/me/tokens', {
+        cookie: bob,
+        payload: { name: 'agent', scope: 'write' },
+      })
+    ).json() as { token: string }
+    await request('POST', '/api/s/beta/notes', {
+      cookie: bob,
+      payload: { title: 'Before Rename', directory: 'work', content: 'by bob' },
+    })
+    // A row by someone else in the same space, so the "my edits" lens below has
+    // something it must NOT return.
+    const alice = await login('alice', 'alice-password-1')
+
+    await request('POST', '/api/s/beta/notes', {
+      cookie: alice,
+      payload: { title: 'By Alice', directory: 'work', content: 'not by bob' },
+    })
+
+    const renamed = await request('PATCH', '/api/me', {
+      cookie: bob,
+      payload: { username: 'bob.smith' },
+    })
+    expect(renamed.statusCode).toBe(200)
+    expect(renamed.json()).toMatchObject({ id: before.id, username: 'bob.smith' })
+
+    // The same session, the same grants, the same token — the person did not change.
+    const after = await meOf(bob)
+    expect(after.id).toBe(before.id)
+    expect(after.spaces).toEqual(before.spaces)
+    expect((await request('GET', '/api/s/beta/notes', { bearer: pat.token })).statusCode).toBe(200)
+    // History shows the NEW handle on every row it ever wrote; no row went missing.
+    const list = (await request('GET', '/api/s/beta/notes', { cookie: bob })).json() as {
+      notes: Array<{ id: string; title: string }>
+    }
+    const note = list.notes.find((n) => n.title === 'Before Rename')
+    const revs = await revisionsOf(note!.id, bob)
+    expect(revs.total).toBe(1)
+    expect(revs.revisions[0].author).toEqual({ kind: 'user', name: 'bob.smith', mine: true })
+    // The "my edits" lens keys on the stable id, not on the handle: a row written
+    // before the rename is still mine after it. A regression here would be silent —
+    // an empty feed, not an error.
+    const titlesWhen = async (
+      query: string,
+      ready: (titles: string[]) => boolean,
+    ): Promise<string[]> => {
+      for (let i = 0; i < 50; i++) {
+        const res = await request('GET', `/api/s/beta/activity/events${query}`, { cookie: bob })
+
+        expect(res.statusCode).toBe(200)
+        const titles = (res.json() as { events: Array<{ title: string }> }).events.map(
+          (e) => e.title,
+        )
+
+        if (ready(titles)) {
+          return titles
+        }
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      throw new Error(`the activity feed never settled for "${query}"`)
+    }
+    // Both rows are in the space's feed…
+    await titlesWhen('', (t) => t.includes('Before Rename') && t.includes('By Alice'))
+    // …and the lens keeps exactly mine. Two-sided on purpose: a filter that stopped
+    // excluding anyone would satisfy "contains mine" just as well.
+    const mine = await titlesWhen('?author=mine', (t) => t.includes('Before Rename'))
+
+    expect(mine).not.toContain('By Alice')
+    // Members lists follow too.
+    const members = (await request('GET', '/api/s/beta/members', { cookie: bob })).json() as {
+      members: Array<{ username: string; role: string }>
+    }
+    expect(members.members).toContainEqual({
+      username: 'bob.smith',
+      displayName: 'bob',
+      role: 'writer',
+    })
+    // The old handle no longer signs in; the new one does.
+    expect(
+      (
+        await request('POST', '/api/auth/login', {
+          payload: { identifier: 'bob', password: 'bob-password-01' },
+        })
+      ).statusCode,
+    ).toBe(401)
+    expect(await login('bob.smith', 'bob-password-01')).toBeTruthy()
+    // The freed handle can be taken by the next account immediately…
+    const root = await login('root', 'root-password-1')
+    expect(
+      (await request('POST', '/api/users', { cookie: root, payload: { username: 'bob' } }))
+        .statusCode,
+    ).toBe(201)
+    // …and an active one cannot.
+    const taken = await request('PATCH', '/api/me', {
+      cookie: bob,
+      payload: { username: 'alice' },
+    })
+    expect(taken.statusCode).toBe(409)
+    expect(taken.json().reason).toBe('username_taken')
+    // Renaming to the same name is an idempotent success.
+    expect(
+      (await request('PATCH', '/api/me', { cookie: bob, payload: { username: 'bob.smith' } }))
+        .statusCode,
+    ).toBe(200)
+  })
+
+  it('the handle admits dots and underscores, never a leading or trailing separator or a capital', async () => {
+    const bob = await login('bob', 'bob-password-01')
+
+    for (const username of ['bob_smith', 'bob..smith', 'b']) {
+      const res = await request('PATCH', '/api/me', { cookie: bob, payload: { username } })
+      expect(res.statusCode, username).toBe(200)
+    }
+    for (const username of ['.bob', 'bob.', '-bob', 'bob_', 'Bob', 'bob smith']) {
+      const res = await request('PATCH', '/api/me', { cookie: bob, payload: { username } })
+      expect(res.statusCode, username).toBe(400)
+    }
+  })
+
+  it('only a session may rename: a PAT with the manage-less ceiling is refused as not found', async () => {
+    const bob = await login('bob', 'bob-password-01')
+    const { token } = (
+      await request('POST', '/api/me/tokens', {
+        cookie: bob,
+        payload: { name: 'agent', scope: 'write' },
+      })
+    ).json() as { token: string }
+    expect(
+      (await request('PATCH', '/api/me', { bearer: token, payload: { username: 'nope' } }))
+        .statusCode,
+    ).toBe(404)
+    expect((await meOf(bob)).username).toBe('bob')
+  })
+
+  it('the address is optional, case-insensitively unique, and settable by the owner or an admin', async () => {
+    const bob = await login('bob', 'bob-password-01')
+    expect((await meOf(bob)).email).toBeNull()
+
+    // The owner sets it; it comes back lower-cased.
+    const set = await request('PATCH', '/api/me', {
+      cookie: bob,
+      payload: { email: '  Bob@Example.com ' },
+    })
+    expect(set.statusCode).toBe(200)
+    expect(set.json().email).toBe('bob@example.com')
+    // A second account with the same address in another case is refused.
+    const alice = await login('alice', 'alice-password-1')
+    const dup = await request('PATCH', '/api/me', {
+      cookie: alice,
+      payload: { email: 'BOB@example.com' },
+    })
+    expect(dup.statusCode).toBe(409)
+    expect(dup.json().reason).toBe('email_taken')
+    expect((await meOf(alice)).email).toBeNull()
+    // The admin sees it, changes it, clears it.
+    const root = await login('root', 'root-password-1')
+    const users = (await request('GET', '/api/users', { cookie: root })).json() as {
+      users: Array<{ username: string; email: string | null }>
+    }
+    expect(users.users.find((u) => u.username === 'bob')?.email).toBe('bob@example.com')
+    const changed = await request('PATCH', '/api/users/bob', {
+      cookie: root,
+      payload: { email: 'robert@example.com' },
+    })
+    expect(changed.statusCode).toBe(200)
+    expect(changed.json().email).toBe('robert@example.com')
+    const cleared = await request('PATCH', '/api/users/bob', {
+      cookie: root,
+      payload: { email: null },
+    })
+    expect(cleared.statusCode).toBe(200)
+    expect(cleared.json().email).toBeNull()
+    expect((await meOf(bob)).email).toBeNull()
+    // An admin creates a user with an address; the same address again is refused.
+    const created = await request('POST', '/api/users', {
+      cookie: root,
+      payload: { username: 'dana', email: 'Dana@Example.com' },
+    })
+    expect(created.statusCode).toBe(201)
+    expect(created.json().user.email).toBe('dana@example.com')
+    const again = await request('POST', '/api/users', {
+      cookie: root,
+      payload: { username: 'dana2', email: 'dana@example.com' },
+    })
+    expect(again.statusCode).toBe(409)
+    expect(again.json().reason).toBe('email_taken')
+  })
+
+  it('an admin renames by the current handle and reads the new one from the answer', async () => {
+    const root = await login('root', 'root-password-1')
+    const renamed = await request('PATCH', '/api/users/rita', {
+      cookie: root,
+      payload: { username: 'rita.r', displayName: 'Rita R.' },
+    })
+    expect(renamed.statusCode).toBe(200)
+    expect(renamed.json()).toMatchObject({ username: 'rita.r', displayName: 'Rita R.' })
+    expect(
+      (await request('PATCH', '/api/users/rita', { cookie: root, payload: {} })).statusCode,
+    ).toBe(404)
+    expect(
+      (await request('PATCH', '/api/users/rita.r', { cookie: root, payload: { username: 'bob' } }))
+        .statusCode,
+    ).toBe(409)
+    // A disabled user renames like any other: the two axes are orthogonal.
+    await request('PATCH', '/api/users/rita.r', { cookie: root, payload: { disabled: true } })
+    expect(
+      (await request('PATCH', '/api/users/rita.r', { cookie: root, payload: { username: 'rita' } }))
+        .statusCode,
+    ).toBe(200)
+  })
+
+  // The two halves of an admin patch share no transaction, so identity — the only half
+  // that can still be refused — goes first. Applied the other way round, a 409 would
+  // leave the display name rewritten and, on the disable path, the sessions gone.
+  it('a refused admin patch leaves the account exactly as it was', async () => {
+    const root = await login('root', 'root-password-1')
+    const usersOf = async () =>
+      (await request('GET', '/api/users', { cookie: root })).json() as {
+        users: Array<Record<string, unknown>>
+      }
+    const before = (await usersOf()).users.find((u) => u.username === 'rita')
+
+    const refused = await request('PATCH', '/api/users/rita', {
+      cookie: root,
+      payload: { username: 'bob', displayName: 'Rita R.', disabled: true },
+    })
+    expect(refused.statusCode).toBe(409)
+    expect((await usersOf()).users.find((u) => u.username === 'rita')).toEqual(before)
+    // The sessions the disable half would have deleted are still good.
+    expect(await login('rita', 'rita-password-1')).toBeTruthy()
+  })
+
+  it('the address never reaches a member list', async () => {
+    const root = await login('root', 'root-password-1')
+    await request('PATCH', '/api/users/bob', {
+      cookie: root,
+      payload: { email: 'bob@example.com' },
+    })
+    const rita = await login('rita', 'rita-password-1')
+    const members = (await request('GET', '/api/s/beta/members', { cookie: rita })).json() as {
+      members: Array<Record<string, unknown>>
+    }
+    expect(members.members.length).toBeGreaterThan(0)
+    for (const member of members.members) {
+      expect(Object.keys(member).sort()).toEqual(['displayName', 'role', 'username'])
+    }
+    expect(JSON.stringify(members)).not.toContain('example.com')
+    expect((await request('GET', '/api/users', { cookie: rita })).statusCode).toBe(404)
+  })
+})
+
+// One identifier field — the handle as typed or the address lower-cased — one indexed
+// read, and one budget per RESOLVED account. canon: docs/auth.md#credentials
+describe('login by handle or e-mail', () => {
+  const attempt = (identifier: string, password: string) =>
+    request('POST', '/api/auth/login', { payload: { identifier, password } })
+
+  const giveBobAnAddress = async () => {
+    const cookie = await login('bob', 'bob-password-01')
+    const res = await request('PATCH', '/api/me', { cookie, payload: { email: 'bob@example.com' } })
+    expect(res.statusCode).toBe(200)
+  }
+
+  // The column compares bytes; the ONE normalizer is the wire schema. A seed that wrote
+  // an address as typed would be unreachable by login and would not collide with its
+  // own lower-case twin — so the fixture applier normalizes exactly like the routes.
+  it('a seeded address is normalized like the wire: a mixed-case one still signs in', async () => {
+    await app.close()
+    const base = fixture()
+    app = await createApp({
+      ...base,
+      auth: {
+        ...base.auth!,
+        users: base.auth!.users.map((u) =>
+          u.username === 'bob' ? { ...u, email: '  Bob@Example.COM ' } : u,
+        ),
+      },
+    })
+    expect(await login('bob@example.com', 'bob-password-01')).toBeTruthy()
+  })
+
+  it('signs in by the handle or by the address; a wrong pair on either is one and the same 401', async () => {
+    await giveBobAnAddress()
+    const byHandle = await attempt('bob', 'bob-password-01')
+    const byAddress = await attempt('bob@example.com', 'bob-password-01')
+    // The address is normalised the way the column stores it.
+    const byShoutedAddress = await attempt('  Bob@Example.COM ', 'bob-password-01')
+    expect([byHandle.statusCode, byAddress.statusCode, byShoutedAddress.statusCode]).toEqual([
+      200, 200, 200,
+    ])
+    expect(byAddress.json().id).toBe(byHandle.json().id)
+    expect(byAddress.headers['set-cookie']).toBeDefined()
+
+    const wrongByHandle = await attempt('bob', 'wrong-password')
+    const wrongByAddress = await attempt('bob@example.com', 'wrong-password')
+    const wrongByNobody = await attempt('nobody@example.com', 'wrong-password')
+    expect(wrongByHandle.statusCode).toBe(401)
+    expect(wrongByAddress.statusCode).toBe(401)
+    expect(wrongByAddress.json()).toEqual(wrongByHandle.json())
+    expect(wrongByNobody.json()).toEqual(wrongByHandle.json())
+    // Seven real scrypt verifies: 3.7 s alone, past the 5 s default under a loaded
+    // lane. The same allowance its siblings in this file already carry.
+  }, 20_000)
+
+  // The mirror case — a handle written past the schema keeps resolving by its exact
+  // spelling — is proven at the service (`test/unit/auth.test.ts`): the wire's
+  // `MeSchema` has always refused such a handle, which is the CLI's business now.
+  it('a handle is matched by its exact spelling: `Bob` is not `bob`', async () => {
+    expect((await attempt('Bob', 'bob-password-01')).statusCode).toBe(401)
+  })
+
+  it('alternating the handle and the address spends ONE budget, and the spent budget answers like a wrong pair', async () => {
+    await giveBobAnAddress()
+    for (let i = 0; i < 5; i++) {
+      expect((await attempt('bob', 'wrong-password')).statusCode).toBe(401)
+    }
+    for (let i = 0; i < 5; i++) {
+      expect((await attempt('bob@example.com', 'wrong-password')).statusCode).toBe(401)
+    }
+    // The eleventh attempt — right password, either identifier — is refused with the
+    // body of an ordinary wrong pair. Nothing in the answer says the budget is spent,
+    // that the account exists, or that the two identifiers are one account.
+    const byHandle = await attempt('bob', 'bob-password-01')
+    const byAddress = await attempt('bob@example.com', 'bob-password-01')
+    const plainWrong = await attempt('rita', 'wrong-password')
+    expect(byHandle.statusCode).toBe(401)
+    expect(byHandle.json()).toEqual(plainWrong.json())
+    expect(byAddress.statusCode).toBe(401)
+    expect(byAddress.json()).toEqual(plainWrong.json())
+  }, 20_000)
+
+  // The body is only half of "answers like a wrong pair". A refusal that arrives
+  // instantly and leaves the ip counter untouched IS the linking oracle in another
+  // shape: it says "this handle and this address are one account" without a body to
+  // read. So the spent budget costs one verification and one ip entry, like any other
+  // failure. canon: docs/auth.md#credentials
+  it('a spent budget costs the same verification and the same ip entry as a wrong pair', async () => {
+    let verifies = 0
+    await app.close()
+    app = await createApp(fixture(), {
+      passwordVerifier: async (password) => {
+        verifies++
+        return password === 'bob-password-01'
+      },
+    })
+    await giveBobAnAddress()
+    const spent = verifies
+
+    for (let i = 0; i < 5; i++) {
+      expect((await attempt('bob', 'wrong-password')).statusCode).toBe(401)
+    }
+    for (let i = 0; i < 5; i++) {
+      expect((await attempt('bob@example.com', 'wrong-password')).statusCode).toBe(401)
+    }
+    expect(verifies).toBe(spent + 10)
+    // Right password, either identifier: refused, and it cost a verification.
+    expect((await attempt('bob', 'bob-password-01')).statusCode).toBe(401)
+    expect((await attempt('bob@example.com', 'bob-password-01')).statusCode).toBe(401)
+    expect(verifies).toBe(spent + 12)
+    // ...and it was not free: the ip gate counted both, so the twentieth failure from
+    // this address trips 429 exactly as ten wrong pairs plus ten probes would.
+    for (let i = 0; i < 8; i++) {
+      expect((await attempt('bob', 'bob-password-01')).statusCode).toBe(401)
+    }
+    expect((await attempt('nobody-at-all', 'x')).statusCode).toBe(429)
+  }, 20_000)
+
+  it('an unknown handle, an unknown address and a wrong password each run exactly one verification', async () => {
+    let verifies = 0
+    await app.close()
+    app = await createApp(fixture(), {
+      passwordVerifier: async () => {
+        verifies++
+        return false
+      },
+    })
+    for (const [n, identifier] of ['nobody', 'nobody@example.com', 'bob'].entries()) {
+      expect((await attempt(identifier, 'wrong-password')).statusCode).toBe(401)
+      expect(verifies).toBe(n + 1)
+    }
+  })
+
+  it('the shape filter and the ip gate refuse without a directory read or a hash; the ip gate alone says 429', async () => {
+    let resolves = 0
+    let verifies = 0
+    await app.close()
+    app = await createApp(fixture(), {
+      passwordVerifier: async () => {
+        verifies++
+        return false
+      },
+      onAuthPersistence: (auth) => {
+        const resolve = auth.getUserByLogin.bind(auth)
+
+        auth.getUserByLogin = async (loginLookup) => {
+          resolves++
+          return resolve(loginLookup)
+        }
+      },
+    })
+    // Step 0: neither a handle nor an address — refused before any read or hash...
+    for (const shape of ['bob@', ' ', 'a'.repeat(320), '?'.repeat(320), 'bob smith']) {
+      expect((await attempt(shape, 'bob-password-01')).statusCode).toBe(401)
+    }
+    expect([resolves, verifies]).toEqual([0, 0])
+    // ...and without a counter entry: twenty-five of them leave the ip budget whole.
+    for (let i = 0; i < 25; i++) {
+      await attempt('bob@', 'x')
+    }
+    expect((await attempt('nobody-0', 'x')).statusCode).toBe(401)
+    expect([resolves, verifies]).toEqual([1, 1])
+    // Rotating unknown identifiers costs one dummy verification each — until the ip
+    // gate trips at twenty; from then on a refusal is 429 with no read and no hash.
+    for (let i = 1; i < 20; i++) {
+      await attempt(`nobody-${i}`, 'x')
+    }
+    expect([resolves, verifies]).toEqual([20, 20])
+    expect((await attempt('bob', 'bob-password-01')).statusCode).toBe(429)
+    expect([resolves, verifies]).toEqual([20, 20])
+  }, 20_000)
+})
+
+// The personal space follows its owner's handle through the same rename sequence the
+// PATCH route runs: registry row, live slug index, SSE `rename`. Only the derived slug
+// follows; a chosen one and a taken target are left alone — and the account rename
+// goes through either way. canon: docs/spaces.md#model
+describe('the personal space follows its owner’s handle', () => {
+  // A fixture space is config-pinned (its slug is frozen, like SPACES_CONFIG), so the
+  // personal space is minted the product way — the first personal write — and only a
+  // collision TARGET comes from the fixture.
+  const withPersonal = async (taken: string[] = []) => {
+    await app.close()
+    const base = fixture()
+    app = await createApp({
+      ...base,
+      // A host that can mint spaces — otherwise the personal write degrades to the
+      // first space (P5) and there is no personal space to follow anything.
+      capabilities: { ...base.capabilities, spaceCreate: true },
+      spaces: [...base.spaces, ...taken.map((slug) => ({ slug, displayName: 'Taken', notes: [] }))],
+      auth: {
+        users: base.auth!.users,
+        members: [
+          ...base.auth!.members,
+          ...taken.map((slug) => ({ space: slug, username: 'rita', role: 'owner' as const })),
+        ],
+      },
+    })
+  }
+
+  const mintPersonal = async (cookie: string) => {
+    const res = await request('PUT', '/api/me/profile', {
+      cookie,
+      payload: { content: '# Me\n' },
+    })
+    expect(res.statusCode).toBe(200)
+  }
+  const rename = (cookie: string, username: string) =>
+    request('PATCH', '/api/me', { cookie, payload: { username } })
+  const meOf = async (cookie: string) =>
+    (await request('GET', '/api/me', { cookie })).json() as {
+      username: string
+      personalSpace: string | null
+    }
+  const spacesOf = async (cookie: string) =>
+    (await request('GET', '/api/spaces', { cookie })).json().spaces as Array<{
+      id: string
+      slug: string
+      aliases?: string[]
+    }>
+
+  it('renames the derived slug with the handle: the new slug resolves live, the old one as an alias, the pointer is the same space', async () => {
+    await withPersonal()
+    const bob = await login('bob', 'bob-password-01')
+    await mintPersonal(bob)
+    expect((await meOf(bob)).personalSpace).toBe('bob')
+    const spaceId = (await spacesOf(bob)).find((s) => s.slug === 'bob')!.id
+
+    expect((await rename(bob, 'bob.smith')).statusCode).toBe(200)
+    expect(await meOf(bob)).toMatchObject({ username: 'bob.smith', personalSpace: 'bob-smith' })
+    // The live process resolves the new slug without a restart, and the old one as an
+    // alias — the in-memory index was re-keyed, not just the registry row.
+    expect((await request('GET', '/api/s/bob-smith/status', { cookie: bob })).statusCode).toBe(200)
+    expect((await request('GET', '/api/s/bob/status', { cookie: bob })).statusCode).toBe(200)
+    expect((await spacesOf(bob)).find((s) => s.slug === 'bob-smith')).toMatchObject({
+      id: spaceId,
+      aliases: ['bob'],
+    })
+  })
+
+  it('leaves a taken target and a slug the owner chose alone — the account renames either way', async () => {
+    await withPersonal(['bob-smith'])
+    const bob = await login('bob', 'bob-password-01')
+    await mintPersonal(bob)
+    expect((await meOf(bob)).personalSpace).toBe('bob')
+
+    // Taken target: no suffixing, no error — the slug simply stays.
+    expect((await rename(bob, 'bob.smith')).statusCode).toBe(200)
+    expect(await meOf(bob)).toMatchObject({ username: 'bob.smith', personalSpace: 'bob' })
+    // A slug the owner chose through the API is not the derived one any more.
+    expect(
+      (await request('PATCH', '/api/s/bob', { cookie: bob, payload: { slug: 'my-notes' } }))
+        .statusCode,
+    ).toBe(200)
+    expect((await rename(bob, 'robert')).statusCode).toBe(200)
+    expect(await meOf(bob)).toMatchObject({ username: 'robert', personalSpace: 'my-notes' })
+  })
+
+  const openStream = async (base: string, cookie: string, space: string) => {
+    const res = await fetch(`${base}/api/s/${space}/events`, { headers: { cookie } })
+    expect(res.status).toBe(200)
+    const reader = res.body!.getReader()
+    await reader.read() // the initial status snapshot
+    return reader
+  }
+
+  const cookieOf = async (base: string, identifier: string, password: string) => {
+    const res = await fetch(`${base}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ identifier, password }),
+    })
+    return (res.headers.get('set-cookie') as string).split(';')[0]
+  }
+
+  const mintPersonalOver = async (base: string, cookie: string) => {
+    const res = await fetch(`${base}/api/me/profile`, {
+      method: 'PUT',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ content: '# Me\n' }),
+    })
+    expect(res.status).toBe(200)
+  }
+
+  it('the owner’s live stream gets `access` and the personal space’s viewers `rename` — no relogin', async () => {
+    await withPersonal()
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const { port } = app.server.address() as { port: number }
+    const base = `http://127.0.0.1:${port}`
+    const bobCookie = await cookieOf(base, 'bob', 'bob-password-01')
+    await mintPersonalOver(base, bobCookie)
+    const reader = await openStream(base, bobCookie, 'bob')
+
+    const renamed = await fetch(`${base}/api/me`, {
+      method: 'PATCH',
+      headers: { cookie: bobCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'bob.smith' }),
+    })
+    expect(renamed.status).toBe(200)
+
+    const seen: string[] = []
+    const decoder = new TextDecoder()
+
+    const collect = async () => {
+      while (!(seen.includes('access') && seen.includes('rename'))) {
+        const { done, value } = await reader.read()
+
+        if (done) {
+          break
+        }
+        for (const m of decoder.decode(value).matchAll(/^event: (\S+)/gm)) {
+          seen.push(m[1])
+        }
+      }
+    }
+    await Promise.race([collect(), new Promise((r) => setTimeout(r, 3_000))])
+    expect(seen).toEqual(expect.arrayContaining(['access', 'rename']))
+    // The ORDER is the invariant, not just the pair: `access` makes the tab refetch
+    // `me`, so it must arrive after the personal space took its new slug — a tab that
+    // refetches earlier caches the old one, and `rename` will not reach it if it sits
+    // in another space.
+    expect(seen.indexOf('rename')).toBeLessThan(seen.indexOf('access'))
+    await reader.cancel().catch(() => {})
+  })
+
+  it('disabling the renamed owner still closes their live stream: the registry keys by id, not by the handle', async () => {
+    await withPersonal()
+    await app.listen({ port: 0, host: '127.0.0.1' })
+    const { port } = app.server.address() as { port: number }
+    const base = `http://127.0.0.1:${port}`
+    const bobCookie = await cookieOf(base, 'bob', 'bob-password-01')
+    await mintPersonalOver(base, bobCookie)
+    const reader = await openStream(base, bobCookie, 'bob')
+    expect(
+      (
+        await fetch(`${base}/api/me`, {
+          method: 'PATCH',
+          headers: { cookie: bobCookie, 'content-type': 'application/json' },
+          body: JSON.stringify({ username: 'bob.smith' }),
+        })
+      ).status,
+    ).toBe(200)
+
+    const rootCookie = await cookieOf(base, 'root', 'root-password-1')
+    const disabled = await fetch(`${base}/api/users/bob.smith`, {
+      method: 'PATCH',
+      headers: { cookie: rootCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ disabled: true }),
+    })
+    expect(disabled.status).toBe(200)
+
+    const drain = async () => {
+      for (;;) {
+        const { done } = await reader.read()
+
+        if (done) {
+          return 'CLOSED'
+        }
+      }
+    }
+    expect(
+      await Promise.race([
+        drain(),
+        new Promise<string>((r) => setTimeout(() => r('TIMEOUT'), 3_000)),
+      ]),
+    ).toBe('CLOSED')
+  })
 })

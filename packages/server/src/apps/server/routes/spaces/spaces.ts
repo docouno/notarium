@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 
+import type { Author } from '@notarium/contract'
 import {
   DurableDisplayNameSchema,
   OkResponseSchema,
@@ -15,7 +16,7 @@ import { HTTP_STATUS } from '@notarium/contract/http'
 import { asciiSlug, freshNoteId, idToSlug, uniqueSlug } from '@notarium/core'
 
 import { can } from '../../../../services/authz'
-import { recordSpaceRename } from '../../../../services/projects'
+import { renameSpace } from '../../../../services/spaces'
 import { type ApiRouteCtx, authz, batchFailure, notFound } from '../_shared'
 
 /** Domain space record → wire row. canon: docs/contract.md#mappers */
@@ -121,11 +122,11 @@ export const spacesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         .send({ error: 'could not allocate a free space handle' })
     }
     // In 'none' auth mode there's no user to grant; the system principal already sees all.
-    if (req.principal.username) {
-      await auth.grantOwner(rec.id, req.principal.username)
+    if (req.principal.userId) {
+      await auth.grantOwner(rec.id, req.principal.userId)
       // Nudge the creator's other tabs so the new space appears without a reload — the
       // access-side notify grantOwner itself omits.
-      auth.notifyGrantsChanged(req.principal.username)
+      auth.notifyGrantsChanged(req.principal.userId)
     }
 
     return reply
@@ -142,13 +143,25 @@ export const spacesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
   // listing filter (anti-enumeration).
   app.get('/api/spaces/archived', { config: authz('spaces:list', 'host') }, async (req) => {
     const mine = spaces.listArchived().filter((srec) => canManageSpaceId(req, srec.id))
-    // Resolve "deleted by" to a privacy-filtered Author, relative to the viewer.
-    const rows = await Promise.all(
-      mine.map(async (srec) => ({
+    // Resolve "deleted by" to a privacy-filtered Author, relative to the viewer. Once
+    // per DISTINCT principal, not once per row: since V0 describeAuthor resolves the id
+    // against the directory, and one operator usually archived them all.
+    const authors = new Map<string | null, Author>()
+    const rows = []
+
+    for (const srec of mine) {
+      let author = authors.get(srec.archivedBy)
+
+      if (author === undefined) {
+        author = await auth.describeAuthor(srec.archivedBy, req.principal.userId)
+        authors.set(srec.archivedBy, author)
+      }
+      rows.push({
         ...spaceToWire(srec, spaces.resolvableAliasesOf(srec.id)),
-        archivedBy: await auth.describeAuthor(srec.archivedBy, req.principal.username),
-      })),
-    )
+        archivedBy: author,
+      })
+    }
+
     return SpacesResponseSchema.parse({ spaces: rows })
   })
 
@@ -255,18 +268,24 @@ export const spacesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
         .send({ error: body.error.issues[0]?.message || 'bad request' })
     }
     const id = req.spaceId
-
-    if (body.data.slug !== undefined && spaces.isConfigPinned(id)) {
-      return reply
-        .code(HTTP_STATUS.BAD_REQUEST)
-        .send({ error: 'this space is pinned by host config — its slug is fixed' })
-    }
-    const result = await recordSpaceRename(
-      { spaces: spacesPersistence, markerStore, now: () => new Date() },
+    // The whole sequence — guard, registry row, in-memory index, SSE `rename` — is the
+    // one operation the personal-space follow-up runs too.
+    const result = await renameSpace(
+      {
+        spaces,
+        spacesPersistence,
+        markerStore,
+        notifyRenamed: (spaceId) => auth.notifySpaceRenamed(spaceId),
+      },
       { id, slug: body.data.slug, displayName: body.data.displayName },
     )
 
     if (result.code !== 'ok') {
+      if (result.code === 'config_pinned') {
+        return reply
+          .code(HTTP_STATUS.BAD_REQUEST)
+          .send({ error: 'this space is pinned by host config — its slug is fixed' })
+      }
       if (result.code === 'not_found') {
         return notFound(reply)
       }
@@ -278,12 +297,7 @@ export const spacesRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
 
       return reply.code(HTTP_STATUS.BAD_REQUEST).send({ error: 'bad slug' })
     }
-    // Re-key the in-memory slug→id index so the new slug resolves immediately; the
-    // store/engine are untouched (the id and notes_dir never changed).
-    spaces.applyRename(result.record)
-    // SSE `rename` event so other tabs follow the new slug without a reload; the stream
-    // is keyed by the unchanged id, so it still resolves.
-    auth.notifySpaceRenamed(id)
+
     return SpaceSchema.parse(
       spaceToWire(result.record, spaces.resolvableAliasesOf(result.record.id)),
     )

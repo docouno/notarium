@@ -138,8 +138,9 @@ write PAT.
 
 ## Agent episodes <a id="agent-sessions"></a>
 
-An episode belongs to the authenticated **username**, not to one PAT/OAuth token. `owner` is an
-internal persistence key derived from that authenticated username; the agent never sends it. Its id is
+An episode belongs to the authenticated **account**, not to one PAT/OAuth token. `owner` is an
+internal persistence key — the account's stable user id, or the reserved `@system` in
+`AUTH_MODE=none` (`agentOwnerOf`, `services/authz/authz.ts`); the agent never sends it. Its id is
 `ses_` plus twelve URL-safe characters. `start_session.session` addresses either `{id}` or a
 non-unique human `{name}`: no name match creates; one sleeping match resumes; one active match
 forks with `parentId`; multiple matches return up to ten matching retained choices and require an id. Names
@@ -185,7 +186,7 @@ The episode separately stores a sticky `project_id`. Only `start_session(project
 `use_role`, `use_skill`, and `list_abilities` read it when their own `project` is absent, while an
 explicit argument wins without rewriting the hint. A resume without `project` preserves it, a fork
 inherits it, and a deleted or no-longer-readable project degrades to Personal resolution. Responses
-say when the hint supplied the context, because episodes belong to the owner username rather than
+say when the hint supplied the context, because episodes belong to the owner account rather than
 one transport connection: parallel agents under the same owner may intentionally share and replace
 the same hint. `start_session` reloads a saved role only when its exact binding is still valid in
 that effective context; otherwise it returns base mode with typed remediation instead of silently

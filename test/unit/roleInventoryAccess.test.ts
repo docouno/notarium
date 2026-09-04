@@ -15,6 +15,7 @@ const SPACE: RoleLocation = { scope: 'space', space: 'shared' }
  *  before any rule is consulted, so every gate in the service is vacuous under it. */
 const reader = (spaces: readonly string[]): Principal => ({
   id: 'pat:alice:narrowed',
+  userId: 'alice',
   username: 'alice',
   admin: false,
   scope: 'read',

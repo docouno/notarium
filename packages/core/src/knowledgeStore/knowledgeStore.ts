@@ -51,7 +51,8 @@ export type Revision = {
    *  name one. The only default lives in SQL, for the mixed-version window (#327).
    *  canon: docs/note-history.md#model */
   entryRole: RevisionEntryRole
-  /** Writer attribution id: 'user:<name>', 'pat:<name>:<id>', or 'ui' (mode none); null = external. */
+  /** Writer attribution id: 'user:<userId>', 'pat:<userId>:<patId>',
+   *  'oauth:<userId>:<tokenId>', or 'ui' (mode none); null = external. */
   principal: string | null
   /** Agent-audit attribution captured with the write. Absent on legacy/human revisions so the
    *  existing revision wire shape stays backwards-compatible. */
@@ -274,7 +275,8 @@ export type ActivityGroupsResult = {
  *  revisions still count as the owner's. */
 export type AuthorFilter = {
   exact: readonly string[]
-  /** LIKE-prefixes — the driver appends `%`. Usernames are `[a-z0-9-]`, so no escaping. */
+  /** LIKE-prefixes — the driver appends `%`. They carry a stable user id (16 hex, no
+   *  LIKE wildcard), never a username, so no escaping. */
   prefixes: readonly string[]
 }
 
@@ -945,7 +947,8 @@ export type WriteInput = {
    * this is the complete space-relative tombstone path, so a deleted imported
    * basename and a prefixed class mount are restored exactly once. */
   restorePath?: string
-  /** Journal attribution: 'pat:<user>:<id>' (agent), 'user:<name>' (human), 'ui' (mode none). */
+  /** Journal attribution: 'pat:<userId>:<patId>' or 'oauth:<userId>:<tokenId>' (agent),
+   * 'user:<userId>' (human), 'ui' (mode none). */
   principal?: string
   /** Host-built agent audit channel. It never crosses the note write wire: the owner
    *  makes unbound writes auditable, while the session snapshot survives session GC. */

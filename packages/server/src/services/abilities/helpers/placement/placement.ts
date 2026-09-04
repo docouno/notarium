@@ -52,10 +52,10 @@ export const createAbilityPlacement = ({
    *  not-found. It reproduces the pre-narrowing resolve exactly, so the availability the
    *  hint reports is identical to what the owner's own session sees on the same host. */
   const rawPersonalSpaceFor = async (principal: Principal): Promise<string | null> => {
-    if (principal.system || !principal.username) {
+    if (principal.system || !principal.userId) {
       return personalSpaceFor(principal)
     }
-    const id = await auth.personalSpaceOf(principal.username)
+    const id = await auth.personalSpaceOf(principal.userId)
     return id && spaces.has(id) ? id : null
   }
 
@@ -92,7 +92,7 @@ export const createAbilityPlacement = ({
 
       return { personalSpace: knownPersonal, principal, space }
     }
-    if (!principal.username || !scopeAllows(principal, 'space:write')) {
+    if (!principal.userId || !principal.username || !scopeAllows(principal, 'space:write')) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
 
@@ -108,12 +108,15 @@ export const createAbilityPlacement = ({
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
 
-    const personal = await ensurePersonalSpaceFor({ auth, spaces }, principal.username)
+    const personal = await ensurePersonalSpaceFor(
+      { auth, spaces },
+      { id: principal.userId, username: principal.username },
+    )
     // A matching pointer proves `ensurePersonalSpaceFor` took the real Personal path
     // and awaited its owner grant. No pointer means operator-static fallback and keeps
     // the original grants. Principal is an immutable request snapshot, so project only
     // the proven owner fact into the continuation; scope and narrowing remain intact.
-    const ownerEstablished = (await auth.personalSpaceOf(principal.username)) === personal
+    const ownerEstablished = (await auth.personalSpaceOf(principal.userId)) === personal
 
     if (!ownerEstablished) {
       throw new RoleInstallUnavailableError(
@@ -252,7 +255,7 @@ export const createAbilityPlacement = ({
       location,
       location.scope === ROLE_SCOPE.personal
         ? location.space
-        : principal.username
+        : principal.userId
           ? personalSpace
           : null,
     )

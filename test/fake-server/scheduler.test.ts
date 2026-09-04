@@ -97,7 +97,7 @@ describe('#196 scheduler interactive-signal wiring (buildApp hooks)', () => {
     const login = await app.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username: 'sergey', password: 'sergey' },
+      payload: { identifier: 'sergey', password: 'sergey' },
     })
     const cookie = login.cookies.map((item) => `${item.name}=${item.value}`).join('; ')
     const session = seeded.agentSessions?.find((item) =>

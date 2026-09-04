@@ -20,6 +20,7 @@ import type {
   MeAgentSkillsResponse,
   MeMemory,
   MeMemoryQuery,
+  MePatchRequest,
   PatCreateRequest,
   PatCreateResponse,
   PatPatchRequest,
@@ -99,6 +100,10 @@ export const meApi = {
       method: 'POST',
       body: JSON.stringify(input),
     }),
+  /** Who I am: rename and/or set the e-mail (session-only). The answer is the fresh
+   *  `me` — read the new handle from it, never from the request. */
+  mePatch: (patch: MePatchRequest) =>
+    req<Me>('/api/me', { method: 'PATCH', body: JSON.stringify(patch) }),
   passwordChange: (currentPassword: string, newPassword: string) =>
     req<{ ok: true }>('/api/me/password', {
       method: 'POST',

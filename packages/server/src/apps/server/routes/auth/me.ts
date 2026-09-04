@@ -52,6 +52,7 @@ import {
   MeAgentSkillsResponseSchema,
   MeMemoryQuerySchema,
   MeMemoryResponseSchema,
+  MePatchRequestSchema,
   MeSchema,
   OkResponseSchema,
   OwnedRoleAbilityLocatorSchema,
@@ -76,6 +77,7 @@ import { AgentSessionIdSchema } from '@notarium/contract/tools'
 import { decodeAbilityLocator } from '@notarium/core'
 
 import { withAuthors } from '../../../../libs/authors'
+import { parsePrincipalId } from '../../../../libs/principalId'
 import type { AbilitiesService } from '../../../../services/abilities'
 import { AGENT_SESSION_IDLE_MS } from '../../../../services/agentSessions'
 import { AuthError, type AuthService } from '../../../../services/auth'
@@ -120,7 +122,7 @@ import {
   weighScopePins,
 } from '../../../../services/storeAccess'
 import { contextRoleSummaryOf, contextSetViewOf, roleContextViewOf } from '../wire'
-import { authz, setSessionCookie } from './_helpers'
+import { accountOf, authz, setSessionCookie } from './_helpers'
 
 const encodeAuditCursor = (value: Record<string, string>): string =>
   Buffer.from(JSON.stringify(value), 'utf8').toString('base64url')
@@ -365,23 +367,35 @@ export const meRoutes = async (
   },
 ) => {
   app.get('/api/me', { config: authz('self:read', 'host') }, async (req) => {
-    if (!req.principal.username) {
+    if (!req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     } // 'none' mode: no user to describe
 
-    return MeSchema.parse(await auth.me(req.principal.username, req.principal))
+    return MeSchema.parse(await auth.me(req.principal.userId, req.principal))
+  })
+
+  // Who I am: the handle and the e-mail. Session-only by construction (`self:manage` is
+  // the manage ceiling only a cookie session carries) and checked explicitly here, so
+  // the guarantee does not rest on the current shape of the token scope enum.
+  app.patch('/api/me', { config: authz('self:manage', 'host') }, async (req) => {
+    if (!req.principal.userId || parsePrincipalId(req.principal.id)?.scheme !== 'user') {
+      throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
+    }
+    const body = MePatchRequestSchema.parse(req.body ?? {})
+    await auth.updateIdentity(req.principal.userId, body)
+    return MeSchema.parse(await auth.me(req.principal.userId, req.principal))
   })
 
   app.post('/api/me/password', { config: authz('self:manage', 'host') }, async (req, reply) => {
     const body = PasswordChangeRequestSchema.parse(req.body ?? {})
 
-    if (!req.principal.username) {
+    if (!req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     // The change drops every session (other devices included); the fresh
     // token keeps THIS tab logged in.
     const { sessionToken } = await auth.changePassword(
-      req.principal.username,
+      req.principal.userId,
       body.currentPassword,
       body.newPassword,
     )
@@ -390,11 +404,11 @@ export const meRoutes = async (
   })
 
   app.get('/api/me/tokens', { config: authz('self:manage', 'host') }, async (req) => {
-    if (!req.principal.username) {
+    if (!req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
 
-    return PatsResponseSchema.parse({ tokens: await auth.listPats(req.principal.username) })
+    return PatsResponseSchema.parse({ tokens: await auth.listPats(req.principal.userId) })
   })
 
   // The wire narrows by slug; grants key on the stable id — resolve, then check
@@ -413,13 +427,13 @@ export const meRoutes = async (
   app.post('/api/me/tokens', { config: authz('self:manage', 'host') }, async (req, reply) => {
     const body = PatCreateRequestSchema.parse(req.body ?? {})
 
-    if (!req.principal.username) {
+    if (!req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     if (body.spaces) {
       assertSpacesReadable(req, body.spaces)
     }
-    const created = await auth.createPat(req.principal.username, body)
+    const created = await auth.createPat(req.principal.userId, body)
     return reply.code(HTTP_STATUS.CREATED).send(PatCreateResponseSchema.parse(created))
   })
 
@@ -428,21 +442,21 @@ export const meRoutes = async (
   app.patch('/api/me/tokens/:id', { config: authz('self:manage', 'host') }, async (req) => {
     const body = PatPatchRequestSchema.parse(req.body ?? {})
 
-    if (!req.principal.username) {
+    if (!req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     if (body.spaces) {
       assertSpacesReadable(req, body.spaces)
     }
-    await auth.updatePat(req.principal.username, (req.params as { id: string }).id, body)
+    await auth.updatePat(req.principal.userId, (req.params as { id: string }).id, body)
     return OkResponseSchema.parse({ ok: true })
   })
 
   app.delete('/api/me/tokens/:id', { config: authz('self:manage', 'host') }, async (req) => {
-    if (!req.principal.username) {
+    if (!req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
-    await auth.revokePat(req.principal.username, (req.params as { id: string }).id)
+    await auth.revokePat(req.principal.userId, (req.params as { id: string }).id)
     return OkResponseSchema.parse({ ok: true })
   })
 
@@ -450,19 +464,19 @@ export const meRoutes = async (
   // self:manage but session-only — a connector token can't manage connections.
   // No POST: a connection is born from the OAuth consent flow, not created here.
   app.get('/api/me/connections', { config: authz('self:manage', 'host') }, async (req) => {
-    if (!req.principal.username) {
+    if (!req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
 
     return ConnectionsResponseSchema.parse({
-      connections: await auth.listConnections(req.principal.username),
+      connections: await auth.listConnections(req.principal.userId),
     })
   })
 
   // The id is the OAuth client id (like revoke); the change covers all the app's
   // live tokens (access + refresh), so it survives the hourly rotation.
   app.patch('/api/me/connections/:id', { config: authz('self:manage', 'host') }, async (req) => {
-    if (!req.principal.username) {
+    if (!req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     const body = ConnectionPatchRequestSchema.parse(req.body ?? {})
@@ -470,16 +484,16 @@ export const meRoutes = async (
     if (body.spaces) {
       assertSpacesReadable(req, body.spaces)
     }
-    await auth.updateConnection(req.principal.username, (req.params as { id: string }).id, body)
+    await auth.updateConnection(req.principal.userId, (req.params as { id: string }).id, body)
     return OkResponseSchema.parse({ ok: true })
   })
 
   app.delete('/api/me/connections/:id', { config: authz('self:manage', 'host') }, async (req) => {
-    if (!req.principal.username) {
+    if (!req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     // The id is the OAuth client id (a CIMD url is url-encoded by the client).
-    await auth.revokeConnection(req.principal.username, (req.params as { id: string }).id)
+    await auth.revokeConnection(req.principal.userId, (req.params as { id: string }).id)
     return OkResponseSchema.parse({ ok: true })
   })
 
@@ -497,7 +511,7 @@ export const meRoutes = async (
     }
     const cats = await listMemoryCategories(await spaces.store(slug), '', query)
     return MeMemoryResponseSchema.parse({
-      categories: await withAuthors(cats, req.principal.username, auth.describeAuthor),
+      categories: await withAuthors(cats, req.principal.userId, auth.describeAuthor),
     })
   })
 
@@ -575,7 +589,7 @@ export const meRoutes = async (
       ...(abilityContext.listing.truncated ? { rolesTruncated: true } : {}),
       ...(roleView ? { role: roleView } : {}),
       pins: curated.pins,
-      memory: await withAuthors(curated.memory, req.principal.username, auth.describeAuthor),
+      memory: await withAuthors(curated.memory, req.principal.userId, auth.describeAuthor),
       sets: curated.sets.map(contextSetViewOf),
       loadedTokens: curated.loadedTokens,
       budgetTokens: PERSONAL_TOKEN_BUDGET,
@@ -1041,7 +1055,7 @@ export const meRoutes = async (
   // space on first attach (write path).
   // canon: docs/projects.md#context-sets-209-reusable-cross-space-bundles
   app.put('/api/me/context-sets/:id', { config: authz('self:manage', 'host') }, async (req) => {
-    if (!contextSets || !req.principal.username) {
+    if (!contextSets || !req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     const set = await contextSets.getSet((req.params as { id?: string }).id ?? '')
@@ -1049,7 +1063,7 @@ export const meRoutes = async (
     if (!set || !can(req.principal, 'space:read', { space: set.homeSpace })) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
-    const slug = await ensurePersonalSpaceFor({ auth, spaces }, req.principal.username)
+    const slug = await ensurePersonalSpaceFor({ auth, spaces }, accountOf(req))
     await contextSets.attach({
       setId: set.id,
       targetKind: CONTEXT_KIND.personal,
@@ -1062,7 +1076,7 @@ export const meRoutes = async (
 
   // Detach a set from my personal scope. Idempotent — a peek (no mint) is enough.
   app.delete('/api/me/context-sets/:id', { config: authz('self:manage', 'host') }, async (req) => {
-    if (!contextSets || !req.principal.username) {
+    if (!contextSets || !req.principal.userId) {
       return OkResponseSchema.parse({ ok: true })
     }
     const slug = await peekPersonalSpace({ auth, spaces }, req.principal)
@@ -1083,7 +1097,7 @@ export const meRoutes = async (
   // cross-space pin). Its authoritative space comes from the registry (hit.space),
   // not the body. Mints the personal space on first pin (write path).
   app.put('/api/me/context-pins', { config: authz('self:manage', 'host') }, async (req) => {
-    if (!scopePins || !req.principal.username) {
+    if (!scopePins || !req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     const body = ContextPinRequestSchema.safeParse(req.body ?? {})
@@ -1096,7 +1110,7 @@ export const meRoutes = async (
     if (!hit) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
-    const slug = await ensurePersonalSpaceFor({ auth, spaces }, req.principal.username)
+    const slug = await ensurePersonalSpaceFor({ auth, spaces }, accountOf(req))
     await scopePins.addPin({
       targetKind: CONTEXT_KIND.personal,
       targetId: slug,
@@ -1113,7 +1127,7 @@ export const meRoutes = async (
     '/api/me/context-pins/:noteId',
     { config: authz('self:manage', 'host') },
     async (req) => {
-      if (!scopePins || !req.principal.username) {
+      if (!scopePins || !req.principal.userId) {
         return OkResponseSchema.parse({ ok: true })
       }
       const slug = await peekPersonalSpace({ auth, spaces }, req.principal)
@@ -1132,7 +1146,7 @@ export const meRoutes = async (
   // is not re-validated (a stale entry ranks nothing). Mints the personal space
   // on first reorder (write path).
   app.put('/api/me/context-order', { config: authz('self:manage', 'host') }, async (req) => {
-    if (!contextOrder || !req.principal.username) {
+    if (!contextOrder || !req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     const body = ContextOrderRequestSchema.safeParse(req.body ?? {})
@@ -1140,7 +1154,7 @@ export const meRoutes = async (
     if (!body.success) {
       throw new AuthError(HTTP_STATUS.BAD_REQUEST, body.error.issues[0]?.message || 'bad request')
     }
-    const slug = await ensurePersonalSpaceFor({ auth, spaces }, req.principal.username)
+    const slug = await ensurePersonalSpaceFor({ auth, spaces }, accountOf(req))
     const entries = await Promise.all(
       body.data.entries.map(async (entry) => {
         if (entry.kind !== 'pin') {
@@ -1695,10 +1709,10 @@ export const meRoutes = async (
   // Read the curated profile (always-load note + display name). 404 in 'none'
   // mode, like /api/me. Read does not mint.
   app.get('/api/me/profile', { config: authz('self:read', 'host') }, async (req) => {
-    if (!req.principal.username) {
+    if (!req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
-    const me = await auth.me(req.principal.username)
+    const me = await auth.me(req.principal.userId)
     const slug = await peekPersonalSpace({ auth, spaces }, req.principal)
     const profile = slug ? await readProfileNote(await spaces.store(slug)) : null
     return ProfileResponseSchema.parse({
@@ -1712,15 +1726,15 @@ export const meRoutes = async (
   // Save the profile: display name (user record) + always-load note. Mints the
   // personal space on first save (write path).
   app.put('/api/me/profile', { config: authz('self:manage', 'host') }, async (req) => {
-    if (!req.principal.username) {
+    if (!req.principal.userId) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
     const body = ProfilePutRequestSchema.parse(req.body ?? {})
 
     if (body.displayName) {
-      await auth.setDisplayName(req.principal.username, body.displayName)
+      await auth.setDisplayName(req.principal.userId, body.displayName)
     }
-    const slug = await ensurePersonalSpaceFor({ auth, spaces }, req.principal.username)
+    const slug = await ensurePersonalSpaceFor({ auth, spaces }, accountOf(req))
     const store = await spaces.store(slug)
     await writeProfileNote(store, {
       content: body.content,
@@ -1728,7 +1742,7 @@ export const meRoutes = async (
       principal: req.principal.id,
     })
     // Re-read for the canonical post-write token + the fresh display name.
-    const me = await auth.me(req.principal.username)
+    const me = await auth.me(req.principal.userId)
     const saved = await readProfileNote(store)
     return ProfileResponseSchema.parse({
       displayName: me.displayName,

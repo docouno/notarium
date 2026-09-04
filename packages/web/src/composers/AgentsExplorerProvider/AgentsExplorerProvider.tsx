@@ -184,7 +184,8 @@ export const AgentsExplorerProvider = ({ children }: { children: ReactNode }) =>
   const { subscribe, agentSessionsRev, connectionRevision } = useSync()
   const natural = naturalAgentsExplorerDataset(location.pathname)
   const activeSpace = resolveAgentsExplorerScope(space, spaces, personalSpace)
-  const owner = me?.username ?? '@system'
+  // The stable account id, so explorer state survives a rename of the handle.
+  const owner = me?.id ?? '@system'
   const storageKey = activeSpace ? agentsExplorerStorageKey(owner, activeSpace.spaceId) : null
   const [state, setState] = useState<AgentsExplorerState>({ dataset: natural, mode: 'natural' })
   const [stateStorageKey, setStateStorageKey] = useState<string | null>(null)

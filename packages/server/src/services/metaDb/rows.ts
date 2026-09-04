@@ -237,7 +237,9 @@ export const spaceOfRow = (r: SpaceRow): SpaceRecord => ({
 })
 
 export type UserRow = {
+  id: string
   username: string
+  email: string | null
   display_name: string
   password_hash: string | null
   admin: number | boolean
@@ -247,7 +249,9 @@ export type UserRow = {
 }
 
 export const userOfRow = (r: UserRow): UserRecord => ({
+  id: r.id,
   username: r.username,
+  email: r.email ?? null,
   displayName: r.display_name,
   passwordHash: r.password_hash,
   admin: Boolean(r.admin),
@@ -259,7 +263,7 @@ export const userOfRow = (r: UserRow): UserRecord => ({
 
 export type PatRow = {
   id: string
-  username: string
+  user_id: string
   name: string
   secret_hash: string
   scope: string
@@ -272,7 +276,7 @@ export type PatRow = {
 
 export const patOfRow = (r: PatRow): PatRecord => ({
   id: r.id,
-  username: r.username,
+  userId: r.user_id,
   name: r.name,
   secretHash: r.secret_hash,
   scope: r.scope as PatRecord['scope'],
@@ -502,7 +506,7 @@ export const dedupOrderEntries = <T extends { entryKind: ContextOrderEntryKind; 
 export type OAuthAccessRow = {
   id: string
   token_hash: string
-  username: string
+  user_id: string
   client_id: string
   scope: string
   /** Space-id allowlist; NULL = all grants (not none). */
@@ -517,7 +521,7 @@ export type OAuthAccessRow = {
 export const accessOfRow = (r: OAuthAccessRow): OAuthAccessRecord => ({
   id: r.id,
   tokenHash: r.token_hash,
-  username: r.username,
+  userId: r.user_id,
   clientId: r.client_id,
   scope: r.scope as OAuthScope,
   spaces: r.spaces == null ? null : (JSON.parse(r.spaces) as string[]),
@@ -531,7 +535,7 @@ export const accessOfRow = (r: OAuthAccessRow): OAuthAccessRecord => ({
 export type OAuthRefreshRow = {
   id: string
   token_hash: string
-  username: string
+  user_id: string
   client_id: string
   scope: string
   /** Space-id allowlist; NULL = all grants (not none). */
@@ -545,7 +549,7 @@ export type OAuthRefreshRow = {
 export const refreshOfRow = (r: OAuthRefreshRow): OAuthRefreshRecord => ({
   id: r.id,
   tokenHash: r.token_hash,
-  username: r.username,
+  userId: r.user_id,
   clientId: r.client_id,
   scope: r.scope as OAuthScope,
   spaces: r.spaces == null ? null : (JSON.parse(r.spaces) as string[]),

@@ -38,8 +38,8 @@ export const ProjectSummarySchema = z.object({
 })
 
 /** Who/what last wrote a note, projected from the journal: `principal` (the
- *  attribution string, e.g. `pat:<user>:<id>`; null for an unattributable external
- *  edit), `kind`, `modifiedAt`. */
+ *  attribution string, e.g. `pat:<userId>:<id>` — the stable user id, never the
+ *  handle; null for an unattributable external edit), `kind`, `modifiedAt`. */
 export const ProvenanceSchema = z.object({
   principal: z.string().nullable(),
   kind: RevisionKindSchema,

@@ -15,6 +15,15 @@ import {
 } from '../../packages/server/src/services/metaDb/migrations'
 import { PgMetaDb } from '../../packages/server/src/services/metaDb/pgMetaDb'
 import {
+  accountIdentityRegistry,
+  accountIdentitySeedSql,
+  expectAccountIdentityWorld,
+  expectActivityProjectionState,
+  type LadderReader,
+  usersCarriedColumnsSql,
+} from './accountIdentityLadder'
+import {
+  ACCOUNT_IDENTITY_CANDIDATE_COLUMNS,
   agentCallTraceCatalog,
   approvedTargetCatalog,
   type MetaDbCatalog,
@@ -1069,6 +1078,140 @@ describePostgres('Postgres meta-DB migrations', { timeout: 30_000 }, () => {
       expect(await client.query(`SELECT to_regclass('mcp_bookmarks') AS legacy`)).toMatchObject({
         rows: [{ legacy: null }],
       })
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('moves every user reference onto the stable id and leaves orphans byte-for-byte', async () => {
+    const testSchema = await createSchema('migration_account_identity')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      const upTo = migrations.findIndex((migration) => migration.name === 'account_identity')
+      await runPgMigrations(client, migrations.slice(0, upTo))
+      await client.query(accountIdentitySeedSql(true))
+      const read: LadderReader = {
+        one: async (sql) => (await client.query(sql)).rows[0],
+        all: async (sql) => (await client.query(sql)).rows,
+      }
+      const triggers = async () =>
+        (
+          await client.query(
+            `SELECT t.tgname AS name, pg_get_triggerdef(t.oid) AS definition
+               FROM pg_trigger t
+               JOIN pg_class c ON c.oid = t.tgrelid
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = $1 AND NOT t.tgisinternal
+              ORDER BY t.tgname`,
+            [testSchema.schema],
+          )
+        ).rows
+
+      const tableCounts = async (): Promise<Record<string, number>> => {
+        const tables = (
+          await client.query(
+            `SELECT c.relname AS name
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = $1 AND c.relkind = 'r'
+              ORDER BY c.relname`,
+            [testSchema.schema],
+          )
+        ).rows as Array<{ name: string }>
+        const counts: Record<string, number> = {}
+
+        for (const { name } of tables) {
+          counts[name] = (
+            await client.query(`SELECT COUNT(*)::int AS n FROM ${quotedIdentifier(name)}`)
+          ).rows[0].n
+        }
+
+        return counts
+      }
+      const triggersBefore = await triggers()
+      const countsBefore = await tableCounts()
+      // The seed must leave the projection built, or the `rebuilding` assertion at the
+      // end would hold without the carrier having done anything. It only does because
+      // the revisions go in one statement per row: PostgreSQL defers AFTER ROW triggers
+      // to the end of a statement, so a single multi-row INSERT would open the
+      // projection already `rebuilding` — and this test would pass on a carrier that
+      // never tripped the invalidation at all.
+      await expectActivityProjectionState(read, 'ready')
+      const usersBefore = await read.all(usersCarriedColumnsSql)
+
+      await runPgMigrations(client, migrations)
+
+      expect(await triggers()).toEqual(triggersBefore)
+      const countsAfter = await tableCounts()
+      expect(countsAfter.mcp_dedup).toBe(0)
+      expect(countsAfter.activity_projection_gc).toBeGreaterThan(
+        countsBefore.activity_projection_gc,
+      )
+      expect(countsAfter.meta_migrations).toBe(countsBefore.meta_migrations + 1)
+      for (const table of ['mcp_dedup', 'activity_projection_gc', 'meta_migrations']) {
+        delete countsBefore[table]
+        delete countsAfter[table]
+      }
+      expect(countsAfter).toEqual(countsBefore)
+
+      // `users` is the only table the carrier rebuilds, and everything the INSERT…SELECT
+      // copies has to come back byte-for-byte — not just the three columns read below.
+      expect(await read.all(usersCarriedColumnsSql)).toEqual(usersBefore)
+
+      const users = (await client.query('SELECT username, id, email FROM users ORDER BY username'))
+        .rows as Array<{ username: string; id: string; email: string | null }>
+      expect(users.map(({ username }) => username)).toEqual([
+        'alice',
+        'bob',
+        'p1',
+        'p2',
+        'p3',
+        'p4',
+        'p5',
+        'p6',
+      ])
+      for (const user of users) {
+        expect(user.id).toMatch(/^[0-9a-f]{16}$/)
+        expect(user.email).toBeNull()
+      }
+      expect(new Set(users.map(({ id }) => id)).size).toBe(users.length)
+      const id = (username: string): string => users.find((u) => u.username === username)!.id
+
+      await expectAccountIdentityWorld(read, { alice: id('alice'), bob: id('bob') })
+      await expectActivityProjectionState(read, 'rebuilding')
+    } finally {
+      client.release()
+      await pool.end()
+    }
+  })
+
+  it('accounts for every schema column that can carry a user reference', async () => {
+    const testSchema = await createSchema('migration_account_registry')
+    const pool = new pg.Pool({ connectionString: testSchema.scopedUrl })
+    const client = await pool.connect()
+
+    try {
+      await runPgMigrations(client)
+      const candidates = (
+        await client.query(
+          `SELECT c.relname AS "table", a.attname AS "column"
+             FROM pg_attribute a
+             JOIN pg_class c ON c.oid = a.attrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = $1 AND c.relkind = 'r'
+              AND a.attnum > 0 AND NOT a.attisdropped
+              AND a.attname = ANY($2::text[])
+            ORDER BY c.relname, a.attname`,
+          [testSchema.schema, [...ACCOUNT_IDENTITY_CANDIDATE_COLUMNS]],
+        )
+      ).rows as Array<{ table: string; column: string }>
+
+      expect(candidates.map(({ table, column }) => `${table}.${column}`).sort()).toEqual(
+        accountIdentityRegistry(),
+      )
     } finally {
       client.release()
       await pool.end()

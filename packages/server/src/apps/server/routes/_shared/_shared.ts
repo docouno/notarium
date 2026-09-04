@@ -5,6 +5,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify'
 import { PROJECT_STATUS } from '@notarium/contract'
 import { HTTP_STATUS } from '@notarium/contract/http'
 
+import { userPrincipalId } from '../../../../libs/principalId'
 import { type Action, type AuthzConfig } from '../../../../services/authz'
 import type { ProjectRecord } from '../../../../services/metaDb'
 import type { SpaceStore } from '../../../../services/spaces'
@@ -140,11 +141,12 @@ export const buildApiRouteCtx = (opts: ApiRoutesOptions): ApiRouteCtx => {
    *  (404 on unknown); this is the lookup, not the access check. */
   const spaceStoreFor = (req: FastifyRequest) => spaceStore(req.spaceId)
 
-  // Journal attribution string: 'user:<name>' (session), 'pat:<name>:<id>' (bearer),
-  // 'ui' in AUTH_MODE=none.
+  // Journal attribution string: 'user:<userId>' (session), 'pat:<userId>:<patId>' or
+  // 'oauth:<userId>:<tokenId>' (bearer), 'ui' in AUTH_MODE=none.
   const principalId = (req: FastifyRequest) => req.principal.id
+  // Favorites are user-level: every credential of one account shares the list.
   const favoriteOwner = (req: FastifyRequest) =>
-    req.principal.username ? `user:${req.principal.username}` : req.principal.id
+    req.principal.userId ? userPrincipalId(req.principal.userId) : req.principal.id
 
   // Identified-folder rows (id + path-history) the tree carries for durable
   // `/folder/<id>` links and old-path/alias resolution — both projects and plain

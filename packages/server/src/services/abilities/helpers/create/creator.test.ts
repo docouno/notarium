@@ -36,6 +36,7 @@ const SKILL_PREFIX = '.notarium/skills'
 
 const principal: Principal = {
   id: 'pat:agent:creator-test',
+  userId: 'alice',
   username: 'alice',
   admin: false,
   scope: 'write',

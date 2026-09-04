@@ -3,7 +3,8 @@
  *  body (truth is the named REST route), `job` carries the job's wire status (validated on
  *  emit against SseJobPayloadSchema / JobSchema in schemas/rest/jobs.ts). */
 export const SSE_EVENT = {
-  /** Principal grants changed → client re-syncs. Truth is /api/auth/session. */
+  /** Facts about the principal changed — its grants, or the account's own handle
+   *  (a rename) → client re-syncs. Truth is /api/auth/session. */
   ACCESS: 'access',
   /** Space membership changed → viewers refetch GET /members. */
   MEMBERS: 'members',

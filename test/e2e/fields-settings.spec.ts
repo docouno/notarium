@@ -689,7 +689,7 @@ test('the tab is hidden from a reader while its direct route remains readable', 
   request,
 }) => {
   const loginResponse = await request.post('/api/auth/login', {
-    data: { username: 'owner', password: 'owner-password-1' },
+    data: { identifier: 'owner', password: 'owner-password-1' },
   })
   expect(loginResponse.ok()).toBe(true)
   const current = (await (await request.get('/api/s/main/fields/schema')).json()) as {

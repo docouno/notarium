@@ -13,10 +13,12 @@
 // stable; a fixture opts in via `capabilities.spaceCreate`.
 
 import type { FastifyInstance } from 'fastify'
+import { createHash } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { EmailSchema } from '@notarium/contract'
 import {
   type AgentWriteAttribution,
   analyzeDocumentState,
@@ -47,6 +49,7 @@ import {
   createJobRunner,
   createRolesService,
   type CustomAbilityCreator,
+  followPersonalSpaceRename,
   hashPassword,
   hostInfoFrom,
   InMemoryAbilityAvailability,
@@ -58,8 +61,12 @@ import {
   markFolderAsProject,
   type MetaDb,
   type MutationGate,
+  oauthPrincipalId,
   ownedRoleLocator,
   ownedSkillLocator,
+  parsePrincipalId,
+  patPrincipalId,
+  PRINCIPAL_SCHEME,
   projectHandleOf,
   type ProjectRecord,
   PROVIDER_CALL_KIND,
@@ -67,6 +74,7 @@ import {
   ProviderRegistry,
   ProviderRuntime,
   type ProviderRuntimeOptions,
+  renameSpace,
   roleContextTargetOf,
   type RoleLocation,
   runProviderJobCall,
@@ -79,6 +87,7 @@ import {
   SYSTEM_PRINCIPAL,
   SystemAbilityNameConflictError,
   TerminalJobError,
+  userPrincipalId,
 } from '@notarium/server'
 import { applyAgentAbilityPreferences } from '../cases/applyAbilityPreferences'
 import { applyAgentRoleMoves } from '../cases/applyAgentRoleMoves'
@@ -183,6 +192,10 @@ export type SpaceFixture = {
 export type AuthFixture = {
   users: Array<{
     username: string
+    /** Optional address; normalized by the wire schema at seed time, exactly as the
+     *  routes normalize it, so a fixture cannot seed an address login cannot find.
+     *  Omit for "not set". */
+    email?: string
     /** Plaintext here, scrypt-hashed at seed time (memoised — scrypt is
      *  deliberately slow and fixtures re-seed per test). */
     password?: string
@@ -331,10 +344,45 @@ const projectRecords = (fixture: Fixture, idOf: (slug: string) => string): Proje
  *  journal. Bypasses the RevisionJournal wrapper (dedup/baseline) on purpose
  *  — we want exact rows at exact dates. Appended chronologically so the journal's
  *  monotonic ids match date order (the events feed sorts by id). */
+/** Fixture accounts are declared by handle; the fake keys them by a stable id the way
+ *  the meta-DB does after the identity carrier. The id derives from the handle so a
+ *  fixture is reproducible without minted state, and it keeps the meta-DB shape
+ *  (16 hex) so nothing downstream can tell the two apart. */
+export const fakeUserId = (username: string): string =>
+  createHash('sha256').update(`fake-user:${username}`).digest('hex').slice(0, 16)
+
+/** The handle→id map of one fixture, plus the rewrite every seeded owner key and
+ *  principal string goes through: cases speak handles, the store speaks ids. An
+ *  unknown handle (the `@system` owner, an orphaned attribution) passes unchanged. */
+const identityOf = (auth: AuthFixture | undefined) => {
+  const ids = new Map((auth?.users ?? []).map((u) => [u.username, fakeUserId(u.username)]))
+  const userIdOf = (username: string): string => ids.get(username) ?? username
+
+  const principalOf = (principal: string): string => {
+    const parsed = parsePrincipalId(principal)
+    const id = parsed ? ids.get(parsed.userId) : undefined
+
+    if (!parsed || !id) {
+      return principal
+    }
+    if (parsed.scheme === PRINCIPAL_SCHEME.user) {
+      return userPrincipalId(id)
+    }
+
+    return parsed.scheme === PRINCIPAL_SCHEME.pat
+      ? patPrincipalId(id, parsed.keyId as string)
+      : oauthPrincipalId(id, parsed.keyId as string)
+  }
+
+  return { userIdOf, principalOf }
+}
+
 const seedActivity = async (
   revisions: InMemoryRevisionPersistence,
   spaceId: string,
   entries: ActivityFixture[],
+  principalOf: (principal: string) => string,
+  userIdOf: (username: string) => string,
 ) => {
   const normDate = (d: string) => (d.includes('T') ? d : `${d}T12:00:00.000Z`)
   const sorted = [...entries].sort((a, b) => (normDate(a.date) < normDate(b.date) ? -1 : 1))
@@ -390,7 +438,7 @@ const seedActivity = async (
         sourceRevisionId: null,
         kind: journalKind,
         entryRole,
-        principal: e.principal ?? 'ui',
+        principal: e.principal ? principalOf(e.principal) : 'ui',
         contentHash,
         semanticFingerprint: e.semanticFingerprint ?? null,
         restoreSafety: e.restoreSafety ?? null,
@@ -402,7 +450,11 @@ const seedActivity = async (
         createdAt: normDate(e.date),
         charsAdded: e.charsAdded ?? null,
         charsRemoved: e.charsRemoved ?? null,
-        agent: e.agent,
+        // The attribution owner is declared by handle like every other seeded owner
+        // key, and the session-audit reader compares it against the principal's user
+        // id — leave the handle here and every write event of the session is filtered
+        // out, taking audit-only sessions with it.
+        agent: e.agent ? { ...e.agent, owner: userIdOf(e.agent.owner) } : undefined,
       },
       blob ?? null,
     )
@@ -452,6 +504,9 @@ export const createApp = async (
     onJobsPersistence?: (jobs: MetaDb['jobs']) => void
     /** Test-only access to archive a configured Space without the product guard. */
     onSpacesPersistence?: (spaces: InMemorySpaces) => void
+    /** Test-only access to the account directory: a login test counts the reads the
+     *  gates let through. */
+    onAuthPersistence?: (auth: InMemoryAuthPersistence) => void
     /** The provider facets, handed back so a test can put an attachment into a state
      *  the acceptance surface will produce once vertical 14 ships it. `idOf` comes
      *  with them because an attachment addresses a Space by its stable id. */
@@ -527,6 +582,7 @@ export const createApp = async (
   // deactivation and owner membership from these rows, so the registry needs them
   // at construction.
   const authDb = new InMemoryAuthPersistence()
+  opts.onAuthPersistence?.(authDb)
   const secretKeyring = new InMemorySecretKeyringPersistence()
   const providerPersistence = createInMemoryProviderPersistence({
     spaceIsLive: async (space) =>
@@ -1095,7 +1151,7 @@ export const createApp = async (
           throw new Error('fixture ability preference has no owner')
         }
 
-        return owner
+        return identityOf(fx.auth).userIdOf(owner)
       },
       setEnabled: (owner, target, enabled) =>
         abilityPreferences.setEnabled(owner, target, enabled, updatedAt),
@@ -1106,12 +1162,16 @@ export const createApp = async (
   let seededPackages = await seedAgentPackages(fixture)
 
   const seedAgentSessions = async (fx: Fixture): Promise<void> => {
+    const { userIdOf } = identityOf(fx.auth)
     const records = await Promise.all(
-      (fx.agentSessions ?? []).map(async (record) => {
+      (fx.agentSessions ?? []).map(async (declared) => {
+        // Sessions are declared by owner handle and stored by owner id.
+        const record = { ...declared, owner: userIdOf(declared.owner) }
+
         if (!record.role) {
           return record
         }
-        const user = fx.auth?.users.find((candidate) => candidate.username === record.owner)
+        const user = fx.auth?.users.find((candidate) => candidate.username === declared.owner)
         const personalSpace = user?.personalSpace ? idOf(user.personalSpace) : null
         const sessionProject = record.projectId ? await projects.getById(record.projectId) : null
         const resolved = await roles.resolveEffective(
@@ -1214,16 +1274,28 @@ export const createApp = async (
     personalSpaceFor: (location) =>
       personalSpaceForPlacement(seededPackages.personalSpaceIds, location.space),
   })
+  /** Calls are declared by owner handle and principal string; the store keys them by id. */
+  const seededAgentCalls = (fx: Fixture) => {
+    const { userIdOf, principalOf } = identityOf(fx.auth)
+
+    return (fx.agentCalls ?? []).map((call) => ({
+      ...call,
+      owner: userIdOf(call.owner),
+      principal: principalOf(call.principal),
+    }))
+  }
   agentCalls.seed(
-    fixture.agentCalls ?? [],
+    seededAgentCalls(fixture),
     fixture.agentCallDetails ?? [],
     fixture.agentTelemetryDetailed ?? false,
   )
   const seedAgentCleanup = async (fx: Fixture) => {
+    const { userIdOf } = identityOf(fx.auth)
+
     for (const marker of fx.agentCleanupMarkers ?? []) {
       for (const operation of marker.operations) {
         const common = {
-          owner: marker.owner,
+          owner: userIdOf(marker.owner),
           sessionId: marker.sessionId,
           acceptedAt: fx.now ?? new Date().toISOString(),
           batchSize: operation.cleanup === 'pending' ? 0 : 10_000,
@@ -1252,6 +1324,8 @@ export const createApp = async (
   }
   // Seed activity history into each world's journal AFTER its store booted.
   const seedActivityForFixture = async (fx: Fixture) => {
+    const { userIdOf, principalOf } = identityOf(fx.auth)
+
     for (const s of fx.spaces) {
       if (!s.activity?.length) {
         continue
@@ -1259,7 +1333,7 @@ export const createApp = async (
       const world = worlds.get(idOf(s.slug))
 
       if (world) {
-        await seedActivity(world.revisions, idOf(s.slug), s.activity)
+        await seedActivity(world.revisions, idOf(s.slug), s.activity, principalOf, userIdOf)
       }
     }
   }
@@ -1282,11 +1356,40 @@ export const createApp = async (
     // invisible only while id ≡ slug.
     spaces: spacesRegistry,
     aliasesForSpace: (id) => manager.resolvableAliasesOf(id),
-    removeMemberAndProviderAttachments: (space, username) =>
+    removeMemberAndProviderAttachments: (space, userId) =>
       providerPersistence.coordinator.run(() => {
-        providerPersistence.removeProviderAttachmentsForMemberInsideCoordinator(space, username)
-        return authDb.removeMember(space, username)
+        providerPersistence.removeProviderAttachmentsForMemberInsideCoordinator(space, userId)
+        return authDb.removeMember(space, userId)
       }),
+    // The personal space follows the handle through the SAME rename sequence the
+    // PATCH route runs — mirrors server.ts, so the follow-up is provable here.
+    onUsernameChanged: async (change) => {
+      try {
+        await followPersonalSpaceRename(
+          {
+            spaces: manager,
+            rename: (input) =>
+              renameSpace(
+                {
+                  spaces: manager,
+                  spacesPersistence: spacesRegistry,
+                  markerStore: opts.markerStore,
+                  notifyRenamed: (id) => auth.notifySpaceRenamed(id),
+                },
+                input,
+              ),
+          },
+          change,
+        )
+      } catch (err) {
+        // Mirrors server.ts down to the failure path: the follow-up is never a reason
+        // to roll the account rename back, so a fake that raised here would prove the
+        // opposite of production.
+        console.warn(
+          `[auth] personal space of ${change.user.id} keeps its slug after the rename: ${(err as Error).message}`,
+        )
+      }
+    },
   })
 
   const seedAuth = async (af: AuthFixture | undefined) => {
@@ -1295,10 +1398,16 @@ export const createApp = async (
       return
     }
     const t = fixture.now || '2026-01-01T00:00:00.000Z'
+    const { userIdOf } = identityOf(af)
 
     for (const u of af.users) {
-      await authDb.createUser({
+      // Same normalizer as the routes, and the same loud failure on a duplicate: the
+      // persistence reports a conflict instead of throwing, and a swallowed one would
+      // leave the fixture's memberships pointing at a user that was never written.
+      const written = await authDb.createUser({
+        id: userIdOf(u.username),
         username: u.username,
+        email: u.email ? EmailSchema.parse(u.email) : null,
         displayName: u.displayName || u.username,
         passwordHash: u.password ? await memoHash(u.password) : null,
         admin: Boolean(u.admin),
@@ -1309,10 +1418,14 @@ export const createApp = async (
         // holds the stable space id, so translate the fixture's slug.
         personalSpace: u.personalSpace ? idOf(u.personalSpace) : null,
       })
+
+      if (written.status === 'conflict') {
+        throw new Error(`fixture: user "${u.username}" collides on ${written.field}`)
+      }
     }
     // Memberships key on the stable space id — translate the fixture slug.
     for (const m of af.members) {
-      await authDb.upsertMember(idOf(m.space), m.username, m.role, t)
+      await authDb.upsertMember(idOf(m.space), userIdOf(m.username), m.role, t)
     }
   }
   await seedAuth(fixture.auth)
@@ -1327,6 +1440,7 @@ export const createApp = async (
     await applyProviderSeed({
       declaration: fx.providers,
       registry: providerSeedRegistry,
+      ownerOf: identityOf(fx.auth).userIdOf,
       resolveSpace: (slug) => manager.resolveId(slug),
       resolveProject: async (space, path) => {
         const record = projectRecords(fx, idOf).find(
@@ -1740,7 +1854,7 @@ export const createApp = async (
         personalSpaceForPlacement(seededPackages.personalSpaceIds, location.space),
     })
     agentCalls.seed(
-      next.agentCalls ?? [],
+      seededAgentCalls(next),
       next.agentCallDetails ?? [],
       next.agentTelemetryDetailed ?? false,
     )

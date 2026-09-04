@@ -9,6 +9,14 @@ export const EXPIRY_DAYS: Record<string, number | null> = { '30d': 30, '90d': 90
 // fallback (server message, or a generic line for anything illegible).
 export const PASSWORD_REASONS: ErrorReasonMap = { bad_password: 'Current password is wrong.' }
 
+export const IDENTITY_REASONS: ErrorReasonMap = {
+  username_taken: 'This username is already taken.',
+  email_taken: 'This email is already used by another account.',
+  // The form refuses invalid input before sending, so this covers only what slipped
+  // past it — the wire message is written for an API client, not for this screen.
+  validation: 'That username or email is not valid.',
+}
+
 /** The read/write Segmented options, shared by the create + edit token forms. */
 export const SCOPE_OPTIONS: { value: PatScope; label: string }[] = [
   { value: PAT_SCOPE.read, label: 'Read' },

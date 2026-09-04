@@ -30,9 +30,12 @@ describe('provider resolution', () => {
   let registry: ProviderRegistry
   let attachments = 0
 
+  // Tests key owners by the handle, so the seeded id IS the handle.
   const seedUser = (username: string, disabledAt: string | null = null) =>
     db.auth.createUser({
+      id: username,
       username,
+      email: null,
       displayName: username,
       passwordHash: null,
       admin: false,
@@ -433,10 +436,10 @@ describe('provider resolution', () => {
       spaces: db.spaces,
       projects: db.projects,
       directory: {
-        getUser: (username: string) => db.auth.getUser(username),
-        grantsFor: (username: string) => {
+        getUserById: (userId: string) => db.auth.getUserById(userId),
+        grantsFor: (userId: string) => {
           grantReads += 1
-          return db.auth.grantsFor(username)
+          return db.auth.grantsFor(userId)
         },
       },
       keyring,
@@ -471,7 +474,7 @@ describe('provider resolution', () => {
       resources: vi.fn(db.providerResources.getMany),
       credentials: vi.fn(db.credentials.getMany),
       spaces: vi.fn(db.spaces.getMany),
-      users: vi.fn(db.auth.getUsers),
+      users: vi.fn(db.auth.getUsersByIds),
       grants: vi.fn(db.auth.grantsForUsers),
       keys: vi.fn((requiredKeyIds: ReadonlySet<string>) => keyring.readableKeyIds(requiredKeyIds)),
     }
@@ -504,9 +507,9 @@ describe('provider resolution', () => {
       },
       projects: db.projects,
       directory: {
-        getUser: noSingleRead,
+        getUserById: noSingleRead,
         grantsFor: noSingleRead,
-        getUsers: calls.users,
+        getUsersByIds: calls.users,
         grantsForUsers: calls.grants,
       },
       keyring: {
@@ -551,7 +554,7 @@ describe('provider resolution', () => {
       attachments: vi.fn(db.providerAttachments.listForResourcesInSpaces),
       credentials: vi.fn(db.credentials.getMany),
       spaces: vi.fn(db.spaces.getMany),
-      users: vi.fn(db.auth.getUsers),
+      users: vi.fn(db.auth.getUsersByIds),
       grants: vi.fn(db.auth.grantsForUsers),
       keys: vi.fn((requiredKeyIds: ReadonlySet<string>) => keyring.readableKeyIds(requiredKeyIds)),
     }
@@ -578,7 +581,7 @@ describe('provider resolution', () => {
       projects: db.projects,
       directory: {
         ...db.auth,
-        getUsers: calls.users,
+        getUsersByIds: calls.users,
         grantsForUsers: calls.grants,
       },
       keyring: { readableKeyIds: calls.keys } as unknown as CredentialKeyringService,
@@ -613,7 +616,7 @@ describe('provider resolution', () => {
     const calls = {
       resources: vi.fn(db.providerResources.getMany),
       credentials: vi.fn(db.credentials.getMany),
-      user: vi.fn(db.auth.getUser),
+      user: vi.fn(db.auth.getUserById),
       keys: vi.fn((requiredKeyIds: ReadonlySet<string>) => keyring.readableKeyIds(requiredKeyIds)),
     }
 
@@ -633,9 +636,9 @@ describe('provider resolution', () => {
       spaces: { getById: forbidden, getMany: forbidden },
       projects: db.projects,
       directory: {
-        getUser: calls.user,
+        getUserById: calls.user,
         grantsFor: forbidden,
-        getUsers: forbidden,
+        getUsersByIds: forbidden,
         grantsForUsers: forbidden,
       },
       keyring: { readableKeyIds: calls.keys } as unknown as CredentialKeyringService,

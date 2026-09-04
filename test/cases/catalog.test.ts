@@ -194,6 +194,102 @@ describe('seed catalog (#175)', () => {
     }
   })
 
+  // #421 turned the owner segment of a principal from a display name into the ONLY thing
+  // an author label can be resolved from. Both defects that followed shipped because the
+  // rule lived in prose alone: a brand there (`pat:CLI:seed`) renders as a nameless agent,
+  // and a two-segment `oauth:Claude` outside the retrieval channel renders as `system`.
+  // This is the machine half of the rule — the prose is in `types.ts` and `docs/seeds.md`.
+  it('every declared principal names a declared account, and the app shorthand keeps to its channel', () => {
+    // The handle the appliers remap onto the seed user; a case may also declare its own.
+    const CATALOG_OWNER = 'sergey'
+    const offenders: string[] = []
+
+    for (const name of NAMES) {
+      const world = buildCaseWorld(name)
+      const accounts = new Set([CATALOG_OWNER, ...(world.auth?.users ?? []).map((u) => u.username)])
+      // Keyed the way the applier keys it — `owner\0appName`, case-folded — so the guard
+      // accepts exactly the pairs it can resolve and no more: an app declared for one
+      // account cannot be addressed from another's row, which is how the same defect
+      // would come back wearing a different owner.
+      const apps = new Set(
+        (world.auth?.connectedApps ?? []).map(
+          (app) => `${app.owner ?? CATALOG_OWNER}\0${app.appName.toLowerCase()}`,
+        ),
+      )
+
+      const check = (principal: string | undefined, channel: string, owner?: string) => {
+        if (principal == null || principal === 'ui') {
+          return
+        }
+        const [scheme, subject, ...tail] = principal.split(':')
+
+        if (subject == null) {
+          offenders.push(`${name} · ${channel} · ${principal} — no owner segment`)
+          return
+        }
+        // The one shorthand: a connected app addressed by its declared name, resolved by
+        // the real applier into that app's minted token principal.
+        if (scheme === 'oauth' && tail.length === 0 && channel === 'retrievals') {
+          if (!apps.has(`${owner ?? CATALOG_OWNER}\0${subject.toLowerCase()}`)) {
+            offenders.push(
+              `${name} · ${channel} · ${principal} — no connected app by that name for "${owner ?? CATALOG_OWNER}"`,
+            )
+          }
+
+          return
+        }
+        if (scheme !== 'user' && scheme !== 'pat' && scheme !== 'oauth') {
+          offenders.push(`${name} · ${channel} · ${principal} — unknown scheme`)
+          return
+        }
+        // A key id may itself carry colons — the parser takes everything after the second
+        // one — so only the SHAPE is fixed here: `user:` carries no key id, the others
+        // carry one, however many colons it spans.
+        if (scheme === 'user' ? tail.length !== 0 : tail.length === 0) {
+          offenders.push(`${name} · ${channel} · ${principal} — wrong segment count`)
+          return
+        }
+        if (!accounts.has(subject)) {
+          offenders.push(
+            `${name} · ${channel} · ${principal} — "${subject}" is not a declared account`,
+          )
+        }
+      }
+
+      for (const event of world.events) {
+        check('principal' in event ? event.principal : undefined, 'timeline')
+      }
+      // Seeded revision states write straight into the journal, so they carry the same
+      // attribution — an empty channel today, an open one tomorrow.
+      for (const state of world.revisionStates ?? []) {
+        check(state.principal, 'revision state')
+      }
+      // The ability packages authored through the agent-attributed producer carry their
+      // own principal — the channel `pat:seed:ability-author` came from.
+      for (const pkg of [...(world.agentRoles ?? []), ...(world.agentSkills ?? [])]) {
+        check('agentAudit' in pkg ? pkg.agentAudit?.principal : undefined, 'ability audit')
+      }
+      // `owner` defaults to the bound session's owner, then to the primary owner — the
+      // same ladder the appliers walk. Resolving it here keeps the guard from crying
+      // wolf over a retrieval that names its owner through its session.
+      const sessionOwner = new Map(
+        (world.agentSessions ?? []).map((session) => [session.ref, session.owner]),
+      )
+
+      for (const retrieval of world.retrievals ?? []) {
+        const owner =
+          retrieval.owner ??
+          (retrieval.sessionRef ? sessionOwner.get(retrieval.sessionRef) : undefined)
+        check(retrieval.principal, 'retrievals', owner)
+      }
+      for (const call of world.agentCalls ?? []) {
+        check(call.principal, 'calls')
+      }
+    }
+
+    expect(offenders).toEqual([])
+  })
+
   it('trash-recovery keeps availability states and a runtime path conflict distinct', () => {
     const world = buildCaseWorld('trash-recovery', { now: DEFAULT_NOW })
     const createdAtPath = world.events.filter(

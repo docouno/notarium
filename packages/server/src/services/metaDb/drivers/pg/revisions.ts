@@ -161,7 +161,8 @@ const activityLastOfRow = (row: RevisionRow): ActivityLastEvent =>
       }
 
 /** Author-scope predicate as `$n` SQL, appending its binds to `params`.
- *  Usernames carry no LIKE wildcard, so prefix matches need no ESCAPE. */
+ *  The prefixes carry the viewer's stable id — 16 hex, no LIKE wildcard — never a
+ *  username (which may hold `_`), so prefix matches need no ESCAPE. */
 const authorClausePg = (author: AuthorFilter | undefined, params: unknown[]): string => {
   if (!author) {
     return ''

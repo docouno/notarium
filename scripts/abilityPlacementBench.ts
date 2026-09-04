@@ -85,7 +85,7 @@ if (container.Image !== BENCH_IMAGE) {
 const login = await fetch(`${BASE_URL}/api/auth/login`, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ username: USERNAME, password: PASSWORD }),
+  body: JSON.stringify({ identifier: USERNAME, password: PASSWORD }),
 })
 
 if (!login.ok) {

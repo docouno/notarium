@@ -29,7 +29,7 @@ describe('provider seed coverage', () => {
       const login = await app.inject({
         method: 'POST',
         url: '/api/auth/login',
-        payload: { username: 'sergey', password: 'seed-pass' },
+        payload: { identifier: 'sergey', password: 'seed-pass' },
       })
       expect(login.statusCode).toBe(200)
       const cookie = (login.headers['set-cookie'] as string).split(';')[0]
@@ -120,7 +120,7 @@ describe('provider seed coverage', () => {
       const login = await app.inject({
         method: 'POST',
         url: '/api/auth/login',
-        payload: { username: 'sergey', password: 'seed-pass' },
+        payload: { identifier: 'sergey', password: 'seed-pass' },
       })
       const cookie = (login.headers['set-cookie'] as string).split(';')[0]
       const [about, credentials] = await Promise.all([

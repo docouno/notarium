@@ -95,7 +95,7 @@ const loginCookie = async (username: string, password: string): Promise<string> 
   const login = await app.inject({
     method: 'POST',
     url: '/api/auth/login',
-    payload: { username, password },
+    payload: { identifier: username, password },
   })
   expect(login.statusCode).toBe(200)
   return (login.headers['set-cookie'] as string).split(';')[0]
@@ -143,8 +143,9 @@ describe('personal layer (#13): memory audit', () => {
     const cat = mem.categories[0]
     expect(cat.category).toBe('preferences')
     expect(cat.summary).toBe('Language: RU.')
-    // Provenance: an agent (PAT) wrote it — `pat:<user>:<id>`, kind 'write'.
-    expect(cat.principal).toMatch(/^pat:sam:/)
+    // Provenance: an agent (PAT) wrote it — `pat:<userId>:<id>`, kind 'write'.
+    const sam = await getJson('/api/me', cookie)
+    expect(cat.principal).toMatch(new RegExp(`^pat:${sam.id}:`))
     expect(cat.kind).toBe('write')
 
     // The user OWNS it: openable/editable by id (direct read is not scoped).

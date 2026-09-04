@@ -20,10 +20,15 @@ describe('owner remap (sergey → SEED_USER)', () => {
     expect(asUser('alex')).toBe('alex')
   })
 
-  it('renames the owner segment in user:/pat: principals, keeps the rest', () => {
+  it('renames the owner segment in every principal scheme, keeps the rest', () => {
     expect(remapPrincipal('user:sergey')).toBe('user:admin')
     expect(remapPrincipal('pat:sergey:tok-9')).toBe('pat:admin:tok-9')
+    // A connected app's principal names its owner exactly like a PAT's. Omitting the
+    // scheme left the catalog owner's OAuth rows on a handle no seeded stand mints, so
+    // their author could never be resolved.
+    expect(remapPrincipal('oauth:sergey:tok-9')).toBe('oauth:admin:tok-9')
     expect(remapPrincipal('user:alex')).toBe('user:alex')
+    expect(remapPrincipal('oauth:alex:tok-9')).toBe('oauth:alex:tok-9')
     expect(remapPrincipal('ui')).toBe('ui')
     expect(remapPrincipal(undefined)).toBeUndefined()
   })

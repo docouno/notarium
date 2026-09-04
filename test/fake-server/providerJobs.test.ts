@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { PROVIDER_CALL_OUTCOME, PROVIDER_DELIVERY_STATE } from '@notarium/contract'
 import type { JobsPersistence } from '@notarium/server'
 
-import { createApp, type Fixture } from './app'
+import { createApp, fakeUserId, type Fixture } from './app'
 import { InMemoryProviderCallLog } from './providerCallLog'
 import { type InMemorySpaces } from './spaces'
 
@@ -90,7 +90,7 @@ const login = async (instance: FastifyInstance) => {
   const response = await instance.inject({
     method: 'POST',
     url: '/api/auth/login',
-    payload: { username: 'alice', password: 'alice-password-1' },
+    payload: { identifier: 'alice', password: 'alice-password-1' },
   })
   expect(response.statusCode).toBe(200)
   return (response.headers['set-cookie'] as string).split(';')[0]
@@ -294,7 +294,7 @@ describe('provider durable-job fake driver', () => {
     const world = await setup(port, { callLog })
     await callLog.intent({
       id: 'call-before-crash',
-      owner: 'alice',
+      owner: fakeUserId('alice'),
       principal: 'ui',
       agent: null,
       resourceId: world.resourceId,
@@ -328,7 +328,7 @@ describe('provider durable-job fake driver', () => {
     await world.spaces.upsert({
       ...current!,
       archivedAt: '2026-08-25T01:00:00.000Z',
-      archivedBy: 'user:alice',
+      archivedBy: `user:${fakeUserId('alice')}`,
     })
     const row = await world.terminal(id)
 

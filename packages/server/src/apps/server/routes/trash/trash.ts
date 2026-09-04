@@ -56,7 +56,7 @@ export const trashRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => {
       let author = cache.get(e.principal)
 
       if (author === undefined) {
-        author = await auth.describeAuthor(e.principal, req.principal.username)
+        author = await auth.describeAuthor(e.principal, req.principal.userId)
         cache.set(e.principal, author)
       }
       wireItems.push(

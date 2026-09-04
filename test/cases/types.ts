@@ -73,6 +73,10 @@ export type ProjectDecl = {
 
 export type UserDecl = {
   username: string
+  /** Optional address; the applier normalizes it through the wire schema exactly as a
+   *  route would, so a case cannot seed an address login would never find. Omit to seed
+   *  the honest "not set" state. */
+  email?: string
   /** Plaintext — scrypt-hashed at seed time by the real applier; the fake stores
    *  it for its production AuthService. */
   password?: string
@@ -139,9 +143,15 @@ export type RetrievalDecl = {
   /** The username whose audit this belongs to; defaults to the bound session owner or
    * primary owner. When sessionRef is present, an explicit value must match it. */
   owner?: string
-  /** The token that made the call (`pat:<name>:<id>` | `oauth:<appName>` shorthand for a
-   *  declared connected app | `ui`), remapped to the seed user like every principal — the
-   *  "which agent" lens. */
+  /** The token that made the call — `pat:<owner>:<id>` | `oauth:<owner>:<id>` | `ui`,
+   *  remapped to the seed user like every principal. The owner segment is an ACCOUNT
+   *  handle, never the agent's brand: it becomes that account's stable id, and it is the
+   *  only thing an author label can be resolved from. The brand goes in `agent`.
+   *  (The real applier also accepts an `oauth:<appName>` shorthand for a declared
+   *  connected app, resolving it to that app's MINTED token principal — the only way an
+   *  audit row can point at a credential the stand actually issued. It is legal in this
+   *  channel only: two segments parse nowhere else, so the same string in a revision
+   *  principal would degrade to `system`.) */
   principal: string
   /** Friendly agent name shown in the audit (a PAT name / connected-app name), e.g. "CLI".
    *  At runtime this is captured from the live token; a case supplies it directly. */
@@ -189,6 +199,8 @@ export type AgentSessionDecl = {
 export type AgentCallDecl = {
   ref: string
   owner?: string
+  /** The caller, in the same grammar as `RetrievalDecl.principal`: the owner segment is
+   *  an account handle, remapped to that account's stable id; the brand goes in `agent`. */
   principal: string
   agent?: string
   sessionRef?: string
@@ -540,7 +552,11 @@ export type CaseEvent = (
       /** Canonical future-import provenance projected into file truth by both
        * seed appliers. Omit deliberately for a source-less legacy state. */
       sourceLocator?: string
-      /** Journal attribution (#12): `user:<name>` | `pat:<name>:<id>` | `ui`. */
+      /** Journal attribution (#12): `user:<owner>` | `pat:<owner>:<id>` |
+       *  `oauth:<owner>:<id>` | `ui`, where `<owner>` is an account HANDLE the case
+       *  declares — never an agent's brand. Both appliers remap it to that account's
+       *  stable id, which is the only thing an author label can be resolved from; the
+       *  brand goes in the surrounding declaration's `agent`. */
       principal?: string
     }
   | {

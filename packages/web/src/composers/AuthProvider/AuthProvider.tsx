@@ -10,7 +10,7 @@ import {
 } from 'react'
 import type { AuthMode, AuthSession, Me, SpaceRole } from '@notarium/contract'
 import { AUTH_MODE } from '@notarium/contract/enums'
-import { clearAbilityDrafts } from '../../libs/abilityDraftStorage'
+import { abilityDraftOwner, clearAbilityDrafts } from '../../libs/abilityDraftStorage'
 import { withGrant } from '../../libs/access'
 import { api, setUnauthorizedHandler } from '../../services/api'
 
@@ -110,7 +110,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     return () => setUnauthorizedHandler(null)
   }, [refresh])
 
-  const draftOwner = session?.mode === AUTH_MODE.none ? '@system' : (session?.me?.username ?? null)
+  // Keyed by the stable account id, not the handle: a rename must not read as a
+  // principal swap and wipe the drafts of the person who just renamed themself. The
+  // key comes from the same helper the authoring page writes under — the two drifted
+  // apart once, and the cleaner then addressed a namespace nobody wrote to.
+  const draftOwner = abilityDraftOwner(session?.mode, session?.me?.id)
 
   // Drafts are principal-local even though sessionStorage is tab-local. Logout,
   // a mid-session 401, and an in-tab principal swap all clear the prior owner's

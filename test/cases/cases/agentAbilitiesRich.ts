@@ -346,7 +346,7 @@ export const agentAbilitiesRich: CaseSpec = {
       instructions: `# Agent-created oversized proof\n\n${'Oversized agent-authored evidence block. '.repeat(2_000)}`,
       home: { kind: 'personal', user: 'sergey' },
       agentAudit: {
-        principal: 'pat:seed:ability-author',
+        principal: 'pat:sergey:ability-author',
         owner: 'sergey',
         agent: 'Seed ability author',
         sessionRef: 'agent-created-ability',

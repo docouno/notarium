@@ -29,7 +29,7 @@ const access = (
   over: Partial<OAuthAccessRecord> & Pick<OAuthAccessRecord, 'id'>,
 ): OAuthAccessRecord => ({
   tokenHash: 'h',
-  username: 'alice',
+  userId: 'alice',
   clientId: 'chatgpt',
   scope: 'write',
   spaces: null,
@@ -45,7 +45,7 @@ const refresh = (
   over: Partial<OAuthRefreshRecord> & Pick<OAuthRefreshRecord, 'id'>,
 ): OAuthRefreshRecord => ({
   tokenHash: 'h',
-  username: 'alice',
+  userId: 'alice',
   clientId: 'chatgpt',
   scope: 'write',
   spaces: null,
@@ -71,7 +71,9 @@ const client = (
 const setup = async (seed: (oauth: InMemoryOAuthPersistence) => Promise<void>) => {
   const db = new InMemoryAuthPersistence()
   await db.createUser({
+    id: 'alice',
     username: 'alice',
+    email: null,
     displayName: 'alice',
     passwordHash: 'x',
     admin: false,
@@ -225,7 +227,7 @@ describe('updateConnection — SSE belt (#181)', () => {
     let closed = 0
     auth.registerSse({
       principalId: 'oauth:alice:a1',
-      username: 'alice',
+      userId: 'alice',
       space: 's',
       close: () => {
         closed++

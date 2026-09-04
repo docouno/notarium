@@ -307,14 +307,16 @@ export const SpaceSlugSchema = z
 export const NoteClassSchema = z.enum(enumValues(NOTE_CLASS))
 
 /** A journal writer, RESOLVED for display and PRIVACY-FILTERED server-side
- *  — wherever a raw `principal` (`pat:<user>:<id>` | `user:<name>` | `ui`)
- *  surfaces to a human (note history, agent memory, a deleted note's banner),
- *  the server also sends this. The viewer never has to parse a principal or sees
- *  a name it shouldn't:
- *  - `kind` — `agent` (a PAT), `user` (a human), `system`, `external` (no journal).
+ *  — wherever a raw `principal` (`user:<userId>` | `pat:<userId>:<patId>` |
+ *  `oauth:<userId>:<tokenId>` | `ui`) surfaces to a human (note history, agent memory,
+ *  a deleted note's banner), the server also sends this. The viewer never has to parse
+ *  a principal or sees a name it shouldn't:
+ *  - `kind` — `agent` (a PAT or a connected app), `user` (a human), `system`,
+ *    `external` (no journal).
  *  - `name` — the DISPLAY name: the viewer's OWN key name (they own it), or
  *    another user's USERNAME (never another user's key name — privacy). null =
- *    anonymous (mode-none UI, system, external).
+ *    anonymous (mode-none UI, system, external) — and also the viewer's OWN
+ *    connected app, which carries no friendly name to show.
  *  - `mine` — is this the viewer's own action/agent? Drives "you" / "your agent X"
  *    vs "<name>" / "<name>'s agent". The wording lives in the client (i18n). */
 export const AuthorKindSchema = z.enum(enumValues(AUTHOR_KIND))

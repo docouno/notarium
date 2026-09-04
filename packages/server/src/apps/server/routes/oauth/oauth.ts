@@ -191,8 +191,8 @@ export const registerOAuthRoutes = async (
 
     // Signed-in user's space slugs for the consent picker; null = unknown user
     // (awaiting inline login) → consent renders the login form without a picker.
-    const userSpaceSlugs = async (username: string | null): Promise<string[] | null> =>
-      username ? (await opts.auth.me(username)).spaces.map((s) => s.slug) : null
+    const userSpaceSlugs = async (userId: string | null): Promise<string[] | null> =>
+      userId ? (await opts.auth.me(userId)).spaces.map((s) => s.slug) : null
 
     // The consenting identity on BOTH /oauth/authorize verbs is a cookie session ONLY.
     // A bearer cred (PAT or OAuth access token) is treated as ABSENT, not refused: a
@@ -216,13 +216,12 @@ export const registerOAuthRoutes = async (
         return reply.code(status).type('text/html').send(renderErrorPage(msg))
       }
       const authed = await consentingSession(req)
-      const username = authed?.principal.username ?? null
       return reply.type('text/html').send(
         renderConsentPage({
           params,
           clientName: client.clientName,
-          username,
-          spaces: await userSpaceSlugs(username),
+          username: authed?.principal.username ?? null,
+          spaces: await userSpaceSlugs(authed?.principal.userId ?? null),
           error: null,
         }),
       )
@@ -257,10 +256,13 @@ export const registerOAuthRoutes = async (
       // A session BEFORE this POST distinguishes approve-with-picker (issue now) from
       // inline login (no picker seen yet → re-render consent WITH the picker, issue only
       // on the next approve).
-      const preAuthed = (await consentingSession(req))?.principal.username ?? null
+      const consenting = (await consentingSession(req))?.principal
+      const preAuthed = consenting?.userId
+        ? { id: consenting.userId, username: consenting.username }
+        : null
 
       if (!preAuthed) {
-        const u = body.username?.trim()
+        const u = body.identifier?.trim()
         const p = body.password
 
         if (!u || !p) {
@@ -270,13 +272,13 @@ export const registerOAuthRoutes = async (
               clientName: client.clientName,
               username: null,
               spaces: null,
-              error: 'Enter your username and password.',
+              error: 'Enter your username or email, and your password.',
             }),
           )
         }
         try {
           const { me, sessionToken } = await opts.auth.login({
-            username: u,
+            identifier: u,
             password: p,
             ip: req.ip,
           })
@@ -286,7 +288,7 @@ export const registerOAuthRoutes = async (
               params,
               clientName: client.clientName,
               username: me.username,
-              spaces: await userSpaceSlugs(me.username),
+              spaces: await userSpaceSlugs(me.id),
               error: null,
             }),
           )
@@ -312,13 +314,13 @@ export const registerOAuthRoutes = async (
               clientName: client.clientName,
               username: null,
               spaces: null,
-              error: 'Invalid username or password.',
+              error: 'Invalid username, email or password.',
             }),
           )
         }
       }
 
-      const available = (await userSpaceSlugs(preAuthed)) ?? []
+      const available = (await userSpaceSlugs(preAuthed.id)) ?? []
       const selection = readConsentSpaces(body, available)
 
       if (selection.error) {
@@ -326,7 +328,7 @@ export const registerOAuthRoutes = async (
           renderConsentPage({
             params,
             clientName: client.clientName,
-            username: preAuthed,
+            username: preAuthed.username,
             spaces: available,
             error: selection.error,
           }),
@@ -337,7 +339,7 @@ export const registerOAuthRoutes = async (
         selection.spaces === null ? null : await opts.auth.spacesToIds(selection.spaces)
 
       try {
-        const code = await oauth.issueCode(params, preAuthed, spaceIds)
+        const code = await oauth.issueCode(params, preAuthed.id, spaceIds)
         return reply.redirect(redirectBack(params.redirectUri, { code, state: params.state }))
       } catch (err) {
         if (err instanceof OAuthError) {

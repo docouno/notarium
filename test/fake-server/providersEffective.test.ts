@@ -56,7 +56,7 @@ describe('provider effective list', () => {
     const response = await app.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username, password },
+      payload: { identifier: username, password },
     })
     expect(response.statusCode).toBe(200)
     return (response.headers['set-cookie'] as string).split(';')[0]

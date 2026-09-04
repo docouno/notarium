@@ -105,7 +105,9 @@ export const AgentsExplorer = ({
   const cacheRef = useRef(cache)
   const abilities = dataset === 'roles' || dataset === 'skills' ? cache[dataset] : null
   const sessions = cache.sessions
-  const owner = me?.username ?? '@system'
+  // The stable account id, like the dataset lens next to it: both halves of the
+  // explorer's per-user state survive a rename of the handle.
+  const owner = me?.id ?? '@system'
   const collapsedKey = scope ? agentsExplorerGroupsStorageKey(owner, scope.spaceId) : null
   // The key and the groups are ONE value: a collapse toggled before the Space
   // resolved had nowhere to persist to and was then overwritten by the read that

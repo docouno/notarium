@@ -17,6 +17,14 @@ export const timingSafeEqualHex = (a: string, b: string): boolean => {
   return timingSafeEqual(Buffer.from(a), Buffer.from(b))
 }
 
+/** The stable user id: 16 hex characters, minted once per account and never changed.
+ *  Hex on purpose — the id travels inside the principal id, which the journal filters
+ *  by `LIKE '<prefix>%'` without an ESCAPE clause, so the alphabet must carry no `_`
+ *  or `%`; a username (which now admits `_`) never enters such a pattern. The carrier
+ *  that backfilled existing accounts mints the same shape in SQL.
+ *  canon: docs/auth.md#model */
+export const mintUserId = (): string => randomBytes(8).toString('hex')
+
 export const mintSessionToken = (): string => `nts_${randomBytes(32).toString('hex')}`
 
 export const mintOneTimeToken = (): string => `nti_${randomBytes(24).toString('hex')}`

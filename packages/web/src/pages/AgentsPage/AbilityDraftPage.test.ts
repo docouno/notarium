@@ -48,7 +48,9 @@ vi.mock('../../composers/AgentsExplorerProvider', () => ({
   useAgentsExplorer: () => ({ scope: { spaceId: 'space-team' }, invalidate: vi.fn() }),
 }))
 vi.mock('../../composers/AuthProvider', () => ({
-  useAuth: () => ({ mode: 'password', me: { username: 'maya' } }),
+  // Drafts key on the stable account id, never on the handle — the two differ here on
+  // purpose, so a page that went back to keying by the handle would read nothing.
+  useAuth: () => ({ mode: 'password', me: { id: 'a1b2c3d4e5f60718', username: 'maya' } }),
 }))
 vi.mock('../../composers/EditingProvider', () => ({ useEditing: () => harness.editing }))
 vi.mock('../../composers/SpaceProvider', () => ({
@@ -254,7 +256,7 @@ describe('the new-ability page', () => {
   it('loads a restored Space draft against its persisted target, not the active Space', async () => {
     writeAbilityDraft({
       version: 1,
-      owner: 'maya',
+      owner: 'a1b2c3d4e5f60718',
       draftId: 'x',
       kind: 'role',
       createdAt: '2026-08-23T00:00:00.000Z',
@@ -313,7 +315,7 @@ describe('the new-ability page', () => {
   it('rejects restored selected projects that no longer belong to the exact target', async () => {
     writeAbilityDraft({
       version: 1,
-      owner: 'maya',
+      owner: 'a1b2c3d4e5f60718',
       draftId: 'x',
       kind: 'role',
       createdAt: '2026-08-23T00:00:00.000Z',
@@ -366,7 +368,7 @@ describe('the new-ability page', () => {
   it('rejects a restored unavailable target before any Save adapter calls the API', async () => {
     writeAbilityDraft({
       version: 1,
-      owner: 'maya',
+      owner: 'a1b2c3d4e5f60718',
       draftId: 'x',
       kind: 'role',
       createdAt: '2026-08-23T00:00:00.000Z',

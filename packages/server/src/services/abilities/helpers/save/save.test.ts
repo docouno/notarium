@@ -29,6 +29,7 @@ const ROLE_LOCATOR: Extract<OwnedAbilityLocator, { kind: 'role' }> = {
 const PRINCIPAL: Principal = {
   id: 'pat:alice:write',
   scope: 'write',
+  userId: 'alice',
   username: 'alice',
   admin: false,
   system: false,

@@ -112,9 +112,9 @@ export class InMemoryOAuthPersistence implements OAuthPersistence {
       t.spaces = patch.spaces == null ? null : [...patch.spaces]
     }
   }
-  async listAccessForUser(username: string): Promise<OAuthAccessRecord[]> {
+  async listAccessForUser(userId: string): Promise<OAuthAccessRecord[]> {
     return [...this.access.values()]
-      .filter((t) => t.username === username && t.revokedAt == null)
+      .filter((t) => t.userId === userId && t.revokedAt == null)
       .map((t) => ({ ...t }))
   }
 
@@ -156,9 +156,9 @@ export class InMemoryOAuthPersistence implements OAuthPersistence {
     t.rotatedTo = rotatedAt
     return true
   }
-  async listRefreshForUser(username: string): Promise<OAuthRefreshRecord[]> {
+  async listRefreshForUser(userId: string): Promise<OAuthRefreshRecord[]> {
     return [...this.refresh.values()]
-      .filter((t) => t.username === username && t.revokedAt == null)
+      .filter((t) => t.userId === userId && t.revokedAt == null)
       .map((t) => ({ ...t }))
   }
 

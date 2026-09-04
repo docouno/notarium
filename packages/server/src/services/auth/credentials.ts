@@ -3,17 +3,18 @@
 
 import { HTTP_STATUS } from '@notarium/contract/http'
 import { hashPassword, verifyPassword } from '../../libs/passwords'
+import { mintUserId } from '../../libs/tokens'
 import { type AuthCtx, AuthError } from './authService'
 
 export const createCredentials = (ctx: AuthCtx) => ({
   /** Change own password: invalidates ALL sessions (credential-change contract),
    *  then returns a fresh token so the calling tab stays logged in. */
   changePassword: async (
-    username: string,
+    userId: string,
     currentPassword: string,
     newPassword: string,
   ): Promise<{ sessionToken: string }> => {
-    const user = await ctx.activeUser(username)
+    const user = await ctx.activeUserById(userId)
 
     if (!user || !user.passwordHash) {
       throw new AuthError(HTTP_STATUS.UNAUTHORIZED, 'unauthorized')
@@ -21,9 +22,9 @@ export const createCredentials = (ctx: AuthCtx) => ({
     if (!(await verifyPassword(currentPassword, user.passwordHash))) {
       throw new AuthError(HTTP_STATUS.BAD_REQUEST, 'current password is wrong', 'bad_password')
     }
-    await ctx.db.updateUser(username, { passwordHash: await hashPassword(newPassword) })
-    await ctx.db.deleteSessionsFor(username)
-    return { sessionToken: await ctx.createSession(username) }
+    await ctx.db.updateUser(user.id, { passwordHash: await hashPassword(newPassword) })
+    await ctx.db.deleteSessionsFor(user.id)
+    return { sessionToken: await ctx.createSession(user.id) }
   },
 
   /** Operator reset (admin CLI): sets a password with NO current-credential proof —
@@ -34,9 +35,9 @@ export const createCredentials = (ctx: AuthCtx) => ({
     if (!user) {
       throw new AuthError(HTTP_STATUS.NOT_FOUND, 'not found')
     }
-    await ctx.db.updateUser(username, { passwordHash: await hashPassword(newPassword) })
-    await ctx.db.deleteSessionsFor(username)
-    await ctx.db.deleteOneTimesFor(username)
+    await ctx.db.updateUser(user.id, { passwordHash: await hashPassword(newPassword) })
+    await ctx.db.deleteSessionsFor(user.id)
+    await ctx.db.deleteOneTimesFor(user.id)
   },
 
   /** Operator-minted admin (admin CLI): locked-out recovery, no invite round-trip.
@@ -45,8 +46,10 @@ export const createCredentials = (ctx: AuthCtx) => ({
     if (await ctx.db.getUser(username)) {
       throw new AuthError(HTTP_STATUS.CONFLICT, 'username is taken', 'username_taken')
     }
-    await ctx.db.createUser({
+    const written = await ctx.db.createUser({
+      id: mintUserId(),
       username,
+      email: null,
       displayName: displayName?.trim() || username,
       passwordHash: await hashPassword(password),
       admin: true,
@@ -54,5 +57,9 @@ export const createCredentials = (ctx: AuthCtx) => ({
       createdAt: ctx.nowIso(),
       personalSpace: null,
     })
+
+    if (written.status === 'conflict') {
+      throw new AuthError(HTTP_STATUS.CONFLICT, 'username is taken', 'username_taken')
+    }
   },
 })

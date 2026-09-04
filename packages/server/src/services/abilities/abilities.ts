@@ -467,7 +467,7 @@ export const createAbilities = (options: CreateAbilitiesOptions): AbilitiesServi
         const personalSpace =
           ready.location.scope === ROLE_SCOPE.personal
             ? ready.location.space
-            : ready.principal.username
+            : ready.principal.userId
               ? ready.personalSpace
               : null
         const publishable =

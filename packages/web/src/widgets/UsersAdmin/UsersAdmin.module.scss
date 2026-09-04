@@ -98,6 +98,11 @@
   color: var(--text-dim);
 }
 
+/* An absent address is stated, not blank: the cell says so in a quieter voice. */
+.cell-muted {
+  color: var(--text-faint);
+}
+
 /* A single ⋮ overflow button → fixed width, the row never reflows. */
 .cell-actions {
   width: 1%;

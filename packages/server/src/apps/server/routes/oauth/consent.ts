@@ -118,8 +118,8 @@ export const renderConsentPage = (input: {
   const errBlock = error ? `<div class="err">${esc(error)}</div>` : ''
   const loginFields = username
     ? `<p>Signed in as <span class="client">${esc(username)}</span>.</p>`
-    : `<label for="u">Username</label>
-       <input id="u" name="username" autocomplete="username" autofocus>
+    : `<label for="u">Username or email</label>
+       <input id="u" name="identifier" autocomplete="username" autofocus>
        <label for="p">Password</label>
        <input id="p" name="password" type="password" autocomplete="current-password">`
   const spacesBlock =

@@ -15,9 +15,7 @@ import { InMemoryAuthPersistence } from '../fake-server/authPersistence'
 
 const T = '2026-01-01T00:00:00.000Z'
 
-const pat = (
-  over: Partial<PatRecord> & Pick<PatRecord, 'id' | 'username' | 'name'>,
-): PatRecord => ({
+const pat = (over: Partial<PatRecord> & Pick<PatRecord, 'id' | 'userId' | 'name'>): PatRecord => ({
   secretHash: 'h',
   scope: 'write',
   spaces: null,
@@ -31,9 +29,12 @@ const pat = (
 const setup = async () => {
   const db = new InMemoryAuthPersistence()
 
+  // Test accounts key by their handle: the id IS the handle, so `user:alice` stays readable.
   for (const username of ['alice', 'bob']) {
     await db.createUser({
+      id: username,
       username,
+      email: null,
       displayName: username,
       passwordHash: 'x',
       admin: false,
@@ -42,8 +43,8 @@ const setup = async () => {
       personalSpace: null,
     })
   }
-  await db.insertPat(pat({ id: 'alice-key', username: 'alice', name: 'Alice Laptop' }))
-  await db.insertPat(pat({ id: 'bob-key', username: 'bob', name: 'Bob Secret CLI' }))
+  await db.insertPat(pat({ id: 'alice-key', userId: 'alice', name: 'Alice Laptop' }))
+  await db.insertPat(pat({ id: 'bob-key', userId: 'bob', name: 'Bob Secret CLI' }))
   return createAuthService({
     mode: 'password',
     persistence: db,
@@ -105,6 +106,27 @@ describe('describeAuthor (#13 — viewer-relative, privacy-filtered attribution)
       kind: 'agent',
       name: null,
       mine: true,
+    })
+  })
+
+  it('an id that no longer resolves renders as a nameless author, never an error', async () => {
+    const auth = await setup()
+    // An account that vanished outside the product: the row stays, the name is gone.
+    expect(await auth.describeAuthor('user:0123456789abcdef', 'alice')).toEqual({
+      kind: 'user',
+      name: null,
+      mine: false,
+    })
+    expect(await auth.describeAuthor('pat:0123456789abcdef:k1', 'alice')).toEqual({
+      kind: 'agent',
+      name: null,
+      mine: false,
+    })
+    // A key id may itself contain colons; only the second segment is the owner.
+    expect(await auth.describeAuthor('pat:bob:key:with:colons', 'alice')).toEqual({
+      kind: 'agent',
+      name: 'bob',
+      mine: false,
     })
   })
 })

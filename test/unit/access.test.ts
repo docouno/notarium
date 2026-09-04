@@ -18,7 +18,9 @@ import {
 // grant — a false `space-lost` takeover and a read-only chrome flash.
 
 const me = (over: Partial<Me> = {}): Me => ({
+  id: 'bob',
   username: 'bob',
+  email: null,
   displayName: 'Bob',
   admin: false,
   spaces: [{ slug: 'work', role: 'writer' }],

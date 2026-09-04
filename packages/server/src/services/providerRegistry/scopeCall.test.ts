@@ -65,7 +65,9 @@ describe('provider scope call', () => {
       archivedBy: null,
     })
     await db.auth.createUser({
+      id: 'alice',
       username: 'alice',
+      email: null,
       displayName: 'Alice',
       passwordHash: null,
       admin: false,

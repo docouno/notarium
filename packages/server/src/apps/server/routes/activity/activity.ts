@@ -95,7 +95,7 @@ export const activityRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
     }
     const to = q.data.to ?? new Date().toISOString()
     const from = q.data.from ?? new Date(Date.parse(to) - ACTIVITY_WEEKS * 7 * DAY_MS).toISOString()
-    const viewer = req.principal.username
+    const viewer = req.principal.userId
     const author = q.data.author === 'mine' ? minePrincipalFilter(viewer) : undefined
     // On the unscoped load, also count the viewer's OWN events in the same window
     // so the client can tell whether anyone ELSE has activity (hasOtherAuthors) —
@@ -142,7 +142,7 @@ export const activityRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
     if (!store.activityGroups) {
       throw revisionsUnavailable()
     }
-    const viewer = req.principal.username
+    const viewer = req.principal.userId
     const author = q.data.author === 'mine' ? minePrincipalFilter(viewer) : undefined
     const viewerAuthor =
       !author && !q.data.from && !q.data.to ? minePrincipalFilter(viewer) : undefined
@@ -269,8 +269,7 @@ export const activityRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
     if (!store.activityEvents) {
       throw revisionsUnavailable()
     }
-    const author =
-      q.data.author === 'mine' ? minePrincipalFilter(req.principal.username) : undefined
+    const author = q.data.author === 'mine' ? minePrincipalFilter(req.principal.userId) : undefined
     const scope = activityCursorScope({
       from: q.data.from,
       to: q.data.to,
@@ -298,7 +297,7 @@ export const activityRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
     }
     const viewerAuthor =
       !author && !q.data.from && !q.data.to && !q.data.noteId
-        ? minePrincipalFilter(req.principal.username)
+        ? minePrincipalFilter(req.principal.userId)
         : undefined
     const projection = await projectionFromNotes(store)
 
@@ -339,7 +338,7 @@ export const activityRoutes = async (app: FastifyInstance, ctx: ApiRouteCtx) => 
           ...activityEventToWire(r),
           path: r.unavailableReason ? null : (pathByNote.get(r.noteId) ?? null),
         })),
-        req.principal.username,
+        req.principal.userId,
         auth.describeAuthor,
       )
     ).map(unattributedIfGap)

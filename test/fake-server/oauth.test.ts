@@ -88,7 +88,7 @@ const login = async (username: string, password: string): Promise<string> => {
   const res = await app.inject({
     method: 'POST',
     url: '/api/auth/login',
-    payload: { username, password },
+    payload: { identifier: username, password },
   })
   expect(res.statusCode).toBe(200)
   return (res.headers['set-cookie'] as string).split(';')[0]
@@ -136,7 +136,7 @@ const fullFlow = async (cookie: string): Promise<Record<string, unknown>> => {
       payload: form({
         ...base,
         decision: 'approve',
-        username: 'alice',
+        identifier: 'alice',
         password: 'alice-password-1',
       }),
     })
@@ -205,7 +205,7 @@ describe('public OAuth perimeter limits', () => {
       code_challenge: 'A'.repeat(43),
       code_challenge_method: 'S256',
       decision: 'approve',
-      username: 'alice',
+      identifier: 'alice',
       password: 'wrong-password',
     })
 
@@ -281,8 +281,14 @@ describe('public OAuth perimeter limits', () => {
     // unchanged by the narrower client-IP fix.
     expect(metadata.json().issuer).toBe('https://notes.example.com')
 
+    let verifies = 0
     await app.close()
-    app = await createApp(fixture(), { passwordVerifier: async () => false })
+    app = await createApp(fixture(), {
+      passwordVerifier: async () => {
+        verifies++
+        return false
+      },
+    })
     const clientId = await registerClient()
 
     // Five failures through each login surface are one shared ten-attempt budget.
@@ -292,7 +298,7 @@ describe('public OAuth perimeter limits', () => {
         method: 'POST',
         url: '/api/auth/login',
         headers: { 'x-forwarded-for': `198.51.100.${i + 1}` },
-        payload: { username: 'alice', password: 'wrong-password' },
+        payload: { identifier: 'alice', password: 'wrong-password' },
       })
       expect(res.statusCode).toBe(401)
     }
@@ -308,13 +314,21 @@ describe('public OAuth perimeter limits', () => {
       })
       expect(res.statusCode).toBe(200)
     }
+    expect(verifies).toBe(10)
+    // The eleventh attempt is refused by the ACCOUNT gate, and the form answers exactly
+    // as it would to a wrong pair — same body, and the same WORK: the verification runs
+    // anyway. Refusing it early would be the linking oracle in another shape, an
+    // instant answer that never touches the ip counter. No 429 here: that is the ip
+    // gate's alone, and it has counted eleven of its twenty.
     const limited = await app.inject({
       method: 'POST',
       url: '/oauth/authorize',
       headers: { ...FORM, 'x-forwarded-for': '192.0.2.99' },
       payload: authorizePayload(clientId),
     })
-    expect(limited.statusCode).toBe(429)
+    expect(limited.statusCode).toBe(200)
+    expect(limited.body).toContain('Invalid username, email or password.')
+    expect(verifies).toBe(11)
   })
 
   it('uses distinct forwarded client IPs only behind an explicitly trusted proxy', async () => {
@@ -328,7 +342,7 @@ describe('public OAuth perimeter limits', () => {
         method: 'POST',
         url: '/api/auth/login',
         headers: { 'x-forwarded-for': `198.51.100.${i + 1}` },
-        payload: { username: 'alice', password: 'wrong-password' },
+        payload: { identifier: 'alice', password: 'wrong-password' },
       })
       expect(res.statusCode).toBe(401)
     }
@@ -360,7 +374,7 @@ describe('public OAuth perimeter limits', () => {
     const apiAttempt = app.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username: 'alice', password: 'wrong-password' },
+      payload: { identifier: 'alice', password: 'wrong-password' },
     })
     const oauthAttempt = app.inject({
       method: 'POST',
@@ -373,7 +387,7 @@ describe('public OAuth perimeter limits', () => {
     const limited = await app.inject({
       method: 'POST',
       url: '/api/auth/login',
-      payload: { username: 'alice', password: 'wrong-password' },
+      payload: { identifier: 'alice', password: 'wrong-password' },
     })
     expect(limited.statusCode).toBe(429)
     release()
@@ -501,6 +515,35 @@ describe('the full authorization-code + PKCE flow', () => {
   it('the inline login path works (no prior session — username/password on the consent form)', async () => {
     const tok = await fullFlow('')
     expect(tok.access_token).toMatch(/^nto_/)
+  })
+
+  it('the inline login takes the e-mail as well as the handle', async () => {
+    const cookie = await login('alice', 'alice-password-1')
+    const addressed = await app.inject({
+      method: 'PATCH',
+      url: '/api/me',
+      headers: { cookie },
+      payload: { email: 'alice@example.com' },
+    })
+    expect(addressed.statusCode).toBe(200)
+    const clientId = await registerClient()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/oauth/authorize',
+      headers: FORM,
+      payload: form({
+        response_type: 'code',
+        client_id: clientId,
+        redirect_uri: REDIRECT,
+        code_challenge: 'A'.repeat(43),
+        code_challenge_method: 'S256',
+        decision: 'approve',
+        identifier: ' Alice@Example.com ',
+        password: 'alice-password-1',
+      }),
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toContain('Signed in as <span class="client">alice</span>')
   })
 })
 
@@ -631,7 +674,7 @@ describe('consent is session-only (#395)', () => {
       method: 'POST',
       url: '/oauth/authorize',
       headers: FORM,
-      payload: form({ ...base, username: 'alice', password: 'alice-password-1' }),
+      payload: form({ ...base, identifier: 'alice', password: 'alice-password-1' }),
     })
     expect(loginRes.statusCode).toBe(200)
     expect(loginRes.body).toContain('name="space:alpha"') // consent re-rendered WITH the picker

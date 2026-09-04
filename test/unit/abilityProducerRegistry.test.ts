@@ -304,8 +304,9 @@ const RULES: readonly SpellingRule[] = [
         'the producer: the pattern half of `isSkillName`, stated next to the length half it owns',
       'packages/contract/src/schemas/rest/_fields.ts#SkillNameSchema':
         'the wire mirror. P8 keeps core and contract decoupled, so the rule is stated twice on purpose — and the two copies are held together by the drift arc in `test/enumDrift.test.ts`, not by being one file',
-      'packages/contract/src/schemas/rest/auth.ts#UsernameSchema':
-        'a USERNAME. The same slug alphabet, a different domain and a different owner: nothing about a skill follows from it, and folding the two would make one rule answer for both',
+      // `auth.ts#UsernameSchema` used to share the slug alphabet and sat here as "a
+      // different domain"; a handle now admits dots and underscores, so the scan no
+      // longer mistakes it for a skill name and the entry would be stale.
     },
   },
   {

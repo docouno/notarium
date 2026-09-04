@@ -334,7 +334,7 @@ export const createAbilityInventory = (
         }
       }
     }
-    const owner = principal.username ?? (principal.system ? 'system' : null)
+    const owner = principal.userId ?? (principal.system ? 'system' : null)
     const active =
       sessions && owner
         ? await sessions.listRecent(

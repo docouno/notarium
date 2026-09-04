@@ -43,6 +43,7 @@ import { freshNoteId } from '@notarium/core'
 
 import type { MutationGate } from '../../libs/mutationGate'
 import { ADDRESS_CLASS, canonicalOriginOf, literalAddressClassOf } from '../../libs/originPolicy'
+import { userPrincipalId } from '../../libs/principalId'
 import { AGENT_SYSTEM_OWNER } from '../authz'
 import {
   canonicalHeaderName,
@@ -378,8 +379,12 @@ export class ProviderRegistry {
     this.mutationGate = options.mutationGate
     this.authMode = options.authMode ?? AUTH_MODE.password
     this.now = options.now ?? (() => new Date())
-    const projectAttachmentResource = (record: ProviderResourceRecord, viewerOwner: string) => {
-      const summary = this.resourceListItemToWire(record, { owner: viewerOwner })
+    const projectAttachmentResource = async (
+      record: ProviderResourceRecord,
+      viewerOwner: string,
+      ownerNames?: ReadonlyMap<string, string | null>,
+    ) => {
+      const summary = await this.resourceListItemToWire(record, { owner: viewerOwner }, ownerNames)
 
       delete summary.baseUrl
 
@@ -394,6 +399,7 @@ export class ProviderRegistry {
       projects: options.projects,
       projectResource: projectAttachmentResource,
       projectResourceListItem: projectAttachmentResource,
+      ownerNamesFor: (owners) => this.ownerNamesFor(owners),
       now: this.now,
     })
   }
@@ -602,7 +608,7 @@ export class ProviderRegistry {
       const prepared = await this.prepareResource(id, owner, input)
       await this.resources.create(prepared.record, prepared.ciphertext)
       return {
-        resource: this.resourceToWire(prepared.record, { owner }),
+        resource: await this.resourceToWire(prepared.record, { owner }),
         warnings: prepared.warnings,
       }
     })
@@ -679,7 +685,7 @@ export class ProviderRegistry {
 
       if (!nameChanged && !disabledChanged && !callConfigChanged) {
         return {
-          resource: this.resourceToWire(current, { owner }),
+          resource: await this.resourceToWire(current, { owner }),
           warnings: prepared.warnings,
         }
       }
@@ -714,7 +720,7 @@ export class ProviderRegistry {
       }
 
       return {
-        resource: this.resourceToWire(replaced.record, { owner }),
+        resource: await this.resourceToWire(replaced.record, { owner }),
         warnings: prepared.warnings,
       }
     }
@@ -725,8 +731,11 @@ export class ProviderRegistry {
   }
 
   async listResources(owner: string): Promise<ProviderResourceListItem[]> {
-    return (await this.resources.listForOwner(owner)).map((record) =>
-      this.resourceListItemToWire(record, { owner }),
+    const records = await this.resources.listForOwner(owner)
+    const ownerNames = await this.ownerNamesFor(records.map((record) => record.owner))
+
+    return Promise.all(
+      records.map((record) => this.resourceListItemToWire(record, { owner }, ownerNames)),
     )
   }
 
@@ -742,21 +751,25 @@ export class ProviderRegistry {
           (record): record is ProviderResourceRecord => record !== null,
         )
     const byId = new Map(loaded.map((record) => [record.id, record]))
+    const ownerNames = await this.ownerNamesFor(loaded.map((record) => record.owner))
 
     return {
-      items: page.ids.flatMap((id) => {
-        const record = byId.get(id)
-        return record ? [this.resourceListItemToWire(record, { owner })] : []
-      }),
+      items: await Promise.all(
+        page.ids.flatMap((id) => {
+          const record = byId.get(id)
+          return record ? [this.resourceListItemToWire(record, { owner }, ownerNames)] : []
+        }),
+      ),
       total: page.total,
     }
   }
 
-  resourceListItemToWire(
+  async resourceListItemToWire(
     record: ProviderResourceRecord,
     viewer: ProviderResourceViewer = {},
-  ): ProviderResourceListItem {
-    const resource = this.resourceToWire(record, viewer)
+    ownerNames?: ReadonlyMap<string, string | null>,
+  ): Promise<ProviderResourceListItem> {
+    const resource = await this.resourceToWire(record, viewer, ownerNames)
     const capabilities = [MODEL_CAPABILITY.completion, MODEL_CAPABILITY.embedding].filter(
       (capability) => record.models.some((model) => model.capabilities.includes(capability)),
     )
@@ -779,11 +792,17 @@ export class ProviderRegistry {
     return this.resources.get(id)
   }
 
-  resourceToWire(
+  /** `ownerNames` is the batch-resolved handle per owner id for a list; a single
+   *  projection resolves its one owner on the spot. */
+  async resourceToWire(
     record: ProviderResourceRecord,
     viewer: ProviderResourceViewer = {},
-  ): ProviderResource {
+    ownerNames?: ReadonlyMap<string, string | null>,
+  ): Promise<ProviderResource> {
     const isOwner = viewer.owner !== undefined && viewer.owner === record.owner
+    const ownerName = ownerNames
+      ? (ownerNames.get(record.owner) ?? null)
+      : ((await this.ownerNamesFor([record.owner])).get(record.owner) ?? null)
     // The addressee and everything derived from it travel together. An ordinary
     // member of a Space a resource is attached to learns what it serves and who
     // pays for it; the host it points at is the consent surface's subject, not
@@ -796,7 +815,7 @@ export class ProviderRegistry {
       id: record.id,
       name: record.name,
       wire: record.wire,
-      owner: this.ownerToWire(record.owner, isOwner),
+      owner: this.ownerToWire(record.owner, isOwner, ownerName),
       ...(canReadAddress
         ? {
             baseUrl: record.baseUrl,
@@ -830,13 +849,38 @@ export class ProviderRegistry {
     }
   }
 
-  /** Who pays for the call. The owner key is a username by construction (a token
-   *  cannot reach this surface), so the attribution needs no principal parsing —
-   *  except for the authless host, which is not a person at all. */
-  private ownerToWire(owner: string, mine: boolean): Author {
+  /** Who pays for the call. The owner key is a stable user id by construction (a
+   *  token cannot reach this surface), so the attribution needs no principal parsing;
+   *  the handle a human sees is resolved at read time — except for the authless host,
+   *  which is not a person at all. */
+  private ownerToWire(owner: string, mine: boolean, name: string | null): Author {
     return owner === AGENT_SYSTEM_OWNER
       ? { kind: AUTHOR_KIND.system, name: null, mine }
-      : { kind: AUTHOR_KIND.user, name: owner, mine }
+      : { kind: AUTHOR_KIND.user, name, mine }
+  }
+
+  /** Owner id → current handle, one directory read for a whole list. An owner that no
+   *  longer resolves (an account gone outside the product) shows as nameless. Lists
+   *  resolve once and hand the map to every projection instead of reading per row. */
+  async ownerNamesFor(owners: readonly string[]): Promise<Map<string, string | null>> {
+    const ids = [...new Set(owners.filter((owner) => owner !== AGENT_SYSTEM_OWNER))]
+    const names = new Map<string, string | null>(ids.map((id) => [id, null]))
+
+    if (!ids.length) {
+      return names
+    }
+    const directory = this.resolution.directory
+    const users = directory.getUsersByIds
+      ? await directory.getUsersByIds(ids)
+      : (await Promise.all(ids.map((id) => directory.getUserById(id)))).filter(
+          (user): user is NonNullable<typeof user> => user !== null,
+        )
+
+    for (const user of users) {
+      names.set(user.id, user.username)
+    }
+
+    return names
   }
 
   hasUsableForPrincipal(input: { owner: string; spaces: readonly string[] }): Promise<boolean> {
@@ -1252,9 +1296,15 @@ export class ProviderRegistry {
         continue
       }
 
+      // One batch for the whole list, like every other list surface: resolving per row
+      // would read the same owner out of the directory once per retargeted resource.
+      const ownerNames = await this.ownerNamesFor(result.resources.map((r) => r.owner))
+
       return {
         credential: this.credentialToWire(result.credential),
-        resources: result.resources.map((resource) => this.resourceToWire(resource, { owner })),
+        resources: await Promise.all(
+          result.resources.map((resource) => this.resourceToWire(resource, { owner }, ownerNames)),
+        ),
       }
     }
 
@@ -1350,7 +1400,7 @@ export class ProviderRegistry {
       capability: input.capability,
       result,
       saved: written.status === 'recorded',
-      resource: this.resourceToWire(stored, { owner: input.owner, admin: input.admin }),
+      resource: await this.resourceToWire(stored, { owner: input.owner, admin: input.admin }),
     }
   }
 
@@ -1452,7 +1502,8 @@ export class ProviderRegistry {
     }
     const outcome = await this.runtime!.validate({
       endpoint: {
-        principalId: `user:${input.owner}`,
+        // The owner key wraps as a user principal, the `@system` owner included.
+        principalId: userPrincipalId(input.owner),
         wire: record.wire,
         baseUrl: record.baseUrl,
         headers: callHeaders.headers,

@@ -4,12 +4,20 @@
 // box. Extracted from scripts/seed.ts as a PURE module so it can be unit-tested —
 // seed.ts runs `run()` on import, so it can't be imported directly. See docs/seeds.md.
 
+import {
+  oauthPrincipalId,
+  parsePrincipalId,
+  patPrincipalId,
+  PRINCIPAL_SCHEME,
+  userPrincipalId,
+} from '@notarium/server'
+
 export type OwnerRemap = {
   /** A bare username: the catalog owner → the init user; anyone else unchanged. */
   asUser: (name: string) => string
-  /** A journal principal (`user:<name>` / `pat:<name>:<id>` / `ui` / null): the owner's
-   *  name segment → the init user, everything else (incl. a same-prefixed different user)
-   *  unchanged. */
+  /** A journal principal (`user:<name>` / `pat:<name>:<id>` / `oauth:<name>:<id>` / `ui`
+   *  / null): the owner's name segment → the init user, everything else (incl. a
+   *  same-prefixed different user) unchanged. */
   remapPrincipal: (p?: string) => string | undefined
 }
 
@@ -22,7 +30,13 @@ export const makeOwnerRemap = (catalogOwner: string, ownerUser: string): OwnerRe
     }
     const parts = p.split(':')
 
-    if ((parts[0] === 'user' || parts[0] === 'pat') && parts[1] === catalogOwner) {
+    // Every agent scheme, not just PATs: a connected app's principal names its owner
+    // the same way, and skipping it left the catalog owner's OAuth rows pointing at a
+    // handle the seeded stand never mints.
+    if (
+      (parts[0] === 'user' || parts[0] === 'pat' || parts[0] === 'oauth') &&
+      parts[1] === catalogOwner
+    ) {
       parts[1] = ownerUser
       return parts.join(':')
     }
@@ -72,4 +86,26 @@ export const resolveSeedAgentActivityOwner = (input: {
   }
 
   return bound ?? explicit ?? input.fallbackOwner
+}
+
+/** A catalog principal names its owner by handle; the meta-DB keys attribution by the
+ *  stable user id. Rewrite the owner segment to the id the seed minted for that handle,
+ *  leaving `ui`, an unknown scheme and an unknown (orphaned) handle exactly as authored. */
+export const principalWithIds = (
+  principal: string,
+  userIdOf: (username: string) => string | undefined,
+): string => {
+  const parsed = parsePrincipalId(principal)
+  const id = parsed ? userIdOf(parsed.userId) : undefined
+
+  if (!parsed || !id) {
+    return principal
+  }
+  if (parsed.scheme === PRINCIPAL_SCHEME.user) {
+    return userPrincipalId(id)
+  }
+
+  return parsed.scheme === PRINCIPAL_SCHEME.pat
+    ? patPrincipalId(id, parsed.keyId as string)
+    : oauthPrincipalId(id, parsed.keyId as string)
 }
