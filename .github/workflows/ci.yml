@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [v1]
+  pull_request:
+    branches: [v1]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '24.22.1'
+      - uses: docker/setup-compose-action@v2.4.0
+        with:
+          version: v5.0.2
+      - run: npx --yes @docouno/devkit@0.4.1 doctor .
+      - run: make setup
+      - run: make check
+      - run: make test
+      - run: make build

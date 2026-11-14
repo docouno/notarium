@@ -1,0 +1,37 @@
+[package]
+name = "notarium-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+default-run = "notariumd"
+
+[[bin]]
+name = "notariumd"
+path = "src/main.rs"
+
+[[bin]]
+name = "notarium-sidecar"
+path = "src/sidecar.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+notarium-core = { workspace = true }
+notarium-syntax = { workspace = true }
+notarium-control = { workspace = true }
+notarium-canonical = { workspace = true }
+notarium-projections = { workspace = true }
+notarium-search = { workspace = true }
+notarium-collab = { workspace = true }
+notarium-jobs = { workspace = true }
+notarium-vault = { workspace = true }
+notarium-agents = { workspace = true }
+notarium-http = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+mimalloc = { workspace = true }
+axum = { workspace = true }

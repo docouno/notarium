@@ -1,0 +1,232 @@
+{
+  "services": {
+    "node": {
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/apps/desktop/dist",
+          "target": "/workspace/apps/desktop/dist",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/apps/desktop/node_modules",
+          "target": "/workspace/apps/desktop/node_modules",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/apps/desktop/release",
+          "target": "/workspace/apps/desktop/release",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/apps/web/dist",
+          "target": "/workspace/apps/web/dist",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/apps/web/node_modules",
+          "target": "/workspace/apps/web/node_modules",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/node_modules",
+          "target": "/workspace/node_modules",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/packages/api-contract/dist",
+          "target": "/workspace/packages/api-contract/dist",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/packages/api-contract/node_modules",
+          "target": "/workspace/packages/api-contract/node_modules",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/packages/api-contract/release",
+          "target": "/workspace/packages/api-contract/release",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/packages/client/dist",
+          "target": "/workspace/packages/client/dist",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/packages/client/node_modules",
+          "target": "/workspace/packages/client/node_modules",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        }
+      ]
+    },
+    "desktop": {
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/apps/desktop/dist",
+          "target": "/workspace/apps/desktop/dist",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/apps/desktop/node_modules",
+          "target": "/workspace/apps/desktop/node_modules",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/apps/desktop/release",
+          "target": "/workspace/apps/desktop/release",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/apps/web/dist",
+          "target": "/workspace/apps/web/dist",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/apps/web/node_modules",
+          "target": "/workspace/apps/web/node_modules",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/node_modules",
+          "target": "/workspace/node_modules",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/packages/api-contract/dist",
+          "target": "/workspace/packages/api-contract/dist",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/packages/api-contract/node_modules",
+          "target": "/workspace/packages/api-contract/node_modules",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/packages/api-contract/release",
+          "target": "/workspace/packages/api-contract/release",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/packages/client/dist",
+          "target": "/workspace/packages/client/dist",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PROJECT_ROOT:?}/packages/client/node_modules",
+          "target": "/workspace/packages/client/node_modules",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        }
+      ]
+    }
+  }
+}

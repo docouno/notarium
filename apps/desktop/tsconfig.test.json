@@ -1,0 +1,7 @@
+{
+  "extends": "@docouno/env/tsconfig/browser.json",
+  "compilerOptions": {
+    "types": ["vite/client", "node"]
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx"]
+}

@@ -1,0 +1,15 @@
+[package]
+name = "notarium-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+notarium-core = { workspace = true }
+saphyr = { workspace = true }
+pulldown-cmark = { workspace = true }

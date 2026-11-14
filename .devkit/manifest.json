@@ -1,0 +1,214 @@
+{
+  "schemaVersion": 2,
+  "version": "0.4.1",
+  "releaseIdentity": "0c2f111d8d53cd95aaa9dc7ed6e34e4c764d96ea4f537a7e758ee2f44e5b8a5a",
+  "generation": "2579982a-2101-4e64-b8f4-eaba88002a1b",
+  "packageMode": "registry",
+  "managed": {
+    ".devkit/compose.apps.yaml": {
+      "sha256": "c7fd7addfb02805429df05cd83c5dd093f4a4f533d297da2b03ad60678a583d5",
+      "mode": 420
+    },
+    ".devkit/compose.workspace.json": {
+      "sha256": "9f9886bbe7f2630db3c05fbda9d7a6db93f6280f349836d41c95bf3e8f278040",
+      "mode": 420
+    },
+    ".devkit/project.mk": {
+      "sha256": "535dec40d70785f1b0fa58860f7049e07c92f21febac9af0eb5fb5567de84db0",
+      "mode": 420
+    },
+    ".devkit/runtime.sha256": {
+      "sha256": "2e1116df20df0f431bf0dedb0072cea27f6ea43829dd4852a65e6263dac9f9e0",
+      "mode": 420
+    },
+    ".devkit/runtime/GUIDE.md": {
+      "sha256": "91ccaebd845aa00cd8ab615d27ecb45b992a404f9e0b97effac96d3920cd17f7",
+      "mode": 420
+    },
+    ".devkit/runtime/LICENSE": {
+      "sha256": "da39312b3c1fd7a483ccb2ef16bf02836ac84ac9ef3b8f9511dc87b7dda929c1",
+      "mode": 420
+    },
+    ".devkit/runtime/compose.tools.yaml": {
+      "sha256": "2b990ca69b475c44c2e3f564ccf3b4bd262adb740b1c06e4e09b3fd0711ca9ac",
+      "mode": 420
+    },
+    ".devkit/runtime/desktop-seccomp.json": {
+      "sha256": "a2e715a1ca0626e5cab2034686b946ad477c1efd8c19887a0f5b652ebf00d18a",
+      "mode": 420
+    },
+    ".devkit/runtime/desktop.Dockerfile": {
+      "sha256": "52f3561339b0fb7d8154b307bda086c9b5cac8ddffaae422e1ad330380f39429",
+      "mode": 420
+    },
+    ".devkit/runtime/devkit.mk": {
+      "sha256": "c94d1ee12fa917dae5342a9917210d1206efc50579e2d5afe2964d3cf046c795",
+      "mode": 420
+    },
+    ".devkit/runtime/devkit.sh": {
+      "sha256": "93cf98b41b40070e472a82a97b2565c3f451f8d65bfb18d0b203c77ac35d3724",
+      "mode": 493
+    },
+    ".devkit/runtime/licenses/Apache-2.0.txt": {
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "mode": 420
+    },
+    ".devkit/runtime/licenses/moby-profiles.NOTICE": {
+      "sha256": "3b102b5f5715e6b3e3f9096e276d77500fa5e0ffeb15c3459e30e0968c8f94c4",
+      "mode": 420
+    },
+    ".devkit/runtime/rust.Dockerfile": {
+      "sha256": "88b4dfb67f04eb6639988453a62e3489bc2492aade0e811e32983ceca5abab94",
+      "mode": 420
+    },
+    ".devkit/runtime/toolchains.env": {
+      "sha256": "f495ddcf6078e26b3347445312ba0a7473a189aa77d7d71f1523c97636350272",
+      "mode": 420
+    },
+    ".devkit/tooling-profiles.json": {
+      "sha256": "6005486797e41f77184a1df662a2c052d5b1f33920db57008a52663542bcfecb",
+      "mode": 420
+    },
+    "apps/api/rust-toolchain.toml": {
+      "sha256": "5e7517b95a2b4e810124f84091dd4a6e3f2192523fcac7b6d52abc7fc6aff91d",
+      "mode": 420
+    }
+  },
+  "components": {
+    "apps/api": {
+      "role": "app",
+      "toolchain": "rust",
+      "toolingProfile": "rust",
+      "origin": {
+        "template": "rust-api",
+        "version": "0.4.1"
+      },
+      "toolDependencies": {},
+      "dependencies": [],
+      "development": {
+        "owner": "managed",
+        "kind": "compose",
+        "service": "api"
+      }
+    },
+    "apps/desktop": {
+      "role": "app",
+      "toolchain": "node",
+      "toolingProfile": "electron",
+      "origin": {
+        "template": "electron-react",
+        "version": "0.4.1"
+      },
+      "toolDependencies": {
+        "@docouno/env": "0.4.1",
+        "@testing-library/dom": "10.4.2",
+        "@testing-library/react": "16.3.3",
+        "@types/node": "24.19.2",
+        "@types/react": "19.3.0",
+        "@types/react-dom": "19.3.0",
+        "@vitejs/plugin-react": "6.1.2",
+        "electron": "45.0.0",
+        "electron-builder": "26.15.3",
+        "electron-vite": "6.0.0",
+        "eslint": "10.13.0",
+        "jsdom": "30.1.3",
+        "prettier": "3.9.10",
+        "typescript": "6.0.3",
+        "vite": "8.3.5",
+        "vitest": "5.0.5"
+      },
+      "dependencies": [
+        "packages/api-contract",
+        "packages/client"
+      ],
+      "development": {
+        "owner": "managed",
+        "kind": "desktop",
+        "service": "desktop",
+        "api": "apps/api"
+      }
+    },
+    "apps/web": {
+      "role": "app",
+      "toolchain": "node",
+      "toolingProfile": "web",
+      "origin": {
+        "template": "react-web",
+        "version": "0.4.1"
+      },
+      "toolDependencies": {
+        "@docouno/env": "0.4.1",
+        "@testing-library/dom": "10.4.2",
+        "@testing-library/react": "16.3.3",
+        "@types/node": "24.19.2",
+        "@types/react": "19.3.0",
+        "@types/react-dom": "19.3.0",
+        "@vitejs/plugin-react": "6.1.2",
+        "eslint": "10.13.0",
+        "jsdom": "30.1.3",
+        "prettier": "3.9.10",
+        "typescript": "6.0.3",
+        "vite": "8.3.5",
+        "vitest": "5.0.5"
+      },
+      "dependencies": [
+        "packages/api-contract",
+        "packages/client"
+      ],
+      "development": {
+        "owner": "managed",
+        "kind": "compose",
+        "service": "web",
+        "api": "apps/api"
+      }
+    },
+    "packages/api-contract": {
+      "role": "library",
+      "toolchain": "node",
+      "toolingProfile": "ts-library",
+      "origin": {
+        "template": "ts-library",
+        "version": "0.4.1"
+      },
+      "toolDependencies": {
+        "@arethetypeswrong/core": "0.18.5",
+        "@docouno/env": "0.4.1",
+        "@types/node": "24.19.2",
+        "eslint": "10.13.0",
+        "prettier": "3.9.10",
+        "publint": "0.3.25",
+        "tsdown": "0.23.7",
+        "typescript": "6.0.3",
+        "vitest": "5.0.5"
+      },
+      "dependencies": []
+    },
+    "packages/client": {
+      "role": "library",
+      "toolchain": "node",
+      "toolingProfile": "react-library",
+      "origin": {
+        "template": "react-client",
+        "version": "0.4.1"
+      },
+      "toolDependencies": {
+        "@docouno/env": "0.4.1",
+        "@testing-library/dom": "10.4.2",
+        "@testing-library/react": "16.3.3",
+        "@types/node": "24.19.2",
+        "@types/react": "19.3.0",
+        "@types/react-dom": "19.3.0",
+        "@vitejs/plugin-react": "6.1.2",
+        "eslint": "10.13.0",
+        "jsdom": "30.1.3",
+        "prettier": "3.9.10",
+        "typescript": "6.0.3",
+        "vite": "8.3.5",
+        "vitest": "5.0.5"
+      },
+      "dependencies": [
+        "packages/api-contract"
+      ]
+    }
+  }
+}

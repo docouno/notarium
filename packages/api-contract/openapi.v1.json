@@ -1,0 +1,84 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Notarium bootstrap API",
+    "description": "Infrastructure and starter examples only; product API is added in later waves.",
+    "license": {
+      "name": "AGPL-3.0-only",
+      "identifier": "AGPL-3.0-only"
+    },
+    "version": "1.0.0-dev.0"
+  },
+  "paths": {
+    "/api/greeting": {
+      "get": {
+        "tags": [],
+        "operationId": "greet",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "query",
+            "description": "Starter greeting subject",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Greeting"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query"
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [],
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Greeting": {
+        "type": "object",
+        "required": ["message"],
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

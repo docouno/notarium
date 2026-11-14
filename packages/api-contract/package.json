@@ -1,0 +1,56 @@
+{
+  "name": "@notarium/package-api-contract",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^24.22.1"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "check": "devkit-verify && npm run format:check && npm run lint && npm run typecheck",
+    "format:check": "prettier --check . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
+    "format": "prettier --write . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
+    "lint": "eslint --max-warnings 0 .",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+    "fix": "npm run format && eslint --max-warnings 0 --fix . && npm run format",
+    "test": "vitest run --config vitest.config.mjs",
+    "build": "tsdown && devkit-verify --pack",
+    "package": "devkit-pack"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/core": "0.18.5",
+    "@docouno/env": "0.4.1",
+    "@types/node": "24.19.2",
+    "eslint": "10.13.0",
+    "prettier": "3.9.10",
+    "publint": "0.3.25",
+    "tsdown": "0.23.7",
+    "typescript": "6.0.3",
+    "vitest": "5.0.5"
+  },
+  "devkit": {
+    "sourceDirectories": [
+      "src",
+      "test"
+    ],
+    "typecheckConfigs": [
+      "tsconfig.json",
+      "tsconfig.test.json"
+    ],
+    "boundaries": {
+      "forbidCrossAppImports": true
+    }
+  },
+  "license": "AGPL-3.0-only"
+}

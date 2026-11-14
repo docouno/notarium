@@ -1,0 +1,82 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/notarium-core",
+    "crates/notarium-syntax",
+    "crates/notarium-control",
+    "crates/notarium-canonical",
+    "crates/notarium-projections",
+    "crates/notarium-search",
+    "crates/notarium-collab",
+    "crates/notarium-jobs",
+    "crates/notarium-vault",
+    "crates/notarium-agents",
+    "crates/notarium-http",
+    "crates/notarium-bin",
+    "crates/notarium-migrate",
+    "crates/fitness-gates",
+]
+default-members = ["crates/notarium-bin"]
+
+[workspace.package]
+version = "1.0.0-dev.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.dependencies]
+notarium-core = { path = "crates/notarium-core" }
+notarium-syntax = { path = "crates/notarium-syntax" }
+notarium-control = { path = "crates/notarium-control" }
+notarium-canonical = { path = "crates/notarium-canonical" }
+notarium-projections = { path = "crates/notarium-projections" }
+notarium-search = { path = "crates/notarium-search" }
+notarium-collab = { path = "crates/notarium-collab" }
+notarium-jobs = { path = "crates/notarium-jobs" }
+notarium-vault = { path = "crates/notarium-vault" }
+notarium-agents = { path = "crates/notarium-agents" }
+notarium-http = { path = "crates/notarium-http" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip"] }
+utoipa = { version = "6", features = ["axum_extras"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite", "postgres", "macros", "migrate"] }
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
+blake3 = "1"
+zstd = "0.14"
+saphyr = "0.3"
+pulldown-cmark = "0.13"
+argon2 = "0.6"
+scrypt = "0.12"
+hkdf = "0.13"
+sha2 = "0.11"
+aes-gcm = "0.11"
+age = "0.12"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "tls-ring", "router", "codegen"] }
+tonic-prost = "0.14"
+prost = "0.14"
+croaring = "2"
+memmap2 = "0.9"
+arc-swap = "1"
+tantivy = "0.27"
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-31"] }
+yrs = "0.28"
+cap-std = "4"
+notify = "8"
+zip = { version = "9", default-features = false, features = ["deflate", "zstd"] }
+mimalloc = { version = "0.1", default-features = false }
+proptest = "1"
+toml = "0.9"

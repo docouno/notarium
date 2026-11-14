@@ -1,0 +1,71 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color: #17233a;
+  background: #f4f7fb;
+  font-synthesis: none;
+}
+
+body {
+  margin: 0;
+}
+main {
+  max-width: 44rem;
+  margin: 4rem auto;
+  padding: 0 1.5rem;
+}
+h1 {
+  font-size: clamp(2rem, 5vw, 3rem);
+  line-height: 1.1;
+}
+h2 {
+  font-size: 1.25rem;
+}
+p {
+  line-height: 1.6;
+}
+.eyebrow {
+  color: #3159a6;
+  font-weight: 650;
+}
+.card,
+.api-panel {
+  display: grid;
+  gap: 1rem;
+  margin-top: 2rem;
+  padding: 1.5rem;
+  border: 1px solid #dce3ef;
+  border-radius: 1rem;
+  background: white;
+}
+input,
+button {
+  font: inherit;
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+}
+input {
+  border: 1px solid #8391a9;
+}
+button {
+  justify-self: start;
+  border: none;
+  background: #3159a6;
+  color: white;
+  cursor: pointer;
+}
+button:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+input:focus-visible,
+button:focus-visible {
+  outline: 3px solid #8eafe8;
+  outline-offset: 3px;
+}
+output {
+  font-size: 1.4rem;
+  font-weight: 600;
+}
+[role='alert'] {
+  color: #a5222a;
+}

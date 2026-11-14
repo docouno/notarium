@@ -1,0 +1,18 @@
+[package]
+name = "notarium-vault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+notarium-core = { workspace = true }
+notarium-syntax = { workspace = true }
+notarium-canonical = { workspace = true }
+cap-std = { workspace = true }
+notify = { workspace = true }
+age = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "notarium-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+notarium-core = { workspace = true }
+sqlx = { workspace = true }
+libsqlite3-sys = { workspace = true }
+argon2 = { workspace = true }
+scrypt = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+aes-gcm = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }

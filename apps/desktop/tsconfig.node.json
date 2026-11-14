@@ -1,0 +1,13 @@
+{
+  "extends": "@docouno/env/tsconfig/node.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023", "DOM"],
+    "allowJs": true,
+    "checkJs": true
+  },
+  "include": ["src/main/**/*.ts", "src/preload/**/*.ts", "src/bridge.ts", "*.cjs", "*.mjs"],
+  "exclude": ["src/**/*.test.ts"]
+}

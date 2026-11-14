@@ -1,0 +1,166 @@
+//! Architecture checks use Cargo's package identities, including renamed,
+//! optional, target, development and build dependency declarations.
+
+use std::{collections::BTreeSet, path::Path};
+
+use serde_json::Value;
+
+pub const ALLOWED: &[(&str, &[&str])] = &[
+    ("notarium-core", &[]),
+    ("notarium-syntax", &["notarium-core"]),
+    ("notarium-control", &["notarium-core"]),
+    ("notarium-canonical", &["notarium-core", "notarium-syntax"]),
+    (
+        "notarium-projections",
+        &["notarium-core", "notarium-syntax", "notarium-canonical"],
+    ),
+    (
+        "notarium-search",
+        &["notarium-core", "notarium-syntax", "notarium-canonical"],
+    ),
+    (
+        "notarium-collab",
+        &["notarium-core", "notarium-syntax", "notarium-canonical"],
+    ),
+    (
+        "notarium-vault",
+        &["notarium-core", "notarium-syntax", "notarium-canonical"],
+    ),
+    (
+        "notarium-jobs",
+        &[
+            "notarium-core",
+            "notarium-syntax",
+            "notarium-canonical",
+            "notarium-control",
+        ],
+    ),
+    (
+        "notarium-agents",
+        &["notarium-core", "notarium-syntax", "notarium-control"],
+    ),
+    (
+        "notarium-http",
+        &[
+            "notarium-core",
+            "notarium-control",
+            "notarium-agents",
+            "notarium-collab",
+            "notarium-vault",
+        ],
+    ),
+    (
+        "notarium-bin",
+        &[
+            "notarium-core",
+            "notarium-syntax",
+            "notarium-control",
+            "notarium-canonical",
+            "notarium-projections",
+            "notarium-search",
+            "notarium-collab",
+            "notarium-jobs",
+            "notarium-vault",
+            "notarium-agents",
+            "notarium-http",
+        ],
+    ),
+    (
+        "notarium-migrate",
+        &[
+            "notarium-core",
+            "notarium-syntax",
+            "notarium-canonical",
+            "notarium-control",
+        ],
+    ),
+    (
+        "fitness-gates",
+        &[
+            "notarium-core",
+            "notarium-syntax",
+            "notarium-control",
+            "notarium-canonical",
+            "notarium-projections",
+            "notarium-search",
+            "notarium-collab",
+            "notarium-jobs",
+            "notarium-vault",
+            "notarium-agents",
+            "notarium-http",
+        ],
+    ),
+];
+
+pub const BANNED: &[&str] = &[
+    "openssl-sys",
+    "native-tls",
+    "aws-lc-sys",
+    "cmake",
+    "cxx",
+    "usearch",
+    "tikv-jemalloc-sys",
+];
+
+pub fn validate_metadata(metadata: &Value, root: &Path) -> Result<(), String> {
+    let packages = metadata["packages"].as_array().ok_or("missing packages")?;
+    let members = metadata["workspace_members"]
+        .as_array()
+        .ok_or("missing workspace_members")?;
+    let expected: BTreeSet<_> = ALLOWED.iter().map(|(name, _)| *name).collect();
+    let actual: BTreeSet<_> = packages
+        .iter()
+        .map(|p| p["name"].as_str().unwrap_or(""))
+        .collect();
+    if actual != expected || members.len() != expected.len() || packages.len() != expected.len() {
+        return Err(format!(
+            "expected exactly 14 workspace packages: {actual:?}"
+        ));
+    }
+    for package in packages {
+        let source = package["name"].as_str().ok_or("missing name")?;
+        if !members.contains(&package["id"]) {
+            return Err(format!("{source} is not a workspace member"));
+        }
+        let manifest = root.join("crates").join(source).join("Cargo.toml");
+        if package["manifest_path"].as_str().map(Path::new) != Some(manifest.as_path()) {
+            return Err(format!("{source} must live at {}", manifest.display()));
+        }
+        let allowed = ALLOWED.iter().find(|(name, _)| *name == source).unwrap().1;
+        for dep in package["dependencies"]
+            .as_array()
+            .ok_or("missing dependencies")?
+        {
+            let target = dep["name"].as_str().ok_or("missing dependency name")?;
+            let local = dep["path"].as_str();
+            if expected.contains(target) {
+                if !allowed.contains(&target)
+                    || local.map(Path::new) != Some(root.join("crates").join(target).as_path())
+                {
+                    return Err(format!(
+                        "forbidden edge {source} -> {target} (alias={}, kind={}, target={})",
+                        dep["rename"], dep["kind"], dep["target"]
+                    ));
+                }
+            } else if local.is_some() {
+                return Err(format!("unregistered path dependency {source} -> {target}"));
+            }
+            if source == "notarium-agents" && ["tantivy", "ort", "yrs"].contains(&target) {
+                return Err(format!("heavy dependency {source} -> {target}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_lock(lock: &toml::Value) -> Result<(), String> {
+    for package in lock["package"].as_array().ok_or("missing lock packages")? {
+        let name = package["name"]
+            .as_str()
+            .ok_or("missing lock package name")?;
+        if BANNED.contains(&name) {
+            return Err(format!("banned package in Cargo.lock: {name}"));
+        }
+    }
+    Ok(())
+}

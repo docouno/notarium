@@ -1,0 +1,11 @@
+{
+  "name": "notarium",
+  "private": true,
+  "workspaces": [
+    "apps/desktop",
+    "apps/web",
+    "packages/api-contract",
+    "packages/client"
+  ],
+  "license": "AGPL-3.0-only"
+}

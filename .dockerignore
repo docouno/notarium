@@ -1,0 +1,10 @@
+.git
+.artifacts
+.devkit/cache
+.devkit/state
+**/target
+**/node_modules
+**/dist
+**/release
+.env
+.env.*
