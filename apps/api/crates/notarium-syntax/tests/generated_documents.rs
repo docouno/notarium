@@ -34,7 +34,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
         ..defaults
     };
     let strategy = (
-        0usize..19,
+        0usize..20,
         any::<u32>(),
         any::<bool>(),
         any::<bool>(),
@@ -55,7 +55,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
             1..16,
         ),
     );
-    let counts = Cell::new([0u32; 19]);
+    let counts = Cell::new([0u32; 20]);
     let outcome = TestRunner::new(config).run(&strategy, |(family, number, crlf, bom, parts)| {
         let eol = if crlf { "\r\n" } else { "\n" };
         let bom = if bom { "\u{feff}" } else { "" };
@@ -199,10 +199,31 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
                     prop_assert_eq!(changed.replacen(&plan.edits[0].replacement, "", 1), source);
                 }
             }
-            _ => {
+            18 => {
                 let source = format!("{bom}---{eol}status: {{a: x, # {new}{eol} b: y}}{eol}next: keep{eol}---{eol}{body}");
                 let expected = format!("{bom}---{eol}   # {new}{eol}  {eol}next: keep{eol}---{eol}{body}");
                 let plan = frontmatter::unset_field(&source, DocClass::UserDoc, "status").unwrap();
+                prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
+            }
+            _ => {
+                let layout = number % 4;
+                let (prefix, parent, replacement, erased) = match layout {
+                    0 => ("status: ", 0, format!("status: {new} # marker{eol}"), format!("  # marker{eol}")),
+                    1 => ("status:\n  child: ", 2, format!("status:{eol}  {new}{eol}"), format!("{eol}    # marker{eol}")),
+                    2 => ("status:\n  - ", 2, format!("status:{eol}  {new}{eol}"), format!("{eol}    # marker{eol}")),
+                    _ => ("status:\n- ", 0, format!("status:{eol}  {new}{eol}"), format!("{eol}  # marker{eol}")),
+                };
+                let marker = ["|", ">-", "|4+", ">-4"][((number / 4) % 4) as usize];
+                let data_indent = " ".repeat(parent + 4);
+                let outside = format!("{}# outside {new}{eol}", " ".repeat(parent + 2));
+                let suffix = if number % 3 == 0 { String::new() } else { format!("next: keep{eol}") };
+                let raw = format!("{}{marker} # marker{eol}{data_indent}# scalar data {text}{eol}{outside}{suffix}", prefix.replace('\n', eol));
+                let source = format!("{bom}---{eol}{raw}---{eol}{body}");
+                let plan = frontmatter::set_field(&source, DocClass::UserDoc, "status", value).unwrap();
+                let expected = format!("{bom}---{eol}{replacement}{outside}{suffix}---{eol}{body}");
+                prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
+                let plan = frontmatter::unset_field(&source, DocClass::UserDoc, "status").unwrap();
+                let expected = format!("{bom}---{eol}{erased}{outside}{suffix}---{eol}{body}");
                 prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
             }
         }

@@ -276,3 +276,150 @@ fn unset_preserves_collection_comment_trivia_but_removes_block_scalar_data() {
         }
     }
 }
+
+#[test]
+fn scalar_data_ownership_and_collection_separators_follow_yaml_indentation() {
+    use saphyr::LoadableYamlNode;
+
+    // Each tuple declares its own concrete parent/content indentation. Markers
+    // on a later line inherit the preceding key or dash, not their own column.
+    let layouts = [
+        ("status: ", 0),
+        ("status:\n  ", 0),
+        ("status: !!str ", 0),
+        ("status: !!str # property comment\n  ", 0),
+        ("status:\n  child: ", 2),
+        ("status:\n  child:\n    ", 2),
+        ("status:\n  - ", 2),
+        ("status:\n  -\n    ", 2),
+        ("status:\n- ", 0),
+        ("status:\n  - child: ", 4),
+        ("status:\n  - - ", 4),
+    ];
+    for (prefix, parent) in layouts {
+        for root_indent in ["", "  "] {
+            for marker in [
+                "|", "|-", "|+", "|4", "|-4", "|4+", ">", ">-", ">+", ">4", ">-4", ">4+",
+            ] {
+                for eol in ["\n", "\r\n"] {
+                    for bom in ["", "\u{feff}"] {
+                        for suffix in ["", "next: keep\n", "\nnext: keep\n"] {
+                            let data_indent = " ".repeat(parent + 4);
+                            let comment_indent = " ".repeat(parent + 2);
+                            let raw = format!(
+                                "{prefix}{marker} # marker comment\n{data_indent}# literal value data 🚀\n{data_indent}\"more data [ {{\n{comment_indent}# outside scalar comment\n{suffix}"
+                            );
+                            let raw = raw
+                                .split_inclusive('\n')
+                                .map(|line| format!("{root_indent}{line}"))
+                                .collect::<String>()
+                                .replace('\n', eol);
+                            let comment_indent = format!("{root_indent}{comment_indent}");
+                            let source = format!("{bom}---{eol}{raw}---{eol}Body🚀");
+                            assert!(
+                                saphyr::Yaml::load_from_str(&raw).is_ok(),
+                                "invalid fixture: {raw:?}"
+                            );
+                            assert!(analyze(&source, DocClass::UserDoc).unwrap().writable);
+                            for unset in [false, true] {
+                                let plan = if unset {
+                                    unset_field(&source, DocClass::UserDoc, "status")
+                                } else {
+                                    set_field(&source, DocClass::UserDoc, "status", string("done"))
+                                }
+                                .unwrap_or_else(|e| panic!("{raw:?}, unset={unset}: {e:?}"));
+                                let changed = patch::apply(&source, &plan).unwrap();
+                                assert!(changed.starts_with(&format!("{bom}---{eol}")));
+                                assert!(
+                                    changed.ends_with(&format!("---{eol}Body🚀")),
+                                    "{changed:?}"
+                                );
+                                assert!(!changed.contains("literal value data"), "{changed:?}");
+                                assert!(!changed.contains("more data"), "{changed:?}");
+                                assert!(
+                                    changed.contains(&format!(
+                                        "{comment_indent}# outside scalar comment{eol}"
+                                    )),
+                                    "{changed:?}"
+                                );
+                                if unset || parent == 0 && !prefix.contains('-') {
+                                    assert!(
+                                        changed.contains(&format!(" # marker comment{eol}")),
+                                        "{changed:?}"
+                                    );
+                                }
+                                if prefix.contains("property comment") {
+                                    assert!(
+                                        changed.contains(&format!(" # property comment{eol}")),
+                                        "{changed:?}"
+                                    );
+                                }
+                                let carrier = Carrier::scan(&changed).unwrap();
+                                assert_eq!(carrier.body.slice(&changed).unwrap(), "Body🚀");
+                                let actual = saphyr::Yaml::load_from_str(
+                                    carrier.yaml.unwrap().slice(&changed).unwrap(),
+                                )
+                                .unwrap();
+                                let expected = format!(
+                                    "{}{suffix}",
+                                    if unset { "" } else { "status: done\n" }
+                                );
+                                let expected = saphyr::Yaml::load_from_str(&expected).unwrap();
+                                // A comments-only YAML document and an empty one both
+                                // represent no fields; compare nonempty mappings fully.
+                                if unset && suffix.is_empty() {
+                                    assert!(
+                                        analyze(&changed, DocClass::UserDoc)
+                                            .unwrap()
+                                            .fields
+                                            .unwrap()
+                                            .is_empty()
+                                    );
+                                } else {
+                                    assert_eq!(actual, expected, "{changed:?}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn replacing_a_final_block_scalar_subtree_preserves_the_carrier_boundary() {
+    for raw in [
+        "status:\n  child: |\n    value\n",
+        "status:\n  child: >-\n    value\n",
+        "status:\n  - key: |\n      value\n",
+        "status:\n  - |\n    # literal\n",
+        "status:\n  child: |\n",
+        "status:\n  - |\n",
+    ] {
+        for eol in ["\n", "\r\n"] {
+            for ending in ["---\nBody", "...\nBody", "---", "..."] {
+                for suffix in ["", "\n", "next: keep\n"] {
+                    let source = format!("\u{feff}---\n{raw}{suffix}{ending}").replace('\n', eol);
+                    let before = Carrier::scan(&source).unwrap();
+                    let plan =
+                        set_field(&source, DocClass::UserDoc, "status", string("done")).unwrap();
+                    let changed = patch::apply(&source, &plan).unwrap();
+                    let after = analyze(&changed, DocClass::UserDoc).unwrap();
+                    assert_eq!(after.fields.unwrap()["status"], string("done"));
+                    assert!(changed.ends_with(&ending.replace('\n', eol)), "{changed:?}");
+                    assert_eq!(
+                        after.carrier.body.slice(&changed).unwrap(),
+                        before.body.slice(&source).unwrap()
+                    );
+                    assert!(
+                        set_field(&changed, DocClass::UserDoc, "status", string("done"))
+                            .unwrap()
+                            .edits
+                            .is_empty()
+                    );
+                }
+            }
+        }
+    }
+}

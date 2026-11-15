@@ -52,13 +52,18 @@ inside that subtree. Unchanged siblings, comments and line endings stay exact.
 Unsetting a key removes syntax nodes while retaining comment and whitespace
 trivia between them, including comments inside collections. Literal block-scalar
 content remains value data and is removed with its value.
+Scalar boundaries account for explicit or inferred content indentation, nested
+sequence markers and markers on a later line. Dedented comments remain trivia.
+Replacing a collection preserves its final line separator and supplies the
+indentation required when an indentless sequence becomes a scalar/flow value.
 
 Missing keys in block mappings are inserted before the closing frontmatter
 fence. Flow mappings insert inside their braces: `{status: todo}` becomes
 `{status: todo, "owner": "editor"}`, not a second mapping after the closing brace.
 Empty mappings and first/middle/last/only-key deletion have explicit punctuation
 rules. The same surgery supports missing view IDs in flow mappings. Results are
-reparsed to verify the requested semantic postcondition.
+reparsed to verify the requested semantic postcondition. Frontmatter edits also
+revalidate the complete carrier and verify that its body is unchanged.
 Plain scalar punctuation and URL colons remain scalar data. Replacement encoding
 accounts for block versus flow context, quoting commas/brackets when necessary.
 

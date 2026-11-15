@@ -92,6 +92,14 @@ impl LexState {
                 continue;
             }
             match b {
+                b'!' if !self.plain => {
+                    // A node property may precede a block scalar. URI tag
+                    // punctuation is not quote/flow syntax of the scalar itself.
+                    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    continue;
+                }
                 b'|' | b'>' if !self.plain && self.flow == 0 => {
                     self.block_indent = Some(indent);
                     self.plain = true;

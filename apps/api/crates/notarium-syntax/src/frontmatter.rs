@@ -48,6 +48,8 @@ struct MappingCst {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Kind {
     Scalar,
+    Indicator,
+    Property,
     Colon,
     Open,
     Close,
@@ -78,6 +80,52 @@ fn leading(source: &str, offset: usize) -> Option<usize> {
         .then_some(offset - start)
 }
 
+/// A block scalar belongs to the preceding mapping key or sequence entry. Its
+/// marker may be on a later line, so the marker's own column is not the parent
+/// indentation. Properties such as `!!str` do not change that relationship.
+fn scalar_parent_indent(source: &str, tokens: &[Token]) -> usize {
+    let Some(index) = tokens.iter().rposition(|t| t.kind != Kind::Property) else {
+        return 0;
+    };
+    let token = &tokens[index];
+    let owner = if token.kind == Kind::Colon && index > 0 {
+        &tokens[index - 1]
+    } else {
+        token
+    };
+    owner.span.start() - line_start(source, owner.span.start())
+}
+
+/// Scan only value-data lines. A dedented comment ends a scalar even when it is
+/// still indented farther than the parent node. Empty lines belong to the scalar;
+/// semantic validation has already checked their indentation and chomping rules.
+fn scalar_tail_end(source: &str, start: usize, marker: &str, parent: usize) -> usize {
+    let explicit = marker.bytes().find(|b| b.is_ascii_digit());
+    let indent = explicit.map_or_else(
+        || {
+            source[start..]
+                .split_inclusive('\n')
+                .find(|line| !line.trim_matches([' ', '\r', '\n']).is_empty())
+                .map_or(parent + 1, |line| {
+                    line.bytes()
+                        .take_while(|b| *b == b' ')
+                        .count()
+                        .max(parent + 1)
+                })
+        },
+        |digit| parent + usize::from(digit - b'0'),
+    );
+    let mut end = start;
+    for line in source[start..].split_inclusive('\n') {
+        let spaces = line.bytes().take_while(|b| *b == b' ').count();
+        if !line.trim_matches([' ', '\r', '\n']).is_empty() && spaces < indent {
+            break;
+        }
+        end += line.len();
+    }
+    end
+}
+
 /// Token boundaries only, not a second YAML value parser. Byte scanning never uses
 /// saphyr markers. Comments are trivia, while block-scalar contents are value data.
 fn tokens(source: &str) -> DomainResult<Vec<Token>> {
@@ -99,6 +147,18 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
         }
         let start = i;
         let kind = match b {
+            b'-' | b'?' if depth == 0 && bytes.get(i + 1).is_none_or(u8::is_ascii_whitespace) => {
+                i += 1;
+                Kind::Indicator
+            }
+            b'!' => {
+                // Tags are node properties, not part of a plain scalar. The YAML
+                // parser validates their spelling; retain their concrete bytes.
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                Kind::Property
+            }
             b'{' | b'[' => {
                 depth += 1;
                 i += 1;
@@ -151,18 +211,9 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
                     i += 1;
                 }
                 let marker_end = i;
-                let parent_indent = source[line_start(source, start)..]
-                    .bytes()
-                    .take_while(|b| *b == b' ')
-                    .count();
-                let mut end = end_line;
-                for line in source[end_line..].split_inclusive('\n') {
-                    let indent = line.bytes().take_while(|b| *b == b' ').count();
-                    if !line.trim().is_empty() && indent <= parent_indent {
-                        break;
-                    }
-                    end += line.len();
-                }
+                let parent_indent = scalar_parent_indent(source, &result);
+                let end =
+                    scalar_tail_end(source, end_line, &source[start..marker_end], parent_indent);
                 result.push(Token {
                     kind: Kind::Scalar,
                     span: span(start, marker_end)?,
@@ -281,17 +332,32 @@ fn cst(source: &str) -> DomainResult<MappingCst> {
             .map_or(colon.span.end(), |t| t.span.start());
         let mut values = Vec::new();
         if let Some(first) = value_tokens.first() {
-            if let Some(tail) = first.tail {
-                values.push(first.span);
+            let direct_scalar = value_tokens
+                .iter()
+                .take_while(|t| t.kind == Kind::Property)
+                .count();
+            if let Some(scalar) = value_tokens.get(direct_scalar).filter(|t| t.tail.is_some()) {
+                // Scalar properties and marker comments are authored separately.
+                // Replace the first syntax token and erase the remaining nodes,
+                // leaving all intervening comment/whitespace trivia untouched.
+                values.extend(value_tokens[..=direct_scalar].iter().map(|t| t.span));
+                let tail = scalar.tail.expect("block scalar");
                 if !tail.is_empty() {
                     values.push(tail);
                 }
             } else {
                 let last = value_tokens.last().expect("nonempty values");
-                values.push(span(
-                    first.span.start(),
-                    last.tail.map_or(last.span.end(), ByteSpan::end),
-                )?);
+                let mut end = last.tail.map_or(last.span.end(), ByteSpan::end);
+                // The final line break also separates this subtree from the next
+                // key or the closing carrier fence. Keep that separator when a
+                // collection (or tagged scalar) is replaced with a single token.
+                if last.tail.is_some() && source[..end].ends_with('\n') {
+                    end -= 1;
+                    if source[..end].ends_with('\r') {
+                        end -= 1;
+                    }
+                }
+                values.push(span(first.span.start(), end)?);
             }
         } else {
             values.push(span(value_start, value_start)?);
@@ -433,6 +499,14 @@ pub(crate) fn edit_mapping(
                         && source.as_bytes().get(first.start().wrapping_sub(1)) == Some(&b':')
                     {
                         encoded.insert(0, ' ');
+                    }
+                    if concrete.flow_close.is_none()
+                        && let Some(indent) = leading(source, first.start())
+                        && indent <= concrete.indent
+                    {
+                        // Block sequences may start at their key's indentation;
+                        // the scalar/flow value replacing them may not.
+                        encoded.insert_str(0, &" ".repeat(concrete.indent + 2 - indent));
                     }
                     result.push((first, encoded));
                     for tail in &entry.values[1..] {
@@ -585,8 +659,13 @@ pub fn patch_frontmatter(
         }
     };
     let plan = patch::plan(source, carrier.body, splices)?;
+    let changed = patch::apply(source, &plan)?;
+    let after = analyze(&changed, expected)?;
+    if !after.writable || after.carrier.body.slice(&changed)? != carrier.body.slice(source)? {
+        return Err(failure(ValidationReason::FmNotWritable));
+    }
     if expected == DocClass::EncryptedNote {
-        crate::encrypted::validate(&patch::apply(source, &plan)?)?;
+        crate::encrypted::validate(&changed)?;
     }
     Ok(plan)
 }
