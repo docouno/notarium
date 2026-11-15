@@ -12,32 +12,56 @@ pub fn plan(
     if body_range.end() != source.len() {
         return Err(DomainError::validation(ValidationReason::OriginMismatch));
     }
-    let mut splices = Vec::new();
+    let mut changed = Vec::new();
     for (origin, bytes, replacement) in edits {
-        let utf16 = bytes.to_utf16(source)?;
+        let original = bytes.slice(source)?;
         if (origin == CarrierEditOrigin::Body && bytes.start() < body_range.start())
             || (origin == CarrierEditOrigin::Header && bytes.end() > body_range.start())
         {
             return Err(DomainError::validation(ValidationReason::OriginMismatch));
         }
-        if bytes.slice(source)? == replacement {
+        if original == replacement {
             continue;
         }
+        changed.push((origin, bytes, replacement));
+    }
+    changed.sort_by_key(|(_, bytes, _)| (bytes.start(), bytes.end()));
+    check_disjoint(changed.iter().map(|(_, bytes, _)| *bytes))?;
+    let mut units = UnitCursor::default();
+    let mut splices = Vec::with_capacity(changed.len());
+    for (origin, bytes, replacement) in changed {
         splices.push(CarrierSplice {
             origin,
             bytes: CarrierByteSpan(bytes),
-            utf16: CarrierUtf16Span(utf16),
+            utf16: CarrierUtf16Span(units.span(source, bytes)?),
             replacement_utf16_len: replacement.encode_utf16().count(),
             replacement,
         });
     }
-    splices.sort_by_key(|edit| (edit.bytes.0.start(), edit.bytes.0.end()));
-    check_disjoint(splices.iter().map(|s| s.bytes.0))?;
     Ok(CarrierPatchPlan {
         base_content_hash: content_digest(source),
         body_range,
         edits: splices,
     })
+}
+
+/// Converts sorted, disjoint endpoints without revisiting earlier source text.
+#[derive(Default)]
+struct UnitCursor {
+    bytes: usize,
+    units: usize,
+}
+impl UnitCursor {
+    fn span(&mut self, source: &str, span: ByteSpan) -> DomainResult<Utf16Span> {
+        let before = source
+            .get(self.bytes..span.start())
+            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidSpan))?;
+        let selected = span.slice(source)?;
+        let start = self.units + before.encode_utf16().count();
+        self.bytes = span.end();
+        self.units = start + selected.encode_utf16().count();
+        Utf16Span::new(start, self.units)
+    }
 }
 fn check_disjoint(spans: impl IntoIterator<Item = ByteSpan>) -> DomainResult<()> {
     let mut previous: Option<ByteSpan> = None;
@@ -50,6 +74,19 @@ fn check_disjoint(spans: impl IntoIterator<Item = ByteSpan>) -> DomainResult<()>
     Ok(())
 }
 pub fn apply(source: &str, plan: &CarrierPatchPlan) -> DomainResult<String> {
+    validate(source, plan)?;
+    let mut result = String::new();
+    let mut cursor = 0;
+    for edit in &plan.edits {
+        result.push_str(&source[cursor..edit.bytes.0.start()]);
+        result.push_str(&edit.replacement);
+        cursor = edit.bytes.0.end();
+    }
+    result.push_str(&source[cursor..]);
+    Ok(result)
+}
+
+fn validate(source: &str, plan: &CarrierPatchPlan) -> DomainResult<()> {
     if content_digest(source) != plan.base_content_hash {
         return Err(DomainError::validation(ValidationReason::SourceMismatch));
     }
@@ -58,8 +95,7 @@ pub fn apply(source: &str, plan: &CarrierPatchPlan) -> DomainResult<String> {
         return Err(DomainError::validation(ValidationReason::OriginMismatch));
     }
     check_disjoint(plan.edits.iter().map(|e| e.bytes.0))?;
-    let mut result = String::new();
-    let mut cursor = 0;
+    let mut units = UnitCursor::default();
     for edit in &plan.edits {
         let bytes = edit.bytes.0;
         if (edit.origin == CarrierEditOrigin::Body && bytes.start() < plan.body_range.start())
@@ -67,21 +103,13 @@ pub fn apply(source: &str, plan: &CarrierPatchPlan) -> DomainResult<String> {
         {
             return Err(DomainError::validation(ValidationReason::OriginMismatch));
         }
-        if bytes.to_utf16(source)? != edit.utf16.0
+        if units.span(source, bytes)? != edit.utf16.0
             || edit.replacement.encode_utf16().count() != edit.replacement_utf16_len
         {
             return Err(DomainError::validation(ValidationReason::SourceMismatch));
         }
-        result.push_str(
-            source
-                .get(cursor..bytes.start())
-                .ok_or_else(|| DomainError::validation(ValidationReason::InvalidSpan))?,
-        );
-        result.push_str(&edit.replacement);
-        cursor = bytes.end();
     }
-    result.push_str(&source[cursor..]);
-    Ok(result)
+    Ok(())
 }
 
 pub fn body_plan(
@@ -90,8 +118,9 @@ pub fn body_plan(
     identity: BodyIdentity,
 ) -> DomainResult<BodyPatchPlan> {
     // Verify all coordinates and units, including header changes that are not copied.
-    apply(source, plan)?;
+    validate(source, plan)?;
     let body = plan.body_range.slice(source)?;
+    let header_units = source[..plan.body_range.start()].encode_utf16().count();
     let mut edits = Vec::new();
     for edit in &plan.edits {
         match edit.origin {
@@ -111,7 +140,10 @@ pub fn body_plan(
                 let bytes = ByteSpan::checked(body, start, end)?;
                 edits.push(BodySplice {
                     bytes: BodyByteSpan(bytes),
-                    utf16: BodyUtf16Span(bytes.to_utf16(body)?),
+                    utf16: BodyUtf16Span(Utf16Span::new(
+                        edit.utf16.0.start() - header_units,
+                        edit.utf16.0.end() - header_units,
+                    )?),
                     replacement: edit.replacement.clone(),
                     replacement_utf16_len: edit.replacement_utf16_len,
                 });

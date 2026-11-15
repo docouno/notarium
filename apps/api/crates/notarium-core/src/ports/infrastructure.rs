@@ -9,9 +9,9 @@ pub trait StructuralSnapshot: Send + Sync {
     fn cut(&self) -> &SnapshotCut;
     fn lookup(&self, note: &NoteId) -> Option<DenseNodeId>;
     fn note_id(&self, node: DenseNodeId) -> DomainResult<&NoteId>;
-    fn folder_subtree(&self, folder: &FolderId) -> DomainResult<&[DenseNodeId]>;
-    fn outgoing(&self, node: DenseNodeId) -> DomainResult<&[DenseNodeId]>;
-    fn incoming(&self, node: DenseNodeId) -> DomainResult<&[DenseNodeId]>;
+    fn folder_subtree(&self, folder: &FolderId) -> DomainResult<DenseNodeIter<'_>>;
+    fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;
+    fn incoming(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;
 }
 pub trait StructuralReadPort: Send + Sync {
     fn acquire_snapshot(

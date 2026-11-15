@@ -97,3 +97,48 @@ impl DenseNodeId {
         Ok(self.index)
     }
 }
+
+/// A borrowed generation-bound traversal over compact snapshot indices.
+/// CSR slices need no allocation. Compressed sets can expose a lazy iterator
+/// without expanding every member or exposing their storage implementation.
+pub struct DenseNodeIter<'a> {
+    generation: ProjectionGeneration,
+    indices: DenseIndices<'a>,
+}
+enum DenseIndices<'a> {
+    Slice(std::iter::Copied<std::slice::Iter<'a, u32>>),
+    Lazy(Box<dyn Iterator<Item = u32> + Send + 'a>),
+}
+impl<'a> DenseNodeIter<'a> {
+    pub fn from_slice(generation: ProjectionGeneration, indices: &'a [u32]) -> Self {
+        Self {
+            generation,
+            indices: DenseIndices::Slice(indices.iter().copied()),
+        }
+    }
+    pub fn from_iter(
+        generation: ProjectionGeneration,
+        indices: impl Iterator<Item = u32> + Send + 'a,
+    ) -> Self {
+        Self {
+            generation,
+            indices: DenseIndices::Lazy(Box::new(indices)),
+        }
+    }
+}
+impl Iterator for DenseNodeIter<'_> {
+    type Item = DenseNodeId;
+    fn next(&mut self) -> Option<Self::Item> {
+        let index = match &mut self.indices {
+            DenseIndices::Slice(indices) => indices.next(),
+            DenseIndices::Lazy(indices) => indices.next(),
+        }?;
+        Some(DenseNodeId::new(self.generation, index))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.indices {
+            DenseIndices::Slice(indices) => indices.size_hint(),
+            DenseIndices::Lazy(indices) => indices.size_hint(),
+        }
+    }
+}

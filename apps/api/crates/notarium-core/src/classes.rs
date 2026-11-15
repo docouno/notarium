@@ -41,6 +41,90 @@ pub enum AbilityKind {
     Skill,
 }
 
+/// Canonical metadata can be admitted without loading a document's carrier.
+/// The owning adapter attests provenance and current resource facts.
+/// ```compile_fail
+/// use notarium_core::classes::ClassifiedMetadata;
+/// let _: ClassifiedMetadata = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone)]
+pub struct ClassifiedMetadata {
+    reference: NoteRef,
+    revision: RevisionId,
+    facts: ResourceFacts,
+    lifecycle: Lifecycle,
+    digest: ContentDigest,
+}
+impl fmt::Debug for ClassifiedMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClassifiedMetadata")
+            .field("reference", &self.reference)
+            .field("revision", &self.revision)
+            .field("class", &self.facts.class)
+            .finish_non_exhaustive()
+    }
+}
+impl ClassifiedMetadata {
+    pub fn from_canonical(
+        reference: NoteRef,
+        revision: RevisionId,
+        facts: ResourceFacts,
+        lifecycle: Lifecycle,
+        digest: ContentDigest,
+    ) -> DomainResult<Self> {
+        if reference.space_id != facts.space.id {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
+        Ok(Self {
+            reference,
+            revision,
+            facts,
+            lifecycle,
+            digest,
+        })
+    }
+    pub fn reference(&self) -> &NoteRef {
+        &self.reference
+    }
+    pub fn revision(&self) -> &RevisionId {
+        &self.revision
+    }
+    pub fn class(&self) -> DocClass {
+        self.facts.class
+    }
+    pub fn lifecycle(&self) -> Lifecycle {
+        self.lifecycle
+    }
+    pub fn digest(&self) -> ContentDigest {
+        self.digest
+    }
+    pub fn listing(&self, auth: &EngineAuthContext) -> DomainResult<ListedDocument> {
+        auth.authorize_read(&self.facts)?;
+        if self.lifecycle == Lifecycle::Purged {
+            return Err(DomainError::ResourceNotFound);
+        }
+        Ok(ListedDocument {
+            reference: self.reference.clone(),
+            revision: self.revision.clone(),
+            class: self.class(),
+            lifecycle: self.lifecycle,
+        })
+    }
+}
+
+/// An active, readable secondary card; it conveys no whole-text capability.
+/// ```compile_fail
+/// use notarium_core::classes::SearchMetadata;
+/// let _: SearchMetadata = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug)]
+pub struct SearchMetadata(ClassifiedMetadata);
+impl SearchMetadata {
+    pub fn provenance(&self) -> &ClassifiedMetadata {
+        &self.0
+    }
+}
+
 /// Canonical ownership must establish these facts before calling the constructor.
 #[derive(Clone)]
 pub struct ClassifiedDocument {
@@ -94,13 +178,16 @@ impl ClassifiedDocument {
         self.lifecycle
     }
     pub fn listing(&self, auth: &EngineAuthContext) -> DomainResult<ListedDocument> {
-        self.explicit_read(auth)?;
-        Ok(ListedDocument {
+        self.metadata().listing(auth)
+    }
+    pub fn metadata(&self) -> ClassifiedMetadata {
+        ClassifiedMetadata {
             reference: self.reference.clone(),
             revision: self.revision.clone(),
-            class: self.class(),
+            facts: self.facts.clone(),
             lifecycle: self.lifecycle,
-        })
+            digest: self.digest,
+        }
     }
     pub fn digest(&self) -> ContentDigest {
         self.digest
@@ -473,15 +560,29 @@ impl ClassEgressFence {
         })
     }
     fn check(document: &ClassifiedDocument, auth: &EngineAuthContext) -> DomainResult<()> {
-        if document.class() == DocClass::EncryptedNote {
+        Self::check_metadata(&document.facts, document.lifecycle, auth)
+    }
+    fn check_metadata(
+        facts: &ResourceFacts,
+        lifecycle: Lifecycle,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<()> {
+        if facts.class == DocClass::EncryptedNote {
             return Err(DomainError::validation(
                 ValidationReason::ClassEgressForbidden,
             ));
         }
-        if document.lifecycle != Lifecycle::Active {
+        if lifecycle != Lifecycle::Active {
             return Err(DomainError::ResourceNotFound);
         }
-        auth.authorize_read(&document.facts)
+        auth.authorize_read(facts)
+    }
+    pub fn search_metadata(
+        document: ClassifiedMetadata,
+        auth: &EngineAuthContext,
+    ) -> DomainResult<SearchMetadata> {
+        Self::check_metadata(&document.facts, document.lifecycle, auth)?;
+        Ok(SearchMetadata(document))
     }
     pub fn projection(
         document: ClassifiedDocument,

@@ -35,13 +35,18 @@ pub fn chunks(
     let source_digest = crate::content_digest(source);
     let mut output = Vec::new();
     let mut pending: Option<(ByteSpan, Vec<ByteSpan>)> = None;
+    let mut next_heading = 0;
+    let mut active_headings = Vec::new();
     for block in &markdown.blocks {
-        let prefix = markdown
-            .headings
+        while let Some(heading) = markdown.headings.get(next_heading)
+            && heading.section_span.start() <= block.start()
+        {
+            active_headings.push(heading);
+            next_heading += 1;
+        }
+        active_headings.retain(|h| h.section_span.end() >= block.end());
+        let prefix = active_headings
             .iter()
-            .filter(|h| {
-                h.section_span.start() <= block.start() && h.section_span.end() >= block.end()
-            })
             .map(|h| {
                 let raw = h.heading_span.slice(source)?;
                 // Preserve a source-bound heading context, including authored
@@ -125,18 +130,23 @@ fn emit(
         );
     }
     let mut offset = 0;
+    let mut context = prefix.to_vec();
     while offset < text.len() {
         let rest = &text[offset..];
-        let window = rest.len().min((limit as usize).saturating_mul(16).max(4));
-        let mut end = tokenizer
-            .split_hint(rest, limit)
+        let mut window = rest.len().min((limit as usize).saturating_mul(16).max(4));
+        while !rest.is_char_boundary(window) {
+            window -= 1;
+        }
+        let hinted = tokenizer
+            .split_hint(&rest[..window], limit)
             .unwrap_or(window)
             .min(window)
             .max(1);
+        let mut end = hinted;
         while !rest.is_char_boundary(end) {
             end += 1;
         }
-        let mut context = prefix.to_vec();
+        let candidate_end = end;
         loop {
             let selected = ByteSpan::new(range.start() + offset, range.start() + offset + end)?;
             let candidate = render_chunk(source, &context, &[selected])?;
@@ -181,6 +191,10 @@ fn emit(
                         context[0] = ByteSpan::new(span.start(), end)?;
                     }
                 }
+                // A shorter breadcrumb frees body budget. Retry the original
+                // bounded candidate instead of emitting a single scalar; keep
+                // the validated shortening for the next chunk of this block.
+                end = candidate_end;
             } else {
                 return Err(DomainError::validation(
                     ValidationReason::TokenBudgetExceeded,

@@ -7,6 +7,7 @@ use notarium_core::{
     span::ByteSpan,
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct FencedBlock {
@@ -140,16 +141,21 @@ pub fn analyze(source: &str, body: ByteSpan) -> DomainResult<MarkdownAnalysis> {
             _ => {}
         }
     }
-    for index in 0..result.headings.len() {
-        let h = &result.headings[index];
+    // Container ordinals are unique within this parse. Six next-heading slots
+    // avoid searching unrelated containers for every section boundary.
+    let mut next_by_owner = BTreeMap::<Option<u32>, [Option<usize>; 6]>::new();
+    for h in result.headings.iter_mut().rev() {
+        let owner = h.containers.last().map(|c| c.ordinal);
         let owner_end = h.containers.last().map_or(body.end(), |c| c.span.end());
-        let end = result.headings[index + 1..]
+        let next = next_by_owner.entry(owner).or_default();
+        let end = next[..usize::from(h.level)]
             .iter()
-            .find(|next| next.level <= h.level && next.containers == h.containers)
-            .map_or(owner_end, |h| {
-                line_start(source, h.heading_span.start()).min(owner_end)
-            });
-        result.headings[index].section_span = ByteSpan::new(h.heading_span.end().min(end), end)?;
+            .flatten()
+            .copied()
+            .min()
+            .map_or(owner_end, |start| start.min(owner_end));
+        h.section_span = ByteSpan::new(h.heading_span.end().min(end), end)?;
+        next[usize::from(h.level - 1)] = Some(line_start(source, h.heading_span.start()));
     }
     result
         .blocks
@@ -285,9 +291,34 @@ pub fn replace_section(
     {
         text.push_str(carrier.eol);
     }
+    if !text.is_empty()
+        && !crate::lines::with_endings(replacement)
+            .last()
+            .is_some_and(|line| line.trim().is_empty())
+        && analysis.headings.iter().any(|next| {
+            next.containers == selected.containers
+                && line_start(source, next.heading_span.start()) == selected.section_span.end()
+                && is_setext(source, next)
+        })
+    {
+        // Setext headings absorb adjacent paragraph lines. The separator is
+        // part of the replaced section, including its container continuation.
+        text.push_str(&prefix);
+        text.push_str(carrier.eol);
+    }
     patch::plan(
         source,
         carrier.body,
         vec![(CarrierEditOrigin::Body, selected.section_span, text)],
     )
+}
+
+fn is_setext(source: &str, heading: &Heading) -> bool {
+    let line = crate::lines::with_endings(&source[heading.heading_span.start()..])
+        .next()
+        .unwrap_or("")
+        .trim_start_matches([' ', '\t']);
+    let hashes = line.bytes().take_while(|b| *b == b'#').count();
+    !(1..=6).contains(&hashes)
+        || !line[hashes..].starts_with([' ', '\t', '\r', '\n']) && hashes != line.len()
 }

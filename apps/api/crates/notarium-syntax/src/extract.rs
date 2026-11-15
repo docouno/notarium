@@ -143,12 +143,17 @@ fn links_and_tags(
     let mut tags = BTreeMap::<String, Vec<ByteSpan>>::new();
     for range in merged {
         let mut index = range.start();
+        let mut no_closer = false;
         while index < range.end() {
             let rest = &source[index..range.end()];
-            if rest.starts_with("[[")
-                && !escaped(source, index)
-                && let Some(end) = rest[2..].find("]]")
-            {
+            let closer = if !no_closer && rest.starts_with("[[") && !escaped(source, index) {
+                let closer = rest[2..].find("]]");
+                no_closer = closer.is_none();
+                closer
+            } else {
+                None
+            };
+            if let Some(end) = closer {
                 let end = index + 2 + end;
                 let raw = &source[index + 2..end];
                 let (target, label) = raw

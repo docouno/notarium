@@ -179,6 +179,9 @@ destinations produce no links or hashtags. Lookup keys use canonical Unicode
 normalization and full case folding; exported Unicode-version constants identify
 the pinned tables. Original source spelling is never normalized in place.
 Tight list items supply source blocks even when Markdown omits paragraph events.
+Section boundaries are computed per owning container; chunk contexts use an
+ordered interval traversal. Unmatched wiki openers do not repeatedly scan the
+same remaining range, and they do not suppress later hashtags.
 
 `ChunkPlan::Deferred` retains source blocks when no model profile is supplied.
 With a `TokenizerBudget`, adjacent blocks share heading context and oversized
@@ -188,6 +191,10 @@ Source ranges are not silently truncated. BLAKE3 keys frame the model-profile
 identity and exact model input. Consumers scope their caches by Space. Fixed greedy
 vocabulary fixtures include subwords, UTF-8 byte fallback and emoji; production
 model/tokenizer assets belong to the search adapter.
+Split hints receive a bounded UTF-8 window, never an unbounded remaining block.
+If a breadcrumb must shrink, the body candidate is retried against the newly
+available budget. That shortened context is reused within the block, with every
+new candidate still checked exactly; no monotonic tokenizer assumption is made.
 Chunk descriptors include source identity and heading-context ranges. Breadcrumbs
 retain source Markdown and fixed separators, so core can reconstruct and verify
 the exact model input before issuing a classified content-part capability.

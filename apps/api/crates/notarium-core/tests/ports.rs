@@ -874,7 +874,7 @@ fn mcp_coverage_has_28_named_operations_and_typed_method_witnesses() {
 struct GraphFixture {
     cut: SnapshotCut,
     notes: Vec<NoteId>,
-    neighbors: Vec<DenseNodeId>,
+    neighbors: Vec<u32>,
 }
 struct PinnedGraph(Arc<GraphFixture>);
 impl StructuralSnapshot for PinnedGraph {
@@ -894,14 +894,20 @@ impl StructuralSnapshot for PinnedGraph {
             .get(node.index(self.0.cut.generation)? as usize)
             .ok_or(DomainError::ResourceNotFound)
     }
-    fn folder_subtree(&self, _: &FolderId) -> notarium_core::DomainResult<&[DenseNodeId]> {
-        Ok(&self.0.neighbors)
+    fn folder_subtree(&self, _: &FolderId) -> notarium_core::DomainResult<DenseNodeIter<'_>> {
+        Ok(DenseNodeIter::from_iter(
+            self.0.cut.generation,
+            self.0.neighbors.iter().copied(),
+        ))
     }
-    fn outgoing(&self, node: DenseNodeId) -> notarium_core::DomainResult<&[DenseNodeId]> {
+    fn outgoing(&self, node: DenseNodeId) -> notarium_core::DomainResult<DenseNodeIter<'_>> {
         self.note_id(node)?;
-        Ok(&self.0.neighbors)
+        Ok(DenseNodeIter::from_slice(
+            self.0.cut.generation,
+            &self.0.neighbors,
+        ))
     }
-    fn incoming(&self, node: DenseNodeId) -> notarium_core::DomainResult<&[DenseNodeId]> {
+    fn incoming(&self, node: DenseNodeId) -> notarium_core::DomainResult<DenseNodeIter<'_>> {
         self.outgoing(node)
     }
 }
@@ -933,7 +939,43 @@ impl StructuralReadPort for StructuralFixture {
     ) -> PortFuture<'_, Vec<Option<NoteCard>>> {
         Box::pin(async move {
             ctx.check_current(&cut.scope)?;
-            Ok(notes.iter().map(|_| None).collect())
+            // This adapter owns only compact indices and metadata, no carrier
+            // store. Hydration must not manufacture empty canonical content.
+            let current = self.current.lock().unwrap().clone();
+            let mut cards = Vec::new();
+            for note in notes {
+                if !self.is_live_visible(&ctx, &note)? || !current.notes.contains(&note) {
+                    cards.push(None);
+                    continue;
+                }
+                let metadata = ClassifiedMetadata::from_canonical(
+                    NoteRef {
+                        space_id: cut.scope.space_id.clone(),
+                        note_id: note,
+                    },
+                    RevisionId::from_bytes([1; 16]),
+                    ResourceFacts {
+                        space: Space {
+                            id: cut.scope.space_id.clone(),
+                            lifecycle: SpaceLifecycle::Active,
+                            kind: SpaceKind::Personal,
+                        },
+                        class: DocClass::UserDoc,
+                        ancestor_folders: vec![],
+                        folder_write_locked: false,
+                        ability_package: None,
+                    },
+                    Lifecycle::Active,
+                    ContentDigest::from_bytes([1; 32]),
+                )?;
+                cards.push(Some(NoteCard {
+                    document: ClassEgressFence::search_metadata(metadata, ctx.auth())?,
+                    title: "Title".into(),
+                    path: "Folder/title".into(),
+                    preview: "preview".into(),
+                }));
+            }
+            Ok(cards)
         })
     }
 }
@@ -947,7 +989,7 @@ fn graph(generation: u64) -> Arc<GraphFixture> {
             projected_seq: SpaceSeq::new(10).unwrap(),
         },
         notes: vec![NoteId::from_bytes([1; 16])],
-        neighbors: vec![DenseNodeId::new(generation, 0)],
+        neighbors: vec![0],
     })
 }
 #[test]
@@ -959,14 +1001,33 @@ fn pinned_graph_survives_a_swap_but_visibility_uses_the_current_fence() {
     let old =
         ready(port.acquire_snapshot(context(), CausalBasis::Exact(ReceiptSet::default()))).unwrap();
     let id = NoteId::from_bytes([1; 16]);
+    let interface: &dyn StructuralReadPort = &port;
+    let page = ready(interface.hydrate(
+        context(),
+        old.cut().clone(),
+        vec![NoteId::from_bytes([9; 16]), id.clone()],
+    ))
+    .unwrap();
+    assert!(page[0].is_none());
+    assert_eq!(
+        page[1]
+            .as_ref()
+            .unwrap()
+            .document
+            .provenance()
+            .reference()
+            .note_id,
+        id
+    );
+    assert_eq!(page[1].as_ref().unwrap().preview, "preview");
     let node = old.lookup(&id).unwrap();
-    let neighbors = old.outgoing(node).unwrap();
+    let mut neighbors = old.outgoing(node).unwrap();
     *port.current.lock().unwrap() = graph(2);
     port.visible
         .store(false, std::sync::atomic::Ordering::SeqCst);
     let new =
         ready(port.acquire_snapshot(context(), CausalBasis::Exact(ReceiptSet::default()))).unwrap();
-    assert_eq!(old.note_id(neighbors[0]).unwrap(), &id);
+    assert_eq!(old.note_id(neighbors.next().unwrap()).unwrap(), &id);
     assert!(new.note_id(node).is_err());
     assert!(!port.is_live_visible(&context(), &id).unwrap());
     assert_eq!(

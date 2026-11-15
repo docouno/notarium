@@ -490,6 +490,11 @@ pub(crate) fn edit_mapping(
         return Err(failure(ValidationReason::FmNotWritable));
     }
     let mut seen = BTreeSet::new();
+    let entries: BTreeMap<_, _> = concrete
+        .entries
+        .iter()
+        .map(|entry| (entry.key.as_str(), entry))
+        .collect();
     let mut result = Vec::new();
     let mut removed = BTreeSet::new();
     let mut insertions = Vec::new();
@@ -497,7 +502,7 @@ pub(crate) fn edit_mapping(
         if !seen.insert(edit.key()) {
             return Err(failure(ValidationReason::InvalidQuery));
         }
-        let entry = concrete.entries.iter().find(|e| e.key == edit.key());
+        let entry = entries.get(edit.key()).copied();
         match edit {
             FieldEdit::Set { key, value } => {
                 value.validate_keys()?;
@@ -561,22 +566,24 @@ pub(crate) fn edit_mapping(
             .iter()
             .filter(|e| !removed.contains(&e.key))
             .collect();
-        let keep_commas: BTreeSet<_> = remaining
-            .windows(2)
-            .filter_map(|pair| {
-                concrete
-                    .commas
-                    .iter()
-                    .find(|c| {
-                        c.start() >= pair[0].values.last().unwrap().end()
-                            && c.start() < pair[1].prefix.start()
-                    })
-                    .map(|c| c.start())
-            })
-            .collect();
-        for comma in &concrete.commas {
-            if !removed.is_empty() && !keep_commas.contains(&comma.start()) {
-                result.push((*comma, String::new()));
+        if !removed.is_empty() {
+            let mut commas = concrete.commas.iter().peekable();
+            let mut keep_commas = BTreeSet::new();
+            for pair in remaining.windows(2) {
+                let left = pair[0].values.last().unwrap().end();
+                while commas.peek().is_some_and(|c| c.start() < left) {
+                    commas.next();
+                }
+                if let Some(comma) = commas.peek()
+                    && comma.start() < pair[1].prefix.start()
+                {
+                    keep_commas.insert(comma.start());
+                }
+            }
+            for comma in &concrete.commas {
+                if !keep_commas.contains(&comma.start()) {
+                    result.push((*comma, String::new()));
+                }
             }
         }
         if !insertions.is_empty() {
@@ -614,6 +621,22 @@ pub(crate) fn edit_mapping(
         result.push((span(source.len(), source.len())?, text));
     }
     result.sort_by_key(|(span, _)| (span.start(), span.end()));
+    // Independent field intents can share a concrete boundary: an absent value
+    // precedes a newly inserted key or a comma removed with its next entry.
+    // Compose only producer-owned, non-overlapping splices; the public patch
+    // validator continues to reject ambiguous coordinates.
+    let mut composed: Vec<(ByteSpan, String)> = Vec::with_capacity(result.len());
+    for (bytes, text) in result {
+        if let Some((previous, replacement)) = composed.last_mut()
+            && previous.end() == bytes.start()
+        {
+            *previous = span(previous.start(), bytes.end())?;
+            replacement.push_str(&text);
+        } else {
+            composed.push((bytes, text));
+        }
+    }
+    let result = composed;
     let test_plan = patch::plan(
         source,
         span(0, source.len())?,

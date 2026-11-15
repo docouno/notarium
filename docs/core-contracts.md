@@ -43,7 +43,20 @@ visibility and revocation at use time.
 Explicit snapshots expose lifecycle. Listings select active, trashed or both
 through `LifecycleMask` and return `NoteListCard` metadata, including encrypted
 identities, without a content capability. Purged documents cannot be read/listed.
-Search, graph and view cards keep their active-only `SearchContent` fence.
+Search, graph and view cards use active-only `SearchMetadata`, admitted through
+the same class, lifecycle and read fences. `ClassifiedMetadata` carries canonical
+identity, revision, digest and resource facts without carrier bytes. Narrow card
+hydration and explicit listings therefore need no whole-document load or dummy
+content under a real revision. Full reads, indexing and provider parts retain
+their distinct content capabilities.
+
+Structural snapshots own their immutable generation and history cut. Neighbor
+and subtree traversal returns `DenseNodeIter`, binding compact `u32` indices to
+that generation lazily. CSR slices require no allocation or expanded edge array;
+compressed sets may supply a boxed lazy iterator without materializing members.
+Each yielded `DenseNodeId` still rejects use in another generation. The iterator
+borrows its snapshot; current visibility remains a separate canonical fence, and
+async card hydration preserves requested ordering and absent entries.
 
 Protected package reads select an exact AbilityId, package revision and entrypoint
 or auxiliary manifest key through `NoteReadPort::read_ability_resource`. Auxiliary
@@ -133,7 +146,9 @@ are distinct. Field sorting has this total order:
 Descending order reverses only scalar values. The final `NoteId` tie-breaker
 always stays ascending. Strings compare original Unicode scalar values without
 locale or case folding; booleans use false before true. Numbers compare exact
-represented values without lossy integer-to-float casts. Dates and timestamps
+represented values without lossy integer-to-float casts. The pinned JSON
+configuration preserves finite float values across cursor serialization and
+deserialization, including adjacent values and subnormals. Dates and timestamps
 are separate types. A sort key has one schema type; incompatible observations
 are Bad. Lists and maps, including empty lists, produce `unsupported_sort_type`;
 there is no implicit minimum, first-item or string conversion. Keysets bind the

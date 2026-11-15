@@ -52,13 +52,13 @@ pub struct NoteSnapshot {
 }
 #[derive(Clone, Debug)]
 pub struct NoteCard {
-    pub content: SearchContent,
+    pub document: SearchMetadata,
     pub title: String,
     pub path: String,
     pub preview: String,
 }
 /// Explicit listing metadata, including trash and encrypted-note identities.
-/// Search/view/graph cards retain their stricter active content capability.
+/// Search/view/graph cards retain their stricter active metadata capability.
 #[derive(Clone, Debug)]
 pub struct NoteListCard {
     pub document: ListedDocument,

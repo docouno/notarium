@@ -635,7 +635,7 @@ fn selected_chunks_reach_embedding_and_recall_with_original_provenance() {
     assert_eq!(result.used_tokens, descriptor.tokens);
     let hit = SearchHit {
         card: NoteCard {
-            content: ClassEgressFence::search((*document).clone(), &auth).unwrap(),
+            document: ClassEgressFence::search_metadata(document.metadata(), &auth).unwrap(),
             title: "Title".into(),
             path: "note.md".into(),
             preview: "sample".into(),
