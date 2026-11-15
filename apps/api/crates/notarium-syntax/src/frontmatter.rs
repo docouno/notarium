@@ -1,0 +1,606 @@
+//! Concrete byte ranges are independent of the semantic YAML parser's character offsets.
+use crate::{carrier::Carrier, patch, yaml};
+use notarium_core::{
+    DomainError, DomainResult,
+    classes::{DocClass, authorize_field_key},
+    error::ValidationReason,
+    patch::{CarrierEditOrigin, CarrierPatchPlan},
+    span::ByteSpan,
+    value::YamlValue,
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Clone, Debug)]
+pub enum FieldEdit {
+    Set { key: String, value: YamlValue },
+    Unset { key: String },
+}
+impl FieldEdit {
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Set { key, .. } | Self::Unset { key } => key,
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub struct HeaderAnalysis {
+    pub carrier: Carrier,
+    pub fields: Option<BTreeMap<String, YamlValue>>,
+    pub writable: bool,
+    pub diagnostic: Option<ValidationReason>,
+}
+#[derive(Clone, Debug)]
+struct Entry {
+    key: String,
+    prefix: ByteSpan,
+    values: Vec<ByteSpan>,
+}
+#[derive(Clone, Debug)]
+struct MappingCst {
+    entries: Vec<Entry>,
+    commas: Vec<ByteSpan>,
+    flow_close: Option<usize>,
+    indent: usize,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Kind {
+    Scalar,
+    Colon,
+    Open,
+    Close,
+    Comma,
+}
+#[derive(Clone, Debug)]
+struct Token {
+    kind: Kind,
+    span: ByteSpan,
+    depth: usize,
+    tail: Option<ByteSpan>,
+}
+
+fn failure(reason: ValidationReason) -> DomainError {
+    DomainError::validation(reason)
+}
+fn span(a: usize, b: usize) -> DomainResult<ByteSpan> {
+    ByteSpan::new(a, b)
+}
+fn line_start(source: &str, offset: usize) -> usize {
+    source[..offset].rfind('\n').map_or(0, |i| i + 1)
+}
+fn leading(source: &str, offset: usize) -> Option<usize> {
+    let start = line_start(source, offset);
+    source[start..offset]
+        .bytes()
+        .all(|b| b == b' ')
+        .then_some(offset - start)
+}
+
+/// Token boundaries only, not a second YAML value parser. Byte scanning never uses
+/// saphyr markers. Comments are trivia, while block-scalar contents are value data.
+fn tokens(source: &str) -> DomainResult<Vec<Token>> {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    let mut depth = 0usize;
+    let mut result = Vec::new();
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        let start = i;
+        let kind = match b {
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+                Kind::Open
+            }
+            b'}' | b']' => {
+                if depth == 0 {
+                    return Err(failure(ValidationReason::InvalidYaml));
+                }
+                depth -= 1;
+                i += 1;
+                Kind::Close
+            }
+            b',' => {
+                i += 1;
+                Kind::Comma
+            }
+            b':' => {
+                i += 1;
+                Kind::Colon
+            }
+            b'\'' | b'"' => {
+                let quote = b;
+                i += 1;
+                let mut closed = false;
+                while i < bytes.len() {
+                    if quote == b'"' && bytes[i] == b'\\' {
+                        i = (i + 2).min(bytes.len());
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        if quote == b'\'' && bytes.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !closed {
+                    return Err(failure(ValidationReason::InvalidYaml));
+                }
+                Kind::Scalar
+            }
+            b'|' | b'>' if depth == 0 => {
+                let end_line = source[i..].find('\n').map_or(source.len(), |n| i + n + 1);
+                while i < end_line && !bytes[i].is_ascii_whitespace() && bytes[i] != b'#' {
+                    i += 1;
+                }
+                let marker_end = i;
+                let parent_indent = source[line_start(source, start)..]
+                    .bytes()
+                    .take_while(|b| *b == b' ')
+                    .count();
+                let mut end = end_line;
+                for line in source[end_line..].split_inclusive('\n') {
+                    let indent = line.bytes().take_while(|b| *b == b' ').count();
+                    if !line.trim().is_empty() && indent <= parent_indent {
+                        break;
+                    }
+                    end += line.len();
+                }
+                result.push(Token {
+                    kind: Kind::Scalar,
+                    span: span(start, marker_end)?,
+                    depth,
+                    tail: Some(span(end_line, end)?),
+                });
+                i = end;
+                continue;
+            }
+            _ => {
+                while i < bytes.len() {
+                    let ch = bytes[i];
+                    if matches!(ch, b'\n' | b'\r')
+                        || (depth > 0 && matches!(ch, b',' | b'[' | b']' | b'{' | b'}'))
+                        || ch == b':'
+                            && (depth > 0
+                                || bytes.get(i + 1).is_none_or(|b| b.is_ascii_whitespace()))
+                        || ch == b'#' && (i == start || bytes[i - 1].is_ascii_whitespace())
+                    {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i == start {
+                    return Err(failure(ValidationReason::InvalidYaml));
+                }
+                Kind::Scalar
+            }
+        };
+        let mut end = i;
+        if kind == Kind::Scalar {
+            while end > start && bytes[end - 1].is_ascii_whitespace() {
+                end -= 1;
+            }
+        }
+        result.push(Token {
+            kind,
+            span: span(start, end)?,
+            depth: if kind == Kind::Open { depth - 1 } else { depth },
+            tail: None,
+        });
+    }
+    if depth != 0 {
+        return Err(failure(ValidationReason::InvalidYaml));
+    }
+    Ok(result)
+}
+
+fn cst(source: &str) -> DomainResult<MappingCst> {
+    let ts = tokens(source)?;
+    if ts.is_empty() {
+        return Ok(MappingCst {
+            entries: vec![],
+            commas: vec![],
+            flow_close: None,
+            indent: 0,
+        });
+    }
+    let flow = ts[0].kind == Kind::Open && ts[0].span.slice(source)? == "{";
+    let indent = ts
+        .iter()
+        .filter(|t| t.depth == 0 && t.kind == Kind::Scalar)
+        .filter_map(|t| leading(source, t.span.start()))
+        .min()
+        .unwrap_or(0);
+    let level = usize::from(flow);
+    let mut starts = Vec::new();
+    for (index, pair) in ts.windows(2).enumerate() {
+        if pair[0].kind == Kind::Scalar
+            && pair[0].depth == level
+            && pair[1].kind == Kind::Colon
+            && pair[1].depth == level
+            && (flow || leading(source, pair[0].span.start()) == Some(indent))
+        {
+            let raw = pair[0].span.slice(source)?;
+            if !flow && (raw.starts_with("- ") || raw.starts_with("? ")) {
+                continue;
+            }
+            let YamlValue::String(key) = yaml::parse(raw)? else {
+                return Err(failure(ValidationReason::FmNotWritable));
+            };
+            starts.push((index, key));
+        }
+    }
+    let commas: Vec<_> = ts
+        .iter()
+        .filter(|t| flow && t.kind == Kind::Comma && t.depth == level)
+        .map(|t| t.span)
+        .collect();
+    let flow_close = if flow {
+        ts.iter()
+            .rev()
+            .find(|t| t.kind == Kind::Close && t.depth == 0)
+            .map(|t| t.span.start())
+    } else {
+        None
+    };
+    if flow && flow_close.is_none() {
+        return Err(failure(ValidationReason::InvalidYaml));
+    }
+    let mut entries = Vec::new();
+    for (position, (index, key)) in starts.iter().enumerate() {
+        let key_token = &ts[*index];
+        let colon = &ts[index + 1];
+        let stop = starts.get(position + 1).map_or(ts.len(), |(i, _)| *i);
+        let value_tokens: Vec<_> = ts[index + 2..stop]
+            .iter()
+            .take_while(|t| {
+                !(flow && t.depth < level) && !(flow && t.kind == Kind::Comma && t.depth == level)
+            })
+            .collect();
+        let value_start = value_tokens
+            .first()
+            .map_or(colon.span.end(), |t| t.span.start());
+        let mut values = Vec::new();
+        if let Some(first) = value_tokens.first() {
+            if let Some(tail) = first.tail {
+                values.push(first.span);
+                if !tail.is_empty() {
+                    values.push(tail);
+                }
+            } else {
+                let last = value_tokens.last().expect("nonempty values");
+                values.push(span(
+                    first.span.start(),
+                    last.tail.map_or(last.span.end(), ByteSpan::end),
+                )?);
+            }
+        } else {
+            values.push(span(value_start, value_start)?);
+        }
+        entries.push(Entry {
+            key: key.clone(),
+            prefix: span(key_token.span.start(), colon.span.end())?,
+            values,
+        });
+    }
+    Ok(MappingCst {
+        entries,
+        commas,
+        flow_close,
+        indent,
+    })
+}
+
+pub fn analyze(source: &str, expected: DocClass) -> DomainResult<HeaderAnalysis> {
+    crate::unicode::validate_content(source)?;
+    let carrier = Carrier::scan(source)?;
+    let Some(range) = carrier.yaml else {
+        if expected == DocClass::EncryptedNote {
+            return Err(failure(ValidationReason::ClassMismatch));
+        }
+        return Ok(HeaderAnalysis {
+            carrier,
+            fields: Some(BTreeMap::new()),
+            writable: true,
+            diagnostic: None,
+        });
+    };
+    let raw = range.slice(source)?;
+    let tree = yaml::parse(raw);
+    if matches!(&tree, Err(DomainError::ValidationFailed { diagnostic }) if diagnostic.reason == ValidationReason::ForbiddenKey)
+    {
+        return Err(failure(ValidationReason::ForbiddenKey));
+    }
+    let fields = match &tree {
+        Ok(YamlValue::Mapping(fields)) => Some(fields.clone()),
+        Ok(YamlValue::Null) => Some(BTreeMap::new()),
+        _ => None,
+    };
+    if let Some(fields) = &fields {
+        check_class(fields.get("class"), expected)?;
+    } else {
+        // Opaque ordinary headers remain editable in their body only. Class evidence
+        // must still be unambiguous, independently of unrelated field diagnostics.
+        let concrete = cst(raw).map_err(|_| failure(ValidationReason::AmbiguousClass))?;
+        let classes: Vec<_> = concrete
+            .entries
+            .iter()
+            .filter(|e| e.key == "class")
+            .collect();
+        if classes.len() > 1 {
+            return Err(failure(ValidationReason::AmbiguousClass));
+        }
+        let class = classes
+            .first()
+            .map(|e| yaml::parse(e.values[0].slice(raw)?))
+            .transpose()
+            .map_err(|_| failure(ValidationReason::AmbiguousClass))?;
+        check_class(class.as_ref(), expected)?;
+    }
+    let writable = fields.is_some();
+    let diagnostic = if writable {
+        None
+    } else {
+        Some(match tree.err() {
+            Some(DomainError::ValidationFailed { diagnostic }) => diagnostic.reason,
+            _ => ValidationReason::FmNotWritable,
+        })
+    };
+    Ok(HeaderAnalysis {
+        carrier,
+        fields,
+        writable,
+        diagnostic,
+    })
+}
+fn check_class(value: Option<&YamlValue>, expected: DocClass) -> DomainResult<()> {
+    let declared = match value {
+        None => {
+            return if expected == DocClass::EncryptedNote {
+                Err(failure(ValidationReason::ClassMismatch))
+            } else {
+                Ok(())
+            };
+        }
+        Some(YamlValue::String(name)) => match name.as_str() {
+            "user-doc" => DocClass::UserDoc,
+            "encrypted-note" => DocClass::EncryptedNote,
+            "agent-memory" => DocClass::AgentMemory,
+            "skill" => DocClass::Skill,
+            "profile" => DocClass::Profile,
+            _ => return Err(failure(ValidationReason::ClassMismatch)),
+        },
+        _ => return Err(failure(ValidationReason::AmbiguousClass)),
+    };
+    if declared == expected {
+        Ok(())
+    } else {
+        Err(failure(ValidationReason::ClassMismatch))
+    }
+}
+
+/// Used for frontmatter and closed nota mappings. Returns original-source coordinates.
+pub(crate) fn edit_mapping(
+    source: &str,
+    edits: &[FieldEdit],
+    eol: &str,
+) -> DomainResult<Vec<(ByteSpan, String)>> {
+    let parsed = yaml::parse(source)?;
+    let mut desired = match parsed {
+        YamlValue::Mapping(fields) => fields,
+        YamlValue::Null => BTreeMap::new(),
+        _ => return Err(failure(ValidationReason::FmNotWritable)),
+    };
+    let concrete = cst(source)?;
+    let keys: BTreeSet<_> = concrete.entries.iter().map(|e| e.key.clone()).collect();
+    if keys.len() != concrete.entries.len() || keys != desired.keys().cloned().collect() {
+        return Err(failure(ValidationReason::FmNotWritable));
+    }
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+    let mut removed = BTreeSet::new();
+    let mut insertions = Vec::new();
+    for edit in edits {
+        if !seen.insert(edit.key()) {
+            return Err(failure(ValidationReason::InvalidQuery));
+        }
+        let entry = concrete.entries.iter().find(|e| e.key == edit.key());
+        match edit {
+            FieldEdit::Set { key, value } => {
+                value.validate_keys()?;
+                if desired.get(key) == Some(value) {
+                    continue;
+                }
+                desired.insert(key.clone(), value.clone());
+                if let Some(entry) = entry {
+                    let first = entry.values[0];
+                    let mut encoded = yaml::encode(value, Some(first.slice(source)?))?;
+                    if first.is_empty()
+                        && source.as_bytes().get(first.start().wrapping_sub(1)) == Some(&b':')
+                    {
+                        encoded.insert(0, ' ');
+                    }
+                    result.push((first, encoded));
+                    for tail in &entry.values[1..] {
+                        result.push((*tail, String::new()));
+                    }
+                } else {
+                    insertions.push(format!(
+                        "{}: {}",
+                        yaml::encode(&YamlValue::String(key.clone()), None)?,
+                        yaml::encode(value, None)?
+                    ));
+                }
+            }
+            FieldEdit::Unset { key } => {
+                desired.remove(key);
+                if let Some(entry) = entry {
+                    removed.insert(key.clone());
+                    result.push((entry.prefix, String::new()));
+                    for value in &entry.values {
+                        if !value.is_empty() {
+                            result.push((*value, String::new()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(close) = concrete.flow_close {
+        let remaining: Vec<_> = concrete
+            .entries
+            .iter()
+            .filter(|e| !removed.contains(&e.key))
+            .collect();
+        let keep_commas: BTreeSet<_> = remaining
+            .windows(2)
+            .filter_map(|pair| {
+                concrete
+                    .commas
+                    .iter()
+                    .find(|c| {
+                        c.start() >= pair[0].values.last().unwrap().end()
+                            && c.start() < pair[1].prefix.start()
+                    })
+                    .map(|c| c.start())
+            })
+            .collect();
+        for comma in &concrete.commas {
+            if !removed.is_empty() && !keep_commas.contains(&comma.start()) {
+                result.push((*comma, String::new()));
+            }
+        }
+        if !insertions.is_empty() {
+            result.push((
+                span(close, close)?,
+                format!(
+                    "{}{}",
+                    if remaining.is_empty() {
+                        ""
+                    } else if removed.is_empty()
+                        && concrete
+                            .commas
+                            .last()
+                            .is_some_and(|c| c.start()
+                                >= remaining.last().unwrap().values.last().unwrap().end())
+                    {
+                        " "
+                    } else {
+                        ", "
+                    },
+                    insertions.join(", ")
+                ),
+            ));
+        }
+    } else if !insertions.is_empty() {
+        let mut text = String::new();
+        if !source.is_empty() && !source.ends_with('\n') {
+            text.push_str(eol);
+        }
+        for insertion in insertions {
+            text.push_str(&" ".repeat(concrete.indent));
+            text.push_str(&insertion);
+            text.push_str(eol);
+        }
+        result.push((span(source.len(), source.len())?, text));
+    }
+    result.sort_by_key(|(span, _)| (span.start(), span.end()));
+    let test_plan = patch::plan(
+        source,
+        span(0, source.len())?,
+        result
+            .iter()
+            .map(|(s, v)| (CarrierEditOrigin::Body, *s, v.clone()))
+            .collect(),
+    )?;
+    let changed = patch::apply(source, &test_plan)?;
+    let actual = yaml::parse(&changed)?;
+    let actual = if actual == YamlValue::Null {
+        YamlValue::Mapping(BTreeMap::new())
+    } else {
+        actual
+    };
+    if actual != YamlValue::Mapping(desired) {
+        return Err(failure(ValidationReason::FmNotWritable));
+    }
+    Ok(result)
+}
+
+pub fn patch_frontmatter(
+    source: &str,
+    expected: DocClass,
+    edits: &[FieldEdit],
+) -> DomainResult<CarrierPatchPlan> {
+    if expected == DocClass::EncryptedNote {
+        crate::encrypted::validate(source)?;
+    }
+    let analysis = analyze(source, expected)?;
+    if !analysis.writable {
+        return Err(failure(ValidationReason::FmNotWritable));
+    }
+    for edit in edits {
+        authorize_field_key(edit.key())?;
+    }
+    let carrier = analysis.carrier;
+    let splices = if let Some(range) = carrier.yaml {
+        edit_mapping(range.slice(source)?, edits, carrier.eol)?
+            .into_iter()
+            .map(|(s, v)| {
+                Ok((
+                    CarrierEditOrigin::Header,
+                    span(range.start() + s.start(), range.start() + s.end())?,
+                    v,
+                ))
+            })
+            .collect::<DomainResult<Vec<_>>>()?
+    } else {
+        let body = edit_mapping("", edits, carrier.eol)?;
+        if body.is_empty() {
+            vec![]
+        } else {
+            let inserted = body.into_iter().map(|(_, v)| v).collect::<String>();
+            vec![(
+                CarrierEditOrigin::Header,
+                span(carrier.bom_end, carrier.bom_end)?,
+                format!("---{}{inserted}---{}", carrier.eol, carrier.eol),
+            )]
+        }
+    };
+    let plan = patch::plan(source, carrier.body, splices)?;
+    if expected == DocClass::EncryptedNote {
+        crate::encrypted::validate(&patch::apply(source, &plan)?)?;
+    }
+    Ok(plan)
+}
+pub fn set_field(
+    source: &str,
+    expected: DocClass,
+    key: &str,
+    value: YamlValue,
+) -> DomainResult<CarrierPatchPlan> {
+    patch_frontmatter(
+        source,
+        expected,
+        &[FieldEdit::Set {
+            key: key.into(),
+            value,
+        }],
+    )
+}
+pub fn unset_field(source: &str, expected: DocClass, key: &str) -> DomainResult<CarrierPatchPlan> {
+    patch_frontmatter(source, expected, &[FieldEdit::Unset { key: key.into() }])
+}

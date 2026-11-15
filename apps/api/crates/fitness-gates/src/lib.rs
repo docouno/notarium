@@ -102,6 +102,29 @@ pub const BANNED: &[&str] = &[
     "tikv-jemalloc-sys",
 ];
 
+/// Core owns values and port signatures, never adapters or parser/runtime engines.
+pub const CORE_RUNTIME_DEPENDENCIES: &[&str] = &[
+    "tokio",
+    "sqlx",
+    "rusqlite",
+    "tantivy",
+    "ort",
+    "yrs",
+    "reqwest",
+    "axum",
+    "utoipa",
+    "tonic",
+    "hyper",
+    "moka",
+    "object_store",
+    "pulldown-cmark",
+    "saphyr",
+    "saphyr-parser",
+    "memmap2",
+    "notify",
+    "croaring",
+];
+
 pub fn validate_metadata(metadata: &Value, root: &Path) -> Result<(), String> {
     let packages = metadata["packages"].as_array().ok_or("missing packages")?;
     let members = metadata["workspace_members"]
@@ -132,6 +155,9 @@ pub fn validate_metadata(metadata: &Value, root: &Path) -> Result<(), String> {
             .ok_or("missing dependencies")?
         {
             let target = dep["name"].as_str().ok_or("missing dependency name")?;
+            if source == "notarium-core" && CORE_RUNTIME_DEPENDENCIES.contains(&target) {
+                return Err(format!("runtime dependency {source} -> {target}"));
+            }
             let local = dep["path"].as_str();
             if expected.contains(target) {
                 if !allowed.contains(&target)

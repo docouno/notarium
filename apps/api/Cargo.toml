@@ -80,3 +80,8 @@ zip = { version = "9", default-features = false, features = ["deflate", "zstd"] 
 mimalloc = { version = "0.1", default-features = false }
 proptest = "1"
 toml = "0.9"
+time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
+caseless = "0.2"
+unicode-normalization = "0.1"
+
+saphyr-parser = "0.3"
