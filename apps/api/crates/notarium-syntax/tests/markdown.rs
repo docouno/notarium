@@ -314,3 +314,92 @@ fn empty_sections_preserve_headings_at_eof_and_before_neighbors() {
         }
     }
 }
+
+#[test]
+fn replacement_line_endings_preserve_every_container_and_neighbor() {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+
+    for (heading, prefix, depth) in [
+        ("# A", "", 0),
+        ("> # A", "> ", 1),
+        ("- # A", "  ", 1),
+        ("> - # A", ">   ", 2),
+        ("> > # A", "> > ", 2),
+        ("1. # A", "   ", 1),
+        ("> 1. # A", ">    ", 2),
+        ("A\n===", "", 0),
+        ("> A\n> ===", "> ", 1),
+    ] {
+        for eol in ["\n", "\r\n", "\r"] {
+            let heading = heading.replace('\n', eol);
+            for first in ["\n", "\r\n", "\r"] {
+                for second in ["\n", "\r\n", "\r"] {
+                    for layout in 0..4 {
+                        let neighbor = format!("{prefix}# B{eol}{prefix}keep");
+                        let source = match layout {
+                            0 => heading.clone(),
+                            1 => format!("{heading}{eol}{prefix}old"),
+                            2 => format!("{heading}{eol}{prefix}old{eol}{neighbor}"),
+                            _ => format!("{heading}{eol}{neighbor}"),
+                        };
+                        let logical = format!("# C{first}# D{second}text🚀");
+                        let inserted =
+                            format!("{prefix}# C{first}{prefix}# D{second}{prefix}text🚀");
+                        let separator = if layout == 0 && !heading.contains(['\r', '\n']) {
+                            "\n"
+                        } else {
+                            eol
+                        };
+                        let expected = if layout < 2 {
+                            format!("{heading}{separator}{inserted}")
+                        } else {
+                            format!("{heading}{eol}{inserted}{eol}{neighbor}")
+                        };
+                        let plan = replace_section(
+                            &source,
+                            &SectionSelector {
+                                title: "A".into(),
+                                occurrence: None,
+                            },
+                            &logical,
+                        )
+                        .unwrap();
+                        let changed = patch::apply(&source, &plan).unwrap();
+                        assert_eq!(changed, expected, "source={source:?}, logical={logical:?}");
+
+                        // Independent CommonMark consumer: new headings must stay
+                        // in the selected quote/list item, including bare-CR lines.
+                        let mut ancestry = 0;
+                        let mut title = None;
+                        let mut headings = Vec::new();
+                        for event in Parser::new(&changed) {
+                            match event {
+                                Event::Start(Tag::BlockQuote(_) | Tag::Item) => ancestry += 1,
+                                Event::End(TagEnd::BlockQuote(_) | TagEnd::Item) => ancestry -= 1,
+                                Event::Start(Tag::Heading { .. }) => title = Some(String::new()),
+                                Event::Text(text) => {
+                                    if let Some(title) = &mut title {
+                                        title.push_str(&text);
+                                    }
+                                }
+                                Event::End(TagEnd::Heading(_)) => {
+                                    headings.push((title.take().unwrap(), ancestry))
+                                }
+                                _ => {}
+                            }
+                        }
+                        let expected: Vec<_> = if layout < 2 {
+                            vec!["A", "C", "D"]
+                        } else {
+                            vec!["A", "C", "D", "B"]
+                        }
+                        .into_iter()
+                        .map(|title| (title.to_owned(), depth))
+                        .collect();
+                        assert_eq!(headings, expected, "{changed:?}");
+                    }
+                }
+            }
+        }
+    }
+}

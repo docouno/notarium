@@ -11,14 +11,10 @@ pub struct Carrier {
 impl Carrier {
     pub fn scan(source: &str) -> DomainResult<Self> {
         let bom_end = if source.starts_with('\u{feff}') { 3 } else { 0 };
-        let first_end = source[bom_end..]
-            .find('\n')
-            .map_or(source.len(), |i| bom_end + i + 1);
-        let eol = if source[..first_end].ends_with("\r\n") {
-            "\r\n"
-        } else {
-            "\n"
-        };
+        let first_end = crate::lines::with_endings(&source[bom_end..])
+            .next()
+            .map_or(source.len(), |line| bom_end + line.len());
+        let eol = crate::lines::ending(&source[..first_end]).unwrap_or("\n");
         if source[bom_end..first_end].trim_end_matches(['\r', '\n', ' ', '\t']) != "---" {
             return Ok(Self {
                 bom_end,
@@ -30,7 +26,7 @@ impl Carrier {
         }
         let mut state = LexState::default();
         let mut offset = first_end;
-        for line in source[first_end..].split_inclusive('\n') {
+        for line in crate::lines::with_endings(&source[first_end..]) {
             let text = line.trim_end_matches(['\r', '\n']);
             if state.at_root() && matches!(text.trim_end_matches([' ', '\t']), "---" | "...") {
                 let body_start = offset + line.len();
@@ -97,6 +93,10 @@ impl LexState {
         self.quote.is_none() && self.flow == 0
     }
     pub fn feed(&mut self, text: &str) {
+        // A blank line does not end a plain scalar, including one inside flow.
+        if self.quote.is_none() && text.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
+            return;
+        }
         let indent = text.bytes().take_while(|b| *b == b' ').count();
         if let Some(scalar) = &mut self.block_scalar {
             if scalar.contains_line(text) {
@@ -153,9 +153,13 @@ impl LexState {
                     self.plain_parent = None;
                     return;
                 }
-                b'\n' | b'\r' => self.plain = false,
+                b'\n' | b'\r' => {
+                    if self.flow == 0 {
+                        self.plain = false;
+                    }
+                }
                 b'#' if i == 0 || bytes[i - 1].is_ascii_whitespace() => {
-                    while i < bytes.len() && bytes[i] != b'\n' {
+                    while i < bytes.len() && !matches!(bytes[i], b'\r' | b'\n') {
                         i += 1;
                     }
                     continue;
@@ -176,10 +180,11 @@ impl LexState {
                     self.plain = false;
                 }
                 b',' if self.flow > 0 => self.plain = false,
-                b':' if bytes.get(i + 1).is_none_or(|b| {
-                    b.is_ascii_whitespace()
-                        || self.flow > 0 && matches!(b, b',' | b'[' | b']' | b'{' | b'}')
-                }) =>
+                b':' if !self.plain
+                    || bytes.get(i + 1).is_none_or(|b| {
+                        b.is_ascii_whitespace()
+                            || self.flow > 0 && matches!(b, b',' | b'[' | b']' | b'{' | b'}')
+                    }) =>
                 {
                     if self.flow == 0 {
                         self.node_parent = self.node_start.unwrap_or(indent);

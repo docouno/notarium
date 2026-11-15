@@ -268,7 +268,7 @@ pub fn replace_section(
         continuation_prefix(source, selected.heading_span.start())?
     };
     let mut text = String::new();
-    for line in replacement.split_inclusive('\n') {
+    for line in crate::lines::with_endings(replacement) {
         text.push_str(&prefix);
         text.push_str(line);
     }

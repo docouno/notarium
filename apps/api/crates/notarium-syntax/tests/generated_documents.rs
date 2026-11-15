@@ -34,7 +34,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
         ..defaults
     };
     let strategy = (
-        0usize..22,
+        0usize..24,
         any::<u32>(),
         any::<bool>(),
         any::<bool>(),
@@ -55,7 +55,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
             1..16,
         ),
     );
-    let counts = Cell::new([0u32; 22]);
+    let counts = Cell::new([0u32; 24]);
     let outcome = TestRunner::new(config).run(&strategy, |(family, number, crlf, bom, parts)| {
         let eol = if crlf { "\r\n" } else { "\n" };
         let bom = if bom { "\u{feff}" } else { "" };
@@ -238,12 +238,35 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
                 let expected = format!("{bom}---{eol}{eol}{marker_indent} # marker{eol}# outside{eol}next: keep{eol}---{eol}{body}");
                 prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
             }
-            _ => {
+            21 => {
                 let (first, continuation) = [("", ""), ("> ", "> "), ("> - ", ">   "), ("- ", "  "), ("1. ", "   ")][(number % 5) as usize];
                 let suffix = if number % 2 == 0 { String::new() } else { format!("{eol}{continuation}# B{eol}{continuation}keep") };
                 let source = format!("{header}{first}# A{suffix}");
                 let plan = markdown::replace_section(&source, &markdown::SectionSelector { title: "A".into(), occurrence: None }, &new).unwrap();
                 let expected = format!("{header}{first}# A{eol}{continuation}{new}{suffix}");
+                prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
+            }
+            22 => {
+                let eol = ["\n", "\r\n", "\r"][(number % 3) as usize];
+                let literal = ["\"literal", "'literal", ":literal", "!!str literal"][(number / 3 % 4) as usize];
+                let blank = if number % 2 == 0 { eol } else { "" };
+                let raw = if number % 2 == 0 {
+                    format!("status: first{eol}{blank}  {literal}{eol}")
+                } else {
+                    format!("status: [first{eol}{blank}  {literal}]{eol}")
+                };
+                let source = format!("{bom}---{eol}{raw}next: keep{eol}---{eol}{body}");
+                let plan = frontmatter::set_field(&source, DocClass::UserDoc, "status", value).unwrap();
+                let expected = format!("{bom}---{eol}status: {new}{eol}next: keep{eol}---{eol}{body}");
+                prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
+            }
+            _ => {
+                let (first, continuation) = [("", ""), ("> ", "> "), ("> - ", ">   "), ("- ", "  "), ("1. ", "   ")][(number % 5) as usize];
+                let ending = ["\n", "\r\n", "\r"][(number / 5 % 3) as usize];
+                let source = format!("{header}{first}# A{eol}{continuation}old{eol}{continuation}# B");
+                let replacement = format!("# C\r# D{ending}{new}");
+                let plan = markdown::replace_section(&source, &markdown::SectionSelector { title: "A".into(), occurrence: None }, &replacement).unwrap();
+                let expected = format!("{header}{first}# A{eol}{continuation}# C\r{continuation}# D{ending}{continuation}{new}{eol}{continuation}# B");
                 prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
             }
         }

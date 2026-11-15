@@ -73,7 +73,7 @@ fn span(a: usize, b: usize) -> DomainResult<ByteSpan> {
     ByteSpan::new(a, b)
 }
 fn line_start(source: &str, offset: usize) -> usize {
-    source[..offset].rfind('\n').map_or(0, |i| i + 1)
+    source[..offset].rfind(['\r', '\n']).map_or(0, |i| i + 1)
 }
 fn leading(source: &str, offset: usize) -> Option<usize> {
     let start = line_start(source, offset);
@@ -105,7 +105,7 @@ fn scalar_parent_indent(source: &str, tokens: &[Token]) -> usize {
 fn scalar_tail_end(source: &str, start: usize, marker: &str, parent: usize) -> usize {
     let mut scalar = BlockScalar::new(parent, marker);
     let mut end = start;
-    for line in source[start..].split_inclusive('\n') {
+    for line in crate::lines::with_endings(&source[start..]) {
         if !scalar.contains_line(line) {
             break;
         }
@@ -122,6 +122,7 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
     let mut depth = 0usize;
     let mut result = Vec::new();
     let mut plain_parent = None;
+    let mut flow_plain = false;
     while i < bytes.len() {
         let b = bytes[i];
         if b.is_ascii_whitespace() {
@@ -129,15 +130,17 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
             continue;
         }
         if b == b'#' {
-            while i < bytes.len() && bytes[i] != b'\n' {
+            while i < bytes.len() && !matches!(bytes[i], b'\r' | b'\n') {
                 i += 1;
             }
             continue;
         }
         let start = i;
-        let continuing = depth == 0
-            && plain_parent
-                .is_some_and(|parent| leading(source, start).is_some_and(|indent| indent > parent));
+        let continuing = depth > 0 && flow_plain
+            || depth == 0
+                && plain_parent.is_some_and(|parent| {
+                    leading(source, start).is_some_and(|indent| indent > parent)
+                });
         if depth == 0 && leading(source, start).is_some() && !continuing {
             plain_parent = None;
         }
@@ -159,12 +162,12 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
                 }
                 Kind::Property
             }
-            b'{' | b'[' if !continuing => {
+            b'{' | b'[' if !continuing || depth > 0 => {
                 depth += 1;
                 i += 1;
                 Kind::Open
             }
-            b'}' | b']' if !continuing => {
+            b'}' | b']' if !continuing || depth > 0 => {
                 if depth == 0 {
                     return Err(failure(ValidationReason::InvalidYaml));
                 }
@@ -172,11 +175,16 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
                 i += 1;
                 Kind::Close
             }
-            b',' if !continuing => {
+            b',' if !continuing || depth > 0 => {
                 i += 1;
                 Kind::Comma
             }
-            b':' if !continuing => {
+            b':' if !continuing
+                || bytes.get(i + 1).is_none_or(|b| {
+                    b.is_ascii_whitespace()
+                        || depth > 0 && matches!(b, b',' | b'[' | b']' | b'{' | b'}')
+                }) =>
+            {
                 i += 1;
                 Kind::Colon
             }
@@ -206,7 +214,9 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
                 Kind::Scalar
             }
             b'|' | b'>' if depth == 0 && !continuing => {
-                let end_line = source[i..].find('\n').map_or(source.len(), |n| i + n + 1);
+                let end_line = i + crate::lines::with_endings(&source[i..])
+                    .next()
+                    .map_or(0, str::len);
                 while i < end_line && !bytes[i].is_ascii_whitespace() && bytes[i] != b'#' {
                     i += 1;
                 }
@@ -260,6 +270,7 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
         } else if kind != Kind::Property {
             plain_parent = None;
         }
+        flow_plain = depth > 0 && plain_token;
         result.push(Token {
             kind,
             span: span(start, end)?,
@@ -360,11 +371,8 @@ fn cst(source: &str) -> DomainResult<MappingCst> {
                 // The final line break also separates this subtree from the next
                 // key or the closing carrier fence. Keep that separator when a
                 // collection (or tagged scalar) is replaced with a single token.
-                if last.tail.is_some() && source[..end].ends_with('\n') {
-                    end -= 1;
-                    if source[..end].ends_with('\r') {
-                        end -= 1;
-                    }
+                if last.tail.is_some() {
+                    end -= crate::lines::ending(&source[..end]).map_or(0, str::len);
                 }
                 values.push(span(first.span.start(), end)?);
             }
@@ -595,7 +603,7 @@ pub(crate) fn edit_mapping(
         }
     } else if !insertions.is_empty() {
         let mut text = String::new();
-        if !source.is_empty() && !source.ends_with('\n') {
+        if !source.is_empty() && !source.ends_with(['\r', '\n']) {
             text.push_str(eol);
         }
         for insertion in insertions {

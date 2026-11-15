@@ -13,10 +13,20 @@ pub fn lookup_key(input: &str) -> String {
 }
 pub(crate) fn source_location(source: &str, offset: usize) -> SourceLocation {
     let prefix = &source[..offset];
+    let mut line = 1;
+    let mut column = 1;
+    for part in crate::lines::with_endings(prefix) {
+        if crate::lines::ending(part).is_some() {
+            line += 1;
+            column = 1;
+        } else {
+            column = part.chars().count() as u64 + 1;
+        }
+    }
     SourceLocation {
         byte_offset: offset as u64,
-        line: prefix.bytes().filter(|b| *b == b'\n').count() as u64 + 1,
-        column: prefix.rsplit('\n').next().unwrap_or("").chars().count() as u64 + 1,
+        line,
+        column,
         code_point: source[offset..].chars().next(),
     }
 }

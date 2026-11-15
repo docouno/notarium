@@ -221,7 +221,7 @@ fn map_insertion(
     // A gap between fragments contains a physical quote/list prefix which must
     // stay before the inserted inline YAML, never in the middle of its value.
     if position < fence.text.len() {
-        if text.contains('\n') {
+        if text.contains(['\r', '\n']) {
             return Err(DomainError::validation(ValidationReason::InvalidView));
         }
         for (logical, physical) in &fence.lines {
@@ -235,9 +235,9 @@ fn map_insertion(
     for (logical, physical) in &fence.lines {
         if position == logical.end() {
             let offset = physical.start() + position - logical.start();
-            let is_line_start = position == 0 || fence.text[..position].ends_with('\n');
+            let is_line_start = position == 0 || fence.text[..position].ends_with(['\r', '\n']);
             let mut replacement = String::new();
-            for (index, line) in text.split_inclusive('\n').enumerate() {
+            for (index, line) in crate::lines::with_endings(text).enumerate() {
                 if is_line_start || index > 0 {
                     replacement.push_str(&fence.continuation_prefix);
                 }
@@ -251,8 +251,7 @@ fn map_insertion(
         return Err(DomainError::validation(ValidationReason::InvalidView));
     }
     let offset = fence.closing_start;
-    let replacement = text
-        .split_inclusive('\n')
+    let replacement = crate::lines::with_endings(text)
         .map(|line| format!("{}{line}", fence.continuation_prefix))
         .collect();
     Ok((ByteSpan::new(offset, offset)?, replacement))

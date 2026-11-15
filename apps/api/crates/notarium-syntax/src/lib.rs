@@ -6,6 +6,7 @@ pub mod chunk;
 pub mod encrypted;
 pub mod extract;
 pub mod frontmatter;
+mod lines;
 pub mod live;
 pub mod markdown;
 pub mod nota;

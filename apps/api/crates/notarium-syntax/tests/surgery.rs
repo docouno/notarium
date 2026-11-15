@@ -397,7 +397,7 @@ fn replacing_a_final_block_scalar_subtree_preserves_the_carrier_boundary() {
         "status:\n  child: |\n",
         "status:\n  - |\n",
     ] {
-        for eol in ["\n", "\r\n"] {
+        for eol in ["\n", "\r\n", "\r"] {
             for ending in ["---\nBody", "...\nBody", "---", "..."] {
                 for suffix in ["", "\n", "next: keep\n"] {
                     let source = format!("\u{feff}---\n{raw}{suffix}{ending}").replace('\n', eol);
@@ -553,5 +553,143 @@ fn literal_lookalikes_and_readonly_properties_preserve_their_authored_bytes() {
             .unwrap();
             assert_eq!(actual, expected);
         }
+    }
+}
+
+#[test]
+fn plain_scalar_continuations_keep_lexical_state_across_blank_and_flow_lines() {
+    use saphyr::LoadableYamlNode;
+
+    for continuation in [
+        "\"literal",
+        "'literal",
+        ":literal",
+        "!!str literal",
+        "a:b",
+        "🚀",
+    ] {
+        for blank in ["", "\n", "  \n\n"] {
+            for raw in [
+                format!("status: first\n{blank}  {continuation}\nnext: keep\n"),
+                format!("status:\n  - first\n{blank}    {continuation}\nnext: keep\n"),
+                format!("status: [first\n{blank}  {continuation}]\nnext: keep\n"),
+                format!("status: {{value: first\n{blank}  {continuation}}}\nnext: keep\n"),
+                format!("{{status: [first\n{blank}  {continuation}], next: keep}}\n"),
+            ] {
+                for eol in ["\n", "\r\n", "\r"] {
+                    for bom in ["", "\u{feff}"] {
+                        let raw = raw.replace('\n', eol);
+                        assert!(saphyr::Yaml::load_from_str(&raw).is_ok(), "{raw:?}");
+                        let source = format!("{bom}---{eol}{raw}# retained{eol}---{eol}Body🚀");
+                        let before = analyze(&source, DocClass::UserDoc).unwrap();
+                        assert!(before.writable, "{source:?}");
+                        let finalized = notarium_syntax::extract::finalize_document(
+                            &source,
+                            DocClass::UserDoc,
+                            &NoteId::from_bytes([1; 16]),
+                            &[],
+                        )
+                        .unwrap();
+                        assert_eq!(patch::apply(&source, &finalized).unwrap(), source);
+                        for unset in [false, true] {
+                            let plan = if unset {
+                                unset_field(&source, DocClass::UserDoc, "status")
+                            } else {
+                                set_field(&source, DocClass::UserDoc, "status", string("done"))
+                            }
+                            .unwrap_or_else(|e| panic!("{source:?}, unset={unset}: {e:?}"));
+                            let changed = patch::apply(&source, &plan).unwrap();
+                            let after = Carrier::scan(&changed).unwrap();
+                            assert!(changed.starts_with(&format!("{bom}---{eol}")));
+                            assert!(changed.contains(&format!("# retained{eol}")));
+                            assert!(changed.contains("next: keep"));
+                            assert_eq!(after.body.slice(&changed).unwrap(), "Body🚀");
+                            assert_eq!(
+                                saphyr::Yaml::load_from_str(
+                                    after.yaml.unwrap().slice(&changed).unwrap()
+                                )
+                                .unwrap(),
+                                saphyr::Yaml::load_from_str(if unset {
+                                    "next: keep"
+                                } else {
+                                    "status: done\nnext: keep"
+                                })
+                                .unwrap(),
+                                "{changed:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_quoted_flow_keys_keep_value_quotes_and_punctuation_distinct() {
+    use saphyr::LoadableYamlNode;
+
+    for value in [r#""]""#, r#""[#""#, r#""a\"b""#, r#""🚀""#] {
+        for eol in ["\n", "\r\n", "\r"] {
+            let raw = format!(r#"{{"status":{value},"next":"keep"}}"#);
+            assert!(saphyr::Yaml::load_from_str(&raw).is_ok(), "{raw:?}");
+            let source = format!("---{eol}{raw}{eol}---{eol}Body");
+            let changed = patch::apply(
+                &source,
+                &set_field(&source, DocClass::UserDoc, "next", string("changed")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(changed, source.replace("\"keep\"", "\"changed\""));
+            for unset in [false, true] {
+                let plan = if unset {
+                    unset_field(&source, DocClass::UserDoc, "status")
+                } else {
+                    set_field(
+                        &source,
+                        DocClass::UserDoc,
+                        "status",
+                        YamlValue::Mapping([("nested".into(), string("]"))].into()),
+                    )
+                }
+                .unwrap();
+                let changed = patch::apply(&source, &plan).unwrap();
+                let carrier = Carrier::scan(&changed).unwrap();
+                assert_eq!(carrier.body.slice(&changed).unwrap(), "Body");
+                assert_eq!(
+                    saphyr::Yaml::load_from_str(carrier.yaml.unwrap().slice(&changed).unwrap())
+                        .unwrap(),
+                    saphyr::Yaml::load_from_str(if unset {
+                        "next: keep"
+                    } else {
+                        "status: {nested: ']'}\nnext: keep"
+                    })
+                    .unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn source_diagnostics_count_each_line_ending_once_and_columns_as_scalars() {
+    use notarium_core::{
+        DomainError,
+        error::{SourceLocation, ValidationReason},
+    };
+
+    for prefix in ["a\rb\nc\r\n", "a\n\r\nb\r", "a\r\r\n"] {
+        let source = format!("{prefix}🚀e\u{301}\u{80}");
+        assert_eq!(
+            validate_content(&source),
+            Err(DomainError::at(
+                ValidationReason::DisallowedCodePoint,
+                SourceLocation {
+                    byte_offset: (prefix.len() + "🚀e\u{301}".len()) as u64,
+                    line: if prefix == "a\r\r\n" { 3 } else { 4 },
+                    column: 4,
+                    code_point: Some('\u{80}')
+                }
+            ))
+        );
     }
 }

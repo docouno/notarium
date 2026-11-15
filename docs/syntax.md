@@ -56,7 +56,8 @@ Scalar boundaries account for explicit or inferred content indentation, nested
 sequence markers and markers on a later line. Dedented comments remain trivia.
 Carrier detection and concrete edits share scalar-data indentation rules.
 Marker indentation does not constrain a later content line; anchors and tags
-remain node properties, and continued plain scalars keep literal punctuation.
+remain node properties, and continued plain scalars keep literal punctuation,
+including after blank lines and inside flow collections.
 Replacing a collection preserves its final line separator and supplies the
 indentation required when an indentless sequence becomes a scalar/flow value.
 
@@ -129,6 +130,9 @@ indentation. Root, quote and list-item cases, including lazy continuation, need
 fixtures with independently known intervals. Unsupported ambiguous layouts fail
 before editing; they never widen the deletion. External paragraphs, neighbouring
 items, headings and frontmatter remain byte-for-byte unchanged.
+LF, CRLF and CR each separate logical lines. Replacement lines retain their
+authored endings and receive the container prefix individually. A required
+separator uses the carrier's first line ending, or LF when none exists.
 The end boundary precedes the next heading's entire physical line, retaining its
 container prefix. Fenced logical content comes from canonical Markdown text
 events; byte mappings are used only where those fragments match the source.
