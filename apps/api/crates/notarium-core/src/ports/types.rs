@@ -556,7 +556,7 @@ pub struct RecallQuery {
 pub struct SearchHit {
     pub card: NoteCard,
     pub score: f64,
-    pub chunks: Vec<SearchContent>,
+    pub chunks: Vec<SearchPart>,
 }
 #[derive(Clone, Debug)]
 pub struct SearchResult {

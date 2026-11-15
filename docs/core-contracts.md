@@ -49,6 +49,15 @@ history before returning a `ClassifiedAbilityResource`; absent revisions never
 fall back to latest. Explicit reads require authority, and provider use additionally
 requires an active package and consent through `ClassEgressFence::ability`.
 
+`ContentPart` binds an extracted chunk to the original shared canonical document,
+source digest, body ranges and source heading context. It verifies that the exact
+selected text can be reconstructed from those ranges with fixed separators;
+foreign text and stale source identities are rejected. `SearchPart` and
+`ProviderPart` retain the same lifecycle/class/authority/consent fences. Embedding
+and recall use these parts without relabelling a fragment as a whole document.
+The tokenizer owner attests the model, token count and cache key; provider owners
+validate model/provider bindings, declared totals and the actual serving budget.
+
 ## History and causal reads
 
 `HistoryIncarnation` is an opaque 128-bit identity owned by each canonical Space.

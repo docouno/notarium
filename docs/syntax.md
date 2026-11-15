@@ -49,6 +49,9 @@ The scanner tracks actual tokens, comments, root shape and paired punctuation.
 Semantic YAML validation does not supply slicing offsets. Existing scalar edits
 replace only their value tokens; an explicitly replaced collection may change
 inside that subtree. Unchanged siblings, comments and line endings stay exact.
+Unsetting a key removes syntax nodes while retaining comment and whitespace
+trivia between them, including comments inside collections. Literal block-scalar
+content remains value data and is removed with its value.
 
 Missing keys in block mappings are inserted before the closing frontmatter
 fence. Flow mappings insert inside their braces: `{status: todo}` becomes
@@ -97,6 +100,10 @@ and stays non-executable while its authored bytes remain saveable.
 
 Repeated finalization of a persisted carrier is a no-op. In a live room, permitted
 ID insertion belongs to the room-authoritative edit before durable acknowledgement.
+Within logical content, an insertion anchors to the source character on its right;
+at the end, it anchors before the closing fence's container prefix. The resulting
+physical Markdown is reparsed before accepting generated IDs. An unrepresentable
+mapping defers optional insertions with diagnostics and preserves the raw carrier.
 
 ## Sections remain inside their Markdown containers
 
@@ -115,6 +122,7 @@ items, headings and frontmatter remain byte-for-byte unchanged.
 The end boundary precedes the next heading's entire physical line, retaining its
 container prefix. Fenced logical content comes from canonical Markdown text
 events; byte mappings are used only where those fragments match the source.
+A file-leading BOM is excluded from container prefixes even without frontmatter.
 
 ## Portable filenames
 
@@ -166,6 +174,9 @@ Source ranges are not silently truncated. BLAKE3 keys frame the model-profile
 identity and exact model input. Consumers scope their caches by Space. Fixed greedy
 vocabulary fixtures include subwords, UTF-8 byte fallback and emoji; production
 model/tokenizer assets belong to the search adapter.
+Chunk descriptors include source identity and heading-context ranges. Breadcrumbs
+retain source Markdown and fixed separators, so core can reconstruct and verify
+the exact model input before issuing a classified content-part capability.
 
 ## Encrypted documents
 

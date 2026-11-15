@@ -168,7 +168,13 @@ pub fn analyze(source: &str, body: ByteSpan) -> DomainResult<MarkdownAnalysis> {
 }
 
 fn continuation_prefix(source: &str, start: usize) -> DomainResult<String> {
-    let prefix = &source[line_start(source, start)..start];
+    let beginning = line_start(source, start);
+    let prefix = &source[beginning..start];
+    let prefix = if beginning == 0 {
+        prefix.strip_prefix('\u{feff}').unwrap_or(prefix)
+    } else {
+        prefix
+    };
     let mut result = String::new();
     let mut chars = prefix.chars().peekable();
     while let Some(ch) = chars.next() {

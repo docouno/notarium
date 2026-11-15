@@ -2,12 +2,17 @@
 use crate::{
     DomainError, DomainResult,
     auth::{EngineAuthContext, ResourceFacts, Space, SpaceKind},
+    document::{ChunkDescriptor, render_chunk},
     error::ValidationReason,
-    ids::{ChatThreadId, ContentDigest, ProviderResourceId, RevisionId, SpaceId, ThreadEntrySeq},
+    ids::{
+        ChatThreadId, ContentDigest, ModelProfileId, ProviderResourceId, RevisionId, SpaceId,
+        ThreadEntrySeq,
+    },
     model::{AbilityResourceRef, Lifecycle, NoteRef},
+    span::ByteSpan,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, fmt};
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -221,6 +226,94 @@ macro_rules! content_wrapper {
 }
 content_wrapper!(ProjectionContent);
 content_wrapper!(SearchContent);
+
+/// A source-bound extraction result, preserving the original canonical identity.
+/// Token count/key/model are assertions of the trusted tokenizer owner; text and
+/// source ranges are checked here and cannot introduce foreign content.
+#[derive(Clone)]
+pub struct ContentPart {
+    document: Arc<ClassifiedDocument>,
+    chunk: ChunkDescriptor,
+}
+impl ContentPart {
+    pub fn from_chunk(
+        document: Arc<ClassifiedDocument>,
+        chunk: ChunkDescriptor,
+    ) -> DomainResult<Self> {
+        if chunk.source != document.digest
+            || chunk.spans.is_empty()
+            || render_chunk(&document.content, &chunk.context, &chunk.spans)? != chunk.text
+        {
+            return Err(DomainError::validation(ValidationReason::SourceMismatch));
+        }
+        if chunk.tokens == 0 || chunk.tokens > 512 {
+            return Err(DomainError::validation(
+                ValidationReason::TokenBudgetExceeded,
+            ));
+        }
+        Ok(Self { document, chunk })
+    }
+    pub fn provenance(&self) -> &ClassifiedDocument {
+        &self.document
+    }
+    pub fn model(&self) -> &ModelProfileId {
+        &self.chunk.model
+    }
+    pub fn key(&self) -> ContentDigest {
+        self.chunk.key
+    }
+    pub fn tokens(&self) -> u32 {
+        self.chunk.tokens
+    }
+    pub fn spans(&self) -> &[ByteSpan] {
+        &self.chunk.spans
+    }
+    pub fn context(&self) -> &[ByteSpan] {
+        &self.chunk.context
+    }
+}
+impl fmt::Debug for ContentPart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContentPart")
+            .field("document", &self.document)
+            .field("model", &self.chunk.model)
+            .field("key", &self.chunk.key)
+            .field("tokens", &self.chunk.tokens)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Clone, Debug)]
+pub struct SearchPart(ContentPart);
+impl SearchPart {
+    pub fn text(&self) -> &str {
+        &self.0.chunk.text
+    }
+    pub fn part(&self) -> &ContentPart {
+        &self.0
+    }
+    pub fn provenance(&self) -> &ClassifiedDocument {
+        self.0.provenance()
+    }
+}
+#[derive(Clone, Debug)]
+pub struct ProviderPart {
+    part: ContentPart,
+    provider: ProviderResourceId,
+}
+impl ProviderPart {
+    pub fn text(&self) -> &str {
+        &self.part.chunk.text
+    }
+    pub fn part(&self) -> &ContentPart {
+        &self.part
+    }
+    pub fn provenance(&self) -> &ClassifiedDocument {
+        self.part.provenance()
+    }
+    pub fn provider(&self) -> &ProviderResourceId {
+        &self.provider
+    }
+}
 #[derive(Clone, Debug)]
 pub struct ProviderContent {
     document: ClassifiedDocument,
@@ -294,6 +387,7 @@ impl ProviderChatContent {
 #[derive(Clone, Debug)]
 pub enum ProviderMessage {
     Document(ProviderContent),
+    Part(ProviderPart),
     Chat(ProviderChatContent),
     Ability(ProviderAbilityContent),
 }
@@ -314,6 +408,22 @@ impl ProviderAbilityContent {
     }
 }
 impl ClassEgressFence {
+    pub fn search_part(part: ContentPart, auth: &EngineAuthContext) -> DomainResult<SearchPart> {
+        Self::check(part.provenance(), auth)?;
+        Ok(SearchPart(part))
+    }
+    pub fn provider_part(
+        part: ContentPart,
+        auth: &EngineAuthContext,
+        policy: &ProviderPolicy,
+    ) -> DomainResult<ProviderPart> {
+        Self::check(part.provenance(), auth)?;
+        Self::provider_policy(&part.document.facts.space, part.document.class(), policy)?;
+        Ok(ProviderPart {
+            part,
+            provider: policy.provider.clone(),
+        })
+    }
     pub fn ability(
         resource: ClassifiedAbilityResource,
         auth: &EngineAuthContext,

@@ -1,4 +1,10 @@
-use crate::{error::Diagnostic, ids::*, span::ByteSpan, value::YamlValue};
+use crate::{
+    DomainError, DomainResult,
+    error::{Diagnostic, ValidationReason},
+    ids::*,
+    span::ByteSpan,
+    value::YamlValue,
+};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContainerKind {
     BlockQuote,
@@ -62,10 +68,41 @@ pub struct ViewBlock {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChunkDescriptor {
+    pub source: ContentDigest,
+    pub model: ModelProfileId,
+    /// Source heading ranges, separated by a fixed breadcrumb delimiter.
+    pub context: Vec<ByteSpan>,
     pub spans: Vec<ByteSpan>,
     pub text: String,
     pub tokens: u32,
     pub key: ContentDigest,
+}
+/// Source-only rendering recipe. No arbitrary prefix can be labelled as content
+/// from a classified document. Body ranges are ordered and non-overlapping.
+pub fn render_chunk(
+    source: &str,
+    context: &[ByteSpan],
+    spans: &[ByteSpan],
+) -> DomainResult<String> {
+    let mut output = String::new();
+    for (index, span) in context.iter().enumerate() {
+        if index > 0 {
+            output.push_str(" > ");
+        }
+        output.push_str(span.slice(source)?);
+    }
+    if !context.is_empty() {
+        output.push_str("\n\n");
+    }
+    let mut previous_end = 0;
+    for span in spans {
+        if span.is_empty() || span.start() < previous_end {
+            return Err(DomainError::validation(ValidationReason::InvalidSpan));
+        }
+        output.push_str(span.slice(source)?);
+        previous_end = span.end();
+    }
+    Ok(output)
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChunkPlan {

@@ -34,6 +34,9 @@ struct Entry {
     key: String,
     prefix: ByteSpan,
     values: Vec<ByteSpan>,
+    /// Deletable syntax nodes; comments/whitespace between them remain authored
+    /// trivia. Block-scalar tails include value data, including literal '#'.
+    erase: Vec<ByteSpan>,
 }
 #[derive(Clone, Debug)]
 struct MappingCst {
@@ -297,6 +300,10 @@ fn cst(source: &str) -> DomainResult<MappingCst> {
             key: key.clone(),
             prefix: span(key_token.span.start(), colon.span.end())?,
             values,
+            erase: value_tokens
+                .iter()
+                .flat_map(|token| std::iter::once(token.span).chain(token.tail))
+                .collect(),
         });
     }
     Ok(MappingCst {
@@ -448,7 +455,7 @@ pub(crate) fn edit_mapping(
                 if let Some(entry) = entry {
                     removed.insert(key.clone());
                     result.push((entry.prefix, String::new()));
-                    for value in &entry.values {
+                    for value in &entry.erase {
                         if !value.is_empty() {
                             result.push((*value, String::new()));
                         }

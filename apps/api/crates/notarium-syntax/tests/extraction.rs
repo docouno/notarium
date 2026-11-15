@@ -427,3 +427,268 @@ fn unsupported_optional_view_edit_preserves_an_ordinary_raw_save() {
     let plan = extract::finalize_document(source, DocClass::UserDoc, &note, &[]).unwrap();
     assert_eq!(patch::apply(source, &plan).unwrap(), source);
 }
+
+#[test]
+fn first_fences_preserve_a_leading_bom_without_frontmatter() {
+    let note = NoteId::from_bytes([1; 16]);
+    for eol in ["\n", "\r\n"] {
+        for info in ["text", "nota"] {
+            let source = format!("\u{feff}```{info}{eol}type: table{eol}```{eol}");
+            assert!(extract::extract(&source, DocClass::UserDoc, &note, "Title", None).is_ok());
+            let plan = extract::finalize_document(&source, DocClass::UserDoc, &note, &[]).unwrap();
+            let changed = patch::apply(&source, &plan).unwrap();
+            assert!(changed.starts_with('\u{feff}'));
+            if info == "text" {
+                assert_eq!(changed, source);
+            } else {
+                assert_eq!(plan.edits.len(), 1);
+                assert_eq!(changed.replacen(&plan.edits[0].replacement, "", 1), source);
+            }
+        }
+    }
+}
+
+#[test]
+fn flow_identity_insertion_has_right_affinity_at_each_physical_line_boundary() {
+    for (opening, continuation) in [
+        ("", ""),
+        ("> ", "> "),
+        ("- ", "  "),
+        ("> - ", ">   "),
+        ("> > ", "> > "),
+    ] {
+        for indent in ["", " ", "  ", "   ", "\t"] {
+            for eol in ["\n", "\r\n"] {
+                let source = format!(
+                    "{opening}```nota{eol}{continuation}{indent}{{type: table, # keep{eol}{continuation}{indent}}}{eol}{continuation}```{eol}"
+                );
+                let analysis = views(&source, true);
+                let changed = patch::apply(&source, &analysis.plan).unwrap();
+                let logical = commonmark_fence_text(&changed);
+                let carrier = format!("---\n{logical}---\n");
+                let fields = notarium_syntax::frontmatter::analyze(&carrier, DocClass::UserDoc)
+                    .unwrap()
+                    .fields
+                    .unwrap();
+                assert_eq!(analysis.blocks[0].state, ViewState::Ready, "{source}");
+                assert!(fields.contains_key("id"), "{changed}");
+                assert_eq!(
+                    changed.replacen(&analysis.plan.edits[0].replacement, "", 1),
+                    source
+                );
+                assert!(views(&changed, true).plan.edits.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_chunks_reach_embedding_and_recall_with_original_provenance() {
+    use notarium_core::{auth::*, classes::*, error::ValidationReason, model::*, ports::*};
+    use std::{
+        collections::BTreeMap,
+        future::Future,
+        sync::Arc,
+        task::{Context, Poll, Waker},
+        time::Duration,
+    };
+    let space = SpaceId::from_bytes([1; 16]);
+    let auth = EngineAuthContext::for_human(VerifiedHuman::attest(
+        PrincipalId::from_bytes([1; 16]),
+        GrantId::from_bytes([1; 16]),
+        BTreeMap::from([(
+            space.clone(),
+            SpaceGrant {
+                role: SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        )]),
+        false,
+    ));
+    let source = format!(
+        "---\ntitle: Carrier metadata\n---\n# Heading 🚀\n{}\n",
+        "hello world sample ".repeat(200)
+    );
+    let make_document = |source: &str, class, lifecycle| {
+        Arc::new(
+            ClassifiedDocument::from_canonical(
+                NoteRef {
+                    space_id: space.clone(),
+                    note_id: NoteId::from_bytes([1; 16]),
+                },
+                RevisionId::from_bytes([7; 16]),
+                ResourceFacts {
+                    space: Space {
+                        id: space.clone(),
+                        lifecycle: SpaceLifecycle::Active,
+                        kind: SpaceKind::Personal,
+                    },
+                    class,
+                    ancestor_folders: vec![],
+                    folder_write_locked: false,
+                    ability_package: None,
+                },
+                lifecycle,
+                source.into(),
+                notarium_syntax::content_digest(source),
+            )
+            .unwrap(),
+        )
+    };
+    let document = make_document(&source, DocClass::UserDoc, Lifecycle::Active);
+    let tokenizer = FixtureTokenizer {
+        limit: 512,
+        model: 1,
+    };
+    let ExtractedDocDelta::Plain(delta) = extract::extract(
+        document.explicit_read(&auth).unwrap(),
+        document.class(),
+        &document.reference().note_id,
+        "Title",
+        Some(&tokenizer),
+    )
+    .unwrap() else {
+        panic!()
+    };
+    let ChunkPlan::Ready { chunks, model } = delta.chunks else {
+        panic!()
+    };
+    assert!(chunks.len() > 1);
+    assert!(tokenizer.count(&source).unwrap() > 512);
+    let descriptor = chunks[0].clone();
+    let part = ContentPart::from_chunk(document.clone(), descriptor.clone()).unwrap();
+    let policy = ProviderPolicy {
+        provider: ProviderResourceId::from_bytes([1; 16]),
+        audience: ProviderAudience::Personal { consented: true },
+        allowed_classes: DocClass::all(),
+    };
+    let selected = ClassEgressFence::provider_part(part.clone(), &auth, &policy).unwrap();
+    assert_eq!(selected.text(), descriptor.text);
+    assert_eq!(selected.part().spans(), descriptor.spans);
+    assert_eq!(selected.part().context(), descriptor.context);
+    assert_eq!(selected.provenance().reference(), document.reference());
+    assert_eq!(selected.provenance().revision(), document.revision());
+    assert_eq!(selected.provenance().digest(), document.digest());
+    assert!(!format!("{part:?}").contains("hello world"));
+    let request = EmbeddingRequest {
+        intent: CommandKey::from_bytes([1; 16]),
+        model,
+        provider: policy.provider.clone(),
+        chunks: vec![selected],
+        declared_tokens: descriptor.tokens,
+    };
+    struct EmbeddingFixture {
+        expected: String,
+    }
+    impl EmbeddingProviderPort for EmbeddingFixture {
+        fn embed(
+            &self,
+            _ctx: SpaceContext,
+            request: EmbeddingRequest,
+        ) -> PortFuture<'_, EmbeddingResult> {
+            Box::pin(async move {
+                request.validate()?;
+                let tokenizer = FixtureTokenizer {
+                    limit: 512,
+                    model: 1,
+                };
+                assert_eq!(request.chunks[0].text(), self.expected);
+                assert_eq!(
+                    tokenizer.count(request.chunks[0].text())?,
+                    request.declared_tokens
+                );
+                assert!(request.declared_tokens <= 512);
+                Ok(EmbeddingResult {
+                    model: request.model,
+                    dimension: 1,
+                    vectors: vec![Ok(vec![1.0])],
+                    used_tokens: request.declared_tokens,
+                })
+            })
+        }
+    }
+    let fixture = EmbeddingFixture {
+        expected: descriptor.text.clone(),
+    };
+    let port: &dyn EmbeddingProviderPort = &fixture;
+    let ctx = SpaceContext::new(
+        auth.clone(),
+        HistoryScope {
+            space_id: space.clone(),
+            incarnation: HistoryIncarnation::from_bytes([1; 16]),
+        },
+        CallBudget {
+            request: RequestId::from_bytes([1; 16]),
+            cancellation: Cancellation::default(),
+            remaining: Duration::from_secs(1),
+        },
+    )
+    .unwrap();
+    let mut future = port.embed(ctx, request.clone());
+    let Poll::Ready(Ok(result)) =
+        Future::poll(future.as_mut(), &mut Context::from_waker(Waker::noop()))
+    else {
+        panic!()
+    };
+    assert_eq!(result.used_tokens, descriptor.tokens);
+    let hit = SearchHit {
+        card: NoteCard {
+            content: ClassEgressFence::search((*document).clone(), &auth).unwrap(),
+            title: "Title".into(),
+            path: "note.md".into(),
+            preview: "sample".into(),
+        },
+        score: 1.0,
+        chunks: vec![ClassEgressFence::search_part(part.clone(), &auth).unwrap()],
+    };
+    assert_eq!(hit.chunks[0].text(), descriptor.text);
+    assert_eq!(hit.chunks[0].provenance().revision(), document.revision());
+    assert!(
+        ContentPart::from_chunk(
+            make_document("foreign source", DocClass::UserDoc, Lifecycle::Active),
+            descriptor.clone()
+        )
+        .is_err()
+    );
+    let mut forged = descriptor.clone();
+    forged.text.push_str("foreign content");
+    assert!(ContentPart::from_chunk(document.clone(), forged).is_err());
+    let mut forged = descriptor.clone();
+    forged.context = vec![ByteSpan::new(0, source.len() + 1).unwrap()];
+    assert!(ContentPart::from_chunk(document.clone(), forged).is_err());
+    for (class, lifecycle) in [
+        (DocClass::EncryptedNote, Lifecycle::Active),
+        (DocClass::UserDoc, Lifecycle::Trashed),
+    ] {
+        let blocked =
+            ContentPart::from_chunk(make_document(&source, class, lifecycle), descriptor.clone())
+                .unwrap();
+        assert!(ClassEgressFence::search_part(blocked.clone(), &auth).is_err());
+        assert!(ClassEgressFence::provider_part(blocked, &auth, &policy).is_err());
+    }
+    assert!(
+        ClassEgressFence::provider_part(
+            part,
+            &auth,
+            &ProviderPolicy {
+                audience: ProviderAudience::Personal { consented: false },
+                ..policy
+            }
+        )
+        .is_err()
+    );
+    let mut bad = request.clone();
+    bad.declared_tokens += 1;
+    assert_eq!(
+        bad.validate().unwrap_err(),
+        notarium_core::DomainError::validation(ValidationReason::TokenBudgetExceeded)
+    );
+    let mut bad = request.clone();
+    bad.model = ModelProfileId::from_bytes([2; 16]);
+    assert!(bad.validate().is_err());
+    let mut bad = request;
+    bad.provider = ProviderResourceId::from_bytes([2; 16]);
+    assert!(bad.validate().is_err());
+}

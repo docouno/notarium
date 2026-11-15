@@ -34,7 +34,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
         ..defaults
     };
     let strategy = (
-        0usize..17,
+        0usize..19,
         any::<u32>(),
         any::<bool>(),
         any::<bool>(),
@@ -55,7 +55,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
             1..16,
         ),
     );
-    let counts = Cell::new([0u32; 17]);
+    let counts = Cell::new([0u32; 19]);
     let outcome = TestRunner::new(config).run(&strategy, |(family, number, crlf, bom, parts)| {
         let eol = if crlf { "\r\n" } else { "\n" };
         let bom = if bom { "\u{feff}" } else { "" };
@@ -134,7 +134,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
             }
             11 => {
                 let plan = frontmatter::patch_frontmatter(&source, DocClass::UserDoc, &[FieldEdit::Set { key: "status".into(), value }, FieldEdit::Unset { key: "custom".into() }]).unwrap();
-                let expected = source.replacen("status: old", &format!("status: {new}"), 1).replacen("custom: {nested: [1, true]}", " ", 1);
+                let expected = source.replacen("status: old", &format!("status: {new}"), 1).replacen("custom: {nested: [1, true]}", "   ", 1);
                 prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
             }
             12 => {
@@ -151,7 +151,10 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
             }
             13 => {
                 let (prefix, continuation) = if number % 2 == 0 { (">   ", "> ") } else { ("> - ", ">   ") };
-                let source = format!("{prefix}```nota{eol}{continuation}{{url: https://example.test/{number}, type: table}}{eol}{continuation}```{eol}");
+                let flow = if number % 3 == 0 {
+                    format!("{{url: https://example.test/{number}, type: table, # keep{eol}{continuation}}}")
+                } else { format!("{{url: https://example.test/{number}, type: table}}") };
+                let source = format!("{prefix}```nota{eol}{continuation}{flow}{eol}{continuation}```{eol}");
                 let plan = extract::finalize_document(&source, DocClass::UserDoc, &NoteId::from_bytes([2;16]), &[]).unwrap();
                 prop_assert_eq!(plan.edits.len(), 1);
                 let changed = patch::apply(&source, &plan).unwrap();
@@ -178,11 +181,29 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
                     prop_assert_eq!(md.blocks.iter().filter(|s| s.start() <= start && s.end() >= start + word.len()).count(), 1);
                 }
             }
-            _ => {
+            16 => {
                 let prefix = if number % 2 == 0 { "> " } else { "> > " };
                 let source = format!("{prefix}# A{eol}{prefix}old{eol}{prefix}# B{eol}{prefix}keep{eol}");
                 let plan = markdown::replace_section(&source, &markdown::SectionSelector { title: "A".into(), occurrence: None }, &format!("{new}{eol}")).unwrap();
                 prop_assert_eq!(patch::apply(&source, &plan).unwrap(), source.replace("old", &new));
+            }
+            17 => {
+                let info = if number % 2 == 0 { "text" } else { "nota" };
+                let source = format!("\u{feff}```{info}{eol}type: table{eol}```{eol}");
+                let plan = extract::finalize_document(&source, DocClass::UserDoc, &NoteId::from_bytes([2;16]), &[]).unwrap();
+                let changed = patch::apply(&source, &plan).unwrap();
+                prop_assert!(extract::extract(&changed, DocClass::UserDoc, &NoteId::from_bytes([2;16]), "Title", None).is_ok());
+                if info == "text" { prop_assert_eq!(changed, source); }
+                else {
+                    prop_assert_eq!(plan.edits.len(), 1);
+                    prop_assert_eq!(changed.replacen(&plan.edits[0].replacement, "", 1), source);
+                }
+            }
+            _ => {
+                let source = format!("{bom}---{eol}status: {{a: x, # {new}{eol} b: y}}{eol}next: keep{eol}---{eol}{body}");
+                let expected = format!("{bom}---{eol}   # {new}{eol}  {eol}next: keep{eol}---{eol}{body}");
+                let plan = frontmatter::unset_field(&source, DocClass::UserDoc, "status").unwrap();
+                prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
             }
         }
         // Independent UTF-16 oracle over every scalar boundary of the generated carrier.

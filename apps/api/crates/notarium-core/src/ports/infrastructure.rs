@@ -1,6 +1,6 @@
 use super::{PortFuture, PortStream, context::*, types::*};
 use crate::{
-    DomainError, DomainResult, classes::ProviderContent, error::ValidationReason, ids::*, model::*,
+    DomainError, DomainResult, classes::ProviderPart, error::ValidationReason, ids::*, model::*,
     patch::*, receipt::*,
 };
 use std::time::Duration;
@@ -60,8 +60,29 @@ pub struct EmbeddingRequest {
     pub intent: CommandKey,
     pub model: ModelProfileId,
     pub provider: ProviderResourceId,
-    pub chunks: Vec<ProviderContent>,
+    pub chunks: Vec<ProviderPart>,
     pub declared_tokens: u32,
+}
+impl EmbeddingRequest {
+    /// Provider owners check this before dispatch, then enforce their real model
+    /// tokenizer and service budget. Declared tokens never replace actual counting.
+    pub fn validate(&self) -> DomainResult<()> {
+        let mut total = 0u32;
+        for chunk in &self.chunks {
+            if chunk.provider() != &self.provider || chunk.part().model() != &self.model {
+                return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+            }
+            total = total
+                .checked_add(chunk.part().tokens())
+                .ok_or_else(|| DomainError::validation(ValidationReason::TokenBudgetExceeded))?;
+        }
+        if total != self.declared_tokens {
+            return Err(DomainError::validation(
+                ValidationReason::TokenBudgetExceeded,
+            ));
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug)]
 pub struct EmbeddingResult {

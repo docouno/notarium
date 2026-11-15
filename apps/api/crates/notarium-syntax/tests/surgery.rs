@@ -251,3 +251,28 @@ fn plain_scalars_do_not_open_collections_and_flow_values_are_quoted_when_needed(
         }
     }
 }
+
+#[test]
+fn unset_preserves_collection_comment_trivia_but_removes_block_scalar_data() {
+    for (mapping, expected) in [
+        (
+            "status: {a: x, # keep this exact comment\n b: y}\nnext: keep\n",
+            "   # keep this exact comment\n  \nnext: keep\n",
+        ),
+        (
+            "status:\n  a: x\n  # authored child comment\n  b: y\n# outside\nnext: keep\n",
+            "\n   \n  # authored child comment\n   \n# outside\nnext: keep\n",
+        ),
+        (
+            "status: | # marker comment\n  # literal value data\nnext: keep\n",
+            "  # marker comment\nnext: keep\n",
+        ),
+    ] {
+        for eol in ["\n", "\r\n"] {
+            let source = format!("---\n{mapping}---\nBody\n").replace('\n', eol);
+            let expected = format!("---\n{expected}---\nBody\n").replace('\n', eol);
+            let plan = unset_field(&source, DocClass::UserDoc, "status").unwrap();
+            assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
+        }
+    }
+}

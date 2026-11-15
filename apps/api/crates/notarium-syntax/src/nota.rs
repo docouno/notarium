@@ -99,6 +99,7 @@ pub fn analyze(
         }
     }
     let mut edits = Vec::new();
+    let mut inserted = Vec::new();
     if insert_missing && !uncertain {
         for (ordinal, (block, fence)) in blocks.iter_mut().zip(fences.iter()).enumerate() {
             let Some(YamlValue::Mapping(fields)) = &mut block.config else {
@@ -163,6 +164,42 @@ pub fn analyze(
             block.id = Some(id);
             block.state = ViewState::Ready;
             block.diagnostics.clear();
+            inserted.push(ordinal);
+        }
+    }
+    if !edits.is_empty() {
+        // Validate the actual persisted Markdown, not only the logical YAML edit.
+        // If a physical mapping cannot preserve the intended config, defer all
+        // optional identities without rejecting or partially changing raw input.
+        let verified = (|| {
+            let plan = patch::plan(source, body, edits.clone())?;
+            let changed = patch::apply(source, &plan)?;
+            let carrier = crate::carrier::Carrier::scan(&changed)?;
+            let parsed = crate::markdown::analyze(&changed, carrier.body)?;
+            let actual: Vec<_> = parsed.fences.iter().filter(|f| f.info == "nota").collect();
+            Ok::<_, notarium_core::DomainError>(
+                actual.len() == fences.len()
+                    && inserted.iter().all(|index| {
+                        actual[*index].closed
+                            && yaml::parse(&actual[*index].text).ok().as_ref()
+                                == blocks[*index].config.as_ref()
+                    }),
+            )
+        })()
+        .unwrap_or(false);
+        if !verified {
+            edits.clear();
+            for index in inserted {
+                let block = &mut blocks[index];
+                if let Some(YamlValue::Mapping(fields)) = &mut block.config {
+                    fields.remove("id");
+                }
+                block.id = None;
+                block.state = ViewState::Invalid;
+                block
+                    .diagnostics
+                    .push(diagnostic(ValidationReason::UnsupportedContainer));
+            }
         }
     }
     Ok(NotaAnalysis {
@@ -180,8 +217,23 @@ fn map_insertion(
         return Err(DomainError::validation(ValidationReason::InvalidView));
     }
     let position = span.start();
+    // Within content, anchor to the character on the right of the insertion.
+    // A gap between fragments contains a physical quote/list prefix which must
+    // stay before the inserted inline YAML, never in the middle of its value.
+    if position < fence.text.len() {
+        if text.contains('\n') {
+            return Err(DomainError::validation(ValidationReason::InvalidView));
+        }
+        for (logical, physical) in &fence.lines {
+            if position >= logical.start() && position < logical.end() {
+                let offset = physical.start() + position - logical.start();
+                return Ok((ByteSpan::new(offset, offset)?, text.to_owned()));
+            }
+        }
+        return Err(DomainError::validation(ValidationReason::InvalidView));
+    }
     for (logical, physical) in &fence.lines {
-        if position >= logical.start() && position <= logical.end() {
+        if position == logical.end() {
             let offset = physical.start() + position - logical.start();
             let is_line_start = position == 0 || fence.text[..position].ends_with('\n');
             let mut replacement = String::new();
