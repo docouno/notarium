@@ -1,8 +1,16 @@
 include .devkit/runtime/devkit.mk
 
 # Process tests and desktop packaging consume standalone debug binaries.
+# API setup prepares digest-pinned PostgreSQL 16 and source-built MinIO CE fixtures;
+# API tests execute offline against ephemeral Unix domain socket fixtures.
+setup-api: setup-storage-fixtures
 test-api: build-api
+test-api: devkit_loader := docker/storage-fixtures/with-storage-fixtures.sh
 package-desktop: build-api
+
+.PHONY: setup-storage-fixtures
+setup-storage-fixtures:
+	@sh docker/storage-fixtures/with-storage-fixtures.sh setup-images
 
 # Starter clients use the development API until product lifecycles are added.
 dev-web dev-desktop: dev-api

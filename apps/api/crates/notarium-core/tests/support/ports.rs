@@ -56,6 +56,11 @@ impl NoteWritePort for RejectingPorts {
             ctx: SpaceContext,
             request: Mutation<DeleteNote>,
         ) -> PortFuture<'_, Committed<NoteRevision>>;
+    fn mint_and_purge(
+            &self,
+            ctx: SpaceContext,
+            request: Mutation<MintAndPurge>,
+        ) -> PortFuture<'_, Committed<MintAndPurgeResult>>;
     fn move_note(
             &self,
             ctx: SpaceContext,
@@ -391,4 +396,23 @@ impl BackupParticipantPort for RejectingPorts {
             restored: Vec<ChangeCursor>,
         ) -> PortFuture<'_, ()>;
         }
+}
+impl BoardMutationFactsProvider for RejectingPorts {
+    fn evaluate_move<'a>(
+        &'a self,
+        _authority: &'a BoardPlannerAuthority,
+        _ctx: SpaceContext,
+        _cutoff: Option<SpaceSeq>,
+        _intent: MoveBoardCard,
+    ) -> PortFuture<'a, BoardMoveFacts> {
+        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
+    }
+    fn evaluate_rollback<'a>(
+        &'a self,
+        _authority: &'a BoardPlannerAuthority,
+        _ctx: SpaceContext,
+        _request: RollbackBoardFactsRequest,
+    ) -> PortFuture<'a, RollbackBoardFacts> {
+        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
+    }
 }

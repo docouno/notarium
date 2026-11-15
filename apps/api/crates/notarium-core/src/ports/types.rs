@@ -10,6 +10,7 @@ use crate::{
     receipt::*,
     value::*,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +113,19 @@ pub enum DeleteDisposition {
     Purge,
 }
 #[derive(Clone, Debug)]
+pub struct MintAndPurge {
+    pub old_note: NoteId,
+    pub expected_revision: RevisionId,
+    pub new_note: NoteId,
+    pub new_slug: Option<String>,
+    pub encrypted_carrier: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MintAndPurgeResult {
+    pub old_note: NoteId,
+    pub new_note: NoteRevision,
+}
+#[derive(Clone, Debug)]
 pub struct MoveNote {
     pub note: NoteId,
     pub parent: Option<FolderId>,
@@ -139,7 +153,7 @@ pub struct RenameProject {
     pub name: String,
     pub display_name: String,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NoteRevision {
     pub note: NoteId,
     pub revision: RevisionId,
@@ -218,16 +232,40 @@ pub struct ReadAbilityResource {
     pub package_revision: RevisionId,
     pub resource: AbilityResourceName,
 }
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "revision", rename_all = "snake_case")]
+pub enum RankExpectation {
+    Absent,
+    Existing(RevisionId),
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssociatedBoardExpectation {
+    pub view: ViewRef,
+    pub note: NoteId,
+    pub expected_rank: RankExpectation,
+    pub expected_placement_revision: RevisionId,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RestoredBoardRank {
+    pub view: ViewRef,
+    pub note: NoteId,
+    pub group: GroupKey,
+    pub rank: String,
+    pub rank_revision: RevisionId,
+    pub placement_revision: RevisionId,
+}
 #[derive(Clone, Debug)]
 pub struct RollbackAgentRun {
     pub run: AgentRunId,
     pub expected_run_revision: RevisionId,
     pub expected_entities: Vec<NoteRevision>,
+    pub associated_board_expectations: Vec<AssociatedBoardExpectation>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RollbackResult {
     pub restored: Vec<NoteRevision>,
     pub trashed: Vec<NoteRevision>,
+    pub restored_ranks: Vec<RestoredBoardRank>,
     pub skipped_manual_edits: Vec<NoteId>,
     pub skipped_room_active: Vec<NoteId>,
 }
@@ -250,9 +288,32 @@ pub enum ChangeKind {
     Purge,
     Redact,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommandSeqRange {
+    pub first_seq: SpaceSeq,
+    pub last_seq: SpaceSeq,
+}
+impl CommandSeqRange {
+    pub fn new(first_seq: SpaceSeq, last_seq: SpaceSeq) -> DomainResult<Self> {
+        if first_seq == SpaceSeq::ZERO || first_seq > last_seq {
+            return Err(DomainError::validation(ValidationReason::InvalidRange));
+        }
+        Ok(Self {
+            first_seq,
+            last_seq,
+        })
+    }
+    pub fn contains(self, seq: SpaceSeq) -> bool {
+        seq >= self.first_seq && seq <= self.last_seq
+    }
+    pub fn splits_cutoff(self, cutoff: SpaceSeq) -> bool {
+        cutoff >= self.first_seq && cutoff < self.last_seq
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Change {
     pub cursor: ChangeCursor,
+    pub command_range: CommandSeqRange,
     pub entity: EntityId,
     pub kind: ChangeKind,
     pub revision: RevisionId,
@@ -264,6 +325,7 @@ pub struct Change {
 pub struct ChangePage {
     pub changes: Vec<Change>,
     pub next: ChangeCursor,
+    pub safe_ack_end: SpaceSeq,
     pub cutoff: SpaceSeq,
     pub complete: bool,
 }
@@ -308,15 +370,25 @@ pub enum ChangeReadResult {
     Seed(ChangeSeed),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatThreadKind {
+    Personal,
+    SpaceGroup,
+    KeeperLog,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatThread {
     pub id: ChatThreadId,
     pub space: SpaceId,
+    pub kind: ChatThreadKind,
+    pub owner: PrincipalId,
+    pub project_folder: Option<FolderId>,
     pub head: ThreadEntrySeq,
     pub revision: RevisionId,
     pub tainted: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChatEntryKind {
     Human,
     Model,
@@ -324,13 +396,62 @@ pub enum ChatEntryKind {
     Compaction,
     Redacted,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChatBody {
     Inline(String),
     Blob(ContentDigest),
     Redacted,
 }
-#[derive(Clone, Debug)]
+/// Canonical proof that a chat body exceeding 512 UTF-8 bytes has been staged in
+/// this Space's CAS for the declared author; raw unowned digests cannot be attached.
+/// ```compile_fail
+/// use notarium_core::ports::StagedChatBlob;
+/// let _: StagedChatBlob = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedChatBlob {
+    space: SpaceId,
+    owner: PrincipalId,
+    digest: ContentDigest,
+    byte_len: u64,
+}
+impl StagedChatBlob {
+    pub const INLINE_MAX_BYTES: u64 = 512;
+    pub fn attest_canonical(
+        space: SpaceId,
+        owner: PrincipalId,
+        digest: ContentDigest,
+        byte_len: u64,
+    ) -> DomainResult<Self> {
+        if byte_len <= Self::INLINE_MAX_BYTES {
+            return Err(DomainError::validation(ValidationReason::InvalidRange));
+        }
+        Ok(Self {
+            space,
+            owner,
+            digest,
+            byte_len,
+        })
+    }
+    pub fn space(&self) -> &SpaceId {
+        &self.space
+    }
+    pub fn owner(&self) -> &PrincipalId {
+        &self.owner
+    }
+    pub fn digest(&self) -> ContentDigest {
+        self.digest
+    }
+    pub fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChatInputBody {
+    Text(String),
+    Staged(StagedChatBlob),
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatEntry {
     pub thread: ChatThreadId,
     pub seq: ThreadEntrySeq,
@@ -361,6 +482,9 @@ pub struct ChatBranch {
 #[derive(Clone, Debug)]
 pub struct CreateChat {
     pub thread: ChatThreadId,
+    pub kind: ChatThreadKind,
+    pub owner: PrincipalId,
+    pub project_folder: Option<FolderId>,
     pub title: String,
 }
 #[derive(Clone, Debug)]
@@ -373,7 +497,7 @@ pub struct AppendChat {
     pub thread: ChatThreadId,
     pub parent: ThreadEntrySeq,
     pub kind: ChatEntryKind,
-    pub body: ChatBody,
+    pub body: ChatInputBody,
     pub referenced_notes: Vec<NoteRef>,
     pub tainted: bool,
 }
@@ -385,6 +509,7 @@ pub struct PendingChatInput {
     pub body: String,
     pub queued_base_leaf: ThreadEntrySeq,
     pub in_flight_run: AgentRunId,
+    pub mentions_agent: bool,
 }
 #[derive(Clone, Debug)]
 pub enum QueueInputOutcome {
@@ -426,12 +551,13 @@ pub struct RedactedChat {
     pub invalidated_contexts: Vec<ThreadEntrySeq>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct ViewRef {
     pub note: NoteId,
     pub key: ViewKey,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum GroupKey {
     Value(ScalarValue),
     Absent,
@@ -466,7 +592,7 @@ pub struct GroupCount {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RankNeighbor {
     pub note: NoteId,
-    pub expected_rank_revision: RevisionId,
+    pub expected_rank: RankExpectation,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MoveBoardCard {
@@ -478,7 +604,7 @@ pub struct MoveBoardCard {
     pub fields: BTreeMap<String, Option<YamlValue>>,
     pub expected_note: RevisionId,
     pub expected_view: RevisionId,
-    pub expected_rank: RevisionId,
+    pub expected_rank: RankExpectation,
 }
 #[derive(Clone, Debug)]
 pub struct BoardMoveResult {

@@ -53,6 +53,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip"] }
 utoipa = { version = "6", features = ["axum_extras"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite", "postgres", "macros", "migrate"] }
+rusqlite = { version = "0.39.0", default-features = false, features = ["backup"] }
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 blake3 = "1"
 zstd = "0.14"
@@ -61,7 +62,17 @@ pulldown-cmark = "=0.13.6"
 argon2 = "0.6"
 scrypt = "0.12"
 hkdf = "0.13"
+hmac = "0.13"
 sha2 = "0.11"
+hex = "0.4"
+getrandom = "0.4"
+percent-encoding = "2"
+bytes = "1"
+http = "1"
+url = "2"
+quick-xml = { version = "0.39", default-features = false }
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 aes-gcm = "0.11"
 age = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

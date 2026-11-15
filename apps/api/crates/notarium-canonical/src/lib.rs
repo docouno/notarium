@@ -1,10 +1,98 @@
-//! Reserved for the canonical subsystem. Domain behavior is added in later waves.
+#![forbid(unsafe_code)]
+
+//! Canonical storage, content-addressed blob persistence, and atomic write-batch runtime.
+
+use std::{future::Future, pin::Pin};
+
+pub mod blobs;
+pub mod codec;
+pub mod config;
+pub mod dialect;
+pub mod runtime;
+pub mod schema;
+pub(crate) mod sql_exec;
+pub mod writer;
+
+pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub use config::{
+    BlobBackendConfig, CanonicalConfig, PgConnectConfig, PgTransport, S3AddressingStyle,
+    S3BucketMode, S3BucketModePolicy, S3Config, S3Credentials, SqlBackendConfig, WriterConfig,
+    default_backup_budget, validate_pg_schema_name,
+};
+pub use dialect::{DataRootOwnerLock, sqlite::observe_sqlite_canonical_witness};
+pub use runtime::{
+    CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec, SpaceRecord,
+    StoredRevisionRecord,
+};
+pub use schema::manifest::{CANONICAL_SCHEMA_VERSION, CANONICAL_TABLES, manifest_checksum};
 
 #[cfg(test)]
 mod tests {
-    // A compile smoke test for the initial scaffold, not domain certification.
+    use std::collections::BTreeSet;
+
+    use crate::{
+        config::validate_pg_schema_name,
+        schema::{
+            POSTGRES_BASELINE_DDL, SQLITE_BASELINE_DDL,
+            manifest::{CANONICAL_TABLES, expected_index_names, expected_table_names},
+            split_sql_statements,
+        },
+    };
+
     #[test]
-    fn scaffold_has_the_expected_package_identity() {
+    fn package_identity_and_schema_manifest_parity() {
         assert_eq!(env!("CARGO_PKG_NAME"), "notarium-canonical");
+        assert!(validate_pg_schema_name("v1_canonical").is_ok());
+        assert!(validate_pg_schema_name("test_a1b2c3").is_ok());
+        assert!(validate_pg_schema_name("public").is_err());
+        assert!(validate_pg_schema_name("test-bad;drop").is_err());
+
+        for (label, ddl) in [
+            ("sqlite", SQLITE_BASELINE_DDL),
+            ("postgres", POSTGRES_BASELINE_DDL),
+        ] {
+            let stmts = split_sql_statements(ddl);
+            let mut tables = BTreeSet::new();
+            let mut indexes = BTreeSet::new();
+            for stmt in &stmts {
+                let upper = stmt.to_ascii_uppercase();
+                if let Some(rest) = upper.strip_prefix("CREATE TABLE IF NOT EXISTS ") {
+                    let name_len = rest
+                        .find(|c: char| c.is_ascii_whitespace() || c == '(')
+                        .expect("table name boundary");
+                    let raw_rest = &stmt["CREATE TABLE IF NOT EXISTS ".len()..];
+                    tables.insert(raw_rest[..name_len].to_owned());
+                } else if let Some(rest) = upper
+                    .strip_prefix("CREATE UNIQUE INDEX IF NOT EXISTS ")
+                    .or_else(|| upper.strip_prefix("CREATE INDEX IF NOT EXISTS "))
+                {
+                    let prefix_len = stmt.len() - rest.len();
+                    let name_len = rest
+                        .find(|c: char| c.is_ascii_whitespace())
+                        .expect("index name boundary");
+                    indexes.insert(stmt[prefix_len..prefix_len + name_len].to_owned());
+                } else {
+                    panic!("unexpected top-level statement in {label} DDL: {stmt}");
+                }
+            }
+            let expected_tables: BTreeSet<String> = expected_table_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let expected_indexes: BTreeSet<String> = expected_index_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(
+                tables, expected_tables,
+                "{label} tables differ from manifest"
+            );
+            assert_eq!(
+                indexes, expected_indexes,
+                "{label} indexes differ from manifest"
+            );
+        }
+        assert_eq!(CANONICAL_TABLES.len(), 34);
     }
 }

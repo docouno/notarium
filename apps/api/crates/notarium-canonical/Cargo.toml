@@ -12,8 +12,32 @@ workspace = true
 [dependencies]
 notarium-core = { workspace = true }
 notarium-syntax = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
 sqlx = { workspace = true }
+rusqlite = { workspace = true }
 libsqlite3-sys = { workspace = true }
 blake3 = { workspace = true }
 zstd = { workspace = true }
-rmp-serde = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+getrandom = { workspace = true }
+percent-encoding = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+url = { workspace = true }
+quick-xml = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+rustls = { workspace = true }
+reqwest = { workspace = true }
+cap-std = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

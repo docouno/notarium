@@ -1,9 +1,10 @@
 use super::{PortFuture, PortStream, context::*, types::*};
 use crate::{
     DomainError, DomainResult, classes::ProviderPart, error::ValidationReason, ids::*, model::*,
-    patch::*, receipt::*,
+    patch::*, receipt::*, value::YamlValue,
 };
-use std::time::Duration;
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 pub trait StructuralSnapshot: Send + Sync {
     fn cut(&self) -> &SnapshotCut;
@@ -35,6 +36,7 @@ pub enum ChangeNotice {
     Advanced(ChangeCursor),
     Lagged { resume: ChangeCursor },
     SeedRequired { cutoff: ChangeCursor },
+    PurgeResync { cutoff: ChangeCursor },
     Resync { scope: HistoryScope },
 }
 pub trait ChangeSubscription: Send {
@@ -99,6 +101,261 @@ pub trait EmbeddingProviderPort: Send + Sync {
     ) -> PortFuture<'_, EmbeddingResult>;
 }
 
+/// Trusted planner capability minted on single-registration by composition root.
+/// ```compile_fail
+/// use notarium_core::ports::BoardPlannerAuthority;
+/// let _: BoardPlannerAuthority = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug)]
+pub struct BoardPlannerAuthority(Arc<()>);
+impl BoardPlannerAuthority {
+    pub fn admit() -> Self {
+        Self(Arc::new(()))
+    }
+    pub fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardGroupFieldKind {
+    String,
+    Bool,
+    Number,
+    Date,
+    Timestamp,
+    Scalar,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "placement", rename_all = "snake_case")]
+pub enum SemanticPlacement {
+    InGroup {
+        group: GroupKey,
+        predecessor: Option<NoteId>,
+        successor: Option<NoteId>,
+    },
+    OutsideView,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvaluatedBoardRow {
+    pub note: NoteId,
+    pub expected_note: RevisionId,
+    pub expected_rank: RankExpectation,
+    pub base_order_binding: ContentDigest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvaluatedBoardGroup {
+    pub group: GroupKey,
+    pub rows: Vec<EvaluatedBoardRow>,
+}
+
+/// Non-deserializable semantic facts attested by the registered board planner.
+/// ```compile_fail
+/// use notarium_core::ports::BoardMoveFacts;
+/// let _: BoardMoveFacts = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug)]
+pub struct BoardMoveFacts {
+    authority: BoardPlannerAuthority,
+    scope: HistoryScope,
+    cutoff: SpaceSeq,
+    view: ViewRef,
+    view_revision: RevisionId,
+    schema_revision: Option<RevisionId>,
+    descriptor_fingerprint: ContentDigest,
+    group_field: String,
+    group_field_kind: BoardGroupFieldKind,
+    groups: Vec<EvaluatedBoardGroup>,
+    before_placement: SemanticPlacement,
+    base_order_binding: ContentDigest,
+    after_eligible_in_group: bool,
+}
+impl PartialEq for BoardMoveFacts {
+    fn eq(&self, other: &Self) -> bool {
+        self.authority.matches(&other.authority)
+            && self.scope == other.scope
+            && self.cutoff == other.cutoff
+            && self.view == other.view
+            && self.view_revision == other.view_revision
+            && self.schema_revision == other.schema_revision
+            && self.descriptor_fingerprint == other.descriptor_fingerprint
+            && self.group_field == other.group_field
+            && self.group_field_kind == other.group_field_kind
+            && self.groups == other.groups
+            && self.before_placement == other.before_placement
+            && self.base_order_binding == other.base_order_binding
+            && self.after_eligible_in_group == other.after_eligible_in_group
+    }
+}
+impl Eq for BoardMoveFacts {}
+
+pub struct BoardMoveFactsSpec {
+    pub scope: HistoryScope,
+    pub cutoff: SpaceSeq,
+    pub view: ViewRef,
+    pub view_revision: RevisionId,
+    pub schema_revision: Option<RevisionId>,
+    pub descriptor_fingerprint: ContentDigest,
+    pub group_field: String,
+    pub group_field_kind: BoardGroupFieldKind,
+    pub groups: Vec<EvaluatedBoardGroup>,
+    pub before_placement: SemanticPlacement,
+    pub base_order_binding: ContentDigest,
+    pub after_eligible_in_group: bool,
+}
+impl BoardMoveFacts {
+    pub fn attest(authority: &BoardPlannerAuthority, spec: BoardMoveFactsSpec) -> Self {
+        Self {
+            authority: authority.clone(),
+            scope: spec.scope,
+            cutoff: spec.cutoff,
+            view: spec.view,
+            view_revision: spec.view_revision,
+            schema_revision: spec.schema_revision,
+            descriptor_fingerprint: spec.descriptor_fingerprint,
+            group_field: spec.group_field,
+            group_field_kind: spec.group_field_kind,
+            groups: spec.groups,
+            before_placement: spec.before_placement,
+            base_order_binding: spec.base_order_binding,
+            after_eligible_in_group: spec.after_eligible_in_group,
+        }
+    }
+    pub fn verify_authority(&self, expected: &BoardPlannerAuthority) -> DomainResult<()> {
+        if self.authority.matches(expected) {
+            Ok(())
+        } else {
+            Err(DomainError::validation(ValidationReason::InvalidAuthority))
+        }
+    }
+    pub fn scope(&self) -> &HistoryScope {
+        &self.scope
+    }
+    pub fn cutoff(&self) -> SpaceSeq {
+        self.cutoff
+    }
+    pub fn view(&self) -> &ViewRef {
+        &self.view
+    }
+    pub fn view_revision(&self) -> &RevisionId {
+        &self.view_revision
+    }
+    pub fn schema_revision(&self) -> Option<&RevisionId> {
+        self.schema_revision.as_ref()
+    }
+    pub fn descriptor_fingerprint(&self) -> ContentDigest {
+        self.descriptor_fingerprint
+    }
+    pub fn group_field(&self) -> &str {
+        &self.group_field
+    }
+    pub fn group_field_kind(&self) -> BoardGroupFieldKind {
+        self.group_field_kind
+    }
+    pub fn groups(&self) -> &[EvaluatedBoardGroup] {
+        &self.groups
+    }
+    pub fn before_placement(&self) -> &SemanticPlacement {
+        &self.before_placement
+    }
+    pub fn base_order_binding(&self) -> ContentDigest {
+        self.base_order_binding
+    }
+    pub fn after_eligible_in_group(&self) -> bool {
+        self.after_eligible_in_group
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PlannedNoteRestoration {
+    pub note: NoteId,
+    pub current_revision: RevisionId,
+    pub restored_from_revision: Option<RevisionId>,
+    pub planned_lifecycle: Lifecycle,
+    pub planned_carrier: Option<String>,
+    pub planned_fields: BTreeMap<String, Option<YamlValue>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoardViewRollbackFacts {
+    pub view: ViewRef,
+    pub view_revision: RevisionId,
+    pub schema_revision: Option<RevisionId>,
+    pub descriptor_fingerprint: ContentDigest,
+    pub group_field: String,
+    pub group_field_kind: BoardGroupFieldKind,
+    pub groups: Vec<EvaluatedBoardGroup>,
+    /// Post-restoration group membership for each eligible target (`None` = outside view).
+    pub post_restore_membership: BTreeMap<NoteId, Option<GroupKey>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RollbackBoardFacts {
+    authority: BoardPlannerAuthority,
+    scope: HistoryScope,
+    cutoff: SpaceSeq,
+    views: BTreeMap<ViewRef, BoardViewRollbackFacts>,
+}
+impl RollbackBoardFacts {
+    pub fn attest(
+        authority: &BoardPlannerAuthority,
+        scope: HistoryScope,
+        cutoff: SpaceSeq,
+        views: BTreeMap<ViewRef, BoardViewRollbackFacts>,
+    ) -> Self {
+        Self {
+            authority: authority.clone(),
+            scope,
+            cutoff,
+            views,
+        }
+    }
+    pub fn verify_authority(&self, expected: &BoardPlannerAuthority) -> DomainResult<()> {
+        if self.authority.matches(expected) {
+            Ok(())
+        } else {
+            Err(DomainError::validation(ValidationReason::InvalidAuthority))
+        }
+    }
+    pub fn scope(&self) -> &HistoryScope {
+        &self.scope
+    }
+    pub fn cutoff(&self) -> SpaceSeq {
+        self.cutoff
+    }
+    pub fn views(&self) -> &BTreeMap<ViewRef, BoardViewRollbackFacts> {
+        &self.views
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RollbackBoardFactsRequest {
+    pub cutoff: Option<SpaceSeq>,
+    pub views: Vec<ViewRef>,
+    pub eligible_notes: Vec<PlannedNoteRestoration>,
+}
+
+pub trait BoardMutationFactsProvider: Send + Sync {
+    fn evaluate_move<'a>(
+        &'a self,
+        authority: &'a BoardPlannerAuthority,
+        ctx: SpaceContext,
+        cutoff: Option<SpaceSeq>,
+        intent: MoveBoardCard,
+    ) -> PortFuture<'a, BoardMoveFacts>;
+
+    fn evaluate_rollback<'a>(
+        &'a self,
+        authority: &'a BoardPlannerAuthority,
+        ctx: SpaceContext,
+        request: RollbackBoardFactsRequest,
+    ) -> PortFuture<'a, RollbackBoardFacts>;
+}
+
 #[derive(Clone, Debug)]
 pub enum InterceptedPayload {
     EditNote {
@@ -106,7 +363,10 @@ pub enum InterceptedPayload {
         body: BodyPatchPlan,
         header: HeaderMutation,
     },
-    MoveBoardCard(MoveBoardCard),
+    MoveBoardCard {
+        card: MoveBoardCard,
+        facts: Box<BoardMoveFacts>,
+    },
     ExternalObservation {
         observation: ExternalObservation,
         body: BodyPatchPlan,
