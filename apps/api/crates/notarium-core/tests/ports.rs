@@ -1491,7 +1491,7 @@ impl BackupSnapshot for SnapshotFixture {
             assert_eq!(self.guard.state.lock().unwrap().pauses, 0);
             budget.check(BackupProgress {
                 elapsed: Duration::from_millis(10),
-                pinned_wal_bytes: 20,
+                retention: BackupRetentionProgress::SqliteWal { pinned_bytes: 20 },
                 spool_bytes: 30,
             })?;
             if cancellation.is_cancelled() {
@@ -1537,7 +1537,9 @@ impl PreparedBackup for PreparedFixture {
 fn backup_budget() -> BackupBudget {
     BackupBudget {
         deadline: Duration::from_secs(1),
-        max_pinned_wal_bytes: 100,
+        retention: BackupRetentionBudget::SqliteWal {
+            max_pinned_bytes: 100,
+        },
         max_spool_bytes: 100,
     }
 }
@@ -1595,7 +1597,9 @@ fn backup_guards_release_every_phase_on_second_participant_failure_budget_or_can
             ..backup_budget()
         },
         BackupBudget {
-            max_pinned_wal_bytes: 0,
+            retention: BackupRetentionBudget::SqliteWal {
+                max_pinned_bytes: 0,
+            },
             ..backup_budget()
         },
         BackupBudget {

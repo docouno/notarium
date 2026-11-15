@@ -1,5 +1,8 @@
 include .devkit/runtime/devkit.mk
 
+# Add a disposable, socket-only PostgreSQL fixture around the pinned API runner.
+devkit_loader := scripts/devkit-with-control-db.sh
+
 # Process tests and desktop packaging consume standalone debug binaries.
 test-api: build-api
 package-desktop: build-api

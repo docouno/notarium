@@ -16,6 +16,10 @@ The domain accepts UTC years 0000–9999 and at most nine fractional digits.
 Out-of-range UTC conversions and leap seconds return `InvalidTimestamp`; they
 are never clamped to a different instant.
 
+Credential key IDs have a separate native grammar: `ck_` followed by 24 lowercase
+hexadecimal digits derived from twelve HKDF output bytes. They do not use the
+generic ID minting or legacy-ID parser.
+
 `StorageEpochFacts` describes observations made by the runtime. The pure
 classifier distinguishes an evidenced empty root, ready v1, migration in progress,
 incompatible and damaged states. Missing, invalid and unreadable observations
@@ -24,7 +28,7 @@ constructs the shared layout from a supplied path.
 
 Verified authority enters through trusted owners, not deserialization of an auth
 context. Delegation intersects role, class and project grants. Agent, Keeper and
-OAuth contexts cannot obtain human `AbilityWrite`. Both old and new resource facts
+OAuth and PAT contexts cannot obtain human `AbilityWrite`. Both old and new resource facts
 are checked on direct writes, including auxiliary ability files. A run pins its
 write Space; an external read taints already-existing clones before content returns.
 Shared chat limits reads to its Space and excludes the sender's profile.
@@ -213,8 +217,10 @@ database read is required. Both snapshots must retain the same original cut.
 The ordinary read-transaction budget remains below 250 ms. Backup source
 snapshots have a bounded exception until a stable local database spool exists
 or the backup aborts. Incremental backup steps do not shorten this lifetime or
-eliminate its WAL checkpoint impact. Budgets specify a deadline, pinned WAL
-bytes and spool bytes. Exceeding a budget aborts the backup with cleanup;
+eliminate its WAL checkpoint impact. Budgets specify a deadline, spool bytes and
+backend-specific retention: pinned WAL bytes for SQLite or snapshot age for
+PostgreSQL. A budget/progress backend mismatch fails closed. PostgreSQL does not
+report a synthetic WAL metric. Exceeding a budget aborts the backup with cleanup;
 interactive writes are not automatically throttled to preserve a backup.
 
 Resume releases the writer pause, not snapshots or the CAS hold. Source snapshots
@@ -226,6 +232,16 @@ adapter compatibility, crash recovery and the target pause below 1 ms require
 proof in the storage/backup deliveries, not core test doubles.
 
 ## Port operation coverage
+
+Control inventory uses explicit pages of 1–200 items. Continuations belong to
+the producer and must remain bound to authorization scope, filters and relevant
+revisions. `ControlCatalogPort` provides canonical metadata and idempotent
+lifecycle coordination without exposing note bodies or database handles.
+
+Schedule claims carry the next slot computed by the scheduler. A committed claim
+advances that slot atomically; repeated claims return an inspection receipt,
+without permission to dispatch again. Terminal run results are typed and do not
+carry a next slot. These are interface requirements, not a scheduler implementation.
 
 All nine named boundaries use object-safe traits and `Send` futures. Streams expose
 typed `next` calls. No runtime channel, database transaction, model session or

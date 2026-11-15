@@ -7,6 +7,7 @@ use notarium_core::{
     ports::{control::*, *},
     query::*,
     receipt::*,
+    value::Timestamp,
 };
 
 pub struct RejectingPorts;
@@ -191,8 +192,8 @@ impl ControlPort for RejectingPorts {
     reject! {
     fn resolve_auth(&self, ctx: PreAuthContext) -> PortFuture<'_, EngineAuthContext>;
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo>;
-    fn list_spaces(&self, ctx: AccountContext) -> PortFuture<'_, Vec<AccessibleSpace>>;
-    fn list_projects(&self, ctx: AccountContext) -> PortFuture<'_, Vec<ProjectInfo>>;
+    fn list_spaces(&self, ctx: AccountContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<AccessibleSpace>>;
+    fn list_projects(&self, ctx: AccountContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<ProjectInfo>>;
     fn create_space(
             &self,
             ctx: AccountContext,
@@ -228,12 +229,13 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: AccountContext,
             episode: EpisodeId,
+            page: ControlPageRequest,
         ) -> PortFuture<'_, BootstrapContext>;
     fn discover_abilities(
             &self,
             ctx: AccountContext,
             request: AbilityQuery,
-        ) -> PortFuture<'_, Vec<AbilityDescriptor>>;
+        ) -> PortFuture<'_, ControlPage<AbilityDescriptor>>;
     fn resolve_ability(
             &self,
             ctx: AccountContext,
@@ -265,7 +267,7 @@ impl ControlPort for RejectingPorts {
             ctx: SpaceContext,
             schedule: ScheduleId,
         ) -> PortFuture<'_, AgentSchedule>;
-    fn list_schedules(&self, ctx: SpaceContext) -> PortFuture<'_, Vec<AgentSchedule>>;
+    fn list_schedules(&self, ctx: SpaceContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<AgentSchedule>>;
     fn update_schedule(
             &self,
             ctx: SpaceContext,
@@ -277,6 +279,9 @@ impl ControlPort for RejectingPorts {
             schedule: ScheduleId,
             expected: ControlRevision,
         ) -> PortFuture<'_, ControlRevision>;
+    fn list_due_schedules(&self, ctx: MaintenanceContext, now: Timestamp, page: ControlPageRequest) -> PortFuture<'_, ControlPage<AgentSchedule>>;
+    fn get_schedule_run(&self, ctx: AccountContext, schedule: ScheduleId, run: AgentRunId) -> PortFuture<'_, ScheduleRunReceipt>;
+    fn list_schedule_runs(&self, ctx: AccountContext, schedule: ScheduleId, page: ControlPageRequest) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
     fn claim_schedule(
             &self,
             ctx: SpaceContext,

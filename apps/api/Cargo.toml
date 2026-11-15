@@ -87,5 +87,16 @@ unicode-normalization = "0.1"
 
 saphyr-parser = "0.3"
 
+rusqlite = { version = "=0.39.0", default-features = false, features = ["backup", "bundled"] }
+base64 = "0.22"
+getrandom = "0.4"
+subtle = "2"
+zeroize = "1"
+url = "2"
+futures-util = "0.3"
+openidconnect = { version = "=4.1.0", default-features = false }
+cron = "0.15"
+chrono-tz = "0.10"
+
 [patch.crates-io]
 pulldown-cmark = { path = "vendor/pulldown-cmark" }

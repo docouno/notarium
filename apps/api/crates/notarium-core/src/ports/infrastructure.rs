@@ -258,9 +258,12 @@ pub trait EventBusPort: Send + Sync {
 }
 #[derive(Clone, Debug)]
 pub enum RevocationSelector {
+    Principal(PrincipalId),
     Session(AuthSessionId),
     Credential(CredentialId),
     Grant(GrantId),
+    OAuthGrant(OAuthGrantId),
+    OAuthFamily(OAuthFamilyId),
     Membership {
         space: SpaceId,
         principal: PrincipalId,
@@ -288,19 +291,40 @@ pub trait SessionRevocationPort: Send + Sync {
 #[derive(Clone, Copy, Debug)]
 pub struct BackupBudget {
     pub deadline: Duration,
-    pub max_pinned_wal_bytes: u64,
+    pub retention: BackupRetentionBudget,
     pub max_spool_bytes: u64,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct BackupProgress {
     pub elapsed: Duration,
-    pub pinned_wal_bytes: u64,
+    pub retention: BackupRetentionProgress,
     pub spool_bytes: u64,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum BackupRetentionBudget {
+    SqliteWal { max_pinned_bytes: u64 },
+    PostgresSnapshot { max_age: Duration },
+}
+#[derive(Clone, Copy, Debug)]
+pub enum BackupRetentionProgress {
+    SqliteWal { pinned_bytes: u64 },
+    PostgresSnapshot { age: Duration },
 }
 impl BackupBudget {
     pub fn check(&self, progress: BackupProgress) -> DomainResult<()> {
+        let retention_exceeded = match (self.retention, progress.retention) {
+            (
+                BackupRetentionBudget::SqliteWal { max_pinned_bytes },
+                BackupRetentionProgress::SqliteWal { pinned_bytes },
+            ) => pinned_bytes > max_pinned_bytes,
+            (
+                BackupRetentionBudget::PostgresSnapshot { max_age },
+                BackupRetentionProgress::PostgresSnapshot { age },
+            ) => age > max_age,
+            _ => return Err(DomainError::validation(ValidationReason::ScopeMismatch)),
+        };
         if progress.elapsed > self.deadline
-            || progress.pinned_wal_bytes > self.max_pinned_wal_bytes
+            || retention_exceeded
             || progress.spool_bytes > self.max_spool_bytes
         {
             return Err(DomainError::validation(ValidationReason::BudgetExceeded));

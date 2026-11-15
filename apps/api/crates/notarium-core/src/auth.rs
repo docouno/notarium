@@ -40,6 +40,7 @@ pub enum Cap {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PrincipalKind {
     DirectHuman,
+    Pat,
     AgentRun(AgentRunId),
     Keeper(AgentRunId),
     OAuth { source: GrantId, narrowed: bool },
@@ -221,6 +222,12 @@ impl EngineAuthContext {
             source,
             narrowed: true,
         };
+        Ok(derived)
+    }
+    /// Personal access tokens are delegated credentials, never interactive humans.
+    pub fn for_pat(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
+        let mut derived = self.narrow(requested)?;
+        derived.kind = PrincipalKind::Pat;
         Ok(derived)
     }
     fn narrow(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {

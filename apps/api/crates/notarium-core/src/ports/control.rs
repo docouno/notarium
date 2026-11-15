@@ -2,6 +2,41 @@ use super::{PortFuture, PortStream, context::*, types::*};
 use crate::{auth::*, classes::*, ids::*, model::*, receipt::*, value::Timestamp};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Opaque continuation bound by the producer to scope, filters and revisions.
+#[derive(Clone, Debug)]
+pub struct ControlPageRequest {
+    limit: u16,
+    continuation: Option<String>,
+}
+impl ControlPageRequest {
+    pub fn new(limit: u16, continuation: Option<String>) -> crate::DomainResult<Self> {
+        if !(1..=200).contains(&limit)
+            || continuation
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.len() > 4096)
+        {
+            return Err(crate::DomainError::validation(
+                crate::error::ValidationReason::InvalidLimit,
+            ));
+        }
+        Ok(Self {
+            limit,
+            continuation,
+        })
+    }
+    pub fn limit(&self) -> u16 {
+        self.limit
+    }
+    pub fn continuation(&self) -> Option<&str> {
+        self.continuation.as_deref()
+    }
+}
+#[derive(Clone, Debug)]
+pub struct ControlPage<T> {
+    pub items: Vec<T>,
+    pub continuation: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PrincipalInfo {
     pub principal: PrincipalId,
@@ -82,6 +117,7 @@ pub struct AbilityDescriptor {
 }
 #[derive(Clone, Debug)]
 pub struct AbilityQuery {
+    pub page: ControlPageRequest,
     pub project: Option<FolderRef>,
     pub kind: Option<AbilityKind>,
     pub name: Option<String>,
@@ -180,6 +216,7 @@ pub struct BootstrapContext {
     pub episode: AgentEpisode,
     pub selection: ContextSelection,
     pub owner_acknowledgements: BTreeMap<SpaceId, AcknowledgedCursor>,
+    pub continuation: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -196,6 +233,7 @@ pub struct AgentSchedule {
     pub coalesce_latest: bool,
     pub paused_reason: Option<SchedulePauseReason>,
     pub revision: ControlRevision,
+    pub next_slot: Timestamp,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedulePauseReason {
@@ -211,6 +249,8 @@ pub struct ClaimSchedule {
     pub slot: Timestamp,
     pub current_role: AbilityRef,
     pub expected: ControlRevision,
+    /// Computed by the scheduler; must be strictly after the claimed slot.
+    pub next_slot: Timestamp,
 }
 #[derive(Clone, Debug)]
 pub enum ScheduleClaim {
@@ -219,7 +259,7 @@ pub enum ScheduleClaim {
         lease: LeaseEpoch,
         schedule: Box<AgentSchedule>,
     },
-    AlreadyClaimed,
+    AlreadyClaimed(ScheduleRunReceipt),
     Paused(SchedulePauseReason),
 }
 #[derive(Clone, Debug)]
@@ -227,8 +267,30 @@ pub struct ScheduleResult {
     pub schedule: ScheduleId,
     pub run: AgentRunId,
     pub lease: LeaseEpoch,
-    pub succeeded: bool,
-    pub next_slot: Option<Timestamp>,
+    pub outcome: ScheduleOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScheduleOutcome {
+    Succeeded,
+    Failed,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScheduleRunStatus {
+    Claimed,
+    Running,
+    Terminal(ScheduleOutcome),
+}
+#[derive(Clone, Debug)]
+pub struct ScheduleRunReceipt {
+    pub schedule: ScheduleId,
+    pub run: AgentRunId,
+    pub lease: LeaseEpoch,
+    pub slot: Timestamp,
+    pub reserved_next_slot: Timestamp,
+    pub claimed_revision: ControlRevision,
+    pub status: ScheduleRunStatus,
 }
 
 #[derive(Clone, Debug)]
@@ -274,8 +336,16 @@ pub enum CompletionEvent {
 pub trait ControlPort: Send + Sync {
     fn resolve_auth(&self, ctx: PreAuthContext) -> PortFuture<'_, EngineAuthContext>;
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo>;
-    fn list_spaces(&self, ctx: AccountContext) -> PortFuture<'_, Vec<AccessibleSpace>>;
-    fn list_projects(&self, ctx: AccountContext) -> PortFuture<'_, Vec<ProjectInfo>>;
+    fn list_spaces(
+        &self,
+        ctx: AccountContext,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<AccessibleSpace>>;
+    fn list_projects(
+        &self,
+        ctx: AccountContext,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<ProjectInfo>>;
     fn create_space(
         &self,
         ctx: AccountContext,
@@ -311,12 +381,13 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: AccountContext,
         episode: EpisodeId,
+        page: ControlPageRequest,
     ) -> PortFuture<'_, BootstrapContext>;
     fn discover_abilities(
         &self,
         ctx: AccountContext,
         request: AbilityQuery,
-    ) -> PortFuture<'_, Vec<AbilityDescriptor>>;
+    ) -> PortFuture<'_, ControlPage<AbilityDescriptor>>;
     fn resolve_ability(
         &self,
         ctx: AccountContext,
@@ -348,7 +419,11 @@ pub trait ControlPort: Send + Sync {
         ctx: SpaceContext,
         schedule: ScheduleId,
     ) -> PortFuture<'_, AgentSchedule>;
-    fn list_schedules(&self, ctx: SpaceContext) -> PortFuture<'_, Vec<AgentSchedule>>;
+    fn list_schedules(
+        &self,
+        ctx: SpaceContext,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
     fn update_schedule(
         &self,
         ctx: SpaceContext,
@@ -360,6 +435,24 @@ pub trait ControlPort: Send + Sync {
         schedule: ScheduleId,
         expected: ControlRevision,
     ) -> PortFuture<'_, ControlRevision>;
+    fn list_due_schedules(
+        &self,
+        ctx: MaintenanceContext,
+        now: Timestamp,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
+    fn get_schedule_run(
+        &self,
+        ctx: AccountContext,
+        schedule: ScheduleId,
+        run: AgentRunId,
+    ) -> PortFuture<'_, ScheduleRunReceipt>;
+    fn list_schedule_runs(
+        &self,
+        ctx: AccountContext,
+        schedule: ScheduleId,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
     fn claim_schedule(
         &self,
         ctx: SpaceContext,

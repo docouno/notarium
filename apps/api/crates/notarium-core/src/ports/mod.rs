@@ -1,6 +1,7 @@
 //! Object-safe ports. Runtime composition and implementations belong to their owners.
 use crate::error::PortError;
 use std::{future::Future, pin::Pin};
+pub mod catalog;
 pub mod context;
 pub mod control;
 pub mod engine;
@@ -12,6 +13,7 @@ pub trait PortStream<T>: Send {
     fn next(&mut self) -> PortFuture<'_, Option<T>>;
 }
 
+pub use catalog::*;
 pub use context::*;
 pub use control::ControlPort;
 pub use engine::*;
