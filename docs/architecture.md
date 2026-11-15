@@ -57,14 +57,16 @@ locked for offline setup. `Cargo.lock` must contain none of `openssl-sys`,
 TLS uses rustls 0.23 with ring, reqwest 0.13 with `rustls-no-provider`, and tonic
 0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
 C++/OpenSSL tools. Core/syntax tests exercise domain and document behavior;
-Control storage also tests its SQL schema, target import/export and password
-primitives. Remaining per-crate scaffold tests are compile smoke checks.
+Control storage also tests its SQL schema, target import/export, authentication,
+Space authority and crash recovery. Remaining per-crate scaffold tests are compile
+smoke checks.
 
 `notarium-control` owns a 45-table baseline in SQLite and the PostgreSQL
 `v1_control` schema. Its typed target records support offline import and paged
-export from a retained read snapshot. These are storage primitives; the complete
-authentication, OAuth, provider and backup participant services are still under
-construction. See [control storage](control.md).
+export from a retained read snapshot. `ControlService` implements `AuthPort` and
+Space membership/lifecycle operations with durable revocation and canonical
+coordination. OAuth issuance/OIDC, provider, account-state and backup participant
+services are still under construction. See [control services](control.md).
 
 ## Client and delivery boundaries
 

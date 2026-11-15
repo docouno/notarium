@@ -72,12 +72,20 @@ pub struct CreateSpace {
 }
 #[derive(Clone, Debug)]
 pub struct MembershipChange {
+    pub command: CommandKey,
     pub member: PrincipalId,
     pub role: Option<SpaceRole>,
     pub expected: ControlRevision,
 }
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MembershipResult {
+    pub space: SpaceId,
+    pub member: PrincipalId,
+    pub role: Option<SpaceRole>,
+}
 #[derive(Clone, Debug)]
 pub struct SpaceLifecycleChange {
+    pub command: CommandKey,
     pub lifecycle: SpaceLifecycle,
     pub expected: ControlRevision,
 }
@@ -355,7 +363,15 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: SpaceContext,
         request: MembershipChange,
-    ) -> PortFuture<'_, ControlCommit<AccessibleSpace>>;
+    ) -> PortFuture<'_, ControlCommit<MembershipResult>>;
+    /// Resume only an existing exact command, including after self-removal.
+    /// Fresh account authentication never grants new Space authority here.
+    fn resume_membership_change(
+        &self,
+        ctx: AccountContext,
+        scope: HistoryScope,
+        request: MembershipChange,
+    ) -> PortFuture<'_, ControlCommit<MembershipResult>>;
     fn change_space_lifecycle(
         &self,
         ctx: SpaceContext,

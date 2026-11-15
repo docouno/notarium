@@ -1,0 +1,485 @@
+use notarium_control::{
+    service::{AuthenticationMode, ControlClock, ControlConfig, ControlService},
+    store::{ControlStore, PostgresConfig},
+};
+use notarium_core::{
+    DomainError,
+    auth::*,
+    epoch::*,
+    error::{CommitEffect, OperationalFailure, PortError, RetryAdvice},
+    ids::*,
+    model::*,
+    ports::{control::*, *},
+    receipt::AccountCommandIdentity,
+};
+use sqlx::Connection;
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+pub static AUTH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub fn budget() -> CallBudget {
+    CallBudget {
+        request: RequestId::from_bytes([1; 16]),
+        cancellation: Cancellation::default(),
+        remaining: Duration::from_secs(30),
+    }
+}
+pub fn evidence(kind: AuthEvidenceKind, token: &str) -> PreAuthContext {
+    PreAuthContext {
+        budget: budget(),
+        evidence: AuthEvidence::new(kind, token.into()),
+    }
+}
+pub fn empty() -> EmptyRootAuthorization {
+    EmptyRootAuthorization::from_classification(
+        InstallationId::from_bytes([1; 16]),
+        EpochClassification {
+            state: StorageEpochState::EmptyRoot,
+            reason: EpochReason::ConfirmedEmpty,
+        },
+    )
+    .unwrap()
+}
+pub fn command(
+    actor: &PrincipalId,
+    owner: &PrincipalId,
+    key: u8,
+    expected: ControlRevision,
+) -> AccountCommandIdentity {
+    AccountCommandIdentity {
+        actor: actor.clone(),
+        owner: owner.clone(),
+        key: CommandKey::from_bytes([key; 16]),
+        hash: ContentDigest::from_bytes([key; 32]),
+        expected,
+    }
+}
+pub struct Clock(pub AtomicI64);
+impl Default for Clock {
+    fn default() -> Self {
+        Self(AtomicI64::new(1_700_000_000_000))
+    }
+}
+impl ControlClock for Clock {
+    fn now_ms(&self) -> Result<i64, PortError> {
+        Ok(self.0.load(Ordering::SeqCst))
+    }
+}
+pub struct CallbackGate {
+    pub enabled: AtomicBool,
+    pub entered: tokio::sync::Semaphore,
+    pub release: tokio::sync::Semaphore,
+}
+impl Default for CallbackGate {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+#[derive(Default)]
+pub struct Catalog {
+    pub fail_after_create: AtomicBool,
+    pub fail_after_lifecycle: AtomicBool,
+    pub create_gate: CallbackGate,
+    pub space_read_fault: AtomicU8,
+    pub space_reads: AtomicUsize,
+    lifecycle_receipts:
+        Mutex<BTreeMap<CommandKey, (ContentDigest, HistoryScope, SpaceLifecycle, CatalogSpace)>>,
+    pub entries: Mutex<BTreeMap<SpaceId, (PrincipalId, String, CatalogSpace)>>,
+}
+impl ControlCatalogPort for Catalog {
+    fn space(&self, _: CallBudget, id: SpaceId) -> PortFuture<'_, CatalogSpace> {
+        Box::pin(async move {
+            self.space_reads.fetch_add(1, Ordering::SeqCst);
+            let mut result = self
+                .entries
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|v| v.2.clone())
+                .ok_or(DomainError::ResourceNotFound)?;
+            match self.space_read_fault.load(Ordering::SeqCst) {
+                1 => {
+                    return Err(PortError::Unavailable(
+                        OperationalFailure::new(
+                            ContentDigest::from_bytes([1; 32]),
+                            CommitEffect::NotCommitted,
+                            RetryAdvice::Never,
+                            false,
+                        )
+                        .unwrap(),
+                    ));
+                }
+                2 => return Err(DomainError::ResourceNotFound.into()),
+                3 => result.history.space_id = SpaceId::from_bytes([255; 16]),
+                _ => {}
+            }
+            Ok(result)
+        })
+    }
+    fn ensure_space(
+        &self,
+        _: CallBudget,
+        request: EnsureCatalogSpace,
+    ) -> PortFuture<'_, CatalogSpace> {
+        Box::pin(async move {
+            let space = CatalogSpace {
+                space: Space {
+                    id: request.space.id.clone(),
+                    kind: request.space.kind,
+                    lifecycle: SpaceLifecycle::Active,
+                },
+                history: HistoryScope {
+                    space_id: request.space.id.clone(),
+                    incarnation: HistoryIncarnation::from_bytes([1; 16]),
+                },
+                last_seq: SpaceSeq::ZERO,
+            };
+            let result = {
+                let mut entries = self.entries.lock().unwrap();
+                let existing = entries.entry(request.space.id).or_insert_with(|| {
+                    (
+                        request.owner.clone(),
+                        request.space.name.clone(),
+                        space.clone(),
+                    )
+                });
+                assert_eq!(existing.0, request.owner);
+                assert_eq!(existing.1, request.space.name);
+                assert_eq!(existing.2.space.kind, request.space.kind);
+                existing.2.clone()
+            };
+            if self.create_gate.enabled.swap(false, Ordering::SeqCst) {
+                self.create_gate.entered.add_permits(1);
+                self.create_gate.release.acquire().await.unwrap().forget();
+            }
+            if self.fail_after_create.load(Ordering::SeqCst) {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            Ok(result)
+        })
+    }
+    fn projects(
+        &self,
+        _: SpaceContext,
+        _: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<ProjectInfo>> {
+        panic!("unexpected projects call")
+    }
+    fn project(&self, _: SpaceContext, _: FolderRef) -> PortFuture<'_, ProjectInfo> {
+        panic!("unexpected project call")
+    }
+    fn abilities(
+        &self,
+        _: AccountContext,
+        _: AbilityQuery,
+    ) -> PortFuture<'_, ControlPage<AbilityDescriptor>> {
+        panic!("unexpected abilities call")
+    }
+    fn ability(&self, _: AccountContext, _: AbilityRef) -> PortFuture<'_, AbilityDescriptor> {
+        panic!("unexpected ability call")
+    }
+    fn note_facts(&self, _: AccountContext, _: NoteRef) -> PortFuture<'_, ResourceFacts> {
+        panic!("unexpected note call")
+    }
+    fn change_lifecycle(
+        &self,
+        _: CallBudget,
+        identity: AccountCommandIdentity,
+        scope: HistoryScope,
+        lifecycle: SpaceLifecycle,
+    ) -> PortFuture<'_, CatalogSpace> {
+        Box::pin(async move {
+            let mut receipts = self.lifecycle_receipts.lock().unwrap();
+            let result = if let Some((hash, old_scope, old_lifecycle, result)) =
+                receipts.get(&identity.key)
+            {
+                assert_eq!(*hash, identity.hash);
+                assert_eq!(*old_scope, scope);
+                assert_eq!(*old_lifecycle, lifecycle);
+                result.clone()
+            } else {
+                let mut entries = self.entries.lock().unwrap();
+                let current = entries
+                    .get_mut(&scope.space_id)
+                    .ok_or(DomainError::ResourceNotFound)?;
+                current.2.history.check(&scope)?;
+                current.2.space.lifecycle = lifecycle;
+                let result = current.2.clone();
+                receipts.insert(
+                    identity.key,
+                    (identity.hash, scope, lifecycle, result.clone()),
+                );
+                result
+            };
+            if self.fail_after_lifecycle.load(Ordering::SeqCst) {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            Ok(result)
+        })
+    }
+    fn resolve_or_ensure_memory_target(
+        &self,
+        _: AccountContext,
+        _: MemoryTarget,
+        _: String,
+    ) -> PortFuture<'_, ResolvedMemoryTarget> {
+        panic!("unexpected memory call")
+    }
+}
+pub struct Revoker {
+    pub fail: AtomicBool,
+    pub gate: AtomicBool,
+    pub entered: tokio::sync::Semaphore,
+    pub release: tokio::sync::Semaphore,
+    pub calls: Mutex<Vec<RequestId>>,
+}
+impl Default for Revoker {
+    fn default() -> Self {
+        Self {
+            fail: AtomicBool::new(false),
+            gate: AtomicBool::new(false),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            calls: Mutex::new(vec![]),
+        }
+    }
+}
+impl SessionRevocationPort for Revoker {
+    fn revoke(
+        &self,
+        ctx: MaintenanceContext,
+        _: RevocationSelector,
+        _: RevocationReason,
+    ) -> PortFuture<'_, ()> {
+        Box::pin(async move {
+            ctx.authority.require(ServicePurpose::Revocation)?;
+            self.calls.lock().unwrap().push(ctx.budget.request);
+            self.entered.add_permits(1);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(DomainError::AccessDenied.into());
+            }
+            if self.gate.load(Ordering::SeqCst) {
+                self.release.acquire().await.unwrap().forget();
+            }
+            Ok(())
+        })
+    }
+}
+pub enum Observer {
+    Sqlite(sqlx::SqliteConnection),
+    Postgres(sqlx::PgConnection),
+}
+impl Observer {
+    pub async fn set_password_hash(&mut self, account: &PrincipalId, hash: &str) {
+        match self {
+            Self::Sqlite(c) => {
+                sqlx::query("UPDATE users SET password_hash=$1 WHERE user_id=$2")
+                    .bind(hash)
+                    .bind(account.as_str())
+                    .execute(c)
+                    .await
+                    .unwrap();
+            }
+            Self::Postgres(c) => {
+                sqlx::query("UPDATE users SET password_hash=$1 WHERE user_id=$2")
+                    .bind(hash)
+                    .bind(account.as_str())
+                    .execute(c)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+    pub async fn seed_oauth_access(
+        &mut self,
+        account: &PrincipalId,
+        token: &notarium_control::auth::token::MintedToken,
+    ) {
+        macro_rules! execute {
+            ($sql:literal; $($bind:expr),*)=>{
+                match &mut *self {
+                    Self::Sqlite(c)=>{sqlx::query($sql)$(.bind($bind))*.execute(c).await.unwrap();},
+                    Self::Postgres(c)=>{sqlx::query($sql)$(.bind($bind))*.execute(c).await.unwrap();},
+                }
+            }
+        }
+        execute!("INSERT INTO oauth_clients(client_id,kind,redirect_uris,client_name,created_at) VALUES('test-client','dcr','[]','test client',0)";);
+        let grant = OAuthGrantId::from_bytes([1; 16]).to_string();
+        let family = OAuthFamilyId::from_bytes([1; 16]).to_string();
+        execute!("INSERT INTO oauth_grants(grant_id,user_id,client_id,resource_uri,scope,created_at) VALUES($1,$2,'test-client','https://resource.example/','read',0)";&grant,account.as_str());
+        execute!("INSERT INTO oauth_refresh_families(family_id,grant_id,created_at) VALUES($1,$2,0)";&family,&grant);
+        execute!("INSERT INTO oauth_access_tokens(token_id,token_hash,grant_id,family_id,resource_uri,scope,issued_at,expires_at) VALUES($1,$2,$3,$4,'https://resource.example/','write',0,1800000000000)";token.id.as_ref().unwrap(),token.digest.as_slice(),&grant,&family);
+    }
+    pub async fn execute(&mut self, sql: &'static str) {
+        match self {
+            Self::Sqlite(c) => {
+                sqlx::query(sql).execute(c).await.unwrap();
+            }
+            Self::Postgres(c) => {
+                sqlx::query(sql).execute(c).await.unwrap();
+            }
+        }
+    }
+    pub async fn count(&mut self, sql: &'static str) -> i64 {
+        match self {
+            Self::Sqlite(c) => sqlx::query_scalar(sql).fetch_one(c).await.unwrap(),
+            Self::Postgres(c) => sqlx::query_scalar(sql).fetch_one(c).await.unwrap(),
+        }
+    }
+    pub async fn text(&mut self, sql: &'static str) -> String {
+        match self {
+            Self::Sqlite(c) => sqlx::query_scalar(sql).fetch_one(c).await.unwrap(),
+            Self::Postgres(c) => sqlx::query_scalar(sql).fetch_one(c).await.unwrap(),
+        }
+    }
+    async fn close(self) {
+        match self {
+            Self::Sqlite(c) => c.close().await.unwrap(),
+            Self::Postgres(c) => c.close().await.unwrap(),
+        }
+    }
+}
+pub struct Fixture {
+    pub store: ControlStore,
+    pub observer: Observer,
+    pub catalog: Arc<Catalog>,
+    pub revoker: Arc<Revoker>,
+    pub clock: Arc<Clock>,
+    root: Option<PathBuf>,
+    admin: Option<sqlx::PgConnection>,
+    database: String,
+}
+impl Fixture {
+    pub async fn new(pg: bool, label: &str) -> Self {
+        let (store, observer, root, admin, database) = if pg {
+            let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../../.artifacts/control-db-fixture/active.json");
+            let descriptor: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(file).expect("run with database fixture"))
+                    .unwrap();
+            let socket = PathBuf::from(descriptor["socket"].as_str().unwrap());
+            let options = sqlx::postgres::PgConnectOptions::new()
+                .socket(&socket)
+                .username("postgres")
+                .database("postgres");
+            let mut admin = sqlx::PgConnection::connect_with(&options).await.unwrap();
+            let database = format!("auth_{label}");
+            assert!(
+                database
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_')
+            );
+            sqlx::QueryBuilder::<sqlx::Postgres>::new("CREATE DATABASE ")
+                .push(&database)
+                .build()
+                .execute(&mut admin)
+                .await
+                .unwrap();
+            let store =
+                ControlStore::postgres(PostgresConfig::unix_socket(socket, &database, "postgres"))
+                    .await
+                    .unwrap();
+            let mut observer = sqlx::PgConnection::connect_with(&options.database(&database))
+                .await
+                .unwrap();
+            sqlx::query("SET search_path TO v1_control,pg_catalog")
+                .execute(&mut observer)
+                .await
+                .unwrap();
+            (
+                store,
+                Observer::Postgres(observer),
+                None,
+                Some(admin),
+                database,
+            )
+        } else {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root =
+                PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").expect("use pinned runner"))
+                    .join(format!("control-tests/auth-{label}-{unique}"));
+            std::fs::create_dir_all(root.join("v1")).unwrap();
+            let store = ControlStore::sqlite(&DataRoot::new(&root)).await.unwrap();
+            let mut observer = sqlx::SqliteConnection::connect(&format!(
+                "sqlite:{}",
+                root.join("v1/control.sqlite").display()
+            ))
+            .await
+            .unwrap();
+            sqlx::query("PRAGMA foreign_keys=ON")
+                .execute(&mut observer)
+                .await
+                .unwrap();
+            (
+                store,
+                Observer::Sqlite(observer),
+                Some(root),
+                None,
+                String::new(),
+            )
+        };
+        let mut result = Self {
+            store,
+            observer,
+            root,
+            admin,
+            database,
+            catalog: Arc::default(),
+            revoker: Arc::default(),
+            clock: Arc::default(),
+        };
+        // The composition fixture owns paired-root publication. Auth never
+        // infers readiness from an empty control schema.
+        result.observer.execute("INSERT INTO v1_storage_epoch(singleton,epoch_version,state,installation_id) VALUES(1,1,'ready','install_01010101010101010101010101010101')").await;
+        result
+    }
+    pub async fn service(
+        &self,
+        mode: AuthenticationMode,
+    ) -> Result<Arc<ControlService>, PortError> {
+        Ok(Arc::new(
+            ControlService::open(
+                self.store.clone(),
+                self.catalog.clone(),
+                self.revoker.clone(),
+                self.clock.clone(),
+                ControlConfig {
+                    authentication: mode,
+                    resource_uri: "https://resource.example/".into(),
+                    max_auth_spaces: 100,
+                },
+                budget(),
+            )
+            .await?,
+        ))
+    }
+    pub async fn close(mut self) {
+        self.store.close().await;
+        self.observer.close().await;
+        if let Some(root) = self.root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        if let Some(admin) = &mut self.admin {
+            sqlx::QueryBuilder::<sqlx::Postgres>::new("DROP DATABASE ")
+                .push(&self.database)
+                .build()
+                .execute(admin)
+                .await
+                .unwrap();
+        }
+    }
+}

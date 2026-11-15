@@ -1,5 +1,8 @@
 use crate::{
-    DomainError, DomainResult, auth::EngineAuthContext, error::ValidationReason, ids::*,
+    DomainError, DomainResult,
+    auth::{EngineAuthContext, SecretString},
+    error::ValidationReason,
+    ids::*,
     model::HistoryScope,
 };
 use std::{
@@ -31,7 +34,8 @@ pub struct CallBudget {
 /// Credentials are consumed by the authentication owner, never formatted in errors.
 pub struct AuthEvidence {
     kind: AuthEvidenceKind,
-    secret: String,
+    secret: SecretString,
+    human_management: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthEvidenceKind {
@@ -42,13 +46,26 @@ pub enum AuthEvidenceKind {
 }
 impl AuthEvidence {
     pub fn new(kind: AuthEvidenceKind, secret: String) -> Self {
-        Self { kind, secret }
+        Self {
+            kind,
+            secret: SecretString::new(secret),
+            human_management: false,
+        }
     }
     pub fn kind(&self) -> AuthEvidenceKind {
         self.kind
     }
     pub fn secret(&self) -> &str {
-        &self.secret
+        self.secret.expose()
+    }
+    /// Trusted interactive transport explicitly admits human management after
+    /// checking its perimeter and CSRF policy. Delegated bearers ignore this bit.
+    pub fn with_human_management(mut self) -> Self {
+        self.human_management = true;
+        self
+    }
+    pub fn human_management(&self) -> bool {
+        self.human_management
     }
 }
 impl fmt::Debug for AuthEvidence {

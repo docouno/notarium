@@ -203,7 +203,13 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: SpaceContext,
             request: MembershipChange,
-        ) -> PortFuture<'_, ControlCommit<AccessibleSpace>>;
+        ) -> PortFuture<'_, ControlCommit<MembershipResult>>;
+    fn resume_membership_change(
+            &self,
+            ctx: AccountContext,
+            scope: HistoryScope,
+            request: MembershipChange,
+        ) -> PortFuture<'_, ControlCommit<MembershipResult>>;
     fn change_space_lifecycle(
             &self,
             ctx: SpaceContext,

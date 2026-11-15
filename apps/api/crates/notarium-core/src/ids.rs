@@ -67,6 +67,43 @@ ids! {
     ArtifactId => "artifact_", ClusterId => "cluster_",
 }
 
+/// Lookup identity of a PAT, OAuth access token or refresh token. Never a bearer.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct CredentialTokenId(String);
+impl CredentialTokenId {
+    pub fn parse(value: &str) -> DomainResult<Self> {
+        if value.len() == 12
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(DomainError::validation(ValidationReason::InvalidId))
+        }
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for CredentialTokenId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl TryFrom<String> for CredentialTokenId {
+    type Error = DomainError;
+    fn try_from(value: String) -> DomainResult<Self> {
+        Self::parse(&value)
+    }
+}
+impl From<CredentialTokenId> for String {
+    fn from(value: CredentialTokenId) -> Self {
+        value.0
+    }
+}
+
 /// Native credential key identity, derived from twelve HKDF output bytes.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]

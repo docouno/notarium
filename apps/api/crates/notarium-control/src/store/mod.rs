@@ -1,8 +1,11 @@
 //! Bounded database ownership. No pool or SQL handle crosses the public service API.
 mod export;
 mod import;
-mod lease;
+pub(crate) mod lease;
+pub(crate) mod statements;
 pub mod target;
+#[cfg(test)]
+mod writer_tests;
 use crate::error::{database, invalid, unavailable};
 pub use export::TargetExport;
 pub use import::TargetImport;
@@ -17,7 +20,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
-use tokio::sync::{OwnedRwLockReadGuard, RwLock, Semaphore};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore, oneshot};
 
 static SQLITE_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 static POSTGRES_MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
@@ -30,6 +33,7 @@ pub struct ControlStore {
     pub(crate) backend: Backend,
     pub(crate) writes: Arc<RwLock<()>>,
     exports: Arc<Semaphore>,
+    write_admission: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -89,6 +93,7 @@ impl ControlStore {
             backend: Backend::Sqlite { pool, path },
             writes: Arc::new(RwLock::new(())),
             exports: Arc::new(Semaphore::new(1)),
+            write_admission: Arc::new(Semaphore::new(4)),
         })
     }
 
@@ -126,6 +131,7 @@ impl ControlStore {
             backend: Backend::Postgres(pool),
             writes: Arc::new(RwLock::new(())),
             exports: Arc::new(Semaphore::new(1)),
+            write_admission: Arc::new(Semaphore::new(4)),
         })
     }
 
@@ -136,26 +142,72 @@ impl ControlStore {
         }
     }
 
-    pub(crate) async fn write(&self) -> Result<WriteTransaction, PortError> {
-        let guard = self.writes.clone().read_owned().await;
-        let inner = match &self.backend {
-            Backend::Sqlite { pool, .. } => {
-                Transaction::Sqlite(pool.begin_with("BEGIN IMMEDIATE").await.map_err(database)?)
+    pub(crate) async fn write(
+        &self,
+        budget: lease::OperationBudget,
+    ) -> Result<WriteTransaction, PortError> {
+        budget.check(CommitEffect::NotCommitted)?;
+        let admission = self
+            .write_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| notarium_core::DomainError::RateLimited {
+                retry_after_ms: 1000,
+                budget: notarium_core::error::BudgetKind::Concurrency,
+            })?;
+        let store = self.clone();
+        let worker_budget = budget.clone();
+        let (sender, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            // Once BEGIN reaches the driver, its owner waits for the reply even
+            // if the requesting future has gone. Admission bounds these owners.
+            let result = async {
+                let guard = worker_budget
+                    .run(
+                        async { Ok(store.writes.clone().read_owned().await) },
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                let inner = match &store.backend {
+                    Backend::Sqlite { pool, .. } => Transaction::Sqlite(
+                        pool.begin_with("BEGIN IMMEDIATE").await.map_err(database)?,
+                    ),
+                    Backend::Postgres(pool) => {
+                        Transaction::Postgres(pool.begin().await.map_err(database)?)
+                    }
+                };
+                let mut tx = WriteTransaction {
+                    resources: Some(WriteResources {
+                        inner,
+                        _guard: guard,
+                        _admission: admission,
+                    }),
+                };
+                if let Transaction::Postgres(inner) = tx.inner_mut() {
+                    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+                        .bind(BACKUP_LOCK)
+                        .execute(&mut **inner)
+                        .await
+                        .map_err(database)?;
+                }
+                worker_budget.check(CommitEffect::NotCommitted)?;
+                Ok(tx)
             }
-            Backend::Postgres(pool) => {
-                let mut transaction = pool.begin().await.map_err(database)?;
-                sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
-                    .bind(BACKUP_LOCK)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(database)?;
-                Transaction::Postgres(transaction)
-            }
-        };
-        Ok(WriteTransaction {
-            inner,
-            _guard: guard,
-        })
+            .await;
+            // A value left in or rejected by the channel also has an owned
+            // rollback destructor; the writer fence survives until its ACK.
+            let _ = sender.send(result);
+        });
+        budget
+            .run(
+                async {
+                    receiver.await.map_err(|_| {
+                        unavailable("control writer worker", CommitEffect::NotCommitted)
+                    })?
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await
     }
 
     /// Read a bounded epoch witness; this does not bless or repair a partial root.
@@ -171,9 +223,9 @@ impl ControlStore {
 }
 
 const EXPORT_PAGE_BYTES: usize = 8 * 1024 * 1024;
-struct RowChunk<T> {
-    rows: Vec<T>,
-    has_more: bool,
+pub(crate) struct RowChunk<T> {
+    pub(crate) rows: Vec<T>,
+    pub(crate) has_more: bool,
 }
 struct ByteCounter(usize);
 impl std::io::Write for ByteCounter {
@@ -194,7 +246,7 @@ fn encoded_size(value: &impl serde::Serialize) -> Result<usize, PortError> {
         .map_err(|_| invalid(ValidationReason::InvalidLimit))?;
     Ok(writer.0)
 }
-async fn collect_rows<T: serde::Serialize, S>(
+pub(crate) async fn collect_rows<T: serde::Serialize, S>(
     mut stream: S,
     limit: u16,
     table: target::TargetTable,
@@ -231,33 +283,73 @@ pub(crate) enum Transaction {
     Sqlite(sqlx::Transaction<'static, sqlx::Sqlite>),
     Postgres(sqlx::Transaction<'static, sqlx::Postgres>),
 }
-pub(crate) struct WriteTransaction {
-    pub(crate) inner: Transaction,
+struct WriteResources {
+    inner: Transaction,
     _guard: OwnedRwLockReadGuard<()>,
+    _admission: OwnedSemaphorePermit,
 }
-impl WriteTransaction {
+impl WriteResources {
     async fn rollback(self) -> Result<(), PortError> {
-        let Self { inner, _guard } = self;
+        let Self {
+            inner,
+            _guard,
+            _admission,
+        } = self;
         let result = match inner {
             Transaction::Sqlite(tx) => tx.rollback().await.map_err(database),
             Transaction::Postgres(tx) => tx.rollback().await.map_err(database),
         };
+        drop(_admission);
         drop(_guard);
         result
     }
-    pub(crate) async fn commit(self) -> Result<(), PortError> {
-        // Cancellation must not release the writer fence while a queued COMMIT
-        // can still reach the database. The owned task outlives its caller.
-        tokio::spawn(async move {
-            let Self { inner, _guard } = self;
-            let result = match inner {
-                Transaction::Sqlite(transaction) => transaction.commit().await.map_err(database),
-                Transaction::Postgres(transaction) => transaction.commit().await.map_err(database),
-            };
-            drop(_guard);
-            result
-        })
-        .await
-        .map_err(|_| unavailable("control commit worker", CommitEffect::Unknown))?
+    async fn commit(self) -> Result<(), PortError> {
+        let Self {
+            inner,
+            _guard,
+            _admission,
+        } = self;
+        let result = match inner {
+            Transaction::Sqlite(tx) => tx.commit().await.map_err(database),
+            Transaction::Postgres(tx) => tx.commit().await.map_err(database),
+        };
+        drop(_admission);
+        drop(_guard);
+        result
+    }
+}
+pub(crate) struct WriteTransaction {
+    resources: Option<WriteResources>,
+}
+impl WriteTransaction {
+    pub(crate) fn inner_mut(&mut self) -> &mut Transaction {
+        &mut self
+            .resources
+            .as_mut()
+            .expect("live write transaction")
+            .inner
+    }
+    pub(crate) async fn rollback(mut self) -> Result<(), PortError> {
+        let resources = self.resources.take().expect("live write transaction");
+        tokio::spawn(resources.rollback())
+            .await
+            .map_err(|_| unavailable("control rollback worker", CommitEffect::Unknown))?
+    }
+    pub(crate) async fn commit(mut self) -> Result<(), PortError> {
+        let resources = self.resources.take().expect("live write transaction");
+        tokio::spawn(resources.commit())
+            .await
+            .map_err(|_| unavailable("control commit worker", CommitEffect::Unknown))?
+    }
+}
+impl Drop for WriteTransaction {
+    fn drop(&mut self) {
+        if let Some(resources) = self.resources.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(resources.rollback());
+        }
+        // With no live runtime there can be no concurrent backup or request;
+        // SQLx's own destructor closes/rolls back the disconnected session.
     }
 }

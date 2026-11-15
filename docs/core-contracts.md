@@ -238,12 +238,22 @@ the producer and must remain bound to authorization scope, filters and relevant
 revisions. `ControlCatalogPort` provides canonical metadata and idempotent
 lifecycle coordination without exposing note bodies or database handles.
 
+`AuthPort` owns bootstrap, password login, native bearer resolution, trusted-none
+perimeter admission, account changes, one-time credentials and PATs. Raw secrets
+use a non-serializable, redacted zeroizing wrapper. Verified contexts retain
+credential lineage, and revalidation can only narrow existing delegation.
+Interactive human management requires explicit admission. Membership and lifecycle
+changes carry stable command keys; removing a member returns an optional role.
+Owner management admission can target an archived Space without granting content
+read/write access. Revocation callbacks receive the durable event request ID for
+idempotent delivery; a committed mutation cannot return success before their ACK.
+
 Schedule claims carry the next slot computed by the scheduler. A committed claim
 advances that slot atomically; repeated claims return an inspection receipt,
 without permission to dispatch again. Terminal run results are typed and do not
 carry a next slot. These are interface requirements, not a scheduler implementation.
 
-All nine named boundaries use object-safe traits and `Send` futures. Streams expose
+Owner boundaries use object-safe traits and `Send` futures. Streams expose
 typed `next` calls. No runtime channel, database transaction, model session or
 collaboration document occurs in a signature. `EnginePort` composes note read/write,
 chat, view/graph, search and content-job subports. Control owns authentication,

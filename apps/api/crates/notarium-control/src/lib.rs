@@ -3,4 +3,5 @@
 
 pub mod auth;
 mod error;
+pub mod service;
 pub mod store;

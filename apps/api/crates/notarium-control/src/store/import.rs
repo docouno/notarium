@@ -24,10 +24,10 @@ impl ControlStore {
     ) -> Result<TargetImport, PortError> {
         ctx.authority.require(ServicePurpose::Restore)?;
         let budget = OperationBudget::new(ctx.budget);
-        let mut tx = budget.run(self.write(), CommitEffect::NotCommitted).await?;
+        let mut tx = self.write(budget.clone()).await?;
         let state=budget.run(async {
-            budget.configure(&mut tx.inner).await?;
-            match &mut tx.inner {
+            budget.configure(tx.inner_mut()).await?;
+            match tx.inner_mut() {
                 Transaction::Sqlite(tx)=>sqlx::query_scalar::<_,String>("SELECT state FROM v1_storage_epoch WHERE singleton=1").fetch_optional(&mut **tx).await.map_err(database),
                 Transaction::Postgres(tx)=>sqlx::query_scalar::<_,String>("SELECT state FROM v1_control.v1_storage_epoch WHERE singleton=1 FOR UPDATE").fetch_optional(&mut **tx).await.map_err(database),
             }

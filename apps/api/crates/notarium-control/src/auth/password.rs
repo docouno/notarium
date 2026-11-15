@@ -138,38 +138,43 @@ pub async fn verify(password: Secret, encoded: &str) -> Result<PasswordVerificat
     let permit = admit(profile.credits())?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let legacy = matches!(&profile, Profile::Scrypt { .. });
-        let valid = match profile {
-            Profile::Argon { encoded, .. } => Argon2::default()
-                .verify_password(password.expose().as_bytes(), encoded.as_str())
-                .is_ok(),
-            Profile::Scrypt {
-                params, salt, key, ..
-            } => {
-                let mut output = Zeroizing::new([0u8; 32]);
-                scrypt::scrypt(password.expose().as_bytes(), &salt, &params, &mut *output)
-                    .map_err(|_| invalid(ValidationReason::InvalidAuthority))?;
-                bool::from(output.as_slice().ct_eq(&key))
-            }
-        };
-        // The scrypt call and its memory-hard buffers have returned before rehash.
-        let upgraded_hash = if valid && legacy {
-            Some(canonical_hash(password.expose().as_bytes())?)
-        } else {
-            None
-        };
-        Ok(PasswordVerification {
-            valid,
-            upgraded_hash,
-        })
+        verify_profile(password, profile)
     })
     .await
     .map_err(|_| unavailable("password worker", CommitEffect::NotCommitted))?
 }
 
+fn verify_profile(password: Secret, profile: Profile) -> Result<PasswordVerification, PortError> {
+    let legacy = matches!(&profile, Profile::Scrypt { .. });
+    let valid = match profile {
+        Profile::Argon { encoded, .. } => Argon2::default()
+            .verify_password(password.expose().as_bytes(), encoded.as_str())
+            .is_ok(),
+        Profile::Scrypt {
+            params, salt, key, ..
+        } => {
+            let mut output = Zeroizing::new([0u8; 32]);
+            scrypt::scrypt(password.expose().as_bytes(), &salt, &params, &mut *output)
+                .map_err(|_| invalid(ValidationReason::InvalidAuthority))?;
+            bool::from(output.as_slice().ct_eq(&key))
+        }
+    };
+    // The scrypt call and its memory-hard buffers have returned before rehash.
+    let upgraded_hash = if valid && legacy {
+        Some(canonical_hash(password.expose().as_bytes())?)
+    } else {
+        None
+    };
+    Ok(PasswordVerification {
+        valid,
+        upgraded_hash,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    static KDF_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     #[test]
     fn admission_costs_and_malicious_parameters_are_checked_before_work() {
         let encoded = format!(
@@ -189,6 +194,7 @@ mod tests {
     }
     #[tokio::test]
     async fn canonical_password_roundtrip() {
+        let _serial = KDF_TEST_LOCK.lock().await;
         let encoded = hash(Secret::new("test password".into())).await.unwrap();
         assert!(encoded.starts_with("$argon2id$v=19$m=65536,t=3,p=1$"));
         assert!(
@@ -203,5 +209,115 @@ mod tests {
                 .unwrap()
                 .valid
         );
+    }
+    #[tokio::test]
+    async fn measured_kdf_heap_and_overhead_stay_bounded() {
+        let _serial = KDF_TEST_LOCK.lock().await;
+        // The counter observes the actual synchronous worker on this thread.
+        // Inputs and profile parsing are included; no nested measurement is used.
+        let canonical = allocation_counter::measure(|| {
+            let password = Secret::new("x".repeat(1024));
+            drop(canonical_hash(password.expose().as_bytes()).unwrap());
+        });
+        assert!(
+            (CREDIT..=CREDIT + 1024 * 1024).contains(&canonical.bytes_max),
+            "{canonical:?}"
+        );
+        assert_eq!(canonical.bytes_current, 0);
+        eprintln!("canonical Argon2 heap peak: {} bytes", canonical.bytes_max);
+        let native_password = "native test password";
+        let mut native_key = [0; 32];
+        scrypt::scrypt(
+            native_password.as_bytes(),
+            &[1; 16],
+            &scrypt::Params::new(17, 8, 1).unwrap(),
+            &mut native_key,
+        )
+        .unwrap();
+        let native = format!(
+            "scrypt:17:8:1:{}:{}",
+            STANDARD.encode([1; 16]),
+            STANDARD.encode(native_key)
+        );
+        let profiles=[
+            ("native scrypt then Argon2",native,native_password,2*CREDIT,true),
+            ("maximum scrypt V",format!("scrypt:16:32:1:{}:{}",STANDARD.encode([0;16]),STANDARD.encode([0;32])),"wrong",4*CREDIT,false),
+            ("maximum scrypt B",format!("scrypt:1:32:16:{}:{}",STANDARD.encode([0;16]),STANDARD.encode([0;32])),"wrong",8192,false),
+            ("maximum Argon2", "$argon2id$v=19$m=262144,t=1,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),"wrong",4*CREDIT,false),
+        ];
+        for (name, encoded, password, primary, valid) in profiles {
+            let info = allocation_counter::measure(|| {
+                let profile = Profile::parse(&encoded).unwrap();
+                let result = verify_profile(Secret::new(password.into()), profile).unwrap();
+                assert_eq!(result.valid, valid);
+                if valid {
+                    assert!(result.upgraded_hash.unwrap().starts_with("$argon2id$"));
+                }
+            });
+            assert!(
+                (primary..=primary + 1024 * 1024).contains(&info.bytes_max),
+                "{name}: {info:?}"
+            );
+            assert_eq!(info.bytes_current, 0, "{name}");
+            eprintln!(
+                "{name}: primary={primary} heap_peak={} overhead={}",
+                info.bytes_max,
+                info.bytes_max - primary
+            );
+        }
+        // Inputs and job metadata have hard bounds independently of buffers.
+        assert!(
+            std::mem::size_of::<Profile>()
+                + std::mem::size_of::<OwnedSemaphorePermit>()
+                + 4096
+                + 1024
+                < 16384
+        );
+    }
+    #[tokio::test]
+    async fn mixed_flood_rejects_before_work_and_drop_retains_credits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _serial = KDF_TEST_LOCK.lock().await;
+        let rejected = AtomicUsize::new(0);
+        let argon = "$argon2id$v=19$m=65536,t=3,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let scrypt = format!(
+            "scrypt:17:8:1:{}:{}",
+            STANDARD.encode([0; 16]),
+            STANDARD.encode([0; 32])
+        );
+        let mut attempts = Box::pin(futures_util::future::join_all((0..50).map(|i| {
+            let encoded = if i % 3 == 0 { scrypt.as_str() } else { argon };
+            let rejected = &rejected;
+            async move {
+                let result = verify(Secret::new("wrong".into()), encoded).await;
+                if matches!(
+                    result,
+                    Err(PortError::Domain(DomainError::RateLimited { .. }))
+                ) {
+                    rejected.fetch_add(1, Ordering::SeqCst);
+                }
+                result
+            }
+        })));
+        assert!(futures_util::poll!(&mut attempts).is_pending());
+        assert_eq!(ADMISSION.available_permits(), 0);
+        assert!((46..=48).contains(&rejected.load(Ordering::SeqCst)));
+        eprintln!(
+            "mixed flood: admitted={} rejected={} peak_credits=4",
+            50 - rejected.load(Ordering::SeqCst),
+            rejected.load(Ordering::SeqCst)
+        );
+        drop(attempts);
+        assert!(matches!(
+            hash(Secret::new("new password".into())).await,
+            Err(PortError::Domain(DomainError::RateLimited { .. }))
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while ADMISSION.available_permits() != 4 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

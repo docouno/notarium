@@ -139,6 +139,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocation-counter"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beb9e990c0a33699f1984d85a6abead615ccc72dd8130bf3e15dcabe2ca149c9"
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2861,6 +2867,7 @@ name = "notarium-control"
 version = "1.0.0-dev.0"
 dependencies = [
  "aes-gcm 0.11.1",
+ "allocation-counter",
  "argon2",
  "base64 0.22.1",
  "blake3",
@@ -2894,6 +2901,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "time",
+ "zeroize",
 ]
 
 [[package]]

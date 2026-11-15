@@ -256,7 +256,8 @@ pub trait EventBusPort: Send + Sync {
         after: ChangeCursor,
     ) -> PortFuture<'_, Box<dyn PortStream<SpaceEvent>>>;
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "target", rename_all = "snake_case")]
 pub enum RevocationSelector {
     Principal(PrincipalId),
     Session(AuthSessionId),
@@ -270,7 +271,8 @@ pub enum RevocationSelector {
     },
     Space(SpaceId),
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RevocationReason {
     Logout,
     Expired,
@@ -280,6 +282,8 @@ pub enum RevocationReason {
 }
 pub trait SessionRevocationPort: Send + Sync {
     /// Completion means all admitted registrations and run callbacks are invalidated.
+    /// The service budget's request ID identifies the durable event and remains
+    /// stable across retries, allowing the registry owner to deduplicate delivery.
     fn revoke(
         &self,
         ctx: MaintenanceContext,

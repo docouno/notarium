@@ -1,24 +1,9 @@
 use crate::error::{invalid, unavailable};
+pub use notarium_core::auth::SecretString as Secret;
 use notarium_core::error::{CommitEffect, PortError, ValidationReason};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
-
-pub struct Secret(Zeroizing<String>);
-impl Secret {
-    pub fn new(value: String) -> Self {
-        Self(Zeroizing::new(value))
-    }
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-impl fmt::Debug for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Secret([REDACTED])")
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TokenKind {

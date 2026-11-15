@@ -1,0 +1,442 @@
+use super::{
+    ControlService,
+    authority::*,
+    commands::{Command, SavedResult},
+    provisioning::stage_space,
+};
+use crate::{
+    error::{invalid, unavailable},
+    store::{
+        Transaction,
+        lease::OperationBudget,
+        statements::{execute, rows},
+        target::*,
+    },
+};
+use notarium_core::{
+    DomainError,
+    auth::*,
+    error::{CommitEffect, PortError, ValidationReason},
+    ids::*,
+    model::HistoryScope,
+    ports::{control::*, *},
+    receipt::AccountCommandIdentity,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpaceCursor {
+    version: u8,
+    scope: ContentDigest,
+    last: SpaceId,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreatedSpace {
+    space: SpaceId,
+    operation: RequestId,
+}
+fn membership_command(
+    auth: &EngineAuthContext,
+    scope: &HistoryScope,
+    request: &MembershipChange,
+) -> Result<Command, PortError> {
+    let payload = (scope, &request.member, request.role);
+    let digest = ContentDigest::from_bytes(
+        *blake3::hash(
+            &serde_json::to_vec(&payload).map_err(|_| invalid(ValidationReason::InvalidQuery))?,
+        )
+        .as_bytes(),
+    );
+    Command::new(
+        AccountCommandIdentity {
+            owner: auth.principal().clone(),
+            actor: auth.principal().clone(),
+            key: request.command.clone(),
+            hash: digest,
+            expected: request.expected,
+        },
+        "change-membership",
+        payload,
+    )
+}
+pub(super) fn expect_space(
+    row: &SpaceAdmissionRow,
+    expected: ControlRevision,
+) -> Result<(), PortError> {
+    if row.revision as u64 != expected.get() {
+        return Err(DomainError::ControlRevisionConflict {
+            current: ControlRevision::new(row.revision as u64)?,
+        }
+        .into());
+    }
+    Ok(())
+}
+pub(super) async fn admission(
+    tx: &mut Transaction,
+    space: &SpaceId,
+    lock: bool,
+) -> Result<SpaceAdmissionRow, PortError> {
+    let row = if lock {
+        rows!(tx,SpaceAdmissionRow,fetch_optional,"SELECT * FROM space_admission WHERE space_id=$1","SELECT * FROM v1_control.space_admission WHERE space_id=$1 FOR UPDATE";space.as_str())?
+    } else {
+        rows!(tx,SpaceAdmissionRow,fetch_optional,"SELECT * FROM space_admission WHERE space_id=$1","SELECT * FROM v1_control.space_admission WHERE space_id=$1";space.as_str())?
+    };
+    row.ok_or(DomainError::ResourceNotFound.into())
+}
+pub(super) async fn require_owner(
+    tx: &mut Transaction,
+    auth: &EngineAuthContext,
+    space: &SpaceId,
+) -> Result<(), PortError> {
+    if auth.kind() != &PrincipalKind::DirectHuman
+        || auth
+            .spaces()
+            .get(space)
+            .is_none_or(|grant| grant.role != SpaceRole::Owner)
+    {
+        return Err(access_denied());
+    }
+    let member = rows!(tx,SpaceMembersRow,fetch_optional,"SELECT * FROM space_members WHERE space_id=$1 AND user_id=$2","SELECT * FROM v1_control.space_members WHERE space_id=$1 AND user_id=$2";space.as_str(),auth.principal().as_str())?;
+    if member.is_none_or(|member| member.role != "owner" || member.admission != "active") {
+        return Err(access_denied());
+    }
+    Ok(())
+}
+impl ControlService {
+    pub async fn admit_space_management(
+        &self,
+        ctx: AccountContext,
+        scope: notarium_core::model::HistoryScope,
+    ) -> Result<SpaceContext, PortError> {
+        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
+            return Err(access_denied());
+        }
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let mut tx = self.store.write(budget.clone()).await?;
+        let auth=budget.run(async {
+            let current=user(tx.inner_mut(),ctx.auth().principal().as_str()).await?;
+            self.live_human(tx.inner_mut(),ctx.auth(),&current).await?;
+            let space=admission(tx.inner_mut(),&scope.space_id,false).await?;
+            if !matches!(space.state.as_str(),"active"|"closing"|"archived") {return Err(access_denied());}
+            let member=rows!(tx.inner_mut(),SpaceMembersRow,fetch_optional,"SELECT * FROM space_members WHERE space_id=$1 AND user_id=$2","SELECT * FROM v1_control.space_members WHERE space_id=$1 AND user_id=$2";scope.space_id.as_str(),&current.user_id)?.ok_or_else(access_denied)?;
+            if member.role!="owner" || member.admission!="active" {return Err(access_denied());}
+            let credential=ctx.auth().credential().cloned().ok_or_else(denied)?;
+            let mut spaces=std::collections::BTreeMap::new();
+            let classes=if space.state=="active" {notarium_core::classes::DocClass::all()} else {Default::default()};
+            spaces.insert(scope.space_id.clone(),SpaceGrant{role:SpaceRole::Owner,read_classes:classes.clone(),write_classes:classes,project_root:None});
+            Ok(EngineAuthContext::for_human(VerifiedHuman::attest(ctx.auth().principal().clone(),ctx.auth().grant().clone(),spaces,ctx.auth().has_cap(Cap::AbilityWrite)).with_credential(credential)))
+        },CommitEffect::NotCommitted).await?;
+        budget
+            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let current = budget
+            .run(
+                self.catalog.space(
+                    budget.context(ctx.budget.request.clone()),
+                    scope.space_id.clone(),
+                ),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        current.history.check(&scope)?;
+        SpaceContext::new(auth, scope, budget.context(ctx.budget.request)).map_err(Into::into)
+    }
+    pub async fn whoami(&self, ctx: AccountContext) -> Result<PrincipalInfo, PortError> {
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let mut tx = self.store.write(budget.clone()).await?;
+        let auth = budget
+            .run(
+                self.revalidate(tx.inner_mut(), ctx.auth()),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        budget
+            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        Ok(PrincipalInfo {
+            principal: auth.principal().clone(),
+            kind: auth.kind().clone(),
+            grant: auth.grant().clone(),
+        })
+    }
+    pub async fn list_spaces(
+        &self,
+        ctx: AccountContext,
+        page: ControlPageRequest,
+    ) -> Result<ControlPage<AccessibleSpace>, PortError> {
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let mut tx = self.store.write(budget.clone()).await?;
+        let auth = budget
+            .run(
+                self.revalidate(tx.inner_mut(), ctx.auth()),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        budget
+            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let facts: Vec<_> = auth
+            .spaces()
+            .iter()
+            .map(|(id, grant)| {
+                (
+                    id,
+                    grant.role,
+                    &grant.read_classes,
+                    &grant.write_classes,
+                    &grant.project_root,
+                )
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&(1, "spaces", auth.principal(), auth.grant(), facts))
+            .map_err(|_| invalid(ValidationReason::InvalidState))?;
+        let scope = ContentDigest::from_bytes(*blake3::hash(&bytes).as_bytes());
+        let cursor: Option<SpaceCursor> = page
+            .continuation()
+            .map(|value| {
+                serde_json::from_str(value).map_err(|_| invalid(ValidationReason::InvalidQuery))
+            })
+            .transpose()?;
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.version != 1 || cursor.scope != scope)
+        {
+            return Err(invalid(ValidationReason::CursorStale));
+        }
+        let mut items = Vec::new();
+        let mut continuation = None;
+        for (id, grant) in auth
+            .spaces()
+            .iter()
+            .filter(|(id, _)| cursor.as_ref().is_none_or(|cursor| *id > &cursor.last))
+        {
+            if items.len() == usize::from(page.limit()) {
+                let last: &AccessibleSpace = items.last().expect("positive page limit");
+                continuation = Some(
+                    serde_json::to_string(&SpaceCursor {
+                        version: 1,
+                        scope,
+                        last: last.space.id.clone(),
+                    })
+                    .map_err(|_| invalid(ValidationReason::InvalidState))?,
+                );
+                break;
+            }
+            let current = budget
+                .run(
+                    self.catalog
+                        .space(budget.context(ctx.budget.request.clone()), id.clone()),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            if current.space.id != *id || current.history.space_id != *id {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            if current.space.lifecycle == SpaceLifecycle::Active {
+                items.push(AccessibleSpace {
+                    space: current.space,
+                    role: grant.role,
+                    history: current.history,
+                });
+            }
+        }
+        Ok(ControlPage {
+            items,
+            continuation,
+        })
+    }
+    pub async fn create_space(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<CreateSpace>,
+    ) -> Result<ControlCommit<AccessibleSpace>, PortError> {
+        if request.input.kind != SpaceKind::Shared
+            || request.input.name.is_empty()
+            || request.input.name.len() > 256
+            || request.input.name.contains('\0')
+        {
+            return Err(invalid(ValidationReason::InvalidQuery));
+        }
+        let command = Command::new(
+            request.identity,
+            "create-space",
+            (&request.input.id, request.input.kind, &request.input.name),
+        )?;
+        command.require(ctx.auth().principal(), ctx.auth().principal())?;
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let mut tx = self.store.write(budget.clone()).await?;
+        let (revision,saved)=budget.run(async {
+            let (actor,_)=self.manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
+            if let Some(replay)=command.replay::<CreatedSpace>(tx.inner_mut()).await? {return Ok(replay);}
+            expect_revision(&actor,command.identity.expected)?;
+            let now=self.clock.now_ms()?;
+            let space=request.input.id.clone();
+            let operation=stage_space(tx.inner_mut(),command.identity.clone(),request.input,now).await?;
+            let revision=next(actor.revision)?;
+            execute!(tx.inner_mut(),"UPDATE users SET revision=$1 WHERE user_id=$2","UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";revision,&actor.user_id)?;
+            let revision=ControlRevision::new(revision as u64)?;
+            let saved=SavedResult{value:CreatedSpace{space,operation},events:vec![]};
+            command.save(tx.inner_mut(),revision,&saved,now).await?;
+            Ok((revision,saved))
+        },CommitEffect::NotCommitted).await?;
+        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        let current = self
+            .finish_space_operation(&budget, &saved.value.operation)
+            .await?;
+        if current.space.id != saved.value.space || current.history.space_id != saved.value.space {
+            return Err(unavailable(
+                "control committed Space receipt mismatch",
+                CommitEffect::Unknown,
+            ));
+        }
+        Ok(ControlCommit {
+            revision,
+            value: AccessibleSpace {
+                space: current.space,
+                role: SpaceRole::Owner,
+                history: current.history,
+            },
+        })
+    }
+    pub async fn resume_membership_change(
+        &self,
+        ctx: AccountContext,
+        scope: HistoryScope,
+        request: MembershipChange,
+    ) -> Result<ControlCommit<MembershipResult>, PortError> {
+        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
+            return Err(access_denied());
+        }
+        let command = membership_command(ctx.auth(), &scope, &request)?;
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let mut tx = self.store.write(budget.clone()).await?;
+        let (revision, saved) = budget
+            .run(
+                async {
+                    let actor = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
+                    self.live_human(tx.inner_mut(), ctx.auth(), &actor).await?;
+                    command
+                        .replay::<MembershipResult>(tx.inner_mut())
+                        .await?
+                        .ok_or(DomainError::ResourceNotFound.into())
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        let finish = async {
+            // Only the already committed receipt is resumed. No catalog read,
+            // new membership admission or mutation is needed after self-removal.
+            budget.run(tx.rollback(), CommitEffect::Unknown).await?;
+            if saved.value.space != scope.space_id
+                || saved.value.member != request.member
+                || saved.value.role != request.role
+            {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            for event in &saved.events {
+                self.flush_event(&budget, event).await?;
+            }
+            Ok(ControlCommit {
+                revision,
+                value: saved.value,
+            })
+        }
+        .await;
+        finish.map_err(|_: PortError| {
+            unavailable("control committed membership replay", CommitEffect::Unknown)
+        })
+    }
+    pub async fn change_membership(
+        &self,
+        ctx: SpaceContext,
+        request: MembershipChange,
+    ) -> Result<ControlCommit<MembershipResult>, PortError> {
+        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
+            return Err(access_denied());
+        }
+        let command = membership_command(ctx.auth(), ctx.scope(), &request)?;
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let space = &ctx.scope().space_id;
+        let mut tx = self.store.write(budget.clone()).await?;
+        let observed = budget
+            .run(
+                async {
+                    let actor = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
+                    self.live_human(tx.inner_mut(), ctx.auth(), &actor).await?;
+                    if command
+                        .replay::<MembershipResult>(tx.inner_mut())
+                        .await?
+                        .is_none()
+                    {
+                        require_owner(tx.inner_mut(), ctx.auth(), space).await?;
+                    }
+                    admission(tx.inner_mut(), space, false).await
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        budget
+            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let catalog = budget
+            .run(
+                self.catalog
+                    .space(budget.context(ctx.budget.request.clone()), space.clone()),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        ctx.check_current(&catalog.history)?;
+        if catalog.space.id != *space {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        let mut tx = self.store.write(budget.clone()).await?;
+        let (revision,saved)=budget.run(async {
+            let accounts=rows!(tx.inner_mut(),UsersRow,fetch_all,
+                "SELECT * FROM users WHERE user_id IN ($1,$2) ORDER BY user_id",
+                "SELECT * FROM v1_control.users WHERE user_id IN ($1,$2) ORDER BY user_id FOR UPDATE";ctx.auth().principal().as_str(),request.member.as_str())?;
+            let actor=accounts.iter().find(|user|user.user_id==ctx.auth().principal().as_str()).ok_or_else(denied)?;
+            self.live_human(tx.inner_mut(),ctx.auth(),actor).await?;
+            if let Some(replay)=command.replay::<MembershipResult>(tx.inner_mut()).await? {return Ok(replay);}
+            let target=accounts.iter().find(|user|user.user_id==request.member.as_str()).ok_or(DomainError::ResourceNotFound)?;
+            if request.role.is_some() && target.disabled_at.is_some() {return Err(access_denied());}
+            let current=admission(tx.inner_mut(),space,true).await?;
+            expect_space(&current,request.expected)?;
+            if current.admission_epoch!=observed.admission_epoch || current.state!="active" || catalog.space.lifecycle!=SpaceLifecycle::Active {return Err(invalid(ValidationReason::InvalidState));}
+            require_owner(tx.inner_mut(),ctx.auth(),space).await?;
+            if catalog.space.kind==SpaceKind::Personal && (target.personal_space_id.as_deref()!=Some(space.as_str()) || request.role!=Some(SpaceRole::Owner)) {return Err(access_denied());}
+            let old=rows!(tx.inner_mut(),SpaceMembersRow,fetch_optional,"SELECT * FROM space_members WHERE space_id=$1 AND user_id=$2","SELECT * FROM v1_control.space_members WHERE space_id=$1 AND user_id=$2";space.as_str(),request.member.as_str())?;
+            if old.as_ref().is_some_and(|old|old.role=="owner") && request.role!=Some(SpaceRole::Owner) {
+                let count=rows!(tx.inner_mut(),(i64,),fetch_one,"SELECT count(*) FROM space_members WHERE space_id=$1 AND role='owner' AND admission='active'","SELECT count(*) FROM v1_control.space_members WHERE space_id=$1 AND role='owner' AND admission='active'";space.as_str())?.0;
+                if count<=1 {return Err(access_denied());}
+            }
+            let now=self.clock.now_ms()?;
+            let revision=next(current.revision)?;
+            let epoch=next(current.admission_epoch)?;
+            if let Some(role)=request.role {
+                let role=match role{SpaceRole::Owner=>"owner",SpaceRole::Editor=>"editor",SpaceRole::Viewer=>"viewer"};
+                if let Some(old)=old {
+                    execute!(tx.inner_mut(),"UPDATE space_members SET role=$1,admission='active',revision=$2 WHERE space_id=$3 AND user_id=$4","UPDATE v1_control.space_members SET role=$1,admission='active',revision=$2 WHERE space_id=$3 AND user_id=$4";role,next(old.revision)?,space.as_str(),request.member.as_str())?;
+                } else {
+                    let row=TargetRecord::SpaceMembers(SpaceMembersRow{space_id:space.to_string(),user_id:request.member.to_string(),role:role.into(),admission:"active".into(),revision:0,created_at:now});
+                    row.validate()?;row.insert(tx.inner_mut()).await?;
+                }
+            } else {execute!(tx.inner_mut(),"DELETE FROM space_members WHERE space_id=$1 AND user_id=$2","DELETE FROM v1_control.space_members WHERE space_id=$1 AND user_id=$2";space.as_str(),request.member.as_str())?;}
+            execute!(tx.inner_mut(),"UPDATE space_admission SET revision=$1,admission_epoch=$2 WHERE space_id=$3","UPDATE v1_control.space_admission SET revision=$1,admission_epoch=$2 WHERE space_id=$3";revision,epoch,space.as_str())?;
+            let event=super::outbox::enqueue(tx.inner_mut(),RevocationSelector::Membership{space:space.clone(),principal:request.member.clone()},RevocationReason::PermissionChanged,epoch,now).await?;
+            let revision=ControlRevision::new(revision as u64)?;
+            let saved=SavedResult{value:MembershipResult{space:space.clone(),member:request.member,role:request.role},events:vec![event]};
+            command.save(tx.inner_mut(),revision,&saved,now).await?;
+            Ok((revision,saved))
+        },CommitEffect::NotCommitted).await?;
+        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        for event in &saved.events {
+            self.flush_event(&budget, event).await?;
+        }
+        Ok(ControlCommit {
+            revision,
+            value: saved.value,
+        })
+    }
+}

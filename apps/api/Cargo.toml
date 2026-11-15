@@ -30,6 +30,7 @@ publish = false
 unsafe_code = "deny"
 
 [workspace.dependencies]
+allocation-counter = "0.8.1"
 notarium-core = { path = "crates/notarium-core" }
 notarium-syntax = { path = "crates/notarium-syntax" }
 notarium-control = { path = "crates/notarium-control" }

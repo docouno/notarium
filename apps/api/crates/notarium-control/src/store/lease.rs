@@ -17,12 +17,19 @@ use std::{
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit};
 
 #[derive(Clone)]
-pub(super) struct OperationBudget {
+pub(crate) struct OperationBudget {
     pub started: Instant,
     remaining: Duration,
     cancellation: Cancellation,
 }
 impl OperationBudget {
+    pub fn context(&self, request: notarium_core::ids::RequestId) -> CallBudget {
+        CallBudget {
+            request,
+            cancellation: self.cancellation.clone(),
+            remaining: self.remaining.saturating_sub(self.started.elapsed()),
+        }
+    }
     pub fn new(budget: CallBudget) -> Self {
         Self {
             started: Instant::now(),
@@ -95,7 +102,7 @@ impl LeasedTransaction {
     pub fn inner(&mut self) -> &mut Transaction {
         match self {
             Self::Read(tx) => tx,
-            Self::Write(tx) => &mut tx.inner,
+            Self::Write(tx) => tx.inner_mut(),
         }
     }
     async fn rollback(self) -> Result<(), PortError> {

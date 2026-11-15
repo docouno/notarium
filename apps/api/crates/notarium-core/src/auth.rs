@@ -4,11 +4,42 @@ use crate::{DomainError, DomainResult, classes::DocClass, error::ValidationReaso
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
+
+/// Secrets cross typed service boundaries without Debug or serialization leaks.
+pub struct SecretString(zeroize::Zeroizing<String>);
+impl SecretString {
+    pub fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret([REDACTED])")
+    }
+}
+
+/// Durable lineage attested by the authentication owner. Derived agents retain
+/// this lineage so a later control effect can recheck the original credential.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthenticatedCredential {
+    Session(AuthSessionId),
+    Pat(CredentialTokenId),
+    OAuth {
+        token: CredentialTokenId,
+        grant: OAuthGrantId,
+        family: Option<OAuthFamilyId>,
+    },
+    TrustedNone,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SpaceRole {
@@ -61,6 +92,7 @@ pub struct VerifiedHuman {
     grant: GrantId,
     spaces: BTreeMap<SpaceId, SpaceGrant>,
     ability_write: bool,
+    credential: Option<AuthenticatedCredential>,
 }
 impl VerifiedHuman {
     pub fn attest(
@@ -74,7 +106,12 @@ impl VerifiedHuman {
             grant,
             spaces,
             ability_write: explicitly_authorized_ability_write,
+            credential: None,
         }
+    }
+    pub fn with_credential(mut self, credential: AuthenticatedCredential) -> Self {
+        self.credential = Some(credential);
+        self
     }
 }
 
@@ -108,6 +145,7 @@ pub struct EngineAuthContext {
     write_space: Option<SpaceId>,
     taint: BranchTaint,
     readonly_abilities: BTreeSet<AbilityId>,
+    credential: Option<AuthenticatedCredential>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +175,7 @@ impl EngineAuthContext {
             write_space: None,
             taint: BranchTaint::default(),
             readonly_abilities: BTreeSet::new(),
+            credential: verified.credential,
         }
     }
     pub fn for_agent_run(
@@ -269,8 +308,37 @@ impl EngineAuthContext {
     pub fn principal(&self) -> &PrincipalId {
         &self.principal
     }
+    /// The authentication owner supplies freshly verified durable authority.
+    /// Keep the caller's delegation, project pin, taint and write-Space pin while
+    /// intersecting current permissions; refreshing cannot widen an old context.
+    pub fn intersect_current(&self, current: &Self) -> DomainResult<Self> {
+        if self.principal != current.principal
+            || self.grant != current.grant
+            || self.credential != current.credential
+            || self.credential.is_none()
+        {
+            return Err(DomainError::AuthenticationFailed);
+        }
+        let requested = current
+            .spaces
+            .iter()
+            .filter_map(|(id, fresh)| {
+                self.spaces.get(id).map(|old| {
+                    let mut wanted = fresh.clone();
+                    wanted.project_root = old.project_root.clone();
+                    (id.clone(), wanted)
+                })
+            })
+            .collect();
+        let mut result = self.narrow(requested)?;
+        result.ability_write = self.ability_write && current.ability_write;
+        Ok(result)
+    }
     pub fn grant(&self) -> &GrantId {
         &self.grant
+    }
+    pub fn credential(&self) -> Option<&AuthenticatedCredential> {
+        self.credential.as_ref()
     }
     pub fn kind(&self) -> &PrincipalKind {
         &self.kind
