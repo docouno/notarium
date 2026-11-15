@@ -9,6 +9,7 @@ pub mod changes;
 pub mod codec;
 pub mod config;
 pub mod dialect;
+pub mod domain;
 pub mod runtime;
 pub mod schema;
 pub(crate) mod sql_exec;
@@ -27,6 +28,7 @@ pub use config::{
     default_backup_budget, validate_pg_schema_name,
 };
 pub use dialect::{DataRootOwnerLock, sqlite::observe_sqlite_canonical_witness};
+pub use domain::{RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
 pub use runtime::{
     CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec, SpaceRecord,
     StoredRevisionRecord,

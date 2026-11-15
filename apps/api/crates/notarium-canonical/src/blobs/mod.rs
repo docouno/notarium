@@ -341,6 +341,20 @@ impl crate::CanonicalStore {
         self.inner.blobs.codec_tag()
     }
 
+    pub(crate) fn local_store_arc(&self) -> Option<Arc<LocalBlobStore>> {
+        match &self.inner.blobs {
+            BlobBackendDriver::Local(l) => Some(Arc::clone(l)),
+            BlobBackendDriver::S3(_) => None,
+        }
+    }
+
+    pub(crate) async fn ensure_blob_backend_ready(&self) -> Result<(), PortError> {
+        if let BlobBackendDriver::S3(s3) = &self.inner.blobs {
+            s3.verify_runtime_bucket_mode().await?;
+        }
+        Ok(())
+    }
+
     pub fn prepare_blob(&self, raw: &[u8]) -> Result<PreparedBlobSource, PortError> {
         PreparedBlobSource::prepare(raw, self.blob_codec())
     }
@@ -1520,6 +1534,148 @@ pub(crate) async fn activate_and_bind_blob_ref_tx(
     Ok(())
 }
 
+/// Binds a new `blob_references` row to an already-active catalog digest in `space_id`
+/// (used by metadata-only note revisions such as `MoveNote`, `RenameNote`, `Trash`, `Restore`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn bind_existing_active_blob_ref_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    owner_kind: BlobOwnerKind,
+    owner_id: &str,
+    owner_rev_id: &str,
+    resource_key: &str,
+    digest: ContentDigest,
+    created_seq: SpaceSeq,
+) -> Result<(), PortError> {
+    let now_ms = now_unix_ms()?;
+    let cat_row: Option<(String, String, Option<String>)> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let r = sqlx::query(
+                "SELECT admission_state, blob_state, current_publication_id
+                 FROM blob_catalog WHERE space_id = ? AND content_blake3 = ?",
+            )
+            .bind(space_id.as_str())
+            .bind(digest.as_bytes().as_slice())
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_rebind_cat", err.to_string()))?;
+            r.map(|row| {
+                (
+                    row.get("admission_state"),
+                    row.get("blob_state"),
+                    row.get("current_publication_id"),
+                )
+            })
+        }
+        BackendConn::Postgres(conn) => {
+            let r = sqlx::query(
+                "SELECT admission_state, blob_state, current_publication_id
+                 FROM blob_catalog WHERE space_id = $1 AND content_blake3 = $2",
+            )
+            .bind(space_id.as_str())
+            .bind(digest.as_bytes().as_slice())
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_rebind_cat", err.to_string()))?;
+            r.map(|row| {
+                (
+                    row.get("admission_state"),
+                    row.get("blob_state"),
+                    row.get("current_publication_id"),
+                )
+            })
+        }
+    };
+
+    let Some((admission, blob_state, Some(pub_id))) = cat_row else {
+        return Err(unavailable_retryable(
+            "blob_missing_for_rebind",
+            "existing blob publication missing during metadata revision bind",
+            Duration::from_millis(25),
+        ));
+    };
+    if admission != "open" || blob_state != "active" {
+        return Err(unavailable_retryable(
+            "blob_retiring_on_rebind",
+            "existing blob entered retirement before metadata revision commit",
+            Duration::from_millis(25),
+        ));
+    }
+
+    let inserted = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query(
+            "INSERT OR IGNORE INTO blob_references (
+                space_id, owner_kind, owner_id, owner_rev_id, resource_key,
+                content_blake3, publication_id, created_seq
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(space_id.as_str())
+        .bind(owner_kind.as_db_str())
+        .bind(owner_id)
+        .bind(owner_rev_id)
+        .bind(resource_key)
+        .bind(digest.as_bytes().as_slice())
+        .bind(&pub_id)
+        .bind(created_seq.get() as i64)
+        .execute(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_rebind_blob_ref", err.to_string()))?
+        .rows_affected(),
+        BackendConn::Postgres(conn) => sqlx::query(
+            "INSERT INTO blob_references (
+                space_id, owner_kind, owner_id, owner_rev_id, resource_key,
+                content_blake3, publication_id, created_seq
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (space_id, owner_kind, owner_id, owner_rev_id, resource_key) DO NOTHING",
+        )
+        .bind(space_id.as_str())
+        .bind(owner_kind.as_db_str())
+        .bind(owner_id)
+        .bind(owner_rev_id)
+        .bind(resource_key)
+        .bind(digest.as_bytes().as_slice())
+        .bind(&pub_id)
+        .bind(created_seq.get() as i64)
+        .execute(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_rebind_blob_ref", err.to_string()))?
+        .rows_affected(),
+    };
+
+    let ref_delta = inserted as i64;
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query(
+                "UPDATE blob_catalog
+                 SET ref_count = ref_count + ?, touched_at_ms = ?
+                 WHERE space_id = ? AND content_blake3 = ?",
+            )
+            .bind(ref_delta)
+            .bind(now_ms)
+            .bind(space_id.as_str())
+            .bind(digest.as_bytes().as_slice())
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_rebind_cat_cnt", err.to_string()))?;
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query(
+                "UPDATE blob_catalog
+                 SET ref_count = ref_count + $1, touched_at_ms = $2
+                 WHERE space_id = $3 AND content_blake3 = $4",
+            )
+            .bind(ref_delta)
+            .bind(now_ms)
+            .bind(space_id.as_str())
+            .bind(digest.as_bytes().as_slice())
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_rebind_cat_cnt", err.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Removes all `blob_references` owned by `(owner_kind, owner_id)` and syncs `blob_catalog.ref_count`,
 /// returning affected digests whose `ref_count` dropped to `0`.
 pub(crate) async fn release_owner_blob_refs_tx(
@@ -2014,7 +2170,7 @@ async fn load_s3_manifest_parts_tx(
     Ok(out)
 }
 
-async fn initiate_digest_retirement_tx(
+pub(crate) async fn initiate_digest_retirement_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     active_epoch: LeaseEpoch,

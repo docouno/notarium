@@ -1067,6 +1067,7 @@ impl CanonicalStore {
                         };
 
                     let mut next_seed_pos: Option<SeedPosition> = None;
+                    let mut folder_cache = crate::domain::common::FolderAncestryCache::default();
 
                     if in_notes_phase {
                         let batch_size = (max_items + 16) as i64;
@@ -1142,7 +1143,10 @@ impl CanonicalStore {
                                 // if SpaceContext caller, enforce BOTH current live fence AND snapshot facts!
                                 let Some((live_facts, snap_facts)) =
                                     load_effective_note_resource_facts_tx(
-                                        tx, &space_rec, &note_meta,
+                                        tx,
+                                        &mut folder_cache,
+                                        &space_rec,
+                                        &note_meta,
                                     )
                                     .await?
                                 else {
@@ -1826,11 +1830,18 @@ async fn list_entity_keys_at_or_below_cutoff_tx(
 /// never bypass current live visibility fences while `ClassifiedDocument` preserves historical facts.
 pub(crate) async fn load_effective_note_resource_facts_tx(
     tx: &mut BackendConn<'_>,
+    folder_cache: &mut crate::domain::common::FolderAncestryCache,
     space_rec: &SpaceRecord,
     snap_meta: &NoteRevisionMetadata,
 ) -> Result<Option<(ResourceFacts, ResourceFacts)>, PortError> {
-    let (snap_ancestors, snap_locked) =
-        walk_folder_ancestry_tx(tx, &space_rec.scope.space_id, &snap_meta.parent_folder_id).await?;
+    let snap_anc = folder_cache
+        .load_ancestry_tx(
+            tx,
+            &space_rec.scope.space_id,
+            &snap_meta.parent_folder_id,
+            false,
+        )
+        .await?;
     let snap_facts = ResourceFacts {
         space: Space {
             id: space_rec.space.id.clone(),
@@ -1838,8 +1849,8 @@ pub(crate) async fn load_effective_note_resource_facts_tx(
             kind: space_rec.space.kind,
         },
         class: snap_meta.doc_class,
-        ancestor_folders: snap_ancestors,
-        folder_write_locked: snap_locked,
+        ancestor_folders: snap_anc.ancestors,
+        folder_write_locked: snap_anc.write_locked,
         ability_package: snap_meta.ability_id.clone(),
     };
 
@@ -1899,8 +1910,9 @@ pub(crate) async fn load_effective_note_resource_facts_tx(
                 })?),
                 None => None,
             };
-        let (ancestor_folders, folder_write_locked) =
-            walk_folder_ancestry_tx(tx, &space_rec.scope.space_id, &cur_parent).await?;
+        let cur_anc = folder_cache
+            .load_ancestry_tx(tx, &space_rec.scope.space_id, &cur_parent, false)
+            .await?;
         let live_facts = ResourceFacts {
             space: Space {
                 id: space_rec.space.id.clone(),
@@ -1908,41 +1920,12 @@ pub(crate) async fn load_effective_note_resource_facts_tx(
                 kind: space_rec.space.kind,
             },
             class: cur_class,
-            ancestor_folders,
-            folder_write_locked,
+            ancestor_folders: cur_anc.ancestors,
+            folder_write_locked: cur_anc.write_locked,
             ability_package: cur_ability,
         };
         Ok(Some((live_facts, snap_facts)))
     } else {
         Ok(Some((snap_facts.clone(), snap_facts)))
     }
-}
-
-pub(crate) async fn walk_folder_ancestry_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
-    start_folder: &FolderId,
-) -> Result<(Vec<FolderId>, bool), PortError> {
-    let mut ancestors = Vec::new();
-    let mut write_locked = false;
-    let mut cursor = Some(start_folder.clone());
-    let mut hops = 0usize;
-
-    while let Some(fid) = cursor {
-        hops += 1;
-        if hops > 512 {
-            return Err(internal_not_committed(
-                "folder_ancestry_cycle",
-                "folder hierarchy exceeded 512 hops",
-            ));
-        }
-        let row = crate::runtime::load_folder_head_row(tx, space_id, &fid).await?;
-        if row.write_locked {
-            write_locked = true;
-        }
-        ancestors.push(fid);
-        cursor = row.parent_folder_id;
-    }
-
-    Ok((ancestors, write_locked))
 }

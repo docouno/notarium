@@ -72,6 +72,12 @@ pub(crate) struct CanonicalInner {
     pub writer_coord: OnceLock<Arc<WriteCoordinator>>,
     pub wal_coord: OnceLock<Arc<SqliteWalCoordinator>>,
     pub broadcast_hub: BroadcastHub,
+    pub board_provider: OnceLock<(
+        notarium_core::ports::BoardPlannerAuthority,
+        Arc<dyn notarium_core::ports::BoardMutationFactsProvider>,
+    )>,
+    pub collab_interceptor: OnceLock<Arc<dyn notarium_core::ports::LiveCollabInterceptor>>,
+    pub room_fences: Arc<crate::domain::RoomFenceTable>,
     pub shutting_down: AtomicBool,
     pub owner_locks: Mutex<Vec<DataRootOwnerLock>>,
 }
@@ -250,6 +256,9 @@ impl CanonicalRuntime {
             writer_coord: OnceLock::new(),
             wal_coord: OnceLock::new(),
             broadcast_hub: BroadcastHub::new(DEFAULT_BROADCAST_CAPACITY),
+            board_provider: OnceLock::new(),
+            collab_interceptor: OnceLock::new(),
+            room_fences: Arc::new(crate::domain::RoomFenceTable::default()),
             shutting_down: AtomicBool::new(false),
             owner_locks: Mutex::new(locks),
         });
@@ -279,12 +288,12 @@ impl CanonicalRuntime {
             let _ = inner.wal_coord.set(wal);
         }
 
-        Ok((
-            CanonicalStore {
-                inner: Arc::clone(&inner),
-            },
-            Self { inner },
-        ))
+        let store = CanonicalStore {
+            inner: Arc::clone(&inner),
+        };
+        crate::domain::purge::resume_pending_purges_on_startup(&store).await?;
+
+        Ok((store, Self { inner }))
     }
 
     pub fn witness(&self) -> &DatabaseWitness {
@@ -326,6 +335,12 @@ impl CanonicalRuntime {
 impl CanonicalStore {
     pub fn installation_id(&self) -> &InstallationId {
         &self.inner.config.installation_id
+    }
+
+    pub async fn read_space(&self, space_id: &SpaceId) -> Result<SpaceRecord, PortError> {
+        let sid = space_id.clone();
+        self.with_read_tx(|tx| Box::pin(async move { load_space_record(tx, &sid).await }))
+            .await
     }
 
     /// Commits an explicit CAS reference claim through `WriteBatchActor`, ensuring local directory `fsync`
@@ -559,6 +574,30 @@ impl CanonicalStore {
                         .fetch_one(&mut **conn)
                         .await
                         .map_err(|err| internal_not_committed("diag_pg_read", err.to_string())),
+                }
+            })
+        })
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn execute_diagnostic_write_sql_for_test(&self, sql: &str) -> Result<u64, PortError> {
+        let owned = sql.to_owned();
+        self.with_write_tx(|tx| {
+            Box::pin(async move {
+                match tx {
+                    BackendConn::Sqlite(conn) => sqlx::query(sqlx::AssertSqlSafe(owned))
+                        .execute(&mut **conn)
+                        .await
+                        .map(|r| r.rows_affected())
+                        .map_err(|err| {
+                            internal_not_committed("diag_sqlite_write", err.to_string())
+                        }),
+                    BackendConn::Postgres(conn) => sqlx::query(sqlx::AssertSqlSafe(owned))
+                        .execute(&mut **conn)
+                        .await
+                        .map(|r| r.rows_affected())
+                        .map_err(|err| internal_not_committed("diag_pg_write", err.to_string())),
                 }
             })
         })
@@ -984,9 +1023,23 @@ impl CanonicalStore {
                 if parent_id == spec_cl.folder_id {
                     return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
                 }
+                if spec_cl.is_project && parent_id != space_rec.root_folder_id {
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                }
 
-                // Verify parent exists in THIS Space and is Active (rejects cross-Space parent IDs!).
+                // Verify parent exists in THIS Space, is Active, and stays within MAX_FOLDER_DEPTH (256).
                 ensure_active_folder_in_space(tx, &spec_cl.scope.space_id, &parent_id).await?;
+                let parent_anc = crate::domain::common::load_folder_ancestry_tx(
+                    tx,
+                    &spec_cl.scope.space_id,
+                    &parent_id,
+                    true,
+                )
+                .await?;
+                let parent_depth = parent_anc.ancestors.len().saturating_sub(1);
+                if parent_depth + 1 > crate::domain::common::MAX_FOLDER_DEPTH {
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                }
 
                 // Check folder_id uniqueness and active sibling Unicode NFC+casefold collision.
                 if folder_exists_in_space(tx, &spec_cl.scope.space_id, &spec_cl.folder_id).await?

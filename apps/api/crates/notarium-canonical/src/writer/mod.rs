@@ -91,6 +91,7 @@ pub struct ItemExecCtx {
     effective_cut_before: SpaceSeq,
     current_seq: SpaceSeq,
     allocated_count: u64,
+    receipt_status: &'static str,
     pending_dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
 }
@@ -106,6 +107,11 @@ impl ItemExecCtx {
 
     pub fn allocated_count(&self) -> u64 {
         self.allocated_count
+    }
+
+    /// Marks this command's initial `command_receipts` row as `'pending_purge'` during Step 1 of D2 Purge/MintAndPurge.
+    pub(crate) fn mark_receipt_pending_purge(&mut self) {
+        self.receipt_status = "pending_purge";
     }
 
     /// Validates up front that allocating `count` contiguous sequences will not overflow `SpaceSeq::MAX`,
@@ -160,10 +166,20 @@ pub struct PreparedWriteIntent {
     pub execute: ItemExecuteFn,
 }
 
-struct QueuedWriteItem {
-    intent: PreparedWriteIntent,
-    staged_bytes_reserved: u64,
-    reply_tx: oneshot::Sender<Result<Vec<u8>, PortError>>,
+type BatchGroupReply = Result<(Vec<Result<Vec<u8>, PortError>>, SpaceSeq), PortError>;
+
+enum QueuedWriteEntry {
+    Single {
+        intent: PreparedWriteIntent,
+        staged_bytes_reserved: u64,
+        reply_tx: oneshot::Sender<Result<Vec<u8>, PortError>>,
+    },
+    Group {
+        space_id: SpaceId,
+        intents: Vec<PreparedWriteIntent>,
+        staged_bytes_reserved: u64,
+        reply_tx: oneshot::Sender<BatchGroupReply>,
+    },
 }
 
 /// Deterministic fault hooks used only by L3/L5 adversarial tests; zero overhead in production.
@@ -258,7 +274,7 @@ pub struct WriterSafePointGuard {
 
 enum CoordinatorMode {
     Sqlite {
-        tx: Mutex<Option<mpsc::Sender<QueuedWriteItem>>>,
+        tx: Mutex<Option<mpsc::Sender<QueuedWriteEntry>>>,
         worker: Mutex<Option<JoinHandle<()>>>,
     },
     Postgres {
@@ -267,7 +283,7 @@ enum CoordinatorMode {
 }
 
 struct SpaceQueueHandle {
-    tx: mpsc::Sender<QueuedWriteItem>,
+    tx: mpsc::Sender<QueuedWriteEntry>,
     worker: JoinHandle<()>,
 }
 
@@ -405,7 +421,7 @@ impl WriteCoordinator {
 
         let (reply_tx, reply_rx) = oneshot::channel();
         // Once sent through `permit.send(...)`, the item is admitted: caller drop/cancel NEVER aborts commit!
-        permit.send(QueuedWriteItem {
+        permit.send(QueuedWriteEntry::Single {
             intent,
             staged_bytes_reserved: reserved_bytes,
             reply_tx,
@@ -429,11 +445,111 @@ impl WriteCoordinator {
         }
     }
 
+    /// Enqueues an ordered group of prepared intents for a single Space (`AcceptBatch` / `LinkMany`)
+    /// so all items execute sequentially in input order inside one outer transaction with per-item `SAVEPOINT`s.
+    pub(crate) async fn submit_batch_raw(
+        &self,
+        inner: &Arc<CanonicalInner>,
+        budget: &CallBudget,
+        space_id: &SpaceId,
+        intents: Vec<PreparedWriteIntent>,
+    ) -> Result<(Vec<Result<Vec<u8>, PortError>>, SpaceSeq), PortError> {
+        if budget.cancellation.is_cancelled() {
+            return Err(cancelled_not_committed(
+                "writer_cancelled_pre_enqueue",
+                "batch write cancelled prior to mailbox admission",
+            ));
+        }
+        if budget.remaining.is_zero() {
+            return Err(deadline_not_committed(
+                "writer_deadline_zero_pre_enqueue",
+                "batch write call budget expired prior to mailbox admission",
+            ));
+        }
+        if !self.accepting.load(Ordering::SeqCst) || inner.shutting_down.load(Ordering::SeqCst) {
+            return Err(unavailable_retryable(
+                "writer_shutting_down",
+                "canonical WriteBatchActor is draining for shutdown",
+                Duration::from_millis(100),
+            ));
+        }
+
+        let total_staged: u64 = intents
+            .iter()
+            .fold(0u64, |acc, it| acc.saturating_add(it.staged_bytes));
+        let reserved_bytes = self.byte_limiter.acquire(total_staged, budget).await?;
+
+        let sender = match self.sender_for_space(inner, space_id).await {
+            Ok(s) => s,
+            Err(err) => {
+                self.byte_limiter.release(reserved_bytes);
+                return Err(err);
+            }
+        };
+
+        let enqueue_deadline = tokio::time::Instant::now() + budget.remaining;
+        let permit = tokio::select! {
+            res = sender.reserve() => match res {
+                Ok(p) => p,
+                Err(_) => {
+                    self.byte_limiter.release(reserved_bytes);
+                    return Err(unavailable_retryable(
+                        "writer_channel_closed",
+                        "canonical WriteBatchActor channel closed",
+                        Duration::from_millis(100),
+                    ));
+                }
+            },
+            _ = tokio::time::sleep_until(enqueue_deadline) => {
+                self.byte_limiter.release(reserved_bytes);
+                return Err(deadline_not_committed(
+                    "writer_mailbox_enqueue_deadline",
+                    "write deadline exceeded waiting for mailbox slot",
+                ));
+            }
+        };
+
+        if budget.cancellation.is_cancelled() {
+            drop(permit);
+            self.byte_limiter.release(reserved_bytes);
+            return Err(cancelled_not_committed(
+                "writer_cancelled_before_commit_handoff",
+                "batch write cancelled prior to permit handoff",
+            ));
+        }
+
+        let all_idempotent = intents.iter().all(|i| i.idempotency.is_some());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        permit.send(QueuedWriteEntry::Group {
+            space_id: space_id.clone(),
+            intents,
+            staged_bytes_reserved: reserved_bytes,
+            reply_tx,
+        });
+
+        match reply_rx.await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                if all_idempotent {
+                    Err(unknown_commit_outcome(
+                        "writer_worker_dropped_batch_reply",
+                        "batch worker dropped group reply channel after admission",
+                    ))
+                } else {
+                    Err(unknown_commit_non_idempotent(
+                        "writer_worker_dropped_batch_reply",
+                        "batch worker dropped group reply channel after admission",
+                    ))
+                }
+            }
+        }
+    }
+
     async fn sender_for_space(
         &self,
         inner: &Arc<CanonicalInner>,
         space_id: &SpaceId,
-    ) -> Result<mpsc::Sender<QueuedWriteItem>, PortError> {
+    ) -> Result<mpsc::Sender<QueuedWriteEntry>, PortError> {
         match &self.mode {
             CoordinatorMode::Sqlite { tx, .. } => {
                 let guard = tx.lock().await;
@@ -527,6 +643,36 @@ impl crate::CanonicalStore {
             .map_err(|err| internal_not_committed("decode_writer_command_outcome", err.to_string()))
     }
 
+    /// Submits an ordered group of item intents for a single Space (`AcceptBatch` / `LinkMany`)
+    /// so all items run in input order with per-item `SAVEPOINT`s inside one outer transaction.
+    pub(crate) async fn submit_write_batch<R>(
+        &self,
+        budget: &CallBudget,
+        space_id: &SpaceId,
+        intents: Vec<PreparedWriteIntent>,
+    ) -> Result<(Vec<Result<R, PortError>>, SpaceSeq), PortError>
+    where
+        R: Serialize + DeserializeOwned + Send + 'static,
+    {
+        let writer = self.inner.writer()?;
+        let (raw_items, effective_cut) = writer
+            .submit_batch_raw(&self.inner, budget, space_id, intents)
+            .await?;
+        let mut decoded = Vec::with_capacity(raw_items.len());
+        for raw_res in raw_items {
+            match raw_res {
+                Ok(bytes) => {
+                    let val = rmp_serde::from_slice(&bytes).map_err(|err| {
+                        internal_not_committed("decode_writer_batch_item_outcome", err.to_string())
+                    })?;
+                    decoded.push(Ok(val));
+                }
+                Err(err) => decoded.push(Err(err)),
+            }
+        }
+        Ok((decoded, effective_cut))
+    }
+
     /// Helper to encode a typed command response into both `receipt_response_blob` and `response_bytes`.
     pub fn encode_command_outcome<R: Serialize>(outcome: &R) -> Result<Vec<u8>, PortError> {
         rmp_serde::to_vec_named(outcome)
@@ -544,9 +690,37 @@ impl crate::CanonicalStore {
     }
 }
 
+fn entry_logical_len(entry: &QueuedWriteEntry) -> usize {
+    match entry {
+        QueuedWriteEntry::Single { .. } => 1,
+        QueuedWriteEntry::Group { intents, .. } => intents.len().max(1),
+    }
+}
+
+fn reject_queued_entry(entry: QueuedWriteEntry, byte_limiter: &StagedByteLimiter, err: PortError) {
+    match entry {
+        QueuedWriteEntry::Single {
+            staged_bytes_reserved,
+            reply_tx,
+            ..
+        } => {
+            byte_limiter.release(staged_bytes_reserved);
+            let _ = reply_tx.send(Err(err));
+        }
+        QueuedWriteEntry::Group {
+            staged_bytes_reserved,
+            reply_tx,
+            ..
+        } => {
+            byte_limiter.release(staged_bytes_reserved);
+            let _ = reply_tx.send(Err(err));
+        }
+    }
+}
+
 async fn run_batch_worker_loop(
     inner_weak: std::sync::Weak<CanonicalInner>,
-    mut rx: mpsc::Receiver<QueuedWriteItem>,
+    mut rx: mpsc::Receiver<QueuedWriteEntry>,
     cfg: WriterConfig,
     byte_limiter: Arc<StagedByteLimiter>,
     commit_gate: Arc<RwLock<()>>,
@@ -556,26 +730,33 @@ async fn run_batch_worker_loop(
     let flush_window = cfg.batch_flush_window;
 
     while let Some(first) = rx.recv().await {
+        let mut item_count = entry_logical_len(&first);
         let mut batch = Vec::with_capacity(max_items.min(64));
         batch.push(first);
 
-        // Drain any immediately queued items without waiting.
-        while batch.len() < max_items {
+        // Drain any immediately queued entries without waiting (never splitting a Group).
+        while item_count < max_items {
             match rx.try_recv() {
-                Ok(item) => batch.push(item),
+                Ok(entry) => {
+                    item_count += entry_logical_len(&entry);
+                    batch.push(entry);
+                }
                 Err(_) => break,
             }
         }
 
         // Coalesce micro-batch up to `flush_window` (1.5 ms) or `max_items` (64), never stalling for min 8!
-        if batch.len() < max_items && !flush_window.is_zero() {
+        if item_count < max_items && !flush_window.is_zero() {
             let deadline = tokio::time::Instant::now() + flush_window;
-            while batch.len() < max_items {
+            while item_count < max_items {
                 tokio::select! {
                     biased;
-                    maybe_item = rx.recv() => {
-                        match maybe_item {
-                            Some(item) => batch.push(item),
+                    maybe_entry = rx.recv() => {
+                        match maybe_entry {
+                            Some(entry) => {
+                                item_count += entry_logical_len(&entry);
+                                batch.push(entry);
+                            }
                             None => break,
                         }
                     }
@@ -585,13 +766,16 @@ async fn run_batch_worker_loop(
         }
 
         let Some(inner) = inner_weak.upgrade() else {
-            for item in batch {
-                byte_limiter.release(item.staged_bytes_reserved);
-                let _ = item.reply_tx.send(Err(unavailable_retryable(
-                    "canonical_runtime_dropped",
-                    "canonical runtime dropped before batch execution",
-                    Duration::from_millis(100),
-                )));
+            for entry in batch {
+                reject_queued_entry(
+                    entry,
+                    &byte_limiter,
+                    unavailable_retryable(
+                        "canonical_runtime_dropped",
+                        "canonical runtime dropped before batch execution",
+                        Duration::from_millis(100),
+                    ),
+                );
             }
             break;
         };
@@ -621,9 +805,21 @@ enum ItemOutcomeSlot {
     Failed(PortError),
 }
 
+enum ReplyTarget {
+    Single {
+        reply_tx: oneshot::Sender<Result<Vec<u8>, PortError>>,
+    },
+    Group {
+        space_id: SpaceId,
+        count: usize,
+        all_idempotent: bool,
+        reply_tx: oneshot::Sender<BatchGroupReply>,
+    },
+}
+
 async fn flush_single_batch(
     inner: &Arc<CanonicalInner>,
-    batch: Vec<QueuedWriteItem>,
+    batch: Vec<QueuedWriteEntry>,
     cfg: WriterConfig,
     byte_limiter: &StagedByteLimiter,
     faults: &WriterFaultState,
@@ -633,13 +829,40 @@ async fn flush_single_batch(
     };
 
     let mut reserved_list = Vec::with_capacity(batch.len());
-    let mut reply_senders = Vec::with_capacity(batch.len());
+    let mut reply_targets = Vec::with_capacity(batch.len());
+    let mut group_spaces = Vec::new();
     let mut intents = Vec::with_capacity(batch.len());
 
-    for item in batch {
-        reserved_list.push(item.staged_bytes_reserved);
-        reply_senders.push(item.reply_tx);
-        intents.push(item.intent);
+    for entry in batch {
+        match entry {
+            QueuedWriteEntry::Single {
+                intent,
+                staged_bytes_reserved,
+                reply_tx,
+            } => {
+                reserved_list.push(staged_bytes_reserved);
+                reply_targets.push(ReplyTarget::Single { reply_tx });
+                intents.push(intent);
+            }
+            QueuedWriteEntry::Group {
+                space_id,
+                intents: group_intents,
+                staged_bytes_reserved,
+                reply_tx,
+            } => {
+                let count = group_intents.len();
+                let all_idempotent = group_intents.iter().all(|it| it.idempotency.is_some());
+                reserved_list.push(staged_bytes_reserved);
+                group_spaces.push(space_id.clone());
+                reply_targets.push(ReplyTarget::Group {
+                    space_id,
+                    count,
+                    all_idempotent,
+                    reply_tx,
+                });
+                intents.extend(group_intents);
+            }
+        }
     }
 
     let exec_result = match &inner.sql {
@@ -648,7 +871,8 @@ async fn flush_single_batch(
             match guard.as_mut() {
                 Some(conn) => {
                     let mut backend = BackendConn::Sqlite(conn);
-                    execute_batch_on_conn(&store, &mut backend, intents, cfg, faults).await
+                    execute_batch_on_conn(&store, &mut backend, intents, &group_spaces, cfg, faults)
+                        .await
                 }
                 None => BatchExecOutcome::AbortedBeforeCommit(unavailable_retryable(
                     "sqlite_writer_closed",
@@ -661,7 +885,8 @@ async fn flush_single_batch(
             Ok(mut pooled) => {
                 let conn: &mut sqlx::PgConnection = &mut pooled;
                 let mut backend = BackendConn::Postgres(conn);
-                execute_batch_on_conn(&store, &mut backend, intents, cfg, faults).await
+                execute_batch_on_conn(&store, &mut backend, intents, &group_spaces, cfg, faults)
+                    .await
             }
             Err(err) => BatchExecOutcome::AbortedBeforeCommit(unavailable_retryable(
                 "pg_acquire_batch_conn",
@@ -676,46 +901,139 @@ async fn flush_single_batch(
     }
 
     match exec_result {
-        BatchExecOutcome::Committed(slots) => {
-            for (tx, slot) in reply_senders.into_iter().zip(slots) {
-                let res = match slot {
-                    ItemOutcomeSlot::Succeeded { response_bytes, .. } => Ok(response_bytes),
-                    ItemOutcomeSlot::Failed(err) => Err(err),
-                };
-                let _ = tx.send(res);
+        BatchExecOutcome::Committed {
+            slots,
+            space_effective_cuts,
+        } => {
+            let mut slot_iter = slots.into_iter();
+            for target in reply_targets {
+                match target {
+                    ReplyTarget::Single { reply_tx } => {
+                        if let Some(slot) = slot_iter.next() {
+                            let res = match slot {
+                                ItemOutcomeSlot::Succeeded { response_bytes, .. } => {
+                                    Ok(response_bytes)
+                                }
+                                ItemOutcomeSlot::Failed(err) => Err(err),
+                            };
+                            let _ = reply_tx.send(res);
+                        }
+                    }
+                    ReplyTarget::Group {
+                        space_id,
+                        count,
+                        reply_tx,
+                        ..
+                    } => {
+                        match space_effective_cuts.get(&space_id).copied() {
+                            Some(cut) => {
+                                let mut group_res = Vec::with_capacity(count);
+                                for _ in 0..count {
+                                    if let Some(slot) = slot_iter.next() {
+                                        let res = match slot {
+                                            ItemOutcomeSlot::Succeeded {
+                                                response_bytes, ..
+                                            } => Ok(response_bytes),
+                                            ItemOutcomeSlot::Failed(err) => Err(err),
+                                        };
+                                        group_res.push(res);
+                                    }
+                                }
+                                let _ = reply_tx.send(Ok((group_res, cut)));
+                            }
+                            None => {
+                                // Space does not exist! Drain group slots and fail closed.
+                                for _ in 0..count {
+                                    let _ = slot_iter.next();
+                                }
+                                let _ = reply_tx.send(Err(DomainError::ResourceNotFound.into()));
+                            }
+                        }
+                    }
+                }
             }
         }
         BatchExecOutcome::UnknownCommit { slots, diag_reason } => {
-            for (tx, slot) in reply_senders.into_iter().zip(slots) {
-                let res = match slot {
-                    ItemOutcomeSlot::Succeeded {
-                        has_idempotency, ..
-                    } => {
-                        if has_idempotency {
-                            Err(unknown_commit_outcome("batch_commit_unknown", &diag_reason))
-                        } else {
-                            Err(unknown_commit_non_idempotent(
-                                "batch_commit_unknown_non_idemp",
-                                &diag_reason,
-                            ))
+            let mut slot_iter = slots.into_iter();
+            for target in reply_targets {
+                match target {
+                    ReplyTarget::Single { reply_tx } => {
+                        if let Some(slot) = slot_iter.next() {
+                            let res = match slot {
+                                ItemOutcomeSlot::Succeeded {
+                                    has_idempotency, ..
+                                } => {
+                                    if has_idempotency {
+                                        Err(unknown_commit_outcome(
+                                            "batch_commit_unknown",
+                                            &diag_reason,
+                                        ))
+                                    } else {
+                                        Err(unknown_commit_non_idempotent(
+                                            "batch_commit_unknown_non_idemp",
+                                            &diag_reason,
+                                        ))
+                                    }
+                                }
+                                ItemOutcomeSlot::Failed(err) => Err(err),
+                            };
+                            let _ = reply_tx.send(res);
                         }
                     }
-                    // Savepoints rolled back before COMMIT definitely did not commit!
-                    ItemOutcomeSlot::Failed(err) => Err(err),
-                };
-                let _ = tx.send(res);
+                    ReplyTarget::Group {
+                        count,
+                        all_idempotent,
+                        reply_tx,
+                        ..
+                    } => {
+                        let mut any_succeeded = false;
+                        for _ in 0..count {
+                            if let Some(ItemOutcomeSlot::Succeeded { .. }) = slot_iter.next() {
+                                any_succeeded = true;
+                            }
+                        }
+                        if !any_succeeded {
+                            // Zero items succeeded in the group -> zero durable effects!
+                            let _ = reply_tx.send(Err(unavailable_retryable(
+                                "batch_commit_aborted_zero_group_effects",
+                                &diag_reason,
+                                Duration::from_millis(25),
+                            )));
+                        } else if all_idempotent {
+                            let _ = reply_tx.send(Err(unknown_commit_outcome(
+                                "batch_commit_unknown",
+                                &diag_reason,
+                            )));
+                        } else {
+                            let _ = reply_tx.send(Err(unknown_commit_non_idempotent(
+                                "batch_commit_unknown_non_idemp",
+                                &diag_reason,
+                            )));
+                        }
+                    }
+                }
             }
         }
         BatchExecOutcome::AbortedBeforeCommit(err) => {
-            for tx in reply_senders {
-                let _ = tx.send(Err(err.clone()));
+            for target in reply_targets {
+                match target {
+                    ReplyTarget::Single { reply_tx } => {
+                        let _ = reply_tx.send(Err(err.clone()));
+                    }
+                    ReplyTarget::Group { reply_tx, .. } => {
+                        let _ = reply_tx.send(Err(err.clone()));
+                    }
+                }
             }
         }
     }
 }
 
 enum BatchExecOutcome {
-    Committed(Vec<ItemOutcomeSlot>),
+    Committed {
+        slots: Vec<ItemOutcomeSlot>,
+        space_effective_cuts: BTreeMap<SpaceId, SpaceSeq>,
+    },
     UnknownCommit {
         slots: Vec<ItemOutcomeSlot>,
         diag_reason: String,
@@ -727,6 +1045,7 @@ async fn execute_batch_on_conn(
     store: &crate::CanonicalStore,
     tx: &mut BackendConn<'_>,
     intents: Vec<PreparedWriteIntent>,
+    group_spaces: &[SpaceId],
     cfg: WriterConfig,
     faults: &WriterFaultState,
 ) -> BatchExecOutcome {
@@ -749,6 +1068,32 @@ async fn execute_batch_on_conn(
     };
     let receipt_ttl_ms = i64::try_from(cfg.receipt_ttl.as_millis()).unwrap_or(86_400_000);
     let expires_at_ms = committed_at_ms.saturating_add(receipt_ttl_ms);
+
+    for gspace in group_spaces {
+        if !space_states.contains_key(gspace) {
+            match lock_and_load_space_outer_tx(tx, gspace).await {
+                Ok(Some(rec)) => {
+                    let init_seq = rec.last_seq;
+                    space_states.insert(
+                        gspace.clone(),
+                        SpaceBatchEntry::Loaded {
+                            record: Box::new(rec),
+                            persisted_initial_seq: init_seq,
+                            effective_cut: init_seq,
+                            max_purge_seq: None,
+                        },
+                    );
+                }
+                Ok(None) => {
+                    space_states.insert(gspace.clone(), SpaceBatchEntry::Missing);
+                }
+                Err(err) => {
+                    tx.rollback_best_effort().await;
+                    return BatchExecOutcome::AbortedBeforeCommit(err);
+                }
+            }
+        }
+    }
 
     for (idx, intent) in intents.into_iter().enumerate() {
         let space_id = intent.scope.space_id.clone();
@@ -886,32 +1231,34 @@ async fn execute_batch_on_conn(
     match tx.commit_write().await {
         Ok(()) => {
             drop(batch_retained_tickets);
+            let mut space_effective_cuts = BTreeMap::new();
             // Publish broadcast hints strictly AFTER confirmed SQL durability!
-            for entry in space_states.values() {
+            for (sid, entry) in &space_states {
                 if let SpaceBatchEntry::Loaded {
                     record,
                     persisted_initial_seq,
                     effective_cut,
                     max_purge_seq,
                 } = entry
-                    && *effective_cut > *persisted_initial_seq
                 {
-                    if let Some(pseq) = max_purge_seq {
+                    space_effective_cuts.insert(sid.clone(), *effective_cut);
+                    if *effective_cut > *persisted_initial_seq {
+                        if let Some(pseq) = max_purge_seq {
+                            store.inner.broadcast_hub.publish(
+                                crate::changes::BroadcastSignal::Purged {
+                                    scope: record.scope.clone(),
+                                    purged_through_seq: *pseq,
+                                    current_safe_cut: *effective_cut,
+                                },
+                            );
+                        }
                         store.inner.broadcast_hub.publish(
-                            crate::changes::BroadcastSignal::Purged {
+                            crate::changes::BroadcastSignal::Committed {
                                 scope: record.scope.clone(),
-                                purged_through_seq: *pseq,
-                                current_safe_cut: *effective_cut,
+                                new_last_seq: *effective_cut,
                             },
                         );
                     }
-                    store
-                        .inner
-                        .broadcast_hub
-                        .publish(crate::changes::BroadcastSignal::Committed {
-                            scope: record.scope.clone(),
-                            new_last_seq: *effective_cut,
-                        });
                 }
             }
             if faults
@@ -923,7 +1270,10 @@ async fn execute_batch_on_conn(
                     diag_reason: "fault_injected_commit_response_loss".to_owned(),
                 };
             }
-            BatchExecOutcome::Committed(slots)
+            BatchExecOutcome::Committed {
+                slots,
+                space_effective_cuts,
+            }
         }
         Err(commit_err) => {
             drop(batch_retained_tickets);
@@ -965,14 +1315,8 @@ async fn execute_single_item_in_savepoint(
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
 
-    // 2. Purge fence check on all declared source note identities.
-    for note_id in &intent.source_note_ids {
-        if is_note_purge_fenced_tx(tx, &intent.scope.space_id, note_id.as_str()).await? {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-    }
-
-    // 3. Idempotent command receipt lookup (`command_receipts`) BEFORE stale head CAS!
+    // 2. Idempotent command receipt lookup (`command_receipts`) BEFORE purge fence and stale head CAS
+    //    so idempotent retries of Purge / MintAndPurge replay their sanitized receipt rather than ResourceNotFound!
     if let Some(idemp) = &intent.idempotency
         && let Some(existing) = lookup_command_receipt_tx(tx, &intent.scope, idemp).await?
     {
@@ -994,6 +1338,13 @@ async fn execute_single_item_in_savepoint(
                 Duration::from_millis(25),
             )),
         };
+    }
+
+    // 3. Purge fence check on all declared source note identities.
+    for note_id in &intent.source_note_ids {
+        if is_note_purge_fenced_tx(tx, &intent.scope.space_id, note_id.as_str()).await? {
+            return Err(DomainError::ResourceNotFound.into());
+        }
     }
 
     // 4. Intra-batch semantic snapshot cut check against `current_effective_cut` (NOT stale pre-batch `last_seq`!).
@@ -1018,6 +1369,7 @@ async fn execute_single_item_in_savepoint(
         effective_cut_before: current_effective_cut,
         current_seq: current_effective_cut,
         allocated_count: 0,
+        receipt_status: "completed",
         pending_dir_syncs: PendingDirSyncs::default(),
         retained_tickets: Vec::new(),
     };
@@ -1082,10 +1434,11 @@ async fn execute_single_item_in_savepoint(
     .await?;
 
     if let Some(idemp) = &intent.idempotency {
-        insert_completed_receipt_tx(
+        insert_receipt_tx(
             tx,
             &intent.scope,
             idemp,
+            item_ctx.receipt_status,
             last_seq,
             artifacts.receipt_detail_blob.as_deref(),
             &artifacts.receipt_sanitized_blob,
@@ -1133,15 +1486,15 @@ async fn lock_and_load_space_outer_tx(
     }
 }
 
-struct StoredReceiptRow {
-    command_hash: ContentDigest,
-    status: String,
-    response_blob: Vec<u8>,
+pub(crate) struct StoredReceiptRow {
+    pub command_hash: ContentDigest,
+    pub status: String,
+    pub response_blob: Vec<u8>,
 }
 
 type RawReceiptRow = (Vec<u8>, String, Option<String>, Vec<u8>);
 
-async fn lookup_command_receipt_tx(
+pub(crate) async fn lookup_command_receipt_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     idemp: &CommandIdentitySpec,
@@ -1437,10 +1790,11 @@ async fn insert_change_command_and_events_tx(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn insert_completed_receipt_tx(
+async fn insert_receipt_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     idemp: &CommandIdentitySpec,
+    status: &str,
     canonical_seq: SpaceSeq,
     detail_blob: Option<&[u8]>,
     sanitized_blob: &[u8],
@@ -1471,13 +1825,14 @@ async fn insert_completed_receipt_tx(
                     space_id, history_incarnation, actor_id, idempotency_key, command_hash,
                     status, envelope_version, response_payload_id, sanitized_envelope_msgpack,
                     canonical_seq, expires_at_ms
-                ) VALUES (?, ?, ?, ?, ?, 'completed', 1, ?, ?, ?, ?)",
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
             )
             .bind(scope.space_id.as_str())
             .bind(scope.incarnation.as_bytes().as_slice())
             .bind(idemp.actor.as_str())
             .bind(idemp.command_key.as_str())
             .bind(idemp.command_hash.as_bytes().as_slice())
+            .bind(status)
             .bind(&resp_payload_id)
             .bind(sanitized_blob)
             .bind(seq_i64)
@@ -1508,13 +1863,14 @@ async fn insert_completed_receipt_tx(
                     space_id, history_incarnation, actor_id, idempotency_key, command_hash,
                     status, envelope_version, response_payload_id, sanitized_envelope_msgpack,
                     canonical_seq, expires_at_ms
-                ) VALUES ($1, $2, $3, $4, $5, 'completed', 1, $6, $7, $8, $9)",
+                ) VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9, $10)",
             )
             .bind(scope.space_id.as_str())
             .bind(scope.incarnation.as_bytes().as_slice())
             .bind(idemp.actor.as_str())
             .bind(idemp.command_key.as_str())
             .bind(idemp.command_hash.as_bytes().as_slice())
+            .bind(status)
             .bind(&resp_payload_id)
             .bind(sanitized_blob)
             .bind(seq_i64)
