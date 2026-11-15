@@ -5,16 +5,22 @@
 use std::{future::Future, pin::Pin};
 
 pub mod blobs;
+pub mod changes;
 pub mod codec;
 pub mod config;
 pub mod dialect;
 pub mod runtime;
 pub mod schema;
 pub(crate) mod sql_exec;
+pub mod wal;
 pub mod writer;
 
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+pub use changes::{
+    ChangedNoteSummaryV1, EFFECT_CODEC_V1, EffectBodyV1, EffectEnvelopeV1, StoredAwaitReasonV1,
+    build_effect_payload_draft,
+};
 pub use config::{
     BlobBackendConfig, CanonicalConfig, PgConnectConfig, PgTransport, S3AddressingStyle,
     S3BucketMode, S3BucketModePolicy, S3Config, S3Credentials, SqlBackendConfig, WriterConfig,
@@ -26,6 +32,7 @@ pub use runtime::{
     StoredRevisionRecord,
 };
 pub use schema::manifest::{CANONICAL_SCHEMA_VERSION, CANONICAL_TABLES, manifest_checksum};
+pub use wal::WalTelemetrySnapshot;
 
 #[cfg(test)]
 mod tests {

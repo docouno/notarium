@@ -321,7 +321,7 @@ impl RevisionMetadataEnvelope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum RevisionMetadataPayload {
     Note(NoteRevisionMetadata),
     Folder(FolderRevisionMetadata),

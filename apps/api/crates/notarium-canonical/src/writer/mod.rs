@@ -606,9 +606,10 @@ async fn run_batch_worker_loop(
 enum SpaceBatchEntry {
     Missing,
     Loaded {
-        record: SpaceRecord,
+        record: Box<SpaceRecord>,
         persisted_initial_seq: SpaceSeq,
         effective_cut: SpaceSeq,
+        max_purge_seq: Option<SpaceSeq>,
     },
 }
 
@@ -761,9 +762,10 @@ async fn execute_batch_on_conn(
                     space_states.insert(
                         space_id.clone(),
                         SpaceBatchEntry::Loaded {
-                            record: rec,
+                            record: Box::new(rec),
                             persisted_initial_seq: init_seq,
                             effective_cut: init_seq,
+                            max_purge_seq: None,
                         },
                     );
                 }
@@ -796,6 +798,7 @@ async fn execute_batch_on_conn(
             Ok(SingleItemSuccess {
                 response_bytes,
                 new_effective_cut,
+                item_purge_seq,
                 dir_syncs,
                 retained_tickets,
             }) => {
@@ -803,10 +806,16 @@ async fn execute_batch_on_conn(
                     tx.rollback_best_effort().await;
                     return BatchExecOutcome::AbortedBeforeCommit(err);
                 }
-                if let Some(SpaceBatchEntry::Loaded { effective_cut, .. }) =
-                    space_states.get_mut(&space_id)
+                if let Some(SpaceBatchEntry::Loaded {
+                    effective_cut,
+                    max_purge_seq,
+                    ..
+                }) = space_states.get_mut(&space_id)
                 {
                     *effective_cut = new_effective_cut;
+                    if let Some(pseq) = item_purge_seq {
+                        *max_purge_seq = Some(max_purge_seq.map_or(pseq, |prev| prev.max(pseq)));
+                    }
                 }
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
@@ -844,6 +853,7 @@ async fn execute_batch_on_conn(
             record,
             persisted_initial_seq,
             effective_cut,
+            ..
         } = entry
             && *effective_cut > *persisted_initial_seq
         {
@@ -876,6 +886,34 @@ async fn execute_batch_on_conn(
     match tx.commit_write().await {
         Ok(()) => {
             drop(batch_retained_tickets);
+            // Publish broadcast hints strictly AFTER confirmed SQL durability!
+            for entry in space_states.values() {
+                if let SpaceBatchEntry::Loaded {
+                    record,
+                    persisted_initial_seq,
+                    effective_cut,
+                    max_purge_seq,
+                } = entry
+                    && *effective_cut > *persisted_initial_seq
+                {
+                    if let Some(pseq) = max_purge_seq {
+                        store.inner.broadcast_hub.publish(
+                            crate::changes::BroadcastSignal::Purged {
+                                scope: record.scope.clone(),
+                                purged_through_seq: *pseq,
+                                current_safe_cut: *effective_cut,
+                            },
+                        );
+                    }
+                    store
+                        .inner
+                        .broadcast_hub
+                        .publish(crate::changes::BroadcastSignal::Committed {
+                            scope: record.scope.clone(),
+                            new_last_seq: *effective_cut,
+                        });
+                }
+            }
             if faults
                 .drop_commit_response_once
                 .swap(false, Ordering::SeqCst)
@@ -900,6 +938,7 @@ async fn execute_batch_on_conn(
 struct SingleItemSuccess {
     response_bytes: Vec<u8>,
     new_effective_cut: SpaceSeq,
+    item_purge_seq: Option<SpaceSeq>,
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
 }
@@ -945,6 +984,7 @@ async fn execute_single_item_in_savepoint(
                 response_bytes: existing.response_blob,
                 // Replay consumes ZERO new sequence numbers!
                 new_effective_cut: current_effective_cut,
+                item_purge_seq: None,
                 dir_syncs: PendingDirSyncs::default(),
                 retained_tickets: Vec::new(),
             }),
@@ -1055,9 +1095,17 @@ async fn execute_single_item_in_savepoint(
         .await?;
     }
 
+    let item_purge_seq = artifacts
+        .events
+        .iter()
+        .filter(|ev| ev.op_kind == "purge")
+        .map(|ev| ev.space_seq)
+        .max();
+
     Ok(SingleItemSuccess {
         response_bytes: artifacts.response_bytes,
         new_effective_cut: last_seq,
+        item_purge_seq,
         dir_syncs: item_ctx.pending_dir_syncs,
         retained_tickets: item_ctx.retained_tickets,
     })

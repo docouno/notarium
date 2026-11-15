@@ -28,18 +28,21 @@ use crate::{
         BlobBackendDriver, BlobOwnerKind, BlobReferenceClaim, activate_and_bind_blob_ref_tx,
         release_owner_blob_refs_tx, s3::S3Transport,
     },
+    changes::{BroadcastHub, BroadcastSignal, DEFAULT_BROADCAST_CAPACITY},
     codec::{
         FolderRevisionMetadata, NoteRevisionMetadata, RevisionMetadataEnvelope,
-        RevisionMetadataPayload, decode_timestamp_parts, doc_class_to_db, encode_timestamp_parts,
-        i64_to_space_seq, internal_not_committed, lifecycle_from_db, lifecycle_to_db,
-        new_prefixed_hex_id, new_revision_id, normalize_slug_key, normalize_title_key, now_unix_ms,
-        now_utc_timestamp, unavailable_retryable,
+        RevisionMetadataPayload, cancelled_not_committed, deadline_not_committed,
+        decode_timestamp_parts, doc_class_to_db, encode_timestamp_parts, i64_to_space_seq,
+        internal_not_committed, lifecycle_from_db, lifecycle_to_db, new_prefixed_hex_id,
+        new_revision_id, normalize_slug_key, normalize_title_key, now_unix_ms, now_utc_timestamp,
+        unavailable_retryable,
     },
     config::{BlobBackendConfig, CanonicalConfig, SqlBackendConfig},
     dialect::{
         DataRootOwnerLock, postgres::open_and_bootstrap_postgres, sqlite::open_and_bootstrap_sqlite,
     },
     sql_exec::BackendConn,
+    wal::{SqliteWalCoordinator, WalTelemetrySnapshot},
     writer::{
         BatchEventDraft, CommandIdentitySpec, ItemCommitArtifacts, PreparedWriteIntent,
         WriteCoordinator,
@@ -50,6 +53,7 @@ pub(crate) enum SqlDriverState {
     Sqlite {
         writer: Mutex<Option<SqliteConnection>>,
         read_pool: SqlitePool,
+        #[allow(dead_code)]
         read_deadline: Duration,
     },
     Postgres {
@@ -66,6 +70,8 @@ pub(crate) struct CanonicalInner {
     pub sql: SqlDriverState,
     pub blobs: BlobBackendDriver,
     pub writer_coord: OnceLock<Arc<WriteCoordinator>>,
+    pub wal_coord: OnceLock<Arc<SqliteWalCoordinator>>,
+    pub broadcast_hub: BroadcastHub,
     pub shutting_down: AtomicBool,
     pub owner_locks: Mutex<Vec<DataRootOwnerLock>>,
 }
@@ -242,12 +248,36 @@ impl CanonicalRuntime {
             sql,
             blobs,
             writer_coord: OnceLock::new(),
+            wal_coord: OnceLock::new(),
+            broadcast_hub: BroadcastHub::new(DEFAULT_BROADCAST_CAPACITY),
             shutting_down: AtomicBool::new(false),
             owner_locks: Mutex::new(locks),
         });
 
         let coord = WriteCoordinator::start(&inner);
         let _ = inner.writer_coord.set(coord);
+
+        if let SqlBackendConfig::Sqlite {
+            data_root,
+            read_deadline,
+            passive_checkpoint_interval,
+            wal_soft_watermark_bytes,
+            wal_high_watermark_bytes,
+            wal_reset_cycle_deadline,
+            ..
+        } = &inner.config.sql
+        {
+            let wal = SqliteWalCoordinator::start(
+                &inner,
+                &data_root.canonical(),
+                *read_deadline,
+                *passive_checkpoint_interval,
+                *wal_soft_watermark_bytes,
+                *wal_high_watermark_bytes,
+                *wal_reset_cycle_deadline,
+            );
+            let _ = inner.wal_coord.set(wal);
+        }
 
         Ok((
             CanonicalStore {
@@ -268,6 +298,9 @@ impl CanonicalRuntime {
     pub async fn shutdown(self) -> Result<(), PortError> {
         if let Some(coord) = self.inner.writer_coord.get() {
             coord.drain_and_shutdown().await;
+        }
+        if let Some(wal) = self.inner.wal_coord.get() {
+            wal.shutdown().await;
         }
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         match &self.inner.sql {
@@ -498,62 +531,144 @@ impl CanonicalStore {
         }
     }
 
+    pub fn wal_telemetry(&self) -> Option<WalTelemetrySnapshot> {
+        self.inner.wal_coord.get().map(|w| w.telemetry())
+    }
+
+    pub async fn run_wal_maintenance_now(&self, force_reset: bool) {
+        if let Some(wal) = self.inner.wal_coord.get() {
+            wal.run_maintenance_tick(&self.inner, force_reset).await;
+        }
+    }
+
+    #[doc(hidden)]
+    pub async fn execute_diagnostic_read_sql_for_test(
+        &self,
+        budget: Option<&CallBudget>,
+        sql: &str,
+    ) -> Result<i64, PortError> {
+        let owned = sql.to_owned();
+        self.with_read_tx_budget(budget, |tx| {
+            Box::pin(async move {
+                match tx {
+                    BackendConn::Sqlite(conn) => sqlx::query_scalar(sqlx::AssertSqlSafe(owned))
+                        .fetch_one(&mut **conn)
+                        .await
+                        .map_err(|err| internal_not_committed("diag_sqlite_read", err.to_string())),
+                    BackendConn::Postgres(conn) => sqlx::query_scalar(sqlx::AssertSqlSafe(owned))
+                        .fetch_one(&mut **conn)
+                        .await
+                        .map_err(|err| internal_not_committed("diag_pg_read", err.to_string())),
+                }
+            })
+        })
+        .await
+    }
+
     pub(crate) async fn with_read_tx<F, T>(&self, op: F) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        self.with_read_tx_budget(None, op).await
+    }
+
+    pub(crate) async fn with_read_tx_budget<F, T>(
+        &self,
+        budget: Option<&CallBudget>,
+        op: F,
+    ) -> Result<T, PortError>
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
         self.ensure_open()?;
         match &self.inner.sql {
-            SqlDriverState::Sqlite {
-                read_pool,
-                read_deadline,
-                ..
-            } => {
-                let mut pooled = read_pool.acquire().await.map_err(|err| {
-                    unavailable_retryable(
-                        "sqlite_acquire_read",
-                        err.to_string(),
-                        Duration::from_millis(50),
+            SqlDriverState::Sqlite { read_pool, .. } => {
+                let wal = self.inner.wal_coord.get().ok_or_else(|| {
+                    internal_not_committed(
+                        "sqlite_wal_coord_missing",
+                        "SqliteWalCoordinator not initialized",
                     )
                 })?;
-                let conn: &mut SqliteConnection = &mut pooled;
-                let mut backend = BackendConn::Sqlite(conn);
-                let timeout_ms = u64::try_from(read_deadline.as_millis()).unwrap_or(200);
-                backend.begin_read(Some(timeout_ms)).await?;
-                match op(&mut backend).await {
-                    Ok(value) => {
-                        backend.commit_read().await?;
-                        Ok(value)
-                    }
-                    Err(err) => {
-                        backend.rollback_best_effort().await;
-                        Err(err)
-                    }
-                }
+                wal.with_ordinary_read_tx(read_pool, budget, op).await
             }
             SqlDriverState::Postgres {
                 pool,
                 statement_timeout,
                 ..
             } => {
-                let mut pooled = pool.acquire().await.map_err(|err| {
-                    unavailable_retryable(
-                        "pg_acquire_read",
-                        err.to_string(),
-                        Duration::from_millis(50),
-                    )
-                })?;
-                let conn: &mut sqlx::PgConnection = &mut pooled;
-                let mut backend = BackendConn::Postgres(conn);
-                let timeout_ms = u64::try_from(statement_timeout.as_millis()).unwrap_or(200);
-                backend.begin_read(Some(timeout_ms)).await?;
-                match op(&mut backend).await {
-                    Ok(value) => {
-                        backend.commit_read().await?;
-                        Ok(value)
+                if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
+                    return Err(cancelled_not_committed(
+                        "pg_read_cancelled_pre_acquire",
+                        "PostgreSQL read cancelled before pool acquire",
+                    ));
+                }
+                let caller_rem = budget.map(|b| b.remaining).unwrap_or(*statement_timeout);
+                if caller_rem.is_zero() {
+                    return Err(deadline_not_committed(
+                        "pg_read_zero_budget",
+                        "PostgreSQL read call budget expired",
+                    ));
+                }
+                let eff_timeout = caller_rem.min(*statement_timeout);
+                let deadline_tokio = tokio::time::Instant::now() + eff_timeout;
+
+                let mut pooled = tokio::select! {
+                    res = pool.acquire() => res.map_err(|err| {
+                        unavailable_retryable(
+                            "pg_acquire_read",
+                            err.to_string(),
+                            Duration::from_millis(50),
+                        )
+                    })?,
+                    _ = tokio::time::sleep_until(deadline_tokio) => {
+                        return Err(deadline_not_committed(
+                            "pg_acquire_read_deadline",
+                            "deadline exceeded acquiring PostgreSQL read connection",
+                        ));
                     }
+                };
+
+                let rem_ms = deadline_tokio
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis()
+                    .max(1);
+                let timeout_ms = u64::try_from(rem_ms).unwrap_or(200);
+
+                let run_res: Result<T, PortError> = {
+                    let conn: &mut sqlx::PgConnection = &mut pooled;
+                    let mut backend = BackendConn::Postgres(conn);
+                    let fut = async {
+                        backend.begin_read(Some(timeout_ms)).await?;
+                        let val = op(&mut backend).await?;
+                        backend.commit_read().await?;
+                        Ok(val)
+                    };
+                    tokio::select! {
+                        res = fut => res,
+                        _ = tokio::time::sleep_until(deadline_tokio) => {
+                            Err(deadline_not_committed(
+                                "pg_read_tx_deadline",
+                                "PostgreSQL read transaction exceeded deadline",
+                            ))
+                        }
+                    }
+                };
+
+                match run_res {
+                    Ok(val) => Ok(val),
                     Err(err) => {
-                        backend.rollback_best_effort().await;
+                        // Detach timed-out or failed connection if needed so clean pool invariants hold.
+                        let mut raw_conn = pooled.detach();
+                        tokio::spawn(async move {
+                            let _ = sqlx::query("ROLLBACK").execute(&mut raw_conn).await;
+                            let _ = raw_conn.close().await;
+                        });
+                        if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
+                            return Err(cancelled_not_committed(
+                                "pg_read_cancelled",
+                                "PostgreSQL read cancelled",
+                            ));
+                        }
                         Err(err)
                     }
                 }
@@ -843,13 +958,14 @@ impl CanonicalStore {
         let rev_id = new_revision_id()?;
         let cmd_id = new_prefixed_hex_id("cmd_")?;
 
-        self.with_write_tx(|tx| {
-            let spec_cl = spec.clone();
-            let slug_fold_cl = slug_fold.clone();
-            let proj_fold_cl = project_slug_fold.clone();
-            let rev_cl = rev_id.clone();
-            let cmd_cl = cmd_id.clone();
-            Box::pin(async move {
+        let out = self
+            .with_write_tx(|tx| {
+                let spec_cl = spec.clone();
+                let slug_fold_cl = slug_fold.clone();
+                let proj_fold_cl = project_slug_fold.clone();
+                let rev_cl = rev_id.clone();
+                let cmd_cl = cmd_id.clone();
+                Box::pin(async move {
                 let space_rec = load_space_record(tx, &spec_cl.scope.space_id).await?;
                 space_rec.scope.check(&spec_cl.scope)?;
                 if space_rec.active_epoch != spec_cl.active_epoch {
@@ -1037,7 +1153,15 @@ impl CanonicalStore {
                 ))
             })
         })
-        .await
+        .await?;
+
+        self.inner
+            .broadcast_hub
+            .publish(BroadcastSignal::Committed {
+                scope: spec.scope,
+                new_last_seq: out.2,
+            });
+        Ok(out)
     }
 
     /// Sets a non-root folder's lifecycle (`Trash` or `Restore`), preserving active-sibling uniqueness.
@@ -1068,10 +1192,12 @@ impl CanonicalStore {
         let expected_cl = expected_revision.clone();
         let actor_cl = actor.clone();
 
-        self.with_write_tx(|tx| {
-            let new_rev_cl = new_rev.clone();
-            let cmd_cl_in = cmd_id.clone();
-            Box::pin(async move {
+        let broadcast_scope = scope.clone();
+        let out = self
+            .with_write_tx(|tx| {
+                let new_rev_cl = new_rev.clone();
+                let cmd_cl_in = cmd_id.clone();
+                Box::pin(async move {
                 let space_rec = load_space_record(tx, &scope_cl.space_id).await?;
                 space_rec.scope.check(&scope_cl)?;
                 if space_rec.active_epoch != active_epoch {
@@ -1243,7 +1369,15 @@ impl CanonicalStore {
                 Ok((new_rev_cl, next_seq))
             })
         })
-        .await
+        .await?;
+
+        self.inner
+            .broadcast_hub
+            .publish(BroadcastSignal::Committed {
+                scope: broadcast_scope,
+                new_last_seq: out.1,
+            });
+        Ok(out)
     }
 
     /// Reads an entity's immutable revision snapshot at a validated command-end cutoff (`visibility_seq <= cutoff`).
