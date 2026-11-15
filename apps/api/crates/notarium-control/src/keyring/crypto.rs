@@ -9,7 +9,7 @@ use hmac::Hmac;
 use notarium_core::{
     auth::SecretString,
     error::{CommitEffect, PortError, ValidationReason},
-    ids::{CredentialId, KeyId, ProviderResourceId},
+    ids::{CredentialId, KeyId, OAuthGrantId, ProviderResourceId, RequestId},
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -26,6 +26,20 @@ pub struct EnvelopeAddress {
     field: String,
 }
 impl EnvelopeAddress {
+    pub fn oauth_intent(id: &OAuthGrantId) -> Self {
+        Self {
+            facet: "oauth-intent".into(),
+            record: id.to_string(),
+            field: "context".into(),
+        }
+    }
+    pub fn oidc_context(id: &RequestId) -> Self {
+        Self {
+            facet: "oidc-flow".into(),
+            record: id.to_string(),
+            field: "context".into(),
+        }
+    }
     pub fn credential(id: &CredentialId) -> Self {
         Self {
             facet: "credential".into(),
@@ -112,6 +126,8 @@ impl Envelope {
 pub(super) struct Material {
     pub id: KeyId,
     encryption: Zeroizing<[u8; 32]>,
+    oauth: Zeroizing<[u8; 32]>,
+    oidc: Zeroizing<[u8; 32]>,
     canary: Zeroizing<String>,
 }
 impl Material {
@@ -124,12 +140,20 @@ impl Material {
         let mut encryption = Zeroizing::new([0; 32]);
         hkdf.expand(b"notarium:secret:credential:v1", &mut *encryption)
             .map_err(|_| failure())?;
+        let mut oauth = Zeroizing::new([0; 32]);
+        hkdf.expand(b"notarium:oauth:intent:v1", &mut *oauth)
+            .map_err(|_| failure())?;
+        let mut oidc = Zeroizing::new([0; 32]);
+        hkdf.expand(b"notarium:oidc:context:v1", &mut *oidc)
+            .map_err(|_| failure())?;
         let mut canary = Zeroizing::new([0; 32]);
         hkdf.expand(b"notarium:canary:v1", &mut *canary)
             .map_err(|_| failure())?;
         Ok(Self {
             id: KeyId::parse(&format!("ck_{}", hex(&id))).map_err(|_| failure())?,
             encryption,
+            oauth,
+            oidc,
             canary: Zeroizing::new(URL_SAFE_NO_PAD.encode(canary.as_slice())),
         })
     }
@@ -137,6 +161,14 @@ impl Material {
         let mut nonce = [0; 12];
         getrandom::fill(&mut nonce).map_err(|_| failure())?;
         self.seal_nonce(address, plaintext, nonce)
+    }
+    fn cipher(&self, address: &EnvelopeAddress) -> Result<Aes256Gcm, PortError> {
+        let key = match address.facet.as_str() {
+            "oauth-intent" => &self.oauth,
+            "oidc-flow" => &self.oidc,
+            _ => &self.encryption,
+        };
+        Aes256Gcm::new_from_slice(&**key).map_err(|_| failure())
     }
     fn seal_nonce(
         &self,
@@ -147,7 +179,7 @@ impl Material {
         if plaintext.len() > MAX_PLAINTEXT {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
-        let cipher = Aes256Gcm::new_from_slice(&*self.encryption).map_err(|_| failure())?;
+        let cipher = self.cipher(address)?;
         let ciphertext = cipher
             .encrypt(
                 &nonce.into(),
@@ -171,7 +203,7 @@ impl Material {
             return Err(failure());
         }
         let nonce: [u8; 12] = envelope.data[..12].try_into().map_err(|_| failure())?;
-        let cipher = Aes256Gcm::new_from_slice(&*self.encryption).map_err(|_| failure())?;
+        let cipher = self.cipher(address)?;
         let plaintext = Zeroizing::new(
             cipher
                 .decrypt(

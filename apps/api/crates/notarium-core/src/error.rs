@@ -76,6 +76,10 @@ pub struct SourceLocation {
 #[derive(Clone, Debug, Eq, PartialEq, Error, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum DomainError {
+    #[error("OAuth request rejected")]
+    OAuth {
+        error: crate::ports::oauth::OAuthErrorCode,
+    },
     #[error("authentication failed")]
     AuthenticationFailed,
     #[error("access denied")]
@@ -145,6 +149,7 @@ impl DomainError {
     }
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::OAuth { .. } => "oauth_error",
             Self::AuthenticationFailed => "authentication_failed",
             Self::AccessDenied => "access_denied",
             Self::ControlRevisionConflict { .. } => "control_revision_conflict",

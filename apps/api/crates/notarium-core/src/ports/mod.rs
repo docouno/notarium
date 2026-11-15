@@ -7,6 +7,8 @@ pub mod context;
 pub mod control;
 pub mod engine;
 pub mod infrastructure;
+pub mod oauth;
+pub mod oidc;
 pub mod types;
 
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, PortError>> + Send + 'a>>;
@@ -20,4 +22,6 @@ pub use context::*;
 pub use control::ControlPort;
 pub use engine::*;
 pub use infrastructure::*;
+pub use oauth::*;
+pub use oidc::*;
 pub use types::*;

@@ -66,8 +66,11 @@ smoke checks.
 export from a retained read snapshot. `ControlService` implements `AuthPort` and
 Space membership/lifecycle operations with durable revocation and canonical
 coordination. Its native keyring and guarded HTTP transport provide credential
-storage and bounded network primitives. OAuth issuance/OIDC, provider, account-state and backup participant
-services are still under construction. See [control services](control.md).
+storage and bounded network primitives. `OAuthService` implements the local
+authorization server, and `OidcService` verifies external identity and issues
+native sessions through explicit account bindings. Provider, account-state and
+backup participant services are still under construction. See
+[control services](control.md).
 
 ## Client and delivery boundaries
 

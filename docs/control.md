@@ -2,9 +2,10 @@
 
 The control crate provides the SQL schema, bounded stores, target record
 import/export and `ControlService`. The service implements `AuthPort` and Space
-membership/lifecycle operations. OAuth issuance/OIDC, the provider gateway,
-account episodes/abilities/schedules and backup participant services remain under
-construction. HTTP routes, cookies, CSRF and the desktop authentication perimeter
+membership/lifecycle operations. `OAuthService` implements `OAuthPort`, and
+`OidcService` implements `OidcPort`. The provider gateway, account
+episodes/abilities/schedules and backup participant services remain under
+construction. HTTP routes, consent UI, cookies, CSRF and the desktop authentication perimeter
 belong to the transport composition.
 
 ## Persistence
@@ -103,7 +104,7 @@ An interactive transport must explicitly admit human management on session
 evidence or a checked trusted-none perimeter attestation before `AbilityWrite`
 can be present. Trusted-none uses the configured durable owner; invalid supplied
 credentials never fall back to that owner. OIDC ID tokens are not bearer evidence;
-a future verified RP flow must issue a native session.
+the verified RP flow issues a native session for an explicitly bound identity.
 
 Each control effect rechecks durable credential and account state. Derived
 contexts retain the original session/PAT/OAuth grant/family lineage. Refreshing
@@ -161,6 +162,109 @@ Writers have four immediate-admission slots per store owner. Owned workers retai
 the writer fence through BEGIN, COMMIT and ROLLBACK acknowledgement, even when the
 request future is dropped. This bounds cancelled-but-still-running database work
 and keeps it visible to the backup owner's write pause.
+
+## OAuth authorization server
+
+`OAuthService::new` takes operator-configured issuer and endpoint URLs. The resource
+URI comes from `ControlConfig`, never an incoming Host header. Only public clients
+with token authentication method `none`, authorization code and optional refresh
+grants are supported. Requested scopes are `read`, `write` and `offline_access`;
+`write` includes read permission. Unknown scopes fail validation. Refresh accepts
+the existing normalized scope only; a different scope requires new authorization.
+
+DCR accepts at most ten redirect URIs and 8 KiB of registration metadata. HTTPS
+redirects compare byte for byte. Native HTTP redirects allow only literal
+`127.0.0.1` or `[::1]`, with the port allowed to vary; all other bytes must match.
+Fragments, userinfo, wildcards and prefix matching are rejected. Inactive clients
+expire after 24 hours and are capped at 1,000 across registration types.
+
+CIMD fetches an HTTPS client ID through the public-only guarded transport and
+requires the metadata's exact matching client ID. JSON responses are limited to
+64 KiB. The cache holds at most 1,024 CIMD records, defaults to five minutes and
+caps freshness at one hour, respecting shorter max-age and Age. No-cache/no-store
+responses are fetched for each operation; their registration record cannot serve
+as reusable cache authority. New registration has a 60/minute process limit;
+activated metadata refresh has a separate 120/minute lane. Each fetch lane admits
+four calls. Changed metadata invalidates previously prepared consent.
+
+Authorization requires a current interactive account and PKCE S256. Preparation
+checks that the account and client identifiers together fit the portable 2 KiB
+index budget; an oversized pair returns `InvalidClient` before consent. The sealed
+ten-minute intent binds account, credential/auth version, browser, client metadata,
+redirect, resource, scope, selected Spaces and PKCE challenge. The transport must
+verify CSRF and explicit consent before constructing `OAuthConsent::attest_checked`.
+Approval rechecks these bindings and atomically creates one grant and one code.
+The intent's unique grant ID prevents repeated or concurrent approval. Empty Space
+selection remains empty; an absent selection uses current memberships.
+
+Codes expire after 60 seconds. Code proof, bindings and PKCE are checked before
+atomic consumption and token issuance. Invalid proof does not consume the code.
+Access tokens expire after one hour; refresh tokens expire 30 days after each
+issuance. Stored native token digests and expiries survive target import unchanged.
+Raw tokens are returned once and are never stored in command receipts.
+
+Refresh rotates the current row and creates its successor and access token in one
+transaction. A valid previously used refresh token revokes the entire family and
+dispatches durable revocation; a wrong secret has no effect. Concurrent refreshes
+have one rotation winner, and the loser's reuse can revoke that winner's family.
+A lost response must not trigger a hidden refresh retry. Used rows and tombstones
+are retained so reuse evidence is not lost.
+
+Token revocation requires the correct secret and client; unknown tokens are an
+idempotent no-op. Access revocation removes its family when present, otherwise
+only that access token. Account-owner disconnect revokes the grant. Revocation
+success waits for the same durable outbox acknowledgement used by account changes.
+
+## OIDC identity
+
+`OidcService::new` accepts at most 64 immutable operator configurations, each with
+an exact public HTTPS issuer, client ID, redirect URI and public or confidential
+client authentication. The issuer retains its exact spelling, including whether
+an origin has a trailing slash; discovery and ID tokens must match it exactly.
+Confidential configuration references an enabled encrypted
+credential of kind `oidc-client-secret`; Basic and POST secret methods are supported.
+The credential's runtime epoch, envelope and complete keyring witness are checked
+under the callback claim transaction. Configuration changes invalidate old flows.
+
+Discovery and JWKS use the guarded transport with 256 KiB JSON limits. Discovery
+freshness is at most one hour and JWKS freshness at most 15 minutes, honoring
+shorter upstream lifetimes. JWKS contains at most 256 keys, with bounded RSA and
+P-256 material. An unknown key ID permits one concurrent forced refresh per issuer
+with a 30-second cooldown, including failed refreshes. Expired metadata cannot be
+used when its refresh fails.
+
+Login uses random state, nonce and PKCE S256, with a ten-minute flow lifetime. SQL
+stores their verifiers and the hash of the protected context. The verifier and
+nonce themselves stay in the AEAD-sealed context, bound to transaction, browser,
+provider and purpose. The adapter must keep this context in a Secure, HttpOnly,
+SameSite cookie; it must never put it in a redirect URL or log. There are at most
+4,096 live transactions, 16 concurrent operations and 60 begins/minute per process.
+
+Callback claims the transaction durably before the single IdP token exchange.
+Concurrent callbacks cannot exchange twice. Cancellation or a lost exchange
+response requires a new login flow. `openidconnect` verifies RS256/ES256 signatures,
+issuer, audience, expiry and nonce; the service also checks exact issuer, bounded
+issue time and authorized party with at most 60 seconds of clock skew. Multiple
+audiences require the configured client as `azp`, and every additional audience
+must be explicitly trusted by the operator. The strict JOSE header rejects none,
+HMAC, remote key URLs and unrecognized extensions. External access/refresh tokens
+are discarded and never become native bearer credentials.
+
+Identity ownership uses only `(issuer, subject)`. Matching email does not link or
+create an account. Unknown identities return `IdentityUnbound` for explicit
+provisioning. Linking requires a current native session created within five minutes
+and rechecks it at claim and final commit. Administrator binding and owner/admin
+unlink use revision CAS and durable command receipts. Each account has at most 64
+external identities; a unique constraint prevents ownership reassignment races.
+Unlink requires a usable password or another configured external identity to
+remain. It prevents future external login; existing native sessions retain their
+explicit logout/revoke lifecycle. Callback rechecks current identity ownership
+before issuing a session, including when unlink or account disable races it.
+
+Protocol tests exercise both databases through a real TLS IdP/CIMD fixture and
+independent ES256 vectors. The fixture's exact-origin loopback route exists only
+in test builds; public destination policy has separate transport tests. These
+services do not implement HTTP routes, consent screens or browser cookie policy.
 
 ## Native credential keyring
 

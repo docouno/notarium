@@ -17,7 +17,7 @@ fn text_bytes(value: &str) -> Result<usize, PortError> {
     }
     Ok(value.len())
 }
-fn validate_index(bytes: usize) -> Result<(), PortError> {
+pub(crate) fn validate_index(bytes: usize) -> Result<(), PortError> {
     if bytes > 2048 {
         return Err(crate::error::invalid(
             notarium_core::error::ValidationReason::InvalidLimit,

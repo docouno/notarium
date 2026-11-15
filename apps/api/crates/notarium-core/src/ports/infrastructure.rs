@@ -265,6 +265,7 @@ pub enum RevocationSelector {
     Grant(GrantId),
     OAuthGrant(OAuthGrantId),
     OAuthFamily(OAuthFamilyId),
+    OAuthAccess(CredentialTokenId),
     Membership {
         space: SpaceId,
         principal: PrincipalId,

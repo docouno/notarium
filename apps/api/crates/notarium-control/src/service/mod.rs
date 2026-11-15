@@ -4,6 +4,8 @@ mod auth_port;
 mod authority;
 mod commands;
 mod lifecycle;
+pub mod oauth;
+pub mod oidc;
 mod one_time;
 mod outbox;
 mod passwords;

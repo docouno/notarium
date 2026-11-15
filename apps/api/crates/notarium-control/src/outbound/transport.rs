@@ -158,6 +158,8 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     lookup: Option<Arc<dyn Lookup>>,
+    #[cfg(test)]
+    fixture: Option<(String, reqwest::Certificate)>,
 }
 
 #[derive(Clone)]
@@ -178,8 +180,22 @@ impl OutboundTransport {
                     clients: HashMap::new(),
                 }),
                 lookup,
+                #[cfg(test)]
+                fixture: None,
             }),
         }
+    }
+    #[cfg(test)]
+    pub(super) fn fixture_https(
+        origin: String,
+        lookup: Arc<dyn Lookup>,
+        ca: reqwest::Certificate,
+    ) -> Self {
+        let mut transport = Self::with_lookup(NetworkPolicy::default(), Some(lookup));
+        Arc::get_mut(&mut transport.shared)
+            .expect("new transport")
+            .fixture = Some((origin, ca));
+        transport
     }
     /// Operator policy changes cancel active calls and discard every old pool.
     pub fn replace_policy(&self, policy: NetworkPolicy) -> Result<(), PortError> {
@@ -215,6 +231,11 @@ impl OutboundTransport {
     ) -> Result<(Arc<Slot>, CheckedEndpoint), PortError> {
         let mut state = self.shared.state.lock().map_err(|_| failed())?;
         let endpoint = state.policy.endpoint(scope.clone(), url)?;
+        #[cfg(test)]
+        let endpoint = match &self.shared.fixture {
+            Some((origin, _)) if endpoint.origin() == origin => endpoint.fixture_loopback(origin),
+            _ => endpoint,
+        };
         if let OutboundScope::Provider {
             resource,
             runtime_epoch,
@@ -303,6 +324,8 @@ impl OutboundTransport {
             _permit: permit,
         };
         let lookup = self.shared.lookup.clone();
+        #[cfg(test)]
+        let fixture_ca = self.shared.fixture.as_ref().map(|(_, ca)| ca.clone());
         tokio::spawn(async move {
             let mut head_tx = Some(head_tx);
             let result = async {
@@ -314,9 +337,16 @@ impl OutboundTransport {
                     .client
                     .get_or_try_init(|| async {
                         let endpoint = context.slot.endpoint.clone();
-                        tokio::task::spawn_blocking(move || build_client(endpoint, lookup))
-                            .await
-                            .map_err(|_| failed())?
+                        tokio::task::spawn_blocking(move || {
+                            build_client(
+                                endpoint,
+                                lookup,
+                                #[cfg(test)]
+                                fixture_ca,
+                            )
+                        })
+                        .await
+                        .map_err(|_| failed())?
                     })
                     .await?;
                 context.check()?;
@@ -404,13 +434,14 @@ impl OutboundTransport {
 fn build_client(
     endpoint: CheckedEndpoint,
     lookup: Option<Arc<dyn Lookup>>,
+    #[cfg(test)] fixture_ca: Option<reqwest::Certificate>,
 ) -> Result<Client, PortError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let resolver = match lookup {
         Some(lookup) => GuardedResolver::with_lookup(endpoint, lookup),
         None => GuardedResolver::new(endpoint),
     };
-    Client::builder()
+    let builder = Client::builder()
         .tls_backend_rustls()
         .dns_resolver(Arc::new(resolver))
         .no_proxy()
@@ -423,9 +454,13 @@ fn build_client(
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(60))
-        .pool_max_idle_per_host(2)
-        .build()
-        .map_err(|_| failed())
+        .pool_max_idle_per_host(2);
+    #[cfg(test)]
+    let builder = match fixture_ca {
+        Some(ca) => builder.tls_certs_only([ca]),
+        None => builder,
+    };
+    builder.build().map_err(|_| failed())
 }
 struct CancelOnDrop(Cancellation);
 impl Drop for CancelOnDrop {

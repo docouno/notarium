@@ -117,6 +117,11 @@ pub struct PasswordVerification {
     pub upgraded_hash: Option<String>,
 }
 
+/// Validate a stored login method without running a KDF or accepting a secret.
+pub(crate) fn supported(encoded: &str) -> bool {
+    Profile::parse(encoded).is_ok()
+}
+
 pub async fn hash(password: Secret) -> Result<String, PortError> {
     if !(8..=1024).contains(&password.expose().len()) {
         return Err(invalid(ValidationReason::InvalidLimit));

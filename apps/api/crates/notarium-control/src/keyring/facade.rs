@@ -6,9 +6,9 @@ use super::{
 use crate::{
     error::invalid,
     store::{
-        Backend, ControlStore,
+        Backend, ControlStore, Transaction,
         lease::OperationBudget,
-        statements::read_rows,
+        statements::{read_rows, rows},
         target::{SecretKeyringRow, TargetRecord},
     },
 };
@@ -44,6 +44,8 @@ pub struct KeyringWitness {
     pub key: KeyId,
     pub generation: u64,
     pub hash: String,
+    active: bool,
+    canary_hash: [u8; 32],
 }
 impl From<&Witness> for KeyringWitness {
     fn from(value: &Witness) -> Self {
@@ -51,7 +53,28 @@ impl From<&Witness> for KeyringWitness {
             key: value.key.clone(),
             generation: value.generation,
             hash: value.hash.clone(),
+            active: value.active,
+            canary_hash: crate::auth::token::digest(value.canary.as_bytes()),
         }
+    }
+}
+impl KeyringWitness {
+    /// Persistence owners recheck the complete witness under their SQL commit
+    /// authority, after filesystem work has finished outside the transaction.
+    pub(crate) async fn verify(&self, tx: &mut Transaction) -> Result<(), PortError> {
+        let row = rows!(tx, SecretKeyringRow, fetch_optional,
+            "SELECT * FROM secret_keyring WHERE key_id=$1",
+            "SELECT * FROM v1_control.secret_keyring WHERE key_id=$1 FOR SHARE";self.key.as_str())?
+        .ok_or_else(failure)?;
+        if row.retired_at.is_some()
+            || row.generation as u64 != self.generation
+            || row.key_hash != self.hash
+            || row.state != if self.active { "active" } else { "readable" }
+            || crate::auth::token::digest(row.canary.as_bytes()) != self.canary_hash
+        {
+            return Err(failure());
+        }
+        Ok(())
     }
 }
 pub struct SealedValue {
@@ -189,12 +212,28 @@ impl Keyring {
         address: EnvelopeAddress,
         encrypted: &str,
     ) -> Result<SecretString, PortError> {
+        self.open_verified(budget, address, encrypted)
+            .await
+            .map(|(secret, _)| secret)
+    }
+    pub(crate) async fn open_verified(
+        &self,
+        budget: CallBudget,
+        address: EnvelopeAddress,
+        encrypted: &str,
+    ) -> Result<(SecretString, KeyringWitness), PortError> {
         let envelope = Envelope::parse(encrypted)?;
         self.execute(
             budget,
             Some(envelope.key.clone()),
             false,
-            move |material, _| material.open(&address, &envelope),
+            move |material, rows| {
+                let witness = rows
+                    .iter()
+                    .find(|row| row.key == material.id)
+                    .ok_or_else(failure)?;
+                Ok((material.open(&address, &envelope)?, witness.into()))
+            },
         )
         .await
     }

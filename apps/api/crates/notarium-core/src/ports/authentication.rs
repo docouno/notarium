@@ -132,7 +132,8 @@ pub struct ConsumeOneTime {
     pub purpose: OneTimePurpose,
     pub password: SecretString,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BearerScope {
     Read,
     Write,

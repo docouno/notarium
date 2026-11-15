@@ -298,6 +298,16 @@ pub struct CheckedEndpoint {
     private: Option<Vec<IpNet>>,
 }
 impl CheckedEndpoint {
+    /// The protocol fixture has no public route in the offline test namespace.
+    /// This seam does not exist in production builds or qualify public routing.
+    #[cfg(test)]
+    pub(super) fn fixture_loopback(mut self, origin: &str) -> Self {
+        assert_eq!(self.origin, origin);
+        assert_eq!(self.url.scheme(), "https");
+        assert_eq!(self.url.host_str(), Some("identity.example.invalid"));
+        self.private = Some(vec!["127.0.0.1/32".parse().expect("fixture network")]);
+        self
+    }
     pub fn origin(&self) -> &str {
         &self.origin
     }
