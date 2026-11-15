@@ -39,9 +39,12 @@ fn all_domain_brands_preserve_v1_and_legacy_identity() {
         EpisodeId,
         AbilityId,
         ProviderResourceId,
-        CredentialId
+        CredentialId,
+        ClusterId
     );
     assert!(NoteId::parse(SpaceId::from_bytes([2; 16]).as_str()).is_err());
+    assert!(NoteId::parse(ClusterId::from_bytes([2; 16]).as_str()).is_err());
+    assert!(ClusterId::parse(NoteId::from_bytes([2; 16]).as_str()).is_err());
     assert!(NoteId::parse_v1(&format!("nt_{}", "AB".repeat(16))).is_err());
 }
 

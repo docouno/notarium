@@ -491,6 +491,9 @@ pub struct BoardMoveResult {
 pub enum GraphTier {
     Superclusters,
     Lens {
+        /// Intersect cluster membership with the project, tags and field filter.
+        /// The owner resolves this stable identity in the request's history scope.
+        cluster: Option<ClusterId>,
         project: Option<FolderId>,
         tags: Vec<String>,
     },
@@ -518,16 +521,23 @@ impl GraphQuery {
         }
     }
 }
+/// Graph identities belong to the request/result history scope. Cluster identity
+/// survives projection generations; it is neither a note nor a dense node index.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum GraphNodeId {
+    Note(NoteId),
+    Cluster(ClusterId),
+}
 #[derive(Clone, Debug)]
 pub struct GraphNode {
-    pub id: NoteId,
+    pub id: GraphNodeId,
     pub card: Option<NoteCard>,
     pub member_count: u64,
 }
 #[derive(Clone, Debug)]
 pub struct GraphEdge {
-    pub source: NoteId,
-    pub target: NoteId,
+    pub source: GraphNodeId,
+    pub target: GraphNodeId,
     pub weight: f64,
 }
 #[derive(Clone, Debug)]

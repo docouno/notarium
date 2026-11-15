@@ -259,6 +259,17 @@ pending-input queue returns `Full` without a mutation receipt. Successful queuei
 returns the accepted input and receipt. Limits and authority must also be enforced
 by each runtime owner before performing effects; port declarations are not adapters.
 
+Graph nodes and edge endpoints distinguish `GraphNodeId::Note(NoteId)` from
+`GraphNodeId::Cluster(ClusterId)`. The projection owner assigns and matches stable
+cluster identities across generations within a history scope; representative notes
+and generation-local dense indices do not serve as cluster identities. Requests
+carry that scope through `SpaceContext`, and results retain it in `SnapshotCut`.
+Cluster supernodes have no fabricated note card. A `Lens` may select a cluster,
+intersecting its members with the existing project, tag and field filters. An
+unknown cluster returns `ResourceNotFound`, without widening the query to the
+whole Space. Clustering, identity matching and membership lookup remain projection
+owner responsibilities. The existing 500/2000 node caps and 1–2 hop bound remain.
+
 ## Verification boundary
 
 Core tests exercise stale history, exact receipts versus

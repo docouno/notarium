@@ -871,6 +871,212 @@ fn mcp_coverage_has_28_named_operations_and_typed_method_witnesses() {
     );
 }
 
+struct ClusterGraphFixture {
+    cut: SnapshotCut,
+    clusters: BTreeMap<ClusterId, Vec<NoteId>>,
+    project: FolderId,
+}
+impl ViewGraphPort for ClusterGraphFixture {
+    fn query_view(
+        &self,
+        ctx: SpaceContext,
+        request: ReadRequest<ViewQuery>,
+    ) -> PortFuture<'_, ViewResult> {
+        support::RejectingPorts.query_view(ctx, request)
+    }
+    fn move_board_card(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<MoveBoardCard>,
+    ) -> PortFuture<'_, Committed<BoardMoveResult>> {
+        support::RejectingPorts.move_board_card(ctx, request)
+    }
+    fn query_graph(&self, ctx: SpaceContext, request: GraphQuery) -> PortFuture<'_, GraphResult> {
+        Box::pin(async move {
+            ctx.check_current(&self.cut.scope)?;
+            request.validate()?;
+            let mut edges = vec![];
+            let nodes: Vec<_> = match request.tier {
+                GraphTier::Superclusters => {
+                    let nodes: Vec<_> = self
+                        .clusters
+                        .iter()
+                        .map(|(id, members)| GraphNode {
+                            id: GraphNodeId::Cluster(id.clone()),
+                            card: None,
+                            member_count: members.len() as u64,
+                        })
+                        .collect();
+                    if nodes.len() == 2 {
+                        edges.push(GraphEdge {
+                            source: nodes[0].id.clone(),
+                            target: nodes[1].id.clone(),
+                            weight: 1.0,
+                        });
+                    }
+                    nodes
+                }
+                GraphTier::Lens {
+                    cluster,
+                    project,
+                    tags,
+                } => {
+                    let members: Vec<_> = match cluster {
+                        Some(id) => self
+                            .clusters
+                            .get(&id)
+                            .ok_or(DomainError::ResourceNotFound)?
+                            .clone(),
+                        None => self
+                            .clusters
+                            .values()
+                            .flatten()
+                            .cloned()
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect(),
+                    };
+                    // Every fixture member belongs to this project and tag.
+                    let matches = project.is_none_or(|p| p == self.project)
+                        && tags.iter().all(|tag| tag == "visible")
+                        && request.filter.matches(&BTreeMap::new(), &BTreeMap::new())?;
+                    members
+                        .into_iter()
+                        .filter(|_| matches)
+                        .map(|id| GraphNode {
+                            id: GraphNodeId::Note(id),
+                            card: None,
+                            member_count: 1,
+                        })
+                        .collect()
+                }
+                GraphTier::Neighborhood { .. } => {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            };
+            Ok(GraphResult {
+                nodes,
+                edges,
+                hidden_count: 0,
+                truncated: false,
+                cut: self.cut.clone(),
+            })
+        })
+    }
+}
+
+#[test]
+fn cluster_identity_survives_membership_changes_and_selects_a_typed_lens() {
+    let first = ClusterId::from_bytes([1; 16]);
+    let second = ClusterId::from_bytes([2; 16]);
+    let note = |value| NoteId::from_bytes([value; 16]);
+    let project = FolderId::from_bytes([3; 16]);
+    let query = |tier| GraphQuery {
+        tier,
+        filter: FieldFilterAstV1 {
+            version: 1,
+            predicate: Predicate::All(vec![]),
+        },
+    };
+    let old = ClusterGraphFixture {
+        cut: fixture_read().cut,
+        clusters: BTreeMap::from([
+            (first.clone(), vec![note(1), note(2)]),
+            (second.clone(), vec![note(3)]),
+        ]),
+        project: project.clone(),
+    };
+    let new = ClusterGraphFixture {
+        cut: SnapshotCut {
+            generation: ProjectionGeneration::new(2).unwrap(),
+            projected_seq: SpaceSeq::new(11).unwrap(),
+            canonical_seq: SpaceSeq::new(11).unwrap(),
+            ..old.cut.clone()
+        },
+        clusters: BTreeMap::from([
+            (first.clone(), vec![note(2), note(4)]),
+            (second.clone(), vec![note(3), note(1)]),
+        ]),
+        project: project.clone(),
+    };
+    let old_port: &dyn ViewGraphPort = &old;
+    let new_port: &dyn ViewGraphPort = &new;
+    let before = ready(old_port.query_graph(context(), query(GraphTier::Superclusters))).unwrap();
+    let after = ready(new_port.query_graph(context(), query(GraphTier::Superclusters))).unwrap();
+    let expected = vec![
+        GraphNodeId::Cluster(first.clone()),
+        GraphNodeId::Cluster(second.clone()),
+    ];
+    for result in [&before, &after] {
+        assert_eq!(
+            result
+                .nodes
+                .iter()
+                .map(|n| n.id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(result.nodes.iter().all(|n| n.card.is_none()));
+        assert_eq!(result.edges[0].source, expected[0]);
+        assert_eq!(result.edges[0].target, expected[1]);
+    }
+    assert_ne!(before.cut.generation, after.cut.generation);
+    assert_eq!(before.nodes[1].member_count, 1);
+    assert_eq!(after.nodes[1].member_count, 2);
+    let GraphNodeId::Cluster(selected) = after.nodes[0].id.clone() else {
+        panic!("the supernode must carry a cluster identity");
+    };
+    let lens = |cluster, project| {
+        query(GraphTier::Lens {
+            cluster,
+            project,
+            tags: vec!["visible".into()],
+        })
+    };
+    for (port, members) in [
+        (
+            old_port,
+            vec![GraphNodeId::Note(note(1)), GraphNodeId::Note(note(2))],
+        ),
+        (
+            new_port,
+            vec![GraphNodeId::Note(note(2)), GraphNodeId::Note(note(4))],
+        ),
+    ] {
+        let result = ready(port.query_graph(
+            context(),
+            lens(Some(selected.clone()), Some(project.clone())),
+        ))
+        .unwrap();
+        assert_eq!(
+            result.nodes.into_iter().map(|n| n.id).collect::<Vec<_>>(),
+            members
+        );
+    }
+    let excluded = ready(new_port.query_graph(
+        context(),
+        lens(Some(selected), Some(FolderId::from_bytes([9; 16]))),
+    ))
+    .unwrap();
+    assert!(excluded.nodes.is_empty());
+    assert!(
+        ready(new_port.query_graph(context(), lens(Some(ClusterId::from_bytes([9; 16])), None),))
+            .is_err()
+    );
+    let stale = SpaceContext::new(auth(), scope(2), budget()).unwrap();
+    assert!(ready(new_port.query_graph(stale, query(GraphTier::Superclusters))).is_err());
+    assert_eq!(query(GraphTier::Superclusters).node_limit(), 500);
+    assert_eq!(lens(None, None).node_limit(), 2000);
+    assert!(
+        query(GraphTier::Neighborhood {
+            note: note(1),
+            hops: 3
+        })
+        .validate()
+        .is_err()
+    );
+}
+
 struct GraphFixture {
     cut: SnapshotCut,
     notes: Vec<NoteId>,

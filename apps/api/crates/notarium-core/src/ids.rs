@@ -63,7 +63,7 @@ ids! {
     CommandKey => "cmd_", ModelProfileId => "model_", BodyIdentity => "body_",
     HeaderIdentity => "header_", EffectiveReadId => "read_", BackupId => "backup_",
     KeyId => "key_", ReservationId => "reservation_", PendingInputId => "pending_",
-    ArtifactId => "artifact_",
+    ArtifactId => "artifact_", ClusterId => "cluster_",
 }
 
 macro_rules! counters {
