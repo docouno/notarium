@@ -51,6 +51,35 @@ impl Carrier {
     }
 }
 
+/// Shared scalar-data ownership for carrier scanning and concrete field edits.
+/// The parent is the owning key/dash, not the column of a later scalar marker.
+#[derive(Clone, Debug)]
+pub(crate) struct BlockScalar {
+    parent: usize,
+    content_indent: Option<usize>,
+}
+impl BlockScalar {
+    pub fn new(parent: usize, marker: &str) -> Self {
+        Self {
+            parent,
+            content_indent: marker
+                .bytes()
+                .find(u8::is_ascii_digit)
+                .map(|digit| parent + usize::from(digit - b'0')),
+        }
+    }
+    pub fn contains_line(&mut self, line: &str) -> bool {
+        if line.trim_matches([' ', '\r', '\n']).is_empty() {
+            return true;
+        }
+        let indent = line.bytes().take_while(|b| *b == b' ').count();
+        let required = self
+            .content_indent
+            .get_or_insert(indent.max(self.parent + 1));
+        indent >= *required
+    }
+}
+
 /// Byte-state tracker only. YAML semantics and validity are delegated to saphyr.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LexState {
@@ -58,7 +87,10 @@ pub(crate) struct LexState {
     pub flow: usize,
     plain: bool,
     escaped: bool,
-    block_indent: Option<usize>,
+    block_scalar: Option<BlockScalar>,
+    node_parent: usize,
+    node_start: Option<usize>,
+    plain_parent: Option<usize>,
 }
 impl LexState {
     pub fn at_root(&self) -> bool {
@@ -66,11 +98,21 @@ impl LexState {
     }
     pub fn feed(&mut self, text: &str) {
         let indent = text.bytes().take_while(|b| *b == b' ').count();
-        if let Some(parent) = self.block_indent {
-            if text.trim().is_empty() || indent > parent {
+        if let Some(scalar) = &mut self.block_scalar {
+            if scalar.contains_line(text) {
                 return;
             }
-            self.block_indent = None;
+            self.block_scalar = None;
+        }
+        if self.quote.is_none() && self.flow == 0 {
+            // Quotes and brackets in a continued plain scalar are text. Keep
+            // its owning indentation across lines, just like block scalar data.
+            if self.plain_parent.is_some_and(|parent| indent > parent) {
+                return;
+            }
+            self.plain = false;
+            self.plain_parent = None;
+            self.node_start = None;
         }
         let bytes = text.as_bytes();
         let mut i = 0;
@@ -92,17 +134,24 @@ impl LexState {
                 continue;
             }
             match b {
-                b'!' if !self.plain => {
+                b'!' | b'&' if !self.plain => {
                     // A node property may precede a block scalar. URI tag
                     // punctuation is not quote/flow syntax of the scalar itself.
+                    self.node_start.get_or_insert(i);
                     while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
                         i += 1;
                     }
                     continue;
                 }
                 b'|' | b'>' if !self.plain && self.flow == 0 => {
-                    self.block_indent = Some(indent);
-                    self.plain = true;
+                    let marker_end = bytes[i..]
+                        .iter()
+                        .position(|b| b.is_ascii_whitespace() || *b == b'#')
+                        .map_or(bytes.len(), |n| i + n);
+                    self.block_scalar =
+                        Some(BlockScalar::new(self.node_parent, &text[i..marker_end]));
+                    self.plain_parent = None;
+                    return;
                 }
                 b'\n' | b'\r' => self.plain = false,
                 b'#' if i == 0 || bytes[i - 1].is_ascii_whitespace() => {
@@ -111,8 +160,14 @@ impl LexState {
                     }
                     continue;
                 }
-                b'\'' | b'"' if !self.plain => self.quote = Some(b),
+                b'\'' | b'"' if !self.plain => {
+                    self.node_start.get_or_insert(i);
+                    self.plain_parent = None;
+                    self.quote = Some(b);
+                }
                 b'[' | b'{' if !self.plain || self.flow > 0 => {
+                    self.node_start.get_or_insert(i);
+                    self.plain_parent = None;
                     self.flow += 1;
                     self.plain = false;
                 }
@@ -126,12 +181,30 @@ impl LexState {
                         || self.flow > 0 && matches!(b, b',' | b'[' | b']' | b'{' | b'}')
                 }) =>
                 {
-                    self.plain = false
+                    if self.flow == 0 {
+                        self.node_parent = self.node_start.unwrap_or(indent);
+                    }
+                    self.node_start = None;
+                    self.plain_parent = None;
+                    self.plain = false;
                 }
                 b' ' | b'\t' => {}
                 b'-' | b'?'
-                    if !self.plain && bytes.get(i + 1).is_some_and(u8::is_ascii_whitespace) => {}
-                _ => self.plain = true,
+                    if !self.plain && bytes.get(i + 1).is_some_and(u8::is_ascii_whitespace) =>
+                {
+                    self.node_parent = i;
+                    self.node_start = None;
+                    self.plain_parent = None;
+                }
+                _ => {
+                    if !self.plain {
+                        self.node_start.get_or_insert(i);
+                        if self.flow == 0 {
+                            self.plain_parent = Some(self.node_parent);
+                        }
+                    }
+                    self.plain = true;
+                }
             }
             i += 1;
         }

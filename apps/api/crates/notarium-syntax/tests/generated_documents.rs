@@ -34,7 +34,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
         ..defaults
     };
     let strategy = (
-        0usize..20,
+        0usize..22,
         any::<u32>(),
         any::<bool>(),
         any::<bool>(),
@@ -55,7 +55,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
             1..16,
         ),
     );
-    let counts = Cell::new([0u32; 20]);
+    let counts = Cell::new([0u32; 22]);
     let outcome = TestRunner::new(config).run(&strategy, |(family, number, crlf, bom, parts)| {
         let eol = if crlf { "\r\n" } else { "\n" };
         let bom = if bom { "\u{feff}" } else { "" };
@@ -205,7 +205,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
                 let plan = frontmatter::unset_field(&source, DocClass::UserDoc, "status").unwrap();
                 prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
             }
-            _ => {
+            19 => {
                 let layout = number % 4;
                 let (prefix, parent, replacement, erased) = match layout {
                     0 => ("status: ", 0, format!("status: {new} # marker{eol}"), format!("  # marker{eol}")),
@@ -224,6 +224,26 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
                 prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
                 let plan = frontmatter::unset_field(&source, DocClass::UserDoc, "status").unwrap();
                 let expected = format!("{bom}---{eol}{erased}{outside}{suffix}---{eol}{body}");
+                prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
+            }
+            20 => {
+                let marker_indent = " ".repeat((number % 8 + 1) as usize);
+                let content_indent = " ".repeat((number / 8 % 8 + 1) as usize);
+                let marker = if number % 2 == 0 { "|" } else { ">-" };
+                let source = format!("{bom}---{eol}status:{eol}{marker_indent}{marker} # marker{eol}{content_indent}\"data [ {{ {text}{eol}# outside{eol}next: keep{eol}---{eol}{body}");
+                let plan = frontmatter::set_field(&source, DocClass::UserDoc, "status", value).unwrap();
+                let expected = format!("{bom}---{eol}status:{eol}{marker_indent}{new} # marker{eol}# outside{eol}next: keep{eol}---{eol}{body}");
+                prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
+                let plan = frontmatter::unset_field(&source, DocClass::UserDoc, "status").unwrap();
+                let expected = format!("{bom}---{eol}{eol}{marker_indent} # marker{eol}# outside{eol}next: keep{eol}---{eol}{body}");
+                prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
+            }
+            _ => {
+                let (first, continuation) = [("", ""), ("> ", "> "), ("> - ", ">   "), ("- ", "  "), ("1. ", "   ")][(number % 5) as usize];
+                let suffix = if number % 2 == 0 { String::new() } else { format!("{eol}{continuation}# B{eol}{continuation}keep") };
+                let source = format!("{header}{first}# A{suffix}");
+                let plan = markdown::replace_section(&source, &markdown::SectionSelector { title: "A".into(), occurrence: None }, &new).unwrap();
+                let expected = format!("{header}{first}# A{eol}{continuation}{new}{suffix}");
                 prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
             }
         }

@@ -423,3 +423,135 @@ fn replacing_a_final_block_scalar_subtree_preserves_the_carrier_boundary() {
         }
     }
 }
+
+#[test]
+fn carrier_and_field_edits_agree_when_marker_and_data_indentation_vary() {
+    use saphyr::LoadableYamlNode;
+    let mut valid = 0;
+    for (prefix, parent) in [
+        ("status:\n", 0),
+        ("status: !!str\n", 0),
+        ("status:\n  child:\n", 2),
+        ("status:\n  -\n", 2),
+        ("status:\n-\n", 0),
+    ] {
+        for marker_indent in parent + 1..=parent + 5 {
+            for content_indent in parent + 1..=parent + 5 {
+                for marker in [
+                    "|", "|-", "|+", "|1", "|2", "|4", ">", ">-", ">1", ">2", ">4",
+                ] {
+                    for eol in ["\n", "\r\n"] {
+                        let raw = format!("{prefix}{}{marker} # marker\n{}\"literal data [ {{ 🚀\n# outside\nnext: keep\n", " ".repeat(marker_indent), " ".repeat(content_indent)).replace('\n', eol);
+                        if saphyr::Yaml::load_from_str(&raw).is_err() {
+                            continue;
+                        }
+                        valid += 1;
+                        let source = format!("---{eol}{raw}---{eol}Body🚀");
+                        for unset in [false, true] {
+                            let plan = if unset {
+                                unset_field(&source, DocClass::UserDoc, "status")
+                            } else {
+                                set_field(&source, DocClass::UserDoc, "status", string("done"))
+                            }
+                            .unwrap_or_else(|e| panic!("{raw:?}: {e:?}"));
+                            let changed = patch::apply(&source, &plan).unwrap();
+                            let after = Carrier::scan(&changed).unwrap();
+                            assert_eq!(after.body.slice(&changed).unwrap(), "Body🚀");
+                            assert!(changed.contains(&format!("# outside{eol}")));
+                            let actual = saphyr::Yaml::load_from_str(
+                                after.yaml.unwrap().slice(&changed).unwrap(),
+                            )
+                            .unwrap();
+                            let expected = saphyr::Yaml::load_from_str(if unset {
+                                "next: keep\n"
+                            } else {
+                                "status: done\nnext: keep\n"
+                            })
+                            .unwrap();
+                            assert_eq!(actual, expected, "{raw:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(valid, 2350);
+}
+
+#[test]
+fn literal_lookalikes_and_readonly_properties_preserve_their_authored_bytes() {
+    use saphyr::LoadableYamlNode;
+    for raw in [
+        "status: &anchor |\n  \"literal [ {\nnext: keep\n",
+        "status: &anchor !!str |\n  \"literal [ {\nnext: keep\n",
+        "status: !!str &anchor |\n  \"literal [ {\nnext: keep\n",
+        "status:\n  &anchor\n    |2\n  \"literal [ {\nnext: keep\n",
+    ] {
+        for eol in ["\n", "\r\n"] {
+            let raw = raw.replace('\n', eol);
+            assert!(saphyr::Yaml::load_from_str(&raw).is_ok());
+            let source = format!("---{eol}{raw}---{eol}Body");
+            let analysis = analyze(&source, DocClass::UserDoc).unwrap();
+            assert!(!analysis.writable);
+            let plan = notarium_syntax::extract::finalize_document(
+                &source,
+                DocClass::UserDoc,
+                &NoteId::from_bytes([1; 16]),
+                &[],
+            )
+            .unwrap();
+            assert_eq!(patch::apply(&source, &plan).unwrap(), source);
+            let plan = patch::plan(
+                &source,
+                analysis.carrier.body,
+                vec![(
+                    CarrierEditOrigin::Body,
+                    analysis.carrier.body,
+                    "New body".into(),
+                )],
+            )
+            .unwrap();
+            assert_eq!(
+                patch::apply(&source, &plan).unwrap(),
+                format!("---{eol}{raw}---{eol}New body")
+            );
+        }
+    }
+    for continuation in [
+        "|",
+        "- |",
+        "!!str |",
+        "\"unclosed quote",
+        "[unclosed flow",
+        ":plain",
+    ] {
+        let raw = format!(
+            "status: first line\n  {continuation}\n          # retained trivia\nnext: keep\n"
+        );
+        assert!(saphyr::Yaml::load_from_str(&raw).is_ok(), "{raw:?}");
+        let source = format!("---\n{raw}---\nBody");
+        for unset in [false, true] {
+            let plan = if unset {
+                unset_field(&source, DocClass::UserDoc, "status")
+            } else {
+                set_field(&source, DocClass::UserDoc, "status", string("done"))
+            }
+            .unwrap();
+            let changed = patch::apply(&source, &plan).unwrap();
+            assert!(
+                changed.contains("          # retained trivia\n"),
+                "{changed:?}"
+            );
+            let after = Carrier::scan(&changed).unwrap();
+            let actual =
+                saphyr::Yaml::load_from_str(after.yaml.unwrap().slice(&changed).unwrap()).unwrap();
+            let expected = saphyr::Yaml::load_from_str(if unset {
+                "next: keep\n"
+            } else {
+                "status: done\nnext: keep\n"
+            })
+            .unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+}

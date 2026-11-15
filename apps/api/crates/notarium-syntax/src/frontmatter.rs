@@ -1,5 +1,8 @@
 //! Concrete byte ranges are independent of the semantic YAML parser's character offsets.
-use crate::{carrier::Carrier, patch, yaml};
+use crate::{
+    carrier::{BlockScalar, Carrier},
+    patch, yaml,
+};
 use notarium_core::{
     DomainError, DomainResult,
     classes::{DocClass, authorize_field_key},
@@ -100,25 +103,10 @@ fn scalar_parent_indent(source: &str, tokens: &[Token]) -> usize {
 /// still indented farther than the parent node. Empty lines belong to the scalar;
 /// semantic validation has already checked their indentation and chomping rules.
 fn scalar_tail_end(source: &str, start: usize, marker: &str, parent: usize) -> usize {
-    let explicit = marker.bytes().find(|b| b.is_ascii_digit());
-    let indent = explicit.map_or_else(
-        || {
-            source[start..]
-                .split_inclusive('\n')
-                .find(|line| !line.trim_matches([' ', '\r', '\n']).is_empty())
-                .map_or(parent + 1, |line| {
-                    line.bytes()
-                        .take_while(|b| *b == b' ')
-                        .count()
-                        .max(parent + 1)
-                })
-        },
-        |digit| parent + usize::from(digit - b'0'),
-    );
+    let mut scalar = BlockScalar::new(parent, marker);
     let mut end = start;
     for line in source[start..].split_inclusive('\n') {
-        let spaces = line.bytes().take_while(|b| *b == b' ').count();
-        if !line.trim_matches([' ', '\r', '\n']).is_empty() && spaces < indent {
+        if !scalar.contains_line(line) {
             break;
         }
         end += line.len();
@@ -133,6 +121,7 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
     let mut i = 0;
     let mut depth = 0usize;
     let mut result = Vec::new();
+    let mut plain_parent = None;
     while i < bytes.len() {
         let b = bytes[i];
         if b.is_ascii_whitespace() {
@@ -146,12 +135,23 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
             continue;
         }
         let start = i;
+        let continuing = depth == 0
+            && plain_parent
+                .is_some_and(|parent| leading(source, start).is_some_and(|indent| indent > parent));
+        if depth == 0 && leading(source, start).is_some() && !continuing {
+            plain_parent = None;
+        }
+        let mut plain_token = false;
         let kind = match b {
-            b'-' | b'?' if depth == 0 && bytes.get(i + 1).is_none_or(u8::is_ascii_whitespace) => {
+            b'-' | b'?'
+                if !continuing
+                    && depth == 0
+                    && bytes.get(i + 1).is_none_or(u8::is_ascii_whitespace) =>
+            {
                 i += 1;
                 Kind::Indicator
             }
-            b'!' => {
+            b'!' if !continuing => {
                 // Tags are node properties, not part of a plain scalar. The YAML
                 // parser validates their spelling; retain their concrete bytes.
                 while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
@@ -159,12 +159,12 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
                 }
                 Kind::Property
             }
-            b'{' | b'[' => {
+            b'{' | b'[' if !continuing => {
                 depth += 1;
                 i += 1;
                 Kind::Open
             }
-            b'}' | b']' => {
+            b'}' | b']' if !continuing => {
                 if depth == 0 {
                     return Err(failure(ValidationReason::InvalidYaml));
                 }
@@ -172,15 +172,15 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
                 i += 1;
                 Kind::Close
             }
-            b',' => {
+            b',' if !continuing => {
                 i += 1;
                 Kind::Comma
             }
-            b':' => {
+            b':' if !continuing => {
                 i += 1;
                 Kind::Colon
             }
-            b'\'' | b'"' => {
+            b'\'' | b'"' if !continuing => {
                 let quote = b;
                 i += 1;
                 let mut closed = false;
@@ -205,7 +205,7 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
                 }
                 Kind::Scalar
             }
-            b'|' | b'>' if depth == 0 => {
+            b'|' | b'>' if depth == 0 && !continuing => {
                 let end_line = source[i..].find('\n').map_or(source.len(), |n| i + n + 1);
                 while i < end_line && !bytes[i].is_ascii_whitespace() && bytes[i] != b'#' {
                     i += 1;
@@ -220,10 +220,12 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
                     depth,
                     tail: Some(span(end_line, end)?),
                 });
+                plain_parent = None;
                 i = end;
                 continue;
             }
             _ => {
+                plain_token = true;
                 while i < bytes.len() {
                     let ch = bytes[i];
                     if matches!(ch, b'\n' | b'\r')
@@ -250,6 +252,13 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
             while end > start && bytes[end - 1].is_ascii_whitespace() {
                 end -= 1;
             }
+        }
+        if plain_token && depth == 0 {
+            if !continuing {
+                plain_parent = Some(scalar_parent_indent(source, &result));
+            }
+        } else if kind != Kind::Property {
+            plain_parent = None;
         }
         result.push(Token {
             kind,

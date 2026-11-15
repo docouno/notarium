@@ -12,6 +12,9 @@ ID brands preserve their exact spelling. Minted v1 IDs contain a type prefix and
 caller-supplied entropy. Sequence newtypes reject values above signed 64-bit
 storage limits and checked increments never wrap. Dates validate the calendar;
 timestamps normalize RFC 3339 offsets without dropping nanosecond precision.
+The domain accepts UTC years 0000–9999 and at most nine fractional digits.
+Out-of-range UTC conversions and leap seconds return `InvalidTimestamp`; they
+are never clamped to a different instant.
 
 `StorageEpochFacts` describes observations made by the runtime. The pure
 classifier distinguishes an evidenced empty root, ready v1, migration in progress,

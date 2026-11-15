@@ -73,6 +73,54 @@ fn dates_validate_calendar_and_timestamps_keep_precision_and_offsets() {
 }
 
 #[test]
+fn timestamp_admission_rejects_unrepresentable_instants_without_rounding_or_panics() {
+    for value in [
+        "9999-12-31T23:59:59-00:01",
+        "9999-12-31T23:59:59.999999999-23:59",
+        "0000-01-01T00:00:00+00:01",
+        "0000-01-01T00:00:00.000000001+23:59",
+        "2016-12-31T23:59:60Z",
+        "2016-12-31T23:59:60.100000001Z",
+        "2016-12-31T23:59:60.200000002Z",
+        "2017-01-01T00:59:60+01:00",
+        "2024-01-01T00:00:00.1234567890Z",
+    ] {
+        assert_eq!(
+            Timestamp::parse(value),
+            Err(DomainError::validation(ValidationReason::InvalidTimestamp)),
+            "{value}"
+        );
+        assert!(serde_json::from_str::<Timestamp>(&serde_json::to_string(value).unwrap()).is_err());
+    }
+    for (input, expected) in [
+        ("0000-01-01T00:00:00Z", "0000-01-01T00:00:00Z"),
+        ("0000-01-01T23:59:00+23:59", "0000-01-01T00:00:00Z"),
+        (
+            "9999-12-31T23:59:59.999999999Z",
+            "9999-12-31T23:59:59.999999999Z",
+        ),
+        (
+            "9999-12-31T00:00:59.999999999-23:59",
+            "9999-12-31T23:59:59.999999999Z",
+        ),
+        (
+            "2016-12-31T23:59:59.100000001Z",
+            "2016-12-31T23:59:59.100000001Z",
+        ),
+        (
+            "2016-12-31T23:59:59.200000002Z",
+            "2016-12-31T23:59:59.200000002Z",
+        ),
+    ] {
+        let value = Timestamp::parse(input).unwrap();
+        assert_eq!(String::from(value), expected);
+        let decoded: Timestamp =
+            serde_json::from_str(&serde_json::to_string(&value).unwrap()).unwrap();
+        assert_eq!(decoded, value);
+    }
+}
+
+#[test]
 fn field_truth_tables_keep_null_empty_bad_and_absent_distinct() {
     let empty = ScalarValue::String(String::new());
     let observations = [

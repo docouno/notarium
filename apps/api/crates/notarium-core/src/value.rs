@@ -147,6 +147,11 @@ impl From<Date> for String {
 pub struct Timestamp(time::OffsetDateTime);
 impl Timestamp {
     pub fn parse(value: &str) -> DomainResult<Self> {
+        // The domain stores UTC instants at nanosecond precision. The underlying
+        // parser clamps leap seconds, so reject them before information is lost.
+        if value.as_bytes().get(17..19) == Some(b"60") {
+            return Err(DomainError::validation(ValidationReason::InvalidTimestamp));
+        }
         if let Some((_, fraction)) = value.split_once('.')
             && fraction.bytes().take_while(u8::is_ascii_digit).count() > 9
         {
@@ -155,7 +160,9 @@ impl Timestamp {
         let parsed =
             time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
                 .map_err(|_| DomainError::validation(ValidationReason::InvalidTimestamp))?;
-        let utc = parsed.to_offset(time::UtcOffset::UTC);
+        let utc = parsed
+            .checked_to_offset(time::UtcOffset::UTC)
+            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidTimestamp))?;
         if !(0..=9999).contains(&utc.year()) {
             return Err(DomainError::validation(ValidationReason::InvalidTimestamp));
         }

@@ -272,9 +272,16 @@ pub fn replace_section(
         text.push_str(&prefix);
         text.push_str(line);
     }
+    if !text.is_empty() && !source[..selected.section_span.start()].ends_with(['\r', '\n']) {
+        // An EOF heading may have no terminal line break. Inserting its body
+        // still needs a separator, even though the original section was empty.
+        text.insert_str(0, carrier.eol);
+    }
     if !text.is_empty()
-        && !text.ends_with('\n')
-        && selected.section_span.slice(source)?.ends_with('\n')
+        && !text.ends_with(['\r', '\n'])
+        && (selected.section_span.slice(source)?.ends_with(['\r', '\n'])
+            || selected.section_span.end() < source.len()
+                && !source[selected.section_span.end()..].starts_with(['\r', '\n']))
     {
         text.push_str(carrier.eol);
     }

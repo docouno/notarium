@@ -223,3 +223,94 @@ fn neighboring_section_prefixes_remain_byte_exact() {
         }
     }
 }
+
+#[test]
+fn empty_sections_preserve_headings_at_eof_and_before_neighbors() {
+    for (heading, prefix) in [
+        ("# A", ""),
+        ("> # A", "> "),
+        ("- # A", "  "),
+        ("> - # A", ">   "),
+        ("> > # A", "> > "),
+        ("1. # A", "   "),
+        ("> 1. # A", ">    "),
+        ("A\n===", ""),
+        ("> A\n> ===", "> "),
+    ] {
+        for eol in ["\n", "\r\n"] {
+            for header in ["", "\u{feff}", "\u{feff}---\nstatus: old\n---\n"] {
+                let header = header.replace('\n', eol);
+                let heading = heading.replace('\n', eol);
+                for ending in 0..3 {
+                    let neighbor = format!("{prefix}# B{eol}{prefix}keep");
+                    let source = match ending {
+                        0 => format!("{header}{heading}"),
+                        1 => format!("{header}{heading}{eol}"),
+                        _ => format!("{header}{heading}{eol}{neighbor}"),
+                    };
+                    for logical in [
+                        String::new(),
+                        "new".into(),
+                        format!("new{eol}"),
+                        format!("new{eol}second"),
+                    ] {
+                        let body = if logical.is_empty() {
+                            String::new()
+                        } else {
+                            logical
+                                .split_inclusive('\n')
+                                .map(|line| format!("{prefix}{line}"))
+                                .collect::<String>()
+                        };
+                        let expected = match ending {
+                            0 if body.is_empty() => source.clone(),
+                            0 => format!(
+                                "{source}{}{body}",
+                                if !heading.contains('\n') && !header.contains('\n') {
+                                    "\n"
+                                } else {
+                                    eol
+                                }
+                            ),
+                            1 => format!("{source}{body}"),
+                            _ => format!(
+                                "{header}{heading}{eol}{body}{}{neighbor}",
+                                if !body.is_empty() && !body.ends_with('\n') {
+                                    eol
+                                } else {
+                                    ""
+                                }
+                            ),
+                        };
+                        let plan = replace_section(
+                            &source,
+                            &SectionSelector {
+                                title: "A".into(),
+                                occurrence: None,
+                            },
+                            &logical,
+                        )
+                        .unwrap();
+                        let changed = patch::apply(&source, &plan).unwrap();
+                        assert_eq!(
+                            changed, expected,
+                            "source={source:?} replacement={logical:?}"
+                        );
+                        let after =
+                            analyze(&changed, Carrier::scan(&changed).unwrap().body).unwrap();
+                        let titles: Vec<_> =
+                            after.headings.iter().map(|h| h.title.as_str()).collect();
+                        assert_eq!(
+                            titles,
+                            if ending == 2 {
+                                vec!["A", "B"]
+                            } else {
+                                vec!["A"]
+                            }
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

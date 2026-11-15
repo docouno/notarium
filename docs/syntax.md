@@ -54,6 +54,9 @@ trivia between them, including comments inside collections. Literal block-scalar
 content remains value data and is removed with its value.
 Scalar boundaries account for explicit or inferred content indentation, nested
 sequence markers and markers on a later line. Dedented comments remain trivia.
+Carrier detection and concrete edits share scalar-data indentation rules.
+Marker indentation does not constrain a later content line; anchors and tags
+remain node properties, and continued plain scalars keep literal punctuation.
 Replacing a collection preserves its final line separator and supplies the
 indentation required when an indentless sequence becomes a scalar/flow value.
 
@@ -117,6 +120,8 @@ at the next heading of equal/lower level in the same container, or at the end of
 its owning blockquote/list item, whichever comes first. Root sections end at the
 body boundary. A nested container's heading does not terminate its parent section.
 Code-block headings are not sections; ambiguous selectors are rejected.
+Empty-section insertions preserve both headings: the builder supplies a line
+separator after an EOF heading and before an adjacent section when needed.
 
 Section replacement accepts logical Markdown without its enclosing quote/list
 prefixes. The builder reapplies the selected container's prefixes and continuation
