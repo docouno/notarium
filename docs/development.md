@@ -66,7 +66,7 @@ quotas and run heavy checks sequentially. Stop only this checkout's services.
 
 `make test` includes the domain, authorization, receipt, port-protocol and document
 tests. `generated_documents` enforces a floor of 10,000 successful generated
-documents across twelve scenario families, even when `PROPTEST_CASES=1`. It reports
+documents across seventeen scenario families, even when `PROPTEST_CASES=1`. It reports
 the effective case count, RNG seed and family counts. Failures shrink and persist
 replay seeds in the writable Cargo target directory. Fixed adversarial fixtures
 remain in the source tree; the normal offline gate needs no external corpus.

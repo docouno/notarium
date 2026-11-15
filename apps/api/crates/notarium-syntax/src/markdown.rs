@@ -14,10 +14,11 @@ pub struct FencedBlock {
     pub info: String,
     pub closed: bool,
     pub text: String,
-    /// Logical content bytes mapped to their physical source bytes, one line at a time.
+    /// Canonical parser text fragments mapped to their physical source bytes.
     pub lines: Vec<(ByteSpan, ByteSpan)>,
     pub closing_start: usize,
     pub continuation_prefix: String,
+    content_end: usize,
 }
 #[derive(Clone, Debug)]
 pub struct MarkdownAnalysis {
@@ -40,6 +41,7 @@ pub fn analyze(source: &str, body: ByteSpan) -> DomainResult<MarkdownAnalysis> {
     let mut ordinal = 0u32;
     let mut heading: Option<Heading> = None;
     let mut code = false;
+    let mut active_fence = None;
     let mut link_depth = 0u32;
     for (event, range) in Parser::new_ext(
         text,
@@ -51,6 +53,8 @@ pub fn analyze(source: &str, body: ByteSpan) -> DomainResult<MarkdownAnalysis> {
         match event {
             Event::Start(Tag::BlockQuote(_)) | Event::Start(Tag::Item) => {
                 let kind = if matches!(event, Event::Start(Tag::Item)) {
+                    // Tight lists do not emit Paragraph events.
+                    result.blocks.push(span);
                     ContainerKind::ListItem
                 } else {
                     ContainerKind::BlockQuote
@@ -84,9 +88,15 @@ pub fn analyze(source: &str, body: ByteSpan) -> DomainResult<MarkdownAnalysis> {
                 result.blocks.push(span);
                 if let CodeBlockKind::Fenced(info) = kind {
                     result.fences.push(fenced(source, span, info.to_string())?);
+                    active_fence = Some(result.fences.len() - 1);
                 }
             }
-            Event::End(TagEnd::CodeBlock) => code = false,
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(index) = active_fence.take() {
+                    finish_fence(source, &mut result.fences[index])?;
+                }
+                code = false;
+            }
             Event::Start(Tag::Link { .. }) | Event::Start(Tag::Image { .. }) => link_depth += 1,
             Event::End(TagEnd::Link) | Event::End(TagEnd::Image) => {
                 link_depth = link_depth.saturating_sub(1)
@@ -97,6 +107,19 @@ pub fn analyze(source: &str, body: ByteSpan) -> DomainResult<MarkdownAnalysis> {
                 }
             }
             Event::Text(value) => {
+                if let Some(index) = active_fence {
+                    let fence = &mut result.fences[index];
+                    let start = fence.text.len();
+                    fence.text.push_str(&value);
+                    fence.content_end = span.end();
+                    // CommonMark can synthesize spaces for a partially consumed
+                    // tab. Keep them readable but never invent a writable offset.
+                    if value.as_ref() == span.slice(source)? {
+                        fence
+                            .lines
+                            .push((ByteSpan::new(start, fence.text.len())?, span));
+                    }
+                }
                 if let Some(h) = &mut heading {
                     h.title.push_str(&value);
                 }
@@ -123,7 +146,9 @@ pub fn analyze(source: &str, body: ByteSpan) -> DomainResult<MarkdownAnalysis> {
         let end = result.headings[index + 1..]
             .iter()
             .find(|next| next.level <= h.level && next.containers == h.containers)
-            .map_or(owner_end, |h| h.heading_span.start().min(owner_end));
+            .map_or(owner_end, |h| {
+                line_start(source, h.heading_span.start()).min(owner_end)
+            });
         result.headings[index].section_span = ByteSpan::new(h.heading_span.end().min(end), end)?;
     }
     result
@@ -143,8 +168,7 @@ pub fn analyze(source: &str, body: ByteSpan) -> DomainResult<MarkdownAnalysis> {
 }
 
 fn continuation_prefix(source: &str, start: usize) -> DomainResult<String> {
-    let line_start = source[..start].rfind('\n').map_or(0, |n| n + 1);
-    let prefix = &source[line_start..start];
+    let prefix = &source[line_start(source, start)..start];
     let mut result = String::new();
     let mut chars = prefix.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -171,67 +195,42 @@ fn continuation_prefix(source: &str, start: usize) -> DomainResult<String> {
     }
     Ok(result)
 }
-fn strip_prefix<'a>(line: &'a str, prefix: &str) -> (&'a str, usize) {
-    if let Some(rest) = line.strip_prefix(prefix) {
-        return (rest, prefix.len());
-    }
-    // Quote continuation may omit a single following space, including an empty line.
-    let trimmed = prefix.trim_end_matches([' ', '\t']);
-    if !trimmed.is_empty()
-        && let Some(rest) = line.strip_prefix(trimmed)
-    {
-        return (rest, trimmed.len());
-    }
-    (line, 0)
+fn line_start(source: &str, offset: usize) -> usize {
+    source[..offset].rfind(['\r', '\n']).map_or(0, |n| n + 1)
 }
 fn fenced(source: &str, span: ByteSpan, info: String) -> DomainResult<FencedBlock> {
-    let raw = span.slice(source)?;
-    let mut physical = span.start();
-    let mut input = raw.split_inclusive('\n');
-    let first = input.next().unwrap_or("");
     let prefix = continuation_prefix(source, span.start())?;
-    let marker = first
-        .trim_start()
-        .as_bytes()
-        .first()
-        .copied()
-        .unwrap_or(b'`');
-    let count = first
-        .trim_start()
-        .bytes()
-        .take_while(|b| *b == marker)
-        .count();
-    physical += first.len();
-    let mut logical = String::new();
-    let mut lines = Vec::new();
-    let mut closed = false;
-    let mut closing_start = span.end();
-    for line in input {
-        let (unprefixed, removed) = strip_prefix(line, &prefix);
-        let indentation = unprefixed.bytes().take_while(|b| *b == b' ').count();
-        let candidate = unprefixed[indentation..].trim_end_matches([' ', '\t', '\r', '\n']);
-        if indentation <= 3 && candidate.len() >= count && candidate.bytes().all(|b| b == marker) {
-            closed = true;
-            closing_start = physical + removed;
-            break;
-        }
-        let start = logical.len();
-        logical.push_str(unprefixed);
-        lines.push((
-            ByteSpan::new(start, logical.len())?,
-            ByteSpan::new(physical + removed, physical + line.len())?,
-        ));
-        physical += line.len();
-    }
     Ok(FencedBlock {
         span,
         info,
-        closed,
-        text: logical,
-        lines,
-        closing_start,
+        closed: false,
+        text: String::new(),
+        lines: vec![],
+        closing_start: span.end(),
         continuation_prefix: prefix,
+        content_end: span.start(),
     })
+}
+fn finish_fence(source: &str, fence: &mut FencedBlock) -> DomainResult<()> {
+    let raw = fence.span.slice(source)?;
+    let marker = raw.as_bytes()[0];
+    let count = raw.bytes().take_while(|b| *b == marker).count();
+    let last_start = line_start(source, fence.span.end());
+    if last_start <= fence.span.start() {
+        return Ok(());
+    }
+    // A real closing marker has no Text event. For an unclosed fence the parser
+    // includes the candidate marker in its logical content, including EOF lines.
+    let candidate = source[last_start..fence.span.end()].trim_start_matches([' ', '\t', '>']);
+    let candidate = candidate.trim_end_matches([' ', '\t']);
+    if fence.content_end <= last_start
+        && candidate.len() >= count
+        && candidate.bytes().all(|b| b == marker)
+    {
+        fence.closed = true;
+        fence.closing_start = last_start;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]

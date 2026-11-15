@@ -34,7 +34,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
         ..defaults
     };
     let strategy = (
-        0usize..12,
+        0usize..17,
         any::<u32>(),
         any::<bool>(),
         any::<bool>(),
@@ -55,7 +55,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
             1..16,
         ),
     );
-    let counts = Cell::new([0u32; 12]);
+    let counts = Cell::new([0u32; 17]);
     let outcome = TestRunner::new(config).run(&strategy, |(family, number, crlf, bom, parts)| {
         let eol = if crlf { "\r\n" } else { "\n" };
         let bom = if bom { "\u{feff}" } else { "" };
@@ -132,10 +132,57 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
                 let with_plaintext = format!("{source}<!-- {text} -->{eol}");
                 prop_assert!(encrypted::validate(&with_plaintext).is_err());
             }
-            _ => {
+            11 => {
                 let plan = frontmatter::patch_frontmatter(&source, DocClass::UserDoc, &[FieldEdit::Set { key: "status".into(), value }, FieldEdit::Unset { key: "custom".into() }]).unwrap();
                 let expected = source.replacen("status: old", &format!("status: {new}"), 1).replacen("custom: {nested: [1, true]}", " ", 1);
                 prop_assert_eq!(patch::apply(&source, &plan).unwrap(), expected);
+            }
+            12 => {
+                let bracket = if number % 2 == 0 { '[' } else { '{' };
+                let source = format!("{bom}---{eol}title: An {bracket}example{eol}status: old{eol}---{eol}{body}");
+                let plan = frontmatter::set_field(&source, DocClass::UserDoc, "status", value).unwrap();
+                prop_assert_eq!(patch::apply(&source, &plan).unwrap(), source.replacen("status: old", &format!("status: {new}"), 1));
+                let source = format!("---{eol}{{url: https://example.test/{number}, status: old}}{eol}---{eol}");
+                let value = YamlValue::String(format!("{new},[tail]"));
+                let plan = frontmatter::set_field(&source, DocClass::UserDoc, "status", value.clone()).unwrap();
+                let changed = patch::apply(&source, &plan).unwrap();
+                prop_assert_eq!(&frontmatter::analyze(&changed, DocClass::UserDoc).unwrap().fields.unwrap()["status"], &value);
+                prop_assert_eq!(changed, source.replace("status: old", &format!("status: \"{new},[tail]\"")));
+            }
+            13 => {
+                let (prefix, continuation) = if number % 2 == 0 { (">   ", "> ") } else { ("> - ", ">   ") };
+                let source = format!("{prefix}```nota{eol}{continuation}{{url: https://example.test/{number}, type: table}}{eol}{continuation}```{eol}");
+                let plan = extract::finalize_document(&source, DocClass::UserDoc, &NoteId::from_bytes([2;16]), &[]).unwrap();
+                prop_assert_eq!(plan.edits.len(), 1);
+                let changed = patch::apply(&source, &plan).unwrap();
+                let mut logical = String::new();
+                for event in pulldown_cmark::Parser::new(&changed) {
+                    if let pulldown_cmark::Event::Text(text) = event { logical.push_str(&text); }
+                }
+                let parsed = frontmatter::analyze(&format!("---\n{logical}---\n"), DocClass::UserDoc).unwrap();
+                prop_assert!(parsed.fields.unwrap().contains_key("id"));
+                prop_assert_eq!(changed.replacen(&plan.edits[0].replacement, "", 1), source);
+            }
+            14 => {
+                let armor = include_str!("fixtures/age-v1.asc");
+                let source = format!("---\nclass: encrypted-note\n---\n# Title\rsecret {number}\n```age\n{armor}```\n");
+                prop_assert!(encrypted::validate(&source).is_err());
+                let source = format!("---{eol}? class{eol}: encrypted-note{eol}x: 1{eol}x: 2{eol}---{eol}{body}");
+                prop_assert!(extract::extract(&source, DocClass::UserDoc, &NoteId::from_bytes([2;16]), "Title", None).is_err());
+            }
+            15 => {
+                let source = format!("- Item{number}{eol}  - Nested{number}{eol}- Last{number}{eol}");
+                let md = markdown::analyze(&source, ByteSpan::new(0, source.len()).unwrap()).unwrap();
+                for word in [format!("Item{number}"), format!("Nested{number}"), format!("Last{number}")] {
+                    let start = source.find(&word).unwrap();
+                    prop_assert_eq!(md.blocks.iter().filter(|s| s.start() <= start && s.end() >= start + word.len()).count(), 1);
+                }
+            }
+            _ => {
+                let prefix = if number % 2 == 0 { "> " } else { "> > " };
+                let source = format!("{prefix}# A{eol}{prefix}old{eol}{prefix}# B{eol}{prefix}keep{eol}");
+                let plan = markdown::replace_section(&source, &markdown::SectionSelector { title: "A".into(), occurrence: None }, &format!("{new}{eol}")).unwrap();
+                prop_assert_eq!(patch::apply(&source, &plan).unwrap(), source.replace("old", &new));
             }
         }
         // Independent UTF-16 oracle over every scalar boundary of the generated carrier.
@@ -149,7 +196,7 @@ fn at_least_ten_thousand_generated_documents_preserve_untouched_bytes() {
         Ok(())
     });
     let counts = counts.get();
-    let rejected = counts[6] + counts[7] + counts[8];
+    let rejected = counts[6] + counts[7] + counts[8] + counts[14];
     let accepted = counts.iter().sum::<u32>() - rejected;
     writeln!(std::io::stdout().lock(), "generated-documents: floor=10000 cases={cases} seed={seed} accepted={accepted} rejected={rejected} families={counts:?} (including persisted regression replays)").unwrap();
     outcome.unwrap();

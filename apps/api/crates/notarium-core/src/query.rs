@@ -281,7 +281,11 @@ impl SortSpec {
     pub fn keys(&self) -> &[SortKey] {
         &self.0
     }
-    pub fn compare(&self, left: &SortTuple, right: &SortTuple) -> DomainResult<Ordering> {
+    pub fn compare<I: Ord>(
+        &self,
+        left: &SortTuple<I>,
+        right: &SortTuple<I>,
+    ) -> DomainResult<Ordering> {
         if left.cells.len() != self.0.len() || right.cells.len() != self.0.len() {
             return Err(DomainError::validation(ValidationReason::InvalidQuery));
         }
@@ -308,7 +312,7 @@ impl SortSpec {
                 }
             }
         }
-        Ok(left.note_id.cmp(&right.note_id))
+        Ok(left.entity_id.cmp(&right.entity_id))
     }
 }
 impl Default for SortSpec {
@@ -338,9 +342,9 @@ pub enum SortCell {
     Absent,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SortTuple {
+pub struct SortTuple<I = NoteId> {
     pub cells: Vec<SortCell>,
-    pub note_id: NoteId,
+    pub entity_id: I,
 }
 fn normalize_cell<'a>(cell: &'a SortCell, key: &SortKey) -> &'a SortCell {
     let (kind, nullable) = match &key.column {
@@ -366,16 +370,16 @@ fn normalize_cell<'a>(cell: &'a SortCell, key: &SortKey) -> &'a SortCell {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct KeysetCursor {
+pub struct KeysetCursor<I = NoteId> {
     pub version: u8,
     pub scope: HistoryScope,
     pub fingerprint: ContentDigest,
     pub effective_read: EffectiveReadId,
     pub generation: ProjectionGeneration,
     pub base_cut: SpaceSeq,
-    pub last: SortTuple,
+    pub last: SortTuple<I>,
 }
-impl KeysetCursor {
+impl<I> KeysetCursor<I> {
     pub fn check(&self, read: &EffectiveRead) -> DomainResult<()> {
         read.cut.scope.check(&self.scope)?;
         if self.version != 1 || self.fingerprint != read.fingerprint {
@@ -402,14 +406,14 @@ pub struct EffectiveRead {
     pub overlay: Vec<OverlayRowVersion>,
 }
 #[derive(Clone, Debug)]
-pub enum ReadRequest<Q> {
+pub enum ReadRequest<Q, I = NoteId> {
     Open { query: Q, causal: CausalBasis },
-    Continue { cursor: KeysetCursor },
+    Continue { cursor: KeysetCursor<I> },
 }
 #[derive(Clone, Debug)]
-pub struct CursorPage<T> {
+pub struct CursorPage<T, I = NoteId> {
     pub items: Vec<T>,
-    pub next: Option<KeysetCursor>,
+    pub next: Option<KeysetCursor<I>>,
     pub scope: HistoryScope,
     pub canonical_seq: SpaceSeq,
     pub projected_seq: SpaceSeq,

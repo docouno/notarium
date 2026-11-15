@@ -207,3 +207,47 @@ fn portable_names_preserve_identity_and_apply_final_filename_budgets() {
     assert_eq!(lookup_key("e\u{301}"), lookup_key("é"));
     assert!(validate_content("a\u{80}b").is_err());
 }
+
+#[test]
+fn plain_scalars_do_not_open_collections_and_flow_values_are_quoted_when_needed() {
+    for title in [
+        "An [example",
+        "An {example",
+        "A } [balanced",
+        "https://example.test/a:b",
+    ] {
+        let source = format!("---\ntitle: {title}\nstatus: old\n---\nBody\n");
+        let plan = set_field(&source, DocClass::UserDoc, "status", string("new")).unwrap();
+        assert_eq!(
+            patch::apply(&source, &plan).unwrap(),
+            source.replace("status: old", "status: new")
+        );
+    }
+    for value in [
+        "one,two",
+        "one[two]",
+        "one{two}",
+        "https://example.test/a:b",
+    ] {
+        for mapping in [
+            "{status: old, url: https://example.test/path, keep: yes}",
+            "status: old\nkeep: yes",
+        ] {
+            let source = format!("---\n{mapping}\n---\nBody\n");
+            let plan = set_field(&source, DocClass::UserDoc, "status", string(value)).unwrap();
+            let changed = patch::apply(&source, &plan).unwrap();
+            assert_eq!(
+                analyze(&changed, DocClass::UserDoc)
+                    .unwrap()
+                    .fields
+                    .unwrap()["status"],
+                string(value)
+            );
+            let replacement = &plan.edits[0].replacement;
+            assert_eq!(
+                changed,
+                source.replace("status: old", &format!("status: {replacement}"))
+            );
+        }
+    }
+}

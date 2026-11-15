@@ -20,6 +20,7 @@ macro_rules! reject {
 }
 impl NoteReadPort for RejectingPorts {
     reject! {
+    fn read_ability_resource(&self, ctx: SpaceContext, request: ReadAbilityResource) -> PortFuture<'_, notarium_core::classes::ClassifiedAbilityResource>;
     fn get_note(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteSnapshot>;
     fn list_notes(
             &self,
@@ -177,8 +178,8 @@ impl ContentJobPort for RejectingPorts {
     fn list_jobs(
             &self,
             ctx: SpaceContext,
-            request: ReadRequest<JobQuery>,
-        ) -> PortFuture<'_, CursorPage<ContentJob>>;
+            request: ReadRequest<JobQuery, JobId>,
+        ) -> PortFuture<'_, CursorPage<ContentJob, JobId>>;
     fn cancel_job(
             &self,
             ctx: SpaceContext,

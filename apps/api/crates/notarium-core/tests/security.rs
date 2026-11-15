@@ -257,3 +257,75 @@ fn encrypted_content_has_no_secondary_egress_and_debug_redacts_content() {
         );
     }
 }
+
+#[test]
+fn nested_keepers_can_only_retain_parent_package_exceptions() {
+    let owner = human(SpaceRole::Owner, true);
+    let approved = AbilityId::from_bytes([4; 16]);
+    let outside = AbilityId::from_bytes([5; 16]);
+    let parent = owner
+        .for_keeper(
+            AgentRunId::from_bytes([1; 16]),
+            SpaceId::from_bytes([1; 16]),
+            Some(FolderId::from_bytes([3; 16])),
+            [approved.clone()].into(),
+        )
+        .unwrap();
+    let child = parent
+        .for_keeper(
+            AgentRunId::from_bytes([2; 16]),
+            SpaceId::from_bytes([1; 16]),
+            Some(FolderId::from_bytes([3; 16])),
+            [approved.clone(), outside.clone()].into(),
+        )
+        .unwrap();
+    let mut resource = facts(1, DocClass::Skill);
+    resource.ancestor_folders.clear();
+    resource.ability_package = Some(outside);
+    assert_eq!(
+        parent.authorize_read(&resource),
+        Err(DomainError::ResourceNotFound)
+    );
+    assert_eq!(
+        child.authorize_read(&resource),
+        Err(DomainError::ResourceNotFound)
+    );
+    resource.ability_package = Some(approved);
+    assert!(parent.authorize_read(&resource).is_ok());
+    assert!(child.authorize_read(&resource).is_ok());
+    assert_eq!(
+        child.authorize_ability_mutation(),
+        Err(DomainError::AbilityWriteForbidden)
+    );
+    let without = parent
+        .for_keeper(
+            AgentRunId::from_bytes([3; 16]),
+            SpaceId::from_bytes([1; 16]),
+            Some(FolderId::from_bytes([3; 16])),
+            BTreeSet::new(),
+        )
+        .unwrap();
+    assert!(without.authorize_read(&resource).is_err());
+
+    let mut scoped_grants = grants(SpaceRole::Owner);
+    scoped_grants
+        .get_mut(&SpaceId::from_bytes([1; 16]))
+        .unwrap()
+        .project_root = Some(FolderId::from_bytes([3; 16]));
+    let scoped_human = EngineAuthContext::for_human(VerifiedHuman::attest(
+        PrincipalId::from_bytes([1; 16]),
+        GrantId::from_bytes([2; 16]),
+        scoped_grants,
+        true,
+    ));
+    let scoped_keeper = scoped_human
+        .for_keeper(
+            AgentRunId::from_bytes([4; 16]),
+            SpaceId::from_bytes([1; 16]),
+            Some(FolderId::from_bytes([3; 16])),
+            [resource.ability_package.clone().unwrap()].into(),
+        )
+        .unwrap();
+    assert!(scoped_human.authorize_read(&resource).is_err());
+    assert!(scoped_keeper.authorize_read(&resource).is_err());
+}

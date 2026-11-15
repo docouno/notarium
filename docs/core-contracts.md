@@ -25,6 +25,8 @@ OAuth contexts cannot obtain human `AbilityWrite`. Both old and new resource fac
 are checked on direct writes, including auxiliary ability files. A run pins its
 write Space; an external read taints already-existing clones before content returns.
 Shared chat limits reads to its Space and excludes the sender's profile.
+Nested Keeper runs can retain or drop approved package read exceptions; they
+cannot add exceptions outside their parent's project authority.
 
 Canonical owners create classified documents. `ClassEgressFence` creates private
 projection/search/provider wrappers only after read, lifecycle and class checks.
@@ -34,6 +36,18 @@ content from committed chat entries; chat has its own provenance and taint check
 These constructors are trusted in-process boundaries, not isolation from malicious
 Rust code that controls the canonical/admission owner. Adapters must recheck live
 visibility and revocation at use time.
+
+Explicit snapshots expose lifecycle. Listings select active, trashed or both
+through `LifecycleMask` and return `NoteListCard` metadata, including encrypted
+identities, without a content capability. Purged documents cannot be read/listed.
+Search, graph and view cards keep their active-only `SearchContent` fence.
+
+Protected package reads select an exact AbilityId, package revision and entrypoint
+or auxiliary manifest key through `NoteReadPort::read_ability_resource`. Auxiliary
+files need no synthetic NoteId. The canonical owner checks current visibility and
+history before returning a `ClassifiedAbilityResource`; absent revisions never
+fall back to latest. Explicit reads require authority, and provider use additionally
+requires an active package and consent through `ClassEgressFence::ability`.
 
 ## History and causal reads
 
@@ -87,6 +101,12 @@ and sort tuples use the same versions, with the current lifecycle fence applied.
 For example, base A=1, B=2, C=3 plus an overlay C=0 returns C on page one.
 Dropping the overlay on continuation would return A, B, C and duplicate C.
 The effective-read identity prevents that change of basis.
+
+Keysets carry the paginated entity's branded identity: note reads use NoteId,
+job reads use JobId. Cold change seeds enumerate notes before chat threads with
+a typed `SeedPosition`. `ContinueSeed` retains the original history, cutoff and
+page limit, including when the snapshot contains only threads. Completion returns
+the cutoff from which durable change-log consumption resumes.
 
 ## Field ordering and errors
 

@@ -126,7 +126,7 @@ pub fn analyze(
                 collision += 1;
             };
             let value = YamlValue::String(id.to_string());
-            let eol = if fence.text.contains("\r\n") {
+            let eol = if fence.span.slice(source)?.contains("\r\n") {
                 "\r\n"
             } else {
                 "\n"
@@ -137,12 +137,28 @@ pub fn analyze(
                     key: "id".into(),
                     value: value.clone(),
                 }],
-                eol,
-            )?;
-            for (span, text) in changes {
-                let (physical, text) = map_insertion(fence, span, &text)?;
-                edits.push((CarrierEditOrigin::Body, physical, text));
-            }
+                "\n",
+            )
+            .and_then(|changes| {
+                changes
+                    .into_iter()
+                    .map(|(span, text)| {
+                        let (physical, text) =
+                            map_insertion(fence, span, &text.replace('\n', eol))?;
+                        Ok((CarrierEditOrigin::Body, physical, text))
+                    })
+                    .collect::<DomainResult<Vec<_>>>()
+            });
+            let Ok(changes) = changes else {
+                // Persistence of ordinary authored bytes does not depend on an
+                // optional concrete-syntax insertion being representable.
+                block.state = ViewState::Invalid;
+                block
+                    .diagnostics
+                    .push(diagnostic(ValidationReason::FmNotWritable));
+                continue;
+            };
+            edits.extend(changes);
             fields.insert("id".into(), value);
             block.id = Some(id);
             block.state = ViewState::Ready;
@@ -167,8 +183,7 @@ fn map_insertion(
     for (logical, physical) in &fence.lines {
         if position >= logical.start() && position <= logical.end() {
             let offset = physical.start() + position - logical.start();
-            let is_line_start = position == logical.start()
-                || position == logical.end() && fence.text[..position].ends_with('\n');
+            let is_line_start = position == 0 || fence.text[..position].ends_with('\n');
             let mut replacement = String::new();
             for (index, line) in text.split_inclusive('\n').enumerate() {
                 if is_line_start || index > 0 {
@@ -180,9 +195,10 @@ fn map_insertion(
         }
     }
     // An empty closed block has no content lines; insert before the closing prefix.
-    let offset = fence
-        .closing_start
-        .saturating_sub(fence.continuation_prefix.len());
+    if !fence.text.is_empty() || position != 0 {
+        return Err(DomainError::validation(ValidationReason::InvalidView));
+    }
+    let offset = fence.closing_start;
     let replacement = text
         .split_inclusive('\n')
         .map(|line| format!("{}{line}", fence.continuation_prefix))

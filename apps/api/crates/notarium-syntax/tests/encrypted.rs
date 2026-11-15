@@ -138,3 +138,49 @@ fn metadata_helpers_also_reject_an_unsafe_existing_encrypted_carrier() {
     );
     assert!(encrypted::validate(&document().replace("\n```\n", "\n    ```\n")).is_err());
 }
+
+#[test]
+fn every_line_ending_separates_plaintext_from_the_permitted_title() {
+    let note = NoteId::from_bytes([1; 16]);
+    for separator in ["\r", "\r\n", "\n", "\r\r\n"] {
+        let source = document().replace("# Private", &format!("# Private{separator}secret"));
+        assert_eq!(
+            encrypted::validate(&source).unwrap_err(),
+            DomainError::UnsafePlaintextOutsideAgeFence
+        );
+        assert!(
+            extract::extract(&source, DocClass::EncryptedNote, &note, "Private", None).is_err()
+        );
+        assert!(extract::finalize_document(&source, DocClass::EncryptedNote, &note, &[]).is_err());
+    }
+}
+
+#[test]
+fn opaque_headers_cannot_hide_protected_class_declarations() {
+    let note = NoteId::from_bytes([1; 16]);
+    for header in [
+        "? class\n: encrypted-note\nx: 1\nx: 2",
+        "?\n  class\n: encrypted-note\nx: 1\nx: 2",
+        "{? class: encrypted-note, x: 1, x: 2}",
+        "class: &kind encrypted-note\nx: *kind",
+        "kind: &kind encrypted-note\nclass: *kind",
+        "class: user-doc\n? class\n: encrypted-note",
+        "base: &base {class: encrypted-note}\n<<: *base",
+    ] {
+        let source = format!("---\n{header}\n---\n# Secret\ntext\n");
+        assert!(
+            extract::extract(&source, DocClass::UserDoc, &note, "Secret", None).is_err(),
+            "{header}"
+        );
+        assert!(extract::finalize_document(&source, DocClass::UserDoc, &note, &[]).is_err());
+        assert!(
+            notarium_syntax::live::raw_header_plan(
+                "# Secret\ntext\n",
+                &source,
+                DocClass::UserDoc,
+                notarium_core::ids::HeaderIdentity::from_bytes([1; 16])
+            )
+            .is_err()
+        );
+    }
+}

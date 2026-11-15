@@ -57,7 +57,7 @@ fn check_outside(
     title: &mut Option<ByteSpan>,
 ) -> DomainResult<()> {
     let mut offset = range.start();
-    for line in range.slice(source)?.split_inclusive('\n') {
+    for line in range.slice(source)?.split_inclusive(['\r', '\n']) {
         let text = line.trim_end_matches(['\r', '\n']);
         if !text.chars().all(char::is_whitespace) {
             let permitted = allow_title

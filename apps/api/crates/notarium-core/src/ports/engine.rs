@@ -2,6 +2,14 @@ use super::{PortFuture, SpaceContext, types::*};
 use crate::{ids::*, model::*, query::*};
 
 pub trait NoteReadPort: Send + Sync {
+    /// Read exactly one committed protected package resource. The canonical owner
+    /// checks Space/history, live package visibility and authorization before
+    /// returning bytes; a missing revision/resource never falls back to latest.
+    fn read_ability_resource(
+        &self,
+        ctx: SpaceContext,
+        request: ReadAbilityResource,
+    ) -> PortFuture<'_, crate::classes::ClassifiedAbilityResource>;
     fn get_note(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteSnapshot>;
     fn list_notes(
         &self,
@@ -149,8 +157,8 @@ pub trait ContentJobPort: Send + Sync {
     fn list_jobs(
         &self,
         ctx: SpaceContext,
-        request: ReadRequest<JobQuery>,
-    ) -> PortFuture<'_, CursorPage<ContentJob>>;
+        request: ReadRequest<JobQuery, JobId>,
+    ) -> PortFuture<'_, CursorPage<ContentJob, JobId>>;
     fn cancel_job(
         &self,
         ctx: SpaceContext,

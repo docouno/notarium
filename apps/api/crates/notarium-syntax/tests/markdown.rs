@@ -196,3 +196,30 @@ fn four_space_indented_marker_is_fence_content_not_a_closer() {
             .closed
     );
 }
+
+#[test]
+fn neighboring_section_prefixes_remain_byte_exact() {
+    for eol in ["\n", "\r\n"] {
+        for source in [
+            "> # A\n> old\n> # B\n> keep\n",
+            "- # A\n  old\n  # B\n  keep\n",
+            "> - # A\n>   old\n>   # B\n>   keep\n",
+            "> > # A\n> > old\n> > # B\n> > keep\n",
+        ] {
+            let source = source.replace('\n', eol);
+            let plan = replace_section(
+                &source,
+                &SectionSelector {
+                    title: "A".into(),
+                    occurrence: None,
+                },
+                &format!("new{eol}"),
+            )
+            .unwrap();
+            assert_eq!(
+                patch::apply(&source, &plan).unwrap(),
+                source.replace("old", "new")
+            );
+        }
+    }
+}

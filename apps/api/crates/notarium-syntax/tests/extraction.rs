@@ -290,3 +290,140 @@ fn adversarial_yaml_depth_is_bounded_before_constructing_a_recursive_tree() {
     assert_eq!(analysis.blocks[0].state, ViewState::Invalid);
     assert!(analysis.plan.edits.is_empty());
 }
+
+#[test]
+fn tight_list_text_is_covered_without_relying_on_the_analyzers_block_list() {
+    let tokenizer = FixtureTokenizer {
+        limit: 48,
+        model: 1,
+    };
+    for source in [
+        "- One\n- Two\n",
+        "Intro\n\n- One\n  - Nested\n- Two\n",
+        "> - One\n> - Two\n",
+    ] {
+        let md = markdown::analyze(source, ByteSpan::new(0, source.len()).unwrap()).unwrap();
+        let ChunkPlan::Ready { chunks, .. } = chunk::chunks(source, &md, Some(&tokenizer)).unwrap()
+        else {
+            panic!()
+        };
+        for word in ["One", "Two", "Nested", "Intro"] {
+            if let Some(start) = source.find(word) {
+                for offset in start..start + word.len() {
+                    assert_eq!(
+                        chunks
+                            .iter()
+                            .flat_map(|c| &c.spans)
+                            .filter(|s| s.start() <= offset && offset < s.end())
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn commonmark_fence_text(source: &str) -> String {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let mut code = false;
+    let mut result = String::new();
+    for event in Parser::new(source) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => code = true,
+            Event::End(TagEnd::CodeBlock) => code = false,
+            Event::Text(text) if code => result.push_str(&text),
+            _ => {}
+        }
+    }
+    result
+}
+
+#[test]
+fn persisted_view_identity_uses_canonical_dedent_and_physical_line_endings() {
+    for source in [
+        ">   ```nota\n> type: table\n>   ```\n",
+        "  ```nota\n type: table\n  ```\n",
+        "- ```nota\n  type: table\n  ```\n",
+        "> - ```nota\n>   type: table\n>   ```\n",
+        ">   ```nota\n>   ```\n",
+        "```nota\n{url: https://example.test, type: table}\n```\n",
+    ] {
+        for eol in ["\n", "\r\n"] {
+            let source = source.replace('\n', eol);
+            let initial = views(&source, true);
+            if commonmark_fence_text(&source).is_empty() {
+                assert_eq!(initial.blocks[0].state, ViewState::Invalid);
+                assert!(initial.plan.edits.is_empty());
+                continue;
+            }
+            assert_eq!(initial.blocks[0].raw_yaml, commonmark_fence_text(&source));
+            let changed = patch::apply(&source, &initial.plan).unwrap();
+            assert_eq!(initial.plan.edits.len(), 1, "{source}");
+            let logical = commonmark_fence_text(&changed);
+            let carrier = format!("---\n{logical}---\n");
+            let fields = notarium_syntax::frontmatter::analyze(&carrier, DocClass::UserDoc)
+                .unwrap()
+                .fields
+                .unwrap();
+            assert_eq!(
+                fields["id"],
+                notarium_core::value::YamlValue::String(
+                    initial.blocks[0].id.as_ref().unwrap().to_string()
+                )
+            );
+            assert_eq!(
+                changed.replacen(&initial.plan.edits[0].replacement, "", 1),
+                source
+            );
+            assert!(views(&changed, true).plan.edits.is_empty());
+        }
+    }
+}
+
+#[test]
+fn fence_indentation_matrix_roundtrips_through_an_independent_parser() {
+    for prefix in ["", "> ", "- ", "> - "] {
+        let continuation = prefix.replace('-', " ");
+        for opening in 0..=3 {
+            for content in 0..=4 {
+                let source = format!(
+                    "{prefix}{}```nota\n{continuation}{}type: table\n{continuation}```\n",
+                    " ".repeat(opening),
+                    " ".repeat(content)
+                );
+                let initial = views(&source, true);
+                let changed = patch::apply(&source, &initial.plan).unwrap();
+                let logical = commonmark_fence_text(&changed);
+                if initial
+                    .blocks
+                    .first()
+                    .is_some_and(|block| block.state == ViewState::Ready)
+                {
+                    let header = format!("---\n{logical}---\n");
+                    let fields = notarium_syntax::frontmatter::analyze(&header, DocClass::UserDoc)
+                        .unwrap()
+                        .fields
+                        .unwrap();
+                    assert!(fields.contains_key("id"), "{changed}");
+                    assert_eq!(
+                        fields["type"],
+                        notarium_core::value::YamlValue::String("table".into())
+                    );
+                    assert!(views(&changed, true).plan.edits.is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unsupported_optional_view_edit_preserves_an_ordinary_raw_save() {
+    let source = "```nota\n? type\n: table\n```\n";
+    let note = NoteId::from_bytes([8; 16]);
+    let analysis = views(source, true);
+    assert_eq!(analysis.blocks[0].state, ViewState::Invalid);
+    assert!(!analysis.blocks[0].diagnostics.is_empty());
+    let plan = extract::finalize_document(source, DocClass::UserDoc, &note, &[]).unwrap();
+    assert_eq!(patch::apply(source, &plan).unwrap(), source);
+}

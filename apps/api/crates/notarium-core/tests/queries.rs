@@ -206,7 +206,7 @@ fn descending_only_reverses_scalars_and_note_tie_break_is_always_ascending() {
         .unwrap();
         let tuple = |cell: SortCell, id| SortTuple {
             cells: vec![cell],
-            note_id: NoteId::from_bytes([id; 16]),
+            entity_id: NoteId::from_bytes([id; 16]),
         };
         let mut rows: Vec<_> = cells
             .iter()
@@ -388,7 +388,7 @@ fn continuation_retains_the_effective_overlay_after_client_receipt_eviction() {
         base_cut: seq(100),
         last: SortTuple {
             cells: vec![SortCell::Value(ScalarValue::Number(0_i64.into()))],
-            note_id: NoteId::from_bytes([3; 16]),
+            entity_id: NoteId::from_bytes([3; 16]),
         },
     };
     let mut client = read.exact_receipts.clone();

@@ -104,17 +104,19 @@ impl LexState {
                     continue;
                 }
                 b'\'' | b'"' if !self.plain => self.quote = Some(b),
-                b'[' | b'{' => {
+                b'[' | b'{' if !self.plain || self.flow > 0 => {
                     self.flow += 1;
                     self.plain = false;
                 }
-                b']' | b'}' => {
+                b']' | b'}' if self.flow > 0 => {
                     self.flow = self.flow.saturating_sub(1);
                     self.plain = false;
                 }
                 b',' if self.flow > 0 => self.plain = false,
-                b':' if self.flow > 0
-                    || bytes.get(i + 1).is_none_or(|b| b.is_ascii_whitespace()) =>
+                b':' if bytes.get(i + 1).is_none_or(|b| {
+                    b.is_ascii_whitespace()
+                        || self.flow > 0 && matches!(b, b',' | b'[' | b']' | b'{' | b'}')
+                }) =>
                 {
                     self.plain = false
                 }

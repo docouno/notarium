@@ -4,7 +4,7 @@ use crate::{
     auth::{EngineAuthContext, ResourceFacts, Space, SpaceKind},
     error::ValidationReason,
     ids::{ChatThreadId, ContentDigest, ProviderResourceId, RevisionId, SpaceId, ThreadEntrySeq},
-    model::{Lifecycle, NoteRef},
+    model::{AbilityResourceRef, Lifecycle, NoteRef},
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt};
@@ -85,6 +85,18 @@ impl ClassifiedDocument {
     pub fn class(&self) -> DocClass {
         self.facts.class
     }
+    pub fn lifecycle(&self) -> Lifecycle {
+        self.lifecycle
+    }
+    pub fn listing(&self, auth: &EngineAuthContext) -> DomainResult<ListedDocument> {
+        self.explicit_read(auth)?;
+        Ok(ListedDocument {
+            reference: self.reference.clone(),
+            revision: self.revision.clone(),
+            class: self.class(),
+            lifecycle: self.lifecycle,
+        })
+    }
     pub fn digest(&self) -> ContentDigest {
         self.digest
     }
@@ -94,6 +106,84 @@ impl ClassifiedDocument {
             return Err(DomainError::ResourceNotFound);
         }
         Ok(&self.content)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ListedDocument {
+    reference: NoteRef,
+    revision: RevisionId,
+    class: DocClass,
+    lifecycle: Lifecycle,
+}
+impl ListedDocument {
+    pub fn reference(&self) -> &NoteRef {
+        &self.reference
+    }
+    pub fn revision(&self) -> &RevisionId {
+        &self.revision
+    }
+    pub fn class(&self) -> DocClass {
+        self.class
+    }
+    pub fn lifecycle(&self) -> Lifecycle {
+        self.lifecycle
+    }
+}
+
+/// Protected auxiliary files retain package provenance without inventing NoteIds.
+#[derive(Clone)]
+pub struct ClassifiedAbilityResource {
+    reference: AbilityResourceRef,
+    facts: ResourceFacts,
+    lifecycle: Lifecycle,
+    content: String,
+    digest: ContentDigest,
+}
+impl ClassifiedAbilityResource {
+    pub fn from_canonical(
+        reference: AbilityResourceRef,
+        facts: ResourceFacts,
+        lifecycle: Lifecycle,
+        content: String,
+        digest: ContentDigest,
+    ) -> DomainResult<Self> {
+        if reference.space != facts.space.id
+            || facts.class != DocClass::Skill
+            || facts.ability_package.as_ref() != Some(&reference.ability)
+        {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
+        Ok(Self {
+            reference,
+            facts,
+            lifecycle,
+            content,
+            digest,
+        })
+    }
+    pub fn reference(&self) -> &AbilityResourceRef {
+        &self.reference
+    }
+    pub fn digest(&self) -> ContentDigest {
+        self.digest
+    }
+    pub fn lifecycle(&self) -> Lifecycle {
+        self.lifecycle
+    }
+    pub fn explicit_read<'a>(&'a self, auth: &EngineAuthContext) -> DomainResult<&'a str> {
+        auth.authorize_read(&self.facts)?;
+        if self.lifecycle == Lifecycle::Purged {
+            return Err(DomainError::ResourceNotFound);
+        }
+        Ok(&self.content)
+    }
+}
+impl fmt::Debug for ClassifiedAbilityResource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClassifiedAbilityResource")
+            .field("reference", &self.reference)
+            .finish_non_exhaustive()
     }
 }
 
@@ -205,8 +295,40 @@ impl ProviderChatContent {
 pub enum ProviderMessage {
     Document(ProviderContent),
     Chat(ProviderChatContent),
+    Ability(ProviderAbilityContent),
+}
+#[derive(Clone, Debug)]
+pub struct ProviderAbilityContent {
+    resource: ClassifiedAbilityResource,
+    provider: ProviderResourceId,
+}
+impl ProviderAbilityContent {
+    pub fn text(&self) -> &str {
+        &self.resource.content
+    }
+    pub fn provenance(&self) -> &ClassifiedAbilityResource {
+        &self.resource
+    }
+    pub fn provider(&self) -> &ProviderResourceId {
+        &self.provider
+    }
 }
 impl ClassEgressFence {
+    pub fn ability(
+        resource: ClassifiedAbilityResource,
+        auth: &EngineAuthContext,
+        policy: &ProviderPolicy,
+    ) -> DomainResult<ProviderAbilityContent> {
+        if resource.lifecycle != Lifecycle::Active {
+            return Err(DomainError::ResourceNotFound);
+        }
+        auth.authorize_read(&resource.facts)?;
+        Self::provider_policy(&resource.facts.space, DocClass::Skill, policy)?;
+        Ok(ProviderAbilityContent {
+            resource,
+            provider: policy.provider.clone(),
+        })
+    }
     pub fn chat(
         entry: CanonicalChatContent,
         auth: &EngineAuthContext,
@@ -271,17 +393,28 @@ impl ClassEgressFence {
         policy: &ProviderPolicy,
     ) -> DomainResult<ProviderContent> {
         Self::check(&document, auth)?;
-        if !policy.allowed_classes.contains(&document.class()) {
+        Self::provider_policy(&document.facts.space, document.class(), policy)?;
+        Ok(ProviderContent {
+            document,
+            provider: policy.provider.clone(),
+        })
+    }
+    fn provider_policy(
+        space: &Space,
+        class: DocClass,
+        policy: &ProviderPolicy,
+    ) -> DomainResult<()> {
+        if !policy.allowed_classes.contains(&class) {
             return Err(DomainError::validation(
                 ValidationReason::ClassEgressForbidden,
             ));
         }
         let permitted = match &policy.audience {
             ProviderAudience::Personal { consented } => {
-                *consented && document.facts.space.kind == SpaceKind::Personal
+                *consented && space.kind == SpaceKind::Personal
             }
             ProviderAudience::Shared {
-                space,
+                space: attached_space,
                 attached,
                 space_consented,
                 sender_consented,
@@ -289,8 +422,8 @@ impl ClassEgressFence {
                 *attached
                     && *space_consented
                     && *sender_consented
-                    && space == &document.reference.space_id
-                    && document.class() != DocClass::Profile
+                    && attached_space == &space.id
+                    && class != DocClass::Profile
             }
         };
         if !permitted {
@@ -298,10 +431,7 @@ impl ClassEgressFence {
                 ValidationReason::ProviderConsentRequired,
             ));
         }
-        Ok(ProviderContent {
-            document,
-            provider: policy.provider.clone(),
-        })
+        Ok(())
     }
 }
 

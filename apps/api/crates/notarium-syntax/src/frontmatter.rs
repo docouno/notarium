@@ -175,8 +175,10 @@ fn tokens(source: &str) -> DomainResult<Vec<Token>> {
                     if matches!(ch, b'\n' | b'\r')
                         || (depth > 0 && matches!(ch, b',' | b'[' | b']' | b'{' | b'}'))
                         || ch == b':'
-                            && (depth > 0
-                                || bytes.get(i + 1).is_none_or(|b| b.is_ascii_whitespace()))
+                            && bytes.get(i + 1).is_none_or(|b| {
+                                b.is_ascii_whitespace()
+                                    || depth > 0 && matches!(b, b',' | b'[' | b']' | b'{' | b'}')
+                            })
                         || ch == b'#' && (i == start || bytes[i - 1].is_ascii_whitespace())
                     {
                         break;
@@ -335,20 +337,7 @@ pub fn analyze(source: &str, expected: DocClass) -> DomainResult<HeaderAnalysis>
     } else {
         // Opaque ordinary headers remain editable in their body only. Class evidence
         // must still be unambiguous, independently of unrelated field diagnostics.
-        let concrete = cst(raw).map_err(|_| failure(ValidationReason::AmbiguousClass))?;
-        let classes: Vec<_> = concrete
-            .entries
-            .iter()
-            .filter(|e| e.key == "class")
-            .collect();
-        if classes.len() > 1 {
-            return Err(failure(ValidationReason::AmbiguousClass));
-        }
-        let class = classes
-            .first()
-            .map(|e| yaml::parse(e.values[0].slice(raw)?))
-            .transpose()
-            .map_err(|_| failure(ValidationReason::AmbiguousClass))?;
+        let class = yaml::class_declaration(raw)?;
         check_class(class.as_ref(), expected)?;
     }
     let writable = fields.is_some();
@@ -428,7 +417,11 @@ pub(crate) fn edit_mapping(
                 desired.insert(key.clone(), value.clone());
                 if let Some(entry) = entry {
                     let first = entry.values[0];
-                    let mut encoded = yaml::encode(value, Some(first.slice(source)?))?;
+                    let mut encoded = yaml::encode(
+                        value,
+                        Some(first.slice(source)?),
+                        concrete.flow_close.is_some(),
+                    )?;
                     if first.is_empty()
                         && source.as_bytes().get(first.start().wrapping_sub(1)) == Some(&b':')
                     {
@@ -441,8 +434,12 @@ pub(crate) fn edit_mapping(
                 } else {
                     insertions.push(format!(
                         "{}: {}",
-                        yaml::encode(&YamlValue::String(key.clone()), None)?,
-                        yaml::encode(value, None)?
+                        yaml::encode(
+                            &YamlValue::String(key.clone()),
+                            None,
+                            concrete.flow_close.is_some()
+                        )?,
+                        yaml::encode(value, None, concrete.flow_close.is_some())?
                     ));
                 }
             }

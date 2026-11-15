@@ -186,6 +186,8 @@ impl EngineAuthContext {
         if grant.project_root.is_some() && grant.project_root != project_root {
             return Err(DomainError::validation(ValidationReason::ScopeMismatch));
         }
+        let may_pin_dependencies =
+            self.kind == PrincipalKind::DirectHuman && grant.project_root.is_none();
         grant.project_root = project_root;
         grant
             .write_classes
@@ -197,7 +199,16 @@ impl EngineAuthContext {
             BTreeMap::from([(space, grant)]),
         )?;
         derived.kind = PrincipalKind::Keeper(run);
-        derived.readonly_abilities = readonly_abilities;
+        derived.readonly_abilities = if may_pin_dependencies {
+            readonly_abilities
+        } else {
+            // A delegated run can retain an approved package exception, never
+            // create a new exception to its parent's project boundary.
+            readonly_abilities
+                .intersection(&self.readonly_abilities)
+                .cloned()
+                .collect()
+        };
         Ok(derived)
     }
     pub fn for_oauth(

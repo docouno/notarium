@@ -42,6 +42,36 @@ pub enum Lifecycle {
     Trashed,
     Purged,
 }
+/// Purged identities are available through changes, never ordinary listings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleMask {
+    Active,
+    Trashed,
+    ActiveAndTrashed,
+}
+impl LifecycleMask {
+    pub fn includes(self, lifecycle: Lifecycle) -> bool {
+        matches!(
+            (self, lifecycle),
+            (Self::Active | Self::ActiveAndTrashed, Lifecycle::Active)
+                | (Self::Trashed | Self::ActiveAndTrashed, Lifecycle::Trashed)
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum AbilityResourceName {
+    Entrypoint,
+    /// An exact package manifest key, never a filesystem path to resolve.
+    Auxiliary(String),
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AbilityResourceRef {
+    pub space: SpaceId,
+    pub ability: AbilityId,
+    pub package_revision: RevisionId,
+    pub resource: AbilityResourceName,
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotCut {
     pub scope: HistoryScope,

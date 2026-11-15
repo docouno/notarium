@@ -56,11 +56,15 @@ fence. Flow mappings insert inside their braces: `{status: todo}` becomes
 Empty mappings and first/middle/last/only-key deletion have explicit punctuation
 rules. The same surgery supports missing view IDs in flow mappings. Results are
 reparsed to verify the requested semantic postcondition.
+Plain scalar punctuation and URL colons remain scalar data. Replacement encoding
+accounts for block versus flow context, quoting commas/brackets when necessary.
 
 Anchors, aliases and duplicate keys make structured frontmatter read-only.
 Authorized body edits to a known ordinary document can preserve that header
 exactly. Uncertain class or protected metadata never falls back to an ordinary
 document. There is no whole-header reserialization to bypass an ambiguous edit.
+Class evidence in an opaque header comes from semantic root events, including
+explicit YAML keys; partial editing support cannot hide a protected declaration.
 
 ## Saving a work-in-progress view
 
@@ -88,6 +92,8 @@ regenerated after moving a block. Duplicate explicit IDs invalidate all affected
 occurrences. If existing IDs cannot be reserved unambiguously, insertion is
 deferred with diagnostics while raw save remains allowed. Unknown options are
 preserved; semantic query compilation belongs to projections.
+If concrete ID insertion is unsupported, the block receives a local diagnostic
+and stays non-executable while its authored bytes remain saveable.
 
 Repeated finalization of a persisted carrier is a no-op. In a live room, permitted
 ID insertion belongs to the room-authoritative edit before durable acknowledgement.
@@ -106,6 +112,9 @@ indentation. Root, quote and list-item cases, including lazy continuation, need
 fixtures with independently known intervals. Unsupported ambiguous layouts fail
 before editing; they never widen the deletion. External paragraphs, neighbouring
 items, headings and frontmatter remain byte-for-byte unchanged.
+The end boundary precedes the next heading's entire physical line, retaining its
+container prefix. Fenced logical content comes from canonical Markdown text
+events; byte mappings are used only where those fragments match the source.
 
 ## Portable filenames
 
@@ -147,6 +156,7 @@ leaf targets, labels and source spans. Escaped text, inline/fenced code and link
 destinations produce no links or hashtags. Lookup keys use canonical Unicode
 normalization and full case folding; exported Unicode-version constants identify
 the pinned tables. Original source spelling is never normalized in place.
+Tight list items supply source blocks even when Markdown omits paragraph events.
 
 `ChunkPlan::Deferred` retains source blocks when no model profile is supplied.
 With a `TokenizerBudget`, adjacent blocks share heading context and oversized
@@ -171,3 +181,5 @@ without a recipient key and performs no production decryption. The public age
 testkit known-answer fixture is separately decrypted in tests to the expected
 plaintext. Finalization validates the encrypted carrier before and after metadata
 edits; plaintext outside the permitted regions is rejected.
+LF, CRLF and bare CR all separate outside lines; a title cannot hide a following
+plaintext paragraph behind a different line ending.

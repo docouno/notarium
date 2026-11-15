@@ -57,17 +57,26 @@ pub struct NoteCard {
     pub path: String,
     pub preview: String,
 }
+/// Explicit listing metadata, including trash and encrypted-note identities.
+/// Search/view/graph cards retain their stricter active content capability.
+#[derive(Clone, Debug)]
+pub struct NoteListCard {
+    pub document: ListedDocument,
+    pub title: String,
+    pub path: String,
+}
 #[derive(Clone, Debug)]
 pub struct FolderPage {
     pub folder: FolderRef,
     pub page: Option<NoteSnapshot>,
-    pub children: CursorPage<NoteCard>,
+    pub children: CursorPage<NoteListCard>,
 }
 #[derive(Clone, Debug)]
 pub struct NoteQuery {
     pub folder: Option<FolderId>,
     pub recursive: bool,
     pub classes: BTreeSet<DocClass>,
+    pub lifecycle: LifecycleMask,
     pub filter: FieldFilterAstV1,
     pub sort: SortSpec,
     pub limit: PageLimit,
@@ -204,6 +213,12 @@ pub struct AbilityPackageRevision {
     pub manifest: BTreeMap<String, ContentDigest>,
 }
 #[derive(Clone, Debug)]
+pub struct ReadAbilityResource {
+    pub ability: AbilityId,
+    pub package_revision: RevisionId,
+    pub resource: AbilityResourceName,
+}
+#[derive(Clone, Debug)]
 pub struct RollbackAgentRun {
     pub run: AgentRunId,
     pub expected_run_revision: RevisionId,
@@ -261,17 +276,31 @@ pub enum ChangeRead {
     },
     Seed {
         scope: HistoryScope,
-        cursor: Option<NoteId>,
         cutoff: Option<SpaceSeq>,
         limit: PageLimit,
     },
+    ContinueSeed {
+        cursor: SeedCursor,
+    },
+}
+/// Notes precede threads; an empty note phase does not require a dummy NoteId.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SeedPosition {
+    NotesAfter(NoteId),
+    ThreadsAfter(ChatThreadId),
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SeedCursor {
+    pub cutoff: ChangeCursor,
+    pub after: SeedPosition,
+    pub limit: PageLimit,
 }
 #[derive(Clone, Debug)]
 pub struct ChangeSeed {
     pub notes: Vec<NoteSnapshot>,
     pub threads: Vec<ChatThread>,
     pub cutoff: ChangeCursor,
-    pub next: Option<NoteId>,
+    pub next: Option<SeedCursor>,
 }
 #[derive(Clone, Debug)]
 pub enum ChangeReadResult {
