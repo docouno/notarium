@@ -108,15 +108,18 @@ pub fn analyze(
             if fields.contains_key("id") {
                 continue;
             }
+            // Reservations can include any number of predictable candidates.
+            // Hash the unchanged payload once without changing ID framing.
+            let mut seed = blake3::Hasher::new();
+            seed.update(b"notarium-view-v1");
+            seed.update(&(note.as_str().len() as u64).to_be_bytes());
+            seed.update(note.as_str().as_bytes());
+            seed.update(&(ordinal as u64).to_be_bytes());
+            seed.update(&(fence.text.len() as u64).to_be_bytes());
+            seed.update(fence.text.as_bytes());
             let mut collision = 0u64;
             let id = loop {
-                let mut hash = blake3::Hasher::new();
-                hash.update(b"notarium-view-v1");
-                hash.update(&(note.as_str().len() as u64).to_be_bytes());
-                hash.update(note.as_str().as_bytes());
-                hash.update(&(ordinal as u64).to_be_bytes());
-                hash.update(&(fence.text.len() as u64).to_be_bytes());
-                hash.update(fence.text.as_bytes());
+                let mut hash = seed.clone();
                 hash.update(&collision.to_be_bytes());
                 let mut bytes = [0; 16];
                 bytes.copy_from_slice(&hash.finalize().as_bytes()[..16]);

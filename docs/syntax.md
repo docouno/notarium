@@ -104,6 +104,8 @@ regenerated after moving a block. Duplicate explicit IDs invalidate all affected
 occurrences. If existing IDs cannot be reserved unambiguously, insertion is
 deferred with diagnostics while raw save remains allowed. Unknown options are
 preserved; semantic query compilation belongs to projections.
+The unchanged hash prefix is prepared once per missing ID; reservation retries
+clone its state and append the counter, without rehashing the whole YAML payload.
 If concrete ID insertion is unsupported, the block receives a local diagnostic
 and stays non-executable while its authored bytes remain saveable.
 
@@ -133,6 +135,9 @@ items, headings and frontmatter remain byte-for-byte unchanged.
 LF, CRLF and CR each separate logical lines. Replacement lines retain their
 authored endings and receive the container prefix individually. A required
 separator uses the carrier's first line ending, or LF when none exists.
+Before a neighbouring Setext heading, the builder preserves a real Markdown
+blank line. Only ASCII spaces and tabs count as blank content; a terminal CR
+must not fuse with an inserted LF and consume that separator.
 The end boundary precedes the next heading's entire physical line, retaining its
 container prefix. Fenced logical content comes from canonical Markdown text
 events; byte mappings are used only where those fragments match the source.
@@ -182,6 +187,9 @@ Tight list items supply source blocks even when Markdown omits paragraph events.
 Section boundaries are computed per owning container; chunk contexts use an
 ordered interval traversal. Unmatched wiki openers do not repeatedly scan the
 same remaining range, and they do not suppress later hashtags.
+The pinned Markdown parser includes a [temporary source patch](../apps/api/vendor/pulldown-cmark/README.md)
+that skips repeated cleanup of unchanged container tails on lazy continuation
+lines. It preserves the accepted syntax and offsets without adding a nesting cap.
 
 `ChunkPlan::Deferred` retains source blocks when no model profile is supplied.
 With a `TokenizerBudget`, adjacent blocks share heading context and oversized
@@ -195,6 +203,14 @@ Split hints receive a bounded UTF-8 window, never an unbounded remaining block.
 If a breadcrumb must shrink, the body candidate is retried against the newly
 available budget. That shortened context is reused within the block, with every
 new candidate still checked exactly; no monotonic tokenizer assumption is made.
+Each active heading retains separate source-bound recipes for its nearest and
+ancestor roles across blocks and child headings. Omitting an ancestor persists
+for that role until its section ends; it does not discard the nearest recipe
+when traversal returns from a child. The splitter does not try to restore the
+largest possible breadcrumb for every new body or sibling. Before a final budget
+failure, it also checks the original complete block and context; if they fit, it
+replaces that block's partial output with the complete input. Large breadcrumbs
+that already fit the tokenizer budget retain their source bytes.
 Chunk descriptors include source identity and heading-context ranges. Breadcrumbs
 retain source Markdown and fixed separators, so core can reconstruct and verify
 the exact model input before issuing a classified content-part capability.

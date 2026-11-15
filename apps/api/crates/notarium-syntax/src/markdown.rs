@@ -294,7 +294,7 @@ pub fn replace_section(
     if !text.is_empty()
         && !crate::lines::with_endings(replacement)
             .last()
-            .is_some_and(|line| line.trim().is_empty())
+            .is_some_and(|line| line.trim_matches([' ', '\t', '\r', '\n']).is_empty())
         && analysis.headings.iter().any(|next| {
             next.containers == selected.containers
                 && line_start(source, next.heading_span.start()) == selected.section_span.end()
@@ -304,6 +304,12 @@ pub fn replace_section(
         // Setext headings absorb adjacent paragraph lines. The separator is
         // part of the replaced section, including its container continuation.
         text.push_str(&prefix);
+        if text.ends_with('\r') && carrier.eol == "\n" {
+            // Keep the authored CR separate from the new blank line's LF.
+            // Otherwise the two endings fuse into one CRLF. A space is valid
+            // Markdown blank-line content; Unicode whitespace is not.
+            text.push(' ');
+        }
         text.push_str(carrier.eol);
     }
     patch::plan(

@@ -106,21 +106,43 @@ fn replacing_a_section_preserves_the_next_setext_heading_semantics() {
         "Selected\n========\nold\n\nNext\n====\nkeep\n",
         "> # Selected\n> old\n>\n> Next\n> ====\n> keep\n",
         "- # Selected\n  old\n\n  Next\n  ====\n  keep\n",
+        "1. # Selected\n   old\n\n   Next\n   ====\n   keep\n",
+        "> > # Selected\n> > old\n> >\n> > Next\n> > ====\n> > keep\n",
     ] {
         for eol in ["\n", "\r\n", "\r"] {
             let source = source.replace('\n', eol);
-            for replacement in ["new", "new\n", "new\n\n", ""] {
+            for (replacement, replacement_eol) in [
+                "new",
+                "new\n",
+                "new\n\n",
+                "new\n \n",
+                "new\n\t\n",
+                "new\n\u{a0}\n",
+                "new\n\u{2003}\n",
+                "new\n\u{202f}\n",
+                "",
+                " ",
+                "\t",
+            ]
+            .into_iter()
+            .flat_map(|text| ["\n", "\r\n", "\r"].map(|eol| (text, eol)))
+            {
+                let replacement = replacement.replace('\n', replacement_eol);
                 let plan = markdown::replace_section(
                     &source,
                     &markdown::SectionSelector {
                         title: "Selected".into(),
                         occurrence: None,
                     },
-                    &replacement.replace('\n', eol),
+                    &replacement,
                 )
                 .unwrap();
                 let changed = patch::apply(&source, &plan).unwrap();
-                assert_eq!(independent_titles(&changed), ["Selected", "Next"]);
+                assert_eq!(
+                    independent_titles(&changed),
+                    ["Selected", "Next"],
+                    "{source:?} / {replacement:?}"
+                );
                 let end = plan.edits.first().map_or(0, |edit| edit.bytes.0.end());
                 assert!(changed.ends_with(&source[end..]));
             }
@@ -175,6 +197,176 @@ fn long_context_is_amortized_and_body_budget_is_retried_after_shortening() {
                 .all(|c| c.tokens == c.text.len() as u32 + 2 && c.tokens <= 512)
         );
         assert!(budget.counted.get() < 40 * source.len());
+    }
+}
+
+#[test]
+fn heading_recipes_are_reused_across_blocks_and_child_headings() {
+    for length in [1024, 4096, 16384] {
+        for children in [false, true] {
+            let count = length / 16;
+            let mut source = format!("# {}\n\n", "h".repeat(length));
+            for index in 0..count {
+                if children {
+                    source.push_str(&format!("## Child{index}\n"));
+                }
+                source.push_str("a\n\n");
+            }
+            let md = markdown::analyze(&source, Carrier::scan(&source).unwrap().body).unwrap();
+            let budget = CountingBudget::default();
+            let ChunkPlan::Ready { chunks, .. } =
+                chunk::chunks(&source, &md, Some(&budget)).unwrap()
+            else {
+                panic!()
+            };
+            assert!(
+                budget.counted.get() < 64 * source.len(),
+                "{} bytes counted for {} source bytes",
+                budget.counted.get(),
+                source.len()
+            );
+            assert!(
+                chunks
+                    .iter()
+                    .all(|c| c.tokens == c.text.len() as u32 + 2 && c.tokens <= 512)
+            );
+            for block in &md.blocks {
+                assert_eq!(
+                    chunks
+                        .iter()
+                        .flat_map(|c| &c.spans)
+                        .filter(|s| s.start() <= block.start() && s.end() >= block.end())
+                        .count(),
+                    1
+                );
+            }
+            if !children {
+                assert!(
+                    chunks.len() < count / 4,
+                    "{} chunks for {count} blocks",
+                    chunks.len()
+                );
+            } else {
+                assert_eq!(chunks.len(), count);
+                for (index, chunk) in chunks.iter().enumerate() {
+                    assert!(chunk.text.contains(&format!("## Child{index}")));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn omitting_an_ancestor_preserves_its_nearest_recipe_after_a_child() {
+    let source = format!("# {}\n\n> ## Child\n> a\n\nparent body\n", "h".repeat(2048));
+    let md = markdown::analyze(&source, Carrier::scan(&source).unwrap().body).unwrap();
+    let budget = CountingBudget::default();
+    let ChunkPlan::Ready { chunks, .. } = chunk::chunks(&source, &md, Some(&budget)).unwrap()
+    else {
+        panic!()
+    };
+    let child = chunks.iter().find(|c| c.text.contains("## Child")).unwrap();
+    assert!(child.context.iter().all(|s| s.start() > 0));
+    let parent = chunks
+        .iter()
+        .find(|c| c.text.contains("parent body"))
+        .unwrap();
+    assert_eq!(parent.context.len(), 1);
+    assert_eq!(parent.context[0].start(), 0);
+    assert!(parent.text.starts_with("# h"));
+    assert!(parent.tokens <= 512);
+}
+
+struct NonmonotoneBudget;
+impl TokenizerBudget for NonmonotoneBudget {
+    fn profile(&self) -> ModelProfileId {
+        ModelProfileId::from_bytes([2; 16])
+    }
+    fn max_tokens(&self) -> u32 {
+        8
+    }
+    fn count(&self, input: &str) -> DomainResult<u32> {
+        // The first child removes the root recipe; the second body can only
+        // fit with the complete original context. A partial body fits first,
+        // so rescue must discard it rather than duplicate source coverage.
+        Ok(
+            if input.starts_with("# Root > ## Second") && input.ends_with("ab\n") {
+                3
+            } else if input.starts_with("# Root") || input.contains('b') {
+                20
+            } else {
+                2
+            },
+        )
+    }
+    fn split_hint(&self, _: &str, _: u32) -> Option<usize> {
+        Some(1)
+    }
+}
+
+#[test]
+fn a_fitting_original_input_can_rescue_cached_context_without_partial_output() {
+    let source = "# Root\n## First\na\n\n## Second\nab\n";
+    let md = markdown::analyze(source, Carrier::scan(source).unwrap().body).unwrap();
+    let ChunkPlan::Ready { chunks, .. } =
+        chunk::chunks(source, &md, Some(&NonmonotoneBudget)).unwrap()
+    else {
+        panic!()
+    };
+    let rescued = chunks.last().unwrap();
+    assert!(rescued.text.starts_with("# Root > ## Second"));
+    assert!(rescued.text.ends_with("ab\n"));
+    assert_eq!(rescued.spans, [md.blocks[1]]);
+    assert_eq!(rescued.tokens, 3);
+    assert!(
+        chunks[..chunks.len() - 1]
+            .iter()
+            .flat_map(|c| &c.spans)
+            .all(|span| span.end() <= md.blocks[1].start())
+    );
+}
+
+struct CompressedHeadingBudget;
+impl TokenizerBudget for CompressedHeadingBudget {
+    fn profile(&self) -> ModelProfileId {
+        ModelProfileId::from_bytes([3; 16])
+    }
+    fn max_tokens(&self) -> u32 {
+        512
+    }
+    fn count(&self, input: &str) -> DomainResult<u32> {
+        let mut previous_h = false;
+        let mut tokens = 2;
+        for ch in input.chars() {
+            if ch != 'h' || !previous_h {
+                tokens += 1;
+            }
+            previous_h = ch == 'h';
+        }
+        Ok(tokens)
+    }
+    fn split_hint(&self, _: &str, _: u32) -> Option<usize> {
+        None
+    }
+}
+
+#[test]
+fn large_but_token_efficient_breadcrumbs_keep_their_source_bytes() {
+    let source = format!("# {}\n## One\na\n\n## Two\nb\n", "h".repeat(16_384));
+    let md = markdown::analyze(&source, Carrier::scan(&source).unwrap().body).unwrap();
+    let ChunkPlan::Ready { chunks, .. } =
+        chunk::chunks(&source, &md, Some(&CompressedHeadingBudget)).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(chunks.len(), 2);
+    for chunk in chunks {
+        assert_eq!(chunk.context[0], ByteSpan::new(0, 16_386).unwrap());
+        assert!(chunk.text.starts_with(&source[..16_386]));
+        assert_eq!(
+            chunk.tokens,
+            CompressedHeadingBudget.count(&chunk.text).unwrap()
+        );
     }
 }
 

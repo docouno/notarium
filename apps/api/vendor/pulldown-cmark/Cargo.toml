@@ -1,0 +1,37 @@
+# Build-only packaging of the patched upstream library; see README.md.
+[package]
+name = "pulldown-cmark"
+version = "0.13.6"
+edition = "2021"
+rust-version = "1.71.1"
+license = "MIT"
+description = "A pull parser for CommonMark"
+repository = "https://github.com/pulldown-cmark/pulldown-cmark"
+readme = "README.md"
+publish = false
+build = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "pulldown_cmark"
+path = "src/lib.rs"
+
+[features]
+default = ["getopts", "html"]
+html = ["pulldown-cmark-escape"]
+simd = ["pulldown-cmark-escape?/simd"]
+
+[dependencies]
+bitflags = "2"
+getopts = { version = "0.2", optional = true }
+memchr = "2.5"
+pulldown-cmark-escape = { version = "0.11", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+unicase = "2.6"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ["cfg(rustbuild)"]

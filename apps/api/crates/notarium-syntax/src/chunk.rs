@@ -1,7 +1,7 @@
 use crate::markdown::MarkdownAnalysis;
 use notarium_core::{
     DomainError, DomainResult,
-    document::{ChunkDescriptor, ChunkPlan, render_chunk},
+    document::{ChunkDescriptor, ChunkPlan, Heading, render_chunk},
     error::ValidationReason,
     ids::{ContentDigest, ModelProfileId},
     span::ByteSpan,
@@ -15,6 +15,54 @@ pub trait TokenizerBudget {
     fn count(&self, input: &str) -> DomainResult<u32>;
     fn split_hint(&self, text: &str, budget: u32) -> Option<usize>;
 }
+
+// A heading can be omitted as a distant ancestor and still be useful when it
+// becomes the nearest heading again. Keep the two source-bound recipes separate.
+// These are chosen renderings, not claims about a tokenizer's monotonicity.
+struct HeadingContext<'a> {
+    heading: &'a Heading,
+    original: ByteSpan,
+    nearest: Option<ByteSpan>,
+    ancestor: Option<ByteSpan>,
+}
+impl<'a> HeadingContext<'a> {
+    fn new(source: &str, heading: &'a Heading) -> DomainResult<Self> {
+        let raw = heading.heading_span.slice(source)?;
+        let original = ByteSpan::new(
+            heading.heading_span.start(),
+            heading.heading_span.start() + raw.trim_end_matches(['\r', '\n']).len(),
+        )?;
+        Ok(Self {
+            heading,
+            original,
+            nearest: Some(original),
+            ancestor: Some(original),
+        })
+    }
+    fn recipe(&mut self, nearest: bool) -> &mut Option<ByteSpan> {
+        if nearest {
+            &mut self.nearest
+        } else {
+            &mut self.ancestor
+        }
+    }
+}
+
+fn context(headings: &[HeadingContext<'_>]) -> (Vec<usize>, Vec<ByteSpan>) {
+    headings
+        .iter()
+        .enumerate()
+        .filter_map(|(index, heading)| {
+            if index + 1 == headings.len() {
+                heading.nearest
+            } else {
+                heading.ancestor
+            }
+            .map(|span| (index, span))
+        })
+        .unzip()
+}
+
 pub fn chunks(
     source: &str,
     markdown: &MarkdownAnalysis,
@@ -34,55 +82,67 @@ pub fn chunks(
     let model = tokenizer.profile();
     let source_digest = crate::content_digest(source);
     let mut output = Vec::new();
-    let mut pending: Option<(ByteSpan, Vec<ByteSpan>)> = None;
+    let mut pending: Option<ByteSpan> = None;
     let mut next_heading = 0;
-    let mut active_headings = Vec::new();
+    let mut active_headings = Vec::<HeadingContext<'_>>::new();
     for block in &markdown.blocks {
+        let first_heading = next_heading;
         while let Some(heading) = markdown.headings.get(next_heading)
             && heading.section_span.start() <= block.start()
         {
-            active_headings.push(heading);
             next_heading += 1;
         }
-        active_headings.retain(|h| h.section_span.end() >= block.end());
-        let prefix = active_headings
+        let entering = &markdown.headings[first_heading..next_heading];
+        let changed = active_headings
             .iter()
-            .map(|h| {
-                let raw = h.heading_span.slice(source)?;
-                // Preserve a source-bound heading context, including authored
-                // Markdown. Rendered titles alone cannot prove byte provenance.
-                ByteSpan::new(
-                    h.heading_span.start(),
-                    h.heading_span.start() + raw.trim_end_matches(['\r', '\n']).len(),
-                )
-            })
-            .collect::<DomainResult<Vec<_>>>()?;
-        if let Some((previous, old_prefix)) = pending.take() {
-            if old_prefix == prefix {
-                let joined = ByteSpan::new(previous.start(), block.end())?;
-                if tokenizer.count(&render_chunk(source, &prefix, &[joined])?)? <= limit {
-                    pending = Some((joined, prefix));
-                    continue;
-                }
+            .any(|h| h.heading.section_span.end() < block.end())
+            || entering.iter().any(|h| h.section_span.end() >= block.end());
+        if changed {
+            if let Some(previous) = pending.take() {
+                emit(
+                    source,
+                    previous,
+                    &mut active_headings,
+                    tokenizer,
+                    &model,
+                    source_digest,
+                    &mut output,
+                )?;
+            }
+            active_headings.retain(|h| h.heading.section_span.end() >= block.end());
+            for heading in entering
+                .iter()
+                .filter(|h| h.section_span.end() >= block.end())
+            {
+                active_headings.push(HeadingContext::new(source, heading)?);
+            }
+        }
+        if let Some(previous) = pending.take() {
+            let (_, prefix) = context(&active_headings);
+            let joined = ByteSpan::new(previous.start(), block.end())?;
+            if tokenizer.count(&render_chunk(source, &prefix, &[joined])?)? <= limit {
+                pending = Some(joined);
+                continue;
             }
             emit(
                 source,
                 previous,
-                &old_prefix,
+                &mut active_headings,
                 tokenizer,
                 &model,
                 source_digest,
                 &mut output,
             )?;
         }
+        let (_, prefix) = context(&active_headings);
         let full = render_chunk(source, &prefix, &[*block])?;
         if tokenizer.count(&full)? <= limit {
-            pending = Some((*block, prefix));
+            pending = Some(*block);
         } else {
             emit(
                 source,
                 *block,
-                &prefix,
+                &mut active_headings,
                 tokenizer,
                 &model,
                 source_digest,
@@ -90,11 +150,11 @@ pub fn chunks(
             )?;
         }
     }
-    if let Some((range, prefix)) = pending {
+    if let Some(range) = pending {
         emit(
             source,
             range,
-            &prefix,
+            &mut active_headings,
             tokenizer,
             &model,
             source_digest,
@@ -109,20 +169,22 @@ pub fn chunks(
 fn emit(
     source: &str,
     range: ByteSpan,
-    prefix: &[ByteSpan],
+    headings: &mut [HeadingContext<'_>],
     tokenizer: &dyn TokenizerBudget,
     model: &ModelProfileId,
     source_digest: ContentDigest,
     output: &mut Vec<ChunkDescriptor>,
 ) -> DomainResult<()> {
+    let output_start = output.len();
     let text = range.slice(source)?;
     let limit = tokenizer.max_tokens();
-    let full = render_chunk(source, prefix, &[range])?;
+    let (mut selected_headings, mut context) = context(headings);
+    let full = render_chunk(source, &context, &[range])?;
     if tokenizer.count(&full)? <= limit {
         return push(
             source,
             range,
-            prefix,
+            &context,
             tokenizer,
             model,
             source_digest,
@@ -130,7 +192,6 @@ fn emit(
         );
     }
     let mut offset = 0;
-    let mut context = prefix.to_vec();
     while offset < text.len() {
         let rest = &text[offset..];
         let mut window = rest.len().min((limit as usize).saturating_mul(16).max(4));
@@ -179,7 +240,12 @@ fn emit(
             } else if !context.is_empty() {
                 if context.len() > 1 {
                     context.remove(0);
+                    let index = selected_headings.remove(0);
+                    let nearest = index + 1 == headings.len();
+                    *headings[index].recipe(nearest) = None;
                 } else {
+                    let index = selected_headings[0];
+                    let nearest = index + 1 == headings.len();
                     let span = context[0];
                     let mut end = span.start() + (span.end() - span.start()) / 2;
                     while !source.is_char_boundary(end) {
@@ -187,15 +253,36 @@ fn emit(
                     }
                     if end == span.start() {
                         context.clear();
+                        selected_headings.clear();
+                        *headings[index].recipe(nearest) = None;
                     } else {
                         context[0] = ByteSpan::new(span.start(), end)?;
+                        *headings[index].recipe(nearest) = Some(context[0]);
                     }
                 }
                 // A shorter breadcrumb frees body budget. Retry the original
                 // bounded candidate instead of emitting a single scalar; keep
-                // the validated shortening for the next chunk of this block.
+                // its recipe for later blocks and descendants of this heading.
                 end = candidate_end;
             } else {
+                // A different full context may tokenize more cheaply than a
+                // shortened one. Before rejecting, rescue the original whole
+                // block if it fits, discarding any partial chunks of this block.
+                // A successful large check is paid for by its emitted output;
+                // a failed check ends this operation rather than every sibling.
+                let original: Vec<_> = headings.iter().map(|h| h.original).collect();
+                if tokenizer.count(&render_chunk(source, &original, &[range])?)? <= limit {
+                    output.truncate(output_start);
+                    return push(
+                        source,
+                        range,
+                        &original,
+                        tokenizer,
+                        model,
+                        source_digest,
+                        output,
+                    );
+                }
                 return Err(DomainError::validation(
                     ValidationReason::TokenBudgetExceeded,
                 ));
