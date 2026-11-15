@@ -1,0 +1,44 @@
+--- a/src/parse.rs
++++ b/src/parse.rs
+@@ -1485,0 +1486 @@
++    let mut retained_empty_end = 0;
+@@ -1508,0 +1510,2 @@
++                        tree.last_line_empty_end
++                            .set(tree.last_line_empty_end.get().max(i + 1));
+@@ -1544,0 +1548,7 @@
++        if let ItemBody::List(ref list_flags, _, _) | ItemBody::DefinitionList(ref list_flags) =
++            tree[node_ix].item.body
++        {
++            if list_flags.get().contains(ListFlags::LAST_LINE_EMPTY) {
++                retained_empty_end = i + 1;
++            }
++        }
+@@ -1547 +1557,5 @@
+-    for &node_ix in &mut spine_iter {
++    // The unmatched container was already consumed by the iterator. Only the
++    // remaining prefix that may contain empty-line flags needs clearing. This
++    // avoids rescanning a clean, deeply nested tail on every lazy paragraph line.
++    let remaining = tree.last_line_empty_end.get().saturating_sub(i + 1);
++    for &node_ix in spine_iter.take(remaining) {
+@@ -1553,0 +1568 @@
++    tree.last_line_empty_end.set(retained_empty_end);
+--- a/src/tree.rs
++++ b/src/tree.rs
+@@ -8,0 +9 @@
++use std::cell::Cell;
+@@ -56,0 +58,3 @@
++    // Exclusive upper bound for LAST_LINE_EMPTY flags on the spine. Pushes
++    // conservatively include the new node; scan_containers tightens the bound.
++    pub(crate) last_line_empty_end: Cell<usize>,
+@@ -73,0 +78 @@
++            last_line_empty_end: Cell::new(0),
+@@ -112,0 +118 @@
++        self.last_line_empty_end.set(self.spine.len());
+@@ -119,0 +126,2 @@
++        self.last_line_empty_end
++            .set(self.last_line_empty_end.get().min(self.spine.len()));
+@@ -126,0 +135,2 @@
++        self.last_line_empty_end
++            .set(self.last_line_empty_end.get().min(self.spine.len()));
+@@ -165,0 +176 @@
++        self.last_line_empty_end.set(0);

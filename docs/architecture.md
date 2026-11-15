@@ -13,6 +13,11 @@ targets pure Rust i8 mmap CSR-HNSW with `std::arch` SIMD. ONNX is loaded dynamic
 through `ort`, never downloaded during offline builds. These are boundaries for
 upcoming work, not implemented storage or search behavior in this scaffold.
 
+The core and syntax libraries implement [domain contracts](core-contracts.md)
+and [document syntax](syntax.md), including authority/egress checks, typed ports,
+history-scoped receipts, exact comparisons and byte-preserving edits. Port
+implementations, durable storage and transport integration remain separate work.
+
 ## Internal dependency allowlist
 
 Every name except `fitness-gates` has the prefix `notarium-`. Allowed edges are
@@ -38,7 +43,10 @@ an upper bound; they do not imply implemented integrations.
 No crate imports `notarium-bin`, `notarium-migrate` or `fitness-gates`. Fitness
 tests invoke compiled binaries as external processes. HTTP cannot directly import
 canonical/projections/search/jobs. Agents cannot directly depend on `tantivy`,
-`ort` or `yrs`. Core has no internal dependencies or I/O behavior.
+`ort` or `yrs`. Core has no internal dependencies or I/O behavior. A separate
+native gate rejects parser, storage and runtime dependencies in core, including
+renamed, optional, target, development and build declarations. Core and syntax
+both use `forbid(unsafe_code)` so inner modules cannot override the workspace rule.
 
 Native tests inspect `cargo metadata --no-deps` using package identities and paths,
 including aliases, development/build dependencies, optional and target-specific
@@ -48,8 +56,8 @@ locked for offline setup. `Cargo.lock` must contain none of `openssl-sys`,
 
 TLS uses rustls 0.23 with ring, reqwest 0.13 with `rustls-no-provider`, and tonic
 0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
-C++/OpenSSL tools. Per-crate scaffold tests are compile smoke checks, not domain
-certification.
+C++/OpenSSL tools. Core/syntax tests exercise domain and document behavior;
+remaining per-crate scaffold tests are compile smoke checks.
 
 ## Client and delivery boundaries
 

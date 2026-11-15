@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, fs, path::PathBuf, process::Command};
 
-use fitness_gates::{ALLOWED, BANNED, validate_lock, validate_metadata};
+use fitness_gates::{ALLOWED, BANNED, CORE_RUNTIME_DEPENDENCIES, validate_lock, validate_metadata};
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
@@ -200,6 +200,39 @@ fn no_package_can_import_executable_or_gate_packages() {
             validate_metadata(&data, &root())
                 .unwrap_err()
                 .contains(destination)
+        );
+    }
+}
+
+#[test]
+fn core_runtime_dependencies_are_rejected_in_every_declaration_kind() {
+    for dependency in CORE_RUNTIME_DEPENDENCIES {
+        for kind in [Value::Null, json!("dev"), json!("build")] {
+            let mut data = metadata();
+            let core = data["packages"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|p| p["name"] == "notarium-core")
+                .unwrap();
+            core["dependencies"].as_array_mut().unwrap().push(json!({"name": dependency, "rename": "innocent_alias", "kind": kind, "optional": true, "target": "cfg(windows)"}));
+            assert!(
+                validate_metadata(&data, &root())
+                    .unwrap_err()
+                    .contains(&format!("notarium-core -> {dependency}"))
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_libraries_forbid_unsafe_code_even_if_an_inner_module_tries_to_allow_it() {
+    for name in ["notarium-core", "notarium-syntax"] {
+        let source =
+            fs::read_to_string(root().join("crates").join(name).join("src/lib.rs")).unwrap();
+        assert!(
+            source.contains("#![forbid(unsafe_code)]"),
+            "{name} must forbid unsafe overrides"
         );
     }
 }

@@ -62,6 +62,27 @@ implementation. Use `umask 022` so container mounts can read new source files.
 Keep temporary evidence in ignored `.artifacts/<task>/`, respect real cgroup
 quotas and run heavy checks sequentially. Stop only this checkout's services.
 
+## Core and syntax gates
+
+`make test` includes the domain, authorization, receipt, port-protocol and document
+tests. `generated_documents` enforces a floor of 10,000 successful generated
+documents across twenty-four scenario families, even when `PROPTEST_CASES=1`. It reports
+the effective case count, RNG seed and family counts. Failures shrink and persist
+replay seeds in the writable Cargo target directory. Fixed adversarial fixtures
+remain in the source tree; the normal offline gate needs no external corpus.
+
+For an isolated reproduction after setup:
+
+```sh
+sh .devkit/runtime/devkit.sh cli exec --component apps/api --network none -- \
+  env PROPTEST_CASES=1 cargo test --locked --offline -p notarium-syntax --test generated_documents
+```
+
+Set `PROPTEST_RNG_SEED` to replay a reported seed or explore another deterministic
+corpus; values above the case floor increase the run. Root `make check`, `make test`
+and `make build` remain the integration gates. Contract doubles demonstrate typed
+ownership and cleanup; they do not certify future runtime durability or latency.
+
 ## Delivery smoke checks
 
 ```sh

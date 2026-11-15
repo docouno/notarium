@@ -17,6 +17,7 @@ members = [
     "crates/fitness-gates",
 ]
 default-members = ["crates/notarium-bin"]
+exclude = ["vendor/pulldown-cmark"]
 
 [workspace.package]
 version = "1.0.0-dev.0"
@@ -42,7 +43,7 @@ notarium-agents = { path = "crates/notarium-agents" }
 notarium-http = { path = "crates/notarium-http" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 rmp-serde = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -56,7 +57,7 @@ libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 blake3 = "1"
 zstd = "0.14"
 saphyr = "0.3"
-pulldown-cmark = "0.13"
+pulldown-cmark = "=0.13.6"
 argon2 = "0.6"
 scrypt = "0.12"
 hkdf = "0.13"
@@ -80,3 +81,11 @@ zip = { version = "9", default-features = false, features = ["deflate", "zstd"] 
 mimalloc = { version = "0.1", default-features = false }
 proptest = "1"
 toml = "0.9"
+time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
+caseless = "0.2"
+unicode-normalization = "0.1"
+
+saphyr-parser = "0.3"
+
+[patch.crates-io]
+pulldown-cmark = { path = "vendor/pulldown-cmark" }
