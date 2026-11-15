@@ -94,6 +94,7 @@ pub struct ItemExecCtx {
     receipt_status: &'static str,
     pending_dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
+    retained_guards: Vec<Box<dyn Send>>,
 }
 
 impl ItemExecCtx {
@@ -145,6 +146,12 @@ impl ItemExecCtx {
     pub fn record_staged_ticket(&mut self, ticket: StagedBlobTicket) {
         self.pending_dir_syncs.merge(&ticket.local_pending_dirs);
         self.retained_tickets.push(ticket);
+    }
+
+    /// Retains a runtime lock guard (such as `OwnedMutexGuard<RoomFenceState>`) until AFTER
+    /// the outer SQL batch transaction commits or rolls back.
+    pub fn retain_until_batch_commit<G: Send + 'static>(&mut self, guard: G) {
+        self.retained_guards.push(Box::new(guard));
     }
 }
 
@@ -342,6 +349,11 @@ impl WriteCoordinator {
     pub async fn acquire_safe_point(&self) -> WriterSafePointGuard {
         let guard = Arc::clone(&self.commit_gate).write_owned().await;
         WriterSafePointGuard { _guard: guard }
+    }
+
+    /// Acquires a shared commit-gate read guard for auxiliary SQL writes that must pause during safe points.
+    pub(crate) async fn acquire_commit_read_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.commit_gate.read().await
     }
 
     /// Enqueues a prepared write intent into `WriteBatchActor` with bounded backpressure and cancellation semantics.
@@ -1055,8 +1067,9 @@ async fn execute_batch_on_conn(
 
     let mut space_states: BTreeMap<SpaceId, SpaceBatchEntry> = BTreeMap::new();
     let mut batch_dir_syncs = PendingDirSyncs::default();
-    // Retain all StagedBlobTickets (and their local shared digest guards) until AFTER outer COMMIT/ROLLBACK!
+    // Retain all StagedBlobTickets and runtime lock guards until AFTER outer COMMIT/ROLLBACK!
     let mut batch_retained_tickets: Vec<StagedBlobTicket> = Vec::new();
+    let mut batch_retained_guards: Vec<Box<dyn Send>> = Vec::new();
     let mut slots: Vec<ItemOutcomeSlot> = Vec::with_capacity(intents.len());
 
     let committed_at_ms = match now_unix_ms() {
@@ -1146,6 +1159,7 @@ async fn execute_batch_on_conn(
                 item_purge_seq,
                 dir_syncs,
                 retained_tickets,
+                retained_guards,
             }) => {
                 if let Err(err) = tx.release_savepoint(idx).await {
                     tx.rollback_best_effort().await;
@@ -1164,6 +1178,7 @@ async fn execute_batch_on_conn(
                 }
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
+                batch_retained_guards.extend(retained_guards);
                 slots.push(ItemOutcomeSlot::Succeeded {
                     response_bytes,
                     has_idempotency: has_idemp,
@@ -1215,6 +1230,7 @@ async fn execute_batch_on_conn(
                 // Epoch fence or concurrent modification invalidated the Space batch: rollback ALL mutations!
                 tx.rollback_best_effort().await;
                 drop(batch_retained_tickets);
+                drop(batch_retained_guards);
                 return BatchExecOutcome::AbortedBeforeCommit(bump_err);
             }
         }
@@ -1224,6 +1240,7 @@ async fn execute_batch_on_conn(
     if let Err(sync_err) = store.flush_pending_local_dirs(&batch_dir_syncs) {
         tx.rollback_best_effort().await;
         drop(batch_retained_tickets);
+        drop(batch_retained_guards);
         return BatchExecOutcome::AbortedBeforeCommit(sync_err);
     }
 
@@ -1231,6 +1248,7 @@ async fn execute_batch_on_conn(
     match tx.commit_write().await {
         Ok(()) => {
             drop(batch_retained_tickets);
+            drop(batch_retained_guards);
             let mut space_effective_cuts = BTreeMap::new();
             // Publish broadcast hints strictly AFTER confirmed SQL durability!
             for (sid, entry) in &space_states {
@@ -1277,6 +1295,7 @@ async fn execute_batch_on_conn(
         }
         Err(commit_err) => {
             drop(batch_retained_tickets);
+            drop(batch_retained_guards);
             BatchExecOutcome::UnknownCommit {
                 slots,
                 diag_reason: format!("{commit_err:?}"),
@@ -1291,6 +1310,7 @@ struct SingleItemSuccess {
     item_purge_seq: Option<SpaceSeq>,
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
+    retained_guards: Vec<Box<dyn Send>>,
 }
 
 async fn execute_single_item_in_savepoint(
@@ -1331,6 +1351,7 @@ async fn execute_single_item_in_savepoint(
                 item_purge_seq: None,
                 dir_syncs: PendingDirSyncs::default(),
                 retained_tickets: Vec::new(),
+                retained_guards: Vec::new(),
             }),
             _ => Err(unavailable_retryable(
                 "command_receipt_pending",
@@ -1372,6 +1393,7 @@ async fn execute_single_item_in_savepoint(
         receipt_status: "completed",
         pending_dir_syncs: PendingDirSyncs::default(),
         retained_tickets: Vec::new(),
+        retained_guards: Vec::new(),
     };
 
     let artifacts = (intent.execute)(tx, &mut item_ctx).await?;
@@ -1461,6 +1483,7 @@ async fn execute_single_item_in_savepoint(
         item_purge_seq,
         dir_syncs: item_ctx.pending_dir_syncs,
         retained_tickets: item_ctx.retained_tickets,
+        retained_guards: item_ctx.retained_guards,
     })
 }
 

@@ -78,6 +78,7 @@ pub(crate) struct CanonicalInner {
     )>,
     pub collab_interceptor: OnceLock<Arc<dyn notarium_core::ports::LiveCollabInterceptor>>,
     pub room_fences: Arc<crate::domain::RoomFenceTable>,
+    pub job_reads: crate::peers::JobReadRegistry,
     pub shutting_down: AtomicBool,
     pub owner_locks: Mutex<Vec<DataRootOwnerLock>>,
 }
@@ -259,6 +260,7 @@ impl CanonicalRuntime {
             board_provider: OnceLock::new(),
             collab_interceptor: OnceLock::new(),
             room_fences: Arc::new(crate::domain::RoomFenceTable::default()),
+            job_reads: crate::peers::JobReadRegistry::default(),
             shutting_down: AtomicBool::new(false),
             owner_locks: Mutex::new(locks),
         });
@@ -291,6 +293,7 @@ impl CanonicalRuntime {
         let store = CanonicalStore {
             inner: Arc::clone(&inner),
         };
+        crate::peers::reconcile_collab_fences_on_startup(&store).await?;
         crate::domain::purge::resume_pending_purges_on_startup(&store).await?;
 
         Ok((store, Self { inner }))
@@ -491,6 +494,15 @@ impl CanonicalStore {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) async fn with_fenced_auxiliary_write_tx<F, T>(&self, op: F) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        self.ensure_open()?;
+        let _commit_gate = self.inner.writer()?.acquire_commit_read_guard().await;
+        self.with_write_tx(op).await
     }
 
     pub(crate) async fn with_write_tx<F, T>(&self, op: F) -> Result<T, PortError>

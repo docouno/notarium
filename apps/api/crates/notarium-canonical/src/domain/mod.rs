@@ -449,7 +449,12 @@ async fn filter_change_result_for_space_caller(
                                 None => auth.spaces().contains_key(&scope.space_id),
                             }
                         }
-                        EntityId::Job(_) => auth.spaces().contains_key(&scope.space_id),
+                        EntityId::Job(_) => {
+                            auth.spaces()
+                                .get(&scope.space_id)
+                                .is_some_and(|g| g.project_root.is_none())
+                                && auth.authorize_chat_read(&srec.space, false).is_ok()
+                        }
                     };
                     if allowed {
                         kept.push(ch);

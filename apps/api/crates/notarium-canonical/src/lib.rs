@@ -6,10 +6,12 @@ use std::{future::Future, pin::Pin};
 
 pub mod blobs;
 pub mod changes;
+pub mod chats;
 pub mod codec;
 pub mod config;
 pub mod dialect;
 pub mod domain;
+pub mod peers;
 pub mod runtime;
 pub mod schema;
 pub(crate) mod sql_exec;
@@ -29,6 +31,11 @@ pub use config::{
 };
 pub use dialect::{DataRootOwnerLock, sqlite::observe_sqlite_canonical_witness};
 pub use domain::{RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
+pub use peers::{
+    AppendCollabUpdate, CheckpointCollabSession, ClaimedContentJob, CloseCollabSession,
+    CollabCarrierSettlement, CollabRoomState, CollabSessionRecord, CollabSessionSnapshot,
+    CollabUpdateEntry, JobCompletionOutcome, OpenCollabSession,
+};
 pub use runtime::{
     CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec, SpaceRecord,
     StoredRevisionRecord,

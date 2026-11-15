@@ -661,15 +661,56 @@ pub(crate) fn build_carrier_replacement_intent(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                let _fence_guard = if let Some(res) = reservation_opt {
-                    Some(
-                        room_fences
-                            .consume_reservation(&scope_cl, &note_id, res, &identity)
-                            .await?,
-                    )
+                let fence_guard = if let Some(res) = reservation_opt {
+                    let g = room_fences
+                        .consume_reservation(&scope_cl, &note_id, res, &identity)
+                        .await?;
+                    let dstate: Option<String> = match tx {
+                        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                            "SELECT room_state FROM collab_sessions WHERE space_id = ? AND note_id = ?",
+                        )
+                        .bind(scope_cl.space_id.as_str())
+                        .bind(note_id.as_str())
+                        .fetch_optional(&mut **conn)
+                        .await
+                        .map_err(|err| internal_not_committed("sqlite_note_collab_state", err.to_string()))?,
+                        BackendConn::Postgres(conn) => sqlx::query_scalar(
+                            "SELECT room_state FROM collab_sessions WHERE space_id = $1 AND note_id = $2",
+                        )
+                        .bind(scope_cl.space_id.as_str())
+                        .bind(note_id.as_str())
+                        .fetch_optional(&mut **conn)
+                        .await
+                        .map_err(|err| internal_not_committed("pg_note_collab_state", err.to_string()))?,
+                    };
+                    if matches!(dstate.as_deref(), Some("active" | "fenced")) {
+                        return Err(unavailable_retryable(
+                            "collab_room_not_closed",
+                            "note collaborative session is active or fenced awaiting recovery",
+                            std::time::Duration::from_millis(50),
+                        ));
+                    }
+                    Some(g)
                 } else {
+                    if crate::domain::common::is_note_room_active_tx(
+                        tx,
+                        &room_fences,
+                        &scope_cl,
+                        &note_id,
+                    )
+                    .await?
+                    {
+                        return Err(unavailable_retryable(
+                            "collab_room_not_closed",
+                            "note collaborative session is active or fenced awaiting recovery",
+                            std::time::Duration::from_millis(50),
+                        ));
+                    }
                     None
                 };
+                if let Some(g) = fence_guard {
+                    item_ctx.retain_until_batch_commit(g);
+                }
 
                 let live_space = load_space_record(tx, &scope_cl.space_id).await?;
                 let head = load_note_head_row_tx(tx, &scope_cl.space_id, &note_id).await?;
@@ -767,6 +808,14 @@ pub(crate) fn build_carrier_replacement_intent(
                         owner_rev_id: new_rev.as_str().to_owned(),
                         resource_key: "carrier".to_owned(),
                     },
+                    seq,
+                )
+                .await?;
+                crate::domain::common::sync_closed_collab_session_on_direct_write_tx(
+                    tx,
+                    &scope_cl.space_id,
+                    &note_id,
+                    &new_rev,
                     seq,
                 )
                 .await?;
@@ -2059,6 +2108,7 @@ pub(crate) async fn accept_batch_impl(
                         },
                     );
                     Ok(build_batch_edit_intent(
+                        store,
                         &space_rec.scope,
                         space_rec.active_epoch,
                         Some(idemp),
@@ -2170,6 +2220,7 @@ pub(crate) async fn accept_batch_impl(
 
 #[allow(clippy::too_many_arguments)]
 fn build_batch_edit_intent(
+    store: &CanonicalStore,
     scope: &notarium_core::model::HistoryScope,
     active_epoch: notarium_core::ids::LeaseEpoch,
     idemp: Option<crate::writer::CommandIdentitySpec>,
@@ -2181,6 +2232,7 @@ fn build_batch_edit_intent(
     ticket: crate::blobs::StagedBlobTicket,
 ) -> PreparedWriteIntent {
     let scope_cl = scope.clone();
+    let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
     let staged_bytes = ticket.compressed_size;
 
     PreparedWriteIntent {
@@ -2215,6 +2267,13 @@ fn build_batch_edit_intent(
                 }
                 check_collab_preconditions_tx(tx, &scope_cl.space_id, &note_id, &preconditions)
                     .await?;
+                if is_note_room_active_tx(tx, &room_fences, &scope_cl, &note_id).await? {
+                    return Err(unavailable_retryable(
+                        "batch_edit_blocked_by_active_or_fenced_room",
+                        "cannot overwrite note carrier directly while collaborative room is active or fenced",
+                        std::time::Duration::from_millis(50),
+                    ));
+                }
 
                 let (facts, anc) = build_resource_facts_tx(
                     tx,
@@ -2245,6 +2304,14 @@ fn build_batch_edit_intent(
                         owner_rev_id: new_rev.as_str().to_owned(),
                         resource_key: "carrier".to_owned(),
                     },
+                    seq,
+                )
+                .await?;
+                crate::domain::common::sync_closed_collab_session_on_direct_write_tx(
+                    tx,
+                    &scope_cl.space_id,
+                    &note_id,
+                    &new_rev,
                     seq,
                 )
                 .await?;
@@ -2707,6 +2774,7 @@ pub(crate) async fn link_impl(
         .await?;
 
     let intent = build_link_item_intent(
+        store,
         &space_rec.scope,
         space_rec.active_epoch,
         Some(idemp),
@@ -2807,6 +2875,7 @@ pub(crate) async fn link_many_impl(
                 (doc_class, slug, new_carrier, new_digest),
             );
             Ok(build_link_item_intent(
+                store,
                 &space_rec.scope,
                 space_rec.active_epoch,
                 Some(idemp),
@@ -2876,6 +2945,7 @@ fn append_link_line_to_carrier(
 
 #[allow(clippy::too_many_arguments)]
 fn build_link_item_intent(
+    store: &CanonicalStore,
     scope: &notarium_core::model::HistoryScope,
     active_epoch: notarium_core::ids::LeaseEpoch,
     idemp: Option<crate::writer::CommandIdentitySpec>,
@@ -2887,6 +2957,7 @@ fn build_link_item_intent(
     ticket: crate::blobs::StagedBlobTicket,
 ) -> PreparedWriteIntent {
     let scope_cl = scope.clone();
+    let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
     let staged_bytes = ticket.compressed_size;
     let source_id = link.source.clone();
 
@@ -2922,6 +2993,15 @@ fn build_link_item_intent(
                         lineage: None,
                     }
                     .into());
+                }
+                check_collab_preconditions_tx(tx, &scope_cl.space_id, &source_id, &preconditions)
+                    .await?;
+                if is_note_room_active_tx(tx, &room_fences, &scope_cl, &source_id).await? {
+                    return Err(unavailable_retryable(
+                        "link_blocked_by_active_or_fenced_room",
+                        "cannot rewrite note carrier for link while collaborative room is active or fenced",
+                        std::time::Duration::from_millis(50),
+                    ));
                 }
 
                 let (facts, anc) = build_resource_facts_tx(
@@ -2997,6 +3077,14 @@ fn build_link_item_intent(
                         owner_rev_id: new_rev.as_str().to_owned(),
                         resource_key: "carrier".to_owned(),
                     },
+                    seq,
+                )
+                .await?;
+                crate::domain::common::sync_closed_collab_session_on_direct_write_tx(
+                    tx,
+                    &scope_cl.space_id,
+                    &source_id,
+                    &new_rev,
                     seq,
                 )
                 .await?;

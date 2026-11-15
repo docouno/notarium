@@ -985,12 +985,37 @@ pub(crate) async fn move_board_card_impl(
             required_semantic_cut: Some((facts.cutoff(), SemanticCutMismatchKind::CursorStale)),
             execute: Box::new(move |tx, item_ctx| {
                 Box::pin(async move {
-                    let _room_guard = match reservation_opt {
-                        Some(res) => Some(
-                            room_fences
+                    match reservation_opt {
+                        Some(res) => {
+                            let g = room_fences
                                 .consume_reservation(&scope_cl, &input.note, res, &req_id)
-                                .await?,
-                        ),
+                                .await?;
+                            let dstate: Option<String> = match tx {
+                                BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                                    "SELECT room_state FROM collab_sessions WHERE space_id = ? AND note_id = ?",
+                                )
+                                .bind(scope_cl.space_id.as_str())
+                                .bind(input.note.as_str())
+                                .fetch_optional(&mut **conn)
+                                .await
+                                .map_err(|err| internal_not_committed("sqlite_bm_collab_state", err.to_string()))?,
+                                BackendConn::Postgres(conn) => sqlx::query_scalar(
+                                    "SELECT room_state FROM collab_sessions WHERE space_id = $1 AND note_id = $2",
+                                )
+                                .bind(scope_cl.space_id.as_str())
+                                .bind(input.note.as_str())
+                                .fetch_optional(&mut **conn)
+                                .await
+                                .map_err(|err| internal_not_committed("pg_bm_collab_state", err.to_string()))?,
+                            };
+                            if matches!(dstate.as_deref(), Some("active" | "fenced")) {
+                                return Err(DomainError::validation(
+                                    ValidationReason::InvalidState,
+                                )
+                                .into());
+                            }
+                            item_ctx.retain_until_batch_commit(g);
+                        }
                         None => {
                             if is_note_room_active_tx(tx, &room_fences, &scope_cl, &input.note)
                                 .await?
@@ -1000,9 +1025,8 @@ pub(crate) async fn move_board_card_impl(
                                 )
                                 .into());
                             }
-                            None
                         }
-                    };
+                    }
 
                     // Re-verify target note, view note, auth, and Space schema under writer lock.
                     let head = load_note_head_row_tx(tx, &scope_cl.space_id, &input.note).await?;
@@ -1287,6 +1311,14 @@ pub(crate) async fn move_board_card_impl(
                         item_ctx.record_staged_ticket(ticket);
                         activate_and_bind_blob_ref_tx(tx, item_ctx.active_epoch, &claim, note_seq)
                             .await?;
+                        crate::domain::common::sync_closed_collab_session_on_direct_write_tx(
+                            tx,
+                            &scope_cl.space_id,
+                            &input.note,
+                            &new_rev,
+                            visibility_seq,
+                        )
+                        .await?;
 
                         let vis_i64 = visibility_seq.get() as i64;
                         match tx {

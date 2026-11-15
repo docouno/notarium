@@ -295,20 +295,19 @@ pub(crate) async fn rollback_agent_run_impl(
             execute: Box::new(move |tx, item_ctx| {
                 Box::pin(async move {
                     // 1. Consume all closed-room reservations in ascending NoteId order.
-                    let mut _room_guards = Vec::with_capacity(eligible_reservations.len());
                     for (nid, res) in eligible_reservations {
                         let guard = room_fences
                             .consume_reservation(&scope_cl, &nid, res, &req_id)
                             .await?;
-                        // Double-check durable `collab_sessions` did not become `'active'` concurrently.
+                        // Double-check durable `collab_sessions` did not become `'active'` or `'fenced'` concurrently.
                         let dstate =
                             read_collab_room_state_tx(tx, &scope_cl.space_id, &nid).await?;
-                        if dstate.as_deref() == Some("active") {
+                        if matches!(dstate.as_deref(), Some("active" | "fenced")) {
                             return Err(
                                 DomainError::validation(ValidationReason::InvalidState).into()
                             );
                         }
-                        _room_guards.push(guard);
+                        item_ctx.retain_until_batch_commit(guard);
                     }
 
                     // 2. Re-verify `expected_run_revision`, `expected_entities`, and `associated_board_expectations`.
@@ -1349,11 +1348,12 @@ async fn discover_rollback_state_tx(
             continue;
         }
 
-        if read_collab_room_state_tx(tx, &srec.scope.space_id, &nid)
-            .await?
-            .as_deref()
-            == Some("active")
-        {
+        if matches!(
+            read_collab_room_state_tx(tx, &srec.scope.space_id, &nid)
+                .await?
+                .as_deref(),
+            Some("active" | "fenced")
+        ) {
             durable_active_rooms.insert(nid.clone());
         }
 
@@ -2087,59 +2087,15 @@ async fn bump_closed_collab_session_lineage_tx(
     new_carrier_rev: &RevisionId,
     vis_seq: i64,
 ) -> Result<(), PortError> {
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query("DELETE FROM collab_update_log WHERE space_id = ? AND note_id = ?")
-                .bind(space_id.as_str())
-                .bind(note_id.as_str())
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("sqlite_rb_clear_collab_log", err.to_string())
-                })?;
-            sqlx::query(
-                "UPDATE collab_sessions
-                 SET lineage_epoch = lineage_epoch + 1,
-                     carrier_rev_id = ?,
-                     yrs_snapshot_blob = NULL,
-                     yrs_snapshot_blake3 = NULL,
-                     updated_seq = ?
-                 WHERE space_id = ? AND note_id = ? AND room_state <> 'active'",
-            )
-            .bind(new_carrier_rev.as_str())
-            .bind(vis_seq)
-            .bind(space_id.as_str())
-            .bind(note_id.as_str())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_rb_bump_lineage", err.to_string()))?;
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query("DELETE FROM collab_update_log WHERE space_id = $1 AND note_id = $2")
-                .bind(space_id.as_str())
-                .bind(note_id.as_str())
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| internal_not_committed("pg_rb_clear_collab_log", err.to_string()))?;
-            sqlx::query(
-                "UPDATE collab_sessions
-                 SET lineage_epoch = lineage_epoch + 1,
-                     carrier_rev_id = $1,
-                     yrs_snapshot_blob = NULL,
-                     yrs_snapshot_blake3 = NULL,
-                     updated_seq = $2
-                 WHERE space_id = $3 AND note_id = $4 AND room_state <> 'active'",
-            )
-            .bind(new_carrier_rev.as_str())
-            .bind(vis_seq)
-            .bind(space_id.as_str())
-            .bind(note_id.as_str())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_rb_bump_lineage", err.to_string()))?;
-        }
-    }
-    Ok(())
+    let seq = crate::codec::i64_to_space_seq(vis_seq)?;
+    crate::domain::common::sync_closed_collab_session_on_direct_write_tx(
+        tx,
+        space_id,
+        note_id,
+        new_carrier_rev,
+        seq,
+    )
+    .await
 }
 
 async fn delete_all_target_overlays_tx(

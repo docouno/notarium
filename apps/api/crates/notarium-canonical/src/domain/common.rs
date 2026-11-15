@@ -141,6 +141,49 @@ impl RoomFenceTable {
         guard.consume(reservation, identity)?;
         Ok(guard)
     }
+
+    pub async fn seed_persisted_room(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+        epoch: LeaseEpoch,
+        active: bool,
+    ) -> Result<(), PortError> {
+        let mut state = if active {
+            let base = LeaseEpoch::new(epoch.get().saturating_sub(1))?;
+            let mut s = RoomFenceState::new(note.clone(), scope.clone(), base);
+            s.open()?;
+            s
+        } else {
+            RoomFenceState::new(note.clone(), scope.clone(), epoch)
+        };
+        let _ = &mut state;
+        let lock = {
+            let mut map = self.fences.lock().expect("room fence table mutex");
+            if let Some(existing) = map.get(&(scope.space_id.clone(), note.clone())) {
+                Some(Arc::clone(existing))
+            } else {
+                map.insert(
+                    (scope.space_id.clone(), note.clone()),
+                    Arc::new(Mutex::new(state)),
+                );
+                return Ok(());
+            }
+        };
+        if let Some(existing_lock) = lock {
+            let mut guard = existing_lock.lock().await;
+            let rebuilt = if active {
+                let base = LeaseEpoch::new(epoch.get().saturating_sub(1))?;
+                let mut s = RoomFenceState::new(note.clone(), scope.clone(), base);
+                s.open()?;
+                s
+            } else {
+                RoomFenceState::new(note.clone(), scope.clone(), epoch)
+            };
+            *guard = rebuilt;
+        }
+        Ok(())
+    }
 }
 
 /// Atomic canonical Space field schema update input.
@@ -1030,7 +1073,83 @@ pub(crate) async fn is_note_room_active_tx(
         .await
         .map_err(|err| internal_not_committed("pg_check_room_active", err.to_string()))?,
     };
-    Ok(state_opt.as_deref() == Some("active"))
+    Ok(matches!(state_opt.as_deref(), Some("active" | "fenced")))
+}
+
+pub(crate) async fn sync_closed_collab_session_on_direct_write_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    note_id: &NoteId,
+    new_carrier_rev: &RevisionId,
+    updated_seq: SpaceSeq,
+) -> Result<(), PortError> {
+    let seq_i64 = updated_seq.get() as i64;
+    let affected = match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query("DELETE FROM collab_update_log WHERE space_id = ? AND note_id = ?")
+                .bind(space_id.as_str())
+                .bind(note_id.as_str())
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("sqlite_sync_clear_collab_log", err.to_string())
+                })?;
+            sqlx::query(
+                "UPDATE collab_sessions
+                 SET lineage_epoch = lineage_epoch + 1,
+                     carrier_rev_id = ?,
+                     yrs_snapshot_blob = NULL,
+                     yrs_snapshot_blake3 = NULL,
+                     updated_seq = ?
+                 WHERE space_id = ? AND note_id = ? AND room_state = 'closed'",
+            )
+            .bind(new_carrier_rev.as_str())
+            .bind(seq_i64)
+            .bind(space_id.as_str())
+            .bind(note_id.as_str())
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_sync_collab_lineage", err.to_string()))?
+            .rows_affected()
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query("DELETE FROM collab_update_log WHERE space_id = $1 AND note_id = $2")
+                .bind(space_id.as_str())
+                .bind(note_id.as_str())
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("pg_sync_clear_collab_log", err.to_string())
+                })?;
+            sqlx::query(
+                "UPDATE collab_sessions
+                 SET lineage_epoch = lineage_epoch + 1,
+                     carrier_rev_id = $1,
+                     yrs_snapshot_blob = NULL,
+                     yrs_snapshot_blake3 = NULL,
+                     updated_seq = $2
+                 WHERE space_id = $3 AND note_id = $4 AND room_state = 'closed'",
+            )
+            .bind(new_carrier_rev.as_str())
+            .bind(seq_i64)
+            .bind(space_id.as_str())
+            .bind(note_id.as_str())
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_sync_collab_lineage", err.to_string()))?
+            .rows_affected()
+        }
+    };
+    if affected > 0 {
+        let _ = crate::blobs::release_owner_blob_refs_tx(
+            tx,
+            space_id,
+            crate::blobs::BlobOwnerKind::CollabSnapshot,
+            note_id.as_str(),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn insert_note_alias_tx(

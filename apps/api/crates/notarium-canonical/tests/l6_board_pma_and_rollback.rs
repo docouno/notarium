@@ -1215,6 +1215,22 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         .expect("inspect run rev")
         .expect("run head exists");
 
+    let lineage_before_rb = store
+        .execute_diagnostic_read_sql_for_test(
+            None,
+            &format!(
+                "SELECT lineage_epoch FROM collab_sessions WHERE space_id = '{}' AND note_id = '{}'",
+                scope.space_id.as_str(),
+                n_pre.as_str()
+            ),
+        )
+        .await
+        .expect("read lineage_epoch before rollback");
+    assert_eq!(
+        lineage_before_rb, 5,
+        "closed collab_sessions.lineage_epoch must advance 3 -> 4 (board field patch) -> 5 (direct edit)"
+    );
+
     let rollback_committed = store
         .rollback_agent_run(
             human_ctx.clone(),
@@ -1338,8 +1354,8 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         .await
         .expect("read lineage_epoch");
     assert_eq!(
-        lineage_after, 4,
-        "closed collab_sessions.lineage_epoch must advance 3 -> 4"
+        lineage_after, 6,
+        "closed collab_sessions.lineage_epoch must advance 5 -> 6 on rollback"
     );
 
     let restored_from_cnt = store
