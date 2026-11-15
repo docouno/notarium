@@ -356,7 +356,7 @@ pub struct Fixture {
     pub catalog: Arc<Catalog>,
     pub revoker: Arc<Revoker>,
     pub clock: Arc<Clock>,
-    root: Option<PathBuf>,
+    pub root: Option<PathBuf>,
     admin: Option<sqlx::PgConnection>,
     database: String,
 }

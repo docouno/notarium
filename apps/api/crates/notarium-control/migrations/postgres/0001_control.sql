@@ -144,6 +144,7 @@ CREATE INDEX access_family ON v1_control.oauth_access_tokens(family_id);
 CREATE INDEX access_expiry ON v1_control.oauth_access_tokens(expires_at);
 CREATE TABLE v1_control.secret_keyring (
     key_id TEXT NOT NULL PRIMARY KEY CHECK (length(key_id)=27),
+    key_hash TEXT NOT NULL CHECK (length(key_hash)=71 AND key_hash ~ '^sha256:[0-9a-f]{64}$'),
     generation BIGINT NOT NULL UNIQUE CHECK (generation > 0),
     state TEXT NOT NULL CHECK (state IN ('active','readable')),
     canary TEXT NOT NULL CHECK (length(canary)<=1024), created_at BIGINT NOT NULL, retired_at BIGINT,

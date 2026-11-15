@@ -201,10 +201,12 @@ CREATE INDEX access_family ON oauth_access_tokens(family_id);
 CREATE INDEX access_expiry ON oauth_access_tokens(expires_at);
 CREATE TABLE secret_keyring (
     key_id TEXT NOT NULL PRIMARY KEY CHECK (length(key_id)=27),
+    key_hash TEXT NOT NULL CHECK (length(key_hash)=71 AND substr(key_hash,1,7)='sha256:' AND substr(key_hash,8) NOT GLOB '*[^0-9a-f]*'),
     generation INTEGER NOT NULL UNIQUE CHECK (generation > 0),
     state TEXT NOT NULL CHECK (state IN ('active','readable')),
     canary TEXT NOT NULL CHECK (length(canary)<=1024), created_at INTEGER NOT NULL, retired_at INTEGER,
     CHECK (instr(key_id,char(0))=0),
+    CHECK (instr(key_hash,char(0))=0),
     CHECK (instr(state,char(0))=0),
     CHECK (instr(canary,char(0))=0),
     CHECK (coalesce(length(CAST(key_id AS BLOB)),0) <= 2048),

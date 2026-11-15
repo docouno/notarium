@@ -196,6 +196,7 @@ pub struct OauthAccessTokensRow {
 #[serde(deny_unknown_fields)]
 pub struct SecretKeyringRow {
     pub key_id: String,
+    pub key_hash: String,
     pub generation: i64,
     pub state: String,
     pub canary: String,
@@ -1172,6 +1173,20 @@ impl TargetRecord {
                     let value = &row.key_id;
                     bytes = bytes.saturating_add(text_bytes(value)?);
                     notarium_core::ids::KeyId::parse(value)?;
+                }
+                {
+                    let value = &row.key_hash;
+                    bytes = bytes.saturating_add(text_bytes(value)?);
+                    if !value.strip_prefix("sha256:").is_some_and(|hash| {
+                        hash.len() == 64
+                            && hash
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    }) {
+                        return Err(crate::error::invalid(
+                            notarium_core::error::ValidationReason::InvalidState,
+                        ));
+                    }
                 }
                 {
                     let value = &row.state;
@@ -2330,10 +2345,10 @@ impl TargetRecord {
             },
             Self::SecretKeyring(row) => match tx {
                 Transaction::Sqlite(tx) => {
-                    sqlx::query("INSERT INTO secret_keyring(key_id,generation,state,canary,created_at,retired_at) VALUES($1,$2,$3,$4,$5,$6)").bind(&row.key_id).bind(row.generation).bind(&row.state).bind(&row.canary).bind(row.created_at).bind(row.retired_at).execute(&mut **tx).await.map_err(database)?;
+                    sqlx::query("INSERT INTO secret_keyring(key_id,key_hash,generation,state,canary,created_at,retired_at) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(&row.key_id).bind(&row.key_hash).bind(row.generation).bind(&row.state).bind(&row.canary).bind(row.created_at).bind(row.retired_at).execute(&mut **tx).await.map_err(database)?;
                 }
                 Transaction::Postgres(tx) => {
-                    sqlx::query("INSERT INTO v1_control.secret_keyring(key_id,generation,state,canary,created_at,retired_at) VALUES($1,$2,$3,$4,$5,$6)").bind(&row.key_id).bind(row.generation).bind(&row.state).bind(&row.canary).bind(row.created_at).bind(row.retired_at).execute(&mut **tx).await.map_err(database)?;
+                    sqlx::query("INSERT INTO v1_control.secret_keyring(key_id,key_hash,generation,state,canary,created_at,retired_at) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(&row.key_id).bind(&row.key_hash).bind(row.generation).bind(&row.state).bind(&row.canary).bind(row.created_at).bind(row.retired_at).execute(&mut **tx).await.map_err(database)?;
                 }
             },
             Self::OidcTransactions(row) => match tx {
@@ -3233,12 +3248,12 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
         TargetTable::SecretKeyring => {
             let chunk:super::RowChunk<SecretKeyringRow>=match after {
 None=>match tx {
-Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,generation,state,canary,created_at,retired_at FROM secret_keyring ORDER BY key_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,generation,state,canary,created_at,retired_at FROM v1_control.secret_keyring ORDER BY key_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM secret_keyring ORDER BY key_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM v1_control.secret_keyring ORDER BY key_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::SecretKeyring{key_id})=>match tx {
-Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,generation,state,canary,created_at,retired_at FROM secret_keyring WHERE key_id > $1 ORDER BY key_id LIMIT $2").bind(key_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,generation,state,canary,created_at,retired_at FROM v1_control.secret_keyring WHERE key_id > $1 ORDER BY key_id LIMIT $2").bind(key_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM secret_keyring WHERE key_id > $1 ORDER BY key_id LIMIT $2").bind(key_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM v1_control.secret_keyring WHERE key_id > $1 ORDER BY key_id LIMIT $2").bind(key_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };

@@ -16,6 +16,10 @@ libsqlite3-sys = { workspace = true }
 argon2 = { workspace = true }
 scrypt = { workspace = true }
 hkdf = { workspace = true }
+hmac = { workspace = true }
+cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
+ipnet = { workspace = true }
 sha2 = { workspace = true }
 aes-gcm = { workspace = true }
 reqwest = { workspace = true }

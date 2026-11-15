@@ -62,8 +62,8 @@ pulldown-cmark = "=0.13.6"
 argon2 = "0.6"
 scrypt = "0.12"
 hkdf = "0.13"
-sha2 = "0.11"
-aes-gcm = "0.11"
+sha2 = { version = "0.11", features = ["zeroize"] }
+aes-gcm = { version = "0.11", features = ["zeroize"] }
 age = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
@@ -77,6 +77,9 @@ tantivy = "0.27"
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-31"] }
 yrs = "0.28"
 cap-std = "4"
+cap-fs-ext = "4"
+hmac = { version = "0.13", features = ["zeroize"] }
+ipnet = "2"
 notify = "8"
 zip = { version = "9", default-features = false, features = ["deflate", "zstd"] }
 mimalloc = { version = "0.1", default-features = false }

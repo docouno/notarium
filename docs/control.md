@@ -162,6 +162,121 @@ the writer fence through BEGIN, COMMIT and ROLLBACK acknowledgement, even when t
 request future is dropped. This bounds cancelled-but-still-running database work
 and keeps it visible to the backup owner's write pause.
 
+## Native credential keyring
+
+The separate `Keyring` service validates existing state without creating files,
+probing writability, changing permissions or repairing missing material. Local
+storage defaults to `<DataRoot>/secret-keyring`; cloud storage requires an explicit
+external location. The composition owner maps operator configuration to
+`KeyringLocation`. No environment-variable lookup or implicit initialization
+occurs inside the service.
+
+`active.json` identifies format `notarium-credential-key-pointer`, format version
+one, generation, key ID and `sha256:<64 lowercase hex digits>` of the exact key
+file bytes, including any final newline. `keys/<key-id>.json` contains format
+`notarium-credential-key`, version one, key ID and a canonical unpadded base64url
+32-byte master secret. Both JSON formats reject unknown or duplicate fields.
+Fresh serialization is compact JSON followed by one newline.
+
+HKDF-SHA256 with an empty salt derives the 12-byte key ID suffix with info
+`notarium:key-id:v1`, the 32-byte encryption key with
+`notarium:secret:credential:v1`, and the canary with `notarium:canary:v1`.
+Envelopes are `v1.<key-id>.<base64url(nonce || ciphertext || tag)>`, using
+AES-256-GCM with a fresh 12-byte random nonce and 16-byte tag. Authenticated data
+joins version, key ID, facet, record ID and field with NUL separators and no final
+separator. Credential secrets, resource headers and key canaries have distinct
+identities; header names are validated and lowercased.
+
+The reader uses directory capabilities to confine relative projected-volume
+symlinks. Files must be regular and at most 16 KiB; nonblocking open rejects FIFOs
+without waiting for a writer. Unix roots and files must not be world writable.
+Existing readable mounts do not need mode `0600`. Pointer generation, key ID,
+exact file hash and encrypted canary must match the durable `secret_keyring`
+witness. Startup validates all nonretired keys. Every later operation reloads
+the active and requested key, then rechecks the SQL witnesses before returning.
+A pointer transition permits only one bounded reread. No raw key cache survives
+an operation. Secret buffers and supported crypto state use zeroization; this
+does not promise removal of every compiler or library temporary copy.
+
+Four process-wide filesystem slots are acquired without queueing. A blocking
+worker retains its slot after caller timeout or drop until the actual work ends.
+Plaintext is limited to 32 KiB and envelopes to 44 KiB. Errors and debug output
+exclude raw keys, plaintext and envelope values. Target export contains only
+key ID, generation, hash and encrypted canary records, never key files.
+
+`FreshLocalInitializer` accepts only the SQLite store's local default path and a
+typed `EmptyRootAuthorization`. It checks all target tables are empty, creates
+directories with mode `0700` and files with mode `0600`, synchronizes files and
+directories, then commits generation one and a migrating installation witness.
+The paired storage coordinator must publish readiness separately. A successful
+repeat validates existing state without rewriting it. Files and SQL are not one
+atomic transaction: interruption between them leaves a partial root requiring
+explicit recovery. Missing or corrupt state never triggers key regeneration.
+
+Linux tests exercise the real read-only source mount, confined projected
+symlinks, FIFO refusal, native independent crypto vectors, both SQL dialects,
+fresh initialization and cancellation ownership. Windows ACLs and filesystem
+durability have not been qualified by these Linux checks.
+
+## Outbound transport
+
+`OutboundTransport` supplies a shared network boundary for provider, CIMD and
+OIDC calls. Provider dispatch still needs current account authority, disclosure
+consent, configuration witnesses and a durable call intent from the provider
+gateway. A cached client is never proof of those permissions.
+
+URLs use the `url` parser with IDNA normalization. User information, fragments,
+control characters, backslashes, zone IDs and alternative integer/octal/hex/short
+IPv4 forms are rejected. Public destinations require HTTPS. The address policy
+excludes IANA special-purpose allocations, multicast and reserved addresses,
+including mapped IPv4 forms. Cloud metadata and platform addresses are denied
+before evaluating private exceptions.
+
+Only an operator's exact Ollama resource/origin rule can permit HTTP or private
+destinations. Its CIDRs must lie within loopback, RFC1918 or ULA ranges; every DNS
+candidate must belong to that rule. Rules never apply to CIMD, OIDC or another
+provider resource. Configuration allows at most 128 rules with 32 CIDRs each.
+
+The guarded resolver runs on the actual connector path, validates the complete
+answer of at most 32 candidates, and passes those same socket addresses to the
+connector. It performs no independent preflight lookup. Literal addresses use
+the same policy before sending. Four process-wide blocking DNS jobs retain their
+slots after caller cancellation until the system lookup really finishes.
+
+Clients explicitly disable environment proxies, redirects, automatic retries,
+referer generation and TLS key logging. HTTP/1 prevents connection coalescing.
+Pools are separated by scope, resource runtime/credential epochs, canonical
+origin and operator policy epoch. They retain at most two idle connections per
+client, with an LRU limit of 128 clients and eviction restricted to idle clients.
+A newer resource epoch cancels its older pools. Provider mutations must use
+`invalidate_provider` inside their dispatch admission fence; operator policy
+replacement cancels all old pools. Fresh DB checks remain mandatory after idle
+pool eviction, because the bounded cache is not an authority ledger.
+
+There are 32 active call slots across transport instances. An owned worker reads
+each response through a one-chunk channel of at most 64 KiB. Caller drop, explicit
+cancellation, epoch changes and deadlines close the response and release its
+slot even if the consumer never polls again. Client construction may load system
+certificates, so it also runs as an owned blocking job. Connect timeout is five
+seconds; first-byte, idle-read and consumer-backpressure limits are 30 seconds.
+Provider total duration is at most 120 seconds and metadata duration ten seconds;
+the caller's smaller absolute budget takes precedence.
+
+Requests are limited to 8 MiB. Provider wire responses have a 32 MiB ceiling plus
+the caller's smaller limit; CIMD allows 64 KiB and OIDC 256 KiB. Accepted request
+and response headers are limited to 16 KiB. Response parsing also limits header
+count to 100, but the HTTP parser can temporarily buffer more than 16 KiB before
+rejection; the acceptance limit is not an exact allocation cap. Header values
+are marked sensitive, and transport diagnostics exclude URL queries and bodies.
+Connector failures before HTTP application bytes report an unsent outcome;
+disconnects or timeouts after possible dispatch report an unknown outcome.
+
+Offline tests use actual loopback HTTP sockets with checked DNS injection and
+invalid proxy environment settings. They verify exact destinations, redirect
+refusal, DNS rebinding, pool separation, epoch cancellation, no replay of a POST
+received before disconnect, and bounded unpolled/cancelled calls. These tests do
+not certify a live external identity provider or public TLS endpoint.
+
 ## Verification
 
 Run `make setup`, `make check`, `make test` and `make build`. The database suite
