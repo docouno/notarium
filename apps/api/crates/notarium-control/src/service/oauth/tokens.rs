@@ -197,7 +197,9 @@ impl OAuthService {
             if changed!=1 {return Err(invalid_grant());}
             Ok((Some(tokens),vec![]))
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        self.control
+            .commit_revocations(tx, &budget, &events)
+            .await?;
         for event in events {
             self.control.flush_event(&budget, &event).await?;
         }
@@ -259,7 +261,9 @@ impl OAuthService {
                 Ok(events)
             }
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        self.control
+            .commit_revocations(tx, &budget, &events)
+            .await?;
         for event in events {
             self.control.flush_event(&budget, &event).await?;
         }

@@ -86,6 +86,53 @@ pub(super) async fn enqueue_at(
     Ok(id)
 }
 impl ControlService {
+    /// SQL authority locks precede registry leases on both dispatch and mutation
+    /// paths. Calls release their registration before starting settlement SQL.
+    pub(super) async fn commit_revocations(
+        &self,
+        mut tx: crate::store::WriteTransaction,
+        budget: &OperationBudget,
+        events: &[RequestId],
+    ) -> Result<(), PortError> {
+        let mut selectors = Vec::new();
+        for id in events {
+            let event = budget
+                .run(
+                    async {
+                        rows!(tx.inner_mut(),RevocationEventsRow,fetch_one,
+                    "SELECT * FROM revocation_events WHERE event_id=$1",
+                    "SELECT * FROM v1_control.revocation_events WHERE event_id=$1";id.as_str())
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            if event.delivered_at.is_none() {
+                let envelope: SelectorEnvelope = serde_json::from_str(&event.selector)
+                    .map_err(|_| invalid(ValidationReason::InvalidState))?;
+                if envelope.version != 1 {
+                    return Err(invalid(ValidationReason::InvalidState));
+                }
+                selectors.push(envelope.selector);
+            }
+        }
+        if !selectors.is_empty() {
+            let fence = budget
+                .run(
+                    self.revoker.fence_provider(
+                        MaintenanceContext {
+                            authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+                            budget: budget.context(events[0].clone()),
+                        },
+                        selectors,
+                    ),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            fence.check()?;
+            tx.hold_revocation_fence(fence);
+        }
+        budget.run(tx.commit(), CommitEffect::Unknown).await
+    }
     pub(super) async fn flush_event(
         &self,
         budget: &OperationBudget,

@@ -236,7 +236,7 @@ CREATE TABLE v1_control.provider_call_log (
     call_id TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL, principal TEXT NOT NULL, run_id TEXT,
     scope_id TEXT NOT NULL, intent_key TEXT NOT NULL, request_hash BYTEA NOT NULL CHECK (length(request_hash)=32),
     resource_id TEXT NOT NULL, credential_id TEXT, policy_epochs TEXT NOT NULL, participating_spaces TEXT NOT NULL,
-    model_id TEXT NOT NULL, reserved_tokens BIGINT NOT NULL CHECK (reserved_tokens>=0), bucket_keys TEXT NOT NULL,
+    model_id TEXT, reserved_tokens BIGINT NOT NULL CHECK (reserved_tokens>=0), bucket_keys TEXT NOT NULL,
     delivery_state TEXT NOT NULL CHECK (delivery_state IN ('intent','sending','settled')),
     outcome TEXT CHECK (outcome IN ('completed','not_sent','unknown','failed','cancelled')),
     usage_source TEXT NOT NULL CHECK (usage_source IN ('exact','unknown','estimate')),
@@ -250,6 +250,7 @@ CREATE TABLE v1_control.provider_call_log (
 );
 CREATE INDEX call_owner ON v1_control.provider_call_log(owner_id,created_at,call_id);
 CREATE INDEX call_pending ON v1_control.provider_call_log(delivery_state,created_at,call_id);
+CREATE INDEX call_budget_resource ON v1_control.provider_call_log(resource_id,created_at,diagnostic);
 CREATE TABLE v1_control.ability_availability (
     placement TEXT NOT NULL, ability_id TEXT NOT NULL,
     mode TEXT NOT NULL CHECK (mode IN ('all-projects','selected-projects')),

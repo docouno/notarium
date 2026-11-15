@@ -179,7 +179,6 @@ fn verify_profile(password: Secret, profile: Profile) -> Result<PasswordVerifica
 #[cfg(test)]
 mod tests {
     use super::*;
-    static KDF_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     #[test]
     fn admission_costs_and_malicious_parameters_are_checked_before_work() {
         let encoded = format!(
@@ -199,7 +198,7 @@ mod tests {
     }
     #[tokio::test]
     async fn canonical_password_roundtrip() {
-        let _serial = KDF_TEST_LOCK.lock().await;
+        let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
         let encoded = hash(Secret::new("test password".into())).await.unwrap();
         assert!(encoded.starts_with("$argon2id$v=19$m=65536,t=3,p=1$"));
         assert!(
@@ -217,7 +216,7 @@ mod tests {
     }
     #[tokio::test]
     async fn measured_kdf_heap_and_overhead_stay_bounded() {
-        let _serial = KDF_TEST_LOCK.lock().await;
+        let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
         // The counter observes the actual synchronous worker on this thread.
         // Inputs and profile parsing are included; no nested measurement is used.
         let canonical = allocation_counter::measure(|| {
@@ -282,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn mixed_flood_rejects_before_work_and_drop_retains_credits() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let _serial = KDF_TEST_LOCK.lock().await;
+        let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
         let rejected = AtomicUsize::new(0);
         let argon = "$argon2id$v=19$m=65536,t=3,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let scrypt = format!(

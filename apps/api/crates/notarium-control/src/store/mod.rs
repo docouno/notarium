@@ -178,6 +178,7 @@ impl ControlStore {
                 };
                 let mut tx = WriteTransaction {
                     resources: Some(WriteResources {
+                        revocation_fences: Vec::new(),
                         inner,
                         _guard: guard,
                         _admission: admission,
@@ -285,6 +286,7 @@ pub(crate) enum Transaction {
 }
 struct WriteResources {
     inner: Transaction,
+    revocation_fences: Vec<Box<dyn notarium_core::ports::RevocationLease>>,
     _guard: OwnedRwLockReadGuard<()>,
     _admission: OwnedSemaphorePermit,
 }
@@ -292,6 +294,7 @@ impl WriteResources {
     async fn rollback(self) -> Result<(), PortError> {
         let Self {
             inner,
+            revocation_fences,
             _guard,
             _admission,
         } = self;
@@ -299,13 +302,23 @@ impl WriteResources {
             Transaction::Sqlite(tx) => tx.rollback().await.map_err(database),
             Transaction::Postgres(tx) => tx.rollback().await.map_err(database),
         };
+        drop(revocation_fences);
         drop(_admission);
         drop(_guard);
         result
     }
     async fn commit(self) -> Result<(), PortError> {
+        let checked = self
+            .revocation_fences
+            .iter()
+            .try_for_each(|fence| fence.check());
+        if let Err(error) = checked {
+            self.rollback().await?;
+            return Err(error);
+        }
         let Self {
             inner,
+            revocation_fences,
             _guard,
             _admission,
         } = self;
@@ -313,6 +326,7 @@ impl WriteResources {
             Transaction::Sqlite(tx) => tx.commit().await.map_err(database),
             Transaction::Postgres(tx) => tx.commit().await.map_err(database),
         };
+        drop(revocation_fences);
         drop(_admission);
         drop(_guard);
         result
@@ -322,6 +336,16 @@ pub(crate) struct WriteTransaction {
     resources: Option<WriteResources>,
 }
 impl WriteTransaction {
+    pub(crate) fn hold_revocation_fence(
+        &mut self,
+        fence: Box<dyn notarium_core::ports::RevocationLease>,
+    ) {
+        self.resources
+            .as_mut()
+            .expect("live write transaction")
+            .revocation_fences
+            .push(fence);
+    }
     pub(crate) fn inner_mut(&mut self) -> &mut Transaction {
         &mut self
             .resources

@@ -323,7 +323,7 @@ pub struct ProviderCallLogRow {
     pub credential_id: Option<String>,
     pub policy_epochs: String,
     pub participating_spaces: String,
-    pub model_id: String,
+    pub model_id: Option<String>,
     pub reserved_tokens: i64,
     pub bucket_keys: String,
     pub delivery_state: String,
@@ -1506,8 +1506,7 @@ impl TargetRecord {
                     let value = &row.participating_spaces;
                     bytes = bytes.saturating_add(text_bytes(value)?);
                 }
-                {
-                    let value = &row.model_id;
+                if let Some(value) = row.model_id.as_ref() {
                     bytes = bytes.saturating_add(text_bytes(value)?);
                     notarium_core::ids::ModelProfileId::parse(value)?;
                 }

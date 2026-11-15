@@ -96,6 +96,7 @@ pub struct Catalog {
     lifecycle_receipts:
         Mutex<BTreeMap<CommandKey, (ContentDigest, HistoryScope, SpaceLifecycle, CatalogSpace)>>,
     pub entries: Mutex<BTreeMap<SpaceId, (PrincipalId, String, CatalogSpace)>>,
+    pub project_entries: Mutex<BTreeMap<(SpaceId, FolderId), ProjectInfo>>,
 }
 impl ControlCatalogPort for Catalog {
     fn space(&self, _: CallBudget, id: SpaceId) -> PortFuture<'_, CatalogSpace> {
@@ -176,8 +177,33 @@ impl ControlCatalogPort for Catalog {
     ) -> PortFuture<'_, ControlPage<ProjectInfo>> {
         panic!("unexpected projects call")
     }
-    fn project(&self, _: SpaceContext, _: FolderRef) -> PortFuture<'_, ProjectInfo> {
-        panic!("unexpected project call")
+    fn project(&self, ctx: SpaceContext, project: FolderRef) -> PortFuture<'_, ProjectInfo> {
+        Box::pin(async move {
+            if project.space_id != ctx.scope().space_id {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let space = self
+                .entries
+                .lock()
+                .unwrap()
+                .get(&project.space_id)
+                .map(|entry| entry.2.clone())
+                .ok_or(DomainError::ResourceNotFound)?;
+            ctx.check_current(&space.history)?;
+            ctx.auth().authorize_read(&ResourceFacts {
+                space: space.space,
+                class: notarium_core::classes::DocClass::UserDoc,
+                ancestor_folders: vec![project.folder_id.clone()],
+                folder_write_locked: false,
+                ability_package: None,
+            })?;
+            self.project_entries
+                .lock()
+                .unwrap()
+                .get(&(project.space_id.clone(), project.folder_id.clone()))
+                .cloned()
+                .ok_or(DomainError::ResourceNotFound.into())
+        })
     }
     fn abilities(
         &self,
@@ -238,6 +264,7 @@ impl ControlCatalogPort for Catalog {
     }
 }
 pub struct Revoker {
+    provider_registry: Arc<Mutex<ProviderRegistry>>,
     pub fail: AtomicBool,
     pub gate: AtomicBool,
     pub entered: tokio::sync::Semaphore,
@@ -247,6 +274,7 @@ pub struct Revoker {
 impl Default for Revoker {
     fn default() -> Self {
         Self {
+            provider_registry: Arc::new(Mutex::new(ProviderRegistry::default())),
             fail: AtomicBool::new(false),
             gate: AtomicBool::new(false),
             entered: tokio::sync::Semaphore::new(0),
@@ -256,6 +284,113 @@ impl Default for Revoker {
     }
 }
 impl SessionRevocationPort for Revoker {
+    fn fence_inactive_provider(
+        &self,
+        ctx: MaintenanceContext,
+        call: RequestId,
+    ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>> {
+        Box::pin(async move {
+            ctx.authority.require(ServicePurpose::Revocation)?;
+            let keys = selector_keys(vec![RevocationSelector::ProviderCall(call)]);
+            let mut registry = self.provider_registry.lock().unwrap();
+            if registry
+                .calls
+                .values()
+                .any(|(other, _)| overlaps(&keys, other))
+                || registry.fences.values().any(|other| overlaps(&keys, other))
+            {
+                return Ok(None);
+            }
+            let id = registry.next;
+            registry.next += 1;
+            registry.fences.insert(id, keys);
+            Ok(Some(Box::new(ProviderRegistryLease {
+                registry: self.provider_registry.clone(),
+                id,
+                fence: true,
+                cancellation: Cancellation::default(),
+            }) as Box<dyn RevocationLease>))
+        })
+    }
+    fn register_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        Box::pin(async move {
+            ctx.authority.require(ServicePurpose::Revocation)?;
+            let keys = selector_keys(selectors);
+            loop {
+                {
+                    let mut registry = self.provider_registry.lock().unwrap();
+                    if !registry.fences.values().any(|other| overlaps(&keys, other)) {
+                        let id = registry.next;
+                        registry.next += 1;
+                        registry.calls.insert(id, (keys, cancellation.clone()));
+                        return Ok(Box::new(ProviderRegistryLease {
+                            registry: self.provider_registry.clone(),
+                            id,
+                            fence: false,
+                            cancellation,
+                        }) as Box<dyn RevocationLease>);
+                    }
+                }
+                if ctx.budget.cancellation.is_cancelled() || cancellation.is_cancelled() {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+    }
+    fn fence_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        Box::pin(async move {
+            ctx.authority.require(ServicePurpose::Revocation)?;
+            let keys = selector_keys(selectors);
+            let lease = {
+                let mut registry = self.provider_registry.lock().unwrap();
+                let id = registry.next;
+                registry.next += 1;
+                registry.fences.insert(id, keys.clone());
+                for (other, cancellation) in registry.calls.values() {
+                    if overlaps(&keys, other) {
+                        cancellation.cancel();
+                    }
+                }
+                ProviderRegistryLease {
+                    registry: self.provider_registry.clone(),
+                    id,
+                    fence: true,
+                    cancellation: Cancellation::default(),
+                }
+            };
+            loop {
+                {
+                    let registry = self.provider_registry.lock().unwrap();
+                    let older = registry
+                        .fences
+                        .iter()
+                        .any(|(id, other)| *id < lease.id && overlaps(&keys, other));
+                    if !older
+                        && !registry
+                            .calls
+                            .values()
+                            .any(|(other, _)| overlaps(&keys, other))
+                    {
+                        return Ok(Box::new(lease) as Box<dyn RevocationLease>);
+                    }
+                }
+                if ctx.budget.cancellation.is_cancelled() {
+                    return Err(DomainError::AccessDenied.into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+    }
     fn revoke(
         &self,
         ctx: MaintenanceContext,
@@ -274,6 +409,46 @@ impl SessionRevocationPort for Revoker {
             }
             Ok(())
         })
+    }
+}
+#[derive(Default)]
+struct ProviderRegistry {
+    next: u64,
+    calls: std::collections::BTreeMap<u64, (Vec<String>, Cancellation)>,
+    fences: std::collections::BTreeMap<u64, Vec<String>>,
+}
+fn selector_keys(selectors: Vec<RevocationSelector>) -> Vec<String> {
+    selectors
+        .into_iter()
+        .map(|selector| serde_json::to_string(&selector).unwrap())
+        .collect()
+}
+fn overlaps(left: &[String], right: &[String]) -> bool {
+    left.iter().any(|key| right.contains(key))
+}
+struct ProviderRegistryLease {
+    registry: Arc<Mutex<ProviderRegistry>>,
+    id: u64,
+    fence: bool,
+    cancellation: Cancellation,
+}
+impl RevocationLease for ProviderRegistryLease {
+    fn check(&self) -> Result<(), PortError> {
+        if self.cancellation.is_cancelled() {
+            Err(DomainError::AccessDenied.into())
+        } else {
+            Ok(())
+        }
+    }
+}
+impl Drop for ProviderRegistryLease {
+    fn drop(&mut self) {
+        let mut registry = self.registry.lock().unwrap();
+        if self.fence {
+            registry.fences.remove(&self.id);
+        } else {
+            registry.calls.remove(&self.id);
+        }
     }
 }
 pub enum Observer {

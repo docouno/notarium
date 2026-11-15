@@ -16,7 +16,7 @@ use std::{
 
 #[tokio::test]
 async fn cimd_https_cache_changes_and_failures_never_fall_back_to_stale_consent() {
-    let _serial = crate::outbound::NETWORK_TEST_LOCK.lock().await;
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
     for pg in [false, true] {
         let mut f = Fixture::new(pg, "cimd_tls").await;
         let v: serde_json::Value =

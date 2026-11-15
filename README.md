@@ -6,8 +6,8 @@ desktop client. The `main` branch remains the released v0 showcase.
 
 This branch contains the development foundation, pure domain contracts,
 byte-preserving document syntax, control storage and transport-independent account
-authentication, Space access, OAuth issuance and OIDC identity services. Provider services,
-canonical storage, search, collaboration, agents and the
+authentication, Space access, OAuth issuance, OIDC identity and provider services.
+Canonical storage, search, collaboration, agents and the
 product UI arrive in subsequent waves. The greeting screen and its API are
 starter examples, not a production application.
 

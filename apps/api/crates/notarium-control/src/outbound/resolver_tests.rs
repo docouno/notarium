@@ -48,7 +48,7 @@ impl Drop for Release {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_dns_jobs_remain_bounded_and_each_connection_checks_the_entire_answer() {
-    let _serial = crate::outbound::NETWORK_TEST_LOCK.lock().await;
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
     let endpoint = NetworkPolicy::default()
         .endpoint(OutboundScope::Cimd, "https://public.example/metadata")
         .unwrap();

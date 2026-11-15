@@ -62,7 +62,7 @@ impl Drop for Flow {
 static RATE: LazyLock<Mutex<(Instant, u16)>> = LazyLock::new(|| Mutex::new((Instant::now(), 0)));
 #[cfg(test)]
 pub(super) fn reset_fixture_rate() {
-    // Isolated database fixtures run under NETWORK_TEST_LOCK. Each represents
+    // Isolated database fixtures run under TEST_RESOURCE_LOCK. Each represents
     // a fresh installation, independent of other protocol qualification cases.
     *RATE.lock().unwrap() = (Instant::now(), 0);
 }

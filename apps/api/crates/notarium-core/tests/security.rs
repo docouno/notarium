@@ -95,6 +95,110 @@ fn only_explicitly_authorized_direct_humans_mutate_abilities() {
 }
 
 #[test]
+fn provider_wrappers_are_rechecked_against_current_class_lifecycle_and_provenance() {
+    let auth = human(SpaceRole::Owner, true);
+    let policy = ProviderPolicy {
+        provider: ProviderResourceId::from_bytes([1; 16]),
+        audience: ProviderAudience::Shared {
+            space: SpaceId::from_bytes([1; 16]),
+            attached: true,
+            space_consented: true,
+            sender_consented: true,
+        },
+        allowed_classes: DocClass::all(),
+    };
+    let original = doc(facts(1, DocClass::UserDoc));
+    let admitted = ProviderMessage::Document(
+        ClassEgressFence::provider(original.clone(), &auth, &policy).unwrap(),
+    );
+    let current = ProviderCurrentContent::Note(original.metadata());
+    ClassEgressFence::revalidate(&admitted, &auth, &policy, &current).unwrap();
+    let encrypted = ProviderCurrentContent::Note(doc(facts(1, DocClass::EncryptedNote)).metadata());
+    assert!(ClassEgressFence::revalidate(&admitted, &auth, &policy, &encrypted).is_err());
+    let metadata = |revision, lifecycle| {
+        ProviderCurrentContent::Note(
+            ClassifiedMetadata::from_canonical(
+                original.reference().clone(),
+                revision,
+                facts(1, DocClass::UserDoc),
+                lifecycle,
+                original.digest(),
+            )
+            .unwrap(),
+        )
+    };
+    assert!(
+        ClassEgressFence::revalidate(
+            &admitted,
+            &auth,
+            &policy,
+            &metadata(RevisionId::from_bytes([2; 16]), Lifecycle::Active)
+        )
+        .is_err()
+    );
+    assert!(
+        ClassEgressFence::revalidate(
+            &admitted,
+            &auth,
+            &policy,
+            &metadata(original.revision().clone(), Lifecycle::Trashed)
+        )
+        .is_err()
+    );
+    let mut revoked = policy.clone();
+    revoked.audience = ProviderAudience::Shared {
+        space: SpaceId::from_bytes([1; 16]),
+        attached: true,
+        space_consented: true,
+        sender_consented: false,
+    };
+    assert!(ClassEgressFence::revalidate(&admitted, &auth, &revoked, &current).is_err());
+    let mut grants = grants(SpaceRole::Owner);
+    grants
+        .get_mut(&SpaceId::from_bytes([1; 16]))
+        .unwrap()
+        .read_classes
+        .clear();
+    let reduced = EngineAuthContext::for_human(VerifiedHuman::attest(
+        PrincipalId::from_bytes([1; 16]),
+        GrantId::from_bytes([1; 16]),
+        grants,
+        false,
+    ));
+    assert!(ClassEgressFence::revalidate(&admitted, &reduced, &policy, &current).is_err());
+    let space = facts(1, DocClass::UserDoc).space;
+    let thread = ChatThreadId::from_bytes([1; 16]);
+    let entry = ThreadEntrySeq::new(1).unwrap();
+    let digest = ContentDigest::from_bytes([1; 32]);
+    let chat = ProviderMessage::Chat(
+        ClassEgressFence::chat(
+            CanonicalChatContent::from_canonical(
+                space.clone(),
+                thread.clone(),
+                entry,
+                false,
+                "chat".into(),
+                digest,
+                None,
+            ),
+            &auth,
+            &policy,
+        )
+        .unwrap(),
+    );
+    let current = ProviderCurrentContent::Chat {
+        space,
+        thread,
+        entry,
+        digest,
+        lifecycle: Lifecycle::Active,
+        tainted: true,
+        project: None,
+    };
+    assert!(ClassEgressFence::revalidate(&chat, &auth, &policy, &current).is_err());
+}
+
+#[test]
 fn scope_narrowing_cannot_widen_roles_classes_or_write_space() {
     let viewer = human(SpaceRole::Viewer, true);
     let narrowed = viewer

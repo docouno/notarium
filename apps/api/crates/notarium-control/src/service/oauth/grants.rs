@@ -86,7 +86,9 @@ impl OAuthService {
             command.save(tx.inner_mut(),revision,&saved,now).await?;
             Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        self.control
+            .commit_revocations(tx, &budget, &saved.events)
+            .await?;
         for event in saved.events {
             self.control.flush_event(&budget, &event).await?;
         }

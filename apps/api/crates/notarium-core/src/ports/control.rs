@@ -1,4 +1,4 @@
-use super::{PortFuture, PortStream, context::*, types::*};
+use super::{PortFuture, PortStream, context::*, provider::*, types::*};
 use crate::{auth::*, classes::*, ids::*, model::*, receipt::*, value::Timestamp};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -305,13 +305,8 @@ pub struct ScheduleRunReceipt {
 pub struct ProviderSelection {
     pub provider: ProviderResourceId,
     pub model: ModelProfileId,
+    pub project: Option<FolderRef>,
     pub policy: ProviderPolicy,
-}
-#[derive(Clone, Debug)]
-pub struct ProviderPreference {
-    pub provider: ProviderResourceId,
-    pub model: ModelProfileId,
-    pub expected: ControlRevision,
 }
 #[derive(Clone, Debug)]
 pub struct CompletionBudget {
@@ -323,22 +318,26 @@ pub struct CompletionBudget {
 pub struct CompletionRequest {
     pub intent: CommandKey,
     pub selection: ProviderSelection,
-    pub messages: Vec<ProviderMessage>,
+    pub messages: Vec<CompletionMessage>,
+    pub tools: Vec<ProviderToolDefinition>,
     pub budget: CompletionBudget,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum CompletionEvent {
     Text(String),
-    ToolCall {
-        call: CommandKey,
-        name: String,
-        arguments: BTreeMap<String, crate::value::YamlValue>,
-    },
-    Usage {
-        input_tokens: u32,
-        output_tokens: u32,
-    },
-    Finished,
+    ToolCall(ProviderToolCall),
+    Usage(ProviderUsage),
+    Finished(CompletionFinish),
+}
+impl std::fmt::Debug for CompletionEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(_) => f.write_str("Text([redacted])"),
+            Self::ToolCall(call) => f.debug_tuple("ToolCall").field(call).finish(),
+            Self::Usage(usage) => f.debug_tuple("Usage").field(usage).finish(),
+            Self::Finished(reason) => f.debug_tuple("Finished").field(reason).finish(),
+        }
+    }
 }
 
 pub trait ControlPort: Send + Sync {
@@ -482,13 +481,13 @@ pub trait ControlPort: Send + Sync {
     fn select_provider(
         &self,
         ctx: SpaceContext,
-        model: Option<ModelProfileId>,
+        request: SelectProvider,
     ) -> PortFuture<'_, ProviderSelection>;
     fn update_provider_preference(
         &self,
         ctx: AccountContext,
-        request: AccountMutation<ProviderPreference>,
-    ) -> PortFuture<'_, ControlCommit<ProviderPreference>>;
+        request: AccountMutation<SetProviderPreference>,
+    ) -> PortFuture<'_, ControlCommit<SetProviderPreference>>;
     fn complete(
         &self,
         ctx: SpaceContext,

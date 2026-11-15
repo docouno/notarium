@@ -135,6 +135,7 @@ pub enum ServicePurpose {
     Search,
     EventPublication,
     Revocation,
+    ProviderRecovery,
     Backup,
     Restore,
 }

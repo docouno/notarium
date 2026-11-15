@@ -3,9 +3,10 @@
 The control crate provides the SQL schema, bounded stores, target record
 import/export and `ControlService`. The service implements `AuthPort` and Space
 membership/lifecycle operations. `OAuthService` implements `OAuthPort`, and
-`OidcService` implements `OidcPort`. The provider gateway, account
-episodes/abilities/schedules and backup participant services remain under
-construction. HTTP routes, consent UI, cookies, CSRF and the desktop authentication perimeter
+`OidcService` implements `OidcPort`. `ProviderService` implements provider
+administration, completion and embeddings. Account episodes/abilities/schedules
+and backup participant services remain under construction. HTTP routes, consent
+UI, cookies, CSRF and the desktop authentication perimeter
 belong to the transport composition.
 
 ## Persistence
@@ -150,7 +151,14 @@ final admission state. Failures retain the fence. Explicit owner management
 admission can inspect the history of an archived Space and request reactivation;
 its context has no content read/write classes while the Space is inactive.
 
-Authority mutations and their revocation events commit together. The public
+Authority mutations acquire SQL locks, then an exclusive provider registration
+fence before committing their revocation events. The fence cancels matching calls
+and waits for their network shutdown. Its SQL owner retains it until COMMIT or
+ROLLBACK acknowledgement, including after caller cancellation. Dispatch takes
+the same SQL-then-registry order and releases registrations before settling its
+audit in SQL. The registry must coordinate every serving instance and fail closed
+when a lease is lost; a process-local map cannot implement this Cloud contract.
+The public
 mutation returns success only after the injected `SessionRevocationPort` confirms
 that admitted registrations and run callbacks have been invalidated. Delivery
 uses a stable event request ID across retries. Failed delivery returns an unknown
@@ -352,9 +360,12 @@ referer generation and TLS key logging. HTTP/1 prevents connection coalescing.
 Pools are separated by scope, resource runtime/credential epochs, canonical
 origin and operator policy epoch. They retain at most two idle connections per
 client, with an LRU limit of 128 clients and eviction restricted to idle clients.
-A newer resource epoch cancels its older pools. Provider mutations must use
-`invalidate_provider` inside their dispatch admission fence; operator policy
-replacement cancels all old pools. Fresh DB checks remain mandatory after idle
+A newer resource epoch or credential epoch replaces older pools. Credential
+rotation can advance independently while resource identity remains unchanged;
+older credential versions cannot reuse the new pool. The provider registration
+fence drains active calls before the mutation commits. Explicit
+`invalidate_provider` discards an owner's pools, and operator policy replacement
+cancels all old pools. Fresh DB checks remain mandatory after idle
 pool eviction, because the bounded cache is not an authority ledger.
 
 There are 32 active call slots across transport instances. An owned worker reads
@@ -381,6 +392,100 @@ refusal, DNS rebinding, pool separation, epoch cancellation, no replay of a POST
 received before disconnect, and bounded unpolled/cancelled calls. These tests do
 not certify a live external identity provider or public TLS endpoint.
 
+## Provider gateway
+
+`ProviderService::new` composes the control service, native keyring, guarded HTTP
+transport, canonical metadata lease owner and operator Space limits. It implements
+`ProviderAdminPort` and `EmbeddingProviderPort`, and exposes `complete`,
+`select_provider` and `recover_calls`. Full `ControlPort` composition remains
+separate. No service installs models, manages provider daemons or retries an
+uncertain paid request.
+
+Only an interactive resource owner can manage credentials, resources and explicit
+model profiles. Readbacks expose secret presence and header names, never secret
+values or ciphertext. Key material is opened outside SQL; the final authority
+transaction checks its complete keyring witness. Reserved framing headers cannot
+be configured. Resource updates replace all custom headers, so callers must supply
+their values again. Endpoint, header, credential binding or model changes require
+renewed disclosure consent. A secret-only credential rotation preserves consent
+while advancing the runtime epoch.
+
+Attachment creation and reconsent carry the resource and credential consent
+epochs displayed during confirmation. The transaction compares both with the
+locked current configuration; a stale confirmation cannot create or update an
+attachment. Inspecting an attachment returns these current epochs, and credential
+inventory exposes its consent epoch. Account and attachment revisions are
+additional checks, not substitutes for the reviewed configuration versions.
+
+Before first personal consent, active Space members can use `list_offers` and
+`list_offer_models` to read approved Space and selected-project offers. These
+bounded pages expose the recipient, allowed disclosure, current consent epochs
+and model metadata. They exclude personal attachments, secrets, expired or stale
+offers and inaccessible projects. Current membership and history are revalidated
+on each page; cursors bind the actor, scope and project filter. Inventory and
+configuration management remain owner-only. Concurrent offer reads use shared
+admission locks. Confirmation still validates the displayed configuration epochs
+in its own transaction.
+
+Provider transactions acquire user authority, then Space admission, then resource
+and credential locks before registering calls or revocations. Current membership
+checks do not upgrade a shared Space lock after acquiring a resource. Attachment
+creation, approval and inspection acquire their Space share first. Replacing a
+shared default takes an exclusive Space lock first to serialize edits across
+resource owners. All locks remain subject to the existing transaction budgets.
+
+Every source Space needs the sender's personal attachment consent. Shared content
+also requires a currently approved Space or project attachment. Project-only
+approval checks each source's current canonical ancestry; a selected project is
+not evidence that unrelated content belongs to it. Shared disclosure excludes
+profiles, and encrypted notes never leave through a provider. Consent expiry
+limits the active request deadline. Without explicit resource/model selection,
+preference order is personal, project, then Space. An invalid configured preference
+fails instead of silently switching providers.
+
+Supported wire protocols are OpenAI-compatible chat completions/embeddings and
+Ollama chat/embed. Base URL paths are preserved. Configure the exact model identity
+returned by the provider, including a version or tag when required. Responses must
+match that identity. SSE/NDJSON parsers handle arbitrary byte boundaries and bound
+frames and assembled tools; embedding responses require an exact index bijection,
+expected dimension and finite values. Reasoning fields are not exposed as text.
+Tools, usage and finish events are released only after valid completion and durable
+settlement; text can arrive earlier. Typed stream errors carry no upstream bodies.
+
+`ConservativeModelCapV1` requires finite model caps, bounds serialized input bytes
+by the input cap and reserves that whole cap plus requested output. It does not
+claim to count arbitrary model tokens. Embedding annotations must be internally
+consistent but do not replace this reservation. Resource, credential and every
+participating Space each pay the full call against atomic UTC-aligned 60-second
+RPM/TPM buckets. The primary Space is charged even for orchestration-only input.
+
+The intent ledger binds principal, history scope, command key and semantic input.
+A repeated accepted intent reports its existing call state, even after configuration
+changes; different input rejects the reused key. No stream is replayed or resent.
+After reservation, the service rechecks current authority/configuration/consent,
+changes intent to sending and acquires its live registration in one SQL transaction.
+The transport handle exists before awaiting response headers. Shutdown acknowledgement
+precedes release of canonical/registry leases and the independent five-second audit
+finalizer. One of 32 global provider slots owns this entire worker lifetime. Dropping
+a stream or pending unary future cancels that operation without cancelling a shared
+parent token. A protocol terminal marker closes the socket without waiting for TCP EOF.
+
+Proven unsent calls refund RPM and TPM. Unknown/partial/cancelled calls retain
+reservations until the original window expires. Exact usage reconciles that window
+and records full input/output counters. Exceeding either model cap blocks further
+resource admission in that window, even if the total fits the reservation. An
+unrepresentable bucket aggregate saturates to its maximum and closes admission;
+individual call counters remain exact. Late usage enriches the audit without
+crediting a later window. Ledger records contain no prompts, responses or headers.
+
+Connection checks are bounded GET model-list requests with no inference, TPM zero
+and a null model ID in the audit. They still require owner authority and RPM
+admission. Composition must drain bounded `recover_calls` pages at startup and
+periodically using `ProviderRecovery` authority. Age of at least 300 seconds only
+selects candidates: the registry must atomically exclude live calls before recovery
+settles unknown spending. Failed finalization remains recoverable; recovery never
+resends or refunds an abandoned call on an assumption that it was unsent.
+
 ## Verification
 
 Run `make setup`, `make check`, `make test` and `make build`. The database suite
@@ -389,5 +494,8 @@ silently skips PostgreSQL. It compares the full table manifest and representativ
 constraints, verifies transactional rollback and tests export snapshot retention
 on SQLite and PostgreSQL. Authentication tests exercise secret issuance, callback
 failure/replay, pending canonical creation, owner races and lifecycle recovery.
+Provider tests use actual offline TLS/HTTP and independent SQL pools to exercise
+single-send intent races, shared budgets, current egress denial, model usage,
+credential rotation, consent expiry and cancellation before/after response headers.
 They do not certify the unimplemented services or a production transport's live
 registry.

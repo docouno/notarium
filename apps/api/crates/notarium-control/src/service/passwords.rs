@@ -134,7 +134,8 @@ impl ControlService {
             execute!(tx.inner_mut(),"UPDATE users SET password_hash=$1,revision=$2,auth_version=$3 WHERE user_id=$4","UPDATE v1_control.users SET password_hash=$1,revision=$2,auth_version=$3 WHERE user_id=$4";&hash,current.revision,current.auth_version,&current.user_id)?;
             Ok((event,account_info(&current)?))
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        self.commit_revocations(tx, &budget, std::slice::from_ref(&event))
+            .await?;
         self.flush_event(&budget, &event).await?;
         Ok(ControlCommit {
             revision: updated.revision,

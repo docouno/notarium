@@ -44,6 +44,21 @@ These constructors are trusted in-process boundaries, not isolation from malicio
 Rust code that controls the canonical/admission owner. Adapters must recheck live
 visibility and revocation at use time.
 
+Provider dispatch uses `ProviderEgressCatalogPort` to pin current metadata for
+every origin and the selected active project. Its lease excludes changes to class,
+lifecycle, provenance and project ancestry until release, or cancels the call and
+waits for release. Chat origins include their canonical digest and optional project;
+current taint remains authoritative. `ClassEgressFence::revalidate` checks these
+fresh facts against the exact source and current provider disclosure. No document
+bodies or SQL handles cross the metadata port.
+
+Completion messages retain roles, classified parts and ordered tool-call/result
+associations. `ProviderInstruction` is for trusted orchestration instructions;
+copied note text still needs classified provenance. Tool schemas are a bounded
+closed subset. `ProviderUsage::Unknown` is distinct from exact zero; interrupted
+streams cannot claim measured usage from an estimate. Provider selection retains
+the explicit project, and embedding requests carry it through the same boundary.
+
 Explicit snapshots expose lifecycle. Listings select active, trashed or both
 through `LifecycleMask` and return `NoteListCard` metadata, including encrypted
 identities, without a content capability. Purged documents cannot be read/listed.

@@ -120,16 +120,16 @@ impl ControlService {
             let event=super::outbox::enqueue(tx.inner_mut(),RevocationSelector::Space(ctx.scope().space_id.clone()),RevocationReason::SpaceClosed,epoch,now).await?;
             execute!(tx.inner_mut(),"UPDATE space_admission SET state='closing',revision=$1,admission_epoch=$2 WHERE space_id=$3","UPDATE v1_control.space_admission SET state='closing',revision=$1,admission_epoch=$2 WHERE space_id=$3";revision,epoch,ctx.scope().space_id.as_str())?;
             let id=RequestId::from_bytes(token::random()?);
-            let pending=PendingLifecycle{version:1,owner:ctx.auth().principal().clone(),key:command.identity.key.clone(),hash:digest,expected:request.expected,scope:ctx.scope().clone(),lifecycle:request.lifecycle,revision,epoch,event};
+            let pending=PendingLifecycle{version:1,owner:ctx.auth().principal().clone(),key:command.identity.key.clone(),hash:digest,expected:request.expected,scope:ctx.scope().clone(),lifecycle:request.lifecycle,revision,epoch,event:event.clone()};
             let payload=serde_json::to_string(&pending).map_err(|_|invalid(ValidationReason::InvalidState))?;
             let row=TargetRecord::ControlOperations(ControlOperationsRow{operation_id:id.to_string(),command_key:id.to_string(),kind:"lifecycle".into(),target_space:ctx.scope().space_id.to_string(),state:"pending".into(),payload_hash:blake3::hash(payload.as_bytes()).as_bytes().to_vec(),payload,canonical_receipt:None,next_action:"revoke-then-canonical".into(),updated_at:now});
             row.validate()?;row.insert(tx.inner_mut()).await?;
             let revision=ControlRevision::new(revision as u64)?;
-            let saved=SavedResult{value:ResultOperation{operation:id},events:vec![]};
+            let saved=SavedResult{value:ResultOperation{operation:id},events:vec![event]};
             command.save(tx.inner_mut(),revision,&saved,now).await?;
             Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        self.commit_revocations(tx, &budget, &saved.events).await?;
         let current = self
             .finish_lifecycle(&budget, &saved.value.operation)
             .await?;

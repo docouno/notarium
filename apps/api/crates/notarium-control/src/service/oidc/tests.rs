@@ -459,7 +459,7 @@ impl Setup {
 
 #[tokio::test]
 async fn oidc_origin_issuer_preserves_exact_identity_without_a_trailing_slash() {
-    let _serial = crate::outbound::NETWORK_TEST_LOCK.lock().await;
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
     for pg in [false, true] {
         let mut s = Setup::new(pg, "oidc_exact_issuer").await;
         let mut config = s.oidc.provider(&s.begin().issuer).unwrap().config.clone();
@@ -539,7 +539,7 @@ async fn oidc_origin_issuer_preserves_exact_identity_without_a_trailing_slash() 
 
 #[tokio::test]
 async fn oidc_both_databases_explicit_linking_native_login_and_one_time_callback() {
-    let _serial = crate::outbound::NETWORK_TEST_LOCK.lock().await;
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
     for pg in [false, true] {
         let mut s = Setup::new(pg, "oidc_lifecycle").await;
         let callback = s.login().await;
@@ -662,7 +662,7 @@ async fn oidc_both_databases_explicit_linking_native_login_and_one_time_callback
 
 #[tokio::test]
 async fn oidc_claim_survives_lost_response_and_caller_cancellation() {
-    let _serial = crate::outbound::NETWORK_TEST_LOCK.lock().await;
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
     for pg in [false, true] {
         let mut s = Setup::new(pg, "oidc_cancel").await;
         s.idp.mode.store(10, Ordering::SeqCst);
@@ -698,7 +698,7 @@ async fn oidc_claim_survives_lost_response_and_caller_cancellation() {
 
 #[tokio::test]
 async fn oidc_key_rotation_unknown_kid_singleflight_and_expired_metadata() {
-    let _serial = crate::outbound::NETWORK_TEST_LOCK.lock().await;
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
     for pg in [false, true] {
         let mut s = Setup::new(pg, "oidc_rotation").await;
         let provider = s.oidc.provider(&s.begin().issuer).unwrap();
@@ -804,7 +804,7 @@ async fn oidc_key_rotation_unknown_kid_singleflight_and_expired_metadata() {
 
 #[tokio::test]
 async fn oidc_identity_ownership_last_method_and_callback_authority_races() {
-    let _serial = crate::outbound::NETWORK_TEST_LOCK.lock().await;
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
     for pg in [false, true] {
         let mut s = Setup::new(pg, "oidc_ownership").await;
         let request = s
@@ -991,7 +991,7 @@ async fn oidc_identity_ownership_last_method_and_callback_authority_races() {
 
 #[tokio::test]
 async fn oidc_confidential_clients_use_encrypted_references_and_fail_before_exchange() {
-    let _serial = crate::outbound::NETWORK_TEST_LOCK.lock().await;
+    let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
     for pg in [false, true] {
         let mut s = Setup::new(pg, "oidc_confidential").await;
         let credential = CredentialId::from_bytes([9; 16]);

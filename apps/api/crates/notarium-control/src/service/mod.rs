@@ -10,6 +10,7 @@ mod one_time;
 mod outbox;
 mod passwords;
 mod pats;
+pub mod provider;
 mod provisioning;
 mod sessions;
 mod spaces;

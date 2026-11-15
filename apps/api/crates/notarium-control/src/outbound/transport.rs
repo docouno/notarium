@@ -167,6 +167,12 @@ pub struct OutboundTransport {
     shared: Arc<Shared>,
 }
 impl OutboundTransport {
+    /// Validate configuration against the current operator policy without DNS or
+    /// network I/O. Send always repeats this check with the current policy.
+    pub fn check_endpoint(&self, scope: OutboundScope, url: &str) -> Result<String, PortError> {
+        let state = self.shared.state.lock().map_err(|_| failed())?;
+        Ok(state.policy.endpoint(scope, url)?.url().to_string())
+    }
     pub fn new(policy: NetworkPolicy) -> Self {
         Self::with_lookup(policy, None)
     }
@@ -239,26 +245,31 @@ impl OutboundTransport {
         if let OutboundScope::Provider {
             resource,
             runtime_epoch,
-            ..
+            credential_epoch,
+            wire,
         } = &scope
         {
             for key in state.clients.keys() {
                 if let OutboundScope::Provider {
                     resource: old_resource,
                     runtime_epoch: old_epoch,
-                    ..
+                    credential_epoch: old_credential,
+                    wire: old_wire,
                 } = &key.scope
                     && old_resource == resource
                     && (*old_epoch > *runtime_epoch
                         || (*old_epoch == *runtime_epoch
-                            && (key.scope != scope || key.origin != endpoint.origin())))
+                            && (old_wire != wire
+                                || key.origin != endpoint.origin()
+                                || old_credential.is_some() != credential_epoch.is_some()
+                                || old_credential > credential_epoch)))
                 {
                     return Err(DomainError::AccessDenied.into());
                 }
             }
             state.clients.retain(|key, entry| {
-                if matches!(&key.scope, OutboundScope::Provider { resource: old_resource, runtime_epoch: old_epoch, .. }
-                    if old_resource == resource && old_epoch < runtime_epoch) {
+                if matches!(&key.scope, OutboundScope::Provider { resource: old_resource, runtime_epoch: old_epoch, credential_epoch: old_credential, .. }
+                    if old_resource == resource && (old_epoch, old_credential) < (runtime_epoch, credential_epoch)) {
                     entry.slot.cancelled.cancel(); false
                 } else { true }
             });
@@ -300,6 +311,17 @@ impl OutboundTransport {
     }
     pub async fn send(
         &self,
+        call: CallBudget,
+        request: OutboundRequest,
+    ) -> Result<OutboundResponse, PortError> {
+        let mut response = self.start(call, request)?;
+        response.receive_head().await?;
+        Ok(response)
+    }
+    /// Returns ownership before any await. Authority owners use `close` to await
+    /// actual network shutdown before releasing their revocation registrations.
+    pub(crate) fn start(
+        &self,
         mut call: CallBudget,
         mut request: OutboundRequest,
     ) -> Result<OutboundResponse, PortError> {
@@ -317,6 +339,7 @@ impl OutboundTransport {
         let (head_tx, head_rx) = oneshot::channel();
         let (chunks_tx, chunks_rx) = mpsc::channel(1);
         let (end_tx, end_rx) = oneshot::channel();
+        let (closed_tx, closed_rx) = oneshot::channel();
         let context = Worker {
             budget: budget.clone(),
             slot,
@@ -413,16 +436,15 @@ impl OutboundTransport {
             let _ = end_tx.send(result);
             // Response, client lease and active admission are owned here. An
             // unpolled consumer cannot keep a socket alive past the budget.
+            drop(context);
+            let _ = closed_tx.send(());
         });
-        let (status, headers) = budget
-            .run(
-                async { head_rx.await.map_err(|_| failed())? },
-                CommitEffect::Unknown,
-            )
-            .await?;
         Ok(OutboundResponse {
-            status,
-            headers,
+            status: 0,
+            headers: HeaderMap::new(),
+            head: Some(head_rx),
+            budget,
+            closed: closed_rx,
             chunks: chunks_rx,
             end: Some(end_rx),
             finished: false,
@@ -490,7 +512,12 @@ impl Worker {
         tokio::select! {
             biased;
             error = async { loop { if let Err(error) = self.check() { break error; } tokio::time::sleep(Duration::from_millis(1)).await; } } => Err(error),
-            result = operation => result,
+            result = operation => {
+                // The driver's timer can finish between watchdog polls. Keep
+                // the current caller deadline/cancellation as the terminal cause.
+                self.check()?;
+                result
+            },
         }
     }
 }
@@ -501,12 +528,37 @@ impl Worker {
 pub struct OutboundResponse {
     status: u16,
     headers: HeaderMap,
+    head: Option<oneshot::Receiver<Result<(u16, HeaderMap), PortError>>>,
+    budget: OperationBudget,
+    closed: oneshot::Receiver<()>,
     chunks: mpsc::Receiver<Vec<u8>>,
     end: Option<oneshot::Receiver<Result<(), PortError>>>,
     finished: bool,
     _guard: CancelOnDrop,
 }
 impl OutboundResponse {
+    pub(crate) async fn receive_head(&mut self) -> Result<(), PortError> {
+        if let Some(head) = self.head.as_mut() {
+            let (status, headers) = self
+                .budget
+                .run(
+                    async { head.await.map_err(|_| failed())? },
+                    CommitEffect::Unknown,
+                )
+                .await?;
+            self.head = None;
+            self.status = status;
+            self.headers = headers;
+        }
+        Ok(())
+    }
+    /// Cancellation is a request; this acknowledgement proves the producer has
+    /// dropped its HTTP response and request future. Do not cancel this wait
+    /// while holding authority that must exclude in-flight application bytes.
+    pub(crate) async fn close(self) -> Result<(), PortError> {
+        self._guard.0.cancel();
+        self.closed.await.map_err(|_| failed())
+    }
     pub fn status(&self) -> u16 {
         self.status
     }

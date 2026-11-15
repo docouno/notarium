@@ -301,13 +301,13 @@ impl ControlPort for RejectingPorts {
     fn select_provider(
             &self,
             ctx: SpaceContext,
-            model: Option<ModelProfileId>,
+            request: SelectProvider,
         ) -> PortFuture<'_, ProviderSelection>;
     fn update_provider_preference(
             &self,
             ctx: AccountContext,
-            request: AccountMutation<ProviderPreference>,
-        ) -> PortFuture<'_, ControlCommit<ProviderPreference>>;
+            request: AccountMutation<SetProviderPreference>,
+        ) -> PortFuture<'_, ControlCommit<SetProviderPreference>>;
     fn complete(
             &self,
             ctx: SpaceContext,
@@ -380,6 +380,22 @@ impl EventBusPort for RejectingPorts {
 }
 impl SessionRevocationPort for RejectingPorts {
     reject! {
+    fn fence_inactive_provider(
+            &self,
+            ctx: MaintenanceContext,
+            call: RequestId,
+        ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>>;
+    fn register_provider(
+            &self,
+            ctx: MaintenanceContext,
+            selectors: Vec<RevocationSelector>,
+            cancellation: Cancellation,
+        ) -> PortFuture<'_, Box<dyn RevocationLease>>;
+    fn fence_provider(
+            &self,
+            ctx: MaintenanceContext,
+            selectors: Vec<RevocationSelector>,
+        ) -> PortFuture<'_, Box<dyn RevocationLease>>;
     fn revoke(
             &self,
             ctx: MaintenanceContext,

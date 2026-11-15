@@ -60,6 +60,7 @@ pub struct EmbeddingRequest {
     pub intent: CommandKey,
     pub model: ModelProfileId,
     pub provider: ProviderResourceId,
+    pub project: Option<FolderRef>,
     pub chunks: Vec<ProviderPart>,
     pub declared_tokens: u32,
 }
@@ -89,7 +90,7 @@ pub struct EmbeddingResult {
     pub model: ModelProfileId,
     pub dimension: u32,
     pub vectors: Vec<Result<Vec<f32>, DomainError>>,
-    pub used_tokens: u32,
+    pub usage: super::provider::ProviderUsage,
 }
 pub trait EmbeddingProviderPort: Send + Sync {
     fn embed(
@@ -262,6 +263,8 @@ pub enum RevocationSelector {
     Principal(PrincipalId),
     Session(AuthSessionId),
     Credential(CredentialId),
+    ProviderResource(ProviderResourceId),
+    ProviderCall(RequestId),
     Grant(GrantId),
     OAuthGrant(OAuthGrantId),
     OAuthFamily(OAuthFamilyId),
@@ -282,6 +285,36 @@ pub enum RevocationReason {
     CredentialRemoved,
 }
 pub trait SessionRevocationPort: Send + Sync {
+    /// Register only after locking and revalidating all selected database
+    /// authorities. Keep the lease until the socket is closed; release it BEFORE
+    /// acquiring a database transaction for usage settlement. The registry owner
+    /// coordinates all service instances, cancels on lease/connection loss, and
+    /// never admits a registration through an active mutation fence.
+    fn register_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>>;
+    /// Close matching admissions, cancel active calls, and wait for their leases
+    /// to drop. The caller already holds database authority locks and retains
+    /// this fence through COMMIT/ROLLBACK, including cancellation of its waiter.
+    /// Selector batches are acquired atomically; implementations must not wait
+    /// for database settlement while draining registrations.
+    fn fence_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>>;
+    /// Recovery alone may claim an inactive call. Atomically return None when
+    /// any live registration/fence exists for this call; otherwise close its
+    /// admissions until the returned lease drops. Never cancel an active call
+    /// merely because another process considers its database row old.
+    fn fence_inactive_provider(
+        &self,
+        ctx: MaintenanceContext,
+        call: RequestId,
+    ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>>;
     /// Completion means all admitted registrations and run callbacks are invalidated.
     /// The service budget's request ID identifies the durable event and remains
     /// stable across retries, allowing the registry owner to deduplicate delivery.
@@ -291,6 +324,12 @@ pub trait SessionRevocationPort: Send + Sync {
         selector: RevocationSelector,
         reason: RevocationReason,
     ) -> PortFuture<'_, ()>;
+}
+
+/// Loss of distributed registry authority invalidates a lease and cancels every
+/// associated call. A local cache alone cannot implement this Cloud contract.
+pub trait RevocationLease: Send {
+    fn check(&self) -> Result<(), crate::error::PortError>;
 }
 
 #[derive(Clone, Copy, Debug)]

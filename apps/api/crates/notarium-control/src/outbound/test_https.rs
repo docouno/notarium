@@ -49,6 +49,11 @@ pub(crate) struct HttpsFixture {
 }
 impl HttpsFixture {
     pub fn start(handler: impl Fn(Request) -> Reply + Send + Sync + 'static) -> Self {
+        Self::start_io(move |request, stream| write_reply(stream, handler(request)))
+    }
+    pub fn start_io(
+        handler: impl Fn(Request, &mut dyn FixtureIo) -> io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -124,7 +129,12 @@ impl Drop for HttpsFixture {
         self.thread.take().unwrap().join().unwrap();
     }
 }
-fn serve(stream: &mut (impl Read + Write), handler: &dyn Fn(Request) -> Reply) -> io::Result<()> {
+pub(crate) trait FixtureIo: Read + Write {}
+impl<T: Read + Write> FixtureIo for T {}
+fn serve(
+    stream: &mut dyn FixtureIo,
+    handler: &dyn Fn(Request, &mut dyn FixtureIo) -> io::Result<()>,
+) -> io::Result<()> {
     let mut bytes = Vec::new();
     while !bytes.ends_with(b"\r\n\r\n") {
         let mut byte = [0];
@@ -149,12 +159,17 @@ fn serve(stream: &mut (impl Read + Write), handler: &dyn Fn(Request) -> Reply) -
     }
     let mut body = vec![0; length];
     stream.read_exact(&mut body)?;
-    let reply = handler(Request {
-        method,
-        path,
-        headers,
-        body,
-    });
+    handler(
+        Request {
+            method,
+            path,
+            headers,
+            body,
+        },
+        stream,
+    )
+}
+pub(crate) fn write_reply(stream: &mut dyn FixtureIo, reply: Reply) -> io::Result<()> {
     if reply.status == 0 {
         return Ok(());
     }

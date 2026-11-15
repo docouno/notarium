@@ -347,7 +347,8 @@ impl ControlService {
             }
             Ok(())
         },CommitEffect::NotCommitted).await?;
-        budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        self.commit_revocations(tx, &budget, std::slice::from_ref(&event))
+            .await?;
         self.flush_event(&budget, &event).await
     }
 }

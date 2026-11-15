@@ -68,8 +68,10 @@ Space membership/lifecycle operations with durable revocation and canonical
 coordination. Its native keyring and guarded HTTP transport provide credential
 storage and bounded network primitives. `OAuthService` implements the local
 authorization server, and `OidcService` verifies external identity and issues
-native sessions through explicit account bindings. Provider, account-state and
-backup participant services are still under construction. See
+native sessions through explicit account bindings. `ProviderService` implements
+encrypted provider configuration, current disclosure admission, bounded completion
+and embedding calls, and durable spending reservations. Account-state and backup
+participant services are still under construction. See
 [control services](control.md).
 
 ## Client and delivery boundaries

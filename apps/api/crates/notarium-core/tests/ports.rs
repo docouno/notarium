@@ -774,6 +774,8 @@ fn completion_accepts_authorized_chat_provenance_without_inventing_a_note() {
         ThreadEntrySeq::new(1).unwrap(),
         false,
         "hello-provider".into(),
+        ContentDigest::from_bytes([1; 32]),
+        None,
     );
     assert!(!format!("{entry:?}").contains("hello-provider"));
     let admitted = ClassEgressFence::chat(entry.clone(), &auth(), &policy).unwrap();
@@ -790,6 +792,8 @@ fn completion_accepts_authorized_chat_provenance_without_inventing_a_note() {
         ThreadEntrySeq::new(2).unwrap(),
         true,
         "external".into(),
+        ContentDigest::from_bytes([2; 32]),
+        None,
     );
     assert!(ClassEgressFence::chat(tainted, &auth(), &policy).is_err());
 }
