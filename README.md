@@ -4,8 +4,11 @@ Notarium is a knowledge workspace for people and AI agents. Version 1.0 is being
 built from scratch on `v1` with a Rust backend, React web client and Electron
 desktop client. The `main` branch remains the released v0 showcase.
 
-This branch contains the development foundation, pure domain contracts and
-byte-preserving document syntax. Storage, search, collaboration, agents and the
+This branch contains the development foundation, pure domain contracts,
+byte-preserving document syntax, control storage and transport-independent account
+authentication, Space access, OAuth issuance, OIDC identity, provider services,
+account context, schedule claims, content-free telemetry and control backup snapshots.
+Canonical storage, search, collaboration, agents and the
 product UI arrive in subsequent waves. The greeting screen and its API are
 starter examples, not a production application.
 
@@ -61,6 +64,8 @@ or search. Native tests enforce the [crate matrix](docs/architecture.md).
 See [development commands and ownership](docs/development.md) for details.
 The implemented library boundaries are documented in [core contracts](docs/core-contracts.md)
 and [document syntax](docs/syntax.md).
+See [control storage](docs/control.md) for the implemented primitives and their
+current integration limits.
 
 ## Contract and delivery
 

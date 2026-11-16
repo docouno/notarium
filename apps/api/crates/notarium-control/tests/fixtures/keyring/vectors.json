@@ -1,0 +1,14 @@
+{
+  "masterHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "keyId": "ck_6cec1c7707250abbc703cfcd",
+  "keyHash": "sha256:9001cdf37c2de11b059fba59e571a38966b314528aca3987f3487102daf0b26d",
+  "canaryPlaintext": "zemQ9JFXnRhWDdp4l9At4_BT3lBnBDANOO9zIsh6ZCI",
+  "canaryEnvelope": "v1.ck_6cec1c7707250abbc703cfcd.AAECAwQFBgcICQoLoYPiPmwNFCKol0NLRQHKVOZ-oFSigJDXvBM03fgKdJq-Yxk13aEAzpJde1KMz0wgUT-CG0c14Ip-Wak",
+  "credentialId": "crd_01010101010101010101010101010101",
+  "credentialPlaintext": "fixture-secret-☃",
+  "credentialEnvelope": "v1.ck_6cec1c7707250abbc703cfcd.DA0ODxAREhMUFRYXi0c68pmGj2SBvnxHhIXkCwhU5tLCXgZEtH_71NpeJB8BGQ",
+  "resourceId": "prv_02020202020202020202020202020202",
+  "headerName": "authorization",
+  "headerPlaintext": "Bearer fixture-token",
+  "headerEnvelope": "v1.ck_6cec1c7707250abbc703cfcd.GBkaGxwdHh8gISIjetKFQUaYrtMYbFHTFGwUzvVCnwEBWiPNrr8sKgSunABq1f3_"
+}

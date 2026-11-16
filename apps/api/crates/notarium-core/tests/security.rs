@@ -17,12 +17,62 @@ fn grants(role: SpaceRole) -> BTreeMap<SpaceId, SpaceGrant> {
         .into()
 }
 fn human(role: SpaceRole, ability: bool) -> EngineAuthContext {
-    EngineAuthContext::for_human(VerifiedHuman::attest(
-        PrincipalId::from_bytes([1; 16]),
-        GrantId::from_bytes([1; 16]),
-        grants(role),
-        ability,
-    ))
+    EngineAuthContext::for_human(
+        VerifiedHuman::attest(
+            PrincipalId::from_bytes([1; 16]),
+            GrantId::from_bytes([1; 16]),
+            grants(role),
+            ability,
+        )
+        .with_human_management(true),
+    )
+}
+
+#[test]
+fn folder_metadata_obeys_project_scope_and_shared_branch_taint() {
+    let owner = human(SpaceRole::Owner, true);
+    let first = facts(1, DocClass::AgentMemory).space;
+    let second = facts(2, DocClass::UserDoc).space;
+    let root = FolderId::from_bytes([3; 16]);
+    let child = FolderId::from_bytes([4; 16]);
+    let keeper = owner
+        .for_keeper(
+            AgentRunId::from_bytes([6; 16]),
+            first.id.clone(),
+            Some(root.clone()),
+            BTreeSet::new(),
+        )
+        .unwrap();
+    keeper.authorize_folder_read(&first, &root, &[]).unwrap();
+    keeper
+        .authorize_folder_read(&first, &child, std::slice::from_ref(&root))
+        .unwrap();
+    assert!(keeper.authorize_folder_read(&first, &child, &[]).is_err());
+    let mut closed = first.clone();
+    closed.lifecycle = SpaceLifecycle::Archived;
+    assert!(keeper.authorize_folder_read(&closed, &root, &[]).is_err());
+    let mut wanted = grants(SpaceRole::Owner);
+    wanted.get_mut(&first.id).unwrap().read_classes.clear();
+    let unreadable = owner.for_pat(wanted).unwrap();
+    assert!(
+        unreadable
+            .authorize_folder_read(&first, &root, &[])
+            .is_err()
+    );
+    let agent = owner
+        .for_agent_run(
+            AgentRunId::from_bytes([7; 16]),
+            first.id.clone(),
+            ChatAudience::Personal,
+            grants(SpaceRole::Owner),
+        )
+        .unwrap();
+    let sibling = agent.clone();
+    let memory = facts(1, DocClass::AgentMemory);
+    sibling.authorize_direct_write(&memory, &memory).unwrap();
+    agent.authorize_folder_read(&second, &child, &[]).unwrap();
+    assert!(sibling.taint().is_tainted());
+    assert!(sibling.authorize_direct_write(&memory, &memory).is_err());
 }
 fn facts(space: u8, class: DocClass) -> ResourceFacts {
     ResourceFacts {
@@ -92,6 +142,110 @@ fn only_explicitly_authorized_direct_humans_mutate_abilities() {
             Err(DomainError::AbilityWriteForbidden)
         );
     }
+}
+
+#[test]
+fn provider_wrappers_are_rechecked_against_current_class_lifecycle_and_provenance() {
+    let auth = human(SpaceRole::Owner, true);
+    let policy = ProviderPolicy {
+        provider: ProviderResourceId::from_bytes([1; 16]),
+        audience: ProviderAudience::Shared {
+            space: SpaceId::from_bytes([1; 16]),
+            attached: true,
+            space_consented: true,
+            sender_consented: true,
+        },
+        allowed_classes: DocClass::all(),
+    };
+    let original = doc(facts(1, DocClass::UserDoc));
+    let admitted = ProviderMessage::Document(
+        ClassEgressFence::provider(original.clone(), &auth, &policy).unwrap(),
+    );
+    let current = ProviderCurrentContent::Note(original.metadata());
+    ClassEgressFence::revalidate(&admitted, &auth, &policy, &current).unwrap();
+    let encrypted = ProviderCurrentContent::Note(doc(facts(1, DocClass::EncryptedNote)).metadata());
+    assert!(ClassEgressFence::revalidate(&admitted, &auth, &policy, &encrypted).is_err());
+    let metadata = |revision, lifecycle| {
+        ProviderCurrentContent::Note(
+            ClassifiedMetadata::from_canonical(
+                original.reference().clone(),
+                revision,
+                facts(1, DocClass::UserDoc),
+                lifecycle,
+                original.digest(),
+            )
+            .unwrap(),
+        )
+    };
+    assert!(
+        ClassEgressFence::revalidate(
+            &admitted,
+            &auth,
+            &policy,
+            &metadata(RevisionId::from_bytes([2; 16]), Lifecycle::Active)
+        )
+        .is_err()
+    );
+    assert!(
+        ClassEgressFence::revalidate(
+            &admitted,
+            &auth,
+            &policy,
+            &metadata(original.revision().clone(), Lifecycle::Trashed)
+        )
+        .is_err()
+    );
+    let mut revoked = policy.clone();
+    revoked.audience = ProviderAudience::Shared {
+        space: SpaceId::from_bytes([1; 16]),
+        attached: true,
+        space_consented: true,
+        sender_consented: false,
+    };
+    assert!(ClassEgressFence::revalidate(&admitted, &auth, &revoked, &current).is_err());
+    let mut grants = grants(SpaceRole::Owner);
+    grants
+        .get_mut(&SpaceId::from_bytes([1; 16]))
+        .unwrap()
+        .read_classes
+        .clear();
+    let reduced = EngineAuthContext::for_human(VerifiedHuman::attest(
+        PrincipalId::from_bytes([1; 16]),
+        GrantId::from_bytes([1; 16]),
+        grants,
+        false,
+    ));
+    assert!(ClassEgressFence::revalidate(&admitted, &reduced, &policy, &current).is_err());
+    let space = facts(1, DocClass::UserDoc).space;
+    let thread = ChatThreadId::from_bytes([1; 16]);
+    let entry = ThreadEntrySeq::new(1).unwrap();
+    let digest = ContentDigest::from_bytes([1; 32]);
+    let chat = ProviderMessage::Chat(
+        ClassEgressFence::chat(
+            CanonicalChatContent::from_canonical(
+                space.clone(),
+                thread.clone(),
+                entry,
+                false,
+                "chat".into(),
+                digest,
+                None,
+            ),
+            &auth,
+            &policy,
+        )
+        .unwrap(),
+    );
+    let current = ProviderCurrentContent::Chat {
+        space,
+        thread,
+        entry,
+        digest,
+        lifecycle: Lifecycle::Active,
+        tainted: true,
+        project: None,
+    };
+    assert!(ClassEgressFence::revalidate(&chat, &auth, &policy, &current).is_err());
 }
 
 #[test]
@@ -328,4 +482,132 @@ fn nested_keepers_can_only_retain_parent_package_exceptions() {
         .unwrap();
     assert!(scoped_human.authorize_read(&resource).is_err());
     assert!(scoped_keeper.authorize_read(&resource).is_err());
+}
+
+#[test]
+fn metadata_visibility_checks_do_not_taint_and_keeper_reads_only_pinned_project_chats() {
+    let owner = EngineAuthContext::for_human(
+        VerifiedHuman::attest(
+            PrincipalId::from_bytes([1; 16]),
+            GrantId::from_bytes([1; 16]),
+            grants(SpaceRole::Owner),
+            false,
+        )
+        .with_human_management(true)
+        .with_credential(AuthenticatedCredential::Session(AuthSessionId::from_bytes(
+            [1; 16],
+        ))),
+    );
+    assert!(owner.human_management());
+    assert!(owner.authorize_human_management().is_ok());
+    assert_eq!(
+        owner.authorize_ability_mutation(),
+        Err(DomainError::AbilityWriteForbidden)
+    );
+    let ambient_ability = EngineAuthContext::for_human(VerifiedHuman::attest(
+        PrincipalId::from_bytes([1; 16]),
+        GrantId::from_bytes([1; 16]),
+        grants(SpaceRole::Owner),
+        true,
+    ));
+    assert_eq!(
+        ambient_ability.authorize_human_management(),
+        Err(DomainError::AccessDenied)
+    );
+    assert_eq!(
+        ambient_ability.authorize_ability_mutation(),
+        Err(DomainError::AbilityWriteForbidden)
+    );
+
+    let agent = owner
+        .for_agent_run(
+            AgentRunId::from_bytes([1; 16]),
+            SpaceId::from_bytes([1; 16]),
+            ChatAudience::Personal,
+            grants(SpaceRole::Owner),
+        )
+        .unwrap();
+    assert!(!agent.human_management());
+    let external = facts(2, DocClass::UserDoc);
+    agent.can_view_resource(&external).unwrap();
+    agent
+        .can_view_folder(&external.space, &FolderId::from_bytes([3; 16]), &[])
+        .unwrap();
+    assert!(!agent.taint().is_tainted());
+    let local = facts(1, DocClass::AgentMemory);
+    agent.authorize_direct_write(&local, &local).unwrap();
+
+    let project_root = FolderId::from_bytes([3; 16]);
+    let other_project = FolderId::from_bytes([9; 16]);
+    let keeper = owner
+        .for_keeper(
+            AgentRunId::from_bytes([2; 16]),
+            SpaceId::from_bytes([1; 16]),
+            Some(project_root.clone()),
+            BTreeSet::new(),
+        )
+        .unwrap();
+    let space = local.space;
+    assert_eq!(
+        keeper.authorize_chat_read(&space, None, false),
+        Err(DomainError::ResourceNotFound)
+    );
+    assert_eq!(
+        keeper.authorize_chat_read(&space, Some(&other_project), false),
+        Err(DomainError::ResourceNotFound)
+    );
+    keeper
+        .authorize_chat_read(&space, Some(&project_root), false)
+        .unwrap();
+}
+
+#[test]
+fn cancellation_future_wakes_registered_task_and_tool_call_ids_accept_provider_delimiters() {
+    use notarium_core::ports::{Cancellation, ProviderToolCallId};
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    struct CountWake(AtomicUsize);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let cancellation = Cancellation::default();
+    for _ in 0..1_000 {
+        let transient = Arc::new(CountWake(AtomicUsize::new(0)));
+        let transient_waker = Waker::from(transient.clone());
+        let mut transient_cx = Context::from_waker(&transient_waker);
+        {
+            let mut fut = cancellation.cancelled();
+            assert_eq!(Pin::new(&mut fut).poll(&mut transient_cx), Poll::Pending);
+        }
+        drop(transient_waker);
+        assert_eq!(
+            Arc::strong_count(&transient),
+            1,
+            "dropped Cancelled future must release its registered Waker in O(1)"
+        );
+    }
+    let counter = Arc::new(CountWake(AtomicUsize::new(0)));
+    let waker = Waker::from(counter.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = cancellation.cancelled();
+    assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending);
+    assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Pending);
+    cancellation.cancel();
+    assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+    assert_eq!(Pin::new(&mut fut).poll(&mut cx), Poll::Ready(()));
+
+    ProviderToolCallId::new("functions.search:0".into()).unwrap();
+    ProviderToolCallId::new("call_abc-123.v2:4".into()).unwrap();
+    assert!(ProviderToolCallId::new("call/bad".into()).is_err());
 }

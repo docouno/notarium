@@ -62,8 +62,101 @@ ids! {
     GrantId => "grant_", AuthSessionId => "auth_", RequestId => "request_",
     CommandKey => "cmd_", ModelProfileId => "model_", BodyIdentity => "body_",
     HeaderIdentity => "header_", EffectiveReadId => "read_", BackupId => "backup_",
-    KeyId => "key_", ReservationId => "reservation_", PendingInputId => "pending_",
+    OAuthFamilyId => "family_", OAuthGrantId => "oauth_",
+    ReservationId => "reservation_", PendingInputId => "pending_",
     ArtifactId => "artifact_", ClusterId => "cluster_",
+    ContextSetId => "context_",
+}
+
+/// Lookup identity of a PAT, OAuth access token or refresh token. Never a bearer.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct CredentialTokenId(String);
+impl CredentialTokenId {
+    pub fn parse(value: &str) -> DomainResult<Self> {
+        if value.len() == 12
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(DomainError::validation(ValidationReason::InvalidId))
+        }
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for CredentialTokenId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl TryFrom<String> for CredentialTokenId {
+    type Error = DomainError;
+    fn try_from(value: String) -> DomainResult<Self> {
+        Self::parse(&value)
+    }
+}
+impl From<CredentialTokenId> for String {
+    fn from(value: CredentialTokenId) -> Self {
+        value.0
+    }
+}
+
+/// Native credential key identity, derived from twelve HKDF output bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct KeyId(String);
+impl KeyId {
+    pub const PREFIX: &'static str = "ck_";
+    pub fn from_derived(bytes: [u8; 12]) -> Self {
+        use fmt::Write;
+        let mut value = String::with_capacity(27);
+        value.push_str(Self::PREFIX);
+        for byte in bytes {
+            write!(&mut value, "{byte:02x}").expect("writing to a String");
+        }
+        Self(value)
+    }
+    pub fn parse(value: &str) -> DomainResult<Self> {
+        if value.strip_prefix(Self::PREFIX).is_some_and(|suffix| {
+            suffix.len() == 24
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(DomainError::validation(ValidationReason::InvalidId))
+        }
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Display for KeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl FromStr for KeyId {
+    type Err = DomainError;
+    fn from_str(value: &str) -> DomainResult<Self> {
+        Self::parse(value)
+    }
+}
+impl TryFrom<String> for KeyId {
+    type Error = DomainError;
+    fn try_from(value: String) -> DomainResult<Self> {
+        Self::parse(&value)
+    }
+}
+impl From<KeyId> for String {
+    fn from(value: KeyId) -> Self {
+        value.0
+    }
 }
 
 macro_rules! counters {

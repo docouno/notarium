@@ -76,6 +76,27 @@ pub struct SourceLocation {
 #[derive(Clone, Debug, Eq, PartialEq, Error, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum DomainError {
+    #[error("provider request rejected")]
+    Provider {
+        error: crate::ports::provider::ProviderErrorCode,
+    },
+    #[error("provider intent already admitted")]
+    ProviderCallAlreadyStarted {
+        call: crate::ids::RequestId,
+        state: crate::ports::provider::ProviderDeliveryState,
+    },
+    #[error("OAuth request rejected")]
+    OAuth {
+        error: crate::ports::oauth::OAuthErrorCode,
+    },
+    #[error("authentication failed")]
+    AuthenticationFailed,
+    #[error("access denied")]
+    AccessDenied,
+    #[error("control revision conflict")]
+    ControlRevisionConflict {
+        current: crate::ids::ControlRevision,
+    },
     #[error("resource not found")]
     ResourceNotFound,
     #[error("revision conflict")]
@@ -137,6 +158,12 @@ impl DomainError {
     }
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::Provider { .. } => "provider_error",
+            Self::ProviderCallAlreadyStarted { .. } => "provider_call_already_started",
+            Self::OAuth { .. } => "oauth_error",
+            Self::AuthenticationFailed => "authentication_failed",
+            Self::AccessDenied => "access_denied",
+            Self::ControlRevisionConflict { .. } => "control_revision_conflict",
             Self::ResourceNotFound => "resource_not_found",
             Self::RevisionConflict { .. } => "revision_conflict",
             Self::PathConflict { .. } => "path_conflict",

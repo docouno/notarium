@@ -7,6 +7,7 @@ use notarium_core::{
     ports::{control::*, *},
     query::*,
     receipt::*,
+    value::Timestamp,
 };
 
 pub struct RejectingPorts;
@@ -191,8 +192,8 @@ impl ControlPort for RejectingPorts {
     reject! {
     fn resolve_auth(&self, ctx: PreAuthContext) -> PortFuture<'_, EngineAuthContext>;
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo>;
-    fn list_spaces(&self, ctx: AccountContext) -> PortFuture<'_, Vec<AccessibleSpace>>;
-    fn list_projects(&self, ctx: AccountContext) -> PortFuture<'_, Vec<ProjectInfo>>;
+    fn list_spaces(&self, ctx: AccountContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<AccessibleSpace>>;
+    fn list_projects(&self, ctx: AccountContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<ProjectInfo>>;
     fn create_space(
             &self,
             ctx: AccountContext,
@@ -202,7 +203,13 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: SpaceContext,
             request: MembershipChange,
-        ) -> PortFuture<'_, ControlCommit<AccessibleSpace>>;
+        ) -> PortFuture<'_, ControlCommit<MembershipResult>>;
+    fn resume_membership_change(
+            &self,
+            ctx: AccountContext,
+            scope: HistoryScope,
+            request: MembershipChange,
+        ) -> PortFuture<'_, ControlCommit<MembershipResult>>;
     fn change_space_lifecycle(
             &self,
             ctx: SpaceContext,
@@ -212,13 +219,14 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: AccountContext,
             request: AccountMutation<StartEpisode>,
-        ) -> PortFuture<'_, EpisodeStartResult>;
+        ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode>;
     fn update_episode(
             &self,
             ctx: AccountContext,
             request: AccountMutation<EpisodeUpdate>,
         ) -> PortFuture<'_, ControlCommit<AgentEpisode>>;
+    fn touch_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, ()>;
     fn acknowledge_delta(
             &self,
             ctx: AccountContext,
@@ -228,12 +236,14 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: AccountContext,
             episode: EpisodeId,
+            space: Option<SpaceId>,
+            page: ControlPageRequest,
         ) -> PortFuture<'_, BootstrapContext>;
     fn discover_abilities(
             &self,
             ctx: AccountContext,
             request: AbilityQuery,
-        ) -> PortFuture<'_, Vec<AbilityDescriptor>>;
+        ) -> PortFuture<'_, ControlPage<AbilityDescriptor>>;
     fn resolve_ability(
             &self,
             ctx: AccountContext,
@@ -243,12 +253,33 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: AccountContext,
             reference: AbilityRef,
+            project: Option<FolderRef>,
         ) -> PortFuture<'_, AbilityDescriptor>;
     fn update_ability_binding(
             &self,
-            ctx: SpaceContext,
-            request: AbilityBindingUpdate,
+            ctx: AccountContext,
+            request: AccountMutation<AbilityBindingUpdate>,
         ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>>;
+    fn set_ability_preference(
+            &self,
+            ctx: AccountContext,
+            request: AccountMutation<AbilityPreferenceUpdate>,
+        ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>>;
+    fn set_ability_trail(
+            &self,
+            ctx: AccountContext,
+            request: AccountMutation<AbilityTrailUpdate>,
+        ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>>;
+    fn lookup_mcp_dedup(
+            &self,
+            ctx: AccountContext,
+            key: McpDedupKey,
+        ) -> PortFuture<'_, Option<McpDedupHit>>;
+    fn record_mcp_dedup(
+            &self,
+            ctx: AccountContext,
+            record: McpDedupRecord,
+        ) -> PortFuture<'_, ()>;
     fn resolve_memory_target(
             &self,
             ctx: AccountContext,
@@ -256,47 +287,68 @@ impl ControlPort for RejectingPorts {
             category: String,
         ) -> PortFuture<'_, ResolvedMemoryTarget>;
     fn create_schedule(
-            &self,
-            ctx: SpaceContext,
-            schedule: AgentSchedule,
-        ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<CreateSchedule>,
+    ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
     fn get_schedule(
-            &self,
-            ctx: SpaceContext,
-            schedule: ScheduleId,
-        ) -> PortFuture<'_, AgentSchedule>;
-    fn list_schedules(&self, ctx: SpaceContext) -> PortFuture<'_, Vec<AgentSchedule>>;
+        &self,
+        ctx: SpaceContext,
+        schedule: ScheduleId,
+    ) -> PortFuture<'_, AgentSchedule>;
+    fn list_schedules(
+        &self,
+        ctx: SpaceContext,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
     fn update_schedule(
-            &self,
-            ctx: SpaceContext,
-            schedule: AgentSchedule,
-        ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<UpdateSchedule>,
+    ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
     fn delete_schedule(
-            &self,
-            ctx: SpaceContext,
-            schedule: ScheduleId,
-            expected: ControlRevision,
-        ) -> PortFuture<'_, ControlRevision>;
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<DeleteSchedule>,
+    ) -> PortFuture<'_, ControlCommit<()>>;
+    fn list_due_schedules(
+        &self,
+        ctx: MaintenanceContext,
+        now: Timestamp,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
+    fn get_schedule_run(
+        &self,
+        ctx: ScheduleRunContext,
+        schedule: ScheduleId,
+        run: AgentRunId,
+    ) -> PortFuture<'_, ScheduleRunReceipt>;
+    fn list_schedule_runs(
+        &self,
+        ctx: ScheduleRunContext,
+        schedule: ScheduleId,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
     fn claim_schedule(
-            &self,
-            ctx: SpaceContext,
-            request: ClaimSchedule,
-        ) -> PortFuture<'_, ScheduleClaim>;
+        &self,
+        ctx: MaintenanceContext,
+        request: ClaimSchedule,
+    ) -> PortFuture<'_, ScheduleClaim>;
     fn record_schedule_result(
-            &self,
-            ctx: SpaceContext,
-            result: ScheduleResult,
-        ) -> PortFuture<'_, ControlRevision>;
+        &self,
+        ctx: MaintenanceContext,
+        result: ScheduleResult,
+    ) -> PortFuture<'_, ScheduleRunReceipt>;
     fn select_provider(
             &self,
             ctx: SpaceContext,
-            model: Option<ModelProfileId>,
+            request: SelectProvider,
         ) -> PortFuture<'_, ProviderSelection>;
     fn update_provider_preference(
             &self,
             ctx: AccountContext,
-            request: AccountMutation<ProviderPreference>,
-        ) -> PortFuture<'_, ControlCommit<ProviderPreference>>;
+            request: AccountMutation<SetProviderPreference>,
+        ) -> PortFuture<'_, ControlCommit<SetProviderPreference>>;
     fn complete(
             &self,
             ctx: SpaceContext,
@@ -369,6 +421,22 @@ impl EventBusPort for RejectingPorts {
 }
 impl SessionRevocationPort for RejectingPorts {
     reject! {
+    fn fence_inactive_provider(
+            &self,
+            ctx: MaintenanceContext,
+            call: RequestId,
+        ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>>;
+    fn register_provider(
+            &self,
+            ctx: MaintenanceContext,
+            selectors: Vec<RevocationSelector>,
+            cancellation: Cancellation,
+        ) -> PortFuture<'_, Box<dyn RevocationLease>>;
+    fn fence_provider(
+            &self,
+            ctx: MaintenanceContext,
+            selectors: Vec<RevocationSelector>,
+        ) -> PortFuture<'_, Box<dyn RevocationLease>>;
     fn revoke(
             &self,
             ctx: MaintenanceContext,

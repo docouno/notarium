@@ -4,11 +4,53 @@ use crate::{DomainError, DomainResult, classes::DocClass, error::ValidationReaso
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
 };
+
+/// Secrets cross typed service boundaries without Debug or serialization leaks.
+pub struct SecretString(zeroize::Zeroizing<String>);
+impl SecretString {
+    pub fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret([REDACTED])")
+    }
+}
+
+/// Durable lineage attested by the authentication owner. Derived agents retain
+/// this lineage so a later control effect can recheck the original credential.
+/// ```compile_fail
+/// use notarium_core::auth::AuthenticatedCredential;
+/// let _: AuthenticatedCredential = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthenticatedCredential {
+    Session(AuthSessionId),
+    Pat(CredentialTokenId),
+    OAuth {
+        token: CredentialTokenId,
+        grant: OAuthGrantId,
+        family: Option<OAuthFamilyId>,
+    },
+    /// Only the successful scheduler claim may attest this lineage. No bearer
+    /// token or request deserializer can select a scheduled credential.
+    ScheduledRun {
+        schedule: ScheduleId,
+        run: AgentRunId,
+        lease: LeaseEpoch,
+    },
+    TrustedNone,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SpaceRole {
@@ -40,6 +82,7 @@ pub enum Cap {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PrincipalKind {
     DirectHuman,
+    Pat,
     AgentRun(AgentRunId),
     Keeper(AgentRunId),
     OAuth { source: GrantId, narrowed: bool },
@@ -59,7 +102,9 @@ pub struct VerifiedHuman {
     principal: PrincipalId,
     grant: GrantId,
     spaces: BTreeMap<SpaceId, SpaceGrant>,
+    human_management: bool,
     ability_write: bool,
+    credential: Option<AuthenticatedCredential>,
 }
 impl VerifiedHuman {
     pub fn attest(
@@ -72,8 +117,18 @@ impl VerifiedHuman {
             principal,
             grant,
             spaces,
+            human_management: false,
             ability_write: explicitly_authorized_ability_write,
+            credential: None,
         }
+    }
+    pub fn with_human_management(mut self, human_management: bool) -> Self {
+        self.human_management = human_management;
+        self
+    }
+    pub fn with_credential(mut self, credential: AuthenticatedCredential) -> Self {
+        self.credential = Some(credential);
+        self
     }
 }
 
@@ -103,10 +158,12 @@ pub struct EngineAuthContext {
     grant: GrantId,
     kind: PrincipalKind,
     spaces: BTreeMap<SpaceId, SpaceGrant>,
+    human_management: bool,
     ability_write: bool,
     write_space: Option<SpaceId>,
     taint: BranchTaint,
     readonly_abilities: BTreeSet<AbilityId>,
+    credential: Option<AuthenticatedCredential>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,10 +189,12 @@ impl EngineAuthContext {
             grant: verified.grant,
             kind: PrincipalKind::DirectHuman,
             spaces: verified.spaces,
-            ability_write: verified.ability_write,
+            human_management: verified.human_management,
+            ability_write: verified.human_management && verified.ability_write,
             write_space: None,
             taint: BranchTaint::default(),
             readonly_abilities: BTreeSet::new(),
+            credential: verified.credential,
         }
     }
     pub fn for_agent_run(
@@ -223,6 +282,12 @@ impl EngineAuthContext {
         };
         Ok(derived)
     }
+    /// Personal access tokens are delegated credentials, never interactive humans.
+    pub fn for_pat(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
+        let mut derived = self.narrow(requested)?;
+        derived.kind = PrincipalKind::Pat;
+        Ok(derived)
+    }
     fn narrow(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
         let mut spaces = BTreeMap::new();
         for (id, wanted) in requested {
@@ -255,6 +320,7 @@ impl EngineAuthContext {
         }
         Ok(Self {
             spaces,
+            human_management: false,
             ability_write: false,
             ..self.clone()
         })
@@ -262,8 +328,39 @@ impl EngineAuthContext {
     pub fn principal(&self) -> &PrincipalId {
         &self.principal
     }
+    /// The authentication owner supplies freshly verified durable authority.
+    /// Keep the caller's delegation, project pin, taint and write-Space pin while
+    /// intersecting current permissions; refreshing cannot widen an old context.
+    pub fn intersect_current(&self, current: &Self) -> DomainResult<Self> {
+        if self.principal != current.principal
+            || self.grant != current.grant
+            || self.credential != current.credential
+            || self.credential.is_none()
+        {
+            return Err(DomainError::AuthenticationFailed);
+        }
+        let requested = current
+            .spaces
+            .iter()
+            .filter_map(|(id, fresh)| {
+                self.spaces.get(id).map(|old| {
+                    let mut wanted = fresh.clone();
+                    wanted.project_root = old.project_root.clone();
+                    (id.clone(), wanted)
+                })
+            })
+            .collect();
+        let mut result = self.narrow(requested)?;
+        result.human_management = self.human_management && current.human_management;
+        result.ability_write =
+            result.human_management && self.ability_write && current.ability_write;
+        Ok(result)
+    }
     pub fn grant(&self) -> &GrantId {
         &self.grant
+    }
+    pub fn credential(&self) -> Option<&AuthenticatedCredential> {
+        self.credential.as_ref()
     }
     pub fn kind(&self) -> &PrincipalKind {
         &self.kind
@@ -274,9 +371,19 @@ impl EngineAuthContext {
     pub fn taint(&self) -> &BranchTaint {
         &self.taint
     }
+    pub fn human_management(&self) -> bool {
+        self.human_management && self.kind == PrincipalKind::DirectHuman
+    }
+    pub fn authorize_human_management(&self) -> DomainResult<()> {
+        if self.human_management() {
+            Ok(())
+        } else {
+            Err(DomainError::AccessDenied)
+        }
+    }
     pub fn has_cap(&self, cap: Cap) -> bool {
         match cap {
-            Cap::AbilityWrite => self.ability_write && self.kind == PrincipalKind::DirectHuman,
+            Cap::AbilityWrite => self.ability_write && self.human_management(),
         }
     }
     pub fn authorize_ability_mutation(&self) -> DomainResult<()> {
@@ -286,7 +393,32 @@ impl EngineAuthContext {
             Err(DomainError::AbilityWriteForbidden)
         }
     }
-    pub fn authorize_read(&self, resource: &ResourceFacts) -> DomainResult<()> {
+    /// Metadata visibility check that never mutates shared branch taint.
+    /// Content reading and provider egress must still call `authorize_folder_read`.
+    pub fn can_view_folder(
+        &self,
+        space: &Space,
+        folder: &FolderId,
+        ancestors: &[FolderId],
+    ) -> DomainResult<()> {
+        let grant = self
+            .spaces
+            .get(&space.id)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if space.lifecycle != SpaceLifecycle::Active
+            || grant.read_classes.is_empty()
+            || grant
+                .project_root
+                .as_ref()
+                .is_some_and(|root| root != folder && !ancestors.contains(root))
+        {
+            return Err(DomainError::ResourceNotFound);
+        }
+        Ok(())
+    }
+    /// Metadata visibility check that never mutates shared branch taint.
+    /// Content reading and provider egress must still call `authorize_read`.
+    pub fn can_view_resource(&self, resource: &ResourceFacts) -> DomainResult<()> {
         let grant = self
             .spaces
             .get(&resource.space.id)
@@ -308,6 +440,24 @@ impl EngineAuthContext {
         {
             return Err(DomainError::ResourceNotFound);
         }
+        Ok(())
+    }
+    /// Folder metadata has no document class. It still requires a nonempty read
+    /// grant and current ancestry, and participates in the same branch taint.
+    pub fn authorize_folder_read(
+        &self,
+        space: &Space,
+        folder: &FolderId,
+        ancestors: &[FolderId],
+    ) -> DomainResult<()> {
+        self.can_view_folder(space, folder, ancestors)?;
+        if self.write_space.as_ref().is_some_and(|id| id != &space.id) {
+            self.taint.mark_external_read();
+        }
+        Ok(())
+    }
+    pub fn authorize_read(&self, resource: &ResourceFacts) -> DomainResult<()> {
+        self.can_view_resource(resource)?;
         if self
             .write_space
             .as_ref()
@@ -317,14 +467,24 @@ impl EngineAuthContext {
         }
         Ok(())
     }
-    /// Chat provenance is separate from document classes. Project-scoped service
-    /// grants do not gain access to whole-space transcripts through this path.
-    pub fn authorize_chat_read(&self, space: &Space, tainted: bool) -> DomainResult<()> {
+    /// Chat provenance is separate from document classes. Project-scoped grants
+    /// may read only chat transcripts explicitly pinned to their exact project.
+    pub fn authorize_chat_read(
+        &self,
+        space: &Space,
+        project: Option<&FolderId>,
+        tainted: bool,
+    ) -> DomainResult<()> {
         let grant = self
             .spaces
             .get(&space.id)
             .ok_or(DomainError::ResourceNotFound)?;
-        if space.lifecycle != SpaceLifecycle::Active || grant.project_root.is_some() {
+        if space.lifecycle != SpaceLifecycle::Active {
+            return Err(DomainError::ResourceNotFound);
+        }
+        if let Some(root) = &grant.project_root
+            && project != Some(root)
+        {
             return Err(DomainError::ResourceNotFound);
         }
         if tainted && space.kind == SpaceKind::Shared {

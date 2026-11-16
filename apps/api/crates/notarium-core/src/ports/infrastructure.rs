@@ -60,6 +60,7 @@ pub struct EmbeddingRequest {
     pub intent: CommandKey,
     pub model: ModelProfileId,
     pub provider: ProviderResourceId,
+    pub project: Option<FolderRef>,
     pub chunks: Vec<ProviderPart>,
     pub declared_tokens: u32,
 }
@@ -89,7 +90,7 @@ pub struct EmbeddingResult {
     pub model: ModelProfileId,
     pub dimension: u32,
     pub vectors: Vec<Result<Vec<f32>, DomainError>>,
-    pub used_tokens: u32,
+    pub usage: super::provider::ProviderUsage,
 }
 pub trait EmbeddingProviderPort: Send + Sync {
     fn embed(
@@ -256,18 +257,28 @@ pub trait EventBusPort: Send + Sync {
         after: ChangeCursor,
     ) -> PortFuture<'_, Box<dyn PortStream<SpaceEvent>>>;
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "target", rename_all = "snake_case")]
 pub enum RevocationSelector {
+    Principal(PrincipalId),
     Session(AuthSessionId),
     Credential(CredentialId),
+    ProviderResource(ProviderResourceId),
+    ProviderCall(RequestId),
+    Schedule(ScheduleId),
+    ScheduledRun(AgentRunId),
     Grant(GrantId),
+    OAuthGrant(OAuthGrantId),
+    OAuthFamily(OAuthFamilyId),
+    OAuthAccess(CredentialTokenId),
     Membership {
         space: SpaceId,
         principal: PrincipalId,
     },
     Space(SpaceId),
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RevocationReason {
     Logout,
     Expired,
@@ -276,7 +287,39 @@ pub enum RevocationReason {
     CredentialRemoved,
 }
 pub trait SessionRevocationPort: Send + Sync {
+    /// Register only after locking and revalidating all selected database
+    /// authorities. Keep the lease until the socket is closed; release it BEFORE
+    /// acquiring a database transaction for usage settlement. The registry owner
+    /// coordinates all service instances, cancels on lease/connection loss, and
+    /// never admits a registration through an active mutation fence.
+    fn register_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>>;
+    /// Close matching admissions, cancel active calls, and wait for their leases
+    /// to drop. The caller already holds database authority locks and retains
+    /// this fence through COMMIT/ROLLBACK, including cancellation of its waiter.
+    /// Selector batches are acquired atomically; implementations must not wait
+    /// for database settlement while draining registrations.
+    fn fence_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>>;
+    /// Recovery alone may claim an inactive call. Atomically return None when
+    /// any live registration/fence exists for this call; otherwise close its
+    /// admissions until the returned lease drops. Never cancel an active call
+    /// merely because another process considers its database row old.
+    fn fence_inactive_provider(
+        &self,
+        ctx: MaintenanceContext,
+        call: RequestId,
+    ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>>;
     /// Completion means all admitted registrations and run callbacks are invalidated.
+    /// The service budget's request ID identifies the durable event and remains
+    /// stable across retries, allowing the registry owner to deduplicate delivery.
     fn revoke(
         &self,
         ctx: MaintenanceContext,
@@ -285,22 +328,49 @@ pub trait SessionRevocationPort: Send + Sync {
     ) -> PortFuture<'_, ()>;
 }
 
+/// Loss of distributed registry authority invalidates a lease and cancels every
+/// associated call. A local cache alone cannot implement this Cloud contract.
+pub trait RevocationLease: Send {
+    fn check(&self) -> Result<(), crate::error::PortError>;
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct BackupBudget {
     pub deadline: Duration,
-    pub max_pinned_wal_bytes: u64,
+    pub retention: BackupRetentionBudget,
     pub max_spool_bytes: u64,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct BackupProgress {
     pub elapsed: Duration,
-    pub pinned_wal_bytes: u64,
+    pub retention: BackupRetentionProgress,
     pub spool_bytes: u64,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum BackupRetentionBudget {
+    SqliteWal { max_pinned_bytes: u64 },
+    PostgresSnapshot { max_age: Duration },
+}
+#[derive(Clone, Copy, Debug)]
+pub enum BackupRetentionProgress {
+    SqliteWal { pinned_bytes: u64 },
+    PostgresSnapshot { age: Duration },
 }
 impl BackupBudget {
     pub fn check(&self, progress: BackupProgress) -> DomainResult<()> {
+        let retention_exceeded = match (self.retention, progress.retention) {
+            (
+                BackupRetentionBudget::SqliteWal { max_pinned_bytes },
+                BackupRetentionProgress::SqliteWal { pinned_bytes },
+            ) => pinned_bytes > max_pinned_bytes,
+            (
+                BackupRetentionBudget::PostgresSnapshot { max_age },
+                BackupRetentionProgress::PostgresSnapshot { age },
+            ) => age > max_age,
+            _ => return Err(DomainError::validation(ValidationReason::ScopeMismatch)),
+        };
         if progress.elapsed > self.deadline
-            || progress.pinned_wal_bytes > self.max_pinned_wal_bytes
+            || retention_exceeded
             || progress.spool_bytes > self.max_spool_bytes
         {
             return Err(DomainError::validation(ValidationReason::BudgetExceeded));
@@ -308,21 +378,34 @@ impl BackupBudget {
         Ok(())
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeyCanary {
     pub key: KeyId,
+    pub generation: u64,
+    pub active: bool,
     pub digest: ContentDigest,
     pub readable: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupWitness {
     pub installation: InstallationId,
+    pub schema_version: u32,
     pub histories: Vec<ChangeCursor>,
     pub canaries: Vec<KeyCanary>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupArtifactKind {
+    SqliteSnapshotV1,
+    PostgresSpoolV1,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupSpool {
     pub artifact: ArtifactId,
+    pub kind: BackupArtifactKind,
     pub bytes: u64,
     pub digest: ContentDigest,
     pub witness: BackupWitness,

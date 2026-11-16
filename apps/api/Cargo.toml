@@ -30,6 +30,7 @@ publish = false
 unsafe_code = "deny"
 
 [workspace.dependencies]
+allocation-counter = "0.8.1"
 notarium-core = { path = "crates/notarium-core" }
 notarium-syntax = { path = "crates/notarium-syntax" }
 notarium-control = { path = "crates/notarium-control" }
@@ -61,8 +62,8 @@ pulldown-cmark = "=0.13.6"
 argon2 = "0.6"
 scrypt = "0.12"
 hkdf = "0.13"
-sha2 = "0.11"
-aes-gcm = "0.11"
+sha2 = { version = "0.11", features = ["zeroize"] }
+aes-gcm = { version = "0.11", features = ["zeroize"] }
 age = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
@@ -76,6 +77,9 @@ tantivy = "0.27"
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-31"] }
 yrs = "0.28"
 cap-std = "4"
+cap-fs-ext = "4"
+hmac = { version = "0.13", features = ["zeroize"] }
+ipnet = "2"
 notify = "8"
 zip = { version = "9", default-features = false, features = ["deflate", "zstd"] }
 mimalloc = { version = "0.1", default-features = false }
@@ -86,6 +90,18 @@ caseless = "0.2"
 unicode-normalization = "0.1"
 
 saphyr-parser = "0.3"
+
+rusqlite = { version = "=0.39.0", default-features = false, features = ["backup", "bundled", "cache"] }
+base64 = "0.22"
+getrandom = "0.4"
+subtle = "2"
+zeroize = "1"
+url = "2"
+futures-util = "0.3"
+openidconnect = { version = "=4.1.0", default-features = false }
+cron = "0.15"
+chrono-tz = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [patch.crates-io]
 pulldown-cmark = { path = "vendor/pulldown-cmark" }

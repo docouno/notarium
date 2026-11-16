@@ -1,6 +1,41 @@
-use super::{PortFuture, PortStream, context::*, types::*};
+use super::{PortFuture, PortStream, context::*, provider::*, types::*};
 use crate::{auth::*, classes::*, ids::*, model::*, receipt::*, value::Timestamp};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+
+/// Opaque continuation bound by the producer to scope, filters and revisions.
+#[derive(Clone, Debug)]
+pub struct ControlPageRequest {
+    limit: u16,
+    continuation: Option<String>,
+}
+impl ControlPageRequest {
+    pub fn new(limit: u16, continuation: Option<String>) -> crate::DomainResult<Self> {
+        if !(1..=200).contains(&limit)
+            || continuation
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.len() > 4096)
+        {
+            return Err(crate::DomainError::validation(
+                crate::error::ValidationReason::InvalidLimit,
+            ));
+        }
+        Ok(Self {
+            limit,
+            continuation,
+        })
+    }
+    pub fn limit(&self) -> u16 {
+        self.limit
+    }
+    pub fn continuation(&self) -> Option<&str> {
+        self.continuation.as_deref()
+    }
+}
+#[derive(Clone, Debug)]
+pub struct ControlPage<T> {
+    pub items: Vec<T>,
+    pub continuation: Option<String>,
+}
 
 #[derive(Clone, Debug)]
 pub struct PrincipalInfo {
@@ -37,17 +72,25 @@ pub struct CreateSpace {
 }
 #[derive(Clone, Debug)]
 pub struct MembershipChange {
+    pub command: CommandKey,
     pub member: PrincipalId,
     pub role: Option<SpaceRole>,
     pub expected: ControlRevision,
 }
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MembershipResult {
+    pub space: SpaceId,
+    pub member: PrincipalId,
+    pub role: Option<SpaceRole>,
+}
 #[derive(Clone, Debug)]
 pub struct SpaceLifecycleChange {
+    pub command: CommandKey,
     pub lifecycle: SpaceLifecycle,
     pub expected: ControlRevision,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AbilityPlacement {
     OwnedProject(FolderRef),
     OwnedSpace(SpaceId),
@@ -64,11 +107,24 @@ impl AbilityPlacement {
         }
     }
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AbilityIdentity {
+    pub id: AbilityId,
+    pub placement: AbilityPlacement,
+}
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AbilityRef {
     pub id: AbilityId,
     pub placement: AbilityPlacement,
     pub revision: RevisionId,
+}
+impl AbilityRef {
+    pub fn identity(&self) -> AbilityIdentity {
+        AbilityIdentity {
+            id: self.id.clone(),
+            placement: self.placement.clone(),
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct AbilityDescriptor {
@@ -77,11 +133,13 @@ pub struct AbilityDescriptor {
     pub name: String,
     pub enabled: bool,
     pub healthy: bool,
+    pub lifecycle: Lifecycle,
     pub entrypoint: NoteRef,
     pub auxiliary_files: Vec<String>,
 }
 #[derive(Clone, Debug)]
 pub struct AbilityQuery {
+    pub page: ControlPageRequest,
     pub project: Option<FolderRef>,
     pub kind: Option<AbilityKind>,
     pub name: Option<String>,
@@ -95,24 +153,45 @@ pub enum AbilityResolution {
     Unhealthy,
     WrongKind,
     OutOfScope,
+    Stale,
 }
 #[derive(Clone, Debug)]
 pub enum AbilitySelection {
-    Exact(AbilityRef),
+    Exact {
+        reference: AbilityRef,
+        project: Option<FolderRef>,
+    },
     Name {
         kind: AbilityKind,
         name: String,
         project: Option<FolderRef>,
     },
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum AbilityProjects {
+    All,
+    Selected(Vec<FolderRef>),
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityBindingUpdate {
     pub ability: AbilityRef,
     pub enabled: bool,
     pub expected: ControlRevision,
+    pub projects: AbilityProjects,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbilityPreferenceUpdate {
+    pub ability: AbilityRef,
+    pub enabled: bool,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbilityTrailUpdate {
+    pub source: AbilityRef,
+    pub expected_destination: Option<AbilityRef>,
+    pub destination: Option<AbilityRef>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EpisodeLifecycle {
     Active,
     Sleeping,
@@ -129,8 +208,19 @@ pub struct AgentEpisode {
     pub parent: Option<EpisodeId>,
     pub revision: ControlRevision,
     pub acknowledgements: BTreeMap<SpaceId, AcknowledgedCursor>,
+    pub diagnostics: Vec<EpisodeDiagnostic>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EpisodeDiagnostic {
+    ProjectUnavailable,
+    RoleUnavailable,
 }
 #[derive(Clone, Debug)]
+pub struct EpisodeChoice {
+    pub id: EpisodeId,
+    pub name: Option<String>,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum EpisodeSelector {
     New {
         requested: EpisodeId,
@@ -139,9 +229,11 @@ pub enum EpisodeSelector {
     Id(EpisodeId),
     Name(String),
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StartEpisode {
     pub selector: EpisodeSelector,
+    /// Initial hint for a new episode. Resume/fork retains the stored selection;
+    /// changing an existing selection requires EpisodeUpdate and its CAS.
     pub project_hint: Option<FolderRef>,
 }
 #[derive(Clone, Debug)]
@@ -149,17 +241,18 @@ pub enum EpisodeStartResult {
     New(AgentEpisode),
     Resumed(AgentEpisode),
     Forked(AgentEpisode),
-    Ambiguous(Vec<AgentEpisode>),
+    Ambiguous(Vec<EpisodeChoice>),
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EpisodeUpdate {
     pub episode: EpisodeId,
     pub expected: ControlRevision,
+    pub name: Option<String>,
     pub active_role: Option<AbilityRef>,
     pub project_hint: Option<FolderRef>,
     pub lifecycle: EpisodeLifecycle,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum AckOwner {
     Account,
     Episode(EpisodeId),
@@ -171,77 +264,49 @@ pub struct AcknowledgeDelta {
 }
 #[derive(Clone, Debug)]
 pub struct ContextSelection {
+    pub space: Option<SpaceId>,
     pub pinned: Vec<NoteRef>,
     pub favorites: Vec<NoteRef>,
     pub readable_spaces: Vec<SpaceId>,
+    pub unavailable: u32,
 }
 #[derive(Clone, Debug)]
 pub struct BootstrapContext {
     pub episode: AgentEpisode,
     pub selection: ContextSelection,
     pub owner_acknowledgements: BTreeMap<SpaceId, AcknowledgedCursor>,
+    pub continuation: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-pub struct AgentSchedule {
-    pub id: ScheduleId,
-    pub owner: PrincipalId,
-    pub space: SpaceId,
-    pub project_folder: Option<FolderId>,
-    pub cron: String,
-    pub timezone: String,
-    pub approved_role: AbilityRef,
-    pub write_classes: BTreeSet<DocClass>,
-    pub budgets: CompletionBudget,
-    pub coalesce_latest: bool,
-    pub paused_reason: Option<SchedulePauseReason>,
-    pub revision: ControlRevision,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SchedulePauseReason {
-    OwnerRevoked,
-    RoleChanged,
-    SpaceUnavailable,
-    BudgetExceeded,
-    Manual,
+pub struct McpDedupKey {
+    pub actor: String,
+    pub request_key: CommandKey,
+    pub request_hash: ContentDigest,
+    pub operation: String,
 }
 #[derive(Clone, Debug)]
-pub struct ClaimSchedule {
-    pub schedule: ScheduleId,
-    pub slot: Timestamp,
-    pub current_role: AbilityRef,
-    pub expected: ControlRevision,
+pub struct McpDedupRecord {
+    pub key: McpDedupKey,
+    pub safe_result: String,
+    pub effect: super::telemetry::AgentEffect,
+    pub ttl_ms: u64,
 }
-#[derive(Clone, Debug)]
-pub enum ScheduleClaim {
-    Claimed {
-        run: AgentRunId,
-        lease: LeaseEpoch,
-        schedule: Box<AgentSchedule>,
-    },
-    AlreadyClaimed,
-    Paused(SchedulePauseReason),
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpDedupHit {
+    pub operation: String,
+    pub safe_result: String,
+    pub effect: super::telemetry::AgentEffect,
 }
-#[derive(Clone, Debug)]
-pub struct ScheduleResult {
-    pub schedule: ScheduleId,
-    pub run: AgentRunId,
-    pub lease: LeaseEpoch,
-    pub succeeded: bool,
-    pub next_slot: Option<Timestamp>,
-}
+
+pub use super::schedules::*;
 
 #[derive(Clone, Debug)]
 pub struct ProviderSelection {
     pub provider: ProviderResourceId,
     pub model: ModelProfileId,
+    pub project: Option<FolderRef>,
     pub policy: ProviderPolicy,
-}
-#[derive(Clone, Debug)]
-pub struct ProviderPreference {
-    pub provider: ProviderResourceId,
-    pub model: ModelProfileId,
-    pub expected: ControlRevision,
 }
 #[derive(Clone, Debug)]
 pub struct CompletionBudget {
@@ -253,29 +318,41 @@ pub struct CompletionBudget {
 pub struct CompletionRequest {
     pub intent: CommandKey,
     pub selection: ProviderSelection,
-    pub messages: Vec<ProviderMessage>,
+    pub messages: Vec<CompletionMessage>,
+    pub tools: Vec<ProviderToolDefinition>,
     pub budget: CompletionBudget,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum CompletionEvent {
     Text(String),
-    ToolCall {
-        call: CommandKey,
-        name: String,
-        arguments: BTreeMap<String, crate::value::YamlValue>,
-    },
-    Usage {
-        input_tokens: u32,
-        output_tokens: u32,
-    },
-    Finished,
+    ToolCall(ProviderToolCall),
+    Usage(ProviderUsage),
+    Finished(CompletionFinish),
+}
+impl std::fmt::Debug for CompletionEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(_) => f.write_str("Text([redacted])"),
+            Self::ToolCall(call) => f.debug_tuple("ToolCall").field(call).finish(),
+            Self::Usage(usage) => f.debug_tuple("Usage").field(usage).finish(),
+            Self::Finished(reason) => f.debug_tuple("Finished").field(reason).finish(),
+        }
+    }
 }
 
 pub trait ControlPort: Send + Sync {
     fn resolve_auth(&self, ctx: PreAuthContext) -> PortFuture<'_, EngineAuthContext>;
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo>;
-    fn list_spaces(&self, ctx: AccountContext) -> PortFuture<'_, Vec<AccessibleSpace>>;
-    fn list_projects(&self, ctx: AccountContext) -> PortFuture<'_, Vec<ProjectInfo>>;
+    fn list_spaces(
+        &self,
+        ctx: AccountContext,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<AccessibleSpace>>;
+    fn list_projects(
+        &self,
+        ctx: AccountContext,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<ProjectInfo>>;
     fn create_space(
         &self,
         ctx: AccountContext,
@@ -285,7 +362,15 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: SpaceContext,
         request: MembershipChange,
-    ) -> PortFuture<'_, ControlCommit<AccessibleSpace>>;
+    ) -> PortFuture<'_, ControlCommit<MembershipResult>>;
+    /// Resume only an existing exact command, including after self-removal.
+    /// Fresh account authentication never grants new Space authority here.
+    fn resume_membership_change(
+        &self,
+        ctx: AccountContext,
+        scope: HistoryScope,
+        request: MembershipChange,
+    ) -> PortFuture<'_, ControlCommit<MembershipResult>>;
     fn change_space_lifecycle(
         &self,
         ctx: SpaceContext,
@@ -295,13 +380,14 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: AccountContext,
         request: AccountMutation<StartEpisode>,
-    ) -> PortFuture<'_, EpisodeStartResult>;
+    ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode>;
     fn update_episode(
         &self,
         ctx: AccountContext,
         request: AccountMutation<EpisodeUpdate>,
     ) -> PortFuture<'_, ControlCommit<AgentEpisode>>;
+    fn touch_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, ()>;
     fn acknowledge_delta(
         &self,
         ctx: AccountContext,
@@ -311,12 +397,16 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: AccountContext,
         episode: EpisodeId,
+        // Optional current Space selection. An existing project must belong to
+        // it; otherwise the caller must explicitly update the episode first.
+        space: Option<SpaceId>,
+        page: ControlPageRequest,
     ) -> PortFuture<'_, BootstrapContext>;
     fn discover_abilities(
         &self,
         ctx: AccountContext,
         request: AbilityQuery,
-    ) -> PortFuture<'_, Vec<AbilityDescriptor>>;
+    ) -> PortFuture<'_, ControlPage<AbilityDescriptor>>;
     fn resolve_ability(
         &self,
         ctx: AccountContext,
@@ -326,12 +416,29 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: AccountContext,
         reference: AbilityRef,
+        project: Option<FolderRef>,
     ) -> PortFuture<'_, AbilityDescriptor>;
     fn update_ability_binding(
         &self,
-        ctx: SpaceContext,
-        request: AbilityBindingUpdate,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityBindingUpdate>,
     ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>>;
+    fn set_ability_preference(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityPreferenceUpdate>,
+    ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>>;
+    fn set_ability_trail(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityTrailUpdate>,
+    ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>>;
+    fn lookup_mcp_dedup(
+        &self,
+        ctx: AccountContext,
+        key: McpDedupKey,
+    ) -> PortFuture<'_, Option<McpDedupHit>>;
+    fn record_mcp_dedup(&self, ctx: AccountContext, record: McpDedupRecord) -> PortFuture<'_, ()>;
     fn resolve_memory_target(
         &self,
         ctx: AccountContext,
@@ -340,46 +447,67 @@ pub trait ControlPort: Send + Sync {
     ) -> PortFuture<'_, ResolvedMemoryTarget>;
     fn create_schedule(
         &self,
-        ctx: SpaceContext,
-        schedule: AgentSchedule,
+        ctx: AccountContext,
+        request: AccountMutation<CreateSchedule>,
     ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
     fn get_schedule(
         &self,
         ctx: SpaceContext,
         schedule: ScheduleId,
     ) -> PortFuture<'_, AgentSchedule>;
-    fn list_schedules(&self, ctx: SpaceContext) -> PortFuture<'_, Vec<AgentSchedule>>;
-    fn update_schedule(
+    fn list_schedules(
         &self,
         ctx: SpaceContext,
-        schedule: AgentSchedule,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
+    fn update_schedule(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<UpdateSchedule>,
     ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
     fn delete_schedule(
         &self,
-        ctx: SpaceContext,
+        ctx: AccountContext,
+        request: AccountMutation<DeleteSchedule>,
+    ) -> PortFuture<'_, ControlCommit<()>>;
+    fn list_due_schedules(
+        &self,
+        ctx: MaintenanceContext,
+        now: Timestamp,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
+    fn get_schedule_run(
+        &self,
+        ctx: ScheduleRunContext,
         schedule: ScheduleId,
-        expected: ControlRevision,
-    ) -> PortFuture<'_, ControlRevision>;
+        run: AgentRunId,
+    ) -> PortFuture<'_, ScheduleRunReceipt>;
+    fn list_schedule_runs(
+        &self,
+        ctx: ScheduleRunContext,
+        schedule: ScheduleId,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
     fn claim_schedule(
         &self,
-        ctx: SpaceContext,
+        ctx: MaintenanceContext,
         request: ClaimSchedule,
     ) -> PortFuture<'_, ScheduleClaim>;
     fn record_schedule_result(
         &self,
-        ctx: SpaceContext,
+        ctx: MaintenanceContext,
         result: ScheduleResult,
-    ) -> PortFuture<'_, ControlRevision>;
+    ) -> PortFuture<'_, ScheduleRunReceipt>;
     fn select_provider(
         &self,
         ctx: SpaceContext,
-        model: Option<ModelProfileId>,
+        request: SelectProvider,
     ) -> PortFuture<'_, ProviderSelection>;
     fn update_provider_preference(
         &self,
         ctx: AccountContext,
-        request: AccountMutation<ProviderPreference>,
-    ) -> PortFuture<'_, ControlCommit<ProviderPreference>>;
+        request: AccountMutation<SetProviderPreference>,
+    ) -> PortFuture<'_, ControlCommit<SetProviderPreference>>;
     fn complete(
         &self,
         ctx: SpaceContext,
