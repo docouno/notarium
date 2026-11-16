@@ -821,3 +821,278 @@ async fn sqlite_ability_resolution_and_memory() {
 async fn postgres_ability_resolution_and_memory() {
     exercise(true).await;
 }
+
+async fn selected_project_bindings_and_paged_bulk_discovery(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let fixture = Fixture::new(pg, "abilities_selected_discovery").await;
+    let service = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let boot = service
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: None,
+                display_name: "Owner".into(),
+                password: Some(SecretString::new(
+                    "abilities discovery fixture password".into(),
+                )),
+            },
+        )
+        .await
+        .unwrap();
+    let token = boot.session.unwrap().token;
+    let mut aw_ev = evidence(AuthEvidenceKind::Session, token.expose());
+    aw_ev.evidence = aw_ev.evidence.with_ability_write();
+    let ctx = AccountContext::new(service.resolve(aw_ev).await.unwrap(), budget());
+
+    let shared = service
+        .create_space(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &ctx, 1).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([22; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Team".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let mut aw_ev = evidence(AuthEvidenceKind::Session, token.expose());
+    aw_ev.evidence = aw_ev.evidence.with_ability_write();
+    let ctx = AccountContext::new(service.resolve(aw_ev).await.unwrap(), budget());
+
+    let project_ok = FolderRef {
+        space_id: shared.space.id.clone(),
+        folder_id: FolderId::from_bytes([23; 16]),
+    };
+    let project_other = FolderRef {
+        space_id: shared.space.id.clone(),
+        folder_id: FolderId::from_bytes([24; 16]),
+    };
+    for (folder, name) in [
+        (project_ok.clone(), "Allowed project"),
+        (project_other.clone(), "Other project"),
+    ] {
+        fixture.catalog.project_entries.lock().unwrap().insert(
+            (folder.space_id.clone(), folder.folder_id.clone()),
+            ProjectInfo {
+                folder: folder.clone(),
+                name: name.into(),
+            },
+        );
+        fixture.catalog.folder_entries.lock().unwrap().insert(
+            (folder.space_id.clone(), folder.folder_id.clone()),
+            CatalogFolder {
+                reference: folder,
+                space: shared.space.clone(),
+                lifecycle: Lifecycle::Active,
+                ancestor_folders: vec![],
+                write_locked: false,
+            },
+        );
+    }
+
+    let selected_role = add(
+        &fixture,
+        &shared.space,
+        AbilityPlacement::OwnedSpace(shared.space.id.clone()),
+        25,
+        "selected-guide",
+        vec![],
+    );
+    service
+        .update_ability_binding(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &ctx, 2).await,
+                input: AbilityBindingUpdate {
+                    ability: selected_role.clone(),
+                    enabled: true,
+                    expected: ControlRevision::ZERO,
+                    projects: AbilityProjects::Selected(vec![project_ok.clone()]),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    // `AbilityProjects::Selected` enforces project matching on both `AbilitySelection::Exact` and `get_ability`.
+    assert!(matches!(
+        service
+            .resolve_ability(
+                ctx.clone(),
+                AbilitySelection::Exact {
+                    reference: selected_role.clone(),
+                    project: None,
+                },
+            )
+            .await
+            .unwrap(),
+        AbilityResolution::Disabled
+    ));
+    assert!(matches!(
+        service
+            .resolve_ability(
+                ctx.clone(),
+                AbilitySelection::Exact {
+                    reference: selected_role.clone(),
+                    project: Some(project_other),
+                },
+            )
+            .await
+            .unwrap(),
+        AbilityResolution::Disabled
+    ));
+    assert!(matches!(
+        service
+            .resolve_ability(
+                ctx.clone(),
+                AbilitySelection::Exact {
+                    reference: selected_role.clone(),
+                    project: Some(project_ok.clone()),
+                },
+            )
+            .await
+            .unwrap(),
+        AbilityResolution::Resolved(_)
+    ));
+    assert!(matches!(
+        service
+            .get_ability(ctx.clone(), selected_role.clone(), None)
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert!(
+        service
+            .get_ability(ctx.clone(), selected_role, Some(project_ok.clone()))
+            .await
+            .unwrap()
+            .enabled
+    );
+
+    // Seed 26 additional abilities (27 total) and verify bulk catalog batching across single-page,
+    // multi-page, and kind-filtered runtime discovery.
+    add(
+        &fixture,
+        &shared.space,
+        AbilityPlacement::OwnedProject(project_ok.clone()),
+        50,
+        "role-project-ok",
+        vec![project_ok.folder_id.clone()],
+    );
+    for idx in 0..25_u8 {
+        add(
+            &fixture,
+            &shared.space,
+            AbilityPlacement::System,
+            60 + idx,
+            &format!("sys-role-{idx:02}"),
+            vec![],
+        );
+    }
+
+    fixture.catalog.abilities_calls.store(0, Ordering::SeqCst);
+    let single_page = service
+        .discover_abilities(ctx.clone(), query(None, Some(project_ok.clone()), 50))
+        .await
+        .unwrap();
+    assert_eq!(single_page.items.len(), 27);
+    assert_eq!(
+        fixture.catalog.abilities_calls.load(Ordering::SeqCst),
+        1,
+        "single-page runtime discover_abilities must issue 1 catalog.abilities call"
+    );
+
+    fixture.catalog.abilities_calls.store(0, Ordering::SeqCst);
+    let page1 = service
+        .discover_abilities(ctx.clone(), query(None, Some(project_ok.clone()), 20))
+        .await
+        .unwrap();
+    assert_eq!(page1.items.len(), 20);
+    assert!(page1.continuation.is_some());
+    assert_eq!(fixture.catalog.abilities_calls.load(Ordering::SeqCst), 2);
+    let page2 = service
+        .discover_abilities(
+            ctx.clone(),
+            query(page1.continuation, Some(project_ok.clone()), 20),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page2.items.len(), 7);
+    assert!(page2.continuation.is_none());
+    assert_eq!(fixture.catalog.abilities_calls.load(Ordering::SeqCst), 4);
+
+    // Colliding unrelated Skill names never break `kind: Some(AbilityKind::Role)` discovery.
+    for dup_id in [95_u8, 96_u8] {
+        let reference = AbilityRef {
+            id: AbilityId::from_bytes([dup_id; 16]),
+            placement: AbilityPlacement::OwnedSpace(shared.space.id.clone()),
+            revision: RevisionId::from_bytes([dup_id; 16]),
+        };
+        let note = NoteRef {
+            space_id: shared.space.id.clone(),
+            note_id: NoteId::from_bytes([dup_id; 16]),
+        };
+        fixture
+            .catalog
+            .ability_entries
+            .lock()
+            .unwrap()
+            .push(AbilityDescriptor {
+                reference: reference.clone(),
+                kind: AbilityKind::Skill,
+                name: "dup-skill".into(),
+                enabled: true,
+                healthy: true,
+                lifecycle: Lifecycle::Active,
+                entrypoint: note.clone(),
+                auxiliary_files: vec![],
+            });
+        fixture.catalog.note_entries.lock().unwrap().insert(
+            (shared.space.id.clone(), note.note_id.clone()),
+            CatalogNote {
+                reference: note,
+                lifecycle: Lifecycle::Active,
+                facts: ResourceFacts {
+                    space: shared.space.clone(),
+                    class: DocClass::Skill,
+                    ancestor_folders: vec![],
+                    folder_write_locked: false,
+                    ability_package: Some(reference.id),
+                },
+            },
+        );
+    }
+    fixture.catalog.abilities_calls.store(0, Ordering::SeqCst);
+    let roles_only = service
+        .discover_abilities(
+            ctx,
+            AbilityQuery {
+                page: ControlPageRequest::new(50, None).unwrap(),
+                project: Some(project_ok),
+                kind: Some(AbilityKind::Role),
+                name: None,
+                authoring: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(roles_only.items.len(), 27);
+    assert_eq!(fixture.catalog.abilities_calls.load(Ordering::SeqCst), 2);
+
+    drop(service);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_selected_project_bindings_and_paged_bulk_discovery() {
+    selected_project_bindings_and_paged_bulk_discovery(false).await;
+}
+#[tokio::test]
+async fn postgres_selected_project_bindings_and_paged_bulk_discovery() {
+    selected_project_bindings_and_paged_bulk_discovery(true).await;
+}

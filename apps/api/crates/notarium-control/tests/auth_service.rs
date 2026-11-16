@@ -3,8 +3,10 @@ use notarium_control::service::AuthenticationMode;
 use notarium_core::{
     DomainError,
     auth::*,
-    error::{CommitEffect, PortError},
+    classes::{AbilityKind, DocClass},
+    error::{CommitEffect, Diagnostic, PortError, ValidationReason},
     ids::*,
+    model::*,
     ports::{control::*, *},
 };
 use std::sync::atomic::Ordering;
@@ -1284,11 +1286,11 @@ async fn committed_recovery(pg: bool) {
     fixture.close().await;
 }
 #[tokio::test]
-async fn sqlite_committed_recovery_regressions() {
+async fn sqlite_committed_space_recovery() {
     committed_recovery(false).await;
 }
 #[tokio::test]
-async fn postgres_committed_recovery_regressions() {
+async fn postgres_committed_space_recovery() {
     committed_recovery(true).await;
 }
 
@@ -1446,10 +1448,332 @@ async fn bootstrap_revocation(pg: bool) {
     }
 }
 #[tokio::test]
-async fn sqlite_bootstrap_revocation_regressions() {
+async fn sqlite_bootstrap_concurrent_revocation() {
     bootstrap_revocation(false).await;
 }
 #[tokio::test]
-async fn postgres_bootstrap_revocation_regressions() {
+async fn postgres_bootstrap_concurrent_revocation() {
     bootstrap_revocation(true).await;
+}
+
+async fn interactive_management_and_account_guards(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let fixture = Fixture::new(pg, "auth_management_guards").await;
+    let control = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let boot = control
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: Some("owner@example.test".into()),
+                display_name: "Owner".into(),
+                password: Some(secret("management fixture password")),
+            },
+        )
+        .await
+        .unwrap();
+    let owner = boot.account.id.clone();
+    let personal_id = boot.account.personal_space.clone().unwrap();
+    let token = boot.session.unwrap().token;
+
+    // Ambient sessions (`human_management = false`) can read identity, cannot perform management
+    // mutations or logout, and never mint `Cap::AbilityWrite` without `human_management`.
+    let ambient_ctx = AccountContext::new(
+        control
+            .resolve(unconfirmed_evidence(
+                AuthEvidenceKind::Session,
+                token.expose(),
+            ))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    control.whoami(ambient_ctx.clone()).await.unwrap();
+    let ambient_with_ability_flag = control
+        .resolve(PreAuthContext {
+            budget: budget(),
+            evidence: AuthEvidence::new(AuthEvidenceKind::Session, token.expose().into())
+                .with_ability_write(),
+        })
+        .await
+        .unwrap();
+    assert!(!ambient_with_ability_flag.human_management());
+    assert!(
+        !ambient_with_ability_flag.has_cap(Cap::AbilityWrite),
+        "Cap::AbilityWrite must never be granted without human_management"
+    );
+    assert!(matches!(
+        control
+            .logout(PreAuthContext {
+                budget: budget(),
+                evidence: AuthEvidence::new(AuthEvidenceKind::Session, token.expose().into()),
+            })
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        control
+            .create_space(
+                ambient_ctx.clone(),
+                AccountMutation {
+                    identity: command(&owner, &owner, 1, boot.account.revision),
+                    input: CreateSpace {
+                        id: SpaceId::from_bytes([21; 16]),
+                        kind: SpaceKind::Shared,
+                        name: "Blocked".into(),
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        control
+            .create_pat(
+                ambient_ctx.clone(),
+                CreatePat {
+                    name: "Blocked".into(),
+                    scope: BearerScope::Read,
+                    selected_spaces: None,
+                    expires_at_ms: None,
+                    expected: boot.account.revision,
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+
+    // Interactive human session (`human_management = true`, `ability_write = false`).
+    let mgmt_ctx = account_context(&control, token.expose()).await;
+    let shared = control
+        .create_space(
+            mgmt_ctx.clone(),
+            AccountMutation {
+                identity: command(
+                    &owner,
+                    &owner,
+                    2,
+                    control
+                        .account(mgmt_ctx.clone(), owner.clone())
+                        .await
+                        .unwrap()
+                        .revision,
+                ),
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([22; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Team".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let mgmt_ctx = account_context(&control, token.expose()).await;
+
+    let project_ok = FolderRef {
+        space_id: shared.space.id.clone(),
+        folder_id: FolderId::from_bytes([23; 16]),
+    };
+    fixture.catalog.project_entries.lock().unwrap().insert(
+        (project_ok.space_id.clone(), project_ok.folder_id.clone()),
+        ProjectInfo {
+            folder: project_ok.clone(),
+            name: "Allowed project".into(),
+        },
+    );
+    fixture.catalog.folder_entries.lock().unwrap().insert(
+        (project_ok.space_id.clone(), project_ok.folder_id.clone()),
+        CatalogFolder {
+            reference: project_ok.clone(),
+            space: shared.space.clone(),
+            lifecycle: Lifecycle::Active,
+            ancestor_folders: vec![],
+            write_locked: false,
+        },
+    );
+
+    let ability_ref = AbilityRef {
+        id: AbilityId::from_bytes([25; 16]),
+        placement: AbilityPlacement::OwnedSpace(shared.space.id.clone()),
+        revision: RevisionId::from_bytes([1; 16]),
+    };
+    let ability_note = NoteRef {
+        space_id: shared.space.id.clone(),
+        note_id: NoteId::from_bytes([26; 16]),
+    };
+    fixture
+        .catalog
+        .ability_entries
+        .lock()
+        .unwrap()
+        .push(AbilityDescriptor {
+            reference: ability_ref.clone(),
+            kind: AbilityKind::Role,
+            name: "selected-guide".into(),
+            enabled: true,
+            healthy: true,
+            lifecycle: Lifecycle::Active,
+            entrypoint: ability_note.clone(),
+            auxiliary_files: vec![],
+        });
+    fixture.catalog.note_entries.lock().unwrap().insert(
+        (shared.space.id.clone(), ability_note.note_id.clone()),
+        CatalogNote {
+            reference: ability_note,
+            lifecycle: Lifecycle::Active,
+            facts: ResourceFacts {
+                space: shared.space,
+                class: DocClass::Skill,
+                ancestor_folders: vec![],
+                folder_write_locked: false,
+                ability_package: Some(ability_ref.id.clone()),
+            },
+        },
+    );
+
+    let rev = control
+        .account(mgmt_ctx.clone(), owner.clone())
+        .await
+        .unwrap()
+        .revision;
+    control
+        .set_favorite(
+            mgmt_ctx.clone(),
+            AccountMutation {
+                identity: command(&owner, &owner, 3, rev),
+                input: SetFavorite {
+                    reference: FavoriteRef::Folder(project_ok.clone()),
+                    saved: true,
+                    rank: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let rev = control
+        .account(mgmt_ctx.clone(), owner.clone())
+        .await
+        .unwrap()
+        .revision;
+    assert!(matches!(
+        control
+            .set_favorite(
+                ambient_ctx,
+                AccountMutation {
+                    identity: command(&owner, &owner, 4, rev),
+                    input: SetFavorite {
+                        reference: FavoriteRef::Folder(project_ok.clone()),
+                        saved: false,
+                        rank: 1,
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        control
+            .update_ability_binding(
+                mgmt_ctx.clone(),
+                AccountMutation {
+                    identity: command(&owner, &owner, 5, rev),
+                    input: AbilityBindingUpdate {
+                        ability: ability_ref,
+                        enabled: true,
+                        expected: ControlRevision::ZERO,
+                        projects: AbilityProjects::Selected(vec![project_ok]),
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AbilityWriteForbidden))
+    ));
+
+    // Personal Space cannot be archived; malformed email and duplicate username return typed validation errors.
+    let personal_history = fixture
+        .catalog
+        .entries
+        .lock()
+        .unwrap()
+        .get(&personal_id)
+        .unwrap()
+        .2
+        .history
+        .clone();
+    let personal_ctx =
+        SpaceContext::new(mgmt_ctx.auth().clone(), personal_history, budget()).unwrap();
+    assert!(matches!(
+        control
+            .change_space_lifecycle(
+                personal_ctx,
+                SpaceLifecycleChange {
+                    command: CommandKey::from_bytes([41; 16]),
+                    lifecycle: SpaceLifecycle::Archived,
+                    expected: ControlRevision::ZERO,
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(matches!(
+        control
+            .create_account(
+                mgmt_ctx.clone(),
+                AccountMutation {
+                    identity: command(&owner, &owner, 42, rev),
+                    input: NewAccount {
+                        username: "alice".into(),
+                        email: Some("invalid-email-without-at".into()),
+                        display_name: "Alice".into(),
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ValidationFailed {
+            diagnostic: Diagnostic {
+                reason: ValidationReason::InvalidQuery,
+                ..
+            }
+        }))
+    ));
+    assert!(matches!(
+        control
+            .create_account(
+                mgmt_ctx.clone(),
+                AccountMutation {
+                    identity: command(&owner, &owner, 43, rev),
+                    input: NewAccount {
+                        username: "owner".into(),
+                        email: None,
+                        display_name: "Duplicate".into(),
+                    },
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ValidationFailed {
+            diagnostic: Diagnostic {
+                reason: ValidationReason::DuplicateKey,
+                ..
+            }
+        }))
+    ));
+
+    control
+        .logout(evidence(AuthEvidenceKind::Session, token.expose()))
+        .await
+        .unwrap();
+
+    drop(control);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_interactive_management_attestation_and_account_guards() {
+    interactive_management_and_account_guards(false).await;
+}
+#[tokio::test]
+async fn postgres_interactive_management_attestation_and_account_guards() {
+    interactive_management_and_account_guards(true).await;
 }

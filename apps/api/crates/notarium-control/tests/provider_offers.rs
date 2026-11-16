@@ -5,7 +5,7 @@ mod support;
 use notarium_control::{
     outbound::{NetworkPolicy, OutboundTransport},
     service::{
-        AuthenticationMode, ControlService,
+        AuthenticationMode, ControlPlane, ControlService,
         provider::{ProviderConfig, ProviderService},
     },
 };
@@ -928,4 +928,215 @@ async fn sqlite_offers_support_first_consent_without_management_authority() {
 #[tokio::test]
 async fn postgres_offers_support_first_consent_without_management_authority() {
     offers(true).await;
+}
+
+async fn preferences_by_model_kind(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(pg, "provider_preferences_by_kind").await;
+    let keys = keyring(&mut fixture).await;
+    let control = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let boot = control
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: None,
+                display_name: "Owner".into(),
+                password: Some(SecretString::new(
+                    "provider preference fixture password".into(),
+                )),
+            },
+        )
+        .await
+        .unwrap();
+    let owner = boot.account.id.clone();
+    let personal_id = boot.account.personal_space.clone().unwrap();
+    let token = boot.session.unwrap().token;
+    let ctx = AccountContext::new(
+        control
+            .resolve(evidence(AuthEvidenceKind::Session, token.expose()))
+            .await
+            .unwrap(),
+        budget(),
+    );
+
+    let provider = ProviderService::new(
+        control.clone(),
+        keys,
+        Arc::new(OutboundTransport::new(NetworkPolicy::default())),
+        Arc::new(NoEgress),
+        ProviderConfig::default(),
+    )
+    .unwrap();
+    provider
+        .create_credential(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 1).await,
+                input: credential_input("secret-key"),
+            },
+        )
+        .await
+        .unwrap();
+    let mut res_spec = resource_input();
+    res_spec.timeout_ms = 90_000;
+    let resource = provider
+        .create_resource(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 2).await,
+                input: res_spec,
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(resource.timeout_ms, 90_000);
+
+    let completion_model = ModelProfileId::from_bytes([31; 16]);
+    let embedding_model = ModelProfileId::from_bytes([32; 16]);
+    provider
+        .put_model(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 3).await,
+                input: PutProviderModel {
+                    resource: resource.id.clone(),
+                    expected: resource.revision,
+                    model: ProviderModelSpec {
+                        id: completion_model.clone(),
+                        wire_name: "gpt-4o".into(),
+                        kind: ProviderModelKind::Completion,
+                        accounting: TokenAccountingProfile::ConservativeModelCapV1,
+                        max_input_tokens: 128_000,
+                        max_output_tokens: 4_096,
+                        tools: true,
+                    },
+                    default: true,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let current_res = current_resource(&provider, &ctx).await;
+    provider
+        .put_model(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 4).await,
+                input: PutProviderModel {
+                    resource: resource.id.clone(),
+                    expected: current_res.revision,
+                    model: ProviderModelSpec {
+                        id: embedding_model.clone(),
+                        wire_name: "text-embedding-3-small".into(),
+                        kind: ProviderModelKind::Embedding { dimension: 1536 },
+                        accounting: TokenAccountingProfile::ConservativeModelCapV1,
+                        max_input_tokens: 8_192,
+                        max_output_tokens: 0,
+                        tools: false,
+                    },
+                    default: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let _attachment = offer(
+        &control,
+        &provider,
+        &ctx,
+        5,
+        ProviderAttachmentTarget::Personal {
+            owner,
+            space: personal_id.clone(),
+        },
+        None,
+    )
+    .await;
+
+    let plane = ControlPlane::new(provider);
+    plane
+        .update_provider_preference(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 6).await,
+                input: SetProviderPreference {
+                    scope: ProviderPreferenceScope::Personal,
+                    kind: PreferenceModelKind::Completion,
+                    resource: resource.id.clone(),
+                    model: completion_model.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    plane
+        .update_provider_preference(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 7).await,
+                input: SetProviderPreference {
+                    scope: ProviderPreferenceScope::Personal,
+                    kind: PreferenceModelKind::Embedding,
+                    resource: resource.id,
+                    model: embedding_model.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let personal_history = fixture
+        .catalog
+        .entries
+        .lock()
+        .unwrap()
+        .get(&personal_id)
+        .unwrap()
+        .2
+        .history
+        .clone();
+    let space_ctx = scope(&ctx, &personal_history);
+    let selected_completion = plane
+        .select_provider(
+            space_ctx.clone(),
+            SelectProvider {
+                kind: PreferenceModelKind::Completion,
+                resource: None,
+                model: None,
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+    let selected_embedding = plane
+        .select_provider(
+            space_ctx,
+            SelectProvider {
+                kind: PreferenceModelKind::Embedding,
+                resource: None,
+                model: None,
+                project: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected_completion.model, completion_model);
+    assert_eq!(selected_embedding.model, embedding_model);
+
+    drop(plane);
+    drop(control);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_completion_and_embedding_preferences_coexist_by_kind() {
+    preferences_by_model_kind(false).await;
+}
+#[tokio::test]
+async fn postgres_completion_and_embedding_preferences_coexist_by_kind() {
+    preferences_by_model_kind(true).await;
 }

@@ -2,15 +2,20 @@
 mod support;
 use notarium_control::service::{AuthenticationMode, ControlService};
 use notarium_core::{
+    DomainError,
     auth::*,
     classes::{AbilityKind, DocClass},
+    error::{PortError, ValidationReason},
     ids::*,
     model::*,
     ports::{control::*, *},
     receipt::AccountCommandIdentity,
     value::Timestamp,
 };
-use std::{collections::BTreeSet, sync::atomic::Ordering};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::atomic::Ordering,
+};
 use support::*;
 
 fn tick(ms: i64) -> Timestamp {
@@ -896,4 +901,373 @@ async fn sqlite_schedule_claims_and_authority() {
 #[tokio::test]
 async fn postgres_schedule_claims_and_authority() {
     exercise(true).await;
+}
+
+async fn role_placement_scope_and_run_inspection_access(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let fixture = Fixture::new(pg, "schedules_role_scope").await;
+    let control = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let boot = control
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: Some("owner@example.test".into()),
+                display_name: "Owner".into(),
+                password: Some(SecretString::new("schedule scope fixture password".into())),
+            },
+        )
+        .await
+        .unwrap();
+    let raw_token = boot.session.unwrap().token;
+    let mut aw_ev = evidence(AuthEvidenceKind::Session, raw_token.expose());
+    aw_ev.evidence = aw_ev.evidence.with_ability_write();
+    let ctx = AccountContext::new(control.resolve(aw_ev).await.unwrap(), budget());
+
+    let shared_a = control
+        .create_space(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 1).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([31; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Shared A".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let shared_b = control
+        .create_space(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 2).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([32; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "Shared B".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let mut aw_ev = evidence(AuthEvidenceKind::Session, raw_token.expose());
+    aw_ev.evidence = aw_ev.evidence.with_ability_write();
+    let ctx = AccountContext::new(control.resolve(aw_ev).await.unwrap(), budget());
+
+    let project_a1 = FolderRef {
+        space_id: shared_a.space.id.clone(),
+        folder_id: FolderId::from_bytes([41; 16]),
+    };
+    let project_a2 = FolderRef {
+        space_id: shared_a.space.id.clone(),
+        folder_id: FolderId::from_bytes([42; 16]),
+    };
+    let project_b = FolderRef {
+        space_id: shared_b.space.id.clone(),
+        folder_id: FolderId::from_bytes([43; 16]),
+    };
+    for (proj, title) in [
+        (&project_a1, "Project A1"),
+        (&project_a2, "Project A2"),
+        (&project_b, "Project B"),
+    ] {
+        fixture.catalog.project_entries.lock().unwrap().insert(
+            (proj.space_id.clone(), proj.folder_id.clone()),
+            ProjectInfo {
+                folder: proj.clone(),
+                name: title.into(),
+            },
+        );
+    }
+
+    let seed_role = |space: &Space,
+                     placement: AbilityPlacement,
+                     id: u8,
+                     name: &str,
+                     ancestors: Vec<FolderId>| {
+        let reference = AbilityRef {
+            id: AbilityId::from_bytes([id; 16]),
+            placement,
+            revision: RevisionId::from_bytes([id; 16]),
+        };
+        let note = NoteRef {
+            space_id: space.id.clone(),
+            note_id: NoteId::from_bytes([id; 16]),
+        };
+        fixture
+            .catalog
+            .ability_entries
+            .lock()
+            .unwrap()
+            .push(AbilityDescriptor {
+                reference: reference.clone(),
+                kind: AbilityKind::Role,
+                name: name.into(),
+                enabled: true,
+                healthy: true,
+                lifecycle: Lifecycle::Active,
+                entrypoint: note.clone(),
+                auxiliary_files: vec![],
+            });
+        fixture.catalog.note_entries.lock().unwrap().insert(
+            (space.id.clone(), note.note_id.clone()),
+            CatalogNote {
+                reference: note,
+                lifecycle: Lifecycle::Active,
+                facts: ResourceFacts {
+                    space: space.clone(),
+                    class: DocClass::Skill,
+                    ancestor_folders: ancestors,
+                    folder_write_locked: false,
+                    ability_package: Some(reference.id.clone()),
+                },
+            },
+        );
+        reference
+    };
+
+    let role_pa1 = seed_role(
+        &shared_a.space,
+        AbilityPlacement::OwnedProject(project_a1.clone()),
+        50,
+        "role-pa1",
+        vec![project_a1.folder_id.clone()],
+    );
+    let role_space_a = seed_role(
+        &shared_a.space,
+        AbilityPlacement::OwnedSpace(shared_a.space.id.clone()),
+        51,
+        "role-space-a",
+        vec![],
+    );
+
+    // Role placement scope enforced in episodes.
+    let ep_id = EpisodeId::from_bytes([70; 16]);
+    control
+        .start_or_resume_episode(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 3).await,
+                input: StartEpisode {
+                    selector: EpisodeSelector::New {
+                        requested: ep_id.clone(),
+                        name: Some("scope-ep".into()),
+                    },
+                    project_hint: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    for bad_project in [None, Some(project_a2.clone()), Some(project_b.clone())] {
+        let err = control
+            .update_episode(
+                ctx.clone(),
+                AccountMutation {
+                    identity: identity(&control, &ctx, 4).await,
+                    input: EpisodeUpdate {
+                        episode: ep_id.clone(),
+                        expected: ControlRevision::new(1).unwrap(),
+                        name: Some("scope-ep".into()),
+                        active_role: Some(role_pa1.clone()),
+                        project_hint: bad_project,
+                        lifecycle: EpisodeLifecycle::Active,
+                    },
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PortError::Domain(DomainError::ResourceNotFound)
+        ));
+    }
+    let cross_space_err = control
+        .update_episode(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 5).await,
+                input: EpisodeUpdate {
+                    episode: ep_id.clone(),
+                    expected: ControlRevision::new(1).unwrap(),
+                    name: Some("scope-ep".into()),
+                    active_role: Some(role_space_a),
+                    project_hint: Some(project_b),
+                    lifecycle: EpisodeLifecycle::Active,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        cross_space_err,
+        PortError::Domain(DomainError::ResourceNotFound)
+    ));
+
+    let updated_ep = control
+        .update_episode(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 6).await,
+                input: EpisodeUpdate {
+                    episode: ep_id,
+                    expected: ControlRevision::new(1).unwrap(),
+                    name: Some("scope-ep".into()),
+                    active_role: Some(role_pa1.clone()),
+                    project_hint: Some(project_a1.clone()),
+                    lifecycle: EpisodeLifecycle::Active,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(updated_ep.active_role, Some(role_pa1.clone()));
+
+    // Space-wide schedule (`project: None`) rejects project-scoped role `role_pa1`.
+    let now_ts = Timestamp::parse("2023-11-14T22:15:00Z").unwrap();
+    let bad_sched = control
+        .create_schedule(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 7).await,
+                input: CreateSchedule {
+                    id: ScheduleId::from_bytes([71; 16]),
+                    definition: ScheduleDefinition {
+                        space: shared_a.space.id.clone(),
+                        project: None,
+                        title: "Project role on space schedule".into(),
+                        init_prompt: "Check".into(),
+                        cron: "0 */5 * * * *".into(),
+                        timezone: "UTC".into(),
+                        approved_role: role_pa1.clone(),
+                        limits: RunLimits::default(),
+                    },
+                    next_slot: now_ts,
+                    paused: false,
+                },
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        bad_sched,
+        PortError::Domain(DomainError::ValidationFailed { diagnostic })
+            if diagnostic.reason == ValidationReason::InvalidState
+    ));
+
+    // Project-pinned schedule claimed -> Keeper inspects its own run via revalidated read,
+    // while narrowed credentials outside the target Space or project receive ResourceNotFound.
+    let good_sched_id = ScheduleId::from_bytes([72; 16]);
+    control
+        .create_schedule(
+            ctx.clone(),
+            AccountMutation {
+                identity: identity(&control, &ctx, 8).await,
+                input: CreateSchedule {
+                    id: good_sched_id.clone(),
+                    definition: ScheduleDefinition {
+                        space: shared_a.space.id.clone(),
+                        project: Some(project_a1),
+                        title: "Project A1 schedule".into(),
+                        init_prompt: "Check".into(),
+                        cron: "0 */5 * * * *".into(),
+                        timezone: "UTC".into(),
+                        approved_role: role_pa1.clone(),
+                        limits: RunLimits::default(),
+                    },
+                    next_slot: Timestamp::parse("2023-11-14T22:15:00Z").unwrap(),
+                    paused: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    fixture.clock.0.store(1_700_000_100_000, Ordering::SeqCst);
+    let (claimed_run, keeper_space_ctx) = match control
+        .claim_schedule(
+            scheduler(),
+            ClaimSchedule {
+                schedule: good_sched_id.clone(),
+                slot: Timestamp::parse("2023-11-14T22:15:00Z").unwrap(),
+                next_slot: Timestamp::parse("2023-11-14T22:20:00Z").unwrap(),
+                current_role: role_pa1,
+                expected: ControlRevision::ZERO,
+            },
+        )
+        .await
+        .unwrap()
+    {
+        ScheduleClaim::Claimed { run, context, .. } => (run, context),
+        other => panic!("expected Claimed, got {other:?}"),
+    };
+    let keeper_owner_ctx = ScheduleRunContext::Owner(Box::new(AccountContext::new(
+        keeper_space_ctx.auth().clone(),
+        budget(),
+    )));
+    let run_receipt = control
+        .get_schedule_run(keeper_owner_ctx, good_sched_id.clone(), claimed_run.clone())
+        .await
+        .unwrap();
+    assert_eq!(run_receipt.run, claimed_run);
+
+    let pat_shared_b = ctx
+        .auth()
+        .for_pat(BTreeMap::from([(
+            shared_b.space.id.clone(),
+            ctx.auth().spaces().get(&shared_b.space.id).unwrap().clone(),
+        )]))
+        .unwrap();
+    let narrowed_err = control
+        .list_schedule_runs(
+            ScheduleRunContext::Owner(Box::new(AccountContext::new(pat_shared_b, budget()))),
+            good_sched_id.clone(),
+            ControlPageRequest::new(10, None).unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        narrowed_err,
+        PortError::Domain(DomainError::ResourceNotFound)
+    ));
+
+    let wrong_proj_auth = ctx
+        .auth()
+        .for_keeper(
+            AgentRunId::from_bytes([73; 16]),
+            shared_a.space.id,
+            Some(project_a2.folder_id),
+            BTreeSet::new(),
+        )
+        .unwrap();
+    let wrong_proj_err = control
+        .get_schedule_run(
+            ScheduleRunContext::Owner(Box::new(AccountContext::new(wrong_proj_auth, budget()))),
+            good_sched_id,
+            claimed_run,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        wrong_proj_err,
+        PortError::Domain(DomainError::ResourceNotFound)
+    ));
+
+    drop(control);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_role_placement_scope_and_run_inspection_access() {
+    role_placement_scope_and_run_inspection_access(false).await;
+}
+#[tokio::test]
+async fn postgres_role_placement_scope_and_run_inspection_access() {
+    role_placement_scope_and_run_inspection_access(true).await;
 }

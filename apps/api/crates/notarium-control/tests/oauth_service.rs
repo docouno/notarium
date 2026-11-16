@@ -1,4 +1,7 @@
 #[allow(dead_code)]
+#[path = "support/provider.rs"]
+mod provider;
+#[allow(dead_code)]
 mod support;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use notarium_control::{
@@ -8,6 +11,7 @@ use notarium_control::{
     service::{
         AuthenticationMode, ControlService,
         oauth::{OAuthConfig, OAuthService},
+        oidc::{OidcClientAuthentication, OidcProviderConfig, OidcService},
     },
     store::TargetRecord,
 };
@@ -18,6 +22,7 @@ use notarium_core::{
     ids::*,
     ports::{control::*, *},
 };
+use provider::keyring;
 use std::{
     path::PathBuf,
     sync::{Arc, atomic::Ordering},
@@ -732,4 +737,305 @@ async fn both_databases_imported_native_tokens_keep_their_verifiers_and_expiry()
         drop(control);
         f.close().await;
     }
+}
+
+async fn refresh_tombstones_and_family_gc(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(pg, "oauth_tombstone_retention").await;
+    let keys = keyring(&mut fixture).await;
+    let control = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let boot = control
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: Some("owner@example.test".into()),
+                display_name: "Owner".into(),
+                password: Some(secret("oauth tombstone fixture password")),
+            },
+        )
+        .await
+        .unwrap();
+    let session = boot.session.unwrap();
+    let ctx = context(&control, session.token.expose()).await;
+    let oauth = Arc::new(
+        OAuthService::new(
+            control.clone(),
+            keys,
+            Arc::new(OutboundTransport::new(NetworkPolicy::default())),
+            OAuthConfig {
+                issuer: "https://auth.example/".into(),
+                authorization_endpoint: "https://auth.example/authorize".into(),
+                token_endpoint: "https://auth.example/token".into(),
+                registration_endpoint: "https://auth.example/register".into(),
+                revocation_endpoint: "https://auth.example/revoke".into(),
+            },
+        )
+        .unwrap(),
+    );
+
+    let client = oauth
+        .register_client(
+            budget(),
+            RegisterOAuthClient {
+                client_name: "CLI".into(),
+                redirect_uris: vec!["http://127.0.0.1:54321/callback".into()],
+            },
+        )
+        .await
+        .unwrap();
+
+    let issue_offline = |ctx: AccountContext| {
+        let oauth = oauth.clone();
+        let client_id = client.client_id.clone();
+        async move {
+            let prepared = oauth
+                .prepare_authorization(
+                    ctx.clone(),
+                    PrepareOAuthAuthorization {
+                        client_id: client_id.clone(),
+                        redirect_uri: "http://127.0.0.1:54321/callback".into(),
+                        resource: "https://resource.example/".into(),
+                        scope: "read offline_access".into(),
+                        selected_spaces: Some(vec![]),
+                        code_challenge: URL_SAFE_NO_PAD.encode(token::digest(VERIFIER.as_bytes())),
+                        code_challenge_method: "S256".into(),
+                        browser_binding: secret(BROWSER),
+                    },
+                )
+                .await
+                .unwrap();
+            let approved = oauth
+                .approve_authorization(
+                    ctx,
+                    OAuthConsent::attest_checked(prepared.intent, secret(BROWSER)),
+                )
+                .await
+                .unwrap();
+            oauth
+                .exchange_code(
+                    budget(),
+                    ExchangeOAuthCode {
+                        client_id,
+                        code: approved.code,
+                        redirect_uri: "http://127.0.0.1:54321/callback".into(),
+                        resource: "https://resource.example/".into(),
+                        code_verifier: secret(VERIFIER),
+                    },
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    // Family 1 rotates RT_1 -> RT_2; Family 2 remains unrotated (`revoked_at IS NULL`) until expiry.
+    let first = issue_offline(ctx).await;
+    let rt1 = first.refresh_token.unwrap().expose().to_owned();
+    let rotated = oauth
+        .refresh(
+            budget(),
+            RefreshOAuthToken {
+                client_id: client.client_id.clone(),
+                refresh_token: secret(&rt1),
+                resource: "https://resource.example/".into(),
+                scope: None,
+            },
+        )
+        .await
+        .unwrap();
+    let rt2 = rotated.refresh_token.unwrap().expose().to_owned();
+    let _second = issue_offline(context(&control, session.token.expose()).await).await;
+
+    // Advance +8 days (> 7d, < 30d refresh lifetime) and run retention cleanup.
+    let t0 = fixture.clock.0.load(Ordering::SeqCst);
+    fixture.clock.0.store(t0 + 8 * 86_400_000, Ordering::SeqCst);
+    control
+        .cleanup_telemetry(
+            MaintenanceContext {
+                authority: ServiceAuthority::admit(ServicePurpose::Telemetry),
+                budget: budget(),
+            },
+            200,
+        )
+        .await
+        .unwrap();
+
+    // Rotated RT_1 tombstone remains intact on day 8 so replay revokes the active family.
+    assert_eq!(
+        fixture
+            .observer
+            .count("SELECT COUNT(*) FROM oauth_refresh_tokens")
+            .await,
+        3,
+        "rotated refresh tombstone must not be deleted before expires_at + 7d"
+    );
+    oauth_error(
+        oauth
+            .refresh(
+                budget(),
+                RefreshOAuthToken {
+                    client_id: client.client_id.clone(),
+                    refresh_token: secret(&rt1),
+                    resource: "https://resource.example/".into(),
+                    scope: None,
+                },
+            )
+            .await,
+        OAuthErrorCode::InvalidGrant,
+    );
+    assert_eq!(
+        fixture
+            .observer
+            .count("SELECT COUNT(*) FROM oauth_refresh_families WHERE reason_code='refresh_reuse' AND revoked_at IS NOT NULL")
+            .await,
+        1,
+        "replaying stolen RT_1 on day 8 must revoke the active OAuth family"
+    );
+    assert!(
+        oauth
+            .refresh(
+                budget(),
+                RefreshOAuthToken {
+                    client_id: client.client_id.clone(),
+                    refresh_token: secret(&rt2),
+                    resource: "https://resource.example/".into(),
+                    scope: None,
+                },
+            )
+            .await
+            .is_err(),
+        "live successor RT_2 must be rejected once RT_1 reuse revokes the family"
+    );
+
+    // Advance +40 days (> 30d expiry + 7d retention) and verify both tokens and families prune.
+    fixture
+        .clock
+        .0
+        .store(t0 + 40 * 86_400_000, Ordering::SeqCst);
+    control
+        .cleanup_telemetry(
+            MaintenanceContext {
+                authority: ServiceAuthority::admit(ServicePurpose::Telemetry),
+                budget: budget(),
+            },
+            200,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .observer
+            .count("SELECT COUNT(*) FROM oauth_refresh_tokens")
+            .await,
+        0
+    );
+    assert_eq!(
+        fixture
+            .observer
+            .count("SELECT COUNT(*) FROM oauth_refresh_families")
+            .await,
+        0,
+        "both revoked and naturally expired unrevoked families must be pruned once childless"
+    );
+
+    drop(oauth);
+    drop(control);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_refresh_tombstones_survive_until_expiry_and_reap_expired_families() {
+    refresh_tombstones_and_family_gc(false).await;
+}
+#[tokio::test]
+async fn postgres_refresh_tombstones_survive_until_expiry_and_reap_expired_families() {
+    refresh_tombstones_and_family_gc(true).await;
+}
+
+async fn oidc_prevalidation_and_link_freshness(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(pg, "oidc_prevalidation").await;
+    let keys = keyring(&mut fixture).await;
+    let control = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let boot = control
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: Some("owner@example.test".into()),
+                display_name: "Owner".into(),
+                password: Some(secret("oidc prevalidation fixture password")),
+            },
+        )
+        .await
+        .unwrap();
+    let token = boot.session.unwrap().token;
+    let ctx = context(&control, token.expose()).await;
+
+    let oidc = OidcService::new(
+        control.clone(),
+        keys,
+        Arc::new(OutboundTransport::new(NetworkPolicy::default())),
+        vec![OidcProviderConfig {
+            issuer: "https://idp.example/".into(),
+            client_id: "notarium-web".into(),
+            redirect_uri: "https://app.example/callback".into(),
+            authentication: OidcClientAuthentication::Public,
+            trusted_additional_audiences: vec![],
+        }],
+    )
+    .unwrap();
+    for _ in 0..100 {
+        assert!(matches!(
+            oidc.begin_login(
+                budget(),
+                BeginOidcLogin {
+                    issuer: "https://unknown-issuer.example/".into(),
+                    browser_binding: secret(BROWSER),
+                },
+            )
+            .await,
+            Err(PortError::Domain(DomainError::AuthenticationFailed))
+        ));
+        oauth_error(
+            oidc.begin_login(
+                budget(),
+                BeginOidcLogin {
+                    issuer: "https://idp.example/".into(),
+                    browser_binding: secret("short"),
+                },
+            )
+            .await,
+            OAuthErrorCode::InvalidRequest,
+        );
+    }
+
+    // Sessions older than 5 minutes fail OIDC link initiation with AccessDenied rather than RateLimited.
+    fixture.clock.0.fetch_add(6 * 60_000, Ordering::SeqCst);
+    assert!(matches!(
+        oidc.begin_link(
+            ctx,
+            BeginOidcLogin {
+                issuer: "https://idp.example/".into(),
+                browser_binding: secret(BROWSER),
+            },
+        )
+        .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+
+    drop(oidc);
+    drop(control);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_oidc_prevalidation_and_link_freshness() {
+    oidc_prevalidation_and_link_freshness(false).await;
+}
+#[tokio::test]
+async fn postgres_oidc_prevalidation_and_link_freshness() {
+    oidc_prevalidation_and_link_freshness(true).await;
 }
