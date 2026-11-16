@@ -164,9 +164,10 @@ impl OidcService {
         ctx: AccountContext,
         request: AccountMutation<BindOidcIdentity>,
     ) -> Result<ControlCommit<OidcIdentity>, PortError> {
-        let _admission = super::admit()?;
+        ctx.auth().authorize_human_management()?;
         self.provider(&request.input.issuer)?;
         valid_identity(&request.input.issuer, &request.input.subject)?;
+        let _admission = self.admit()?;
         let command = Command::new(request.identity, "bind-oidc", &request.input)?;
         command.require(ctx.auth().principal(), &request.input.account)?;
         let budget = OperationBudget::new(ctx.budget.clone());
@@ -216,8 +217,9 @@ impl OidcService {
         ctx: AccountContext,
         request: AccountMutation<UnlinkOidcIdentity>,
     ) -> Result<ControlCommit<()>, PortError> {
-        let _admission = super::admit()?;
+        ctx.auth().authorize_human_management()?;
         valid_identity(&request.input.issuer, &request.input.subject)?;
+        let _admission = self.admit()?;
         let command = Command::new(request.identity, "unlink-oidc", &request.input)?;
         command.require(ctx.auth().principal(), &request.input.account)?;
         let budget = OperationBudget::new(ctx.budget.clone());

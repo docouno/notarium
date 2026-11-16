@@ -84,6 +84,24 @@ pub(super) async fn epochs(
         Ok(None)
     }
 }
+pub(super) async fn epochs_read(
+    tx: &mut Transaction,
+    resource: &ProviderResourcesRow,
+) -> Result<Option<i64>, PortError> {
+    if resource.disabled_at.is_some() {
+        return Err(DomainError::AccessDenied.into());
+    }
+    if let Some(id) = &resource.credential_id {
+        let credential = credential_read(tx, id).await?;
+        owned(&resource.owner_id, &credential.owner_id)?;
+        if credential.disabled_at.is_some() {
+            return Err(DomainError::AccessDenied.into());
+        }
+        Ok(Some(credential.consent_epoch))
+    } else {
+        Ok(None)
+    }
+}
 pub(super) async fn bump(
     tx: &mut Transaction,
     resource: &ProviderResourcesRow,
@@ -189,10 +207,10 @@ impl ProviderService {
                 revision(old.revision,input.expected.ok_or_else(||invalid(ValidationReason::InvalidState))?)?;next(old.revision)?
             } else {if input.expected.is_some(){return Err(DomainError::ResourceNotFound.into());} 0};
             let row=ProviderAttachmentsRow{id:input.id.to_string(),resource_id:resource.id.clone(),target_kind:kind.into(),target_owner,target_space:space.to_string(),target_project,resource_epoch:resource.consent_epoch,credential_epoch,state:state.into(),disclosure:json(input.consent.disclosure())?,expires_at:input.expires_at_ms,revision:rev};
-            TargetRecord::ProviderAttachments(row.clone()).validate()?;
+            TargetRecord::from(row.clone()).validate()?;
             if old.is_some() {
                 execute!(tx,"UPDATE provider_attachments SET resource_epoch=$1,credential_epoch=$2,state=$3,disclosure=$4,expires_at=$5,revision=$6 WHERE id=$7","UPDATE v1_control.provider_attachments SET resource_epoch=$1,credential_epoch=$2,state=$3,disclosure=$4,expires_at=$5,revision=$6 WHERE id=$7";row.resource_epoch,row.credential_epoch,&row.state,&row.disclosure,row.expires_at,row.revision,&row.id)?;
-            } else {TargetRecord::ProviderAttachments(row.clone()).insert(tx).await?;}
+            } else {TargetRecord::from(row.clone()).insert_or_conflict(tx).await?;}
             bump(tx,&resource).await?;
             Ok((attachment_info(&row)?,vec![RevocationSelector::ProviderResource(input.resource)]))
         })).await

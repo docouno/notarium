@@ -1,7 +1,7 @@
 use super::super::{commands::Command, spaces::require_owner};
 use super::{
     ProviderService,
-    attachments::{check_member, epochs},
+    attachments::{check_member, epochs, epochs_read},
     records::*,
 };
 use crate::{
@@ -53,11 +53,30 @@ fn active(
         && row.credential_epoch == credential_epoch
         && row.expires_at.is_none_or(|time| time > now)
 }
+fn model_kind_name(kind: PreferenceModelKind) -> &'static str {
+    match kind {
+        PreferenceModelKind::Completion => "completion",
+        PreferenceModelKind::Embedding => "embedding",
+    }
+}
+fn matches_preference_kind(actual: &ProviderModelKind, wanted: PreferenceModelKind) -> bool {
+    matches!(
+        (actual, wanted),
+        (
+            ProviderModelKind::Completion,
+            PreferenceModelKind::Completion
+        ) | (
+            ProviderModelKind::Embedding { .. },
+            PreferenceModelKind::Embedding
+        )
+    )
+}
 pub(super) struct PolicyAdmission {
     pub policy: ProviderPolicy,
     pub project_only: Option<FolderRef>,
     pub expires_at_ms: Option<i64>,
 }
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn policy(
     tx: &mut Transaction,
     auth: &EngineAuthContext,
@@ -66,6 +85,7 @@ pub(super) async fn policy(
     space: &Space,
     project: Option<&FolderRef>,
     now: i64,
+    lock: bool,
 ) -> Result<PolicyAdmission, PortError> {
     // Current-auth revalidation already holds shared Space admission. Policy
     // checks must not upgrade it after taking resource/credential locks.
@@ -73,17 +93,33 @@ pub(super) async fn policy(
     if space.lifecycle != SpaceLifecycle::Active {
         return Err(unavailable());
     }
-    let personal=rows!(tx,ProviderAttachmentsRow,fetch_optional,
-        "SELECT * FROM provider_attachments WHERE resource_id=$1 AND target_kind='personal' AND target_owner=$2 AND target_space=$3",
-        "SELECT * FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_kind='personal' AND target_owner=$2 AND target_space=$3 FOR SHARE";&resource.id,auth.principal().as_str(),space.id.as_str())?.filter(|row|active(row,resource,credential_epoch,now)).ok_or_else(unavailable)?;
+    let personal = if lock {
+        rows!(tx,ProviderAttachmentsRow,fetch_optional,
+            "SELECT * FROM provider_attachments WHERE resource_id=$1 AND target_kind='personal' AND target_owner=$2 AND target_space=$3",
+            "SELECT * FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_kind='personal' AND target_owner=$2 AND target_space=$3 FOR SHARE";&resource.id,auth.principal().as_str(),space.id.as_str())?
+    } else {
+        rows!(tx,ProviderAttachmentsRow,fetch_optional,
+            "SELECT * FROM provider_attachments WHERE resource_id=$1 AND target_kind='personal' AND target_owner=$2 AND target_space=$3",
+            "SELECT * FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_kind='personal' AND target_owner=$2 AND target_space=$3";&resource.id,auth.principal().as_str(),space.id.as_str())?
+    }
+    .filter(|row| active(row, resource, credential_epoch, now))
+    .ok_or_else(unavailable)?;
     let mut disclosure: ProviderDisclosure = parse(&personal.disclosure)?;
     let mut project_only = None;
     let mut expires_at_ms = personal.expires_at;
     let audience = if space.kind == SpaceKind::Personal {
         ProviderAudience::Personal { consented: true }
     } else {
-        let shared =
-            shared_attachment(tx, resource, credential_epoch, &space.id, project, now).await?;
+        let shared = shared_attachment(
+            tx,
+            resource,
+            credential_epoch,
+            &space.id,
+            project,
+            now,
+            lock,
+        )
+        .await?;
         expires_at_ms = [expires_at_ms, shared.expires_at]
             .into_iter()
             .flatten()
@@ -132,15 +168,27 @@ async fn shared_attachment(
     space: &SpaceId,
     project: Option<&FolderRef>,
     now: i64,
+    lock: bool,
 ) -> Result<ProviderAttachmentsRow, PortError> {
-    let global = rows!(tx,ProviderAttachmentsRow,fetch_optional,"SELECT * FROM provider_attachments WHERE resource_id=$1 AND target_kind='space' AND target_space=$2","SELECT * FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_kind='space' AND target_space=$2 FOR SHARE";&resource.id,space.as_str())?;
+    let global = if lock {
+        rows!(tx,ProviderAttachmentsRow,fetch_optional,"SELECT * FROM provider_attachments WHERE resource_id=$1 AND target_kind='space' AND target_space=$2","SELECT * FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_kind='space' AND target_space=$2 FOR SHARE";&resource.id,space.as_str())?
+    } else {
+        rows!(tx,ProviderAttachmentsRow,fetch_optional,"SELECT * FROM provider_attachments WHERE resource_id=$1 AND target_kind='space' AND target_space=$2","SELECT * FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_kind='space' AND target_space=$2";&resource.id,space.as_str())?
+    };
     if let Some(row) = global.filter(|row| active(row, resource, credential_epoch, now)) {
         return Ok(row);
     }
     let project = project
         .filter(|project| project.space_id == *space)
         .ok_or_else(unavailable)?;
-    rows!(tx,ProviderAttachmentsRow,fetch_optional,"SELECT * FROM provider_attachments WHERE resource_id=$1 AND target_kind='project' AND target_space=$2 AND target_project=$3","SELECT * FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_kind='project' AND target_space=$2 AND target_project=$3 FOR SHARE";&resource.id,space.as_str(),project.folder_id.as_str())?.filter(|row|active(row,resource,credential_epoch,now)).ok_or_else(unavailable)
+    let scoped = if lock {
+        rows!(tx,ProviderAttachmentsRow,fetch_optional,"SELECT * FROM provider_attachments WHERE resource_id=$1 AND target_kind='project' AND target_space=$2 AND target_project=$3","SELECT * FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_kind='project' AND target_space=$2 AND target_project=$3 FOR SHARE";&resource.id,space.as_str(),project.folder_id.as_str())?
+    } else {
+        rows!(tx,ProviderAttachmentsRow,fetch_optional,"SELECT * FROM provider_attachments WHERE resource_id=$1 AND target_kind='project' AND target_space=$2 AND target_project=$3","SELECT * FROM v1_control.provider_attachments WHERE resource_id=$1 AND target_kind='project' AND target_space=$2 AND target_project=$3";&resource.id,space.as_str(),project.folder_id.as_str())?
+    };
+    scoped
+        .filter(|row| active(row, resource, credential_epoch, now))
+        .ok_or_else(unavailable)
 }
 impl ProviderService {
     pub(super) async fn selection_catalog(
@@ -188,24 +236,36 @@ impl ProviderService {
         let space = self
             .selection_catalog(&ctx, request.project.as_ref())
             .await?;
-        let mut tx = self.control.store.write(budget.clone()).await?;
+        let wanted_kind = model_kind_name(request.kind);
+        let mut tx = self.control.store.read(budget.clone()).await?;
         let selected=budget.run(async {
-            let auth=self.control.revalidate(tx.inner_mut(),ctx.auth()).await?;
+            let auth=self.control.revalidate_read(tx.inner_mut(),ctx.auth()).await?;
+            let now=self.control.clock.now_ms()?;
             let (id,model_id)=if let Some(id)=request.resource { (id,request.model) }
             else if let Some(model)=request.model {
+                let project_id = request.project.as_ref().map(|p| p.folder_id.as_str());
+                let is_shared = if space.space.kind == SpaceKind::Shared { 1_i64 } else { 0_i64 };
                 let candidates=rows!(tx.inner_mut(),(String,),fetch_all,
-                    "SELECT r.id FROM provider_resources r JOIN provider_models m ON m.resource_id=r.id JOIN provider_attachments a ON a.resource_id=r.id WHERE m.model_id=$1 AND r.disabled_at IS NULL AND a.target_kind='personal' AND a.target_owner=$2 AND a.target_space=$3 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$4) ORDER BY r.id LIMIT 2",
-                    "SELECT r.id FROM v1_control.provider_resources r JOIN v1_control.provider_models m ON m.resource_id=r.id JOIN v1_control.provider_attachments a ON a.resource_id=r.id WHERE m.model_id=$1 AND r.disabled_at IS NULL AND a.target_kind='personal' AND a.target_owner=$2 AND a.target_space=$3 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$4) ORDER BY r.id LIMIT 2";model.as_str(),auth.principal().as_str(),space.space.id.as_str(),self.control.clock.now_ms()?)?;
+                    "SELECT r.id FROM provider_resources r JOIN users u ON u.user_id=r.owner_id LEFT JOIN credentials c ON c.id=r.credential_id JOIN provider_models m ON m.resource_id=r.id JOIN provider_attachments a ON a.resource_id=r.id WHERE m.model_id=$1 AND m.kind=$2 AND r.disabled_at IS NULL AND u.disabled_at IS NULL AND ((r.credential_id IS NULL AND a.credential_epoch IS NULL) OR (c.kind='provider-header-v1' AND c.owner_id=r.owner_id AND c.disabled_at IS NULL AND a.credential_epoch=c.consent_epoch)) AND a.target_kind='personal' AND a.target_owner=$3 AND a.target_space=$4 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$5) AND ($6=0 OR EXISTS (SELECT 1 FROM provider_attachments sa WHERE sa.resource_id=r.id AND sa.target_space=$4 AND (sa.target_kind='space' OR (sa.target_kind='project' AND sa.target_project=$7)) AND sa.state='approved' AND sa.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND sa.credential_epoch IS NULL) OR sa.credential_epoch=c.consent_epoch) AND (sa.expires_at IS NULL OR sa.expires_at>$5))) ORDER BY r.id LIMIT 2",
+                    "SELECT r.id FROM v1_control.provider_resources r JOIN v1_control.users u ON u.user_id=r.owner_id LEFT JOIN v1_control.credentials c ON c.id=r.credential_id JOIN v1_control.provider_models m ON m.resource_id=r.id JOIN v1_control.provider_attachments a ON a.resource_id=r.id WHERE m.model_id=$1 AND m.kind=$2 AND r.disabled_at IS NULL AND u.disabled_at IS NULL AND ((r.credential_id IS NULL AND a.credential_epoch IS NULL) OR (c.kind='provider-header-v1' AND c.owner_id=r.owner_id AND c.disabled_at IS NULL AND a.credential_epoch=c.consent_epoch)) AND a.target_kind='personal' AND a.target_owner=$3 AND a.target_space=$4 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$5) AND ($6=0 OR EXISTS (SELECT 1 FROM v1_control.provider_attachments sa WHERE sa.resource_id=r.id AND sa.target_space=$4 AND (sa.target_kind='space' OR (sa.target_kind='project' AND sa.target_project=$7)) AND sa.state='approved' AND sa.resource_epoch=r.consent_epoch AND ((r.credential_id IS NULL AND sa.credential_epoch IS NULL) OR sa.credential_epoch=c.consent_epoch) AND (sa.expires_at IS NULL OR sa.expires_at>$5))) ORDER BY r.id LIMIT 2";model.as_str(),wanted_kind,auth.principal().as_str(),space.space.id.as_str(),now,is_shared,project_id)?;
                 if candidates.len()!=1 {return Err(unavailable());}
                 (ProviderResourceId::parse(&candidates[0].0)?,Some(model))
             } else {
-                let preferred=self.preference(tx.inner_mut(),&auth,&space.space.id,request.project.as_ref()).await?;
+                let preferred=self.preference(tx.inner_mut(),&auth,&space.space.id,request.project.as_ref(),wanted_kind).await?;
                 (ProviderResourceId::parse(&preferred.resource_id)?,Some(ModelProfileId::parse(&preferred.model_id)?))
             };
-            let resource=resource(tx.inner_mut(),id.as_str()).await?;let credential_epoch=epochs(tx.inner_mut(),&resource).await?;
+            let resource=resource_read(tx.inner_mut(),id.as_str()).await?;
+            let owner_active = rows!(tx.inner_mut(),(i64,),fetch_one,"SELECT count(*) FROM users WHERE user_id=$1 AND disabled_at IS NULL","SELECT count(*) FROM v1_control.users WHERE user_id=$1 AND disabled_at IS NULL";&resource.owner_id)?.0;
+            if owner_active != 1 {
+                return Err(unavailable());
+            }
+            let credential_epoch=epochs_read(tx.inner_mut(),&resource).await.map_err(|_| unavailable())?;
             let model_id=model_id.or_else(||resource.default_model.as_deref().and_then(|value|ModelProfileId::parse(value).ok())).ok_or_else(unavailable)?;
-            model_info(&model(tx.inner_mut(),&resource.id,model_id.as_str()).await?)?;
-            let admission=policy(tx.inner_mut(),&auth,&resource,credential_epoch,&space.space,request.project.as_ref(),self.control.clock.now_ms()?).await?;
+            let loaded=model_info(&model_read(tx.inner_mut(),&resource.id,model_id.as_str()).await.map_err(|_| unavailable())?)?;
+            if !matches_preference_kind(&loaded.model.kind, request.kind) {
+                return Err(unavailable());
+            }
+            let admission=policy(tx.inner_mut(),&auth,&resource,credential_epoch,&space.space,request.project.as_ref(),now,false).await?;
             Ok(ProviderSelection{provider:id,model:model_id,project:request.project,policy:admission.policy})
         },CommitEffect::NotCommitted).await?;
         budget
@@ -219,8 +279,9 @@ impl ProviderService {
         auth: &EngineAuthContext,
         space: &SpaceId,
         project: Option<&FolderRef>,
+        model_kind: &str,
     ) -> Result<ProviderPreferencesRow, PortError> {
-        let personal = rows!(tx,ProviderPreferencesRow,fetch_optional,"SELECT * FROM provider_preferences WHERE owner_id=$1 AND scope_kind='personal' AND scope_id=$1","SELECT * FROM v1_control.provider_preferences WHERE owner_id=$1 AND scope_kind='personal' AND scope_id=$1";auth.principal().as_str())?;
+        let personal = rows!(tx,ProviderPreferencesRow,fetch_optional,"SELECT * FROM provider_preferences WHERE owner_id=$1 AND scope_kind='personal' AND scope_id=$1 AND model_kind=$2","SELECT * FROM v1_control.provider_preferences WHERE owner_id=$1 AND scope_kind='personal' AND scope_id=$1 AND model_kind=$2";auth.principal().as_str(),model_kind)?;
         if let Some(row) = personal {
             return Ok(row);
         }
@@ -233,7 +294,7 @@ impl ProviderService {
         }
         scopes.push(("space", space.to_string()));
         for (kind, id) in scopes {
-            let rows = rows!(tx,ProviderPreferencesRow,fetch_all,"SELECT * FROM provider_preferences WHERE scope_kind=$1 AND scope_id=$2 ORDER BY owner_id LIMIT 2","SELECT * FROM v1_control.provider_preferences WHERE scope_kind=$1 AND scope_id=$2 ORDER BY owner_id LIMIT 2";kind,&id)?;
+            let rows = rows!(tx,ProviderPreferencesRow,fetch_all,"SELECT * FROM provider_preferences WHERE scope_kind=$1 AND scope_id=$2 AND model_kind=$3 ORDER BY owner_id LIMIT 2","SELECT * FROM v1_control.provider_preferences WHERE scope_kind=$1 AND scope_id=$2 AND model_kind=$3 ORDER BY owner_id LIMIT 2";kind,&id,model_kind)?;
             if rows.len() > 1 {
                 return Err(unavailable());
             }
@@ -272,17 +333,22 @@ impl ProviderService {
                 super::super::spaces::admission(tx,&catalog.space.id,true).await?;
                 check_member(tx,&auth,&catalog.space.id).await?;require_owner(tx,&auth,&catalog.space.id).await?;
             }
-            let resource=resource(tx,input.resource.as_str()).await?;let credential_epoch=epochs(tx,&resource).await?;model_info(&model(tx,&resource.id,input.model.as_str()).await?)?;
+            let resource=resource(tx,input.resource.as_str()).await?;let credential_epoch=epochs(tx,&resource).await?;
+            let loaded=model_info(&model(tx,&resource.id,input.model.as_str()).await?)?;
+            if !matches_preference_kind(&loaded.model.kind, input.kind) {
+                return Err(invalid(ValidationReason::InvalidQuery));
+            }
             if let Some(catalog)=&catalog {
                 let project=match &input.scope{ProviderPreferenceScope::Project(project)=>Some(project),_=>None};
-                shared_attachment(tx,&resource,credential_epoch,&catalog.space.id,project,now).await?;
+                shared_attachment(tx,&resource,credential_epoch,&catalog.space.id,project,now,true).await?;
             } else {super::inventory::resource_visible(tx,&owner.user_id,&resource).await?;}
             let (kind,id)=preference_scope(&input.scope,auth.principal());
-            // Space/project preferences belong to that scope. The row owner is
-            // its last authorized editor; a second owner replaces the default.
-            if kind=="personal" {execute!(tx,"DELETE FROM provider_preferences WHERE owner_id=$1 AND scope_kind=$2 AND scope_id=$3","DELETE FROM v1_control.provider_preferences WHERE owner_id=$1 AND scope_kind=$2 AND scope_id=$3";&owner.user_id,kind,&id)?;}
-            else {execute!(tx,"DELETE FROM provider_preferences WHERE scope_kind=$1 AND scope_id=$2","DELETE FROM v1_control.provider_preferences WHERE scope_kind=$1 AND scope_id=$2";kind,&id)?;}
-            let row=TargetRecord::ProviderPreferences(ProviderPreferencesRow{owner_id:owner.user_id.clone(),scope_kind:kind.into(),scope_id:id,resource_id:resource.id,model_id:input.model.to_string(),revision:super::super::authority::next(owner.revision)?});row.validate()?;row.insert(tx).await?;
+            let wanted_kind = model_kind_name(input.kind);
+            // Space/project preferences belong to that scope and model_kind. The
+            // row owner is its last authorized editor; a second owner replaces it.
+            if kind=="personal" {execute!(tx,"DELETE FROM provider_preferences WHERE owner_id=$1 AND scope_kind=$2 AND scope_id=$3 AND model_kind=$4","DELETE FROM v1_control.provider_preferences WHERE owner_id=$1 AND scope_kind=$2 AND scope_id=$3 AND model_kind=$4";&owner.user_id,kind,&id,wanted_kind)?;}
+            else {execute!(tx,"DELETE FROM provider_preferences WHERE scope_kind=$1 AND scope_id=$2 AND model_kind=$3","DELETE FROM v1_control.provider_preferences WHERE scope_kind=$1 AND scope_id=$2 AND model_kind=$3";kind,&id,wanted_kind)?;}
+            let row=TargetRecord::from(ProviderPreferencesRow{owner_id:owner.user_id.clone(),scope_kind:kind.into(),scope_id:id,model_kind:wanted_kind.into(),resource_id:resource.id,model_id:input.model.to_string(),revision:super::super::authority::next(owner.revision)?});row.validate()?;row.insert(tx).await?;
             Ok((input,vec![]))
         })).await
     }

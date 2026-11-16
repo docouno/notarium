@@ -70,26 +70,79 @@ impl ControlService {
         }
         let budget = OperationBudget::new(ctx.budget.clone());
         let mut tx = self.store.write(budget.clone()).await?;
-        let result=budget.run(async {
-            let (_,current)=self.manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
-            expect_revision(&current,request.expected)?;
-            let now=self.clock.now_ms()?;
-            if request.expires_at_ms.is_some_and(|time|time<=now) {return Err(invalid(ValidationReason::InvalidTimestamp));}
-            if let Some(spaces)=&request.selected_spaces {
-                let auth=self.human_context(tx.inner_mut(),&current,ctx.auth().credential().cloned().ok_or_else(denied)?,ctx.auth().grant().clone(),false).await?;
-                if spaces.iter().any(|id|!auth.spaces().contains_key(id)) {return Err(DomainError::ResourceNotFound.into());}
-            }
-            let spaces=request.selected_spaces.map(|spaces|spaces.into_iter().collect::<std::collections::BTreeSet<_>>());
-            let selected_spaces=spaces.map(|spaces|serde_json::to_string(&spaces).map_err(|_|invalid(ValidationReason::InvalidQuery))).transpose()?;
-            let token=token::mint(TokenKind::Pat)?;
-            let row=PatsRow{token_id:token.id.ok_or_else(denied)?,secret_hash:token.digest.to_vec(),user_id:current.user_id.clone(),name:request.name,scope:scope(request.scope).into(),selected_spaces,expires_at:request.expires_at_ms,last_used_at:None,revoked_at:None,created_at:now};
-            let record=TargetRecord::Pats(row.clone());
-            record.validate()?;
-            record.insert(tx.inner_mut()).await?;
-            let revision=next(current.revision)?;
-            execute!(tx.inner_mut(),"UPDATE users SET revision=$1 WHERE user_id=$2","UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";revision,&current.user_id)?;
-            Ok(ControlCommit{revision:ControlRevision::new(revision as u64)?,value:IssuedPat{metadata:metadata(row,self.config.max_auth_spaces)?,token:token.secret}})
-        },CommitEffect::NotCommitted).await?;
+        let result = budget
+            .run(
+                async {
+                    let (_, current) = self
+                        .manager(tx.inner_mut(), ctx.auth(), ctx.auth().principal())
+                        .await?;
+                    expect_revision(&current, request.expected)?;
+                    let now = self.clock.now_ms()?;
+                    if request.expires_at_ms.is_some_and(|time| time <= now) {
+                        return Err(invalid(ValidationReason::InvalidTimestamp));
+                    }
+                    if let Some(spaces) = &request.selected_spaces {
+                        let auth = self
+                            .human_context(
+                                tx.inner_mut(),
+                                &current,
+                                ctx.auth().credential().cloned().ok_or_else(denied)?,
+                                ctx.auth().grant().clone(),
+                                false,
+                                false,
+                                true,
+                            )
+                            .await?;
+                        if spaces.iter().any(|id| !auth.spaces().contains_key(id)) {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                    }
+                    let spaces = request.selected_spaces.map(|spaces| {
+                        spaces
+                            .into_iter()
+                            .collect::<std::collections::BTreeSet<_>>()
+                    });
+                    let selected_spaces = spaces
+                        .map(|spaces| {
+                            serde_json::to_string(&spaces)
+                                .map_err(|_| invalid(ValidationReason::InvalidQuery))
+                        })
+                        .transpose()?;
+                    let token = token::mint(TokenKind::Pat)?;
+                    let row = PatsRow {
+                        token_id: token.id.ok_or_else(denied)?,
+                        secret_hash: token.digest.to_vec(),
+                        user_id: current.user_id.clone(),
+                        name: request.name,
+                        scope: scope(request.scope).into(),
+                        selected_spaces,
+                        expires_at: request.expires_at_ms,
+                        last_used_at: None,
+                        revoked_at: None,
+                        created_at: now,
+                    };
+                    let record = TargetRecord::from(row.clone());
+                    record.validate()?;
+                    record.insert(tx.inner_mut()).await?;
+                    let revision = next(current.revision)?;
+                    execute!(
+                        tx.inner_mut(),
+                        "UPDATE users SET revision=$1 WHERE user_id=$2",
+                        "UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";
+                        revision,
+                        &current.user_id
+                    )?;
+                    Ok(ControlCommit {
+                        revision: ControlRevision::new(revision as u64)?,
+                        value: IssuedPat {
+                            metadata: metadata(row, self.config.max_auth_spaces)?,
+                            token: token.secret,
+                        },
+                    })
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
         Ok(result)
     }
@@ -106,26 +159,61 @@ impl ControlService {
             })
             .transpose()?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
-        let result=budget.run(async {
-            let (_,current)=self.manager(tx.inner_mut(),ctx.auth(),&account).await?;
-            if let Some(cursor)=&cursor {
-                if cursor.version!=1 || cursor.owner!=account {return Err(invalid(ValidationReason::ScopeMismatch));}
-                expect_revision(&current,cursor.revision)?;
-            }
-            let last=cursor.as_ref().map(|c|c.last.as_str()).unwrap_or("");
-            let rows=page_rows!(tx.inner_mut(),PatsRow,TargetTable::Pats,page.limit(),
-                "SELECT * FROM pats WHERE user_id=$1 AND token_id>$2 ORDER BY token_id LIMIT $3",
-                "SELECT * FROM v1_control.pats WHERE user_id=$1 AND token_id>$2 ORDER BY token_id LIMIT $3";account.as_str(),last,i64::from(page.limit())+1)?;
-            let continuation=if rows.has_more {
-                let last=rows.rows.last().ok_or_else(||invalid(ValidationReason::BudgetExceeded))?;
-                Some(serde_json::to_string(&Cursor{version:1,owner:account,revision:ControlRevision::new(current.revision as u64)?,last:CredentialTokenId::parse(&last.token_id)?}).map_err(|_|invalid(ValidationReason::InvalidState))?)
-            } else {None};
-            Ok(ControlPage{items:rows.rows.into_iter().map(|row|metadata(row,self.config.max_auth_spaces)).collect::<Result<_,_>>()?,continuation})
-        },CommitEffect::NotCommitted).await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
+        let mut rtx = self.store.read(budget.clone()).await?;
+        let result = budget
+            .run(
+                async {
+                    let (_, current) = self
+                        .manager_read(rtx.inner_mut(), ctx.auth(), &account)
+                        .await?;
+                    if let Some(cursor) = &cursor {
+                        if cursor.version != 1 || cursor.owner != account {
+                            return Err(invalid(ValidationReason::ScopeMismatch));
+                        }
+                        expect_revision(&current, cursor.revision)?;
+                    }
+                    let last = cursor.as_ref().map(|c| c.last.as_str()).unwrap_or("");
+                    let rows = page_rows!(
+                        rtx.inner_mut(),
+                        PatsRow,
+                        TargetTable::Pats,
+                        page.limit(),
+                        "SELECT * FROM pats WHERE user_id=$1 AND token_id>$2 ORDER BY token_id LIMIT $3",
+                        "SELECT * FROM v1_control.pats WHERE user_id=$1 AND token_id>$2 ORDER BY token_id LIMIT $3";
+                        account.as_str(),
+                        last,
+                        i64::from(page.limit()) + 1
+                    )?;
+                    let continuation = if rows.has_more {
+                        let last = rows
+                            .rows
+                            .last()
+                            .ok_or_else(|| invalid(ValidationReason::BudgetExceeded))?;
+                        Some(
+                            serde_json::to_string(&Cursor {
+                                version: 1,
+                                owner: account,
+                                revision: ControlRevision::new(current.revision as u64)?,
+                                last: CredentialTokenId::parse(&last.token_id)?,
+                            })
+                            .map_err(|_| invalid(ValidationReason::InvalidState))?,
+                        )
+                    } else {
+                        None
+                    };
+                    Ok(ControlPage {
+                        items: rows
+                            .rows
+                            .into_iter()
+                            .map(|row| metadata(row, self.config.max_auth_spaces))
+                            .collect::<Result<_, _>>()?,
+                        continuation,
+                    })
+                },
+                CommitEffect::NotCommitted,
+            )
             .await?;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         Ok(result)
     }
     pub async fn revoke_pat(

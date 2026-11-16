@@ -260,9 +260,10 @@ fn policy(origin: &str, resources: &[u8]) -> NetworkPolicy {
 fn transport(origin: &str, resources: &[u8], dns: Arc<Dns>) -> OutboundTransport {
     OutboundTransport::with_lookup(policy(origin, resources), Some(dns))
 }
-async fn released() {
+async fn released(client: &OutboundTransport) {
+    let expected = client.max_active_requests();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while SEND_ADMISSION.available_permits() != 32 {
+        while client.available_permits() != expected {
             tokio::task::yield_now().await;
         }
     })
@@ -270,34 +271,43 @@ async fn released() {
     .unwrap();
 }
 
-fn worker_for_completion_test(remaining: Duration) -> Worker {
+fn worker_for_completion_test(remaining: Duration) -> (OutboundTransport, Worker) {
     let origin = "http://127.0.0.1:38117";
     let client = transport(origin, &[1], Dns::new(&[&["127.0.0.1:0"]]));
     let (slot, _) = client.slot(scope(1, 1), origin).unwrap();
-    let permit = SEND_ADMISSION.clone().try_acquire_owned().unwrap();
+    let permit = client
+        .shared
+        .send_admission
+        .clone()
+        .try_acquire_owned()
+        .unwrap();
     let mut call = budget();
     call.remaining = remaining;
-    Worker {
-        budget: OperationBudget::new(call),
-        slot,
-        dropped: Cancellation::default(),
-        _permit: permit,
-    }
+    (
+        client,
+        Worker {
+            budget: OperationBudget::new(call),
+            slot,
+            dropped: Cancellation::default(),
+            _permit: permit,
+        },
+    )
 }
 
 #[tokio::test]
 async fn operation_completion_preserves_current_deadline_and_cancellation() {
     let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
-    let worker = worker_for_completion_test(Duration::from_secs(1));
+    let (client, worker) = worker_for_completion_test(Duration::from_secs(1));
     worker.run(async { Ok(()) }).await.unwrap();
     assert!(matches!(
         worker.run(async { Err::<(), _>(failed()) }).await,
         Err(PortError::Unavailable(_))
     ));
     drop(worker);
+    released(&client).await;
 
     for success in [false, true] {
-        let worker = worker_for_completion_test(Duration::from_millis(20));
+        let (client, worker) = worker_for_completion_test(Duration::from_millis(20));
         let mut entered = false;
         let result = worker
             .run(async {
@@ -313,10 +323,12 @@ async fn operation_completion_preserves_current_deadline_and_cancellation() {
             matches!(result, Err(PortError::DeadlineExceeded(_))),
             "{result:?}"
         );
+        drop(worker);
+        released(&client).await;
     }
 
     for invalidate_epoch in [false, true] {
-        let worker = worker_for_completion_test(Duration::from_secs(1));
+        let (client, worker) = worker_for_completion_test(Duration::from_secs(1));
         let cancelled = if invalidate_epoch {
             worker.slot.cancelled.clone()
         } else {
@@ -329,8 +341,9 @@ async fn operation_completion_preserves_current_deadline_and_cancellation() {
             })
             .await;
         assert!(matches!(result, Err(PortError::Cancelled(_))), "{result:?}");
+        drop(worker);
+        released(&client).await;
     }
-    released().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -396,7 +409,7 @@ async fn actual_connector_uses_checked_addresses_and_isolates_pools_and_epochs()
             .await
             .is_err()
     );
-    released().await;
+    released(&transport).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -427,7 +440,7 @@ async fn credential_epoch_rotation_replaces_pool_without_reviving_the_old_epoch(
         assert_eq!(requests.len(), 2);
         assert_ne!(requests[0].connection, requests[1].connection);
     }
-    released().await;
+    released(&client).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -481,7 +494,8 @@ async fn redirects_dns_rebinding_mixed_answers_and_metadata_do_not_reach_denied_
     metadata.response_limit = 65536;
     assert!(client.send(budget(), metadata).await.is_err());
     assert_eq!(target.connections.load(Ordering::SeqCst), 0);
-    released().await;
+    released(&client).await;
+    released(&mixed).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -500,7 +514,7 @@ async fn literal_path_stream_limits_deadlines_and_epoch_cancellation_release_rea
             .unwrap();
         // Keep an unpolled response. Its worker still closes on the absolute
         // budget, regardless of which timer first observes that deadline.
-        released().await;
+        released(&client).await;
         let result = response.next_chunk().await;
         assert!(
             matches!(result, Err(PortError::DeadlineExceeded(_))),
@@ -539,7 +553,7 @@ async fn literal_path_stream_limits_deadlines_and_epoch_cancellation_release_rea
     client
         .invalidate_provider(&ProviderResourceId::from_bytes([1; 16]))
         .unwrap();
-    released().await;
+    released(&client).await;
     assert!(matches!(
         response.next_chunk().await,
         Err(PortError::Cancelled(_))
@@ -595,7 +609,7 @@ async fn literal_path_stream_limits_deadlines_and_epoch_cancellation_release_rea
         before + 1,
         "a POST received before disconnect must not be replayed"
     );
-    released().await;
+    released(&client).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -603,9 +617,13 @@ async fn active_call_limit_survives_caller_drop_and_idle_pool_cache_is_bounded()
     let _serial = crate::TEST_RESOURCE_LOCK.lock().await;
     let server = Server::new(Reply::StallHeaders).await;
     let origin = server.origin("127.0.0.1");
-    let client = transport(&origin, &[1], Dns::new(&[&["127.0.0.1:0"]]));
+    let client = OutboundTransport::with_lookup_and_limit(
+        policy(&origin, &[1]),
+        Some(Dns::new(&[&["127.0.0.1:0"]])),
+        64,
+    );
     let mut jobs = Vec::new();
-    for _ in 0..32 {
+    for _ in 0..64 {
         let client = client.clone();
         let origin = origin.clone();
         jobs.push(tokio::spawn(async move {
@@ -614,7 +632,7 @@ async fn active_call_limit_survives_caller_drop_and_idle_pool_cache_is_bounded()
                 .await
         }));
     }
-    server.count(32).await;
+    server.count(64).await;
     assert!(matches!(
         client
             .send(budget(), request(1, 1, &origin, "secret"))
@@ -625,7 +643,7 @@ async fn active_call_limit_survives_caller_drop_and_idle_pool_cache_is_bounded()
         job.abort();
         assert!(job.await.is_err());
     }
-    released().await;
+    released(&client).await;
     let client = OutboundTransport::new(NetworkPolicy::default());
     for n in 0..140 {
         client

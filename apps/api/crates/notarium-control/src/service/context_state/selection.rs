@@ -1,12 +1,182 @@
 use super::*;
 use crate::service::episodes::episode;
 
-#[derive(sqlx::FromRow)]
 struct Candidate {
     position: i64,
     note_space: String,
     note_id: String,
     favorite: i64,
+}
+#[derive(sqlx::FromRow)]
+struct PinCandidateRow {
+    rank: i64,
+    note_space: String,
+    note_id: String,
+}
+#[derive(sqlx::FromRow)]
+struct SetCandidateRow {
+    rank: i64,
+    set_id: String,
+    note_refs: String,
+}
+#[derive(sqlx::FromRow)]
+struct FavoriteCandidateRow {
+    rank: i64,
+    space_id: String,
+    entity_id: String,
+}
+#[derive(Eq, PartialEq, Ord, PartialOrd)]
+struct ScopeItem {
+    level: i64,
+    rank: i64,
+    entry: String,
+    item_index: usize,
+    note_space: String,
+    note_id: String,
+}
+async fn load_bootstrap_candidates(
+    tx: &mut Transaction,
+    owner_id: &str,
+    project: &str,
+    space: &str,
+    personal: &str,
+    after: i64,
+    page_limit: u16,
+) -> Result<Vec<Candidate>, PortError> {
+    let skip = usize::try_from(after).map_err(|_| invalid(ValidationReason::InvalidQuery))?;
+    let want = usize::from(page_limit) + 1;
+    let needed = skip
+        .checked_add(want)
+        .ok_or_else(|| invalid(ValidationReason::InvalidLimit))?;
+    let mut targets = Vec::with_capacity(3);
+    if !project.is_empty() {
+        targets.push((0_i64, "project", project));
+    }
+    if !space.is_empty() {
+        targets.push((1_i64, "space", space));
+    }
+    if !personal.is_empty() {
+        targets.push((2_i64, "personal", personal));
+    }
+    let mut scope_items = Vec::new();
+    for (level, kind, target_id) in targets {
+        let pins = rows!(
+            tx,
+            PinCandidateRow,
+            fetch_all,
+            "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM context_scope_pins p LEFT JOIN context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2",
+            "SELECT coalesce(o.rank,0) AS rank, p.note_space, p.note_id FROM v1_control.context_scope_pins p LEFT JOIN v1_control.context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note' AND o.entry_ref=('{\"space_id\":\"' || p.note_space || '\",\"note_id\":\"' || p.note_id || '\"}') WHERE p.target_kind=$1 AND p.target_id=$2";
+            kind,
+            target_id
+        )?;
+        for pin in pins {
+            scope_items.push(ScopeItem {
+                level,
+                rank: pin.rank,
+                entry: format!("n:{}:{}", pin.note_space, pin.note_id),
+                item_index: 0,
+                note_space: pin.note_space,
+                note_id: pin.note_id,
+            });
+        }
+        let sets = rows!(
+            tx,
+            SetCandidateRow,
+            fetch_all,
+            "SELECT coalesce(o.rank,0) AS rank, a.set_id, s.note_refs FROM context_set_attachments a JOIN context_sets s ON s.set_id=a.set_id LEFT JOIN context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2",
+            "SELECT coalesce(o.rank,0) AS rank, a.set_id, s.note_refs FROM v1_control.context_set_attachments a JOIN v1_control.context_sets s ON s.set_id=a.set_id LEFT JOIN v1_control.context_order o ON o.target_kind=a.target_kind AND o.target_id=a.target_id AND o.entry_kind='set' AND o.entry_ref=a.set_id WHERE a.target_kind=$1 AND a.target_id=$2";
+            kind,
+            target_id
+        )?;
+        for set in sets {
+            if set.note_refs.len() > 65536 {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            let notes: Vec<NoteRef> = serde_json::from_str(&set.note_refs)
+                .map_err(|_| invalid(ValidationReason::InvalidState))?;
+            if notes.len() > 200 {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            let entry = format!("s:{}", set.set_id);
+            for (idx, note) in notes.into_iter().enumerate() {
+                scope_items.push(ScopeItem {
+                    level,
+                    rank: set.rank,
+                    entry: entry.clone(),
+                    item_index: idx,
+                    note_space: note.space_id.to_string(),
+                    note_id: note.note_id.to_string(),
+                });
+            }
+        }
+    }
+    scope_items.sort();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut deduped: Vec<(String, String, i64)> = Vec::new();
+    for item in scope_items {
+        if seen.insert((item.note_space.clone(), item.note_id.clone())) {
+            deduped.push((item.note_space, item.note_id, 0));
+        }
+    }
+    let mut fav_cursor: Option<(i64, String, String)> = None;
+    while deduped.len() < needed {
+        let batch_limit = ((needed - deduped.len())
+            .saturating_add(seen.len())
+            .clamp(32, 512)) as i64;
+        let favs = match &fav_cursor {
+            None => rows!(
+                tx,
+                FavoriteCandidateRow,
+                fetch_all,
+                "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2",
+                "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' ORDER BY rank,space_id,entity_id LIMIT $2";
+                owner_id,
+                batch_limit
+            )?,
+            Some((rank, space_id, entity_id)) => rows!(
+                tx,
+                FavoriteCandidateRow,
+                fetch_all,
+                "SELECT rank, space_id, entity_id FROM favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5",
+                "SELECT rank, space_id, entity_id FROM v1_control.favorites WHERE owner_id=$1 AND entity_kind='note' AND (rank,space_id,entity_id)>($2,$3,$4) ORDER BY rank,space_id,entity_id LIMIT $5";
+                owner_id,
+                *rank,
+                space_id,
+                entity_id,
+                batch_limit
+            )?,
+        };
+        if favs.is_empty() {
+            break;
+        }
+        let exhausted = (favs.len() as i64) < batch_limit;
+        if let Some(last) = favs.last() {
+            fav_cursor = Some((last.rank, last.space_id.clone(), last.entity_id.clone()));
+        }
+        for fav in favs {
+            if seen.insert((fav.space_id.clone(), fav.entity_id.clone())) {
+                deduped.push((fav.space_id, fav.entity_id, 1));
+                if deduped.len() >= needed {
+                    break;
+                }
+            }
+        }
+        if exhausted {
+            break;
+        }
+    }
+    Ok(deduped
+        .into_iter()
+        .enumerate()
+        .skip(skip)
+        .take(want)
+        .map(|(idx, (note_space, note_id, favorite))| Candidate {
+            position: (idx + 1) as i64,
+            note_space,
+            note_id,
+            favorite,
+        })
+        .collect())
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,14 +210,15 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<BootstrapContext, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
         let result = budget
             .run(
                 async {
-                    let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
                     let current =
                         AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
-                    let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
+                    let owner =
+                        user_read(tx.inner_mut(), current.auth().principal().as_str()).await?;
                     let row = episode(tx.inner_mut(), current.auth().principal(), &id).await?;
                     let had_project = row.project_space.is_some();
                     let episode = self.project_episode(tx.inner_mut(), &current, row).await?;
@@ -144,33 +315,16 @@ impl ControlService {
                         .unwrap_or_default();
                     let space = selected.as_ref().map_or("", SpaceId::as_str);
                     let after = cursor.as_ref().map_or(0, |cursor| cursor.after);
-                    let limit = i64::from(page.limit()) + 1;
-                    let mut candidates: Vec<Candidate> = match tx.inner_mut() {
-                        Transaction::Sqlite(tx) => {
-                            sqlx::query_as(include_str!("selection.sqlite.sql"))
-                                .bind(&owner.user_id)
-                                .bind(&project)
-                                .bind(space)
-                                .bind(&personal)
-                                .bind(after)
-                                .bind(limit)
-                                .fetch_all(&mut **tx)
-                                .await
-                                .map_err(crate::error::database)?
-                        }
-                        Transaction::Postgres(tx) => {
-                            sqlx::query_as(include_str!("selection.postgres.sql"))
-                                .bind(&owner.user_id)
-                                .bind(&project)
-                                .bind(space)
-                                .bind(&personal)
-                                .bind(after)
-                                .bind(limit)
-                                .fetch_all(&mut **tx)
-                                .await
-                                .map_err(crate::error::database)?
-                        }
-                    };
+                    let mut candidates = load_bootstrap_candidates(
+                        tx.inner_mut(),
+                        &owner.user_id,
+                        &project,
+                        space,
+                        &personal,
+                        after,
+                        page.limit(),
+                    )
+                    .await?;
                     let continuation = if candidates.len() > usize::from(page.limit()) {
                         candidates.pop();
                         Some(
@@ -245,14 +399,15 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<ContextEntryInfo>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
         let result = budget
             .run(
                 async {
-                    let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
                     let current =
                         AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
-                    let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
+                    let owner =
+                        user_read(tx.inner_mut(), current.auth().principal().as_str()).await?;
                     let key = scope_key(&owner, &scope)?;
                     self.context_scope_read(&current, &scope, &key).await?;
                     let digest = self

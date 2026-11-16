@@ -90,7 +90,7 @@ async fn admissions(pg: bool) {
     for provider in [&mut setup.provider, &mut setup.other] {
         provider.config.default_space_limits = ProviderLimits {
             requests_per_minute: Some(7),
-            tokens_per_minute: Some(3 * 8224),
+            tokens_per_minute: Some(3 * 41),
         };
     }
     let mut tasks = tokio::task::JoinSet::new();
@@ -120,7 +120,7 @@ async fn admissions(pg: bool) {
     }
     assert_eq!(successful, 3);
     assert_eq!(requests.load(Ordering::SeqCst), 3);
-    assert_eq!(setup.fixture.observer.count("SELECT COUNT(*) FROM provider_budget_buckets WHERE rpm_used=3 AND tpm_reserved=24672 AND tpm_exact=0").await,3);
+    assert_eq!(setup.fixture.observer.count("SELECT COUNT(*) FROM provider_budget_buckets WHERE rpm_used=3 AND tpm_reserved=123 AND tpm_exact=0").await,3);
     assert_eq!(setup.fixture.observer.count("SELECT COUNT(*) FROM provider_call_log WHERE delivery_state='settled' AND usage_source='unknown'").await,3);
     assert_eq!(setup.egress.active.load(Ordering::SeqCst), 0);
     setup.close().await;

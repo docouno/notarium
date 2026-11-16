@@ -27,12 +27,10 @@ use notarium_core::{
 use std::{
     collections::BTreeSet,
     fs::File,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Semaphore;
-static BACKUP_ADMISSION: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
-static ARTIFACT_IO: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
 fn failure() -> PortError {
     unavailable("control backup operation", CommitEffect::NotCommitted)
 }
@@ -73,6 +71,8 @@ pub struct ControlBackup {
     data: DataRoot,
     config: BackupConfig,
     metrics: Arc<Mutex<Option<BackupMetrics>>>,
+    pub(crate) admission: Arc<Semaphore>,
+    artifact_io: Arc<Semaphore>,
 }
 impl ControlBackup {
     pub fn new(
@@ -95,6 +95,8 @@ impl ControlBackup {
             data,
             config,
             metrics: Arc::new(Mutex::new(None)),
+            admission: Arc::new(Semaphore::new(1)),
+            artifact_io: Arc::new(Semaphore::new(4)),
         })
     }
     pub fn default_budget(&self) -> BackupBudget {
@@ -139,7 +141,7 @@ impl ControlBackup {
         let operation = OperationBudget::new(ctx.budget);
         operation.check(CommitEffect::NotCommitted)?;
         let permit =
-            ARTIFACT_IO
+            self.artifact_io
                 .clone()
                 .try_acquire_owned()
                 .map_err(|_| DomainError::RateLimited {
@@ -183,7 +185,7 @@ impl BackupParticipantPort for ControlBackup {
         Box::pin(async move {
             ctx.authority.require(ServicePurpose::Backup)?;
             let budget = self.budget(budget)?;
-            let slot = BACKUP_ADMISSION.clone().try_acquire_owned().map_err(|_| {
+            let slot = self.admission.clone().try_acquire_owned().map_err(|_| {
                 DomainError::RateLimited {
                     retry_after_ms: 1000,
                     budget: BudgetKind::Concurrency,

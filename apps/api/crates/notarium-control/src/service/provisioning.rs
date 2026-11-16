@@ -101,13 +101,13 @@ pub(super) async fn stage_space(
     let payload =
         serde_json::to_string(&data).map_err(|_| invalid(ValidationReason::InvalidState))?;
     let rows = [
-        TargetRecord::SpaceAdmission(SpaceAdmissionRow {
+        TargetRecord::from(SpaceAdmissionRow {
             space_id: space.id.to_string(),
             state: "pending".into(),
             admission_epoch: 0,
             revision: 0,
         }),
-        TargetRecord::SpaceMembers(SpaceMembersRow {
+        TargetRecord::from(SpaceMembersRow {
             space_id: space.id.to_string(),
             user_id: identity.owner.to_string(),
             role: "owner".into(),
@@ -115,7 +115,7 @@ pub(super) async fn stage_space(
             revision: 0,
             created_at: now,
         }),
-        TargetRecord::ControlOperations(ControlOperationsRow {
+        TargetRecord::from(ControlOperationsRow {
             operation_id: id.to_string(),
             command_key: id.to_string(),
             kind: "create-space".into(),
@@ -130,7 +130,7 @@ pub(super) async fn stage_space(
     ];
     for record in rows {
         record.validate()?;
-        record.insert(tx).await?;
+        record.insert_or_conflict(tx).await?;
     }
     Ok(id)
 }
@@ -247,9 +247,9 @@ impl ControlService {
             let count=rows!(tx.inner_mut(),(i64,),fetch_one,"SELECT count(*) FROM (SELECT 1 FROM users LIMIT 1) existing","SELECT count(*) FROM (SELECT 1 FROM v1_control.users LIMIT 1) existing";)?.0;
             if count!=0 {return Err(access_denied());}
             let row=UsersRow{user_id:id.to_string(),username,email,display_name,password_hash,is_admin:1,disabled_at:None,personal_space_id:Some(SpaceId::from_bytes(token::random()?).to_string()),revision:0,metadata_revision:0,auth_version:0,created_at:self.clock.now_ms()?};
-            let record=TargetRecord::Users(row.clone());
+            let record=TargetRecord::from(row.clone());
             record.validate()?;
-            record.insert(tx.inner_mut()).await?;
+            record.insert_or_conflict(tx.inner_mut()).await?;
             let operation=stage_personal(tx.inner_mut(),&row,row.created_at).await?;
             Ok((account_info(&row)?,operation,row.auth_version,row.password_hash))
         },CommitEffect::NotCommitted).await?;
@@ -314,9 +314,9 @@ impl ControlService {
             expect_revision(&actor,command.identity.expected)?;
             let now=self.clock.now_ms()?;
             let row=UsersRow{user_id:PrincipalId::from_bytes(token::random()?).to_string(),username,email,display_name,password_hash:None,is_admin:0,disabled_at:None,personal_space_id:Some(SpaceId::from_bytes(token::random()?).to_string()),revision:0,metadata_revision:0,auth_version:0,created_at:now};
-            let record=TargetRecord::Users(row.clone());
+            let record=TargetRecord::from(row.clone());
             record.validate()?;
-            record.insert(tx.inner_mut()).await?;
+            record.insert_or_conflict(tx.inner_mut()).await?;
             stage_personal(tx.inner_mut(),&row,now).await?;
             let revision=next(actor.revision)?;
             execute!(tx.inner_mut(),"UPDATE users SET revision=$1 WHERE user_id=$2","UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";revision,&actor.user_id)?;

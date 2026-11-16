@@ -26,8 +26,11 @@ pub(in crate::service::provider) fn decode_embedding(
     }
     let nodes = count * dimension as usize + count * 8 + 4096;
     let value = super::bounded_json::parse(bytes, nodes).map_err(|_| protocol())?;
-    if value.get("error").is_some()
-        || value.get("model").and_then(Value::as_str) != Some(model.wire_name.as_str())
+    if value.get("error").is_some_and(|v| !v.is_null())
+        || value
+            .get("model")
+            .and_then(Value::as_str)
+            .is_none_or(|m| m.is_empty() || m.len() > 256 || m.chars().any(char::is_control))
     {
         return Err(protocol());
     }
@@ -62,7 +65,8 @@ pub(in crate::service::provider) fn decode_embedding(
                         .ok_or_else(protocol)?;
                     if usage
                         .get("total_tokens")
-                        .is_some_and(|v| v.as_u64() != Some(input))
+                        .filter(|v| !v.is_null())
+                        .is_some_and(|v| v.as_u64().is_none_or(|t| t < input))
                     {
                         return Err(protocol());
                     }
@@ -83,7 +87,7 @@ pub(in crate::service::provider) fn decode_embedding(
             for (target, item) in vectors.iter_mut().zip(data) {
                 *target = Some(vector(item, dimension)?);
             }
-            match value.get("prompt_eval_count") {
+            match value.get("prompt_eval_count").filter(|v| !v.is_null()) {
                 Some(input) => ProviderUsage::Exact {
                     input_tokens: input
                         .as_u64()

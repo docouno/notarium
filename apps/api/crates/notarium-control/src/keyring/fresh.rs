@@ -2,7 +2,6 @@
 use super::{
     Keyring, KeyringLocation,
     crypto::{Material, file_hash},
-    facade::IO_ADMISSION,
 };
 use crate::{
     error::{database, invalid, unavailable},
@@ -160,8 +159,9 @@ impl FreshLocalInitializer {
         let request = call.request.clone();
         let budget = OperationBudget::new(call);
         budget.check(CommitEffect::NotCommitted)?;
+        let io_admission = Keyring::new_admission();
         let permit =
-            IO_ADMISSION
+            io_admission
                 .clone()
                 .try_acquire_owned()
                 .map_err(|_| DomainError::RateLimited {
@@ -222,7 +222,7 @@ impl FreshLocalInitializer {
             let (row, permit) = files.await.map_err(|_| failed())?;
             let row = row?;
             worker_budget.check(CommitEffect::Unknown)?;
-            TargetRecord::V1StorageEpoch(V1StorageEpochRow {
+            TargetRecord::from(V1StorageEpochRow {
                 singleton: 1,
                 epoch_version: 1,
                 state: "migrating".into(),
@@ -232,9 +232,7 @@ impl FreshLocalInitializer {
             })
             .insert(tx.inner_mut())
             .await?;
-            TargetRecord::SecretKeyring(row)
-                .insert(tx.inner_mut())
-                .await?;
+            TargetRecord::from(row).insert(tx.inner_mut()).await?;
             worker_budget.check(CommitEffect::Unknown)?;
             tx.commit().await?;
             Ok::<_, PortError>(permit)
@@ -246,10 +244,11 @@ impl FreshLocalInitializer {
             )
             .await?;
         drop(permit);
-        Keyring::open(
+        Keyring::open_with_admission(
             store,
             KeyringLocation::LocalDefault(root),
             budget.context(request),
+            io_admission,
         )
         .await
         .map_err(|_| failed())

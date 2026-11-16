@@ -71,6 +71,26 @@ pub(super) async fn existing(
     }
     Ok(())
 }
+pub(super) async fn existing_read(
+    tx: &mut Transaction,
+    principal: &str,
+    scope: &str,
+    intent: &CommandKey,
+    hash: &[u8; 32],
+) -> Result<(), PortError> {
+    if let Some(row) = rows!(tx,ProviderCallLogRow,fetch_optional,"SELECT * FROM provider_call_log WHERE principal=$1 AND scope_id=$2 AND intent_key=$3","SELECT * FROM v1_control.provider_call_log WHERE principal=$1 AND scope_id=$2 AND intent_key=$3";principal,scope,intent.as_str())?
+    {
+        if row.request_hash != hash {
+            return Err(DomainError::IdempotencyKeyReused.into());
+        }
+        return Err(DomainError::ProviderCallAlreadyStarted {
+            call: RequestId::parse(&row.call_id)?,
+            state: state(&row.delivery_state)?,
+        }
+        .into());
+    }
+    Ok(())
+}
 /// Called under the fresh principal/resource/Space authority transaction. All
 /// bucket locks use a common lexical order across callers and service instances.
 pub(super) async fn reserve(
@@ -102,10 +122,6 @@ pub(super) async fn reserve(
         .collect();
     if actual.len() != budgets.len() || actual != expected_buckets(&row)? {
         return Err(invalid(ValidationReason::InvalidState));
-    }
-    let mismatch=rows!(tx,(i64,),fetch_optional,"SELECT CAST(1 AS BIGINT) FROM provider_call_log WHERE resource_id=$1 AND created_at>=$2 AND created_at<$3 AND diagnostic='budget_mismatch' LIMIT 1","SELECT CAST(1 AS BIGINT) FROM v1_control.provider_call_log WHERE resource_id=$1 AND created_at>=$2 AND created_at<$3 AND diagnostic='budget_mismatch' LIMIT 1";&row.resource_id,start,end)?.is_some();
-    if mismatch {
-        return Err(limited(BudgetKind::Tokens, end, now));
     }
     budgets.sort_by(|left, right| (left.kind, &left.owner).cmp(&(right.kind, &right.owner)));
     if budgets
@@ -168,7 +184,7 @@ pub(super) async fn reserve(
     row.output_tokens = None;
     row.diagnostic = None;
     row.settled_at = None;
-    let record = TargetRecord::ProviderCallLog(row.clone());
+    let record = TargetRecord::from(row.clone());
     record.validate()?;
     record.insert(tx).await?;
     Ok(row)
@@ -196,6 +212,12 @@ pub(super) async fn call(
     id: &RequestId,
 ) -> Result<ProviderCallLogRow, PortError> {
     rows!(tx,ProviderCallLogRow,fetch_optional,"SELECT * FROM provider_call_log WHERE call_id=$1","SELECT * FROM v1_control.provider_call_log WHERE call_id=$1 FOR UPDATE";id.as_str())?.ok_or(DomainError::ResourceNotFound.into())
+}
+pub(super) async fn call_read(
+    tx: &mut Transaction,
+    id: &RequestId,
+) -> Result<ProviderCallLogRow, PortError> {
+    rows!(tx,ProviderCallLogRow,fetch_optional,"SELECT * FROM provider_call_log WHERE call_id=$1","SELECT * FROM v1_control.provider_call_log WHERE call_id=$1";id.as_str())?.ok_or(DomainError::ResourceNotFound.into())
 }
 fn state(value: &str) -> Result<ProviderDeliveryState, PortError> {
     match value {
@@ -455,12 +477,15 @@ impl ProviderService {
         id: RequestId,
     ) -> Result<ProviderCallStatus, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.control.store.write(budget.clone()).await?;
+        let mut tx = self.control.store.read(budget.clone()).await?;
         let status = budget
             .run(
                 async {
-                    let auth = self.control.revalidate(tx.inner_mut(), ctx.auth()).await?;
-                    let row = call(tx.inner_mut(), &id).await?;
+                    let auth = self
+                        .control
+                        .revalidate_read(tx.inner_mut(), ctx.auth())
+                        .await?;
+                    let row = call_read(tx.inner_mut(), &id).await?;
                     owned(auth.principal().as_str(), &row.owner_id)?;
                     status(&row)
                 },

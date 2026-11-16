@@ -27,13 +27,15 @@ pub(crate) struct Session {
     started: Instant,
     remaining: Duration,
     wal: Option<PathBuf>,
-    pinned_wal: Mutex<Option<File>>,
     file: Mutex<Option<File>>,
+    spool_bytes: AtomicU64,
+    in_memory_spool_bytes: AtomicBool,
     final_bytes: AtomicU64,
     done: AtomicBool,
     result: Mutex<Option<Result<(), PortError>>>,
     failure: Mutex<Option<PortError>>,
     notify: Notify,
+    watch_notify: Notify,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     commands: Mutex<Option<mpsc::WeakSender<Command>>>,
 }
@@ -62,13 +64,15 @@ impl Session {
             started,
             remaining,
             wal,
-            pinned_wal: Mutex::new(None),
             file: Mutex::new(None),
+            spool_bytes: AtomicU64::new(0),
+            in_memory_spool_bytes: AtomicBool::new(false),
             final_bytes: AtomicU64::new(0),
             done: AtomicBool::new(false),
             result: Mutex::new(None),
             failure: Mutex::new(None),
             notify: Notify::new(),
+            watch_notify: Notify::new(),
             worker: Mutex::new(None),
             commands: Mutex::new(None),
         })
@@ -98,6 +102,7 @@ impl Session {
     }
     pub(crate) fn cancel(&self) {
         self.local.cancel();
+        self.watch_notify.notify_waiters();
         self.wake();
         if let Ok(handles) = self.interrupts.lock() {
             for handle in handles.iter() {
@@ -109,17 +114,16 @@ impl Session {
         if let Ok(mut at) = self.pinned.lock() {
             *at = None;
         }
-        if let Ok(mut wal) = self.pinned_wal.lock() {
-            *wal = None;
-        }
+        self.watch_notify.notify_waiters();
     }
     pub(crate) fn mark_pinned(&self) -> Result<(), PortError> {
-        if let Some(path) = &self.wal {
-            *self.pinned_wal.lock().map_err(|_| failure())? =
-                Some(File::open(path).map_err(|_| failure())?);
-        }
         *self.pinned.lock().map_err(|_| failure())? = Some(Instant::now());
+        self.watch_notify.notify_waiters();
         Ok(())
+    }
+    pub(crate) fn set_spool_bytes(&self, bytes: u64) {
+        self.spool_bytes.store(bytes, Ordering::SeqCst);
+        self.in_memory_spool_bytes.store(true, Ordering::SeqCst);
     }
     pub(crate) fn track(&self, file: File) -> Result<(), PortError> {
         *self.file.lock().map_err(|_| failure())? = Some(file);
@@ -131,6 +135,7 @@ impl Session {
                 file.metadata().map_err(|_| failure())?.len(),
                 Ordering::SeqCst,
             );
+            self.in_memory_spool_bytes.store(false, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -159,6 +164,7 @@ impl Session {
         }
         *self.spool_cancellation.lock().map_err(|_| failure())? = Some(cancellation);
         drop(limits);
+        self.watch_notify.notify_waiters();
         self.check()
     }
     pub(crate) fn check(&self) -> Result<(), PortError> {
@@ -177,22 +183,23 @@ impl Session {
         }
         self.operation.check(CommitEffect::NotCommitted)?;
         let limits = *self.limits.lock().map_err(|_| failure())?;
-        let pinned = self.pinned.lock().map_err(|_| failure())?;
-        let bytes = match self.file.lock().map_err(|_| failure())?.as_ref() {
-            Some(file) => file.metadata().map_err(|_| failure())?.len(),
-            None => self.final_bytes.load(Ordering::SeqCst),
+        let pinned = *self.pinned.lock().map_err(|_| failure())?;
+        let bytes = if self.in_memory_spool_bytes.load(Ordering::SeqCst) {
+            self.spool_bytes.load(Ordering::SeqCst)
+        } else {
+            match self.file.lock().map_err(|_| failure())?.as_ref() {
+                Some(file) => file.metadata().map_err(|_| failure())?.len(),
+                None => self.final_bytes.load(Ordering::SeqCst),
+            }
         };
         let retention = match &self.wal {
-            Some(_) => BackupRetentionProgress::SqliteWal {
+            Some(path) => BackupRetentionProgress::SqliteWal {
                 pinned_bytes: if pinned.is_some() {
-                    self.pinned_wal
-                        .lock()
-                        .map_err(|_| failure())?
-                        .as_ref()
-                        .ok_or_else(failure)?
-                        .metadata()
-                        .map_err(|_| failure())?
-                        .len()
+                    match std::fs::metadata(path) {
+                        Ok(meta) => meta.len(),
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+                        Err(_) => return Err(failure()),
+                    }
                 } else {
                     0
                 },
@@ -208,27 +215,65 @@ impl Session {
         })?;
         Ok(())
     }
-    pub(crate) fn watchdog(self: &Arc<Self>) {
-        let session = self.clone();
-        std::thread::spawn(move || {
-            while !session.done.load(Ordering::SeqCst) {
-                if let Err(error) = session.check() {
-                    if let Ok(mut saved) = session.failure.lock()
-                        && saved.is_none()
-                    {
-                        *saved = Some(error);
-                    }
-                    session.cancel();
+    fn next_watch_delay(&self) -> Duration {
+        let Ok(limits) = self.limits.lock().map(|g| *g) else {
+            return Duration::from_millis(20);
+        };
+        let mut delay = limits.deadline.saturating_sub(self.started.elapsed());
+        if let Ok(pinned) = self.pinned.lock().map(|g| *g)
+            && let Some(at) = pinned
+        {
+            match limits.retention {
+                BackupRetentionBudget::PostgresSnapshot { max_age } => {
+                    delay = delay.min(max_age.saturating_sub(at.elapsed()));
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                BackupRetentionBudget::SqliteWal { .. } => {
+                    delay = delay.min(Duration::from_millis(20));
+                }
             }
-        });
+        }
+        delay
+    }
+    pub(crate) async fn watch_background(self: Arc<Self>) {
+        while !self.done.load(Ordering::SeqCst) {
+            let notified = self.watch_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Err(error) = self.check() {
+                if let Ok(mut saved) = self.failure.lock()
+                    && saved.is_none()
+                {
+                    *saved = Some(error);
+                }
+                self.cancel();
+                return;
+            }
+            let spool_cancel = self
+                .spool_cancellation
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone());
+            let delay = self.next_watch_delay();
+            tokio::select! {
+                _ = notified => {}
+                _ = self.original.cancelled() => {}
+                _ = self.local.cancelled() => {}
+                _ = async {
+                    match &spool_cancel {
+                        Some(cancel) => cancel.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
     }
     pub(crate) fn finished(&self, result: Result<(), PortError>) {
         if let Ok(mut saved) = self.result.lock() {
             *saved = Some(result);
         }
         self.done.store(true, Ordering::SeqCst);
+        self.watch_notify.notify_waiters();
         self.notify.notify_waiters();
     }
     pub(crate) async fn closed(&self) -> Result<(), PortError> {

@@ -16,7 +16,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// A single-store read cut. A watchdog releases the transaction on cancellation,
@@ -47,10 +47,25 @@ impl ControlStore {
             .run(
                 async {
                     match &self.backend {
-                        Backend::Sqlite { pool, path } => Ok((
-                            Transaction::Sqlite(pool.begin().await.map_err(database)?),
-                            Some(PathBuf::from(format!("{}-wal", path.display()))),
-                        )),
+                        Backend::Sqlite {
+                            pool,
+                            read_pool,
+                            path,
+                        } => {
+                            if sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                                .execute(pool)
+                                .await
+                                .is_err()
+                            {
+                                let _ = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+                                    .execute(pool)
+                                    .await;
+                            }
+                            Ok((
+                                Transaction::Sqlite(read_pool.begin().await.map_err(database)?),
+                                Some(PathBuf::from(format!("{}-wal", path.display()))),
+                            ))
+                        }
                         Backend::Postgres(pool) => Ok((
                             Transaction::Postgres(
                                 pool.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -65,13 +80,28 @@ impl ControlStore {
             )
             .await?;
         let pinned = Instant::now();
-        let epoch=operation.run(async {
-            operation.configure(&mut tx).await?;
-            match &mut tx {
-                Transaction::Sqlite(tx)=>sqlx::query_as::<_,(i64,String)>("SELECT epoch_version,state FROM v1_storage_epoch WHERE singleton=1").fetch_optional(&mut **tx).await.map_err(database),
-                Transaction::Postgres(tx)=>sqlx::query_as::<_,(i64,String)>("SELECT epoch_version,state FROM v1_control.v1_storage_epoch WHERE singleton=1").fetch_optional(&mut **tx).await.map_err(database),
-            }
-        },CommitEffect::NotCommitted).await?;
+        let epoch = operation
+            .run(
+                async {
+                    operation.configure(&mut tx).await?;
+                    match &mut tx {
+                        Transaction::Sqlite(tx) => sqlx::query_as::<_, (i64, String)>(
+                            "SELECT epoch_version,state FROM v1_storage_epoch WHERE singleton=1",
+                        )
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .map_err(database),
+                        Transaction::Postgres(tx) => sqlx::query_as::<_, (i64, String)>(
+                            "SELECT epoch_version,state FROM v1_control.v1_storage_epoch WHERE singleton=1",
+                        )
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .map_err(database),
+                    }
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
         if epoch != Some((1, "ready".into())) {
             return Err(invalid(ValidationReason::InvalidState));
         }
@@ -80,11 +110,17 @@ impl ControlStore {
         let started = operation.started;
         let retention = Arc::new(move || {
             let retention = if let Some(wal) = &wal {
-                BackupRetentionProgress::SqliteWal {
-                    pinned_bytes: std::fs::metadata(wal)
-                        .map_err(|_| unavailable("control export WAL", CommitEffect::NotCommitted))?
-                        .len(),
-                }
+                let pinned_bytes = match std::fs::metadata(wal) {
+                    Ok(meta) => meta.len(),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(_) => {
+                        return Err(unavailable(
+                            "control export WAL",
+                            CommitEffect::NotCommitted,
+                        ));
+                    }
+                };
+                BackupRetentionProgress::SqliteWal { pinned_bytes }
             } else {
                 BackupRetentionProgress::PostgresSnapshot {
                     age: pinned.elapsed(),
@@ -105,6 +141,7 @@ impl ControlStore {
                 operation,
                 retention,
                 Some(slot),
+                Some(Duration::from_millis(20)),
             ),
             exported_bytes,
         })

@@ -30,11 +30,25 @@ use notarium_core::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{collections::BTreeMap, sync::Arc};
+use tokio::sync::Semaphore;
 
-#[derive(Clone, Debug, Default)]
+pub const DEFAULT_MAX_ACTIVE_CALLS: usize = 64;
+const MAX_ACTIVE_CALLS_CAP: usize = 1024;
+
+#[derive(Clone, Debug)]
 pub struct ProviderConfig {
     pub default_space_limits: ProviderLimits,
     pub space_limits: BTreeMap<notarium_core::ids::SpaceId, ProviderLimits>,
+    pub max_active_calls: usize,
+}
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            default_space_limits: ProviderLimits::default(),
+            space_limits: BTreeMap::new(),
+            max_active_calls: DEFAULT_MAX_ACTIVE_CALLS,
+        }
+    }
 }
 #[derive(Clone)]
 pub struct ProviderService {
@@ -44,6 +58,7 @@ pub struct ProviderService {
     egress: Arc<dyn ProviderEgressCatalogPort>,
     config: ProviderConfig,
     dispatcher: notarium_core::ids::RequestId,
+    active_calls: Arc<Semaphore>,
 }
 impl ProviderService {
     pub(super) fn control_service(&self) -> Arc<ControlService> {
@@ -57,12 +72,16 @@ impl ProviderService {
         config: ProviderConfig,
     ) -> Result<Self, PortError> {
         records::limits(config.default_space_limits)?;
-        if config.space_limits.len() > 4096 {
+        if config.space_limits.len() > 4096
+            || config.max_active_calls == 0
+            || config.max_active_calls > MAX_ACTIVE_CALLS_CAP
+        {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
         for limits in config.space_limits.values() {
             records::limits(*limits)?;
         }
+        let active_calls = Arc::new(Semaphore::new(config.max_active_calls));
         Ok(Self {
             control,
             keyring,
@@ -70,19 +89,24 @@ impl ProviderService {
             egress,
             config,
             dispatcher: notarium_core::ids::RequestId::from_bytes(crate::auth::token::random()?),
+            active_calls,
         })
     }
     async fn management(&self, ctx: &AccountContext) -> Result<(), PortError> {
+        ctx.auth().authorize_human_management()?;
+        self.management_read(ctx).await
+    }
+    async fn management_read(&self, ctx: &AccountContext) -> Result<(), PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.control.store.write(budget.clone()).await?;
+        let mut rtx = self.control.store.read(budget.clone()).await?;
         budget
             .run(
                 self.control
-                    .manager(tx.inner_mut(), ctx.auth(), ctx.auth().principal()),
+                    .manager_read(rtx.inner_mut(), ctx.auth(), ctx.auth().principal()),
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget.run(tx.rollback(), CommitEffect::NotCommitted).await
+        budget.run(rtx.rollback(), CommitEffect::NotCommitted).await
     }
     async fn mutate<T, F>(
         &self,

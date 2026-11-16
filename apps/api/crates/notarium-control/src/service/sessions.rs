@@ -17,6 +17,8 @@ use notarium_core::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+const TOUCH_WINDOW_MS: i64 = 60 * 60 * 1000;
+
 pub(super) fn selected(
     value: Option<&str>,
     max: u16,
@@ -61,6 +63,14 @@ impl ControlService {
         tx: &mut Transaction,
         auth: &EngineAuthContext,
     ) -> Result<EngineAuthContext, PortError> {
+        self.revalidate_with_keeper(tx, auth, None).await
+    }
+    pub(super) async fn revalidate_with_keeper(
+        &self,
+        tx: &mut Transaction,
+        auth: &EngineAuthContext,
+        keeper: Option<&super::schedules::PrecheckedKeeper>,
+    ) -> Result<EngineAuthContext, PortError> {
         let current_user = user(tx, auth.principal().as_str()).await?;
         let credential = auth.credential().cloned().ok_or_else(denied)?;
         let current = self
@@ -68,28 +78,64 @@ impl ControlService {
                 tx,
                 &current_user,
                 credential,
+                auth.human_management(),
                 auth.has_cap(Cap::AbilityWrite),
+                true,
+                keeper,
             )
             .await?;
         auth.intersect_current(&current).map_err(Into::into)
     }
+    pub(super) async fn revalidate_read(
+        &self,
+        tx: &mut Transaction,
+        auth: &EngineAuthContext,
+    ) -> Result<EngineAuthContext, PortError> {
+        let current_user = user_read(tx, auth.principal().as_str()).await?;
+        let credential = auth.credential().cloned().ok_or_else(denied)?;
+        let current = self
+            .credential_context(
+                tx,
+                &current_user,
+                credential,
+                auth.human_management(),
+                auth.has_cap(Cap::AbilityWrite),
+                false,
+                None,
+            )
+            .await?;
+        auth.intersect_current(&current).map_err(Into::into)
+    }
+    #[allow(clippy::too_many_arguments)]
     async fn credential_context(
         &self,
         tx: &mut Transaction,
         current_user: &UsersRow,
         credential: AuthenticatedCredential,
+        human_management: bool,
         ability_write: bool,
+        lock: bool,
+        keeper: Option<&super::schedules::PrecheckedKeeper>,
     ) -> Result<EngineAuthContext, PortError> {
         let now = self.clock.now_ms()?;
         match &credential {
             AuthenticatedCredential::ScheduledRun { .. } => {
-                self.scheduled_context(tx, current_user, credential).await
+                self.scheduled_context(tx, current_user, credential, lock, keeper)
+                    .await
             }
             AuthenticatedCredential::Session(id) => {
                 live_session(&session(tx, id.as_str()).await?, current_user, now)?;
                 let source = grant("session", id.as_str());
-                self.human_context(tx, current_user, credential, source, ability_write)
-                    .await
+                self.human_context(
+                    tx,
+                    current_user,
+                    credential,
+                    source,
+                    human_management,
+                    ability_write,
+                    lock,
+                )
+                .await
             }
             AuthenticatedCredential::TrustedNone => {
                 if !matches!(&self.config.authentication,AuthenticationMode::TrustedNone{owner} if owner.as_str()==current_user.user_id)
@@ -101,7 +147,9 @@ impl ControlService {
                     current_user,
                     credential,
                     grant("none", &current_user.user_id),
+                    human_management,
                     ability_write,
+                    lock,
                 )
                 .await
             }
@@ -115,7 +163,7 @@ impl ControlService {
                 }
                 let source = grant("pat", id.as_str());
                 let human = self
-                    .human_context(tx, current_user, credential, source, false)
+                    .human_context(tx, current_user, credential, source, false, false, lock)
                     .await?;
                 let wanted = restrict(
                     &human,
@@ -146,14 +194,26 @@ impl ControlService {
                     return Err(denied());
                 }
                 if let Some(id) = family {
-                    let family=rows!(tx,OauthRefreshFamiliesRow,fetch_optional,"SELECT * FROM oauth_refresh_families WHERE family_id=$1","SELECT * FROM v1_control.oauth_refresh_families WHERE family_id=$1 FOR SHARE";id.as_str())?.ok_or_else(denied)?;
+                    let family = if lock {
+                        rows!(tx,OauthRefreshFamiliesRow,fetch_optional,"SELECT * FROM oauth_refresh_families WHERE family_id=$1","SELECT * FROM v1_control.oauth_refresh_families WHERE family_id=$1 FOR SHARE";id.as_str())?.ok_or_else(denied)?
+                    } else {
+                        rows!(tx,OauthRefreshFamiliesRow,fetch_optional,"SELECT * FROM oauth_refresh_families WHERE family_id=$1","SELECT * FROM v1_control.oauth_refresh_families WHERE family_id=$1";id.as_str())?.ok_or_else(denied)?
+                    };
                     if family.grant_id != consent.grant_id || family.revoked_at.is_some() {
                         return Err(denied());
                     }
                 }
                 let source = grant("oauth", &consent.grant_id);
                 let human = self
-                    .human_context(tx, current_user, credential, source.clone(), false)
+                    .human_context(
+                        tx,
+                        current_user,
+                        credential,
+                        source.clone(),
+                        false,
+                        false,
+                        lock,
+                    )
                     .await?;
                 let consent_context = human.for_oauth(
                     source.clone(),
@@ -188,16 +248,41 @@ impl ControlService {
             AuthEvidenceKind::OAuth => TokenKind::Access,
             AuthEvidenceKind::Oidc => return Err(denied()),
         };
+        let human_management = ctx.evidence.human_management();
+        let ability_write = ctx.evidence.ability_write();
         let (id, digest) = token::parse(kind, ctx.evidence.secret()).map_err(|_| denied())?;
+
+        // Fast path: consistent read-only resolution with zero writer contention
+        // when the credential's hourly `last_used_at` window has not elapsed.
+        let mut rtx = self.store.read(budget.clone()).await?;
+        let (auth, needs_touch) = budget
+            .run(
+                self.resolve_evidence_read(
+                    rtx.inner_mut(),
+                    kind,
+                    id,
+                    digest,
+                    human_management,
+                    ability_write,
+                ),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
+        if !needs_touch {
+            return Ok(auth);
+        }
+
         let mut tx = self.store.write(budget.clone()).await?;
         let auth = budget
             .run(
-                self.resolve_evidence(
+                self.resolve_evidence_write(
                     tx.inner_mut(),
                     kind,
                     id,
                     digest,
-                    ctx.evidence.human_management(),
+                    human_management,
+                    ability_write,
                 ),
                 CommitEffect::NotCommitted,
             )
@@ -205,13 +290,95 @@ impl ControlService {
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
         Ok(auth)
     }
-    async fn resolve_evidence(
+    async fn resolve_evidence_read(
         &self,
         tx: &mut Transaction,
         kind: TokenKind,
         id: Option<&str>,
         digest: [u8; 32],
         human_management: bool,
+        ability_write: bool,
+    ) -> Result<(EngineAuthContext, bool), PortError> {
+        let now = self.clock.now_ms()?;
+        match kind {
+            TokenKind::Session => {
+                let current = rows!(tx, SessionsRow, fetch_optional,
+                    "SELECT * FROM sessions WHERE token_hash=$1",
+                    "SELECT * FROM v1_control.sessions WHERE token_hash=$1"; digest.as_slice())?
+                .ok_or_else(denied)?;
+                check_digest(&current.token_hash, &digest)?;
+                let current_user = user_read(tx, &current.user_id).await?;
+                let credential =
+                    AuthenticatedCredential::Session(AuthSessionId::parse(&current.session_id)?);
+                let auth = self
+                    .credential_context(
+                        tx,
+                        &current_user,
+                        credential,
+                        human_management,
+                        ability_write,
+                        false,
+                        None,
+                    )
+                    .await?;
+                let needs_touch = current.last_used_at <= now.saturating_sub(TOUCH_WINDOW_MS);
+                Ok((auth, needs_touch))
+            }
+            TokenKind::Pat => {
+                let id = id.ok_or_else(denied)?;
+                let current = pat(tx, id).await?;
+                check_digest(&current.secret_hash, &digest)?;
+                let current_user = user_read(tx, &current.user_id).await?;
+                let auth = self
+                    .credential_context(
+                        tx,
+                        &current_user,
+                        AuthenticatedCredential::Pat(CredentialTokenId::parse(id)?),
+                        false,
+                        false,
+                        false,
+                        None,
+                    )
+                    .await?;
+                let needs_touch = current
+                    .last_used_at
+                    .is_none_or(|time| time <= now.saturating_sub(TOUCH_WINDOW_MS));
+                Ok((auth, needs_touch))
+            }
+            TokenKind::Access => {
+                let id = id.ok_or_else(denied)?;
+                let current = access(tx, id).await?;
+                check_digest(&current.token_hash, &digest)?;
+                let observed_grant = oauth_grant(tx, &current.grant_id).await?;
+                let current_user = user_read(tx, &observed_grant.user_id).await?;
+                let credential = AuthenticatedCredential::OAuth {
+                    token: CredentialTokenId::parse(id)?,
+                    grant: OAuthGrantId::parse(&current.grant_id)?,
+                    family: current
+                        .family_id
+                        .as_deref()
+                        .map(OAuthFamilyId::parse)
+                        .transpose()?,
+                };
+                let auth = self
+                    .credential_context(tx, &current_user, credential, false, false, false, None)
+                    .await?;
+                let needs_touch = current
+                    .last_used_at
+                    .is_none_or(|time| time <= now.saturating_sub(TOUCH_WINDOW_MS));
+                Ok((auth, needs_touch))
+            }
+            _ => Err(denied()),
+        }
+    }
+    async fn resolve_evidence_write(
+        &self,
+        tx: &mut Transaction,
+        kind: TokenKind,
+        id: Option<&str>,
+        digest: [u8; 32],
+        human_management: bool,
+        ability_write: bool,
     ) -> Result<EngineAuthContext, PortError> {
         match kind {
             TokenKind::Session => {
@@ -225,10 +392,18 @@ impl ControlService {
                 let credential =
                     AuthenticatedCredential::Session(AuthSessionId::parse(&current.session_id)?);
                 let auth = self
-                    .credential_context(tx, &current_user, credential, human_management)
+                    .credential_context(
+                        tx,
+                        &current_user,
+                        credential,
+                        human_management,
+                        ability_write,
+                        true,
+                        None,
+                    )
                     .await?;
                 let now = self.clock.now_ms()?;
-                if current.last_used_at <= now.saturating_sub(60 * 60 * 1000) {
+                if current.last_used_at <= now.saturating_sub(TOUCH_WINDOW_MS) {
                     let expiry = now
                         .checked_add(30 * 24 * 60 * 60 * 1000)
                         .ok_or_else(|| invalid(ValidationReason::InvalidTimestamp))?;
@@ -250,12 +425,15 @@ impl ControlService {
                         &current_user,
                         AuthenticatedCredential::Pat(CredentialTokenId::parse(id)?),
                         false,
+                        false,
+                        true,
+                        None,
                     )
                     .await?;
                 let now = self.clock.now_ms()?;
                 if current
                     .last_used_at
-                    .is_none_or(|time| time <= now.saturating_sub(60 * 60 * 1000))
+                    .is_none_or(|time| time <= now.saturating_sub(TOUCH_WINDOW_MS))
                 {
                     execute!(tx,"UPDATE pats SET last_used_at=$1 WHERE token_id=$2","UPDATE v1_control.pats SET last_used_at=$1 WHERE token_id=$2"; now, id)?;
                 }
@@ -278,12 +456,12 @@ impl ControlService {
                         .transpose()?,
                 };
                 let auth = self
-                    .credential_context(tx, &current_user, credential, false)
+                    .credential_context(tx, &current_user, credential, false, false, true, None)
                     .await?;
                 let now = self.clock.now_ms()?;
                 if current
                     .last_used_at
-                    .is_none_or(|time| time <= now.saturating_sub(60 * 60 * 1000))
+                    .is_none_or(|time| time <= now.saturating_sub(TOUCH_WINDOW_MS))
                 {
                     execute!(tx,"UPDATE oauth_access_tokens SET last_used_at=$1 WHERE token_id=$2","UPDATE v1_control.oauth_access_tokens SET last_used_at=$1 WHERE token_id=$2"; now, id)?;
                 }
@@ -301,26 +479,26 @@ impl ControlService {
             return Err(denied());
         };
         let budget = OperationBudget::new(ctx);
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
         let auth = budget
             .run(
                 async {
-                    let current = user(tx.inner_mut(), owner.as_str()).await?;
+                    let current = user_read(rtx.inner_mut(), owner.as_str()).await?;
                     self.human_context(
-                        tx.inner_mut(),
+                        rtx.inner_mut(),
                         &current,
                         AuthenticatedCredential::TrustedNone,
                         grant("none", owner.as_str()),
                         perimeter.human_management(),
+                        perimeter.ability_write(),
+                        false,
                     )
                     .await
                 },
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         Ok(auth)
     }
     pub async fn logout(&self, ctx: PreAuthContext) -> Result<(), PortError> {

@@ -47,23 +47,31 @@ impl ControlService {
     ) -> Result<ControlCommit<()>, PortError> {
         let command = Command::new(request.identity, "set-favorite", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
+        ctx.auth().authorize_human_management()?;
         let budget = OperationBudget::new(ctx.budget.clone());
+        if request.input.saved {
+            let current = self.current_account(&ctx, &budget).await?;
+            budget
+                .run(
+                    self.favorite_visible(&current, &request.input.reference),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+        }
         let mut tx = self.store.write(budget.clone()).await?;
         let revision = budget.run(async {
             let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
-            if auth.kind() != &PrincipalKind::DirectHuman { return Err(access_denied()); }
-            let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+            auth.authorize_human_management()?;
             if let Some((revision, _)) = command.replay::<()>(tx.inner_mut()).await? { return Ok(revision); }
-            let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
+            let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
             expect_revision(&owner, command.identity.expected)?;
             let (kind, space, entity) = match &request.input.reference {
                 FavoriteRef::Note(note) => ("note", &note.space_id, note.note_id.as_str()),
                 FavoriteRef::Folder(folder) => ("folder", &folder.space_id, folder.folder_id.as_str()),
             };
             if request.input.saved {
-                self.favorite_visible(&current, &request.input.reference).await?;
                 let row = FavoritesRow { owner_id: owner.user_id.clone(), space_id: space.to_string(), entity_kind: kind.into(), entity_id: entity.into(), rank: request.input.rank, created_at: self.clock.now_ms()? };
-                TargetRecord::Favorites(row.clone()).validate()?;
+                TargetRecord::from(row.clone()).validate()?;
                 execute!(tx.inner_mut(),"INSERT INTO favorites(owner_id,space_id,entity_kind,entity_id,rank,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(owner_id,space_id,entity_kind,entity_id) DO UPDATE SET rank=excluded.rank",
                     "INSERT INTO v1_control.favorites(owner_id,space_id,entity_kind,entity_id,rank,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(owner_id,space_id,entity_kind,entity_id) DO UPDATE SET rank=excluded.rank";&owner.user_id,space.as_str(),kind,entity,row.rank,row.created_at)?;
             } else {
@@ -87,9 +95,9 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<FavoriteInfo>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
         let result = budget.run(async {
-            let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+            let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
             let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
             let scope = self.context_digest(tx.inner_mut(), &current, "favorites").await?;
             let cursor: Option<Cursor> = page.continuation().map(|value| serde_json::from_str(value).map_err(|_| invalid(ValidationReason::InvalidQuery))).transpose()?;

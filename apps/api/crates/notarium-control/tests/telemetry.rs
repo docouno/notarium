@@ -202,8 +202,10 @@ async fn exercise(pg: bool) {
             .await
             .is_err()
     );
+    // An orphaned crashed call (> 24h old) is eligible for GC, while an active
+    // recent call (< 24h old) and its child retrieval must be preserved.
     service
-        .begin_agent_call(ctx.clone(), start(3))
+        .begin_agent_call(ctx.clone(), start(99))
         .await
         .unwrap();
     let retrieval = AgentRetrieval {
@@ -230,13 +232,6 @@ async fn exercise(pg: bool) {
             .await
             .is_err()
     );
-    let mut pending = retrieval;
-    pending.id = RequestId::from_bytes([5; 16]);
-    pending.call = Some(RequestId::from_bytes([3; 16]));
-    service
-        .record_agent_retrieval(ctx.clone(), pending)
-        .await
-        .unwrap();
     let first = service
         .list_agent_calls(ctx.clone(), ControlPageRequest::new(1, None).unwrap())
         .await
@@ -253,7 +248,41 @@ async fn exercise(pg: bool) {
     assert_eq!(second.items[0].start.call, RequestId::from_bytes([2; 16]));
     assert!(second.items[0].detail.is_none());
     fixture.observer.execute("INSERT INTO control_commands(owner,actor,command_key,request_hash,target,expected,state,expires_at) SELECT owner,actor,'cmd_ffffffffffffffffffffffffffffffff',request_hash,'pending-fixture',0,'pending',0 FROM control_commands LIMIT 1").await;
-    fixture.clock.0.fetch_add(91 * 86_400_000, Ordering::SeqCst);
+    fixture.clock.0.fetch_add(29 * 86_400_000, Ordering::SeqCst);
+    // Touch session within its 30d window so we can open an active in-flight call right before retention GC.
+    let ctx_mid = AccountContext::new(
+        service
+            .resolve(evidence(AuthEvidenceKind::Session, token.expose()))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    fixture.clock.0.fetch_add(29 * 86_400_000, Ordering::SeqCst);
+    let _ = service
+        .resolve(evidence(AuthEvidenceKind::Session, token.expose()))
+        .await
+        .unwrap();
+    fixture.clock.0.fetch_add(29 * 86_400_000, Ordering::SeqCst);
+    let ctx_recent = AccountContext::new(
+        service
+            .resolve(evidence(AuthEvidenceKind::Session, token.expose()))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    fixture.clock.0.fetch_add(4 * 86_400_000, Ordering::SeqCst); // Total +91d; session still valid for 26d.
+    let _ = ctx_mid;
+    service
+        .begin_agent_call(ctx_recent.clone(), start(3))
+        .await
+        .unwrap();
+    let mut pending = retrieval;
+    pending.id = RequestId::from_bytes([5; 16]);
+    pending.call = Some(RequestId::from_bytes([3; 16]));
+    service
+        .record_agent_retrieval(ctx_recent.clone(), pending)
+        .await
+        .unwrap();
     let mut removed = (0, 0, 0, 0);
     let mut ended = false;
     for _ in 0..20 {
@@ -269,7 +298,7 @@ async fn exercise(pg: bool) {
         }
     }
     assert!(ended);
-    assert_eq!((removed.0, removed.1, removed.2), (1, 1, 2));
+    assert_eq!((removed.0, removed.1, removed.2), (1, 1, 3));
     assert!(removed.3 > 0);
     assert_eq!(
         fixture
@@ -292,11 +321,17 @@ async fn exercise(pg: bool) {
             .await,
         1
     );
-    assert!(service.whoami(ctx).await.is_err()); // Old session expired.
+    // Simulate a backward NTP clock step before finishing call 3: duration clamps to 0.
+    fixture.clock.0.fetch_sub(50, Ordering::SeqCst);
     service
         .finish_agent_call(maintenance(), finish(3, AgentCallDetail::default()))
         .await
         .unwrap();
+    fixture
+        .clock
+        .0
+        .fetch_add(31 * 86_400_000 + 50, Ordering::SeqCst);
+    assert!(service.whoami(ctx).await.is_err()); // Old session expired.
     assert_eq!(
         fixture
             .observer

@@ -9,7 +9,7 @@ use notarium_control::{
         AuthenticationMode, ControlService,
         oauth::{OAuthConfig, OAuthService},
     },
-    store::target::*,
+    store::TargetRecord,
 };
 use notarium_core::{
     DomainError,
@@ -55,15 +55,15 @@ async fn service(f: &mut Fixture) -> (Arc<ControlService>, Arc<OAuthService>, Is
                 budget: budget(),
             },
             &[
-                TargetRecord::V1StorageEpoch(V1StorageEpochRow {
+                TargetRecord::V1StorageEpoch {
                     singleton: 1,
                     epoch_version: 1,
                     state: "migrating".into(),
                     installation_id: InstallationId::from_bytes([1; 16]).to_string(),
                     receipt_sha256: None,
                     receipt_json: None,
-                }),
-                TargetRecord::SecretKeyring(SecretKeyringRow {
+                },
+                TargetRecord::SecretKeyring {
                     key_id: v["keyId"].as_str().unwrap().into(),
                     key_hash: v["keyHash"].as_str().unwrap().into(),
                     generation: 1,
@@ -71,7 +71,7 @@ async fn service(f: &mut Fixture) -> (Arc<ControlService>, Arc<OAuthService>, Is
                     canary: v["canaryEnvelope"].as_str().unwrap().into(),
                     created_at: 0,
                     retired_at: None,
-                }),
+                },
             ],
         )
         .await
@@ -596,7 +596,7 @@ async fn both_databases_imported_native_tokens_keep_their_verifiers_and_expiry()
         let now = 1_700_000_000_000;
         let expires = now + 123_456;
         let records = vec![
-            TargetRecord::Sessions(SessionsRow {
+            TargetRecord::Sessions {
                 session_id: AuthSessionId::from_bytes([83; 16]).to_string(),
                 token_hash: digest("session"),
                 user_id: owner.account.id.to_string(),
@@ -605,8 +605,8 @@ async fn both_databases_imported_native_tokens_keep_their_verifiers_and_expiry()
                 last_used_at: now,
                 revoked_at: None,
                 auth_version: 0,
-            }),
-            TargetRecord::OauthClients(OauthClientsRow {
+            },
+            TargetRecord::OauthClients {
                 client_id: "imported-client".into(),
                 kind: "dcr".into(),
                 redirect_uris: "[\"https://client.example/callback\"]".into(),
@@ -617,8 +617,8 @@ async fn both_databases_imported_native_tokens_keep_their_verifiers_and_expiry()
                 activated_at: Some(now),
                 created_at: now,
                 last_seen_at: Some(now),
-            }),
-            TargetRecord::OauthGrants(OauthGrantsRow {
+            },
+            TargetRecord::OauthGrants {
                 grant_id: grant.clone(),
                 user_id: owner.account.id.to_string(),
                 client_id: "imported-client".into(),
@@ -628,15 +628,15 @@ async fn both_databases_imported_native_tokens_keep_their_verifiers_and_expiry()
                 revoked_at: None,
                 revision: 0,
                 created_at: now,
-            }),
-            TargetRecord::OauthRefreshFamilies(OauthRefreshFamiliesRow {
+            },
+            TargetRecord::OauthRefreshFamilies {
                 family_id: family.clone(),
                 grant_id: grant.clone(),
                 revoked_at: None,
                 reason_code: None,
                 created_at: now,
-            }),
-            TargetRecord::OauthRefreshTokens(OauthRefreshTokensRow {
+            },
+            TargetRecord::OauthRefreshTokens {
                 token_id: id("refresh"),
                 token_hash: digest("refresh"),
                 family_id: family.clone(),
@@ -646,8 +646,8 @@ async fn both_databases_imported_native_tokens_keep_their_verifiers_and_expiry()
                 used_at: None,
                 revoked_at: None,
                 rotated_to: None,
-            }),
-            TargetRecord::OauthAccessTokens(OauthAccessTokensRow {
+            },
+            TargetRecord::OauthAccessTokens {
                 token_id: id("access"),
                 token_hash: digest("access"),
                 grant_id: grant,
@@ -660,7 +660,7 @@ async fn both_databases_imported_native_tokens_keep_their_verifiers_and_expiry()
                 expires_at: expires,
                 revoked_at: None,
                 last_used_at: Some(now),
-            }),
+            },
         ];
         f.observer
             .execute("UPDATE v1_storage_epoch SET state='migrating'")

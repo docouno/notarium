@@ -1,6 +1,6 @@
 #[allow(dead_code)]
 mod support;
-use notarium_control::{service::AuthenticationMode, store::target::*};
+use notarium_control::{service::AuthenticationMode, store::TargetRecord};
 use notarium_core::{
     auth::*,
     classes::DocClass,
@@ -82,13 +82,14 @@ async fn state_import(pg: bool) {
             },
         },
     );
-    let call = AgentCallsRow {
-        call_id: RequestId::from_bytes([20; 16]).to_string(),
+    let call_id_str = RequestId::from_bytes([20; 16]).to_string();
+    let call = |call_id: String, request_id: String| TargetRecord::AgentCalls {
+        call_id,
         owner_id: owner.clone(),
         principal: owner.clone(),
         agent: None,
         transport: "internal".into(),
-        request_id: RequestId::from_bytes([21; 16]).to_string(),
+        request_id,
         episode_id: None,
         tool: "list".into(),
         effect: "read".into(),
@@ -107,12 +108,13 @@ async fn state_import(pg: bool) {
         truncated: 0,
         detail_capture_failed: 0,
     };
-    let episode = AgentEpisodesRow {
-        episode_id: EpisodeId::from_bytes([22; 16]).to_string(),
+    let episode_id_str = EpisodeId::from_bytes([22; 16]).to_string();
+    let episode = |episode_id: String, active_role: Option<String>| TargetRecord::AgentEpisodes {
+        episode_id,
         owner_id: owner.clone(),
         name: Some("Imported episode".into()),
         parent_id: None,
-        active_role: Some(serde_json::to_string(&role).unwrap()),
+        active_role,
         project_space: None,
         project_folder: None,
         lifecycle: "active".into(),
@@ -122,29 +124,32 @@ async fn state_import(pg: bool) {
         closed_at: None,
         calls: 0,
     };
-    let pin = ContextScopePinsRow {
+    let pin = |target_id: String| TargetRecord::ContextScopePins {
         owner_id: owner.clone(),
         target_kind: "project".into(),
-        target_id: serde_json::to_string(&project).unwrap(),
+        target_id,
         target_space: space.to_string(),
         note_space: space.to_string(),
         note_id: note.note_id.to_string(),
         revision: 1,
         created_at: 0,
     };
-    let availability = AbilityAvailabilityRow {
-        placement: serde_json::to_string(&placement).unwrap(),
+    let placement_json = serde_json::to_string(&placement).unwrap();
+    let availability = |placement: String| TargetRecord::AbilityAvailability {
+        placement,
         ability_id: role.id.to_string(),
         mode: "all-projects".into(),
         enabled: 0,
         revision: 1,
     };
-    let trail = AbilityPlacementTrailRow {
-        source_placement: availability.placement.clone(),
-        ability_id: role.id.to_string(),
-        destination_placement: availability.placement.clone(),
+    let trail_manifest =
+        serde_json::json!({"source": role, "destination": destination}).to_string();
+    let trail = |ability_id: String, manifest_ref: String| TargetRecord::AbilityPlacementTrail {
+        source_placement: placement_json.clone(),
+        ability_id,
+        destination_placement: placement_json.clone(),
         destination_id: destination.id.to_string(),
-        manifest_ref: serde_json::json!({"source": role, "destination": destination}).to_string(),
+        manifest_ref,
         created_at: 0,
     };
     f.observer
@@ -154,34 +159,23 @@ async fn state_import(pg: bool) {
         .import_target_batch(
             restore(),
             &[
-                TargetRecord::AgentCalls(call.clone()),
-                TargetRecord::AgentEpisodes(episode.clone()),
-                TargetRecord::ContextScopePins(pin.clone()),
-                TargetRecord::AbilityAvailability(availability.clone()),
-                TargetRecord::AbilityPlacementTrail(trail.clone()),
+                call(
+                    call_id_str.clone(),
+                    RequestId::from_bytes([21; 16]).to_string(),
+                ),
+                episode(
+                    episode_id_str.clone(),
+                    Some(serde_json::to_string(&role).unwrap()),
+                ),
+                pin(serde_json::to_string(&project).unwrap()),
+                availability(placement_json.clone()),
+                trail(role.id.to_string(), trail_manifest.clone()),
             ],
         )
         .await
         .unwrap();
 
-    let mut malformed_call = call.clone();
-    malformed_call.call_id = RequestId::from_bytes([30; 16]).to_string();
-    malformed_call.request_id = "invalid-request".into();
-    let mut malformed_episode = episode.clone();
-    malformed_episode.episode_id = EpisodeId::from_bytes([31; 16]).to_string();
-    malformed_episode.active_role = Some("{}".into());
-    let mut malformed_placement = availability.clone();
-    malformed_placement.placement = "{}".into();
-    let mut pretty_placement = availability.clone();
-    pretty_placement.placement = serde_json::to_string_pretty(&placement).unwrap();
-    let mut malformed_trail = trail.clone();
-    malformed_trail.ability_id = AbilityId::from_bytes([32; 16]).to_string();
-    malformed_trail.manifest_ref = "{}".into();
-    let mut mismatched_trail = trail.clone();
-    mismatched_trail.ability_id = AbilityId::from_bytes([33; 16]).to_string();
-    let mut pretty_pin = pin.clone();
-    pretty_pin.target_id = serde_json::to_string_pretty(&project).unwrap();
-    let pretty_order = ContextOrderRow {
+    let pretty_order = TargetRecord::ContextOrder {
         owner_id: owner.clone(),
         target_kind: "personal".into(),
         target_id: owner.clone(),
@@ -192,48 +186,51 @@ async fn state_import(pg: bool) {
         revision: 1,
     };
     let candidates = [
-        ("request ID", TargetRecord::AgentCalls(malformed_call)),
+        (
+            "request ID",
+            call(
+                RequestId::from_bytes([30; 16]).to_string(),
+                "invalid-request".into(),
+            ),
+        ),
         (
             "episode role",
-            TargetRecord::AgentEpisodes(malformed_episode),
+            episode(
+                EpisodeId::from_bytes([31; 16]).to_string(),
+                Some("{}".into()),
+            ),
         ),
-        (
-            "ability placement",
-            TargetRecord::AbilityAvailability(malformed_placement),
-        ),
+        ("ability placement", availability("{}".into())),
         (
             "formatted placement key",
-            TargetRecord::AbilityAvailability(pretty_placement),
+            availability(serde_json::to_string_pretty(&placement).unwrap()),
         ),
         (
             "ability trail payload",
-            TargetRecord::AbilityPlacementTrail(malformed_trail),
+            trail(AbilityId::from_bytes([32; 16]).to_string(), "{}".into()),
         ),
         (
             "ability trail identity",
-            TargetRecord::AbilityPlacementTrail(mismatched_trail),
+            trail(AbilityId::from_bytes([33; 16]).to_string(), trail_manifest),
         ),
         (
             "formatted project key",
-            TargetRecord::ContextScopePins(pretty_pin),
+            pin(serde_json::to_string_pretty(&project).unwrap()),
         ),
-        (
-            "formatted order key",
-            TargetRecord::ContextOrder(pretty_order),
-        ),
+        ("formatted order key", pretty_order),
     ];
     let mut accepted = Vec::new();
     for (index, (label, invalid)) in candidates.into_iter().enumerate() {
         // A preceding valid page makes rejection prove transaction rollback,
         // including work that already reached the driver.
-        let sentinel = TargetRecord::Favorites(FavoritesRow {
+        let sentinel = TargetRecord::Favorites {
             owner_id: owner.clone(),
             space_id: space.to_string(),
             entity_kind: "note".into(),
             entity_id: NoteId::from_bytes([100 + index as u8; 16]).to_string(),
             rank: 0,
             created_at: 0,
-        });
+        };
         let mut import = f.store.begin_target_import(restore()).await.unwrap();
         import.append(&[sentinel]).await.unwrap();
         if import.append(&[invalid]).await.is_ok() {
@@ -250,7 +247,7 @@ async fn state_import(pg: bool) {
         .execute("UPDATE v1_storage_epoch SET state='ready' WHERE singleton=1")
         .await;
     service
-        .get_agent_call(ctx.clone(), RequestId::parse(&call.call_id).unwrap())
+        .get_agent_call(ctx.clone(), RequestId::parse(&call_id_str).unwrap())
         .await
         .unwrap();
     assert_eq!(
@@ -263,7 +260,7 @@ async fn state_import(pg: bool) {
         1
     );
     service
-        .get_episode(ctx.clone(), EpisodeId::parse(&episode.episode_id).unwrap())
+        .get_episode(ctx.clone(), EpisodeId::parse(&episode_id_str).unwrap())
         .await
         .unwrap();
     let entries = service

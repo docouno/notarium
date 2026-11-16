@@ -1,5 +1,8 @@
 use super::*;
-use std::{io, time::Instant};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 async fn wait_count(value: &AtomicUsize, count: usize) {
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -107,7 +110,7 @@ async fn lifecycle(pg: bool) {
         setup
             .fixture
             .observer
-            .count("SELECT COUNT(*) FROM provider_budget_buckets WHERE tpm_reserved=8224")
+            .count("SELECT COUNT(*) FROM provider_budget_buckets WHERE tpm_reserved=41")
             .await,
         3
     );
@@ -229,7 +232,7 @@ async fn lifecycle(pg: bool) {
         setup
             .fixture
             .observer
-            .count("SELECT COUNT(*) FROM provider_budget_buckets WHERE tpm_reserved=32896")
+            .count("SELECT COUNT(*) FROM provider_budget_buckets WHERE tpm_reserved=164")
             .await,
         3
     );

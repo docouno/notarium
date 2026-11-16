@@ -92,7 +92,7 @@ async fn owned_key_jobs_keep_admission_after_timeout_and_drop_and_recheck_databa
         }
         jobs.push(tokio::spawn(async move {
             keyring
-                .execute(call, None, false, move |_, _| {
+                .execute(call, Vec::new(), false, move |_, _| {
                     // This executes after real confined I/O and key validation.
                     gate.wait();
                     Ok(())
@@ -113,14 +113,14 @@ async fn owned_key_jobs_keep_admission_after_timeout_and_drop_and_recheck_databa
         job.abort();
         assert!(job.await.unwrap_err().is_cancelled());
     }
-    assert_eq!(IO_ADMISSION.available_permits(), 0);
+    assert_eq!(keyring.available_io_permits(), 0);
     assert!(matches!(
         keyring.inspect(call()).await,
         Err(PortError::Domain(DomainError::RateLimited { .. }))
     ));
     drop(release);
     tokio::time::timeout(Duration::from_secs(5), async {
-        while IO_ADMISSION.available_permits() != 4 {
+        while keyring.available_io_permits() != 4 {
             tokio::task::yield_now().await;
         }
     })
@@ -135,7 +135,7 @@ async fn owned_key_jobs_keep_admission_after_timeout_and_drop_and_recheck_databa
         let gate = gate.clone();
         tokio::spawn(async move {
             keyring
-                .execute(call(), None, false, move |_, _| {
+                .execute(call(), Vec::new(), false, move |_, _| {
                     gate.wait();
                     Ok(())
                 })

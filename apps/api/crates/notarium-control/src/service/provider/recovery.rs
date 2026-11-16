@@ -57,7 +57,7 @@ impl ProviderService {
                 id: String::new(),
             }
         };
-        let mut read = self.control.store.write(budget.clone()).await?;
+        let mut read = self.control.store.read(budget.clone()).await?;
         let candidates=budget.run(async {page_rows!(read.inner_mut(),ProviderCallLogRow,TargetTable::ProviderCallLog,page.limit(),
             "SELECT * FROM provider_call_log WHERE delivery_state IN ('intent','sending') AND created_at<=$1 AND (created_at,call_id)>($2,$3) ORDER BY created_at,call_id LIMIT $4",
             "SELECT * FROM v1_control.provider_call_log WHERE delivery_state IN ('intent','sending') AND created_at<=$1 AND (created_at,call_id)>($2,$3) ORDER BY created_at,call_id LIMIT $4";cursor.before,cursor.created,&cursor.id,i64::from(page.limit())+1)},CommitEffect::NotCommitted).await?;

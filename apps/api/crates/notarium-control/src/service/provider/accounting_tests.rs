@@ -214,8 +214,19 @@ async fn accounting(pg: bool) {
     .await;
     assert_eq!(mismatch.diagnostic, Some(ProviderErrorCode::BudgetMismatch));
     assert_eq!(mismatch.usage, exact(100, 20));
+    // A single call's budget_mismatch records full Exact spend (120) without
+    // locking out subsequent calls while remaining window TPM (300 - 120 = 180) permits.
+    admit(&fixture.store, 5, 10, late + 2).await.unwrap();
+    finish(
+        &fixture.store,
+        5,
+        exact(5, 5),
+        ProviderOutcome::Completed,
+        late + 2,
+    )
+    .await;
     assert!(matches!(
-        admit(&fixture.store, 5, 10, late + 2).await,
+        admit(&fixture.store, 6, 200, late + 3).await,
         Err(PortError::Domain(DomainError::RateLimited {
             budget: BudgetKind::Tokens,
             ..
@@ -328,7 +339,7 @@ async fn recovery(pg: bool) {
                 authority: ServiceAuthority::admit(ServicePurpose::Restore),
                 budget: budget(),
             },
-            &[TargetRecord::SecretKeyring(SecretKeyringRow {
+            &[TargetRecord::from(SecretKeyringRow {
                 key_id: value["keyId"].as_str().unwrap().into(),
                 key_hash: value["keyHash"].as_str().unwrap().into(),
                 generation: 1,

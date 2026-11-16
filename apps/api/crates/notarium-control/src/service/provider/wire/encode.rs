@@ -238,9 +238,6 @@ fn text(
     }
     let mut pieces = Vec::new();
     if let Some(instruction) = &message.instruction {
-        if message.role != CompletionRole::System {
-            return Err(invalid());
-        }
         pieces.push(instruction.text());
     }
     for part in &message.parts {
@@ -275,7 +272,10 @@ fn history(request: &CompletionRequest, wire: ProviderWireKind) -> Result<Vec<Va
             return Err(invalid());
         }
         let content = text(message, request, &mut bytes)?;
-        if content.is_empty() && message.tool_calls.is_empty() {
+        if content.is_empty()
+            && message.tool_calls.is_empty()
+            && message.role != CompletionRole::Tool
+        {
             return Err(invalid());
         }
         let role = match message.role {
@@ -337,15 +337,68 @@ fn history(request: &CompletionRequest, wire: ProviderWireKind) -> Result<Vec<Va
     }
     Ok(messages)
 }
-fn encoded(value: Value, model: &ProviderModelSpec) -> Result<Vec<u8>, PortError> {
+/// Conservative Unicode-aware upper bound (`~1` token per `3` ASCII chars,
+/// `~1` per `2` 2-byte UTF-8 chars such as Cyrillic, `1` per CJK/astral scalar).
+fn text_token_twelfths(value: &str) -> u64 {
+    let mut twelfths = 0u64;
+    for ch in value.chars() {
+        twelfths = twelfths.saturating_add(match ch.len_utf8() {
+            1 => 4,
+            2 => 6,
+            _ => 12,
+        });
+    }
+    twelfths
+}
+fn text_tokens(value: &str) -> u64 {
+    text_token_twelfths(value).div_ceil(12)
+}
+pub(in crate::service::provider) fn estimate_completion_input_tokens(
+    request: &CompletionRequest,
+) -> Result<u32, PortError> {
+    let mut total = 0u64;
+    for message in &request.messages {
+        total = total.saturating_add(4);
+        let mut msg_twelfths = 0u64;
+        if let Some(instruction) = &message.instruction {
+            msg_twelfths = msg_twelfths.saturating_add(text_token_twelfths(instruction.text()));
+        }
+        for part in &message.parts {
+            msg_twelfths = msg_twelfths.saturating_add(text_token_twelfths(part.text()));
+        }
+        total = total.saturating_add(msg_twelfths.div_ceil(12));
+        for call in &message.tool_calls {
+            let args = serde_json::to_string(&call.arguments).map_err(|_| invalid())?;
+            total = total
+                .saturating_add(8)
+                .saturating_add(text_tokens(&call.name))
+                .saturating_add(text_tokens(&args));
+        }
+    }
+    if !request.tools.is_empty() {
+        let definitions = tools(&request.tools)?;
+        let raw = serde_json::to_string(&definitions).map_err(|_| invalid())?;
+        // Tool schemas are structural JSON; count ~1 token per 4 UTF-8 bytes + framing.
+        total = total
+            .saturating_add((raw.len() as u64).div_ceil(4))
+            .saturating_add((request.tools.len() as u64).saturating_mul(8));
+    }
+    u32::try_from(total.max(1)).map_err(|_| limited())
+}
+pub(in crate::service::provider) fn estimate_embedding_input_tokens(
+    request: &EmbeddingRequest,
+) -> Result<u32, PortError> {
+    let mut estimated = 0u64;
+    for chunk in &request.chunks {
+        estimated = estimated.saturating_add(text_tokens(chunk.text()).max(1));
+    }
+    let estimated = u32::try_from(estimated.max(1)).map_err(|_| limited())?;
+    Ok(request.declared_tokens.max(estimated))
+}
+fn encoded(value: Value) -> Result<Vec<u8>, PortError> {
     let bytes = serde_json::to_vec(&value).map_err(|_| invalid())?;
     if bytes.len() > MAX_PAYLOAD {
         return Err(limited());
-    }
-    // This deliberately conservative profile admits only a byte-bounded payload
-    // and reserves the full input cap. It does not report an exact token count.
-    if bytes.len() > model.max_input_tokens as usize {
-        return Err(DomainError::validation(ValidationReason::TokenBudgetExceeded).into());
     }
     Ok(bytes)
 }
@@ -358,7 +411,8 @@ pub(in crate::service::provider) fn completion(
         || request.selection.model != model.id
         || request.budget.max_output_tokens == 0
         || request.budget.max_output_tokens > model.max_output_tokens
-        || request.budget.max_input_tokens < model.max_input_tokens
+        || request.budget.max_input_tokens == 0
+        || request.budget.max_input_tokens > model.max_input_tokens
         || request.budget.max_tool_calls as usize > MAX_TOOLS
         || !request.tools.is_empty() && (!model.tools || request.budget.max_tool_calls == 0)
     {
@@ -366,18 +420,21 @@ pub(in crate::service::provider) fn completion(
     }
     let messages = history(request, wire)?;
     let definitions = tools(&request.tools)?;
+    if estimate_completion_input_tokens(request)? > request.budget.max_input_tokens {
+        return Err(DomainError::validation(ValidationReason::TokenBudgetExceeded).into());
+    }
     let mut body = match wire {
         ProviderWireKind::OpenaiCompatible => {
-            json!({"model":model.wire_name,"messages":messages,"stream":true,"n":1,"store":false,"max_completion_tokens":request.budget.max_output_tokens,"stream_options":{"include_usage":true}})
+            json!({"model":model.wire_name,"messages":messages,"stream":true,"n":1,"max_completion_tokens":request.budget.max_output_tokens,"stream_options":{"include_usage":true}})
         }
         ProviderWireKind::Ollama => {
-            json!({"model":model.wire_name,"messages":messages,"stream":true,"options":{"num_predict":request.budget.max_output_tokens,"num_ctx":u64::from(model.max_input_tokens)+u64::from(request.budget.max_output_tokens)}})
+            json!({"model":model.wire_name,"messages":messages,"stream":true,"options":{"num_predict":request.budget.max_output_tokens}})
         }
     };
     if !definitions.is_empty() {
         body["tools"] = Value::Array(definitions);
     }
-    encoded(body, model)
+    encoded(body)
 }
 pub(in crate::service::provider) fn embedding(
     wire: ProviderWireKind,
@@ -398,6 +455,11 @@ pub(in crate::service::provider) fn embedding(
     {
         return Err(invalid());
     }
+    if request.declared_tokens > model.max_input_tokens
+        || estimate_embedding_input_tokens(request)? > model.max_input_tokens
+    {
+        return Err(DomainError::validation(ValidationReason::TokenBudgetExceeded).into());
+    }
     let mut total = 0usize;
     for chunk in &request.chunks {
         total = total.checked_add(chunk.text().len()).ok_or_else(limited)?;
@@ -410,15 +472,12 @@ pub(in crate::service::provider) fn embedding(
         .iter()
         .map(|part| part.text())
         .collect::<Vec<_>>();
-    encoded(
-        match wire {
-            ProviderWireKind::OpenaiCompatible => {
-                json!({"model":model.wire_name,"input":input,"encoding_format":"float"})
-            }
-            ProviderWireKind::Ollama => {
-                json!({"model":model.wire_name,"input":input,"truncate":false})
-            }
-        },
-        model,
-    )
+    encoded(match wire {
+        ProviderWireKind::OpenaiCompatible => {
+            json!({"model":model.wire_name,"input":input,"encoding_format":"float"})
+        }
+        ProviderWireKind::Ollama => {
+            json!({"model":model.wire_name,"input":input,"truncate":false})
+        }
+    })
 }

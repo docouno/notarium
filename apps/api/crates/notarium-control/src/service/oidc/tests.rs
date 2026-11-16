@@ -298,7 +298,6 @@ struct Setup {
 }
 impl Setup {
     async fn new(pg: bool, label: &str) -> Self {
-        super::flows::reset_fixture_rate();
         let mut f = Fixture::new(pg, label).await;
         let v: serde_json::Value =
             serde_json::from_str(include_str!("../../../tests/fixtures/keyring/vectors.json"))
@@ -311,7 +310,7 @@ impl Setup {
                     budget: budget(),
                 },
                 &[
-                    TargetRecord::V1StorageEpoch(V1StorageEpochRow {
+                    TargetRecord::from(V1StorageEpochRow {
                         singleton: 1,
                         epoch_version: 1,
                         state: "migrating".into(),
@@ -319,7 +318,7 @@ impl Setup {
                         receipt_sha256: None,
                         receipt_json: None,
                     }),
-                    TargetRecord::SecretKeyring(SecretKeyringRow {
+                    TargetRecord::from(SecretKeyringRow {
                         key_id: v["keyId"].as_str().unwrap().into(),
                         key_hash: v["keyHash"].as_str().unwrap().into(),
                         generation: 1,
@@ -650,11 +649,11 @@ async fn oidc_both_databases_explicit_linking_native_login_and_one_time_callback
         assert!(s.oidc.finish_callback(budget(), expired).await.is_err());
         assert_eq!(s.idp.calls.load(Ordering::SeqCst), count);
         assert!(
-            s.oidc
-                .begin_link(s.context().await, s.begin())
-                .await
-                .is_err(),
-            "link requires a recent session"
+            matches!(
+                s.oidc.begin_link(s.context().await, s.begin()).await,
+                Err(PortError::Domain(DomainError::AccessDenied))
+            ),
+            "link requires a recent session with explicit AccessDenied step-up signal"
         );
         s.close().await;
     }
@@ -1005,7 +1004,7 @@ async fn oidc_confidential_clients_use_encrypted_references_and_fail_before_exch
             )
             .await
             .unwrap();
-        let record = TargetRecord::Credentials(CredentialsRow {
+        let record = TargetRecord::from(CredentialsRow {
             id: credential.to_string(),
             owner_id: s.session.account.id.to_string(),
             name: "OIDC fixture".into(),

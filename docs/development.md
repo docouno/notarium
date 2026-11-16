@@ -33,8 +33,9 @@ disposable database with `--network none`, no published ports and a shared Unix
 socket. The pinned test container keeps read-only sources and accesses that
 socket through `.artifacts/control-db-fixture/active.json`. Missing fixture
 configuration fails the database suite. The project wrapper serializes fixture
-runs within one checkout and removes its container on exit; logs remain in
-`.artifacts/control-db-fixture/`. No host PostgreSQL installation is required.
+runs within one checkout and removes its container and scratch directory on
+clean exit; logs remain in `.artifacts/control-db-fixture/` when a run fails.
+No host PostgreSQL installation is required.
 
 ## Dependencies and ownership
 

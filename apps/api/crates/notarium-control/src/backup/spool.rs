@@ -271,7 +271,10 @@ impl<W: Write> SpoolWriter<W> {
         self.last = None;
         Ok(())
     }
-    pub(crate) fn finish(mut self) -> Result<W, PortError> {
+    pub(crate) fn written_bytes(&self) -> u64 {
+        self.bytes
+    }
+    pub(crate) fn finish(mut self) -> Result<(W, u64), PortError> {
         if self.in_table || self.table != TargetTable::ALL.len() {
             return Err(invalid_stream());
         }
@@ -281,7 +284,7 @@ impl<W: Write> SpoolWriter<W> {
             digest,
         })?;
         self.writer.flush().map_err(|_| invalid_stream())?;
-        Ok(self.writer)
+        Ok((self.writer, self.bytes))
     }
 }
 
@@ -310,7 +313,7 @@ mod tests {
             stream.begin_table(table).unwrap();
             if table == TargetTable::Users {
                 stream
-                    .row(TargetRecord::Users(UsersRow {
+                    .row(TargetRecord::from(UsersRow {
                         user_id: PrincipalId::from_bytes([1; 16]).to_string(),
                         username: "backup".into(),
                         email: None,
@@ -328,7 +331,7 @@ mod tests {
             }
             stream.end_table().unwrap();
         }
-        stream.finish().unwrap()
+        stream.finish().unwrap().0
     }
     fn decode_frames(bytes: &[u8]) -> Vec<Value> {
         let mut at = MAGIC.len();
@@ -380,7 +383,7 @@ mod tests {
         assert_eq!(reader.witness().schema_version, 1);
         assert!(matches!(
             reader.next_record().unwrap(),
-            Some(TargetRecord::Users(_))
+            Some(TargetRecord::Users { .. })
         ));
         assert!(reader.next_record().unwrap().is_none());
         let frames = decode_frames(&bytes);

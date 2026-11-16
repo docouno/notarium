@@ -85,7 +85,7 @@ pub(super) async fn admission(
     };
     row.ok_or(DomainError::ResourceNotFound.into())
 }
-pub(super) async fn require_owner(
+pub(super) async fn require_owner_read(
     tx: &mut Transaction,
     auth: &EngineAuthContext,
     space: &SpaceId,
@@ -104,33 +104,78 @@ pub(super) async fn require_owner(
     }
     Ok(())
 }
+pub(super) async fn require_owner(
+    tx: &mut Transaction,
+    auth: &EngineAuthContext,
+    space: &SpaceId,
+) -> Result<(), PortError> {
+    auth.authorize_human_management()?;
+    require_owner_read(tx, auth, space).await
+}
 impl ControlService {
     pub async fn admit_space_management(
         &self,
         ctx: AccountContext,
         scope: notarium_core::model::HistoryScope,
     ) -> Result<SpaceContext, PortError> {
-        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
-            return Err(access_denied());
-        }
+        ctx.auth().authorize_human_management()?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
-        let auth=budget.run(async {
-            let current=user(tx.inner_mut(),ctx.auth().principal().as_str()).await?;
-            self.live_human(tx.inner_mut(),ctx.auth(),&current).await?;
-            let space=admission(tx.inner_mut(),&scope.space_id,false).await?;
-            if !matches!(space.state.as_str(),"active"|"closing"|"archived") {return Err(access_denied());}
-            let member=rows!(tx.inner_mut(),SpaceMembersRow,fetch_optional,"SELECT * FROM space_members WHERE space_id=$1 AND user_id=$2","SELECT * FROM v1_control.space_members WHERE space_id=$1 AND user_id=$2";scope.space_id.as_str(),&current.user_id)?.ok_or_else(access_denied)?;
-            if member.role!="owner" || member.admission!="active" {return Err(access_denied());}
-            let credential=ctx.auth().credential().cloned().ok_or_else(denied)?;
-            let mut spaces=std::collections::BTreeMap::new();
-            let classes=if space.state=="active" {notarium_core::classes::DocClass::all()} else {Default::default()};
-            spaces.insert(scope.space_id.clone(),SpaceGrant{role:SpaceRole::Owner,read_classes:classes.clone(),write_classes:classes,project_root:None});
-            Ok(EngineAuthContext::for_human(VerifiedHuman::attest(ctx.auth().principal().clone(),ctx.auth().grant().clone(),spaces,ctx.auth().has_cap(Cap::AbilityWrite)).with_credential(credential)))
-        },CommitEffect::NotCommitted).await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
+        let mut rtx = self.store.read(budget.clone()).await?;
+        let auth = budget
+            .run(
+                async {
+                    let current =
+                        user_read(rtx.inner_mut(), ctx.auth().principal().as_str()).await?;
+                    self.live_human(rtx.inner_mut(), ctx.auth(), &current)
+                        .await?;
+                    let space = admission(rtx.inner_mut(), &scope.space_id, false).await?;
+                    if !matches!(space.state.as_str(), "active" | "closing" | "archived") {
+                        return Err(access_denied());
+                    }
+                    let member = rows!(
+                        rtx.inner_mut(),
+                        SpaceMembersRow,
+                        fetch_optional,
+                        "SELECT * FROM space_members WHERE space_id=$1 AND user_id=$2",
+                        "SELECT * FROM v1_control.space_members WHERE space_id=$1 AND user_id=$2";
+                        scope.space_id.as_str(),
+                        &current.user_id
+                    )?
+                    .ok_or_else(access_denied)?;
+                    if member.role != "owner" || member.admission != "active" {
+                        return Err(access_denied());
+                    }
+                    let credential = ctx.auth().credential().cloned().ok_or_else(denied)?;
+                    let mut spaces = std::collections::BTreeMap::new();
+                    let classes = if space.state == "active" {
+                        notarium_core::classes::DocClass::all()
+                    } else {
+                        Default::default()
+                    };
+                    spaces.insert(
+                        scope.space_id.clone(),
+                        SpaceGrant {
+                            role: SpaceRole::Owner,
+                            read_classes: classes.clone(),
+                            write_classes: classes,
+                            project_root: None,
+                        },
+                    );
+                    Ok(EngineAuthContext::for_human(
+                        VerifiedHuman::attest(
+                            ctx.auth().principal().clone(),
+                            ctx.auth().grant().clone(),
+                            spaces,
+                            ctx.auth().has_cap(Cap::AbilityWrite),
+                        )
+                        .with_human_management(ctx.auth().human_management())
+                        .with_credential(credential),
+                    ))
+                },
+                CommitEffect::NotCommitted,
+            )
             .await?;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         let current = budget
             .run(
                 self.catalog.space(
@@ -145,16 +190,14 @@ impl ControlService {
     }
     pub async fn whoami(&self, ctx: AccountContext) -> Result<PrincipalInfo, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
         let auth = budget
             .run(
-                self.revalidate(tx.inner_mut(), ctx.auth()),
+                self.revalidate_read(rtx.inner_mut(), ctx.auth()),
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         Ok(PrincipalInfo {
             principal: auth.principal().clone(),
             kind: auth.kind().clone(),
@@ -167,16 +210,14 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<AccessibleSpace>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
         let auth = budget
             .run(
-                self.revalidate(tx.inner_mut(), ctx.auth()),
+                self.revalidate_read(rtx.inner_mut(), ctx.auth()),
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         let facts: Vec<_> = auth
             .spaces()
             .iter()
@@ -311,14 +352,14 @@ impl ControlService {
         }
         let command = membership_command(ctx.auth(), &scope, &request)?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
         let (revision, saved) = budget
             .run(
                 async {
-                    let actor = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
-                    self.live_human(tx.inner_mut(), ctx.auth(), &actor).await?;
+                    let actor = user_read(rtx.inner_mut(), ctx.auth().principal().as_str()).await?;
+                    self.live_human(rtx.inner_mut(), ctx.auth(), &actor).await?;
                     command
-                        .replay::<MembershipResult>(tx.inner_mut())
+                        .replay::<MembershipResult>(rtx.inner_mut())
                         .await?
                         .ok_or(DomainError::ResourceNotFound.into())
                 },
@@ -328,7 +369,7 @@ impl ControlService {
         let finish = async {
             // Only the already committed receipt is resumed. No catalog read,
             // new membership admission or mutation is needed after self-removal.
-            budget.run(tx.rollback(), CommitEffect::Unknown).await?;
+            budget.run(rtx.finish(), CommitEffect::Unknown).await?;
             if saved.value.space != scope.space_id
                 || saved.value.member != request.member
                 || saved.value.role != request.role
@@ -353,33 +394,29 @@ impl ControlService {
         ctx: SpaceContext,
         request: MembershipChange,
     ) -> Result<ControlCommit<MembershipResult>, PortError> {
-        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
-            return Err(access_denied());
-        }
+        ctx.auth().authorize_human_management()?;
         let command = membership_command(ctx.auth(), ctx.scope(), &request)?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let space = &ctx.scope().space_id;
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
         let observed = budget
             .run(
                 async {
-                    let actor = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
-                    self.live_human(tx.inner_mut(), ctx.auth(), &actor).await?;
+                    let actor = user_read(rtx.inner_mut(), ctx.auth().principal().as_str()).await?;
+                    self.live_human(rtx.inner_mut(), ctx.auth(), &actor).await?;
                     if command
-                        .replay::<MembershipResult>(tx.inner_mut())
+                        .replay::<MembershipResult>(rtx.inner_mut())
                         .await?
                         .is_none()
                     {
-                        require_owner(tx.inner_mut(), ctx.auth(), space).await?;
+                        require_owner_read(rtx.inner_mut(), ctx.auth(), space).await?;
                     }
-                    admission(tx.inner_mut(), space, false).await
+                    admission(rtx.inner_mut(), space, false).await
                 },
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         let catalog = budget
             .run(
                 self.catalog
@@ -419,8 +456,8 @@ impl ControlService {
                 if let Some(old)=old {
                     execute!(tx.inner_mut(),"UPDATE space_members SET role=$1,admission='active',revision=$2 WHERE space_id=$3 AND user_id=$4","UPDATE v1_control.space_members SET role=$1,admission='active',revision=$2 WHERE space_id=$3 AND user_id=$4";role,next(old.revision)?,space.as_str(),request.member.as_str())?;
                 } else {
-                    let row=TargetRecord::SpaceMembers(SpaceMembersRow{space_id:space.to_string(),user_id:request.member.to_string(),role:role.into(),admission:"active".into(),revision:0,created_at:now});
-                    row.validate()?;row.insert(tx.inner_mut()).await?;
+                    let row=TargetRecord::from(SpaceMembersRow{space_id:space.to_string(),user_id:request.member.to_string(),role:role.into(),admission:"active".into(),revision:0,created_at:now});
+                    row.validate()?;row.insert_or_conflict(tx.inner_mut()).await?;
                 }
             } else {execute!(tx.inner_mut(),"DELETE FROM space_members WHERE space_id=$1 AND user_id=$2","DELETE FROM v1_control.space_members WHERE space_id=$1 AND user_id=$2";space.as_str(),request.member.as_str())?;}
             execute!(tx.inner_mut(),"UPDATE space_admission SET revision=$1,admission_epoch=$2 WHERE space_id=$3","UPDATE v1_control.space_admission SET revision=$1,admission_epoch=$2 WHERE space_id=$3";revision,epoch,space.as_str())?;

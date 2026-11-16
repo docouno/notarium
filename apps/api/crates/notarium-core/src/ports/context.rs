@@ -7,23 +7,72 @@ use crate::{
 };
 use std::{
     fmt,
+    future::Future,
+    pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
-#[derive(Clone, Debug, Default)]
-pub struct Cancellation(Arc<AtomicBool>);
+#[derive(Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    wakers: Mutex<Vec<Waker>>,
+}
+
+#[derive(Clone, Default)]
+pub struct Cancellation(Arc<CancellationState>);
 impl Cancellation {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        let wakers = {
+            let mut guard = self.0.wakers.lock().unwrap_or_else(|e| e.into_inner());
+            if self.0.cancelled.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            std::mem::take(&mut *guard)
+        };
+        for waker in wakers {
+            waker.wake();
+        }
     }
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+    pub fn cancelled(&self) -> Cancelled<'_> {
+        Cancelled(self)
     }
 }
+impl fmt::Debug for Cancellation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Cancellation")
+            .field(&self.is_cancelled())
+            .finish()
+    }
+}
+pub struct Cancelled<'a>(&'a Cancellation);
+impl Future for Cancelled<'_> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0.is_cancelled() {
+            return Poll::Ready(());
+        }
+        let mut guard = self.0.0.wakers.lock().unwrap_or_else(|e| e.into_inner());
+        if self.0.is_cancelled() {
+            return Poll::Ready(());
+        }
+        let waker = cx.waker();
+        if let Some(existing) = guard.iter_mut().find(|item| item.will_wake(waker)) {
+            existing.clone_from(waker);
+        } else {
+            guard.push(waker.clone());
+        }
+        Poll::Pending
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CallBudget {
     pub request: RequestId,
@@ -36,6 +85,7 @@ pub struct AuthEvidence {
     kind: AuthEvidenceKind,
     secret: SecretString,
     human_management: bool,
+    ability_write: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthEvidenceKind {
@@ -50,6 +100,7 @@ impl AuthEvidence {
             kind,
             secret: SecretString::new(secret),
             human_management: false,
+            ability_write: false,
         }
     }
     pub fn kind(&self) -> AuthEvidenceKind {
@@ -66,6 +117,15 @@ impl AuthEvidence {
     }
     pub fn human_management(&self) -> bool {
         self.human_management
+    }
+    /// Trusted interactive transport explicitly admits ability package authoring
+    /// independently from ordinary account/Space management mutations.
+    pub fn with_ability_write(mut self) -> Self {
+        self.ability_write = true;
+        self
+    }
+    pub fn ability_write(&self) -> bool {
+        self.ability_write
     }
 }
 impl fmt::Debug for AuthEvidence {

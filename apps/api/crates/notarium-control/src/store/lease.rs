@@ -16,6 +16,16 @@ use std::{
 };
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit};
 
+fn budget_failure(effect: CommitEffect) -> OperationalFailure {
+    OperationalFailure::new(
+        ContentDigest::from_bytes(*blake3::hash(b"control operation budget").as_bytes()),
+        effect,
+        RetryAdvice::Never,
+        false,
+    )
+    .expect("non-retryable failure is valid")
+}
+
 #[derive(Clone)]
 pub(crate) struct OperationBudget {
     pub started: Instant,
@@ -37,21 +47,18 @@ impl OperationBudget {
             cancellation: budget.cancellation,
         }
     }
+    pub fn cancellation(&self) -> &Cancellation {
+        &self.cancellation
+    }
+    pub fn remaining_now(&self) -> Duration {
+        self.remaining.saturating_sub(self.started.elapsed())
+    }
     pub fn check(&self, effect: CommitEffect) -> Result<(), PortError> {
-        let failure = || {
-            OperationalFailure::new(
-                ContentDigest::from_bytes(*blake3::hash(b"control operation budget").as_bytes()),
-                effect,
-                RetryAdvice::Never,
-                false,
-            )
-            .expect("non-retryable failure is valid")
-        };
         if self.cancellation.is_cancelled() {
-            return Err(PortError::Cancelled(failure()));
+            return Err(PortError::Cancelled(budget_failure(effect)));
         }
         if self.started.elapsed() >= self.remaining {
-            return Err(PortError::DeadlineExceeded(failure()));
+            return Err(PortError::DeadlineExceeded(budget_failure(effect)));
         }
         Ok(())
     }
@@ -61,34 +68,34 @@ impl OperationBudget {
         effect: CommitEffect,
     ) -> Result<T, PortError> {
         self.check(effect)?;
+        let sleep_for = self.remaining_now();
         tokio::select! {
             biased;
-            error = async {
-                loop {
-                    if let Err(error) = self.check(effect) { break error; }
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            } => Err(error),
+            () = self.cancellation.cancelled() => Err(PortError::Cancelled(budget_failure(effect))),
+            () = tokio::time::sleep(sleep_for) => Err(PortError::DeadlineExceeded(budget_failure(effect))),
             result = operation => result,
         }
     }
     pub async fn configure(&self, tx: &mut Transaction) -> Result<(), PortError> {
-        // PostgreSQL's server-side fallback is finite too. The local watchdog
-        // owns prompt cancellation; a dead process must not leave an idle cut.
+        // Override pool-default 250ms statement_timeout as well as idle timeout
+        // so bounded cuts/imports/exports honour their explicit operation budget.
         if let Transaction::Postgres(tx) = tx {
             let millis = self
                 .remaining
                 .saturating_sub(self.started.elapsed())
-                // Give the watchdog time to acknowledge ROLLBACK before the
+                // Give the local watchdog time to acknowledge ROLLBACK before the
                 // server kills the connection as a process-failure fallback.
                 .saturating_add(Duration::from_secs(1))
                 .as_millis()
                 .clamp(1, i32::MAX as u128);
-            sqlx::query("SELECT set_config('idle_in_transaction_session_timeout',$1,true)")
-                .bind(format!("{millis}ms"))
-                .execute(&mut **tx)
-                .await
-                .map_err(database)?;
+            let setting = format!("{millis}ms");
+            sqlx::query(
+                "SELECT set_config('statement_timeout',$1,true), set_config('idle_in_transaction_session_timeout',$1,true)",
+            )
+            .bind(&setting)
+            .execute(&mut **tx)
+            .await
+            .map_err(database)?;
         }
         Ok(())
     }
@@ -157,6 +164,7 @@ impl TransactionLease {
         budget: OperationBudget,
         retention: RetentionCheck,
         slot: Option<OwnedSemaphorePermit>,
+        retention_poll: Option<Duration>,
     ) -> Self {
         let state = Arc::new(Mutex::new(Some(value)));
         let shared = Arc::new(Shared {
@@ -181,9 +189,15 @@ impl TransactionLease {
                     *worker_shared.failure.lock().expect("lease failure lock") = Some(error);
                     break;
                 }
+                let wait_for = match retention_poll {
+                    Some(interval) => worker_budget.remaining_now().min(interval),
+                    None => worker_budget.remaining_now(),
+                };
                 tokio::select! {
-                    _=worker_shared.notify.notified()=>{},
-                    _=tokio::time::sleep(Duration::from_millis(1))=>{},
+                    biased;
+                    _ = worker_shared.notify.notified() => {},
+                    () = worker_budget.cancellation().cancelled() => {},
+                    () = tokio::time::sleep(wait_for) => {},
                 }
             }
             let value = worker_state.lock().await.take();

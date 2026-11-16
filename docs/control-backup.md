@@ -9,9 +9,10 @@ registrations before serving restored state.
 
 ## Snapshot protocol
 
-1. `prepare` admits one active control backup per process. It opens files and
-   dedicated connections, warms metadata statements and validates key canaries
-   before pausing writes. An owner lock serializes artifact recovery across processes.
+1. `prepare` admits one active control backup per `ControlBackup` instance. It opens files and
+   dedicated connections, warms metadata statements, attempts a best-effort SQLite WAL
+   truncating checkpoint and validates key canaries before pausing writes. An owner lock
+   serializes artifact recovery across processes.
 2. `acquire_hold` returns validated metadata. Control has no CAS blob hold; raw
    key material does not cross into the backup worker.
 3. `pause_writes` blocks new admitted control writers and drains existing writers.
@@ -22,8 +23,10 @@ registrations before serving restored state.
    keyring witness. SQLite first drains its native writer lock with a prepared
    write connection, covering driver cleanup after an async runtime disappears.
 5. `resume` releases the writer pause while retaining the source snapshot.
-   PostgreSQL uses `REPEATABLE READ READ ONLY`; SQLite retains its read transaction
-   on the same native connection. Later commits cannot change the cut.
+   PostgreSQL unlocks its advisory lock and releases local writer admission before
+   closing the lock connection, retaining `REPEATABLE READ READ ONLY` on the source
+   connection; SQLite retains its read transaction on the same native connection.
+   Later commits cannot change the cut.
 6. `spool` produces a complete local artifact, checks it, fsyncs it and computes a
    streaming BLAKE3 digest before releasing the source. `close` waits for actual
    local resource cleanup. Packaging and upload do not retain a database snapshot.
@@ -39,8 +42,10 @@ queue. Stale completed phase handles cannot cancel their successor. An unread
 spool reply remains participant-owned: receipt acceptance and abort race through
 one atomic ownership transition.
 
-An independent watchdog monitors cancellation and retention even while the caller
-is idle. PostgreSQL graceful unlock/close and rollback cleanup each have a
+A background task on the owner runtime monitors event-driven cancellation,
+deadlines and retention even while the caller is idle, tracking PostgreSQL spool
+bytes in memory without per-row filesystem metadata syscalls. PostgreSQL graceful
+unlock/close and rollback cleanup each have a
 five-second grace; timed-out handles remain owned by the private pool until its
 close-on-drop work has closed their local sockets. SQLx's pinned close-on-drop
 grace is five seconds. A timeout returns an error, not a graceful rollback ACK.
@@ -55,7 +60,8 @@ Default operator ceilings are five minutes overall, 10 GiB of spool bytes,
 256 MiB of pinned SQLite WAL, and five minutes of PostgreSQL snapshot age.
 `BackupConfig`, the call budget and coordinator budget clamp these ceilings;
 the coordinator may lower them again at spool time. The deadline includes
-preparation, drain, pin and spool. SQLite observes the actual WAL file handle;
+preparation, drain, pin and spool. SQLite observes the WAL file size on disk
+(treating an absent WAL file as zero bytes);
 PostgreSQL measures snapshot age from immediately before its real pin read.
 Backend metric mismatches fail closed. Exceeding retention aborts the backup
 and releases its cut; it does not throttle interactive writers.
@@ -92,9 +98,8 @@ before its source cut is released. No database-wide RAM serialization is used.
 each target table in schema order, typed rows in primary-key order, per-table
 counts, and a final counts/digest frame. Table reads contain at most 200 records
 and 8 MiB of encoded target records. Frames are capped at 8 MiB plus 128 bytes of
-framing overhead before allocation. PostgreSQL text keys use `COLLATE "C"` for
-portable byte ordering, including keyset predicates. Databases using other
-collations may need an explicit sort within the configured statement budget.
+framing overhead before allocation. PostgreSQL text columns and primary keys declare `COLLATE "C"` in schema DDL so
+portable byte-ordered keyset predicates use B-tree index order directly.
 
 `SpoolReader` checks version, closed DTOs, typed target validation, table/key order,
 counts, truncation, final digest and absence of trailing bytes. Any error poisons

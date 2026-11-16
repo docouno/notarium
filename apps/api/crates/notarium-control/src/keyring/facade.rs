@@ -20,15 +20,12 @@ use notarium_core::{
     ids::KeyId,
     ports::CallBudget,
 };
-use std::{
-    fmt,
-    path::PathBuf,
-    sync::{Arc, LazyLock},
-};
+use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 
-pub(super) static IO_ADMISSION: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(4)));
+const MAX_IO_WORKERS: usize = 4;
+const MAX_IO_QUEUE: usize = 64;
+const IO_ADMISSION_WAIT: Duration = Duration::from_millis(50);
 
 #[cfg(test)]
 #[path = "facade_tests.rs"]
@@ -109,12 +106,29 @@ impl fmt::Debug for SealedValue {
 pub struct Keyring {
     store: ControlStore,
     path: PathBuf,
+    io_admission: Arc<Semaphore>,
+    io_queue: Arc<Semaphore>,
 }
 impl Keyring {
+    pub(super) fn new_admission() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(MAX_IO_WORKERS))
+    }
+    #[cfg(test)]
+    pub(super) fn available_io_permits(&self) -> usize {
+        self.io_admission.available_permits()
+    }
     pub async fn open(
         store: ControlStore,
         location: KeyringLocation,
         budget: CallBudget,
+    ) -> Result<Self, PortError> {
+        Self::open_with_admission(store, location, budget, Self::new_admission()).await
+    }
+    pub(super) async fn open_with_admission(
+        store: ControlStore,
+        location: KeyringLocation,
+        budget: CallBudget,
+        io_admission: Arc<Semaphore>,
     ) -> Result<Self, PortError> {
         let path = match (&store.backend, location) {
             (Backend::Sqlite { path, .. }, KeyringLocation::LocalDefault(root))
@@ -125,9 +139,46 @@ impl Keyring {
             (_, KeyringLocation::External(path)) => path,
             _ => return Err(invalid(ValidationReason::InvalidState)),
         };
-        let keyring = Self { store, path };
-        keyring.execute(budget, None, true, |_, _| Ok(())).await?;
+        let keyring = Self {
+            store,
+            path,
+            io_admission,
+            io_queue: Arc::new(Semaphore::new(MAX_IO_QUEUE)),
+        };
+        keyring
+            .execute(budget, Vec::new(), true, |_, _| Ok(()))
+            .await?;
         Ok(keyring)
+    }
+    async fn acquire_io_permit(
+        &self,
+        budget: &OperationBudget,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, PortError> {
+        let _queue = self.io_queue.clone().try_acquire_owned().map_err(|_| {
+            PortError::Domain(DomainError::RateLimited {
+                retry_after_ms: 100,
+                budget: BudgetKind::Concurrency,
+            })
+        })?;
+        if let Ok(permit) = self.io_admission.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
+        let wait_for = budget.remaining_now().min(IO_ADMISSION_WAIT);
+        tokio::select! {
+            biased;
+            () = budget.cancellation().cancelled() => Err(budget.check(CommitEffect::NotCommitted).expect_err("cancelled")),
+            permit = self.io_admission.clone().acquire_owned() => permit.map_err(|_| failure()),
+            () = tokio::time::sleep(wait_for) => {
+                if budget.remaining_now() == Duration::ZERO {
+                    Err(budget.check(CommitEffect::NotCommitted).expect_err("deadline"))
+                } else {
+                    Err(PortError::Domain(DomainError::RateLimited {
+                        retry_after_ms: 100,
+                        budget: BudgetKind::Concurrency,
+                    }))
+                }
+            }
+        }
     }
     async fn witnesses(&self, budget: &OperationBudget) -> Result<Vec<Witness>, PortError> {
         let rows = budget.run(async {
@@ -140,7 +191,7 @@ impl Keyring {
         }
         rows.into_iter()
             .map(|row| {
-                TargetRecord::SecretKeyring(row.clone()).validate()?;
+                TargetRecord::from(row.clone()).validate()?;
                 if !matches!(row.state.as_str(), "active" | "readable")
                     || row.generation <= 0
                     || row.canary.len() > 1024
@@ -160,18 +211,13 @@ impl Keyring {
     async fn execute<T: Send + 'static>(
         &self,
         call: CallBudget,
-        requested: Option<KeyId>,
+        requested: Vec<KeyId>,
         all: bool,
-        action: impl FnOnce(Material, &[Witness]) -> Result<T, PortError> + Send + 'static,
+        action: impl FnOnce(Vec<Material>, &[Witness]) -> Result<T, PortError> + Send + 'static,
     ) -> Result<T, PortError> {
         let budget = OperationBudget::new(call);
         budget.check(CommitEffect::NotCommitted)?;
-        let permit = IO_ADMISSION.clone().try_acquire_owned().map_err(|_| {
-            PortError::Domain(DomainError::RateLimited {
-                retry_after_ms: 100,
-                budget: BudgetKind::Concurrency,
-            })
-        })?;
+        let permit = self.acquire_io_permit(&budget).await?;
         let before = self.witnesses(&budget).await?;
         let rows = before.clone();
         let path = self.path.clone();
@@ -179,9 +225,9 @@ impl Keyring {
         let worker = tokio::task::spawn_blocking(move || {
             let result = (|| {
                 worker_budget.check(CommitEffect::NotCommitted)?;
-                let material = reader::load(&path, &rows, requested.as_ref(), all, &worker_budget)?;
+                let materials = reader::load_many(&path, &rows, &requested, all, &worker_budget)?;
                 worker_budget.check(CommitEffect::NotCommitted)?;
-                action(material, &rows)
+                action(materials, &rows)
             })();
             // Cancellation of the caller never detaches the admission credit
             // from actual blocking I/O. Keep it through the final DB recheck too.
@@ -208,14 +254,15 @@ impl Keyring {
         if value.expose().len() > super::crypto::MAX_PLAINTEXT {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
-        self.execute(budget, None, false, move |material, rows| {
-            let row = rows
+        self.execute(budget, Vec::new(), false, move |materials, rows| {
+            let active = rows.iter().find(|row| row.active).ok_or_else(failure)?;
+            let material = materials
                 .iter()
-                .find(|row| row.key == material.id)
+                .find(|item| item.id == active.key)
                 .ok_or_else(failure)?;
             Ok(SealedValue {
                 encrypted: material.seal(&address, value.expose())?,
-                witness: row.into(),
+                witness: active.into(),
             })
         })
         .await
@@ -236,24 +283,49 @@ impl Keyring {
         address: EnvelopeAddress,
         encrypted: &str,
     ) -> Result<(SecretString, KeyringWitness), PortError> {
-        let envelope = Envelope::parse(encrypted)?;
-        self.execute(
-            budget,
-            Some(envelope.key.clone()),
-            false,
-            move |material, rows| {
+        let mut opened = self
+            .open_verified_many(budget, vec![(address, encrypted.to_owned())])
+            .await?;
+        opened.pop().ok_or_else(failure)
+    }
+    /// Opens a batch of envelopes in one DB witness read and one filesystem pass.
+    pub(crate) async fn open_verified_many(
+        &self,
+        budget: CallBudget,
+        items: Vec<(EnvelopeAddress, String)>,
+    ) -> Result<Vec<(SecretString, KeyringWitness)>, PortError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut parsed = Vec::with_capacity(items.len());
+        let mut keys = Vec::new();
+        for (address, encrypted) in items {
+            let envelope = Envelope::parse(&encrypted)?;
+            if !keys.contains(&envelope.key) {
+                keys.push(envelope.key.clone());
+            }
+            parsed.push((address, envelope));
+        }
+        self.execute(budget, keys, false, move |materials, rows| {
+            let mut out = Vec::with_capacity(parsed.len());
+            for (address, envelope) in parsed {
+                let material = materials
+                    .iter()
+                    .find(|item| item.id == envelope.key)
+                    .ok_or_else(failure)?;
                 let witness = rows
                     .iter()
                     .find(|row| row.key == material.id)
                     .ok_or_else(failure)?;
-                Ok((material.open(&address, &envelope)?, witness.into()))
-            },
-        )
+                out.push((material.open(&address, &envelope)?, witness.into()));
+            }
+            Ok(out)
+        })
         .await
     }
     /// Validated key identity witnesses contain no file bytes or master secrets.
     pub async fn inspect(&self, budget: CallBudget) -> Result<Vec<KeyringWitness>, PortError> {
-        self.execute(budget, None, true, |_, rows| {
+        self.execute(budget, Vec::new(), true, |_, rows| {
             Ok(rows.iter().map(Into::into).collect())
         })
         .await

@@ -6,16 +6,31 @@ enum Change {
     Delete(DeleteSchedule),
 }
 impl ControlService {
-    async fn mutate_schedule(
-        &self,
+    fn mutate_schedule<'a>(
+        &'a self,
         ctx: AccountContext,
         command: Command,
         change: Change,
-    ) -> Result<ControlCommit<ScheduleId>, PortError> {
-        command.require(ctx.auth().principal(), ctx.auth().principal())?;
-        let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
-        let (revision,saved) = budget.run(async {
+    ) -> PortFuture<'a, ControlCommit<ScheduleId>> {
+        Box::pin(async move {
+            ctx.auth().authorize_human_management()?;
+            command.require(ctx.auth().principal(), ctx.auth().principal())?;
+            let budget = OperationBudget::new(ctx.budget.clone());
+            let prechecked = match &change {
+                Change::Create(input) => Some(
+                    self.precheck_schedule_definition(&ctx, &budget, &input.definition)
+                        .await
+                        .map(|(_, raw)| raw),
+                ),
+                Change::Update(input) => Some(
+                    self.precheck_schedule_definition(&ctx, &budget, &input.definition)
+                        .await
+                        .map(|(_, raw)| raw),
+                ),
+                Change::Delete(_) => None,
+            };
+            let mut tx = self.store.write(budget.clone()).await?;
+            let (revision,saved) = budget.run(async {
             let (owner,_) = self.manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
             if let Some(replay) = command.replay::<ScheduleId>(tx.inner_mut()).await? {return Ok(replay);}
             expect_revision(&owner,command.identity.expected)?;
@@ -25,7 +40,8 @@ impl ControlService {
             let (id, revoke) = match change {
                 Change::Create(input) => {
                     validate(&input.definition,input.next_slot,self.config.schedule_limits)?;
-                    self.schedule_definition_authority(tx.inner_mut(),&current,&input.definition).await?;
+                    let raw = prechecked.expect("create prechecked")?;
+                    self.verify_schedule_definition_db(tx.inner_mut(),&current,&input.definition,raw).await?;
                     if rows!(tx.inner_mut(),(i64,),fetch_optional,"SELECT 1 FROM agent_schedules WHERE schedule_id=$1","SELECT 1 FROM v1_control.agent_schedules WHERE schedule_id=$1";input.id.as_str())?.is_some() {return Err(DomainError::IdempotencyKeyReused.into());}
                     let row = AgentSchedulesRow {
                         schedule_id:input.id.to_string(),owner_id:owner.user_id.clone(),space_id:input.definition.space.to_string(),
@@ -34,7 +50,7 @@ impl ControlService {
                         paused_reason:input.paused.then(||"manual".into()),write_class_mask:1,budgets:json(&input.definition.limits)?,misfire_policy:"coalesce_latest".into(),
                         next_slot_utc_ms:ms(input.next_slot)?,deleted_at:None,revision:0,config_revision:0,created_at:now,updated_at:now,
                     };
-                    let record = TargetRecord::AgentSchedules(row); record.validate()?; record.insert(tx.inner_mut()).await?;
+                    let record = TargetRecord::from(row); record.validate()?; record.insert(tx.inner_mut()).await?;
                     (input.id,false)
                 }
                 Change::Update(input) => {
@@ -52,7 +68,8 @@ impl ControlService {
                         if grant.role==SpaceRole::Viewer || !grant.write_classes.contains(&DocClass::AgentMemory) {return Err(access_denied());}
                     } else {
                         validate(&input.definition,input.next_slot,self.config.schedule_limits)?;
-                        self.schedule_definition_authority(tx.inner_mut(),&current,&input.definition).await?;
+                        let raw = prechecked.expect("update prechecked")?;
+                        self.verify_schedule_definition_db(tx.inner_mut(),&current,&input.definition,raw).await?;
                     }
                     let project = input.definition.project.as_ref().map(|p|p.folder_id.to_string());
                     let approved = json(&input.definition.approved_role)?;
@@ -73,7 +90,7 @@ impl ControlService {
                     let space = SpaceId::parse(&row.space_id)?;
                     let grant = current.auth().spaces().get(&space).ok_or(DomainError::ResourceNotFound)?;
                     if grant.role==SpaceRole::Viewer || !grant.write_classes.contains(&DocClass::AgentMemory) {return Err(access_denied());}
-                    execute!(tx.inner_mut(),"UPDATE agent_schedules SET deleted_at=$1,revision=$2,config_revision=$3,updated_at=$1 WHERE schedule_id=$4","UPDATE v1_control.agent_schedules SET deleted_at=$1,revision=$2,config_revision=$3,updated_at=$1 WHERE schedule_id=$4";now,next(row.revision)?,next(row.config_revision)?,input.schedule.as_str())?;
+                    execute!(tx.inner_mut(),"UPDATE agent_schedules SET init_prompt='',deleted_at=$1,revision=$2,config_revision=$3,updated_at=$1 WHERE schedule_id=$4","UPDATE v1_control.agent_schedules SET init_prompt='',deleted_at=$1,revision=$2,config_revision=$3,updated_at=$1 WHERE schedule_id=$4";now,next(row.revision)?,next(row.config_revision)?,input.schedule.as_str())?;
                     (input.schedule,true)
                 }
             };
@@ -86,13 +103,14 @@ impl ControlService {
             command.save(tx.inner_mut(),revision,&saved,now).await?;
             Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
-        self.commit_revocations(tx, &budget, &saved.events).await?;
-        for event in &saved.events {
-            self.flush_event(&budget, event).await?;
-        }
-        Ok(ControlCommit {
-            revision,
-            value: saved.value,
+            self.commit_revocations(tx, &budget, &saved.events).await?;
+            for event in &saved.events {
+                self.flush_event(&budget, event).await?;
+            }
+            Ok(ControlCommit {
+                revision,
+                value: saved.value,
+            })
         })
     }
     pub async fn create_schedule(

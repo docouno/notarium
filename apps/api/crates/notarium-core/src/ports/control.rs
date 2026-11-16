@@ -157,7 +157,10 @@ pub enum AbilityResolution {
 }
 #[derive(Clone, Debug)]
 pub enum AbilitySelection {
-    Exact(AbilityRef),
+    Exact {
+        reference: AbilityRef,
+        project: Option<FolderRef>,
+    },
     Name {
         kind: AbilityKind,
         name: String,
@@ -275,6 +278,27 @@ pub struct BootstrapContext {
     pub continuation: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct McpDedupKey {
+    pub actor: String,
+    pub request_key: CommandKey,
+    pub request_hash: ContentDigest,
+    pub operation: String,
+}
+#[derive(Clone, Debug)]
+pub struct McpDedupRecord {
+    pub key: McpDedupKey,
+    pub safe_result: String,
+    pub effect: super::telemetry::AgentEffect,
+    pub ttl_ms: u64,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpDedupHit {
+    pub operation: String,
+    pub safe_result: String,
+    pub effect: super::telemetry::AgentEffect,
+}
+
 pub use super::schedules::*;
 
 #[derive(Clone, Debug)]
@@ -363,6 +387,7 @@ pub trait ControlPort: Send + Sync {
         ctx: AccountContext,
         request: AccountMutation<EpisodeUpdate>,
     ) -> PortFuture<'_, ControlCommit<AgentEpisode>>;
+    fn touch_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, ()>;
     fn acknowledge_delta(
         &self,
         ctx: AccountContext,
@@ -391,12 +416,29 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: AccountContext,
         reference: AbilityRef,
+        project: Option<FolderRef>,
     ) -> PortFuture<'_, AbilityDescriptor>;
     fn update_ability_binding(
         &self,
         ctx: AccountContext,
         request: AccountMutation<AbilityBindingUpdate>,
     ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>>;
+    fn set_ability_preference(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityPreferenceUpdate>,
+    ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>>;
+    fn set_ability_trail(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityTrailUpdate>,
+    ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>>;
+    fn lookup_mcp_dedup(
+        &self,
+        ctx: AccountContext,
+        key: McpDedupKey,
+    ) -> PortFuture<'_, Option<McpDedupHit>>;
+    fn record_mcp_dedup(&self, ctx: AccountContext, record: McpDedupRecord) -> PortFuture<'_, ()>;
     fn resolve_memory_target(
         &self,
         ctx: AccountContext,

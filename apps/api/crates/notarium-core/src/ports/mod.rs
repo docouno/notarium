@@ -24,7 +24,7 @@ pub use account_state::*;
 pub use authentication::*;
 pub use catalog::*;
 pub use context::*;
-pub use control::ControlPort;
+pub use control::*;
 pub use engine::*;
 pub use infrastructure::*;
 pub use oauth::*;

@@ -66,11 +66,8 @@ impl ControlService {
         if value.lifecycle != Lifecycle::Active {
             return Err(DomainError::ResourceNotFound.into());
         }
-        ctx.auth().authorize_folder_read(
-            &value.space,
-            &folder.folder_id,
-            &value.ancestor_folders,
-        )?;
+        ctx.auth()
+            .can_view_folder(&value.space, &folder.folder_id, &value.ancestor_folders)?;
         Ok(value)
     }
     pub async fn resolve_memory_target(
@@ -89,25 +86,42 @@ impl ControlService {
             return Err(invalid(ValidationReason::InvalidQuery));
         }
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
-        let value = budget
+        let mut rtx = self.store.read(budget.clone()).await?;
+        let (current, personal_space) = budget
             .run(
                 async {
-                    let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
-                    let current =
-                        AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+                    let auth = self.revalidate_read(rtx.inner_mut(), ctx.auth()).await?;
+                    let personal = if let MemoryTarget::User { owner } = &target {
+                        if owner != auth.principal() {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        let user =
+                            super::authority::user_read(rtx.inner_mut(), owner.as_str()).await?;
+                        Some(SpaceId::parse(
+                            user.personal_space_id
+                                .as_deref()
+                                .ok_or(DomainError::ResourceNotFound)?,
+                        )?)
+                    } else {
+                        None
+                    };
+                    Ok((
+                        AccountContext::new(auth, budget.context(ctx.budget.request.clone())),
+                        personal,
+                    ))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        budget
+            .run(rtx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        budget
+            .run(
+                async {
                     let space = match &target {
-                        MemoryTarget::User { owner } => {
-                            if owner != current.auth().principal() {
-                                return Err(DomainError::ResourceNotFound.into());
-                            }
-                            let user =
-                                super::authority::user(tx.inner_mut(), owner.as_str()).await?;
-                            SpaceId::parse(
-                                user.personal_space_id
-                                    .as_deref()
-                                    .ok_or(DomainError::ResourceNotFound)?,
-                            )?
+                        MemoryTarget::User { .. } => {
+                            personal_space.ok_or(DomainError::ResourceNotFound)?
                         }
                         MemoryTarget::Project { folder } => {
                             self.catalog_project(&current, folder).await?;
@@ -161,24 +175,22 @@ impl ControlService {
                 },
                 CommitEffect::Unknown,
             )
-            .await?;
-        budget.run(tx.rollback(), CommitEffect::Unknown).await?;
-        Ok(value)
+            .await
     }
     pub(super) async fn current_account(
         &self,
         ctx: &AccountContext,
         budget: &OperationBudget,
     ) -> Result<AccountContext, PortError> {
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
         let auth = budget
             .run(
-                self.revalidate(tx.inner_mut(), ctx.auth()),
+                self.revalidate_read(rtx.inner_mut(), ctx.auth()),
                 CommitEffect::NotCommitted,
             )
             .await?;
         budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .run(rtx.rollback(), CommitEffect::NotCommitted)
             .await?;
         Ok(AccountContext::new(
             auth,
@@ -246,7 +258,7 @@ impl ControlService {
         if value.lifecycle != Lifecycle::Active {
             return Err(DomainError::ResourceNotFound.into());
         }
-        ctx.auth().authorize_read(&value.facts)?;
+        ctx.auth().can_view_resource(&value.facts)?;
         Ok(value)
     }
     pub async fn list_projects(
@@ -325,19 +337,17 @@ impl ControlService {
         }
         let mut items = Vec::with_capacity(result.items.len());
         for project in result.items {
-            if project.folder.space_id != space {
+            if project.folder.space_id != space || project.name.len() > 4096 {
                 return Err(invalid(ValidationReason::InvalidState));
             }
-            match budget
-                .run(
-                    self.catalog_project(&current, &project.folder),
-                    CommitEffect::NotCommitted,
-                )
-                .await
-            {
-                Ok(value) => items.push(value),
-                Err(error) if hidden(&error) => (),
-                Err(error) => return Err(error),
+            match current.auth().can_view_folder(
+                &catalog.space,
+                &project.folder.folder_id,
+                std::slice::from_ref(&project.folder.folder_id),
+            ) {
+                Ok(()) => items.push(project),
+                Err(DomainError::ResourceNotFound | DomainError::AccessDenied) => (),
+                Err(error) => return Err(error.into()),
             }
         }
         let next = if let Some(inner) = result.continuation {

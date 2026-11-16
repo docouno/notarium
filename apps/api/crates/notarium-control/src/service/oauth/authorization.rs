@@ -51,6 +51,7 @@ impl OAuthService {
         ctx: &AccountContext,
         user: &UsersRow,
         spaces: Option<&[SpaceId]>,
+        lock: bool,
     ) -> Result<(), PortError> {
         if let Some(spaces) = spaces {
             if spaces.len() > usize::from(self.control.config.max_auth_spaces).min(256) {
@@ -64,6 +65,8 @@ impl OAuthService {
                     ctx.auth().credential().cloned().ok_or_else(denied)?,
                     ctx.auth().grant().clone(),
                     false,
+                    false,
+                    lock,
                 )
                 .await?;
             if spaces.iter().any(|id| !auth.spaces().contains_key(id)) {
@@ -110,18 +113,18 @@ impl OAuthService {
             .await?;
         let info = clients::info(&client)?;
         validation::matches_redirect(&info.redirect_uris, &request.redirect_uri)?;
-        let mut tx = self.control.store.write(budget.clone()).await?;
+        let mut rtx = self.control.store.read(budget.clone()).await?;
         let now = self.control.clock.now_ms()?;
         let intent = budget
             .run(
                 async {
                     let (_, user) = self
                         .control
-                        .manager(tx.inner_mut(), ctx.auth(), ctx.auth().principal())
+                        .manager_read(rtx.inner_mut(), ctx.auth(), ctx.auth().principal())
                         .await?;
-                    self.check_spaces(tx.inner_mut(), &ctx, &user, spaces.as_deref())
+                    self.check_spaces(rtx.inner_mut(), &ctx, &user, spaces.as_deref(), false)
                         .await?;
-                    let current = clients::locked(tx.inner_mut(), &request.client_id).await?;
+                    let current = clients::observed(rtx.inner_mut(), &request.client_id).await?;
                     if !client.matches(&current, now) {
                         return Err(rejected(OAuthErrorCode::InvalidClient));
                     }
@@ -145,9 +148,7 @@ impl OAuthService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         let plaintext =
             SecretString::new(serde_json::to_string(&intent).map_err(|_| invalid_grant())?);
         let sealed = self
@@ -176,6 +177,7 @@ impl OAuthService {
         ctx: AccountContext,
         consent: OAuthConsent,
     ) -> Result<IssuedAuthorizationCode, PortError> {
+        ctx.auth().authorize_human_management()?;
         let (protected, browser) = consent.into_parts();
         let browser = validation::browser(browser.expose())?;
         let budget = OperationBudget::new(ctx.budget.clone());
@@ -216,18 +218,18 @@ impl OAuthService {
             let (_,user)=self.control.manager(tx.inner_mut(),ctx.auth(),&intent.user).await?;
             let now=self.control.clock.now_ms()?;
             if user.auth_version!=intent.auth_version || intent.expires<=now {return Err(invalid_grant());}
-            self.check_spaces(tx.inner_mut(),&ctx,&user,intent.spaces.as_deref()).await?;
+            self.check_spaces(tx.inner_mut(),&ctx,&user,intent.spaces.as_deref(),true).await?;
             let current=clients::locked(tx.inner_mut(),&intent.client_id).await?;
             if !client.matches(&current,now) || clients::digest(&current)!=intent.client_digest {return Err(rejected(OAuthErrorCode::InvalidClient));}
             witness.verify(tx.inner_mut()).await?;
             let existing=rows!(tx.inner_mut(),(String,),fetch_optional,"SELECT grant_id FROM oauth_grants WHERE grant_id=$1","SELECT grant_id FROM v1_control.oauth_grants WHERE grant_id=$1";intent.grant.as_str())?;
             if existing.is_some() {return Err(invalid_grant());}
-            let grant=TargetRecord::OauthGrants(OauthGrantsRow {grant_id:intent.grant.to_string(),user_id:user.user_id.clone(),client_id:intent.client_id.clone(),resource_uri:intent.resource.clone(),scope:validation::scope_name(intent.scope.access).into(),
+            let grant=TargetRecord::from(OauthGrantsRow {grant_id:intent.grant.to_string(),user_id:user.user_id.clone(),client_id:intent.client_id.clone(),resource_uri:intent.resource.clone(),scope:validation::scope_name(intent.scope.access).into(),
                 selected_spaces:intent.spaces.as_ref().map(serde_json::to_string).transpose().map_err(|_|invalid_grant())?,revoked_at:None,revision:1,created_at:now});
             grant.validate()?; grant.insert(tx.inner_mut()).await?;
             let code=token::mint(TokenKind::AuthorizationCode)?;
             let expires=expiry(now,60*1000)?;
-            let record=TargetRecord::OauthAuthCodes(OauthAuthCodesRow {code_hash:code.digest.to_vec(),grant_id:intent.grant.to_string(),client_id:intent.client_id.clone(),redirect_uri:intent.redirect.clone(),resource_uri:intent.resource,code_challenge:intent.challenge,method:"S256".into(),offline_access:i64::from(intent.scope.offline_access),expires_at:expires,used_at:None,created_at:now});
+            let record=TargetRecord::from(OauthAuthCodesRow {code_hash:code.digest.to_vec(),grant_id:intent.grant.to_string(),client_id:intent.client_id.clone(),redirect_uri:intent.redirect.clone(),resource_uri:intent.resource,code_challenge:intent.challenge,method:"S256".into(),offline_access:i64::from(intent.scope.offline_access),expires_at:expires,used_at:None,created_at:now});
             record.validate()?; record.insert(tx.inner_mut()).await?;
             execute!(tx.inner_mut(),"UPDATE oauth_clients SET activated_at=COALESCE(activated_at,$1),last_seen_at=$1 WHERE client_id=$2","UPDATE v1_control.oauth_clients SET activated_at=COALESCE(activated_at,$1),last_seen_at=$1 WHERE client_id=$2";now,&intent.client_id)?;
             let revision=next(user.revision)?;

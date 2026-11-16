@@ -671,6 +671,7 @@ impl ClassEgressFence {
                 ProviderMessage::Chat(value),
                 ProviderCurrentContent::Chat {
                     space,
+                    project,
                     lifecycle,
                     tainted,
                     ..
@@ -679,7 +680,13 @@ impl ClassEgressFence {
                 if *lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound);
                 }
-                Self::check_chat(space, value.entry.tainted || *tainted, auth, policy)
+                Self::check_chat(
+                    space,
+                    project.as_ref(),
+                    value.entry.tainted || *tainted,
+                    auth,
+                    policy,
+                )
             }
             _ => Err(DomainError::validation(ValidationReason::SourceMismatch)),
         }
@@ -720,7 +727,13 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<ProviderChatContent> {
-        Self::check_chat(&entry.space, entry.tainted, auth, policy)?;
+        Self::check_chat(
+            &entry.space,
+            entry.project.as_ref(),
+            entry.tainted,
+            auth,
+            policy,
+        )?;
         Ok(ProviderChatContent {
             entry,
             provider: policy.provider.clone(),
@@ -728,11 +741,12 @@ impl ClassEgressFence {
     }
     fn check_chat(
         current: &Space,
+        project: Option<&crate::ids::FolderId>,
         tainted: bool,
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<()> {
-        auth.authorize_chat_read(current, tainted)?;
+        auth.authorize_chat_read(current, project, tainted)?;
         let permitted = match &policy.audience {
             ProviderAudience::Personal { consented } => {
                 *consented && current.kind == SpaceKind::Personal

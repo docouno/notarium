@@ -90,7 +90,7 @@ impl Command {
         if value.len() > 65536 {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
-        let record = TargetRecord::ControlCommands(ControlCommandsRow {
+        let record = TargetRecord::from(ControlCommandsRow {
             owner: self.identity.owner.to_string(),
             actor: self.identity.actor.to_string(),
             command_key: self.identity.key.to_string(),

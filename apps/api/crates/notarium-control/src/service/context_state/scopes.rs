@@ -77,27 +77,75 @@ impl ControlService {
         change: Change,
     ) -> Result<ControlCommit<ContextScopeInfo>, PortError> {
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
+        ctx.auth().authorize_human_management()?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let home = if let Change::Attachment(id, _, true) = &change {
             budget.run(async { read_rows!(&self.store.backend,ContextSetsRow,fetch_optional,"SELECT * FROM context_sets WHERE set_id=$1","SELECT * FROM v1_control.context_sets WHERE set_id=$1";id.as_str()) }, CommitEffect::NotCommitted).await?.map(|row| SpaceId::parse(&row.home_space)).transpose()?
         } else {
             None
         };
+        let (pre_key, space_kinds) = {
+            let mut rtx = self.store.read(budget.clone()).await?;
+            let (current, owner) = budget
+                .run(
+                    async {
+                        let auth = self.revalidate_read(rtx.inner_mut(), ctx.auth()).await?;
+                        let owner = user_read(rtx.inner_mut(), auth.principal().as_str()).await?;
+                        Ok((
+                            AccountContext::new(auth, budget.context(ctx.budget.request.clone())),
+                            owner,
+                        ))
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            budget
+                .run(rtx.rollback(), CommitEffect::NotCommitted)
+                .await?;
+            let key = scope_key(&owner, &scope)?;
+            let mut spaces = BTreeMap::from([(key.space.clone(), true)]);
+            if let Some(home) = &home {
+                spaces.entry(home.clone()).or_insert(false);
+            }
+            if let Change::Pin(note, true) = &change {
+                spaces.entry(note.space_id.clone()).or_insert(false);
+                budget
+                    .run(
+                        self.catalog_note(&current, note),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+            }
+            budget
+                .run(
+                    self.context_scope_read(&current, &scope, &key),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            let kinds = budget
+                .run(
+                    self.context_precheck_spaces(&current, &spaces),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            (key, kinds)
+        };
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision, saved) = budget.run(async {
             let owner = self.context_manager(tx.inner_mut(), &ctx).await?;
             let key = scope_key(&owner, &scope)?;
+            if key != pre_key {
+                return Err(invalid(ValidationReason::CursorStale));
+            }
             if let Some(replay) = command.replay::<ContextScopeInfo>(tx.inner_mut()).await? {
-                let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
-                self.context_scope_read(&AccountContext::new(auth, budget.context(ctx.budget.request.clone())), &scope, &key).await?;
+                let _ = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
                 return Ok(replay);
             }
             expect_revision(&owner, command.identity.expected)?;
             let mut spaces = BTreeMap::from([(key.space.clone(), true)]);
             if let Some(home) = &home { spaces.entry(home.clone()).or_insert(false); }
             if let Change::Pin(note, true) = &change { spaces.entry(note.space_id.clone()).or_insert(false); }
-            self.context_write_spaces(tx.inner_mut(), &ctx, &owner, &spaces, &spaces).await?;
-            self.context_scope_read(&ctx, &scope, &key).await?;
+            self.context_write_spaces(tx.inner_mut(), &ctx, &owner, &spaces, &spaces, &space_kinds).await?;
             let previous = self.context_scope_revision(tx.inner_mut(), &owner, &key).await?;
             if previous != expected { return Err(DomainError::ControlRevisionConflict { current: previous }.into()); }
             let changed = previous.checked_next()?;
@@ -110,7 +158,7 @@ impl ControlService {
                         if row.revision as u64 != expected_set.get() { return Err(DomainError::ControlRevisionConflict { current: ControlRevision::new(row.revision as u64)? }.into()); }
                         if old.is_none() {
                             if sets::attachments(tx.inner_mut(), &id).await?.len() >= 64 { return Err(invalid(ValidationReason::BudgetExceeded)); }
-                            let record = TargetRecord::ContextSetAttachments(ContextSetAttachmentsRow { set_id: id.to_string(), target_kind: key.kind.clone(), target_id: key.id.clone(), target_space: key.space.to_string(), owner_id: owner.user_id.clone(), revision: changed.get() as i64 });
+                            let record = TargetRecord::from(ContextSetAttachmentsRow { set_id: id.to_string(), target_kind: key.kind.clone(), target_id: key.id.clone(), target_space: key.space.to_string(), owner_id: owner.user_id.clone(), revision: changed.get() as i64 });
                             record.validate()?; record.insert(tx.inner_mut()).await?;
                         }
                     } else {
@@ -123,10 +171,9 @@ impl ControlService {
                 },
                 Change::Pin(note, pinned) => {
                     if pinned {
-                        self.catalog_note(&ctx, &note).await?;
                         let existing = rows!(tx.inner_mut(),ContextScopePinsRow,fetch_optional,"SELECT * FROM context_scope_pins WHERE target_kind=$1 AND target_id=$2 AND note_space=$3 AND note_id=$4","SELECT * FROM v1_control.context_scope_pins WHERE target_kind=$1 AND target_id=$2 AND note_space=$3 AND note_id=$4";&key.kind,&key.id,note.space_id.as_str(),note.note_id.as_str())?;
                         if existing.is_none() {
-                            let record = TargetRecord::ContextScopePins(ContextScopePinsRow { owner_id: owner.user_id.clone(), target_kind: key.kind.clone(), target_id: key.id.clone(), target_space: key.space.to_string(), note_space: note.space_id.to_string(), note_id: note.note_id.to_string(), revision: changed.get() as i64, created_at: self.clock.now_ms()? });
+                            let record = TargetRecord::from(ContextScopePinsRow { owner_id: owner.user_id.clone(), target_kind: key.kind.clone(), target_id: key.id.clone(), target_space: key.space.to_string(), note_space: note.space_id.to_string(), note_id: note.note_id.to_string(), revision: changed.get() as i64, created_at: self.clock.now_ms()? });
                             record.validate()?; record.insert(tx.inner_mut()).await?;
                         }
                     } else {
@@ -146,7 +193,7 @@ impl ControlService {
                         };
                         if !exists { return Err(DomainError::ResourceNotFound.into()); }
                         execute!(tx.inner_mut(),"DELETE FROM context_order WHERE target_kind=$1 AND target_id=$2 AND entry_kind=$3 AND entry_ref=$4","DELETE FROM v1_control.context_order WHERE target_kind=$1 AND target_id=$2 AND entry_kind=$3 AND entry_ref=$4";&key.kind,&key.id,kind,&reference)?;
-                        let record = TargetRecord::ContextOrder(ContextOrderRow { owner_id: owner.user_id.clone(), target_kind: key.kind.clone(), target_id: key.id.clone(), target_space: key.space.to_string(), entry_kind: kind.into(), entry_ref: reference, rank: entry.rank, revision: changed.get() as i64 });
+                        let record = TargetRecord::from(ContextOrderRow { owner_id: owner.user_id.clone(), target_kind: key.kind.clone(), target_id: key.id.clone(), target_space: key.space.to_string(), entry_kind: kind.into(), entry_ref: reference, rank: entry.rank, revision: changed.get() as i64 });
                         record.validate()?; record.insert(tx.inner_mut()).await?;
                     }
                 },

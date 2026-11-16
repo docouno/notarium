@@ -47,11 +47,10 @@ impl ControlService {
         ctx: SpaceContext,
         request: SpaceLifecycleChange,
     ) -> Result<ControlCommit<AccessibleSpace>, PortError> {
-        if request.lifecycle == SpaceLifecycle::Closing
-            || ctx.auth().kind() != &PrincipalKind::DirectHuman
-        {
+        if request.lifecycle == SpaceLifecycle::Closing {
             return Err(access_denied());
         }
+        ctx.auth().authorize_human_management()?;
         let digest = ContentDigest::from_bytes(
             *blake3::hash(
                 &serde_json::to_vec(&(ctx.scope(), request.lifecycle))
@@ -71,27 +70,25 @@ impl ControlService {
             (ctx.scope(), request.lifecycle),
         )?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
         let observed = budget
             .run(
                 async {
-                    let actor = user(tx.inner_mut(), ctx.auth().principal().as_str()).await?;
-                    self.live_human(tx.inner_mut(), ctx.auth(), &actor).await?;
+                    let actor = user_read(rtx.inner_mut(), ctx.auth().principal().as_str()).await?;
+                    self.live_human(rtx.inner_mut(), ctx.auth(), &actor).await?;
                     if command
-                        .replay::<ResultOperation>(tx.inner_mut())
+                        .replay::<ResultOperation>(rtx.inner_mut())
                         .await?
                         .is_none()
                     {
-                        require_owner(tx.inner_mut(), ctx.auth(), &ctx.scope().space_id).await?;
+                        require_owner(rtx.inner_mut(), ctx.auth(), &ctx.scope().space_id).await?;
                     }
-                    admission(tx.inner_mut(), &ctx.scope().space_id, false).await
+                    admission(rtx.inner_mut(), &ctx.scope().space_id, false).await
                 },
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         let catalog = budget
             .run(
                 self.catalog.space(
@@ -104,6 +101,11 @@ impl ControlService {
         ctx.check_current(&catalog.history)?;
         if catalog.space.id != ctx.scope().space_id {
             return Err(invalid(ValidationReason::InvalidState));
+        }
+        // Personal Spaces are inseparable from the account and cannot be archived.
+        if catalog.space.kind == SpaceKind::Personal && request.lifecycle != SpaceLifecycle::Active
+        {
+            return Err(access_denied());
         }
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision,saved)=budget.run(async {
@@ -122,7 +124,7 @@ impl ControlService {
             let id=RequestId::from_bytes(token::random()?);
             let pending=PendingLifecycle{version:1,owner:ctx.auth().principal().clone(),key:command.identity.key.clone(),hash:digest,expected:request.expected,scope:ctx.scope().clone(),lifecycle:request.lifecycle,revision,epoch,event:event.clone()};
             let payload=serde_json::to_string(&pending).map_err(|_|invalid(ValidationReason::InvalidState))?;
-            let row=TargetRecord::ControlOperations(ControlOperationsRow{operation_id:id.to_string(),command_key:id.to_string(),kind:"lifecycle".into(),target_space:ctx.scope().space_id.to_string(),state:"pending".into(),payload_hash:blake3::hash(payload.as_bytes()).as_bytes().to_vec(),payload,canonical_receipt:None,next_action:"revoke-then-canonical".into(),updated_at:now});
+            let row=TargetRecord::from(ControlOperationsRow{operation_id:id.to_string(),command_key:id.to_string(),kind:"lifecycle".into(),target_space:ctx.scope().space_id.to_string(),state:"pending".into(),payload_hash:blake3::hash(payload.as_bytes()).as_bytes().to_vec(),payload,canonical_receipt:None,next_action:"revoke-then-canonical".into(),updated_at:now});
             row.validate()?;row.insert(tx.inner_mut()).await?;
             let revision=ControlRevision::new(revision as u64)?;
             let saved=SavedResult{value:ResultOperation{operation:id},events:vec![event]};

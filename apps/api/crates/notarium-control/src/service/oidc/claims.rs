@@ -6,19 +6,10 @@ use openidconnect::{
     ClientId, IssuerUrl, Nonce,
     core::{CoreIdToken, CoreIdTokenVerifier, CoreJwsSigningAlgorithm, CoreProviderMetadata},
 };
-use serde::Deserialize;
 use zeroize::Zeroizing;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Header {
-    alg: String,
     kid: Option<String>,
-    typ: Option<String>,
-    #[serde(rename = "x5t")]
-    _thumbprint: Option<String>,
-    #[serde(rename = "x5t#S256")]
-    _sha256_thumbprint: Option<String>,
 }
 fn header(raw: &str) -> Result<Header, PortError> {
     if raw.len() > 64 * 1024 {
@@ -32,17 +23,44 @@ fn header(raw: &str) -> Result<Header, PortError> {
     if URL_SAFE_NO_PAD.encode(&decoded) != first {
         return Err(denied());
     }
-    let header: Header = serde_json::from_slice(&decoded).map_err(|_| denied())?;
-    if !matches!(header.alg.as_str(), "RS256" | "ES256")
-        || header.typ.as_deref().is_some_and(|v| v != "JWT")
-        || header
-            .kid
-            .as_deref()
-            .is_some_and(|v| v.is_empty() || v.len() > 256)
+    let map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&decoded).map_err(|_| denied())?;
+    if map.len() > 16
+        || map.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "jku" | "x5u" | "jwk" | "x5c" | "crit" | "enc" | "zip"
+            )
+        })
     {
         return Err(denied());
     }
-    Ok(header)
+    let alg = map
+        .get("alg")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(denied)?;
+    if !matches!(alg, "RS256" | "ES256") {
+        return Err(denied());
+    }
+    if let Some(typ) = map.get("typ") {
+        let Some(typ) = typ.as_str() else {
+            return Err(denied());
+        };
+        if !typ.eq_ignore_ascii_case("JWT") {
+            return Err(denied());
+        }
+    }
+    let kid = match map.get("kid") {
+        Some(value) => {
+            let kid = value.as_str().ok_or_else(denied)?;
+            if kid.is_empty() || kid.len() > 256 {
+                return Err(denied());
+            }
+            Some(kid.to_owned())
+        }
+        None => None,
+    };
+    Ok(Header { kid })
 }
 pub(super) struct VerifiedIdentity {
     pub issuer: String,
@@ -233,6 +251,15 @@ mod tests {
                 ))
             ))
             .is_err()
+        );
+        assert!(
+            header(&format!(
+                "{}.e30.sig",
+                URL_SAFE_NO_PAD.encode(
+                    r#"{"alg":"ES256","typ":"jwt","cty":"JWT","vendor_claim":"allowed","kid":"k1"}"#
+                )
+            ))
+            .is_ok()
         );
     }
 }

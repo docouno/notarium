@@ -27,11 +27,16 @@ remain different; an I/O error cannot authorize initialization. `DataRoot` only
 constructs the shared layout from a supplied path.
 
 Verified authority enters through trusted owners, not deserialization of an auth
-context. Delegation intersects role, class and project grants. Agent, Keeper and
-OAuth and PAT contexts cannot obtain human `AbilityWrite`. Both old and new resource facts
+context. Delegation intersects role, class and project grants. Interactive
+`human_management` attestation is orthogonal to `Cap::AbilityWrite`; Agent, Keeper,
+OAuth and PAT contexts can obtain neither. Both old and new resource facts
 are checked on direct writes, including auxiliary ability files. A run pins its
-write Space; an external read taints already-existing clones before content returns.
-Shared chat limits reads to its Space and excludes the sender's profile.
+write Space; non-tainting metadata visibility checks (`can_view_resource`,
+`can_view_folder`) filter listings and references without tainting the branch,
+whereas content-bearing `authorize_read` / `authorize_folder_read` taint
+already-existing clones before external content returns. Shared chat limits reads
+to its Space (and to matching project-scoped threads when a Keeper is pinned to a
+`project_root`) and excludes the sender's profile.
 Nested Keeper runs can retain or drop approved package read exceptions; they
 cannot add exceptions outside their parent's project authority.
 
@@ -53,11 +58,15 @@ fresh facts against the exact source and current provider disclosure. No documen
 bodies or SQL handles cross the metadata port.
 
 Completion messages retain roles, classified parts and ordered tool-call/result
-associations. `ProviderInstruction` is for trusted orchestration instructions;
-copied note text still needs classified provenance. Tool schemas are a bounded
-closed subset. `ProviderUsage::Unknown` is distinct from exact zero; interrupted
-streams cannot claim measured usage from an estimate. Provider selection retains
-the explicit project, and embedding requests carry it through the same boundary.
+associations. `ProviderInstruction` carries trusted orchestration text on `System`,
+`User` (such as scheduled `init_prompt`) or `Tool` (control-plane tool outputs and
+structured validation errors); copied note text still needs classified provenance.
+Tool schemas are a bounded closed subset, and `ProviderToolCallId` accepts standard
+alphanumeric, `_`, `-`, `.` and `:` characters. `ProviderUsage::Unknown` is distinct
+from exact zero; interrupted streams cannot claim measured usage from an estimate.
+Provider selection and preferences distinguish `PreferenceModelKind::Completion`
+from `Embedding` and retain the explicit project, and embedding requests carry it
+through the same boundary.
 
 Explicit snapshots expose lifecycle. Listings select active, trashed or both
 through `LifecycleMask` and return `NoteListCard` metadata, including encrypted

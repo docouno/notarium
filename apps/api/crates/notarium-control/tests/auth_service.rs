@@ -63,16 +63,25 @@ async fn lifecycle(pg: bool) {
     assert_eq!(fixture.catalog.entries.lock().unwrap().len(), 1);
     let actor = account_context(&service, initial.token.expose()).await;
     assert_eq!(actor.auth().spaces().len(), 1);
+    assert!(actor.auth().human_management());
     assert!(!actor.auth().has_cap(Cap::AbilityWrite));
+    let ambient = service
+        .resolve(unconfirmed_evidence(
+            AuthEvidenceKind::Session,
+            initial.token.expose(),
+        ))
+        .await
+        .unwrap();
+    assert!(!ambient.human_management());
+    assert!(!ambient.has_cap(Cap::AbilityWrite));
     let mut interactive = evidence(AuthEvidenceKind::Session, initial.token.expose());
-    interactive.evidence = interactive.evidence.with_human_management();
-    assert!(
-        service
-            .resolve(interactive)
-            .await
-            .unwrap()
-            .has_cap(Cap::AbilityWrite)
-    );
+    interactive.evidence = interactive
+        .evidence
+        .with_human_management()
+        .with_ability_write();
+    let interactive_auth = service.resolve(interactive).await.unwrap();
+    assert!(interactive_auth.human_management());
+    assert!(interactive_auth.has_cap(Cap::AbilityWrite));
     denied(
         service
             .login(
@@ -194,9 +203,13 @@ async fn lifecycle(pg: bool) {
         .await
         .unwrap();
     let mut pat_evidence = evidence(AuthEvidenceKind::Pat, pat.value.token.expose());
-    pat_evidence.evidence = pat_evidence.evidence.with_human_management();
+    pat_evidence.evidence = pat_evidence
+        .evidence
+        .with_human_management()
+        .with_ability_write();
     let pat_auth = service.resolve(pat_evidence).await.unwrap();
     assert_eq!(pat_auth.kind(), &PrincipalKind::Pat);
+    assert!(!pat_auth.human_management());
     assert!(!pat_auth.has_cap(Cap::AbilityWrite));
     assert!(
         pat_auth

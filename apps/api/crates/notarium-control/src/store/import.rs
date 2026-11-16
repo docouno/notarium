@@ -25,13 +25,28 @@ impl ControlStore {
         ctx.authority.require(ServicePurpose::Restore)?;
         let budget = OperationBudget::new(ctx.budget);
         let mut tx = self.write(budget.clone()).await?;
-        let epoch=budget.run(async {
-            budget.configure(tx.inner_mut()).await?;
-            match tx.inner_mut() {
-                Transaction::Sqlite(tx)=>sqlx::query_as::<_,(i64,String)>("SELECT epoch_version,state FROM v1_storage_epoch WHERE singleton=1").fetch_optional(&mut **tx).await.map_err(database),
-                Transaction::Postgres(tx)=>sqlx::query_as::<_,(i64,String)>("SELECT epoch_version,state FROM v1_control.v1_storage_epoch WHERE singleton=1 FOR UPDATE").fetch_optional(&mut **tx).await.map_err(database),
-            }
-        },CommitEffect::NotCommitted).await?;
+        let epoch = budget
+            .run(
+                async {
+                    budget.configure(tx.inner_mut()).await?;
+                    match tx.inner_mut() {
+                        Transaction::Sqlite(tx) => sqlx::query_as::<_, (i64, String)>(
+                            "SELECT epoch_version,state FROM v1_storage_epoch WHERE singleton=1",
+                        )
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .map_err(database),
+                        Transaction::Postgres(tx) => sqlx::query_as::<_, (i64, String)>(
+                            "SELECT epoch_version,state FROM v1_control.v1_storage_epoch WHERE singleton=1 FOR UPDATE",
+                        )
+                        .fetch_optional(&mut **tx)
+                        .await
+                        .map_err(database),
+                    }
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
         if epoch
             .as_ref()
             .is_some_and(|(version, state)| *version != 1 || state != "migrating")
@@ -45,6 +60,7 @@ impl ControlStore {
                 LeasedTransaction::Write(tx),
                 budget,
                 Arc::new(|| Ok(())),
+                None,
                 None,
             ),
         })
@@ -80,15 +96,21 @@ impl TargetImport {
                         if bytes > EXPORT_PAGE_BYTES {
                             return Err(invalid(ValidationReason::InvalidLimit));
                         }
-                        if let TargetRecord::V1StorageEpoch(row) = record {
-                            if row.epoch_version != 1 || row.state != "migrating" {
+                        if let TargetRecord::V1StorageEpoch {
+                            epoch_version,
+                            state,
+                            installation_id,
+                            ..
+                        } = record
+                        {
+                            if *epoch_version != 1 || state != "migrating" {
                                 return Err(invalid(ValidationReason::InvalidState));
                             }
-                            InstallationId::parse(&row.installation_id)?;
+                            InstallationId::parse(installation_id)?;
                         }
                     }
                     if !self.has_epoch
-                        && !matches!(records.first(), Some(TargetRecord::V1StorageEpoch(_)))
+                        && !matches!(records.first(), Some(TargetRecord::V1StorageEpoch { .. }))
                     {
                         return Err(invalid(ValidationReason::InvalidState));
                     }

@@ -78,7 +78,7 @@ async fn cancelled_dns_jobs_remain_bounded_and_each_connection_checks_the_entire
         job.abort();
         assert!(job.await.is_err());
     }
-    assert_eq!(DNS_ADMISSION.available_permits(), 0);
+    assert_eq!(resolver.available_permits(), 0);
     assert!(
         resolver
             .resolve("public.example".parse().unwrap())
@@ -88,7 +88,7 @@ async fn cancelled_dns_jobs_remain_bounded_and_each_connection_checks_the_entire
     assert_eq!(source.calls.load(Ordering::SeqCst), 4);
     drop(release);
     tokio::time::timeout(Duration::from_secs(5), async {
-        while DNS_ADMISSION.available_permits() != 4 {
+        while resolver.available_permits() != 4 {
             tokio::task::yield_now().await;
         }
     })

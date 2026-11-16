@@ -55,7 +55,7 @@ impl ControlService {
             _ => Ok(()),
         }
     }
-    async fn raw_ability(
+    pub(super) async fn raw_ability(
         &self,
         ctx: &AccountContext,
         identity: AbilityIdentity,
@@ -177,12 +177,32 @@ impl ControlService {
         request: AbilitySelection,
     ) -> Result<AbilityResolution, PortError> {
         let (value, kind) = match request {
-            AbilitySelection::Exact(reference) => {
+            AbilitySelection::Exact { reference, project } => {
+                if let Some(project) = &project {
+                    match self.catalog_project(ctx, project).await {
+                        Ok(_) => (),
+                        Err(error) if hidden(&error) => return Ok(AbilityResolution::OutOfScope),
+                        Err(error) => return Err(error),
+                    }
+                }
                 let reference = match self.follow_ability(tx, ctx, reference).await {
                     Ok(value) => value,
                     Err(error) if hidden(&error) => return Ok(AbilityResolution::OutOfScope),
                     Err(error) => return Err(error),
                 };
+                match (&reference.placement, project.as_ref()) {
+                    (AbilityPlacement::OwnedProject(placement), Some(active))
+                        if placement != active =>
+                    {
+                        return Ok(AbilityResolution::OutOfScope);
+                    }
+                    (AbilityPlacement::OwnedSpace(space), Some(active))
+                        if *space != active.space_id =>
+                    {
+                        return Ok(AbilityResolution::OutOfScope);
+                    }
+                    _ => (),
+                }
                 let value = match self.raw_ability(ctx, reference.identity()).await {
                     Ok(value) => value,
                     Err(error) if hidden(&error) => return Ok(AbilityResolution::Missing),
@@ -191,11 +211,11 @@ impl ControlService {
                 if value.reference != reference {
                     return Ok(AbilityResolution::Stale);
                 }
-                let project = match &reference.placement {
-                    AbilityPlacement::OwnedProject(project) => Some(project),
-                    _ => None,
+                let effective_project = match &reference.placement {
+                    AbilityPlacement::OwnedProject(placement) => Some(placement),
+                    _ => project.as_ref(),
                 };
-                (self.overlay(tx, ctx, value, project).await?, None)
+                (self.overlay(tx, ctx, value, effective_project).await?, None)
             }
             AbilitySelection::Name {
                 kind,
@@ -317,17 +337,85 @@ impl ControlService {
             other => other,
         }
     }
+    pub(super) async fn current_role_db_only(
+        &self,
+        tx: &mut Transaction,
+        ctx: &AccountContext,
+        raw: AbilityDescriptor,
+        project: Option<&FolderRef>,
+    ) -> Result<bool, PortError> {
+        if self
+            .follow_ability_db(tx, ctx, raw.reference.clone())
+            .await?
+            != raw.reference
+        {
+            return Ok(false);
+        }
+        if raw.kind != AbilityKind::Role || !raw.healthy {
+            return Ok(false);
+        }
+        Ok(self.overlay(tx, ctx, raw, project).await?.enabled)
+    }
+    pub(super) async fn follow_ability_db(
+        &self,
+        tx: &mut Transaction,
+        ctx: &AccountContext,
+        mut reference: AbilityRef,
+    ) -> Result<AbilityRef, PortError> {
+        let mut visited = Vec::with_capacity(17);
+        for hop in 0..=16 {
+            match &reference.placement {
+                AbilityPlacement::OwnedPersonal(owner) if owner != ctx.auth().principal() => {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                AbilityPlacement::OwnedSpace(space) if !ctx.auth().spaces().contains_key(space) => {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                AbilityPlacement::OwnedProject(project)
+                    if !ctx.auth().spaces().contains_key(&project.space_id) =>
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                _ => (),
+            }
+            let key = placement(&reference.placement)?;
+            let identity = (key.clone(), reference.id.clone());
+            if visited.contains(&identity) {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            visited.push(identity);
+            let row = rows!(tx,AbilityPlacementTrailRow,fetch_optional,"SELECT * FROM ability_placement_trail WHERE source_placement=$1 AND ability_id=$2","SELECT * FROM v1_control.ability_placement_trail WHERE source_placement=$1 AND ability_id=$2";&key,reference.id.as_str())?;
+            let Some(row) = row else {
+                return Ok(reference);
+            };
+            let trail: Trail = serde_json::from_str(&row.manifest_ref)
+                .map_err(|_| invalid(ValidationReason::InvalidState))?;
+            if trail.source != reference {
+                return Ok(reference);
+            }
+            if hop == 16 {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            if placement(&trail.destination.placement)? != row.destination_placement
+                || trail.destination.id.as_str() != row.destination_id
+            {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            reference = trail.destination;
+        }
+        Err(invalid(ValidationReason::InvalidState))
+    }
     pub async fn resolve_ability(
         &self,
         ctx: AccountContext,
         request: AbilitySelection,
     ) -> Result<AbilityResolution, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
         let value = budget
             .run(
                 async {
-                    let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
                     self.resolve_ability_in(
                         tx.inner_mut(),
                         &AccountContext::new(auth, budget.context(ctx.budget.request.clone())),
@@ -347,9 +435,10 @@ impl ControlService {
         &self,
         ctx: AccountContext,
         reference: AbilityRef,
+        project: Option<FolderRef>,
     ) -> Result<AbilityDescriptor, PortError> {
         match self
-            .resolve_ability(ctx, AbilitySelection::Exact(reference))
+            .resolve_ability(ctx, AbilitySelection::Exact { reference, project })
             .await?
         {
             AbilityResolution::Resolved(value) => Ok(*value),
@@ -362,7 +451,7 @@ impl ControlService {
         ctx: &AccountContext,
         query: &AbilityQuery,
     ) -> Result<ContentDigest, PortError> {
-        let owner = user(tx, ctx.auth().principal().as_str()).await?;
+        let owner = user_read(tx, ctx.auth().principal().as_str()).await?;
         let mut revisions = Vec::with_capacity(ctx.auth().spaces().len());
         for space in ctx.auth().spaces().keys() {
             revisions.push((
@@ -392,11 +481,11 @@ impl ControlService {
             valid_name(name)?;
         }
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
         let result = budget
             .run(
                 async {
-                    let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
                     if query.authoring && !auth.has_cap(Cap::AbilityWrite) {
                         return Err(DomainError::AbilityWriteForbidden.into());
                     }
@@ -443,6 +532,10 @@ impl ControlService {
                         return Err(invalid(ValidationReason::InvalidState));
                     }
                     let mut items = Vec::new();
+                    let mut winners: std::collections::BTreeMap<
+                        (bool, String),
+                        Option<AbilityDescriptor>,
+                    > = std::collections::BTreeMap::new();
                     for candidate in raw.items {
                         if query.kind.is_some_and(|kind| kind != candidate.kind)
                             || query
@@ -487,20 +580,35 @@ impl ControlService {
                                 )
                                 .await?,
                             );
-                        } else if let AbilityResolution::Resolved(winner) = self
-                            .resolve_ability_in(
-                                tx.inner_mut(),
-                                &current,
-                                AbilitySelection::Name {
-                                    name: value.name.clone(),
-                                    kind: value.kind,
-                                    project: query.project.clone(),
-                                },
-                            )
-                            .await?
-                            && winner.reference == value.reference
-                        {
-                            items.push(*winner);
+                        } else {
+                            let winner_key =
+                                (matches!(value.kind, AbilityKind::Role), value.name.clone());
+                            let cached = if let Some(existing) = winners.get(&winner_key) {
+                                existing.clone()
+                            } else {
+                                let resolved = match self
+                                    .resolve_ability_in(
+                                        tx.inner_mut(),
+                                        &current,
+                                        AbilitySelection::Name {
+                                            name: value.name.clone(),
+                                            kind: value.kind,
+                                            project: query.project.clone(),
+                                        },
+                                    )
+                                    .await?
+                                {
+                                    AbilityResolution::Resolved(w) => Some(*w),
+                                    _ => None,
+                                };
+                                winners.insert(winner_key, resolved.clone());
+                                resolved
+                            };
+                            if let Some(winner) = cached
+                                && winner.reference == value.reference
+                            {
+                                items.push(winner);
+                            }
                         }
                     }
                     let continuation = raw

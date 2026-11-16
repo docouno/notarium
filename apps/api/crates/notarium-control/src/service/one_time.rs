@@ -44,7 +44,7 @@ impl ControlService {
             let token=token::mint(TokenKind::OneTime)?;
             // Reissuing invalidates the previous token of the same purpose.
             execute!(tx.inner_mut(),"UPDATE one_time_tokens SET used_at=$1 WHERE user_id=$2 AND purpose=$3 AND used_at IS NULL","UPDATE v1_control.one_time_tokens SET used_at=$1 WHERE user_id=$2 AND purpose=$3 AND used_at IS NULL";now,&current.user_id,purpose(request.purpose))?;
-            let row=TargetRecord::OneTimeTokens(OneTimeTokensRow{token_hash:token.digest.to_vec(),user_id:current.user_id.clone(),purpose:purpose(request.purpose).into(),expires_at,used_at:None,created_at:now});
+            let row=TargetRecord::from(OneTimeTokensRow{token_hash:token.digest.to_vec(),user_id:current.user_id.clone(),purpose:purpose(request.purpose).into(),expires_at,used_at:None,created_at:now});
             row.validate()?;
             row.insert(tx.inner_mut()).await?;
             let revision=next(current.revision)?;

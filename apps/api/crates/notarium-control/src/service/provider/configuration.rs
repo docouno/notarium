@@ -69,9 +69,9 @@ impl ProviderService {
                     created_at: now,
                     updated_at: now,
                 };
-                let record = TargetRecord::Credentials(row.clone());
+                let record = TargetRecord::from(row.clone());
                 record.validate()?;
-                record.insert(tx).await?;
+                record.insert_or_conflict(tx).await?;
                 Ok((credential_info(&row)?, vec![]))
             })
         })
@@ -130,7 +130,7 @@ impl ProviderService {
             row.name=input.name;row.injection=json(&input.injection)?;row.disabled_at=input.disabled.then_some(now);row.updated_at=now;
             row.rpm=input.limits.requests_per_minute.map(i64::from);row.tpm=input.limits.tokens_per_minute.map(|n|n as i64);
             if let Some(sealed)=sealed {sealed.witness.verify(tx).await?;row.secret=sealed.encrypted;}
-            TargetRecord::Credentials(row.clone()).validate()?;
+            TargetRecord::from(row.clone()).validate()?;
             execute!(tx,"UPDATE credentials SET name=$1,secret=$2,injection=$3,disabled_at=$4,rpm=$5,tpm=$6,consent_epoch=$7,runtime_epoch=$8,revision=$9,updated_at=$10 WHERE id=$11","UPDATE v1_control.credentials SET name=$1,secret=$2,injection=$3,disabled_at=$4,rpm=$5,tpm=$6,consent_epoch=$7,runtime_epoch=$8,revision=$9,updated_at=$10 WHERE id=$11";&row.name,&row.secret,&row.injection,row.disabled_at,row.rpm,row.tpm,row.consent_epoch,row.runtime_epoch,row.revision,row.updated_at,&row.id)?;
             Ok((credential_info(&row)?,vec![RevocationSelector::Credential(input.id)]))
         })).await
@@ -244,7 +244,7 @@ impl ProviderService {
         if row.headers.len() > 65536 {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
-        TargetRecord::ProviderResources(row.clone()).validate()?;
+        TargetRecord::from(row.clone()).validate()?;
         Ok((row, witnesses, fingerprints))
     }
     pub async fn create_resource(
@@ -270,8 +270,8 @@ impl ProviderService {
                 for witness in witnesses {
                     witness.verify(tx).await?;
                 }
-                TargetRecord::ProviderResources(row.clone())
-                    .insert(tx)
+                TargetRecord::from(row.clone())
+                    .insert_or_conflict(tx)
                     .await?;
                 Ok((resource_info(&row)?, vec![]))
             })
@@ -285,6 +285,7 @@ impl ProviderService {
     ) -> Result<ControlCommit<ProviderResourceInfo>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
         let input = request.input;
+        let resource_id = input.spec.id.clone();
         let (mut row, witnesses, fingerprints) = self.prepare_resource(&ctx, input.spec).await?;
         let command = Command::new(
             request.identity,
@@ -297,7 +298,7 @@ impl ProviderService {
             ),
         )?;
         ctx.budget = budget.context(ctx.budget.request.clone());
-        self.mutate(ctx,command,move |tx,owner,now|Box::pin(async move {
+        let committed = self.mutate(ctx,command,move |tx,owner,now|Box::pin(async move {
             let old=resource(tx,&row.id).await?;owned(&owner.user_id,&old.owner_id)?;revision(old.revision,input.expected)?;
             if let Some(id)=&row.credential_id {let c=credential(tx,id).await?;owned(&owner.user_id,&c.owner_id)?;check_injection(&row,&c)?;}
             for witness in witnesses {witness.verify(tx).await?;}
@@ -309,7 +310,9 @@ impl ProviderService {
             row.runtime_epoch=next(old.runtime_epoch)?;row.revision=next(old.revision)?;row.default_model=old.default_model;row.disabled_at=input.disabled.then_some(now);
             execute!(tx,"UPDATE provider_resources SET name=$1,wire=$2,base_url=$3,headers=$4,credential_id=$5,consent_epoch=$6,runtime_epoch=$7,timeouts=$8,rpm=$9,tpm=$10,disabled_at=$11,revision=$12 WHERE id=$13","UPDATE v1_control.provider_resources SET name=$1,wire=$2,base_url=$3,headers=$4,credential_id=$5,consent_epoch=$6,runtime_epoch=$7,timeouts=$8,rpm=$9,tpm=$10,disabled_at=$11,revision=$12 WHERE id=$13";&row.name,&row.wire,&row.base_url,&row.headers,&row.credential_id,row.consent_epoch,row.runtime_epoch,&row.timeouts,row.rpm,row.tpm,row.disabled_at,row.revision,&row.id)?;
             Ok((resource_info(&row)?,vec![RevocationSelector::ProviderResource(ProviderResourceId::parse(&row.id)?)]))
-        })).await
+        })).await?;
+        self.outbound.invalidate_provider(&resource_id)?;
+        Ok(committed)
     }
     pub async fn delete_resource(
         &self,
@@ -317,18 +320,21 @@ impl ProviderService {
         request: AccountMutation<DeleteProviderResource>,
     ) -> Result<ControlCommit<()>, PortError> {
         let input = request.input;
+        let resource_id = input.resource.clone();
         let command = Command::new(
             request.identity,
             "delete-provider-resource",
             (&input.resource, input.expected),
         )?;
-        self.mutate(ctx,command,move |tx,owner,_|Box::pin(async move {
+        let committed = self.mutate(ctx,command,move |tx,owner,_|Box::pin(async move {
             let row=resource(tx,input.resource.as_str()).await?;owned(&owner.user_id,&row.owner_id)?;revision(row.revision,input.expected)?;
             execute!(tx,"DELETE FROM provider_preferences WHERE resource_id=$1","DELETE FROM v1_control.provider_preferences WHERE resource_id=$1";input.resource.as_str())?;
             execute!(tx,"DELETE FROM provider_attachments WHERE resource_id=$1","DELETE FROM v1_control.provider_attachments WHERE resource_id=$1";input.resource.as_str())?;
             execute!(tx,"DELETE FROM provider_resources WHERE id=$1","DELETE FROM v1_control.provider_resources WHERE id=$1";input.resource.as_str())?;
             Ok(((),vec![RevocationSelector::ProviderResource(input.resource)]))
-        })).await
+        })).await?;
+        self.outbound.invalidate_provider(&resource_id)?;
+        Ok(committed)
     }
     pub async fn put_model(
         &self,
@@ -347,10 +353,10 @@ impl ProviderService {
             let old=rows!(tx,ProviderModelsRow,fetch_optional,"SELECT * FROM provider_models WHERE resource_id=$1 AND model_id=$2","SELECT * FROM v1_control.provider_models WHERE resource_id=$1 AND model_id=$2";input.resource.as_str(),input.model.id.as_str())?;
             let (kind,dimension)=match input.model.kind {ProviderModelKind::Completion=>("completion",None),ProviderModelKind::Embedding{dimension}=>("embedding",Some(i64::from(dimension)))};
             let row=ProviderModelsRow{resource_id:input.resource.to_string(),model_id:input.model.id.to_string(),wire_model_name:input.model.wire_name,kind:kind.into(),tokenizer_profile:"conservative-model-cap-v1".into(),max_input:i64::from(input.model.max_input_tokens),max_output:i64::from(input.model.max_output_tokens),dimension,capabilities:json(&Capabilities{version:1,tools:input.model.tools})?,revision:old.as_ref().map_or(Ok(0),|old|next(old.revision))?};
-            TargetRecord::ProviderModels(row.clone()).validate()?;
+            TargetRecord::from(row.clone()).validate()?;
             if old.is_some() {
                 execute!(tx,"UPDATE provider_models SET wire_model_name=$1,kind=$2,tokenizer_profile=$3,max_input=$4,max_output=$5,dimension=$6,capabilities=$7,revision=$8 WHERE resource_id=$9 AND model_id=$10","UPDATE v1_control.provider_models SET wire_model_name=$1,kind=$2,tokenizer_profile=$3,max_input=$4,max_output=$5,dimension=$6,capabilities=$7,revision=$8 WHERE resource_id=$9 AND model_id=$10";&row.wire_model_name,&row.kind,&row.tokenizer_profile,row.max_input,row.max_output,row.dimension,&row.capabilities,row.revision,&row.resource_id,&row.model_id)?;
-            } else {TargetRecord::ProviderModels(row.clone()).insert(tx).await?;}
+            } else {TargetRecord::from(row.clone()).insert(tx).await?;}
             resource.consent_epoch=next(resource.consent_epoch)?;resource.runtime_epoch=next(resource.runtime_epoch)?;resource.revision=next(resource.revision)?;
             if input.default {resource.default_model=Some(row.model_id.clone());}
             execute!(tx,"UPDATE provider_resources SET consent_epoch=$1,runtime_epoch=$2,revision=$3,default_model=$4 WHERE id=$5","UPDATE v1_control.provider_resources SET consent_epoch=$1,runtime_epoch=$2,revision=$3,default_model=$4 WHERE id=$5";resource.consent_epoch,resource.runtime_epoch,resource.revision,&resource.default_model,&resource.id)?;

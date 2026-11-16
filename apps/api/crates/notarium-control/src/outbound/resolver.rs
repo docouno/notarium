@@ -4,13 +4,15 @@ use std::{
     io,
     net::{SocketAddr, ToSocketAddrs},
     sync::{
-        Arc, LazyLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 use tokio::sync::Semaphore;
 
-static DNS_ADMISSION: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
+pub(super) const DEFAULT_DNS_PERMITS: usize = 4;
+const DNS_ADMISSION_WAIT: Duration = Duration::from_millis(50);
 
 fn rejected() -> io::Error {
     io::Error::other("outbound destination unavailable")
@@ -40,31 +42,63 @@ impl Drop for CancelOnDrop {
 
 /// A resolver bound to one checked origin. Pass it to ClientBuilder::dns_resolver
 /// so the connector uses these exact verified addresses without another lookup.
-/// System jobs own one of four process-wide slots until they actually finish.
+/// System jobs own one of four transport-scoped slots until they actually finish.
 pub struct GuardedResolver {
     endpoint: CheckedEndpoint,
     lookup: Arc<dyn Lookup>,
+    dns_admission: Arc<Semaphore>,
 }
 impl GuardedResolver {
     pub fn new(endpoint: CheckedEndpoint) -> Self {
-        Self::with_lookup(endpoint, Arc::new(SystemLookup))
+        Self::with_admission(
+            endpoint,
+            Arc::new(SystemLookup),
+            Arc::new(Semaphore::new(DEFAULT_DNS_PERMITS)),
+        )
     }
+    #[cfg(test)]
     pub(super) fn with_lookup(endpoint: CheckedEndpoint, lookup: Arc<dyn Lookup>) -> Self {
-        Self { endpoint, lookup }
+        Self::with_admission(
+            endpoint,
+            lookup,
+            Arc::new(Semaphore::new(DEFAULT_DNS_PERMITS)),
+        )
+    }
+    pub(super) fn with_admission(
+        endpoint: CheckedEndpoint,
+        lookup: Arc<dyn Lookup>,
+        dns_admission: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            endpoint,
+            lookup,
+            dns_admission,
+        }
+    }
+    pub(super) fn default_lookup() -> Arc<dyn Lookup> {
+        Arc::new(SystemLookup)
+    }
+    #[cfg(test)]
+    pub(super) fn available_permits(&self) -> usize {
+        self.dns_admission.available_permits()
     }
 }
 impl Resolve for GuardedResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let endpoint = self.endpoint.clone();
         let lookup = self.lookup.clone();
+        let dns_admission = self.dns_admission.clone();
         Box::pin(async move {
             if endpoint.url().host_str() != Some(name.as_str()) {
                 return Err(rejected().into());
             }
-            let permit = DNS_ADMISSION
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| rejected())?;
+            let permit = match dns_admission.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => tokio::time::timeout(DNS_ADMISSION_WAIT, dns_admission.acquire_owned())
+                    .await
+                    .map_err(|_| rejected())?
+                    .map_err(|_| rejected())?,
+            };
             let cancelled = Arc::new(AtomicBool::new(false));
             let _cancel = CancelOnDrop(cancelled.clone());
             let worker = tokio::task::spawn_blocking(move || {

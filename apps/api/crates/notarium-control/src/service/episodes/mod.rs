@@ -159,11 +159,11 @@ impl ControlService {
         id: EpisodeId,
     ) -> Result<AgentEpisode, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
         let value = budget
             .run(
                 async {
-                    let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
                     let row = episode(tx.inner_mut(), auth.principal(), &id).await?;
                     self.project_episode(
                         tx.inner_mut(),
@@ -193,12 +193,15 @@ impl ControlService {
         let command = Command::new(request.identity, "start-episode", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         let budget = OperationBudget::new(ctx.budget.clone());
+        let keeper = self
+            .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
+            .await?;
         let mut tx = self.store.write(budget.clone()).await?;
-        let (revision, value) = budget.run(async {
-            let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+        let (revision, current, started_value) = budget.run(async {
+            let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
             let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
             if let Some((revision, saved)) = command.replay::<Started>(tx.inner_mut()).await? {
-                return Ok((revision, self.project_started(tx.inner_mut(), &current, saved.value).await?));
+                return Ok((revision, current, saved.value));
             }
             let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
             expect_revision(&owner, command.identity.expected)?;
@@ -216,7 +219,7 @@ impl ControlService {
                         let revision = bump_owner(tx.inner_mut(), &owner).await?;
                         let saved = SavedResult { value, events: vec![] };
                         command.save(tx.inner_mut(), revision, &saved, now).await?;
-                        return Ok((revision, self.project_started(tx.inner_mut(), &current, saved.value).await?));
+                        return Ok((revision, current, saved.value));
                     }
                     (matches.into_iter().next(), EpisodeId::from_bytes(crate::auth::token::random()?), Some(name.clone()))
                 },
@@ -234,7 +237,7 @@ impl ControlService {
                         parent_id: Some(old.episode_id.clone()), active_role: old.active_role, project_space: old.project_space,
                         project_folder: old.project_folder, lifecycle: "active".into(), revision: 1, created_at: now,
                         last_seen_at: now, closed_at: None, calls: 0 };
-                    let record = TargetRecord::AgentEpisodes(row); record.validate()?; record.insert(tx.inner_mut()).await?;
+                    let record = TargetRecord::from(row); record.validate()?; record.insert_or_conflict(tx.inner_mut()).await?;
                     self.fork_acknowledgements(tx.inner_mut(), &old.episode_id, &requested).await?;
                     Started::Forked(requested)
                 }
@@ -245,15 +248,23 @@ impl ControlService {
                     parent_id: None, active_role: None, project_space: request.input.project_hint.as_ref().map(|p| p.space_id.to_string()),
                     project_folder: request.input.project_hint.as_ref().map(|p| p.folder_id.to_string()), lifecycle: "active".into(),
                     revision: 1, created_at: now, last_seen_at: now, closed_at: None, calls: 0 };
-                let record = TargetRecord::AgentEpisodes(row); record.validate()?; record.insert(tx.inner_mut()).await?;
+                let record = TargetRecord::from(row); record.validate()?; record.insert_or_conflict(tx.inner_mut()).await?;
                 Started::New(requested)
             };
             let revision = bump_owner(tx.inner_mut(), &owner).await?;
             let saved = SavedResult { value: started, events: vec![] };
             command.save(tx.inner_mut(), revision, &saved, now).await?;
-            Ok((revision, self.project_started(tx.inner_mut(), &current, saved.value).await?))
+            Ok((revision, current, saved.value))
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
+        let value = budget
+            .run(
+                self.project_started(rtx.inner_mut(), &current, started_value),
+                CommitEffect::Unknown,
+            )
+            .await?;
+        budget.run(rtx.rollback(), CommitEffect::Unknown).await?;
         Ok(ControlCommit { value, revision })
     }
     pub async fn update_episode(
@@ -265,13 +276,45 @@ impl ControlService {
         let command = Command::new(request.identity, "update-episode", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         let budget = OperationBudget::new(ctx.budget.clone());
+        let prechecked_role = {
+            let current = self.current_account(&ctx, &budget).await?;
+            if let Some(project) = &request.input.project_hint {
+                budget
+                    .run(
+                        self.catalog_project(&current, project),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+            }
+            if let Some(role) = &request.input.active_role {
+                let raw = match budget
+                    .run(
+                        self.raw_ability(&current, role.identity()),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await
+                {
+                    Ok(raw) if raw.reference == *role => raw,
+                    Ok(_) => return Err(DomainError::ResourceNotFound.into()),
+                    Err(error) if hidden(&error) => {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    Err(error) => return Err(error),
+                };
+                Some(raw)
+            } else {
+                None
+            }
+        };
+        let keeper = self
+            .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
+            .await?;
         let mut tx = self.store.write(budget.clone()).await?;
-        let (revision, value) = budget.run(async {
-            let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+        let (revision, current, saved_id) = budget.run(async {
+            let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
             let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
             if let Some((revision, saved)) = command.replay::<EpisodeId>(tx.inner_mut()).await? {
-                let row = episode(tx.inner_mut(), current.auth().principal(), &saved.value).await?;
-                return Ok((revision, self.project_episode(tx.inner_mut(), &current, row).await?));
+                return Ok((revision, current, saved.value));
             }
             let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
             expect_revision(&owner, command.identity.expected)?;
@@ -280,9 +323,10 @@ impl ControlService {
                 return Err(DomainError::ControlRevisionConflict { current: ControlRevision::new(old.revision as u64)? }.into());
             }
             if old.lifecycle == "closed" { return Err(invalid(ValidationReason::InvalidState)); }
-            if let Some(role) = &request.input.active_role
-                && !self.current_role_in_project(tx.inner_mut(), &current, role, request.input.project_hint.as_ref()).await? { return Err(DomainError::ResourceNotFound.into()); }
-            if let Some(project) = &request.input.project_hint { self.catalog_project(&current, project).await?; }
+            if let Some(raw) = prechecked_role
+                && !self.current_role_db_only(tx.inner_mut(), &current, raw, request.input.project_hint.as_ref()).await? {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             let active_role = request.input.active_role.as_ref().map(serde_json::to_string).transpose().map_err(|_| invalid(ValidationReason::InvalidQuery))?;
             let project_space = request.input.project_hint.as_ref().map(|p| p.space_id.to_string());
             let project_folder = request.input.project_hint.as_ref().map(|p| p.folder_id.to_string());
@@ -297,18 +341,32 @@ impl ControlService {
             let revision = bump_owner(tx.inner_mut(), &owner).await?;
             let saved = SavedResult { value: request.input.episode.clone(), events: vec![] };
             command.save(tx.inner_mut(), revision, &saved, now).await?;
-            let row = episode(tx.inner_mut(), current.auth().principal(), &saved.value).await?;
-            Ok((revision, self.project_episode(tx.inner_mut(), &current, row).await?))
+            Ok((revision, current, saved.value))
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
+        let value = budget
+            .run(
+                async {
+                    let row =
+                        episode(rtx.inner_mut(), current.auth().principal(), &saved_id).await?;
+                    self.project_episode(rtx.inner_mut(), &current, row).await
+                },
+                CommitEffect::Unknown,
+            )
+            .await?;
+        budget.run(rtx.rollback(), CommitEffect::Unknown).await?;
         Ok(ControlCommit { revision, value })
     }
     /// Trusted accepted-call path. It cannot change role, project or acknowledgements.
     pub async fn touch_episode(&self, ctx: AccountContext, id: EpisodeId) -> Result<(), PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
+        let keeper = self
+            .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
+            .await?;
         let mut tx = self.store.write(budget.clone()).await?;
         budget.run(async {
-            let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+            let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
             let row = episode(tx.inner_mut(), auth.principal(), &id).await?;
             if row.lifecycle != "active" { return Err(invalid(ValidationReason::InvalidState)); }
             let now = self.clock.now_ms()?;

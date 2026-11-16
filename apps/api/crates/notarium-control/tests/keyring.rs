@@ -2,7 +2,7 @@
 mod support;
 use notarium_control::{
     keyring::{EnvelopeAddress, FreshLocalInitializer, Keyring, KeyringLocation},
-    store::target::{SecretKeyringRow, TargetRecord, TargetTable, V1StorageEpochRow},
+    store::{TargetRecord, TargetTable},
 };
 use notarium_core::{auth::SecretString, epoch::DataRoot, ids::*, ports::*};
 use std::{fs, path::PathBuf, time::Duration};
@@ -14,9 +14,9 @@ fn native() -> PathBuf {
 fn vector() -> serde_json::Value {
     serde_json::from_str(include_str!("fixtures/keyring/vectors.json")).unwrap()
 }
-fn row() -> SecretKeyringRow {
+fn row() -> TargetRecord {
     let v = vector();
-    SecretKeyringRow {
+    TargetRecord::SecretKeyring {
         key_id: v["keyId"].as_str().unwrap().into(),
         key_hash: v["keyHash"].as_str().unwrap().into(),
         generation: 1,
@@ -33,22 +33,19 @@ fn maintenance(purpose: ServicePurpose) -> MaintenanceContext {
     }
 }
 fn epoch() -> TargetRecord {
-    TargetRecord::V1StorageEpoch(V1StorageEpochRow {
+    TargetRecord::V1StorageEpoch {
         singleton: 1,
         epoch_version: 1,
         state: "migrating".into(),
         installation_id: InstallationId::from_bytes([1; 16]).to_string(),
         receipt_sha256: None,
         receipt_json: None,
-    })
+    }
 }
 async fn seed(f: &mut Fixture) {
     f.observer.execute("DELETE FROM v1_storage_epoch").await;
     f.store
-        .import_target_batch(
-            maintenance(ServicePurpose::Restore),
-            &[epoch(), TargetRecord::SecretKeyring(row())],
-        )
+        .import_target_batch(maintenance(ServicePurpose::Restore), &[epoch(), row()])
         .await
         .unwrap();
     f.observer
@@ -105,7 +102,7 @@ async fn both_databases_verify_and_export_native_witnesses_without_caching_keys(
             sealed.encrypted, again.encrypted,
             "each encryption needs a fresh nonce"
         );
-        assert_eq!(sealed.witness.hash, row().key_hash);
+        assert_eq!(sealed.witness.hash, v["keyHash"].as_str().unwrap());
         assert_eq!(
             keyring
                 .open_envelope(budget(), address.clone(), &sealed.encrypted)
@@ -140,11 +137,14 @@ async fn both_databases_verify_and_export_native_witnesses_without_caching_keys(
             .await
             .unwrap();
         assert_eq!(page.records.len(), 1);
-        let TargetRecord::SecretKeyring(exported) = &page.records[0] else {
+        let TargetRecord::SecretKeyring {
+            key_hash, canary, ..
+        } = &page.records[0]
+        else {
             panic!("expected key witness");
         };
-        assert_eq!(exported.key_hash, row().key_hash);
-        assert_eq!(exported.canary, row().canary);
+        assert_eq!(key_hash, v["keyHash"].as_str().unwrap());
+        assert_eq!(canary, v["canaryEnvelope"].as_str().unwrap());
         let encoded = serde_json::to_string(&page.records).unwrap();
         assert!(!encoded.contains("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"));
         export.close().await.unwrap();

@@ -53,12 +53,19 @@ impl Runtime {
         effect: CommitEffect,
     ) -> Result<T, PortError> {
         self.check(effect)?;
-        let result=self.budget.run(async {
-            tokio::select!{biased;
-                _=async {while !self.cancelled.is_cancelled(){tokio::time::sleep(Duration::from_millis(1)).await;}}=>Err(cancelled(effect)),
-                value=operation=>value,
-            }
-        },effect).await?;
+        let result = self
+            .budget
+            .run(
+                async {
+                    tokio::select! {
+                        biased;
+                        () = self.cancelled.cancelled() => Err(cancelled(effect)),
+                        value = operation => value,
+                    }
+                },
+                effect,
+            )
+            .await?;
         self.check(effect)?;
         Ok(result)
     }
@@ -229,18 +236,20 @@ impl Job {
             Request::Check(_) => Ok(vec![]),
         }
     }
-    pub fn reservation(&self, snapshot: &Snapshot) -> Result<i64, PortError> {
-        let input = snapshot
-            .model
-            .as_ref()
-            .map_or(0, |model| i64::from(model.max_input_tokens));
-        let output = match &self.request {
-            Request::Completion(request) => i64::from(request.budget.max_output_tokens),
-            _ => 0,
-        };
-        input
-            .checked_add(output)
-            .ok_or_else(|| invalid(ValidationReason::InvalidLimit))
+    pub fn reservation(&self, _snapshot: &Snapshot) -> Result<i64, PortError> {
+        match &self.request {
+            Request::Completion(request) => {
+                let input = i64::from(wire::estimate_completion_input_tokens(request)?);
+                let output = i64::from(request.budget.max_output_tokens);
+                input
+                    .checked_add(output)
+                    .ok_or_else(|| invalid(ValidationReason::InvalidLimit))
+            }
+            Request::Embedding(request) => {
+                Ok(i64::from(wire::estimate_embedding_input_tokens(request)?))
+            }
+            Request::Check(_) => Ok(0),
+        }
     }
     pub fn usage_mismatch(&self, model: Option<&ProviderModelSpec>, usage: ProviderUsage) -> bool {
         let ProviderUsage::Exact {
@@ -250,11 +259,15 @@ impl Job {
         else {
             return false;
         };
-        let maximum = match &self.request {
-            Request::Completion(request) => request.budget.max_output_tokens,
-            _ => 0,
-        };
-        input_tokens > u64::from(model.map_or(0, |model| model.max_input_tokens))
-            || output_tokens > u64::from(maximum)
+        let model_cap = u64::from(model.map_or(0, |model| model.max_input_tokens));
+        match &self.request {
+            Request::Completion(request) => {
+                let input_cap = u64::from(request.budget.max_input_tokens).min(model_cap);
+                input_tokens > input_cap
+                    || output_tokens > u64::from(request.budget.max_output_tokens)
+            }
+            Request::Embedding(_) => input_tokens > model_cap || output_tokens > 0,
+            Request::Check(_) => input_tokens > 0 || output_tokens > 0,
+        }
     }
 }

@@ -30,7 +30,7 @@ async fn cimd_https_cache_changes_and_failures_never_fall_back_to_stale_consent(
                     budget: budget(),
                 },
                 &[
-                    TargetRecord::V1StorageEpoch(V1StorageEpochRow {
+                    TargetRecord::from(V1StorageEpochRow {
                         singleton: 1,
                         epoch_version: 1,
                         state: "migrating".into(),
@@ -38,7 +38,7 @@ async fn cimd_https_cache_changes_and_failures_never_fall_back_to_stale_consent(
                         receipt_sha256: None,
                         receipt_json: None,
                     }),
-                    TargetRecord::SecretKeyring(SecretKeyringRow {
+                    TargetRecord::from(SecretKeyringRow {
                         key_id: v["keyId"].as_str().unwrap().into(),
                         key_hash: v["keyHash"].as_str().unwrap().into(),
                         generation: 1,

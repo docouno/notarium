@@ -20,7 +20,7 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
-    auth::{PrincipalKind, SpaceKind, SpaceRole},
+    auth::{SpaceKind, SpaceRole},
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
     model::{FolderRef, NoteRef},
@@ -87,12 +87,22 @@ impl ControlService {
         tx: &mut Transaction,
         ctx: &AccountContext,
     ) -> Result<UsersRow, PortError> {
-        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
-            return Err(access_denied());
-        }
+        ctx.auth().authorize_human_management()?;
         let owner = user(tx, ctx.auth().principal().as_str()).await?;
         self.live_human(tx, ctx.auth(), &owner).await?;
         Ok(owner)
+    }
+    async fn context_precheck_spaces(
+        &self,
+        ctx: &AccountContext,
+        required: &BTreeMap<SpaceId, bool>,
+    ) -> Result<BTreeMap<SpaceId, SpaceKind>, PortError> {
+        let mut kinds = BTreeMap::new();
+        for space in required.keys() {
+            let catalog = self.catalog_space(ctx, space).await?;
+            kinds.insert(space.clone(), catalog.space.kind);
+        }
+        Ok(kinds)
     }
     async fn context_write_spaces(
         &self,
@@ -101,6 +111,7 @@ impl ControlService {
         owner: &UsersRow,
         required: &BTreeMap<SpaceId, bool>,
         spaces: &BTreeMap<SpaceId, bool>,
+        space_kinds: &BTreeMap<SpaceId, SpaceKind>,
     ) -> Result<(), PortError> {
         if spaces.len() > 65 {
             return Err(invalid(ValidationReason::BudgetExceeded));
@@ -128,8 +139,11 @@ impl ControlService {
             {
                 return Err(access_denied());
             }
-            let catalog = self.catalog_space(ctx, space).await?;
-            if catalog.space.kind == SpaceKind::Personal
+            let kind = space_kinds
+                .get(space)
+                .copied()
+                .ok_or(DomainError::ResourceNotFound)?;
+            if kind == SpaceKind::Personal
                 && owner.personal_space_id.as_deref() != Some(space.as_str())
             {
                 return Err(DomainError::ResourceNotFound.into());
@@ -191,14 +205,15 @@ impl ControlService {
         scope: ContextScope,
     ) -> Result<ContextScopeInfo, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
         let revision = budget
             .run(
                 async {
-                    let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
                     let current =
                         AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
-                    let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
+                    let owner =
+                        user_read(tx.inner_mut(), current.auth().principal().as_str()).await?;
                     let key = scope_key(&owner, &scope)?;
                     self.context_scope_read(&current, &scope, &key).await?;
                     self.context_scope_revision(tx.inner_mut(), &owner, &key)
@@ -218,7 +233,7 @@ impl ControlService {
         ctx: &AccountContext,
         extra: impl Serialize,
     ) -> Result<ContentDigest, PortError> {
-        let owner = user(tx, ctx.auth().principal().as_str()).await?;
+        let owner = user_read(tx, ctx.auth().principal().as_str()).await?;
         let mut spaces = Vec::with_capacity(ctx.auth().spaces().len());
         for space in ctx.auth().spaces().keys() {
             spaces.push((

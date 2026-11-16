@@ -118,7 +118,7 @@ async fn keys(fixture: &mut Fixture) -> Arc<Keyring> {
                 authority: ServiceAuthority::admit(ServicePurpose::Restore),
                 budget: budget(),
             },
-            &[TargetRecord::SecretKeyring(SecretKeyringRow {
+            &[TargetRecord::from(SecretKeyringRow {
                 key_id: value["keyId"].as_str().unwrap().into(),
                 key_hash: value["keyHash"].as_str().unwrap().into(),
                 generation: 1,
@@ -308,6 +308,7 @@ impl Setup {
             .select_provider(
                 space.clone(),
                 SelectProvider {
+                    kind: PreferenceModelKind::Completion,
                     resource: Some(resource.value.id),
                     model: Some(ModelProfileId::from_bytes([3; 16])),
                     project: None,
@@ -658,7 +659,7 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         setup
             .fixture
             .observer
-            .count("SELECT COUNT(*) FROM provider_budget_buckets WHERE tpm_reserved=8224")
+            .count("SELECT COUNT(*) FROM provider_budget_buckets WHERE tpm_reserved=41")
             .await,
         3
     );
@@ -679,24 +680,30 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
         setup
             .fixture
             .observer
-            .count("SELECT COUNT(*) FROM provider_budget_buckets WHERE tpm_reserved=24672")
+            .count("SELECT COUNT(*) FROM provider_budget_buckets WHERE tpm_reserved=123")
             .await,
         3
     );
     mode.store(2, Ordering::SeqCst);
+    let over_events = complete(&setup.provider, setup.space.clone(), setup.completion(17))
+        .await
+        .unwrap();
     assert!(matches!(
-        complete(&setup.provider, setup.space.clone(), setup.completion(17)).await,
-        Err(PortError::Domain(DomainError::Provider {
-            error: ProviderErrorCode::BudgetMismatch
-        }))
+        over_events[1],
+        CompletionEvent::Usage(ProviderUsage::Exact {
+            input_tokens: 8193,
+            output_tokens: 0
+        })
     ));
-    assert_eq!(setup.fixture.observer.count("SELECT COUNT(*) FROM provider_call_log WHERE diagnostic='budget_mismatch' AND input_tokens=8193 AND output_tokens=0").await,1);
+    assert_eq!(setup.fixture.observer.count("SELECT COUNT(*) FROM provider_call_log WHERE outcome='completed' AND diagnostic='budget_mismatch' AND input_tokens=8193 AND output_tokens=0").await,1);
+    mode.store(0, Ordering::SeqCst);
+    assert!(
+        complete(&setup.provider, setup.space.clone(), setup.completion(18))
+            .await
+            .is_ok(),
+        "budget_mismatch records audit spend without cross-user 60s DoS lockout"
+    );
     let count = requests.lock().unwrap().len();
-    assert!(matches!(
-        complete(&setup.provider, setup.space.clone(), setup.completion(18)).await,
-        Err(PortError::Domain(DomainError::RateLimited { .. }))
-    ));
-    assert_eq!(requests.lock().unwrap().len(), count);
     // A retry still resolves the old intent after mutable configuration changes.
     let changed = setup
         .other

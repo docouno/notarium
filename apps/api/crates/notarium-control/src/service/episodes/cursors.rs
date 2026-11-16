@@ -91,20 +91,38 @@ impl ControlService {
         )?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         let budget = OperationBudget::new(ctx.budget.clone());
+        let delivered = &request.input.delivered;
+        let current_pre = self.current_account(&ctx, &budget).await?;
+        if current_pre
+            .auth()
+            .spaces()
+            .get(&delivered.scope.space_id)
+            .is_none_or(|g| g.read_classes.is_empty())
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        let catalog = budget
+            .run(
+                self.catalog_space(&current_pre, &delivered.scope.space_id),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        catalog.history.check(&delivered.scope)?;
+        if delivered.after > catalog.last_seq {
+            return Err(invalid(ValidationReason::InvalidQuery));
+        }
+        let keeper = self
+            .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
+            .await?;
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision, saved) = budget.run(async {
-            let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
-            let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
-            let delivered = &request.input.delivered;
-            if current.auth().spaces().get(&delivered.scope.space_id).is_none_or(|g| g.read_classes.is_empty()) {
+            let auth = self.revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref()).await?;
+            if auth.spaces().get(&delivered.scope.space_id).is_none_or(|g| g.read_classes.is_empty()) {
                 return Err(DomainError::ResourceNotFound.into());
             }
-            if let AckOwner::Episode(id) = &request.input.owner { episode(tx.inner_mut(), current.auth().principal(), id).await?; }
-            let catalog = self.catalog_space(&current, &delivered.scope.space_id).await?;
-            catalog.history.check(&delivered.scope)?;
-            if delivered.after > catalog.last_seq { return Err(invalid(ValidationReason::InvalidQuery)); }
+            if let AckOwner::Episode(id) = &request.input.owner { episode(tx.inner_mut(), auth.principal(), id).await?; }
             if let Some(replay) = command.replay::<SavedAck>(tx.inner_mut()).await? { return Ok(replay); }
-            let owner = user(tx.inner_mut(), current.auth().principal().as_str()).await?;
+            let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
             let space = delivered.scope.space_id.as_str();
             let existing = match &request.input.owner {
                 AckOwner::Account => rows!(tx.inner_mut(),CursorRow,fetch_optional,"SELECT history_incarnation,acked_space_seq FROM mcp_delta_owner_cursors WHERE owner_id=$1 AND space_id=$2","SELECT history_incarnation,acked_space_seq FROM v1_control.mcp_delta_owner_cursors WHERE owner_id=$1 AND space_id=$2";&owner.user_id,space)?,
@@ -148,4 +166,159 @@ impl ControlService {
             },
         })
     }
+    pub async fn lookup_mcp_dedup(
+        &self,
+        ctx: AccountContext,
+        key: McpDedupKey,
+    ) -> Result<Option<McpDedupHit>, PortError> {
+        validate_dedup_key(&key)?;
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let mut rtx = self.store.read(budget.clone()).await?;
+        let hit = budget
+            .run(
+                async {
+                    let auth = self.revalidate_read(rtx.inner_mut(), ctx.auth()).await?;
+                    if auth.principal().as_str().len() + key.actor.len() + key.request_key.as_str().len()
+                        > 2048
+                    {
+                        return Err(invalid(ValidationReason::InvalidLimit));
+                    }
+                    let row = rows!(
+                        rtx.inner_mut(),
+                        McpDedupRow,
+                        fetch_optional,
+                        "SELECT * FROM mcp_dedup WHERE owner=$1 AND actor=$2 AND request_key=$3",
+                        "SELECT * FROM v1_control.mcp_dedup WHERE owner=$1 AND actor=$2 AND request_key=$3";
+                        auth.principal().as_str(),
+                        &key.actor,
+                        key.request_key.as_str()
+                    )?;
+                    let Some(row) = row else {
+                        return Ok(None);
+                    };
+                    if row.expires_at <= self.clock.now_ms()? {
+                        return Ok(None);
+                    }
+                    if row.request_hash != key.request_hash.as_bytes()
+                        || row.operation != key.operation
+                    {
+                        return Err(DomainError::IdempotencyKeyReused.into());
+                    }
+                    let effect: AgentEffect = serde_json::from_value(serde_json::Value::String(
+                        row.effect,
+                    ))
+                    .map_err(|_| invalid(ValidationReason::InvalidState))?;
+                    Ok(Some(McpDedupHit {
+                        operation: row.operation,
+                        safe_result: row.safe_result,
+                        effect,
+                    }))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        budget
+            .run(rtx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        Ok(hit)
+    }
+    pub async fn record_mcp_dedup(
+        &self,
+        ctx: AccountContext,
+        record: McpDedupRecord,
+    ) -> Result<(), PortError> {
+        validate_dedup_key(&record.key)?;
+        if record.safe_result.len() > 65536
+            || record.safe_result.contains('\0')
+            || record.ttl_ms == 0
+            || record.ttl_ms > 7 * 86_400_000
+        {
+            return Err(invalid(ValidationReason::InvalidLimit));
+        }
+        let effect = match serde_json::to_value(record.effect)
+            .map_err(|_| invalid(ValidationReason::InvalidState))?
+        {
+            serde_json::Value::String(s) => s,
+            _ => return Err(invalid(ValidationReason::InvalidState)),
+        };
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let keeper = self
+            .precheck_keeper_catalog(ctx.auth(), &budget, &ctx.budget.request)
+            .await?;
+        let mut tx = self.store.write(budget.clone()).await?;
+        budget
+            .run(
+                async {
+                    let auth = self
+                        .revalidate_with_keeper(tx.inner_mut(), ctx.auth(), keeper.as_ref())
+                        .await?;
+                    let owner = auth.principal().as_str();
+                    if owner.len() + record.key.actor.len() + record.key.request_key.as_str().len()
+                        > 2048
+                    {
+                        return Err(invalid(ValidationReason::InvalidLimit));
+                    }
+                    let now = self.clock.now_ms()?;
+                    let expires_at = now
+                        .checked_add(record.ttl_ms as i64)
+                        .ok_or_else(|| invalid(ValidationReason::InvalidTimestamp))?;
+                    let existing = rows!(
+                        tx.inner_mut(),
+                        McpDedupRow,
+                        fetch_optional,
+                        "SELECT * FROM mcp_dedup WHERE owner=$1 AND actor=$2 AND request_key=$3",
+                        "SELECT * FROM v1_control.mcp_dedup WHERE owner=$1 AND actor=$2 AND request_key=$3 FOR UPDATE";
+                        owner,
+                        &record.key.actor,
+                        record.key.request_key.as_str()
+                    )?;
+                    if let Some(existing) = existing {
+                        if existing.expires_at > now {
+                            if existing.request_hash != record.key.request_hash.as_bytes()
+                                || existing.operation != record.key.operation
+                            {
+                                return Err(DomainError::IdempotencyKeyReused.into());
+                            }
+                            return Ok(());
+                        }
+                        execute!(
+                            tx.inner_mut(),
+                            "DELETE FROM mcp_dedup WHERE owner=$1 AND actor=$2 AND request_key=$3",
+                            "DELETE FROM v1_control.mcp_dedup WHERE owner=$1 AND actor=$2 AND request_key=$3";
+                            owner,
+                            &record.key.actor,
+                            record.key.request_key.as_str()
+                        )?;
+                    }
+                    let row = TargetRecord::from(McpDedupRow {
+                        owner: owner.to_owned(),
+                        actor: record.key.actor,
+                        request_key: record.key.request_key.to_string(),
+                        request_hash: record.key.request_hash.as_bytes().to_vec(),
+                        operation: record.key.operation,
+                        safe_result: record.safe_result,
+                        effect,
+                        expires_at,
+                    });
+                    row.validate()?;
+                    row.insert(tx.inner_mut()).await
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        budget.run(tx.commit(), CommitEffect::Unknown).await
+    }
+}
+
+fn validate_dedup_key(key: &McpDedupKey) -> Result<(), PortError> {
+    if key.actor.is_empty()
+        || key.actor.len() > 512
+        || key.actor.contains('\0')
+        || key.operation.is_empty()
+        || key.operation.len() > 128
+        || key.operation.contains('\0')
+    {
+        return Err(invalid(ValidationReason::InvalidQuery));
+    }
+    Ok(())
 }

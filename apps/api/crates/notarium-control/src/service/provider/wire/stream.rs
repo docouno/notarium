@@ -16,7 +16,6 @@ struct Tool {
 /// Nothing from this decoder is executable; the orchestrator owns tool policy.
 pub(in crate::service::provider) struct CompletionDecoder {
     wire: ProviderWireKind,
-    model: String,
     intent: CommandKey,
     allowed_tools: BTreeSet<String>,
     tool_limit: usize,
@@ -39,12 +38,12 @@ impl CompletionDecoder {
         allowed_tools: BTreeSet<String>,
         tool_limit: u16,
     ) -> Result<Self, PortError> {
+        let _ = model;
         if tool_limit as usize > MAX_TOOLS || allowed_tools.len() > MAX_TOOLS {
             return Err(limited());
         }
         Ok(Self {
             wire,
-            model,
             intent,
             allowed_tools,
             tool_limit: tool_limit as usize,
@@ -160,9 +159,13 @@ impl CompletionDecoder {
         Ok(())
     }
     fn model(&self, value: &Value) -> Result<(), PortError> {
-        if value.get("error").is_some()
-            || value.get("model").and_then(Value::as_str) != Some(self.model.as_str())
-        {
+        if value.get("error").is_some_and(|v| !v.is_null()) {
+            return Err(protocol());
+        }
+        let Some(model) = value.get("model").and_then(Value::as_str) else {
+            return Err(protocol());
+        };
+        if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
             return Err(protocol());
         }
         Ok(())
@@ -194,8 +197,9 @@ impl CompletionDecoder {
                 .get("completion_tokens")
                 .and_then(Value::as_u64)
                 .ok_or_else(protocol)?;
-            if let Some(total) = usage.get("total_tokens")
-                && total.as_u64() != input.checked_add(output)
+            let sum = input.checked_add(output).ok_or_else(protocol)?;
+            if let Some(total) = usage.get("total_tokens").filter(|v| !v.is_null())
+                && total.as_u64().is_none_or(|t| t < sum)
             {
                 return Err(protocol());
             }
@@ -205,7 +209,7 @@ impl CompletionDecoder {
             .get("choices")
             .and_then(Value::as_array)
             .ok_or_else(protocol)?;
-        if choices.len() > 1 || choices.is_empty() && self.usage.is_none() {
+        if choices.len() > 1 {
             return Err(protocol());
         }
         for choice in choices {
@@ -216,12 +220,17 @@ impl CompletionDecoder {
                 .get("delta")
                 .and_then(Value::as_object)
                 .ok_or_else(protocol)?;
+            let has_post_finish_payload = delta
+                .get("content")
+                .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+                || delta.get("tool_calls").is_some_and(|v| !v.is_null());
             if self.reason.is_some()
-                && (!delta.is_empty() || choice.get("finish_reason").is_some_and(|v| !v.is_null()))
+                && (has_post_finish_payload
+                    || choice.get("finish_reason").is_some_and(|v| !v.is_null()))
             {
                 return Err(protocol());
             }
-            if let Some(role) = delta.get("role")
+            if let Some(role) = delta.get("role").filter(|v| !v.is_null())
                 && role.as_str() != Some("assistant")
             {
                 return Err(protocol());
@@ -232,7 +241,7 @@ impl CompletionDecoder {
                     events.push(CompletionEvent::Text(text.into()));
                 }
             }
-            if let Some(calls) = delta.get("tool_calls") {
+            if let Some(calls) = delta.get("tool_calls").filter(|v| !v.is_null()) {
                 let calls = calls.as_array().ok_or_else(protocol)?;
                 if calls.len() > MAX_TOOLS {
                     return Err(protocol());
@@ -243,14 +252,14 @@ impl CompletionDecoder {
                         .and_then(Value::as_u64)
                         .filter(|v| *v < self.tool_limit as u64)
                         .ok_or_else(protocol)? as usize;
-                    if let Some(kind) = call.get("type")
+                    if let Some(kind) = call.get("type").filter(|v| !v.is_null())
                         && kind.as_str() != Some("function")
                     {
                         return Err(protocol());
                     }
                     let tool = self.tools.entry(index).or_default();
                     append(call.get("id"), &mut tool.id, 128, &mut self.tool_bytes)?;
-                    if let Some(function) = call.get("function") {
+                    if let Some(function) = call.get("function").filter(|v| !v.is_null()) {
                         if !function.is_object() {
                             return Err(protocol());
                         }
@@ -283,21 +292,22 @@ impl CompletionDecoder {
     }
     fn ollama(&mut self, value: Value, events: &mut Vec<CompletionEvent>) -> Result<(), PortError> {
         self.model(&value)?;
-        if let Some(message) = value.get("message") {
+        if let Some(message) = value.get("message").filter(|v| !v.is_null()) {
             if !message.is_object()
                 || message
                     .get("role")
+                    .filter(|v| !v.is_null())
                     .is_some_and(|v| v.as_str() != Some("assistant"))
             {
                 return Err(protocol());
             }
-            if let Some(content) = message.get("content") {
+            if let Some(content) = message.get("content").filter(|v| !v.is_null()) {
                 let text = content.as_str().ok_or_else(protocol)?;
                 if !text.is_empty() {
                     events.push(CompletionEvent::Text(text.into()));
                 }
             }
-            if let Some(calls) = message.get("tool_calls") {
+            if let Some(calls) = message.get("tool_calls").filter(|v| !v.is_null()) {
                 let calls = calls.as_array().ok_or_else(protocol)?;
                 if calls.len() > MAX_TOOLS {
                     return Err(protocol());
@@ -307,7 +317,7 @@ impl CompletionDecoder {
                         .get("function")
                         .and_then(Value::as_object)
                         .ok_or_else(protocol)?;
-                    let index = match function.get("index") {
+                    let index = match function.get("index").filter(|v| !v.is_null()) {
                         Some(value) => usize::try_from(value.as_u64().ok_or_else(protocol)?)
                             .map_err(|_| protocol())?,
                         None => self.tools.len(),
@@ -348,20 +358,30 @@ impl CompletionDecoder {
             .and_then(Value::as_bool)
             .ok_or_else(protocol)?;
         if done {
-            match (value.get("prompt_eval_count"), value.get("eval_count")) {
+            let prompt_eval = value.get("prompt_eval_count").filter(|v| !v.is_null());
+            let eval = value.get("eval_count").filter(|v| !v.is_null());
+            match (prompt_eval, eval) {
                 (Some(input), Some(output)) => self.set_usage(
                     input.as_u64().ok_or_else(protocol)?,
                     output.as_u64().ok_or_else(protocol)?,
                 )?,
+                (Some(input), None) => self.set_usage(input.as_u64().ok_or_else(protocol)?, 0)?,
+                (None, Some(output)) => self.set_usage(0, output.as_u64().ok_or_else(protocol)?)?,
                 (None, None) => {}
-                _ => return Err(protocol()),
             }
-            self.reason = Some(match value.get("done_reason").and_then(Value::as_str) {
-                Some("length") => CompletionFinish::Length,
-                Some("stop") | None if !self.tools.is_empty() => CompletionFinish::ToolCalls,
-                Some("stop") | None => CompletionFinish::Stop,
-                _ => return Err(protocol()),
-            });
+            self.reason = Some(
+                match value
+                    .get("done_reason")
+                    .filter(|v| !v.is_null())
+                    .and_then(Value::as_str)
+                {
+                    Some("length") => CompletionFinish::Length,
+                    Some("tool_calls") => CompletionFinish::ToolCalls,
+                    Some("stop") | None if !self.tools.is_empty() => CompletionFinish::ToolCalls,
+                    Some("stop") | None => CompletionFinish::Stop,
+                    _ => return Err(protocol()),
+                },
+            );
             self.finish(events)?;
         }
         Ok(())
@@ -432,7 +452,7 @@ fn append(
     maximum: usize,
     total: &mut usize,
 ) -> Result<(), PortError> {
-    if let Some(value) = value {
+    if let Some(value) = value.filter(|v| !v.is_null()) {
         let value = value.as_str().ok_or_else(protocol)?;
         *total = total.checked_add(value.len()).ok_or_else(protocol)?;
         if target.len().saturating_add(value.len()) > maximum || *total > MAX_TOOL_BYTES {

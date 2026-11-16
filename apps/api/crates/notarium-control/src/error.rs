@@ -20,3 +20,18 @@ pub(crate) fn unavailable(label: &'static str, effect: CommitEffect) -> PortErro
 pub(crate) fn database(_: sqlx::Error) -> PortError {
     unavailable("control database operation", CommitEffect::Unknown)
 }
+
+pub(crate) fn is_unique_violation(error: &sqlx::Error) -> bool {
+    let sqlx::Error::Database(db) = error else {
+        return false;
+    };
+    db.is_unique_violation() || matches!(db.code().as_deref(), Some("23505" | "1555" | "2067"))
+}
+
+pub(crate) fn database_or_conflict(error: sqlx::Error) -> PortError {
+    if is_unique_violation(&error) {
+        invalid(ValidationReason::DuplicateKey)
+    } else {
+        database(error)
+    }
+}

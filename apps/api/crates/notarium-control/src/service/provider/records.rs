@@ -121,11 +121,23 @@ pub(super) async fn credential(
 ) -> Result<CredentialsRow, PortError> {
     rows!(tx,CredentialsRow,fetch_optional,"SELECT * FROM credentials WHERE id=$1 AND kind='provider-header-v1'","SELECT * FROM v1_control.credentials WHERE id=$1 AND kind='provider-header-v1' FOR UPDATE";id)?.ok_or(DomainError::ResourceNotFound.into())
 }
+pub(super) async fn credential_read(
+    tx: &mut Transaction,
+    id: &str,
+) -> Result<CredentialsRow, PortError> {
+    rows!(tx,CredentialsRow,fetch_optional,"SELECT * FROM credentials WHERE id=$1 AND kind='provider-header-v1'","SELECT * FROM v1_control.credentials WHERE id=$1 AND kind='provider-header-v1'";id)?.ok_or(DomainError::ResourceNotFound.into())
+}
 pub(super) async fn resource(
     tx: &mut Transaction,
     id: &str,
 ) -> Result<ProviderResourcesRow, PortError> {
     rows!(tx,ProviderResourcesRow,fetch_optional,"SELECT * FROM provider_resources WHERE id=$1","SELECT * FROM v1_control.provider_resources WHERE id=$1 FOR UPDATE";id)?.ok_or(DomainError::ResourceNotFound.into())
+}
+pub(super) async fn resource_read(
+    tx: &mut Transaction,
+    id: &str,
+) -> Result<ProviderResourcesRow, PortError> {
+    rows!(tx,ProviderResourcesRow,fetch_optional,"SELECT * FROM provider_resources WHERE id=$1","SELECT * FROM v1_control.provider_resources WHERE id=$1";id)?.ok_or(DomainError::ResourceNotFound.into())
 }
 pub(super) async fn model(
     tx: &mut Transaction,
@@ -133,6 +145,13 @@ pub(super) async fn model(
     id: &str,
 ) -> Result<ProviderModelsRow, PortError> {
     rows!(tx,ProviderModelsRow,fetch_optional,"SELECT * FROM provider_models WHERE resource_id=$1 AND model_id=$2","SELECT * FROM v1_control.provider_models WHERE resource_id=$1 AND model_id=$2 FOR UPDATE";resource,id)?.ok_or(DomainError::ResourceNotFound.into())
+}
+pub(super) async fn model_read(
+    tx: &mut Transaction,
+    resource: &str,
+    id: &str,
+) -> Result<ProviderModelsRow, PortError> {
+    rows!(tx,ProviderModelsRow,fetch_optional,"SELECT * FROM provider_models WHERE resource_id=$1 AND model_id=$2","SELECT * FROM v1_control.provider_models WHERE resource_id=$1 AND model_id=$2";resource,id)?.ok_or(DomainError::ResourceNotFound.into())
 }
 pub(super) fn credential_info(row: &CredentialsRow) -> Result<ProviderCredentialInfo, PortError> {
     Ok(ProviderCredentialInfo {
@@ -282,6 +301,12 @@ pub(super) async fn attachment(
     id: &str,
 ) -> Result<ProviderAttachmentsRow, PortError> {
     rows!(tx,ProviderAttachmentsRow,fetch_optional,"SELECT * FROM provider_attachments WHERE id=$1","SELECT * FROM v1_control.provider_attachments WHERE id=$1 FOR UPDATE";id)?.ok_or(DomainError::ResourceNotFound.into())
+}
+pub(super) async fn attachment_read(
+    tx: &mut Transaction,
+    id: &str,
+) -> Result<ProviderAttachmentsRow, PortError> {
+    rows!(tx,ProviderAttachmentsRow,fetch_optional,"SELECT * FROM provider_attachments WHERE id=$1","SELECT * FROM v1_control.provider_attachments WHERE id=$1";id)?.ok_or(DomainError::ResourceNotFound.into())
 }
 pub(super) fn attachment_target(
     row: &ProviderAttachmentsRow,

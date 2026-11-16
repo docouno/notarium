@@ -1,4 +1,4 @@
-use notarium_control::store::{ControlStore, PostgresConfig, target::*};
+use notarium_control::store::{ControlStore, PostgresConfig, TargetRecord, TargetTable};
 use notarium_core::{epoch::DataRoot, ids::*, ports::*};
 use sqlx::Connection;
 use std::{
@@ -17,19 +17,22 @@ fn ctx(purpose: ServicePurpose) -> MaintenanceContext {
     }
 }
 fn epoch() -> TargetRecord {
-    TargetRecord::V1StorageEpoch(V1StorageEpochRow {
+    TargetRecord::V1StorageEpoch {
         singleton: 1,
         epoch_version: 1,
         state: "migrating".into(),
         installation_id: InstallationId::from_bytes([1; 16]).to_string(),
         receipt_sha256: None,
         receipt_json: None,
-    })
+    }
 }
 fn user(n: u8) -> TargetRecord {
-    TargetRecord::Users(UsersRow {
+    user_with_username(n, format!("user{n}"))
+}
+fn user_with_username(n: u8, username: String) -> TargetRecord {
+    TargetRecord::Users {
         user_id: PrincipalId::from_bytes([n; 16]).to_string(),
-        username: format!("user{n}"),
+        username,
         email: None,
         display_name: "user".into(),
         password_hash: None,
@@ -40,10 +43,10 @@ fn user(n: u8) -> TargetRecord {
         metadata_revision: 0,
         auth_version: 0,
         created_at: 0,
-    })
+    }
 }
 fn client(name: String, metadata: Option<String>) -> TargetRecord {
-    TargetRecord::OauthClients(OauthClientsRow {
+    TargetRecord::OauthClients {
         client_id: "client".into(),
         kind: "dcr".into(),
         redirect_uris: "[]".into(),
@@ -54,10 +57,10 @@ fn client(name: String, metadata: Option<String>) -> TargetRecord {
         activated_at: None,
         created_at: 0,
         last_seen_at: None,
-    })
+    }
 }
 fn episode(n: u8, parent: Option<u8>) -> TargetRecord {
-    TargetRecord::AgentEpisodes(AgentEpisodesRow {
+    TargetRecord::AgentEpisodes {
         episode_id: EpisodeId::from_bytes([n; 16]).to_string(),
         owner_id: PrincipalId::from_bytes([1; 16]).to_string(),
         name: None,
@@ -71,10 +74,10 @@ fn episode(n: u8, parent: Option<u8>) -> TargetRecord {
         last_seen_at: 0,
         closed_at: None,
         calls: 0,
-    })
+    }
 }
 fn refresh(n: u8, next: Option<u8>) -> TargetRecord {
-    TargetRecord::OauthRefreshTokens(OauthRefreshTokensRow {
+    TargetRecord::OauthRefreshTokens {
         token_id: format!("{n:012x}"),
         token_hash: vec![n; 32],
         family_id: OAuthFamilyId::from_bytes([1; 16]).to_string(),
@@ -84,14 +87,14 @@ fn refresh(n: u8, next: Option<u8>) -> TargetRecord {
         used_at: None,
         revoked_at: None,
         rotated_to: next.map(|n| format!("{n:012x}")),
-    })
+    }
 }
 enum Observer {
     Sqlite(sqlx::SqliteConnection),
     Postgres(sqlx::PgConnection),
 }
 fn retrieval(number: usize, score: Option<f64>) -> TargetRecord {
-    TargetRecord::AgentRetrievals(AgentRetrievalsRow {
+    TargetRecord::AgentRetrievals {
         retrieval_id: RequestId::from_bytes((number as u128).to_be_bytes()).to_string(),
         owner_id: PrincipalId::from_bytes([1; 16]).to_string(),
         principal: PrincipalId::from_bytes([1; 16]).to_string(),
@@ -104,7 +107,7 @@ fn retrieval(number: usize, score: Option<f64>) -> TargetRecord {
         result_count: 1,
         top_score: score,
         created_at: 0,
-    })
+    }
 }
 impl Observer {
     async fn raw_score(&mut self, score: f64) -> Result<(), sqlx::Error> {
@@ -312,40 +315,31 @@ async fn verify(store: ControlStore, mut observer: Observer) {
     // The target domain is portable, including unindexed text and composite
     // index keys. PostgreSQL cannot store NUL or arbitrarily large B-tree keys.
     for value in ["valid\0tail".into(), "x".repeat(8192), "Ж".repeat(1025)] {
-        let TargetRecord::Users(mut row) = user(2) else {
-            unreachable!()
-        };
-        row.username = value.clone();
+        let row = user_with_username(2, value.clone());
         assert!(
             store
-                .import_target_batch(ctx(ServicePurpose::Restore), &[TargetRecord::Users(row)])
+                .import_target_batch(ctx(ServicePurpose::Restore), &[row])
                 .await
                 .is_err()
         );
         assert!(!observer.raw_user(&value, "display").await);
     }
     assert!(!observer.raw_user("normal", "unindexed\0text").await);
-    let oversized_key = TargetRecord::UserOidcIdentities(UserOidcIdentitiesRow {
+    let oversized_key = TargetRecord::UserOidcIdentities {
         issuer: "i".repeat(1100),
         subject: "s".repeat(1100),
         user_id: PrincipalId::from_bytes([1; 16]).to_string(),
         created_at: 0,
-    });
+    };
     assert!(
         store
             .import_target_batch(ctx(ServicePurpose::Restore), &[oversized_key])
             .await
             .is_err()
     );
-    let TargetRecord::Users(mut boundary_user) = user(2) else {
-        unreachable!()
-    };
-    boundary_user.username = "Ж".repeat(1024); // Exactly 2048 UTF-8 bytes.
+    let boundary_user = user_with_username(2, "Ж".repeat(1024)); // Exactly 2048 UTF-8 bytes.
     store
-        .import_target_batch(
-            ctx(ServicePurpose::Restore),
-            &[TargetRecord::Users(boundary_user)],
-        )
+        .import_target_batch(ctx(ServicePurpose::Restore), &[boundary_user])
         .await
         .unwrap();
     observer
@@ -373,10 +367,10 @@ async fn verify(store: ControlStore, mut observer: Observer) {
     // overhead may make an accepted boundary row permanently unreadable.
     let mut boundary = client("\u{1}".repeat(1024 * 1024), Some("\u{1}".repeat(300_000)));
     let size = serde_json::to_vec(&boundary).unwrap().len();
-    let TargetRecord::OauthClients(row) = &mut boundary else {
+    let TargetRecord::OauthClients { metadata_uri, .. } = &mut boundary else {
         unreachable!()
     };
-    row.metadata_uri
+    metadata_uri
         .as_mut()
         .unwrap()
         .push_str(&"a".repeat(8 * 1024 * 1024 - size));
@@ -406,11 +400,11 @@ async fn verify(store: ControlStore, mut observer: Observer) {
     for (record, expected) in scores.records.iter().zip(finite_scores) {
         let decoded: TargetRecord =
             serde_json::from_slice(&serde_json::to_vec(record).unwrap()).unwrap();
-        let TargetRecord::AgentRetrievals(row) = decoded else {
+        let TargetRecord::AgentRetrievals { top_score, .. } = decoded else {
             unreachable!()
         };
         assert_eq!(
-            row.top_score, expected,
+            top_score, expected,
             "finite score must survive both database and JSON"
         );
     }
@@ -424,7 +418,7 @@ async fn verify(store: ControlStore, mut observer: Observer) {
         .execute("UPDATE v1_storage_epoch SET state='migrating'")
         .await;
 
-    let grant = TargetRecord::OauthGrants(OauthGrantsRow {
+    let grant = TargetRecord::OauthGrants {
         grant_id: OAuthGrantId::from_bytes([1; 16]).to_string(),
         user_id: PrincipalId::from_bytes([1; 16]).to_string(),
         client_id: "client".into(),
@@ -434,14 +428,14 @@ async fn verify(store: ControlStore, mut observer: Observer) {
         revoked_at: None,
         revision: 0,
         created_at: 0,
-    });
-    let family = TargetRecord::OauthRefreshFamilies(OauthRefreshFamiliesRow {
+    };
+    let family = TargetRecord::OauthRefreshFamilies {
         family_id: OAuthFamilyId::from_bytes([1; 16]).to_string(),
         grant_id: OAuthGrantId::from_bytes([1; 16]).to_string(),
         revoked_at: None,
         reason_code: None,
         created_at: 0,
-    });
+    };
     store
         .import_target_batch(
             ctx(ServicePurpose::Restore),

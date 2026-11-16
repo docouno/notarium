@@ -2,7 +2,7 @@ use crate::support::{Fixture, budget};
 use notarium_control::{
     keyring::{Keyring, KeyringLocation},
     service::provider::ProviderService,
-    store::target::{SecretKeyringRow, TargetRecord},
+    store::TargetRecord,
 };
 use notarium_core::{
     DomainError,
@@ -38,7 +38,7 @@ pub async fn keyring(fixture: &mut Fixture) -> Arc<Keyring> {
                 authority: ServiceAuthority::admit(ServicePurpose::Restore),
                 budget: budget(),
             },
-            &[TargetRecord::SecretKeyring(SecretKeyringRow {
+            &[TargetRecord::SecretKeyring {
                 key_id: value["keyId"].as_str().unwrap().into(),
                 key_hash: value["keyHash"].as_str().unwrap().into(),
                 generation: 1,
@@ -46,7 +46,7 @@ pub async fn keyring(fixture: &mut Fixture) -> Arc<Keyring> {
                 canary: value["canaryEnvelope"].as_str().unwrap().into(),
                 created_at: 0,
                 retired_at: None,
-            })],
+            }],
         )
         .await
         .unwrap();

@@ -52,7 +52,7 @@ async fn issue(
         None
     };
     if let (Some(family), Some(refresh), Some(expires)) = (family, &refresh, refresh_expiry) {
-        let record = TargetRecord::OauthRefreshTokens(OauthRefreshTokensRow {
+        let record = TargetRecord::from(OauthRefreshTokensRow {
             token_id: refresh.id.clone().ok_or_else(invalid_grant)?,
             token_hash: refresh.digest.to_vec(),
             family_id: family.to_string(),
@@ -68,7 +68,7 @@ async fn issue(
     }
     let access = token::mint(TokenKind::Access)?;
     let expires = expiry(now, 60 * 60 * 1000)?;
-    let record = TargetRecord::OauthAccessTokens(OauthAccessTokensRow {
+    let record = TargetRecord::from(OauthAccessTokensRow {
         token_id: access.id.ok_or_else(invalid_grant)?,
         token_hash: access.digest.to_vec(),
         grant_id: grant.grant_id.clone(),
@@ -144,7 +144,7 @@ impl OAuthService {
             if changed!=1 {return Err(invalid_grant());}
             let family=if current.offline_access==1 {
                 let id=OAuthFamilyId::from_bytes(token::random()?);
-                let record=TargetRecord::OauthRefreshFamilies(OauthRefreshFamiliesRow {family_id:id.to_string(),grant_id:grant.grant_id.clone(),revoked_at:None,reason_code:None,created_at:now});
+                let record=TargetRecord::from(OauthRefreshFamiliesRow {family_id:id.to_string(),grant_id:grant.grant_id.clone(),revoked_at:None,reason_code:None,created_at:now});
                 record.validate()?; record.insert(tx.inner_mut()).await?; Some(id)
             } else {None};
             issue(tx.inner_mut(),&grant,family.as_ref(),now).await

@@ -23,6 +23,12 @@ impl ControlPlane {
             provider,
         }
     }
+    pub fn control_service(&self) -> &Arc<ControlService> {
+        &self.control
+    }
+    pub fn provider_service(&self) -> &ProviderService {
+        &self.provider
+    }
 }
 impl ControlPort for ControlPlane {
     fn resolve_auth(&self, ctx: PreAuthContext) -> PortFuture<'_, EngineAuthContext> {
@@ -91,6 +97,9 @@ impl ControlPort for ControlPlane {
     ) -> PortFuture<'_, ControlCommit<AgentEpisode>> {
         Box::pin(self.control.update_episode(ctx, request))
     }
+    fn touch_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, ()> {
+        Box::pin(self.control.touch_episode(ctx, episode))
+    }
     fn acknowledge_delta(
         &self,
         ctx: AccountContext,
@@ -127,8 +136,9 @@ impl ControlPort for ControlPlane {
         &self,
         ctx: AccountContext,
         reference: AbilityRef,
+        project: Option<FolderRef>,
     ) -> PortFuture<'_, AbilityDescriptor> {
-        Box::pin(self.control.get_ability(ctx, reference))
+        Box::pin(self.control.get_ability(ctx, reference, project))
     }
     fn update_ability_binding(
         &self,
@@ -136,6 +146,30 @@ impl ControlPort for ControlPlane {
         request: AccountMutation<AbilityBindingUpdate>,
     ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>> {
         Box::pin(self.control.update_ability_binding(ctx, request))
+    }
+    fn set_ability_preference(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityPreferenceUpdate>,
+    ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>> {
+        Box::pin(self.control.set_ability_preference(ctx, request))
+    }
+    fn set_ability_trail(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityTrailUpdate>,
+    ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>> {
+        Box::pin(self.control.set_ability_trail(ctx, request))
+    }
+    fn lookup_mcp_dedup(
+        &self,
+        ctx: AccountContext,
+        key: McpDedupKey,
+    ) -> PortFuture<'_, Option<McpDedupHit>> {
+        Box::pin(self.control.lookup_mcp_dedup(ctx, key))
+    }
+    fn record_mcp_dedup(&self, ctx: AccountContext, record: McpDedupRecord) -> PortFuture<'_, ()> {
+        Box::pin(self.control.record_mcp_dedup(ctx, record))
     }
     fn resolve_memory_target(
         &self,

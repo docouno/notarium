@@ -4,7 +4,7 @@ CREATE TABLE v1_storage_epoch (
     state TEXT NOT NULL CHECK (state IN ('migrating', 'ready')),
     installation_id TEXT NOT NULL,
     receipt_sha256 BLOB CHECK (length(receipt_sha256) = 32),
-    receipt_json TEXT CHECK (length(receipt_json) <= 1048576),
+    receipt_json TEXT CHECK (length(CAST(receipt_json AS BLOB)) <= 1048576),
     CHECK (instr(state,char(0))=0),
     CHECK (instr(installation_id,char(0))=0),
     CHECK (instr(receipt_json,char(0))=0)
@@ -89,6 +89,7 @@ CREATE TABLE one_time_tokens (
     CHECK (coalesce(length(CAST(user_id AS BLOB)),0) + coalesce(length(CAST(purpose AS BLOB)),0) + 8 <= 2048)
 ) STRICT;
 CREATE INDEX one_time_user ON one_time_tokens(user_id,purpose,expires_at);
+CREATE INDEX one_time_expiry ON one_time_tokens(expires_at);
 CREATE TABLE pats (
     token_id TEXT NOT NULL PRIMARY KEY CHECK (length(token_id)=12),
     secret_hash BLOB NOT NULL CHECK (length(secret_hash)=32),
@@ -114,9 +115,11 @@ CREATE TABLE oauth_clients (
     CHECK (instr(redirect_uris,char(0))=0),
     CHECK (instr(client_name,char(0))=0),
     CHECK (instr(metadata_uri,char(0))=0),
-    CHECK (coalesce(length(CAST(client_id AS BLOB)),0) <= 2048)
+    CHECK (coalesce(length(CAST(client_id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(kind AS BLOB)),0) + 16 <= 2048)
 ) STRICT;
-CREATE INDEX client_pending ON oauth_clients(activated_at,created_at);
+CREATE INDEX client_pending ON oauth_clients(kind,activated_at,created_at);
+CREATE INDEX client_kind_cache ON oauth_clients(kind,cache_expires_at,created_at);
 CREATE TABLE oauth_grants (
     grant_id TEXT NOT NULL PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(user_id),
     client_id TEXT NOT NULL REFERENCES oauth_clients(client_id), resource_uri TEXT NOT NULL,
@@ -149,9 +152,11 @@ CREATE TABLE oauth_auth_codes (
     CHECK (instr(resource_uri,char(0))=0),
     CHECK (instr(code_challenge,char(0))=0),
     CHECK (instr(method,char(0))=0),
-    CHECK (coalesce(length(CAST(code_hash AS BLOB)),0) <= 2048)
+    CHECK (coalesce(length(CAST(code_hash AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(client_id AS BLOB)),0) <= 2048)
 ) STRICT;
 CREATE INDEX code_expiry ON oauth_auth_codes(expires_at);
+CREATE INDEX code_client ON oauth_auth_codes(client_id);
 CREATE TABLE oauth_refresh_families (
     family_id TEXT NOT NULL PRIMARY KEY, grant_id TEXT NOT NULL REFERENCES oauth_grants(grant_id),
     revoked_at INTEGER, reason_code TEXT, created_at INTEGER NOT NULL,
@@ -168,22 +173,26 @@ CREATE TABLE oauth_refresh_tokens (
     family_id TEXT NOT NULL REFERENCES oauth_refresh_families(family_id),
     client_id TEXT NOT NULL REFERENCES oauth_clients(client_id),
     issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER, revoked_at INTEGER,
-    rotated_to TEXT REFERENCES oauth_refresh_tokens(token_id) DEFERRABLE INITIALLY DEFERRED,
+    rotated_to TEXT REFERENCES oauth_refresh_tokens(token_id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED,
     CHECK (instr(token_id,char(0))=0),
     CHECK (instr(family_id,char(0))=0),
     CHECK (instr(client_id,char(0))=0),
     CHECK (instr(rotated_to,char(0))=0),
     CHECK (coalesce(length(CAST(token_id AS BLOB)),0) <= 2048),
-    CHECK (coalesce(length(CAST(family_id AS BLOB)),0) <= 2048)
+    CHECK (coalesce(length(CAST(family_id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(client_id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(rotated_to AS BLOB)),0) <= 2048)
 ) STRICT;
 CREATE INDEX refresh_family ON oauth_refresh_tokens(family_id);
 CREATE INDEX refresh_expiry ON oauth_refresh_tokens(expires_at);
+CREATE INDEX refresh_client ON oauth_refresh_tokens(client_id);
+CREATE INDEX refresh_rotated_to ON oauth_refresh_tokens(rotated_to);
 CREATE TABLE oauth_access_tokens (
     token_id TEXT NOT NULL PRIMARY KEY CHECK (length(token_id)=12),
     token_hash BLOB NOT NULL CHECK (length(token_hash)=32),
     grant_id TEXT NOT NULL REFERENCES oauth_grants(grant_id),
     family_id TEXT REFERENCES oauth_refresh_families(family_id),
-    refresh_id TEXT REFERENCES oauth_refresh_tokens(token_id), resource_uri TEXT NOT NULL,
+    refresh_id TEXT REFERENCES oauth_refresh_tokens(token_id) ON DELETE SET NULL, resource_uri TEXT NOT NULL,
     scope TEXT NOT NULL CHECK (scope IN ('read','write')), selected_spaces TEXT,
     issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER, last_used_at INTEGER,
     CHECK (instr(token_id,char(0))=0),
@@ -195,10 +204,12 @@ CREATE TABLE oauth_access_tokens (
     CHECK (instr(selected_spaces,char(0))=0),
     CHECK (coalesce(length(CAST(token_id AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(grant_id AS BLOB)),0) <= 2048),
-    CHECK (coalesce(length(CAST(family_id AS BLOB)),0) <= 2048)
+    CHECK (coalesce(length(CAST(family_id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(refresh_id AS BLOB)),0) <= 2048)
 ) STRICT;
 CREATE INDEX access_grant ON oauth_access_tokens(grant_id);
 CREATE INDEX access_family ON oauth_access_tokens(family_id);
+CREATE INDEX access_refresh ON oauth_access_tokens(refresh_id);
 CREATE INDEX access_expiry ON oauth_access_tokens(expires_at);
 CREATE TABLE secret_keyring (
     key_id TEXT NOT NULL PRIMARY KEY CHECK (length(key_id)=27),
@@ -253,7 +264,7 @@ CREATE TABLE credentials (
 ) STRICT;
 CREATE TABLE provider_resources (
     id TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(user_id), name TEXT NOT NULL,
-    wire TEXT NOT NULL CHECK (wire IN ('openai-compatible','ollama')), base_url TEXT NOT NULL,
+    wire TEXT NOT NULL CHECK (length(CAST(wire AS BLOB)) BETWEEN 1 AND 64), base_url TEXT NOT NULL,
     headers TEXT NOT NULL CHECK (length(headers)<=65536), credential_id TEXT REFERENCES credentials(id) ON DELETE RESTRICT,
     consent_epoch INTEGER NOT NULL CHECK (consent_epoch>=0), runtime_epoch INTEGER NOT NULL CHECK (runtime_epoch>=0),
     default_model TEXT, timeouts TEXT NOT NULL, rpm INTEGER CHECK (rpm>0), tpm INTEGER CHECK (tpm>0),
@@ -306,6 +317,7 @@ CREATE TABLE provider_attachments (
     CHECK (instr(state,char(0))=0),
     CHECK (instr(disclosure,char(0))=0),
     CHECK (coalesce(length(CAST(id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(resource_id AS BLOB)),0) + coalesce(length(CAST(id AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(resource_id AS BLOB)),0) + coalesce(length(CAST(target_owner AS BLOB)),0) + coalesce(length(CAST(target_space AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(resource_id AS BLOB)),0) + coalesce(length(CAST(target_space AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(resource_id AS BLOB)),0) + coalesce(length(CAST(target_space AS BLOB)),0) + coalesce(length(CAST(target_project AS BLOB)),0) <= 2048),
@@ -315,18 +327,24 @@ CREATE UNIQUE INDEX attachment_personal ON provider_attachments(resource_id,targ
 CREATE UNIQUE INDEX attachment_space ON provider_attachments(resource_id,target_space) WHERE target_kind='space';
 CREATE UNIQUE INDEX attachment_project ON provider_attachments(resource_id,target_space,target_project) WHERE target_kind='project';
 CREATE INDEX attachment_target ON provider_attachments(target_space,state,resource_id);
+CREATE INDEX attachment_resource ON provider_attachments(resource_id,id);
 CREATE TABLE provider_preferences (
     owner_id TEXT NOT NULL REFERENCES users(user_id), scope_kind TEXT NOT NULL CHECK (scope_kind IN ('personal','space','project')),
-    scope_id TEXT NOT NULL, resource_id TEXT NOT NULL, model_id TEXT NOT NULL,
-    revision INTEGER NOT NULL CHECK (revision>=0), PRIMARY KEY(owner_id,scope_kind,scope_id),
+    scope_id TEXT NOT NULL, model_kind TEXT NOT NULL DEFAULT 'completion' CHECK (model_kind IN ('completion','embedding')),
+    resource_id TEXT NOT NULL, model_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision>=0), PRIMARY KEY(owner_id,scope_kind,scope_id,model_kind),
     FOREIGN KEY(resource_id,model_id) REFERENCES provider_models(resource_id,model_id),
     CHECK (instr(owner_id,char(0))=0),
     CHECK (instr(scope_kind,char(0))=0),
     CHECK (instr(scope_id,char(0))=0),
+    CHECK (instr(model_kind,char(0))=0),
     CHECK (instr(resource_id,char(0))=0),
     CHECK (instr(model_id,char(0))=0),
-    CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(scope_kind AS BLOB)),0) + coalesce(length(CAST(scope_id AS BLOB)),0) <= 2048)
+    CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(scope_kind AS BLOB)),0) + coalesce(length(CAST(scope_id AS BLOB)),0) + coalesce(length(CAST(model_kind AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(resource_id AS BLOB)),0) + coalesce(length(CAST(model_id AS BLOB)),0) <= 2048)
 ) STRICT;
+CREATE INDEX preference_scope ON provider_preferences(scope_kind,scope_id,model_kind,owner_id);
+CREATE INDEX preference_model ON provider_preferences(resource_id,model_id);
 CREATE TABLE provider_budget_buckets (
     budget_kind TEXT NOT NULL CHECK (budget_kind IN ('resource','credential','space')),
     budget_owner TEXT NOT NULL, window_start_ms INTEGER NOT NULL, window_end_ms INTEGER NOT NULL,
@@ -337,6 +355,7 @@ CREATE TABLE provider_budget_buckets (
     CHECK (instr(budget_owner,char(0))=0),
     CHECK (coalesce(length(CAST(budget_kind AS BLOB)),0) + coalesce(length(CAST(budget_owner AS BLOB)),0) + 8 <= 2048)
 ) STRICT;
+CREATE INDEX budget_bucket_expiry ON provider_budget_buckets(window_end_ms);
 CREATE TABLE provider_call_log (
     call_id TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL, principal TEXT NOT NULL, run_id TEXT,
     scope_id TEXT NOT NULL, intent_key TEXT NOT NULL, request_hash BLOB NOT NULL CHECK (length(request_hash)=32),
@@ -372,6 +391,7 @@ CREATE TABLE provider_call_log (
 ) STRICT;
 CREATE INDEX call_owner ON provider_call_log(owner_id,created_at,call_id);
 CREATE INDEX call_pending ON provider_call_log(delivery_state,created_at,call_id);
+CREATE INDEX call_settled ON provider_call_log(delivery_state,settled_at,call_id);
 CREATE INDEX call_budget_resource ON provider_call_log(resource_id,created_at,diagnostic);
 CREATE TABLE ability_availability (
     placement TEXT NOT NULL, ability_id TEXT NOT NULL,
@@ -517,8 +537,10 @@ CREATE TABLE mcp_delta_owner_cursors (
     PRIMARY KEY(owner_id,space_id),
     CHECK (instr(owner_id,char(0))=0),
     CHECK (instr(space_id,char(0))=0),
-    CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(space_id AS BLOB)),0) <= 2048)
+    CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(space_id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(space_id AS BLOB)),0) <= 2048)
 ) STRICT;
+CREATE INDEX owner_cursor_space ON mcp_delta_owner_cursors(space_id);
 CREATE TABLE mcp_delta_session_cursors (
     episode_id TEXT NOT NULL REFERENCES agent_episodes(episode_id) ON DELETE CASCADE, space_id TEXT NOT NULL,
     history_incarnation BLOB NOT NULL CHECK (length(history_incarnation)=16),
@@ -574,6 +596,7 @@ CREATE TABLE agent_call_details (
     CHECK (coalesce(length(CAST(call_id AS BLOB)),0) <= 2048)
 ) STRICT;
 CREATE INDEX detail_expiry ON agent_call_details(expires_at);
+CREATE INDEX detail_created ON agent_call_details(created_at,call_id);
 CREATE TABLE agent_retrievals (
     retrieval_id TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(user_id), principal TEXT NOT NULL, agent TEXT,
     call_id TEXT REFERENCES agent_calls(call_id), tool TEXT NOT NULL, query_summary TEXT NOT NULL CHECK (length(query_summary)<=4096),
@@ -621,7 +644,7 @@ CREATE TABLE agent_schedules (
     CHECK (instr(space_id,char(0))=0),
     CHECK (instr(project_folder_id,char(0))=0),
     CHECK (instr(title,char(0))=0 AND length(CAST(title AS BLOB)) BETWEEN 1 AND 512),
-    CHECK (instr(init_prompt,char(0))=0 AND length(CAST(init_prompt AS BLOB)) BETWEEN 1 AND 32768),
+    CHECK (instr(init_prompt,char(0))=0 AND ((deleted_at IS NULL AND length(CAST(init_prompt AS BLOB)) BETWEEN 1 AND 32768) OR (deleted_at IS NOT NULL AND length(CAST(init_prompt AS BLOB)) <= 32768))),
     CHECK (instr(cron_expr,char(0))=0),
     CHECK (instr(timezone,char(0))=0),
     CHECK (instr(approved_role,char(0))=0),
@@ -633,6 +656,7 @@ CREATE TABLE agent_schedules (
     CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(space_id AS BLOB)),0) + coalesce(length(CAST(schedule_id AS BLOB)),0) <= 2048)
 ) STRICT;
 CREATE INDEX schedule_due ON agent_schedules(deleted_at,paused_reason,next_slot_utc_ms,schedule_id);
+CREATE INDEX schedule_deleted ON agent_schedules(deleted_at,updated_at,schedule_id);
 CREATE INDEX schedule_owner ON agent_schedules(owner_id,space_id,schedule_id);
 CREATE TABLE agent_schedule_runs (
     run_id TEXT NOT NULL PRIMARY KEY, schedule_id TEXT NOT NULL REFERENCES agent_schedules(schedule_id) ON DELETE RESTRICT,
@@ -654,6 +678,7 @@ CREATE TABLE agent_schedule_runs (
     CHECK (coalesce(length(CAST(schedule_id AS BLOB)),0) + coalesce(length(CAST(status AS BLOB)),0) + 8 + coalesce(length(CAST(run_id AS BLOB)),0) <= 2048)
 ) STRICT;
 CREATE INDEX schedule_run_status ON agent_schedule_runs(schedule_id,status,slot_utc_ms,run_id);
+CREATE INDEX schedule_run_retention ON agent_schedule_runs(status,finished_at,run_id);
 CREATE TABLE control_commands (
     owner TEXT NOT NULL REFERENCES users(user_id), actor TEXT NOT NULL, command_key TEXT NOT NULL,
     request_hash BLOB NOT NULL CHECK (length(request_hash)=32), target TEXT NOT NULL,
@@ -688,7 +713,7 @@ CREATE TABLE control_operations (
     CHECK (coalesce(length(CAST(command_key AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(state AS BLOB)),0) + 8 <= 2048)
 ) STRICT;
-CREATE INDEX operation_pending ON control_operations(state,updated_at);
+CREATE INDEX operation_state_time ON control_operations(state,updated_at);
 CREATE TABLE revocation_events (
     event_id TEXT NOT NULL PRIMARY KEY, selector TEXT NOT NULL CHECK (length(selector)<=4096), reason TEXT NOT NULL,
     authority_version INTEGER NOT NULL CHECK (authority_version>=0), committed_at INTEGER NOT NULL,

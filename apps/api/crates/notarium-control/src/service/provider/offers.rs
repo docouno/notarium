@@ -68,7 +68,7 @@ impl ProviderService {
             return Err(DomainError::ResourceNotFound.into());
         }
         let account = AccountContext::new(ctx.auth().clone(), ctx.budget.clone());
-        self.management(&account).await?;
+        self.management_read(&account).await?;
         let target = project.as_ref().map_or_else(
             || ProviderAttachmentTarget::Space(ctx.scope().space_id.clone()),
             |project| ProviderAttachmentTarget::Project(project.clone()),
@@ -86,9 +86,9 @@ impl ProviderService {
     ) -> Result<ContentDigest, PortError> {
         let (_, owner) = self
             .control
-            .manager(tx, ctx.auth(), ctx.auth().principal())
+            .manager_read(tx, ctx.auth(), ctx.auth().principal())
             .await?;
-        let auth = self.control.revalidate(tx, ctx.auth()).await?;
+        let auth = self.control.revalidate_read(tx, ctx.auth()).await?;
         let grant = auth
             .spaces()
             .get(&ctx.scope().space_id)
@@ -193,7 +193,7 @@ impl ProviderService {
         let budget = OperationBudget::new(ctx.budget.clone());
         ctx.budget = budget.context(ctx.budget.request.clone());
         let catalog = self.offer_catalog(&ctx, &query.project).await?;
-        let mut tx = self.control.store.write(budget.clone()).await?;
+        let mut tx = self.control.store.read(budget.clone()).await?;
         let result = budget.run(async {
             let access = self.offer_access(tx.inner_mut(), &ctx, ("offers", &query.project)).await?;
             let last = position(&query.page, &access)?;
@@ -227,7 +227,7 @@ impl ProviderService {
         let budget = OperationBudget::new(ctx.budget.clone());
         ctx.budget = budget.context(ctx.budget.request.clone());
         let account = AccountContext::new(ctx.auth().clone(), ctx.budget.clone());
-        self.management(&account).await?;
+        self.management_read(&account).await?;
         let observed = self.observe_attachment(&account, &offer).await?;
         if observed.target_space != ctx.scope().space_id.as_str() {
             return Err(DomainError::ResourceNotFound.into());
@@ -240,7 +240,7 @@ impl ProviderService {
             }
         };
         let catalog = self.offer_catalog(&ctx, &project).await?;
-        let mut tx = self.control.store.write(budget.clone()).await?;
+        let mut tx = self.control.store.read(budget.clone()).await?;
         let result = budget.run(async {
             let scope_access = self.offer_access(tx.inner_mut(), &ctx, ("offer-models", &project, &offer)).await?;
             let row = rows!(tx.inner_mut(), ProviderAttachmentsRow, fetch_optional,

@@ -22,7 +22,8 @@ use notarium_core::{
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
-    sync::{Arc, LazyLock},
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
@@ -42,18 +43,57 @@ pub struct OidcProviderConfig {
     /// The token must still contain this client's audience and matching azp.
     pub trusted_additional_audiences: Vec<String>,
 }
+struct RateWindow {
+    started: Instant,
+    used: u16,
+}
+impl RateWindow {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            used: 0,
+        }
+    }
+    fn admit(&mut self, limit: u16) -> Result<(), PortError> {
+        if self.started.elapsed() >= Duration::from_secs(60) {
+            self.started = Instant::now();
+            self.used = 0;
+        }
+        if self.used >= limit {
+            return Err(DomainError::RateLimited {
+                retry_after_ms: 60_000,
+                budget: BudgetKind::Requests,
+            }
+            .into());
+        }
+        self.used += 1;
+        Ok(())
+    }
+}
 struct Provider {
     config: OidcProviderConfig,
     digest: [u8; 32],
     cache: Mutex<cache::Cache>,
+    login_rate: StdMutex<RateWindow>,
+    link_rate: StdMutex<RateWindow>,
+}
+impl Provider {
+    fn admit_begin(&self, is_link: bool) -> Result<(), PortError> {
+        let target = if is_link {
+            &self.link_rate
+        } else {
+            &self.login_rate
+        };
+        target.lock().map_err(|_| limited())?.admit(60)
+    }
 }
 pub struct OidcService {
     control: Arc<ControlService>,
     keyring: Arc<Keyring>,
     outbound: Arc<OutboundTransport>,
     providers: BTreeMap<String, Arc<Provider>>,
+    admission: Arc<Semaphore>,
 }
-static ADMISSION: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(16)));
 fn denied() -> PortError {
     DomainError::AuthenticationFailed.into()
 }
@@ -63,9 +103,6 @@ fn limited() -> PortError {
         budget: BudgetKind::Concurrency,
     }
     .into()
-}
-fn admit() -> Result<OwnedSemaphorePermit, PortError> {
-    ADMISSION.clone().try_acquire_owned().map_err(|_| limited())
 }
 impl OidcService {
     pub fn new(
@@ -107,6 +144,8 @@ impl OidcService {
                         config,
                         digest,
                         cache: Mutex::new(cache::Cache::default()),
+                        login_rate: StdMutex::new(RateWindow::new()),
+                        link_rate: StdMutex::new(RateWindow::new()),
                     }),
                 )
                 .is_some()
@@ -119,7 +158,14 @@ impl OidcService {
             keyring,
             outbound,
             providers,
+            admission: Arc::new(Semaphore::new(16)),
         })
+    }
+    pub(super) fn admit(&self) -> Result<OwnedSemaphorePermit, PortError> {
+        self.admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| limited())
     }
     fn provider(&self, issuer: &str) -> Result<Arc<Provider>, PortError> {
         self.providers.get(issuer).cloned().ok_or_else(denied)

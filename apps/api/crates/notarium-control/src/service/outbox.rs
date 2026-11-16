@@ -72,7 +72,7 @@ pub(super) async fn enqueue_at(
         RevocationReason::SpaceClosed => "space_closed",
         RevocationReason::CredentialRemoved => "credential_removed",
     };
-    let record = TargetRecord::RevocationEvents(RevocationEventsRow {
+    let record = TargetRecord::from(RevocationEventsRow {
         event_id: id.to_string(),
         selector,
         reason: reason.into(),

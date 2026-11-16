@@ -15,14 +15,24 @@ belong to the transport composition.
 ## Persistence
 
 SQLite uses `<DataRoot>/v1/control.sqlite`, WAL mode, full synchronous writes,
-foreign keys, strict tables and a 250 ms busy timeout. The composition owner must
-classify the data root before opening it and create the approved parent directory.
-PostgreSQL uses the `v1_control` schema and qualified queries. Pools have four
-SQLite connections or eight PostgreSQL connections. SQL migrations reject unknown
-migration versions; both dialects have explicit baseline DDL.
+foreign keys, strict tables, a 4 MiB `journal_size_limit`, a 256-page
+`wal_autocheckpoint`, a 2500 ms write busy timeout and a 250 ms read busy timeout.
+The composition owner must classify the data root before opening it and create the
+approved parent directory. PostgreSQL uses the `v1_control` schema, qualified
+queries and `COLLATE "C"` on text keys so keyset pagination and export order match
+SQLite byte order. SQLite separates a 1-connection write pool from a 16-connection
+read-only pool; PostgreSQL uses a 16-connection pool with per-operation `SET LOCAL
+statement_timeout` and `idle_in_transaction_session_timeout`. SQL migrations
+reject unknown migration versions; both dialects have explicit baseline DDL.
 
-All admitted mutations retain the backup writer fence through actual commit or
-rollback completion. SQLite uses separate shared handles on the stable
+Read-only queries and fast-path credential resolution (`ControlStore::read()`)
+use read-only transactions (`BEGIN DEFERRED` on SQLite read pool, `BEGIN READ ONLY`
+on PostgreSQL) without acquiring the backup writer fence or row locks, and
+`ControlCatalogPort` calls run outside `controlDb` write transactions. All admitted
+mutations (`ControlStore::write()`) wait in a bounded 64-entry queue for an active
+writer slot (one serialized local writer on SQLite, up to four concurrent writers on
+PostgreSQL) within the caller's `OperationBudget` and retain the backup writer fence
+through actual commit or rollback completion. SQLite uses separate shared handles on the stable
 `control.sqlite.write.lock`; PostgreSQL uses a shared transaction advisory lock.
 SQLite bootstrap initializes WAL under an exclusive file fence before opening its
 request pool. PostgreSQL bootstrap holds a separate shared session fence through
@@ -112,7 +122,9 @@ pending prevents that bootstrap request from admitting a session. The response
 reports an unknown outcome because account creation already committed.
 
 New usernames are lowercase ASCII alphanumeric with interior `.`, `_` or `-`,
-limited to 32 bytes. Email is optional, trimmed and lowercased, up to 254 bytes.
+limited to 32 bytes. Email is optional, trimmed, lowercased, required to contain
+`@` with non-empty local and domain parts, and limited to 254 bytes, preventing
+collisions with `@`-free usernames.
 Login preserves exact username spelling and gives it priority over normalized
 email. Unknown, passwordless, disabled and incorrect-password outcomes share the
 authentication failure. Unknown/passwordless/disabled accounts perform a bounded
@@ -127,9 +139,11 @@ PAT expiry is optional; `Some(empty)` selected Spaces grants no Spaces, while
 `None` intersects all current memberships. PAT/OAuth contexts always remain
 delegated and cannot manage account credentials or acquire `AbilityWrite`.
 
-An interactive transport must explicitly admit human management on session
-evidence or a checked trusted-none perimeter attestation before `AbilityWrite`
-can be present. Trusted-none uses the configured durable owner; invalid supplied
+An interactive transport must explicitly attest `human_management` on session
+evidence or a checked trusted-none perimeter attestation to authorize account,
+credential, Space, provider, OAuth, OIDC, context, schedule and telemetry-settings
+mutations. `Cap::AbilityWrite` is attested separately on interactive evidence and
+additionally requires `human_management`. Trusted-none uses the configured durable owner; invalid supplied
 credentials never fall back to that owner. OIDC ID tokens are not bearer evidence;
 the verified RP flow issues a native session for an explicitly bound identity.
 
@@ -171,7 +185,8 @@ command and its pending revocation acknowledgement, without requiring current
 membership or authorizing a new mutation. Changed payload, revision or history
 cannot reuse that command key; another actor cannot retrieve its receipt.
 
-Archive and reactivation commit a closing fence and revoke event first, wait for
+Archive and reactivation apply only to shared Spaces (`Personal` Spaces cannot
+be archived); they commit a closing fence and revoke event first, wait for
 revocation ACK, perform the idempotent canonical lifecycle change, then publish the
 final admission state. Failures retain the fence. Explicit owner management
 admission can inspect the history of an archived Space and request reactivation;
@@ -192,8 +207,9 @@ commit outcome while fresh admissions already see the durable denial. Logout
 evidence may resume only its own exact committed logout. Network-wide registration
 ownership and websocket/SSE disconnect delivery belong to the transport adapter.
 
-Writers have four immediate-admission slots per store owner. Owned workers retain
-the writer fence through BEGIN, COMMIT and ROLLBACK acknowledgement, even when the
+Writers have four active slots and a bounded 64-waiter queue per store owner. Owned workers retain
+the writer fence through BEGIN, COMMIT and ROLLBACK acknowledgement, releasing the
+file fence before dropping in-process admission guards even when the
 request future is dropped. This bounds cancelled-but-still-running database work
 and keeps it visible to the backup owner's write pause.
 
@@ -209,15 +225,18 @@ the existing normalized scope only; a different scope requires new authorization
 DCR accepts at most ten redirect URIs and 8 KiB of registration metadata. HTTPS
 redirects compare byte for byte. Native HTTP redirects allow only literal
 `127.0.0.1` or `[::1]`, with the port allowed to vary; all other bytes must match.
-Fragments, userinfo, wildcards and prefix matching are rejected. Inactive clients
-expire after 24 hours and are capped at 1,000 across registration types.
+Fragments, userinfo, wildcards and prefix matching are rejected. Inactive DCR
+clients expire after 24 hours and are capped at 1,000 in a rolling 24-hour window,
+isolated from CIMD quotas.
 
 CIMD fetches an HTTPS client ID through the public-only guarded transport and
 requires the metadata's exact matching client ID. JSON responses are limited to
-64 KiB. The cache holds at most 1,024 CIMD records, defaults to five minutes and
+64 KiB. Unactivated CIMD records are capped at 256, and the cache holds at most
+1,024 CIMD records (evicting inactive expired entries without active grants when
+full), defaults to five minutes and
 caps freshness at one hour, respecting shorter max-age and Age. No-cache/no-store
 responses are fetched for each operation; their registration record cannot serve
-as reusable cache authority. New registration has a 60/minute process limit;
+as reusable cache authority. New registration has a 60/minute per-instance limit;
 activated metadata refresh has a separate 120/minute lane. Each fetch lane admits
 four calls. Changed metadata invalidates previously prepared consent.
 
@@ -271,8 +290,10 @@ Login uses random state, nonce and PKCE S256, with a ten-minute flow lifetime. S
 stores their verifiers and the hash of the protected context. The verifier and
 nonce themselves stay in the AEAD-sealed context, bound to transaction, browser,
 provider and purpose. The adapter must keep this context in a Secure, HttpOnly,
-SameSite cookie; it must never put it in a redirect URL or log. There are at most
-4,096 live transactions, 16 concurrent operations and 60 begins/minute per process.
+SameSite cookie; it must never put it in a redirect URL or log. Cheap input
+invariants and configured-issuer existence are verified before charging the
+per-instance rate limit (60 begins/minute, 16 concurrent operations and 4,096 live
+transactions).
 
 Callback claims the transaction durably before the single IdP token exchange.
 Concurrent callbacks cannot exchange twice. Cancellation or a lost exchange
@@ -280,8 +301,9 @@ response requires a new login flow. `openidconnect` verifies RS256/ES256 signatu
 issuer, audience, expiry and nonce; the service also checks exact issuer, bounded
 issue time and authorized party with at most 60 seconds of clock skew. Multiple
 audiences require the configured client as `azp`, and every additional audience
-must be explicitly trusted by the operator. The strict JOSE header rejects none,
-HMAC, remote key URLs and unrecognized extensions. External access/refresh tokens
+must be explicitly trusted by the operator. The JOSE header check rejects `none`,
+HMAC, remote key URLs (`jku`, `jwk`, `x5u`) and critical extensions (`crit`) while
+allowing benign standard/provider header fields and case-insensitive `JWT` `typ`. External access/refresh tokens
 are discarded and never become native bearer credentials.
 
 Identity ownership uses only `(issuer, subject)`. Matching email does not link or
@@ -336,8 +358,9 @@ A pointer transition permits only one bounded reread. No raw key cache survives
 an operation. Secret buffers and supported crypto state use zeroization; this
 does not promise removal of every compiler or library temporary copy.
 
-Four process-wide filesystem slots are acquired without queueing. A blocking
-worker retains its slot after caller timeout or drop until the actual work ends.
+Four per-instance filesystem slots have a bounded 64-waiter queue (50 ms wait)
+and batch-decrypt multiple secrets per provider dispatch over `ControlStore::read()`.
+A blocking worker retains its slot after caller timeout or drop until the actual work ends.
 Plaintext is limited to 32 KiB and envelopes to 44 KiB. Errors and debug output
 exclude raw keys, plaintext and envelope values. Target export contains only
 key ID, generation, hash and encrypted canary records, never key files.
@@ -378,7 +401,7 @@ provider resource. Configuration allows at most 128 rules with 32 CIDRs each.
 The guarded resolver runs on the actual connector path, validates the complete
 answer of at most 32 candidates, and passes those same socket addresses to the
 connector. It performs no independent preflight lookup. Literal addresses use
-the same policy before sending. Four process-wide blocking DNS jobs retain their
+the same policy before sending. Four per-instance blocking DNS jobs retain their
 slots after caller cancellation until the system lookup really finishes.
 
 Clients explicitly disable environment proxies, redirects, automatic retries,
@@ -389,18 +412,19 @@ client, with an LRU limit of 128 clients and eviction restricted to idle clients
 A newer resource epoch or credential epoch replaces older pools. Credential
 rotation can advance independently while resource identity remains unchanged;
 older credential versions cannot reuse the new pool. The provider registration
-fence drains active calls before the mutation commits. Explicit
-`invalidate_provider` discards an owner's pools, and operator policy replacement
+fence drains active calls before the mutation commits. Resource update/delete
+calls `invalidate_provider` to discard an owner's pools, and operator policy replacement
 cancels all old pools. Fresh DB checks remain mandatory after idle
 pool eviction, because the bounded cache is not an authority ledger.
 
-There are 32 active call slots across transport instances. An owned worker reads
+Each transport instance defaults to 64 active call slots (configurable up to 512). An owned worker reads
 each response through a one-chunk channel of at most 64 KiB. Caller drop, explicit
 cancellation, epoch changes and deadlines close the response and release its
 slot even if the consumer never polls again. Client construction may load system
 certificates, so it also runs as an owned blocking job. Connect timeout is five
-seconds; first-byte, idle-read and consumer-backpressure limits are 30 seconds.
-Provider total duration is at most 120 seconds and metadata duration ten seconds;
+seconds; idle-chunk read and consumer-backpressure limits are 30 seconds.
+Provider total duration (including first-byte wait) honors the configured resource
+timeout up to 120 seconds, and metadata duration is ten seconds;
 the caller's smaller absolute budget takes precedence.
 
 Requests are limited to 8 MiB. Provider wire responses have a 32 MiB ceiling plus
@@ -466,23 +490,28 @@ approval checks each source's current canonical ancestry; a selected project is
 not evidence that unrelated content belongs to it. Shared disclosure excludes
 profiles, and encrypted notes never leave through a provider. Consent expiry
 limits the active request deadline. Without explicit resource/model selection,
-preference order is personal, project, then Space. An invalid configured preference
+preference order is personal, project, then Space, keyed separately by
+`PreferenceModelKind` (`Completion` versus `Embedding`). An invalid configured preference
 fails instead of silently switching providers.
 
 Supported wire protocols are OpenAI-compatible chat completions/embeddings and
-Ollama chat/embed. Base URL paths are preserved. Configure the exact model identity
-returned by the provider, including a version or tag when required. Responses must
-match that identity. SSE/NDJSON parsers handle arbitrary byte boundaries and bound
+Ollama chat/embed (stored openly as bounded text in SQL so future wire adapters do
+not require table rewrites). Base URL paths are preserved, OpenAI-compatible
+requests omit vendor-proprietary `"store"` fields, and Ollama requests omit forced
+full-window `"num_ctx"` overrides. Provider responses may return a non-empty
+snapshot/deployment model identifier (`gpt-4o-2024-08-06`, `:latest`), null SSE
+delta fields, empty tool outputs, `omitempty` zero Ollama eval counts and
+`done_reason: "tool_calls"`. SSE/NDJSON parsers handle arbitrary byte boundaries and bound
 frames and assembled tools; embedding responses require an exact index bijection,
 expected dimension and finite values. Reasoning fields are not exposed as text.
 Tools, usage and finish events are released only after valid completion and durable
 settlement; text can arrive earlier. Typed stream errors carry no upstream bodies.
 
-`ConservativeModelCapV1` requires finite model caps, bounds serialized input bytes
-by the input cap and reserves that whole cap plus requested output. It does not
-claim to count arbitrary model tokens. Embedding annotations must be internally
-consistent but do not replace this reservation. Resource, credential and every
-participating Space each pay the full call against atomic UTC-aligned 60-second
+Input token admission and reservation use a conservative request-proportional
+estimate (`ceil(utf8_chars / 2)` plus framing and tool-schema overhead) checked
+against `min(request.budget.max_input_tokens, model.max_input_tokens)`, while
+embedding calls reserve `declared_tokens`. Resource, credential and every
+participating Space each pay the reserved call against atomic UTC-aligned 60-second
 RPM/TPM buckets. The primary Space is charged even for orchestration-only input.
 
 The intent ledger binds principal, history scope, command key and semantic input.
@@ -492,14 +521,16 @@ After reservation, the service rechecks current authority/configuration/consent,
 changes intent to sending and acquires its live registration in one SQL transaction.
 The transport handle exists before awaiting response headers. Shutdown acknowledgement
 precedes release of canonical/registry leases and the independent five-second audit
-finalizer. One of 32 global provider slots owns this entire worker lifetime. Dropping
+finalizer. `ProviderConfig.max_active_calls` (default 64 per `ProviderService`
+instance) bounds active worker lifetimes. Dropping
 a stream or pending unary future cancels that operation without cancelling a shared
 parent token. A protocol terminal marker closes the socket without waiting for TCP EOF.
 
 Proven unsent calls refund RPM and TPM. Unknown/partial/cancelled calls retain
 reservations until the original window expires. Exact usage reconciles that window
-and records full input/output counters. Exceeding either model cap blocks further
-resource admission in that window, even if the total fits the reservation. An
+and records full input/output counters; if a provider returns slightly more tokens
+than requested, the valid completion still succeeds and records `BudgetMismatch`
+in audit diagnostics without locking out other users on the resource. An
 unrepresentable bucket aggregate saturates to its maximum and closes admission;
 individual call counters remain exact. Late usage enriches the audit without
 crediting a later window. Ledger records contain no prompts, responses or headers.
@@ -554,9 +585,13 @@ package revisions. Control stores availability, selected-project bindings, perso
 preferences and typed placement trails. Effective precedence is project, Space,
 personal, then System. A disabled, unhealthy or wrong-kind candidate shadows lower
 precedence; equal-precedence ambiguity fails rather than choosing arbitrarily.
-Exact selections reject stale revisions. Trails bind exact typed references, stop
+Exact selections and `get_ability` accept an optional contextual `project` so
+selected-project Space abilities resolve consistently, and reject stale revisions.
+Trails bind exact typed references, stop
 at 16 hops and reject cycles. Discovery preserves continuation across filtered
 pages and never emits a lower candidate as a duplicate of the selected winner.
+`ControlPort` / `ControlPlane` also exposes episode touches, ability preferences
+and trails, and `mcp_dedup` idempotency lookup/recording.
 Authoring requires interactive human authority and `AbilityWrite`; package content
 remains canonical-owned.
 
@@ -574,9 +609,12 @@ FolderRef. Approved roles must be readable, healthy, enabled and at their exact
 current revision. Pausing the exact existing definition remains possible after
 its role or project disappears. Definitions contain a private title and initial prompt, redacted
 in Debug; receipts persist the schedule ID, not that private payload. Titles allow
-128 scalars/512 UTF-8 bytes and prompts 32 KiB. Cron expressions include seconds and
+128 scalars/512 UTF-8 bytes and prompts 32 KiB. Cron expressions include seconds,
+require a minimum interval of 60 seconds, and
 are validated with `cron`; timezones use the IANA `chrono-tz` catalog. A supplied
-slot must match the expression in that timezone, including second precision.
+slot must match the expression in that timezone, including second precision, while
+`list_due_schedules(now)` floors sub-millisecond wall-clock timestamps to whole
+milliseconds. Soft-deleting a schedule clears `init_prompt` on the tombstone row.
 
 Run limits default to 25 steps, 100,000 tokens and 300 seconds. The composition sets
 `ControlConfig.schedule_limits` within hard ceilings of 1,000 steps, 10,000,000 tokens
@@ -624,17 +662,25 @@ account and settings revision CAS.
 Begin records bind current owner authority and the actual request payload. Exact
 repeats are idempotent; changed payloads conflict. Trusted `Telemetry` authority can
 finish a pending audit after the initiating credential expires, without granting
-any tool permission. Detailed capture follows the current explicit setting. Call
+any tool permission; backward NTP clock steps clamp `duration_ms` to zero rather
+than rejecting completion. Detailed capture follows the current explicit setting. Call
 lists contain compact metadata; individual detail reads filter references through
 current authority. Retrieval records store typed references and finite scores, not
 query text. Logging middleware remains outside this crate.
 
-Compact retention defaults to 90 days and detail retention to 30 days. A cleanup
-transaction deletes at most 200 rows across expired details, retrievals, terminal
-calls and committed command receipts. Pending calls, their retrievals and pending
-commands survive. Command receipts are conservatively retained while canonical
-operations or revocations still need reconciliation. Cleanup never settles or
-re-executes schedule/provider runs and does not erase their spending audit.
+Compact retention defaults to 90 days and detail retention to 30 days. A batched
+cleanup transaction deletes at most 200 rows across expired details, retrievals,
+terminal calls (plus orphaned unfinished calls older than 24 hours), committed
+command receipts (retained only while their own canonical operation or a
+contemporaneous revocation event is still pending), and the 12 growing operational
+tables: 24 hours after expiry for one-time tokens, OAuth auth codes/access tokens,
+OIDC transactions, `mcp_dedup` entries and closed provider budget buckets; 7 days
+after expiry/revocation/completion for sessions, OAuth refresh tokens and childless
+revoked refresh families, delivered revocation events and committed control
+operations; and `compact_retention_days` for settled provider call logs, terminal
+schedule runs and childless deleted schedule tombstones. Active calls, their
+retrievals and pending commands survive. Cleanup never settles or
+re-executes live schedule/provider runs.
 
 ## Verification
 

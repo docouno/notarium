@@ -7,7 +7,7 @@ WITH entries AS (
     SELECT 'note', p.note_space, p.note_id, coalesce(o.rank, 0)
     FROM context_scope_pins p
     LEFT JOIN context_order o ON o.target_kind=p.target_kind AND o.target_id=p.target_id AND o.entry_kind='note'
-        AND json_extract(CASE WHEN o.entry_kind='note' THEN o.entry_ref ELSE '{}' END, '$.space_id')=p.note_space AND json_extract(CASE WHEN o.entry_kind='note' THEN o.entry_ref ELSE '{}' END, '$.note_id')=p.note_id
+        AND o.entry_ref=('{"space_id":"' || p.note_space || '","note_id":"' || p.note_id || '"}')
     WHERE p.target_kind=$1 AND p.target_id=$2
 )
 SELECT kind, space, entity, rank FROM entries WHERE (rank,kind,space,entity)>($3,$4,$5,$6) ORDER BY rank,kind,space,entity LIMIT $7

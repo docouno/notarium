@@ -1,5 +1,4 @@
-use notarium_control::store::target::{TargetRecord, TargetTable, UsersRow, V1StorageEpochRow};
-use notarium_control::store::{ControlStore, PostgresConfig};
+use notarium_control::store::{ControlStore, PostgresConfig, TargetRecord, TargetTable};
 use notarium_core::epoch::DataRoot;
 use notarium_core::{ids::*, ports::*};
 use sqlx::{Connection, Row};
@@ -19,7 +18,7 @@ fn maintenance(purpose: ServicePurpose) -> MaintenanceContext {
     }
 }
 fn user(number: u8, username: &str) -> TargetRecord {
-    TargetRecord::Users(UsersRow {
+    TargetRecord::Users {
         user_id: PrincipalId::from_bytes([number; 16]).to_string(),
         username: username.into(),
         email: None,
@@ -32,7 +31,7 @@ fn user(number: u8, username: &str) -> TargetRecord {
         metadata_revision: 0,
         auth_version: 0,
         created_at: 0,
-    })
+    }
 }
 
 fn scratch() -> PathBuf {
@@ -119,6 +118,42 @@ async fn both_dialects_have_the_same_schema_and_constraints() {
         local_names, target_tables,
         "every table has a target row contract"
     );
+    for table in &local_names {
+        let local_cols: Vec<(String, bool)> = sqlx::query(
+            "SELECT name, (\"notnull\" <> 0 OR pk <> 0) AS required FROM pragma_table_info($1) ORDER BY name",
+        )
+        .bind(table)
+        .fetch_all(&mut local)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get::<String, _>(0), row.get::<bool, _>(1)))
+        .collect();
+        let cloud_cols: Vec<(String, bool)> = sqlx::query(
+            "SELECT column_name, (is_nullable = 'NO') AS required FROM information_schema.columns WHERE table_schema='v1_control' AND table_name=$1 ORDER BY column_name",
+        )
+        .bind(table)
+        .fetch_all(&mut cloud)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.get::<String, _>(0), row.get::<bool, _>(1)))
+        .collect();
+        assert_eq!(
+            local_cols, cloud_cols,
+            "column nullability mismatch on {table}"
+        );
+    }
+    let non_c_text_cols: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='v1_control' AND table_name NOT LIKE '\\_%' ESCAPE '\\' AND data_type='text' AND coalesce(collation_name, '') <> 'C'",
+    )
+    .fetch_one(&mut cloud)
+    .await
+    .unwrap();
+    assert_eq!(
+        non_c_text_cols, 0,
+        "all PostgreSQL TEXT columns must use COLLATE \"C\""
+    );
 
     for (sql, valid) in [
         (
@@ -188,14 +223,14 @@ async fn both_dialects_have_the_same_schema_and_constraints() {
         ControlStore::postgres(PostgresConfig::unix_socket(socket, "postgres", "postgres"))
             .await
             .unwrap();
-    let epoch = TargetRecord::V1StorageEpoch(V1StorageEpochRow {
+    let epoch = TargetRecord::V1StorageEpoch {
         singleton: 1,
         epoch_version: 1,
         state: "migrating".into(),
         installation_id: InstallationId::from_bytes([3; 16]).to_string(),
         receipt_sha256: None,
         receipt_json: None,
-    });
+    };
     for store in [&local_store, &cloud_store] {
         assert!(
             store
@@ -287,11 +322,16 @@ async fn both_dialects_have_the_same_schema_and_constraints() {
         assert!(second.continuation.is_none());
         let mut saw_importer = false;
         for row in first.records.into_iter().chain(second.records) {
-            let TargetRecord::Users(row) = row else {
+            let TargetRecord::Users {
+                username,
+                display_name,
+                ..
+            } = row
+            else {
                 panic!("wrong target table")
             };
-            if row.username == "Importer" {
-                assert_eq!(row.display_name, "Importer");
+            if username == "Importer" {
+                assert_eq!(display_name, "Importer");
                 saw_importer = true;
             }
         }

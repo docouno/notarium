@@ -37,22 +37,20 @@ impl OAuthService {
             .map(|s| serde_json::from_str(s).map_err(|_| invalid_grant()))
             .transpose()?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.control.store.write(budget.clone()).await?;
+        let mut rtx = self.control.store.read(budget.clone()).await?;
         let result=budget.run(async {
-            let (_,user)=self.control.manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
+            let (_,user)=self.control.manager_read(rtx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
             if let Some(cursor)=&cursor {
                 if cursor.version!=1 || cursor.owner!=*ctx.auth().principal() {return Err(invalid_grant());}
                 expect_revision(&user,cursor.revision)?;
             }
             let last=cursor.as_ref().map_or("",|v|v.last.as_str());
-            let rows=page_rows!(tx.inner_mut(),OauthGrantsRow,TargetTable::OauthGrants,page.limit(),"SELECT * FROM oauth_grants WHERE user_id=$1 AND grant_id>$2 ORDER BY grant_id LIMIT $3","SELECT * FROM v1_control.oauth_grants WHERE user_id=$1 AND grant_id>$2 ORDER BY grant_id LIMIT $3";&user.user_id,last,i64::from(page.limit())+1)?;
+            let rows=page_rows!(rtx.inner_mut(),OauthGrantsRow,TargetTable::OauthGrants,page.limit(),"SELECT * FROM oauth_grants WHERE user_id=$1 AND grant_id>$2 ORDER BY grant_id LIMIT $3","SELECT * FROM v1_control.oauth_grants WHERE user_id=$1 AND grant_id>$2 ORDER BY grant_id LIMIT $3";&user.user_id,last,i64::from(page.limit())+1)?;
             let continuation=if rows.has_more {Some(serde_json::to_string(&Cursor {version:1,owner:ctx.auth().principal().clone(),revision:ControlRevision::new(user.revision as u64)?,last:OAuthGrantId::parse(&rows.rows.last().ok_or_else(invalid_grant)?.grant_id)?}).map_err(|_|invalid_grant())?)} else {None};
             let items=rows.rows.into_iter().map(|row|Ok(OAuthGrantInfo {id:OAuthGrantId::parse(&row.grant_id)?,client_id:row.client_id,resource:row.resource_uri,scope:validation::stored_scope(&row.scope)?,selected_spaces:selected(row.selected_spaces.as_deref(),self.control.config.max_auth_spaces)?.map(|s|s.into_iter().collect()),revoked_at_ms:row.revoked_at,created_at_ms:row.created_at})).collect::<Result<_,PortError>>()?;
             Ok(ControlPage {items,continuation})
         },CommitEffect::NotCommitted).await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         Ok(result)
     }
     pub(super) async fn disconnect(

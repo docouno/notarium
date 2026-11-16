@@ -39,11 +39,13 @@ impl EmptyRootAuthorization {
 /// This attestation cannot be parsed from a request or replace bearer validation.
 pub struct PerimeterAttestation {
     human_management: bool,
+    ability_write: bool,
 }
 impl PerimeterAttestation {
     pub fn attest_checked() -> Self {
         Self {
             human_management: false,
+            ability_write: false,
         }
     }
     /// The transport has also admitted an interactive human management action.
@@ -53,6 +55,14 @@ impl PerimeterAttestation {
     }
     pub fn human_management(&self) -> bool {
         self.human_management
+    }
+    /// The transport has also admitted interactive ability package authoring.
+    pub fn with_ability_write(mut self) -> Self {
+        self.ability_write = true;
+        self
+    }
+    pub fn ability_write(&self) -> bool {
+        self.ability_write
     }
 }
 

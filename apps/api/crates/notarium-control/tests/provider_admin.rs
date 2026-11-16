@@ -222,6 +222,7 @@ async fn administration(pg: bool) {
         .history;
     let space_ctx = SpaceContext::new(ctx.auth().clone(), scope, budget()).unwrap();
     let select = SelectProvider {
+        kind: PreferenceModelKind::Completion,
         resource: Some(resource.id.clone()),
         model: Some(model.id.clone()),
         project: None,
@@ -239,6 +240,7 @@ async fn administration(pg: bool) {
             .select_provider(
                 space_ctx.clone(),
                 SelectProvider {
+                    kind: PreferenceModelKind::Completion,
                     resource: None,
                     model: None,
                     project: None
@@ -254,6 +256,7 @@ async fn administration(pg: bool) {
                 identity: command(&owner, &owner, 30, revision),
                 input: SetProviderPreference {
                     scope: ProviderPreferenceScope::Personal,
+                    kind: PreferenceModelKind::Completion,
                     resource: resource.id.clone(),
                     model: model.id.clone(),
                 },
@@ -267,6 +270,7 @@ async fn administration(pg: bool) {
             .select_provider(
                 space_ctx.clone(),
                 SelectProvider {
+                    kind: PreferenceModelKind::Completion,
                     resource: None,
                     model: None,
                     project: None

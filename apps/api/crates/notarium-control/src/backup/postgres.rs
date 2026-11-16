@@ -80,9 +80,11 @@ impl PostgresCut {
         // Prepare and warm source metadata outside the measured pause. This is an
         // ordinary autocommit read; no source transaction exists yet.
         session.operation.run(async{
-   sqlx::query("SELECT epoch_version,state,installation_id FROM v1_control.v1_storage_epoch WHERE singleton=1").fetch_optional(&mut **self.source.as_mut().ok_or_else(failure)?).await.map_err(database)?;
-   Ok(())
-  },CommitEffect::NotCommitted).await
+            let conn = self.source.as_mut().ok_or_else(failure)?;
+            sqlx::query("SELECT epoch_version,state,installation_id FROM v1_control.v1_storage_epoch WHERE singleton=1").fetch_optional(&mut **conn).await.map_err(database)?;
+            sqlx::query("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM v1_control.secret_keyring WHERE retired_at IS NULL ORDER BY generation LIMIT 4097").fetch_all(&mut **conn).await.map_err(database)?;
+            Ok(())
+        },CommitEffect::NotCommitted).await
     }
     pub(crate) async fn pause(&mut self, session: &Session) -> Result<(), PortError> {
         session.check()?;
@@ -149,30 +151,40 @@ impl PostgresCut {
         if rows.len() != keys.len() || !rows.iter().zip(keys).all(|(row, key)| key.matches(row)) {
             return Err(failure());
         }
-        session.check()?;
         Ok(expected.clone())
     }
-    pub(crate) async fn resume(&mut self) -> Result<(), PortError> {
+    pub(crate) async fn unlock(&mut self) -> Result<PoolConnection<Postgres>, PortError> {
         let Some(mut connection) = self.lock.take() else {
             return Err(failure());
         };
-        let result = tokio::time::timeout(CLEANUP_GRACE, async {
-            let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+        let unlocked = tokio::time::timeout(CLEANUP_GRACE, async {
+            sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
                 .bind(BACKUP_LOCK)
                 .fetch_one(&mut *connection)
                 .await
-                .map_err(database);
-            let closed = connection.close().await.map_err(database);
-            closed?;
-            if !unlocked? {
-                return Err(failure());
+                .map_err(database)
+        })
+        .await;
+        match unlocked {
+            Ok(Ok(true)) => {
+                self.locked = false;
+                Ok(connection)
             }
-            Ok(())
+            _ => {
+                let _ = tokio::time::timeout(CLEANUP_GRACE, connection.close()).await;
+                self.locked = false;
+                Err(failure())
+            }
+        }
+    }
+    pub(crate) async fn close_unlocked_connection(
+        connection: PoolConnection<Postgres>,
+    ) -> Result<(), PortError> {
+        tokio::time::timeout(CLEANUP_GRACE, async {
+            connection.close().await.map_err(database)
         })
         .await
-        .unwrap_or_else(|_| Err(failure()));
-        self.locked = false;
-        result
+        .unwrap_or_else(|_| Err(failure()))
     }
     pub(crate) async fn spool<W: Write>(
         &mut self,
@@ -185,8 +197,11 @@ impl PostgresCut {
         }
         let tx = self.tx.as_mut().ok_or_else(failure)?;
         let mut stream = SpoolWriter::new(writer, witness)?;
+        session.set_spool_bytes(stream.written_bytes());
+        session.check()?;
         for &table in TargetTable::ALL {
             stream.begin_table(table)?;
+            session.set_spool_bytes(stream.written_bytes());
             let mut after = None;
             loop {
                 session.check()?;
@@ -199,6 +214,7 @@ impl PostgresCut {
                     .await?;
                 for record in page.records {
                     stream.row(record)?;
+                    session.set_spool_bytes(stream.written_bytes());
                     session.check()?;
                 }
                 after = page.continuation;
@@ -207,9 +223,12 @@ impl PostgresCut {
                 }
             }
             stream.end_table()?;
+            session.set_spool_bytes(stream.written_bytes());
         }
+        let (writer, total_bytes) = stream.finish()?;
+        session.set_spool_bytes(total_bytes);
         session.check()?;
-        stream.finish()
+        Ok(writer)
     }
     pub(crate) async fn close(mut self) -> Result<(), PortError> {
         let outcome = tokio::time::timeout(CLEANUP_GRACE, self.release())

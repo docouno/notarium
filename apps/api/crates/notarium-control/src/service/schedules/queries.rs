@@ -51,25 +51,27 @@ impl ControlService {
         id: ScheduleId,
     ) -> Result<AgentSchedule, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
-        let result = budget
+        let mut tx = self.store.read(budget.clone()).await?;
+        let (auth, row) = budget
             .run(
                 async {
-                    let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
-                    let row = schedule(tx.inner_mut(), &id, false).await?;
-                    self.readable_schedule(
-                        &AccountContext::new(auth, budget.context(ctx.budget.request.clone())),
-                        &row,
-                    )
-                    .await
+                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
+                    let row = schedule_read(tx.inner_mut(), &id).await?;
+                    Ok((auth, row))
                 },
                 CommitEffect::NotCommitted,
             )
             .await?;
+        budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
         budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
-        Ok(result)
+            .run(
+                self.readable_schedule(
+                    &AccountContext::new(auth, budget.context(ctx.budget.request.clone())),
+                    &row,
+                ),
+                CommitEffect::NotCommitted,
+            )
+            .await
     }
     pub async fn get_schedule(
         &self,
@@ -93,28 +95,53 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<AgentSchedule>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
-        let result = budget.run(async {
-            let auth = self.revalidate(tx.inner_mut(),ctx.auth()).await?;
-            let current = AccountContext::new(auth,budget.context(ctx.budget.request.clone()));
-            self.catalog_space(&current,&ctx.scope().space_id).await?.history.check(ctx.scope())?;
-            let scope = digest(current.auth(),("schedules",ctx.scope()))?;
-            let cursor = cursor(&page,scope)?;
-            let after = cursor.as_ref().map_or("",|c|c.last.as_str());
-            let rows = rows!(tx.inner_mut(),AgentSchedulesRow,fetch_all,"SELECT * FROM agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id>$3 ORDER BY schedule_id LIMIT $4","SELECT * FROM v1_control.agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id>$3 ORDER BY schedule_id LIMIT $4";current.auth().principal().as_str(),ctx.scope().space_id.as_str(),after,i64::from(page.limit())+1)?;
-            let has_more=rows.len()>usize::from(page.limit());
-            let mut items=Vec::new(); let mut last=None;
-            for row in rows.into_iter().take(usize::from(page.limit())) {
-                last=Some(row.schedule_id.clone());
-                match self.readable_schedule(&current,&row).await {Ok(value)=>items.push(value),Err(e) if hidden(&e)=>(),Err(e)=>return Err(e)}
-            }
-            let continuation=if has_more {Some(json(&Cursor{version:1,scope,last:last.expect("positive page"),slot:0})?)} else {None};
-            Ok(ControlPage{items,continuation})
-        },CommitEffect::NotCommitted).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
+        let (current, scope, rows) = budget.run(async {
+            let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
+            let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+            let scope = digest(current.auth(), ("schedules", ctx.scope()))?;
+            let cursor = cursor(&page, scope)?;
+            let after = cursor.as_ref().map_or("", |c| c.last.as_str());
+            let rows = rows!(tx.inner_mut(),AgentSchedulesRow,fetch_all,"SELECT * FROM agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id>$3 ORDER BY schedule_id LIMIT $4","SELECT * FROM v1_control.agent_schedules WHERE owner_id=$1 AND space_id=$2 AND deleted_at IS NULL AND schedule_id COLLATE \"C\">$3 ORDER BY schedule_id COLLATE \"C\" LIMIT $4";current.auth().principal().as_str(),ctx.scope().space_id.as_str(),after,i64::from(page.limit())+1)?;
+            Ok((current, scope, rows))
+        }, CommitEffect::NotCommitted).await?;
+        budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
         budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
-        Ok(result)
+            .run(
+                async {
+                    self.catalog_space(&current, &ctx.scope().space_id)
+                        .await?
+                        .history
+                        .check(ctx.scope())?;
+                    let has_more = rows.len() > usize::from(page.limit());
+                    let mut items = Vec::new();
+                    let mut last = None;
+                    for row in rows.into_iter().take(usize::from(page.limit())) {
+                        last = Some(row.schedule_id.clone());
+                        match self.readable_schedule(&current, &row).await {
+                            Ok(value) => items.push(value),
+                            Err(e) if hidden(&e) => (),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    let continuation = if has_more {
+                        Some(json(&Cursor {
+                            version: 1,
+                            scope,
+                            last: last.expect("positive page"),
+                            slot: 0,
+                        })?)
+                    } else {
+                        None
+                    };
+                    Ok(ControlPage {
+                        items,
+                        continuation,
+                    })
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await
     }
     pub async fn list_due_schedules(
         &self,
@@ -123,7 +150,7 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<AgentSchedule>, PortError> {
         ctx.authority.require(ServicePurpose::Scheduler)?;
-        let at = ms(now)?;
+        let at = floor_ms(now)?;
         if at > self.clock.now_ms()? {
             return Err(invalid(ValidationReason::InvalidTimestamp));
         }
@@ -136,7 +163,7 @@ impl ControlService {
         let budget = OperationBudget::new(ctx.budget);
         let rows = budget.run(async { read_rows!(&self.store.backend,AgentSchedulesRow,fetch_all,
             "SELECT * FROM agent_schedules WHERE deleted_at IS NULL AND paused_reason IS NULL AND next_slot_utc_ms<=$1 AND (next_slot_utc_ms>$2 OR (next_slot_utc_ms=$2 AND schedule_id>$3)) ORDER BY next_slot_utc_ms,schedule_id LIMIT $4",
-            "SELECT * FROM v1_control.agent_schedules WHERE deleted_at IS NULL AND paused_reason IS NULL AND next_slot_utc_ms<=$1 AND (next_slot_utc_ms>$2 OR (next_slot_utc_ms=$2 AND schedule_id>$3)) ORDER BY next_slot_utc_ms,schedule_id LIMIT $4";at,slot,id,i64::from(page.limit())+1)
+            "SELECT * FROM v1_control.agent_schedules WHERE deleted_at IS NULL AND paused_reason IS NULL AND next_slot_utc_ms<=$1 AND (next_slot_utc_ms>$2 OR (next_slot_utc_ms=$2 AND schedule_id COLLATE \"C\">$3)) ORDER BY next_slot_utc_ms,schedule_id COLLATE \"C\" LIMIT $4";at,slot,id,i64::from(page.limit())+1)
         },CommitEffect::NotCommitted).await?;
         let has_more = rows.len() > usize::from(page.limit());
         let selected: Vec<_> = rows.into_iter().take(usize::from(page.limit())).collect();
@@ -170,8 +197,8 @@ impl ControlService {
                 ctx.authority.require(ServicePurpose::Scheduler)?
             }
             ScheduleRunContext::Owner(ctx) => {
-                let auth = self.revalidate(tx, ctx.auth()).await?;
-                let row = schedule(tx, schedule_id, false).await?;
+                let auth = self.revalidate_read(tx, ctx.auth()).await?;
+                let row = schedule_read(tx, schedule_id).await?;
                 if row.owner_id != auth.principal().as_str() {
                     return Err(DomainError::ResourceNotFound.into());
                 }
@@ -189,15 +216,13 @@ impl ControlService {
             ScheduleRunContext::Owner(c) => c.budget.clone(),
             ScheduleRunContext::Scheduler(c) => c.budget.clone(),
         });
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
         let result=budget.run(async {
             self.run_reader(tx.inner_mut(),&ctx,&schedule_id).await?;
             let row=rows!(tx.inner_mut(),AgentScheduleRunsRow,fetch_optional,"SELECT * FROM agent_schedule_runs WHERE schedule_id=$1 AND run_id=$2","SELECT * FROM v1_control.agent_schedule_runs WHERE schedule_id=$1 AND run_id=$2";schedule_id.as_str(),run.as_str())?.ok_or(DomainError::ResourceNotFound)?;
             receipt(&row)
         },CommitEffect::NotCommitted).await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
+        budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
         Ok(result)
     }
     pub async fn list_schedule_runs(
@@ -210,7 +235,7 @@ impl ControlService {
             ScheduleRunContext::Owner(c) => c.budget.clone(),
             ScheduleRunContext::Scheduler(c) => c.budget.clone(),
         });
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
         let result=budget.run(async {
             self.run_reader(tx.inner_mut(),&ctx,&schedule_id).await?;
             let owner=match &ctx {ScheduleRunContext::Owner(c)=>Some(c.auth().principal()),ScheduleRunContext::Scheduler(_)=>None};
@@ -222,9 +247,7 @@ impl ControlService {
             let continuation=if has_more {let last=selected.last().expect("positive page");Some(json(&Cursor{version:1,scope,last:last.run_id.clone(),slot:last.slot_utc_ms})?)} else {None};
             Ok(ControlPage{items:selected.iter().map(receipt).collect::<Result<_,_>>()?,continuation})
         },CommitEffect::NotCommitted).await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
+        budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
         Ok(result)
     }
 }

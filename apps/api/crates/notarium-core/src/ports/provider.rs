@@ -39,9 +39,16 @@ pub enum ProviderModelKind {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TokenAccountingProfile {
-    /// Reserve the entire configured finite input cap. This is an admission
-    /// bound, never an assertion of the actual token count or a byte/4 estimate.
+    /// Conservative payload-derived upper bound (`ceil(utf8_chars / 2)` plus
+    /// tool-schema overhead), capped by `min(request.budget.max_input_tokens, model.max_input_tokens)`.
     ConservativeModelCapV1,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreferenceModelKind {
+    #[default]
+    Completion,
+    Embedding,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct ProviderLimits {
@@ -232,6 +239,7 @@ pub struct ProviderOfferQuery {
 }
 #[derive(Clone, Debug)]
 pub struct SelectProvider {
+    pub kind: PreferenceModelKind,
     pub resource: Option<ProviderResourceId>,
     pub model: Option<ModelProfileId>,
     pub project: Option<FolderRef>,
@@ -245,13 +253,15 @@ pub enum ProviderPreferenceScope {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SetProviderPreference {
     pub scope: ProviderPreferenceScope,
+    #[serde(default)]
+    pub kind: PreferenceModelKind,
     pub resource: ProviderResourceId,
     pub model: ModelProfileId,
 }
 
-/// Trusted orchestration instructions are not a carrier for copied note text.
-/// Content from notes, chat entries or abilities must retain ProviderMessage
-/// provenance even when it appears in a system-role message.
+/// Trusted orchestration text (`System` instructions, scheduled `User` prompts,
+/// or control-plane `Tool` outputs/errors). Never copy note, chat or ability
+/// content into this wrapper; content bytes must retain `ProviderMessage` provenance.
 #[derive(Clone)]
 pub struct ProviderInstruction(String);
 impl ProviderInstruction {
@@ -295,7 +305,7 @@ impl ProviderToolCallId {
             || value.len() > 128
             || !value
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+                .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
         {
             return Err(DomainError::validation(ValidationReason::InvalidQuery));
         }

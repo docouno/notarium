@@ -18,14 +18,20 @@ name=notarium-control-$(basename "$run")-$$
 cleanup() {
     result=$?
     trap - EXIT HUP INT TERM
-    docker logs "$name" > "$run/postgres.log" 2>&1 || true
+    if [ "$result" -ne 0 ]; then
+        docker logs "$name" > "$run/postgres.log" 2>&1 || true
+    fi
+    docker exec -u 0 "$name" sh -c 'chmod 0777 /var/run/postgresql && rm -rf /var/run/postgresql/* /var/run/postgresql/.[!.]*' > /dev/null 2>&1 || true
     docker rm -f "$name" > /dev/null 2>&1 || true
     rm -f .artifacts/control-db-fixture/active.json
+    if [ "$result" -eq 0 ]; then
+        rm -rf "$run"
+    fi
     exit "$result"
 }
 trap cleanup EXIT HUP INT TERM
 mkdir "$run/socket"
-chmod 1777 "$run/socket"
+chmod 0777 "$run/socket"
 docker run --detach --name "$name" --network none \
     --mount "type=bind,src=$root/$run/socket,dst=/var/run/postgresql" \
     --tmpfs /var/lib/postgresql/data:rw \

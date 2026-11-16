@@ -1,5 +1,5 @@
 use super::super::authority;
-use super::{OidcClientAuthentication, OidcService, Provider, admit, denied, http::IdentityHttp};
+use super::{OidcClientAuthentication, OidcService, Provider, denied, http::IdentityHttp};
 use crate::{
     auth::token,
     error::unavailable,
@@ -13,6 +13,7 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use notarium_core::{
+    DomainError,
     auth::{AuthenticatedCredential, SecretString},
     error::{CommitEffect, PortError},
     ids::*,
@@ -24,10 +25,6 @@ use openidconnect::{
     core::{CoreAuthenticationFlow, CoreClient},
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    sync::{LazyLock, Mutex},
-    time::{Duration, Instant},
-};
 use zeroize::Zeroize;
 
 #[derive(Serialize, Deserialize)]
@@ -59,22 +56,22 @@ impl Drop for Flow {
         self.verifier.zeroize();
     }
 }
-static RATE: LazyLock<Mutex<(Instant, u16)>> = LazyLock::new(|| Mutex::new((Instant::now(), 0)));
-#[cfg(test)]
-pub(super) fn reset_fixture_rate() {
-    // Isolated database fixtures run under TEST_RESOURCE_LOCK. Each represents
-    // a fresh installation, independent of other protocol qualification cases.
-    *RATE.lock().unwrap() = (Instant::now(), 0);
-}
-fn admit_begin() -> Result<(), PortError> {
-    let mut rate = RATE.lock().map_err(|_| super::limited())?;
-    if rate.0.elapsed() >= Duration::from_secs(60) {
-        *rate = (Instant::now(), 0);
+async fn check_bound(
+    user: &UsersRow,
+    tx: &mut Transaction,
+    bound: &BoundUser,
+    now: i64,
+    recent: bool,
+) -> Result<(), PortError> {
+    let session = authority::session(tx, bound.session.as_str()).await?;
+    authority::live_session(&session, user, now)?;
+    if user.auth_version != bound.auth_version {
+        return Err(denied());
     }
-    if rate.1 >= 60 {
-        return Err(super::limited());
+    if recent && session.created_at < now.saturating_sub(5 * 60 * 1000) {
+        // Explicit step-up failure for a valid session older than 5 minutes.
+        return Err(DomainError::AccessDenied.into());
     }
-    rate.1 += 1;
     Ok(())
 }
 async fn live_bound(
@@ -84,14 +81,16 @@ async fn live_bound(
     recent: bool,
 ) -> Result<(), PortError> {
     let user = authority::user(tx, bound.user.as_str()).await?;
-    let session = authority::session(tx, bound.session.as_str()).await?;
-    authority::live_session(&session, &user, now)?;
-    if user.auth_version != bound.auth_version
-        || (recent && session.created_at < now.saturating_sub(5 * 60 * 1000))
-    {
-        return Err(denied());
-    }
-    Ok(())
+    check_bound(&user, tx, bound, now, recent).await
+}
+async fn live_bound_read(
+    tx: &mut Transaction,
+    bound: &BoundUser,
+    now: i64,
+    recent: bool,
+) -> Result<(), PortError> {
+    let user = authority::user_read(tx, bound.user.as_str()).await?;
+    check_bound(&user, tx, bound, now, recent).await
 }
 struct Confidential {
     row: CredentialsRow,
@@ -118,42 +117,48 @@ impl OidcService {
         ctx: Option<AccountContext>,
         request: BeginOidcLogin,
     ) -> Result<OidcAuthorization, PortError> {
-        let _admission = admit()?;
-        admit_begin()?;
+        // Validate configured issuer, browser binding and link authority BEFORE
+        // consuming rate-limit or concurrency permits.
         let provider = self.provider(&request.issuer)?;
         let browser = super::super::oauth::validation::browser(request.browser_binding.expose())?;
         let budget = OperationBudget::new(call.clone());
         let bound = if let Some(ctx) = &ctx {
+            ctx.auth().authorize_human_management()?;
             let Some(AuthenticatedCredential::Session(id)) = ctx.auth().credential() else {
                 return Err(denied());
             };
-            let mut tx = self.control.store.write(budget.clone()).await?;
+            let mut rtx = self.control.store.read(budget.clone()).await?;
             let bound = budget
                 .run(
                     async {
                         let (_, user) = self
                             .control
-                            .manager(tx.inner_mut(), ctx.auth(), ctx.auth().principal())
+                            .manager_read(rtx.inner_mut(), ctx.auth(), ctx.auth().principal())
                             .await?;
                         let bound = BoundUser {
                             user: ctx.auth().principal().clone(),
                             session: id.clone(),
                             auth_version: user.auth_version,
                         };
-                        live_bound(tx.inner_mut(), &bound, self.control.clock.now_ms()?, true)
-                            .await?;
+                        live_bound_read(
+                            rtx.inner_mut(),
+                            &bound,
+                            self.control.clock.now_ms()?,
+                            true,
+                        )
+                        .await?;
                         Ok(bound)
                     },
                     CommitEffect::NotCommitted,
                 )
                 .await?;
-            budget
-                .run(tx.rollback(), CommitEffect::NotCommitted)
-                .await?;
+            budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
             Some(bound)
         } else {
             None
         };
+        let _admission = self.admit()?;
+        provider.admit_begin(bound.is_some())?;
         let metadata = self.metadata(&provider, &budget, &call.request).await?;
         let now = self.control.clock.now_ms()?;
         let flow = Flow {
@@ -207,7 +212,7 @@ impl OidcService {
             execute!(tx.inner_mut(),"DELETE FROM oidc_transactions WHERE expires_at<=$1","DELETE FROM v1_control.oidc_transactions WHERE expires_at<=$1";now)?;
             let (count,)=rows!(tx.inner_mut(),(i64,),fetch_one,"SELECT COUNT(*) FROM oidc_transactions","SELECT COUNT(*) FROM v1_control.oidc_transactions";)?;
             if count>=4096 {return Err(super::limited());}
-            let record=TargetRecord::OidcTransactions(OidcTransactionsRow {transaction_id:flow.transaction.to_string(),state_hash:token::digest(state.expose().as_bytes()).to_vec(),nonce_hash:token::digest(flow.nonce.as_bytes()).to_vec(),flow_context_hash:token::digest(sealed.encrypted.as_bytes()).to_vec(),key_id:sealed.witness.key.to_string(),issuer:flow.issuer.clone(),client_id:flow.client.clone(),redirect_uri:flow.redirect.clone(),purpose:if flow.bound.is_some() {"link"} else {"login"}.into(),bound_user:flow.bound.as_ref().map(|b|b.user.to_string()),browser_binding_hash:browser.to_vec(),expires_at:flow.expires,consumed_at:None,created_at:flow.created});
+            let record=TargetRecord::from(OidcTransactionsRow {transaction_id:flow.transaction.to_string(),state_hash:token::digest(state.expose().as_bytes()).to_vec(),nonce_hash:token::digest(flow.nonce.as_bytes()).to_vec(),flow_context_hash:token::digest(sealed.encrypted.as_bytes()).to_vec(),key_id:sealed.witness.key.to_string(),issuer:flow.issuer.clone(),client_id:flow.client.clone(),redirect_uri:flow.redirect.clone(),purpose:if flow.bound.is_some() {"link"} else {"login"}.into(),bound_user:flow.bound.as_ref().map(|b|b.user.to_string()),browser_binding_hash:browser.to_vec(),expires_at:flow.expires,consumed_at:None,created_at:flow.created});
             record.validate()?;record.insert(tx.inner_mut()).await
         },CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
@@ -257,7 +262,6 @@ impl OidcService {
         call: CallBudget,
         request: FinishOidcCallback,
     ) -> Result<OidcOutcome, PortError> {
-        let _admission = admit()?;
         if request.code.expose().is_empty()
             || request.code.expose().len() > 8192
             || request.state.expose().len() != 43
@@ -265,6 +269,7 @@ impl OidcService {
             return Err(denied());
         }
         let browser = super::super::oauth::validation::browser(request.browser_binding.expose())?;
+        let _admission = self.admit()?;
         let budget = OperationBudget::new(call.clone());
         let (plaintext, witness) = self
             .keyring

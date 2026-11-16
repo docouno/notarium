@@ -16,14 +16,41 @@ fn budget(milliseconds: u64) -> lease::OperationBudget {
 }
 async fn abandon_waiting_writers(store: &ControlStore) {
     let mut attempts = Box::pin(futures_util::future::join_all(
-        (0..4).map(|_| store.write(budget(80))),
+        (0..store.max_active_writers()).map(|_| store.write(budget(80))),
     ));
     assert!(futures_util::poll!(&mut attempts).is_pending());
     assert_eq!(store.write_admission.available_permits(), 0);
+
+    // Concurrent reads never block on active or queued writers.
+    for _ in 0..8 {
+        store
+            .read(budget(500))
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+    }
+
+    // Bounded wait queue holds up to MAX_QUEUED_WRITERS waiters; overflow rejects fast.
+    let mut queued = Box::pin(futures_util::future::join_all(
+        (0..MAX_QUEUED_WRITERS).map(|_| store.write(budget(60))),
+    ));
+    assert!(futures_util::poll!(&mut queued).is_pending());
+    assert_eq!(store.write_queue.available_permits(), 0);
     assert!(matches!(
         store.write(budget(1000)).await,
         Err(PortError::Domain(DomainError::RateLimited { .. }))
     ));
+
+    let queued_results = queued.await;
+    assert!(
+        queued_results
+            .iter()
+            .all(|result| matches!(result, Err(PortError::DeadlineExceeded(_))))
+    );
+    assert_eq!(store.write_queue.available_permits(), MAX_QUEUED_WRITERS);
+
     // Allow BEGIN/advisory-lock workers to reach the database. The caller's
     // budget expires first, but rollback ownership must survive its future.
     let results = attempts.await;
@@ -46,7 +73,10 @@ async fn await_rollback_ack(store: &ControlStore) {
     let pause = tokio::time::timeout(Duration::from_secs(2), store.writes.clone().write_owned())
         .await
         .unwrap();
-    assert_eq!(store.write_admission.available_permits(), 4);
+    assert_eq!(
+        store.write_admission.available_permits(),
+        store.max_active_writers()
+    );
     drop(pause);
     store
         .write(budget(2000))

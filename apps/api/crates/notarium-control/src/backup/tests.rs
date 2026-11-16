@@ -61,9 +61,9 @@ pub(super) async fn update(store: ControlStore, name: &str) {
     execute!(tx.inner_mut(),"UPDATE users SET display_name=$1 WHERE username='backup'","UPDATE v1_control.users SET display_name=$1 WHERE username='backup'";name).unwrap();
     tx.commit().await.unwrap();
 }
-pub(super) async fn idle() {
+pub(super) async fn idle(participant: &ControlBackup) {
     let until = Instant::now() + Duration::from_secs(5);
-    while BACKUP_ADMISSION.available_permits() != 1 {
+    while participant.admission.available_permits() != 1 {
         assert!(
             Instant::now() < until,
             "backup owner did not acknowledge cleanup"
@@ -128,7 +128,7 @@ async fn exercise(pg: bool) {
         .unwrap();
     snapshot.close().await.unwrap();
     hold.release().await.unwrap();
-    idle().await;
+    idle(&participant).await;
     assert!(receipt.bytes > 0);
     assert_eq!(incomplete(&data), 0);
     let (saved, file) = participant
@@ -177,8 +177,8 @@ async fn exercise(pg: bool) {
             let mut reader = SpoolReader::open(file).unwrap();
             let mut users = 0;
             while let Some(record) = reader.next_record().unwrap() {
-                if let TargetRecord::Users(row) = record {
-                    assert_eq!(row.display_name, "before");
+                if let TargetRecord::Users { display_name, .. } = record {
+                    assert_eq!(display_name, "before");
                     users += 1;
                 }
             }
@@ -213,7 +213,7 @@ async fn exercise(pg: bool) {
             drop(prepared);
         }
         hold.release().await.unwrap();
-        idle().await;
+        idle(&participant).await;
         assert_eq!(incomplete(&data), 0);
         update(fixture.store.clone(), "live").await;
     }
@@ -259,7 +259,7 @@ async fn exercise(pg: bool) {
     snapshot.close().await.unwrap();
     drop(prepared);
     hold.release().await.unwrap();
-    idle().await;
+    idle(&participant).await;
     assert_eq!(incomplete(&data), 0);
     participant
         .open_artifact(context(ServicePurpose::Backup), receipt.artifact.clone())
@@ -388,7 +388,7 @@ async fn faults(pg: bool) {
             pause.take().unwrap().resume().await.unwrap();
         }
         cancel.cancel();
-        idle().await;
+        idle(&participant).await;
         if let Some(snapshot) = snapshot {
             snapshot.close().await.unwrap();
         }
@@ -420,7 +420,7 @@ async fn faults(pg: bool) {
     writer.rollback().await.unwrap();
     drop(prepared);
     hold.release().await.unwrap();
-    idle().await;
+    idle(&participant).await;
     assert_eq!(incomplete(&data), 0);
 
     // Retention expires independently of the caller while its cut is idle.
@@ -431,8 +431,8 @@ async fn faults(pg: bool) {
         }
     } else {
         let bytes = fs::metadata(data.control().with_file_name("control.sqlite-wal"))
-            .unwrap()
-            .len();
+            .map(|m| m.len())
+            .unwrap_or(0);
         BackupRetentionBudget::SqliteWal {
             max_pinned_bytes: bytes + 32 * 1024,
         }
@@ -456,7 +456,7 @@ async fn faults(pg: bool) {
             update(fixture.store.clone(), &format!("grow-wal-{index}")).await;
         }
     }
-    idle().await;
+    idle(&participant).await;
     assert!(
         snapshot
             .spool(retained, Cancellation::default())
@@ -501,7 +501,7 @@ async fn faults(pg: bool) {
     snapshot.close().await.unwrap();
     drop(prepared);
     hold.release().await.unwrap();
-    idle().await;
+    idle(&participant).await;
     assert_eq!(
         fs::read_dir(data.staging().join("control"))
             .unwrap()
@@ -541,7 +541,7 @@ async fn faults(pg: bool) {
     drop(pause);
     drop(prepared);
     hold.release().await.unwrap();
-    idle().await;
+    idle(&participant).await;
     update(fixture.store.clone(), "runtime-cleaned").await;
 
     if !pg {
@@ -622,7 +622,7 @@ async fn faults(pg: bool) {
     drop(pause);
     drop(prepared);
     hold.release().await.unwrap();
-    idle().await;
+    idle(&participant).await;
     assert_eq!(incomplete(&data), 0);
     update(fixture.store.clone(), "witness-cleaned").await;
     drop(participant);
@@ -686,7 +686,7 @@ async fn postgres_stalled_query_has_bounded_cleanup() {
     fixture.observer.execute("ROLLBACK").await;
     drop(prepared);
     hold.release().await.unwrap();
-    idle().await;
+    idle(&participant).await;
     assert_eq!(incomplete(&data), 0);
     update(fixture.store.clone(), "after-stalled-query").await;
     drop(participant);
@@ -814,7 +814,7 @@ async fn postgres_prepare_observes_cancellation_before_worker_launch() {
     };
     let cancelled = matches!(result, Err(PortError::Cancelled(_)));
     drop(result);
-    idle().await;
+    idle(&participant).await;
     drop(participant);
     fixture.close().await;
     fs::remove_dir_all(data.root()).unwrap();

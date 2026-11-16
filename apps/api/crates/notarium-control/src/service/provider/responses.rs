@@ -60,7 +60,7 @@ pub(super) async fn receive(
                     events.extend(decoder.eof()?);
                     progress.usage = decoder.usage();
                     if job.usage_mismatch(Some(model), progress.usage) {
-                        return Err(provider_error(ProviderErrorCode::BudgetMismatch));
+                        progress.mismatch = true;
                     }
                 }
                 for event in events {
@@ -93,7 +93,7 @@ pub(super) async fn receive(
             let decoded = wire::decode_embedding(kind, model, request.chunks.len(), &bytes)?;
             progress.usage = decoded.usage;
             if job.usage_mismatch(Some(model), progress.usage) {
-                return Err(provider_error(ProviderErrorCode::BudgetMismatch));
+                progress.mismatch = true;
             }
             let ProviderModelKind::Embedding { dimension } = model.kind else {
                 return Err(protocol());

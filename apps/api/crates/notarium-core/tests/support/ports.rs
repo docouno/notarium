@@ -226,6 +226,7 @@ impl ControlPort for RejectingPorts {
             ctx: AccountContext,
             request: AccountMutation<EpisodeUpdate>,
         ) -> PortFuture<'_, ControlCommit<AgentEpisode>>;
+    fn touch_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, ()>;
     fn acknowledge_delta(
             &self,
             ctx: AccountContext,
@@ -252,12 +253,33 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: AccountContext,
             reference: AbilityRef,
+            project: Option<FolderRef>,
         ) -> PortFuture<'_, AbilityDescriptor>;
     fn update_ability_binding(
             &self,
             ctx: AccountContext,
             request: AccountMutation<AbilityBindingUpdate>,
         ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>>;
+    fn set_ability_preference(
+            &self,
+            ctx: AccountContext,
+            request: AccountMutation<AbilityPreferenceUpdate>,
+        ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>>;
+    fn set_ability_trail(
+            &self,
+            ctx: AccountContext,
+            request: AccountMutation<AbilityTrailUpdate>,
+        ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>>;
+    fn lookup_mcp_dedup(
+            &self,
+            ctx: AccountContext,
+            key: McpDedupKey,
+        ) -> PortFuture<'_, Option<McpDedupHit>>;
+    fn record_mcp_dedup(
+            &self,
+            ctx: AccountContext,
+            record: McpDedupRecord,
+        ) -> PortFuture<'_, ()>;
     fn resolve_memory_target(
             &self,
             ctx: AccountContext,

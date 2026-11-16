@@ -1,4 +1,7 @@
-use super::{CheckedEndpoint, GuardedResolver, NetworkPolicy, OutboundScope, resolver::Lookup};
+use super::{
+    CheckedEndpoint, GuardedResolver, NetworkPolicy, OutboundScope,
+    resolver::{DEFAULT_DNS_PERMITS, Lookup},
+};
 use crate::{
     error::{invalid, unavailable},
     store::lease::OperationBudget,
@@ -15,17 +18,19 @@ use reqwest::{Client, Method, header::HeaderMap};
 use std::{
     collections::HashMap,
     future::Future,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
-static SEND_ADMISSION: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(32)));
+pub const DEFAULT_MAX_ACTIVE_REQUESTS: usize = 64;
+const MAX_ACTIVE_REQUESTS_CAP: usize = 1024;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CLIENTS: usize = 128;
 const CHUNK_BYTES: usize = 64 * 1024;
+const IDLE_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn failed() -> PortError {
     unavailable("control outbound request", CommitEffect::Unknown)
@@ -157,6 +162,10 @@ struct State {
 }
 struct Shared {
     state: Mutex<State>,
+    send_admission: Arc<Semaphore>,
+    #[cfg(test)]
+    max_active_requests: usize,
+    dns_admission: Arc<Semaphore>,
     lookup: Option<Arc<dyn Lookup>>,
     #[cfg(test)]
     fixture: Option<(String, reqwest::Certificate)>,
@@ -174,9 +183,30 @@ impl OutboundTransport {
         Ok(state.policy.endpoint(scope, url)?.url().to_string())
     }
     pub fn new(policy: NetworkPolicy) -> Self {
-        Self::with_lookup(policy, None)
+        Self::with_lookup_and_limit(policy, None, DEFAULT_MAX_ACTIVE_REQUESTS)
     }
+    pub fn with_max_active_requests(
+        policy: NetworkPolicy,
+        max_active_requests: usize,
+    ) -> Result<Self, PortError> {
+        if max_active_requests == 0 || max_active_requests > MAX_ACTIVE_REQUESTS_CAP {
+            return Err(invalid(ValidationReason::InvalidLimit));
+        }
+        Ok(Self::with_lookup_and_limit(
+            policy,
+            None,
+            max_active_requests,
+        ))
+    }
+    #[cfg(test)]
     fn with_lookup(policy: NetworkPolicy, lookup: Option<Arc<dyn Lookup>>) -> Self {
+        Self::with_lookup_and_limit(policy, lookup, DEFAULT_MAX_ACTIVE_REQUESTS)
+    }
+    fn with_lookup_and_limit(
+        policy: NetworkPolicy,
+        lookup: Option<Arc<dyn Lookup>>,
+        max_active_requests: usize,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
@@ -185,11 +215,23 @@ impl OutboundTransport {
                     tick: 0,
                     clients: HashMap::new(),
                 }),
+                send_admission: Arc::new(Semaphore::new(max_active_requests)),
+                #[cfg(test)]
+                max_active_requests,
+                dns_admission: Arc::new(Semaphore::new(DEFAULT_DNS_PERMITS)),
                 lookup,
                 #[cfg(test)]
                 fixture: None,
             }),
         }
+    }
+    #[cfg(test)]
+    pub(super) fn available_permits(&self) -> usize {
+        self.shared.send_admission.available_permits()
+    }
+    #[cfg(test)]
+    pub(super) fn max_active_requests(&self) -> usize {
+        self.shared.max_active_requests
     }
     #[cfg(test)]
     pub(super) fn fixture_https(
@@ -329,7 +371,9 @@ impl OutboundTransport {
         let request_id = call.request.clone();
         let budget = OperationBudget::new(call);
         budget.check(CommitEffect::NotCommitted)?;
-        let permit = SEND_ADMISSION
+        let permit = self
+            .shared
+            .send_admission
             .clone()
             .try_acquire_owned()
             .map_err(|_| saturated())?;
@@ -347,6 +391,7 @@ impl OutboundTransport {
             _permit: permit,
         };
         let lookup = self.shared.lookup.clone();
+        let dns_admission = self.shared.dns_admission.clone();
         #[cfg(test)]
         let fixture_ca = self.shared.fixture.as_ref().map(|(_, ca)| ca.clone());
         tokio::spawn(async move {
@@ -364,6 +409,7 @@ impl OutboundTransport {
                             build_client(
                                 endpoint,
                                 lookup,
+                                dns_admission,
                                 #[cfg(test)]
                                 fixture_ca,
                             )
@@ -381,12 +427,7 @@ impl OutboundTransport {
                     .build()
                     .map_err(|_| failed())?;
                 let mut response = context
-                    .run(async {
-                        tokio::time::timeout(Duration::from_secs(30), client.execute(outgoing))
-                            .await
-                            .map_err(|_| failed())?
-                            .map_err(send_failed)
-                    })
+                    .run(async { client.execute(outgoing).await.map_err(send_failed) })
                     .await?;
                 header_bytes(response.headers()).map_err(|_| failed())?;
                 if response
@@ -406,7 +447,12 @@ impl OutboundTransport {
                     .map_err(|_| cancelled())?;
                 let mut received = 0usize;
                 while let Some(chunk) = context
-                    .run(async { response.chunk().await.map_err(|_| failed()) })
+                    .run(async {
+                        tokio::time::timeout(IDLE_CHUNK_TIMEOUT, response.chunk())
+                            .await
+                            .map_err(|_| failed())?
+                            .map_err(|_| failed())
+                    })
                     .await?
                 {
                     received = received.checked_add(chunk.len()).ok_or_else(failed)?;
@@ -417,7 +463,7 @@ impl OutboundTransport {
                         context
                             .run(async {
                                 tokio::time::timeout(
-                                    Duration::from_secs(30),
+                                    IDLE_CHUNK_TIMEOUT,
                                     chunks_tx.send(part.to_vec()),
                                 )
                                 .await
@@ -456,13 +502,15 @@ impl OutboundTransport {
 fn build_client(
     endpoint: CheckedEndpoint,
     lookup: Option<Arc<dyn Lookup>>,
+    dns_admission: Arc<Semaphore>,
     #[cfg(test)] fixture_ca: Option<reqwest::Certificate>,
 ) -> Result<Client, PortError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let resolver = match lookup {
-        Some(lookup) => GuardedResolver::with_lookup(endpoint, lookup),
-        None => GuardedResolver::new(endpoint),
-    };
+    let resolver = GuardedResolver::with_admission(
+        endpoint,
+        lookup.unwrap_or_else(GuardedResolver::default_lookup),
+        dns_admission,
+    );
     let builder = Client::builder()
         .tls_backend_rustls()
         .dns_resolver(Arc::new(resolver))
@@ -474,7 +522,6 @@ fn build_client(
         .http1_only()
         .http1_max_headers(100)
         .connect_timeout(Duration::from_secs(5))
-        .read_timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(60))
         .pool_max_idle_per_host(2);
     #[cfg(test)]
@@ -509,12 +556,23 @@ impl Worker {
         operation: impl Future<Output = Result<T, PortError>>,
     ) -> Result<T, PortError> {
         self.check()?;
+        let wait_for = self.budget.remaining_now();
         tokio::select! {
             biased;
-            error = async { loop { if let Err(error) = self.check() { break error; } tokio::time::sleep(Duration::from_millis(1)).await; } } => Err(error),
+            () = self.budget.cancellation().cancelled() => {
+                Err(self.budget.check(CommitEffect::Unknown).expect_err("budget cancelled"))
+            }
+            () = self.dropped.cancelled() => Err(cancelled()),
+            () = self.slot.cancelled.cancelled() => Err(cancelled()),
+            () = tokio::time::sleep(wait_for) => {
+                while self.budget.remaining_now() > Duration::ZERO {
+                    tokio::time::sleep(self.budget.remaining_now()).await;
+                }
+                Err(self.budget.check(CommitEffect::Unknown).expect_err("budget expired"))
+            }
             result = operation => {
-                // The driver's timer can finish between watchdog polls. Keep
-                // the current caller deadline/cancellation as the terminal cause.
+                // The driver's timer can finish between wakeups. Keep the
+                // current caller deadline/cancellation as the terminal cause.
                 self.check()?;
                 result
             },

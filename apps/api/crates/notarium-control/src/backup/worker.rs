@@ -55,7 +55,6 @@ struct Worker {
     keys: Vec<KeyringWitness>,
     witness: BackupWitness,
     session: Arc<Session>,
-    runtime: tokio::runtime::Runtime,
     source: Option<Source>,
     artifacts: Option<Artifacts>,
     artifact: Option<ArtifactId>,
@@ -69,7 +68,7 @@ struct Worker {
     _slot: OwnedSemaphorePermit,
 }
 impl Worker {
-    fn prepare(&mut self) -> Result<(), PortError> {
+    async fn prepare(&mut self) -> Result<(), PortError> {
         self.session.check()?;
         self.artifacts = Some(Artifacts::open(&self.data, || self.session.check())?);
         let mut entropy = [0; 16];
@@ -93,25 +92,29 @@ impl Worker {
             Backend::Sqlite { path: source, .. } => {
                 Source::Sqlite(SqliteCut::prepare(source, &path, &self.session)?)
             }
-            Backend::Postgres(pool) => Source::Postgres(
-                self.runtime
-                    .block_on(PostgresCut::prepare(pool, &self.session))?,
-            ),
+            Backend::Postgres(pool) => {
+                Source::Postgres(PostgresCut::prepare(pool, &self.session).await?)
+            }
         });
         self.session.check()?;
         self.metrics.prepare = self.session.elapsed();
         Ok(())
     }
-    fn pause(&mut self) -> Result<(), PortError> {
+    async fn pause(&mut self) -> Result<(), PortError> {
         if self.phase != Phase::Prepared {
             return Err(failure());
         }
         let started = Instant::now();
         self.pause_started = Some(started);
-        self.local_pause = Some(self.runtime.block_on(self.session.operation.run(
-            async { Ok(self.store.writes.clone().write_owned().await) },
-            CommitEffect::NotCommitted,
-        ))?);
+        self.local_pause = Some(
+            self.session
+                .operation
+                .run(
+                    async { Ok(self.store.writes.clone().write_owned().await) },
+                    CommitEffect::NotCommitted,
+                )
+                .await?,
+        );
         match self.source.as_mut().ok_or_else(failure)? {
             Source::Sqlite(_) => {
                 let Backend::Sqlite { path, .. } = &self.store.backend else {
@@ -122,57 +125,61 @@ impl Worker {
                         self.session.check()
                     })?);
             }
-            Source::Postgres(source) => self.runtime.block_on(source.pause(&self.session))?,
+            Source::Postgres(source) => source.pause(&self.session).await?,
         }
         self.metrics.drain = started.elapsed();
         self.phase = Phase::Paused;
         self.session.check()
     }
-    fn pin(&mut self) -> Result<BackupWitness, PortError> {
+    async fn pin(&mut self) -> Result<BackupWitness, PortError> {
         if self.phase != Phase::Paused {
             return Err(failure());
         }
         let witness = match self.source.as_mut().ok_or_else(failure)? {
             Source::Sqlite(source) => source.pin(&self.witness, &self.keys, &self.session)?,
             Source::Postgres(source) => {
-                self.runtime
-                    .block_on(source.pin(&self.witness, &self.keys, &self.session))?
+                source.pin(&self.witness, &self.keys, &self.session).await?
             }
         };
         self.phase = Phase::Pinned;
         Ok(witness)
     }
-    fn resume(&mut self) -> Result<(), PortError> {
+    async fn resume(&mut self) -> Result<(), PortError> {
         if !matches!(self.phase, Phase::Paused | Phase::Pinned) {
             return Err(failure());
         }
-        if let Some(Source::Postgres(source)) = &mut self.source {
-            self.runtime.block_on(source.resume())?;
-        }
+        let unlocked_conn = if let Some(Source::Postgres(source)) = &mut self.source {
+            Some(source.unlock().await?)
+        } else {
+            None
+        };
         if let Some(fence) = self.file_pause.take() {
             fence.release()?;
         }
         self.local_pause.take();
         self.metrics.pause = self.pause_started.ok_or_else(failure)?.elapsed();
+        if let Some(connection) = unlocked_conn {
+            PostgresCut::close_unlocked_connection(connection).await?;
+        }
         if self.phase == Phase::Paused {
             // A coordinator may resume after another participant fails before pin.
-            self.close_source()?;
+            self.close_source().await?;
             self.phase = Phase::Finished;
         } else {
             self.phase = Phase::Resumed;
         }
         Ok(())
     }
-    fn close_source(&mut self) -> Result<(), PortError> {
+    async fn close_source(&mut self) -> Result<(), PortError> {
         let result = match self.source.take() {
             Some(Source::Sqlite(source)) => source.close(),
-            Some(Source::Postgres(source)) => self.runtime.block_on(source.close()),
+            Some(Source::Postgres(source)) => source.close().await,
             None => Ok(()),
         };
         self.session.unpin();
         result
     }
-    fn spool(
+    async fn spool(
         &mut self,
         budget: BackupBudget,
         cancellation: Cancellation,
@@ -194,11 +201,9 @@ impl Worker {
                     .write(true)
                     .open(path)
                     .map_err(|_| failure())?;
-                let file = self.runtime.block_on(source.spool(
-                    file,
-                    self.witness.clone(),
-                    &self.session,
-                ))?;
+                let file = source
+                    .spool(file, self.witness.clone(), &self.session)
+                    .await?;
                 file.sync_all().map_err(|_| failure())?;
                 BackupArtifactKind::PostgresSpoolV1
             }
@@ -235,7 +240,7 @@ impl Worker {
         };
         // A stable complete file exists before releasing the source cut. Uploading
         // or packaging later cannot retain a database snapshot through this handle.
-        self.close_source()?;
+        self.close_source().await?;
         self.session.finish_tracking()?;
         self.artifacts
             .as_ref()
@@ -247,30 +252,41 @@ impl Worker {
         self.metrics.bytes = bytes;
         Ok(receipt)
     }
-    fn run(&mut self, commands: &mut mpsc::Receiver<Command>) -> Result<(), PortError> {
+    async fn run(&mut self, commands: &mut mpsc::Receiver<Command>) -> Result<(), PortError> {
         loop {
             if self.phase == Phase::Finished || self.session.receipt.load(Ordering::SeqCst) == 1 {
                 return Ok(());
             }
             self.session.check()?;
-            match commands.blocking_recv() {
+            let cancel = self
+                .session
+                .operation
+                .context(notarium_core::ids::RequestId::from_bytes([0; 16]))
+                .cancellation;
+            let command = tokio::select! {
+                cmd = commands.recv() => cmd,
+                _ = cancel.cancelled() => {
+                    return self.session.check();
+                }
+            };
+            match command {
                 Some(Command::Wake) => (),
                 Some(Command::Pause(reply)) => {
-                    let result = self.pause();
+                    let result = self.pause().await;
                     let failed = result.is_err();
                     if reply.send(result).is_err() || failed {
                         return Err(failure());
                     }
                 }
                 Some(Command::Pin(reply)) => {
-                    let result = self.pin();
+                    let result = self.pin().await;
                     let failed = result.is_err();
                     if reply.send(result).is_err() || failed {
                         return Err(failure());
                     }
                 }
                 Some(Command::Resume(reply)) => {
-                    let result = self.resume();
+                    let result = self.resume().await;
                     let failed = result.is_err();
                     if reply.send(result).is_err() || failed {
                         return Err(failure());
@@ -281,7 +297,7 @@ impl Worker {
                     cancellation,
                     reply,
                 }) => {
-                    let result = self.spool(budget, cancellation);
+                    let result = self.spool(budget, cancellation).await;
                     let failed = result.is_err();
                     if reply.send(result).is_err() || failed {
                         return Err(failure());
@@ -291,8 +307,8 @@ impl Worker {
             }
         }
     }
-    fn cleanup(&mut self) -> Result<(), PortError> {
-        let source = self.close_source();
+    async fn cleanup(&mut self) -> Result<(), PortError> {
+        let source = self.close_source().await;
         let fence = if let Some(fence) = self.file_pause.take() {
             fence.release()
         } else {
@@ -373,7 +389,6 @@ pub(crate) async fn launch(start: Start) -> Result<Client, PortError> {
                 keys: start.keys,
                 witness: start.witness,
                 session: owner_session.clone(),
-                runtime,
                 source: None,
                 artifacts: None,
                 artifact: None,
@@ -385,21 +400,29 @@ pub(crate) async fn launch(start: Start) -> Result<Client, PortError> {
                 metrics_sink: start.metrics,
                 _slot: start.slot,
             };
-            let run =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match worker.prepare() {
-                    Ok(()) => {
-                        if ready.send(Ok(())).is_ok() {
-                            let _ = worker.run(&mut receiver);
+            let watch_session = owner_session.clone();
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(async {
+                    let watch = tokio::spawn(watch_session.watch_background());
+                    match worker.prepare().await {
+                        Ok(()) => {
+                            if ready.send(Ok(())).is_ok() {
+                                let _ = worker.run(&mut receiver).await;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = ready.send(Err(error));
                         }
                     }
-                    Err(error) => {
-                        let _ = ready.send(Err(error));
-                    }
-                }));
-            let cleanup =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.cleanup()))
-                    .unwrap_or_else(|_| Err(failure()));
+                    watch.abort();
+                })
+            }));
+            let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.block_on(worker.cleanup())
+            }))
+            .unwrap_or_else(|_| Err(failure()));
             drop(worker);
+            drop(runtime);
             owner_session.finished(if run.is_err() {
                 Err(failure())
             } else {
@@ -408,7 +431,6 @@ pub(crate) async fn launch(start: Start) -> Result<Client, PortError> {
         })
         .map_err(|_| failure())?;
     session.set_worker(worker)?;
-    session.watchdog();
     let result = session
         .operation
         .run(

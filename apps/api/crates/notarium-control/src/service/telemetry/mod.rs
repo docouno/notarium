@@ -93,30 +93,45 @@ async fn configuration(
         updated_at: 0,
     }))
 }
+async fn configuration_read(tx: &mut Transaction) -> Result<AgentTelemetryConfigRow, PortError> {
+    let row = rows!(
+        tx,
+        AgentTelemetryConfigRow,
+        fetch_optional,
+        "SELECT * FROM agent_telemetry_config WHERE singleton=1",
+        "SELECT * FROM v1_control.agent_telemetry_config WHERE singleton=1";
+    )?;
+    Ok(row.unwrap_or(AgentTelemetryConfigRow {
+        singleton: 1,
+        detailed_enabled: 0,
+        compact_retention_days: 90,
+        detailed_retention_days: 30,
+        version: 0,
+        updated_at: 0,
+    }))
+}
 impl ControlService {
     pub async fn telemetry_settings(
         &self,
         ctx: AccountContext,
     ) -> Result<TelemetrySettings, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
         let result = budget
             .run(
                 async {
                     let (owner, _) = self
-                        .manager(tx.inner_mut(), ctx.auth(), ctx.auth().principal())
+                        .manager_read(tx.inner_mut(), ctx.auth(), ctx.auth().principal())
                         .await?;
                     if owner.is_admin != 1 {
                         return Err(access_denied());
                     }
-                    settings(&configuration(tx.inner_mut(), false).await?)
+                    settings(&configuration_read(tx.inner_mut()).await?)
                 },
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
+        budget.run(tx.finish(), CommitEffect::NotCommitted).await?;
         Ok(result)
     }
     pub async fn update_telemetry_settings(
@@ -124,6 +139,7 @@ impl ControlService {
         ctx: AccountContext,
         request: AccountMutation<TelemetrySettings>,
     ) -> Result<ControlCommit<TelemetrySettings>, PortError> {
+        ctx.auth().authorize_human_management()?;
         let input = request.input;
         if input.compact_retention_days == 0
             || input.compact_retention_days > 3650

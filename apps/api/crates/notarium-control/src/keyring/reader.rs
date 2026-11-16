@@ -98,10 +98,10 @@ fn attempt(
     root: &Dir,
     bytes: &[u8],
     witnesses: &[Witness],
-    requested: Option<&KeyId>,
+    requested: &[KeyId],
     all: bool,
     budget: &OperationBudget,
-) -> Result<Material, PortError> {
+) -> Result<Vec<Material>, PortError> {
     let pointer: Pointer = serde_json::from_slice(bytes).map_err(|_| failure())?;
     if pointer.format != "notarium-credential-key-pointer"
         || pointer.format_version != 1
@@ -120,29 +120,36 @@ fn attempt(
     {
         return Err(failure());
     }
-    let requested = requested.unwrap_or(&active.key);
-    let mut selected = None;
+    let mut loaded = Vec::new();
     for witness in witnesses {
         budget.check(CommitEffect::NotCommitted)?;
-        if all || witness.active || &witness.key == requested {
-            let value = material(root, witness)?;
-            if &witness.key == requested {
-                selected = Some(value);
-            }
+        let needed = all || witness.active || requested.iter().any(|key| key == &witness.key);
+        if needed {
+            loaded.push(material(root, witness)?);
         }
     }
-    selected.ok_or_else(failure)
+    if requested.is_empty() {
+        if !loaded.iter().any(|item| item.id == active.key) {
+            return Err(failure());
+        }
+    } else if requested
+        .iter()
+        .any(|key| !loaded.iter().any(|item| &item.id == key))
+    {
+        return Err(failure());
+    }
+    Ok(loaded)
 }
 
 /// Existing-keyring reads never create, repair, chmod or probe for writability.
 /// All blocking I/O must be called from the bounded owned worker in the facade.
-pub(super) fn load(
+pub(super) fn load_many(
     path: &Path,
     witnesses: &[Witness],
-    requested: Option<&KeyId>,
+    requested: &[KeyId],
     all: bool,
     budget: &OperationBudget,
-) -> Result<Material, PortError> {
+) -> Result<Vec<Material>, PortError> {
     if witnesses.is_empty() || witnesses.len() > MAX_KEYS {
         return Err(failure());
     }
@@ -165,6 +172,31 @@ pub(super) fn load(
         }
     }
     Err(failure())
+}
+
+#[cfg(test)]
+pub(super) fn load(
+    path: &Path,
+    witnesses: &[Witness],
+    requested: Option<&KeyId>,
+    all: bool,
+    budget: &OperationBudget,
+) -> Result<Material, PortError> {
+    let keys: Vec<KeyId> = requested.cloned().into_iter().collect();
+    let loaded = load_many(path, witnesses, &keys, all, budget)?;
+    match requested {
+        Some(target) => loaded
+            .into_iter()
+            .find(|m| &m.id == target)
+            .ok_or_else(failure),
+        None => {
+            let active = witnesses.iter().find(|w| w.active).ok_or_else(failure)?;
+            loaded
+                .into_iter()
+                .find(|m| m.id == active.key)
+                .ok_or_else(failure)
+        }
+    }
 }
 
 #[cfg(test)]

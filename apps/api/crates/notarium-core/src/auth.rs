@@ -102,6 +102,7 @@ pub struct VerifiedHuman {
     principal: PrincipalId,
     grant: GrantId,
     spaces: BTreeMap<SpaceId, SpaceGrant>,
+    human_management: bool,
     ability_write: bool,
     credential: Option<AuthenticatedCredential>,
 }
@@ -116,9 +117,14 @@ impl VerifiedHuman {
             principal,
             grant,
             spaces,
+            human_management: false,
             ability_write: explicitly_authorized_ability_write,
             credential: None,
         }
+    }
+    pub fn with_human_management(mut self, human_management: bool) -> Self {
+        self.human_management = human_management;
+        self
     }
     pub fn with_credential(mut self, credential: AuthenticatedCredential) -> Self {
         self.credential = Some(credential);
@@ -152,6 +158,7 @@ pub struct EngineAuthContext {
     grant: GrantId,
     kind: PrincipalKind,
     spaces: BTreeMap<SpaceId, SpaceGrant>,
+    human_management: bool,
     ability_write: bool,
     write_space: Option<SpaceId>,
     taint: BranchTaint,
@@ -182,6 +189,7 @@ impl EngineAuthContext {
             grant: verified.grant,
             kind: PrincipalKind::DirectHuman,
             spaces: verified.spaces,
+            human_management: verified.human_management,
             ability_write: verified.ability_write,
             write_space: None,
             taint: BranchTaint::default(),
@@ -312,6 +320,7 @@ impl EngineAuthContext {
         }
         Ok(Self {
             spaces,
+            human_management: false,
             ability_write: false,
             ..self.clone()
         })
@@ -342,6 +351,7 @@ impl EngineAuthContext {
             })
             .collect();
         let mut result = self.narrow(requested)?;
+        result.human_management = self.human_management && current.human_management;
         result.ability_write = self.ability_write && current.ability_write;
         Ok(result)
     }
@@ -360,6 +370,16 @@ impl EngineAuthContext {
     pub fn taint(&self) -> &BranchTaint {
         &self.taint
     }
+    pub fn human_management(&self) -> bool {
+        self.human_management && self.kind == PrincipalKind::DirectHuman
+    }
+    pub fn authorize_human_management(&self) -> DomainResult<()> {
+        if self.human_management() {
+            Ok(())
+        } else {
+            Err(DomainError::AccessDenied)
+        }
+    }
     pub fn has_cap(&self, cap: Cap) -> bool {
         match cap {
             Cap::AbilityWrite => self.ability_write && self.kind == PrincipalKind::DirectHuman,
@@ -372,9 +392,9 @@ impl EngineAuthContext {
             Err(DomainError::AbilityWriteForbidden)
         }
     }
-    /// Folder metadata has no document class. It still requires a nonempty read
-    /// grant and current ancestry, and participates in the same branch taint.
-    pub fn authorize_folder_read(
+    /// Metadata visibility check that never mutates shared branch taint.
+    /// Content reading and provider egress must still call `authorize_folder_read`.
+    pub fn can_view_folder(
         &self,
         space: &Space,
         folder: &FolderId,
@@ -393,12 +413,11 @@ impl EngineAuthContext {
         {
             return Err(DomainError::ResourceNotFound);
         }
-        if self.write_space.as_ref().is_some_and(|id| id != &space.id) {
-            self.taint.mark_external_read();
-        }
         Ok(())
     }
-    pub fn authorize_read(&self, resource: &ResourceFacts) -> DomainResult<()> {
+    /// Metadata visibility check that never mutates shared branch taint.
+    /// Content reading and provider egress must still call `authorize_read`.
+    pub fn can_view_resource(&self, resource: &ResourceFacts) -> DomainResult<()> {
         let grant = self
             .spaces
             .get(&resource.space.id)
@@ -420,6 +439,24 @@ impl EngineAuthContext {
         {
             return Err(DomainError::ResourceNotFound);
         }
+        Ok(())
+    }
+    /// Folder metadata has no document class. It still requires a nonempty read
+    /// grant and current ancestry, and participates in the same branch taint.
+    pub fn authorize_folder_read(
+        &self,
+        space: &Space,
+        folder: &FolderId,
+        ancestors: &[FolderId],
+    ) -> DomainResult<()> {
+        self.can_view_folder(space, folder, ancestors)?;
+        if self.write_space.as_ref().is_some_and(|id| id != &space.id) {
+            self.taint.mark_external_read();
+        }
+        Ok(())
+    }
+    pub fn authorize_read(&self, resource: &ResourceFacts) -> DomainResult<()> {
+        self.can_view_resource(resource)?;
         if self
             .write_space
             .as_ref()
@@ -429,14 +466,24 @@ impl EngineAuthContext {
         }
         Ok(())
     }
-    /// Chat provenance is separate from document classes. Project-scoped service
-    /// grants do not gain access to whole-space transcripts through this path.
-    pub fn authorize_chat_read(&self, space: &Space, tainted: bool) -> DomainResult<()> {
+    /// Chat provenance is separate from document classes. Project-scoped grants
+    /// may read only chat transcripts explicitly pinned to their exact project.
+    pub fn authorize_chat_read(
+        &self,
+        space: &Space,
+        project: Option<&FolderId>,
+        tainted: bool,
+    ) -> DomainResult<()> {
         let grant = self
             .spaces
             .get(&space.id)
             .ok_or(DomainError::ResourceNotFound)?;
-        if space.lifecycle != SpaceLifecycle::Active || grant.project_root.is_some() {
+        if space.lifecycle != SpaceLifecycle::Active {
+            return Err(DomainError::ResourceNotFound);
+        }
+        if let Some(root) = &grant.project_root
+            && project != Some(root)
+        {
             return Err(DomainError::ResourceNotFound);
         }
         if tainted && space.kind == SpaceKind::Shared {

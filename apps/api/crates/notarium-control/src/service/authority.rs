@@ -68,6 +68,9 @@ pub(super) fn check_digest(stored: &[u8], actual: &[u8; 32]) -> Result<(), PortE
 pub(super) async fn user(tx: &mut Transaction, id: &str) -> Result<UsersRow, PortError> {
     rows!(tx,UsersRow,fetch_optional,"SELECT * FROM users WHERE user_id=$1","SELECT * FROM v1_control.users WHERE user_id=$1 FOR UPDATE";id)?.ok_or_else(denied)
 }
+pub(super) async fn user_read(tx: &mut Transaction, id: &str) -> Result<UsersRow, PortError> {
+    rows!(tx,UsersRow,fetch_optional,"SELECT * FROM users WHERE user_id=$1","SELECT * FROM v1_control.users WHERE user_id=$1";id)?.ok_or_else(denied)
+}
 pub(super) async fn session(tx: &mut Transaction, id: &str) -> Result<SessionsRow, PortError> {
     rows!(tx,SessionsRow,fetch_optional,"SELECT * FROM sessions WHERE session_id=$1","SELECT * FROM v1_control.sessions WHERE session_id=$1";id)?.ok_or_else(denied)
 }
@@ -92,7 +95,7 @@ pub(super) async fn mint_session(
     let expires_at = now
         .checked_add(30 * 24 * 60 * 60 * 1000)
         .ok_or_else(|| invalid(ValidationReason::InvalidTimestamp))?;
-    let record = TargetRecord::Sessions(SessionsRow {
+    let record = TargetRecord::from(SessionsRow {
         session_id: id.to_string(),
         token_hash: minted.digest.to_vec(),
         user_id: user.user_id.clone(),
@@ -112,9 +115,38 @@ pub(super) async fn mint_session(
     })
 }
 impl ControlService {
-    /// All credential mutations lock their users in lexical order before checking
-    /// credentials. This also serializes concurrent administrator cross-edits.
+    /// All credential/account management mutations require an interactive human
+    /// with checked perimeter/CSRF attestation (`human_management`) and lock
+    /// involved user rows in lexical order.
     pub(super) async fn manager(
+        &self,
+        tx: &mut Transaction,
+        auth: &EngineAuthContext,
+        target: &PrincipalId,
+    ) -> Result<(UsersRow, UsersRow), PortError> {
+        auth.authorize_human_management()?;
+        let actor_id = auth.principal().as_str();
+        let target_id = target.as_str();
+        let users = rows!(tx,UsersRow,fetch_all,
+            "SELECT * FROM users WHERE user_id IN ($1,$2) ORDER BY user_id",
+            "SELECT * FROM v1_control.users WHERE user_id IN ($1,$2) ORDER BY user_id FOR UPDATE";actor_id,target_id)?;
+        let actor = users
+            .iter()
+            .find(|u| u.user_id == actor_id)
+            .ok_or_else(denied)?;
+        self.live_human(tx, auth, actor).await?;
+        if actor_id != target_id && actor.is_admin != 1 {
+            return Err(access_denied());
+        }
+        let target = users
+            .iter()
+            .find(|u| u.user_id == target_id)
+            .ok_or(DomainError::ResourceNotFound)?;
+        Ok((actor.clone(), target.clone()))
+    }
+    /// Read-only inspection for an interactive human (`DirectHuman`) without
+    /// requiring mutation CSRF attestation or acquiring row write locks.
+    pub(super) async fn manager_read(
         &self,
         tx: &mut Transaction,
         auth: &EngineAuthContext,
@@ -127,7 +159,7 @@ impl ControlService {
         let target_id = target.as_str();
         let users = rows!(tx,UsersRow,fetch_all,
             "SELECT * FROM users WHERE user_id IN ($1,$2) ORDER BY user_id",
-            "SELECT * FROM v1_control.users WHERE user_id IN ($1,$2) ORDER BY user_id FOR UPDATE";actor_id,target_id)?;
+            "SELECT * FROM v1_control.users WHERE user_id IN ($1,$2) ORDER BY user_id";actor_id,target_id)?;
         let actor = users
             .iter()
             .find(|u| u.user_id == actor_id)
@@ -161,13 +193,16 @@ impl ControlService {
             _ => Err(denied()),
         }
     }
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn human_context(
         &self,
         tx: &mut Transaction,
         user: &UsersRow,
         credential: AuthenticatedCredential,
         source: GrantId,
+        human_management: bool,
         ability_write: bool,
+        lock: bool,
     ) -> Result<EngineAuthContext, PortError> {
         if user.disabled_at.is_some() {
             return Err(denied());
@@ -175,9 +210,15 @@ impl ControlService {
         // EngineAuthContext is intentionally finite. Exceeding the configured
         // bound fails the whole admission instead of silently dropping Spaces.
         let limit = i64::from(self.config.max_auth_spaces) + 1;
-        let memberships = rows!(tx,SpaceMembersRow,fetch_all,
-            "SELECT m.* FROM space_members m JOIN space_admission s ON s.space_id=m.space_id WHERE m.user_id=$1 AND m.admission='active' AND s.state='active' ORDER BY m.space_id LIMIT $2",
-            "SELECT m.* FROM v1_control.space_members m JOIN v1_control.space_admission s ON s.space_id=m.space_id WHERE m.user_id=$1 AND m.admission='active' AND s.state='active' ORDER BY m.space_id LIMIT $2 FOR SHARE OF m,s";&user.user_id,limit)?;
+        let memberships = if lock {
+            rows!(tx,SpaceMembersRow,fetch_all,
+                "SELECT m.* FROM space_members m JOIN space_admission s ON s.space_id=m.space_id WHERE m.user_id=$1 AND m.admission='active' AND s.state='active' ORDER BY m.space_id LIMIT $2",
+                "SELECT m.* FROM v1_control.space_members m JOIN v1_control.space_admission s ON s.space_id=m.space_id WHERE m.user_id=$1 AND m.admission='active' AND s.state='active' ORDER BY m.space_id LIMIT $2 FOR SHARE OF m,s";&user.user_id,limit)?
+        } else {
+            rows!(tx,SpaceMembersRow,fetch_all,
+                "SELECT m.* FROM space_members m JOIN space_admission s ON s.space_id=m.space_id WHERE m.user_id=$1 AND m.admission='active' AND s.state='active' ORDER BY m.space_id LIMIT $2",
+                "SELECT m.* FROM v1_control.space_members m JOIN v1_control.space_admission s ON s.space_id=m.space_id WHERE m.user_id=$1 AND m.admission='active' AND s.state='active' ORDER BY m.space_id LIMIT $2";&user.user_id,limit)?
+        };
         if memberships.len() > usize::from(self.config.max_auth_spaces) {
             return Err(invalid(ValidationReason::BudgetExceeded));
         }
@@ -210,6 +251,7 @@ impl ControlService {
                 spaces,
                 ability_write,
             )
+            .with_human_management(human_management)
             .with_credential(credential),
         ))
     }

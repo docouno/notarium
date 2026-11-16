@@ -73,6 +73,8 @@ impl ControlService {
         tx: &mut Transaction,
         ctx: &AccountContext,
         row: ContextSetsRow,
+        preloaded_home: Option<&CatalogSpace>,
+        note_cache: &mut BTreeMap<(SpaceId, NoteId), bool>,
     ) -> Result<ContextSetInfo, PortError> {
         let home = SpaceId::parse(&row.home_space)?;
         let grant = ctx
@@ -83,10 +85,12 @@ impl ControlService {
         if grant.read_classes.is_empty() {
             return Err(DomainError::ResourceNotFound.into());
         }
-        let current = self.catalog_space(ctx, &home).await?;
-        if current.space.kind == SpaceKind::Personal
-            && row.owner_id != ctx.auth().principal().as_str()
-        {
+        let kind = if let Some(space) = preloaded_home.filter(|s| s.space.id == home) {
+            space.space.kind
+        } else {
+            self.catalog_space(ctx, &home).await?.space.kind
+        };
+        if kind == SpaceKind::Personal && row.owner_id != ctx.auth().principal().as_str() {
             return Err(DomainError::ResourceNotFound.into());
         }
         if let Some(root) = &grant.project_root {
@@ -103,10 +107,22 @@ impl ControlService {
         let mut visible = Vec::new();
         let mut unavailable = 0;
         for note in notes(&row)? {
-            match self.catalog_note(ctx, &note).await {
-                Ok(_) => visible.push(note),
-                Err(error) if hidden(&error) => unavailable += 1,
-                Err(error) => return Err(error),
+            let key = (note.space_id.clone(), note.note_id.clone());
+            let is_visible = if let Some(&cached) = note_cache.get(&key) {
+                cached
+            } else {
+                let checked = match self.catalog_note(ctx, &note).await {
+                    Ok(_) => true,
+                    Err(error) if hidden(&error) => false,
+                    Err(error) => return Err(error),
+                };
+                note_cache.insert(key, checked);
+                checked
+            };
+            if is_visible {
+                visible.push(note);
+            } else {
+                unavailable += 1;
             }
         }
         Ok(ContextSetInfo {
@@ -125,18 +141,21 @@ impl ControlService {
         id: ContextSetId,
     ) -> Result<ContextSetInfo, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
         let result = budget
             .run(
                 async {
-                    let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
                     let row = bundle(tx.inner_mut(), &id, false)
                         .await?
                         .ok_or(DomainError::ResourceNotFound)?;
+                    let mut cache = BTreeMap::new();
                     self.context_bundle_info(
                         tx.inner_mut(),
                         &AccountContext::new(auth, budget.context(ctx.budget.request.clone())),
                         row,
+                        None,
+                        &mut cache,
                     )
                     .await
                 },
@@ -155,11 +174,11 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<ContextSetInfo>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut tx = self.store.read(budget.clone()).await?;
         let result = budget.run(async {
-            let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
+            let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
             let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
-            self.catalog_space(&current, &home).await?;
+            let home_space = self.catalog_space(&current, &home).await?;
             let scope = self.context_digest(tx.inner_mut(), &current, ("context-sets", &home)).await?;
             let cursor: Option<Cursor> = page.continuation().map(|value| serde_json::from_str(value).map_err(|_| invalid(ValidationReason::InvalidQuery))).transpose()?;
             if cursor.as_ref().is_some_and(|cursor| cursor.version != 1 || cursor.scope != scope) { return Err(invalid(ValidationReason::CursorStale)); }
@@ -169,8 +188,9 @@ impl ControlService {
                 values.pop(); Some(serde_json::to_string(&Cursor { version: 1, scope, last: ContextSetId::parse(&values.last().expect("positive page limit").set_id)? }).map_err(|_| invalid(ValidationReason::InvalidState))?)
             } else { None };
             let mut items = Vec::with_capacity(values.len());
+            let mut note_cache = BTreeMap::new();
             for row in values {
-                match self.context_bundle_info(tx.inner_mut(), &current, row).await {
+                match self.context_bundle_info(tx.inner_mut(), &current, row, Some(&home_space), &mut note_cache).await {
                     Ok(value) => items.push(value), Err(error) if hidden(&error) => (), Err(error) => return Err(error),
                 }
             }
@@ -200,24 +220,43 @@ impl ControlService {
         }
         let command = Command::new(request.identity, "put-context-set", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
+        ctx.auth().authorize_human_management()?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let observed = self
             .observe_context_attachments(&budget, &request.input.id)
             .await?;
+        let space_kinds = {
+            let current = self.current_account(&ctx, &budget).await?;
+            let mut required = BTreeMap::from([(request.input.home.clone(), true)]);
+            for note in &request.input.notes {
+                required.entry(note.space_id.clone()).or_insert(false);
+                budget
+                    .run(
+                        self.catalog_note(&current, note),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+            }
+            budget
+                .run(
+                    self.context_precheck_spaces(&current, &required),
+                    CommitEffect::NotCommitted,
+                )
+                .await?
+        };
         let mut tx = self.store.write(budget.clone()).await?;
-        let (revision, value) = budget.run(async {
+        let (revision, current_ctx, saved_id) = budget.run(async {
             let owner = self.context_manager(tx.inner_mut(), &ctx).await?;
             if let Some((revision, saved)) = command.replay::<ContextSetId>(tx.inner_mut()).await? {
                 let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
-                let row = bundle(tx.inner_mut(), &saved.value, false).await?.ok_or(DomainError::ResourceNotFound)?;
-                return Ok((revision, self.context_bundle_info(tx.inner_mut(), &AccountContext::new(auth, budget.context(ctx.budget.request.clone())), row).await?));
+                return Ok((revision, AccountContext::new(auth, budget.context(ctx.budget.request.clone())), saved.value));
             }
             expect_revision(&owner, command.identity.expected)?;
             let mut spaces = BTreeMap::from([(request.input.home.clone(), true)]);
             for row in &observed { spaces.insert(SpaceId::parse(&row.target_space)?, true); }
             let mut required = BTreeMap::from([(request.input.home.clone(), true)]);
             for note in &request.input.notes { spaces.entry(note.space_id.clone()).or_insert(false); required.entry(note.space_id.clone()).or_insert(false); }
-            self.context_write_spaces(tx.inner_mut(), &ctx, &owner, &required, &spaces).await?;
+            self.context_write_spaces(tx.inner_mut(), &ctx, &owner, &required, &spaces, &space_kinds).await?;
             let old = bundle(tx.inner_mut(), &request.input.id, true).await?;
             if old.as_ref().is_some_and(|row| row.home_space != request.input.home.as_str()) { return Err(DomainError::ResourceNotFound.into()); }
             let actual = old.as_ref().map(|row| ControlRevision::new(row.revision as u64)).transpose()?;
@@ -230,16 +269,30 @@ impl ControlService {
                 // does not edit their attachment or acquire their content rights.
                 decode_scope(&key, &row.owner_id)?;
             }
-            for note in &request.input.notes { self.catalog_note(&ctx, note).await?; }
             let row = ContextSetsRow { set_id: request.input.id.to_string(), owner_id: old.as_ref().map_or_else(|| owner.user_id.clone(), |row| row.owner_id.clone()), home_space: request.input.home.to_string(), name: request.input.name.clone(), note_refs: encoded.clone(), revision: next(old.as_ref().map_or(0, |row| row.revision))?, created_at: old.as_ref().map_or(self.clock.now_ms()?, |row| row.created_at) };
-            let record = TargetRecord::ContextSets(row.clone()); record.validate()?;
+            let record = TargetRecord::from(row.clone()); record.validate()?;
             if old.is_none() { record.insert(tx.inner_mut()).await?; }
             else { execute!(tx.inner_mut(),"UPDATE context_sets SET name=$1,note_refs=$2,revision=$3 WHERE set_id=$4","UPDATE v1_control.context_sets SET name=$1,note_refs=$2,revision=$3 WHERE set_id=$4";&row.name,&row.note_refs,row.revision,&row.set_id)?; }
             let revision = self.bump_context_spaces(tx.inner_mut(), &owner, &spaces).await?;
             command.save(tx.inner_mut(), revision, &SavedResult { value: request.input.id.clone(), events: vec![] }, self.clock.now_ms()?).await?;
-            Ok((revision, self.context_bundle_info(tx.inner_mut(), &ctx, row).await?))
+            Ok((revision, ctx.clone(), request.input.id.clone()))
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
+        let value = budget
+            .run(
+                async {
+                    let row = bundle(rtx.inner_mut(), &saved_id, false)
+                        .await?
+                        .ok_or(DomainError::ResourceNotFound)?;
+                    let mut cache = BTreeMap::new();
+                    self.context_bundle_info(rtx.inner_mut(), &current_ctx, row, None, &mut cache)
+                        .await
+                },
+                CommitEffect::Unknown,
+            )
+            .await?;
+        budget.run(rtx.rollback(), CommitEffect::Unknown).await?;
         Ok(ControlCommit { revision, value })
     }
     pub async fn delete_context_set(
@@ -249,11 +302,24 @@ impl ControlService {
     ) -> Result<ControlCommit<()>, PortError> {
         let command = Command::new(request.identity, "delete-context-set", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
+        ctx.auth().authorize_human_management()?;
         let budget = OperationBudget::new(ctx.budget.clone());
         let observed = self
             .observe_context_attachments(&budget, &request.input.id)
             .await?;
         let observed_home = budget.run(async { read_rows!(&self.store.backend,ContextSetsRow,fetch_optional,"SELECT * FROM context_sets WHERE set_id=$1","SELECT * FROM v1_control.context_sets WHERE set_id=$1";request.input.id.as_str()) }, CommitEffect::NotCommitted).await?;
+        let space_kinds = if let Some(home_row) = &observed_home {
+            let home = SpaceId::parse(&home_row.home_space)?;
+            let current = self.current_account(&ctx, &budget).await?;
+            budget
+                .run(
+                    self.context_precheck_spaces(&current, &BTreeMap::from([(home, true)])),
+                    CommitEffect::NotCommitted,
+                )
+                .await?
+        } else {
+            BTreeMap::new()
+        };
         let mut tx = self.store.write(budget.clone()).await?;
         let revision = budget.run(async {
             let owner = self.context_manager(tx.inner_mut(), &ctx).await?;
@@ -262,7 +328,7 @@ impl ControlService {
             let home = SpaceId::parse(&observed_home.as_ref().ok_or(DomainError::ResourceNotFound)?.home_space)?;
             let mut spaces = BTreeMap::from([(home.clone(), true)]);
             for row in &observed { spaces.insert(SpaceId::parse(&row.target_space)?, true); }
-            self.context_write_spaces(tx.inner_mut(), &ctx, &owner, &BTreeMap::from([(home.clone(), true)]), &spaces).await?;
+            self.context_write_spaces(tx.inner_mut(), &ctx, &owner, &BTreeMap::from([(home.clone(), true)]), &spaces, &space_kinds).await?;
             let row = bundle(tx.inner_mut(), &request.input.id, true).await?.ok_or(DomainError::ResourceNotFound)?;
             if row.home_space != home.as_str() { return Err(invalid(ValidationReason::CursorStale)); }
             if row.revision as u64 != request.input.expected.get() { return Err(DomainError::ControlRevisionConflict { current: ControlRevision::new(row.revision as u64)? }.into()); }

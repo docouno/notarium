@@ -183,6 +183,7 @@ async fn shared(pg: bool) {
                 identity: command(&owner, &owner, 95, setup.revision),
                 input: SetProviderPreference {
                     scope: ProviderPreferenceScope::Space(catalog.space.id.clone()),
+                    kind: PreferenceModelKind::Completion,
                     resource: setup.selection.provider.clone(),
                     model: setup.selection.model.clone(),
                 },
@@ -196,6 +197,7 @@ async fn shared(pg: bool) {
         .select_provider(
             setup.space.clone(),
             SelectProvider {
+                kind: PreferenceModelKind::Completion,
                 resource: None,
                 model: None,
                 project: None,
@@ -236,6 +238,7 @@ async fn shared(pg: bool) {
             .select_provider(
                 setup.space.clone(),
                 SelectProvider {
+                    kind: PreferenceModelKind::Completion,
                     resource: None,
                     model: None,
                     project: None

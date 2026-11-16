@@ -32,6 +32,17 @@ pub fn budget() -> CallBudget {
     }
 }
 pub fn evidence(kind: AuthEvidenceKind, token: &str) -> PreAuthContext {
+    let mut evidence = AuthEvidence::new(kind, token.into());
+    if kind == AuthEvidenceKind::Session {
+        evidence = evidence.with_human_management();
+    }
+    PreAuthContext {
+        budget: budget(),
+        evidence,
+    }
+}
+#[allow(dead_code)]
+pub fn unconfirmed_evidence(kind: AuthEvidenceKind, token: &str) -> PreAuthContext {
     PreAuthContext {
         budget: budget(),
         evidence: AuthEvidence::new(kind, token.into()),
@@ -218,7 +229,7 @@ impl ControlCatalogPort for Catalog {
                 .map(|entry| entry.2.clone())
                 .ok_or(DomainError::ResourceNotFound)?;
             ctx.check_current(&space.history)?;
-            ctx.auth().authorize_read(&ResourceFacts {
+            ctx.auth().can_view_resource(&ResourceFacts {
                 space: space.space,
                 class: notarium_core::classes::DocClass::UserDoc,
                 ancestor_folders: vec![project.folder_id.clone()],
@@ -304,7 +315,7 @@ impl ControlCatalogPort for Catalog {
                 .get(&(note.space_id, note.note_id))
                 .cloned()
                 .ok_or(DomainError::ResourceNotFound)?;
-            ctx.auth().authorize_read(&value.facts)?;
+            ctx.auth().can_view_resource(&value.facts)?;
             Ok(value)
         })
     }
@@ -317,7 +328,7 @@ impl ControlCatalogPort for Catalog {
                 .get(&(folder.space_id, folder.folder_id))
                 .cloned()
                 .ok_or(DomainError::ResourceNotFound)?;
-            ctx.auth().authorize_folder_read(
+            ctx.auth().can_view_folder(
                 &value.space,
                 &value.reference.folder_id,
                 &value.ancestor_folders,

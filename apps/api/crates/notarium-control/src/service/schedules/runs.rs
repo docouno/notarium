@@ -6,6 +6,7 @@ impl ControlService {
         ctx: MaintenanceContext,
         request: ClaimSchedule,
     ) -> Result<ScheduleClaim, PortError> {
+        Box::pin(async move {
         ctx.authority.require(ServicePurpose::Scheduler)?;
         let slot = ms(request.slot)?;
         let next_slot = ms(request.next_slot)?;
@@ -18,6 +19,77 @@ impl ControlService {
             .to_vec();
         let budget = OperationBudget::new(ctx.budget.clone());
         let observed = self.observe_schedule(&budget, &request.schedule).await?;
+        let prechecked_catalog = if observed.deleted_at.is_none() && observed.paused_reason.is_none() {
+            let observed_info = schedule_info(&observed)?;
+            let space = SpaceId::parse(&observed.space_id)?;
+            let mut rtx = self.store.read(budget.clone()).await?;
+            let probe_source = budget
+                .run(
+                    async {
+                        let owner = user_read(rtx.inner_mut(), &observed.owner_id).await?;
+                        self.schedule_source(
+                            rtx.inner_mut(),
+                            &owner,
+                            &space,
+                            AuthenticatedCredential::ScheduledRun {
+                                schedule: request.schedule.clone(),
+                                run: AgentRunId::from_bytes([0; 16]),
+                                lease: LeaseEpoch::new(1)?,
+                            },
+                            grant("scheduled-run-probe", request.schedule.as_str()),
+                            false,
+                        )
+                        .await
+                    },
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            budget
+                .run(rtx.finish(), CommitEffect::NotCommitted)
+                .await?;
+            if let Some((probe_auth, _)) = probe_source {
+                let keeper = probe_auth.for_keeper(
+                    AgentRunId::from_bytes([0; 16]),
+                    space.clone(),
+                    observed_info
+                        .definition
+                        .project
+                        .as_ref()
+                        .map(|p| p.folder_id.clone()),
+                    BTreeSet::from([observed_info.definition.approved_role.id.clone()]),
+                )?;
+                let current = AccountContext::new(keeper, budget.context(ctx.budget.request.clone()));
+                Some(
+                    budget
+                        .run(
+                            async {
+                                let facts = self.catalog_space(&current, &space).await?;
+                                if let Some(project) = &observed_info.definition.project {
+                                    self.catalog_project(&current, project).await?;
+                                }
+                                let raw = match self
+                                    .raw_ability(
+                                        &current,
+                                        observed_info.definition.approved_role.identity(),
+                                    )
+                                    .await
+                                {
+                                    Ok(raw) => Some(raw),
+                                    Err(error) if hidden(&error) => None,
+                                    Err(error) => return Err(error),
+                                };
+                                Ok::<_, PortError>((observed.config_revision, facts.history, raw))
+                            },
+                            CommitEffect::NotCommitted,
+                        )
+                        .await,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut tx = self.store.write(budget.clone()).await?;
         let (result,events)=budget.run(async {
             let owner=user(tx.inner_mut(),&observed.owner_id).await?;
@@ -25,7 +97,7 @@ impl ControlService {
             let lease=LeaseEpoch::new(1)?;
             let space=SpaceId::parse(&observed.space_id)?;
             let credential=AuthenticatedCredential::ScheduledRun{schedule:request.schedule.clone(),run:run.clone(),lease};
-            let source=self.schedule_source(tx.inner_mut(),&owner,&space,credential,grant("scheduled-run",run.as_str())).await?;
+            let source=self.schedule_source(tx.inner_mut(),&owner,&space,credential,grant("scheduled-run",run.as_str()),true).await?;
             let row=schedule(tx.inner_mut(),&request.schedule,true).await?;
             let previous=rows!(tx.inner_mut(),AgentScheduleRunsRow,fetch_optional,"SELECT * FROM agent_schedule_runs WHERE schedule_id=$1 AND slot_utc_ms=$2","SELECT * FROM v1_control.agent_schedule_runs WHERE schedule_id=$1 AND slot_utc_ms=$2";request.schedule.as_str(),slot)?;
             if let Some(previous)=previous {
@@ -44,17 +116,29 @@ impl ControlService {
             else if let Some((source,admission))=source {
                 let keeper=source.for_keeper(run.clone(),space.clone(),info.definition.project.as_ref().map(|p|p.folder_id.clone()),BTreeSet::from([info.definition.approved_role.id.clone()]))?;
                 let current=AccountContext::new(keeper.clone(),budget.context(ctx.budget.request.clone()));
-                let facts=async {
-                    let facts=self.catalog_space(&current,&space).await?;
-                    if let Some(project)=&info.definition.project {self.catalog_project(&current,project).await?;}
-                    Ok::<_,PortError>(facts)
-                }.await;
-                match facts {
-                    Err(error) if hidden(&error)=>reason=Some(SchedulePauseReason::SpaceUnavailable),
-                    Err(error)=>return Err(error),
-                    Ok(facts)=>{
-                        if !self.current_role_in_project(tx.inner_mut(),&current,&info.definition.approved_role,info.definition.project.as_ref()).await? {reason=Some(SchedulePauseReason::RoleChanged);}
-                        else {admitted=Some((keeper,admission,facts.history));}
+                match prechecked_catalog {
+                    None => return Err(DomainError::ControlRevisionConflict{current:ControlRevision::new(row.revision as u64)?}.into()),
+                    Some(Err(error)) if hidden(&error)=>reason=Some(SchedulePauseReason::SpaceUnavailable),
+                    Some(Err(error))=>return Err(error),
+                    Some(Ok((observed_cfg,history,raw_opt)))=>{
+                        if observed_cfg != row.config_revision {
+                            return Err(DomainError::ControlRevisionConflict{current:ControlRevision::new(row.revision as u64)?}.into());
+                        }
+                        if let Some(raw) = raw_opt
+                            && raw.reference == info.definition.approved_role
+                            && self
+                                .current_role_db_only(
+                                    tx.inner_mut(),
+                                    &current,
+                                    raw,
+                                    info.definition.project.as_ref(),
+                                )
+                                .await?
+                        {
+                            admitted = Some((keeper, admission, history));
+                        } else {
+                            reason = Some(SchedulePauseReason::RoleChanged);
+                        }
                     }
                 }
             } else {
@@ -71,7 +155,7 @@ impl ControlService {
             }
             let (keeper,admission,history)=admitted.ok_or_else(||invalid(ValidationReason::InvalidState))?;
             let expires_at=now.checked_add(info.definition.limits.timeout_ms as i64).ok_or_else(||invalid(ValidationReason::InvalidTimestamp))?;
-            let record=TargetRecord::AgentScheduleRuns(AgentScheduleRunsRow{
+            let record=TargetRecord::from(AgentScheduleRunsRow{
                 run_id:run.to_string(),schedule_id:request.schedule.to_string(),slot_utc_ms:slot,lease_epoch:1,
                 claim_request_hash:fingerprint,claimed_schedule_revision:row.revision,reserved_next_slot:next_slot,status:"claimed".into(),
                 started_at:now,finished_at:None,safe_result:None,owner_auth_version:owner.auth_version,config_revision:row.config_revision,
@@ -88,6 +172,8 @@ impl ControlService {
             self.flush_event(&budget, event).await?;
         }
         Ok(result)
+        })
+        .await
     }
     pub async fn record_schedule_result(
         &self,

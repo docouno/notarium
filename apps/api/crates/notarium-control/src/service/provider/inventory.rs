@@ -2,7 +2,7 @@ use super::{ProviderService, records::*};
 use crate::{
     error::invalid,
     store::{
-        Transaction, WriteTransaction,
+        ReadTransaction, Transaction,
         lease::OperationBudget,
         statements::{page_rows, rows},
         target::*,
@@ -50,19 +50,19 @@ impl ProviderService {
         kind: &str,
         id: Option<ProviderResourceId>,
         page: &ControlPageRequest,
-    ) -> Result<(WriteTransaction, OperationBudget, Cursor), PortError> {
+    ) -> Result<(ReadTransaction, OperationBudget, Cursor), PortError> {
         let old: Option<Cursor> = page.continuation().map(parse).transpose()?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.control.store.write(budget.clone()).await?;
+        let mut tx = self.control.store.read(budget.clone()).await?;
         let cursor = budget
             .run(
                 async {
                     let (_, owner) = self
                         .control
-                        .manager(tx.inner_mut(), ctx.auth(), ctx.auth().principal())
+                        .manager_read(tx.inner_mut(), ctx.auth(), ctx.auth().principal())
                         .await?;
                     let resource_revision = if let Some(id) = &id {
-                        let row = resource(tx.inner_mut(), id.as_str()).await?;
+                        let row = resource_read(tx.inner_mut(), id.as_str()).await?;
                         resource_visible(tx.inner_mut(), &owner.user_id, &row).await?;
                         Some(row.revision)
                     } else {
@@ -212,18 +212,17 @@ impl ProviderService {
     ) -> Result<ProviderAttachmentReview, PortError> {
         let observed = self.observe_attachment(&ctx, &id).await?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.control.store.write(budget.clone()).await?;
+        let mut tx = self.control.store.read(budget.clone()).await?;
         let result = budget
             .run(
                 async {
                     let (_, owner) = self
                         .control
-                        .manager(tx.inner_mut(), ctx.auth(), ctx.auth().principal())
+                        .manager_read(tx.inner_mut(), ctx.auth(), ctx.auth().principal())
                         .await?;
                     let space = SpaceId::parse(&observed.target_space)?;
-                    super::attachments::lock_space_read(tx.inner_mut(), &space).await?;
-                    let resource = resource(tx.inner_mut(), &observed.resource_id).await?;
-                    let row = attachment(tx.inner_mut(), id.as_str()).await?;
+                    let resource = resource_read(tx.inner_mut(), &observed.resource_id).await?;
+                    let row = attachment_read(tx.inner_mut(), id.as_str()).await?;
                     if row.resource_id != resource.id
                         || attachment_target(&row)? != attachment_target(&observed)?
                     {
@@ -233,13 +232,17 @@ impl ProviderService {
                         super::attachments::check_member(tx.inner_mut(), ctx.auth(), &space)
                             .await?;
                         if row.target_owner.as_deref() != Some(owner.user_id.as_str()) {
-                            super::super::spaces::require_owner(tx.inner_mut(), ctx.auth(), &space)
-                                .await?;
+                            super::super::spaces::require_owner_read(
+                                tx.inner_mut(),
+                                ctx.auth(),
+                                &space,
+                            )
+                            .await?;
                         }
                     }
                     let current_credential_consent_epoch = if let Some(id) = &resource.credential_id
                     {
-                        Some(credential(tx.inner_mut(), id).await?.consent_epoch as u64)
+                        Some(credential_read(tx.inner_mut(), id).await?.consent_epoch as u64)
                     } else {
                         None
                     };

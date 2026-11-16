@@ -118,6 +118,7 @@ async fn concurrent_selection(
         provider.select_provider(
             scope(actor, history),
             SelectProvider {
+                kind: PreferenceModelKind::Completion,
                 resource: Some(resource.clone()),
                 model: Some(ModelProfileId::from_bytes([40; 16])),
                 project: None,
@@ -194,6 +195,7 @@ async fn concurrent_selection(
             identity: identity(control, owner, 230 + index).await,
             input: SetProviderPreference {
                 scope: ProviderPreferenceScope::Space(history.space_id.clone()),
+                kind: PreferenceModelKind::Completion,
                 resource: resource.clone(),
                 model: ModelProfileId::from_bytes([40; 16]),
             },
@@ -579,6 +581,7 @@ async fn offers(pg: bool) {
             .select_provider(
                 ctx,
                 SelectProvider {
+                    kind: PreferenceModelKind::Completion,
                     resource: Some(review.resource.id.clone()),
                     model: Some(ModelProfileId::from_bytes([40; 16])),
                     project: None,

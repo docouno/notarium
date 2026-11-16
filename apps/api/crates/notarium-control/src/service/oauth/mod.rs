@@ -27,6 +27,7 @@ pub struct OAuthService {
     keyring: Arc<Keyring>,
     outbound: Arc<OutboundTransport>,
     metadata: OAuthMetadata,
+    limits: clients::ClientLimits,
 }
 fn rejected(error: OAuthErrorCode) -> PortError {
     DomainError::OAuth { error }.into()
@@ -71,6 +72,7 @@ impl OAuthService {
             control,
             keyring,
             outbound,
+            limits: clients::ClientLimits::new(),
         })
     }
 }

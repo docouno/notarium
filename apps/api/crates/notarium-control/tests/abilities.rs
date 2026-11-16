@@ -124,7 +124,8 @@ async fn exercise(pg: bool) {
             .resolve(PreAuthContext {
                 budget: budget(),
                 evidence: AuthEvidence::new(AuthEvidenceKind::Session, token.expose().into())
-                    .with_human_management(),
+                    .with_human_management()
+                    .with_ability_write(),
             })
             .await
             .unwrap(),
@@ -402,7 +403,13 @@ async fn exercise(pg: bool) {
         .unwrap();
     assert!(matches!(
         service
-            .resolve_ability(plain.clone(), AbilitySelection::Exact(system.clone()))
+            .resolve_ability(
+                plain.clone(),
+                AbilitySelection::Exact {
+                    reference: system.clone(),
+                    project: None,
+                },
+            )
             .await
             .unwrap(),
         AbilityResolution::Disabled
@@ -423,7 +430,13 @@ async fn exercise(pg: bool) {
     assert_eq!(
         resolved(
             service
-                .resolve_ability(plain.clone(), AbilitySelection::Exact(system))
+                .resolve_ability(
+                    plain.clone(),
+                    AbilitySelection::Exact {
+                        reference: system,
+                        project: None,
+                    },
+                )
                 .await
                 .unwrap()
         )
@@ -457,7 +470,13 @@ async fn exercise(pg: bool) {
     assert_eq!(
         resolved(
             service
-                .resolve_ability(ctx.clone(), AbilitySelection::Exact(personal.clone()))
+                .resolve_ability(
+                    ctx.clone(),
+                    AbilitySelection::Exact {
+                        reference: personal.clone(),
+                        project: None,
+                    },
+                )
                 .await
                 .unwrap()
         )
@@ -497,7 +516,13 @@ async fn exercise(pg: bool) {
     assert_eq!(
         resolved(
             service
-                .resolve_ability(ctx.clone(), AbilitySelection::Exact(personal.clone()))
+                .resolve_ability(
+                    ctx.clone(),
+                    AbilitySelection::Exact {
+                        reference: personal.clone(),
+                        project: None,
+                    },
+                )
                 .await
                 .unwrap()
         )
@@ -508,7 +533,13 @@ async fn exercise(pg: bool) {
     stale_ref.revision = RevisionId::from_bytes([99; 16]);
     assert!(matches!(
         service
-            .resolve_ability(ctx.clone(), AbilitySelection::Exact(stale_ref))
+            .resolve_ability(
+                ctx.clone(),
+                AbilitySelection::Exact {
+                    reference: stale_ref,
+                    project: None,
+                },
+            )
             .await
             .unwrap(),
         AbilityResolution::Stale

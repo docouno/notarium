@@ -34,6 +34,10 @@ impl SqliteCut {
         barrier
             .busy_timeout(Duration::from_millis(5))
             .map_err(|_| failure())?;
+        barrier
+            .execute_batch("PRAGMA journal_size_limit=4194304; PRAGMA trusted_schema=OFF;")
+            .map_err(|_| failure())?;
+        let _ = barrier.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         let source = Connection::open_with_flags(
             source,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -149,7 +153,6 @@ impl SqliteCut {
         if count != keys.len() {
             return Err(failure());
         }
-        session.check()?;
         Ok(expected.clone())
     }
     pub(crate) fn spool(&mut self, session: &Session) -> Result<(), PortError> {

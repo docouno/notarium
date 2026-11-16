@@ -105,7 +105,7 @@ async fn exercise(pg: bool) {
         project: None,
         title: "private schedule title".into(),
         init_prompt: "private initial prompt".into(),
-        cron: "* * * * * * *".into(),
+        cron: "20 * * * * * *".into(),
         timezone: "UTC".into(),
         approved_role: role.clone(),
         limits: RunLimits::default(),
@@ -143,6 +143,25 @@ async fn exercise(pg: bool) {
         .await
         .unwrap();
     assert_eq!(due.items.len(), 1);
+    let sub_ms = Timestamp::parse(
+        &chrono::DateTime::from_timestamp(now / 1000, 500_123)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+    )
+    .unwrap();
+    assert_eq!(
+        service
+            .list_due_schedules(
+                scheduler(),
+                sub_ms,
+                ControlPageRequest::new(1, None).unwrap(),
+            )
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
     assert!(
         service
             .list_due_schedules(
@@ -170,7 +189,7 @@ async fn exercise(pg: bool) {
         slot: tick(now),
         current_role: role.clone(),
         expected: created.revision,
-        next_slot: tick(now + 1000),
+        next_slot: tick(now + 60_000),
     };
     let mut workers = Vec::new();
     for _ in 0..3 {
@@ -242,23 +261,23 @@ async fn exercise(pg: bool) {
         ScheduleRunStatus::Claimed
     );
     let mut different = claim.clone();
-    different.next_slot = tick(now + 2000);
+    different.next_slot = tick(now + 120_000);
     assert!(
         restarted
             .claim_schedule(scheduler(), different)
             .await
             .is_err()
     );
-    fixture.clock.0.store(now + 1000, Ordering::SeqCst);
+    fixture.clock.0.store(now + 60_000, Ordering::SeqCst);
     let (run2, lease2, keeper2) = match service
         .claim_schedule(
             scheduler(),
             ClaimSchedule {
                 schedule: created.id.clone(),
-                slot: tick(now + 1000),
+                slot: tick(now + 60_000),
                 current_role: role.clone(),
                 expected: advanced.revision,
-                next_slot: tick(now + 2000),
+                next_slot: tick(now + 120_000),
             },
         )
         .await
@@ -399,7 +418,7 @@ async fn exercise(pg: bool) {
                     schedule: created.id.clone(),
                     expected: paused.revision,
                     definition: definition.clone(),
-                    next_slot: tick(now + 2000),
+                    next_slot: tick(now + 120_000),
                     paused: false,
                 },
             },
@@ -407,7 +426,7 @@ async fn exercise(pg: bool) {
         .await
         .unwrap()
         .value;
-    fixture.clock.0.store(now + 2000, Ordering::SeqCst);
+    fixture.clock.0.store(now + 120_000, Ordering::SeqCst);
     fixture.catalog.ability_entries.lock().unwrap()[0]
         .reference
         .revision = RevisionId::from_bytes([8; 16]);
@@ -416,10 +435,10 @@ async fn exercise(pg: bool) {
             scheduler(),
             ClaimSchedule {
                 schedule: created.id.clone(),
-                slot: tick(now + 2000),
+                slot: tick(now + 120_000),
                 current_role: role.clone(),
                 expected: resumed.revision,
-                next_slot: tick(now + 3000),
+                next_slot: tick(now + 180_000),
             },
         )
         .await
@@ -432,7 +451,7 @@ async fn exercise(pg: bool) {
         service
             .list_due_schedules(
                 scheduler(),
-                tick(now + 2000),
+                tick(now + 120_000),
                 ControlPageRequest::new(200, None).unwrap()
             )
             .await
@@ -454,7 +473,7 @@ async fn exercise(pg: bool) {
                     schedule: created.id.clone(),
                     expected: changed.revision,
                     definition: definition.clone(),
-                    next_slot: tick(now + 2000),
+                    next_slot: tick(now + 120_000),
                     paused: false,
                 },
             },
@@ -467,10 +486,10 @@ async fn exercise(pg: bool) {
             scheduler(),
             ClaimSchedule {
                 schedule: created.id.clone(),
-                slot: tick(now + 2000),
+                slot: tick(now + 120_000),
                 current_role: role.clone(),
                 expected: active.revision,
-                next_slot: tick(now + 3000),
+                next_slot: tick(now + 180_000),
             },
         )
         .await
@@ -484,7 +503,7 @@ async fn exercise(pg: bool) {
         } => (run, lease, context),
         other => panic!("{other:?}"),
     };
-    fixture.clock.0.store(now + 302_000, Ordering::SeqCst);
+    fixture.clock.0.store(now + 480_000, Ordering::SeqCst);
     assert!(
         service
             .whoami(AccountContext::new(keeper3.auth().clone(), budget()))
@@ -554,20 +573,29 @@ async fn exercise(pg: bool) {
         .observer
         .count("SELECT next_slot_utc_ms FROM agent_schedules LIMIT 1")
         .await;
-    assert_eq!(persisted, now + 3000);
+    assert_eq!(persisted, now + 180_000);
+    assert_eq!(
+        fixture
+            .observer
+            .text("SELECT init_prompt FROM agent_schedules LIMIT 1")
+            .await,
+        ""
+    );
     assert!(!fixture.revoker.calls.lock().unwrap().is_empty());
-    // Invalid parser input and over-budget runs cannot create rows.
+    // Invalid parser input, sub-minute cron, and over-budget runs cannot create rows.
     for (i, mut def) in [
         (6, definition.clone()),
         (7, definition.clone()),
-        (8, definition),
+        (8, definition.clone()),
+        (9, definition),
     ]
     .into_iter()
     {
         match i {
             6 => def.timezone = "invalid/zone".into(),
             7 => def.cron = "every day".into(),
-            _ => def.limits.max_steps = 1001,
+            8 => def.limits.max_steps = 1001,
+            _ => def.cron = "* * * * * * *".into(),
         }
         assert!(
             service
@@ -667,7 +695,7 @@ async fn authority_changes(
         project: Some(project.clone()),
         title: "Scope checks".into(),
         init_prompt: "Inspect project memory".into(),
-        cron: "* * * * * * *".into(),
+        cron: "20 * * * * * *".into(),
         timezone: "UTC".into(),
         approved_role: role.clone(),
         limits: RunLimits::default(),
@@ -694,7 +722,7 @@ async fn authority_changes(
             ClaimSchedule {
                 schedule: created.id.clone(),
                 slot: tick(now),
-                next_slot: tick(now + 1000),
+                next_slot: tick(now + 60_000),
                 current_role: role.clone(),
                 expected: created.revision,
             },
@@ -755,15 +783,15 @@ async fn authority_changes(
         .await
         .unwrap();
     assert!(service.whoami(account).await.is_err());
-    fixture.clock.0.store(now + 1000, Ordering::SeqCst);
+    fixture.clock.0.store(now + 60_000, Ordering::SeqCst);
     assert!(matches!(
         service
             .claim_schedule(
                 scheduler(),
                 ClaimSchedule {
                     schedule: created.id.clone(),
-                    slot: tick(now + 1000),
-                    next_slot: tick(now + 2000),
+                    slot: tick(now + 60_000),
+                    next_slot: tick(now + 120_000),
                     current_role: role.clone(),
                     expected: advanced.revision
                 }
@@ -795,7 +823,7 @@ async fn authority_changes(
         project: None,
         title: "Auth version check".into(),
         init_prompt: "Inspect memory".into(),
-        cron: "* * * * * * *".into(),
+        cron: "20 * * * * * *".into(),
         timezone: "UTC".into(),
         approved_role: role.clone(),
         limits: RunLimits::default(),
@@ -808,7 +836,7 @@ async fn authority_changes(
                 input: CreateSchedule {
                     id: ScheduleId::from_bytes([31; 16]),
                     definition,
-                    next_slot: tick(now + 1000),
+                    next_slot: tick(now + 60_000),
                     paused: false,
                 },
             },
@@ -821,8 +849,8 @@ async fn authority_changes(
             scheduler(),
             ClaimSchedule {
                 schedule: created.id,
-                slot: tick(now + 1000),
-                next_slot: tick(now + 2000),
+                slot: tick(now + 60_000),
+                next_slot: tick(now + 120_000),
                 current_role: role,
                 expected: created.revision,
             },

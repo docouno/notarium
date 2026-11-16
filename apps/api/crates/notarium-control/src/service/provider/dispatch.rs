@@ -23,26 +23,15 @@ use reqwest::{
 };
 use std::{
     future::Future,
-    sync::{Arc, LazyLock, Mutex},
-    time::Duration,
+    sync::{Arc, Mutex},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 #[path = "responses.rs"]
 mod responses;
 #[cfg(test)]
 #[path = "dispatch_tests.rs"]
 mod tests;
 
-static ACTIVE: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(32)));
-fn permit() -> Result<OwnedSemaphorePermit, PortError> {
-    ACTIVE.clone().try_acquire_owned().map_err(|_| {
-        DomainError::RateLimited {
-            retry_after_ms: 100,
-            budget: BudgetKind::Concurrency,
-        }
-        .into()
-    })
-}
 fn failed() -> PortError {
     unavailable("provider worker", CommitEffect::Unknown)
 }
@@ -74,18 +63,16 @@ impl Leases {
         operation: impl Future<Output = Result<T, PortError>>,
     ) -> Result<T, PortError> {
         self.check()?;
-        runtime.run(async {
-            tokio::select! {biased;
-                error = async {loop {if let Err(error)=self.check(){break error;} tokio::time::sleep(Duration::from_millis(1)).await;}} => Err(error),
-                result = operation => result,
-            }
-        },CommitEffect::Unknown).await
+        let result = runtime.run(operation, CommitEffect::Unknown).await;
+        self.check()?;
+        result
     }
 }
 struct Progress {
     call: RequestId,
     reserved: bool,
     submitted: bool,
+    mismatch: bool,
     usage: ProviderUsage,
     leases: Leases,
     response: Option<OutboundResponse>,
@@ -115,12 +102,21 @@ impl PortStream<CompletionEvent> for CompletionStream {
     }
 }
 impl ProviderService {
+    fn acquire_call_permit(&self) -> Result<OwnedSemaphorePermit, PortError> {
+        self.active_calls.clone().try_acquire_owned().map_err(|_| {
+            DomainError::RateLimited {
+                retry_after_ms: 100,
+                budget: BudgetKind::Concurrency,
+            }
+            .into()
+        })
+    }
     pub async fn complete(
         &self,
         ctx: SpaceContext,
         request: CompletionRequest,
     ) -> Result<Box<dyn PortStream<CompletionEvent>>, PortError> {
-        let permit = permit()?;
+        let permit = self.acquire_call_permit()?;
         let job = Job::completion(ctx, request);
         let runtime = Runtime::new(job.ctx.budget.clone());
         runtime.check(CommitEffect::NotCommitted)?;
@@ -159,7 +155,7 @@ impl ProviderService {
         }))
     }
     async fn unary(&self, job: Job) -> Result<Output, PortError> {
-        let permit = permit()?;
+        let permit = self.acquire_call_permit()?;
         let runtime = Runtime::new(job.ctx.budget.clone());
         runtime.check(CommitEffect::NotCommitted)?;
         let _guard = CancelOnDrop(runtime.cancelled.clone());
@@ -202,6 +198,7 @@ impl ProviderService {
             call: RequestId::from_bytes(crate::auth::token::random()?),
             reserved: false,
             submitted: false,
+            mismatch: false,
             usage: ProviderUsage::Unknown,
             leases: Leases::default(),
             response: None,
@@ -230,6 +227,7 @@ impl ProviderService {
             };
             let diagnostic = match &result {
                 Err(PortError::Domain(DomainError::Provider { error })) => Some(*error),
+                Ok(_) if progress.mismatch => Some(ProviderErrorCode::BudgetMismatch),
                 _ => None,
             };
             self.finalize(
@@ -254,7 +252,7 @@ impl ProviderService {
         let scope_key = job.scope_key()?;
         let mut tx = runtime
             .run(
-                self.control.store.write(runtime.budget.clone()),
+                self.control.store.read(runtime.budget.clone()),
                 CommitEffect::NotCommitted,
             )
             .await?;
@@ -263,9 +261,9 @@ impl ProviderService {
                 async {
                     let auth = self
                         .control
-                        .revalidate(tx.inner_mut(), job.ctx.auth())
+                        .revalidate_read(tx.inner_mut(), job.ctx.auth())
                         .await?;
-                    accounting::existing(
+                    accounting::existing_read(
                         tx.inner_mut(),
                         auth.principal().as_str(),
                         &scope_key,
@@ -321,6 +319,10 @@ impl ProviderService {
         } else {
             Vec::new()
         };
+        let keeper = self
+            .control
+            .precheck_keeper_catalog(job.ctx.auth(), &runtime.budget, &job.ctx.budget.request)
+            .await?;
         let authority = || DispatchAuthority {
             snapshot: &snapshot,
             ctx: &job.ctx,
@@ -328,6 +330,7 @@ impl ProviderService {
             project: job.project(),
             parts: &parts,
             current: &current,
+            keeper: keeper.as_ref(),
         };
         let body = job.encode(&snapshot)?;
         let mut tx = runtime

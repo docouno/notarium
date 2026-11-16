@@ -17,7 +17,7 @@ use crate::{
 };
 use notarium_core::{
     DomainError,
-    auth::{AuthenticatedCredential, EngineAuthContext, PrincipalKind, Space},
+    auth::{AuthenticatedCredential, EngineAuthContext, Space},
     classes::{ClassEgressFence, ProviderCurrentContent, ProviderMessage},
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
@@ -49,6 +49,7 @@ pub(super) struct DispatchAuthority<'a> {
     pub project: Option<&'a FolderRef>,
     pub parts: &'a [ProviderMessage],
     pub current: &'a [ProviderCurrentContent],
+    pub keeper: Option<&'a crate::service::schedules::PrecheckedKeeper>,
 }
 impl Snapshot {
     pub fn budgets(
@@ -123,6 +124,7 @@ impl ProviderService {
             project,
             parts,
             current,
+            keeper,
         } = authority;
         let users = rows!(tx,UsersRow,fetch_all,"SELECT * FROM users WHERE user_id IN ($1,$2) ORDER BY user_id","SELECT * FROM v1_control.users WHERE user_id IN ($1,$2) ORDER BY user_id FOR UPDATE";ctx.auth().principal().as_str(),&snapshot.resource.owner_id)?;
         if !users
@@ -131,7 +133,10 @@ impl ProviderService {
         {
             return Err(selection::unavailable());
         }
-        let auth = self.control.revalidate(tx, ctx.auth()).await?;
+        let auth = self
+            .control
+            .revalidate_with_keeper(tx, ctx.auth(), keeper)
+            .await?;
         let resource = resource(tx, &snapshot.resource.id).await?;
         if resource.owner_id != snapshot.resource.owner_id
             || resource.runtime_epoch != snapshot.resource.runtime_epoch
@@ -193,19 +198,28 @@ impl ProviderService {
         {
             return Err(invalid(ValidationReason::ScopeMismatch));
         }
-        if primary.is_none()
-            && (auth.kind() != &PrincipalKind::DirectHuman
-                || auth.principal().as_str() != resource.owner_id)
-        {
-            return Err(DomainError::AccessDenied.into());
+        if primary.is_none() {
+            auth.authorize_human_management()?;
+            if auth.principal().as_str() != resource.owner_id {
+                return Err(DomainError::AccessDenied.into());
+            }
         }
         let mut policies: BTreeMap<SpaceId, PolicyAdmission> = BTreeMap::new();
         let now = self.control.clock.now_ms()?;
         for space in spaces.values() {
             policies.insert(
                 space.id.clone(),
-                selection::policy(tx, &auth, &resource, credential_epoch, space, project, now)
-                    .await?,
+                selection::policy(
+                    tx,
+                    &auth,
+                    &resource,
+                    credential_epoch,
+                    space,
+                    project,
+                    now,
+                    true,
+                )
+                .await?,
             );
         }
         let mut used = std::collections::BTreeSet::new();
@@ -283,36 +297,46 @@ impl ProviderService {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
         let id = ProviderResourceId::parse(&snapshot.resource.id)?;
-        let mut headers = HeaderMap::new();
-        let mut witnesses = Vec::new();
-        let mut bytes = 0usize;
+        let mut names = Vec::with_capacity(encrypted.len());
+        let mut batch = Vec::with_capacity(encrypted.len() + 1);
         for (name, ciphertext) in encrypted {
             let normalized = header(&name)?;
             if normalized != name {
                 return Err(invalid(ValidationReason::InvalidState));
             }
-            let (value, witness) = self
-                .keyring
-                .open_verified(
-                    budget.context(request.clone()),
-                    EnvelopeAddress::resource_header(&id, &name)?,
-                    &ciphertext,
-                )
-                .await?;
+            batch.push((EnvelopeAddress::resource_header(&id, &name)?, ciphertext));
+            names.push(name);
+        }
+        let credential_inject = if let Some(credential) = &snapshot.credential {
+            let mut inject: CredentialInjection = parse(&credential.injection)?;
+            injection(&mut inject)?;
+            batch.push((
+                EnvelopeAddress::credential(&CredentialId::parse(&credential.id)?),
+                credential.secret.clone(),
+            ));
+            Some(inject)
+        } else {
+            None
+        };
+        let mut opened = self
+            .keyring
+            .open_verified_many(budget.context(request.clone()), batch)
+            .await?
+            .into_iter();
+        let mut headers = HeaderMap::new();
+        let mut witnesses = Vec::with_capacity(names.len() + 1);
+        let mut bytes = 0usize;
+        for name in names {
+            let (value, witness) = opened
+                .next()
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
             put_header(&mut headers, &name, value.expose(), &mut bytes)?;
             witnesses.push(witness);
         }
-        if let Some(credential) = &snapshot.credential {
-            let mut inject: CredentialInjection = parse(&credential.injection)?;
-            injection(&mut inject)?;
-            let (value, witness) = self
-                .keyring
-                .open_verified(
-                    budget.context(request.clone()),
-                    EnvelopeAddress::credential(&CredentialId::parse(&credential.id)?),
-                    &credential.secret,
-                )
-                .await?;
+        if let Some(inject) = credential_inject {
+            let (value, witness) = opened
+                .next()
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
             let value = format!("{}{}", inject.prefix, value.expose());
             put_header(&mut headers, &inject.header, &value, &mut bytes)?;
             witnesses.push(witness);

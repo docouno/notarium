@@ -37,22 +37,26 @@ fn chunk(delta: Value, reason: Option<&str>) -> Value {
 #[test]
 fn openai_sse_every_byte_boundary_preserves_text_tools_usage_and_terminal_order() {
     let raw = format!(
-        "\u{feff}: heartbeat\r\n\r\n{}{}{}{}{}data: [DONE]\r\n\r\n",
+        "\u{feff}: heartbeat\r\n\r\n{}{}{}{}{}{}data: [DONE]\r\n\r\n",
+        sse(json!({"model":"fixture-model-2026-11-16","choices":[]})),
         sse(chunk(
-            json!({"role":"assistant","content":"Hello 🦀"}),
+            json!({"role":"assistant","content":"Hello 🦀","tool_calls":null}),
             None
         )),
         sse(chunk(
-            json!({"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"look","arguments":"{\"city\":"}}]}),
+            json!({"role":null,"tool_calls":[{"index":0,"id":"functions.lookup:0","type":"function","function":{"name":"look","arguments":"{\"city\":"}}]}),
             None
         )),
         sse(chunk(
-            json!({"tool_calls":[{"index":0,"function":{"name":"up","arguments":"\"東京\"}"}}]}),
+            json!({"tool_calls":[{"index":0,"id":null,"type":null,"function":{"name":"up","arguments":"\"東京\"}"}}]}),
             None
         )),
-        sse(chunk(json!({}), Some("tool_calls"))),
+        sse(chunk(
+            json!({"content":null,"tool_calls":null}),
+            Some("tool_calls")
+        )),
         sse(
-            json!({"model":"fixture-model","choices":[],"usage":{"prompt_tokens":23,"completion_tokens":17,"total_tokens":40}})
+            json!({"model":"fixture-model-2026-11-16","choices":[],"usage":{"prompt_tokens":23,"completion_tokens":17,"total_tokens":45}})
         ),
     );
     for boundary in 0..=raw.len() {
@@ -63,7 +67,7 @@ fn openai_sse_every_byte_boundary_preserves_text_tools_usage_and_terminal_order(
         assert_eq!(events.len(), 4);
         assert!(matches!(&events[0],CompletionEvent::Text(text) if text=="Hello 🦀"));
         assert!(
-            matches!(&events[1],CompletionEvent::ToolCall(call) if call.name=="lookup" && call.id.as_str()=="call_a" && call.arguments["city"]=="東京")
+            matches!(&events[1],CompletionEvent::ToolCall(call) if call.name=="lookup" && call.id.as_str()=="functions.lookup:0" && call.arguments["city"]=="東京")
         );
         assert!(matches!(
             events[2],
@@ -153,8 +157,29 @@ fn ollama_ndjson_byte_splits_and_tool_ids_are_stable_and_reasoning_is_not_text()
             }
         );
     }
+    // Ollama Go omitempty (zero eval_count omitted) and done_reason="tool_calls" are accepted.
+    let mut omitempty_parser = decoder(ProviderWireKind::Ollama);
+    let omitempty_raw = format!(
+        "{}\n{}",
+        json!({"model":"fixture-model:latest","message":{"tool_calls":[{"function":{"index":0,"name":"lookup","arguments":{"city":"Oslo"}}}]},"done":false}),
+        json!({"model":"fixture-model:latest","done":true,"done_reason":"tool_calls","prompt_eval_count":12}),
+    );
+    let mut omitempty_events = omitempty_parser.feed(omitempty_raw.as_bytes()).unwrap();
+    omitempty_events.extend(omitempty_parser.eof().unwrap());
+    assert_eq!(
+        omitempty_parser.usage(),
+        ProviderUsage::Exact {
+            input_tokens: 12,
+            output_tokens: 0
+        }
+    );
+    assert!(matches!(
+        omitempty_events.last(),
+        Some(CompletionEvent::Finished(CompletionFinish::ToolCalls))
+    ));
     for value in [
-        json!({"model":"fixture-model","done":true,"prompt_eval_count":2}),
+        json!({"model":"fixture-model","done":true,"prompt_eval_count":"bad"}),
+        json!({"model":"","done":true}),
         json!({"model":"fixture-model","message":{"tool_calls":[{"function":{"index":2,"name":"lookup","arguments":{}}}]},"done":true}),
         json!({"model":"fixture-model","message":{"tool_calls":[{"function":{"name":"unknown","arguments":{}}}]},"done":true}),
     ] {
@@ -311,7 +336,7 @@ fn encoded_requests_keep_base_paths_roles_tools_and_conservative_limits() {
     )
     .unwrap();
     assert_eq!(openai["max_completion_tokens"], 16);
-    assert_eq!(openai["store"], false);
+    assert!(openai.get("store").is_none());
     assert_eq!(openai["stream_options"]["include_usage"], true);
     assert_eq!(
         openai["tools"][0]["function"]["parameters"]["additionalProperties"],
@@ -321,25 +346,47 @@ fn encoded_requests_keep_base_paths_roles_tools_and_conservative_limits() {
         serde_json::from_slice(&completion(ProviderWireKind::Ollama, &model, &request).unwrap())
             .unwrap();
     assert_eq!(ollama["options"]["num_predict"], 16);
-    request.messages[0].role = CompletionRole::User;
-    assert!(completion(ProviderWireKind::OpenaiCompatible, &model, &request).is_err());
-    request.messages[0].role = CompletionRole::System;
+    assert!(ollama["options"].get("num_ctx").is_none());
+    // Tighter caller max_input_tokens (< model cap) and Cyrillic + tool-output instructions succeed.
+    request.budget.max_input_tokens = 4096;
+    request.messages.push(CompletionMessage {
+        role: CompletionRole::User,
+        instruction: Some(
+            ProviderInstruction::from_orchestrator("Привет! Проверь погоду в Москве.".into())
+                .unwrap(),
+        ),
+        parts: vec![],
+        tool_calls: vec![],
+        result_for: None,
+    });
     request.messages.push(CompletionMessage {
         role: CompletionRole::Assistant,
         instruction: None,
         parts: vec![],
         tool_calls: vec![ProviderToolCall {
-            id: ProviderToolCallId::new("call_x".into()).unwrap(),
+            id: ProviderToolCallId::new("functions.lookup:0".into()).unwrap(),
             name: "lookup".into(),
             arguments: BTreeMap::new(),
         }],
         result_for: None,
     });
+    request.messages.push(CompletionMessage {
+        role: CompletionRole::Tool,
+        instruction: None,
+        parts: vec![],
+        tool_calls: vec![],
+        result_for: Some(ProviderToolCallId::new("functions.lookup:0".into()).unwrap()),
+    });
+    assert!(completion(ProviderWireKind::OpenaiCompatible, &model, &request).is_ok());
+    request.messages.pop();
     assert!(
         completion(ProviderWireKind::OpenaiCompatible, &model, &request).is_err(),
         "unresolved tool calls cannot be sent as complete history"
     );
     request.messages.pop();
+    request.messages.pop();
+    request.budget.max_input_tokens = model.max_input_tokens + 1;
+    assert!(completion(ProviderWireKind::OpenaiCompatible, &model, &request).is_err());
     request.budget.max_input_tokens = 1;
     assert!(completion(ProviderWireKind::OpenaiCompatible, &model, &request).is_err());
 }

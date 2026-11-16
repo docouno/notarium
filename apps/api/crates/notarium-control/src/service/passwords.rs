@@ -35,11 +35,40 @@ impl ControlService {
         {
             return Err(denied());
         }
-        let email = request.identifier.trim().to_lowercase();
-        let observed=budget.run(async {read_rows!(&self.store.backend,UsersRow,fetch_optional,
-            "SELECT * FROM users WHERE username=$1 OR email=$2 ORDER BY CASE WHEN username=$1 THEN 0 ELSE 1 END LIMIT 1",
-            "SELECT * FROM v1_control.users WHERE username=$1 OR email=$2 ORDER BY CASE WHEN username=$1 THEN 0 ELSE 1 END LIMIT 1";&request.identifier,&email)
-        },CommitEffect::NotCommitted).await?;
+        // Usernames never contain `@`; emails always contain `@`. Disjoint lookup
+        // prevents any email/username cross-account ambiguity.
+        let is_email = request.identifier.contains('@');
+        let lookup = if is_email {
+            request.identifier.trim().to_lowercase()
+        } else {
+            request.identifier
+        };
+        let observed = budget
+            .run(
+                async {
+                    if is_email {
+                        read_rows!(
+                            &self.store.backend,
+                            UsersRow,
+                            fetch_optional,
+                            "SELECT * FROM users WHERE email=$1",
+                            "SELECT * FROM v1_control.users WHERE email=$1";
+                            &lookup
+                        )
+                    } else {
+                        read_rows!(
+                            &self.store.backend,
+                            UsersRow,
+                            fetch_optional,
+                            "SELECT * FROM users WHERE username=$1",
+                            "SELECT * FROM v1_control.users WHERE username=$1";
+                            &lookup
+                        )
+                    }
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
         let hash = observed
             .as_ref()
             .filter(|user| user.disabled_at.is_none())
@@ -73,16 +102,14 @@ impl ControlService {
         id: PrincipalId,
     ) -> Result<AccountInfo, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
         let (_, row) = budget
             .run(
-                self.manager(tx.inner_mut(), ctx.auth(), &id),
+                self.manager_read(rtx.inner_mut(), ctx.auth(), &id),
                 CommitEffect::NotCommitted,
             )
             .await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         account_info(&row)
     }
     pub async fn change_password(
@@ -93,18 +120,17 @@ impl ControlService {
         if !matches!(self.config.authentication, AuthenticationMode::Password) {
             return Err(denied());
         }
+        ctx.auth().authorize_human_management()?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.write(budget.clone()).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
         let (actor, observed) = budget
             .run(
-                self.manager(tx.inner_mut(), ctx.auth(), &request.account),
+                self.manager_read(rtx.inner_mut(), ctx.auth(), &request.account),
                 CommitEffect::NotCommitted,
             )
             .await?;
         expect_revision(&observed, request.expected)?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         if actor.user_id == observed.user_id {
             let current = request.current.ok_or_else(denied)?;
             let hash = observed.password_hash.as_deref().ok_or_else(denied)?;
@@ -144,6 +170,20 @@ impl ControlService {
     }
 }
 
+fn valid_email(value: &str) -> bool {
+    if value.is_empty() || value.len() > 254 || value.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return false;
+    }
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && !domain.contains('@')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+}
+
 pub(super) fn normalize_account(
     username: String,
     email: Option<String>,
@@ -159,9 +199,7 @@ pub(super) fn normalize_account(
         return Err(invalid(ValidationReason::InvalidQuery));
     }
     let email = email.map(|v| v.trim().to_lowercase());
-    if email
-        .as_ref()
-        .is_some_and(|v| v.is_empty() || v.len() > 254 || v.contains('\0'))
+    if email.as_deref().is_some_and(|v| !valid_email(v))
         || display_name.len() > 256
         || display_name.contains('\0')
     {

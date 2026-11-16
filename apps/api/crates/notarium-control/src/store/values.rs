@@ -5,22 +5,37 @@ use notarium_core::{
     value::Timestamp,
 };
 use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
 
-/// Preserve the complete typed structure. Some reusable core DTOs intentionally
-/// accept unknown fields on deserialization, but persisted metadata must not keep
-/// arbitrary fields that its runtime decoder would discard. Object order and
-/// whitespace remain irrelevant here; SQL equality keys have a stricter check.
+fn is_closed_subset(original: &Value, typed: &Value) -> bool {
+    match (original, typed) {
+        (Value::Object(orig), Value::Object(typ)) => orig
+            .iter()
+            .all(|(key, val)| typ.get(key).is_some_and(|tval| is_closed_subset(val, tval))),
+        (Value::Array(orig), Value::Array(typ)) => {
+            orig.len() == typ.len()
+                && orig
+                    .iter()
+                    .zip(typ)
+                    .all(|(oval, tval)| is_closed_subset(oval, tval))
+        }
+        (orig, typ) => orig == typ,
+    }
+}
+
+/// Preserve the complete typed structure via a single text parse. Reusable core
+/// DTOs without `deny_unknown_fields` still reject extra keys in persisted JSON,
+/// while omitted `#[serde(default)]` fields remain forward-compatible.
 pub(crate) fn closed_json<T: DeserializeOwned + Serialize>(source: &str) -> Result<T, PortError> {
     if source.len() > 65536 {
         return Err(invalid(ValidationReason::InvalidLimit));
     }
-    let value: T =
+    let original: Value =
         serde_json::from_str(source).map_err(|_| invalid(ValidationReason::InvalidState))?;
-    let original: serde_json::Value =
-        serde_json::from_str(source).map_err(|_| invalid(ValidationReason::InvalidState))?;
+    let value = T::deserialize(&original).map_err(|_| invalid(ValidationReason::InvalidState))?;
     let typed =
         serde_json::to_value(&value).map_err(|_| invalid(ValidationReason::InvalidState))?;
-    if typed != original {
+    if !is_closed_subset(&original, &typed) {
         return Err(invalid(ValidationReason::InvalidState));
     }
     Ok(value)
