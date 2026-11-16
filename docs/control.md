@@ -38,7 +38,9 @@ NaN and infinities are rejected before binding, preserving JSON export semantics
 
 Target records name every persisted column and table. Import accepts at most 200
 records and 8 MiB of encoded JSON records per page, requires restore authority and
-refuses a ready epoch. The first page supplies an epoch-one migrating witness.
+refuses a ready epoch or an existing epoch with an unsupported version. A target
+without an epoch requires an epoch-one migrating witness on the first page;
+resuming an existing target requires the same version and migrating state.
 `begin_target_import` / `append` / `finish` keep one transaction across bounded
 pages. Episode-parent and refresh-rotation references are checked at commit, so
 primary-key export order can be restored without loading the corpus into memory.

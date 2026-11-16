@@ -226,6 +226,35 @@ async fn verify(store: ControlStore, mut observer: Observer) {
         .await
         .unwrap();
 
+    // A persisted marker must satisfy the same version boundary as an incoming
+    // marker, even when restore resumes without supplying the marker again.
+    observer
+        .execute("UPDATE v1_storage_epoch SET epoch_version=2")
+        .await;
+    let error = store
+        .import_target_batch(ctx(ServicePurpose::Restore), &[user(2)])
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "validation_failed");
+    assert_eq!(observer.count("SELECT count(*) FROM users").await, 1);
+    assert_eq!(
+        observer
+            .count("SELECT epoch_version FROM v1_storage_epoch WHERE singleton=1")
+            .await,
+        2
+    );
+    observer
+        .execute("UPDATE v1_storage_epoch SET epoch_version=1")
+        .await;
+    store
+        .import_target_batch(ctx(ServicePurpose::Restore), &[user(2)])
+        .await
+        .unwrap();
+    assert_eq!(observer.count("SELECT count(*) FROM users").await, 2);
+    observer
+        .execute("DELETE FROM users WHERE username='user2'")
+        .await;
+
     observer.raw_score(0.125).await.unwrap();
     observer
         .execute("DELETE FROM agent_retrievals WHERE retrieval_id='raw'")

@@ -25,19 +25,22 @@ impl ControlStore {
         ctx.authority.require(ServicePurpose::Restore)?;
         let budget = OperationBudget::new(ctx.budget);
         let mut tx = self.write(budget.clone()).await?;
-        let state=budget.run(async {
+        let epoch=budget.run(async {
             budget.configure(tx.inner_mut()).await?;
             match tx.inner_mut() {
-                Transaction::Sqlite(tx)=>sqlx::query_scalar::<_,String>("SELECT state FROM v1_storage_epoch WHERE singleton=1").fetch_optional(&mut **tx).await.map_err(database),
-                Transaction::Postgres(tx)=>sqlx::query_scalar::<_,String>("SELECT state FROM v1_control.v1_storage_epoch WHERE singleton=1 FOR UPDATE").fetch_optional(&mut **tx).await.map_err(database),
+                Transaction::Sqlite(tx)=>sqlx::query_as::<_,(i64,String)>("SELECT epoch_version,state FROM v1_storage_epoch WHERE singleton=1").fetch_optional(&mut **tx).await.map_err(database),
+                Transaction::Postgres(tx)=>sqlx::query_as::<_,(i64,String)>("SELECT epoch_version,state FROM v1_control.v1_storage_epoch WHERE singleton=1 FOR UPDATE").fetch_optional(&mut **tx).await.map_err(database),
             }
         },CommitEffect::NotCommitted).await?;
-        if state.as_deref().is_some_and(|s| s != "migrating") {
+        if epoch
+            .as_ref()
+            .is_some_and(|(version, state)| *version != 1 || state != "migrating")
+        {
             return Err(invalid(ValidationReason::InvalidState));
         }
         budget.check(CommitEffect::NotCommitted)?;
         Ok(TargetImport {
-            has_epoch: state.is_some(),
+            has_epoch: epoch.is_some(),
             lease: TransactionLease::new(
                 LeasedTransaction::Write(tx),
                 budget,
