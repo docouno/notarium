@@ -53,6 +53,7 @@ impl Drop for Release {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owned_key_jobs_keep_admission_after_timeout_and_drop_and_recheck_database() {
+    let _guard = crate::TEST_RESOURCE_LOCK.lock().await;
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

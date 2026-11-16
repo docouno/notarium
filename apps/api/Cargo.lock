@@ -4007,6 +4007,7 @@ dependencies = [
  "bitflags",
  "fallible-iterator",
  "fallible-streaming-iterator",
+ "hashlink 0.11.1",
  "libsqlite3-sys",
  "smallvec",
  "sqlite-wasm-rs",

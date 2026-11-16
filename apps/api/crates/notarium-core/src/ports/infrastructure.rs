@@ -378,21 +378,34 @@ impl BackupBudget {
         Ok(())
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeyCanary {
     pub key: KeyId,
+    pub generation: u64,
+    pub active: bool,
     pub digest: ContentDigest,
     pub readable: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupWitness {
     pub installation: InstallationId,
+    pub schema_version: u32,
     pub histories: Vec<ChangeCursor>,
     pub canaries: Vec<KeyCanary>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupArtifactKind {
+    SqliteSnapshotV1,
+    PostgresSpoolV1,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackupSpool {
     pub artifact: ArtifactId,
+    pub kind: BackupArtifactKind,
     pub bytes: u64,
     pub digest: ContentDigest,
     pub witness: BackupWitness,

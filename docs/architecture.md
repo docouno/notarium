@@ -73,7 +73,9 @@ encrypted provider configuration, current disclosure admission, bounded completi
 and embedding calls, and durable spending reservations. `ControlPlane` composes that provider with
 its matching account-state service. Episodes, reference contexts, ability overlays,
 schedule claims and content-free telemetry are implemented without a tool loop
-or ticker. Backup participant services are still under construction. See
+or ticker. `ControlBackup` implements the control participant's writer fence,
+pinned snapshots, stable artifacts and cursor rebinding. A paired canonical/control
+backup and archive coordinator remains a separate integration. See
 [control services](control.md).
 
 ## Client and delivery boundaries

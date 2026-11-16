@@ -59,6 +59,25 @@ impl From<&Witness> for KeyringWitness {
     }
 }
 impl KeyringWitness {
+    pub(crate) fn matches(&self, row: &SecretKeyringRow) -> bool {
+        row.retired_at.is_none()
+            && row.key_id == self.key.as_str()
+            && row.generation as u64 == self.generation
+            && row.key_hash == self.hash
+            && row.state == if self.active { "active" } else { "readable" }
+            && crate::auth::token::digest(row.canary.as_bytes()) == self.canary_hash
+    }
+
+    pub(crate) fn backup_canary(&self) -> notarium_core::ports::KeyCanary {
+        notarium_core::ports::KeyCanary {
+            key: self.key.clone(),
+            generation: self.generation,
+            active: self.active,
+            digest: notarium_core::ids::ContentDigest::from_bytes(self.canary_hash),
+            readable: true,
+        }
+    }
+
     /// Persistence owners recheck the complete witness under their SQL commit
     /// authority, after filesystem work has finished outside the transaction.
     pub(crate) async fn verify(&self, tx: &mut Transaction) -> Result<(), PortError> {
@@ -66,12 +85,7 @@ impl KeyringWitness {
             "SELECT * FROM secret_keyring WHERE key_id=$1",
             "SELECT * FROM v1_control.secret_keyring WHERE key_id=$1 FOR SHARE";self.key.as_str())?
         .ok_or_else(failure)?;
-        if row.retired_at.is_some()
-            || row.generation as u64 != self.generation
-            || row.key_hash != self.hash
-            || row.state != if self.active { "active" } else { "readable" }
-            || crate::auth::token::digest(row.canary.as_bytes()) != self.canary_hash
-        {
+        if !self.matches(&row) {
             return Err(failure());
         }
         Ok(())

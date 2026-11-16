@@ -1,5 +1,6 @@
 //! Bounded database ownership. No pool or SQL handle crosses the public service API.
 mod export;
+pub(crate) mod fence;
 mod import;
 pub(crate) mod lease;
 mod state_validation;
@@ -19,7 +20,7 @@ use notarium_core::{
 use sqlx::{
     ConnectOptions, PgPool, SqlitePool,
     postgres::{PgConnectOptions, PgPoolOptions},
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore, oneshot};
@@ -71,15 +72,58 @@ impl ControlStore {
     /// Missing parent directories are deliberately not created by this adapter.
     pub async fn sqlite(root: &DataRoot) -> Result<Self, PortError> {
         let path = root.control();
+        // The bootstrap owner survives cancellation of this caller. Its file
+        // fence covers native initialization and the migration driver's ACK.
+        tokio::spawn(Self::sqlite_owned(path))
+            .await
+            .map_err(|_| unavailable("control SQLite bootstrap worker", CommitEffect::Unknown))?
+    }
+
+    async fn sqlite_owned(path: PathBuf) -> Result<Self, PortError> {
+        let native_path = path.clone();
+        let fence = tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            let fence = fence::FileFence::acquire(
+                &fence::sqlite_writer_lock(&native_path),
+                true,
+                || {
+                    if started.elapsed() >= Duration::from_secs(5) {
+                        Err(unavailable("control SQLite bootstrap admission", CommitEffect::NotCommitted))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )?;
+            let connection = rusqlite::Connection::open_with_flags(
+                &native_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|_| unavailable("control SQLite bootstrap", CommitEffect::Unknown))?;
+            connection
+                .busy_timeout(Duration::from_millis(250))
+                .and_then(|()| connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;"))
+                .map_err(|_| unavailable("control SQLite bootstrap", CommitEffect::Unknown))?;
+            connection
+                .close()
+                .map_err(|_| unavailable("control SQLite bootstrap close", CommitEffect::Unknown))?;
+            Ok::<_, PortError>(fence)
+        })
+        .await
+        .map_err(|_| unavailable("control SQLite bootstrap worker", CommitEffect::Unknown))??;
+        // A request pool only joins the already initialized WAL database. Its
+        // connection-local PRAGMAs cannot switch persistent journal mode or
+        // create the database outside the cooperative writer fence.
         let options = SqliteConnectOptions::new()
             .filename(&path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full)
             .foreign_keys(true)
             .busy_timeout(Duration::from_millis(250))
             .pragma("cache_size", "-2048")
             .pragma("wal_autocheckpoint", "1000")
+            .pragma("secure_delete", "ON")
+            .optimize_on_close(false, None)
             .disable_statement_logging();
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
@@ -87,10 +131,15 @@ impl ControlStore {
             .connect_with(options)
             .await
             .map_err(database)?;
-        SQLITE_MIGRATIONS
+        let migrated = SQLITE_MIGRATIONS
             .run(&pool)
             .await
-            .map_err(|_| unavailable("control SQLite schema", CommitEffect::Unknown))?;
+            .map_err(|_| unavailable("control SQLite schema", CommitEffect::Unknown));
+        if let Err(error) = migrated {
+            pool.close().await;
+            return Err(error);
+        }
+        fence.release()?;
         Ok(Self {
             backend: Backend::Sqlite { pool, path },
             writes: Arc::new(RwLock::new(())),
@@ -100,6 +149,14 @@ impl ControlStore {
     }
 
     pub async fn postgres(config: PostgresConfig) -> Result<Self, PortError> {
+        tokio::spawn(Self::postgres_owned(config))
+            .await
+            .map_err(|_| {
+                unavailable("control PostgreSQL bootstrap worker", CommitEffect::Unknown)
+            })?
+    }
+
+    async fn postgres_owned(config: PostgresConfig) -> Result<Self, PortError> {
         let pool = PgPoolOptions::new()
             .max_connections(8)
             .acquire_timeout(Duration::from_millis(250))
@@ -120,21 +177,80 @@ impl ControlStore {
             .connect_with(config.options.disable_statement_logging())
             .await
             .map_err(database)?;
-        // Schema creation is bootstrap-only; normal queries use qualified names.
-        sqlx::query("CREATE SCHEMA IF NOT EXISTS v1_control")
-            .execute(&pool)
-            .await
-            .map_err(database)?;
-        POSTGRES_MIGRATIONS
-            .run(&pool)
-            .await
-            .map_err(|_| unavailable("control PostgreSQL schema", CommitEffect::Unknown))?;
+        if let Err(error) = Self::postgres_migrate(&pool).await {
+            pool.close().await;
+            return Err(error);
+        }
         Ok(Self {
             backend: Backend::Postgres(pool),
             writes: Arc::new(RwLock::new(())),
             exports: Arc::new(Semaphore::new(1)),
             write_admission: Arc::new(Semaphore::new(4)),
         })
+    }
+
+    async fn postgres_migrate(pool: &PgPool) -> Result<(), PortError> {
+        let mut fence = pool.acquire().await.map_err(database)?;
+        fence.close_on_drop();
+        let mut locked = false;
+        let migrated = async {
+            sqlx::query("SET statement_timeout TO '5s'")
+                .execute(&mut *fence)
+                .await
+                .map_err(database)?;
+            sqlx::query("SET idle_session_timeout TO '5s'")
+                .execute(&mut *fence)
+                .await
+                .map_err(database)?;
+            sqlx::query("SELECT pg_advisory_lock_shared($1)")
+                .bind(BACKUP_LOCK)
+                .execute(&mut *fence)
+                .await
+                .map_err(database)?;
+            locked = true;
+            // The migration connection is separate from the session-level
+            // fence and is explicitly closed before the fence is released.
+            let mut connection = pool.acquire().await.map_err(database)?;
+            connection.close_on_drop();
+            let migration = async {
+                sqlx::query("CREATE SCHEMA IF NOT EXISTS v1_control")
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(database)?;
+                POSTGRES_MIGRATIONS
+                    .run_direct(None, &mut *connection, false)
+                    .await
+                    .map_err(|_| unavailable("control PostgreSQL schema", CommitEffect::Unknown))
+            }
+            .await;
+            let closed = connection.close().await.map_err(database);
+            migration?;
+            closed
+        }
+        .await;
+        let unlocked = if locked {
+            sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock_shared($1)")
+                .bind(BACKUP_LOCK)
+                .fetch_one(&mut *fence)
+                .await
+                .map_err(database)
+                .and_then(|unlocked| {
+                    if unlocked {
+                        Ok(())
+                    } else {
+                        Err(unavailable(
+                            "control PostgreSQL bootstrap fence",
+                            CommitEffect::Unknown,
+                        ))
+                    }
+                })
+        } else {
+            Ok(())
+        };
+        let closed = fence.close().await.map_err(database);
+        migrated?;
+        unlocked?;
+        closed
     }
 
     pub async fn close(self) {
@@ -170,6 +286,16 @@ impl ControlStore {
                         CommitEffect::NotCommitted,
                     )
                     .await?;
+                let file_fence = match &store.backend {
+                    Backend::Sqlite { path, .. } => Some(
+                        fence::FileFence::writer(
+                            fence::sqlite_writer_lock(path),
+                            worker_budget.clone(),
+                        )
+                        .await?,
+                    ),
+                    Backend::Postgres(_) => None,
+                };
                 let inner = match &store.backend {
                     Backend::Sqlite { pool, .. } => Transaction::Sqlite(
                         pool.begin_with("BEGIN IMMEDIATE").await.map_err(database)?,
@@ -184,6 +310,7 @@ impl ControlStore {
                         inner,
                         _guard: guard,
                         _admission: admission,
+                        file_fence,
                     }),
                 };
                 if let Transaction::Postgres(inner) = tx.inner_mut() {
@@ -291,6 +418,7 @@ struct WriteResources {
     revocation_fences: Vec<Box<dyn notarium_core::ports::RevocationLease>>,
     _guard: OwnedRwLockReadGuard<()>,
     _admission: OwnedSemaphorePermit,
+    file_fence: Option<fence::FileFence>,
 }
 impl WriteResources {
     async fn rollback(self) -> Result<(), PortError> {
@@ -299,6 +427,7 @@ impl WriteResources {
             revocation_fences,
             _guard,
             _admission,
+            file_fence,
         } = self;
         let result = match inner {
             Transaction::Sqlite(tx) => tx.rollback().await.map_err(database),
@@ -307,6 +436,9 @@ impl WriteResources {
         drop(revocation_fences);
         drop(_admission);
         drop(_guard);
+        if let Some(fence) = file_fence {
+            fence.release()?;
+        }
         result
     }
     async fn commit(self) -> Result<(), PortError> {
@@ -323,6 +455,7 @@ impl WriteResources {
             revocation_fences,
             _guard,
             _admission,
+            file_fence,
         } = self;
         let result = match inner {
             Transaction::Sqlite(tx) => tx.commit().await.map_err(database),
@@ -331,6 +464,9 @@ impl WriteResources {
         drop(revocation_fences);
         drop(_admission);
         drop(_guard);
+        if let Some(fence) = file_fence {
+            fence.release()?;
+        }
         result
     }
 }
@@ -375,7 +511,8 @@ impl Drop for WriteTransaction {
         {
             runtime.spawn(resources.rollback());
         }
-        // With no live runtime there can be no concurrent backup or request;
-        // SQLx's own destructor closes/rolls back the disconnected session.
+        // During runtime shutdown SQLx closes/rolls back its driver session.
+        // Backup also drains SQLite's native writer lock before pinning; the
+        // PostgreSQL transaction advisory fence lives on the server until ACK.
     }
 }

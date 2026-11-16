@@ -246,6 +246,13 @@ and holds; incomplete artifacts are never successful backups. Numeric budgets,
 adapter compatibility, crash recovery and the target pause below 1 ms require
 proof in the storage/backup deliveries, not core test doubles.
 
+`BackupWitness` carries installation and schema version, canonical history cursors
+when owned by that participant, and key ID/generation/active/readable/canary-digest
+metadata. `BackupSpool` adds a typed artifact ID, explicit `SqliteSnapshotV1` or
+`PostgresSpoolV1` kind, byte count and complete-file digest. These DTOs contain no
+database handles, raw keys or arbitrary filesystem paths. The implemented control
+adapter and its qualification limits are documented in [control backups](control-backup.md).
+
 ## Port operation coverage
 
 Control inventory uses explicit pages of 1–200 items. Continuations belong to

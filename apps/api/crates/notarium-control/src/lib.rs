@@ -14,6 +14,7 @@ mod test_support;
 pub(crate) static TEST_RESOURCE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub mod auth;
+pub mod backup;
 mod error;
 pub mod keyring;
 pub mod outbound;

@@ -7,7 +7,8 @@ membership/lifecycle operations. `OAuthService` implements `OAuthPort`, and
 administration, completion and embeddings. `ControlPlane` implements the complete
 `ControlPort`, deriving its authority owner from that provider instance.
 `ControlService` also implements context administration and content-free agent
-telemetry. Backup participant services remain under construction. HTTP routes, consent
+telemetry. `ControlBackup` implements `BackupParticipantPort`; its protocol and
+artifact contracts are described in [control backups](control-backup.md). HTTP routes, consent
 UI, cookies, CSRF and the desktop authentication perimeter
 belong to the transport composition.
 
@@ -19,6 +20,14 @@ classify the data root before opening it and create the approved parent director
 PostgreSQL uses the `v1_control` schema and qualified queries. Pools have four
 SQLite connections or eight PostgreSQL connections. SQL migrations reject unknown
 migration versions; both dialects have explicit baseline DDL.
+
+All admitted mutations retain the backup writer fence through actual commit or
+rollback completion. SQLite uses separate shared handles on the stable
+`control.sqlite.write.lock`; PostgreSQL uses a shared transaction advisory lock.
+SQLite bootstrap initializes WAL under an exclusive file fence before opening its
+request pool. PostgreSQL bootstrap holds a separate shared session fence through
+migration connection close. Caller cancellation does not release an owned writer
+or bootstrap task early. Arbitrary external SQL does not participate in these fences.
 
 All text is NUL-free. Each declared primary, unique or secondary index key has a
 shared 2 KiB data budget: UTF-8 bytes for text, bytes for blobs, and eight bytes
@@ -638,3 +647,8 @@ single-send intent races, shared budgets, current egress denial, model usage,
 credential rotation, consent expiry and cancellation before/after response headers.
 They do not certify the unimplemented services or a production transport's live
 registry.
+
+Backup tests exercise both databases, cross-process SQLite writers, idle retention,
+phase cancellation, native writer drain, caller runtime shutdown, artifact recovery,
+framed stream corruption and cursor restoration. They also record control-only
+pause distributions under concurrent writes. See [backup verification](control-backup.md#verification).

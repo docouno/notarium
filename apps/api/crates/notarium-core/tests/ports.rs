@@ -1436,6 +1436,7 @@ impl Drop for PhaseGuard {
 fn witness() -> BackupWitness {
     BackupWitness {
         installation: InstallationId::from_bytes([1; 16]),
+        schema_version: 1,
         histories: vec![cursor(10)],
         canaries: vec![],
     }
@@ -1503,6 +1504,7 @@ impl BackupSnapshot for SnapshotFixture {
             }
             Ok(BackupSpool {
                 artifact: ArtifactId::from_bytes([1; 16]),
+                kind: BackupArtifactKind::SqliteSnapshotV1,
                 bytes: 30,
                 digest: ContentDigest::from_bytes([1; 32]),
                 witness: self.witness.clone(),

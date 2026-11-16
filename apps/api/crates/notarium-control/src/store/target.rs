@@ -675,7 +675,12 @@ pub enum TargetTable {
     RevocationEvents,
 }
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "table", content = "row", rename_all = "snake_case")]
+#[serde(
+    tag = "table",
+    content = "row",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum TargetRecord {
     V1StorageEpoch(V1StorageEpochRow),
     Users(UsersRow),
@@ -731,6 +736,177 @@ impl std::fmt::Debug for TargetRecord {
     }
 }
 impl TargetRecord {
+    /// Canonical byte-ordered primary key used by the backup stream.
+    pub(crate) fn position(&self) -> TargetPosition {
+        match self {
+            Self::V1StorageEpoch(row) => TargetPosition::V1StorageEpoch {
+                singleton: row.singleton,
+            },
+            Self::Users(row) => TargetPosition::Users {
+                user_id: row.user_id.clone(),
+            },
+            Self::UserOidcIdentities(row) => TargetPosition::UserOidcIdentities {
+                issuer: row.issuer.clone(),
+                subject: row.subject.clone(),
+            },
+            Self::SpaceAdmission(row) => TargetPosition::SpaceAdmission {
+                space_id: row.space_id.clone(),
+            },
+            Self::SpaceMembers(row) => TargetPosition::SpaceMembers {
+                space_id: row.space_id.clone(),
+                user_id: row.user_id.clone(),
+            },
+            Self::Sessions(row) => TargetPosition::Sessions {
+                session_id: row.session_id.clone(),
+            },
+            Self::OneTimeTokens(row) => TargetPosition::OneTimeTokens {
+                token_hash: row.token_hash.clone(),
+            },
+            Self::Pats(row) => TargetPosition::Pats {
+                token_id: row.token_id.clone(),
+            },
+            Self::OauthClients(row) => TargetPosition::OauthClients {
+                client_id: row.client_id.clone(),
+            },
+            Self::OauthGrants(row) => TargetPosition::OauthGrants {
+                grant_id: row.grant_id.clone(),
+            },
+            Self::OauthAuthCodes(row) => TargetPosition::OauthAuthCodes {
+                code_hash: row.code_hash.clone(),
+            },
+            Self::OauthRefreshFamilies(row) => TargetPosition::OauthRefreshFamilies {
+                family_id: row.family_id.clone(),
+            },
+            Self::OauthRefreshTokens(row) => TargetPosition::OauthRefreshTokens {
+                token_id: row.token_id.clone(),
+            },
+            Self::OauthAccessTokens(row) => TargetPosition::OauthAccessTokens {
+                token_id: row.token_id.clone(),
+            },
+            Self::SecretKeyring(row) => TargetPosition::SecretKeyring {
+                key_id: row.key_id.clone(),
+            },
+            Self::OidcTransactions(row) => TargetPosition::OidcTransactions {
+                transaction_id: row.transaction_id.clone(),
+            },
+            Self::Credentials(row) => TargetPosition::Credentials { id: row.id.clone() },
+            Self::ProviderResources(row) => {
+                TargetPosition::ProviderResources { id: row.id.clone() }
+            }
+            Self::ProviderModels(row) => TargetPosition::ProviderModels {
+                resource_id: row.resource_id.clone(),
+                model_id: row.model_id.clone(),
+            },
+            Self::ProviderAttachments(row) => {
+                TargetPosition::ProviderAttachments { id: row.id.clone() }
+            }
+            Self::ProviderPreferences(row) => TargetPosition::ProviderPreferences {
+                owner_id: row.owner_id.clone(),
+                scope_kind: row.scope_kind.clone(),
+                scope_id: row.scope_id.clone(),
+            },
+            Self::ProviderBudgetBuckets(row) => TargetPosition::ProviderBudgetBuckets {
+                budget_kind: row.budget_kind.clone(),
+                budget_owner: row.budget_owner.clone(),
+                window_start_ms: row.window_start_ms,
+            },
+            Self::ProviderCallLog(row) => TargetPosition::ProviderCallLog {
+                call_id: row.call_id.clone(),
+            },
+            Self::AbilityAvailability(row) => TargetPosition::AbilityAvailability {
+                placement: row.placement.clone(),
+                ability_id: row.ability_id.clone(),
+            },
+            Self::AbilityProjectBindings(row) => TargetPosition::AbilityProjectBindings {
+                placement: row.placement.clone(),
+                ability_id: row.ability_id.clone(),
+                target_space: row.target_space.clone(),
+                project_id: row.project_id.clone(),
+            },
+            Self::AbilityPreferences(row) => TargetPosition::AbilityPreferences {
+                owner_id: row.owner_id.clone(),
+                ability_id: row.ability_id.clone(),
+                placement: row.placement.clone(),
+            },
+            Self::AbilityPlacementTrail(row) => TargetPosition::AbilityPlacementTrail {
+                source_placement: row.source_placement.clone(),
+                ability_id: row.ability_id.clone(),
+            },
+            Self::Favorites(row) => TargetPosition::Favorites {
+                owner_id: row.owner_id.clone(),
+                space_id: row.space_id.clone(),
+                entity_kind: row.entity_kind.clone(),
+                entity_id: row.entity_id.clone(),
+            },
+            Self::ContextSets(row) => TargetPosition::ContextSets {
+                set_id: row.set_id.clone(),
+            },
+            Self::ContextSetAttachments(row) => TargetPosition::ContextSetAttachments {
+                set_id: row.set_id.clone(),
+                target_kind: row.target_kind.clone(),
+                target_id: row.target_id.clone(),
+            },
+            Self::ContextScopePins(row) => TargetPosition::ContextScopePins {
+                owner_id: row.owner_id.clone(),
+                target_kind: row.target_kind.clone(),
+                target_id: row.target_id.clone(),
+                note_space: row.note_space.clone(),
+                note_id: row.note_id.clone(),
+            },
+            Self::ContextOrder(row) => TargetPosition::ContextOrder {
+                owner_id: row.owner_id.clone(),
+                target_kind: row.target_kind.clone(),
+                target_id: row.target_id.clone(),
+                entry_kind: row.entry_kind.clone(),
+                entry_ref: row.entry_ref.clone(),
+            },
+            Self::AgentEpisodes(row) => TargetPosition::AgentEpisodes {
+                episode_id: row.episode_id.clone(),
+            },
+            Self::McpDeltaOwnerCursors(row) => TargetPosition::McpDeltaOwnerCursors {
+                owner_id: row.owner_id.clone(),
+                space_id: row.space_id.clone(),
+            },
+            Self::McpDeltaSessionCursors(row) => TargetPosition::McpDeltaSessionCursors {
+                episode_id: row.episode_id.clone(),
+                space_id: row.space_id.clone(),
+            },
+            Self::AgentTelemetryConfig(row) => TargetPosition::AgentTelemetryConfig {
+                singleton: row.singleton,
+            },
+            Self::AgentCalls(row) => TargetPosition::AgentCalls {
+                call_id: row.call_id.clone(),
+            },
+            Self::AgentCallDetails(row) => TargetPosition::AgentCallDetails {
+                call_id: row.call_id.clone(),
+            },
+            Self::AgentRetrievals(row) => TargetPosition::AgentRetrievals {
+                retrieval_id: row.retrieval_id.clone(),
+            },
+            Self::McpDedup(row) => TargetPosition::McpDedup {
+                owner: row.owner.clone(),
+                actor: row.actor.clone(),
+                request_key: row.request_key.clone(),
+            },
+            Self::AgentSchedules(row) => TargetPosition::AgentSchedules {
+                schedule_id: row.schedule_id.clone(),
+            },
+            Self::AgentScheduleRuns(row) => TargetPosition::AgentScheduleRuns {
+                run_id: row.run_id.clone(),
+            },
+            Self::ControlCommands(row) => TargetPosition::ControlCommands {
+                owner: row.owner.clone(),
+                actor: row.actor.clone(),
+                command_key: row.command_key.clone(),
+            },
+            Self::ControlOperations(row) => TargetPosition::ControlOperations {
+                operation_id: row.operation_id.clone(),
+            },
+            Self::RevocationEvents(row) => TargetPosition::RevocationEvents {
+                event_id: row.event_id.clone(),
+            },
+        }
+    }
     pub fn table(&self) -> TargetTable {
         match self {
             Self::V1StorageEpoch(_) => TargetTable::V1StorageEpoch,
@@ -2713,7 +2889,7 @@ impl TargetTable {
         }
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "table", content = "key", rename_all = "snake_case")]
 pub enum TargetPosition {
     V1StorageEpoch {
@@ -2930,11 +3106,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<UsersRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,metadata_revision,auth_version,created_at FROM users ORDER BY user_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,metadata_revision,auth_version,created_at FROM v1_control.users ORDER BY user_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,metadata_revision,auth_version,created_at FROM v1_control.users ORDER BY user_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::Users{user_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,metadata_revision,auth_version,created_at FROM users WHERE user_id > $1 ORDER BY user_id LIMIT $2").bind(user_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,metadata_revision,auth_version,created_at FROM v1_control.users WHERE user_id > $1 ORDER BY user_id LIMIT $2").bind(user_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,metadata_revision,auth_version,created_at FROM v1_control.users WHERE user_id COLLATE \"C\" > $1 ORDER BY user_id COLLATE \"C\" LIMIT $2").bind(user_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -2955,11 +3131,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<UserOidcIdentitiesRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT issuer,subject,user_id,created_at FROM user_oidc_identities ORDER BY issuer,subject LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT issuer,subject,user_id,created_at FROM v1_control.user_oidc_identities ORDER BY issuer,subject LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT issuer,subject,user_id,created_at FROM v1_control.user_oidc_identities ORDER BY issuer COLLATE \"C\",subject COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::UserOidcIdentities{issuer,subject})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT issuer,subject,user_id,created_at FROM user_oidc_identities WHERE (issuer,subject) > ($1,$2) ORDER BY issuer,subject LIMIT $3").bind(issuer).bind(subject).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT issuer,subject,user_id,created_at FROM v1_control.user_oidc_identities WHERE (issuer,subject) > ($1,$2) ORDER BY issuer,subject LIMIT $3").bind(issuer).bind(subject).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT issuer,subject,user_id,created_at FROM v1_control.user_oidc_identities WHERE (issuer COLLATE \"C\",subject COLLATE \"C\") > ($1,$2) ORDER BY issuer COLLATE \"C\",subject COLLATE \"C\" LIMIT $3").bind(issuer).bind(subject).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -2984,11 +3160,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<SpaceAdmissionRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT space_id,state,admission_epoch,revision FROM space_admission ORDER BY space_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT space_id,state,admission_epoch,revision FROM v1_control.space_admission ORDER BY space_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT space_id,state,admission_epoch,revision FROM v1_control.space_admission ORDER BY space_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::SpaceAdmission{space_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT space_id,state,admission_epoch,revision FROM space_admission WHERE space_id > $1 ORDER BY space_id LIMIT $2").bind(space_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT space_id,state,admission_epoch,revision FROM v1_control.space_admission WHERE space_id > $1 ORDER BY space_id LIMIT $2").bind(space_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT space_id,state,admission_epoch,revision FROM v1_control.space_admission WHERE space_id COLLATE \"C\" > $1 ORDER BY space_id COLLATE \"C\" LIMIT $2").bind(space_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3009,11 +3185,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<SpaceMembersRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT space_id,user_id,role,admission,revision,created_at FROM space_members ORDER BY space_id,user_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT space_id,user_id,role,admission,revision,created_at FROM v1_control.space_members ORDER BY space_id,user_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT space_id,user_id,role,admission,revision,created_at FROM v1_control.space_members ORDER BY space_id COLLATE \"C\",user_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::SpaceMembers{space_id,user_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT space_id,user_id,role,admission,revision,created_at FROM space_members WHERE (space_id,user_id) > ($1,$2) ORDER BY space_id,user_id LIMIT $3").bind(space_id).bind(user_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT space_id,user_id,role,admission,revision,created_at FROM v1_control.space_members WHERE (space_id,user_id) > ($1,$2) ORDER BY space_id,user_id LIMIT $3").bind(space_id).bind(user_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT space_id,user_id,role,admission,revision,created_at FROM v1_control.space_members WHERE (space_id COLLATE \"C\",user_id COLLATE \"C\") > ($1,$2) ORDER BY space_id COLLATE \"C\",user_id COLLATE \"C\" LIMIT $3").bind(space_id).bind(user_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3035,11 +3211,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<SessionsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT session_id,token_hash,user_id,created_at,expires_at,last_used_at,revoked_at,auth_version FROM sessions ORDER BY session_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT session_id,token_hash,user_id,created_at,expires_at,last_used_at,revoked_at,auth_version FROM v1_control.sessions ORDER BY session_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT session_id,token_hash,user_id,created_at,expires_at,last_used_at,revoked_at,auth_version FROM v1_control.sessions ORDER BY session_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::Sessions{session_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT session_id,token_hash,user_id,created_at,expires_at,last_used_at,revoked_at,auth_version FROM sessions WHERE session_id > $1 ORDER BY session_id LIMIT $2").bind(session_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT session_id,token_hash,user_id,created_at,expires_at,last_used_at,revoked_at,auth_version FROM v1_control.sessions WHERE session_id > $1 ORDER BY session_id LIMIT $2").bind(session_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT session_id,token_hash,user_id,created_at,expires_at,last_used_at,revoked_at,auth_version FROM v1_control.sessions WHERE session_id COLLATE \"C\" > $1 ORDER BY session_id COLLATE \"C\" LIMIT $2").bind(session_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3085,11 +3261,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<PatsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,secret_hash,user_id,name,scope,selected_spaces,expires_at,last_used_at,revoked_at,created_at FROM pats ORDER BY token_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,secret_hash,user_id,name,scope,selected_spaces,expires_at,last_used_at,revoked_at,created_at FROM v1_control.pats ORDER BY token_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,secret_hash,user_id,name,scope,selected_spaces,expires_at,last_used_at,revoked_at,created_at FROM v1_control.pats ORDER BY token_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::Pats{token_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,secret_hash,user_id,name,scope,selected_spaces,expires_at,last_used_at,revoked_at,created_at FROM pats WHERE token_id > $1 ORDER BY token_id LIMIT $2").bind(token_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,secret_hash,user_id,name,scope,selected_spaces,expires_at,last_used_at,revoked_at,created_at FROM v1_control.pats WHERE token_id > $1 ORDER BY token_id LIMIT $2").bind(token_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,secret_hash,user_id,name,scope,selected_spaces,expires_at,last_used_at,revoked_at,created_at FROM v1_control.pats WHERE token_id COLLATE \"C\" > $1 ORDER BY token_id COLLATE \"C\" LIMIT $2").bind(token_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3110,11 +3286,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<OauthClientsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT client_id,kind,redirect_uris,client_name,metadata_uri,metadata_digest,cache_expires_at,activated_at,created_at,last_seen_at FROM oauth_clients ORDER BY client_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT client_id,kind,redirect_uris,client_name,metadata_uri,metadata_digest,cache_expires_at,activated_at,created_at,last_seen_at FROM v1_control.oauth_clients ORDER BY client_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT client_id,kind,redirect_uris,client_name,metadata_uri,metadata_digest,cache_expires_at,activated_at,created_at,last_seen_at FROM v1_control.oauth_clients ORDER BY client_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::OauthClients{client_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT client_id,kind,redirect_uris,client_name,metadata_uri,metadata_digest,cache_expires_at,activated_at,created_at,last_seen_at FROM oauth_clients WHERE client_id > $1 ORDER BY client_id LIMIT $2").bind(client_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT client_id,kind,redirect_uris,client_name,metadata_uri,metadata_digest,cache_expires_at,activated_at,created_at,last_seen_at FROM v1_control.oauth_clients WHERE client_id > $1 ORDER BY client_id LIMIT $2").bind(client_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT client_id,kind,redirect_uris,client_name,metadata_uri,metadata_digest,cache_expires_at,activated_at,created_at,last_seen_at FROM v1_control.oauth_clients WHERE client_id COLLATE \"C\" > $1 ORDER BY client_id COLLATE \"C\" LIMIT $2").bind(client_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3135,11 +3311,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<OauthGrantsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT grant_id,user_id,client_id,resource_uri,scope,selected_spaces,revoked_at,revision,created_at FROM oauth_grants ORDER BY grant_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT grant_id,user_id,client_id,resource_uri,scope,selected_spaces,revoked_at,revision,created_at FROM v1_control.oauth_grants ORDER BY grant_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT grant_id,user_id,client_id,resource_uri,scope,selected_spaces,revoked_at,revision,created_at FROM v1_control.oauth_grants ORDER BY grant_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::OauthGrants{grant_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT grant_id,user_id,client_id,resource_uri,scope,selected_spaces,revoked_at,revision,created_at FROM oauth_grants WHERE grant_id > $1 ORDER BY grant_id LIMIT $2").bind(grant_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT grant_id,user_id,client_id,resource_uri,scope,selected_spaces,revoked_at,revision,created_at FROM v1_control.oauth_grants WHERE grant_id > $1 ORDER BY grant_id LIMIT $2").bind(grant_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT grant_id,user_id,client_id,resource_uri,scope,selected_spaces,revoked_at,revision,created_at FROM v1_control.oauth_grants WHERE grant_id COLLATE \"C\" > $1 ORDER BY grant_id COLLATE \"C\" LIMIT $2").bind(grant_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3185,11 +3361,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<OauthRefreshFamiliesRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT family_id,grant_id,revoked_at,reason_code,created_at FROM oauth_refresh_families ORDER BY family_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT family_id,grant_id,revoked_at,reason_code,created_at FROM v1_control.oauth_refresh_families ORDER BY family_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT family_id,grant_id,revoked_at,reason_code,created_at FROM v1_control.oauth_refresh_families ORDER BY family_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::OauthRefreshFamilies{family_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT family_id,grant_id,revoked_at,reason_code,created_at FROM oauth_refresh_families WHERE family_id > $1 ORDER BY family_id LIMIT $2").bind(family_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT family_id,grant_id,revoked_at,reason_code,created_at FROM v1_control.oauth_refresh_families WHERE family_id > $1 ORDER BY family_id LIMIT $2").bind(family_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT family_id,grant_id,revoked_at,reason_code,created_at FROM v1_control.oauth_refresh_families WHERE family_id COLLATE \"C\" > $1 ORDER BY family_id COLLATE \"C\" LIMIT $2").bind(family_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3213,11 +3389,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<OauthRefreshTokensRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,token_hash,family_id,client_id,issued_at,expires_at,used_at,revoked_at,rotated_to FROM oauth_refresh_tokens ORDER BY token_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,token_hash,family_id,client_id,issued_at,expires_at,used_at,revoked_at,rotated_to FROM v1_control.oauth_refresh_tokens ORDER BY token_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,token_hash,family_id,client_id,issued_at,expires_at,used_at,revoked_at,rotated_to FROM v1_control.oauth_refresh_tokens ORDER BY token_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::OauthRefreshTokens{token_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,token_hash,family_id,client_id,issued_at,expires_at,used_at,revoked_at,rotated_to FROM oauth_refresh_tokens WHERE token_id > $1 ORDER BY token_id LIMIT $2").bind(token_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,token_hash,family_id,client_id,issued_at,expires_at,used_at,revoked_at,rotated_to FROM v1_control.oauth_refresh_tokens WHERE token_id > $1 ORDER BY token_id LIMIT $2").bind(token_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,token_hash,family_id,client_id,issued_at,expires_at,used_at,revoked_at,rotated_to FROM v1_control.oauth_refresh_tokens WHERE token_id COLLATE \"C\" > $1 ORDER BY token_id COLLATE \"C\" LIMIT $2").bind(token_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3241,11 +3417,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<OauthAccessTokensRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,token_hash,grant_id,family_id,refresh_id,resource_uri,scope,selected_spaces,issued_at,expires_at,revoked_at,last_used_at FROM oauth_access_tokens ORDER BY token_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,token_hash,grant_id,family_id,refresh_id,resource_uri,scope,selected_spaces,issued_at,expires_at,revoked_at,last_used_at FROM v1_control.oauth_access_tokens ORDER BY token_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,token_hash,grant_id,family_id,refresh_id,resource_uri,scope,selected_spaces,issued_at,expires_at,revoked_at,last_used_at FROM v1_control.oauth_access_tokens ORDER BY token_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::OauthAccessTokens{token_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,token_hash,grant_id,family_id,refresh_id,resource_uri,scope,selected_spaces,issued_at,expires_at,revoked_at,last_used_at FROM oauth_access_tokens WHERE token_id > $1 ORDER BY token_id LIMIT $2").bind(token_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,token_hash,grant_id,family_id,refresh_id,resource_uri,scope,selected_spaces,issued_at,expires_at,revoked_at,last_used_at FROM v1_control.oauth_access_tokens WHERE token_id > $1 ORDER BY token_id LIMIT $2").bind(token_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT token_id,token_hash,grant_id,family_id,refresh_id,resource_uri,scope,selected_spaces,issued_at,expires_at,revoked_at,last_used_at FROM v1_control.oauth_access_tokens WHERE token_id COLLATE \"C\" > $1 ORDER BY token_id COLLATE \"C\" LIMIT $2").bind(token_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3269,11 +3445,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<SecretKeyringRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM secret_keyring ORDER BY key_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM v1_control.secret_keyring ORDER BY key_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM v1_control.secret_keyring ORDER BY key_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::SecretKeyring{key_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM secret_keyring WHERE key_id > $1 ORDER BY key_id LIMIT $2").bind(key_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM v1_control.secret_keyring WHERE key_id > $1 ORDER BY key_id LIMIT $2").bind(key_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM v1_control.secret_keyring WHERE key_id COLLATE \"C\" > $1 ORDER BY key_id COLLATE \"C\" LIMIT $2").bind(key_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3294,11 +3470,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<OidcTransactionsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT transaction_id,state_hash,nonce_hash,flow_context_hash,key_id,issuer,client_id,redirect_uri,purpose,bound_user,browser_binding_hash,expires_at,consumed_at,created_at FROM oidc_transactions ORDER BY transaction_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT transaction_id,state_hash,nonce_hash,flow_context_hash,key_id,issuer,client_id,redirect_uri,purpose,bound_user,browser_binding_hash,expires_at,consumed_at,created_at FROM v1_control.oidc_transactions ORDER BY transaction_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT transaction_id,state_hash,nonce_hash,flow_context_hash,key_id,issuer,client_id,redirect_uri,purpose,bound_user,browser_binding_hash,expires_at,consumed_at,created_at FROM v1_control.oidc_transactions ORDER BY transaction_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::OidcTransactions{transaction_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT transaction_id,state_hash,nonce_hash,flow_context_hash,key_id,issuer,client_id,redirect_uri,purpose,bound_user,browser_binding_hash,expires_at,consumed_at,created_at FROM oidc_transactions WHERE transaction_id > $1 ORDER BY transaction_id LIMIT $2").bind(transaction_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT transaction_id,state_hash,nonce_hash,flow_context_hash,key_id,issuer,client_id,redirect_uri,purpose,bound_user,browser_binding_hash,expires_at,consumed_at,created_at FROM v1_control.oidc_transactions WHERE transaction_id > $1 ORDER BY transaction_id LIMIT $2").bind(transaction_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT transaction_id,state_hash,nonce_hash,flow_context_hash,key_id,issuer,client_id,redirect_uri,purpose,bound_user,browser_binding_hash,expires_at,consumed_at,created_at FROM v1_control.oidc_transactions WHERE transaction_id COLLATE \"C\" > $1 ORDER BY transaction_id COLLATE \"C\" LIMIT $2").bind(transaction_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3322,11 +3498,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<CredentialsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT id,owner_id,name,kind,secret,injection,disabled_at,rpm,tpm,consent_epoch,runtime_epoch,revision,created_at,updated_at FROM credentials ORDER BY id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT id,owner_id,name,kind,secret,injection,disabled_at,rpm,tpm,consent_epoch,runtime_epoch,revision,created_at,updated_at FROM v1_control.credentials ORDER BY id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT id,owner_id,name,kind,secret,injection,disabled_at,rpm,tpm,consent_epoch,runtime_epoch,revision,created_at,updated_at FROM v1_control.credentials ORDER BY id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::Credentials{id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT id,owner_id,name,kind,secret,injection,disabled_at,rpm,tpm,consent_epoch,runtime_epoch,revision,created_at,updated_at FROM credentials WHERE id > $1 ORDER BY id LIMIT $2").bind(id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT id,owner_id,name,kind,secret,injection,disabled_at,rpm,tpm,consent_epoch,runtime_epoch,revision,created_at,updated_at FROM v1_control.credentials WHERE id > $1 ORDER BY id LIMIT $2").bind(id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT id,owner_id,name,kind,secret,injection,disabled_at,rpm,tpm,consent_epoch,runtime_epoch,revision,created_at,updated_at FROM v1_control.credentials WHERE id COLLATE \"C\" > $1 ORDER BY id COLLATE \"C\" LIMIT $2").bind(id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3346,11 +3522,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<ProviderResourcesRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT id,owner_id,name,wire,base_url,headers,credential_id,consent_epoch,runtime_epoch,default_model,timeouts,rpm,tpm,disabled_at,revision FROM provider_resources ORDER BY id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT id,owner_id,name,wire,base_url,headers,credential_id,consent_epoch,runtime_epoch,default_model,timeouts,rpm,tpm,disabled_at,revision FROM v1_control.provider_resources ORDER BY id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT id,owner_id,name,wire,base_url,headers,credential_id,consent_epoch,runtime_epoch,default_model,timeouts,rpm,tpm,disabled_at,revision FROM v1_control.provider_resources ORDER BY id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::ProviderResources{id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT id,owner_id,name,wire,base_url,headers,credential_id,consent_epoch,runtime_epoch,default_model,timeouts,rpm,tpm,disabled_at,revision FROM provider_resources WHERE id > $1 ORDER BY id LIMIT $2").bind(id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT id,owner_id,name,wire,base_url,headers,credential_id,consent_epoch,runtime_epoch,default_model,timeouts,rpm,tpm,disabled_at,revision FROM v1_control.provider_resources WHERE id > $1 ORDER BY id LIMIT $2").bind(id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT id,owner_id,name,wire,base_url,headers,credential_id,consent_epoch,runtime_epoch,default_model,timeouts,rpm,tpm,disabled_at,revision FROM v1_control.provider_resources WHERE id COLLATE \"C\" > $1 ORDER BY id COLLATE \"C\" LIMIT $2").bind(id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3373,11 +3549,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<ProviderModelsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT resource_id,model_id,wire_model_name,kind,tokenizer_profile,max_input,max_output,dimension,capabilities,revision FROM provider_models ORDER BY resource_id,model_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT resource_id,model_id,wire_model_name,kind,tokenizer_profile,max_input,max_output,dimension,capabilities,revision FROM v1_control.provider_models ORDER BY resource_id,model_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT resource_id,model_id,wire_model_name,kind,tokenizer_profile,max_input,max_output,dimension,capabilities,revision FROM v1_control.provider_models ORDER BY resource_id COLLATE \"C\",model_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::ProviderModels{resource_id,model_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT resource_id,model_id,wire_model_name,kind,tokenizer_profile,max_input,max_output,dimension,capabilities,revision FROM provider_models WHERE (resource_id,model_id) > ($1,$2) ORDER BY resource_id,model_id LIMIT $3").bind(resource_id).bind(model_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT resource_id,model_id,wire_model_name,kind,tokenizer_profile,max_input,max_output,dimension,capabilities,revision FROM v1_control.provider_models WHERE (resource_id,model_id) > ($1,$2) ORDER BY resource_id,model_id LIMIT $3").bind(resource_id).bind(model_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT resource_id,model_id,wire_model_name,kind,tokenizer_profile,max_input,max_output,dimension,capabilities,revision FROM v1_control.provider_models WHERE (resource_id COLLATE \"C\",model_id COLLATE \"C\") > ($1,$2) ORDER BY resource_id COLLATE \"C\",model_id COLLATE \"C\" LIMIT $3").bind(resource_id).bind(model_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3399,11 +3575,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<ProviderAttachmentsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT id,resource_id,target_kind,target_owner,target_space,target_project,resource_epoch,credential_epoch,state,disclosure,expires_at,revision FROM provider_attachments ORDER BY id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT id,resource_id,target_kind,target_owner,target_space,target_project,resource_epoch,credential_epoch,state,disclosure,expires_at,revision FROM v1_control.provider_attachments ORDER BY id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT id,resource_id,target_kind,target_owner,target_space,target_project,resource_epoch,credential_epoch,state,disclosure,expires_at,revision FROM v1_control.provider_attachments ORDER BY id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::ProviderAttachments{id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT id,resource_id,target_kind,target_owner,target_space,target_project,resource_epoch,credential_epoch,state,disclosure,expires_at,revision FROM provider_attachments WHERE id > $1 ORDER BY id LIMIT $2").bind(id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT id,resource_id,target_kind,target_owner,target_space,target_project,resource_epoch,credential_epoch,state,disclosure,expires_at,revision FROM v1_control.provider_attachments WHERE id > $1 ORDER BY id LIMIT $2").bind(id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT id,resource_id,target_kind,target_owner,target_space,target_project,resource_epoch,credential_epoch,state,disclosure,expires_at,revision FROM v1_control.provider_attachments WHERE id COLLATE \"C\" > $1 ORDER BY id COLLATE \"C\" LIMIT $2").bind(id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3426,11 +3602,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<ProviderPreferencesRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,scope_kind,scope_id,resource_id,model_id,revision FROM provider_preferences ORDER BY owner_id,scope_kind,scope_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,scope_kind,scope_id,resource_id,model_id,revision FROM v1_control.provider_preferences ORDER BY owner_id,scope_kind,scope_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,scope_kind,scope_id,resource_id,model_id,revision FROM v1_control.provider_preferences ORDER BY owner_id COLLATE \"C\",scope_kind COLLATE \"C\",scope_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::ProviderPreferences{owner_id,scope_kind,scope_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,scope_kind,scope_id,resource_id,model_id,revision FROM provider_preferences WHERE (owner_id,scope_kind,scope_id) > ($1,$2,$3) ORDER BY owner_id,scope_kind,scope_id LIMIT $4").bind(owner_id).bind(scope_kind).bind(scope_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,scope_kind,scope_id,resource_id,model_id,revision FROM v1_control.provider_preferences WHERE (owner_id,scope_kind,scope_id) > ($1,$2,$3) ORDER BY owner_id,scope_kind,scope_id LIMIT $4").bind(owner_id).bind(scope_kind).bind(scope_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,scope_kind,scope_id,resource_id,model_id,revision FROM v1_control.provider_preferences WHERE (owner_id COLLATE \"C\",scope_kind COLLATE \"C\",scope_id COLLATE \"C\") > ($1,$2,$3) ORDER BY owner_id COLLATE \"C\",scope_kind COLLATE \"C\",scope_id COLLATE \"C\" LIMIT $4").bind(owner_id).bind(scope_kind).bind(scope_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3456,11 +3632,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<ProviderBudgetBucketsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT budget_kind,budget_owner,window_start_ms,window_end_ms,rpm_used,tpm_reserved,tpm_exact FROM provider_budget_buckets ORDER BY budget_kind,budget_owner,window_start_ms LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT budget_kind,budget_owner,window_start_ms,window_end_ms,rpm_used,tpm_reserved,tpm_exact FROM v1_control.provider_budget_buckets ORDER BY budget_kind,budget_owner,window_start_ms LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT budget_kind,budget_owner,window_start_ms,window_end_ms,rpm_used,tpm_reserved,tpm_exact FROM v1_control.provider_budget_buckets ORDER BY budget_kind COLLATE \"C\",budget_owner COLLATE \"C\",window_start_ms LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::ProviderBudgetBuckets{budget_kind,budget_owner,window_start_ms})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT budget_kind,budget_owner,window_start_ms,window_end_ms,rpm_used,tpm_reserved,tpm_exact FROM provider_budget_buckets WHERE (budget_kind,budget_owner,window_start_ms) > ($1,$2,$3) ORDER BY budget_kind,budget_owner,window_start_ms LIMIT $4").bind(budget_kind).bind(budget_owner).bind(window_start_ms).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT budget_kind,budget_owner,window_start_ms,window_end_ms,rpm_used,tpm_reserved,tpm_exact FROM v1_control.provider_budget_buckets WHERE (budget_kind,budget_owner,window_start_ms) > ($1,$2,$3) ORDER BY budget_kind,budget_owner,window_start_ms LIMIT $4").bind(budget_kind).bind(budget_owner).bind(window_start_ms).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT budget_kind,budget_owner,window_start_ms,window_end_ms,rpm_used,tpm_reserved,tpm_exact FROM v1_control.provider_budget_buckets WHERE (budget_kind COLLATE \"C\",budget_owner COLLATE \"C\",window_start_ms) > ($1,$2,$3) ORDER BY budget_kind COLLATE \"C\",budget_owner COLLATE \"C\",window_start_ms LIMIT $4").bind(budget_kind).bind(budget_owner).bind(window_start_ms).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3487,11 +3663,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<ProviderCallLogRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at FROM provider_call_log ORDER BY call_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at FROM v1_control.provider_call_log ORDER BY call_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at FROM v1_control.provider_call_log ORDER BY call_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::ProviderCallLog{call_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at FROM provider_call_log WHERE call_id > $1 ORDER BY call_id LIMIT $2").bind(call_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at FROM v1_control.provider_call_log WHERE call_id > $1 ORDER BY call_id LIMIT $2").bind(call_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,owner_id,principal,run_id,scope_id,intent_key,request_hash,resource_id,credential_id,policy_epochs,participating_spaces,model_id,reserved_tokens,bucket_keys,delivery_state,outcome,usage_source,input_tokens,output_tokens,diagnostic,dispatch_owner,created_at,settled_at FROM v1_control.provider_call_log WHERE call_id COLLATE \"C\" > $1 ORDER BY call_id COLLATE \"C\" LIMIT $2").bind(call_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3515,11 +3691,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<AbilityAvailabilityRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT placement,ability_id,mode,enabled,revision FROM ability_availability ORDER BY placement,ability_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT placement,ability_id,mode,enabled,revision FROM v1_control.ability_availability ORDER BY placement,ability_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT placement,ability_id,mode,enabled,revision FROM v1_control.ability_availability ORDER BY placement COLLATE \"C\",ability_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::AbilityAvailability{placement,ability_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT placement,ability_id,mode,enabled,revision FROM ability_availability WHERE (placement,ability_id) > ($1,$2) ORDER BY placement,ability_id LIMIT $3").bind(placement).bind(ability_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT placement,ability_id,mode,enabled,revision FROM v1_control.ability_availability WHERE (placement,ability_id) > ($1,$2) ORDER BY placement,ability_id LIMIT $3").bind(placement).bind(ability_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT placement,ability_id,mode,enabled,revision FROM v1_control.ability_availability WHERE (placement COLLATE \"C\",ability_id COLLATE \"C\") > ($1,$2) ORDER BY placement COLLATE \"C\",ability_id COLLATE \"C\" LIMIT $3").bind(placement).bind(ability_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3544,11 +3720,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<AbilityProjectBindingsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT placement,ability_id,target_space,project_id FROM ability_project_bindings ORDER BY placement,ability_id,target_space,project_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT placement,ability_id,target_space,project_id FROM v1_control.ability_project_bindings ORDER BY placement,ability_id,target_space,project_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT placement,ability_id,target_space,project_id FROM v1_control.ability_project_bindings ORDER BY placement COLLATE \"C\",ability_id COLLATE \"C\",target_space COLLATE \"C\",project_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::AbilityProjectBindings{placement,ability_id,target_space,project_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT placement,ability_id,target_space,project_id FROM ability_project_bindings WHERE (placement,ability_id,target_space,project_id) > ($1,$2,$3,$4) ORDER BY placement,ability_id,target_space,project_id LIMIT $5").bind(placement).bind(ability_id).bind(target_space).bind(project_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT placement,ability_id,target_space,project_id FROM v1_control.ability_project_bindings WHERE (placement,ability_id,target_space,project_id) > ($1,$2,$3,$4) ORDER BY placement,ability_id,target_space,project_id LIMIT $5").bind(placement).bind(ability_id).bind(target_space).bind(project_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT placement,ability_id,target_space,project_id FROM v1_control.ability_project_bindings WHERE (placement COLLATE \"C\",ability_id COLLATE \"C\",target_space COLLATE \"C\",project_id COLLATE \"C\") > ($1,$2,$3,$4) ORDER BY placement COLLATE \"C\",ability_id COLLATE \"C\",target_space COLLATE \"C\",project_id COLLATE \"C\" LIMIT $5").bind(placement).bind(ability_id).bind(target_space).bind(project_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3576,11 +3752,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<AbilityPreferencesRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,ability_id,placement,enabled,revision FROM ability_preferences ORDER BY owner_id,ability_id,placement LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,ability_id,placement,enabled,revision FROM v1_control.ability_preferences ORDER BY owner_id,ability_id,placement LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,ability_id,placement,enabled,revision FROM v1_control.ability_preferences ORDER BY owner_id COLLATE \"C\",ability_id COLLATE \"C\",placement COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::AbilityPreferences{owner_id,ability_id,placement})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,ability_id,placement,enabled,revision FROM ability_preferences WHERE (owner_id,ability_id,placement) > ($1,$2,$3) ORDER BY owner_id,ability_id,placement LIMIT $4").bind(owner_id).bind(ability_id).bind(placement).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,ability_id,placement,enabled,revision FROM v1_control.ability_preferences WHERE (owner_id,ability_id,placement) > ($1,$2,$3) ORDER BY owner_id,ability_id,placement LIMIT $4").bind(owner_id).bind(ability_id).bind(placement).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,ability_id,placement,enabled,revision FROM v1_control.ability_preferences WHERE (owner_id COLLATE \"C\",ability_id COLLATE \"C\",placement COLLATE \"C\") > ($1,$2,$3) ORDER BY owner_id COLLATE \"C\",ability_id COLLATE \"C\",placement COLLATE \"C\" LIMIT $4").bind(owner_id).bind(ability_id).bind(placement).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3606,11 +3782,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<AbilityPlacementTrailRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT source_placement,ability_id,destination_placement,destination_id,manifest_ref,created_at FROM ability_placement_trail ORDER BY source_placement,ability_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT source_placement,ability_id,destination_placement,destination_id,manifest_ref,created_at FROM v1_control.ability_placement_trail ORDER BY source_placement,ability_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT source_placement,ability_id,destination_placement,destination_id,manifest_ref,created_at FROM v1_control.ability_placement_trail ORDER BY source_placement COLLATE \"C\",ability_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::AbilityPlacementTrail{source_placement,ability_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT source_placement,ability_id,destination_placement,destination_id,manifest_ref,created_at FROM ability_placement_trail WHERE (source_placement,ability_id) > ($1,$2) ORDER BY source_placement,ability_id LIMIT $3").bind(source_placement).bind(ability_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT source_placement,ability_id,destination_placement,destination_id,manifest_ref,created_at FROM v1_control.ability_placement_trail WHERE (source_placement,ability_id) > ($1,$2) ORDER BY source_placement,ability_id LIMIT $3").bind(source_placement).bind(ability_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT source_placement,ability_id,destination_placement,destination_id,manifest_ref,created_at FROM v1_control.ability_placement_trail WHERE (source_placement COLLATE \"C\",ability_id COLLATE \"C\") > ($1,$2) ORDER BY source_placement COLLATE \"C\",ability_id COLLATE \"C\" LIMIT $3").bind(source_placement).bind(ability_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3636,11 +3812,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<FavoritesRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,space_id,entity_kind,entity_id,rank,created_at FROM favorites ORDER BY owner_id,space_id,entity_kind,entity_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,space_id,entity_kind,entity_id,rank,created_at FROM v1_control.favorites ORDER BY owner_id,space_id,entity_kind,entity_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,space_id,entity_kind,entity_id,rank,created_at FROM v1_control.favorites ORDER BY owner_id COLLATE \"C\",space_id COLLATE \"C\",entity_kind COLLATE \"C\",entity_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::Favorites{owner_id,space_id,entity_kind,entity_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,space_id,entity_kind,entity_id,rank,created_at FROM favorites WHERE (owner_id,space_id,entity_kind,entity_id) > ($1,$2,$3,$4) ORDER BY owner_id,space_id,entity_kind,entity_id LIMIT $5").bind(owner_id).bind(space_id).bind(entity_kind).bind(entity_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,space_id,entity_kind,entity_id,rank,created_at FROM v1_control.favorites WHERE (owner_id,space_id,entity_kind,entity_id) > ($1,$2,$3,$4) ORDER BY owner_id,space_id,entity_kind,entity_id LIMIT $5").bind(owner_id).bind(space_id).bind(entity_kind).bind(entity_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,space_id,entity_kind,entity_id,rank,created_at FROM v1_control.favorites WHERE (owner_id COLLATE \"C\",space_id COLLATE \"C\",entity_kind COLLATE \"C\",entity_id COLLATE \"C\") > ($1,$2,$3,$4) ORDER BY owner_id COLLATE \"C\",space_id COLLATE \"C\",entity_kind COLLATE \"C\",entity_id COLLATE \"C\" LIMIT $5").bind(owner_id).bind(space_id).bind(entity_kind).bind(entity_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3664,11 +3840,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<ContextSetsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT set_id,owner_id,home_space,name,note_refs,revision,created_at FROM context_sets ORDER BY set_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT set_id,owner_id,home_space,name,note_refs,revision,created_at FROM v1_control.context_sets ORDER BY set_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT set_id,owner_id,home_space,name,note_refs,revision,created_at FROM v1_control.context_sets ORDER BY set_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::ContextSets{set_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT set_id,owner_id,home_space,name,note_refs,revision,created_at FROM context_sets WHERE set_id > $1 ORDER BY set_id LIMIT $2").bind(set_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT set_id,owner_id,home_space,name,note_refs,revision,created_at FROM v1_control.context_sets WHERE set_id > $1 ORDER BY set_id LIMIT $2").bind(set_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT set_id,owner_id,home_space,name,note_refs,revision,created_at FROM v1_control.context_sets WHERE set_id COLLATE \"C\" > $1 ORDER BY set_id COLLATE \"C\" LIMIT $2").bind(set_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3689,11 +3865,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<ContextSetAttachmentsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT set_id,target_kind,target_id,target_space,owner_id,revision FROM context_set_attachments ORDER BY set_id,target_kind,target_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT set_id,target_kind,target_id,target_space,owner_id,revision FROM v1_control.context_set_attachments ORDER BY set_id,target_kind,target_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT set_id,target_kind,target_id,target_space,owner_id,revision FROM v1_control.context_set_attachments ORDER BY set_id COLLATE \"C\",target_kind COLLATE \"C\",target_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::ContextSetAttachments{set_id,target_kind,target_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT set_id,target_kind,target_id,target_space,owner_id,revision FROM context_set_attachments WHERE (set_id,target_kind,target_id) > ($1,$2,$3) ORDER BY set_id,target_kind,target_id LIMIT $4").bind(set_id).bind(target_kind).bind(target_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT set_id,target_kind,target_id,target_space,owner_id,revision FROM v1_control.context_set_attachments WHERE (set_id,target_kind,target_id) > ($1,$2,$3) ORDER BY set_id,target_kind,target_id LIMIT $4").bind(set_id).bind(target_kind).bind(target_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT set_id,target_kind,target_id,target_space,owner_id,revision FROM v1_control.context_set_attachments WHERE (set_id COLLATE \"C\",target_kind COLLATE \"C\",target_id COLLATE \"C\") > ($1,$2,$3) ORDER BY set_id COLLATE \"C\",target_kind COLLATE \"C\",target_id COLLATE \"C\" LIMIT $4").bind(set_id).bind(target_kind).bind(target_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3720,11 +3896,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<ContextScopePinsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,target_kind,target_id,target_space,note_space,note_id,revision,created_at FROM context_scope_pins ORDER BY owner_id,target_kind,target_id,note_space,note_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,target_kind,target_id,target_space,note_space,note_id,revision,created_at FROM v1_control.context_scope_pins ORDER BY owner_id,target_kind,target_id,note_space,note_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,target_kind,target_id,target_space,note_space,note_id,revision,created_at FROM v1_control.context_scope_pins ORDER BY owner_id COLLATE \"C\",target_kind COLLATE \"C\",target_id COLLATE \"C\",note_space COLLATE \"C\",note_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::ContextScopePins{owner_id,target_kind,target_id,note_space,note_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,target_kind,target_id,target_space,note_space,note_id,revision,created_at FROM context_scope_pins WHERE (owner_id,target_kind,target_id,note_space,note_id) > ($1,$2,$3,$4,$5) ORDER BY owner_id,target_kind,target_id,note_space,note_id LIMIT $6").bind(owner_id).bind(target_kind).bind(target_id).bind(note_space).bind(note_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,target_kind,target_id,target_space,note_space,note_id,revision,created_at FROM v1_control.context_scope_pins WHERE (owner_id,target_kind,target_id,note_space,note_id) > ($1,$2,$3,$4,$5) ORDER BY owner_id,target_kind,target_id,note_space,note_id LIMIT $6").bind(owner_id).bind(target_kind).bind(target_id).bind(note_space).bind(note_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,target_kind,target_id,target_space,note_space,note_id,revision,created_at FROM v1_control.context_scope_pins WHERE (owner_id COLLATE \"C\",target_kind COLLATE \"C\",target_id COLLATE \"C\",note_space COLLATE \"C\",note_id COLLATE \"C\") > ($1,$2,$3,$4,$5) ORDER BY owner_id COLLATE \"C\",target_kind COLLATE \"C\",target_id COLLATE \"C\",note_space COLLATE \"C\",note_id COLLATE \"C\" LIMIT $6").bind(owner_id).bind(target_kind).bind(target_id).bind(note_space).bind(note_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3752,11 +3928,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<ContextOrderRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,target_kind,target_id,target_space,entry_kind,entry_ref,rank,revision FROM context_order ORDER BY owner_id,target_kind,target_id,entry_kind,entry_ref LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,target_kind,target_id,target_space,entry_kind,entry_ref,rank,revision FROM v1_control.context_order ORDER BY owner_id,target_kind,target_id,entry_kind,entry_ref LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,target_kind,target_id,target_space,entry_kind,entry_ref,rank,revision FROM v1_control.context_order ORDER BY owner_id COLLATE \"C\",target_kind COLLATE \"C\",target_id COLLATE \"C\",entry_kind COLLATE \"C\",entry_ref COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::ContextOrder{owner_id,target_kind,target_id,entry_kind,entry_ref})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,target_kind,target_id,target_space,entry_kind,entry_ref,rank,revision FROM context_order WHERE (owner_id,target_kind,target_id,entry_kind,entry_ref) > ($1,$2,$3,$4,$5) ORDER BY owner_id,target_kind,target_id,entry_kind,entry_ref LIMIT $6").bind(owner_id).bind(target_kind).bind(target_id).bind(entry_kind).bind(entry_ref).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,target_kind,target_id,target_space,entry_kind,entry_ref,rank,revision FROM v1_control.context_order WHERE (owner_id,target_kind,target_id,entry_kind,entry_ref) > ($1,$2,$3,$4,$5) ORDER BY owner_id,target_kind,target_id,entry_kind,entry_ref LIMIT $6").bind(owner_id).bind(target_kind).bind(target_id).bind(entry_kind).bind(entry_ref).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,target_kind,target_id,target_space,entry_kind,entry_ref,rank,revision FROM v1_control.context_order WHERE (owner_id COLLATE \"C\",target_kind COLLATE \"C\",target_id COLLATE \"C\",entry_kind COLLATE \"C\",entry_ref COLLATE \"C\") > ($1,$2,$3,$4,$5) ORDER BY owner_id COLLATE \"C\",target_kind COLLATE \"C\",target_id COLLATE \"C\",entry_kind COLLATE \"C\",entry_ref COLLATE \"C\" LIMIT $6").bind(owner_id).bind(target_kind).bind(target_id).bind(entry_kind).bind(entry_ref).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3781,11 +3957,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<AgentEpisodesRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT episode_id,owner_id,name,parent_id,active_role,project_space,project_folder,lifecycle,revision,created_at,last_seen_at,closed_at,calls FROM agent_episodes ORDER BY episode_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT episode_id,owner_id,name,parent_id,active_role,project_space,project_folder,lifecycle,revision,created_at,last_seen_at,closed_at,calls FROM v1_control.agent_episodes ORDER BY episode_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT episode_id,owner_id,name,parent_id,active_role,project_space,project_folder,lifecycle,revision,created_at,last_seen_at,closed_at,calls FROM v1_control.agent_episodes ORDER BY episode_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::AgentEpisodes{episode_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT episode_id,owner_id,name,parent_id,active_role,project_space,project_folder,lifecycle,revision,created_at,last_seen_at,closed_at,calls FROM agent_episodes WHERE episode_id > $1 ORDER BY episode_id LIMIT $2").bind(episode_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT episode_id,owner_id,name,parent_id,active_role,project_space,project_folder,lifecycle,revision,created_at,last_seen_at,closed_at,calls FROM v1_control.agent_episodes WHERE episode_id > $1 ORDER BY episode_id LIMIT $2").bind(episode_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT episode_id,owner_id,name,parent_id,active_role,project_space,project_folder,lifecycle,revision,created_at,last_seen_at,closed_at,calls FROM v1_control.agent_episodes WHERE episode_id COLLATE \"C\" > $1 ORDER BY episode_id COLLATE \"C\" LIMIT $2").bind(episode_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3806,11 +3982,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<McpDeltaOwnerCursorsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,space_id,history_incarnation,acked_space_seq,updated_at FROM mcp_delta_owner_cursors ORDER BY owner_id,space_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,space_id,history_incarnation,acked_space_seq,updated_at FROM v1_control.mcp_delta_owner_cursors ORDER BY owner_id,space_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,space_id,history_incarnation,acked_space_seq,updated_at FROM v1_control.mcp_delta_owner_cursors ORDER BY owner_id COLLATE \"C\",space_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::McpDeltaOwnerCursors{owner_id,space_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,space_id,history_incarnation,acked_space_seq,updated_at FROM mcp_delta_owner_cursors WHERE (owner_id,space_id) > ($1,$2) ORDER BY owner_id,space_id LIMIT $3").bind(owner_id).bind(space_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,space_id,history_incarnation,acked_space_seq,updated_at FROM v1_control.mcp_delta_owner_cursors WHERE (owner_id,space_id) > ($1,$2) ORDER BY owner_id,space_id LIMIT $3").bind(owner_id).bind(space_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner_id,space_id,history_incarnation,acked_space_seq,updated_at FROM v1_control.mcp_delta_owner_cursors WHERE (owner_id COLLATE \"C\",space_id COLLATE \"C\") > ($1,$2) ORDER BY owner_id COLLATE \"C\",space_id COLLATE \"C\" LIMIT $3").bind(owner_id).bind(space_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3835,11 +4011,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<McpDeltaSessionCursorsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT episode_id,space_id,history_incarnation,acked_space_seq,updated_at FROM mcp_delta_session_cursors ORDER BY episode_id,space_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT episode_id,space_id,history_incarnation,acked_space_seq,updated_at FROM v1_control.mcp_delta_session_cursors ORDER BY episode_id,space_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT episode_id,space_id,history_incarnation,acked_space_seq,updated_at FROM v1_control.mcp_delta_session_cursors ORDER BY episode_id COLLATE \"C\",space_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::McpDeltaSessionCursors{episode_id,space_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT episode_id,space_id,history_incarnation,acked_space_seq,updated_at FROM mcp_delta_session_cursors WHERE (episode_id,space_id) > ($1,$2) ORDER BY episode_id,space_id LIMIT $3").bind(episode_id).bind(space_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT episode_id,space_id,history_incarnation,acked_space_seq,updated_at FROM v1_control.mcp_delta_session_cursors WHERE (episode_id,space_id) > ($1,$2) ORDER BY episode_id,space_id LIMIT $3").bind(episode_id).bind(space_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT episode_id,space_id,history_incarnation,acked_space_seq,updated_at FROM v1_control.mcp_delta_session_cursors WHERE (episode_id COLLATE \"C\",space_id COLLATE \"C\") > ($1,$2) ORDER BY episode_id COLLATE \"C\",space_id COLLATE \"C\" LIMIT $3").bind(episode_id).bind(space_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3893,11 +4069,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<AgentCallsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,owner_id,principal,agent,transport,request_id,episode_id,tool,effect,domain,started_at,finished_at,duration_ms,outcome,reason,input_bytes,output_bytes,summaries,fingerprint,projection_version,redacted,truncated,detail_capture_failed FROM agent_calls ORDER BY call_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,owner_id,principal,agent,transport,request_id,episode_id,tool,effect,domain,started_at,finished_at,duration_ms,outcome,reason,input_bytes,output_bytes,summaries,fingerprint,projection_version,redacted,truncated,detail_capture_failed FROM v1_control.agent_calls ORDER BY call_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,owner_id,principal,agent,transport,request_id,episode_id,tool,effect,domain,started_at,finished_at,duration_ms,outcome,reason,input_bytes,output_bytes,summaries,fingerprint,projection_version,redacted,truncated,detail_capture_failed FROM v1_control.agent_calls ORDER BY call_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::AgentCalls{call_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,owner_id,principal,agent,transport,request_id,episode_id,tool,effect,domain,started_at,finished_at,duration_ms,outcome,reason,input_bytes,output_bytes,summaries,fingerprint,projection_version,redacted,truncated,detail_capture_failed FROM agent_calls WHERE call_id > $1 ORDER BY call_id LIMIT $2").bind(call_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,owner_id,principal,agent,transport,request_id,episode_id,tool,effect,domain,started_at,finished_at,duration_ms,outcome,reason,input_bytes,output_bytes,summaries,fingerprint,projection_version,redacted,truncated,detail_capture_failed FROM v1_control.agent_calls WHERE call_id > $1 ORDER BY call_id LIMIT $2").bind(call_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,owner_id,principal,agent,transport,request_id,episode_id,tool,effect,domain,started_at,finished_at,duration_ms,outcome,reason,input_bytes,output_bytes,summaries,fingerprint,projection_version,redacted,truncated,detail_capture_failed FROM v1_control.agent_calls WHERE call_id COLLATE \"C\" > $1 ORDER BY call_id COLLATE \"C\" LIMIT $2").bind(call_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3918,11 +4094,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<AgentCallDetailsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,payload,created_at,expires_at FROM agent_call_details ORDER BY call_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,payload,created_at,expires_at FROM v1_control.agent_call_details ORDER BY call_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,payload,created_at,expires_at FROM v1_control.agent_call_details ORDER BY call_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::AgentCallDetails{call_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,payload,created_at,expires_at FROM agent_call_details WHERE call_id > $1 ORDER BY call_id LIMIT $2").bind(call_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,payload,created_at,expires_at FROM v1_control.agent_call_details WHERE call_id > $1 ORDER BY call_id LIMIT $2").bind(call_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT call_id,payload,created_at,expires_at FROM v1_control.agent_call_details WHERE call_id COLLATE \"C\" > $1 ORDER BY call_id COLLATE \"C\" LIMIT $2").bind(call_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3946,11 +4122,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<AgentRetrievalsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT retrieval_id,owner_id,principal,agent,call_id,tool,query_summary,filters,hit_refs,result_count,top_score,created_at FROM agent_retrievals ORDER BY retrieval_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT retrieval_id,owner_id,principal,agent,call_id,tool,query_summary,filters,hit_refs,result_count,top_score,created_at FROM v1_control.agent_retrievals ORDER BY retrieval_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT retrieval_id,owner_id,principal,agent,call_id,tool,query_summary,filters,hit_refs,result_count,top_score,created_at FROM v1_control.agent_retrievals ORDER BY retrieval_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::AgentRetrievals{retrieval_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT retrieval_id,owner_id,principal,agent,call_id,tool,query_summary,filters,hit_refs,result_count,top_score,created_at FROM agent_retrievals WHERE retrieval_id > $1 ORDER BY retrieval_id LIMIT $2").bind(retrieval_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT retrieval_id,owner_id,principal,agent,call_id,tool,query_summary,filters,hit_refs,result_count,top_score,created_at FROM v1_control.agent_retrievals WHERE retrieval_id > $1 ORDER BY retrieval_id LIMIT $2").bind(retrieval_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT retrieval_id,owner_id,principal,agent,call_id,tool,query_summary,filters,hit_refs,result_count,top_score,created_at FROM v1_control.agent_retrievals WHERE retrieval_id COLLATE \"C\" > $1 ORDER BY retrieval_id COLLATE \"C\" LIMIT $2").bind(retrieval_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3974,11 +4150,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<McpDedupRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner,actor,request_key,request_hash,operation,safe_result,effect,expires_at FROM mcp_dedup ORDER BY owner,actor,request_key LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner,actor,request_key,request_hash,operation,safe_result,effect,expires_at FROM v1_control.mcp_dedup ORDER BY owner,actor,request_key LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner,actor,request_key,request_hash,operation,safe_result,effect,expires_at FROM v1_control.mcp_dedup ORDER BY owner COLLATE \"C\",actor COLLATE \"C\",request_key COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::McpDedup{owner,actor,request_key})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner,actor,request_key,request_hash,operation,safe_result,effect,expires_at FROM mcp_dedup WHERE (owner,actor,request_key) > ($1,$2,$3) ORDER BY owner,actor,request_key LIMIT $4").bind(owner).bind(actor).bind(request_key).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner,actor,request_key,request_hash,operation,safe_result,effect,expires_at FROM v1_control.mcp_dedup WHERE (owner,actor,request_key) > ($1,$2,$3) ORDER BY owner,actor,request_key LIMIT $4").bind(owner).bind(actor).bind(request_key).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner,actor,request_key,request_hash,operation,safe_result,effect,expires_at FROM v1_control.mcp_dedup WHERE (owner COLLATE \"C\",actor COLLATE \"C\",request_key COLLATE \"C\") > ($1,$2,$3) ORDER BY owner COLLATE \"C\",actor COLLATE \"C\",request_key COLLATE \"C\" LIMIT $4").bind(owner).bind(actor).bind(request_key).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -4001,11 +4177,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<AgentSchedulesRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at,title,init_prompt,config_revision FROM agent_schedules ORDER BY schedule_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at,title,init_prompt,config_revision FROM v1_control.agent_schedules ORDER BY schedule_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at,title,init_prompt,config_revision FROM v1_control.agent_schedules ORDER BY schedule_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::AgentSchedules{schedule_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at,title,init_prompt,config_revision FROM agent_schedules WHERE schedule_id > $1 ORDER BY schedule_id LIMIT $2").bind(schedule_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at,title,init_prompt,config_revision FROM v1_control.agent_schedules WHERE schedule_id > $1 ORDER BY schedule_id LIMIT $2").bind(schedule_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at,title,init_prompt,config_revision FROM v1_control.agent_schedules WHERE schedule_id COLLATE \"C\" > $1 ORDER BY schedule_id COLLATE \"C\" LIMIT $2").bind(schedule_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -4026,11 +4202,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<AgentScheduleRunsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at FROM agent_schedule_runs ORDER BY run_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at FROM v1_control.agent_schedule_runs ORDER BY run_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at FROM v1_control.agent_schedule_runs ORDER BY run_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::AgentScheduleRuns{run_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at FROM agent_schedule_runs WHERE run_id > $1 ORDER BY run_id LIMIT $2").bind(run_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at FROM v1_control.agent_schedule_runs WHERE run_id > $1 ORDER BY run_id LIMIT $2").bind(run_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at FROM v1_control.agent_schedule_runs WHERE run_id COLLATE \"C\" > $1 ORDER BY run_id COLLATE \"C\" LIMIT $2").bind(run_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -4054,11 +4230,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<ControlCommandsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner,actor,command_key,request_hash,target,expected,result_revision,state,safe_result,expires_at FROM control_commands ORDER BY owner,actor,command_key LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner,actor,command_key,request_hash,target,expected,result_revision,state,safe_result,expires_at FROM v1_control.control_commands ORDER BY owner,actor,command_key LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner,actor,command_key,request_hash,target,expected,result_revision,state,safe_result,expires_at FROM v1_control.control_commands ORDER BY owner COLLATE \"C\",actor COLLATE \"C\",command_key COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::ControlCommands{owner,actor,command_key})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT owner,actor,command_key,request_hash,target,expected,result_revision,state,safe_result,expires_at FROM control_commands WHERE (owner,actor,command_key) > ($1,$2,$3) ORDER BY owner,actor,command_key LIMIT $4").bind(owner).bind(actor).bind(command_key).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner,actor,command_key,request_hash,target,expected,result_revision,state,safe_result,expires_at FROM v1_control.control_commands WHERE (owner,actor,command_key) > ($1,$2,$3) ORDER BY owner,actor,command_key LIMIT $4").bind(owner).bind(actor).bind(command_key).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT owner,actor,command_key,request_hash,target,expected,result_revision,state,safe_result,expires_at FROM v1_control.control_commands WHERE (owner COLLATE \"C\",actor COLLATE \"C\",command_key COLLATE \"C\") > ($1,$2,$3) ORDER BY owner COLLATE \"C\",actor COLLATE \"C\",command_key COLLATE \"C\" LIMIT $4").bind(owner).bind(actor).bind(command_key).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -4084,11 +4260,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<ControlOperationsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT operation_id,command_key,kind,target_space,state,payload_hash,payload,canonical_receipt,next_action,updated_at FROM control_operations ORDER BY operation_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT operation_id,command_key,kind,target_space,state,payload_hash,payload,canonical_receipt,next_action,updated_at FROM v1_control.control_operations ORDER BY operation_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT operation_id,command_key,kind,target_space,state,payload_hash,payload,canonical_receipt,next_action,updated_at FROM v1_control.control_operations ORDER BY operation_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::ControlOperations{operation_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT operation_id,command_key,kind,target_space,state,payload_hash,payload,canonical_receipt,next_action,updated_at FROM control_operations WHERE operation_id > $1 ORDER BY operation_id LIMIT $2").bind(operation_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT operation_id,command_key,kind,target_space,state,payload_hash,payload,canonical_receipt,next_action,updated_at FROM v1_control.control_operations WHERE operation_id > $1 ORDER BY operation_id LIMIT $2").bind(operation_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT operation_id,command_key,kind,target_space,state,payload_hash,payload,canonical_receipt,next_action,updated_at FROM v1_control.control_operations WHERE operation_id COLLATE \"C\" > $1 ORDER BY operation_id COLLATE \"C\" LIMIT $2").bind(operation_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -4112,11 +4288,11 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
             let chunk:super::RowChunk<RevocationEventsRow>=match after {
 None=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT event_id,selector,reason,authority_version,committed_at,delivered_at,attempts FROM revocation_events ORDER BY event_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT event_id,selector,reason,authority_version,committed_at,delivered_at,attempts FROM v1_control.revocation_events ORDER BY event_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT event_id,selector,reason,authority_version,committed_at,delivered_at,attempts FROM v1_control.revocation_events ORDER BY event_id COLLATE \"C\" LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::RevocationEvents{event_id})=>match tx {
 Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT event_id,selector,reason,authority_version,committed_at,delivered_at,attempts FROM revocation_events WHERE event_id > $1 ORDER BY event_id LIMIT $2").bind(event_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT event_id,selector,reason,authority_version,committed_at,delivered_at,attempts FROM v1_control.revocation_events WHERE event_id > $1 ORDER BY event_id LIMIT $2").bind(event_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT event_id,selector,reason,authority_version,committed_at,delivered_at,attempts FROM v1_control.revocation_events WHERE event_id COLLATE \"C\" > $1 ORDER BY event_id COLLATE \"C\" LIMIT $2").bind(event_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
