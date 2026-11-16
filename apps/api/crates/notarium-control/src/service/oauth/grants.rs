@@ -74,6 +74,7 @@ impl OAuthService {
             let revision=if grant.revoked_at.is_none() {
                 let grant_revision=next(grant.revision)?;
                 execute!(tx.inner_mut(),"UPDATE oauth_grants SET revoked_at=$1,revision=$2 WHERE grant_id=$3","UPDATE v1_control.oauth_grants SET revoked_at=$1,revision=$2 WHERE grant_id=$3";now,grant_revision,&grant.grant_id)?;
+                execute!(tx.inner_mut(),"UPDATE oauth_refresh_families SET revoked_at=$1,reason_code='grant_revoked' WHERE grant_id=$2 AND revoked_at IS NULL","UPDATE v1_control.oauth_refresh_families SET revoked_at=$1,reason_code='grant_revoked' WHERE grant_id=$2 AND revoked_at IS NULL";now,&grant.grant_id)?;
                 let revision=next(user.revision)?;
                 execute!(tx.inner_mut(),"UPDATE users SET revision=$1 WHERE user_id=$2","UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";revision,&user.user_id)?;
                 events.push(outbox::enqueue(tx.inner_mut(),selector,RevocationReason::CredentialRemoved,grant_revision,now).await?);

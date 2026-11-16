@@ -69,9 +69,10 @@ impl ControlService {
         call: RequestId,
     ) -> Result<AgentCallInfo, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.read(budget.clone()).await?;
+        let (mut tx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
         let (current, row, record) = budget.run(async{
-            let auth=self.revalidate_read(tx.inner_mut(),ctx.auth()).await?;
             let current=AccountContext::new(auth,budget.context(ctx.budget.request.clone()));
             let row=rows!(tx.inner_mut(),AgentCallsRow,fetch_optional,"SELECT * FROM agent_calls WHERE call_id=$1 AND owner_id=$2","SELECT * FROM v1_control.agent_calls WHERE call_id=$1 AND owner_id=$2";call.as_str(),current.auth().principal().as_str())?.ok_or(DomainError::ResourceNotFound)?;
             let record=rows!(tx.inner_mut(),AgentCallDetailsRow,fetch_optional,"SELECT * FROM agent_call_details WHERE call_id=$1 AND expires_at>$2","SELECT * FROM v1_control.agent_call_details WHERE call_id=$1 AND expires_at>$2";&row.call_id,self.clock.now_ms()?)?;
@@ -91,9 +92,10 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<AgentCallInfo>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.read(budget.clone()).await?;
+        let (mut tx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
         let (current, scope, rows) = budget.run(async{
-            let auth=self.revalidate_read(tx.inner_mut(),ctx.auth()).await?;
             let current=AccountContext::new(auth,budget.context(ctx.budget.request.clone()));
             let scope=digest(current.auth(),"agent-calls")?;
             let cursor:Option<Cursor>=page.continuation().map(parse).transpose()?;

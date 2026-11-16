@@ -356,12 +356,13 @@ impl ControlService {
             BTreeSet::from([info.definition.approved_role.id]),
         )?;
         let history: HistoryScope = parse(&running.history_scope)?;
-        if lock {
-            let prechecked = keeper.ok_or_else(denied)?;
+        if let Some(prechecked) = keeper {
             if prechecked.space != space || prechecked.project != project_folder {
                 return Err(denied());
             }
             prechecked.history.check(&history)?;
+        } else if lock {
+            return Err(denied());
         } else {
             // The enclosing effect's operation budget also bounds this callback.
             let budget = CallBudget {

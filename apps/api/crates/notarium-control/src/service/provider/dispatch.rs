@@ -250,19 +250,19 @@ impl ProviderService {
     ) -> Result<Output, PortError> {
         let hash = job.fingerprint()?;
         let scope_key = job.scope_key()?;
-        let mut tx = runtime
+        let (mut tx, auth) = runtime
             .run(
-                self.control.store.read(runtime.budget.clone()),
+                self.control.open_revalidated_read(
+                    &runtime.budget,
+                    &job.ctx.budget.request,
+                    job.ctx.auth(),
+                ),
                 CommitEffect::NotCommitted,
             )
             .await?;
         runtime
             .run(
                 async {
-                    let auth = self
-                        .control
-                        .revalidate_read(tx.inner_mut(), job.ctx.auth())
-                        .await?;
                     accounting::existing_read(
                         tx.inner_mut(),
                         auth.principal().as_str(),

@@ -237,9 +237,11 @@ impl ProviderService {
             .selection_catalog(&ctx, request.project.as_ref())
             .await?;
         let wanted_kind = model_kind_name(request.kind);
-        let mut tx = self.control.store.read(budget.clone()).await?;
+        let (mut tx, auth) = self
+            .control
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
         let selected=budget.run(async {
-            let auth=self.control.revalidate_read(tx.inner_mut(),ctx.auth()).await?;
             let now=self.control.clock.now_ms()?;
             let (id,model_id)=if let Some(id)=request.resource { (id,request.model) }
             else if let Some(model)=request.model {

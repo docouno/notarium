@@ -1,5 +1,4 @@
 use super::*;
-use crate::service::episodes::episode;
 
 struct Candidate {
     position: i64,
@@ -210,18 +209,32 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<BootstrapContext, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.read(budget.clone()).await?;
-        let result = budget
+        let (mut rtx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+        let first_db = budget
             .run(
                 async {
-                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
-                    let current =
-                        AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
                     let owner =
-                        user_read(tx.inner_mut(), current.auth().principal().as_str()).await?;
-                    let row = episode(tx.inner_mut(), current.auth().principal(), &id).await?;
-                    let had_project = row.project_space.is_some();
-                    let episode = self.project_episode(tx.inner_mut(), &current, row).await?;
+                        user_read(rtx.inner_mut(), current.auth().principal().as_str()).await?;
+                    let loaded_ep = self.load_episode_db(rtx.inner_mut(), &current, &id).await?;
+                    let owner_ack_rows = self
+                        .acknowledgement_rows(rtx.inner_mut(), &current, None)
+                        .await?;
+                    Ok::<_, PortError>((owner, loaded_ep, owner_ack_rows))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
+        let (owner, loaded_ep, owner_ack_rows) = first_db?;
+        let had_project = loaded_ep.row.project_space.is_some();
+        let (mut episode, role_to_overlay, selected, personal, owner_acknowledgements) = budget
+            .run(
+                async {
+                    let (episode, role_to_overlay) =
+                        self.resolve_episode_catalog(&current, loaded_ep).await?;
                     let selected = if let Some(space) = space {
                         if current
                             .auth()
@@ -280,9 +293,46 @@ impl ControlService {
                     } else {
                         String::new()
                     };
+                    let owner_acknowledgements = self
+                        .resolve_acknowledgements(&current, owner_ack_rows)
+                        .await?;
+                    Ok::<_, PortError>((
+                        episode,
+                        role_to_overlay,
+                        selected,
+                        personal,
+                        owner_acknowledgements,
+                    ))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        let had_overlay_candidate = role_to_overlay.is_some();
+        let mut rtx = self.store.read(budget.clone()).await?;
+        let second_db = budget
+            .run(
+                async {
+                    let role_enabled = if let Some((reference, raw)) = role_to_overlay {
+                        if self
+                            .overlay(
+                                rtx.inner_mut(),
+                                &current,
+                                raw,
+                                episode.project_hint.as_ref(),
+                            )
+                            .await?
+                            .enabled
+                        {
+                            Some(reference)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     let scope = self
                         .context_digest(
-                            tx.inner_mut(),
+                            rtx.inner_mut(),
                             &current,
                             (
                                 "bootstrap",
@@ -313,13 +363,13 @@ impl ControlService {
                         .transpose()
                         .map_err(|_| invalid(ValidationReason::InvalidState))?
                         .unwrap_or_default();
-                    let space = selected.as_ref().map_or("", SpaceId::as_str);
+                    let space_str = selected.as_ref().map_or("", SpaceId::as_str);
                     let after = cursor.as_ref().map_or(0, |cursor| cursor.after);
                     let mut candidates = load_bootstrap_candidates(
-                        tx.inner_mut(),
+                        rtx.inner_mut(),
                         &owner.user_id,
                         &project,
-                        space,
+                        space_str,
                         &personal,
                         after,
                         page.limit(),
@@ -338,6 +388,21 @@ impl ControlService {
                     } else {
                         None
                     };
+                    Ok::<_, PortError>((role_enabled, after, candidates, continuation))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
+        let (role_enabled, after, candidates, continuation) = second_db?;
+        if let Some(reference) = role_enabled {
+            episode.active_role = Some(reference);
+        } else if had_overlay_candidate {
+            episode.diagnostics.push(EpisodeDiagnostic::RoleUnavailable);
+        }
+        budget
+            .run(
+                async {
                     let mut pinned = Vec::new();
                     let mut favorites = Vec::new();
                     let mut unavailable = 0;
@@ -361,9 +426,6 @@ impl ControlService {
                             Err(error) => return Err(error),
                         }
                     }
-                    let owner_acknowledgements = self
-                        .acknowledgements(tx.inner_mut(), &current, None)
-                        .await?;
                     let readable_spaces = current
                         .auth()
                         .spaces()
@@ -386,11 +448,7 @@ impl ControlService {
                 },
                 CommitEffect::NotCommitted,
             )
-            .await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
-        Ok(result)
+            .await
     }
     pub async fn list_context_entries(
         &self,
@@ -399,17 +457,16 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<ContextEntryInfo>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.read(budget.clone()).await?;
-        let result = budget
+        let (mut tx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+        let db_result = budget
             .run(
                 async {
-                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
-                    let current =
-                        AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
                     let owner =
                         user_read(tx.inner_mut(), current.auth().principal().as_str()).await?;
                     let key = scope_key(&owner, &scope)?;
-                    self.context_scope_read(&current, &scope, &key).await?;
                     let digest = self
                         .context_digest(tx.inner_mut(), &current, ("context-entries", &key))
                         .await?;
@@ -483,6 +540,19 @@ impl ControlService {
                     } else {
                         None
                     };
+                    Ok::<_, PortError>((key, rows, continuation))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget
+            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let (key, rows, continuation) = db_result?;
+        budget
+            .run(
+                async {
+                    self.context_scope_read(&current, &scope, &key).await?;
                     let mut items = Vec::with_capacity(rows.len());
                     for row in rows {
                         let entry = match row.kind.as_str() {
@@ -513,11 +583,7 @@ impl ControlService {
                 },
                 CommitEffect::NotCommitted,
             )
-            .await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
-        Ok(result)
+            .await
     }
 }
 

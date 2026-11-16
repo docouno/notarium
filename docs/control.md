@@ -207,7 +207,9 @@ commit outcome while fresh admissions already see the durable denial. Logout
 evidence may resume only its own exact committed logout. Network-wide registration
 ownership and websocket/SSE disconnect delivery belong to the transport adapter.
 
-Writers have four active slots and a bounded 64-waiter queue per store owner. Owned workers retain
+Writers have one active slot on SQLite (four on PostgreSQL) and a bounded
+64-waiter queue per store owner; read transactions use an isolated read pool with
+16 active reader slots and a bounded 512-waiter queue. Owned workers retain
 the writer fence through BEGIN, COMMIT and ROLLBACK acknowledgement, releasing the
 file fence before dropping in-process admission guards even when the
 request future is dropped. This bounds cancelled-but-still-running database work
@@ -231,9 +233,9 @@ isolated from CIMD quotas.
 
 CIMD fetches an HTTPS client ID through the public-only guarded transport and
 requires the metadata's exact matching client ID. JSON responses are limited to
-64 KiB. Unactivated CIMD records are capped at 256, and the cache holds at most
-1,024 CIMD records (evicting inactive expired entries without active grants when
-full), defaults to five minutes and
+64 KiB. Unactivated CIMD records are capped at 1,000 (evicting inactive expired
+entries that hold no grants, authorization codes or refresh tokens before new
+admission), defaults to five minutes and
 caps freshness at one hour, respecting shorter max-age and Age. No-cache/no-store
 responses are fetched for each operation; their registration record cannot serve
 as reusable cache authority. New registration has a 60/minute per-instance limit;
@@ -417,7 +419,7 @@ calls `invalidate_provider` to discard an owner's pools, and operator policy rep
 cancels all old pools. Fresh DB checks remain mandatory after idle
 pool eviction, because the bounded cache is not an authority ledger.
 
-Each transport instance defaults to 64 active call slots (configurable up to 512). An owned worker reads
+Each transport instance defaults to 64 active call slots (configurable up to 1,024). An owned worker reads
 each response through a one-chunk channel of at most 64 KiB. Caller drop, explicit
 cancellation, epoch changes and deadlines close the response and release its
 slot even if the consumer never polls again. Client construction may load system
@@ -573,7 +575,8 @@ content permissions remain independent. Deletion removes dangling order entries.
 Bootstrap selection accepts an optional current Space. It must match an available
 saved project; otherwise the caller must explicitly update the episode. Selection
 orders project, Space, personal context and favorites, retaining each NoteRef's
-first occurrence. SQL performs deduplication before keyset paging. Each page checks
+first occurrence via bounded in-memory deduplication over indexed SQL reads before
+keyset paging. Each page checks
 at most 200 candidate notes; an empty filtered page can still have a continuation.
 Folder favorites are never expanded into a corpus. Cursors bind authority, episode
 selection and metadata revisions. `users.metadata_revision` changes with reference

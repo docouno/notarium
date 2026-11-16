@@ -205,25 +205,33 @@ impl ControlService {
         scope: ContextScope,
     ) -> Result<ContextScopeInfo, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.read(budget.clone()).await?;
-        let revision = budget
+        let (mut tx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+        let db_result = budget
             .run(
                 async {
-                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
-                    let current =
-                        AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
                     let owner =
                         user_read(tx.inner_mut(), current.auth().principal().as_str()).await?;
                     let key = scope_key(&owner, &scope)?;
-                    self.context_scope_read(&current, &scope, &key).await?;
-                    self.context_scope_revision(tx.inner_mut(), &owner, &key)
-                        .await
+                    let revision = self
+                        .context_scope_revision(tx.inner_mut(), &owner, &key)
+                        .await?;
+                    Ok::<_, PortError>((key, revision))
                 },
                 CommitEffect::NotCommitted,
             )
-            .await?;
+            .await;
         budget
             .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let (key, revision) = db_result?;
+        budget
+            .run(
+                self.context_scope_read(&current, &scope, &key),
+                CommitEffect::NotCommitted,
+            )
             .await?;
         Ok(ContextScopeInfo { scope, revision })
     }

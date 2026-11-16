@@ -68,9 +68,36 @@ impl ControlService {
         }
         Ok(values)
     }
-    async fn context_bundle_info(
+    async fn check_bundle_attachment_db(
         &self,
         tx: &mut Transaction,
+        ctx: &AccountContext,
+        row: &ContextSetsRow,
+    ) -> Result<(), PortError> {
+        let home = SpaceId::parse(&row.home_space)?;
+        let grant = ctx
+            .auth()
+            .spaces()
+            .get(&home)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if grant.read_classes.is_empty() {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        if let Some(root) = &grant.project_root {
+            let target = serde_json::to_string(&FolderRef {
+                space_id: home.clone(),
+                folder_id: root.clone(),
+            })
+            .map_err(|_| invalid(ValidationReason::InvalidState))?;
+            let allowed = rows!(tx,ContextSetAttachmentsRow,fetch_optional,"SELECT * FROM context_set_attachments WHERE set_id=$1 AND target_kind='project' AND target_id=$2 AND target_space=$3","SELECT * FROM v1_control.context_set_attachments WHERE set_id=$1 AND target_kind='project' AND target_id=$2 AND target_space=$3";&row.set_id,&target,home.as_str())?;
+            if allowed.is_none() {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+        }
+        Ok(())
+    }
+    async fn context_bundle_info(
+        &self,
         ctx: &AccountContext,
         row: ContextSetsRow,
         preloaded_home: Option<&CatalogSpace>,
@@ -92,17 +119,6 @@ impl ControlService {
         };
         if kind == SpaceKind::Personal && row.owner_id != ctx.auth().principal().as_str() {
             return Err(DomainError::ResourceNotFound.into());
-        }
-        if let Some(root) = &grant.project_root {
-            let target = serde_json::to_string(&FolderRef {
-                space_id: home.clone(),
-                folder_id: root.clone(),
-            })
-            .map_err(|_| invalid(ValidationReason::InvalidState))?;
-            let allowed = rows!(tx,ContextSetAttachmentsRow,fetch_optional,"SELECT * FROM context_set_attachments WHERE set_id=$1 AND target_kind='project' AND target_id=$2 AND target_space=$3","SELECT * FROM v1_control.context_set_attachments WHERE set_id=$1 AND target_kind='project' AND target_id=$2 AND target_space=$3";&row.set_id,&target,home.as_str())?;
-            if allowed.is_none() {
-                return Err(DomainError::ResourceNotFound.into());
-            }
         }
         let mut visible = Vec::new();
         let mut unavailable = 0;
@@ -141,31 +157,37 @@ impl ControlService {
         id: ContextSetId,
     ) -> Result<ContextSetInfo, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.read(budget.clone()).await?;
-        let result = budget
+        let (mut tx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+        let db_result = budget
             .run(
                 async {
-                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
                     let row = bundle(tx.inner_mut(), &id, false)
                         .await?
                         .ok_or(DomainError::ResourceNotFound)?;
-                    let mut cache = BTreeMap::new();
-                    self.context_bundle_info(
-                        tx.inner_mut(),
-                        &AccountContext::new(auth, budget.context(ctx.budget.request.clone())),
-                        row,
-                        None,
-                        &mut cache,
-                    )
-                    .await
+                    self.check_bundle_attachment_db(tx.inner_mut(), &current, &row)
+                        .await?;
+                    Ok::<_, PortError>(row)
                 },
                 CommitEffect::NotCommitted,
             )
-            .await?;
+            .await;
         budget
             .run(tx.rollback(), CommitEffect::NotCommitted)
             .await?;
-        Ok(result)
+        let row = db_result?;
+        budget
+            .run(
+                async {
+                    let mut cache = BTreeMap::new();
+                    self.context_bundle_info(&current, row, None, &mut cache)
+                        .await
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await
     }
     pub async fn list_context_sets(
         &self,
@@ -174,11 +196,11 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<ContextSetInfo>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.read(budget.clone()).await?;
-        let result = budget.run(async {
-            let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
-            let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
-            let home_space = self.catalog_space(&current, &home).await?;
+        let (mut tx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+        let db_result = budget.run(async {
             let scope = self.context_digest(tx.inner_mut(), &current, ("context-sets", &home)).await?;
             let cursor: Option<Cursor> = page.continuation().map(|value| serde_json::from_str(value).map_err(|_| invalid(ValidationReason::InvalidQuery))).transpose()?;
             if cursor.as_ref().is_some_and(|cursor| cursor.version != 1 || cursor.scope != scope) { return Err(invalid(ValidationReason::CursorStale)); }
@@ -187,19 +209,44 @@ impl ControlService {
             let continuation = if values.len() > usize::from(page.limit()) {
                 values.pop(); Some(serde_json::to_string(&Cursor { version: 1, scope, last: ContextSetId::parse(&values.last().expect("positive page limit").set_id)? }).map_err(|_| invalid(ValidationReason::InvalidState))?)
             } else { None };
-            let mut items = Vec::with_capacity(values.len());
-            let mut note_cache = BTreeMap::new();
+            let mut allowed_rows = Vec::with_capacity(values.len());
             for row in values {
-                match self.context_bundle_info(tx.inner_mut(), &current, row, Some(&home_space), &mut note_cache).await {
-                    Ok(value) => items.push(value), Err(error) if hidden(&error) => (), Err(error) => return Err(error),
+                match self.check_bundle_attachment_db(tx.inner_mut(), &current, &row).await {
+                    Ok(()) => allowed_rows.push(row),
+                    Err(error) if hidden(&error) => (),
+                    Err(error) => return Err(error),
                 }
             }
-            Ok(ControlPage { items, continuation })
-        }, CommitEffect::NotCommitted).await?;
+            Ok::<_, PortError>((allowed_rows, continuation))
+        }, CommitEffect::NotCommitted).await;
         budget
             .run(tx.rollback(), CommitEffect::NotCommitted)
             .await?;
-        Ok(result)
+        let (allowed_rows, continuation) = db_result?;
+        budget
+            .run(
+                async {
+                    let home_space = self.catalog_space(&current, &home).await?;
+                    let mut items = Vec::with_capacity(allowed_rows.len());
+                    let mut note_cache = BTreeMap::new();
+                    for row in allowed_rows {
+                        match self
+                            .context_bundle_info(&current, row, Some(&home_space), &mut note_cache)
+                            .await
+                        {
+                            Ok(value) => items.push(value),
+                            Err(error) if hidden(&error) => (),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Ok(ControlPage {
+                        items,
+                        continuation,
+                    })
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await
     }
     pub async fn put_context_set(
         &self,
@@ -270,29 +317,42 @@ impl ControlService {
                 decode_scope(&key, &row.owner_id)?;
             }
             let row = ContextSetsRow { set_id: request.input.id.to_string(), owner_id: old.as_ref().map_or_else(|| owner.user_id.clone(), |row| row.owner_id.clone()), home_space: request.input.home.to_string(), name: request.input.name.clone(), note_refs: encoded.clone(), revision: next(old.as_ref().map_or(0, |row| row.revision))?, created_at: old.as_ref().map_or(self.clock.now_ms()?, |row| row.created_at) };
-            let record = TargetRecord::from(row.clone()); record.validate()?;
-            if old.is_none() { record.insert(tx.inner_mut()).await?; }
-            else { execute!(tx.inner_mut(),"UPDATE context_sets SET name=$1,note_refs=$2,revision=$3 WHERE set_id=$4","UPDATE v1_control.context_sets SET name=$1,note_refs=$2,revision=$3 WHERE set_id=$4";&row.name,&row.note_refs,row.revision,&row.set_id)?; }
+            let record = TargetRecord::from(row.clone());
+            record.validate()?;
+            if old.is_none() {
+                record.insert_or_conflict(tx.inner_mut()).await?;
+            } else { execute!(tx.inner_mut(),"UPDATE context_sets SET name=$1,note_refs=$2,revision=$3 WHERE set_id=$4","UPDATE v1_control.context_sets SET name=$1,note_refs=$2,revision=$3 WHERE set_id=$4";&row.name,&row.note_refs,row.revision,&row.set_id)?; }
             let revision = self.bump_context_spaces(tx.inner_mut(), &owner, &spaces).await?;
             command.save(tx.inner_mut(), revision, &SavedResult { value: request.input.id.clone(), events: vec![] }, self.clock.now_ms()?).await?;
             Ok((revision, ctx.clone(), request.input.id.clone()))
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
         let mut rtx = self.store.read(budget.clone()).await?;
-        let value = budget
+        let db_result = budget
             .run(
                 async {
                     let row = bundle(rtx.inner_mut(), &saved_id, false)
                         .await?
                         .ok_or(DomainError::ResourceNotFound)?;
+                    self.check_bundle_attachment_db(rtx.inner_mut(), &current_ctx, &row)
+                        .await?;
+                    Ok::<_, PortError>(row)
+                },
+                CommitEffect::Unknown,
+            )
+            .await;
+        budget.run(rtx.rollback(), CommitEffect::Unknown).await?;
+        let row = db_result?;
+        let value = budget
+            .run(
+                async {
                     let mut cache = BTreeMap::new();
-                    self.context_bundle_info(rtx.inner_mut(), &current_ctx, row, None, &mut cache)
+                    self.context_bundle_info(&current_ctx, row, None, &mut cache)
                         .await
                 },
                 CommitEffect::Unknown,
             )
             .await?;
-        budget.run(rtx.rollback(), CommitEffect::Unknown).await?;
         Ok(ControlCommit { revision, value })
     }
     pub async fn delete_context_set(

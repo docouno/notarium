@@ -53,12 +53,13 @@ CREATE TABLE v1_control.sessions (
     user_id TEXT COLLATE "C" NOT NULL REFERENCES v1_control.users(user_id), created_at BIGINT NOT NULL,
     expires_at BIGINT NOT NULL, last_used_at BIGINT NOT NULL, revoked_at BIGINT,
     auth_version BIGINT NOT NULL CHECK (auth_version >= 0),
-    CHECK (coalesce(octet_length(session_id),0) <= 2048),
+    CHECK (coalesce(octet_length(session_id),0) + 8 <= 2048),
     CHECK (coalesce(octet_length(token_hash),0) <= 2048),
     CHECK (coalesce(octet_length(user_id),0) + 8 <= 2048)
 );
 CREATE INDEX session_by_user ON v1_control.sessions(user_id,revoked_at);
 CREATE INDEX session_expiry ON v1_control.sessions(expires_at);
+CREATE INDEX session_revoked ON v1_control.sessions(revoked_at,session_id) WHERE revoked_at IS NOT NULL;
 CREATE TABLE v1_control.one_time_tokens (
     token_hash BYTEA NOT NULL PRIMARY KEY CHECK (length(token_hash)=32),
     user_id TEXT COLLATE "C" NOT NULL REFERENCES v1_control.users(user_id),
@@ -117,10 +118,12 @@ CREATE INDEX code_client ON v1_control.oauth_auth_codes(client_id);
 CREATE TABLE v1_control.oauth_refresh_families (
     family_id TEXT COLLATE "C" NOT NULL PRIMARY KEY, grant_id TEXT COLLATE "C" NOT NULL REFERENCES v1_control.oauth_grants(grant_id),
     revoked_at BIGINT, reason_code TEXT COLLATE "C", created_at BIGINT NOT NULL,
-    CHECK (coalesce(octet_length(family_id),0) <= 2048),
+    CHECK (coalesce(octet_length(family_id),0) + 8 <= 2048),
     CHECK (coalesce(octet_length(grant_id),0) <= 2048)
 );
 CREATE INDEX family_grant ON v1_control.oauth_refresh_families(grant_id);
+CREATE INDEX family_revoked ON v1_control.oauth_refresh_families(revoked_at,family_id) WHERE revoked_at IS NOT NULL;
+CREATE INDEX family_created ON v1_control.oauth_refresh_families(created_at,family_id) WHERE revoked_at IS NULL;
 CREATE TABLE v1_control.oauth_refresh_tokens (
     token_id TEXT COLLATE "C" NOT NULL PRIMARY KEY CHECK (length(token_id)=12),
     token_hash BYTEA NOT NULL CHECK (length(token_hash)=32),
@@ -270,7 +273,6 @@ CREATE TABLE v1_control.provider_call_log (
 CREATE INDEX call_owner ON v1_control.provider_call_log(owner_id,created_at,call_id);
 CREATE INDEX call_pending ON v1_control.provider_call_log(delivery_state,created_at,call_id);
 CREATE INDEX call_settled ON v1_control.provider_call_log(delivery_state,settled_at,call_id);
-CREATE INDEX call_budget_resource ON v1_control.provider_call_log(resource_id,created_at,diagnostic);
 CREATE TABLE v1_control.ability_availability (
     placement TEXT COLLATE "C" NOT NULL, ability_id TEXT COLLATE "C" NOT NULL,
     mode TEXT COLLATE "C" NOT NULL CHECK (mode IN ('all-projects','selected-projects')),

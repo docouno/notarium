@@ -95,10 +95,11 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<FavoriteInfo>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.read(budget.clone()).await?;
-        let result = budget.run(async {
-            let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
-            let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+        let (mut tx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+        let db_result = budget.run(async {
             let scope = self.context_digest(tx.inner_mut(), &current, "favorites").await?;
             let cursor: Option<Cursor> = page.continuation().map(|value| serde_json::from_str(value).map_err(|_| invalid(ValidationReason::InvalidQuery))).transpose()?;
             if cursor.as_ref().is_some_and(|cursor| cursor.version != 1 || cursor.scope != scope || !matches!(cursor.kind.as_str(), "note" | "folder")) { return Err(invalid(ValidationReason::CursorStale)); }
@@ -110,18 +111,34 @@ impl ControlService {
                 values.pop(); let last = values.last().expect("positive page limit");
                 Some(serde_json::to_string(&Cursor { version: 1, scope, rank: last.rank, space: SpaceId::parse(&last.space_id)?, kind: last.entity_kind.clone(), entity: last.entity_id.clone() }).map_err(|_| invalid(ValidationReason::InvalidState))?)
             } else { None };
-            let mut items = Vec::with_capacity(values.len());
-            for row in values {
-                let reference = reference(&row)?;
-                match self.favorite_visible(&current, &reference).await {
-                    Ok(()) => items.push(FavoriteInfo { reference, rank: row.rank }), Err(error) if hidden(&error) => (), Err(error) => return Err(error),
-                }
-            }
-            Ok(ControlPage { items, continuation })
-        }, CommitEffect::NotCommitted).await?;
+            Ok::<_, PortError>((values, continuation))
+        }, CommitEffect::NotCommitted).await;
         budget
             .run(tx.rollback(), CommitEffect::NotCommitted)
             .await?;
-        Ok(result)
+        let (values, continuation) = db_result?;
+        budget
+            .run(
+                async {
+                    let mut items = Vec::with_capacity(values.len());
+                    for row in values {
+                        let reference = reference(&row)?;
+                        match self.favorite_visible(&current, &reference).await {
+                            Ok(()) => items.push(FavoriteInfo {
+                                reference,
+                                rank: row.rank,
+                            }),
+                            Err(error) if hidden(&error) => (),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Ok(ControlPage {
+                        items,
+                        continuation,
+                    })
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await
     }
 }

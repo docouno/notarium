@@ -18,23 +18,30 @@ use std::{
 };
 
 #[derive(Default)]
+struct WakerSlab {
+    entries: Vec<Option<Waker>>,
+    free: Vec<usize>,
+}
+
+#[derive(Default)]
 struct CancellationState {
     cancelled: AtomicBool,
-    wakers: Mutex<Vec<Waker>>,
+    wakers: Mutex<WakerSlab>,
 }
 
 #[derive(Clone, Default)]
 pub struct Cancellation(Arc<CancellationState>);
 impl Cancellation {
     pub fn cancel(&self) {
-        let wakers = {
+        let entries = {
             let mut guard = self.0.wakers.lock().unwrap_or_else(|e| e.into_inner());
             if self.0.cancelled.swap(true, Ordering::SeqCst) {
                 return;
             }
-            std::mem::take(&mut *guard)
+            guard.free.clear();
+            std::mem::take(&mut guard.entries)
         };
-        for waker in wakers {
+        for waker in entries.into_iter().flatten() {
             waker.wake();
         }
     }
@@ -42,7 +49,10 @@ impl Cancellation {
         self.0.cancelled.load(Ordering::SeqCst)
     }
     pub fn cancelled(&self) -> Cancelled<'_> {
-        Cancelled(self)
+        Cancelled {
+            cancellation: self,
+            slot: None,
+        }
     }
 }
 impl fmt::Debug for Cancellation {
@@ -52,24 +62,69 @@ impl fmt::Debug for Cancellation {
             .finish()
     }
 }
-pub struct Cancelled<'a>(&'a Cancellation);
+pub struct Cancelled<'a> {
+    cancellation: &'a Cancellation,
+    slot: Option<usize>,
+}
+impl Unpin for Cancelled<'_> {}
 impl Future for Cancelled<'_> {
     type Output = ();
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.0.is_cancelled() {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.cancellation.is_cancelled() {
             return Poll::Ready(());
         }
-        let mut guard = self.0.0.wakers.lock().unwrap_or_else(|e| e.into_inner());
-        if self.0.is_cancelled() {
+        let mut guard = self
+            .cancellation
+            .0
+            .wakers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.cancellation.is_cancelled() {
+            self.slot = None;
             return Poll::Ready(());
         }
         let waker = cx.waker();
-        if let Some(existing) = guard.iter_mut().find(|item| item.will_wake(waker)) {
-            existing.clone_from(waker);
-        } else {
-            guard.push(waker.clone());
+        match self.slot {
+            Some(idx) => {
+                if let Some(entry) = guard.entries.get_mut(idx) {
+                    match entry {
+                        Some(existing) if existing.will_wake(waker) => {}
+                        _ => *entry = Some(waker.clone()),
+                    }
+                }
+            }
+            None => {
+                let idx = if let Some(free_idx) = guard.free.pop() {
+                    guard.entries[free_idx] = Some(waker.clone());
+                    free_idx
+                } else {
+                    let idx = guard.entries.len();
+                    guard.entries.push(Some(waker.clone()));
+                    idx
+                };
+                self.slot = Some(idx);
+            }
         }
         Poll::Pending
+    }
+}
+impl Drop for Cancelled<'_> {
+    fn drop(&mut self) {
+        if let Some(idx) = self.slot.take()
+            && !self.cancellation.is_cancelled()
+        {
+            let mut guard = self
+                .cancellation
+                .0
+                .wakers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = guard.entries.get_mut(idx)
+                && entry.take().is_some()
+            {
+                guard.free.push(idx);
+            }
+        }
     }
 }
 

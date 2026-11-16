@@ -607,20 +607,23 @@ fn budget() -> CallBudget {
     }
 }
 fn auth() -> EngineAuthContext {
-    EngineAuthContext::for_human(VerifiedHuman::attest(
-        PrincipalId::from_bytes([1; 16]),
-        GrantId::from_bytes([1; 16]),
-        BTreeMap::from([(
-            scope(1).space_id,
-            SpaceGrant {
-                role: SpaceRole::Owner,
-                read_classes: DocClass::all(),
-                write_classes: DocClass::all(),
-                project_root: None,
-            },
-        )]),
-        true,
-    ))
+    EngineAuthContext::for_human(
+        VerifiedHuman::attest(
+            PrincipalId::from_bytes([1; 16]),
+            GrantId::from_bytes([1; 16]),
+            BTreeMap::from([(
+                scope(1).space_id,
+                SpaceGrant {
+                    role: SpaceRole::Owner,
+                    read_classes: DocClass::all(),
+                    write_classes: DocClass::all(),
+                    project_root: None,
+                },
+            )]),
+            true,
+        )
+        .with_human_management(true),
+    )
 }
 fn context() -> SpaceContext {
     SpaceContext::new(auth(), scope(1), budget()).unwrap()

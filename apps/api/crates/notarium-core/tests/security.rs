@@ -17,12 +17,15 @@ fn grants(role: SpaceRole) -> BTreeMap<SpaceId, SpaceGrant> {
         .into()
 }
 fn human(role: SpaceRole, ability: bool) -> EngineAuthContext {
-    EngineAuthContext::for_human(VerifiedHuman::attest(
-        PrincipalId::from_bytes([1; 16]),
-        GrantId::from_bytes([1; 16]),
-        grants(role),
-        ability,
-    ))
+    EngineAuthContext::for_human(
+        VerifiedHuman::attest(
+            PrincipalId::from_bytes([1; 16]),
+            GrantId::from_bytes([1; 16]),
+            grants(role),
+            ability,
+        )
+        .with_human_management(true),
+    )
 }
 
 #[test]
@@ -501,9 +504,19 @@ fn metadata_visibility_checks_do_not_taint_and_keeper_reads_only_pinned_project_
         owner.authorize_ability_mutation(),
         Err(DomainError::AbilityWriteForbidden)
     );
+    let ambient_ability = EngineAuthContext::for_human(VerifiedHuman::attest(
+        PrincipalId::from_bytes([1; 16]),
+        GrantId::from_bytes([1; 16]),
+        grants(SpaceRole::Owner),
+        true,
+    ));
     assert_eq!(
-        human(SpaceRole::Owner, true).authorize_human_management(),
+        ambient_ability.authorize_human_management(),
         Err(DomainError::AccessDenied)
+    );
+    assert_eq!(
+        ambient_ability.authorize_ability_mutation(),
+        Err(DomainError::AbilityWriteForbidden)
     );
 
     let agent = owner
@@ -569,6 +582,21 @@ fn cancellation_future_wakes_registered_task_and_tool_call_ids_accept_provider_d
     }
 
     let cancellation = Cancellation::default();
+    for _ in 0..1_000 {
+        let transient = Arc::new(CountWake(AtomicUsize::new(0)));
+        let transient_waker = Waker::from(transient.clone());
+        let mut transient_cx = Context::from_waker(&transient_waker);
+        {
+            let mut fut = cancellation.cancelled();
+            assert_eq!(Pin::new(&mut fut).poll(&mut transient_cx), Poll::Pending);
+        }
+        drop(transient_waker);
+        assert_eq!(
+            Arc::strong_count(&transient),
+            1,
+            "dropped Cancelled future must release its registered Waker in O(1)"
+        );
+    }
     let counter = Arc::new(CountWake(AtomicUsize::new(0)));
     let waker = Waker::from(counter.clone());
     let mut cx = Context::from_waker(&waker);

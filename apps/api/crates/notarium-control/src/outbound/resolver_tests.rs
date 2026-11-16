@@ -79,6 +79,20 @@ async fn cancelled_dns_jobs_remain_bounded_and_each_connection_checks_the_entire
         assert!(job.await.is_err());
     }
     assert_eq!(resolver.available_permits(), 0);
+    let tiny_queue_resolver = Arc::new(GuardedResolver::with_admission(
+        NetworkPolicy::default()
+            .endpoint(OutboundScope::Cimd, "https://public.example/metadata")
+            .unwrap(),
+        source.clone(),
+        Arc::new(Semaphore::new(0)),
+        Arc::new(Semaphore::new(0)),
+    ));
+    assert!(
+        tiny_queue_resolver
+            .resolve("public.example".parse().unwrap())
+            .await
+            .is_err()
+    );
     assert!(
         resolver
             .resolve("public.example".parse().unwrap())

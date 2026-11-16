@@ -91,6 +91,14 @@ impl ControlService {
         tx: &mut Transaction,
         auth: &EngineAuthContext,
     ) -> Result<EngineAuthContext, PortError> {
+        self.revalidate_read_with_keeper(tx, auth, None).await
+    }
+    pub(super) async fn revalidate_read_with_keeper(
+        &self,
+        tx: &mut Transaction,
+        auth: &EngineAuthContext,
+        keeper: Option<&super::schedules::PrecheckedKeeper>,
+    ) -> Result<EngineAuthContext, PortError> {
         let current_user = user_read(tx, auth.principal().as_str()).await?;
         let credential = auth.credential().cloned().ok_or_else(denied)?;
         let current = self
@@ -101,10 +109,32 @@ impl ControlService {
                 auth.human_management(),
                 auth.has_cap(Cap::AbilityWrite),
                 false,
-                None,
+                keeper,
             )
             .await?;
         auth.intersect_current(&current).map_err(Into::into)
+    }
+    pub(super) async fn open_revalidated_read(
+        &self,
+        budget: &OperationBudget,
+        request: &RequestId,
+        auth: &EngineAuthContext,
+    ) -> Result<(crate::store::ReadTransaction, EngineAuthContext), PortError> {
+        let keeper = self.precheck_keeper_catalog(auth, budget, request).await?;
+        let mut rtx = self.store.read(budget.clone()).await?;
+        match budget
+            .run(
+                self.revalidate_read_with_keeper(rtx.inner_mut(), auth, keeper.as_ref()),
+                CommitEffect::NotCommitted,
+            )
+            .await
+        {
+            Ok(revalidated) => Ok((rtx, revalidated)),
+            Err(err) => {
+                let _ = rtx.finish().await;
+                Err(err)
+            }
+        }
     }
     #[allow(clippy::too_many_arguments)]
     async fn credential_context(
@@ -249,7 +279,7 @@ impl ControlService {
             AuthEvidenceKind::Oidc => return Err(denied()),
         };
         let human_management = ctx.evidence.human_management();
-        let ability_write = ctx.evidence.ability_write();
+        let ability_write = human_management && ctx.evidence.ability_write();
         let (id, digest) = token::parse(kind, ctx.evidence.secret()).map_err(|_| denied())?;
 
         // Fast path: consistent read-only resolution with zero writer contention
@@ -490,7 +520,7 @@ impl ControlService {
                         AuthenticatedCredential::TrustedNone,
                         grant("none", owner.as_str()),
                         perimeter.human_management(),
-                        perimeter.ability_write(),
+                        perimeter.human_management() && perimeter.ability_write(),
                         false,
                     )
                     .await
@@ -504,6 +534,9 @@ impl ControlService {
     pub async fn logout(&self, ctx: PreAuthContext) -> Result<(), PortError> {
         if ctx.evidence.kind() != AuthEvidenceKind::Session {
             return Err(denied());
+        }
+        if !ctx.evidence.human_management() {
+            return Err(notarium_core::DomainError::AccessDenied.into());
         }
         let (_, digest) =
             token::parse(TokenKind::Session, ctx.evidence.secret()).map_err(|_| denied())?;

@@ -190,12 +190,8 @@ impl ControlService {
     }
     pub async fn whoami(&self, ctx: AccountContext) -> Result<PrincipalInfo, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut rtx = self.store.read(budget.clone()).await?;
-        let auth = budget
-            .run(
-                self.revalidate_read(rtx.inner_mut(), ctx.auth()),
-                CommitEffect::NotCommitted,
-            )
+        let (rtx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         Ok(PrincipalInfo {
@@ -210,12 +206,8 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<AccessibleSpace>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut rtx = self.store.read(budget.clone()).await?;
-        let auth = budget
-            .run(
-                self.revalidate_read(rtx.inner_mut(), ctx.auth()),
-                CommitEffect::NotCommitted,
-            )
+        let (rtx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         let facts: Vec<_> = auth

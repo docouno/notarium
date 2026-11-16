@@ -102,6 +102,8 @@ pub struct Catalog {
     pub fail_after_create: AtomicBool,
     pub fail_after_lifecycle: AtomicBool,
     pub create_gate: CallbackGate,
+    pub abilities_gate: CallbackGate,
+    pub abilities_calls: AtomicUsize,
     pub space_read_fault: AtomicU8,
     pub space_reads: AtomicUsize,
     lifecycle_receipts:
@@ -250,6 +252,11 @@ impl ControlCatalogPort for Catalog {
         query: AbilityQuery,
     ) -> PortFuture<'_, ControlPage<AbilityDescriptor>> {
         Box::pin(async move {
+            self.abilities_calls.fetch_add(1, Ordering::SeqCst);
+            if self.abilities_gate.enabled.load(Ordering::SeqCst) {
+                self.abilities_gate.entered.add_permits(1);
+                let _ = self.abilities_gate.release.acquire().await.unwrap();
+            }
             let offset = query
                 .page
                 .continuation()

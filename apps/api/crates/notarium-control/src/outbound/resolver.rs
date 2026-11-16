@@ -12,6 +12,7 @@ use std::{
 use tokio::sync::Semaphore;
 
 pub(super) const DEFAULT_DNS_PERMITS: usize = 4;
+pub(super) const DEFAULT_DNS_QUEUE: usize = 64;
 const DNS_ADMISSION_WAIT: Duration = Duration::from_millis(50);
 
 fn rejected() -> io::Error {
@@ -43,36 +44,33 @@ impl Drop for CancelOnDrop {
 /// A resolver bound to one checked origin. Pass it to ClientBuilder::dns_resolver
 /// so the connector uses these exact verified addresses without another lookup.
 /// System jobs own one of four transport-scoped slots until they actually finish.
-pub struct GuardedResolver {
+pub(super) struct GuardedResolver {
     endpoint: CheckedEndpoint,
     lookup: Arc<dyn Lookup>,
     dns_admission: Arc<Semaphore>,
+    dns_queue: Arc<Semaphore>,
 }
 impl GuardedResolver {
-    pub fn new(endpoint: CheckedEndpoint) -> Self {
-        Self::with_admission(
-            endpoint,
-            Arc::new(SystemLookup),
-            Arc::new(Semaphore::new(DEFAULT_DNS_PERMITS)),
-        )
-    }
     #[cfg(test)]
     pub(super) fn with_lookup(endpoint: CheckedEndpoint, lookup: Arc<dyn Lookup>) -> Self {
         Self::with_admission(
             endpoint,
             lookup,
             Arc::new(Semaphore::new(DEFAULT_DNS_PERMITS)),
+            Arc::new(Semaphore::new(DEFAULT_DNS_QUEUE)),
         )
     }
     pub(super) fn with_admission(
         endpoint: CheckedEndpoint,
         lookup: Arc<dyn Lookup>,
         dns_admission: Arc<Semaphore>,
+        dns_queue: Arc<Semaphore>,
     ) -> Self {
         Self {
             endpoint,
             lookup,
             dns_admission,
+            dns_queue,
         }
     }
     pub(super) fn default_lookup() -> Arc<dyn Lookup> {
@@ -88,16 +86,20 @@ impl Resolve for GuardedResolver {
         let endpoint = self.endpoint.clone();
         let lookup = self.lookup.clone();
         let dns_admission = self.dns_admission.clone();
+        let dns_queue = self.dns_queue.clone();
         Box::pin(async move {
             if endpoint.url().host_str() != Some(name.as_str()) {
                 return Err(rejected().into());
             }
             let permit = match dns_admission.clone().try_acquire_owned() {
                 Ok(permit) => permit,
-                Err(_) => tokio::time::timeout(DNS_ADMISSION_WAIT, dns_admission.acquire_owned())
-                    .await
-                    .map_err(|_| rejected())?
-                    .map_err(|_| rejected())?,
+                Err(_) => {
+                    let _queue_slot = dns_queue.try_acquire_owned().map_err(|_| rejected())?;
+                    tokio::time::timeout(DNS_ADMISSION_WAIT, dns_admission.acquire_owned())
+                        .await
+                        .map_err(|_| rejected())?
+                        .map_err(|_| rejected())?
+                }
             };
             let cancelled = Arc::new(AtomicBool::new(false));
             let _cancel = CancelOnDrop(cancelled.clone());

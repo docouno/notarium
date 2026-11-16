@@ -10,13 +10,17 @@ Local delivery uses independent SQLite files without `ATTACH DATABASE`: control
 data, canonical data with a batch writer and Zstd CAS, and derived generations
 published through ArcSwap. Cloud delivery targets PostgreSQL 16 and S3. Search
 targets pure Rust i8 mmap CSR-HNSW with `std::arch` SIMD. ONNX is loaded dynamically
-through `ort`, never downloaded during offline builds. These are boundaries for
-upcoming work, not implemented storage or search behavior in this scaffold.
+through `ort`, never downloaded during offline builds. Canonical/derived storage,
+search and live collaboration remain boundaries for upcoming work, not implemented
+behavior in this tree.
 
-The core and syntax libraries implement [domain contracts](core-contracts.md)
-and [document syntax](syntax.md), including authority/egress checks, typed ports,
-history-scoped receipts, exact comparisons and byte-preserving edits. Port
-implementations, durable storage and transport integration remain separate work.
+The core, syntax and control libraries implement [domain contracts](core-contracts.md),
+[document syntax](syntax.md) and [control-plane services](control.md), including
+authority/egress checks, typed ports, history-scoped receipts, exact comparisons,
+byte-preserving edits, SQLite/PostgreSQL control storage, authentication, OAuth/OIDC,
+the native keyring, guarded outbound HTTP, the AI provider gateway and the
+[control backup participant](control-backup.md). Canonical storage, projections,
+search, collaboration and HTTP/MCP transport integration remain separate work.
 
 ## Internal dependency allowlist
 

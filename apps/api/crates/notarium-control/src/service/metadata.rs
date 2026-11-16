@@ -86,11 +86,12 @@ impl ControlService {
             return Err(invalid(ValidationReason::InvalidQuery));
         }
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut rtx = self.store.read(budget.clone()).await?;
+        let (mut rtx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
         let (current, personal_space) = budget
             .run(
                 async {
-                    let auth = self.revalidate_read(rtx.inner_mut(), ctx.auth()).await?;
                     let personal = if let MemoryTarget::User { owner } = &target {
                         if owner != auth.principal() {
                             return Err(DomainError::ResourceNotFound.into());
@@ -182,12 +183,8 @@ impl ControlService {
         ctx: &AccountContext,
         budget: &OperationBudget,
     ) -> Result<AccountContext, PortError> {
-        let mut rtx = self.store.read(budget.clone()).await?;
-        let auth = budget
-            .run(
-                self.revalidate_read(rtx.inner_mut(), ctx.auth()),
-                CommitEffect::NotCommitted,
-            )
+        let (rtx, auth) = self
+            .open_revalidated_read(budget, &ctx.budget.request, ctx.auth())
             .await?;
         budget
             .run(rtx.rollback(), CommitEffect::NotCommitted)

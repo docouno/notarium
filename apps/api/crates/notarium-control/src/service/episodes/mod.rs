@@ -62,13 +62,57 @@ async fn bump_owner(tx: &mut Transaction, owner: &UsersRow) -> Result<ControlRev
     execute!(tx,"UPDATE users SET revision=$1 WHERE user_id=$2","UPDATE v1_control.users SET revision=$1 WHERE user_id=$2";revision,&owner.user_id)?;
     Ok(ControlRevision::new(revision as u64)?)
 }
+type FollowedRoleChain = Result<(AbilityRef, Vec<AbilityPlacement>), PortError>;
+
+pub(in super::super) struct LoadedEpisodeDb {
+    pub(in super::super) row: AgentEpisodesRow,
+    pub(in super::super) ack_rows: Vec<(SpaceId, Vec<u8>, i64)>,
+    pub(in super::super) parsed_role: Option<(AbilityRef, FollowedRoleChain)>,
+}
+enum LoadedStartedDb {
+    New(LoadedEpisodeDb),
+    Resumed(LoadedEpisodeDb),
+    Forked(LoadedEpisodeDb),
+    Ambiguous(Vec<EpisodeChoice>),
+}
 impl ControlService {
-    pub(super) async fn project_episode(
+    pub(in super::super) async fn load_episode_db(
         &self,
         tx: &mut Transaction,
         ctx: &AccountContext,
-        row: AgentEpisodesRow,
-    ) -> Result<AgentEpisode, PortError> {
+        id: &EpisodeId,
+    ) -> Result<LoadedEpisodeDb, PortError> {
+        let row = episode(tx, ctx.auth().principal(), id).await?;
+        if row.owner_id != ctx.auth().principal().as_str() {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        let parsed_role = if let Some(value) = &row.active_role {
+            let reference: AbilityRef =
+                serde_json::from_str(value).map_err(|_| invalid(ValidationReason::InvalidState))?;
+            let followed = self
+                .follow_ability_chain_db(tx, ctx, reference.clone())
+                .await;
+            Some((reference, followed))
+        } else {
+            None
+        };
+        let ack_rows = self.acknowledgement_rows(tx, ctx, Some(id)).await?;
+        Ok(LoadedEpisodeDb {
+            row,
+            ack_rows,
+            parsed_role,
+        })
+    }
+    pub(in super::super) async fn resolve_episode_catalog(
+        &self,
+        ctx: &AccountContext,
+        loaded: LoadedEpisodeDb,
+    ) -> Result<(AgentEpisode, Option<(AbilityRef, AbilityDescriptor)>), PortError> {
+        let LoadedEpisodeDb {
+            row,
+            ack_rows,
+            parsed_role,
+        } = loaded;
         if row.owner_id != ctx.auth().principal().as_str() {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -91,54 +135,84 @@ impl ControlService {
             (None, None) => None,
             _ => return Err(invalid(ValidationReason::InvalidState)),
         };
-        let active_role = if let Some(value) = row.active_role {
-            let reference: AbilityRef = serde_json::from_str(&value)
-                .map_err(|_| invalid(ValidationReason::InvalidState))?;
-            if self
-                .current_role_in_project(tx, ctx, &reference, project_hint.as_ref())
+        let role_to_overlay = if let Some((reference, followed)) = parsed_role {
+            match self
+                .check_active_role_catalog(ctx, &reference, followed, project_hint.as_ref())
                 .await?
             {
-                Some(reference)
-            } else {
-                diagnostics.push(EpisodeDiagnostic::RoleUnavailable);
-                None
+                Some(raw) => Some((reference, raw)),
+                None => {
+                    diagnostics.push(EpisodeDiagnostic::RoleUnavailable);
+                    None
+                }
             }
         } else {
             None
         };
         let id = EpisodeId::parse(&row.episode_id)?;
-        let acknowledgements = self.acknowledgements(tx, ctx, Some(&id)).await?;
-        Ok(AgentEpisode {
-            id,
-            owner: ctx.auth().principal().clone(),
-            name: row.name,
-            active_role,
-            project_hint,
-            lifecycle: lifecycle(&row.lifecycle)?,
-            parent: row.parent_id.as_deref().map(EpisodeId::parse).transpose()?,
-            revision: ControlRevision::new(row.revision as u64)?,
-            acknowledgements,
-            diagnostics,
-        })
+        let acknowledgements = self.resolve_acknowledgements(ctx, ack_rows).await?;
+        Ok((
+            AgentEpisode {
+                id,
+                owner: ctx.auth().principal().clone(),
+                name: row.name,
+                active_role: None,
+                project_hint,
+                lifecycle: lifecycle(&row.lifecycle)?,
+                parent: row.parent_id.as_deref().map(EpisodeId::parse).transpose()?,
+                revision: ControlRevision::new(row.revision as u64)?,
+                acknowledgements,
+                diagnostics,
+            },
+            role_to_overlay,
+        ))
     }
-    async fn project_started(
+    async fn finish_episode_projection(
+        &self,
+        budget: &OperationBudget,
+        effect: CommitEffect,
+        ctx: &AccountContext,
+        loaded: LoadedEpisodeDb,
+    ) -> Result<AgentEpisode, PortError> {
+        let (mut episode, role_to_overlay) = budget
+            .run(self.resolve_episode_catalog(ctx, loaded), effect)
+            .await?;
+        if let Some((reference, raw)) = role_to_overlay {
+            let mut rtx = self.store.read(budget.clone()).await?;
+            let enabled = budget
+                .run(
+                    async {
+                        Ok::<_, PortError>(
+                            self.overlay(rtx.inner_mut(), ctx, raw, episode.project_hint.as_ref())
+                                .await?
+                                .enabled,
+                        )
+                    },
+                    effect,
+                )
+                .await;
+            budget.run(rtx.finish(), effect).await?;
+            if enabled? {
+                episode.active_role = Some(reference);
+            } else {
+                episode.diagnostics.push(EpisodeDiagnostic::RoleUnavailable);
+            }
+        }
+        Ok(episode)
+    }
+    async fn load_started_db(
         &self,
         tx: &mut Transaction,
         ctx: &AccountContext,
         result: Started,
-    ) -> Result<EpisodeStartResult, PortError> {
+    ) -> Result<LoadedStartedDb, PortError> {
         Ok(match result {
-            Started::New(id) => {
-                let row = episode(tx, ctx.auth().principal(), &id).await?;
-                EpisodeStartResult::New(self.project_episode(tx, ctx, row).await?)
-            }
+            Started::New(id) => LoadedStartedDb::New(self.load_episode_db(tx, ctx, &id).await?),
             Started::Resumed(id) => {
-                let row = episode(tx, ctx.auth().principal(), &id).await?;
-                EpisodeStartResult::Resumed(self.project_episode(tx, ctx, row).await?)
+                LoadedStartedDb::Resumed(self.load_episode_db(tx, ctx, &id).await?)
             }
             Started::Forked(id) => {
-                let row = episode(tx, ctx.auth().principal(), &id).await?;
-                EpisodeStartResult::Forked(self.project_episode(tx, ctx, row).await?)
+                LoadedStartedDb::Forked(self.load_episode_db(tx, ctx, &id).await?)
             }
             Started::Ambiguous(ids) => {
                 if ids.len() > 200 {
@@ -149,7 +223,7 @@ impl ControlService {
                     let row = episode(tx, ctx.auth().principal(), &id).await?;
                     choices.push(EpisodeChoice { id, name: row.name });
                 }
-                EpisodeStartResult::Ambiguous(choices)
+                LoadedStartedDb::Ambiguous(choices)
             }
         })
     }
@@ -159,26 +233,19 @@ impl ControlService {
         id: EpisodeId,
     ) -> Result<AgentEpisode, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.read(budget.clone()).await?;
-        let value = budget
+        let (mut rtx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+        let loaded = budget
             .run(
-                async {
-                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
-                    let row = episode(tx.inner_mut(), auth.principal(), &id).await?;
-                    self.project_episode(
-                        tx.inner_mut(),
-                        &AccountContext::new(auth, budget.context(ctx.budget.request.clone())),
-                        row,
-                    )
-                    .await
-                },
+                self.load_episode_db(rtx.inner_mut(), &current, &id),
                 CommitEffect::NotCommitted,
             )
-            .await?;
-        budget
-            .run(tx.rollback(), CommitEffect::NotCommitted)
-            .await?;
-        Ok(value)
+            .await;
+        budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
+        self.finish_episode_projection(&budget, CommitEffect::NotCommitted, &current, loaded?)
+            .await
     }
     pub async fn start_or_resume_episode(
         &self,
@@ -258,13 +325,28 @@ impl ControlService {
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
         let mut rtx = self.store.read(budget.clone()).await?;
-        let value = budget
+        let loaded = budget
             .run(
-                self.project_started(rtx.inner_mut(), &current, started_value),
+                self.load_started_db(rtx.inner_mut(), &current, started_value),
                 CommitEffect::Unknown,
             )
-            .await?;
-        budget.run(rtx.rollback(), CommitEffect::Unknown).await?;
+            .await;
+        budget.run(rtx.finish(), CommitEffect::Unknown).await?;
+        let value = match loaded? {
+            LoadedStartedDb::New(ep) => EpisodeStartResult::New(
+                self.finish_episode_projection(&budget, CommitEffect::Unknown, &current, ep)
+                    .await?,
+            ),
+            LoadedStartedDb::Resumed(ep) => EpisodeStartResult::Resumed(
+                self.finish_episode_projection(&budget, CommitEffect::Unknown, &current, ep)
+                    .await?,
+            ),
+            LoadedStartedDb::Forked(ep) => EpisodeStartResult::Forked(
+                self.finish_episode_projection(&budget, CommitEffect::Unknown, &current, ep)
+                    .await?,
+            ),
+            LoadedStartedDb::Ambiguous(choices) => EpisodeStartResult::Ambiguous(choices),
+        };
         Ok(ControlCommit { value, revision })
     }
     pub async fn update_episode(
@@ -345,17 +427,16 @@ impl ControlService {
         }, CommitEffect::NotCommitted).await?;
         budget.run(tx.commit(), CommitEffect::Unknown).await?;
         let mut rtx = self.store.read(budget.clone()).await?;
-        let value = budget
+        let loaded = budget
             .run(
-                async {
-                    let row =
-                        episode(rtx.inner_mut(), current.auth().principal(), &saved_id).await?;
-                    self.project_episode(rtx.inner_mut(), &current, row).await
-                },
+                self.load_episode_db(rtx.inner_mut(), &current, &saved_id),
                 CommitEffect::Unknown,
             )
+            .await;
+        budget.run(rtx.finish(), CommitEffect::Unknown).await?;
+        let value = self
+            .finish_episode_projection(&budget, CommitEffect::Unknown, &current, loaded?)
             .await?;
-        budget.run(rtx.rollback(), CommitEffect::Unknown).await?;
         Ok(ControlCommit { revision, value })
     }
     /// Trusted accepted-call path. It cannot change role, project or acknowledgements.

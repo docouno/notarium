@@ -477,14 +477,13 @@ impl ProviderService {
         id: RequestId,
     ) -> Result<ProviderCallStatus, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.control.store.read(budget.clone()).await?;
+        let (mut tx, auth) = self
+            .control
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
         let status = budget
             .run(
                 async {
-                    let auth = self
-                        .control
-                        .revalidate_read(tx.inner_mut(), ctx.auth())
-                        .await?;
                     let row = call_read(tx.inner_mut(), &id).await?;
                     owned(auth.principal().as_str(), &row.owner_id)?;
                     status(&row)

@@ -28,8 +28,10 @@ constructs the shared layout from a supplied path.
 
 Verified authority enters through trusted owners, not deserialization of an auth
 context. Delegation intersects role, class and project grants. Interactive
-`human_management` attestation is orthogonal to `Cap::AbilityWrite`; Agent, Keeper,
-OAuth and PAT contexts can obtain neither. Both old and new resource facts
+`human_management` attestation is separate from `Cap::AbilityWrite`:
+`human_management` does not grant `Cap::AbilityWrite`, while `Cap::AbilityWrite`
+additionally requires `human_management`; Agent, Keeper, OAuth and PAT contexts
+can obtain neither. Both old and new resource facts
 are checked on direct writes, including auxiliary ability files. A run pins its
 write Space; non-tainting metadata visibility checks (`can_view_resource`,
 `can_view_folder`) filter listings and references without tainting the branch,

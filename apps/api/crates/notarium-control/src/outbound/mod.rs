@@ -6,5 +6,4 @@ mod resolver;
 pub(crate) mod test_https;
 mod transport;
 pub use policy::{CheckedEndpoint, NetworkPolicy, OutboundScope, PrivateNetworkRule, ProviderWire};
-pub use resolver::GuardedResolver;
 pub use transport::{OutboundRequest, OutboundResponse, OutboundTransport};

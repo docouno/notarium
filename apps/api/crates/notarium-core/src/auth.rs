@@ -190,7 +190,7 @@ impl EngineAuthContext {
             kind: PrincipalKind::DirectHuman,
             spaces: verified.spaces,
             human_management: verified.human_management,
-            ability_write: verified.ability_write,
+            ability_write: verified.human_management && verified.ability_write,
             write_space: None,
             taint: BranchTaint::default(),
             readonly_abilities: BTreeSet::new(),
@@ -352,7 +352,8 @@ impl EngineAuthContext {
             .collect();
         let mut result = self.narrow(requested)?;
         result.human_management = self.human_management && current.human_management;
-        result.ability_write = self.ability_write && current.ability_write;
+        result.ability_write =
+            result.human_management && self.ability_write && current.ability_write;
         Ok(result)
     }
     pub fn grant(&self) -> &GrantId {
@@ -382,7 +383,7 @@ impl EngineAuthContext {
     }
     pub fn has_cap(&self, cap: Cap) -> bool {
         match cap {
-            Cap::AbilityWrite => self.ability_write && self.kind == PrincipalKind::DirectHuman,
+            Cap::AbilityWrite => self.ability_write && self.human_management(),
         }
     }
     pub fn authorize_ability_mutation(&self) -> DomainResult<()> {

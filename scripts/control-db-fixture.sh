@@ -36,7 +36,7 @@ docker run --detach --name "$name" --network none \
     --mount "type=bind,src=$root/$run/socket,dst=/var/run/postgresql" \
     --tmpfs /var/lib/postgresql/data:rw \
     --env POSTGRES_HOST_AUTH_METHOD=trust "$image" \
-    -c listen_addresses= -c max_connections=40 -c shared_buffers=32MB > "$run/container-id"
+    -c listen_addresses= -c max_connections=100 -c shared_buffers=32MB > "$run/container-id"
 attempt=0
 until docker exec "$name" pg_isready -q -U postgres; do
     attempt=$((attempt + 1))

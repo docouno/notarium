@@ -797,7 +797,7 @@ async fn postgres_prepare_observes_cancellation_before_worker_launch() {
             .await
     });
     let until = Instant::now() + Duration::from_secs(2);
-    let Backend::Postgres(pool) = &fixture.store.backend else {
+    let Backend::Postgres { pool, .. } = &fixture.store.backend else {
         unreachable!()
     };
     while sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT installation_id%'").fetch_one(pool).await.unwrap() == 0 {

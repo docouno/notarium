@@ -547,7 +547,7 @@ target_tables! {
             session_id: String,
         ]
         indexes(|r| {
-            validate_index(r.session_id.len())?;
+            validate_index(r.session_id.len() + 8)?;
             validate_index(r.token_hash.len())?;
             validate_index(r.user_id.len() + 8)?;
         })
@@ -666,7 +666,7 @@ target_tables! {
             family_id: String,
         ]
         indexes(|r| {
-            validate_index(r.family_id.len())?;
+            validate_index(r.family_id.len() + 8)?;
             validate_index(r.grant_id.len())?;
         })
     },

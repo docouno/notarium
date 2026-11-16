@@ -50,7 +50,22 @@ impl ControlService {
                         paused_reason:input.paused.then(||"manual".into()),write_class_mask:1,budgets:json(&input.definition.limits)?,misfire_policy:"coalesce_latest".into(),
                         next_slot_utc_ms:ms(input.next_slot)?,deleted_at:None,revision:0,config_revision:0,created_at:now,updated_at:now,
                     };
-                    let record = TargetRecord::from(row); record.validate()?; record.insert(tx.inner_mut()).await?;
+                    let record = TargetRecord::from(row);
+                    record.validate()?;
+                    record
+                        .insert_or_conflict(tx.inner_mut())
+                        .await
+                        .map_err(|err| {
+                            if matches!(
+                                &err,
+                                PortError::Domain(DomainError::ValidationFailed { diagnostic })
+                                    if diagnostic.reason == ValidationReason::DuplicateKey
+                            ) {
+                                DomainError::IdempotencyKeyReused.into()
+                            } else {
+                                err
+                            }
+                        })?;
                     (input.id,false)
                 }
                 Change::Update(input) => {

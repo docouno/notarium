@@ -31,13 +31,13 @@ impl ControlService {
             "INSERT INTO v1_control.mcp_delta_session_cursors(episode_id,space_id,history_incarnation,acked_space_seq,updated_at) SELECT $1,space_id,history_incarnation,acked_space_seq,updated_at FROM v1_control.mcp_delta_session_cursors WHERE episode_id=$2";child.as_str(),parent)?;
         Ok(())
     }
-    pub(in super::super) async fn acknowledgements(
+    pub(in super::super) async fn acknowledgement_rows(
         &self,
         tx: &mut Transaction,
         ctx: &AccountContext,
         episode: Option<&EpisodeId>,
-    ) -> Result<BTreeMap<SpaceId, AcknowledgedCursor>, PortError> {
-        let mut result = BTreeMap::new();
+    ) -> Result<Vec<(SpaceId, Vec<u8>, i64)>, PortError> {
+        let mut rows_out = Vec::new();
         for (space, grant) in ctx.auth().spaces() {
             if grant.read_classes.is_empty() {
                 continue;
@@ -51,26 +51,37 @@ impl ControlService {
                 }
             };
             if let Some(row) = row {
-                let current = match self.catalog_space(ctx, space).await {
-                    Ok(value) => value,
-                    Err(error) if hidden(&error) => continue,
-                    Err(error) => return Err(error),
-                };
-                let scope = HistoryScope {
-                    space_id: space.clone(),
-                    incarnation: HistoryIncarnation::from_bytes(
-                        row.history_incarnation
-                            .try_into()
-                            .map_err(|_| invalid(ValidationReason::InvalidState))?,
-                    ),
-                };
-                current.history.check(&scope)?;
-                let seq = SpaceSeq::new(row.acked_space_seq as u64)?;
-                if seq > current.last_seq {
-                    return Err(invalid(ValidationReason::InvalidState));
-                }
-                result.insert(space.clone(), AcknowledgedCursor { scope, seq });
+                rows_out.push((space.clone(), row.history_incarnation, row.acked_space_seq));
             }
+        }
+        Ok(rows_out)
+    }
+    pub(in super::super) async fn resolve_acknowledgements(
+        &self,
+        ctx: &AccountContext,
+        rows_in: Vec<(SpaceId, Vec<u8>, i64)>,
+    ) -> Result<BTreeMap<SpaceId, AcknowledgedCursor>, PortError> {
+        let mut result = BTreeMap::new();
+        for (space, history_incarnation, acked_space_seq) in rows_in {
+            let current = match self.catalog_space(ctx, &space).await {
+                Ok(value) => value,
+                Err(error) if hidden(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let scope = HistoryScope {
+                space_id: space.clone(),
+                incarnation: HistoryIncarnation::from_bytes(
+                    history_incarnation
+                        .try_into()
+                        .map_err(|_| invalid(ValidationReason::InvalidState))?,
+                ),
+            };
+            current.history.check(&scope)?;
+            let seq = SpaceSeq::new(acked_space_seq as u64)?;
+            if seq > current.last_seq {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            result.insert(space, AcknowledgedCursor { scope, seq });
         }
         Ok(result)
     }
@@ -173,11 +184,12 @@ impl ControlService {
     ) -> Result<Option<McpDedupHit>, PortError> {
         validate_dedup_key(&key)?;
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut rtx = self.store.read(budget.clone()).await?;
+        let (mut rtx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
         let hit = budget
             .run(
                 async {
-                    let auth = self.revalidate_read(rtx.inner_mut(), ctx.auth()).await?;
                     if auth.principal().as_str().len() + key.actor.len() + key.request_key.as_str().len()
                         > 2048
                     {
@@ -290,18 +302,49 @@ impl ControlService {
                             record.key.request_key.as_str()
                         )?;
                     }
-                    let row = TargetRecord::from(McpDedupRow {
+                    let raw_row = McpDedupRow {
                         owner: owner.to_owned(),
-                        actor: record.key.actor,
+                        actor: record.key.actor.clone(),
                         request_key: record.key.request_key.to_string(),
                         request_hash: record.key.request_hash.as_bytes().to_vec(),
-                        operation: record.key.operation,
+                        operation: record.key.operation.clone(),
                         safe_result: record.safe_result,
                         effect,
                         expires_at,
-                    });
-                    row.validate()?;
-                    row.insert(tx.inner_mut()).await
+                    };
+                    TargetRecord::from(raw_row.clone()).validate()?;
+                    let inserted = execute!(
+                        tx.inner_mut(),
+                        "INSERT INTO mcp_dedup(owner,actor,request_key,request_hash,operation,safe_result,effect,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(owner,actor,request_key) DO NOTHING",
+                        "INSERT INTO v1_control.mcp_dedup(owner,actor,request_key,request_hash,operation,safe_result,effect,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(owner,actor,request_key) DO NOTHING";
+                        &raw_row.owner,
+                        &raw_row.actor,
+                        &raw_row.request_key,
+                        &raw_row.request_hash,
+                        &raw_row.operation,
+                        &raw_row.safe_result,
+                        &raw_row.effect,
+                        raw_row.expires_at
+                    )?;
+                    if inserted == 0 {
+                        let raced = rows!(
+                            tx.inner_mut(),
+                            McpDedupRow,
+                            fetch_optional,
+                            "SELECT * FROM mcp_dedup WHERE owner=$1 AND actor=$2 AND request_key=$3",
+                            "SELECT * FROM v1_control.mcp_dedup WHERE owner=$1 AND actor=$2 AND request_key=$3";
+                            owner,
+                            &record.key.actor,
+                            record.key.request_key.as_str()
+                        )?
+                        .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                        if raced.request_hash != record.key.request_hash.as_bytes()
+                            || raced.operation != record.key.operation
+                        {
+                            return Err(DomainError::IdempotencyKeyReused.into());
+                        }
+                    }
+                    Ok(())
                 },
                 CommitEffect::NotCommitted,
             )

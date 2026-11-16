@@ -34,6 +34,8 @@ pub(crate) const BACKUP_LOCK: i64 = 0x4e54_4354_524c;
 pub(crate) const SQLITE_MAX_ACTIVE_WRITERS: usize = 1;
 pub(crate) const POSTGRES_MAX_ACTIVE_WRITERS: usize = 4;
 pub(crate) const MAX_QUEUED_WRITERS: usize = 64;
+pub(crate) const MAX_ACTIVE_READERS: usize = 16;
+pub(crate) const MAX_QUEUED_READERS: usize = 512;
 
 #[derive(Clone)]
 pub struct ControlStore {
@@ -42,6 +44,8 @@ pub struct ControlStore {
     exports: Arc<Semaphore>,
     write_queue: Arc<Semaphore>,
     write_admission: Arc<Semaphore>,
+    read_queue: Arc<Semaphore>,
+    read_admission: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
@@ -51,7 +55,10 @@ pub(crate) enum Backend {
         read_pool: SqlitePool,
         path: PathBuf,
     },
-    Postgres(PgPool),
+    Postgres {
+        pool: PgPool,
+        read_pool: PgPool,
+    },
 }
 
 /// Connection configuration is kept out of Debug to avoid credential disclosure.
@@ -164,7 +171,7 @@ impl ControlStore {
             .optimize_on_close(false, None)
             .disable_statement_logging();
         let read_pool = match SqlitePoolOptions::new()
-            .max_connections(16)
+            .max_connections((MAX_ACTIVE_READERS + 4) as u32)
             .acquire_timeout(Duration::from_secs(2))
             .connect_with(read_options)
             .await
@@ -187,6 +194,8 @@ impl ControlStore {
             exports: Arc::new(Semaphore::new(1)),
             write_queue: Arc::new(Semaphore::new(MAX_QUEUED_WRITERS)),
             write_admission: Arc::new(Semaphore::new(SQLITE_MAX_ACTIVE_WRITERS)),
+            read_queue: Arc::new(Semaphore::new(MAX_QUEUED_READERS)),
+            read_admission: Arc::new(Semaphore::new(MAX_ACTIVE_READERS)),
         })
     }
 
@@ -199,8 +208,9 @@ impl ControlStore {
     }
 
     async fn postgres_owned(config: PostgresConfig) -> Result<Self, PortError> {
+        let options = config.options.disable_statement_logging();
         let pool = PgPoolOptions::new()
-            .max_connections(16)
+            .max_connections((POSTGRES_MAX_ACTIVE_WRITERS + 2) as u32)
             .acquire_timeout(Duration::from_secs(2))
             .after_connect(|connection, _| {
                 Box::pin(async move {
@@ -216,19 +226,47 @@ impl ControlStore {
                     Ok(())
                 })
             })
-            .connect_with(config.options.disable_statement_logging())
+            .connect_with(options.clone())
             .await
             .map_err(database)?;
         if let Err(error) = Self::postgres_migrate(&pool).await {
             pool.close().await;
             return Err(error);
         }
+        let read_pool = match PgPoolOptions::new()
+            .max_connections((MAX_ACTIVE_READERS + 4) as u32)
+            .acquire_timeout(Duration::from_secs(2))
+            .after_connect(|connection, _| {
+                Box::pin(async move {
+                    sqlx::query("SET search_path TO v1_control, pg_catalog")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SET statement_timeout TO '250ms'")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("SET idle_in_transaction_session_timeout TO '500ms'")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await
+        {
+            Ok(read_pool) => read_pool,
+            Err(err) => {
+                pool.close().await;
+                return Err(database(err));
+            }
+        };
         Ok(Self {
-            backend: Backend::Postgres(pool),
+            backend: Backend::Postgres { pool, read_pool },
             writes: Arc::new(RwLock::new(())),
             exports: Arc::new(Semaphore::new(1)),
             write_queue: Arc::new(Semaphore::new(MAX_QUEUED_WRITERS)),
             write_admission: Arc::new(Semaphore::new(POSTGRES_MAX_ACTIVE_WRITERS)),
+            read_queue: Arc::new(Semaphore::new(MAX_QUEUED_READERS)),
+            read_admission: Arc::new(Semaphore::new(MAX_ACTIVE_READERS)),
         })
     }
 
@@ -241,7 +279,7 @@ impl ControlStore {
                 .execute(&mut *fence)
                 .await
                 .map_err(database)?;
-            sqlx::query("SET idle_session_timeout TO '5s'")
+            sqlx::query("SET idle_session_timeout TO '30s'")
                 .execute(&mut *fence)
                 .await
                 .map_err(database)?;
@@ -256,6 +294,14 @@ impl ControlStore {
             let mut connection = pool.acquire().await.map_err(database)?;
             connection.close_on_drop();
             let migration = async {
+                sqlx::query("SET statement_timeout TO '15s'")
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(database)?;
+                sqlx::query("SET idle_in_transaction_session_timeout TO '15s'")
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(database)?;
                 sqlx::query("CREATE SCHEMA IF NOT EXISTS v1_control")
                     .execute(&mut *connection)
                     .await
@@ -300,7 +346,7 @@ impl ControlStore {
     pub(crate) fn max_active_writers(&self) -> usize {
         match &self.backend {
             Backend::Sqlite { .. } => SQLITE_MAX_ACTIVE_WRITERS,
-            Backend::Postgres(_) => POSTGRES_MAX_ACTIVE_WRITERS,
+            Backend::Postgres { .. } => POSTGRES_MAX_ACTIVE_WRITERS,
         }
     }
 
@@ -312,7 +358,10 @@ impl ControlStore {
                 read_pool.close().await;
                 pool.close().await;
             }
-            Backend::Postgres(pool) => pool.close().await,
+            Backend::Postgres { pool, read_pool } => {
+                read_pool.close().await;
+                pool.close().await;
+            }
         }
     }
 
@@ -323,6 +372,34 @@ impl ControlStore {
         budget: lease::OperationBudget,
     ) -> Result<ReadTransaction, PortError> {
         budget.check(CommitEffect::NotCommitted)?;
+        let admission = match self.read_admission.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let _queue_slot = self.read_queue.clone().try_acquire_owned().map_err(|_| {
+                    notarium_core::DomainError::RateLimited {
+                        retry_after_ms: 1000,
+                        budget: notarium_core::error::BudgetKind::Concurrency,
+                    }
+                })?;
+                budget
+                    .run(
+                        async {
+                            self.read_admission
+                                .clone()
+                                .acquire_owned()
+                                .await
+                                .map_err(|_| {
+                                    unavailable(
+                                        "control reader admission",
+                                        CommitEffect::NotCommitted,
+                                    )
+                                })
+                        },
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?
+            }
+        };
         budget
             .run(
                 async {
@@ -330,14 +407,20 @@ impl ControlStore {
                         Backend::Sqlite { read_pool, .. } => {
                             Transaction::Sqlite(read_pool.begin().await.map_err(database)?)
                         }
-                        Backend::Postgres(pool) => Transaction::Postgres(
-                            pool.begin_with("BEGIN TRANSACTION READ ONLY")
+                        Backend::Postgres { read_pool, .. } => Transaction::Postgres(
+                            read_pool
+                                .begin_with("BEGIN TRANSACTION READ ONLY")
                                 .await
                                 .map_err(database)?,
                         ),
                     };
                     budget.configure(&mut inner).await?;
-                    Ok(ReadTransaction { inner: Some(inner) })
+                    Ok(ReadTransaction {
+                        resources: Some(ReadResources {
+                            inner,
+                            _admission: admission,
+                        }),
+                    })
                 },
                 CommitEffect::NotCommitted,
             )
@@ -398,7 +481,7 @@ impl ControlStore {
                         )
                         .await?,
                     ),
-                    Backend::Postgres(_) => None,
+                    Backend::Postgres { .. } => None,
                 };
                 let inner = match &store.backend {
                     Backend::Sqlite { pool, .. } => {
@@ -412,7 +495,7 @@ impl ControlStore {
                             }
                         }
                     }
-                    Backend::Postgres(pool) => {
+                    Backend::Postgres { pool, .. } => {
                         Transaction::Postgres(pool.begin().await.map_err(database)?)
                     }
                 };
@@ -462,10 +545,10 @@ impl ControlStore {
             .fetch_optional(read_pool)
             .await
             .map_err(database)?,
-            Backend::Postgres(pool) => sqlx::query_scalar(
+            Backend::Postgres { read_pool, .. } => sqlx::query_scalar(
                 "SELECT installation_id FROM v1_control.v1_storage_epoch WHERE singleton=1 AND epoch_version=1 AND state='ready'",
             )
-            .fetch_optional(pool)
+            .fetch_optional(read_pool)
             .await
             .map_err(database)?,
         };
@@ -537,18 +620,31 @@ pub(crate) enum Transaction {
     Postgres(sqlx::Transaction<'static, sqlx::Postgres>),
 }
 
+struct ReadResources {
+    inner: Transaction,
+    _admission: OwnedSemaphorePermit,
+}
+
 pub(crate) struct ReadTransaction {
-    inner: Option<Transaction>,
+    resources: Option<ReadResources>,
 }
 impl ReadTransaction {
     pub(crate) fn inner_mut(&mut self) -> &mut Transaction {
-        self.inner.as_mut().expect("live read transaction")
+        &mut self
+            .resources
+            .as_mut()
+            .expect("live read transaction")
+            .inner
     }
     pub(crate) async fn finish(mut self) -> Result<(), PortError> {
-        match self.inner.take().expect("live read transaction") {
+        let ReadResources { inner, _admission } =
+            self.resources.take().expect("live read transaction");
+        let result = match inner {
             Transaction::Sqlite(tx) => tx.rollback().await.map_err(database),
             Transaction::Postgres(tx) => tx.rollback().await.map_err(database),
-        }
+        };
+        drop(_admission);
+        result
     }
     pub(crate) async fn rollback(self) -> Result<(), PortError> {
         self.finish().await
@@ -556,7 +652,7 @@ impl ReadTransaction {
 }
 impl Drop for ReadTransaction {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.take()
+        if let Some(ReadResources { inner, _admission }) = self.resources.take()
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
             runtime.spawn(async move {
@@ -568,6 +664,7 @@ impl Drop for ReadTransaction {
                         let _ = tx.rollback().await;
                     }
                 }
+                drop(_admission);
             });
         }
     }

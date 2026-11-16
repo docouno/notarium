@@ -66,7 +66,7 @@ impl ControlStore {
                                 Some(PathBuf::from(format!("{}-wal", path.display()))),
                             ))
                         }
-                        Backend::Postgres(pool) => Ok((
+                        Backend::Postgres { pool, .. } => Ok((
                             Transaction::Postgres(
                                 pool.begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
                                     .await

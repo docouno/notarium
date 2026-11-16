@@ -22,12 +22,22 @@ fn native_key_ids_have_one_exact_encoding() {
 
 #[test]
 fn pat_authority_never_mints_ability_write() {
-    let human = EngineAuthContext::for_human(VerifiedHuman::attest(
+    let ambient = EngineAuthContext::for_human(VerifiedHuman::attest(
         PrincipalId::from_bytes([1; 16]),
         GrantId::from_bytes([2; 16]),
         BTreeMap::new(),
         true,
     ));
+    assert!(!ambient.has_cap(Cap::AbilityWrite));
+    let human = EngineAuthContext::for_human(
+        VerifiedHuman::attest(
+            PrincipalId::from_bytes([1; 16]),
+            GrantId::from_bytes([2; 16]),
+            BTreeMap::new(),
+            true,
+        )
+        .with_human_management(true),
+    );
     assert!(human.has_cap(Cap::AbilityWrite));
     let pat = human.for_pat(BTreeMap::new()).unwrap();
     assert_eq!(pat.kind(), &PrincipalKind::Pat);

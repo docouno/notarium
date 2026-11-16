@@ -51,14 +51,12 @@ impl ControlService {
         id: ScheduleId,
     ) -> Result<AgentSchedule, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.read(budget.clone()).await?;
-        let (auth, row) = budget
+        let (mut tx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let row = budget
             .run(
-                async {
-                    let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
-                    let row = schedule_read(tx.inner_mut(), &id).await?;
-                    Ok((auth, row))
-                },
+                schedule_read(tx.inner_mut(), &id),
                 CommitEffect::NotCommitted,
             )
             .await?;
@@ -95,9 +93,10 @@ impl ControlService {
         page: ControlPageRequest,
     ) -> Result<ControlPage<AgentSchedule>, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let mut tx = self.store.read(budget.clone()).await?;
+        let (mut tx, auth) = self
+            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+            .await?;
         let (current, scope, rows) = budget.run(async {
-            let auth = self.revalidate_read(tx.inner_mut(), ctx.auth()).await?;
             let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
             let scope = digest(current.auth(), ("schedules", ctx.scope()))?;
             let cursor = cursor(&page, scope)?;

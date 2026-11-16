@@ -107,7 +107,7 @@ impl ControlBackup {
                 Backend::Sqlite { .. } => BackupRetentionBudget::SqliteWal {
                     max_pinned_bytes: self.config.max_pinned_wal_bytes,
                 },
-                Backend::Postgres(_) => BackupRetentionBudget::PostgresSnapshot {
+                Backend::Postgres { .. } => BackupRetentionBudget::PostgresSnapshot {
                     max_age: self.config.max_snapshot_age,
                 },
             },
@@ -123,7 +123,7 @@ impl ControlBackup {
             (Backend::Sqlite { .. }, BackupRetentionBudget::SqliteWal { max_pinned_bytes }) => {
                 *max_pinned_bytes = (*max_pinned_bytes).min(self.config.max_pinned_wal_bytes)
             }
-            (Backend::Postgres(_), BackupRetentionBudget::PostgresSnapshot { max_age }) => {
+            (Backend::Postgres { .. }, BackupRetentionBudget::PostgresSnapshot { max_age }) => {
                 *max_age = (*max_age).min(self.config.max_snapshot_age)
             }
             _ => return Err(invalid(ValidationReason::ScopeMismatch)),
@@ -195,7 +195,7 @@ impl BackupParticipantPort for ControlBackup {
                 Backend::Sqlite { path, .. } => {
                     Some(PathBuf::from(format!("{}-wal", path.display())))
                 }
-                Backend::Postgres(_) => None,
+                Backend::Postgres { .. } => None,
             };
             let session = session::Session::new(ctx.budget.clone(), budget, wal);
             let mut guard = Preparing {

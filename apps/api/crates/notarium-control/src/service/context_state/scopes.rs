@@ -85,11 +85,12 @@ impl ControlService {
             None
         };
         let (pre_key, space_kinds) = {
-            let mut rtx = self.store.read(budget.clone()).await?;
+            let (mut rtx, auth) = self
+                .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
+                .await?;
             let (current, owner) = budget
                 .run(
                     async {
-                        let auth = self.revalidate_read(rtx.inner_mut(), ctx.auth()).await?;
                         let owner = user_read(rtx.inner_mut(), auth.principal().as_str()).await?;
                         Ok((
                             AccountContext::new(auth, budget.context(ctx.budget.request.clone())),

@@ -72,12 +72,13 @@ CREATE TABLE sessions (
     auth_version INTEGER NOT NULL CHECK (auth_version >= 0),
     CHECK (instr(session_id,char(0))=0),
     CHECK (instr(user_id,char(0))=0),
-    CHECK (coalesce(length(CAST(session_id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(session_id AS BLOB)),0) + 8 <= 2048),
     CHECK (coalesce(length(CAST(token_hash AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(user_id AS BLOB)),0) + 8 <= 2048)
 ) STRICT;
 CREATE INDEX session_by_user ON sessions(user_id,revoked_at);
 CREATE INDEX session_expiry ON sessions(expires_at);
+CREATE INDEX session_revoked ON sessions(revoked_at,session_id) WHERE revoked_at IS NOT NULL;
 CREATE TABLE one_time_tokens (
     token_hash BLOB NOT NULL PRIMARY KEY CHECK (length(token_hash)=32),
     user_id TEXT NOT NULL REFERENCES users(user_id),
@@ -163,10 +164,12 @@ CREATE TABLE oauth_refresh_families (
     CHECK (instr(family_id,char(0))=0),
     CHECK (instr(grant_id,char(0))=0),
     CHECK (instr(reason_code,char(0))=0),
-    CHECK (coalesce(length(CAST(family_id AS BLOB)),0) <= 2048),
+    CHECK (coalesce(length(CAST(family_id AS BLOB)),0) + 8 <= 2048),
     CHECK (coalesce(length(CAST(grant_id AS BLOB)),0) <= 2048)
 ) STRICT;
 CREATE INDEX family_grant ON oauth_refresh_families(grant_id);
+CREATE INDEX family_revoked ON oauth_refresh_families(revoked_at,family_id) WHERE revoked_at IS NOT NULL;
+CREATE INDEX family_created ON oauth_refresh_families(created_at,family_id) WHERE revoked_at IS NULL;
 CREATE TABLE oauth_refresh_tokens (
     token_id TEXT NOT NULL PRIMARY KEY CHECK (length(token_id)=12),
     token_hash BLOB NOT NULL CHECK (length(token_hash)=32),
@@ -392,7 +395,6 @@ CREATE TABLE provider_call_log (
 CREATE INDEX call_owner ON provider_call_log(owner_id,created_at,call_id);
 CREATE INDEX call_pending ON provider_call_log(delivery_state,created_at,call_id);
 CREATE INDEX call_settled ON provider_call_log(delivery_state,settled_at,call_id);
-CREATE INDEX call_budget_resource ON provider_call_log(resource_id,created_at,diagnostic);
 CREATE TABLE ability_availability (
     placement TEXT NOT NULL, ability_id TEXT NOT NULL,
     mode TEXT NOT NULL CHECK (mode IN ('all-projects','selected-projects')),

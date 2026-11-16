@@ -40,9 +40,19 @@ impl ControlService {
                     if remaining > 0 {
                         let deleted = execute!(
                             tx.inner_mut(),
-                            "DELETE FROM agent_call_details WHERE call_id IN (SELECT d.call_id FROM agent_call_details d JOIN agent_calls c ON c.call_id=d.call_id WHERE (d.expires_at<=$1 OR d.created_at<=$2) AND (c.finished_at IS NOT NULL OR c.started_at<=$3) ORDER BY d.expires_at,d.call_id LIMIT $4)",
-                            "DELETE FROM v1_control.agent_call_details WHERE call_id IN (SELECT d.call_id FROM v1_control.agent_call_details d JOIN v1_control.agent_calls c ON c.call_id=d.call_id WHERE (d.expires_at<=$1 OR d.created_at<=$2) AND (c.finished_at IS NOT NULL OR c.started_at<=$3) ORDER BY d.expires_at,d.call_id LIMIT $4 FOR UPDATE OF d SKIP LOCKED)";
-                            now, detailed, cutoff_24h, remaining
+                            "DELETE FROM agent_call_details WHERE call_id IN (SELECT d.call_id FROM agent_call_details d WHERE d.expires_at<=$1 AND EXISTS(SELECT 1 FROM agent_calls c WHERE c.call_id=d.call_id AND (c.finished_at IS NOT NULL OR c.started_at<=$2)) ORDER BY d.expires_at,d.call_id LIMIT $3)",
+                            "DELETE FROM v1_control.agent_call_details WHERE call_id IN (SELECT d.call_id FROM v1_control.agent_call_details d WHERE d.expires_at<=$1 AND EXISTS(SELECT 1 FROM v1_control.agent_calls c WHERE c.call_id=d.call_id AND (c.finished_at IS NOT NULL OR c.started_at<=$2)) ORDER BY d.expires_at,d.call_id LIMIT $3 FOR UPDATE OF d SKIP LOCKED)";
+                            now, cutoff_24h, remaining
+                        )? as i64;
+                        result.details += deleted as u16;
+                        remaining -= deleted;
+                    }
+                    if remaining > 0 {
+                        let deleted = execute!(
+                            tx.inner_mut(),
+                            "DELETE FROM agent_call_details WHERE call_id IN (SELECT d.call_id FROM agent_call_details d WHERE d.created_at<=$1 AND EXISTS(SELECT 1 FROM agent_calls c WHERE c.call_id=d.call_id AND (c.finished_at IS NOT NULL OR c.started_at<=$2)) ORDER BY d.created_at,d.call_id LIMIT $3)",
+                            "DELETE FROM v1_control.agent_call_details WHERE call_id IN (SELECT d.call_id FROM v1_control.agent_call_details d WHERE d.created_at<=$1 AND EXISTS(SELECT 1 FROM v1_control.agent_calls c WHERE c.call_id=d.call_id AND (c.finished_at IS NOT NULL OR c.started_at<=$2)) ORDER BY d.created_at,d.call_id LIMIT $3 FOR UPDATE OF d SKIP LOCKED)";
+                            detailed, cutoff_24h, remaining
                         )? as i64;
                         result.details += deleted as u16;
                         remaining -= deleted;
@@ -134,27 +144,60 @@ impl ControlService {
                     }
 
                     // 7 days after expiry/revocation/completion: sessions, refresh tokens/families, delivered revocations, committed operations.
+                    // Never delete rotated (`used_at`) refresh tokens before `expires_at + 7d`:
+                    // retaining used tombstones until token expiry preserves OAuth 2.1 reuse detection.
                     if remaining > 0 {
                         remaining -= execute!(
                             tx.inner_mut(),
-                            "DELETE FROM sessions WHERE session_id IN (SELECT session_id FROM sessions WHERE expires_at<=$1 OR (revoked_at IS NOT NULL AND revoked_at<=$1) ORDER BY expires_at,session_id LIMIT $2)",
-                            "DELETE FROM v1_control.sessions WHERE session_id IN (SELECT session_id FROM v1_control.sessions WHERE expires_at<=$1 OR (revoked_at IS NOT NULL AND revoked_at<=$1) ORDER BY expires_at,session_id LIMIT $2 FOR UPDATE SKIP LOCKED)";
+                            "DELETE FROM sessions WHERE session_id IN (SELECT session_id FROM sessions WHERE expires_at<=$1 ORDER BY expires_at,session_id LIMIT $2)",
+                            "DELETE FROM v1_control.sessions WHERE session_id IN (SELECT session_id FROM v1_control.sessions WHERE expires_at<=$1 ORDER BY expires_at,session_id LIMIT $2 FOR UPDATE SKIP LOCKED)";
                             cutoff_7d, remaining
                         )? as i64;
                     }
                     if remaining > 0 {
                         remaining -= execute!(
                             tx.inner_mut(),
-                            "DELETE FROM oauth_refresh_tokens WHERE token_id IN (SELECT token_id FROM oauth_refresh_tokens WHERE expires_at<=$1 OR (revoked_at IS NOT NULL AND revoked_at<=$1) OR (used_at IS NOT NULL AND used_at<=$1) ORDER BY expires_at,token_id LIMIT $2)",
-                            "DELETE FROM v1_control.oauth_refresh_tokens WHERE token_id IN (SELECT token_id FROM v1_control.oauth_refresh_tokens WHERE expires_at<=$1 OR (revoked_at IS NOT NULL AND revoked_at<=$1) OR (used_at IS NOT NULL AND used_at<=$1) ORDER BY expires_at,token_id LIMIT $2 FOR UPDATE SKIP LOCKED)";
+                            "DELETE FROM sessions WHERE session_id IN (SELECT session_id FROM sessions WHERE revoked_at IS NOT NULL AND revoked_at<=$1 ORDER BY revoked_at,session_id LIMIT $2)",
+                            "DELETE FROM v1_control.sessions WHERE session_id IN (SELECT session_id FROM v1_control.sessions WHERE revoked_at IS NOT NULL AND revoked_at<=$1 ORDER BY revoked_at,session_id LIMIT $2 FOR UPDATE SKIP LOCKED)";
                             cutoff_7d, remaining
                         )? as i64;
+                    }
+                    let mut touched_families = std::collections::BTreeSet::new();
+                    if remaining > 0 {
+                        let deleted_families: Vec<(String,)> = rows!(
+                            tx.inner_mut(),
+                            (String,),
+                            fetch_all,
+                            "DELETE FROM oauth_refresh_tokens WHERE token_id IN (SELECT token_id FROM oauth_refresh_tokens WHERE expires_at<=$1 ORDER BY expires_at,token_id LIMIT $2) RETURNING family_id",
+                            "DELETE FROM v1_control.oauth_refresh_tokens WHERE token_id IN (SELECT token_id FROM v1_control.oauth_refresh_tokens WHERE expires_at<=$1 ORDER BY expires_at,token_id LIMIT $2 FOR UPDATE SKIP LOCKED) RETURNING family_id";
+                            cutoff_7d, remaining
+                        )?;
+                        remaining -= deleted_families.len() as i64;
+                        for (fid,) in deleted_families {
+                            touched_families.insert(fid);
+                        }
+                    }
+                    for fid in touched_families {
+                        execute!(
+                            tx.inner_mut(),
+                            "UPDATE oauth_refresh_families SET revoked_at=$1,reason_code='expired' WHERE family_id=$2 AND revoked_at IS NULL AND NOT EXISTS(SELECT 1 FROM oauth_refresh_tokens t WHERE t.family_id=$2)",
+                            "UPDATE v1_control.oauth_refresh_families SET revoked_at=$1,reason_code='expired' WHERE family_id=$2 AND revoked_at IS NULL AND NOT EXISTS(SELECT 1 FROM v1_control.oauth_refresh_tokens t WHERE t.family_id=$2)";
+                            cutoff_7d, &fid
+                        )?;
                     }
                     if remaining > 0 {
                         remaining -= execute!(
                             tx.inner_mut(),
                             "DELETE FROM oauth_refresh_families WHERE family_id IN (SELECT f.family_id FROM oauth_refresh_families f WHERE f.revoked_at IS NOT NULL AND f.revoked_at<=$1 AND NOT EXISTS(SELECT 1 FROM oauth_refresh_tokens t WHERE t.family_id=f.family_id) AND NOT EXISTS(SELECT 1 FROM oauth_access_tokens a WHERE a.family_id=f.family_id) ORDER BY f.revoked_at,f.family_id LIMIT $2)",
                             "DELETE FROM v1_control.oauth_refresh_families WHERE family_id IN (SELECT f.family_id FROM v1_control.oauth_refresh_families f WHERE f.revoked_at IS NOT NULL AND f.revoked_at<=$1 AND NOT EXISTS(SELECT 1 FROM v1_control.oauth_refresh_tokens t WHERE t.family_id=f.family_id) AND NOT EXISTS(SELECT 1 FROM v1_control.oauth_access_tokens a WHERE a.family_id=f.family_id) ORDER BY f.revoked_at,f.family_id LIMIT $2 FOR UPDATE OF f SKIP LOCKED)";
+                            cutoff_7d, remaining
+                        )? as i64;
+                    }
+                    if remaining > 0 {
+                        remaining -= execute!(
+                            tx.inner_mut(),
+                            "DELETE FROM oauth_refresh_families WHERE family_id IN (SELECT f.family_id FROM oauth_refresh_families f WHERE f.revoked_at IS NULL AND f.created_at<=$1 AND NOT EXISTS(SELECT 1 FROM oauth_refresh_tokens t WHERE t.family_id=f.family_id) AND NOT EXISTS(SELECT 1 FROM oauth_access_tokens a WHERE a.family_id=f.family_id) ORDER BY f.created_at,f.family_id LIMIT $2)",
+                            "DELETE FROM v1_control.oauth_refresh_families WHERE family_id IN (SELECT f.family_id FROM v1_control.oauth_refresh_families f WHERE f.revoked_at IS NULL AND f.created_at<=$1 AND NOT EXISTS(SELECT 1 FROM v1_control.oauth_refresh_tokens t WHERE t.family_id=f.family_id) AND NOT EXISTS(SELECT 1 FROM v1_control.oauth_access_tokens a WHERE a.family_id=f.family_id) ORDER BY f.created_at,f.family_id LIMIT $2 FOR UPDATE OF f SKIP LOCKED)";
                             cutoff_7d, remaining
                         )? as i64;
                     }

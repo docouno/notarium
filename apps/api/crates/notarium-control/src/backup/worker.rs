@@ -92,7 +92,7 @@ impl Worker {
             Backend::Sqlite { path: source, .. } => {
                 Source::Sqlite(SqliteCut::prepare(source, &path, &self.session)?)
             }
-            Backend::Postgres(pool) => {
+            Backend::Postgres { pool, .. } => {
                 Source::Postgres(PostgresCut::prepare(pool, &self.session).await?)
             }
         });

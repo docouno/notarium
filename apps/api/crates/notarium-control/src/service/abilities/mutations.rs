@@ -205,14 +205,25 @@ impl ControlService {
                 )
                 .await?;
             let mut rtx = self.store.read(budget.clone()).await?;
-            budget
+            let (_, visited) = budget
                 .run(
-                    self.follow_ability(rtx.inner_mut(), &current, destination.clone()),
+                    self.follow_ability_chain_db(rtx.inner_mut(), &current, destination.clone()),
                     CommitEffect::NotCommitted,
                 )
                 .await?;
             budget
                 .run(rtx.rollback(), CommitEffect::NotCommitted)
+                .await?;
+            budget
+                .run(
+                    async {
+                        for item in &visited {
+                            self.ability_placement(&current, item).await?;
+                        }
+                        Ok::<_, PortError>(())
+                    },
+                    CommitEffect::NotCommitted,
+                )
                 .await?;
             Some((source, target))
         } else {

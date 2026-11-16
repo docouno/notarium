@@ -19,7 +19,7 @@ macro_rules! read_rows {
     ($backend:expr,$row:ty,$method:ident,$sqlite:literal,$postgres:literal; $($value:expr),* $(,)?) => {
         match $backend {
             crate::store::Backend::Sqlite{read_pool,..}=>sqlx::query_as::<_,$row>($sqlite)$(.bind($value))*.$method(read_pool).await.map_err(crate::error::database),
-            crate::store::Backend::Postgres(pool)=>sqlx::query_as::<_,$row>($postgres)$(.bind($value))*.$method(pool).await.map_err(crate::error::database),
+            crate::store::Backend::Postgres{read_pool,..}=>sqlx::query_as::<_,$row>($postgres)$(.bind($value))*.$method(read_pool).await.map_err(crate::error::database),
         }
     }
 }

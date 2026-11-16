@@ -1,6 +1,6 @@
 use super::{
-    CheckedEndpoint, GuardedResolver, NetworkPolicy, OutboundScope,
-    resolver::{DEFAULT_DNS_PERMITS, Lookup},
+    CheckedEndpoint, NetworkPolicy, OutboundScope,
+    resolver::{DEFAULT_DNS_PERMITS, DEFAULT_DNS_QUEUE, GuardedResolver, Lookup},
 };
 use crate::{
     error::{invalid, unavailable},
@@ -166,6 +166,7 @@ struct Shared {
     #[cfg(test)]
     max_active_requests: usize,
     dns_admission: Arc<Semaphore>,
+    dns_queue: Arc<Semaphore>,
     lookup: Option<Arc<dyn Lookup>>,
     #[cfg(test)]
     fixture: Option<(String, reqwest::Certificate)>,
@@ -219,6 +220,7 @@ impl OutboundTransport {
                 #[cfg(test)]
                 max_active_requests,
                 dns_admission: Arc::new(Semaphore::new(DEFAULT_DNS_PERMITS)),
+                dns_queue: Arc::new(Semaphore::new(DEFAULT_DNS_QUEUE)),
                 lookup,
                 #[cfg(test)]
                 fixture: None,
@@ -392,6 +394,7 @@ impl OutboundTransport {
         };
         let lookup = self.shared.lookup.clone();
         let dns_admission = self.shared.dns_admission.clone();
+        let dns_queue = self.shared.dns_queue.clone();
         #[cfg(test)]
         let fixture_ca = self.shared.fixture.as_ref().map(|(_, ca)| ca.clone());
         tokio::spawn(async move {
@@ -410,6 +413,7 @@ impl OutboundTransport {
                                 endpoint,
                                 lookup,
                                 dns_admission,
+                                dns_queue,
                                 #[cfg(test)]
                                 fixture_ca,
                             )
@@ -503,6 +507,7 @@ fn build_client(
     endpoint: CheckedEndpoint,
     lookup: Option<Arc<dyn Lookup>>,
     dns_admission: Arc<Semaphore>,
+    dns_queue: Arc<Semaphore>,
     #[cfg(test)] fixture_ca: Option<reqwest::Certificate>,
 ) -> Result<Client, PortError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -510,6 +515,7 @@ fn build_client(
         endpoint,
         lookup.unwrap_or_else(GuardedResolver::default_lookup),
         dns_admission,
+        dns_queue,
     );
     let builder = Client::builder()
         .tls_backend_rustls()
