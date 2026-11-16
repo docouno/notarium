@@ -356,28 +356,11 @@ impl ControlService {
             BTreeSet::from([info.definition.approved_role.id]),
         )?;
         let history: HistoryScope = parse(&running.history_scope)?;
-        if let Some(prechecked) = keeper {
-            if prechecked.space != space || prechecked.project != project_folder {
-                return Err(denied());
-            }
-            prechecked.history.check(&history)?;
-        } else if lock {
+        let prechecked = keeper.ok_or_else(denied)?;
+        if prechecked.space != space || prechecked.project != project_folder {
             return Err(denied());
-        } else {
-            // The enclosing effect's operation budget also bounds this callback.
-            let budget = CallBudget {
-                request: RequestId::from_bytes(crate::auth::token::random()?),
-                cancellation: Cancellation::default(),
-                remaining: Duration::from_millis((running.expires_at - now) as u64)
-                    .min(Duration::from_secs(5)),
-            };
-            let ctx = AccountContext::new(auth.clone(), budget);
-            let current = self.catalog_space(&ctx, &space).await?;
-            current.history.check(&history)?;
-            if let Some(project) = &info.definition.project {
-                self.catalog_project(&ctx, project).await?;
-            }
         }
+        prechecked.history.check(&history)?;
         Ok(auth)
     }
     async fn precheck_schedule_definition(
@@ -386,12 +369,8 @@ impl ControlService {
         budget: &OperationBudget,
         definition: &ScheduleDefinition,
     ) -> Result<(AccountContext, AbilityDescriptor), PortError> {
-        let mut rtx = self.store.read(budget.clone()).await?;
-        let auth = budget
-            .run(
-                self.revalidate_read(rtx.inner_mut(), ctx.auth()),
-                CommitEffect::NotCommitted,
-            )
+        let (rtx, auth) = self
+            .open_revalidated_read(budget, &ctx.budget.request, ctx.auth())
             .await?;
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         let grant = auth

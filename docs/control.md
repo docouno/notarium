@@ -20,15 +20,17 @@ foreign keys, strict tables, a 4 MiB `journal_size_limit`, a 256-page
 The composition owner must classify the data root before opening it and create the
 approved parent directory. PostgreSQL uses the `v1_control` schema, qualified
 queries and `COLLATE "C"` on text keys so keyset pagination and export order match
-SQLite byte order. SQLite separates a 1-connection write pool from a 16-connection
-read-only pool; PostgreSQL uses a 16-connection pool with per-operation `SET LOCAL
-statement_timeout` and `idle_in_transaction_session_timeout`. SQL migrations
+SQLite byte order. SQLite separates a 1-connection write pool from a 20-connection
+read-only pool; PostgreSQL separates a 6-connection write/export pool from a
+20-connection read pool, with 16 active reader slots, a bounded 512-waiter read
+queue, and per-operation `SET LOCAL statement_timeout` and
+`idle_in_transaction_session_timeout`. SQL migrations
 reject unknown migration versions; both dialects have explicit baseline DDL.
 
 Read-only queries and fast-path credential resolution (`ControlStore::read()`)
 use read-only transactions (`BEGIN DEFERRED` on SQLite read pool, `BEGIN READ ONLY`
 on PostgreSQL) without acquiring the backup writer fence or row locks, and
-`ControlCatalogPort` calls run outside `controlDb` write transactions. All admitted
+`ControlCatalogPort` calls run outside all `controlDb` read and write transactions. All admitted
 mutations (`ControlStore::write()`) wait in a bounded 64-entry queue for an active
 writer slot (one serialized local writer on SQLite, up to four concurrent writers on
 PostgreSQL) within the caller's `OperationBudget` and retain the backup writer fence
@@ -679,7 +681,7 @@ contemporaneous revocation event is still pending), and the 12 growing operation
 tables: 24 hours after expiry for one-time tokens, OAuth auth codes/access tokens,
 OIDC transactions, `mcp_dedup` entries and closed provider budget buckets; 7 days
 after expiry/revocation/completion for sessions, OAuth refresh tokens and childless
-revoked refresh families, delivered revocation events and committed control
+expired or revoked refresh families, delivered revocation events and committed control
 operations; and `compact_retention_days` for settled provider call logs, terminal
 schedule runs and childless deleted schedule tombstones. Active calls, their
 retrievals and pending commands survive. Cleanup never settles or

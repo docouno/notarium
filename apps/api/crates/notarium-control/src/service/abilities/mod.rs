@@ -731,12 +731,10 @@ impl ControlService {
                                     .push(candidate.clone());
                             }
                         } else {
+                            let page_names: BTreeSet<String> =
+                                page_candidates.iter().map(|c| c.name.clone()).collect();
                             let mut bulk_complete = false;
-                            if inner.is_none()
-                                && raw.continuation.is_none()
-                                && query.kind.is_some()
-                                && page_candidates.len() > 1
-                            {
+                            if page_names.len() > 1 {
                                 let all = self
                                     .catalog
                                     .abilities(
@@ -753,6 +751,9 @@ impl ControlService {
                                 if all.items.len() <= 200 && all.continuation.is_none() {
                                     bulk_complete = true;
                                     for candidate in all.items {
+                                        if !page_names.contains(&candidate.name) {
+                                            continue;
+                                        }
                                         if !role_placement_matches_project(
                                             &candidate.reference.placement,
                                             query.project.as_ref(),
@@ -773,6 +774,9 @@ impl ControlService {
                                         };
                                         if actual.reference != candidate.reference {
                                             continue;
+                                        }
+                                        if actual.name != candidate.name {
+                                            return Err(invalid(ValidationReason::InvalidState));
                                         }
                                         by_name_candidates
                                             .entry(actual.name.clone())

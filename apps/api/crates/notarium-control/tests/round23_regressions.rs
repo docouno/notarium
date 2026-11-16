@@ -541,6 +541,106 @@ async fn run_pool_isolation_role_scope_and_race_idempotency(pg: bool) {
         "single-page runtime discover_abilities must make 1 catalog.abilities call, not N+1"
     );
 
+    // IMPL-047: Paginated limit=20 over 27 abilities makes 2+2=4 catalog.abilities calls (not 21+8=29),
+    // and kind=Some(Role) ignores colliding unrelated Skill names!
+    fixture.catalog.abilities_calls.store(0, Ordering::SeqCst);
+    let page1 = control
+        .discover_abilities(
+            ctx.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(20, None).unwrap(),
+                project: Some(project_a1.clone()),
+                kind: None,
+                name: None,
+                authoring: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page1.items.len(), 20);
+    assert!(page1.continuation.is_some());
+    assert_eq!(fixture.catalog.abilities_calls.load(Ordering::SeqCst), 2);
+    let page2 = control
+        .discover_abilities(
+            ctx.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(20, page1.continuation).unwrap(),
+                project: Some(project_a1.clone()),
+                kind: None,
+                name: None,
+                authoring: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page2.items.len(), 7);
+    assert!(page2.continuation.is_none());
+    assert_eq!(fixture.catalog.abilities_calls.load(Ordering::SeqCst), 4);
+
+    // Seed two colliding Skills ("dup-skill") at OwnedSpace(shared_a), verify kind=Some(Role) succeeds!
+    for dup_id in [95_u8, 96_u8] {
+        let reference = AbilityRef {
+            id: AbilityId::from_bytes([dup_id; 16]),
+            placement: AbilityPlacement::OwnedSpace(shared_a.space.id.clone()),
+            revision: RevisionId::from_bytes([dup_id; 16]),
+        };
+        let note = NoteRef {
+            space_id: shared_a.space.id.clone(),
+            note_id: NoteId::from_bytes([dup_id; 16]),
+        };
+        fixture
+            .catalog
+            .ability_entries
+            .lock()
+            .unwrap()
+            .push(AbilityDescriptor {
+                reference: reference.clone(),
+                kind: AbilityKind::Skill,
+                name: "dup-skill".into(),
+                enabled: true,
+                healthy: true,
+                lifecycle: Lifecycle::Active,
+                entrypoint: note.clone(),
+                auxiliary_files: vec![],
+            });
+        fixture.catalog.note_entries.lock().unwrap().insert(
+            (shared_a.space.id.clone(), note.note_id.clone()),
+            CatalogNote {
+                reference: note,
+                lifecycle: Lifecycle::Active,
+                facts: ResourceFacts {
+                    space: shared_a.space.clone(),
+                    class: DocClass::Skill,
+                    ancestor_folders: vec![],
+                    folder_write_locked: false,
+                    ability_package: Some(reference.id),
+                },
+            },
+        );
+    }
+    fixture.catalog.abilities_calls.store(0, Ordering::SeqCst);
+    let roles_only = control
+        .discover_abilities(
+            ctx.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(50, None).unwrap(),
+                project: Some(project_a1.clone()),
+                kind: Some(AbilityKind::Role),
+                name: None,
+                authoring: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(roles_only.items.len(), 27);
+    assert_eq!(fixture.catalog.abilities_calls.load(Ordering::SeqCst), 2);
+    fixture
+        .catalog
+        .ability_entries
+        .lock()
+        .unwrap()
+        .retain(|d| d.name != "dup-skill");
+
     // IMPL-042: Role placement scope enforced in episodes & schedules.
     let ep_id = EpisodeId::from_bytes([70; 16]);
     control
@@ -658,6 +758,107 @@ async fn run_pool_isolation_role_scope_and_race_idempotency(pg: bool) {
         bad_sched,
         PortError::Domain(DomainError::ValidationFailed { diagnostic })
             if diagnostic.reason == ValidationReason::InvalidState
+    ));
+
+    // IMPL-046: Valid project-pinned schedule claimed -> Keeper can inspect its own run via
+    // open_revalidated_read, while narrowed PAT/Keeper outside Space/project is denied!
+    let good_sched_id = ScheduleId::from_bytes([72; 16]);
+    control
+        .create_schedule(
+            ctx.clone(),
+            AccountMutation {
+                identity: next_identity(&control, &ctx, 8).await,
+                input: CreateSchedule {
+                    id: good_sched_id.clone(),
+                    definition: ScheduleDefinition {
+                        space: shared_a.space.id.clone(),
+                        project: Some(project_a1.clone()),
+                        title: "Project A1 schedule".into(),
+                        init_prompt: "Check".into(),
+                        cron: "0 */5 * * * *".into(),
+                        timezone: "UTC".into(),
+                        approved_role: role_pa1.clone(),
+                        limits: RunLimits::default(),
+                    },
+                    next_slot: Timestamp::parse("2023-11-14T22:15:00Z").unwrap(),
+                    paused: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    fixture.clock.0.store(1_700_000_100_000, Ordering::SeqCst);
+    let (claimed_run, keeper_space_ctx) = match control
+        .claim_schedule(
+            MaintenanceContext {
+                authority: ServiceAuthority::admit(ServicePurpose::Scheduler),
+                budget: budget(),
+            },
+            ClaimSchedule {
+                schedule: good_sched_id.clone(),
+                slot: Timestamp::parse("2023-11-14T22:15:00Z").unwrap(),
+                next_slot: Timestamp::parse("2023-11-14T22:20:00Z").unwrap(),
+                current_role: role_pa1.clone(),
+                expected: ControlRevision::ZERO,
+            },
+        )
+        .await
+        .unwrap()
+    {
+        ScheduleClaim::Claimed { run, context, .. } => (run, context),
+        other => panic!("expected Claimed, got {other:?}"),
+    };
+    let keeper_owner_ctx = ScheduleRunContext::Owner(Box::new(AccountContext::new(
+        keeper_space_ctx.auth().clone(),
+        budget(),
+    )));
+    let run_receipt = control
+        .get_schedule_run(keeper_owner_ctx, good_sched_id.clone(), claimed_run.clone())
+        .await
+        .unwrap();
+    assert_eq!(run_receipt.run, claimed_run);
+
+    // Narrowed PAT restricted to shared_b cannot inspect runs of shared_a schedule.
+    let pat_shared_b = ctx
+        .auth()
+        .for_pat(std::collections::BTreeMap::from([(
+            shared_b.space.id.clone(),
+            ctx.auth().spaces().get(&shared_b.space.id).unwrap().clone(),
+        )]))
+        .unwrap();
+    let narrowed_err = control
+        .list_schedule_runs(
+            ScheduleRunContext::Owner(Box::new(AccountContext::new(pat_shared_b, budget()))),
+            good_sched_id.clone(),
+            ControlPageRequest::new(10, None).unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        narrowed_err,
+        PortError::Domain(DomainError::ResourceNotFound)
+    ));
+    // Keeper pinned to project_a2 cannot inspect runs of project_a1 schedule.
+    let wrong_proj_auth = ctx
+        .auth()
+        .for_keeper(
+            AgentRunId::from_bytes([73; 16]),
+            shared_a.space.id.clone(),
+            Some(project_a2.folder_id.clone()),
+            std::collections::BTreeSet::new(),
+        )
+        .unwrap();
+    let wrong_proj_err = control
+        .get_schedule_run(
+            ScheduleRunContext::Owner(Box::new(AccountContext::new(wrong_proj_auth, budget()))),
+            good_sched_id.clone(),
+            claimed_run,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        wrong_proj_err,
+        PortError::Domain(DomainError::ResourceNotFound)
     ));
 
     // IMPL-041: 20 concurrent slow catalog reads (> 16 pool connections!) never hold ReadTransaction
