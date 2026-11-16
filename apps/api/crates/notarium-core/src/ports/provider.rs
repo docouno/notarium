@@ -39,8 +39,9 @@ pub enum ProviderModelKind {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TokenAccountingProfile {
-    /// Conservative payload-derived upper bound (`ceil(utf8_chars / 2)` plus
-    /// tool-schema overhead), capped by `min(request.budget.max_input_tokens, model.max_input_tokens)`.
+    /// Conservative UTF-8 scalar upper bound (`1/3`, `1/2`, or `1` token per 1-, 2-,
+    /// or 3/4-byte scalar plus framing and tool-schema overhead; completion reserves
+    /// `estimated_input + max_output_tokens`, embeddings reserve `max(declared_tokens, estimated)`).
     ConservativeModelCapV1,
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

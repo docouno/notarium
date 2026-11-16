@@ -196,18 +196,37 @@ impl SqliteCut {
             .map_err(|_| failure())?;
         session.check()
     }
-    pub(crate) fn close(mut self) -> Result<(), PortError> {
+    pub(crate) fn close(mut self, session: &Session) -> Result<(), PortError> {
+        session.disarm_interrupts();
+        let mut outcome = Ok(());
         if self.pinned {
-            self.source
-                .execute_batch("ROLLBACK")
-                .map_err(|_| failure())?;
+            while !self.source.is_autocommit() {
+                match self.source.execute_batch("ROLLBACK") {
+                    Ok(()) => break,
+                    Err(rusqlite::Error::SqliteFailure(code, _))
+                        if code.code == rusqlite::ErrorCode::OperationInterrupted =>
+                    {
+                        continue;
+                    }
+                    Err(_) => {
+                        outcome = Err(failure());
+                        break;
+                    }
+                }
+            }
             self.pinned = false;
         }
-        self.barrier.close().map_err(|_| failure())?;
-        if let Some(destination) = self.destination {
-            destination.close().map_err(|_| failure())?;
+        if self.barrier.close().is_err() {
+            outcome = Err(failure());
         }
-        self.source.close().map_err(|_| failure())?;
-        Ok(())
+        if let Some(destination) = self.destination
+            && destination.close().is_err()
+        {
+            outcome = Err(failure());
+        }
+        if self.source.close().is_err() {
+            outcome = Err(failure());
+        }
+        outcome
     }
 }

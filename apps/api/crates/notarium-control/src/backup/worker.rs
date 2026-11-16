@@ -172,7 +172,7 @@ impl Worker {
     }
     async fn close_source(&mut self) -> Result<(), PortError> {
         let result = match self.source.take() {
-            Some(Source::Sqlite(source)) => source.close(),
+            Some(Source::Sqlite(source)) => source.close(&self.session),
             Some(Source::Postgres(source)) => source.close().await,
             None => Ok(()),
         };
@@ -417,6 +417,7 @@ pub(crate) async fn launch(start: Start) -> Result<Client, PortError> {
                     watch.abort();
                 })
             }));
+            owner_session.disarm_interrupts();
             let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 runtime.block_on(worker.cleanup())
             }))

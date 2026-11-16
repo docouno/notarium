@@ -511,10 +511,12 @@ expected dimension and finite values. Reasoning fields are not exposed as text.
 Tools, usage and finish events are released only after valid completion and durable
 settlement; text can arrive earlier. Typed stream errors carry no upstream bodies.
 
-Input token admission and reservation use a conservative request-proportional
-estimate (`ceil(utf8_chars / 2)` plus framing and tool-schema overhead) checked
-against `min(request.budget.max_input_tokens, model.max_input_tokens)`, while
-embedding calls reserve `declared_tokens`. Resource, credential and every
+Completion input admission checks `request.budget.max_input_tokens <= model.max_input_tokens`
+and bounds a conservative UTF-8 scalar token estimate (`1/3` token per 1-byte scalar, `1/2`
+per 2-byte scalar, `1` per 3/4-byte scalar, plus framing and tool-schema overhead) against
+`request.budget.max_input_tokens`, reserving `estimated_input_tokens + request.budget.max_output_tokens`;
+embedding calls require `declared_tokens <= model.max_input_tokens` and check/reserve
+`max(declared_tokens, estimated_chunk_tokens)`. Resource, credential and every
 participating Space each pay the reserved call against atomic UTC-aligned 60-second
 RPM/TPM buckets. The primary Space is charged even for orchestration-only input.
 

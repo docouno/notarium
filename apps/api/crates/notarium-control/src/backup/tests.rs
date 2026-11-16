@@ -255,7 +255,11 @@ async fn exercise(pg: bool) {
     pause.resume().await.unwrap();
     let mut tiny = limits;
     tiny.max_spool_bytes = 1;
-    assert!(snapshot.spool(tiny, Cancellation::default()).await.is_err());
+    assert!(matches!(
+        snapshot.spool(tiny, Cancellation::default()).await,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == ValidationReason::BudgetExceeded
+    ));
     snapshot.close().await.unwrap();
     drop(prepared);
     hold.release().await.unwrap();
@@ -823,4 +827,53 @@ async fn postgres_prepare_observes_cancellation_before_worker_launch() {
         "prepare ignored cancellation until the blocked installation read completed"
     );
     assert!(cancelled, "prepare must preserve the cancellation outcome");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_pinned_cut_close_survives_concurrent_interrupts() {
+    let _guard = crate::TEST_RESOURCE_LOCK.lock().await;
+    let (fixture, participant, data) = fixture(false, "backup_close_interrupt").await;
+    let limits = participant.default_budget();
+    let keys = participant.keyring.inspect(budget()).await.unwrap();
+    let installation = fixture.store.installation().await.unwrap().unwrap();
+    let witness = BackupWitness {
+        installation,
+        schema_version: TARGET_SCHEMA_VERSION,
+        histories: vec![],
+        canaries: vec![],
+    };
+    let wal = PathBuf::from(format!("{}-wal", data.control().display()));
+
+    for idx in 0..64_u8 {
+        let dest = data.root().join(format!("interrupt-dest-{idx}.sqlite"));
+        fs::write(&dest, b"").unwrap();
+        let session = session::Session::new(budget(), limits, Some(wal.clone()));
+        let mut cut = sqlite::SqliteCut::prepare(&data.control(), &dest, &session).unwrap();
+        cut.pin(&witness, &keys, &session).unwrap();
+        let mut tiny = limits;
+        tiny.max_spool_bytes = 1;
+        session.spool_budget(tiny, Cancellation::default()).unwrap();
+        let _ = cut.spool(&session);
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let ready_bg = ready.clone();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        let cancel_session = session.clone();
+        let interrupter = std::thread::spawn(move || {
+            ready_bg.wait();
+            while !stop_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                cancel_session.cancel();
+            }
+        });
+        ready.wait();
+        let closed = cut.close(&session);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        interrupter.join().unwrap();
+        closed.expect(
+            "pinned SQLite backup cut close must not fail under concurrent sqlite3_interrupt",
+        );
+    }
+
+    drop(participant);
+    fixture.close().await;
 }

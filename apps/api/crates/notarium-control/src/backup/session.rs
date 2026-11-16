@@ -110,6 +110,11 @@ impl Session {
             }
         }
     }
+    pub(crate) fn disarm_interrupts(&self) {
+        if let Ok(mut handles) = self.interrupts.lock() {
+            handles.clear();
+        }
+    }
     pub(crate) fn unpin(&self) {
         if let Ok(mut at) = self.pinned.lock() {
             *at = None;
