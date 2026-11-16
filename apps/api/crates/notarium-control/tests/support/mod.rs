@@ -97,6 +97,10 @@ pub struct Catalog {
         Mutex<BTreeMap<CommandKey, (ContentDigest, HistoryScope, SpaceLifecycle, CatalogSpace)>>,
     pub entries: Mutex<BTreeMap<SpaceId, (PrincipalId, String, CatalogSpace)>>,
     pub project_entries: Mutex<BTreeMap<(SpaceId, FolderId), ProjectInfo>>,
+    pub ability_entries: Mutex<Vec<AbilityDescriptor>>,
+    pub note_entries: Mutex<BTreeMap<(SpaceId, NoteId), CatalogNote>>,
+    pub folder_entries: Mutex<BTreeMap<(SpaceId, FolderId), CatalogFolder>>,
+    pub memory_calls: AtomicUsize,
 }
 impl ControlCatalogPort for Catalog {
     fn space(&self, _: CallBudget, id: SpaceId) -> PortFuture<'_, CatalogSpace> {
@@ -172,10 +176,34 @@ impl ControlCatalogPort for Catalog {
     }
     fn projects(
         &self,
-        _: SpaceContext,
-        _: ControlPageRequest,
+        ctx: SpaceContext,
+        page: ControlPageRequest,
     ) -> PortFuture<'_, ControlPage<ProjectInfo>> {
-        panic!("unexpected projects call")
+        Box::pin(async move {
+            let after = page.continuation().map(FolderId::parse).transpose()?;
+            let entries = self.project_entries.lock().unwrap();
+            let mut values: Vec<_> = entries
+                .values()
+                .filter(|value| {
+                    value.folder.space_id == ctx.scope().space_id
+                        && after
+                            .as_ref()
+                            .is_none_or(|after| value.folder.folder_id > *after)
+                })
+                .take(usize::from(page.limit()) + 1)
+                .cloned()
+                .collect();
+            let continuation = if values.len() > usize::from(page.limit()) {
+                values.pop();
+                Some(values.last().unwrap().folder.folder_id.to_string())
+            } else {
+                None
+            };
+            Ok(ControlPage {
+                items: values,
+                continuation,
+            })
+        })
     }
     fn project(&self, ctx: SpaceContext, project: FolderRef) -> PortFuture<'_, ProjectInfo> {
         Box::pin(async move {
@@ -208,15 +236,94 @@ impl ControlCatalogPort for Catalog {
     fn abilities(
         &self,
         _: AccountContext,
-        _: AbilityQuery,
+        query: AbilityQuery,
     ) -> PortFuture<'_, ControlPage<AbilityDescriptor>> {
-        panic!("unexpected abilities call")
+        Box::pin(async move {
+            let offset = query
+                .page
+                .continuation()
+                .map(|v| v.parse::<usize>().unwrap())
+                .unwrap_or(0);
+            let values: Vec<_> = self
+                .ability_entries
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|value| {
+                    query.kind.is_none_or(|kind| value.kind == kind)
+                        && query.name.as_ref().is_none_or(|name| value.name == *name)
+                })
+                .cloned()
+                .collect();
+            let end = offset
+                .saturating_add(usize::from(query.page.limit()))
+                .min(values.len());
+            Ok(ControlPage {
+                items: values.get(offset..end).unwrap_or_default().to_vec(),
+                continuation: (end < values.len()).then(|| end.to_string()),
+            })
+        })
     }
-    fn ability(&self, _: AccountContext, _: AbilityRef) -> PortFuture<'_, AbilityDescriptor> {
-        panic!("unexpected ability call")
+    fn ability(
+        &self,
+        _: AccountContext,
+        reference: AbilityRef,
+    ) -> PortFuture<'_, AbilityDescriptor> {
+        Box::pin(async move {
+            self.ability_entries
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|value| value.reference == reference)
+                .cloned()
+                .ok_or(DomainError::ResourceNotFound.into())
+        })
     }
-    fn note_facts(&self, _: AccountContext, _: NoteRef) -> PortFuture<'_, ResourceFacts> {
-        panic!("unexpected note call")
+    fn current_ability(
+        &self,
+        _: AccountContext,
+        identity: AbilityIdentity,
+    ) -> PortFuture<'_, AbilityDescriptor> {
+        Box::pin(async move {
+            self.ability_entries
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|value| value.reference.identity() == identity)
+                .cloned()
+                .ok_or(DomainError::ResourceNotFound.into())
+        })
+    }
+    fn note(&self, ctx: AccountContext, note: NoteRef) -> PortFuture<'_, CatalogNote> {
+        Box::pin(async move {
+            let value = self
+                .note_entries
+                .lock()
+                .unwrap()
+                .get(&(note.space_id, note.note_id))
+                .cloned()
+                .ok_or(DomainError::ResourceNotFound)?;
+            ctx.auth().authorize_read(&value.facts)?;
+            Ok(value)
+        })
+    }
+    fn folder(&self, ctx: AccountContext, folder: FolderRef) -> PortFuture<'_, CatalogFolder> {
+        Box::pin(async move {
+            let value = self
+                .folder_entries
+                .lock()
+                .unwrap()
+                .get(&(folder.space_id, folder.folder_id))
+                .cloned()
+                .ok_or(DomainError::ResourceNotFound)?;
+            ctx.auth().authorize_folder_read(
+                &value.space,
+                &value.reference.folder_id,
+                &value.ancestor_folders,
+            )?;
+            Ok(value)
+        })
     }
     fn change_lifecycle(
         &self,
@@ -256,11 +363,66 @@ impl ControlCatalogPort for Catalog {
     }
     fn resolve_or_ensure_memory_target(
         &self,
-        _: AccountContext,
-        _: MemoryTarget,
-        _: String,
+        ctx: AccountContext,
+        target: MemoryTarget,
+        category: String,
     ) -> PortFuture<'_, ResolvedMemoryTarget> {
-        panic!("unexpected memory call")
+        Box::pin(async move {
+            self.memory_calls.fetch_add(1, Ordering::SeqCst);
+            let (space, ancestors) = match &target {
+                MemoryTarget::User { owner } => {
+                    let entries = self.entries.lock().unwrap();
+                    let space = entries
+                        .values()
+                        .find(|(id, _, value)| {
+                            id == owner && value.space.kind == SpaceKind::Personal
+                        })
+                        .ok_or(DomainError::ResourceNotFound)?
+                        .2
+                        .space
+                        .clone();
+                    (space, vec![])
+                }
+                MemoryTarget::Project { folder } => {
+                    let space = self
+                        .entries
+                        .lock()
+                        .unwrap()
+                        .get(&folder.space_id)
+                        .ok_or(DomainError::ResourceNotFound)?
+                        .2
+                        .space
+                        .clone();
+                    (space, vec![folder.folder_id.clone()])
+                }
+            };
+            let facts = ResourceFacts {
+                space: space.clone(),
+                class: notarium_core::classes::DocClass::AgentMemory,
+                ancestor_folders: ancestors,
+                folder_write_locked: false,
+                ability_package: None,
+            };
+            ctx.auth().authorize_direct_write(&facts, &facts)?;
+            let digest = blake3::hash(format!("{target:?}:{category}").as_bytes());
+            let reference = NoteRef {
+                space_id: space.id,
+                note_id: NoteId::from_bytes(digest.as_bytes()[..16].try_into().unwrap()),
+            };
+            self.note_entries.lock().unwrap().insert(
+                (reference.space_id.clone(), reference.note_id.clone()),
+                CatalogNote {
+                    reference: reference.clone(),
+                    lifecycle: Lifecycle::Active,
+                    facts,
+                },
+            );
+            Ok(ResolvedMemoryTarget {
+                target,
+                note: reference,
+                category,
+            })
+        })
     }
 }
 pub struct Revoker {
@@ -636,6 +798,7 @@ impl Fixture {
                     authentication: mode,
                     resource_uri: "https://resource.example/".into(),
                     max_auth_spaces: 100,
+                    schedule_limits: notarium_core::ports::control::RunLimits::HARD_CEILING,
                 },
                 budget(),
             )

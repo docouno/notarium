@@ -29,6 +29,7 @@ fn user(number: u8, username: &str) -> TargetRecord {
         disabled_at: None,
         personal_space_id: None,
         revision: 0,
+        metadata_revision: 0,
         auth_version: 0,
         created_at: 0,
     })

@@ -64,6 +64,7 @@ async fn cimd_https_cache_changes_and_failures_never_fall_back_to_stale_consent(
                     authentication: AuthenticationMode::Password,
                     resource_uri: "https://resource.example/".into(),
                     max_auth_spaces: 100,
+                    schedule_limits: notarium_core::ports::control::RunLimits::HARD_CEILING,
                 },
                 budget(),
             )

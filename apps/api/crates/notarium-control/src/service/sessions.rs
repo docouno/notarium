@@ -82,6 +82,9 @@ impl ControlService {
     ) -> Result<EngineAuthContext, PortError> {
         let now = self.clock.now_ms()?;
         match &credential {
+            AuthenticatedCredential::ScheduledRun { .. } => {
+                self.scheduled_context(tx, current_user, credential).await
+            }
             AuthenticatedCredential::Session(id) => {
                 live_session(&session(tx, id.as_str()).await?, current_user, now)?;
                 let source = grant("session", id.as_str());

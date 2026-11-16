@@ -65,6 +65,7 @@ ids! {
     OAuthFamilyId => "family_", OAuthGrantId => "oauth_",
     ReservationId => "reservation_", PendingInputId => "pending_",
     ArtifactId => "artifact_", ClusterId => "cluster_",
+    ContextSetId => "context_",
 }
 
 /// Lookup identity of a PAT, OAuth access token or refresh token. Never a bearer.

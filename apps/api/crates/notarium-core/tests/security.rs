@@ -24,6 +24,53 @@ fn human(role: SpaceRole, ability: bool) -> EngineAuthContext {
         ability,
     ))
 }
+
+#[test]
+fn folder_metadata_obeys_project_scope_and_shared_branch_taint() {
+    let owner = human(SpaceRole::Owner, true);
+    let first = facts(1, DocClass::AgentMemory).space;
+    let second = facts(2, DocClass::UserDoc).space;
+    let root = FolderId::from_bytes([3; 16]);
+    let child = FolderId::from_bytes([4; 16]);
+    let keeper = owner
+        .for_keeper(
+            AgentRunId::from_bytes([6; 16]),
+            first.id.clone(),
+            Some(root.clone()),
+            BTreeSet::new(),
+        )
+        .unwrap();
+    keeper.authorize_folder_read(&first, &root, &[]).unwrap();
+    keeper
+        .authorize_folder_read(&first, &child, std::slice::from_ref(&root))
+        .unwrap();
+    assert!(keeper.authorize_folder_read(&first, &child, &[]).is_err());
+    let mut closed = first.clone();
+    closed.lifecycle = SpaceLifecycle::Archived;
+    assert!(keeper.authorize_folder_read(&closed, &root, &[]).is_err());
+    let mut wanted = grants(SpaceRole::Owner);
+    wanted.get_mut(&first.id).unwrap().read_classes.clear();
+    let unreadable = owner.for_pat(wanted).unwrap();
+    assert!(
+        unreadable
+            .authorize_folder_read(&first, &root, &[])
+            .is_err()
+    );
+    let agent = owner
+        .for_agent_run(
+            AgentRunId::from_bytes([7; 16]),
+            first.id.clone(),
+            ChatAudience::Personal,
+            grants(SpaceRole::Owner),
+        )
+        .unwrap();
+    let sibling = agent.clone();
+    let memory = facts(1, DocClass::AgentMemory);
+    sibling.authorize_direct_write(&memory, &memory).unwrap();
+    agent.authorize_folder_read(&second, &child, &[]).unwrap();
+    assert!(sibling.taint().is_tainted());
+    assert!(sibling.authorize_direct_write(&memory, &memory).is_err());
+}
 fn facts(space: u8, class: DocClass) -> ResourceFacts {
     ResourceFacts {
         space: Space {

@@ -37,6 +37,7 @@ fn user(n: u8) -> TargetRecord {
         disabled_at: None,
         personal_space_id: None,
         revision: 0,
+        metadata_revision: 0,
         auth_version: 0,
         created_at: 0,
     })
@@ -91,14 +92,14 @@ enum Observer {
 }
 fn retrieval(number: usize, score: Option<f64>) -> TargetRecord {
     TargetRecord::AgentRetrievals(AgentRetrievalsRow {
-        retrieval_id: format!("retrieval{number}"),
+        retrieval_id: RequestId::from_bytes((number as u128).to_be_bytes()).to_string(),
         owner_id: PrincipalId::from_bytes([1; 16]).to_string(),
         principal: PrincipalId::from_bytes([1; 16]).to_string(),
         agent: None,
         call_id: None,
         tool: "search".into(),
-        query_summary: "{}".into(),
-        filters: "{}".into(),
+        query_summary: "\"hybrid\"".into(),
+        filters: serde_json::to_string(&ContentDigest::from_bytes([0; 32])).unwrap(),
         hit_refs: "[]".into(),
         result_count: 1,
         top_score: score,

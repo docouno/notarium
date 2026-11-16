@@ -266,7 +266,16 @@ idempotent delivery; a committed mutation cannot return success before their ACK
 Schedule claims carry the next slot computed by the scheduler. A committed claim
 advances that slot atomically; repeated claims return an inspection receipt,
 without permission to dispatch again. Terminal run results are typed and do not
-carry a next slot. These are interface requirements, not a scheduler implementation.
+carry a next slot. Only a new winning claim returns a non-deserializable
+ScheduledRun/Keeper context. Scheduler maintenance authority owns claims and
+terminal audit; human schedule edits use account commands and configuration CAS.
+Run limits are separate from per-call completion budgets. The ticker and tool loop
+remain consumer responsibilities.
+
+`ContextAdminPort` owns reference preferences and typed Note/Folder favorites.
+`AgentTelemetryPort` accepts finite enums, typed references and counters, with no
+raw content fields. Canonical catalog lookups distinguish immutable ability refs
+from current tips and provide note/folder authorization facts without bodies.
 
 Owner boundaries use object-safe traits and `Send` futures. Streams expose
 typed `next` calls. No runtime channel, database transaction, model session or

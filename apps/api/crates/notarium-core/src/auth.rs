@@ -29,6 +29,10 @@ impl fmt::Debug for SecretString {
 
 /// Durable lineage attested by the authentication owner. Derived agents retain
 /// this lineage so a later control effect can recheck the original credential.
+/// ```compile_fail
+/// use notarium_core::auth::AuthenticatedCredential;
+/// let _: AuthenticatedCredential = serde_json::from_str("{}").unwrap();
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthenticatedCredential {
     Session(AuthSessionId),
@@ -37,6 +41,13 @@ pub enum AuthenticatedCredential {
         token: CredentialTokenId,
         grant: OAuthGrantId,
         family: Option<OAuthFamilyId>,
+    },
+    /// Only the successful scheduler claim may attest this lineage. No bearer
+    /// token or request deserializer can select a scheduled credential.
+    ScheduledRun {
+        schedule: ScheduleId,
+        run: AgentRunId,
+        lease: LeaseEpoch,
     },
     TrustedNone,
 }
@@ -360,6 +371,32 @@ impl EngineAuthContext {
         } else {
             Err(DomainError::AbilityWriteForbidden)
         }
+    }
+    /// Folder metadata has no document class. It still requires a nonempty read
+    /// grant and current ancestry, and participates in the same branch taint.
+    pub fn authorize_folder_read(
+        &self,
+        space: &Space,
+        folder: &FolderId,
+        ancestors: &[FolderId],
+    ) -> DomainResult<()> {
+        let grant = self
+            .spaces
+            .get(&space.id)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if space.lifecycle != SpaceLifecycle::Active
+            || grant.read_classes.is_empty()
+            || grant
+                .project_root
+                .as_ref()
+                .is_some_and(|root| root != folder && !ancestors.contains(root))
+        {
+            return Err(DomainError::ResourceNotFound);
+        }
+        if self.write_space.as_ref().is_some_and(|id| id != &space.id) {
+            self.taint.mark_external_read();
+        }
+        Ok(())
     }
     pub fn authorize_read(&self, resource: &ResourceFacts) -> DomainResult<()> {
         let grant = self

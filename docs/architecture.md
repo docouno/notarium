@@ -70,8 +70,10 @@ storage and bounded network primitives. `OAuthService` implements the local
 authorization server, and `OidcService` verifies external identity and issues
 native sessions through explicit account bindings. `ProviderService` implements
 encrypted provider configuration, current disclosure admission, bounded completion
-and embedding calls, and durable spending reservations. Account-state and backup
-participant services are still under construction. See
+and embedding calls, and durable spending reservations. `ControlPlane` composes that provider with
+its matching account-state service. Episodes, reference contexts, ability overlays,
+schedule claims and content-free telemetry are implemented without a tool loop
+or ticker. Backup participant services are still under construction. See
 [control services](control.md).
 
 ## Client and delivery boundaries

@@ -219,7 +219,7 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: AccountContext,
             request: AccountMutation<StartEpisode>,
-        ) -> PortFuture<'_, EpisodeStartResult>;
+        ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode>;
     fn update_episode(
             &self,
@@ -235,6 +235,7 @@ impl ControlPort for RejectingPorts {
             &self,
             ctx: AccountContext,
             episode: EpisodeId,
+            space: Option<SpaceId>,
             page: ControlPageRequest,
         ) -> PortFuture<'_, BootstrapContext>;
     fn discover_abilities(
@@ -254,8 +255,8 @@ impl ControlPort for RejectingPorts {
         ) -> PortFuture<'_, AbilityDescriptor>;
     fn update_ability_binding(
             &self,
-            ctx: SpaceContext,
-            request: AbilityBindingUpdate,
+            ctx: AccountContext,
+            request: AccountMutation<AbilityBindingUpdate>,
         ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>>;
     fn resolve_memory_target(
             &self,
@@ -264,40 +265,58 @@ impl ControlPort for RejectingPorts {
             category: String,
         ) -> PortFuture<'_, ResolvedMemoryTarget>;
     fn create_schedule(
-            &self,
-            ctx: SpaceContext,
-            schedule: AgentSchedule,
-        ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<CreateSchedule>,
+    ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
     fn get_schedule(
-            &self,
-            ctx: SpaceContext,
-            schedule: ScheduleId,
-        ) -> PortFuture<'_, AgentSchedule>;
-    fn list_schedules(&self, ctx: SpaceContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<AgentSchedule>>;
+        &self,
+        ctx: SpaceContext,
+        schedule: ScheduleId,
+    ) -> PortFuture<'_, AgentSchedule>;
+    fn list_schedules(
+        &self,
+        ctx: SpaceContext,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
     fn update_schedule(
-            &self,
-            ctx: SpaceContext,
-            schedule: AgentSchedule,
-        ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<UpdateSchedule>,
+    ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
     fn delete_schedule(
-            &self,
-            ctx: SpaceContext,
-            schedule: ScheduleId,
-            expected: ControlRevision,
-        ) -> PortFuture<'_, ControlRevision>;
-    fn list_due_schedules(&self, ctx: MaintenanceContext, now: Timestamp, page: ControlPageRequest) -> PortFuture<'_, ControlPage<AgentSchedule>>;
-    fn get_schedule_run(&self, ctx: AccountContext, schedule: ScheduleId, run: AgentRunId) -> PortFuture<'_, ScheduleRunReceipt>;
-    fn list_schedule_runs(&self, ctx: AccountContext, schedule: ScheduleId, page: ControlPageRequest) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<DeleteSchedule>,
+    ) -> PortFuture<'_, ControlCommit<()>>;
+    fn list_due_schedules(
+        &self,
+        ctx: MaintenanceContext,
+        now: Timestamp,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
+    fn get_schedule_run(
+        &self,
+        ctx: ScheduleRunContext,
+        schedule: ScheduleId,
+        run: AgentRunId,
+    ) -> PortFuture<'_, ScheduleRunReceipt>;
+    fn list_schedule_runs(
+        &self,
+        ctx: ScheduleRunContext,
+        schedule: ScheduleId,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
     fn claim_schedule(
-            &self,
-            ctx: SpaceContext,
-            request: ClaimSchedule,
-        ) -> PortFuture<'_, ScheduleClaim>;
+        &self,
+        ctx: MaintenanceContext,
+        request: ClaimSchedule,
+    ) -> PortFuture<'_, ScheduleClaim>;
     fn record_schedule_result(
-            &self,
-            ctx: SpaceContext,
-            result: ScheduleResult,
-        ) -> PortFuture<'_, ControlRevision>;
+        &self,
+        ctx: MaintenanceContext,
+        result: ScheduleResult,
+    ) -> PortFuture<'_, ScheduleRunReceipt>;
     fn select_provider(
             &self,
             ctx: SpaceContext,

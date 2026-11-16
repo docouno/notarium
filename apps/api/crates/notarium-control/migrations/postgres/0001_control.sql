@@ -14,6 +14,7 @@ CREATE TABLE v1_control.users (
     is_admin BIGINT NOT NULL DEFAULT 0 CHECK (is_admin IN (0,1)),
     disabled_at BIGINT, personal_space_id TEXT UNIQUE,
     revision BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    metadata_revision BIGINT NOT NULL DEFAULT 0 CHECK (metadata_revision >= 0),
     auth_version BIGINT NOT NULL DEFAULT 0 CHECK (auth_version >= 0),
     created_at BIGINT NOT NULL,
     CHECK (coalesce(octet_length(user_id),0) <= 2048),
@@ -286,7 +287,7 @@ CREATE TABLE v1_control.favorites (
     CHECK (coalesce(octet_length(owner_id),0) + coalesce(octet_length(space_id),0) + coalesce(octet_length(entity_kind),0) + coalesce(octet_length(entity_id),0) <= 2048),
     CHECK (coalesce(octet_length(owner_id),0) + coalesce(octet_length(space_id),0) + 8 + coalesce(octet_length(entity_id),0) <= 2048)
 );
-CREATE INDEX favorite_order ON v1_control.favorites(owner_id,space_id,rank,entity_id);
+CREATE INDEX favorite_order ON v1_control.favorites(owner_id,rank,space_id,entity_kind,entity_id);
 CREATE TABLE v1_control.context_sets (
     set_id TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES v1_control.users(user_id), home_space TEXT NOT NULL,
     name TEXT NOT NULL, note_refs TEXT NOT NULL CHECK (length(note_refs)<=65536),
@@ -300,28 +301,34 @@ CREATE TABLE v1_control.context_set_attachments (
     target_kind TEXT NOT NULL CHECK (target_kind IN ('personal','space','project')), target_id TEXT NOT NULL,
     target_space TEXT NOT NULL, owner_id TEXT NOT NULL REFERENCES v1_control.users(user_id), revision BIGINT NOT NULL CHECK (revision>=0),
     PRIMARY KEY(set_id,target_kind,target_id),
+    CHECK (target_kind<>'personal' OR target_id=owner_id),
     CHECK (coalesce(octet_length(set_id),0) + coalesce(octet_length(target_kind),0) + coalesce(octet_length(target_id),0) <= 2048),
     CHECK (coalesce(octet_length(owner_id),0) + coalesce(octet_length(target_kind),0) + coalesce(octet_length(target_id),0) + coalesce(octet_length(set_id),0) <= 2048)
 );
-CREATE INDEX context_attachment_target ON v1_control.context_set_attachments(owner_id,target_kind,target_id,set_id);
+CREATE INDEX context_attachment_target ON v1_control.context_set_attachments(target_kind,target_id,set_id);
 CREATE TABLE v1_control.context_scope_pins (
     owner_id TEXT NOT NULL REFERENCES v1_control.users(user_id), target_kind TEXT NOT NULL CHECK (target_kind IN ('personal','space','project')),
     target_id TEXT NOT NULL, target_space TEXT NOT NULL, note_space TEXT NOT NULL, note_id TEXT NOT NULL,
     revision BIGINT NOT NULL CHECK (revision>=0), created_at BIGINT NOT NULL,
     PRIMARY KEY(owner_id,target_kind,target_id,note_space,note_id),
+    CHECK (target_kind<>'personal' OR target_id=owner_id),
     CHECK (coalesce(octet_length(owner_id),0) + coalesce(octet_length(target_kind),0) + coalesce(octet_length(target_id),0) + coalesce(octet_length(note_space),0) + coalesce(octet_length(note_id),0) <= 2048),
     CHECK (coalesce(octet_length(target_space),0) + coalesce(octet_length(note_space),0) <= 2048)
 );
 CREATE INDEX context_pin_space ON v1_control.context_scope_pins(target_space,note_space);
+CREATE INDEX context_pin_target ON v1_control.context_scope_pins(target_kind,target_id,note_space,note_id);
+CREATE UNIQUE INDEX context_shared_pin ON v1_control.context_scope_pins(target_kind,target_id,note_space,note_id) WHERE target_kind<>'personal';
 CREATE TABLE v1_control.context_order (
     owner_id TEXT NOT NULL REFERENCES v1_control.users(user_id), target_kind TEXT NOT NULL CHECK (target_kind IN ('personal','space','project')),
     target_id TEXT NOT NULL, target_space TEXT NOT NULL, entry_kind TEXT NOT NULL CHECK (entry_kind IN ('set','note')),
     entry_ref TEXT NOT NULL, rank BIGINT NOT NULL, revision BIGINT NOT NULL CHECK (revision>=0),
     PRIMARY KEY(owner_id,target_kind,target_id,entry_kind,entry_ref),
+    CHECK (target_kind<>'personal' OR target_id=owner_id),
     CHECK (coalesce(octet_length(owner_id),0) + coalesce(octet_length(target_kind),0) + coalesce(octet_length(target_id),0) + coalesce(octet_length(entry_kind),0) + coalesce(octet_length(entry_ref),0) <= 2048),
     CHECK (coalesce(octet_length(owner_id),0) + coalesce(octet_length(target_kind),0) + coalesce(octet_length(target_id),0) + 8 + coalesce(octet_length(entry_ref),0) <= 2048)
 );
-CREATE INDEX context_order_target ON v1_control.context_order(owner_id,target_kind,target_id,rank,entry_ref);
+CREATE INDEX context_order_target ON v1_control.context_order(target_kind,target_id,rank,entry_kind,entry_ref);
+CREATE UNIQUE INDEX context_shared_order ON v1_control.context_order(target_kind,target_id,entry_kind,entry_ref) WHERE target_kind<>'personal';
 CREATE TABLE v1_control.agent_episodes (
     episode_id TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES v1_control.users(user_id), name TEXT,
     parent_id TEXT REFERENCES v1_control.agent_episodes(episode_id) DEFERRABLE INITIALLY DEFERRED, active_role TEXT, project_space TEXT, project_folder TEXT,
@@ -370,6 +377,7 @@ CREATE TABLE v1_control.agent_calls (
 );
 CREATE INDEX agent_call_owner ON v1_control.agent_calls(owner_id,started_at,call_id);
 CREATE INDEX agent_call_episode ON v1_control.agent_calls(owner_id,episode_id,started_at,call_id);
+CREATE INDEX agent_call_retention ON v1_control.agent_calls(finished_at,call_id);
 CREATE INDEX agent_call_pending ON v1_control.agent_calls(finished_at,started_at);
 CREATE TABLE v1_control.agent_call_details (
     call_id TEXT NOT NULL PRIMARY KEY REFERENCES v1_control.agent_calls(call_id) ON DELETE CASCADE,
@@ -386,6 +394,7 @@ CREATE TABLE v1_control.agent_retrievals (
     CHECK (coalesce(octet_length(owner_id),0) + 8 + coalesce(octet_length(retrieval_id),0) <= 2048),
     CHECK (coalesce(octet_length(call_id),0) <= 2048)
 );
+CREATE INDEX retrieval_retention ON v1_control.agent_retrievals(created_at,retrieval_id);
 CREATE INDEX retrieval_owner ON v1_control.agent_retrievals(owner_id,created_at,retrieval_id);
 CREATE INDEX retrieval_call ON v1_control.agent_retrievals(call_id);
 CREATE TABLE v1_control.mcp_dedup (
@@ -398,11 +407,13 @@ CREATE TABLE v1_control.mcp_dedup (
 CREATE INDEX dedup_expiry ON v1_control.mcp_dedup(expires_at);
 CREATE TABLE v1_control.agent_schedules (
     schedule_id TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES v1_control.users(user_id), space_id TEXT NOT NULL,
-    project_folder_id TEXT, cron_expr TEXT NOT NULL, timezone TEXT NOT NULL, approved_role TEXT NOT NULL,
+    project_folder_id TEXT, title TEXT NOT NULL, init_prompt TEXT NOT NULL, cron_expr TEXT NOT NULL, timezone TEXT NOT NULL, approved_role TEXT NOT NULL,
     paused_reason TEXT CHECK (paused_reason IN ('owner_revoked','role_changed','space_unavailable','budget_exceeded','manual')),
     write_class_mask BIGINT NOT NULL CHECK (write_class_mask=1), budgets TEXT NOT NULL,
     misfire_policy TEXT NOT NULL CHECK (misfire_policy='coalesce_latest'), next_slot_utc_ms BIGINT NOT NULL,
-    deleted_at BIGINT, revision BIGINT NOT NULL CHECK (revision>=0), created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
+    deleted_at BIGINT, config_revision BIGINT NOT NULL CHECK (config_revision>=0), revision BIGINT NOT NULL CHECK (revision>=0), created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
+    CHECK (octet_length(title) BETWEEN 1 AND 512),
+    CHECK (octet_length(init_prompt) BETWEEN 1 AND 32768),
     CHECK (coalesce(octet_length(schedule_id),0) <= 2048),
     CHECK (8 + coalesce(octet_length(paused_reason),0) + 8 + coalesce(octet_length(schedule_id),0) <= 2048),
     CHECK (coalesce(octet_length(owner_id),0) + coalesce(octet_length(space_id),0) + coalesce(octet_length(schedule_id),0) <= 2048)
@@ -416,7 +427,10 @@ CREATE TABLE v1_control.agent_schedule_runs (
     claimed_schedule_revision BIGINT NOT NULL CHECK (claimed_schedule_revision>=0), reserved_next_slot BIGINT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('claimed','running','succeeded','failed','unknown')),
     started_at BIGINT NOT NULL, finished_at BIGINT, safe_result TEXT CHECK (length(safe_result)<=4096),
+    owner_auth_version BIGINT NOT NULL CHECK (owner_auth_version>=0), config_revision BIGINT NOT NULL CHECK (config_revision>=0),
+    admission_epoch BIGINT NOT NULL CHECK (admission_epoch>=0), history_scope TEXT NOT NULL, expires_at BIGINT NOT NULL CHECK (expires_at>started_at),
     UNIQUE(schedule_id,slot_utc_ms), CHECK (reserved_next_slot>slot_utc_ms),
+    CHECK (octet_length(history_scope)<=2048),
     CHECK (coalesce(octet_length(run_id),0) <= 2048),
     CHECK (coalesce(octet_length(schedule_id),0) + 8 <= 2048),
     CHECK (coalesce(octet_length(schedule_id),0) + coalesce(octet_length(status),0) + 8 + coalesce(octet_length(run_id),0) <= 2048)

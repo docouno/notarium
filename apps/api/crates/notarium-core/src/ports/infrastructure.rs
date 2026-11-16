@@ -265,6 +265,8 @@ pub enum RevocationSelector {
     Credential(CredentialId),
     ProviderResource(ProviderResourceId),
     ProviderCall(RequestId),
+    Schedule(ScheduleId),
+    ScheduledRun(AgentRunId),
     Grant(GrantId),
     OAuthGrant(OAuthGrantId),
     OAuthFamily(OAuthFamilyId),

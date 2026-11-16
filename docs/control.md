@@ -4,8 +4,10 @@ The control crate provides the SQL schema, bounded stores, target record
 import/export and `ControlService`. The service implements `AuthPort` and Space
 membership/lifecycle operations. `OAuthService` implements `OAuthPort`, and
 `OidcService` implements `OidcPort`. `ProviderService` implements provider
-administration, completion and embeddings. Account episodes/abilities/schedules
-and backup participant services remain under construction. HTTP routes, consent
+administration, completion and embeddings. `ControlPlane` implements the complete
+`ControlPort`, deriving its authority owner from that provider instance.
+`ControlService` also implements context administration and content-free agent
+telemetry. Backup participant services remain under construction. HTTP routes, consent
 UI, cookies, CSRF and the desktop authentication perimeter
 belong to the transport composition.
 
@@ -35,8 +37,21 @@ primary-key export order can be restored without loading the corpus into memory.
 Constraint failures, cancellation and expiry roll back the whole cut. Dropping
 an active append future also invalidates the cut; a retained handle cannot commit
 a partially appended page. Import does not publish a ready
-epoch or parse an earlier product's database schema. Further semantic validation
-belongs to the owning services and the offline migration delivery.
+epoch or parse an earlier product's database schema. Account-state payloads must
+decode to their runtime types, including telemetry request IDs, episode roles and
+ability trails. Trail payloads use `AbilityTrailPayload` and must agree with their
+source and destination columns. JSON strings used as SQL keys must exactly match
+`serde_json::to_string` of the corresponding core type: ability placements,
+project `FolderRef` scope keys and `NoteRef` ordering keys. Import rejects alternate
+formatting before commit; it does not silently merge or normalize conflicting
+keys. Current canonical existence, ownership and lifecycle are still checked by
+the owning services when those references are used.
+Payload decoding also checks that no JSON members disappear during typed
+conversion, including nested note/folder references. Non-key payloads may use
+different whitespace or object ordering; unknown members are rejected rather than
+retained or silently removed. Schedule and run slots use the same decoder at
+import and receipt projection: whole UTC seconds within the core Timestamp range
+(years 0000 through 9999). Out-of-range or fractional slots abort the import.
 
 Target export pins a real read transaction and returns keyset pages of at most
 200 records, bounded to 8 MiB including record envelopes. The source snapshot
@@ -108,7 +123,7 @@ credentials never fall back to that owner. OIDC ID tokens are not bearer evidenc
 the verified RP flow issues a native session for an explicitly bound identity.
 
 Each control effect rechecks durable credential and account state. Derived
-contexts retain the original session/PAT/OAuth grant/family lineage. Refreshing
+contexts retain the original session/PAT/OAuth grant/family or scheduled-run lineage. Refreshing
 authority intersects current permissions with the original delegation, retaining
 project limits, write-Space pins and taint. `max_auth_spaces` is an explicit
 composition limit of 1–4096; exceeding it rejects admission rather than truncating
@@ -397,8 +412,8 @@ not certify a live external identity provider or public TLS endpoint.
 `ProviderService::new` composes the control service, native keyring, guarded HTTP
 transport, canonical metadata lease owner and operator Space limits. It implements
 `ProviderAdminPort` and `EmbeddingProviderPort`, and exposes `complete`,
-`select_provider` and `recover_calls`. Full `ControlPort` composition remains
-separate. No service installs models, manages provider daemons or retries an
+`select_provider` and `recover_calls`. `ControlPlane::new(provider)` supplies
+the matching account-state operations through `ControlPort`. No service installs models, manages provider daemons or retries an
 uncertain paid request.
 
 Only an interactive resource owner can manage credentials, resources and explicit
@@ -485,6 +500,130 @@ periodically using `ProviderRecovery` authority. Age of at least 300 seconds onl
 selects candidates: the registry must atomically exclude live calls before recovery
 settles unknown spending. Failed finalization remains recoverable; recovery never
 resends or refunds an abandoned call on an assumption that it was unsent.
+
+## Episodes, context references and abilities
+
+Episodes belong to an account, independent of its browser sessions. New episodes
+have explicit IDs and replayable commands. An active ID forks a fresh episode;
+a sleeping episode or one idle for at least 30 minutes resumes. Forks copy separate
+acknowledgement rows. Name lookup returns bounded ID/name choices when ambiguous.
+Updates use both account and episode revision CAS. Closed episodes cannot resume.
+Activity touches are throttled to once per minute; the stored touch counter is not
+an exact transport-call total.
+
+Acknowledgements are monotonic MAX values keyed by owner or episode, Space and
+history incarnation. The catalog checks the current history and delivered sequence
+ceiling. They never combine unrelated Spaces. Concurrent acknowledgements may use
+the same observed account revision: this commutative operation fingerprints it but
+does not impose an account CAS precondition. Reads project saved references through
+current authority. Unavailable project/role selections produce diagnostics instead
+of disclosing their metadata or silently choosing a replacement.
+
+`ContextAdminPort` stores reference bundles, attachments, pins, order and typed
+Note/Folder favorites. Bundles contain at most 200 references and have at most 64
+attachments. Shared pins and ordering entries are unique across editors. A bundle
+attachment grants no content access. Editing a shared bundle requires authority on
+its home and new references; subscribers cannot prevent an authorized edit by
+attaching it to a private Space. Ordered Space locks, a bounded attachment-set
+comparison and revision invalidation keep concurrent edits coherent. Consumers'
+content permissions remain independent. Deletion removes dangling order entries.
+
+Bootstrap selection accepts an optional current Space. It must match an available
+saved project; otherwise the caller must explicitly update the episode. Selection
+orders project, Space, personal context and favorites, retaining each NoteRef's
+first occurrence. SQL performs deduplication before keyset paging. Each page checks
+at most 200 candidate notes; an empty filtered page can still have a continuation.
+Folder favorites are never expanded into a corpus. Cursors bind authority, episode
+selection and metadata revisions. `users.metadata_revision` changes with reference
+preferences; the separate account CAS revision also changes for acknowledgements,
+which do not invalidate an unchanged preference page.
+
+The catalog owns current note/folder facts, current ability tips and immutable
+package revisions. Control stores availability, selected-project bindings, personal
+preferences and typed placement trails. Effective precedence is project, Space,
+personal, then System. A disabled, unhealthy or wrong-kind candidate shadows lower
+precedence; equal-precedence ambiguity fails rather than choosing arbitrarily.
+Exact selections reject stale revisions. Trails bind exact typed references, stop
+at 16 hops and reject cycles. Discovery preserves continuation across filtered
+pages and never emits a lower candidate as a duplicate of the selected winner.
+Authoring requires interactive human authority and `AbilityWrite`; package content
+remains canonical-owned.
+
+Memory targets are fixed account/project/category references. Categories are
+bounded lowercase slugs, not filesystem paths. Control verifies current authority,
+project ancestry and AgentMemory write permission, then asks the idempotent canonical
+owner to resolve or create the target. It never writes a second copy of note bodies.
+
+## Schedule persistence and run authority
+
+Schedule creation and updates require an interactive owner with current Editor or
+Owner membership and AgentMemory write permission. Account and schedule revisions
+provide separate CAS checks. A schedule's Space is immutable; a project is an exact
+FolderRef. Approved roles must be readable, healthy, enabled and at their exact
+current revision. Pausing the exact existing definition remains possible after
+its role or project disappears. Definitions contain a private title and initial prompt, redacted
+in Debug; receipts persist the schedule ID, not that private payload. Titles allow
+128 scalars/512 UTF-8 bytes and prompts 32 KiB. Cron expressions include seconds and
+are validated with `cron`; timezones use the IANA `chrono-tz` catalog. A supplied
+slot must match the expression in that timezone, including second precision.
+
+Run limits default to 25 steps, 100,000 tokens and 300 seconds. The composition sets
+`ControlConfig.schedule_limits` within hard ceilings of 1,000 steps, 10,000,000 tokens
+and one hour. These limits bound a whole run; per-call provider budgets remain
+separate. Only AgentMemory writes are admitted. The ticker, slot computation, prompt
+loading and tool loop are consumer responsibilities.
+
+Trusted `Scheduler` authority lists due schedules, claims slots and records terminal
+results. A claim checks the expected revision, saved slot, current owner/membership,
+Space/project and exact role. Role drift pauses the schedule. The unique
+`(schedule, slot)` run row and next-slot advancement commit together. Only the new
+winner receives a non-deserializable ScheduledRun credential and Keeper context.
+Exact retries return `AlreadyClaimed` inspection receipts, including after restart;
+changed claim payloads conflict. A lost response never authorizes a second execution.
+The next distinct due slot can still be claimed through its fresh revision.
+
+Each scheduled effect checks the owner auth version, current membership, Space
+admission/history, run lease/status/expiry and schedule configuration revision,
+then intersects the original delegation. The context has one Space, an optional
+project pin, no `AbilityWrite`, AgentMemory writes and a read-only approved role.
+Provider deadlines also respect run expiry. Advancing the next slot changes the
+ordinary schedule revision; interactive edits change `config_revision` as well.
+Thus a later slot does not revoke an earlier active run. Configuration edits,
+pause/delete and terminal results use the durable SQL-to-registry revocation fence
+and wait for shutdown acknowledgement. Deletion retains audit rows and the ID.
+Canonical role mutation is checked on a new claim; an already active run still
+requires the canonical content lease at provider dispatch.
+
+Terminal Succeeded/Failed/Unknown results require the exact run and lease. They can
+finish audit after expiry or schedule deletion, but cannot mint authority or change
+any next slot. An identical terminal result is idempotent; a different result
+conflicts. Owner or trusted scheduler readers inspect bounded run pages without
+recovering dispatch permission. Due and audit pages are keyset views, not retained
+SQL snapshots; the ticker must revisit due work as the database changes.
+
+## Content-free telemetry and retention
+
+`AgentTelemetryPort` accepts fixed operation, transport, effect, outcome and failure
+enums, typed resource references, counts and durations. Its DTOs have no raw prompt,
+header, token, provider-error or tool-result fields. Detailed payloads reject unknown
+fields, allow at most 200 entries per collection and fit in 64 KiB. Capture is off
+by default. Only an interactive instance administrator can change settings through
+account and settings revision CAS.
+
+Begin records bind current owner authority and the actual request payload. Exact
+repeats are idempotent; changed payloads conflict. Trusted `Telemetry` authority can
+finish a pending audit after the initiating credential expires, without granting
+any tool permission. Detailed capture follows the current explicit setting. Call
+lists contain compact metadata; individual detail reads filter references through
+current authority. Retrieval records store typed references and finite scores, not
+query text. Logging middleware remains outside this crate.
+
+Compact retention defaults to 90 days and detail retention to 30 days. A cleanup
+transaction deletes at most 200 rows across expired details, retrievals, terminal
+calls and committed command receipts. Pending calls, their retrievals and pending
+commands survive. Command receipts are conservatively retained while canonical
+operations or revocations still need reconciliation. Cleanup never settles or
+re-executes schedule/provider runs and does not erase their spending audit.
 
 ## Verification
 

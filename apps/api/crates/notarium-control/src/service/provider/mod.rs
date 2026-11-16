@@ -46,6 +46,9 @@ pub struct ProviderService {
     dispatcher: notarium_core::ids::RequestId,
 }
 impl ProviderService {
+    pub(super) fn control_service(&self) -> Arc<ControlService> {
+        self.control.clone()
+    }
     pub fn new(
         control: Arc<ControlService>,
         keyring: Arc<Keyring>,

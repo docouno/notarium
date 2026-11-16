@@ -47,6 +47,7 @@ pub struct UsersRow {
     pub disabled_at: Option<i64>,
     pub personal_space_id: Option<String>,
     pub revision: i64,
+    pub metadata_revision: i64,
     pub auth_version: i64,
     pub created_at: i64,
 }
@@ -372,6 +373,13 @@ pub struct AbilityPlacementTrailRow {
     pub manifest_ref: String,
     pub created_at: i64,
 }
+/// The typed payload of `AbilityPlacementTrailRow::manifest_ref`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbilityTrailPayload {
+    pub source: notarium_core::ports::control::AbilityRef,
+    pub destination: notarium_core::ports::control::AbilityRef,
+}
 #[derive(Clone, Serialize, Deserialize, FromRow)]
 #[serde(deny_unknown_fields)]
 pub struct FavoritesRow {
@@ -542,6 +550,9 @@ pub struct AgentSchedulesRow {
     pub owner_id: String,
     pub space_id: String,
     pub project_folder_id: Option<String>,
+    pub title: String,
+    pub init_prompt: String,
+    pub config_revision: i64,
     pub cron_expr: String,
     pub timezone: String,
     pub approved_role: String,
@@ -563,6 +574,11 @@ pub struct AgentScheduleRunsRow {
     pub slot_utc_ms: i64,
     pub lease_epoch: i64,
     pub claim_request_hash: Vec<u8>,
+    pub owner_auth_version: i64,
+    pub config_revision: i64,
+    pub admission_epoch: i64,
+    pub history_scope: String,
+    pub expires_at: i64,
     pub claimed_schedule_revision: i64,
     pub reserved_next_slot: i64,
     pub status: String,
@@ -765,6 +781,7 @@ impl TargetRecord {
         }
     }
     pub(crate) fn validate(&self) -> Result<usize, PortError> {
+        super::state_validation::validate(self)?;
         let mut bytes = 0usize;
         match self {
             Self::V1StorageEpoch(row) => {
@@ -2042,6 +2059,9 @@ impl TargetRecord {
                 validate_index(8usize)?;
             }
             Self::AgentSchedules(row) => {
+                bytes = bytes
+                    .saturating_add(text_bytes(&row.title)?)
+                    .saturating_add(text_bytes(&row.init_prompt)?);
                 {
                     let value = &row.schedule_id;
                     bytes = bytes.saturating_add(text_bytes(value)?);
@@ -2094,6 +2114,7 @@ impl TargetRecord {
                 validate_index(row.owner_id.len() + row.space_id.len() + row.schedule_id.len())?;
             }
             Self::AgentScheduleRuns(row) => {
+                bytes = bytes.saturating_add(text_bytes(&row.history_scope)?);
                 {
                     let value = &row.run_id;
                     bytes = bytes.saturating_add(text_bytes(value)?);
@@ -2240,10 +2261,10 @@ impl TargetRecord {
             },
             Self::Users(row) => match tx {
                 Transaction::Sqlite(tx) => {
-                    sqlx::query("INSERT INTO users(user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,auth_version,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)").bind(&row.user_id).bind(&row.username).bind(&row.email).bind(&row.display_name).bind(&row.password_hash).bind(row.is_admin).bind(row.disabled_at).bind(&row.personal_space_id).bind(row.revision).bind(row.auth_version).bind(row.created_at).execute(&mut **tx).await.map_err(database)?;
+                    sqlx::query("INSERT INTO users(user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,metadata_revision,auth_version,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)").bind(&row.user_id).bind(&row.username).bind(&row.email).bind(&row.display_name).bind(&row.password_hash).bind(row.is_admin).bind(row.disabled_at).bind(&row.personal_space_id).bind(row.revision).bind(row.metadata_revision).bind(row.auth_version).bind(row.created_at).execute(&mut **tx).await.map_err(database)?;
                 }
                 Transaction::Postgres(tx) => {
-                    sqlx::query("INSERT INTO v1_control.users(user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,auth_version,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)").bind(&row.user_id).bind(&row.username).bind(&row.email).bind(&row.display_name).bind(&row.password_hash).bind(row.is_admin).bind(row.disabled_at).bind(&row.personal_space_id).bind(row.revision).bind(row.auth_version).bind(row.created_at).execute(&mut **tx).await.map_err(database)?;
+                    sqlx::query("INSERT INTO v1_control.users(user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,metadata_revision,auth_version,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)").bind(&row.user_id).bind(&row.username).bind(&row.email).bind(&row.display_name).bind(&row.password_hash).bind(row.is_admin).bind(row.disabled_at).bind(&row.personal_space_id).bind(row.revision).bind(row.metadata_revision).bind(row.auth_version).bind(row.created_at).execute(&mut **tx).await.map_err(database)?;
                 }
             },
             Self::UserOidcIdentities(row) => match tx {
@@ -2552,18 +2573,18 @@ impl TargetRecord {
             },
             Self::AgentSchedules(row) => match tx {
                 Transaction::Sqlite(tx) => {
-                    sqlx::query("INSERT INTO agent_schedules(schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)").bind(&row.schedule_id).bind(&row.owner_id).bind(&row.space_id).bind(&row.project_folder_id).bind(&row.cron_expr).bind(&row.timezone).bind(&row.approved_role).bind(&row.paused_reason).bind(row.write_class_mask).bind(&row.budgets).bind(&row.misfire_policy).bind(row.next_slot_utc_ms).bind(row.deleted_at).bind(row.revision).bind(row.created_at).bind(row.updated_at).execute(&mut **tx).await.map_err(database)?;
+                    sqlx::query("INSERT INTO agent_schedules(schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at,title,init_prompt,config_revision) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)").bind(&row.schedule_id).bind(&row.owner_id).bind(&row.space_id).bind(&row.project_folder_id).bind(&row.cron_expr).bind(&row.timezone).bind(&row.approved_role).bind(&row.paused_reason).bind(row.write_class_mask).bind(&row.budgets).bind(&row.misfire_policy).bind(row.next_slot_utc_ms).bind(row.deleted_at).bind(row.revision).bind(row.created_at).bind(row.updated_at).bind(&row.title).bind(&row.init_prompt).bind(row.config_revision).execute(&mut **tx).await.map_err(database)?;
                 }
                 Transaction::Postgres(tx) => {
-                    sqlx::query("INSERT INTO v1_control.agent_schedules(schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)").bind(&row.schedule_id).bind(&row.owner_id).bind(&row.space_id).bind(&row.project_folder_id).bind(&row.cron_expr).bind(&row.timezone).bind(&row.approved_role).bind(&row.paused_reason).bind(row.write_class_mask).bind(&row.budgets).bind(&row.misfire_policy).bind(row.next_slot_utc_ms).bind(row.deleted_at).bind(row.revision).bind(row.created_at).bind(row.updated_at).execute(&mut **tx).await.map_err(database)?;
+                    sqlx::query("INSERT INTO v1_control.agent_schedules(schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at,title,init_prompt,config_revision) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)").bind(&row.schedule_id).bind(&row.owner_id).bind(&row.space_id).bind(&row.project_folder_id).bind(&row.cron_expr).bind(&row.timezone).bind(&row.approved_role).bind(&row.paused_reason).bind(row.write_class_mask).bind(&row.budgets).bind(&row.misfire_policy).bind(row.next_slot_utc_ms).bind(row.deleted_at).bind(row.revision).bind(row.created_at).bind(row.updated_at).bind(&row.title).bind(&row.init_prompt).bind(row.config_revision).execute(&mut **tx).await.map_err(database)?;
                 }
             },
             Self::AgentScheduleRuns(row) => match tx {
                 Transaction::Sqlite(tx) => {
-                    sqlx::query("INSERT INTO agent_schedule_runs(run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)").bind(&row.run_id).bind(&row.schedule_id).bind(row.slot_utc_ms).bind(row.lease_epoch).bind(&row.claim_request_hash).bind(row.claimed_schedule_revision).bind(row.reserved_next_slot).bind(&row.status).bind(row.started_at).bind(row.finished_at).bind(&row.safe_result).execute(&mut **tx).await.map_err(database)?;
+                    sqlx::query("INSERT INTO agent_schedule_runs(run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)").bind(&row.run_id).bind(&row.schedule_id).bind(row.slot_utc_ms).bind(row.lease_epoch).bind(&row.claim_request_hash).bind(row.claimed_schedule_revision).bind(row.reserved_next_slot).bind(&row.status).bind(row.started_at).bind(row.finished_at).bind(&row.safe_result).bind(row.owner_auth_version).bind(row.config_revision).bind(row.admission_epoch).bind(&row.history_scope).bind(row.expires_at).execute(&mut **tx).await.map_err(database)?;
                 }
                 Transaction::Postgres(tx) => {
-                    sqlx::query("INSERT INTO v1_control.agent_schedule_runs(run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)").bind(&row.run_id).bind(&row.schedule_id).bind(row.slot_utc_ms).bind(row.lease_epoch).bind(&row.claim_request_hash).bind(row.claimed_schedule_revision).bind(row.reserved_next_slot).bind(&row.status).bind(row.started_at).bind(row.finished_at).bind(&row.safe_result).execute(&mut **tx).await.map_err(database)?;
+                    sqlx::query("INSERT INTO v1_control.agent_schedule_runs(run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)").bind(&row.run_id).bind(&row.schedule_id).bind(row.slot_utc_ms).bind(row.lease_epoch).bind(&row.claim_request_hash).bind(row.claimed_schedule_revision).bind(row.reserved_next_slot).bind(&row.status).bind(row.started_at).bind(row.finished_at).bind(&row.safe_result).bind(row.owner_auth_version).bind(row.config_revision).bind(row.admission_epoch).bind(&row.history_scope).bind(row.expires_at).execute(&mut **tx).await.map_err(database)?;
                 }
             },
             Self::ControlCommands(row) => match tx {
@@ -2908,12 +2929,12 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
         TargetTable::Users => {
             let chunk:super::RowChunk<UsersRow>=match after {
 None=>match tx {
-Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,auth_version,created_at FROM users ORDER BY user_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,auth_version,created_at FROM v1_control.users ORDER BY user_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,metadata_revision,auth_version,created_at FROM users ORDER BY user_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,metadata_revision,auth_version,created_at FROM v1_control.users ORDER BY user_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::Users{user_id})=>match tx {
-Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,auth_version,created_at FROM users WHERE user_id > $1 ORDER BY user_id LIMIT $2").bind(user_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,auth_version,created_at FROM v1_control.users WHERE user_id > $1 ORDER BY user_id LIMIT $2").bind(user_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,metadata_revision,auth_version,created_at FROM users WHERE user_id > $1 ORDER BY user_id LIMIT $2").bind(user_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT user_id,username,email,display_name,password_hash,is_admin,disabled_at,personal_space_id,revision,metadata_revision,auth_version,created_at FROM v1_control.users WHERE user_id > $1 ORDER BY user_id LIMIT $2").bind(user_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -3979,12 +4000,12 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
         TargetTable::AgentSchedules => {
             let chunk:super::RowChunk<AgentSchedulesRow>=match after {
 None=>match tx {
-Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at FROM agent_schedules ORDER BY schedule_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at FROM v1_control.agent_schedules ORDER BY schedule_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at,title,init_prompt,config_revision FROM agent_schedules ORDER BY schedule_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at,title,init_prompt,config_revision FROM v1_control.agent_schedules ORDER BY schedule_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::AgentSchedules{schedule_id})=>match tx {
-Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at FROM agent_schedules WHERE schedule_id > $1 ORDER BY schedule_id LIMIT $2").bind(schedule_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at FROM v1_control.agent_schedules WHERE schedule_id > $1 ORDER BY schedule_id LIMIT $2").bind(schedule_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at,title,init_prompt,config_revision FROM agent_schedules WHERE schedule_id > $1 ORDER BY schedule_id LIMIT $2").bind(schedule_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT schedule_id,owner_id,space_id,project_folder_id,cron_expr,timezone,approved_role,paused_reason,write_class_mask,budgets,misfire_policy,next_slot_utc_ms,deleted_at,revision,created_at,updated_at,title,init_prompt,config_revision FROM v1_control.agent_schedules WHERE schedule_id > $1 ORDER BY schedule_id LIMIT $2").bind(schedule_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };
@@ -4004,12 +4025,12 @@ _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::Scop
         TargetTable::AgentScheduleRuns => {
             let chunk:super::RowChunk<AgentScheduleRunsRow>=match after {
 None=>match tx {
-Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result FROM agent_schedule_runs ORDER BY run_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result FROM v1_control.agent_schedule_runs ORDER BY run_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at FROM agent_schedule_runs ORDER BY run_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at FROM v1_control.agent_schedule_runs ORDER BY run_id LIMIT $1").bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 Some(TargetPosition::AgentScheduleRuns{run_id})=>match tx {
-Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result FROM agent_schedule_runs WHERE run_id > $1 ORDER BY run_id LIMIT $2").bind(run_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
-Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result FROM v1_control.agent_schedule_runs WHERE run_id > $1 ORDER BY run_id LIMIT $2").bind(run_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Sqlite(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at FROM agent_schedule_runs WHERE run_id > $1 ORDER BY run_id LIMIT $2").bind(run_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
+Transaction::Postgres(tx)=>super::collect_rows(sqlx::query_as("SELECT run_id,schedule_id,slot_utc_ms,lease_epoch,claim_request_hash,claimed_schedule_revision,reserved_next_slot,status,started_at,finished_at,safe_result,owner_auth_version,config_revision,admission_epoch,history_scope,expires_at FROM v1_control.agent_schedule_runs WHERE run_id > $1 ORDER BY run_id LIMIT $2").bind(run_id).bind(i64::from(limit)+1).fetch(&mut **tx),limit,table).await?,
 },
 _=>return Err(crate::error::invalid(notarium_core::error::ValidationReason::ScopeMismatch)),
 };

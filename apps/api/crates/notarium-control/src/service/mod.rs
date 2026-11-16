@@ -1,9 +1,15 @@
 //! Control service composition. Database authority is rechecked for each effect.
+mod abilities;
 mod accounts;
 mod auth_port;
 mod authority;
 mod commands;
+mod context_state;
+mod control_port;
+pub use control_port::ControlPlane;
+mod episodes;
 mod lifecycle;
+mod metadata;
 pub mod oauth;
 pub mod oidc;
 mod one_time;
@@ -12,8 +18,10 @@ mod passwords;
 mod pats;
 pub mod provider;
 mod provisioning;
+mod schedules;
 mod sessions;
 mod spaces;
+mod telemetry;
 use crate::{
     error::{invalid, unavailable},
     store::{ControlStore, lease::OperationBudget},
@@ -38,6 +46,7 @@ pub struct ControlConfig {
     pub authentication: AuthenticationMode,
     pub resource_uri: String,
     pub max_auth_spaces: u16,
+    pub schedule_limits: control::RunLimits,
 }
 pub trait ControlClock: Send + Sync {
     fn now_ms(&self) -> Result<i64, PortError>;
@@ -73,7 +82,11 @@ impl ControlService {
         budget: CallBudget,
     ) -> Result<Self, PortError> {
         let operation = OperationBudget::new(budget.clone());
-        if !(1..=4096).contains(&config.max_auth_spaces) {
+        if !config
+            .schedule_limits
+            .fits(control::RunLimits::HARD_CEILING)
+            || !(1..=4096).contains(&config.max_auth_spaces)
+        {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
         let url = url::Url::parse(&config.resource_uri)

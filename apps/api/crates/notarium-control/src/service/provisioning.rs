@@ -246,7 +246,7 @@ impl ControlService {
             }
             let count=rows!(tx.inner_mut(),(i64,),fetch_one,"SELECT count(*) FROM (SELECT 1 FROM users LIMIT 1) existing","SELECT count(*) FROM (SELECT 1 FROM v1_control.users LIMIT 1) existing";)?.0;
             if count!=0 {return Err(access_denied());}
-            let row=UsersRow{user_id:id.to_string(),username,email,display_name,password_hash,is_admin:1,disabled_at:None,personal_space_id:Some(SpaceId::from_bytes(token::random()?).to_string()),revision:0,auth_version:0,created_at:self.clock.now_ms()?};
+            let row=UsersRow{user_id:id.to_string(),username,email,display_name,password_hash,is_admin:1,disabled_at:None,personal_space_id:Some(SpaceId::from_bytes(token::random()?).to_string()),revision:0,metadata_revision:0,auth_version:0,created_at:self.clock.now_ms()?};
             let record=TargetRecord::Users(row.clone());
             record.validate()?;
             record.insert(tx.inner_mut()).await?;
@@ -313,7 +313,7 @@ impl ControlService {
             if let Some(replay)=command.replay::<AccountInfo>(tx.inner_mut()).await? {return Ok(replay);}
             expect_revision(&actor,command.identity.expected)?;
             let now=self.clock.now_ms()?;
-            let row=UsersRow{user_id:PrincipalId::from_bytes(token::random()?).to_string(),username,email,display_name,password_hash:None,is_admin:0,disabled_at:None,personal_space_id:Some(SpaceId::from_bytes(token::random()?).to_string()),revision:0,auth_version:0,created_at:now};
+            let row=UsersRow{user_id:PrincipalId::from_bytes(token::random()?).to_string(),username,email,display_name,password_hash:None,is_admin:0,disabled_at:None,personal_space_id:Some(SpaceId::from_bytes(token::random()?).to_string()),revision:0,metadata_revision:0,auth_version:0,created_at:now};
             let record=TargetRecord::Users(row.clone());
             record.validate()?;
             record.insert(tx.inner_mut()).await?;

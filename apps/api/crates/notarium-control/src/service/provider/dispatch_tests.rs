@@ -367,6 +367,7 @@ impl Setup {
                     authentication: AuthenticationMode::Password,
                     resource_uri: "https://resource.example/".into(),
                     max_auth_spaces: 100,
+                    schedule_limits: notarium_core::ports::control::RunLimits::HARD_CEILING,
                 },
                 budget(),
             )

@@ -16,6 +16,7 @@ CREATE TABLE users (
     is_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0,1)),
     disabled_at INTEGER, personal_space_id TEXT UNIQUE,
     revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+    metadata_revision INTEGER NOT NULL DEFAULT 0 CHECK (metadata_revision >= 0),
     auth_version INTEGER NOT NULL DEFAULT 0 CHECK (auth_version >= 0),
     created_at INTEGER NOT NULL,
     CHECK (instr(user_id,char(0))=0),
@@ -426,7 +427,7 @@ CREATE TABLE favorites (
     CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(space_id AS BLOB)),0) + coalesce(length(CAST(entity_kind AS BLOB)),0) + coalesce(length(CAST(entity_id AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(space_id AS BLOB)),0) + 8 + coalesce(length(CAST(entity_id AS BLOB)),0) <= 2048)
 ) STRICT;
-CREATE INDEX favorite_order ON favorites(owner_id,space_id,rank,entity_id);
+CREATE INDEX favorite_order ON favorites(owner_id,rank,space_id,entity_kind,entity_id);
 CREATE TABLE context_sets (
     set_id TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(user_id), home_space TEXT NOT NULL,
     name TEXT NOT NULL, note_refs TEXT NOT NULL CHECK (length(note_refs)<=65536),
@@ -450,10 +451,11 @@ CREATE TABLE context_set_attachments (
     CHECK (instr(target_id,char(0))=0),
     CHECK (instr(target_space,char(0))=0),
     CHECK (instr(owner_id,char(0))=0),
+    CHECK (target_kind<>'personal' OR target_id=owner_id),
     CHECK (coalesce(length(CAST(set_id AS BLOB)),0) + coalesce(length(CAST(target_kind AS BLOB)),0) + coalesce(length(CAST(target_id AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(target_kind AS BLOB)),0) + coalesce(length(CAST(target_id AS BLOB)),0) + coalesce(length(CAST(set_id AS BLOB)),0) <= 2048)
 ) STRICT;
-CREATE INDEX context_attachment_target ON context_set_attachments(owner_id,target_kind,target_id,set_id);
+CREATE INDEX context_attachment_target ON context_set_attachments(target_kind,target_id,set_id);
 CREATE TABLE context_scope_pins (
     owner_id TEXT NOT NULL REFERENCES users(user_id), target_kind TEXT NOT NULL CHECK (target_kind IN ('personal','space','project')),
     target_id TEXT NOT NULL, target_space TEXT NOT NULL, note_space TEXT NOT NULL, note_id TEXT NOT NULL,
@@ -465,10 +467,13 @@ CREATE TABLE context_scope_pins (
     CHECK (instr(target_space,char(0))=0),
     CHECK (instr(note_space,char(0))=0),
     CHECK (instr(note_id,char(0))=0),
+    CHECK (target_kind<>'personal' OR target_id=owner_id),
     CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(target_kind AS BLOB)),0) + coalesce(length(CAST(target_id AS BLOB)),0) + coalesce(length(CAST(note_space AS BLOB)),0) + coalesce(length(CAST(note_id AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(target_space AS BLOB)),0) + coalesce(length(CAST(note_space AS BLOB)),0) <= 2048)
 ) STRICT;
 CREATE INDEX context_pin_space ON context_scope_pins(target_space,note_space);
+CREATE INDEX context_pin_target ON context_scope_pins(target_kind,target_id,note_space,note_id);
+CREATE UNIQUE INDEX context_shared_pin ON context_scope_pins(target_kind,target_id,note_space,note_id) WHERE target_kind<>'personal';
 CREATE TABLE context_order (
     owner_id TEXT NOT NULL REFERENCES users(user_id), target_kind TEXT NOT NULL CHECK (target_kind IN ('personal','space','project')),
     target_id TEXT NOT NULL, target_space TEXT NOT NULL, entry_kind TEXT NOT NULL CHECK (entry_kind IN ('set','note')),
@@ -480,10 +485,12 @@ CREATE TABLE context_order (
     CHECK (instr(target_space,char(0))=0),
     CHECK (instr(entry_kind,char(0))=0),
     CHECK (instr(entry_ref,char(0))=0),
+    CHECK (target_kind<>'personal' OR target_id=owner_id),
     CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(target_kind AS BLOB)),0) + coalesce(length(CAST(target_id AS BLOB)),0) + coalesce(length(CAST(entry_kind AS BLOB)),0) + coalesce(length(CAST(entry_ref AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + coalesce(length(CAST(target_kind AS BLOB)),0) + coalesce(length(CAST(target_id AS BLOB)),0) + 8 + coalesce(length(CAST(entry_ref AS BLOB)),0) <= 2048)
 ) STRICT;
-CREATE INDEX context_order_target ON context_order(owner_id,target_kind,target_id,rank,entry_ref);
+CREATE INDEX context_order_target ON context_order(target_kind,target_id,rank,entry_kind,entry_ref);
+CREATE UNIQUE INDEX context_shared_order ON context_order(target_kind,target_id,entry_kind,entry_ref) WHERE target_kind<>'personal';
 CREATE TABLE agent_episodes (
     episode_id TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(user_id), name TEXT,
     parent_id TEXT REFERENCES agent_episodes(episode_id) DEFERRABLE INITIALLY DEFERRED, active_role TEXT, project_space TEXT, project_folder TEXT,
@@ -557,6 +564,7 @@ CREATE TABLE agent_calls (
 ) STRICT;
 CREATE INDEX agent_call_owner ON agent_calls(owner_id,started_at,call_id);
 CREATE INDEX agent_call_episode ON agent_calls(owner_id,episode_id,started_at,call_id);
+CREATE INDEX agent_call_retention ON agent_calls(finished_at,call_id);
 CREATE INDEX agent_call_pending ON agent_calls(finished_at,started_at);
 CREATE TABLE agent_call_details (
     call_id TEXT NOT NULL PRIMARY KEY REFERENCES agent_calls(call_id) ON DELETE CASCADE,
@@ -584,6 +592,7 @@ CREATE TABLE agent_retrievals (
     CHECK (coalesce(length(CAST(owner_id AS BLOB)),0) + 8 + coalesce(length(CAST(retrieval_id AS BLOB)),0) <= 2048),
     CHECK (coalesce(length(CAST(call_id AS BLOB)),0) <= 2048)
 ) STRICT;
+CREATE INDEX retrieval_retention ON agent_retrievals(created_at,retrieval_id);
 CREATE INDEX retrieval_owner ON agent_retrievals(owner_id,created_at,retrieval_id);
 CREATE INDEX retrieval_call ON agent_retrievals(call_id);
 CREATE TABLE mcp_dedup (
@@ -602,15 +611,17 @@ CREATE TABLE mcp_dedup (
 CREATE INDEX dedup_expiry ON mcp_dedup(expires_at);
 CREATE TABLE agent_schedules (
     schedule_id TEXT NOT NULL PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(user_id), space_id TEXT NOT NULL,
-    project_folder_id TEXT, cron_expr TEXT NOT NULL, timezone TEXT NOT NULL, approved_role TEXT NOT NULL,
+    project_folder_id TEXT, title TEXT NOT NULL, init_prompt TEXT NOT NULL, cron_expr TEXT NOT NULL, timezone TEXT NOT NULL, approved_role TEXT NOT NULL,
     paused_reason TEXT CHECK (paused_reason IN ('owner_revoked','role_changed','space_unavailable','budget_exceeded','manual')),
     write_class_mask INTEGER NOT NULL CHECK (write_class_mask=1), budgets TEXT NOT NULL,
     misfire_policy TEXT NOT NULL CHECK (misfire_policy='coalesce_latest'), next_slot_utc_ms INTEGER NOT NULL,
-    deleted_at INTEGER, revision INTEGER NOT NULL CHECK (revision>=0), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+    deleted_at INTEGER, config_revision INTEGER NOT NULL CHECK (config_revision>=0), revision INTEGER NOT NULL CHECK (revision>=0), created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
     CHECK (instr(schedule_id,char(0))=0),
     CHECK (instr(owner_id,char(0))=0),
     CHECK (instr(space_id,char(0))=0),
     CHECK (instr(project_folder_id,char(0))=0),
+    CHECK (instr(title,char(0))=0 AND length(CAST(title AS BLOB)) BETWEEN 1 AND 512),
+    CHECK (instr(init_prompt,char(0))=0 AND length(CAST(init_prompt AS BLOB)) BETWEEN 1 AND 32768),
     CHECK (instr(cron_expr,char(0))=0),
     CHECK (instr(timezone,char(0))=0),
     CHECK (instr(approved_role,char(0))=0),
@@ -630,9 +641,12 @@ CREATE TABLE agent_schedule_runs (
     claimed_schedule_revision INTEGER NOT NULL CHECK (claimed_schedule_revision>=0), reserved_next_slot INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('claimed','running','succeeded','failed','unknown')),
     started_at INTEGER NOT NULL, finished_at INTEGER, safe_result TEXT CHECK (length(safe_result)<=4096),
+    owner_auth_version INTEGER NOT NULL CHECK (owner_auth_version>=0), config_revision INTEGER NOT NULL CHECK (config_revision>=0),
+    admission_epoch INTEGER NOT NULL CHECK (admission_epoch>=0), history_scope TEXT NOT NULL, expires_at INTEGER NOT NULL CHECK (expires_at>started_at),
     UNIQUE(schedule_id,slot_utc_ms), CHECK (reserved_next_slot>slot_utc_ms),
     CHECK (instr(run_id,char(0))=0),
     CHECK (instr(schedule_id,char(0))=0),
+    CHECK (instr(history_scope,char(0))=0 AND length(CAST(history_scope AS BLOB))<=2048),
     CHECK (instr(status,char(0))=0),
     CHECK (instr(safe_result,char(0))=0),
     CHECK (coalesce(length(CAST(run_id AS BLOB)),0) <= 2048),

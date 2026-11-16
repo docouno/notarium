@@ -1,6 +1,6 @@
 use super::{PortFuture, PortStream, context::*, provider::*, types::*};
 use crate::{auth::*, classes::*, ids::*, model::*, receipt::*, value::Timestamp};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Opaque continuation bound by the producer to scope, filters and revisions.
 #[derive(Clone, Debug)]
@@ -90,7 +90,7 @@ pub struct SpaceLifecycleChange {
     pub expected: ControlRevision,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum AbilityPlacement {
     OwnedProject(FolderRef),
     OwnedSpace(SpaceId),
@@ -107,11 +107,24 @@ impl AbilityPlacement {
         }
     }
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AbilityIdentity {
+    pub id: AbilityId,
+    pub placement: AbilityPlacement,
+}
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AbilityRef {
     pub id: AbilityId,
     pub placement: AbilityPlacement,
     pub revision: RevisionId,
+}
+impl AbilityRef {
+    pub fn identity(&self) -> AbilityIdentity {
+        AbilityIdentity {
+            id: self.id.clone(),
+            placement: self.placement.clone(),
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct AbilityDescriptor {
@@ -120,6 +133,7 @@ pub struct AbilityDescriptor {
     pub name: String,
     pub enabled: bool,
     pub healthy: bool,
+    pub lifecycle: Lifecycle,
     pub entrypoint: NoteRef,
     pub auxiliary_files: Vec<String>,
 }
@@ -139,6 +153,7 @@ pub enum AbilityResolution {
     Unhealthy,
     WrongKind,
     OutOfScope,
+    Stale,
 }
 #[derive(Clone, Debug)]
 pub enum AbilitySelection {
@@ -149,14 +164,31 @@ pub enum AbilitySelection {
         project: Option<FolderRef>,
     },
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum AbilityProjects {
+    All,
+    Selected(Vec<FolderRef>),
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityBindingUpdate {
     pub ability: AbilityRef,
     pub enabled: bool,
     pub expected: ControlRevision,
+    pub projects: AbilityProjects,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbilityPreferenceUpdate {
+    pub ability: AbilityRef,
+    pub enabled: bool,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbilityTrailUpdate {
+    pub source: AbilityRef,
+    pub expected_destination: Option<AbilityRef>,
+    pub destination: Option<AbilityRef>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum EpisodeLifecycle {
     Active,
     Sleeping,
@@ -173,8 +205,19 @@ pub struct AgentEpisode {
     pub parent: Option<EpisodeId>,
     pub revision: ControlRevision,
     pub acknowledgements: BTreeMap<SpaceId, AcknowledgedCursor>,
+    pub diagnostics: Vec<EpisodeDiagnostic>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EpisodeDiagnostic {
+    ProjectUnavailable,
+    RoleUnavailable,
 }
 #[derive(Clone, Debug)]
+pub struct EpisodeChoice {
+    pub id: EpisodeId,
+    pub name: Option<String>,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum EpisodeSelector {
     New {
         requested: EpisodeId,
@@ -183,9 +226,11 @@ pub enum EpisodeSelector {
     Id(EpisodeId),
     Name(String),
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StartEpisode {
     pub selector: EpisodeSelector,
+    /// Initial hint for a new episode. Resume/fork retains the stored selection;
+    /// changing an existing selection requires EpisodeUpdate and its CAS.
     pub project_hint: Option<FolderRef>,
 }
 #[derive(Clone, Debug)]
@@ -193,17 +238,18 @@ pub enum EpisodeStartResult {
     New(AgentEpisode),
     Resumed(AgentEpisode),
     Forked(AgentEpisode),
-    Ambiguous(Vec<AgentEpisode>),
+    Ambiguous(Vec<EpisodeChoice>),
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EpisodeUpdate {
     pub episode: EpisodeId,
     pub expected: ControlRevision,
+    pub name: Option<String>,
     pub active_role: Option<AbilityRef>,
     pub project_hint: Option<FolderRef>,
     pub lifecycle: EpisodeLifecycle,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum AckOwner {
     Account,
     Episode(EpisodeId),
@@ -215,9 +261,11 @@ pub struct AcknowledgeDelta {
 }
 #[derive(Clone, Debug)]
 pub struct ContextSelection {
+    pub space: Option<SpaceId>,
     pub pinned: Vec<NoteRef>,
     pub favorites: Vec<NoteRef>,
     pub readable_spaces: Vec<SpaceId>,
+    pub unavailable: u32,
 }
 #[derive(Clone, Debug)]
 pub struct BootstrapContext {
@@ -227,79 +275,7 @@ pub struct BootstrapContext {
     pub continuation: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct AgentSchedule {
-    pub id: ScheduleId,
-    pub owner: PrincipalId,
-    pub space: SpaceId,
-    pub project_folder: Option<FolderId>,
-    pub cron: String,
-    pub timezone: String,
-    pub approved_role: AbilityRef,
-    pub write_classes: BTreeSet<DocClass>,
-    pub budgets: CompletionBudget,
-    pub coalesce_latest: bool,
-    pub paused_reason: Option<SchedulePauseReason>,
-    pub revision: ControlRevision,
-    pub next_slot: Timestamp,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SchedulePauseReason {
-    OwnerRevoked,
-    RoleChanged,
-    SpaceUnavailable,
-    BudgetExceeded,
-    Manual,
-}
-#[derive(Clone, Debug)]
-pub struct ClaimSchedule {
-    pub schedule: ScheduleId,
-    pub slot: Timestamp,
-    pub current_role: AbilityRef,
-    pub expected: ControlRevision,
-    /// Computed by the scheduler; must be strictly after the claimed slot.
-    pub next_slot: Timestamp,
-}
-#[derive(Clone, Debug)]
-pub enum ScheduleClaim {
-    Claimed {
-        run: AgentRunId,
-        lease: LeaseEpoch,
-        schedule: Box<AgentSchedule>,
-    },
-    AlreadyClaimed(ScheduleRunReceipt),
-    Paused(SchedulePauseReason),
-}
-#[derive(Clone, Debug)]
-pub struct ScheduleResult {
-    pub schedule: ScheduleId,
-    pub run: AgentRunId,
-    pub lease: LeaseEpoch,
-    pub outcome: ScheduleOutcome,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScheduleOutcome {
-    Succeeded,
-    Failed,
-    Unknown,
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScheduleRunStatus {
-    Claimed,
-    Running,
-    Terminal(ScheduleOutcome),
-}
-#[derive(Clone, Debug)]
-pub struct ScheduleRunReceipt {
-    pub schedule: ScheduleId,
-    pub run: AgentRunId,
-    pub lease: LeaseEpoch,
-    pub slot: Timestamp,
-    pub reserved_next_slot: Timestamp,
-    pub claimed_revision: ControlRevision,
-    pub status: ScheduleRunStatus,
-}
+pub use super::schedules::*;
 
 #[derive(Clone, Debug)]
 pub struct ProviderSelection {
@@ -380,7 +356,7 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: AccountContext,
         request: AccountMutation<StartEpisode>,
-    ) -> PortFuture<'_, EpisodeStartResult>;
+    ) -> PortFuture<'_, ControlCommit<EpisodeStartResult>>;
     fn get_episode(&self, ctx: AccountContext, episode: EpisodeId) -> PortFuture<'_, AgentEpisode>;
     fn update_episode(
         &self,
@@ -396,6 +372,9 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: AccountContext,
         episode: EpisodeId,
+        // Optional current Space selection. An existing project must belong to
+        // it; otherwise the caller must explicitly update the episode first.
+        space: Option<SpaceId>,
         page: ControlPageRequest,
     ) -> PortFuture<'_, BootstrapContext>;
     fn discover_abilities(
@@ -415,8 +394,8 @@ pub trait ControlPort: Send + Sync {
     ) -> PortFuture<'_, AbilityDescriptor>;
     fn update_ability_binding(
         &self,
-        ctx: SpaceContext,
-        request: AbilityBindingUpdate,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityBindingUpdate>,
     ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>>;
     fn resolve_memory_target(
         &self,
@@ -426,8 +405,8 @@ pub trait ControlPort: Send + Sync {
     ) -> PortFuture<'_, ResolvedMemoryTarget>;
     fn create_schedule(
         &self,
-        ctx: SpaceContext,
-        schedule: AgentSchedule,
+        ctx: AccountContext,
+        request: AccountMutation<CreateSchedule>,
     ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
     fn get_schedule(
         &self,
@@ -441,15 +420,14 @@ pub trait ControlPort: Send + Sync {
     ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
     fn update_schedule(
         &self,
-        ctx: SpaceContext,
-        schedule: AgentSchedule,
+        ctx: AccountContext,
+        request: AccountMutation<UpdateSchedule>,
     ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
     fn delete_schedule(
         &self,
-        ctx: SpaceContext,
-        schedule: ScheduleId,
-        expected: ControlRevision,
-    ) -> PortFuture<'_, ControlRevision>;
+        ctx: AccountContext,
+        request: AccountMutation<DeleteSchedule>,
+    ) -> PortFuture<'_, ControlCommit<()>>;
     fn list_due_schedules(
         &self,
         ctx: MaintenanceContext,
@@ -458,26 +436,26 @@ pub trait ControlPort: Send + Sync {
     ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
     fn get_schedule_run(
         &self,
-        ctx: AccountContext,
+        ctx: ScheduleRunContext,
         schedule: ScheduleId,
         run: AgentRunId,
     ) -> PortFuture<'_, ScheduleRunReceipt>;
     fn list_schedule_runs(
         &self,
-        ctx: AccountContext,
+        ctx: ScheduleRunContext,
         schedule: ScheduleId,
         page: ControlPageRequest,
     ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
     fn claim_schedule(
         &self,
-        ctx: SpaceContext,
+        ctx: MaintenanceContext,
         request: ClaimSchedule,
     ) -> PortFuture<'_, ScheduleClaim>;
     fn record_schedule_result(
         &self,
-        ctx: SpaceContext,
+        ctx: MaintenanceContext,
         result: ScheduleResult,
-    ) -> PortFuture<'_, ControlRevision>;
+    ) -> PortFuture<'_, ScheduleRunReceipt>;
     fn select_provider(
         &self,
         ctx: SpaceContext,
