@@ -63,9 +63,32 @@ struct ReaderGateState {
     last_backup_abort_reason: Option<String>,
 }
 
+thread_local! {
+    static LAST_WAL_COMMIT_FRAMES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn sqlite_writer_wal_hook(
+    _wal: &rusqlite::hooks::Wal,
+    pages: std::os::raw::c_int,
+) -> rusqlite::Result<()> {
+    LAST_WAL_COMMIT_FRAMES.set(Some(u64::try_from(pages.max(0)).unwrap_or(0)));
+    Ok(())
+}
+
+pub(crate) fn take_last_wal_commit_frames() -> Option<u64> {
+    LAST_WAL_COMMIT_FRAMES.take()
+}
+
 #[derive(Default)]
 struct WalAtomicCounters {
     wal_bytes: AtomicU64,
+    logical_wal_bytes: AtomicU64,
+    has_wal_hook_frames: AtomicBool,
+    retained_wal_bytes: AtomicU64,
+    last_passive_wal_bytes: AtomicU64,
+    commits_since_passive: AtomicU64,
+    commits_since_reset: AtomicU64,
+    last_commit_elapsed_ns: AtomicU64,
     log_frames: AtomicU64,
     checkpointed_frames: AtomicU64,
     total_admission_wait_ns: AtomicU64,
@@ -79,7 +102,10 @@ struct WalAtomicCounters {
 }
 
 pub struct SqliteWalCoordinator {
+    started_at: Instant,
+    db_path: PathBuf,
     wal_path: PathBuf,
+    wal_frame_bytes: u64,
     read_deadline: Duration,
     passive_checkpoint_interval: Duration,
     wal_soft_watermark_bytes: u64,
@@ -90,6 +116,7 @@ pub struct SqliteWalCoordinator {
     drained_notify: Notify,
     counters: WalAtomicCounters,
     maintenance_lock: Mutex<()>,
+    passive_conn: Mutex<Option<rusqlite::Connection>>,
     bg_stop: AtomicBool,
     bg_wake: Notify,
     bg_task: Mutex<Option<JoinHandle<()>>>,
@@ -133,6 +160,44 @@ impl Drop for GateReopenGuard<'_> {
     fn drop(&mut self) {
         if !self.reopened {
             self.coord.reopen_reader_gate();
+        }
+    }
+}
+
+pub(crate) struct FastReaderGateGuard {
+    coord: Arc<SqliteWalCoordinator>,
+    reader_id: u64,
+    completed_cleanly: bool,
+    counted_timeout: bool,
+}
+
+impl FastReaderGateGuard {
+    pub fn mark_timeout(&mut self) {
+        if !self.counted_timeout {
+            self.counted_timeout = true;
+            self.coord
+                .counters
+                .timed_out_reads
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn finish_cleanly(mut self) {
+        self.completed_cleanly = true;
+        self.coord.release_reader_slot(self.reader_id);
+    }
+}
+
+impl Drop for FastReaderGateGuard {
+    fn drop(&mut self) {
+        if !self.completed_cleanly {
+            if !self.counted_timeout {
+                self.coord
+                    .counters
+                    .cancelled_or_dropped_reads
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.coord.release_reader_slot(self.reader_id);
         }
     }
 }
@@ -221,9 +286,25 @@ impl SqliteWalCoordinator {
     ) -> Arc<Self> {
         let wal_path = sqlite_wal_path_for(db_path);
         let initial_wal_bytes = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        let page_size_bytes = {
+            use std::io::Read;
+            let mut hdr = [0u8; 18];
+            match fs::File::open(db_path).and_then(|mut f| f.read_exact(&mut hdr)) {
+                Ok(()) => match u16::from_be_bytes([hdr[16], hdr[17]]) {
+                    1 => 65_536u64,
+                    ps if ps >= 512 && ps.is_power_of_two() => u64::from(ps),
+                    _ => 4_096u64,
+                },
+                Err(_) => 4_096u64,
+            }
+        };
+        let wal_frame_bytes = page_size_bytes + 24;
 
         let coord = Arc::new(Self {
+            started_at: Instant::now(),
+            db_path: db_path.to_path_buf(),
             wal_path,
+            wal_frame_bytes,
             read_deadline: read_deadline.max(Duration::from_millis(1)),
             passive_checkpoint_interval: passive_checkpoint_interval.max(Duration::from_millis(2)),
             wal_soft_watermark_bytes: wal_soft_watermark_bytes.max(4096),
@@ -246,6 +327,7 @@ impl SqliteWalCoordinator {
                 ..WalAtomicCounters::default()
             },
             maintenance_lock: Mutex::new(()),
+            passive_conn: Mutex::new(None),
             bg_stop: AtomicBool::new(false),
             bg_wake: Notify::new(),
             bg_task: Mutex::new(None),
@@ -268,6 +350,89 @@ impl SqliteWalCoordinator {
         let bytes = fs::metadata(&self.wal_path).map(|m| m.len()).unwrap_or(0);
         self.counters.wal_bytes.store(bytes, Ordering::Relaxed);
         bytes
+    }
+
+    fn now_elapsed_ns(&self) -> u64 {
+        u64::try_from(self.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    pub fn note_writer_commit(&self) {
+        self.counters
+            .last_commit_elapsed_ns
+            .store(self.now_elapsed_ns(), Ordering::Relaxed);
+        self.counters
+            .has_wal_hook_frames
+            .store(false, Ordering::Relaxed);
+        self.counters
+            .commits_since_passive
+            .fetch_add(1, Ordering::Release);
+        self.counters
+            .commits_since_reset
+            .fetch_add(1, Ordering::Release);
+    }
+
+    pub fn note_writer_commit_with_frames(&self, frames_opt: Option<u64>) {
+        self.counters
+            .last_commit_elapsed_ns
+            .store(self.now_elapsed_ns(), Ordering::Relaxed);
+        if let Some(frames) = frames_opt {
+            let new_bytes = frames.saturating_mul(self.wal_frame_bytes);
+            let prev_bytes = self
+                .counters
+                .logical_wal_bytes
+                .swap(new_bytes, Ordering::Relaxed);
+            if new_bytes < prev_bytes {
+                // SQLite natively auto-wrapped the WAL back to frame 1 after `PASSIVE` caught up!
+                self.counters
+                    .checkpointed_frames
+                    .store(0, Ordering::Relaxed);
+                self.counters
+                    .last_passive_wal_bytes
+                    .store(0, Ordering::Relaxed);
+            }
+            self.counters.log_frames.store(frames, Ordering::Relaxed);
+            self.counters
+                .has_wal_hook_frames
+                .store(true, Ordering::Relaxed);
+        }
+        self.counters
+            .commits_since_passive
+            .fetch_add(1, Ordering::Release);
+        self.counters
+            .commits_since_reset
+            .fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn read_deadline(&self) -> Duration {
+        self.read_deadline
+    }
+
+    pub(crate) async fn lock_maintenance(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.maintenance_lock.lock().await
+    }
+
+    pub(crate) fn note_external_wal_restart(&self) {
+        let disk_bytes = self.observe_wal_file_bytes();
+        self.counters
+            .last_commit_elapsed_ns
+            .store(self.now_elapsed_ns(), Ordering::Relaxed);
+        self.counters.log_frames.store(0, Ordering::Relaxed);
+        self.counters
+            .checkpointed_frames
+            .store(0, Ordering::Relaxed);
+        self.counters.logical_wal_bytes.store(0, Ordering::Relaxed);
+        self.counters
+            .retained_wal_bytes
+            .store(disk_bytes, Ordering::Relaxed);
+        self.counters
+            .last_passive_wal_bytes
+            .store(0, Ordering::Relaxed);
+        self.counters
+            .commits_since_passive
+            .store(0, Ordering::Release);
+        self.counters
+            .commits_since_reset
+            .store(0, Ordering::Release);
     }
 
     pub fn record_busy_if_any(&self, err_msg: &str) {
@@ -376,12 +541,12 @@ impl SqliteWalCoordinator {
     }
 
     fn release_reader_slot(&self, reader_id: u64) {
-        let drained = {
+        let should_notify = {
             let mut st = self.gate.lock().expect("wal gate mutex");
             st.active_readers.remove(&reader_id);
-            st.active_readers.is_empty()
+            st.active_readers.is_empty() && (!st.open || st.shutting_down)
         };
-        if drained {
+        if should_notify {
             self.drained_notify.notify_waiters();
         }
     }
@@ -403,6 +568,126 @@ impl SqliteWalCoordinator {
             st.open = true;
         }
         self.gate_open_notify.notify_waiters();
+    }
+
+    /// Admits a short-lived synchronous `rusqlite` read transaction through the exact same
+    /// WAL reader gate and monotonic deadline contract as `with_ordinary_read_tx`.
+    pub(crate) async fn acquire_reader_gate_slot(
+        self: &Arc<Self>,
+        budget: Option<&CallBudget>,
+    ) -> Result<(FastReaderGateGuard, tokio::time::Instant, Instant), PortError> {
+        if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
+            return Err(cancelled_not_committed(
+                "sqlite_read_cancelled_pre_admission",
+                "read cancelled before admission",
+            ));
+        }
+        let caller_remaining = budget.map(|b| b.remaining).unwrap_or(self.read_deadline);
+        if caller_remaining.is_zero() {
+            return Err(deadline_not_committed(
+                "sqlite_read_zero_budget",
+                "read call budget expired before admission",
+            ));
+        }
+
+        let start_wait = Instant::now();
+        let caller_deadline_tokio = tokio::time::Instant::now() + caller_remaining;
+
+        // Fast path: 99.99% of the time `st.open == true`; avoid allocating/enabling `Notify` waiter!
+        let fast_id = {
+            let mut st = self.gate.lock().expect("wal gate mutex");
+            if st.shutting_down {
+                return Err(unavailable_retryable(
+                    "sqlite_wal_shutting_down",
+                    "SQLite WAL coordinator is shutting down",
+                    Duration::from_millis(50),
+                ));
+            }
+            if st.open {
+                let id = st.next_reader_id;
+                st.next_reader_id += 1;
+                st.active_readers.insert(id, start_wait);
+                Some(id)
+            } else {
+                None
+            }
+        };
+
+        let reader_id = match fast_id {
+            Some(id) => id,
+            None => loop {
+                let notified = self.gate_open_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                {
+                    let mut st = self.gate.lock().expect("wal gate mutex");
+                    if st.shutting_down {
+                        return Err(unavailable_retryable(
+                            "sqlite_wal_shutting_down",
+                            "SQLite WAL coordinator is shutting down",
+                            Duration::from_millis(50),
+                        ));
+                    }
+                    if st.open {
+                        let id = st.next_reader_id;
+                        st.next_reader_id += 1;
+                        st.active_readers.insert(id, Instant::now());
+                        break id;
+                    }
+                }
+
+                if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
+                    return Err(cancelled_not_committed(
+                        "sqlite_read_cancelled_waiting_gate",
+                        "read cancelled while waiting for WAL reset gate",
+                    ));
+                }
+                if tokio::time::Instant::now() >= caller_deadline_tokio {
+                    self.counters
+                        .timed_out_reads
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(deadline_not_committed(
+                        "sqlite_read_gate_deadline",
+                        "read deadline exceeded while waiting for WAL reset gate",
+                    ));
+                }
+
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep_until(caller_deadline_tokio) => {
+                        self.counters.timed_out_reads.fetch_add(1, Ordering::Relaxed);
+                        return Err(deadline_not_committed(
+                            "sqlite_read_gate_deadline",
+                            "read deadline exceeded while waiting for WAL reset gate",
+                        ));
+                    }
+                }
+            },
+        };
+
+        let waited_ns = u64::try_from(start_wait.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.counters
+            .total_admission_wait_ns
+            .fetch_add(waited_ns, Ordering::Relaxed);
+
+        let now_tokio = tokio::time::Instant::now();
+        let remaining_after_gate = caller_deadline_tokio.saturating_duration_since(now_tokio);
+        let eff_budget = remaining_after_gate
+            .min(self.read_deadline)
+            .max(Duration::from_millis(1));
+        let tx_deadline_std = Instant::now() + eff_budget;
+
+        Ok((
+            FastReaderGateGuard {
+                coord: Arc::clone(self),
+                reader_id,
+                completed_cleanly: false,
+                counted_timeout: false,
+            },
+            caller_deadline_tokio,
+            tx_deadline_std,
+        ))
     }
 
     /// Executes an ordinary short-lived read transaction with reader-gate admission,
@@ -630,17 +915,22 @@ impl SqliteWalCoordinator {
             return;
         }
 
-        // 1. Run `PRAGMA wal_checkpoint(PASSIVE)` on the writer connection between micro-batches.
-        let passive_res = self.run_passive_checkpoint(inner).await;
-        let wal_bytes = self.observe_wal_file_bytes();
+        let disk_wal_bytes = self.observe_wal_file_bytes();
+        let pre_wal_bytes = if self.counters.has_wal_hook_frames.load(Ordering::Relaxed) {
+            self.counters.logical_wal_bytes.load(Ordering::Relaxed)
+        } else {
+            disk_wal_bytes
+        };
 
-        // 2. Check active backup WAL budgets first: if any backup exceeded `max_pinned_wal_bytes`,
+        // 1. Check active backup WAL budgets first: if any backup exceeded `max_pinned_wal_bytes`,
         // signal abort and wait for it to close before resetting WAL!
         let mut aborted_any_backup = false;
         {
             let mut st = self.gate.lock().expect("wal gate mutex");
             for pin in st.active_backups.values() {
-                let pinned = wal_bytes.saturating_sub(pin.baseline_wal_bytes);
+                let pinned = disk_wal_bytes
+                    .max(pre_wal_bytes)
+                    .saturating_sub(pin.baseline_wal_bytes);
                 if pinned > pin.max_pinned_wal_bytes && !pin.abort_flag.swap(true, Ordering::SeqCst)
                 {
                     pin.abort_notify.notify_waiters();
@@ -649,7 +939,7 @@ impl SqliteWalCoordinator {
             }
             if aborted_any_backup {
                 st.last_backup_abort_reason = Some(format!(
-                    "pinned WAL exceeded backup budget (current wal_bytes={wal_bytes})"
+                    "pinned WAL exceeded backup budget (current wal_bytes={disk_wal_bytes})"
                 ));
             }
         }
@@ -680,49 +970,139 @@ impl SqliteWalCoordinator {
             }
         }
 
-        // Do not run `TRUNCATE` while a valid within-budget backup holds a read snapshot.
-        if !self
+        let active_backups_empty = self
             .gate
             .lock()
             .expect("wal gate mutex")
             .active_backups
-            .is_empty()
-        {
+            .is_empty();
+
+        let commits_since_reset = self.counters.commits_since_reset.load(Ordering::Acquire);
+        let has_hook_frames = self.counters.has_wal_hook_frames.load(Ordering::Relaxed);
+        let retained_floor = if has_hook_frames {
+            0
+        } else {
+            self.counters.retained_wal_bytes.load(Ordering::Relaxed)
+        };
+
+        // Per design/03: force bounded `RESTART` immediately at `wal_high_watermark_bytes` (`128 MiB`),
+        // while `wal_soft_watermark_bytes` (`64 MiB`) triggers background `PASSIVE` and only escalates
+        // to an exclusive reset when `passive_busy` or `writer_idle`.
+        let reset_threshold = self.wal_high_watermark_bytes;
+        let threshold_hit = commits_since_reset > 0 && pre_wal_bytes >= reset_threshold;
+
+        if active_backups_empty && (force_reset || threshold_hit) {
+            self.run_bounded_wal_reset(inner, force_reset).await;
             return;
         }
 
-        let passive_blocked_or_lagging = match passive_res {
-            Some((busy, log_f, ckpt_f)) => busy != 0 || log_f > ckpt_f,
+        // 2. Otherwise run concurrent `PASSIVE` checkpoint during quiet ticks (or small test watermarks)
+        // without issuing mid-burst `fsync(canonical.sqlite)` storms against active batch writes.
+        let commits_pending = self.counters.commits_since_passive.load(Ordering::Acquire);
+        let quiet_ns = self
+            .now_elapsed_ns()
+            .saturating_sub(self.counters.last_commit_elapsed_ns.load(Ordering::Relaxed));
+        let writer_idle = quiet_ns >= 250_000_000
+            && inner
+                .writer_coord
+                .get()
+                .is_none_or(|w| !w.has_active_sqlite_ops());
+        let unckpt_frames = self
+            .counters
+            .log_frames
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.counters.checkpointed_frames.load(Ordering::Relaxed));
+        let should_run_passive = (self.wal_soft_watermark_bytes <= 1024 * 1024
+            && pre_wal_bytes >= 4096
+            && commits_pending > 0)
+            || (writer_idle && (commits_pending > 0 || unckpt_frames > 0) && pre_wal_bytes > 0);
+        let passive_res = if should_run_passive {
+            self.run_passive_checkpoint(pre_wal_bytes, false).await
+        } else {
+            None
+        };
+        let wal_bytes = if has_hook_frames {
+            self.counters.logical_wal_bytes.load(Ordering::Relaxed)
+        } else if passive_res.is_some() {
+            self.observe_wal_file_bytes()
+        } else {
+            pre_wal_bytes
+        };
+
+        if !active_backups_empty {
+            return;
+        }
+
+        let passive_busy = match passive_res {
+            Some((busy, _, _)) => busy != 0,
             None => false,
         };
 
-        let needs_reset = force_reset
-            || wal_bytes >= self.wal_high_watermark_bytes
-            || (wal_bytes >= self.wal_soft_watermark_bytes
-                && (passive_blocked_or_lagging || wal_bytes > 0));
+        let needs_soft_reset = commits_since_reset > 0
+            && wal_bytes >= self.wal_soft_watermark_bytes
+            && (passive_busy || (writer_idle && wal_bytes > retained_floor));
 
-        if needs_reset {
-            self.run_bounded_wal_reset(inner).await;
+        if needs_soft_reset {
+            self.run_bounded_wal_reset(inner, false).await;
         }
     }
 
-    async fn run_passive_checkpoint(&self, inner: &Arc<CanonicalInner>) -> Option<(i64, i64, i64)> {
-        let SqlDriverState::Sqlite { writer, .. } = &inner.sql else {
+    async fn run_passive_checkpoint(
+        &self,
+        pre_wal_bytes: u64,
+        force: bool,
+    ) -> Option<(i64, i64, i64)> {
+        if !force
+            && self.counters.commits_since_passive.load(Ordering::Acquire) == 0
+            && self.counters.last_passive_wal_bytes.load(Ordering::Relaxed) == pre_wal_bytes
+            && self.counters.checkpointed_frames.load(Ordering::Relaxed)
+                >= self.counters.log_frames.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+
+        self.counters
+            .commits_since_passive
+            .store(0, Ordering::Release);
+        let conn = {
+            let mut slot = self.passive_conn.lock().await;
+            match slot.take() {
+                Some(c) => c,
+                None => {
+                    match crate::dialect::sqlite::open_rusqlite_checkpoint_connection(&self.db_path)
+                    {
+                        Ok(c) => c,
+                        Err(_) => return None,
+                    }
+                }
+            }
+        };
+
+        let ckpt_join = tokio::task::spawn_blocking(move || {
+            let res = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            });
+            (conn, res)
+        })
+        .await;
+
+        let Ok((conn, ckpt_res)) = ckpt_join else {
             return None;
         };
-        let mut guard = writer.lock().await;
-        let conn = guard.as_mut()?;
-        match sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
-            .fetch_one(&mut *conn)
-            .await
-        {
-            Ok(row) => {
-                let busy: i64 = row.get(0);
-                let log_frames: i64 = row.get(1);
-                let ckpt_frames: i64 = row.get(2);
+        *self.passive_conn.lock().await = Some(conn);
+
+        match ckpt_res {
+            Ok((busy, log_frames, ckpt_frames)) => {
                 self.counters
                     .passive_checkpoints
                     .fetch_add(1, Ordering::Relaxed);
+                self.counters
+                    .last_passive_wal_bytes
+                    .store(pre_wal_bytes, Ordering::Relaxed);
                 self.counters.log_frames.store(
                     u64::try_from(log_frames.max(0)).unwrap_or(0),
                     Ordering::Relaxed,
@@ -734,19 +1114,41 @@ impl SqliteWalCoordinator {
                 Some((busy, log_frames, ckpt_frames))
             }
             Err(err) => {
-                self.record_busy_if_any(&err.to_string());
+                // Note: `PASSIVE` never blocks writers/readers; do not count internal ckpt-lock busy as leaked caller busy.
+                let _ = err;
                 None
             }
         }
     }
 
-    async fn run_bounded_wal_reset(&self, inner: &Arc<CanonicalInner>) {
+    async fn run_bounded_wal_reset(&self, inner: &Arc<CanonicalInner>, force_truncate: bool) {
         let Some(writer_coord) = inner.writer_coord.get() else {
             return;
         };
         let SqlDriverState::Sqlite { writer, .. } = &inner.sql else {
             return;
         };
+
+        // Pre-backfill uncheckpointed WAL frames concurrently in up to 3 converging `PASSIVE` passes
+        // BEFORE closing the reader gate or acquiring the exclusive writer safe point so `WriteBatchActor`
+        // keeps committing during the bulk copy and the exclusive `RESTART`/`TRUNCATE` pause only flushes <= ~3 MiB!
+        for _ in 0..3 {
+            let pre_bytes = self.observe_wal_file_bytes();
+            let Some((busy, _log_f, ckpt_f)) = self.run_passive_checkpoint(pre_bytes, true).await
+            else {
+                break;
+            };
+            let live_frames = if self.counters.has_wal_hook_frames.load(Ordering::Relaxed) {
+                self.counters.logical_wal_bytes.load(Ordering::Relaxed)
+                    / self.wal_frame_bytes.max(1)
+            } else {
+                self.observe_wal_file_bytes() / self.wal_frame_bytes.max(1)
+            };
+            let ckpt_u64 = u64::try_from(ckpt_f.max(0)).unwrap_or(0);
+            if busy == 0 && live_frames.saturating_sub(ckpt_u64) <= 768 {
+                break;
+            }
+        }
 
         self.counters.reset_attempts.fetch_add(1, Ordering::Relaxed);
         let cycle_deadline = tokio::time::Instant::now() + self.wal_reset_cycle_deadline;
@@ -780,43 +1182,93 @@ impl SqliteWalCoordinator {
             }
         }
 
-        // 2. Acquire writer safe point bounded by `cycle_deadline` so no new batch commits occur during TRUNCATE.
+        // 2. Acquire writer safe point bounded by `cycle_deadline` so no new batch commits occur during reset.
         let Ok(safe_point) =
             tokio::time::timeout_at(cycle_deadline, writer_coord.acquire_safe_point()).await
         else {
             return;
         };
 
-        // 3. Run bounded `PRAGMA wal_checkpoint(TRUNCATE)` on writer connection.
+        // 3. Run bounded `RESTART` (preserving `journal_size_limit = 64MiB` pre-allocated blocks)
+        // or `TRUNCATE` (when explicitly forced or using small test watermarks) on writer connection.
         let Ok(mut writer_guard) = tokio::time::timeout_at(cycle_deadline, writer.lock()).await
         else {
             drop(safe_point);
             return;
         };
 
-        if let Some(conn) = writer_guard.as_mut() {
-            let rem_ms = cycle_deadline
-                .saturating_duration_since(tokio::time::Instant::now())
-                .as_millis()
-                .clamp(5, 250);
-            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "PRAGMA busy_timeout = {rem_ms}"
-            )))
-            .execute(&mut *conn)
-            .await;
+        let use_truncate = force_truncate || self.wal_high_watermark_bytes <= 1024 * 1024;
+        let ckpt_sql = if use_truncate {
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        } else {
+            "PRAGMA wal_checkpoint(RESTART)"
+        };
+        let quiet_ns = self
+            .now_elapsed_ns()
+            .saturating_sub(self.counters.last_commit_elapsed_ns.load(Ordering::Relaxed));
+        let burst_active =
+            !use_truncate && (quiet_ns < 250_000_000 || writer_coord.has_active_sqlite_ops());
+        let high_limit_i64 = i64::try_from(self.wal_high_watermark_bytes).unwrap_or(134_217_728);
 
-            let trunc_res = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-                .fetch_one(&mut *conn)
+        if let Some(pair) = writer_guard.as_mut() {
+            let rem_ms = u64::try_from(
+                cycle_deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis()
+                    .clamp(5, 250),
+            )
+            .unwrap_or(250);
+
+            let trunc_tuple = if let Some(rconn) = pair.rusqlite_conn.take() {
+                let join_res = tokio::task::spawn_blocking(move || {
+                    let _ = rconn.busy_timeout(Duration::from_millis(rem_ms));
+                    let target_journal_limit = if burst_active {
+                        high_limit_i64.saturating_add(high_limit_i64 / 2)
+                    } else {
+                        crate::dialect::sqlite::SQLITE_JOURNAL_SIZE_LIMIT_BYTES
+                    };
+                    let _ = rconn.execute_batch(&format!(
+                        "PRAGMA journal_size_limit = {target_journal_limit};"
+                    ));
+                    let res = rconn.query_row(ckpt_sql, [], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    });
+                    let _ = rconn.busy_timeout(Duration::from_secs(5));
+                    (rconn, res.ok())
+                })
                 .await;
-
-            let _ = sqlx::query("PRAGMA busy_timeout = 5000")
+                match join_res {
+                    Ok((rc, out)) => {
+                        pair.rusqlite_conn = Some(rc);
+                        out
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                let conn = &mut pair.sqlx_conn;
+                let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "PRAGMA busy_timeout = {rem_ms}"
+                )))
                 .execute(&mut *conn)
                 .await;
+                let trunc_res = sqlx::query(ckpt_sql).fetch_one(&mut *conn).await;
+                let _ = sqlx::query("PRAGMA busy_timeout = 5000")
+                    .execute(&mut *conn)
+                    .await;
+                trunc_res.ok().map(|row| {
+                    (
+                        row.get::<i64, _>(0),
+                        row.get::<i64, _>(1),
+                        row.get::<i64, _>(2),
+                    )
+                })
+            };
 
-            if let Ok(row) = trunc_res {
-                let busy: i64 = row.get(0);
-                let log_frames: i64 = row.get(1);
-                let ckpt_frames: i64 = row.get(2);
+            if let Some((busy, log_frames, ckpt_frames)) = trunc_tuple {
                 self.counters.log_frames.store(
                     u64::try_from(log_frames.max(0)).unwrap_or(0),
                     Ordering::Relaxed,
@@ -826,6 +1278,27 @@ impl SqliteWalCoordinator {
                     Ordering::Relaxed,
                 );
                 if busy == 0 {
+                    let post_bytes = self.observe_wal_file_bytes();
+                    self.counters.log_frames.store(0, Ordering::Relaxed);
+                    self.counters
+                        .checkpointed_frames
+                        .store(0, Ordering::Relaxed);
+                    self.counters.logical_wal_bytes.store(0, Ordering::Relaxed);
+                    self.counters
+                        .retained_wal_bytes
+                        .store(post_bytes, Ordering::Relaxed);
+                    let next_passive_base =
+                        if self.counters.has_wal_hook_frames.load(Ordering::Relaxed) {
+                            0
+                        } else {
+                            post_bytes
+                        };
+                    self.counters
+                        .last_passive_wal_bytes
+                        .store(next_passive_base, Ordering::Relaxed);
+                    self.counters
+                        .commits_since_reset
+                        .store(0, Ordering::Release);
                     self.counters
                         .reset_successes
                         .fetch_add(1, Ordering::Relaxed);
@@ -854,6 +1327,14 @@ impl SqliteWalCoordinator {
 
         if let Some(handle) = self.bg_task.lock().await.take() {
             let _ = handle.await;
+        }
+
+        let _maint = self.maintenance_lock.lock().await;
+        if let Some(conn) = self.passive_conn.lock().await.take() {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = conn.close();
+            })
+            .await;
         }
 
         let cleanups: Vec<JoinHandle<()>> = {

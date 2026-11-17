@@ -1030,13 +1030,46 @@ async fn read_chat_impl(
     ctx: SpaceContext,
     request: ChatRead,
 ) -> Result<ChatBranch, PortError> {
+    store.ensure_open()?;
+    if let crate::runtime::SqlDriverState::Sqlite { fast_read_pool, .. } = &store.inner.sql {
+        let wal = store.inner.wal_coord.get().ok_or_else(|| {
+            internal_not_committed(
+                "sqlite_wal_coord_missing",
+                "SqliteWalCoordinator not initialized",
+            )
+        })?;
+        let scope = ctx.scope().clone();
+        let auth = ctx.auth().clone();
+        return fast_read_pool
+            .with_read_conn(wal, Some(&ctx.budget), move |conn| {
+                read_chat_rusqlite(conn, &scope, &auth, &request)
+            })
+            .await;
+    }
+
     let scope = ctx.scope().clone();
     let auth = ctx.auth().clone();
 
+    if store.is_postgres() && request.before.is_none() && request.leaf != ThreadEntrySeq::ZERO {
+        return store
+            .with_pg_autocommit_read_budget(Some(&ctx.budget), |conn| {
+                Box::pin(
+                    async move { read_chat_pg_single_query(conn, &scope, &auth, &request).await },
+                )
+            })
+            .await;
+    }
+
+    // Every table lookup in `read_chat` (`spaces`, `chat_threads`, `chat_entries`) is an exact
+    // primary-key probe. Disable `seqscan` locally inside the PostgreSQL `BEGIN READ ONLY`
+    // Simple Query for multi-statement `before: Some(...)` reads.
     store
-        .with_read_tx_budget(Some(&ctx.budget), |tx| {
-            Box::pin(async move {
-                let srec = load_space_record(tx, &scope.space_id).await?;
+        .with_read_tx_budget_pg_local_sql(
+            Some(&ctx.budget),
+            Some("SET LOCAL enable_seqscan = off"),
+            |tx| {
+                Box::pin(async move {
+                    let srec = load_space_record(tx, &scope.space_id).await?;
                 srec.scope.check(&scope)?;
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &request.thread).await?;
@@ -1065,16 +1098,19 @@ async fn read_chat_impl(
                     });
                 }
 
-                let Some((leaf_depth, _)) =
-                    load_entry_depth_and_taint_tx(tx, &scope.space_id, &request.thread, request.leaf)
-                        .await?
-                else {
-                    return Err(DomainError::ResourceNotFound.into());
-                };
-
                 let window_tip = match request.before {
                     None => request.leaf,
                     Some(anc_seq) => {
+                        let Some((leaf_depth, _)) = load_entry_depth_and_taint_tx(
+                            tx,
+                            &scope.space_id,
+                            &request.thread,
+                            request.leaf,
+                        )
+                        .await?
+                        else {
+                            return Err(DomainError::ResourceNotFound.into());
+                        };
                         if anc_seq == ThreadEntrySeq::ZERO {
                             return Err(
                                 DomainError::validation(ValidationReason::InvalidRange).into()
@@ -1211,8 +1247,14 @@ async fn read_chat_impl(
                                         e.ext_space_tainted::BIGINT, e.is_chain_node::BIGINT, e.branch_depth::BIGINT,
                                         e.anc_16_seq, e.anc_256_seq, w.n + 1
                                  FROM win w
-                                 JOIN chat_entries e
-                                   ON e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = w.parent_seq
+                                 CROSS JOIN LATERAL (
+                                     SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
+                                            agent_run_id, inline_text, payload_blake3, referenced_notes_json,
+                                            ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq
+                                     FROM chat_entries ce
+                                     WHERE ce.space_id = $1 AND ce.thread_id = $2 AND ce.entry_seq = w.parent_seq
+                                     LIMIT 1
+                                 ) e
                                  WHERE w.parent_seq IS NOT NULL AND w.n < $4
                              )
                              SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
@@ -1251,6 +1293,10 @@ async fn read_chat_impl(
                             .collect()
                     }
                 };
+
+                if raw_rows.is_empty() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
 
                 let mut entries = Vec::with_capacity(raw_rows.len());
                 for (
@@ -1316,10 +1362,13 @@ async fn read_chat_impl(
                         })?),
                         None => None,
                     };
-                    let referenced_notes: Vec<NoteRef> =
+                    let referenced_notes: Vec<NoteRef> = if refs_json == "[]" {
+                        Vec::new()
+                    } else {
                         serde_json::from_str(&refs_json).map_err(|err| {
                             internal_not_committed("corrupt_chat_refs", err.to_string())
-                        })?;
+                        })?
+                    };
                     let depth = u32::try_from(depth_raw).map_err(|_| {
                         internal_not_committed("corrupt_chat_depth", "invalid depth")
                     })?;
@@ -1351,8 +1400,785 @@ async fn read_chat_impl(
                     next_ancestor,
                 })
             })
-        })
+        },
+    )
+    .await
+}
+
+async fn read_chat_pg_single_query(
+    conn: &mut sqlx::PgConnection,
+    scope: &HistoryScope,
+    auth: &EngineAuthContext,
+    request: &ChatRead,
+) -> Result<ChatBranch, PortError> {
+    let tip_i64 = request.leaf.get() as i64;
+    let max_n = usize::from(request.max_entries.get());
+    let scan_limit =
+        i64::try_from((max_n.saturating_mul(2)).clamp(max_n.max(1), 128)).unwrap_or(128);
+
+    // Fast 1-RT path: single `Index Scan Backward` on `chat_entries_pkey` (`ORDER BY ce.entry_seq DESC LIMIT $4`)
+    // plus `spaces` + `chat_threads` PK lookups. Because `parent_seq < entry_seq` holds monotonically,
+    // both linear threads and localized branched DAG windows resolve in 1 B-tree leaf scan without recursion;
+    // only branches jumping across an older fork gap > `scan_limit` invoke the recursive PK continuation.
+    let rows = sqlx::query(
+        "SELECT
+            CASE WHEN COALESCE(w.rn, 1) = 1 THEN s.history_incarnation ELSE NULL END,
+            CASE WHEN COALESCE(w.rn, 1) = 1 THEN s.space_kind ELSE NULL END,
+            CASE WHEN COALESCE(w.rn, 1) = 1 THEN s.lifecycle_state ELSE NULL END,
+            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.thread_id ELSE NULL END,
+            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.kind ELSE NULL END,
+            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.owner_id ELSE NULL END,
+            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.project_folder_id ELSE NULL END,
+            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.head_leaf_seq ELSE NULL END,
+            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.head_rev_id ELSE NULL END,
+            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.ext_space_tainted_mask ELSE NULL END,
+            w.entry_seq,
+            w.parent_seq,
+            w.kind,
+            w.tool_call_id,
+            w.author_id,
+            w.agent_run_id,
+            w.inline_text,
+            w.payload_blake3,
+            w.referenced_notes_json,
+            w.ext_space_tainted,
+            w.is_chain_node,
+            w.branch_depth,
+            w.anc_16_seq,
+            w.anc_256_seq
+         FROM spaces s
+         LEFT JOIN chat_threads ct
+           ON ct.space_id = s.space_id AND ct.thread_id = $2
+         LEFT JOIN LATERAL (
+             SELECT
+                 ce.entry_seq, ce.parent_seq, ce.kind, ce.tool_call_id, ce.author_id,
+                 ce.agent_run_id, ce.inline_text, ce.payload_blake3, ce.referenced_notes_json,
+                 ce.ext_space_tainted, ce.is_chain_node, ce.branch_depth,
+                 ce.anc_16_seq, ce.anc_256_seq,
+                 (CASE WHEN ce.entry_seq = $3 THEN 1 ELSE 2 END)::INT4 AS rn
+             FROM chat_entries ce
+             WHERE ce.space_id = $1 AND ce.thread_id = $2 AND ce.entry_seq <= $3
+             ORDER BY ce.entry_seq DESC
+             LIMIT $4
+         ) w ON ct.thread_id IS NOT NULL
+         WHERE s.space_id = $1",
+    )
+    .bind(scope.space_id.as_str())
+    .bind(request.thread.as_str())
+    .bind(tip_i64)
+    .bind(scan_limit)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| internal_not_committed("pg_read_chat_single", err.to_string()))?;
+
+    let Some(first) = rows.first() else {
+        return Err(DomainError::ResourceNotFound.into());
+    };
+    // If `request.leaf` does not exist in `chat_entries` (either 0 entry rows or highest `entry_seq < tip_i64`),
+    // row 0 might have `rn = 2` (so header cols were suppressed) only if `entry_seq < tip_i64` existed.
+    // Wait: if `request.leaf` is absent, we still must check `HistoryIncarnation` and `authorize_chat_read` BEFORE returning `ResourceNotFound`!
+    let hdr = match rows
+        .iter()
+        .find(|r| r.get::<Option<&[u8]>, usize>(0).is_some())
+    {
+        Some(h) => h,
+        None => {
+            // `space` and `thread` exist, `chat_entries` had rows `< tip_i64` but `tip_i64` itself is absent:
+            // verify space incarnation + thread auth before returning `ResourceNotFound`.
+            let hrow = sqlx::query(
+                "SELECT s.history_incarnation, s.space_kind, s.lifecycle_state,
+                        ct.thread_id, ct.kind, ct.owner_id, ct.project_folder_id,
+                        ct.head_leaf_seq, ct.head_rev_id, ct.ext_space_tainted_mask
+                 FROM spaces s
+                 LEFT JOIN chat_threads ct ON ct.space_id = s.space_id AND ct.thread_id = $2
+                 WHERE s.space_id = $1",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(request.thread.as_str())
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_read_chat_hdr_miss", err.to_string()))?
+            .ok_or(DomainError::ResourceNotFound)?;
+
+            let inc_b: &[u8] = hrow.get::<&[u8], usize>(0);
+            let inc_a: [u8; 16] = inc_b
+                .try_into()
+                .map_err(|_| internal_not_committed("corrupt_incarnation", "incarnation != 16B"))?;
+            HistoryScope {
+                space_id: scope.space_id.clone(),
+                incarnation: notarium_core::ids::HistoryIncarnation::from_bytes(inc_a),
+            }
+            .check(scope)?;
+            let sk = match hrow.get::<&str, usize>(1) {
+                "personal" => SpaceKind::Personal,
+                "shared" => SpaceKind::Shared,
+                o => {
+                    return Err(internal_not_committed(
+                        "corrupt_space_kind",
+                        format!("unexpected space_kind '{o}'"),
+                    ));
+                }
+            };
+            let slc = match hrow.get::<&str, usize>(2) {
+                "active" => SpaceLifecycle::Active,
+                "closing" => SpaceLifecycle::Closing,
+                "archived" => SpaceLifecycle::Archived,
+                o => {
+                    return Err(internal_not_committed(
+                        "corrupt_space_lifecycle",
+                        format!("unexpected space lifecycle '{o}'"),
+                    ));
+                }
+            };
+            if hrow.get::<Option<&str>, usize>(3).is_none() {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let sp = Space {
+                id: scope.space_id.clone(),
+                lifecycle: slc,
+                kind: sk,
+            };
+            let t_taint = hrow.get::<i32, usize>(9) != 0;
+            auth.authorize_chat_read(&sp, t_taint)?;
+            return Err(DomainError::ResourceNotFound.into());
+        }
+    };
+    let _ = first;
+
+    let inc_bytes: &[u8] = hdr
+        .get::<Option<&[u8]>, usize>(0)
+        .ok_or_else(|| internal_not_committed("corrupt_incarnation", "missing incarnation"))?;
+    let inc_arr: [u8; 16] = inc_bytes
+        .try_into()
+        .map_err(|_| internal_not_committed("corrupt_incarnation", "incarnation not 16 bytes"))?;
+    let db_scope = HistoryScope {
+        space_id: scope.space_id.clone(),
+        incarnation: notarium_core::ids::HistoryIncarnation::from_bytes(inc_arr),
+    };
+    db_scope.check(scope)?;
+
+    let s_kind_raw: &str = hdr
+        .get::<Option<&str>, usize>(1)
+        .ok_or_else(|| internal_not_committed("corrupt_space_kind", "missing space_kind"))?;
+    let s_lc_raw: &str = hdr
+        .get::<Option<&str>, usize>(2)
+        .ok_or_else(|| internal_not_committed("corrupt_space_lifecycle", "missing lifecycle"))?;
+    let space_kind = match s_kind_raw {
+        "personal" => SpaceKind::Personal,
+        "shared" => SpaceKind::Shared,
+        other => {
+            return Err(internal_not_committed(
+                "corrupt_space_kind",
+                format!("unexpected space_kind '{other}'"),
+            ));
+        }
+    };
+    let space_lc = match s_lc_raw {
+        "active" => SpaceLifecycle::Active,
+        "closing" => SpaceLifecycle::Closing,
+        "archived" => SpaceLifecycle::Archived,
+        other => {
+            return Err(internal_not_committed(
+                "corrupt_space_lifecycle",
+                format!("unexpected space lifecycle '{other}'"),
+            ));
+        }
+    };
+    let space = Space {
+        id: scope.space_id.clone(),
+        lifecycle: space_lc,
+        kind: space_kind,
+    };
+
+    let ct_id_opt: Option<&str> = hdr.get::<Option<&str>, usize>(3);
+    if ct_id_opt.is_none() {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let ct_kind_raw: &str = hdr
+        .get::<Option<&str>, usize>(4)
+        .ok_or_else(|| internal_not_committed("corrupt_thread_kind", "missing thread kind"))?;
+    let ct_owner_raw: &str = hdr
+        .get::<Option<&str>, usize>(5)
+        .ok_or_else(|| internal_not_committed("corrupt_thread_owner", "missing owner_id"))?;
+    let ct_proj_raw: Option<&str> = hdr.get::<Option<&str>, usize>(6);
+    let ct_head_leaf_raw: i64 = hdr
+        .get::<Option<i64>, usize>(7)
+        .ok_or_else(|| internal_not_committed("corrupt_head_leaf", "missing head_leaf_seq"))?;
+    let ct_head_rev_raw: &str = hdr
+        .get::<Option<&str>, usize>(8)
+        .ok_or_else(|| internal_not_committed("corrupt_thread_rev", "missing head_rev_id"))?;
+    let ct_tainted_raw: i32 = hdr
+        .get::<Option<i32>, usize>(9)
+        .ok_or_else(|| internal_not_committed("corrupt_thread_taint", "missing tainted_mask"))?;
+
+    let th_kind = chat_thread_kind_from_db(ct_kind_raw)?;
+    let th_owner = PrincipalId::parse(ct_owner_raw)
+        .map_err(|_| internal_not_committed("corrupt_thread_owner", "invalid owner_id"))?;
+    let th_proj = match ct_proj_raw {
+        Some(s) => Some(
+            FolderId::parse(s)
+                .map_err(|_| internal_not_committed("corrupt_thread_proj", "invalid FolderId"))?,
+        ),
+        None => None,
+    };
+    let th_head = ThreadEntrySeq::new(
+        u64::try_from(ct_head_leaf_raw)
+            .map_err(|_| internal_not_committed("corrupt_head_leaf", "negative head_leaf_seq"))?,
+    )?;
+    let th_rev = RevisionId::parse(ct_head_rev_raw)
+        .map_err(|_| internal_not_committed("corrupt_thread_rev", "invalid head_rev_id"))?;
+    let thread_tainted = ct_tainted_raw != 0;
+    auth.authorize_chat_read(&space, thread_tainted)?;
+
+    let first_e_seq: Option<i64> = hdr.get::<Option<i64>, usize>(10);
+    if first_e_seq != Some(tip_i64) {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+
+    let thread_out = ChatThread {
+        id: request.thread.clone(),
+        space: scope.space_id.clone(),
+        kind: th_kind,
+        owner: th_owner,
+        project_folder: th_proj,
+        head: th_head,
+        revision: th_rev,
+        tainted: thread_tainted,
+    };
+
+    let decode_entry_row =
+        |r: &sqlx::postgres::PgRow, base_col: usize| -> Result<ChatEntry, PortError> {
+            let e_seq_raw: i64 = r.get::<i64, usize>(base_col);
+            let p_seq_opt: Option<i64> = r.get::<Option<i64>, usize>(base_col + 1);
+            let k_str: &str = r.get::<&str, usize>(base_col + 2);
+            let tc_opt: Option<&str> = r.get::<Option<&str>, usize>(base_col + 3);
+            let author_str: &str = r.get::<&str, usize>(base_col + 4);
+            let run_opt: Option<&str> = r.get::<Option<&str>, usize>(base_col + 5);
+            let inline_opt: Option<&str> = r.get::<Option<&str>, usize>(base_col + 6);
+            let blob_opt: Option<&[u8]> = r.get::<Option<&[u8]>, usize>(base_col + 7);
+            let refs_json: &str = r.get::<&str, usize>(base_col + 8);
+            let taint_raw: i32 = r.get::<i32, usize>(base_col + 9);
+            let chain_raw: i32 = r.get::<i32, usize>(base_col + 10);
+            let depth_raw: i32 = r.get::<i32, usize>(base_col + 11);
+            let a16_opt: Option<i64> = r.get::<Option<i64>, usize>(base_col + 12);
+            let a256_opt: Option<i64> = r.get::<Option<i64>, usize>(base_col + 13);
+
+            let seq =
+                ThreadEntrySeq::new(u64::try_from(e_seq_raw).map_err(|_| {
+                    internal_not_committed("corrupt_entry_seq", "negative entry_seq")
+                })?)?;
+            let parent = match p_seq_opt {
+                Some(p) => Some(ThreadEntrySeq::new(u64::try_from(p).map_err(|_| {
+                    internal_not_committed("corrupt_parent_seq", "negative parent_seq")
+                })?)?),
+                None => None,
+            };
+            let anc_16 = match a16_opt {
+                Some(a) => Some(ThreadEntrySeq::new(u64::try_from(a).map_err(|_| {
+                    internal_not_committed("corrupt_a16", "negative anc_16_seq")
+                })?)?),
+                None => None,
+            };
+            let anc_256 = match a256_opt {
+                Some(a) => Some(ThreadEntrySeq::new(u64::try_from(a).map_err(|_| {
+                    internal_not_committed("corrupt_a256", "negative anc_256_seq")
+                })?)?),
+                None => None,
+            };
+            let kind = entry_kind_from_db(k_str, tc_opt.map(str::to_owned))?;
+            let body = if kind == ChatEntryKind::Redacted {
+                ChatBody::Redacted
+            } else if let Some(txt) = inline_opt {
+                ChatBody::Inline(txt.to_owned())
+            } else if let Some(b) = blob_opt {
+                let arr: [u8; 32] = b
+                    .try_into()
+                    .map_err(|_| internal_not_committed("corrupt_chat_blob", "digest != 32B"))?;
+                ChatBody::Blob(ContentDigest::from_bytes(arr))
+            } else {
+                return Err(internal_not_committed(
+                    "corrupt_chat_body",
+                    "entry lacks inline_text and payload_blake3",
+                ));
+            };
+            let author = PrincipalId::parse(author_str).map_err(|_| {
+                internal_not_committed("corrupt_chat_author", "invalid PrincipalId")
+            })?;
+            let run = match run_opt {
+                Some(s) => Some(AgentRunId::parse(s).map_err(|_| {
+                    internal_not_committed("corrupt_chat_run", "invalid AgentRunId")
+                })?),
+                None => None,
+            };
+            let referenced_notes: Vec<NoteRef> = if refs_json == "[]" {
+                Vec::new()
+            } else {
+                serde_json::from_str(refs_json)
+                    .map_err(|err| internal_not_committed("corrupt_chat_refs", err.to_string()))?
+            };
+            let depth = u32::try_from(depth_raw)
+                .map_err(|_| internal_not_committed("corrupt_chat_depth", "invalid depth"))?;
+            let entry_taint = taint_raw != 0;
+            if entry_taint {
+                auth.authorize_chat_read(&space, true)?;
+            }
+
+            Ok(ChatEntry {
+                thread: request.thread.clone(),
+                seq,
+                parent,
+                is_chain_node: chain_raw != 0,
+                depth,
+                ancestors: build_ancestors_vec(anc_16, anc_256),
+                author,
+                run,
+                kind,
+                body,
+                tainted: entry_taint,
+                referenced_notes,
+            })
+        };
+
+    let mut entries = Vec::with_capacity(max_n.min(rows.len()));
+    let mut want_i64: Option<i64> = Some(tip_i64);
+    for r in &rows {
+        let Some(target_seq) = want_i64 else {
+            break;
+        };
+        if entries.len() >= max_n {
+            want_i64 = None;
+            break;
+        }
+        let e_seq_raw: i64 = r.get::<i64, usize>(10);
+        if e_seq_raw != target_seq {
+            continue;
+        }
+        let entry = decode_entry_row(r, 10)?;
+        want_i64 = entry.parent.map(|p| p.get() as i64);
+        entries.push(entry);
+    }
+
+    if entries.len() < max_n
+        && let Some(rem_start) = want_i64
+    {
+        let rem_n = i32::try_from(max_n - entries.len()).unwrap_or(i32::MAX);
+        let tail_rows = sqlx::query(
+            "WITH RECURSIVE win(
+                 entry_seq, parent_seq, kind, tool_call_id, author_id,
+                 agent_run_id, inline_text, payload_blake3, referenced_notes_json,
+                 ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq, n
+             ) AS (
+                 SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
+                        agent_run_id, inline_text, payload_blake3, referenced_notes_json,
+                        ext_space_tainted, is_chain_node, branch_depth,
+                        anc_16_seq, anc_256_seq, 1::INT4
+                 FROM chat_entries
+                 WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3
+                 UNION ALL
+                 SELECT e.entry_seq, e.parent_seq, e.kind, e.tool_call_id, e.author_id,
+                        e.agent_run_id, e.inline_text, e.payload_blake3, e.referenced_notes_json,
+                        e.ext_space_tainted, e.is_chain_node, e.branch_depth,
+                        e.anc_16_seq, e.anc_256_seq, w2.n + 1
+                 FROM (SELECT parent_seq, n FROM win LIMIT 1) w2
+                 JOIN chat_entries e
+                   ON e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = w2.parent_seq
+                 WHERE w2.parent_seq IS NOT NULL AND w2.n < $4
+             )
+             SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
+                    agent_run_id, inline_text, payload_blake3, referenced_notes_json,
+                    ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq
+             FROM win",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(request.thread.as_str())
+        .bind(rem_start)
+        .bind(rem_n)
+        .fetch_all(&mut *conn)
         .await
+        .map_err(|err| internal_not_committed("pg_read_chat_gap_tail", err.to_string()))?;
+
+        for tr in &tail_rows {
+            entries.push(decode_entry_row(tr, 0)?);
+        }
+    }
+
+    entries.reverse();
+    entries.sort_unstable_by_key(|e| e.depth);
+
+    let next_ancestor = entries.first().and_then(|oldest| oldest.parent);
+    Ok(ChatBranch {
+        thread: thread_out,
+        entries,
+        next_ancestor,
+    })
+}
+
+fn read_chat_rusqlite(
+    conn: &rusqlite::Connection,
+    scope: &HistoryScope,
+    auth: &EngineAuthContext,
+    request: &ChatRead,
+) -> Result<ChatBranch, PortError> {
+    use rusqlite::{OptionalExtension, params};
+
+    let srec = crate::sqlite_fast::load_space_record_rusqlite(conn, &scope.space_id)?;
+    srec.scope.check(scope)?;
+
+    let th =
+        {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT kind, owner_id, project_folder_id, title, head_leaf_seq,
+                        head_rev_id, next_entry_seq, active_run_id, ext_space_tainted_mask
+                 FROM chat_threads WHERE space_id = ?1 AND thread_id = ?2",
+                )
+                .map_err(|err| internal_not_committed("sqlite_load_thread", err.to_string()))?;
+            let raw = stmt
+                .query_row(
+                    params![scope.space_id.as_str(), request.thread.as_str()],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, i64>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                            r.get::<_, i64>(8)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|err| {
+                    crate::sqlite_fast::map_interrupt_or_internal(err, "sqlite_load_thread")
+                })?
+                .ok_or(DomainError::ResourceNotFound)?;
+
+            let kind = chat_thread_kind_from_db(&raw.0)?;
+            let owner = PrincipalId::parse(&raw.1)
+                .map_err(|_| internal_not_committed("corrupt_thread_owner", "invalid owner_id"))?;
+            let project_folder = match raw.2 {
+                Some(s) => Some(FolderId::parse(&s).map_err(|_| {
+                    internal_not_committed("corrupt_thread_proj", "invalid FolderId")
+                })?),
+                None => None,
+            };
+            let head_leaf_seq = ThreadEntrySeq::new(u64::try_from(raw.4).map_err(|_| {
+                internal_not_committed("corrupt_head_leaf", "negative head_leaf_seq")
+            })?)?;
+            let head_rev_id = RevisionId::parse(&raw.5)
+                .map_err(|_| internal_not_committed("corrupt_thread_rev", "invalid head_rev_id"))?;
+            let next_entry_seq = ThreadEntrySeq::new(u64::try_from(raw.6).map_err(|_| {
+                internal_not_committed("corrupt_next_entry", "negative next_entry_seq")
+            })?)?;
+            let active_run_id = match raw.7 {
+                Some(s) => Some(AgentRunId::parse(&s).map_err(|_| {
+                    internal_not_committed("corrupt_thread_run", "invalid AgentRunId")
+                })?),
+                None => None,
+            };
+            ThreadHeadRow {
+                thread_id: request.thread.clone(),
+                kind,
+                owner,
+                project_folder,
+                title: raw.3,
+                head_leaf_seq,
+                head_rev_id,
+                next_entry_seq,
+                active_run_id,
+                tainted_mask: raw.8,
+            }
+        };
+
+    let thread_tainted = th.tainted_mask != 0;
+    auth.authorize_chat_read(&srec.space, thread_tainted)?;
+
+    let thread_out = ChatThread {
+        id: th.thread_id,
+        space: scope.space_id.clone(),
+        kind: th.kind,
+        owner: th.owner,
+        project_folder: th.project_folder,
+        head: th.head_leaf_seq,
+        revision: th.head_rev_id,
+        tainted: thread_tainted,
+    };
+
+    if request.leaf == ThreadEntrySeq::ZERO {
+        if request.before.is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidRange).into());
+        }
+        return Ok(ChatBranch {
+            thread: thread_out,
+            entries: Vec::new(),
+            next_ancestor: None,
+        });
+    }
+
+    let load_depth_rusqlite = |seq: ThreadEntrySeq| -> Result<Option<u32>, PortError> {
+        let mut dstmt = conn
+            .prepare_cached(
+                "SELECT branch_depth FROM chat_entries
+                 WHERE space_id = ?1 AND thread_id = ?2 AND entry_seq = ?3",
+            )
+            .map_err(|err| internal_not_committed("sqlite_entry_depth", err.to_string()))?;
+        let d_opt: Option<i64> = dstmt
+            .query_row(
+                params![
+                    scope.space_id.as_str(),
+                    request.thread.as_str(),
+                    seq.get() as i64
+                ],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|err| {
+                crate::sqlite_fast::map_interrupt_or_internal(err, "sqlite_entry_depth")
+            })?;
+        match d_opt {
+            Some(d) => Ok(Some(u32::try_from(d).map_err(|_| {
+                internal_not_committed("corrupt_branch_depth", "invalid branch_depth")
+            })?)),
+            None => Ok(None),
+        }
+    };
+
+    let window_tip = match request.before {
+        None => request.leaf,
+        Some(anc_seq) => {
+            let Some(leaf_depth) = load_depth_rusqlite(request.leaf)? else {
+                return Err(DomainError::ResourceNotFound.into());
+            };
+            if anc_seq == ThreadEntrySeq::ZERO {
+                return Err(DomainError::validation(ValidationReason::InvalidRange).into());
+            }
+            let Some(anc_depth) = load_depth_rusqlite(anc_seq)? else {
+                return Err(DomainError::validation(ValidationReason::InvalidRange).into());
+            };
+            if anc_depth >= leaf_depth {
+                return Err(DomainError::validation(ValidationReason::InvalidRange).into());
+            }
+            let mut jstmt = conn
+                .prepare_cached(
+                    "WITH RECURSIVE jump(entry_seq, branch_depth, parent_seq, anc_16_seq, anc_256_seq, hops) AS (
+                         SELECT entry_seq, branch_depth, parent_seq, anc_16_seq, anc_256_seq, 0
+                         FROM chat_entries
+                         WHERE space_id = ?1 AND thread_id = ?2 AND entry_seq = ?3
+                         UNION ALL
+                         SELECT e.entry_seq, e.branch_depth, e.parent_seq, e.anc_16_seq, e.anc_256_seq, j.hops + 1
+                         FROM jump j
+                         JOIN chat_entries e
+                           ON e.space_id = ?1
+                          AND e.thread_id = ?2
+                          AND e.entry_seq = CASE
+                              WHEN j.branch_depth - ?4 >= 256 AND j.anc_256_seq IS NOT NULL THEN j.anc_256_seq
+                              WHEN j.branch_depth - ?4 >= 16 AND j.anc_16_seq IS NOT NULL THEN j.anc_16_seq
+                              ELSE j.parent_seq
+                          END
+                         WHERE j.branch_depth > ?4 AND j.hops < 100000
+                     )
+                     SELECT entry_seq FROM jump WHERE branch_depth = ?4 LIMIT 1",
+                )
+                .map_err(|err| internal_not_committed("sqlite_jump_ancestor", err.to_string()))?;
+            let landed_opt: Option<i64> = jstmt
+                .query_row(
+                    params![
+                        scope.space_id.as_str(),
+                        request.thread.as_str(),
+                        request.leaf.get() as i64,
+                        i64::from(anc_depth),
+                    ],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|err| {
+                    crate::sqlite_fast::map_interrupt_or_internal(err, "sqlite_jump_ancestor")
+                })?;
+            let actual_anc = match landed_opt {
+                Some(raw) => Some(ThreadEntrySeq::new(u64::try_from(raw).map_err(|_| {
+                    internal_not_committed("corrupt_jump_seq", "negative entry_seq")
+                })?)?),
+                None => None,
+            };
+            if actual_anc != Some(anc_seq) {
+                return Err(DomainError::validation(ValidationReason::InvalidRange).into());
+            }
+            anc_seq
+        }
+    };
+
+    let max_n = i64::from(request.max_entries.get());
+    let tip_i64 = window_tip.get() as i64;
+
+    let mut wstmt = conn
+        .prepare_cached(
+            "WITH RECURSIVE win(
+                 entry_seq, parent_seq, kind, tool_call_id, author_id,
+                 agent_run_id, inline_text, payload_blake3, referenced_notes_json,
+                 ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq, n
+             ) AS (
+                 SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
+                        agent_run_id, inline_text, payload_blake3, referenced_notes_json,
+                        ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq, 1
+                 FROM chat_entries
+                 WHERE space_id = ?1 AND thread_id = ?2 AND entry_seq = ?3
+                 UNION ALL
+                 SELECT e.entry_seq, e.parent_seq, e.kind, e.tool_call_id, e.author_id,
+                        e.agent_run_id, e.inline_text, e.payload_blake3, e.referenced_notes_json,
+                        e.ext_space_tainted, e.is_chain_node, e.branch_depth, e.anc_16_seq, e.anc_256_seq, w.n + 1
+                 FROM win w
+                 JOIN chat_entries e
+                   ON e.space_id = ?1 AND e.thread_id = ?2 AND e.entry_seq = w.parent_seq
+                 WHERE w.parent_seq IS NOT NULL AND w.n < ?4
+             )
+             SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
+                    agent_run_id, inline_text, payload_blake3, referenced_notes_json,
+                    ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq
+             FROM win
+             ORDER BY branch_depth ASC",
+        )
+        .map_err(|err| internal_not_committed("sqlite_read_chat_win", err.to_string()))?;
+
+    let rows = wstmt
+        .query_map(
+            params![
+                scope.space_id.as_str(),
+                request.thread.as_str(),
+                tip_i64,
+                max_n
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<Vec<u8>>>(7)?,
+                    r.get::<_, String>(8)?,
+                    r.get::<_, i64>(9)?,
+                    r.get::<_, i64>(10)?,
+                    r.get::<_, i64>(11)?,
+                    r.get::<_, Option<i64>>(12)?,
+                    r.get::<_, Option<i64>>(13)?,
+                ))
+            },
+        )
+        .map_err(|err| {
+            crate::sqlite_fast::map_interrupt_or_internal(err, "sqlite_read_chat_win")
+        })?;
+
+    let mut entries = Vec::with_capacity(usize::from(request.max_entries.get().min(256)));
+    for item in rows {
+        let (
+            e_seq_raw,
+            p_seq_opt,
+            k_str,
+            tc_opt,
+            author_str,
+            run_opt,
+            inline_opt,
+            blob_opt,
+            refs_json,
+            taint_raw,
+            chain_raw,
+            depth_raw,
+            a16_opt,
+            a256_opt,
+        ) = item.map_err(|err| {
+            crate::sqlite_fast::map_interrupt_or_internal(err, "sqlite_read_chat_win")
+        })?;
+        let seq = ThreadEntrySeq::new(
+            u64::try_from(e_seq_raw)
+                .map_err(|_| internal_not_committed("corrupt_entry_seq", "negative entry_seq"))?,
+        )?;
+        let parent = match p_seq_opt {
+            Some(p) => Some(ThreadEntrySeq::new(u64::try_from(p).map_err(|_| {
+                internal_not_committed("corrupt_parent_seq", "negative parent_seq")
+            })?)?),
+            None => None,
+        };
+        let anc_16 = match a16_opt {
+            Some(a) => Some(ThreadEntrySeq::new(u64::try_from(a).map_err(|_| {
+                internal_not_committed("corrupt_a16", "negative anc_16_seq")
+            })?)?),
+            None => None,
+        };
+        let anc_256 = match a256_opt {
+            Some(a) => Some(ThreadEntrySeq::new(u64::try_from(a).map_err(|_| {
+                internal_not_committed("corrupt_a256", "negative anc_256_seq")
+            })?)?),
+            None => None,
+        };
+        let kind = entry_kind_from_db(&k_str, tc_opt)?;
+        let body = if kind == ChatEntryKind::Redacted {
+            ChatBody::Redacted
+        } else if let Some(txt) = inline_opt {
+            ChatBody::Inline(txt)
+        } else if let Some(b) = blob_opt {
+            let arr: [u8; 32] = b
+                .try_into()
+                .map_err(|_| internal_not_committed("corrupt_chat_blob", "digest != 32B"))?;
+            ChatBody::Blob(ContentDigest::from_bytes(arr))
+        } else {
+            return Err(internal_not_committed(
+                "corrupt_chat_body",
+                "entry lacks inline_text and payload_blake3",
+            ));
+        };
+        let author = PrincipalId::parse(&author_str)
+            .map_err(|_| internal_not_committed("corrupt_chat_author", "invalid PrincipalId"))?;
+        let run =
+            match run_opt {
+                Some(s) => Some(AgentRunId::parse(&s).map_err(|_| {
+                    internal_not_committed("corrupt_chat_run", "invalid AgentRunId")
+                })?),
+                None => None,
+            };
+        let referenced_notes: Vec<NoteRef> = if refs_json == "[]" {
+            Vec::new()
+        } else {
+            serde_json::from_str(&refs_json)
+                .map_err(|err| internal_not_committed("corrupt_chat_refs", err.to_string()))?
+        };
+        let depth = u32::try_from(depth_raw)
+            .map_err(|_| internal_not_committed("corrupt_chat_depth", "invalid depth"))?;
+        let entry_taint = taint_raw != 0;
+        if entry_taint {
+            auth.authorize_chat_read(&srec.space, true)?;
+        }
+
+        entries.push(ChatEntry {
+            thread: request.thread.clone(),
+            seq,
+            parent,
+            is_chain_node: chain_raw != 0,
+            depth,
+            ancestors: build_ancestors_vec(anc_16, anc_256),
+            author,
+            run,
+            kind,
+            body,
+            tainted: entry_taint,
+            referenced_notes,
+        });
+    }
+
+    if entries.is_empty() {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+
+    let next_ancestor = entries.first().and_then(|oldest| oldest.parent);
+    Ok(ChatBranch {
+        thread: thread_out,
+        entries,
+        next_ancestor,
+    })
 }
 
 async fn create_chat_impl(

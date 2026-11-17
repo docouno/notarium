@@ -303,6 +303,17 @@ impl BroadcastHub {
             .map(|c| c.seq)
             .min()
     }
+
+    pub fn rebind_and_clamp_watermarks(&self, new_scope: &HistoryScope, ceiling: SpaceSeq) {
+        let mut map = self.watermarks.lock().expect("watermarks mutex");
+        for cursor in map.values_mut() {
+            if cursor.scope.space_id == new_scope.space_id
+                && let Ok(restored) = cursor.restore(new_scope.clone(), ceiling)
+            {
+                *cursor = restored;
+            }
+        }
+    }
 }
 
 pub(crate) fn check_change_consumer_authority(auth: &ServiceAuthority) -> DomainResult<()> {

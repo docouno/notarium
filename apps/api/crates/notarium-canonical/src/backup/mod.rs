@@ -1,0 +1,3424 @@
+use std::{
+    collections::BTreeSet,
+    fs::{self, File, OpenOptions},
+    io::{BufReader, BufWriter, Read, Write},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
+};
+
+use notarium_core::{
+    DomainError,
+    error::{PortError, ValidationReason},
+    ids::{
+        ArtifactId, BackupId, ContentDigest, HistoryIncarnation, InstallationId, KeyId, SpaceId,
+    },
+    model::HistoryScope,
+    ports::{
+        BackupBudget, BackupHold, BackupParticipantPort, BackupProgress, BackupSnapshot,
+        BackupSpool, BackupWitness, Cancellation, KeyCanary, MaintenanceContext, PausedBackup,
+        PortFuture, PreparedBackup, ServicePurpose,
+    },
+    receipt::ChangeCursor,
+};
+use serde::{Deserialize, Serialize};
+use sqlx::{Connection, Postgres, Row, pool::PoolConnection};
+
+use crate::{
+    CanonicalStore,
+    changes::BroadcastSignal,
+    codec::{
+        MAX_MSGPACK_DECODE_BYTES, cancelled_not_committed, deadline_not_committed,
+        decode_msgpack_bounded, encode_msgpack, i64_to_space_seq, internal_not_committed,
+        now_unix_ms, unavailable_retryable,
+    },
+    config::{BlobBackendConfig, SqlBackendConfig},
+    domain::purge::has_incomplete_pending_purges_tx,
+    runtime::{CanonicalInner, SqlDriverState, load_space_record},
+    schema::manifest::{
+        CANONICAL_SCHEMA_VERSION, CANONICAL_TABLES, LogicalColKind, manifest_checksum,
+    },
+    sql_exec::BackendConn,
+    wal::BackupWalPinGuard,
+    writer::WriterSafePointGuard,
+};
+
+pub const POSTGRES_SPOOL_V1_MAGIC: &[u8] = b"NOTARIUM_PG_SPOOL_V1\n";
+pub const PG_SLICE_MAX_BYTES: usize = 64 * 1024;
+pub const SQLITE_BACKUP_PAGES_PER_STEP: i32 = 16;
+const SQLITE_CACHE_KIB: i32 = 512;
+const STREAM_IO_BUF_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupArtifactEncoding {
+    SqliteSnapshotV1,
+    PostgresSpoolV1,
+}
+
+impl BackupArtifactEncoding {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::SqliteSnapshotV1 => "sqlite_snapshot_v1",
+            Self::PostgresSpoolV1 => "postgres_spool_v1",
+        }
+    }
+
+    pub fn from_db_str(raw: &str) -> Result<Self, PortError> {
+        match raw {
+            "sqlite_snapshot_v1" => Ok(Self::SqliteSnapshotV1),
+            "postgres_spool_v1" => Ok(Self::PostgresSpoolV1),
+            other => Err(internal_not_committed(
+                "corrupt_backup_encoding",
+                format!("unknown backup artifact encoding '{other}'"),
+            )),
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::SqliteSnapshotV1 => "sqlite",
+            Self::PostgresSpoolV1 => "pgspool",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BackupArtifactRecord {
+    pub artifact_id: ArtifactId,
+    pub backup_id: BackupId,
+    pub installation_id: InstallationId,
+    pub encoding: BackupArtifactEncoding,
+    pub schema_version: u32,
+    pub artifact_path: PathBuf,
+    pub byte_size: u64,
+    pub digest: ContentDigest,
+    pub witness: BackupWitness,
+    pub state: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackupExporterMemoryStats {
+    pub encoding: BackupArtifactEncoding,
+    pub max_chunk_buffer_bytes: usize,
+    pub max_working_buffer_bytes: usize,
+    pub total_bytes_written: u64,
+    pub step_or_slice_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PostgresSpoolValue {
+    Null,
+    Int(i64),
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedPostgresSpoolTable {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<PostgresSpoolValue>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DecodedPostgresSpoolV1 {
+    pub schema_version: u32,
+    pub manifest_checksum: ContentDigest,
+    pub witness: BackupWitness,
+    pub tables: Vec<DecodedPostgresSpoolTable>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WireKeyCanaryV1 {
+    key: KeyId,
+    digest: ContentDigest,
+    readable: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WireBackupWitnessV1 {
+    installation: InstallationId,
+    histories: Vec<ChangeCursor>,
+    canaries: Vec<WireKeyCanaryV1>,
+}
+
+impl From<&BackupWitness> for WireBackupWitnessV1 {
+    fn from(w: &BackupWitness) -> Self {
+        Self {
+            installation: w.installation.clone(),
+            histories: w.histories.clone(),
+            canaries: w
+                .canaries
+                .iter()
+                .map(|c| WireKeyCanaryV1 {
+                    key: c.key.clone(),
+                    digest: c.digest,
+                    readable: c.readable,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<WireBackupWitnessV1> for BackupWitness {
+    fn from(w: WireBackupWitnessV1) -> Self {
+        Self {
+            installation: w.installation,
+            histories: w.histories,
+            canaries: w
+                .canaries
+                .into_iter()
+                .map(|c| KeyCanary {
+                    key: c.key,
+                    digest: c.digest,
+                    readable: c.readable,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn encode_witness_json(w: &BackupWitness) -> Result<String, PortError> {
+    let wire = WireBackupWitnessV1::from(w);
+    serde_json::to_string(&wire)
+        .map_err(|err| internal_not_committed("encode_backup_witness_json", err.to_string()))
+}
+
+fn decode_witness_json(raw: &str) -> Result<BackupWitness, PortError> {
+    let wire: WireBackupWitnessV1 = serde_json::from_str(raw)
+        .map_err(|err| internal_not_committed("decode_backup_witness_json", err.to_string()))?;
+    Ok(wire.into())
+}
+
+fn register_cleanup_task(inner: &CanonicalInner, handle: tokio::task::JoinHandle<()>) {
+    let mut guard = inner.backup_cleanups.lock().expect("backup cleanups mutex");
+    guard.retain(|h| !h.is_finished());
+    guard.push(handle);
+}
+
+fn resolve_spool_dir(inner: &CanonicalInner) -> Result<PathBuf, PortError> {
+    if let Some(custom) = inner
+        .backup_spool_override
+        .lock()
+        .expect("backup spool override mutex")
+        .clone()
+    {
+        ensure_private_dir(&custom)?;
+        return Ok(custom);
+    }
+
+    let dir = match (&inner.config.sql, &inner.config.blobs) {
+        (SqlBackendConfig::Sqlite { data_root, .. }, _) => data_root.staging().join("backups"),
+        (_, BlobBackendConfig::Local { data_root }) => data_root.staging().join("backups"),
+        _ => std::env::temp_dir().join(format!(
+            "notarium-backup-spool-{}",
+            inner.config.installation_id.as_str()
+        )),
+    };
+    ensure_private_dir(&dir)?;
+    Ok(dir)
+}
+
+fn ensure_private_dir(path: &Path) -> Result<(), PortError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(path)
+            .map_err(|err| internal_not_committed("create_backup_spool_dir", err.to_string()))?;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+            .map_err(|err| internal_not_committed("create_backup_spool_dir", err.to_string()))?;
+    }
+    Ok(())
+}
+
+fn create_private_tmp_file(path: &Path) -> Result<File, PortError> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+        .map_err(|err| internal_not_committed("create_backup_tmp_file", err.to_string()))
+}
+
+fn fsync_parent_dir(path: &Path) -> Result<(), PortError> {
+    if let Some(parent) = path.parent() {
+        let dir_file = File::open(parent)
+            .map_err(|err| internal_not_committed("open_backup_parent_dir", err.to_string()))?;
+        dir_file
+            .sync_all()
+            .map_err(|err| internal_not_committed("fsync_backup_parent_dir", err.to_string()))?;
+    }
+    Ok(())
+}
+
+fn remove_tmp_artifacts_best_effort(tmp_path: &Path) {
+    let _ = fs::remove_file(tmp_path);
+    let mut journal = tmp_path.as_os_str().to_os_string();
+    journal.push("-journal");
+    let _ = fs::remove_file(PathBuf::from(journal));
+    let mut wal = tmp_path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let _ = fs::remove_file(PathBuf::from(wal));
+    let mut shm = tmp_path.as_os_str().to_os_string();
+    shm.push("-shm");
+    let _ = fs::remove_file(PathBuf::from(shm));
+}
+
+fn mint_artifact_id() -> Result<ArtifactId, PortError> {
+    let mut raw = [0u8; 16];
+    getrandom::fill(&mut raw)
+        .map_err(|err| internal_not_committed("csprng_artifact_id", err.to_string()))?;
+    Ok(ArtifactId::from_bytes(raw))
+}
+
+fn tighten_budget(a: BackupBudget, b: BackupBudget) -> BackupBudget {
+    BackupBudget {
+        deadline: a.deadline.min(b.deadline),
+        max_pinned_wal_bytes: a.max_pinned_wal_bytes.min(b.max_pinned_wal_bytes),
+        max_spool_bytes: a.max_spool_bytes.min(b.max_spool_bytes),
+    }
+}
+
+fn validate_backup_budget(budget: BackupBudget) -> Result<(), PortError> {
+    if budget.deadline.is_zero() || budget.max_spool_bytes == 0 {
+        return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+    }
+    Ok(())
+}
+
+impl CanonicalStore {
+    pub fn set_backup_spool_dir(&self, dir: PathBuf) {
+        *self
+            .inner
+            .backup_spool_override
+            .lock()
+            .expect("backup spool override mutex") = Some(dir);
+    }
+
+    pub fn last_backup_memory_stats(&self) -> Option<BackupExporterMemoryStats> {
+        *self
+            .inner
+            .last_backup_memory_stats
+            .lock()
+            .expect("backup memory stats mutex")
+    }
+
+    #[doc(hidden)]
+    pub fn set_backup_step_delay_for_test(&self, delay: Duration) {
+        let us = u64::try_from(delay.as_micros()).unwrap_or(u64::MAX);
+        self.inner.backup_step_delay_us.store(us, Ordering::SeqCst);
+    }
+
+    pub async fn get_backup_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+    ) -> Result<BackupArtifactRecord, PortError> {
+        let aid = artifact_id.clone();
+        let spool_dir = resolve_spool_dir(&self.inner)?;
+        self.with_read_tx(|tx| {
+            Box::pin(async move {
+                let row_opt: Option<(
+                    String,
+                    String,
+                    String,
+                    i64,
+                    String,
+                    i64,
+                    Vec<u8>,
+                    String,
+                    String,
+                    i64,
+                )> = match tx {
+                    BackendConn::Sqlite(conn) => {
+                        let r = sqlx::query(
+                            "SELECT backup_id, installation_id, encoding, schema_version,
+                                    artifact_rel_path, byte_size, content_blake3, witness_json,
+                                    state, created_at_ms
+                             FROM backup_artifacts
+                             WHERE artifact_id = ?",
+                        )
+                        .bind(aid.as_str())
+                        .fetch_optional(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("sqlite_get_backup_artifact", err.to_string())
+                        })?;
+                        r.map(|row| {
+                            (
+                                row.get("backup_id"),
+                                row.get("installation_id"),
+                                row.get("encoding"),
+                                row.get("schema_version"),
+                                row.get("artifact_rel_path"),
+                                row.get("byte_size"),
+                                row.get("content_blake3"),
+                                row.get("witness_json"),
+                                row.get("state"),
+                                row.get("created_at_ms"),
+                            )
+                        })
+                    }
+                    BackendConn::Postgres(conn) => {
+                        let r = sqlx::query(
+                            "SELECT backup_id, installation_id, encoding, schema_version::BIGINT AS schema_version,
+                                    artifact_rel_path, byte_size, content_blake3, witness_json,
+                                    state, created_at_ms
+                             FROM backup_artifacts
+                             WHERE artifact_id = $1",
+                        )
+                        .bind(aid.as_str())
+                        .fetch_optional(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("pg_get_backup_artifact", err.to_string())
+                        })?;
+                        r.map(|row| {
+                            (
+                                row.get("backup_id"),
+                                row.get("installation_id"),
+                                row.get("encoding"),
+                                row.get("schema_version"),
+                                row.get("artifact_rel_path"),
+                                row.get("byte_size"),
+                                row.get("content_blake3"),
+                                row.get("witness_json"),
+                                row.get("state"),
+                                row.get("created_at_ms"),
+                            )
+                        })
+                    }
+                };
+
+                let Some((
+                    backup_raw,
+                    inst_raw,
+                    enc_raw,
+                    schema_ver_i64,
+                    rel_path,
+                    byte_size_i64,
+                    digest_bytes,
+                    witness_json,
+                    state,
+                    created_at_ms,
+                )) = row_opt
+                else {
+                    return Err(DomainError::ResourceNotFound.into());
+                };
+
+                let backup_id = BackupId::parse(&backup_raw).map_err(|_| {
+                    internal_not_committed("corrupt_backup_id", "invalid BackupId in registry")
+                })?;
+                let installation_id = InstallationId::parse(&inst_raw).map_err(|_| {
+                    internal_not_committed(
+                        "corrupt_backup_installation",
+                        "invalid InstallationId in registry",
+                    )
+                })?;
+                let encoding = BackupArtifactEncoding::from_db_str(&enc_raw)?;
+                let schema_version = u32::try_from(schema_ver_i64).map_err(|_| {
+                    internal_not_committed("corrupt_backup_schema_ver", "negative schema_version")
+                })?;
+                let byte_size = u64::try_from(byte_size_i64).map_err(|_| {
+                    internal_not_committed("corrupt_backup_byte_size", "negative byte_size")
+                })?;
+                let digest_arr: [u8; 32] = digest_bytes.try_into().map_err(|_| {
+                    internal_not_committed("corrupt_backup_digest", "content_blake3 != 32B")
+                })?;
+                let witness = decode_witness_json(&witness_json)?;
+
+                Ok(BackupArtifactRecord {
+                    artifact_id: aid,
+                    backup_id,
+                    installation_id,
+                    encoding,
+                    schema_version,
+                    artifact_path: spool_dir.join(rel_path),
+                    byte_size,
+                    digest: ContentDigest::from_bytes(digest_arr),
+                    witness,
+                    state,
+                    created_at_ms,
+                })
+            })
+        })
+        .await
+    }
+}
+
+// ============================================================================
+// SQLite dedicated owner-thread worker (`!Send` `rusqlite::Connection` + `Backup`)
+// ============================================================================
+
+struct SqliteSpoolSuccess {
+    bytes: u64,
+    digest: ContentDigest,
+    stats: BackupExporterMemoryStats,
+}
+
+enum SqliteWorkerCmd {
+    OpenCut {
+        expected_installation: InstallationId,
+        reply: tokio::sync::oneshot::Sender<Result<BackupWitness, PortError>>,
+    },
+    Spool {
+        budget: BackupBudget,
+        wal_pin: BackupWalPinGuard,
+        expected_witness: BackupWitness,
+        final_path: PathBuf,
+        step_delay_us: u64,
+        reply: tokio::sync::oneshot::Sender<Result<SqliteSpoolSuccess, PortError>>,
+    },
+    Abort {
+        reply: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+}
+
+struct SqliteBackupWorkerHandle {
+    cmd_tx: Option<mpsc::SyncSender<SqliteWorkerCmd>>,
+    cancel_flag: Arc<AtomicBool>,
+    interrupt_handle: Arc<rusqlite::InterruptHandle>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
+    tmp_path: PathBuf,
+}
+
+impl SqliteBackupWorkerHandle {
+    fn spawn(src_path: PathBuf, tmp_path: PathBuf) -> Result<Self, PortError> {
+        // Pre-create private `0600` destination file before opening SQLite on it.
+        let pre_file = create_private_tmp_file(&tmp_path)?;
+        drop(pre_file);
+
+        let (init_tx, init_rx) =
+            mpsc::sync_channel::<Result<rusqlite::InterruptHandle, PortError>>(1);
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<SqliteWorkerCmd>(2);
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_cl = Arc::clone(&cancel_flag);
+        let tmp_cl = tmp_path.clone();
+
+        let join_handle = std::thread::Builder::new()
+            .name("notarium-sqlite-backup".to_owned())
+            .spawn(move || {
+                sqlite_backup_worker_loop(src_path, tmp_cl, cancel_cl, init_tx, cmd_rx);
+            })
+            .map_err(|err| {
+                remove_tmp_artifacts_best_effort(&tmp_path);
+                internal_not_committed("spawn_sqlite_backup_thread", err.to_string())
+            })?;
+
+        match init_rx.recv() {
+            Ok(Ok(interrupt_handle)) => Ok(Self {
+                cmd_tx: Some(cmd_tx),
+                cancel_flag,
+                interrupt_handle: Arc::new(interrupt_handle),
+                join_handle: Some(join_handle),
+                tmp_path,
+            }),
+            Ok(Err(err)) => {
+                let _ = join_handle.join();
+                remove_tmp_artifacts_best_effort(&tmp_path);
+                Err(err)
+            }
+            Err(err) => {
+                let _ = join_handle.join();
+                remove_tmp_artifacts_best_effort(&tmp_path);
+                Err(internal_not_committed(
+                    "sqlite_backup_worker_init_eof",
+                    err.to_string(),
+                ))
+            }
+        }
+    }
+
+    async fn abort_and_join(&mut self) {
+        self.cancel_flag.store(true, Ordering::SeqCst);
+        self.interrupt_handle.interrupt();
+        if let Some(tx) = self.cmd_tx.take() {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let _ = tx.try_send(SqliteWorkerCmd::Abort {
+                reply: Some(reply_tx),
+            });
+            drop(tx);
+            let _ = reply_rx.await;
+        }
+        if let Some(jh) = self.join_handle.take() {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = jh.join();
+            })
+            .await;
+        }
+        remove_tmp_artifacts_best_effort(&self.tmp_path);
+    }
+
+    fn detach_abort_cleanup(&mut self, inner: &CanonicalInner) {
+        self.cancel_flag.store(true, Ordering::SeqCst);
+        self.interrupt_handle.interrupt();
+        if let Some(tx) = self.cmd_tx.take() {
+            let _ = tx.try_send(SqliteWorkerCmd::Abort { reply: None });
+            drop(tx);
+        }
+        let tmp = self.tmp_path.clone();
+        if let Some(jh) = self.join_handle.take() {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let handle = rt.spawn_blocking(move || {
+                    let _ = jh.join();
+                    remove_tmp_artifacts_best_effort(&tmp);
+                });
+                register_cleanup_task(inner, handle);
+            } else {
+                let _ = jh.join();
+                remove_tmp_artifacts_best_effort(&tmp);
+            }
+        }
+    }
+}
+
+fn sqlite_backup_worker_loop(
+    src_path: PathBuf,
+    tmp_path: PathBuf,
+    cancel_flag: Arc<AtomicBool>,
+    init_tx: mpsc::SyncSender<Result<rusqlite::InterruptHandle, PortError>>,
+    cmd_rx: mpsc::Receiver<SqliteWorkerCmd>,
+) {
+    let open_res = (|| -> Result<(rusqlite::Connection, rusqlite::Connection), PortError> {
+        let src = rusqlite::Connection::open_with_flags(
+            &src_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|err| internal_not_committed("rusqlite_open_backup_src", err.to_string()))?;
+        src.busy_timeout(Duration::from_millis(250))
+            .map_err(|err| internal_not_committed("rusqlite_src_busy_timeout", err.to_string()))?;
+        src.execute_batch(&format!(
+            "PRAGMA query_only = ON; PRAGMA cache_size = -{SQLITE_CACHE_KIB}; PRAGMA temp_store = MEMORY;"
+        ))
+        .map_err(|err| internal_not_committed("rusqlite_src_pragmas", err.to_string()))?;
+
+        let dst = rusqlite::Connection::open_with_flags(
+            &tmp_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|err| internal_not_committed("rusqlite_open_backup_dst", err.to_string()))?;
+        dst.busy_timeout(Duration::from_millis(250))
+            .map_err(|err| internal_not_committed("rusqlite_dst_busy_timeout", err.to_string()))?;
+        dst.execute_batch(&format!(
+            "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA secure_delete = ON; PRAGMA cache_size = -{SQLITE_CACHE_KIB}; PRAGMA temp_store = MEMORY;"
+        ))
+        .map_err(|err| internal_not_committed("rusqlite_dst_pragmas", err.to_string()))?;
+
+        Ok((src, dst))
+    })();
+
+    let (src, dst) = match open_res {
+        Ok(pair) => {
+            let handle = pair.0.get_interrupt_handle();
+            if init_tx.send(Ok(handle)).is_err() {
+                drop(pair);
+                remove_tmp_artifacts_best_effort(&tmp_path);
+                return;
+            }
+            pair
+        }
+        Err(err) => {
+            let _ = init_tx.send(Err(err));
+            remove_tmp_artifacts_best_effort(&tmp_path);
+            return;
+        }
+    };
+
+    let mut src_opt = Some(src);
+    let mut dst_opt = Some(dst);
+    let mut pinned = false;
+    let mut published = false;
+
+    while let Ok(cmd) = cmd_rx.recv() {
+        match cmd {
+            SqliteWorkerCmd::OpenCut {
+                expected_installation,
+                reply,
+            } => {
+                let res = if let Some(src_conn) = src_opt.as_ref() {
+                    match pin_and_read_sqlite_witness(src_conn, &expected_installation) {
+                        Ok(w) => {
+                            pinned = true;
+                            Ok(w)
+                        }
+                        Err(err) => {
+                            let _ = src_conn.execute_batch("ROLLBACK;");
+                            Err(err)
+                        }
+                    }
+                } else {
+                    Err(internal_not_committed(
+                        "sqlite_backup_src_gone",
+                        "source connection already closed",
+                    ))
+                };
+                let ok = res.is_ok();
+                let _ = reply.send(res);
+                if !ok {
+                    break;
+                }
+            }
+            SqliteWorkerCmd::Spool {
+                budget,
+                wal_pin,
+                expected_witness,
+                final_path,
+                step_delay_us,
+                reply,
+            } => {
+                let res = run_sqlite_spool_on_owner_thread(
+                    &mut src_opt,
+                    &mut dst_opt,
+                    &mut pinned,
+                    wal_pin,
+                    budget,
+                    &cancel_flag,
+                    &expected_witness,
+                    &tmp_path,
+                    &final_path,
+                    step_delay_us,
+                );
+                if res.is_ok() {
+                    published = true;
+                }
+                let _ = reply.send(res);
+                break;
+            }
+            SqliteWorkerCmd::Abort { reply } => {
+                if let Some(src_conn) = src_opt.take() {
+                    if pinned {
+                        let _ = src_conn.execute_batch("ROLLBACK;");
+                    }
+                    let _ = src_conn.close();
+                }
+                if let Some(dst_conn) = dst_opt.take() {
+                    let _ = dst_conn.close();
+                }
+                remove_tmp_artifacts_best_effort(&tmp_path);
+                if let Some(r) = reply {
+                    let _ = r.send(());
+                }
+                return;
+            }
+        }
+    }
+
+    if let Some(src_conn) = src_opt.take() {
+        if pinned {
+            let _ = src_conn.execute_batch("ROLLBACK;");
+        }
+        let _ = src_conn.close();
+    }
+    if let Some(dst_conn) = dst_opt.take() {
+        let _ = dst_conn.close();
+    }
+    if !published {
+        remove_tmp_artifacts_best_effort(&tmp_path);
+    }
+}
+
+fn pin_and_read_sqlite_witness(
+    src: &rusqlite::Connection,
+    expected_installation: &InstallationId,
+) -> Result<BackupWitness, PortError> {
+    src.execute_batch("BEGIN DEFERRED;")
+        .map_err(|err| internal_not_committed("sqlite_backup_begin", err.to_string()))?;
+
+    read_and_verify_sqlite_conn_witness(src, expected_installation)
+}
+
+fn read_and_verify_sqlite_conn_witness(
+    conn: &rusqlite::Connection,
+    expected_installation: &InstallationId,
+) -> Result<BackupWitness, PortError> {
+    let (schema_version, installation_raw, checksum_bytes): (i64, String, Vec<u8>) = conn
+        .query_row(
+            "SELECT schema_version, installation_id, manifest_checksum
+             FROM schema_meta
+             WHERE singleton_id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|err| internal_not_committed("sqlite_backup_read_schema_meta", err.to_string()))?;
+
+    if schema_version != i64::from(CANONICAL_SCHEMA_VERSION) {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+    if installation_raw != expected_installation.as_str() {
+        return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+    }
+    if checksum_bytes.as_slice() != manifest_checksum().as_bytes().as_slice() {
+        return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT space_id, history_incarnation, last_seq
+             FROM spaces
+             ORDER BY space_id ASC",
+        )
+        .map_err(|err| internal_not_committed("sqlite_backup_prepare_spaces", err.to_string()))?;
+
+    let mut rows = stmt
+        .query([])
+        .map_err(|err| internal_not_committed("sqlite_backup_query_spaces", err.to_string()))?;
+
+    let mut histories = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|err| internal_not_committed("sqlite_backup_next_space", err.to_string()))?
+    {
+        let sid_raw: String = row
+            .get(0)
+            .map_err(|err| internal_not_committed("sqlite_backup_space_id", err.to_string()))?;
+        let inc_bytes: Vec<u8> = row
+            .get(1)
+            .map_err(|err| internal_not_committed("sqlite_backup_space_inc", err.to_string()))?;
+        let last_seq_i64: i64 = row
+            .get(2)
+            .map_err(|err| internal_not_committed("sqlite_backup_space_seq", err.to_string()))?;
+
+        let space_id = SpaceId::parse(&sid_raw).map_err(|_| {
+            internal_not_committed("corrupt_backup_space_id", "invalid SpaceId in spaces")
+        })?;
+        let inc_arr: [u8; 16] = inc_bytes.try_into().map_err(|_| {
+            internal_not_committed("corrupt_backup_inc", "history_incarnation != 16B")
+        })?;
+        let after = i64_to_space_seq(last_seq_i64)?;
+        histories.push(ChangeCursor {
+            scope: HistoryScope {
+                space_id,
+                incarnation: HistoryIncarnation::from_bytes(inc_arr),
+            },
+            after,
+        });
+    }
+
+    Ok(BackupWitness {
+        installation: expected_installation.clone(),
+        histories,
+        canaries: Vec::new(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sqlite_spool_on_owner_thread(
+    src_opt: &mut Option<rusqlite::Connection>,
+    dst_opt: &mut Option<rusqlite::Connection>,
+    pinned: &mut bool,
+    wal_pin: BackupWalPinGuard,
+    budget: BackupBudget,
+    cancel_flag: &AtomicBool,
+    expected_witness: &BackupWitness,
+    tmp_path: &Path,
+    final_path: &Path,
+    step_delay_us: u64,
+) -> Result<SqliteSpoolSuccess, PortError> {
+    if !*pinned {
+        return Err(internal_not_committed(
+            "sqlite_backup_not_pinned",
+            "spool called before open_cut pinned source snapshot",
+        ));
+    }
+
+    let started = Instant::now();
+    let mut step_count = 0u64;
+    let mut src_page_size = 4096u64;
+
+    let step_res: Result<(), PortError> = (|| {
+        let src = src_opt.as_ref().ok_or_else(|| {
+            internal_not_committed("sqlite_backup_missing_src", "missing source connection")
+        })?;
+        if let Ok(ps) = src.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))
+            && ps >= 512
+        {
+            src_page_size = ps as u64;
+        }
+        let dst = dst_opt.as_mut().ok_or_else(|| {
+            internal_not_committed(
+                "sqlite_backup_missing_dst",
+                "missing destination connection",
+            )
+        })?;
+
+        let backup = rusqlite::backup::Backup::new(src, dst)
+            .map_err(|err| internal_not_committed("rusqlite_backup_init", err.to_string()))?;
+
+        loop {
+            if cancel_flag.load(Ordering::SeqCst) {
+                return Err(cancelled_not_committed(
+                    "sqlite_backup_cancelled",
+                    "SQLite backup spool cancelled",
+                ));
+            }
+            if wal_pin.is_aborted_by_coordinator() {
+                return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+            }
+
+            let disk_bytes = fs::metadata(tmp_path).map(|m| m.len()).unwrap_or(0);
+            let progress_info = backup.progress();
+            let copied_pages = (progress_info.pagecount - progress_info.remaining).max(0) as u64;
+            let est_bytes = disk_bytes.max(copied_pages.saturating_mul(src_page_size));
+            budget.check(BackupProgress {
+                elapsed: started.elapsed(),
+                pinned_wal_bytes: wal_pin.current_pinned_wal_bytes(),
+                spool_bytes: est_bytes,
+            })?;
+
+            if step_delay_us > 0 {
+                sleep_interruptible(
+                    Duration::from_micros(step_delay_us),
+                    started,
+                    budget.deadline,
+                    cancel_flag,
+                    &wal_pin,
+                )?;
+            }
+
+            match backup.step(SQLITE_BACKUP_PAGES_PER_STEP) {
+                Ok(rusqlite::backup::StepResult::Done) => {
+                    step_count += 1;
+                    break;
+                }
+                Ok(rusqlite::backup::StepResult::More) => {
+                    step_count += 1;
+                }
+                Ok(rusqlite::backup::StepResult::Busy)
+                | Ok(rusqlite::backup::StepResult::Locked) => {
+                    sleep_interruptible(
+                        Duration::from_millis(2),
+                        started,
+                        budget.deadline,
+                        cancel_flag,
+                        &wal_pin,
+                    )?;
+                }
+                Ok(_) => {
+                    sleep_interruptible(
+                        Duration::from_millis(1),
+                        started,
+                        budget.deadline,
+                        cancel_flag,
+                        &wal_pin,
+                    )?;
+                }
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::OperationInterrupted =>
+                {
+                    return Err(cancelled_not_committed(
+                        "sqlite_backup_interrupted",
+                        "SQLite backup interrupted",
+                    ));
+                }
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if matches!(
+                        err.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) =>
+                {
+                    sleep_interruptible(
+                        Duration::from_millis(2),
+                        started,
+                        budget.deadline,
+                        cancel_flag,
+                        &wal_pin,
+                    )?;
+                }
+                Err(err) => {
+                    return Err(internal_not_committed(
+                        "rusqlite_backup_step",
+                        err.to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    // ALWAYS release `src` transaction and `wal_pin` immediately after page copy finishes or aborts,
+    // BEFORE verifying/hashing/fsyncing destination!
+    if let Some(src_conn) = src_opt.take() {
+        if *pinned {
+            let _ = src_conn.execute_batch("ROLLBACK;");
+            *pinned = false;
+        }
+        let _ = src_conn.close();
+    }
+    drop(wal_pin);
+
+    if let Err(err) = step_res {
+        if let Some(dst_conn) = dst_opt.take() {
+            let _ = dst_conn.close();
+        }
+        remove_tmp_artifacts_best_effort(tmp_path);
+        return Err(err);
+    }
+
+    // Verify destination witness and integrity before closing `dst`.
+    let verify_res: Result<(), PortError> = (|| {
+        let dst = dst_opt.take().ok_or_else(|| {
+            internal_not_committed("sqlite_backup_dst_gone", "destination connection missing")
+        })?;
+        let dst_witness =
+            read_and_verify_sqlite_conn_witness(&dst, &expected_witness.installation)?;
+        if !witnesses_equal(&dst_witness, expected_witness) {
+            let _ = dst.close();
+            return Err(internal_not_committed(
+                "sqlite_backup_witness_mismatch",
+                "destination snapshot witness diverged from pinned cut witness",
+            ));
+        }
+        let quick_ok: String = dst
+            .query_row("PRAGMA quick_check(1)", [], |r| r.get(0))
+            .map_err(|err| internal_not_committed("sqlite_backup_quick_check", err.to_string()))?;
+        dst.close().map_err(|(_, err)| {
+            internal_not_committed("sqlite_backup_close_dst", err.to_string())
+        })?;
+        if quick_ok != "ok" {
+            return Err(internal_not_committed(
+                "sqlite_backup_corrupt_dst",
+                format!("PRAGMA quick_check failed: {quick_ok}"),
+            ));
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = verify_res {
+        remove_tmp_artifacts_best_effort(tmp_path);
+        return Err(err);
+    }
+
+    // Check final file size against budget, stream BLAKE3 with a bounded 64 KiB buffer, fsync, atomic rename.
+    let final_meta = fs::metadata(tmp_path)
+        .map_err(|err| internal_not_committed("sqlite_backup_stat_tmp", err.to_string()))?;
+    let total_bytes = final_meta.len();
+    budget.check(BackupProgress {
+        elapsed: started.elapsed(),
+        pinned_wal_bytes: 0,
+        spool_bytes: total_bytes,
+    })?;
+
+    let digest = match stream_file_blake3_and_sync(tmp_path, cancel_flag) {
+        Ok(d) => d,
+        Err(err) => {
+            remove_tmp_artifacts_best_effort(tmp_path);
+            return Err(err);
+        }
+    };
+
+    if let Err(err) = fs::rename(tmp_path, final_path) {
+        remove_tmp_artifacts_best_effort(tmp_path);
+        return Err(internal_not_committed(
+            "sqlite_backup_publish_rename",
+            err.to_string(),
+        ));
+    }
+    fsync_parent_dir(final_path)?;
+
+    let page_step_bytes = (SQLITE_BACKUP_PAGES_PER_STEP as usize) * (src_page_size as usize);
+    let working_bytes = STREAM_IO_BUF_BYTES + 2 * (SQLITE_CACHE_KIB as usize) * 1024;
+
+    Ok(SqliteSpoolSuccess {
+        bytes: total_bytes,
+        digest,
+        stats: BackupExporterMemoryStats {
+            encoding: BackupArtifactEncoding::SqliteSnapshotV1,
+            max_chunk_buffer_bytes: page_step_bytes.max(STREAM_IO_BUF_BYTES),
+            max_working_buffer_bytes: working_bytes,
+            total_bytes_written: total_bytes,
+            step_or_slice_count: step_count,
+        },
+    })
+}
+
+fn sleep_interruptible(
+    total: Duration,
+    started: Instant,
+    deadline: Duration,
+    cancel_flag: &AtomicBool,
+    wal_pin: &BackupWalPinGuard,
+) -> Result<(), PortError> {
+    let target = Instant::now() + total;
+    while Instant::now() < target {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return Err(cancelled_not_committed(
+                "sqlite_backup_cancelled",
+                "SQLite backup cancelled",
+            ));
+        }
+        if wal_pin.is_aborted_by_coordinator() {
+            return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+        }
+        if started.elapsed() > deadline {
+            return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+        }
+        let rem = target.saturating_duration_since(Instant::now());
+        std::thread::sleep(rem.min(Duration::from_millis(5)));
+    }
+    Ok(())
+}
+
+fn stream_file_blake3_and_sync(
+    path: &Path,
+    cancel_flag: &AtomicBool,
+) -> Result<ContentDigest, PortError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|err| internal_not_committed("open_backup_for_hash_sync", err.to_string()))?;
+    file.sync_all()
+        .map_err(|err| internal_not_committed("fsync_backup_tmp", err.to_string()))?;
+
+    let mut reader = BufReader::with_capacity(STREAM_IO_BUF_BYTES, file);
+    let mut buf = vec![0u8; STREAM_IO_BUF_BYTES];
+    let mut hasher = blake3::Hasher::new();
+    loop {
+        if cancel_flag.load(Ordering::SeqCst) {
+            return Err(cancelled_not_committed(
+                "backup_hash_cancelled",
+                "backup hashing cancelled",
+            ));
+        }
+        let n = reader
+            .read(&mut buf)
+            .map_err(|err| internal_not_committed("read_backup_for_hash", err.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(ContentDigest::from_bytes(*hasher.finalize().as_bytes()))
+}
+
+fn witnesses_equal(a: &BackupWitness, b: &BackupWitness) -> bool {
+    a.installation == b.installation
+        && a.histories == b.histories
+        && a.canaries.len() == b.canaries.len()
+}
+
+// ============================================================================
+// PostgreSQL prepared / pinned connection state (`PostgresSpoolV1`)
+// ============================================================================
+
+struct PgPreparedSource {
+    pool: sqlx::PgPool,
+    pooled: Option<PoolConnection<Postgres>>,
+    backend_pid: i32,
+    in_tx: bool,
+    tmp_path: PathBuf,
+}
+
+impl PgPreparedSource {
+    async fn abort_cleanly(&mut self) {
+        if let Some(mut conn) = self.pooled.take() {
+            if self.in_tx {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                self.in_tx = false;
+            }
+        }
+        remove_tmp_artifacts_best_effort(&self.tmp_path);
+    }
+
+    fn detach_abort_cleanup(&mut self, inner: &CanonicalInner) {
+        let tmp = self.tmp_path.clone();
+        if let Some(pooled) = self.pooled.take() {
+            let mut raw = pooled.detach();
+            let pool = self.pool.clone();
+            let pid = self.backend_pid;
+            let in_tx = self.in_tx;
+            self.in_tx = false;
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let handle = rt.spawn(async move {
+                    if let Ok(mut cancel_conn) = pool.acquire().await {
+                        let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                            .bind(pid)
+                            .execute(&mut *cancel_conn)
+                            .await;
+                    }
+                    if in_tx {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut raw).await;
+                    }
+                    let _ = raw.close().await;
+                    remove_tmp_artifacts_best_effort(&tmp);
+                });
+                register_cleanup_task(inner, handle);
+                return;
+            }
+            drop(raw);
+        }
+        remove_tmp_artifacts_best_effort(&tmp);
+    }
+}
+
+const PG_PIN_WITNESS_STMT: &str = "__notarium_pin_witness_v1";
+
+async fn warm_pg_backup_connection(conn: &mut sqlx::PgConnection) -> Result<i32, PortError> {
+    let row = sqlx::query(
+        "SELECT pg_backend_pid(),
+                EXISTS(SELECT 1 FROM pg_prepared_statements WHERE name = $1)",
+    )
+    .bind(PG_PIN_WITNESS_STMT)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| internal_not_committed("pg_backup_backend_pid", err.to_string()))?;
+
+    let pid: i32 = row.get(0);
+    let already_prepared: bool = row.get(1);
+    let warm_sql = if already_prepared {
+        format!("EXECUTE {PG_PIN_WITNESS_STMT}")
+    } else {
+        format!(
+            "PREPARE {PG_PIN_WITNESS_STMT} AS
+             SELECT 0::int2 AS kind, schema_version::bigint AS num_col, installation_id AS txt_col, manifest_checksum AS bin_col
+             FROM schema_meta
+             WHERE singleton_id = 1
+             UNION ALL
+             SELECT 1::int2 AS kind, last_seq AS num_col, space_id AS txt_col, history_incarnation AS bin_col
+             FROM spaces
+             ORDER BY 1 ASC, 3 ASC;
+             EXECUTE {PG_PIN_WITNESS_STMT}"
+        )
+    };
+    sqlx::raw_sql(sqlx::AssertSqlSafe(warm_sql))
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_backup_warm_stmt", err.to_string()))?;
+    Ok(pid)
+}
+
+async fn pin_and_read_pg_witness(
+    conn: &mut sqlx::PgConnection,
+    expected_installation: &InstallationId,
+    deadline: Duration,
+) -> Result<BackupWitness, PortError> {
+    let timeout_ms = u64::try_from(deadline.as_millis().max(1)).unwrap_or(30_000);
+    // Execute `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`, `SET LOCAL statement_timeout`,
+    // and the pre-prepared `EXECUTE __notarium_pin_witness_v1` in a single PostgreSQL Simple Query
+    // round-trip (`1` UDS write/read, zero parser/planner/relcache cold misses) so paired writer pauses stay `< 1 ms`.
+    let sql = format!(
+        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+         SET LOCAL statement_timeout = {timeout_ms};
+         EXECUTE {PG_PIN_WITNESS_STMT}"
+    );
+    let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_backup_pin_and_read_witness", err.to_string()))?;
+
+    let meta_row = rows
+        .iter()
+        .find(|r| r.get::<i16, usize>(0) == 0)
+        .ok_or_else(|| {
+            internal_not_committed("pg_backup_read_schema_meta", "missing schema_meta row")
+        })?;
+    let schema_version: i64 = meta_row
+        .try_get::<i64, usize>(1)
+        .map_err(|err| internal_not_committed("pg_backup_decode_schema_ver", err.to_string()))?;
+    let installation_raw: String = meta_row
+        .try_get::<String, usize>(2)
+        .map_err(|err| internal_not_committed("pg_backup_decode_inst", err.to_string()))?;
+    let checksum_bytes: Vec<u8> = meta_row
+        .try_get::<Vec<u8>, usize>(3)
+        .map_err(|err| internal_not_committed("pg_backup_decode_checksum", err.to_string()))?;
+
+    if schema_version != i64::from(CANONICAL_SCHEMA_VERSION) {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+    if installation_raw != expected_installation.as_str() {
+        return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+    }
+    if checksum_bytes.as_slice() != manifest_checksum().as_bytes().as_slice() {
+        return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
+    }
+
+    let mut histories = Vec::with_capacity(rows.len().saturating_sub(1));
+    for row in &rows {
+        let kind: i16 = row
+            .try_get::<i16, usize>(0)
+            .map_err(|err| internal_not_committed("pg_backup_decode_kind", err.to_string()))?;
+        if kind != 1 {
+            continue;
+        }
+        let last_seq_i64: i64 = row
+            .try_get::<i64, usize>(1)
+            .map_err(|err| internal_not_committed("pg_backup_decode_seq", err.to_string()))?;
+        let sid_raw: String = row
+            .try_get::<String, usize>(2)
+            .map_err(|err| internal_not_committed("pg_backup_decode_sid", err.to_string()))?;
+        let inc_bytes: Vec<u8> = row
+            .try_get::<Vec<u8>, usize>(3)
+            .map_err(|err| internal_not_committed("pg_backup_decode_inc", err.to_string()))?;
+
+        let space_id = SpaceId::parse(&sid_raw).map_err(|_| {
+            internal_not_committed("corrupt_pg_backup_space_id", "invalid SpaceId in spaces")
+        })?;
+        let inc_arr: [u8; 16] = inc_bytes.try_into().map_err(|_| {
+            internal_not_committed("corrupt_pg_backup_inc", "history_incarnation != 16B")
+        })?;
+        let after = i64_to_space_seq(last_seq_i64)?;
+        histories.push(ChangeCursor {
+            scope: HistoryScope {
+                space_id,
+                incarnation: HistoryIncarnation::from_bytes(inc_arr),
+            },
+            after,
+        });
+    }
+
+    Ok(BackupWitness {
+        installation: expected_installation.clone(),
+        histories,
+        canaries: Vec::new(),
+    })
+}
+
+struct HashingSpoolWriter {
+    writer: BufWriter<File>,
+    body_hasher: blake3::Hasher,
+    whole_hasher: blake3::Hasher,
+    bytes_written: u64,
+    started: Instant,
+    budget: BackupBudget,
+}
+
+impl HashingSpoolWriter {
+    fn new(file: File, started: Instant, budget: BackupBudget) -> Self {
+        Self {
+            writer: BufWriter::with_capacity(STREAM_IO_BUF_BYTES, file),
+            body_hasher: blake3::Hasher::new(),
+            whole_hasher: blake3::Hasher::new(),
+            bytes_written: 0,
+            started,
+            budget,
+        }
+    }
+
+    fn write_body(&mut self, bytes: &[u8]) -> Result<(), PortError> {
+        let next_bytes = self.bytes_written.saturating_add(bytes.len() as u64);
+        self.budget.check(BackupProgress {
+            elapsed: self.started.elapsed(),
+            pinned_wal_bytes: 0,
+            spool_bytes: next_bytes,
+        })?;
+        self.writer
+            .write_all(bytes)
+            .map_err(|err| internal_not_committed("pg_spool_write", err.to_string()))?;
+        self.body_hasher.update(bytes);
+        self.whole_hasher.update(bytes);
+        self.bytes_written = next_bytes;
+        Ok(())
+    }
+
+    fn finish_trailer_and_into_file(mut self) -> Result<(File, u64, ContentDigest), PortError> {
+        let body_digest = *self.body_hasher.finalize().as_bytes();
+        let next_bytes = self.bytes_written.saturating_add(32);
+        self.budget.check(BackupProgress {
+            elapsed: self.started.elapsed(),
+            pinned_wal_bytes: 0,
+            spool_bytes: next_bytes,
+        })?;
+        self.writer
+            .write_all(&body_digest)
+            .map_err(|err| internal_not_committed("pg_spool_write_trailer", err.to_string()))?;
+        self.whole_hasher.update(&body_digest);
+        self.bytes_written = next_bytes;
+        self.writer
+            .flush()
+            .map_err(|err| internal_not_committed("pg_spool_flush", err.to_string()))?;
+        let file = self.writer.into_inner().map_err(|err| {
+            internal_not_committed("pg_spool_into_inner", err.error().to_string())
+        })?;
+        let whole_digest = ContentDigest::from_bytes(*self.whole_hasher.finalize().as_bytes());
+        Ok((file, self.bytes_written, whole_digest))
+    }
+}
+
+async fn run_pg_query_bounded<F, T>(
+    started: Instant,
+    budget: BackupBudget,
+    cancellation: &Cancellation,
+    fut: F,
+) -> Result<T, PortError>
+where
+    F: std::future::Future<Output = Result<T, sqlx::Error>>,
+{
+    if cancellation.is_cancelled() {
+        return Err(cancelled_not_committed(
+            "pg_backup_cancelled",
+            "PostgreSQL backup spool cancelled",
+        ));
+    }
+    let elapsed = started.elapsed();
+    if elapsed > budget.deadline {
+        return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+    }
+    let rem = budget.deadline.saturating_sub(elapsed);
+    if rem.is_zero() {
+        return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+    }
+    match tokio::time::timeout(rem, fut).await {
+        Ok(Ok(v)) => {
+            if cancellation.is_cancelled() {
+                return Err(cancelled_not_committed(
+                    "pg_backup_cancelled",
+                    "PostgreSQL backup spool cancelled",
+                ));
+            }
+            Ok(v)
+        }
+        Ok(Err(err)) => {
+            if cancellation.is_cancelled() {
+                return Err(cancelled_not_committed(
+                    "pg_backup_cancelled",
+                    "PostgreSQL backup spool cancelled",
+                ));
+            }
+            // Query canceled due to statement_timeout maps cleanly to BudgetExceeded.
+            if let Some(db_err) = err.as_database_error()
+                && db_err.code().as_deref() == Some("57014")
+            {
+                return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+            }
+            Err(internal_not_committed("pg_backup_query", err.to_string()))
+        }
+        Err(_) => Err(DomainError::validation(ValidationReason::BudgetExceeded).into()),
+    }
+}
+
+async fn stream_postgres_spool_v1(
+    pg: &mut PgPreparedSource,
+    witness: &BackupWitness,
+    budget: BackupBudget,
+    cancellation: &Cancellation,
+    final_path: &Path,
+    step_delay_us: u64,
+) -> Result<(u64, ContentDigest, BackupExporterMemoryStats), PortError> {
+    let started = Instant::now();
+    let timeout_ms = u64::try_from(budget.deadline.as_millis().max(1)).unwrap_or(30_000);
+
+    let tmp_file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&pg.tmp_path)
+        .map_err(|err| internal_not_committed("open_pg_spool_tmp", err.to_string()))?;
+
+    let mut spool_writer = HashingSpoolWriter::new(tmp_file, started, budget);
+    let mut max_slice_seen = 0usize;
+    let mut slice_or_row_ops = 0u64;
+
+    let stream_res: Result<(File, u64, ContentDigest), PortError> = async {
+        let conn = pg.pooled.as_mut().ok_or_else(|| {
+            internal_not_committed("pg_backup_conn_missing", "PostgreSQL pinned connection missing")
+        })?;
+
+        run_pg_query_bounded(
+            started,
+            budget,
+            cancellation,
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SET LOCAL statement_timeout = {timeout_ms}"
+            )))
+            .persistent(false)
+            .execute(&mut **conn),
+        )
+        .await?;
+
+        // Header: magic + schema_version + manifest_checksum + witness_msgpack + table_count
+        spool_writer.write_body(POSTGRES_SPOOL_V1_MAGIC)?;
+        spool_writer.write_body(&CANONICAL_SCHEMA_VERSION.to_be_bytes())?;
+        spool_writer.write_body(manifest_checksum().as_bytes())?;
+
+        let witness_wire = WireBackupWitnessV1::from(witness);
+        let witness_bytes = encode_msgpack(&witness_wire)?;
+        let witness_len = u32::try_from(witness_bytes.len()).map_err(|_| {
+            internal_not_committed("pg_spool_witness_too_large", "witness > u32::MAX")
+        })?;
+        spool_writer.write_body(&witness_len.to_be_bytes())?;
+        spool_writer.write_body(&witness_bytes)?;
+
+        let table_count = u32::try_from(CANONICAL_TABLES.len()).expect("34 tables fit in u32");
+        spool_writer.write_body(&table_count.to_be_bytes())?;
+
+        for (t_idx, table) in CANONICAL_TABLES.iter().enumerate() {
+            let name_bytes = table.name.as_bytes();
+            let name_len = u16::try_from(name_bytes.len()).expect("table name fits in u16");
+            spool_writer.write_body(&name_len.to_be_bytes())?;
+            spool_writer.write_body(name_bytes)?;
+
+            let col_count = u16::try_from(table.columns.len()).expect("col count fits in u16");
+            spool_writer.write_body(&col_count.to_be_bytes())?;
+
+            let pk_order = table
+                .primary_key
+                .iter()
+                .map(|pk| format!("\"{pk}\" ASC"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let cursor_name = format!("backup_cur_{t_idx}");
+            let declare_sql = format!(
+                "DECLARE {cursor_name} NO SCROLL CURSOR FOR SELECT ctid::text FROM \"{}\" ORDER BY {pk_order}",
+                table.name
+            );
+            let fetch_sql = format!("FETCH 1 FROM {cursor_name}");
+            let close_sql = format!("CLOSE {cursor_name}");
+
+            let meta_projections = table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(c_idx, c)| match c.kind {
+                    LogicalColKind::Int => format!("\"{}\"::BIGINT AS m{c_idx}", c.name),
+                    LogicalColKind::Text => {
+                        format!(
+                            "octet_length(convert_to(\"{}\", 'UTF8'))::BIGINT AS m{c_idx}",
+                            c.name
+                        )
+                    }
+                    LogicalColKind::Bytes => {
+                        format!("octet_length(\"{}\")::BIGINT AS m{c_idx}", c.name)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let meta_sql = format!(
+                "SELECT {meta_projections} FROM \"{}\" WHERE ctid = $1::tid",
+                table.name
+            );
+
+            run_pg_query_bounded(
+                started,
+                budget,
+                cancellation,
+                sqlx::query(sqlx::AssertSqlSafe(declare_sql))
+                    .persistent(false)
+                    .execute(&mut **conn),
+            )
+            .await?;
+
+            let mut row_count = 0u64;
+            loop {
+                if step_delay_us > 0 {
+                    sleep_async_interruptible(
+                        Duration::from_micros(step_delay_us),
+                        started,
+                        budget.deadline,
+                        cancellation,
+                    )
+                    .await?;
+                }
+
+                let ctid_opt: Option<String> = run_pg_query_bounded(
+                    started,
+                    budget,
+                    cancellation,
+                    sqlx::query_scalar(sqlx::AssertSqlSafe(fetch_sql.clone()))
+                        .persistent(false)
+                        .fetch_optional(&mut **conn),
+                )
+                .await?;
+
+                let Some(ctid_str) = ctid_opt else {
+                    break;
+                };
+
+                // Row frame present tag = 1 (`ctid` is NEVER written to the spool artifact!).
+                spool_writer.write_body(&[1u8])?;
+                row_count += 1;
+                slice_or_row_ops += 1;
+
+                let meta_row = run_pg_query_bounded(
+                    started,
+                    budget,
+                    cancellation,
+                    sqlx::query(sqlx::AssertSqlSafe(meta_sql.clone()))
+                        .bind(&ctid_str)
+                        .persistent(false)
+                        .fetch_one(&mut **conn),
+                )
+                .await?;
+
+                for (c_idx, col) in table.columns.iter().enumerate() {
+                    let meta_val: Option<i64> = meta_row.try_get(c_idx).map_err(|err| {
+                        internal_not_committed("pg_backup_meta_col", err.to_string())
+                    })?;
+
+                    match (meta_val, col.kind) {
+                        (None, _) => {
+                            if !col.nullable {
+                                return Err(internal_not_committed(
+                                    "pg_backup_unexpected_null",
+                                    format!("unexpected NULL in {}.{}", table.name, col.name),
+                                ));
+                            }
+                            spool_writer.write_body(&[0u8])?;
+                        }
+                        (Some(int_val), LogicalColKind::Int) => {
+                            spool_writer.write_body(&[1u8])?;
+                            spool_writer.write_body(&int_val.to_be_bytes())?;
+                        }
+                        (Some(byte_len_i64), LogicalColKind::Text | LogicalColKind::Bytes) => {
+                            let total_len = u64::try_from(byte_len_i64).map_err(|_| {
+                                internal_not_committed(
+                                    "pg_backup_neg_octet_len",
+                                    "negative octet_length",
+                                )
+                            })?;
+                            spool_writer.write_body(&[1u8])?;
+                            spool_writer.write_body(&total_len.to_be_bytes())?;
+
+                            if total_len > 0 {
+                                let slice_sql = match col.kind {
+                                    LogicalColKind::Text => format!(
+                                        "SELECT substring(convert_to(\"{}\", 'UTF8') FROM $2 FOR $3) FROM \"{}\" WHERE ctid = $1::tid",
+                                        col.name, table.name
+                                    ),
+                                    LogicalColKind::Bytes => format!(
+                                        "SELECT substring(\"{}\" FROM $2 FOR $3) FROM \"{}\" WHERE ctid = $1::tid",
+                                        col.name, table.name
+                                    ),
+                                    LogicalColKind::Int => unreachable!(),
+                                };
+
+                                let mut offset = 0u64;
+                                while offset < total_len {
+                                    if step_delay_us > 0 {
+                                        sleep_async_interruptible(
+                                            Duration::from_micros(step_delay_us),
+                                            started,
+                                            budget.deadline,
+                                            cancellation,
+                                        )
+                                        .await?;
+                                    }
+                                    let want_usize =
+                                        ((total_len - offset).min(PG_SLICE_MAX_BYTES as u64))
+                                            as usize;
+                                    let start_1based =
+                                        i32::try_from(offset + 1).map_err(|_| {
+                                            internal_not_committed(
+                                                "pg_slice_offset_overflow",
+                                                "column exceeds 2 GiB PostgreSQL toast limit",
+                                            )
+                                        })?;
+                                    let want_i32 = want_usize as i32;
+
+                                    let slice: Vec<u8> = run_pg_query_bounded(
+                                        started,
+                                        budget,
+                                        cancellation,
+                                        sqlx::query_scalar(sqlx::AssertSqlSafe(slice_sql.clone()))
+                                            .bind(&ctid_str)
+                                            .bind(start_1based)
+                                            .bind(want_i32)
+                                            .persistent(false)
+                                            .fetch_one(&mut **conn),
+                                    )
+                                    .await?;
+
+                                    if slice.len() != want_usize {
+                                        return Err(internal_not_committed(
+                                            "pg_slice_len_mismatch",
+                                            format!(
+                                                "expected {want_usize}B slice for {}.{}, got {}B",
+                                                table.name,
+                                                col.name,
+                                                slice.len()
+                                            ),
+                                        ));
+                                    }
+                                    max_slice_seen = max_slice_seen.max(slice.len());
+                                    let chunk_u32 = slice.len() as u32;
+                                    spool_writer.write_body(&chunk_u32.to_be_bytes())?;
+                                    spool_writer.write_body(&slice)?;
+                                    offset += slice.len() as u64;
+                                    slice_or_row_ops += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // End-of-table row marker = 0 followed by verified row_count.
+            spool_writer.write_body(&[0u8])?;
+            spool_writer.write_body(&row_count.to_be_bytes())?;
+
+            run_pg_query_bounded(
+                started,
+                budget,
+                cancellation,
+                sqlx::query(sqlx::AssertSqlSafe(close_sql))
+                    .persistent(false)
+                    .execute(&mut **conn),
+            )
+            .await?;
+        }
+
+        spool_writer.finish_trailer_and_into_file()
+    }
+    .await;
+
+    // Close the REPEATABLE READ source transaction BEFORE fsync/publish or on error!
+    match &stream_res {
+        Ok(_) => {
+            if let Some(mut conn) = pg.pooled.take() {
+                if pg.in_tx {
+                    let _ = sqlx::query("COMMIT").execute(&mut *conn).await;
+                    pg.in_tx = false;
+                }
+            }
+        }
+        Err(_) => {
+            if let Some(pooled) = pg.pooled.take() {
+                let mut raw = pooled.detach();
+                let pool = pg.pool.clone();
+                let pid = pg.backend_pid;
+                pg.in_tx = false;
+                if let Ok(mut cancel_conn) = pool.acquire().await {
+                    let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                        .bind(pid)
+                        .execute(&mut *cancel_conn)
+                        .await;
+                }
+                let _ = sqlx::query("ROLLBACK").execute(&mut raw).await;
+                let _ = raw.close().await;
+            }
+            remove_tmp_artifacts_best_effort(&pg.tmp_path);
+        }
+    }
+
+    let (file, total_bytes, whole_digest) = stream_res?;
+
+    if let Err(err) = file.sync_all() {
+        drop(file);
+        remove_tmp_artifacts_best_effort(&pg.tmp_path);
+        return Err(internal_not_committed(
+            "pg_spool_fsync_tmp",
+            err.to_string(),
+        ));
+    }
+    drop(file);
+
+    if let Err(err) = fs::rename(&pg.tmp_path, final_path) {
+        remove_tmp_artifacts_best_effort(&pg.tmp_path);
+        return Err(internal_not_committed("pg_spool_rename", err.to_string()));
+    }
+    fsync_parent_dir(final_path)?;
+
+    let max_chunk = max_slice_seen.max(STREAM_IO_BUF_BYTES);
+    let working_bytes = STREAM_IO_BUF_BYTES + PG_SLICE_MAX_BYTES;
+
+    Ok((
+        total_bytes,
+        whole_digest,
+        BackupExporterMemoryStats {
+            encoding: BackupArtifactEncoding::PostgresSpoolV1,
+            max_chunk_buffer_bytes: max_chunk,
+            max_working_buffer_bytes: working_bytes,
+            total_bytes_written: total_bytes,
+            step_or_slice_count: slice_or_row_ops,
+        },
+    ))
+}
+
+async fn sleep_async_interruptible(
+    total: Duration,
+    started: Instant,
+    deadline: Duration,
+    cancellation: &Cancellation,
+) -> Result<(), PortError> {
+    let target = tokio::time::Instant::now() + total;
+    while tokio::time::Instant::now() < target {
+        if cancellation.is_cancelled() {
+            return Err(cancelled_not_committed(
+                "pg_backup_cancelled",
+                "PostgreSQL backup cancelled",
+            ));
+        }
+        if started.elapsed() > deadline {
+            return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+        }
+        let rem = target.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(rem.min(Duration::from_millis(5))).await;
+    }
+    Ok(())
+}
+
+/// Streaming independent decoder and verifier for `PostgresSpoolV1` artifacts.
+pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, PortError> {
+    let file = File::open(path)
+        .map_err(|err| internal_not_committed("open_pg_spool_decode", err.to_string()))?;
+    let total_file_len = file
+        .metadata()
+        .map_err(|err| internal_not_committed("stat_pg_spool_decode", err.to_string()))?
+        .len();
+    if total_file_len < (POSTGRES_SPOOL_V1_MAGIC.len() as u64 + 4 + 32 + 4 + 4 + 32) {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+    let body_limit = total_file_len - 32;
+
+    struct HashingReader<R> {
+        inner: R,
+        hasher: blake3::Hasher,
+        pos: u64,
+    }
+
+    impl<R: Read> HashingReader<R> {
+        fn read_exact_body(&mut self, buf: &mut [u8], body_limit: u64) -> Result<(), PortError> {
+            if self.pos.saturating_add(buf.len() as u64) > body_limit {
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            }
+            self.inner
+                .read_exact(buf)
+                .map_err(|err| internal_not_committed("read_pg_spool_body", err.to_string()))?;
+            self.hasher.update(buf);
+            self.pos += buf.len() as u64;
+            Ok(())
+        }
+    }
+
+    let mut reader = HashingReader {
+        inner: BufReader::with_capacity(STREAM_IO_BUF_BYTES, file),
+        hasher: blake3::Hasher::new(),
+        pos: 0,
+    };
+
+    let mut magic = [0u8; POSTGRES_SPOOL_V1_MAGIC.len()];
+    reader.read_exact_body(&mut magic, body_limit)?;
+    if magic != POSTGRES_SPOOL_V1_MAGIC {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+
+    let mut u32_buf = [0u8; 4];
+    reader.read_exact_body(&mut u32_buf, body_limit)?;
+    let schema_version = u32::from_be_bytes(u32_buf);
+    if schema_version != CANONICAL_SCHEMA_VERSION {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+
+    let mut checksum_buf = [0u8; 32];
+    reader.read_exact_body(&mut checksum_buf, body_limit)?;
+    let observed_checksum = ContentDigest::from_bytes(checksum_buf);
+    if observed_checksum != manifest_checksum() {
+        return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
+    }
+
+    reader.read_exact_body(&mut u32_buf, body_limit)?;
+    let witness_len = u32::from_be_bytes(u32_buf) as usize;
+    if witness_len > MAX_MSGPACK_DECODE_BYTES {
+        return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+    }
+    let mut witness_bytes = vec![0u8; witness_len];
+    reader.read_exact_body(&mut witness_bytes, body_limit)?;
+    let wire_witness: WireBackupWitnessV1 =
+        decode_msgpack_bounded(&witness_bytes, MAX_MSGPACK_DECODE_BYTES)?;
+    let witness: BackupWitness = wire_witness.into();
+
+    reader.read_exact_body(&mut u32_buf, body_limit)?;
+    let table_count = u32::from_be_bytes(u32_buf) as usize;
+    if table_count != CANONICAL_TABLES.len() {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+
+    let mut tables = Vec::with_capacity(table_count);
+    let mut u16_buf = [0u8; 2];
+    let mut u64_buf = [0u8; 8];
+    let mut tag_buf = [0u8; 1];
+
+    for expected_table in CANONICAL_TABLES {
+        reader.read_exact_body(&mut u16_buf, body_limit)?;
+        let name_len = u16::from_be_bytes(u16_buf) as usize;
+        let mut name_bytes = vec![0u8; name_len];
+        reader.read_exact_body(&mut name_bytes, body_limit)?;
+        let table_name = String::from_utf8(name_bytes)
+            .map_err(|_| DomainError::validation(ValidationReason::InvalidState))?;
+        if table_name != expected_table.name {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+
+        reader.read_exact_body(&mut u16_buf, body_limit)?;
+        let col_count = u16::from_be_bytes(u16_buf) as usize;
+        if col_count != expected_table.columns.len() {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+
+        let mut rows = Vec::new();
+        loop {
+            reader.read_exact_body(&mut tag_buf, body_limit)?;
+            match tag_buf[0] {
+                0 => break,
+                1 => {
+                    let mut row_vals = Vec::with_capacity(col_count);
+                    for col_spec in expected_table.columns {
+                        reader.read_exact_body(&mut tag_buf, body_limit)?;
+                        match tag_buf[0] {
+                            0 => {
+                                if !col_spec.nullable {
+                                    return Err(DomainError::validation(
+                                        ValidationReason::InvalidState,
+                                    )
+                                    .into());
+                                }
+                                row_vals.push(PostgresSpoolValue::Null);
+                            }
+                            1 => match col_spec.kind {
+                                LogicalColKind::Int => {
+                                    reader.read_exact_body(&mut u64_buf, body_limit)?;
+                                    row_vals
+                                        .push(PostgresSpoolValue::Int(i64::from_be_bytes(u64_buf)));
+                                }
+                                LogicalColKind::Text | LogicalColKind::Bytes => {
+                                    reader.read_exact_body(&mut u64_buf, body_limit)?;
+                                    let total_len = u64::from_be_bytes(u64_buf);
+                                    let cap = usize::try_from(total_len).map_err(|_| {
+                                        DomainError::validation(ValidationReason::BudgetExceeded)
+                                    })?;
+                                    let mut assembled = Vec::with_capacity(cap);
+                                    let mut read_so_far = 0u64;
+                                    while read_so_far < total_len {
+                                        reader.read_exact_body(&mut u32_buf, body_limit)?;
+                                        let chunk_len = u32::from_be_bytes(u32_buf) as usize;
+                                        if chunk_len == 0
+                                            || chunk_len > PG_SLICE_MAX_BYTES
+                                            || read_so_far + (chunk_len as u64) > total_len
+                                        {
+                                            return Err(DomainError::validation(
+                                                ValidationReason::InvalidState,
+                                            )
+                                            .into());
+                                        }
+                                        let prev = assembled.len();
+                                        assembled.resize(prev + chunk_len, 0);
+                                        reader.read_exact_body(
+                                            &mut assembled[prev..prev + chunk_len],
+                                            body_limit,
+                                        )?;
+                                        read_so_far += chunk_len as u64;
+                                    }
+                                    if col_spec.kind == LogicalColKind::Text {
+                                        let s = String::from_utf8(assembled).map_err(|_| {
+                                            DomainError::validation(ValidationReason::InvalidState)
+                                        })?;
+                                        row_vals.push(PostgresSpoolValue::Text(s));
+                                    } else {
+                                        row_vals.push(PostgresSpoolValue::Bytes(assembled));
+                                    }
+                                }
+                            },
+                            _ => {
+                                return Err(DomainError::validation(
+                                    ValidationReason::InvalidState,
+                                )
+                                .into());
+                            }
+                        }
+                    }
+                    rows.push(row_vals);
+                }
+                _ => return Err(DomainError::validation(ValidationReason::InvalidState).into()),
+            }
+        }
+
+        reader.read_exact_body(&mut u64_buf, body_limit)?;
+        let declared_row_count = u64::from_be_bytes(u64_buf);
+        if declared_row_count != rows.len() as u64 {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+
+        tables.push(DecodedPostgresSpoolTable {
+            name: table_name,
+            columns: expected_table
+                .columns
+                .iter()
+                .map(|c| c.name.to_owned())
+                .collect(),
+            rows,
+        });
+    }
+
+    if reader.pos != body_limit {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+
+    let mut trailer = [0u8; 32];
+    reader
+        .inner
+        .read_exact(&mut trailer)
+        .map_err(|err| internal_not_committed("read_pg_spool_trailer", err.to_string()))?;
+    let expected_body_digest = *reader.hasher.finalize().as_bytes();
+    if trailer != expected_body_digest {
+        return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
+    }
+
+    Ok(DecodedPostgresSpoolV1 {
+        schema_version,
+        manifest_checksum: observed_checksum,
+        witness,
+        tables,
+    })
+}
+
+// ============================================================================
+// Core `BackupParticipantPort` phase handles and `Drop` guarantees
+// ============================================================================
+
+enum PreparedBackendDriver {
+    Sqlite(SqliteBackupWorkerHandle),
+    Postgres(PgPreparedSource),
+}
+
+impl PreparedBackendDriver {
+    fn encoding(&self) -> BackupArtifactEncoding {
+        match self {
+            Self::Sqlite(_) => BackupArtifactEncoding::SqliteSnapshotV1,
+            Self::Postgres(_) => BackupArtifactEncoding::PostgresSpoolV1,
+        }
+    }
+
+    fn detach_abort_cleanup(&mut self, inner: &CanonicalInner) {
+        match self {
+            Self::Sqlite(w) => w.detach_abort_cleanup(inner),
+            Self::Postgres(pg) => pg.detach_abort_cleanup(inner),
+        }
+    }
+}
+
+struct CanonicalPreparedBackup {
+    store: CanonicalStore,
+    backup_id: BackupId,
+    artifact_id: ArtifactId,
+    prepare_budget: BackupBudget,
+    spool_dir: PathBuf,
+    driver: Option<PreparedBackendDriver>,
+}
+
+impl Drop for CanonicalPreparedBackup {
+    fn drop(&mut self) {
+        if let Some(mut drv) = self.driver.take() {
+            drv.detach_abort_cleanup(&self.store.inner);
+        }
+    }
+}
+
+struct CanonicalBackupHold {
+    store: CanonicalStore,
+    backup_id: BackupId,
+    witness: BackupWitness,
+    released: bool,
+}
+
+impl Drop for CanonicalBackupHold {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let store = self.store.clone();
+        let backup_id = self.backup_id.clone();
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let inner_cl = Arc::clone(&store.inner);
+            let handle = rt.spawn(async move {
+                let _ = delete_backup_hold_rows(&store, &backup_id).await;
+            });
+            register_cleanup_task(&inner_cl, handle);
+        }
+    }
+}
+
+impl BackupHold for CanonicalBackupHold {
+    fn witness(&self) -> &BackupWitness {
+        &self.witness
+    }
+
+    fn release(mut self: Box<Self>) -> PortFuture<'static, ()> {
+        self.released = true;
+        let store = self.store.clone();
+        let backup_id = self.backup_id.clone();
+        Box::pin(async move { delete_backup_hold_rows(&store, &backup_id).await })
+    }
+}
+
+struct CanonicalPausedBackup {
+    store: CanonicalStore,
+    backup_id: BackupId,
+    artifact_id: ArtifactId,
+    prepare_budget: BackupBudget,
+    spool_dir: PathBuf,
+    safe_point: Option<WriterSafePointGuard>,
+    unpinned_driver: Option<PreparedBackendDriver>,
+}
+
+impl Drop for CanonicalPausedBackup {
+    fn drop(&mut self) {
+        // Release writer safe point first so concurrent writers are never stranded.
+        drop(self.safe_point.take());
+        if let Some(mut drv) = self.unpinned_driver.take() {
+            drv.detach_abort_cleanup(&self.store.inner);
+        }
+    }
+}
+
+impl PausedBackup for CanonicalPausedBackup {
+    fn open_cut(&mut self) -> PortFuture<'_, Box<dyn BackupSnapshot>> {
+        Box::pin(async move {
+            if self.safe_point.is_none() {
+                return Err(internal_not_committed(
+                    "backup_pause_already_resumed",
+                    "open_cut called after writer pause was released",
+                ));
+            }
+            let mut drv = self
+                .unpinned_driver
+                .take()
+                .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
+
+            let expected_inst = self.store.inner.config.installation_id.clone();
+            match &mut drv {
+                PreparedBackendDriver::Sqlite(worker) => {
+                    let wal = self.store.inner.wal_coord.get().ok_or_else(|| {
+                        internal_not_committed(
+                            "sqlite_wal_coord_missing",
+                            "SqliteWalCoordinator missing on SQLite store",
+                        )
+                    })?;
+                    let wal_pin = wal.register_backup_pin(self.prepare_budget.max_pinned_wal_bytes);
+
+                    let tx = worker.cmd_tx.as_ref().ok_or_else(|| {
+                        internal_not_committed(
+                            "sqlite_backup_channel_closed",
+                            "SQLite backup worker channel closed",
+                        )
+                    })?;
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    tx.send(SqliteWorkerCmd::OpenCut {
+                        expected_installation: expected_inst,
+                        reply: reply_tx,
+                    })
+                    .map_err(|err| {
+                        internal_not_committed("sqlite_backup_send_open_cut", err.to_string())
+                    })?;
+
+                    let witness = match reply_rx.await {
+                        Ok(Ok(w)) => w,
+                        Ok(Err(err)) => {
+                            drop(wal_pin);
+                            worker.abort_and_join().await;
+                            return Err(err);
+                        }
+                        Err(err) => {
+                            drop(wal_pin);
+                            worker.abort_and_join().await;
+                            return Err(internal_not_committed(
+                                "sqlite_backup_open_cut_eof",
+                                err.to_string(),
+                            ));
+                        }
+                    };
+
+                    Ok(Box::new(CanonicalBackupSnapshot {
+                        store: self.store.clone(),
+                        backup_id: self.backup_id.clone(),
+                        artifact_id: self.artifact_id.clone(),
+                        prepare_budget: self.prepare_budget,
+                        spool_dir: self.spool_dir.clone(),
+                        witness,
+                        state: Some(PinnedSnapshotDriver::Sqlite {
+                            worker: match drv {
+                                PreparedBackendDriver::Sqlite(w) => w,
+                                PreparedBackendDriver::Postgres(_) => unreachable!(),
+                            },
+                            wal_pin,
+                        }),
+                    }) as Box<dyn BackupSnapshot>)
+                }
+                PreparedBackendDriver::Postgres(pg) => {
+                    let conn = pg.pooled.as_mut().ok_or_else(|| {
+                        internal_not_committed(
+                            "pg_backup_conn_missing",
+                            "PostgreSQL backup connection missing",
+                        )
+                    })?;
+                    let pin_res = pin_and_read_pg_witness(
+                        &mut *conn,
+                        &expected_inst,
+                        self.prepare_budget.deadline,
+                    )
+                    .await;
+                    pg.in_tx = true;
+                    let witness = match pin_res {
+                        Ok(w) => w,
+                        Err(err) => {
+                            pg.abort_cleanly().await;
+                            return Err(err);
+                        }
+                    };
+
+                    Ok(Box::new(CanonicalBackupSnapshot {
+                        store: self.store.clone(),
+                        backup_id: self.backup_id.clone(),
+                        artifact_id: self.artifact_id.clone(),
+                        prepare_budget: self.prepare_budget,
+                        spool_dir: self.spool_dir.clone(),
+                        witness,
+                        state: Some(PinnedSnapshotDriver::Postgres(match drv {
+                            PreparedBackendDriver::Postgres(p) => p,
+                            PreparedBackendDriver::Sqlite(_) => unreachable!(),
+                        })),
+                    }) as Box<dyn BackupSnapshot>)
+                }
+            }
+        })
+    }
+
+    fn resume(mut self: Box<Self>) -> PortFuture<'static, ()> {
+        drop(self.safe_point.take());
+        let unpinned = self.unpinned_driver.take();
+        Box::pin(async move {
+            if let Some(drv) = unpinned {
+                match drv {
+                    PreparedBackendDriver::Sqlite(mut w) => w.abort_and_join().await,
+                    PreparedBackendDriver::Postgres(mut p) => p.abort_cleanly().await,
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+enum PinnedSnapshotDriver {
+    Sqlite {
+        worker: SqliteBackupWorkerHandle,
+        wal_pin: BackupWalPinGuard,
+    },
+    Postgres(PgPreparedSource),
+}
+
+struct CanonicalBackupSnapshot {
+    store: CanonicalStore,
+    backup_id: BackupId,
+    artifact_id: ArtifactId,
+    prepare_budget: BackupBudget,
+    spool_dir: PathBuf,
+    witness: BackupWitness,
+    state: Option<PinnedSnapshotDriver>,
+}
+
+impl Drop for CanonicalBackupSnapshot {
+    fn drop(&mut self) {
+        if let Some(st) = self.state.take() {
+            match st {
+                PinnedSnapshotDriver::Sqlite {
+                    mut worker,
+                    wal_pin,
+                } => {
+                    // Drop wal_pin inside worker cleanup after source closes.
+                    worker.cancel_flag.store(true, Ordering::SeqCst);
+                    worker.interrupt_handle.interrupt();
+                    if let Some(tx) = worker.cmd_tx.take() {
+                        let _ = tx.try_send(SqliteWorkerCmd::Abort { reply: None });
+                        drop(tx);
+                    }
+                    let tmp = worker.tmp_path.clone();
+                    if let Some(jh) = worker.join_handle.take() {
+                        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                            let inner_cl = Arc::clone(&self.store.inner);
+                            let handle = rt.spawn_blocking(move || {
+                                let _ = jh.join();
+                                drop(wal_pin);
+                                remove_tmp_artifacts_best_effort(&tmp);
+                            });
+                            register_cleanup_task(&inner_cl, handle);
+                        } else {
+                            let _ = jh.join();
+                            drop(wal_pin);
+                            remove_tmp_artifacts_best_effort(&tmp);
+                        }
+                    } else {
+                        drop(wal_pin);
+                        remove_tmp_artifacts_best_effort(&tmp);
+                    }
+                }
+                PinnedSnapshotDriver::Postgres(mut pg) => {
+                    pg.detach_abort_cleanup(&self.store.inner);
+                }
+            }
+        }
+    }
+}
+
+impl BackupSnapshot for CanonicalBackupSnapshot {
+    fn witness(&self) -> &BackupWitness {
+        &self.witness
+    }
+
+    fn spool(
+        &mut self,
+        budget: BackupBudget,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, BackupSpool> {
+        Box::pin(async move {
+            if cancellation.is_cancelled() {
+                if let Some(st) = self.state.take() {
+                    abort_pinned_driver(st).await;
+                }
+                return Err(cancelled_not_committed(
+                    "backup_spool_cancelled_pre_start",
+                    "backup spool cancelled before start",
+                ));
+            }
+            validate_backup_budget(budget)?;
+            let eff_budget = tighten_budget(self.prepare_budget, budget);
+
+            let Some(pinned) = self.state.take() else {
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            };
+
+            let step_delay_us = self.store.inner.backup_step_delay_us.load(Ordering::SeqCst);
+
+            let (encoding, rel_name, bytes, digest, stats) = match pinned {
+                PinnedSnapshotDriver::Sqlite {
+                    mut worker,
+                    wal_pin,
+                } => {
+                    let rel_name = format!(
+                        "{}.{}",
+                        self.artifact_id.as_str(),
+                        BackupArtifactEncoding::SqliteSnapshotV1.extension()
+                    );
+                    let final_path = self.spool_dir.join(&rel_name);
+
+                    let cancel_bridge_stop = Arc::new(AtomicBool::new(false));
+                    let cancel_bridge_stop_cl = Arc::clone(&cancel_bridge_stop);
+                    let worker_cancel_cl = Arc::clone(&worker.cancel_flag);
+                    let interrupt_cl = Arc::clone(&worker.interrupt_handle);
+                    let abort_notify_cl = Arc::clone(&wal_pin.abort_notify);
+                    let caller_cancel_cl = cancellation.clone();
+
+                    let watcher = tokio::spawn(async move {
+                        loop {
+                            if cancel_bridge_stop_cl.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            if caller_cancel_cl.is_cancelled() {
+                                worker_cancel_cl.store(true, Ordering::SeqCst);
+                                interrupt_cl.interrupt();
+                                break;
+                            }
+                            tokio::select! {
+                                _ = abort_notify_cl.notified() => {
+                                    interrupt_cl.interrupt();
+                                    break;
+                                }
+                                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                            }
+                        }
+                    });
+
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    let send_res = worker
+                        .cmd_tx
+                        .as_ref()
+                        .ok_or_else(|| {
+                            internal_not_committed(
+                                "sqlite_backup_tx_missing",
+                                "SQLite backup channel missing",
+                            )
+                        })
+                        .and_then(|tx| {
+                            tx.send(SqliteWorkerCmd::Spool {
+                                budget: eff_budget,
+                                wal_pin,
+                                expected_witness: self.witness.clone(),
+                                final_path: final_path.clone(),
+                                step_delay_us,
+                                reply: reply_tx,
+                            })
+                            .map_err(|err| {
+                                internal_not_committed("sqlite_backup_send_spool", err.to_string())
+                            })
+                        });
+
+                    if let Err(err) = send_res {
+                        cancel_bridge_stop.store(true, Ordering::SeqCst);
+                        let _ = watcher.await;
+                        worker.abort_and_join().await;
+                        return Err(err);
+                    }
+
+                    let outcome = reply_rx.await;
+                    cancel_bridge_stop.store(true, Ordering::SeqCst);
+                    let _ = watcher.await;
+
+                    // Join the owner thread so all SQLite handles are guaranteed closed before return.
+                    worker.cmd_tx.take();
+                    if let Some(jh) = worker.join_handle.take() {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = jh.join();
+                        })
+                        .await;
+                    }
+
+                    match outcome {
+                        Ok(Ok(ok)) => (
+                            BackupArtifactEncoding::SqliteSnapshotV1,
+                            rel_name,
+                            ok.bytes,
+                            ok.digest,
+                            ok.stats,
+                        ),
+                        Ok(Err(err)) => {
+                            let _ = fs::remove_file(&final_path);
+                            return Err(err);
+                        }
+                        Err(err) => {
+                            let _ = fs::remove_file(&final_path);
+                            return Err(internal_not_committed(
+                                "sqlite_backup_spool_eof",
+                                err.to_string(),
+                            ));
+                        }
+                    }
+                }
+                PinnedSnapshotDriver::Postgres(mut pg) => {
+                    let rel_name = format!(
+                        "{}.{}",
+                        self.artifact_id.as_str(),
+                        BackupArtifactEncoding::PostgresSpoolV1.extension()
+                    );
+                    let final_path = self.spool_dir.join(&rel_name);
+                    match stream_postgres_spool_v1(
+                        &mut pg,
+                        &self.witness,
+                        eff_budget,
+                        &cancellation,
+                        &final_path,
+                        step_delay_us,
+                    )
+                    .await
+                    {
+                        Ok((bytes, digest, stats)) => (
+                            BackupArtifactEncoding::PostgresSpoolV1,
+                            rel_name,
+                            bytes,
+                            digest,
+                            stats,
+                        ),
+                        Err(err) => {
+                            let _ = fs::remove_file(&final_path);
+                            return Err(err);
+                        }
+                    }
+                }
+            };
+
+            *self
+                .store
+                .inner
+                .last_backup_memory_stats
+                .lock()
+                .expect("backup memory stats mutex") = Some(stats);
+
+            persist_backup_artifact_ready(
+                &self.store,
+                &self.artifact_id,
+                &self.backup_id,
+                encoding,
+                &rel_name,
+                bytes,
+                digest,
+                &self.witness,
+            )
+            .await?;
+
+            Ok(BackupSpool {
+                artifact: self.artifact_id.clone(),
+                bytes,
+                digest,
+                witness: self.witness.clone(),
+            })
+        })
+    }
+
+    fn close(mut self: Box<Self>) -> PortFuture<'static, ()> {
+        let state = self.state.take();
+        Box::pin(async move {
+            if let Some(st) = state {
+                abort_pinned_driver(st).await;
+            }
+            Ok(())
+        })
+    }
+}
+
+async fn abort_pinned_driver(st: PinnedSnapshotDriver) {
+    match st {
+        PinnedSnapshotDriver::Sqlite {
+            mut worker,
+            wal_pin,
+        } => {
+            worker.abort_and_join().await;
+            drop(wal_pin);
+        }
+        PinnedSnapshotDriver::Postgres(mut pg) => {
+            if let Some(pooled) = pg.pooled.take() {
+                let mut raw = pooled.detach();
+                let pool = pg.pool.clone();
+                let pid = pg.backend_pid;
+                pg.in_tx = false;
+                if let Ok(mut cancel_conn) = pool.acquire().await {
+                    let _ = sqlx::query("SELECT pg_cancel_backend($1)")
+                        .bind(pid)
+                        .execute(&mut *cancel_conn)
+                        .await;
+                }
+                let _ = sqlx::query("ROLLBACK").execute(&mut raw).await;
+                let _ = raw.close().await;
+            }
+            remove_tmp_artifacts_best_effort(&pg.tmp_path);
+        }
+    }
+}
+
+impl PreparedBackup for CanonicalPreparedBackup {
+    fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
+        Box::pin(async move {
+            if self.driver.is_none() {
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            }
+            let witness = acquire_durable_backup_holds(&self.store, &self.backup_id).await?;
+            Ok(Box::new(CanonicalBackupHold {
+                store: self.store.clone(),
+                backup_id: self.backup_id.clone(),
+                witness,
+                released: false,
+            }) as Box<dyn BackupHold>)
+        })
+    }
+
+    fn pause_writes(&mut self) -> PortFuture<'_, Box<dyn PausedBackup>> {
+        Box::pin(async move {
+            let drv = self
+                .driver
+                .take()
+                .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
+
+            let safe_point = self.store.inner.writer()?.acquire_safe_point().await;
+
+            Ok(Box::new(CanonicalPausedBackup {
+                store: self.store.clone(),
+                backup_id: self.backup_id.clone(),
+                artifact_id: self.artifact_id.clone(),
+                prepare_budget: self.prepare_budget,
+                spool_dir: self.spool_dir.clone(),
+                safe_point: Some(safe_point),
+                unpinned_driver: Some(drv),
+            }) as Box<dyn PausedBackup>)
+        })
+    }
+}
+
+impl BackupParticipantPort for CanonicalStore {
+    fn prepare(
+        &self,
+        ctx: MaintenanceContext,
+        backup: BackupId,
+        budget: BackupBudget,
+    ) -> PortFuture<'_, Box<dyn PreparedBackup>> {
+        let store = self.clone();
+        Box::pin(async move {
+            ctx.authority.require(ServicePurpose::Backup)?;
+            if ctx.budget.cancellation.is_cancelled() {
+                return Err(cancelled_not_committed(
+                    "backup_prepare_cancelled",
+                    "backup prepare cancelled",
+                ));
+            }
+            if ctx.budget.remaining.is_zero() {
+                return Err(deadline_not_committed(
+                    "backup_prepare_zero_budget",
+                    "backup prepare call budget expired",
+                ));
+            }
+            validate_backup_budget(budget)?;
+            store.ensure_open()?;
+
+            let spool_dir = resolve_spool_dir(&store.inner)?;
+            let artifact_id = mint_artifact_id()?;
+            let tmp_path = spool_dir.join(format!("{}.tmp", artifact_id.as_str()));
+
+            let driver = match (&store.inner.config.sql, &store.inner.sql) {
+                (SqlBackendConfig::Sqlite { data_root, .. }, SqlDriverState::Sqlite { .. }) => {
+                    let src_path = data_root.canonical();
+                    let worker = SqliteBackupWorkerHandle::spawn(src_path, tmp_path)?;
+                    PreparedBackendDriver::Sqlite(worker)
+                }
+                (_, SqlDriverState::Postgres { pool, .. }) => {
+                    let pre_file = create_private_tmp_file(&tmp_path)?;
+                    drop(pre_file);
+
+                    let mut pooled = match pool.acquire().await {
+                        Ok(c) => c,
+                        Err(err) => {
+                            remove_tmp_artifacts_best_effort(&tmp_path);
+                            return Err(unavailable_retryable(
+                                "pg_backup_prepare_acquire",
+                                err.to_string(),
+                                Duration::from_millis(50),
+                            ));
+                        }
+                    };
+                    let backend_pid: i32 = match warm_pg_backup_connection(&mut *pooled).await {
+                        Ok(pid) => pid,
+                        Err(err) => {
+                            remove_tmp_artifacts_best_effort(&tmp_path);
+                            return Err(err);
+                        }
+                    };
+                    PreparedBackendDriver::Postgres(PgPreparedSource {
+                        pool: pool.clone(),
+                        pooled: Some(pooled),
+                        backend_pid,
+                        in_tx: false,
+                        tmp_path,
+                    })
+                }
+                _ => {
+                    remove_tmp_artifacts_best_effort(&tmp_path);
+                    return Err(internal_not_committed(
+                        "backup_driver_mismatch",
+                        "SQL config and runtime state mismatch",
+                    ));
+                }
+            };
+
+            let _ = driver.encoding();
+
+            Ok(Box::new(CanonicalPreparedBackup {
+                store,
+                backup_id: backup,
+                artifact_id,
+                prepare_budget: budget,
+                spool_dir,
+                driver: Some(driver),
+            }) as Box<dyn PreparedBackup>)
+        })
+    }
+
+    fn restore_cursors(
+        &self,
+        ctx: MaintenanceContext,
+        restored: Vec<ChangeCursor>,
+    ) -> PortFuture<'_, ()> {
+        let store = self.clone();
+        Box::pin(async move {
+            ctx.authority.require(ServicePurpose::Restore)?;
+            if ctx.budget.cancellation.is_cancelled() {
+                return Err(cancelled_not_committed(
+                    "restore_cursors_cancelled",
+                    "restore_cursors cancelled",
+                ));
+            }
+            if ctx.budget.remaining.is_zero() {
+                return Err(deadline_not_committed(
+                    "restore_cursors_zero_budget",
+                    "restore_cursors call budget expired",
+                ));
+            }
+            store.ensure_open()?;
+
+            if restored.is_empty() {
+                return Ok(());
+            }
+
+            let mut seen_spaces = BTreeSet::new();
+            for cur in &restored {
+                if !seen_spaces.insert(cur.scope.space_id.clone()) {
+                    return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
+                }
+            }
+
+            // Acquire exclusive writer safe point so zero concurrent batch or auxiliary writes race restore_cursors.
+            let _safe_point = store.inner.writer()?.acquire_safe_point().await;
+
+            let restored_cl = restored.clone();
+            store
+                .with_write_tx_unfenced(|tx| {
+                    Box::pin(async move {
+                        for cur in &restored_cl {
+                            apply_restore_cursor_tx(tx, cur).await?;
+                        }
+                        Ok(())
+                    })
+                })
+                .await?;
+
+            // Clear per-Space in-memory caches, clamp watermarks, re-seed collab fences, and notify subscribers.
+            store.inner.clear_pg_immutable_caches();
+            for cur in &restored {
+                store.inner.room_fences.remove_space(&cur.scope.space_id);
+                store.inner.job_reads.remove_space(&cur.scope.space_id);
+                store
+                    .inner
+                    .broadcast_hub
+                    .rebind_and_clamp_watermarks(&cur.scope, cur.after);
+                store
+                    .inner
+                    .broadcast_hub
+                    .publish(BroadcastSignal::IncarnationChanged {
+                        new_scope: cur.scope.clone(),
+                        ceiling: cur.after,
+                    });
+            }
+
+            reseed_collab_fences_after_restore(&store).await?;
+            Ok(())
+        })
+    }
+}
+
+// ============================================================================
+// Durable SQL helpers for `backup_holds`, `backup_artifacts`, `restore_cursors`
+// ============================================================================
+
+async fn acquire_durable_backup_holds(
+    store: &CanonicalStore,
+    backup_id: &BackupId,
+) -> Result<BackupWitness, PortError> {
+    let bid = backup_id.clone();
+    let inst_id = store.inner.config.installation_id.clone();
+    let now_ms = now_unix_ms()?;
+
+    store
+        .with_write_tx(|tx| {
+            Box::pin(async move {
+                let spaces: Vec<(String, Vec<u8>, i64)> = match tx {
+                    BackendConn::Sqlite(conn) => {
+                        let rows = sqlx::query(
+                            "SELECT space_id, history_incarnation, last_seq
+                             FROM spaces
+                             ORDER BY space_id ASC",
+                        )
+                        .fetch_all(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("sqlite_hold_scan_spaces", err.to_string())
+                        })?;
+                        rows.into_iter()
+                            .map(|r| {
+                                (
+                                    r.get("space_id"),
+                                    r.get("history_incarnation"),
+                                    r.get("last_seq"),
+                                )
+                            })
+                            .collect()
+                    }
+                    BackendConn::Postgres(conn) => {
+                        let rows = sqlx::query(
+                            "SELECT space_id, history_incarnation, last_seq
+                             FROM spaces
+                             ORDER BY space_id ASC
+                             FOR UPDATE",
+                        )
+                        .fetch_all(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("pg_hold_scan_spaces", err.to_string())
+                        })?;
+                        rows.into_iter()
+                            .map(|r| {
+                                (
+                                    r.get("space_id"),
+                                    r.get("history_incarnation"),
+                                    r.get("last_seq"),
+                                )
+                            })
+                            .collect()
+                    }
+                };
+
+                let mut histories = Vec::with_capacity(spaces.len());
+                for (sid_raw, inc_bytes, last_seq_i64) in &spaces {
+                    let space_id = SpaceId::parse(sid_raw).map_err(|_| {
+                        internal_not_committed("corrupt_hold_space_id", "invalid SpaceId")
+                    })?;
+                    let inc_arr: [u8; 16] = inc_bytes.as_slice().try_into().map_err(|_| {
+                        internal_not_committed("corrupt_hold_inc", "history_incarnation != 16B")
+                    })?;
+                    let after = i64_to_space_seq(*last_seq_i64)?;
+
+                    // Mutual exclusion with incomplete purges and pending CAS retirements!
+                    if has_incomplete_pending_purges_tx(tx, &space_id).await?
+                        || has_pending_blob_retirements_tx(tx, &space_id).await?
+                    {
+                        return Err(unavailable_retryable(
+                            "backup_blocked_by_active_purge",
+                            "cannot acquire backup hold while a purge or CAS retirement is incomplete",
+                            Duration::from_millis(100),
+                        ));
+                    }
+
+                    histories.push(ChangeCursor {
+                        scope: HistoryScope {
+                            space_id,
+                            incarnation: HistoryIncarnation::from_bytes(inc_arr),
+                        },
+                        after,
+                    });
+                }
+
+                let witness = BackupWitness {
+                    installation: inst_id.clone(),
+                    histories,
+                    canaries: Vec::new(),
+                };
+                let witness_json = encode_witness_json(&witness)?;
+
+                for cur in &witness.histories {
+                    let cutoff_i64 = cur.after.get() as i64;
+                    match tx {
+                        BackendConn::Sqlite(conn) => {
+                            sqlx::query(
+                                "INSERT INTO backup_holds (
+                                    backup_id, space_id, history_incarnation, owner_installation_id,
+                                    phase, cutoff_seq, witness_json, created_at_ms
+                                ) VALUES (?, ?, ?, ?, 'holding', ?, ?, ?)
+                                ON CONFLICT (backup_id, space_id) DO UPDATE SET
+                                    history_incarnation = excluded.history_incarnation,
+                                    phase = 'holding',
+                                    cutoff_seq = excluded.cutoff_seq,
+                                    witness_json = excluded.witness_json",
+                            )
+                            .bind(bid.as_str())
+                            .bind(cur.scope.space_id.as_str())
+                            .bind(cur.scope.incarnation.as_bytes().as_slice())
+                            .bind(inst_id.as_str())
+                            .bind(cutoff_i64)
+                            .bind(&witness_json)
+                            .bind(now_ms)
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("sqlite_insert_backup_hold", err.to_string())
+                            })?;
+                        }
+                        BackendConn::Postgres(conn) => {
+                            sqlx::query(
+                                "INSERT INTO backup_holds (
+                                    backup_id, space_id, history_incarnation, owner_installation_id,
+                                    phase, cutoff_seq, witness_json, created_at_ms
+                                ) VALUES ($1, $2, $3, $4, 'holding', $5, $6, $7)
+                                ON CONFLICT (backup_id, space_id) DO UPDATE SET
+                                    history_incarnation = EXCLUDED.history_incarnation,
+                                    phase = 'holding',
+                                    cutoff_seq = EXCLUDED.cutoff_seq,
+                                    witness_json = EXCLUDED.witness_json",
+                            )
+                            .bind(bid.as_str())
+                            .bind(cur.scope.space_id.as_str())
+                            .bind(cur.scope.incarnation.as_bytes().as_slice())
+                            .bind(inst_id.as_str())
+                            .bind(cutoff_i64)
+                            .bind(&witness_json)
+                            .bind(now_ms)
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("pg_insert_backup_hold", err.to_string())
+                            })?;
+                        }
+                    }
+                }
+
+                Ok(witness)
+            })
+        })
+        .await
+}
+
+async fn has_pending_blob_retirements_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+) -> Result<bool, PortError> {
+    let found: Option<i64> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT 1 FROM blob_retirements WHERE space_id = ? AND status = 'pending' LIMIT 1",
+        )
+        .bind(space_id.as_str())
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_check_pending_retirements", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT 1::BIGINT FROM blob_retirements WHERE space_id = $1 AND status = 'pending' LIMIT 1",
+        )
+        .bind(space_id.as_str())
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_check_pending_retirements", err.to_string()))?,
+    };
+    Ok(found.is_some())
+}
+
+async fn delete_backup_hold_rows(
+    store: &CanonicalStore,
+    backup_id: &BackupId,
+) -> Result<(), PortError> {
+    let bid = backup_id.clone();
+    store
+        .with_write_tx(|tx| {
+            Box::pin(async move {
+                match tx {
+                    BackendConn::Sqlite(conn) => {
+                        sqlx::query("DELETE FROM backup_holds WHERE backup_id = ?")
+                            .bind(bid.as_str())
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("sqlite_delete_backup_hold", err.to_string())
+                            })?;
+                    }
+                    BackendConn::Postgres(conn) => {
+                        sqlx::query("DELETE FROM backup_holds WHERE backup_id = $1")
+                            .bind(bid.as_str())
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("pg_delete_backup_hold", err.to_string())
+                            })?;
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_backup_artifact_ready(
+    store: &CanonicalStore,
+    artifact_id: &ArtifactId,
+    backup_id: &BackupId,
+    encoding: BackupArtifactEncoding,
+    rel_path: &str,
+    byte_size: u64,
+    digest: ContentDigest,
+    witness: &BackupWitness,
+) -> Result<(), PortError> {
+    let aid = artifact_id.clone();
+    let bid = backup_id.clone();
+    let inst = witness.installation.clone();
+    let rel_owned = rel_path.to_owned();
+    let witness_json = encode_witness_json(witness)?;
+    let now_ms = now_unix_ms()?;
+    let byte_size_i64 = i64::try_from(byte_size)
+        .map_err(|_| DomainError::validation(ValidationReason::BudgetExceeded))?;
+    let histories = witness.histories.clone();
+
+    store
+        .with_write_tx(|tx| {
+            Box::pin(async move {
+                match tx {
+                    BackendConn::Sqlite(conn) => {
+                        sqlx::query(
+                            "INSERT INTO backup_artifacts (
+                                artifact_id, backup_id, installation_id, encoding, schema_version,
+                                artifact_rel_path, byte_size, content_blake3, witness_json, state, created_at_ms
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?)",
+                        )
+                        .bind(aid.as_str())
+                        .bind(bid.as_str())
+                        .bind(inst.as_str())
+                        .bind(encoding.as_db_str())
+                        .bind(i64::from(CANONICAL_SCHEMA_VERSION))
+                        .bind(&rel_owned)
+                        .bind(byte_size_i64)
+                        .bind(digest.as_bytes().as_slice())
+                        .bind(&witness_json)
+                        .bind(now_ms)
+                        .execute(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("sqlite_insert_backup_artifact", err.to_string())
+                        })?;
+
+                        for cur in &histories {
+                            sqlx::query(
+                                "UPDATE backup_holds
+                                 SET phase = 'spooled', cutoff_seq = ?, witness_json = ?
+                                 WHERE backup_id = ? AND space_id = ?",
+                            )
+                            .bind(cur.after.get() as i64)
+                            .bind(&witness_json)
+                            .bind(bid.as_str())
+                            .bind(cur.scope.space_id.as_str())
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("sqlite_update_hold_spooled", err.to_string())
+                            })?;
+                        }
+                    }
+                    BackendConn::Postgres(conn) => {
+                        sqlx::query(
+                            "INSERT INTO backup_artifacts (
+                                artifact_id, backup_id, installation_id, encoding, schema_version,
+                                artifact_rel_path, byte_size, content_blake3, witness_json, state, created_at_ms
+                            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ready', $10)",
+                        )
+                        .bind(aid.as_str())
+                        .bind(bid.as_str())
+                        .bind(inst.as_str())
+                        .bind(encoding.as_db_str())
+                        .bind(CANONICAL_SCHEMA_VERSION as i32)
+                        .bind(&rel_owned)
+                        .bind(byte_size_i64)
+                        .bind(digest.as_bytes().as_slice())
+                        .bind(&witness_json)
+                        .bind(now_ms)
+                        .execute(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("pg_insert_backup_artifact", err.to_string())
+                        })?;
+
+                        for cur in &histories {
+                            sqlx::query(
+                                "UPDATE backup_holds
+                                 SET phase = 'spooled', cutoff_seq = $1, witness_json = $2
+                                 WHERE backup_id = $3 AND space_id = $4",
+                            )
+                            .bind(cur.after.get() as i64)
+                            .bind(&witness_json)
+                            .bind(bid.as_str())
+                            .bind(cur.scope.space_id.as_str())
+                            .execute(&mut **conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("pg_update_hold_spooled", err.to_string())
+                            })?;
+                        }
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await
+}
+
+async fn apply_restore_cursor_tx(
+    tx: &mut BackendConn<'_>,
+    target: &ChangeCursor,
+) -> Result<(), PortError> {
+    let space_rec = load_space_record(tx, &target.scope.space_id).await?;
+
+    // Restore MUST rotate HistoryIncarnation so old external tokens/receipts at >= ceiling are invalidated.
+    if target.scope.incarnation == space_rec.scope.incarnation {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+
+    if target.after > space_rec.last_seq {
+        return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
+    }
+
+    // Check no active backup hold on this Space.
+    let hold_exists: Option<i64> = match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_scalar("SELECT 1 FROM backup_holds WHERE space_id = ? LIMIT 1")
+                .bind(target.scope.space_id.as_str())
+                .fetch_optional(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("sqlite_restore_check_hold", err.to_string())
+                })?
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_scalar("SELECT 1::BIGINT FROM backup_holds WHERE space_id = $1 LIMIT 1")
+                .bind(target.scope.space_id.as_str())
+                .fetch_optional(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_restore_check_hold", err.to_string()))?
+        }
+    };
+    if hold_exists.is_some() {
+        return Err(unavailable_retryable(
+            "restore_blocked_by_backup_hold",
+            "cannot restore Space cursors while a backup hold is active",
+            Duration::from_millis(100),
+        ));
+    }
+
+    let ceiling_i64 = target.after.get() as i64;
+    if ceiling_i64 > 0 {
+        let valid_cut: Option<i64> = match tx {
+            BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                "SELECT 1 FROM change_commands
+                 WHERE space_id = ? AND history_incarnation = ? AND last_seq = ?
+                 LIMIT 1",
+            )
+            .bind(target.scope.space_id.as_str())
+            .bind(space_rec.scope.incarnation.as_bytes().as_slice())
+            .bind(ceiling_i64)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_restore_check_cut", err.to_string()))?,
+            BackendConn::Postgres(conn) => sqlx::query_scalar(
+                "SELECT 1::BIGINT FROM change_commands
+                 WHERE space_id = $1 AND history_incarnation = $2 AND last_seq = $3
+                 LIMIT 1",
+            )
+            .bind(target.scope.space_id.as_str())
+            .bind(space_rec.scope.incarnation.as_bytes().as_slice())
+            .bind(ceiling_i64)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_restore_check_cut", err.to_string()))?,
+        };
+        if valid_cut.is_none() {
+            return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
+        }
+    }
+
+    let next_epoch = space_rec.active_epoch.checked_next()?;
+    let next_epoch_i64 = next_epoch.get() as i64;
+    let sid = target.scope.space_id.as_str();
+    let new_inc = target.scope.incarnation.as_bytes().as_slice();
+
+    let history_scoped_tables = [
+        "revisions",
+        "revision_purge_fences",
+        "blob_retirements",
+        "change_commands",
+        "change_log",
+        "agent_run_heads",
+        "board_move_history",
+        "chat_threads",
+        "pending_purges",
+    ];
+
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query("DELETE FROM command_receipts WHERE space_id = ?")
+                .bind(sid)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("sqlite_restore_clear_receipts", err.to_string())
+                })?;
+
+            sqlx::query(
+                "DELETE FROM payload_owners
+                 WHERE space_id = ? AND payload_kind = 'command_receipt'",
+            )
+            .bind(sid)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_restore_clear_receipt_owners", err.to_string())
+            })?;
+
+            sqlx::query(
+                "DELETE FROM change_payloads
+                 WHERE space_id = ? AND codec = 'receipt_detail_v1'",
+            )
+            .bind(sid)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_restore_clear_receipt_payloads", err.to_string())
+            })?;
+
+            sqlx::query(
+                "DELETE FROM payload_owners
+                 WHERE space_id = ? AND payload_kind = 'change_payload' AND payload_id IN (
+                     SELECT payload_id FROM change_payloads WHERE space_id = ? AND created_seq > ?
+                 )",
+            )
+            .bind(sid)
+            .bind(sid)
+            .bind(ceiling_i64)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_restore_prune_payload_owners", err.to_string())
+            })?;
+
+            sqlx::query("DELETE FROM change_log WHERE space_id = ? AND space_seq > ?")
+                .bind(sid)
+                .bind(ceiling_i64)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("sqlite_restore_prune_change_log", err.to_string())
+                })?;
+
+            sqlx::query(
+                "DELETE FROM change_commands WHERE space_id = ? AND last_seq > ? AND first_seq > ?",
+            )
+            .bind(sid)
+            .bind(ceiling_i64)
+            .bind(ceiling_i64)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_restore_prune_change_commands", err.to_string())
+            })?;
+
+            sqlx::query("DELETE FROM change_payloads WHERE space_id = ? AND created_seq > ?")
+                .bind(sid)
+                .bind(ceiling_i64)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("sqlite_restore_prune_change_payloads", err.to_string())
+                })?;
+
+            sqlx::query(
+                "DELETE FROM board_move_history WHERE space_id = ? AND command_end_seq > ?",
+            )
+            .bind(sid)
+            .bind(ceiling_i64)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_restore_prune_board_moves", err.to_string())
+            })?;
+
+            for table in history_scoped_tables {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE {table} SET history_incarnation = ? WHERE space_id = ?"
+                )))
+                .bind(new_inc)
+                .bind(sid)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("sqlite_restore_rebind_inc", err.to_string())
+                })?;
+            }
+
+            sqlx::query(
+                "UPDATE spaces
+                 SET history_incarnation = ?, active_epoch = ?, last_seq = ?
+                 WHERE space_id = ?",
+            )
+            .bind(new_inc)
+            .bind(next_epoch_i64)
+            .bind(ceiling_i64)
+            .bind(sid)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_restore_update_space", err.to_string())
+            })?;
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query("DELETE FROM command_receipts WHERE space_id = $1")
+                .bind(sid)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("pg_restore_clear_receipts", err.to_string())
+                })?;
+
+            sqlx::query(
+                "DELETE FROM payload_owners
+                 WHERE space_id = $1 AND payload_kind = 'command_receipt'",
+            )
+            .bind(sid)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("pg_restore_clear_receipt_owners", err.to_string())
+            })?;
+
+            sqlx::query(
+                "DELETE FROM change_payloads
+                 WHERE space_id = $1 AND codec = 'receipt_detail_v1'",
+            )
+            .bind(sid)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("pg_restore_clear_receipt_payloads", err.to_string())
+            })?;
+
+            sqlx::query(
+                "DELETE FROM payload_owners
+                 WHERE space_id = $1 AND payload_kind = 'change_payload' AND payload_id IN (
+                     SELECT payload_id FROM change_payloads WHERE space_id = $1 AND created_seq > $2
+                 )",
+            )
+            .bind(sid)
+            .bind(ceiling_i64)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("pg_restore_prune_payload_owners", err.to_string())
+            })?;
+
+            sqlx::query("DELETE FROM change_log WHERE space_id = $1 AND space_seq > $2")
+                .bind(sid)
+                .bind(ceiling_i64)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("pg_restore_prune_change_log", err.to_string())
+                })?;
+
+            sqlx::query(
+                "DELETE FROM change_commands WHERE space_id = $1 AND last_seq > $2 AND first_seq > $2",
+            )
+            .bind(sid)
+            .bind(ceiling_i64)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("pg_restore_prune_change_commands", err.to_string())
+            })?;
+
+            sqlx::query("DELETE FROM change_payloads WHERE space_id = $1 AND created_seq > $2")
+                .bind(sid)
+                .bind(ceiling_i64)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("pg_restore_prune_change_payloads", err.to_string())
+                })?;
+
+            sqlx::query(
+                "DELETE FROM board_move_history WHERE space_id = $1 AND command_end_seq > $2",
+            )
+            .bind(sid)
+            .bind(ceiling_i64)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("pg_restore_prune_board_moves", err.to_string())
+            })?;
+
+            for table in history_scoped_tables {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE {table} SET history_incarnation = $1 WHERE space_id = $2"
+                )))
+                .bind(new_inc)
+                .bind(sid)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_restore_rebind_inc", err.to_string()))?;
+            }
+
+            sqlx::query(
+                "UPDATE spaces
+                 SET history_incarnation = $1, active_epoch = $2, last_seq = $3
+                 WHERE space_id = $4",
+            )
+            .bind(new_inc)
+            .bind(next_epoch_i64)
+            .bind(ceiling_i64)
+            .bind(sid)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_restore_update_space", err.to_string()))?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn reseed_collab_fences_after_restore(store: &CanonicalStore) -> Result<(), PortError> {
+    let rows: Vec<(String, Vec<u8>, String, i64, String)> = store
+        .with_read_tx(|tx| {
+            Box::pin(async move {
+                match tx {
+                    BackendConn::Sqlite(conn) => {
+                        let r = sqlx::query(
+                            "SELECT c.space_id, s.history_incarnation, c.note_id, c.lease_epoch, c.room_state
+                             FROM collab_sessions c
+                             JOIN spaces s ON s.space_id = c.space_id",
+                        )
+                        .fetch_all(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("sqlite_reseed_collab_restore", err.to_string())
+                        })?;
+                        Ok(r.into_iter()
+                            .map(|row| {
+                                (
+                                    row.get("space_id"),
+                                    row.get("history_incarnation"),
+                                    row.get("note_id"),
+                                    row.get("lease_epoch"),
+                                    row.get("room_state"),
+                                )
+                            })
+                            .collect())
+                    }
+                    BackendConn::Postgres(conn) => {
+                        let r = sqlx::query(
+                            "SELECT c.space_id, s.history_incarnation, c.note_id, c.lease_epoch, c.room_state
+                             FROM collab_sessions c
+                             JOIN spaces s ON s.space_id = c.space_id",
+                        )
+                        .fetch_all(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("pg_reseed_collab_restore", err.to_string())
+                        })?;
+                        Ok(r.into_iter()
+                            .map(|row| {
+                                (
+                                    row.get("space_id"),
+                                    row.get("history_incarnation"),
+                                    row.get("note_id"),
+                                    row.get("lease_epoch"),
+                                    row.get("room_state"),
+                                )
+                            })
+                            .collect())
+                    }
+                }
+            })
+        })
+        .await?;
+
+    for (space_raw, inc_bytes, note_raw, lease_raw, state_raw) in rows {
+        let space_id = SpaceId::parse(&space_raw)
+            .map_err(|_| internal_not_committed("corrupt_collab_space", "invalid SpaceId"))?;
+        let inc_arr: [u8; 16] = inc_bytes.try_into().map_err(|_| {
+            internal_not_committed("corrupt_collab_inc", "history_incarnation != 16B")
+        })?;
+        let note_id = notarium_core::ids::NoteId::parse(&note_raw)
+            .map_err(|_| internal_not_committed("corrupt_collab_note", "invalid NoteId"))?;
+        let epoch =
+            notarium_core::ids::LeaseEpoch::new(u64::try_from(lease_raw).map_err(|_| {
+                internal_not_committed("corrupt_collab_lease", "negative lease_epoch")
+            })?)?;
+        let scope = HistoryScope {
+            space_id,
+            incarnation: HistoryIncarnation::from_bytes(inc_arr),
+        };
+        let active = state_raw == "active";
+        store
+            .inner
+            .room_fences
+            .seed_persisted_room(&scope, &note_id, epoch, active)
+            .await?;
+    }
+    Ok(())
+}

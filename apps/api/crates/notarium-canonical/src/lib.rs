@@ -4,6 +4,7 @@
 
 use std::{future::Future, pin::Pin};
 
+pub mod backup;
 pub mod blobs;
 pub mod changes;
 pub mod chats;
@@ -15,10 +16,17 @@ pub mod peers;
 pub mod runtime;
 pub mod schema;
 pub(crate) mod sql_exec;
+pub(crate) mod sqlite_fast;
 pub mod wal;
 pub mod writer;
 
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub use backup::{
+    BackupArtifactEncoding, BackupArtifactRecord, BackupExporterMemoryStats,
+    DecodedPostgresSpoolTable, DecodedPostgresSpoolV1, PostgresSpoolValue,
+    decode_postgres_spool_v1,
+};
 
 pub use changes::{
     ChangedNoteSummaryV1, EFFECT_CODEC_V1, EffectBodyV1, EffectEnvelopeV1, StoredAwaitReasonV1,
@@ -38,7 +46,7 @@ pub use peers::{
 };
 pub use runtime::{
     CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec, SpaceRecord,
-    StoredRevisionRecord,
+    SqliteBenchSeed, StoredRevisionRecord,
 };
 pub use schema::manifest::{CANONICAL_SCHEMA_VERSION, CANONICAL_TABLES, manifest_checksum};
 pub use wal::WalTelemetrySnapshot;

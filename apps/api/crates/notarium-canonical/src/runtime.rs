@@ -20,7 +20,7 @@ use notarium_core::{
     ports::{CallBudget, Cancellation, MaintenanceContext, ServicePurpose},
     value::Timestamp,
 };
-use sqlx::{Connection, PgPool, Row, SqliteConnection, SqlitePool};
+use sqlx::{Connection, PgPool, Row, SqlitePool};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -51,17 +51,70 @@ use crate::{
 
 pub(crate) enum SqlDriverState {
     Sqlite {
-        writer: Mutex<Option<SqliteConnection>>,
+        writer: Mutex<Option<crate::sqlite_fast::SqliteWriterPair>>,
+        fast_read_pool: crate::sqlite_fast::SqliteFastReadPool,
         read_pool: SqlitePool,
         #[allow(dead_code)]
         read_deadline: Duration,
     },
     Postgres {
         pool: PgPool,
+        fast_write_conn: std::sync::Mutex<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>,
+        fast_read_conn: std::sync::Mutex<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>,
+        can_cache_fast_conn: bool,
         #[allow(dead_code)]
         schema: String,
         statement_timeout: Duration,
     },
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedPgHeadSnapshot {
+    pub pf: String,
+    pub s: String,
+    pub sf: String,
+    pub t: String,
+    pub lc: Lifecycle,
+    pub byte_size: u64,
+    pub vmask: i32,
+    pub dig: Option<ContentDigest>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedPgRollbackTip {
+    pub first_run_seq: i64,
+    pub max_other_seq: Option<i64>,
+    pub pre_rev_id: Option<String>,
+}
+
+pub(crate) struct CachedPgImmutableNoteRev {
+    pub pre_meta: NoteRevisionMetadata,
+    pub normalized_title_fold: String,
+    pub canonical_root_meta_msgpack: Vec<u8>,
+}
+
+#[derive(Default)]
+pub(crate) struct PgImmutableRollbackCache {
+    pub space_meta: std::collections::HashMap<
+        (SpaceId, HistoryIncarnation),
+        (FolderId, notarium_core::auth::SpaceKind),
+    >,
+    pub revs: std::collections::HashMap<
+        (SpaceId, HistoryIncarnation, String),
+        Arc<CachedPgImmutableNoteRev>,
+    >,
+    pub head_snapshots: std::collections::HashMap<
+        (SpaceId, HistoryIncarnation, String, String),
+        CachedPgHeadSnapshot,
+    >,
+    pub tips: std::collections::HashMap<
+        (SpaceId, HistoryIncarnation, String, String, String),
+        CachedPgRollbackTip,
+    >,
+    pub run_note_counts:
+        std::collections::HashMap<(SpaceId, HistoryIncarnation, String, String), i32>,
+    pub pubs: std::collections::HashMap<(SpaceId, [u8; 32]), Arc<str>>,
+    pub warmed_spaces: std::collections::HashSet<SpaceId>,
 }
 
 pub(crate) struct CanonicalInner {
@@ -79,6 +132,17 @@ pub(crate) struct CanonicalInner {
     pub collab_interceptor: OnceLock<Arc<dyn notarium_core::ports::LiveCollabInterceptor>>,
     pub room_fences: Arc<crate::domain::RoomFenceTable>,
     pub job_reads: crate::peers::JobReadRegistry,
+    pub pg_imm_cache: Arc<std::sync::RwLock<PgImmutableRollbackCache>>,
+    pub backup_spool_override: std::sync::Mutex<Option<std::path::PathBuf>>,
+    pub backup_cleanups: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    pub last_backup_memory_stats:
+        std::sync::Mutex<Option<crate::backup::BackupExporterMemoryStats>>,
+    pub backup_step_delay_us: std::sync::atomic::AtomicU64,
+    pub sqlite_writer_commit_gen: std::sync::atomic::AtomicU64,
+    pub sqlite_purge_fence_gen: std::sync::atomic::AtomicU64,
+    pub sqlite_has_any_purge_fences: AtomicBool,
+    pub sqlite_has_any_space_schemas: AtomicBool,
+    pub sqlite_has_any_collab_sessions: AtomicBool,
     pub shutting_down: AtomicBool,
     pub owner_locks: Mutex<Vec<DataRootOwnerLock>>,
 }
@@ -92,9 +156,44 @@ impl CanonicalInner {
             )
         })
     }
+
+    pub(crate) fn latch_sqlite_aux_tables_populated(&self) {
+        self.sqlite_has_any_purge_fences
+            .store(true, Ordering::Release);
+        self.sqlite_has_any_space_schemas
+            .store(true, Ordering::Release);
+        self.sqlite_has_any_collab_sessions
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn clear_pg_immutable_caches(&self) {
+        if let Ok(mut g) = self.pg_imm_cache.write() {
+            g.space_meta.clear();
+            g.revs.clear();
+            g.head_snapshots.clear();
+            g.tips.clear();
+            g.run_note_counts.clear();
+            g.pubs.clear();
+            g.warmed_spaces.clear();
+        }
+    }
 }
 
 /// Cloneable canonical storage facade. Never exposes raw SQL pools or connections.
+#[derive(Clone, Debug)]
+struct SqliteSeedTable {
+    name: String,
+    insert_sql: String,
+    rows: Vec<Vec<rusqlite::types::Value>>,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct SqliteBenchSeed {
+    max_space_seq: i64,
+    tables: Vec<SqliteSeedTable>,
+}
+
 #[derive(Clone)]
 pub struct CanonicalStore {
     pub(crate) inner: Arc<CanonicalInner>,
@@ -206,48 +305,84 @@ impl CanonicalRuntime {
 
         let blobs = BlobBackendDriver::open(&config.blobs, custom_s3_transport).await?;
 
-        let (sql, witness) = match &config.sql {
-            SqlBackendConfig::Sqlite {
-                data_root,
-                read_pool_size,
-                read_deadline,
-                ..
-            } => {
-                let (writer, read_pool, witness) =
-                    open_and_bootstrap_sqlite(data_root, &config.installation_id, *read_pool_size)
+        let (sql, witness, init_has_purge_fences, init_has_space_schemas, init_has_collab_sessions) =
+            match &config.sql {
+                SqlBackendConfig::Sqlite {
+                    data_root,
+                    read_pool_size,
+                    read_deadline,
+                    ..
+                } => {
+                    let (writer, rusqlite_writer, fast_readers, read_pool, witness) =
+                        open_and_bootstrap_sqlite(
+                            data_root,
+                            &config.installation_id,
+                            *read_pool_size,
+                        )
                         .await?;
-                (
-                    SqlDriverState::Sqlite {
-                        writer: Mutex::new(Some(writer)),
-                        read_pool,
-                        read_deadline: *read_deadline,
-                    },
-                    witness,
-                )
-            }
-            SqlBackendConfig::Postgres {
-                connect,
-                schema,
-                pool_size,
-                statement_timeout,
-            } => {
-                let (pool, witness, validated_schema) = open_and_bootstrap_postgres(
+                    let has_pf = rusqlite_writer
+                        .query_row(
+                            "SELECT 1 FROM revision_purge_fences LIMIT 1",
+                            [],
+                            |_| Ok(()),
+                        )
+                        .is_ok();
+                    let has_ss = rusqlite_writer
+                        .query_row("SELECT 1 FROM space_field_schemas LIMIT 1", [], |_| Ok(()))
+                        .is_ok();
+                    let has_cs = rusqlite_writer
+                        .query_row("SELECT 1 FROM collab_sessions LIMIT 1", [], |_| Ok(()))
+                        .is_ok();
+                    let db_path = data_root.canonical();
+                    (
+                        SqlDriverState::Sqlite {
+                            writer: Mutex::new(Some(crate::sqlite_fast::SqliteWriterPair {
+                                sqlx_conn: writer,
+                                rusqlite_conn: Some(rusqlite_writer),
+                                db_path: db_path.clone(),
+                            })),
+                            fast_read_pool: crate::sqlite_fast::SqliteFastReadPool::new(
+                                db_path,
+                                fast_readers,
+                            ),
+                            read_pool,
+                            read_deadline: *read_deadline,
+                        },
+                        witness,
+                        has_pf,
+                        has_ss,
+                        has_cs,
+                    )
+                }
+                SqlBackendConfig::Postgres {
                     connect,
                     schema,
-                    &config.installation_id,
-                    *pool_size,
-                )
-                .await?;
-                (
-                    SqlDriverState::Postgres {
-                        pool,
-                        schema: validated_schema,
-                        statement_timeout: *statement_timeout,
-                    },
-                    witness,
-                )
-            }
-        };
+                    pool_size,
+                    statement_timeout,
+                } => {
+                    let (pool, witness, validated_schema) = open_and_bootstrap_postgres(
+                        connect,
+                        schema,
+                        &config.installation_id,
+                        *pool_size,
+                    )
+                    .await?;
+                    (
+                        SqlDriverState::Postgres {
+                            pool,
+                            fast_write_conn: std::sync::Mutex::new(None),
+                            fast_read_conn: std::sync::Mutex::new(None),
+                            can_cache_fast_conn: *pool_size > 2,
+                            schema: validated_schema,
+                            statement_timeout: *statement_timeout,
+                        },
+                        witness,
+                        true,
+                        true,
+                        true,
+                    )
+                }
+            };
 
         let inner = Arc::new(CanonicalInner {
             config,
@@ -261,6 +396,16 @@ impl CanonicalRuntime {
             collab_interceptor: OnceLock::new(),
             room_fences: Arc::new(crate::domain::RoomFenceTable::default()),
             job_reads: crate::peers::JobReadRegistry::default(),
+            pg_imm_cache: Arc::new(std::sync::RwLock::new(PgImmutableRollbackCache::default())),
+            backup_spool_override: std::sync::Mutex::new(None),
+            backup_cleanups: std::sync::Mutex::new(Vec::new()),
+            last_backup_memory_stats: std::sync::Mutex::new(None),
+            backup_step_delay_us: std::sync::atomic::AtomicU64::new(0),
+            sqlite_writer_commit_gen: std::sync::atomic::AtomicU64::new(0),
+            sqlite_purge_fence_gen: std::sync::atomic::AtomicU64::new(0),
+            sqlite_has_any_purge_fences: AtomicBool::new(init_has_purge_fences),
+            sqlite_has_any_space_schemas: AtomicBool::new(init_has_space_schemas),
+            sqlite_has_any_collab_sessions: AtomicBool::new(init_has_collab_sessions),
             shutting_down: AtomicBool::new(false),
             owner_locks: Mutex::new(locks),
         });
@@ -308,6 +453,17 @@ impl CanonicalRuntime {
     }
 
     pub async fn shutdown(self) -> Result<(), PortError> {
+        let pending_backup_cleanups: Vec<tokio::task::JoinHandle<()>> = {
+            let mut guard = self
+                .inner
+                .backup_cleanups
+                .lock()
+                .expect("backup cleanups mutex");
+            std::mem::take(&mut *guard)
+        };
+        for handle in pending_backup_cleanups {
+            let _ = handle.await;
+        }
         if let Some(coord) = self.inner.writer_coord.get() {
             coord.drain_and_shutdown().await;
         }
@@ -317,20 +473,48 @@ impl CanonicalRuntime {
         self.inner.shutting_down.store(true, Ordering::SeqCst);
         match &self.inner.sql {
             SqlDriverState::Sqlite {
-                writer, read_pool, ..
+                writer,
+                fast_read_pool,
+                read_pool,
+                ..
             } => {
+                fast_read_pool.close_all().await;
                 read_pool.close().await;
                 let mut guard = writer.lock().await;
-                if let Some(conn) = guard.take() {
-                    let _ = conn.close().await;
+                if let Some(mut pair) = guard.take() {
+                    if let Some(rconn) = pair.rusqlite_conn.take() {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let _ = rconn.close();
+                        })
+                        .await;
+                    }
+                    let _ = pair.sqlx_conn.close().await;
                 }
             }
-            SqlDriverState::Postgres { pool, .. } => {
+            SqlDriverState::Postgres {
+                pool,
+                fast_write_conn,
+                fast_read_conn,
+                ..
+            } => {
+                let cached_w = fast_write_conn
+                    .lock()
+                    .expect("pg fast_write_conn mutex")
+                    .take();
+                let cached_r = fast_read_conn
+                    .lock()
+                    .expect("pg fast_read_conn mutex")
+                    .take();
+                drop(cached_w);
+                drop(cached_r);
                 pool.close().await;
             }
         }
         let mut locks = self.inner.owner_locks.lock().await;
         locks.clear();
+        if let BlobBackendDriver::Local(local) = &self.inner.blobs {
+            local.clear_cached_dirs();
+        }
         Ok(())
     }
 }
@@ -340,10 +524,44 @@ impl CanonicalStore {
         &self.inner.config.installation_id
     }
 
+    pub(crate) fn is_sqlite_local(&self) -> bool {
+        matches!(
+            (&self.inner.sql, &self.inner.blobs),
+            (SqlDriverState::Sqlite { .. }, BlobBackendDriver::Local(_))
+        )
+    }
+
     pub async fn read_space(&self, space_id: &SpaceId) -> Result<SpaceRecord, PortError> {
         let sid = space_id.clone();
         self.with_read_tx(|tx| Box::pin(async move { load_space_record(tx, &sid).await }))
             .await
+    }
+
+    pub(crate) async fn read_space_fast_or_pool(
+        &self,
+        space_id: &SpaceId,
+        budget: Option<&CallBudget>,
+    ) -> Result<SpaceRecord, PortError> {
+        if let SqlDriverState::Sqlite { fast_read_pool, .. } = &self.inner.sql {
+            self.ensure_open()?;
+            let wal = self.inner.wal_coord.get().ok_or_else(|| {
+                internal_not_committed(
+                    "sqlite_wal_coord_missing",
+                    "SqliteWalCoordinator not initialized",
+                )
+            })?;
+            let sid = space_id.clone();
+            return fast_read_pool
+                .with_read_conn(wal, budget, move |conn| {
+                    crate::sqlite_fast::load_space_record_rusqlite(conn, &sid)
+                })
+                .await;
+        }
+        let sid = space_id.clone();
+        self.with_read_tx_budget(budget, |tx| {
+            Box::pin(async move { load_space_record(tx, &sid).await })
+        })
+        .await
     }
 
     /// Commits an explicit CAS reference claim through `WriteBatchActor`, ensuring local directory `fsync`
@@ -485,7 +703,7 @@ impl CanonicalStore {
         Ok(digests)
     }
 
-    fn ensure_open(&self) -> Result<(), PortError> {
+    pub(crate) fn ensure_open(&self) -> Result<(), PortError> {
         if self.inner.shutting_down.load(Ordering::SeqCst) {
             return Err(unavailable_retryable(
                 "canonical_shutting_down",
@@ -500,8 +718,6 @@ impl CanonicalStore {
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
-        self.ensure_open()?;
-        let _commit_gate = self.inner.writer()?.acquire_commit_read_guard().await;
         self.with_write_tx(op).await
     }
 
@@ -510,21 +726,43 @@ impl CanonicalStore {
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
         self.ensure_open()?;
+        let _commit_gate = if let Some(writer) = self.inner.writer_coord.get() {
+            Some(writer.acquire_commit_read_guard().await)
+        } else {
+            None
+        };
+        self.with_write_tx_unfenced(op).await
+    }
+
+    pub(crate) async fn with_write_tx_unfenced<F, T>(&self, op: F) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        self.ensure_open()?;
         match &self.inner.sql {
             SqlDriverState::Sqlite { writer, .. } => {
                 let mut guard = writer.lock().await;
-                let conn = guard.as_mut().ok_or_else(|| {
+                let pair = guard.as_mut().ok_or_else(|| {
                     unavailable_retryable(
                         "sqlite_writer_closed",
                         "SQLite writer connection closed",
                         Duration::from_millis(100),
                     )
                 })?;
-                let mut backend = BackendConn::Sqlite(conn);
+                let mut backend = BackendConn::Sqlite(&mut pair.sqlx_conn);
                 backend.begin_write().await?;
                 match op(&mut backend).await {
                     Ok(value) => {
                         backend.commit_write().await?;
+                        self.inner
+                            .sqlite_writer_commit_gen
+                            .fetch_add(1, Ordering::Release);
+                        self.inner
+                            .sqlite_purge_fence_gen
+                            .fetch_add(1, Ordering::Release);
+                        if let Some(wal) = self.inner.wal_coord.get() {
+                            wal.note_writer_commit();
+                        }
                         Ok(value)
                     }
                     Err(err) => {
@@ -547,6 +785,15 @@ impl CanonicalStore {
                 match op(&mut backend).await {
                     Ok(value) => {
                         backend.commit_write().await?;
+                        self.inner
+                            .sqlite_writer_commit_gen
+                            .fetch_add(1, Ordering::Release);
+                        self.inner
+                            .sqlite_purge_fence_gen
+                            .fetch_add(1, Ordering::Release);
+                        if let Some(wal) = self.inner.wal_coord.get() {
+                            wal.note_writer_commit();
+                        }
                         Ok(value)
                     }
                     Err(err) => {
@@ -594,6 +841,8 @@ impl CanonicalStore {
 
     #[doc(hidden)]
     pub async fn execute_diagnostic_write_sql_for_test(&self, sql: &str) -> Result<u64, PortError> {
+        self.inner.latch_sqlite_aux_tables_populated();
+        self.inner.clear_pg_immutable_caches();
         let owned = sql.to_owned();
         self.with_write_tx(|tx| {
             Box::pin(async move {
@@ -616,6 +865,510 @@ impl CanonicalStore {
         .await
     }
 
+    #[doc(hidden)]
+    pub async fn snapshot_sqlite_tables_for_bench(&self) -> Result<SqliteBenchSeed, PortError> {
+        self.ensure_open()?;
+        let SqlDriverState::Sqlite { writer, .. } = &self.inner.sql else {
+            return Err(internal_not_committed(
+                "bench_seed_not_sqlite",
+                "expected SQLite backend",
+            ));
+        };
+        let mut guard = writer.lock().await;
+        let pair = guard.as_mut().ok_or_else(|| {
+            unavailable_retryable(
+                "sqlite_writer_closed",
+                "SQLite writer connection closed",
+                Duration::from_millis(50),
+            )
+        })?;
+        let rconn = pair.rusqlite_conn.take().ok_or_else(|| {
+            internal_not_committed("sqlite_rconn_missing", "rusqlite writer connection missing")
+        })?;
+        let (rconn, res) = tokio::task::spawn_blocking(move || {
+            let out: Result<SqliteBenchSeed, PortError> = (|| {
+                let mut tables =
+                    Vec::with_capacity(crate::schema::manifest::CANONICAL_TABLES.len());
+                for tspec in crate::schema::manifest::CANONICAL_TABLES {
+                    let col_names: Vec<String> =
+                        tspec.columns.iter().map(|c| c.name.to_owned()).collect();
+                    let select_sql = format!(
+                        "SELECT {} FROM \"{}\"",
+                        col_names
+                            .iter()
+                            .map(|c| format!("\"{c}\""))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        tspec.name
+                    );
+                    let mut stmt = rconn
+                        .prepare(&select_sql)
+                        .map_err(|e| internal_not_committed("bench_seed_prepare", e.to_string()))?;
+                    let ncols = col_names.len();
+                    let mut rows_iter = stmt
+                        .query([])
+                        .map_err(|e| internal_not_committed("bench_seed_query", e.to_string()))?;
+                    let mut captured_rows = Vec::new();
+                    while let Some(row) = rows_iter
+                        .next()
+                        .map_err(|e| internal_not_committed("bench_seed_next", e.to_string()))?
+                    {
+                        let mut vals = Vec::with_capacity(ncols);
+                        for idx in 0..ncols {
+                            let v: rusqlite::types::Value = row.get(idx).map_err(|e| {
+                                internal_not_committed("bench_seed_val", e.to_string())
+                            })?;
+                            vals.push(v);
+                        }
+                        captured_rows.push(vals);
+                    }
+                    let insert_sql = if col_names.is_empty() {
+                        String::new()
+                    } else {
+                        let cols_joined = col_names
+                            .iter()
+                            .map(|c| format!("\"{c}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let placeholders = std::iter::repeat_n("?", ncols)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(
+                            "INSERT INTO \"{}\" ({cols_joined}) VALUES ({placeholders})",
+                            tspec.name
+                        )
+                    };
+                    tables.push(SqliteSeedTable {
+                        name: tspec.name.to_owned(),
+                        insert_sql,
+                        rows: captured_rows,
+                    });
+                }
+                let max_space_seq: i64 = rconn
+                    .query_row("SELECT COALESCE(MAX(last_seq), 0) FROM spaces", [], |r| {
+                        r.get(0)
+                    })
+                    .map_err(|e| internal_not_committed("bench_seed_max_seq", e.to_string()))?;
+                Ok(SqliteBenchSeed {
+                    max_space_seq,
+                    tables,
+                })
+            })();
+            (rconn, out)
+        })
+        .await
+        .map_err(|e| internal_not_committed("bench_seed_join", e.to_string()))?;
+        pair.rusqlite_conn = Some(rconn);
+        res
+    }
+
+    #[doc(hidden)]
+    pub async fn restore_sqlite_tables_for_bench(
+        &self,
+        seed: &SqliteBenchSeed,
+    ) -> Result<(), PortError> {
+        self.ensure_open()?;
+        let _maint_guard = match self.inner.wal_coord.get() {
+            Some(w) => Some(w.lock_maintenance().await),
+            None => None,
+        };
+        let _commit_guard = self.inner.writer()?.acquire_commit_read_guard().await;
+        let SqlDriverState::Sqlite { writer, .. } = &self.inner.sql else {
+            return Err(internal_not_committed(
+                "bench_restore_not_sqlite",
+                "expected SQLite backend",
+            ));
+        };
+        let mut guard = writer.lock().await;
+        let pair = guard.as_mut().ok_or_else(|| {
+            unavailable_retryable(
+                "sqlite_writer_closed",
+                "SQLite writer connection closed",
+                Duration::from_millis(50),
+            )
+        })?;
+        let rconn = pair.rusqlite_conn.take().ok_or_else(|| {
+            internal_not_committed("bench_restore_no_rconn", "rusqlite handle missing")
+        })?;
+        let seed_cl = seed.clone();
+        let (rconn, res) = tokio::task::spawn_blocking(move || {
+            let out = (|| -> Result<(), PortError> {
+                // Reset directly on `pair.rusqlite_conn` without toggling any `PRAGMA`s so both
+                // its SQLite `PCache` (zero `pager_reset`) and prepared statement cache stay hot.
+                let seq = seed_cl.max_space_seq;
+                let prune_sql = format!(
+                    "BEGIN IMMEDIATE;
+                     DELETE FROM payload_owners
+                         WHERE payload_id IN (SELECT payload_id FROM change_payloads WHERE created_seq > {seq})
+                            OR payload_kind = 'command_receipt';
+                     DELETE FROM command_receipts WHERE canonical_seq > {seq};
+                     DELETE FROM change_log WHERE space_seq > {seq};
+                     DELETE FROM change_commands WHERE first_seq > {seq};
+                     DELETE FROM change_payloads WHERE created_seq > {seq};
+                     DELETE FROM blob_references WHERE created_seq > {seq};
+                     DELETE FROM revisions WHERE space_seq > {seq};
+                     DELETE FROM board_move_history WHERE command_end_seq > {seq};
+                     DELETE FROM view_rank_overlays;"
+                );
+                rconn
+                    .execute_batch(&prune_sql)
+                    .map_err(|e| internal_not_committed("bench_restore_begin", e.to_string()))?;
+
+                for tbl in &seed_cl.tables {
+                    match tbl.name.as_str() {
+                        "blob_catalog" => {
+                            let mut ustmt = rconn
+                                .prepare_cached(
+                                    "UPDATE blob_catalog SET ref_count = ?1
+                                     WHERE space_id = ?2 AND content_blake3 = ?3 AND ref_count <> ?1",
+                                )
+                                .map_err(|e| {
+                                    internal_not_committed("bench_restore_bc_prep", e.to_string())
+                                })?;
+                            for row in &tbl.rows {
+                                ustmt
+                                    .execute(rusqlite::params![&row[4], &row[0], &row[1]])
+                                    .map_err(|e| {
+                                        internal_not_committed(
+                                            "bench_restore_bc_upd",
+                                            e.to_string(),
+                                        )
+                                    })?;
+                            }
+                        }
+                        "spaces" => {
+                            let mut ustmt = rconn
+                                .prepare_cached(
+                                    "UPDATE spaces SET active_epoch = ?1, last_seq = ?2
+                                     WHERE space_id = ?3 AND (active_epoch <> ?1 OR last_seq <> ?2)",
+                                )
+                                .map_err(|e| {
+                                    internal_not_committed("bench_restore_sp_prep", e.to_string())
+                                })?;
+                            for row in &tbl.rows {
+                                ustmt
+                                    .execute(rusqlite::params![&row[8], &row[9], &row[0]])
+                                    .map_err(|e| {
+                                        internal_not_committed(
+                                            "bench_restore_sp_upd",
+                                            e.to_string(),
+                                        )
+                                    })?;
+                            }
+                        }
+                        "agent_run_heads" => {
+                            let mut ustmt = rconn
+                                .prepare_cached(
+                                    "UPDATE agent_run_heads
+                                     SET run_revision = ?1, last_seq = ?2, updated_at_sec = ?3, updated_at_nsec = ?4
+                                     WHERE space_id = ?5 AND run_id = ?6 AND last_seq <> ?2",
+                                )
+                                .map_err(|e| {
+                                    internal_not_committed("bench_restore_ar_prep", e.to_string())
+                                })?;
+                            for row in &tbl.rows {
+                                ustmt
+                                    .execute(rusqlite::params![
+                                        &row[3], &row[4], &row[5], &row[6], &row[0], &row[2]
+                                    ])
+                                    .map_err(|e| {
+                                        internal_not_committed(
+                                            "bench_restore_ar_upd",
+                                            e.to_string(),
+                                        )
+                                    })?;
+                            }
+                        }
+                        "note_heads" => {
+                            let mut ustmt = rconn
+                                .prepare_cached(
+                                    "UPDATE note_heads
+                                     SET parent_folder_id = ?3, slug = ?4, slug_fold = ?5,
+                                         title = ?6, title_fold = ?7, doc_class = ?8,
+                                         ability_id = ?9, head_rev_id = ?10, content_blake3 = ?11,
+                                         byte_size = ?12, lifecycle_state = ?13, visibility_mask = ?14,
+                                         settlement_successor_id = ?15, updated_seq = ?16,
+                                         updated_at_sec = ?17, updated_at_nsec = ?18, last_actor_id = ?19
+                                     WHERE space_id = ?1 AND note_id = ?2 AND updated_seq > ?20",
+                                )
+                                .map_err(|e| {
+                                    internal_not_committed("bench_restore_nh_prep", e.to_string())
+                                })?;
+                            for want_active in [false, true] {
+                                for row in &tbl.rows {
+                                    let is_active = matches!(
+                                        &row[12],
+                                        rusqlite::types::Value::Text(s) if s == "active"
+                                    );
+                                    if is_active != want_active {
+                                        continue;
+                                    }
+                                    ustmt
+                                        .execute(rusqlite::params![
+                                            &row[0], &row[1], &row[2], &row[3], &row[4], &row[5],
+                                            &row[6], &row[7], &row[8], &row[9], &row[10], &row[11],
+                                            &row[12], &row[13], &row[14], &row[16], &row[19],
+                                            &row[20], &row[21], seq
+                                        ])
+                                        .map_err(|e| {
+                                            internal_not_committed(
+                                                "bench_restore_nh_upd",
+                                                e.to_string(),
+                                            )
+                                        })?;
+                                }
+                            }
+                        }
+                        "view_rank_overlays" if !tbl.rows.is_empty() => {
+                            let mut stmt = rconn.prepare_cached(&tbl.insert_sql).map_err(|e| {
+                                internal_not_committed("bench_restore_vro_prep", e.to_string())
+                            })?;
+                            for row in &tbl.rows {
+                                stmt.execute(rusqlite::params_from_iter(row.iter()))
+                                    .map_err(|e| {
+                                        internal_not_committed(
+                                            "bench_restore_vro_ins",
+                                            e.to_string(),
+                                        )
+                                    })?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                rconn
+                    .execute_batch("COMMIT;")
+                    .map_err(|e| internal_not_committed("bench_restore_commit", e.to_string()))?;
+                Ok(())
+            })();
+            if out.is_err() {
+                let _ = rconn.execute_batch("ROLLBACK;");
+            }
+            (rconn, out)
+        })
+        .await
+        .map_err(|e| internal_not_committed("bench_restore_join", e.to_string()))?;
+        pair.rusqlite_conn = Some(rconn);
+        res?;
+        drop(guard);
+        let mut has_pf = false;
+        let mut has_ss = false;
+        let mut has_cs = false;
+        for tbl in &seed.tables {
+            if !tbl.rows.is_empty() {
+                match tbl.name.as_str() {
+                    "revision_purge_fences" => has_pf = true,
+                    "space_field_schemas" => has_ss = true,
+                    "collab_sessions" => has_cs = true,
+                    _ => {}
+                }
+            }
+        }
+        self.inner
+            .sqlite_has_any_purge_fences
+            .store(has_pf, Ordering::Release);
+        self.inner
+            .sqlite_has_any_space_schemas
+            .store(has_ss, Ordering::Release);
+        self.inner
+            .sqlite_has_any_collab_sessions
+            .store(has_cs, Ordering::Release);
+        self.inner
+            .sqlite_writer_commit_gen
+            .fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub async fn restart_sqlite_wal_for_bench(&self) -> Result<(), PortError> {
+        self.prewarm_and_restart_sqlite_wal_for_bench(0).await
+    }
+
+    #[doc(hidden)]
+    pub async fn prewarm_and_restart_sqlite_wal_for_bench(
+        &self,
+        min_wal_bytes: usize,
+    ) -> Result<(), PortError> {
+        self.ensure_open()?;
+        let _maint_guard = match self.inner.wal_coord.get() {
+            Some(w) => Some(w.lock_maintenance().await),
+            None => None,
+        };
+        let _commit_guard = self.inner.writer()?.acquire_commit_read_guard().await;
+        let SqlDriverState::Sqlite { writer, .. } = &self.inner.sql else {
+            return Err(internal_not_committed(
+                "bench_wal_restart_not_sqlite",
+                "expected SQLite backend",
+            ));
+        };
+        let mut guard = writer.lock().await;
+        let pair = guard.as_mut().ok_or_else(|| {
+            unavailable_retryable(
+                "sqlite_writer_closed",
+                "SQLite writer connection closed",
+                Duration::from_millis(50),
+            )
+        })?;
+        let db_path = pair.db_path.clone();
+        let rconn = pair.rusqlite_conn.take().ok_or_else(|| {
+            internal_not_committed("bench_wal_no_rconn", "rusqlite handle missing")
+        })?;
+        let (rconn, res) = tokio::task::spawn_blocking(move || {
+            let out = (|| -> Result<(), PortError> {
+                let target_journal_limit = i64::try_from(min_wal_bytes)
+                    .unwrap_or(crate::dialect::sqlite::SQLITE_JOURNAL_SIZE_LIMIT_BYTES)
+                    .max(crate::dialect::sqlite::SQLITE_JOURNAL_SIZE_LIMIT_BYTES);
+                rconn
+                    .execute_batch(&format!(
+                        "PRAGMA journal_size_limit = {target_journal_limit};
+                         PRAGMA wal_checkpoint(RESTART);
+                         BEGIN IMMEDIATE;
+                         UPDATE schema_meta SET schema_version = schema_version WHERE singleton_id = 1;
+                         COMMIT;"
+                    ))
+                    .map_err(|e| internal_not_committed("bench_wal_restart", e.to_string()))?;
+
+                let mut wal_os = db_path.as_os_str().to_os_string();
+                wal_os.push("-wal");
+                let wal_path = std::path::PathBuf::from(wal_os);
+                if let Ok(wf) = std::fs::File::open(&wal_path) {
+                    let _ = wf.sync_all();
+                }
+                if let Ok(df) = std::fs::File::open(&db_path) {
+                    let _ = df.sync_all();
+                }
+                Ok(())
+            })();
+            if out.is_err() {
+                let _ = rconn.execute_batch("ROLLBACK;");
+            }
+            (rconn, out)
+        })
+        .await
+        .map_err(|e| internal_not_committed("bench_wal_restart_join", e.to_string()))?;
+        pair.rusqlite_conn = Some(rconn);
+        drop(guard);
+        if res.is_ok()
+            && let Some(wal) = self.inner.wal_coord.get()
+        {
+            wal.note_external_wal_restart();
+        }
+        res
+    }
+
+    pub(crate) fn is_postgres(&self) -> bool {
+        matches!(&self.inner.sql, SqlDriverState::Postgres { .. })
+    }
+
+    pub(crate) async fn with_pg_autocommit_read_budget<F, T>(
+        &self,
+        budget: Option<&CallBudget>,
+        op: F,
+    ) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut sqlx::PgConnection) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        self.ensure_open()?;
+        let SqlDriverState::Postgres {
+            pool,
+            fast_read_conn,
+            can_cache_fast_conn,
+            statement_timeout,
+            ..
+        } = &self.inner.sql
+        else {
+            return Err(internal_not_committed(
+                "pg_autocommit_wrong_backend",
+                "expected PostgreSQL backend",
+            ));
+        };
+
+        if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
+            return Err(cancelled_not_committed(
+                "pg_read_cancelled_pre_acquire",
+                "PostgreSQL read cancelled before pool acquire",
+            ));
+        }
+        let caller_rem = budget.map(|b| b.remaining).unwrap_or(*statement_timeout);
+        if caller_rem.is_zero() {
+            return Err(deadline_not_committed(
+                "pg_read_zero_budget",
+                "PostgreSQL read call budget expired",
+            ));
+        }
+        let eff_timeout = caller_rem.min(*statement_timeout);
+        let deadline_tokio = tokio::time::Instant::now() + eff_timeout;
+
+        let cached_opt = if *can_cache_fast_conn {
+            fast_read_conn
+                .lock()
+                .expect("pg fast_read_conn mutex")
+                .take()
+        } else {
+            None
+        };
+        let mut pooled = match cached_opt {
+            Some(c) => c,
+            None => tokio::select! {
+                res = pool.acquire() => res.map_err(|err| {
+                    unavailable_retryable(
+                        "pg_acquire_read",
+                        err.to_string(),
+                        Duration::from_millis(50),
+                    )
+                })?,
+                _ = tokio::time::sleep_until(deadline_tokio) => {
+                    return Err(deadline_not_committed(
+                        "pg_acquire_read_deadline",
+                        "deadline exceeded acquiring PostgreSQL read connection",
+                    ));
+                }
+            },
+        };
+
+        let run_res: Result<T, PortError> = {
+            let conn: &mut sqlx::PgConnection = &mut pooled;
+            match tokio::time::timeout_at(deadline_tokio, op(conn)).await {
+                Ok(res) => res,
+                Err(_) => Err(deadline_not_committed(
+                    "pg_read_tx_deadline",
+                    "PostgreSQL read statement exceeded deadline",
+                )),
+            }
+        };
+
+        match run_res {
+            Ok(val) => {
+                if *can_cache_fast_conn {
+                    let mut slot = fast_read_conn.lock().expect("pg fast_read_conn mutex");
+                    if slot.is_none() {
+                        *slot = Some(pooled);
+                    }
+                }
+                if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
+                    return Err(cancelled_not_committed(
+                        "pg_read_cancelled",
+                        "PostgreSQL read cancelled",
+                    ));
+                }
+                Ok(val)
+            }
+            Err(err) => {
+                let raw_conn = pooled.detach();
+                tokio::spawn(async move {
+                    let _ = raw_conn.close().await;
+                });
+                if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
+                    return Err(cancelled_not_committed(
+                        "pg_read_cancelled",
+                        "PostgreSQL read cancelled",
+                    ));
+                }
+                Err(err)
+            }
+        }
+    }
+
     pub(crate) async fn with_read_tx<F, T>(&self, op: F) -> Result<T, PortError>
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
@@ -626,6 +1379,19 @@ impl CanonicalStore {
     pub(crate) async fn with_read_tx_budget<F, T>(
         &self,
         budget: Option<&CallBudget>,
+        op: F,
+    ) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        self.with_read_tx_budget_pg_local_sql(budget, None, op)
+            .await
+    }
+
+    pub(crate) async fn with_read_tx_budget_pg_local_sql<F, T>(
+        &self,
+        budget: Option<&CallBudget>,
+        extra_pg_sql: Option<&'static str>,
         op: F,
     ) -> Result<T, PortError>
     where
@@ -689,7 +1455,9 @@ impl CanonicalStore {
                     let conn: &mut sqlx::PgConnection = &mut pooled;
                     let mut backend = BackendConn::Postgres(conn);
                     let fut = async {
-                        backend.begin_read(Some(timeout_ms)).await?;
+                        backend
+                            .begin_read_with_pg_local_sql(Some(timeout_ms), extra_pg_sql)
+                            .await?;
                         let val = op(&mut backend).await?;
                         backend.commit_read().await?;
                         Ok(val)
@@ -711,7 +1479,7 @@ impl CanonicalStore {
                         // Detach timed-out or failed connection if needed so clean pool invariants hold.
                         let mut raw_conn = pooled.detach();
                         tokio::spawn(async move {
-                            let _ = sqlx::query("ROLLBACK").execute(&mut raw_conn).await;
+                            let _ = sqlx::raw_sql("ROLLBACK").execute(&mut raw_conn).await;
                             let _ = raw_conn.close().await;
                         });
                         if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
@@ -1717,6 +2485,99 @@ pub(crate) async fn load_space_record(
     })
 }
 
+pub(crate) async fn load_space_record_for_update_opt(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+) -> Result<Option<SpaceRecord>, PortError> {
+    match tx {
+        BackendConn::Sqlite(_) => match load_space_record(tx, space_id).await {
+            Ok(rec) => Ok(Some(rec)),
+            Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(None),
+            Err(other) => Err(other),
+        },
+        BackendConn::Postgres(conn) => {
+            let row_opt = sqlx::query(
+                "SELECT history_incarnation, root_folder_id, slug, space_kind, owner_id,
+                        lifecycle_state, active_epoch, last_seq, created_at_sec, created_at_nsec
+                 FROM spaces WHERE space_id = $1 FOR NO KEY UPDATE",
+            )
+            .bind(space_id.as_str())
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_lock_and_load_space", err.to_string()))?;
+
+            let Some(row) = row_opt else {
+                return Ok(None);
+            };
+            let inc_bytes: Vec<u8> = row.get("history_incarnation");
+            let root_raw: String = row.get("root_folder_id");
+            let slug: String = row.get("slug");
+            let kind_raw: String = row.get("space_kind");
+            let owner_raw: String = row.get("owner_id");
+            let lc_raw: String = row.get("lifecycle_state");
+            let active_epoch_raw: i64 = row.get("active_epoch");
+            let last_seq_raw: i64 = row.get("last_seq");
+            let sec: i64 = row.get("created_at_sec");
+            let nsec: i32 = row.get("created_at_nsec");
+
+            let inc_arr: [u8; 16] = inc_bytes.try_into().map_err(|_| {
+                internal_not_committed("corrupt_incarnation", "incarnation not 16 bytes")
+            })?;
+            let incarnation = HistoryIncarnation::from_bytes(inc_arr);
+            let root_folder_id = FolderId::parse(&root_raw).map_err(|_| {
+                internal_not_committed("corrupt_root_folder", "invalid root_folder_id")
+            })?;
+            let owner = PrincipalId::parse(&owner_raw)
+                .map_err(|_| internal_not_committed("corrupt_owner_id", "invalid owner_id"))?;
+            let kind = match kind_raw.as_str() {
+                "personal" => SpaceKind::Personal,
+                "shared" => SpaceKind::Shared,
+                other => {
+                    return Err(internal_not_committed(
+                        "corrupt_space_kind",
+                        format!("unexpected space_kind '{other}'"),
+                    ));
+                }
+            };
+            let lifecycle = match lc_raw.as_str() {
+                "active" => SpaceLifecycle::Active,
+                "closing" => SpaceLifecycle::Closing,
+                "archived" => SpaceLifecycle::Archived,
+                other => {
+                    return Err(internal_not_committed(
+                        "corrupt_space_lifecycle",
+                        format!("unexpected space lifecycle '{other}'"),
+                    ));
+                }
+            };
+            let active_epoch =
+                LeaseEpoch::new(u64::try_from(active_epoch_raw).map_err(|_| {
+                    internal_not_committed("corrupt_epoch", "negative active_epoch")
+                })?)?;
+            let last_seq = i64_to_space_seq(last_seq_raw)?;
+            let created_at = decode_timestamp_parts(sec, nsec)?;
+
+            Ok(Some(SpaceRecord {
+                space: Space {
+                    id: space_id.clone(),
+                    lifecycle,
+                    kind,
+                },
+                scope: HistoryScope {
+                    space_id: space_id.clone(),
+                    incarnation,
+                },
+                root_folder_id,
+                slug,
+                owner,
+                active_epoch,
+                last_seq,
+                created_at,
+            }))
+        }
+    }
+}
+
 pub(crate) async fn bump_space_seq_checked(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
@@ -2117,6 +2978,150 @@ pub(crate) async fn insert_revision_row(
     Ok(())
 }
 
+pub(crate) struct RevisionInsertItem<'a> {
+    pub rev_id: &'a RevisionId,
+    pub entity_type: &'a str,
+    pub entity_key: &'a str,
+    pub space_seq: SpaceSeq,
+    pub visibility_seq: SpaceSeq,
+    pub parent_rev_id: Option<&'a RevisionId>,
+    pub restored_from_rev_id: Option<&'a RevisionId>,
+    pub content_blake3: Option<ContentDigest>,
+    pub metadata_msgpack: &'a [u8],
+    pub actor_id: &'a PrincipalId,
+    pub agent_run_id: Option<&'a AgentRunId>,
+    pub created_at: Timestamp,
+}
+
+pub(crate) async fn insert_revision_rows_batch_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    items: &[RevisionInsertItem<'_>],
+) -> Result<(), PortError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            for chunk in items.chunks(50) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "INSERT INTO revisions (
+                        space_id, history_incarnation, rev_id, entity_type, entity_key,
+                        space_seq, visibility_seq, parent_rev_id, their_rev_id,
+                        restored_from_rev_id, content_blake3, metadata_msgpack,
+                        patch_meta_json, actor_id, session_id, agent_run_id,
+                        quarantine_reason, created_at_sec, created_at_nsec
+                    ) ",
+                );
+                qb.push_values(chunk, |mut b, it| {
+                    let (sec, nsec) = encode_timestamp_parts(it.created_at);
+                    b.push_bind(scope.space_id.as_str())
+                        .push_bind(scope.incarnation.as_bytes().as_slice())
+                        .push_bind(it.rev_id.as_str())
+                        .push_bind(it.entity_type)
+                        .push_bind(it.entity_key)
+                        .push_bind(it.space_seq.get() as i64)
+                        .push_bind(it.visibility_seq.get() as i64)
+                        .push_bind(it.parent_rev_id.map(RevisionId::as_str))
+                        .push("NULL")
+                        .push_bind(it.restored_from_rev_id.map(RevisionId::as_str))
+                        .push_bind(it.content_blake3.as_ref().map(|d| d.as_bytes().as_slice()))
+                        .push_bind(it.metadata_msgpack)
+                        .push("NULL")
+                        .push_bind(it.actor_id.as_str())
+                        .push("NULL")
+                        .push_bind(it.agent_run_id.map(AgentRunId::as_str))
+                        .push("NULL")
+                        .push_bind(sec)
+                        .push_bind(nsec);
+                });
+                qb.build().execute(&mut **conn).await.map_err(|err| {
+                    internal_not_committed("sqlite_insert_revisions_batch", err.to_string())
+                })?;
+            }
+        }
+        BackendConn::Postgres(conn) => {
+            let mut rev_ids: Vec<&str> = Vec::with_capacity(items.len());
+            let mut entity_types: Vec<&str> = Vec::with_capacity(items.len());
+            let mut entity_keys: Vec<&str> = Vec::with_capacity(items.len());
+            let mut space_seqs: Vec<i64> = Vec::with_capacity(items.len());
+            let mut vis_seqs: Vec<i64> = Vec::with_capacity(items.len());
+            let mut parent_revs: Vec<Option<&str>> = Vec::with_capacity(items.len());
+            let mut restored_revs: Vec<Option<&str>> = Vec::with_capacity(items.len());
+            let mut digests: Vec<Option<&[u8]>> = Vec::with_capacity(items.len());
+            let mut metas: Vec<&[u8]> = Vec::with_capacity(items.len());
+            let mut actors: Vec<&str> = Vec::with_capacity(items.len());
+            let mut runs: Vec<Option<&str>> = Vec::with_capacity(items.len());
+            let mut secs: Vec<i64> = Vec::with_capacity(items.len());
+            let mut nsecs: Vec<i32> = Vec::with_capacity(items.len());
+
+            for it in items {
+                let (sec, nsec) = encode_timestamp_parts(it.created_at);
+                rev_ids.push(it.rev_id.as_str());
+                entity_types.push(it.entity_type);
+                entity_keys.push(it.entity_key);
+                space_seqs.push(it.space_seq.get() as i64);
+                vis_seqs.push(it.visibility_seq.get() as i64);
+                parent_revs.push(it.parent_rev_id.map(RevisionId::as_str));
+                restored_revs.push(it.restored_from_rev_id.map(RevisionId::as_str));
+                digests.push(match &it.content_blake3 {
+                    Some(d) => Some(d.as_bytes().as_slice()),
+                    None => None,
+                });
+                metas.push(it.metadata_msgpack);
+                actors.push(it.actor_id.as_str());
+                runs.push(it.agent_run_id.map(AgentRunId::as_str));
+                secs.push(sec);
+                nsecs.push(nsec);
+            }
+
+            sqlx::query(
+                "INSERT INTO revisions (
+                    space_id, history_incarnation, rev_id, entity_type, entity_key,
+                    space_seq, visibility_seq, parent_rev_id, their_rev_id,
+                    restored_from_rev_id, content_blake3, metadata_msgpack,
+                    patch_meta_json, actor_id, session_id, agent_run_id,
+                    quarantine_reason, created_at_sec, created_at_nsec
+                )
+                SELECT
+                    $1, $2, u.rev_id, u.entity_type, u.entity_key,
+                    u.space_seq, u.vis_seq, u.parent_rev_id, NULL,
+                    u.restored_rev_id, u.content_blake3, u.metadata_msgpack,
+                    NULL, u.actor_id, NULL, u.agent_run_id,
+                    NULL, u.sec, u.nsec
+                FROM UNNEST(
+                    $3::TEXT[], $4::TEXT[], $5::TEXT[], $6::BIGINT[], $7::BIGINT[],
+                    $8::TEXT[], $9::TEXT[], $10::BYTEA[], $11::BYTEA[], $12::TEXT[],
+                    $13::TEXT[], $14::BIGINT[], $15::INT4[]
+                ) AS u(
+                    rev_id, entity_type, entity_key, space_seq, vis_seq,
+                    parent_rev_id, restored_rev_id, content_blake3, metadata_msgpack,
+                    actor_id, agent_run_id, sec, nsec
+                )",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(rev_ids)
+            .bind(entity_types)
+            .bind(entity_keys)
+            .bind(space_seqs)
+            .bind(vis_seqs)
+            .bind(parent_revs)
+            .bind(restored_revs)
+            .bind(digests)
+            .bind(metas)
+            .bind(actors)
+            .bind(runs)
+            .bind(secs)
+            .bind(nsecs)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_insert_revisions_batch", err.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_command_and_event(
     tx: &mut BackendConn<'_>,
@@ -2301,6 +3306,65 @@ pub(crate) async fn is_note_purge_fenced_tx(
         .map_err(|err| internal_not_committed("pg_check_purge_fence", err.to_string()))?,
     };
     Ok(exists.is_some())
+}
+
+pub(crate) async fn are_any_notes_purge_fenced_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    note_ids: &[NoteId],
+) -> Result<bool, PortError> {
+    if note_ids.is_empty() {
+        return Ok(false);
+    }
+    if note_ids.len() == 1 {
+        return is_note_purge_fenced_tx(tx, space_id, note_ids[0].as_str()).await;
+    }
+    for chunk in note_ids.chunks(200) {
+        let found = match tx {
+            BackendConn::Sqlite(conn) => {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT 1 FROM revision_purge_fences WHERE space_id = ",
+                );
+                qb.push_bind(space_id.as_str()).push(" AND note_id IN (");
+                let mut sep = qb.separated(", ");
+                for nid in chunk {
+                    sep.push_bind(nid.as_str());
+                }
+                sep.push_unseparated(") LIMIT 1");
+                let row: Option<i64> = qb
+                    .build_query_scalar()
+                    .fetch_optional(&mut **conn)
+                    .await
+                    .map_err(|err| {
+                        internal_not_committed("sqlite_check_purge_fence_batch", err.to_string())
+                    })?;
+                row.is_some()
+            }
+            BackendConn::Postgres(conn) => {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                    "SELECT 1::BIGINT FROM revision_purge_fences WHERE space_id = ",
+                );
+                qb.push_bind(space_id.as_str()).push(" AND note_id IN (");
+                let mut sep = qb.separated(", ");
+                for nid in chunk {
+                    sep.push_bind(nid.as_str());
+                }
+                sep.push_unseparated(") LIMIT 1");
+                let row: Option<i64> = qb
+                    .build_query_scalar()
+                    .fetch_optional(&mut **conn)
+                    .await
+                    .map_err(|err| {
+                        internal_not_committed("pg_check_purge_fence_batch", err.to_string())
+                    })?;
+                row.is_some()
+            }
+        };
+        if found {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[allow(clippy::type_complexity)]

@@ -70,19 +70,21 @@ pub async fn open_and_bootstrap_postgres(
 
     let _ = bootstrap_conn.close().await;
 
-    let search_path_stmt = Arc::new(format!("SET search_path TO \"{validated_schema}\""));
+    let init_session_sql = Arc::new(format!(
+        "SET search_path TO \"{validated_schema}\"; \
+         SET synchronous_commit = on; \
+         SET timezone = 'UTC'; \
+         SET plan_cache_mode = force_generic_plan; \
+         SET seq_page_cost = 0.2; \
+         SET random_page_cost = 0.2;"
+    ));
     let pool = PgPoolOptions::new()
         .max_connections(pool_size.max(1))
+        .test_before_acquire(false)
         .after_connect(move |conn, _meta| {
-            let search_path_stmt = Arc::clone(&search_path_stmt);
+            let init_session_sql = Arc::clone(&init_session_sql);
             Box::pin(async move {
-                sqlx::query(sqlx::AssertSqlSafe(search_path_stmt.as_str()))
-                    .execute(&mut *conn)
-                    .await?;
-                sqlx::query("SET synchronous_commit = on")
-                    .execute(&mut *conn)
-                    .await?;
-                sqlx::query("SET timezone = 'UTC'")
+                sqlx::raw_sql(sqlx::AssertSqlSafe(init_session_sql.as_str()))
                     .execute(&mut *conn)
                     .await?;
                 Ok(())

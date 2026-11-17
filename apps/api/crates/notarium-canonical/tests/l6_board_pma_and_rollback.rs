@@ -1513,3 +1513,155 @@ async fn l6_rollback_agent_run_ordering_trash_first_and_atomicity_dual_dialect_p
         fixtures.drop_pg_schema(&schema).await;
     }
 }
+
+async fn run_note_only_rollback_suite(store: &CanonicalStore) {
+    let owner = sample_principal_id(45);
+    let run_id = sample_run_id(45);
+    let (scope, _root) = seed_space(
+        store,
+        sample_space_id(45),
+        sample_incarnation(45),
+        owner.clone(),
+    )
+    .await;
+    let human_ctx = owner_ctx(&scope, owner.clone());
+    let run_ctx = agent_run_ctx(&human_ctx, run_id.clone());
+
+    let n_ed = sample_note_id(201);
+    let cur_c = "---\ntitle: V0\n---\nHello v0\n";
+    let _pre = store
+        .create_note(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    note: n_ed.clone(),
+                    parent: None,
+                    slug: "note-only-pre".to_owned(),
+                    class: DocClass::UserDoc,
+                    carrier: cur_c.to_owned(),
+                },
+            ),
+        )
+        .await
+        .expect("create pre");
+
+    let plan = extract::finalize_document(
+        cur_c,
+        DocClass::UserDoc,
+        &n_ed,
+        &[FieldEdit::Set {
+            key: "touched".to_owned(),
+            value: YamlValue::Bool(true),
+        }],
+    )
+    .expect("plan");
+    let ed = store
+        .edit_note(
+            run_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                EditNote {
+                    note: n_ed.clone(),
+                    plan,
+                },
+            ),
+        )
+        .await
+        .expect("run edit");
+
+    let n_cr = sample_note_id(202);
+    let cr = store
+        .create_note(
+            run_ctx,
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    note: n_cr.clone(),
+                    parent: None,
+                    slug: "note-only-created".to_owned(),
+                    class: DocClass::UserDoc,
+                    carrier: "---\ntitle: Created\n---\nBody\n".to_owned(),
+                },
+            ),
+        )
+        .await
+        .expect("run create");
+
+    let run_rev = store
+        .inspect_agent_run_revision_for_test(&scope.space_id, &run_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let rb = store
+        .rollback_agent_run(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                RollbackAgentRun {
+                    run: run_id,
+                    expected_run_revision: run_rev,
+                    expected_entities: vec![
+                        NoteRevision {
+                            note: n_ed.clone(),
+                            revision: ed.value.revision,
+                        },
+                        NoteRevision {
+                            note: n_cr.clone(),
+                            revision: cr.value.revision,
+                        },
+                    ],
+                    associated_board_expectations: Vec::new(),
+                },
+            ),
+        )
+        .await
+        .expect("note-only rollback");
+    assert_eq!(rb.value.restored.len(), 1);
+    assert_eq!(rb.value.trashed.len(), 1);
+    let got = store
+        .get_note(
+            human_ctx.clone(),
+            GetNote {
+                note: n_ed,
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::new([rb.receipt]).unwrap()),
+            },
+        )
+        .await
+        .expect("read restored");
+    assert_eq!(
+        got.document.explicit_read(human_ctx.auth()).expect("read"),
+        cur_c
+    );
+}
+
+#[tokio::test]
+async fn l6_note_only_rollback_dual_dialect_parity() {
+    {
+        let root = TempDataRoot::new("l6-nonly-sqlite");
+        let cfg = CanonicalConfig::local_default(sample_installation_id(1), root.data_root());
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
+        run_note_only_rollback_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown sqlite");
+    }
+    {
+        let fixtures = StorageTestFixtures::load_required();
+        let schema = fixtures.fresh_pg_schema();
+        let bucket = fixtures.fresh_s3_bucket("l6non");
+        let s3_cfg = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
+        admin_ensure_bucket(&s3_cfg, Some("Enabled"))
+            .await
+            .expect("ensure S3 bucket");
+        let cfg = fixtures.pg_s3_config(sample_installation_id(2), &schema, s3_cfg);
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
+        run_note_only_rollback_suite(&store).await;
+        runtime.shutdown().await.expect("shutdown pg+s3");
+        fixtures.drop_pg_schema(&schema).await;
+    }
+}

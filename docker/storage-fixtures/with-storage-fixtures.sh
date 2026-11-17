@@ -114,7 +114,7 @@ export NOTARIUM_FIXTURE_S3_SECRET_KEY="$S3_SECRET_KEY"
 
 cleanup() {
   rm -f -- "$ACTIVE_MANIFEST"
-  docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true
+  docker compose --progress plain -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" down -v --remove-orphans </dev/null >/dev/null 2>&1 || true
   rm -rf -- "$RUN_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -122,7 +122,7 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d --pull never --no-build
+docker compose --progress plain -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" up -d --pull never --no-build </dev/null
 
 # Wait for PostgreSQL 16 UDS readiness (bounded 30s).
 pg_ready=0

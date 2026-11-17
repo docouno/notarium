@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS note_heads (
     ),
     FOREIGN KEY (space_id) REFERENCES spaces (space_id),
     FOREIGN KEY (space_id, parent_folder_id) REFERENCES folder_heads (space_id, folder_id)
-);
+) WITH (fillfactor = 80);
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_note_heads_active_sibling
     ON note_heads (space_id, parent_folder_id, slug_fold)
@@ -141,9 +141,6 @@ CREATE INDEX IF NOT EXISTS idx_note_heads_parent_lifecycle
 
 CREATE INDEX IF NOT EXISTS idx_note_heads_created_seq
     ON note_heads (space_id, created_seq, note_id);
-
-CREATE INDEX IF NOT EXISTS idx_note_heads_updated_seq
-    ON note_heads (space_id, updated_seq DESC, note_id);
 
 CREATE TABLE IF NOT EXISTS note_aliases (
     space_id TEXT NOT NULL,
@@ -208,12 +205,8 @@ CREATE TABLE IF NOT EXISTS revisions (
     quarantine_reason TEXT,
     created_at_sec BIGINT NOT NULL,
     created_at_nsec INTEGER NOT NULL CHECK (created_at_nsec >= 0 AND created_at_nsec < 1000000000),
-    PRIMARY KEY (space_id, rev_id),
-    FOREIGN KEY (space_id) REFERENCES spaces (space_id)
+    PRIMARY KEY (space_id, rev_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_revisions_entity_space_seq
-    ON revisions (space_id, entity_type, entity_key, space_seq DESC);
 
 CREATE INDEX IF NOT EXISTS idx_revisions_entity_vis_seq
     ON revisions (space_id, entity_type, entity_key, visibility_seq DESC, space_seq DESC);
@@ -295,9 +288,8 @@ CREATE TABLE IF NOT EXISTS blob_catalog (
     admission_state TEXT NOT NULL CHECK (admission_state IN ('open', 'retiring')),
     blob_state TEXT NOT NULL CHECK (blob_state IN ('staging', 'active', 'quarantined', 'retired', 'corrupt')),
     touched_at_ms BIGINT NOT NULL,
-    PRIMARY KEY (space_id, content_blake3),
-    FOREIGN KEY (space_id) REFERENCES spaces (space_id)
-);
+    PRIMARY KEY (space_id, content_blake3)
+) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_blob_catalog_zero_ref
     ON blob_catalog (space_id, touched_at_ms)
@@ -316,19 +308,16 @@ CREATE TABLE IF NOT EXISTS blob_publications (
     compressed_size BIGINT NOT NULL CHECK (compressed_size >= 0),
     created_at_ms BIGINT NOT NULL,
     updated_at_ms BIGINT NOT NULL,
-    PRIMARY KEY (space_id, publication_id),
-    FOREIGN KEY (space_id, content_blake3) REFERENCES blob_catalog (space_id, content_blake3)
+    PRIMARY KEY (space_id, publication_id)
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_blob_publications_global_id
-    ON blob_publications (publication_id);
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_blob_publications_active_digest
     ON blob_publications (space_id, content_blake3)
     WHERE state = 'active';
 
 CREATE INDEX IF NOT EXISTS idx_blob_publications_digest_state
-    ON blob_publications (space_id, content_blake3, state);
+    ON blob_publications (space_id, content_blake3, state)
+    WHERE state <> 'active';
 
 CREATE TABLE IF NOT EXISTS blob_parts (
     space_id TEXT NOT NULL,
@@ -356,16 +345,12 @@ CREATE TABLE IF NOT EXISTS blob_references (
     content_blake3 BYTEA NOT NULL CHECK (octet_length(content_blake3) = 32),
     publication_id TEXT NOT NULL,
     created_seq BIGINT NOT NULL CHECK (created_seq >= 0),
-    PRIMARY KEY (space_id, owner_kind, owner_id, owner_rev_id, resource_key),
-    FOREIGN KEY (space_id, content_blake3) REFERENCES blob_catalog (space_id, content_blake3),
-    FOREIGN KEY (space_id, publication_id) REFERENCES blob_publications (space_id, publication_id)
+    PRIMARY KEY (space_id, owner_kind, owner_rev_id, owner_id, resource_key)
 );
 
-CREATE INDEX IF NOT EXISTS idx_blob_references_digest
-    ON blob_references (space_id, content_blake3);
-
-CREATE INDEX IF NOT EXISTS idx_blob_references_owner
-    ON blob_references (space_id, owner_kind, owner_id);
+CREATE INDEX IF NOT EXISTS idx_blob_references_non_note_owner
+    ON blob_references (space_id, owner_kind, owner_id)
+    WHERE owner_kind <> 'note_revision';
 
 CREATE TABLE IF NOT EXISTS blob_retirements (
     space_id TEXT NOT NULL,
@@ -445,8 +430,7 @@ CREATE TABLE IF NOT EXISTS command_receipts (
     sanitized_envelope_msgpack BYTEA NOT NULL,
     canonical_seq BIGINT NOT NULL CHECK (canonical_seq >= 0),
     expires_at_ms BIGINT NOT NULL,
-    PRIMARY KEY (space_id, history_incarnation, actor_id, idempotency_key),
-    FOREIGN KEY (space_id) REFERENCES spaces (space_id)
+    PRIMARY KEY (space_id, history_incarnation, actor_id, idempotency_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_command_receipts_expires
@@ -461,15 +445,11 @@ CREATE TABLE IF NOT EXISTS change_commands (
     command_kind TEXT NOT NULL,
     payload_id TEXT,
     committed_at_ms BIGINT NOT NULL,
-    PRIMARY KEY (space_id, history_incarnation, command_id),
-    FOREIGN KEY (space_id) REFERENCES spaces (space_id)
+    PRIMARY KEY (space_id, history_incarnation, command_id)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_change_commands_last_seq
     ON change_commands (space_id, history_incarnation, last_seq);
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_change_commands_first_seq
-    ON change_commands (space_id, history_incarnation, first_seq);
 
 CREATE TABLE IF NOT EXISTS change_log (
     space_id TEXT NOT NULL,
@@ -486,8 +466,7 @@ CREATE TABLE IF NOT EXISTS change_log (
     doc_class TEXT CHECK (doc_class IS NULL OR doc_class IN ('user-doc', 'encrypted-note', 'agent-memory', 'skill', 'profile')),
     payload_id TEXT,
     committed_at_ms BIGINT NOT NULL,
-    PRIMARY KEY (space_id, space_seq),
-    FOREIGN KEY (space_id) REFERENCES spaces (space_id)
+    PRIMARY KEY (space_id, space_seq)
 );
 
 CREATE TABLE IF NOT EXISTS change_payloads (
@@ -501,8 +480,7 @@ CREATE TABLE IF NOT EXISTS change_payloads (
     CHECK (
         (erased_by_purge = 0 AND effect_msgpack IS NOT NULL)
         OR (erased_by_purge = 1 AND effect_msgpack IS NULL)
-    ),
-    FOREIGN KEY (space_id) REFERENCES spaces (space_id)
+    )
 );
 
 CREATE TABLE IF NOT EXISTS payload_owners (
@@ -510,12 +488,8 @@ CREATE TABLE IF NOT EXISTS payload_owners (
     payload_kind TEXT NOT NULL CHECK (payload_kind IN ('change_payload', 'command_receipt', 'content_job', 'materialized_observation', 'board_move_history')),
     payload_id TEXT NOT NULL,
     note_id TEXT NOT NULL,
-    PRIMARY KEY (space_id, payload_kind, payload_id, note_id),
-    FOREIGN KEY (space_id) REFERENCES spaces (space_id)
+    PRIMARY KEY (space_id, payload_kind, payload_id, note_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_payload_owners_note
-    ON payload_owners (space_id, note_id, payload_kind, payload_id);
 
 CREATE TABLE IF NOT EXISTS agent_run_heads (
     space_id TEXT NOT NULL,
@@ -525,9 +499,8 @@ CREATE TABLE IF NOT EXISTS agent_run_heads (
     last_seq BIGINT NOT NULL CHECK (last_seq >= 1),
     updated_at_sec BIGINT NOT NULL,
     updated_at_nsec INTEGER NOT NULL CHECK (updated_at_nsec >= 0 AND updated_at_nsec < 1000000000),
-    PRIMARY KEY (space_id, run_id),
-    FOREIGN KEY (space_id) REFERENCES spaces (space_id)
-);
+    PRIMARY KEY (space_id, run_id)
+) WITH (fillfactor = 70);
 
 CREATE TABLE IF NOT EXISTS board_move_history (
     space_id TEXT NOT NULL,
@@ -673,11 +646,11 @@ CREATE TABLE IF NOT EXISTS collab_sessions (
     lease_epoch BIGINT NOT NULL CHECK (lease_epoch >= 0),
     lineage_epoch BIGINT NOT NULL CHECK (lineage_epoch >= 0),
     carrier_rev_id TEXT NOT NULL,
-    yrs_snapshot_blob BYTEA,
     yrs_snapshot_blake3 BYTEA CHECK (yrs_snapshot_blake3 IS NULL OR octet_length(yrs_snapshot_blake3) = 32),
     room_state TEXT NOT NULL CHECK (room_state IN ('closed', 'active', 'fenced')),
     owner_id TEXT,
     updated_seq BIGINT NOT NULL CHECK (updated_seq >= 1),
+    yrs_snapshot_blob BYTEA,
     PRIMARY KEY (space_id, note_id),
     FOREIGN KEY (space_id, note_id) REFERENCES note_heads (space_id, note_id)
 );

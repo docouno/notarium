@@ -74,10 +74,48 @@ pub(crate) fn analyze_and_prepare_carrier(
     slug: &str,
     codec: BlobCodecTag,
 ) -> Result<PreparedCarrierInfo, PortError> {
-    let extracted = notarium_syntax::extract::extract(carrier, class, note_id, slug, None)?;
-    let (raw_fields, diagnostics, headings) = match extracted {
-        ExtractedDocDelta::Encrypted(_) => (None, Vec::new(), Vec::new()),
-        ExtractedDocDelta::Plain(plain) => (plain.fields, plain.diagnostics, plain.headings),
+    analyze_and_prepare_carrier_opt_preparsed(carrier, class, note_id, slug, codec, None)
+}
+
+fn analyze_and_prepare_carrier_opt_preparsed(
+    carrier: &str,
+    class: DocClass,
+    _note_id: &NoteId,
+    slug: &str,
+    codec: BlobCodecTag,
+    preparsed_hdr: Option<(
+        Option<BTreeMap<String, YamlValue>>,
+        Option<notarium_core::error::ValidationReason>,
+        usize,
+    )>,
+) -> Result<PreparedCarrierInfo, PortError> {
+    let (raw_fields, diagnostics, headings) = if class == DocClass::EncryptedNote {
+        notarium_syntax::encrypted::validate(carrier)?;
+        (None, Vec::new(), Vec::new())
+    } else if let Some((fields, diag_opt, body_start)) = preparsed_hdr
+        && let Ok(body_span) = ByteSpan::new(body_start, carrier.len())
+    {
+        let md = notarium_syntax::markdown::analyze(carrier, body_span)?;
+        let diags = diag_opt
+            .map(|reason| Diagnostic {
+                reason,
+                location: None,
+            })
+            .into_iter()
+            .collect();
+        (fields, diags, md.headings)
+    } else {
+        let header = notarium_syntax::frontmatter::analyze(carrier, class)?;
+        let md = notarium_syntax::markdown::analyze(carrier, header.carrier.body)?;
+        let diags = header
+            .diagnostic
+            .map(|reason| Diagnostic {
+                reason,
+                location: None,
+            })
+            .into_iter()
+            .collect();
+        (header.fields, diags, md.headings)
     };
     let title = extract_note_title(carrier, slug, class, raw_fields.as_ref(), &headings);
     let title_fold = if class == DocClass::EncryptedNote {
@@ -149,6 +187,7 @@ pub(crate) async fn create_note_impl(
     ctx: SpaceContext,
     request: Mutation<CreateNote>,
 ) -> Result<Committed<NoteRevision>, PortError> {
+    let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
     validate_mutation_identity(&ctx, &request.identity)?;
     let slug_fold = normalize_slug_key(&request.input.slug)?;
     if request.input.class == DocClass::Skill {
@@ -163,11 +202,13 @@ pub(crate) async fn create_note_impl(
         store.blob_codec(),
     )?;
 
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let ticket = store
-        .stage_blob(
+        .stage_blob_for_batch_prechecked(
             &space_rec.scope,
             space_rec.active_epoch,
             &info.prepared_blob,
@@ -189,6 +230,23 @@ pub(crate) async fn create_note_impl(
     let idemp =
         derive_command_identity_spec(&request.identity, "create_note", fp.finalize().as_bytes());
 
+    if store.is_sqlite_local() {
+        let (intent, fast_plan) = crate::sqlite_fast::build_create_note_fast_intent(
+            &space_rec.scope,
+            space_rec.active_epoch,
+            Some(idemp),
+            ctx.auth().clone(),
+            request.input,
+            slug_fold,
+            info,
+            ticket,
+        )?;
+        let stored: StoredCommittedNoteRevV1 = store
+            .submit_write_command_tracked(&ctx.budget, intent, Some(fast_plan), active_op_guard)
+            .await?;
+        return Ok(stored.into_committed());
+    }
+
     let intent = build_create_note_intent(
         &space_rec.scope,
         space_rec.active_epoch,
@@ -200,12 +258,14 @@ pub(crate) async fn create_note_impl(
         ticket,
     );
 
-    let stored: StoredCommittedNoteRevV1 = store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedNoteRevV1 = store
+        .submit_write_command_tracked(&ctx.budget, intent, None, active_op_guard)
+        .await?;
     Ok(stored.into_committed())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_create_note_intent(
+pub(crate) fn build_create_note_intent(
     scope: &notarium_core::model::HistoryScope,
     active_epoch: notarium_core::ids::LeaseEpoch,
     idemp: Option<crate::writer::CommandIdentitySpec>,
@@ -492,6 +552,7 @@ pub(crate) async fn edit_note_impl(
     ctx: SpaceContext,
     request: Mutation<EditNote>,
 ) -> Result<Committed<NoteRevision>, PortError> {
+    let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
     validate_mutation_identity(&ctx, &request.identity)?;
     let mut fp_hasher = blake3::Hasher::new();
     fp_hasher.update(request.input.note.as_str().as_bytes());
@@ -509,46 +570,176 @@ pub(crate) async fn edit_note_impl(
         fp_hasher.finalize().as_bytes(),
     );
 
-    // Check idempotency receipt BEFORE reading live head so replayed edits work even if head moved on!
-    if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
-        store,
-        ctx.scope(),
-        &idemp,
-        Some(&ctx.budget),
-    )
-    .await?
-    {
-        return Ok(replayed.into_committed());
-    }
-
-    let (space_rec, base_head) =
-        read_active_note_for_mutation(store, &ctx, &request.input.note, &request.preconditions)
-            .await?;
-
-    let base_digest = base_head.content_digest.ok_or_else(|| {
-        internal_not_committed(
-            "active_note_missing_digest",
-            "active note lacks content_blake3",
+    let phase1 = if store.is_sqlite_local() {
+        crate::sqlite_fast::edit_note_phase1_sqlite_local(
+            store,
+            &ctx,
+            &request.input.note,
+            &request.preconditions,
+            request.input.plan.base_content_hash,
+            &idemp,
         )
-    })?;
-    if base_digest != request.input.plan.base_content_hash {
-        return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-    }
+        .await?
+    } else {
+        let scope_p1 = ctx.scope().clone();
+        let auth_p1 = ctx.auth().clone();
+        let nid_p1 = request.input.note.clone();
+        let prec_p1 = request.preconditions.clone();
+        let expected_hash_p1 = request.input.plan.base_content_hash;
+        let idemp_p1 = idemp.clone();
+        let store_p1 = store.clone();
 
-    let raw_bytes = store
-        .read_verified_blob(&space_rec.scope, base_digest)
-        .await?;
-    let base_carrier = String::from_utf8(raw_bytes).map_err(|_| {
-        internal_not_committed(
-            "corrupt_note_utf8",
-            "canonical note carrier is not valid UTF-8",
-        )
-    })?;
+        store
+            .with_read_tx_budget(Some(&ctx.budget), |tx| {
+                Box::pin(async move {
+                    let srec = load_space_record(tx, &scope_p1.space_id).await?;
+                    srec.scope.check(&scope_p1)?;
+
+                    // Check idempotency receipt BEFORE reading live head so replayed edits work even if head moved on!
+                    if let Some(existing) =
+                        crate::writer::lookup_command_receipt_tx(tx, &scope_p1, &idemp_p1).await?
+                    {
+                        if existing.command_hash != idemp_p1.command_hash {
+                            return Err(DomainError::IdempotencyKeyReused.into());
+                        }
+                        if existing.status == "completed" {
+                            let decoded: StoredCommittedNoteRevV1 =
+                                rmp_serde::from_slice(&existing.response_blob).map_err(|err| {
+                                    internal_not_committed(
+                                        "decode_replayed_receipt",
+                                        err.to_string(),
+                                    )
+                                })?;
+                            return Ok(crate::sqlite_fast::EditPhase1Read::Replayed(decoded));
+                        }
+                    }
+
+                    if is_note_purge_fenced_tx(tx, &scope_p1.space_id, nid_p1.as_str()).await? {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let head = load_note_head_row_tx(tx, &scope_p1.space_id, &nid_p1).await?;
+                    if head.lifecycle != Lifecycle::Active {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    if let Some(expected_rev) = &prec_p1.revision
+                        && *expected_rev != head.head_rev_id
+                    {
+                        return Err(DomainError::RevisionConflict {
+                            current: head.head_rev_id,
+                            lineage: None,
+                        }
+                        .into());
+                    }
+                    check_collab_preconditions_tx(tx, &scope_p1.space_id, &nid_p1, &prec_p1)
+                        .await?;
+                    let (facts, _) = build_resource_facts_tx(
+                        tx,
+                        &srec.space,
+                        &head.parent_folder_id,
+                        head.doc_class,
+                        head.ability_id.clone(),
+                        true,
+                    )
+                    .await?;
+                    auth_p1.authorize_direct_write(&facts, &facts)?;
+
+                    let base_digest = head.content_digest.ok_or_else(|| {
+                        internal_not_committed(
+                            "active_note_missing_digest",
+                            "active note lacks content_blake3",
+                        )
+                    })?;
+                    if base_digest != expected_hash_p1 {
+                        return Err(
+                            DomainError::validation(ValidationReason::SourceMismatch).into()
+                        );
+                    }
+
+                    let fast_local_read = store_p1
+                        .try_prepare_local_blob_read_in_tx(tx, &srec.scope.space_id, base_digest)
+                        .await?;
+
+                    Ok(crate::sqlite_fast::EditPhase1Read::Proceed {
+                        space_rec: srec,
+                        base_head: head,
+                        base_anc: None,
+                        base_digest,
+                        preloaded_base_carrier: None,
+                        fast_local_read,
+                        phase1_receipt_checked_gen: None,
+                    })
+                })
+            })
+            .await?
+    };
+
+    let (
+        space_rec,
+        base_head,
+        base_anc,
+        base_digest,
+        preloaded_base_carrier,
+        fast_local_read,
+        phase1_receipt_checked_gen,
+    ) = match phase1 {
+        crate::sqlite_fast::EditPhase1Read::Replayed(replayed) => {
+            return Ok(replayed.into_committed());
+        }
+        crate::sqlite_fast::EditPhase1Read::Proceed {
+            space_rec,
+            base_head,
+            base_anc,
+            base_digest,
+            preloaded_base_carrier,
+            fast_local_read,
+            phase1_receipt_checked_gen,
+        } => (
+            space_rec,
+            base_head,
+            base_anc,
+            base_digest,
+            preloaded_base_carrier,
+            fast_local_read,
+            phase1_receipt_checked_gen,
+        ),
+    };
+
+    let base_carrier = match preloaded_base_carrier {
+        Some(carrier) => carrier,
+        None => {
+            let raw_bytes = match fast_local_read {
+                Some(plan) => {
+                    if base_head.byte_size <= 64 * 1024 {
+                        plan.read_verified()?
+                    } else {
+                        plan.read_verified_async().await?
+                    }
+                }
+                None => {
+                    store
+                        .read_verified_blob(&space_rec.scope, base_digest)
+                        .await?
+                }
+            };
+            String::from_utf8(raw_bytes).map_err(|_| {
+                internal_not_committed(
+                    "corrupt_note_utf8",
+                    "canonical note carrier is not valid UTF-8",
+                )
+            })?
+        }
+    };
 
     let new_carrier = notarium_syntax::patch::apply(&base_carrier, &request.input.plan)?;
-    if base_head.doc_class != DocClass::EncryptedNote {
-        enforce_protected_frontmatter_unchanged(&base_carrier, &new_carrier, base_head.doc_class)?;
-    }
+    let preparsed_hdr = if base_head.doc_class != DocClass::EncryptedNote {
+        enforce_protected_frontmatter_unchanged_with_header(
+            &base_carrier,
+            &new_carrier,
+            base_head.doc_class,
+        )?
+    } else {
+        None
+    };
 
     let mut reservation_opt = None;
     if let Some(interceptor) = store.inner.collab_interceptor.get()
@@ -595,20 +786,46 @@ pub(crate) async fn edit_note_impl(
         }
     }
 
-    let info = analyze_and_prepare_carrier(
+    let info = analyze_and_prepare_carrier_opt_preparsed(
         &new_carrier,
         base_head.doc_class,
         &request.input.note,
         &base_head.slug,
         store.blob_codec(),
+        preparsed_hdr,
     )?;
     let ticket = store
-        .stage_blob(
+        .stage_blob_for_batch_prechecked(
             &space_rec.scope,
             space_rec.active_epoch,
             &info.prepared_blob,
         )
         .await?;
+
+    if store.is_sqlite_local() && reservation_opt.is_none() {
+        let phase1_cached = base_anc.map(|anc| (base_head.clone(), anc));
+        let (intent, fast_plan) = crate::sqlite_fast::build_carrier_replacement_fast_intent(
+            store,
+            &space_rec.scope,
+            space_rec.active_epoch,
+            Some(idemp),
+            "edit_note",
+            ctx.auth().clone(),
+            request.identity,
+            request.preconditions,
+            request.input.note,
+            base_head.head_rev_id,
+            None,
+            info,
+            ticket,
+            phase1_receipt_checked_gen,
+            phase1_cached,
+        )?;
+        let stored: StoredCommittedNoteRevV1 = store
+            .submit_write_command_tracked(&ctx.budget, intent, Some(fast_plan), active_op_guard)
+            .await?;
+        return Ok(stored.into_committed());
+    }
 
     let intent = build_carrier_replacement_intent(
         store,
@@ -627,7 +844,9 @@ pub(crate) async fn edit_note_impl(
         reservation_opt,
     );
 
-    let stored: StoredCommittedNoteRevV1 = store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedNoteRevV1 = store
+        .submit_write_command_tracked(&ctx.budget, intent, None, active_op_guard)
+        .await?;
     Ok(stored.into_committed())
 }
 
@@ -661,7 +880,7 @@ pub(crate) fn build_carrier_replacement_intent(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                let fence_guard = if let Some(res) = reservation_opt {
+                let (fence_guard, has_closed_collab_session) = if let Some(res) = reservation_opt {
                     let g = room_fences
                         .consume_reservation(&scope_cl, &note_id, res, &identity)
                         .await?;
@@ -690,9 +909,9 @@ pub(crate) fn build_carrier_replacement_intent(
                             std::time::Duration::from_millis(50),
                         ));
                     }
-                    Some(g)
+                    (Some(g), dstate.is_some())
                 } else {
-                    if crate::domain::common::is_note_room_active_tx(
+                    match crate::domain::common::check_note_room_direct_write_tx(
                         tx,
                         &room_fences,
                         &scope_cl,
@@ -700,19 +919,25 @@ pub(crate) fn build_carrier_replacement_intent(
                     )
                     .await?
                     {
-                        return Err(unavailable_retryable(
-                            "collab_room_not_closed",
-                            "note collaborative session is active or fenced awaiting recovery",
-                            std::time::Duration::from_millis(50),
-                        ));
+                        crate::domain::common::NoteRoomDirectWriteState::ActiveOrFenced => {
+                            return Err(unavailable_retryable(
+                                "collab_room_not_closed",
+                                "note collaborative session is active or fenced awaiting recovery",
+                                std::time::Duration::from_millis(50),
+                            ));
+                        }
+                        crate::domain::common::NoteRoomDirectWriteState::ClosedSessionRow => {
+                            (None, true)
+                        }
+                        crate::domain::common::NoteRoomDirectWriteState::NoSessionRow => {
+                            (None, false)
+                        }
                     }
-                    None
                 };
                 if let Some(g) = fence_guard {
                     item_ctx.retain_until_batch_commit(g);
                 }
 
-                let live_space = load_space_record(tx, &scope_cl.space_id).await?;
                 let head = load_note_head_row_tx(tx, &scope_cl.space_id, &note_id).await?;
                 if head.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
@@ -738,7 +963,7 @@ pub(crate) fn build_carrier_replacement_intent(
 
                 let (facts, anc) = build_resource_facts_tx(
                     tx,
-                    &live_space.space,
+                    &item_ctx.space,
                     &head.parent_folder_id,
                     head.doc_class,
                     head.ability_id.clone(),
@@ -811,14 +1036,16 @@ pub(crate) fn build_carrier_replacement_intent(
                     seq,
                 )
                 .await?;
-                crate::domain::common::sync_closed_collab_session_on_direct_write_tx(
-                    tx,
-                    &scope_cl.space_id,
-                    &note_id,
-                    &new_rev,
-                    seq,
-                )
-                .await?;
+                if has_closed_collab_session {
+                    crate::domain::common::sync_closed_collab_session_on_direct_write_tx(
+                        tx,
+                        &scope_cl.space_id,
+                        &note_id,
+                        &new_rev,
+                        seq,
+                    )
+                    .await?;
+                }
 
                 match tx {
                     BackendConn::Sqlite(conn) => {
@@ -2659,7 +2886,7 @@ pub(crate) async fn append_memory_impl(
         store.blob_codec(),
     )?;
     let ticket = store
-        .stage_blob(
+        .stage_blob_for_batch(
             &space_rec.scope,
             space_rec.active_epoch,
             &info.prepared_blob,
@@ -3374,9 +3601,15 @@ pub(crate) async fn accept_external_observation_impl(
     if computed_digest != request.input.observed_digest {
         return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
     }
-    if base_head.doc_class != DocClass::EncryptedNote {
-        enforce_protected_frontmatter_unchanged(&base_carrier, &new_carrier, base_head.doc_class)?;
-    }
+    let preparsed_hdr = if base_head.doc_class != DocClass::EncryptedNote {
+        enforce_protected_frontmatter_unchanged_with_header(
+            &base_carrier,
+            &new_carrier,
+            base_head.doc_class,
+        )?
+    } else {
+        None
+    };
 
     let mut reservation_opt = None;
     if let Some(interceptor) = store.inner.collab_interceptor.get()
@@ -3432,12 +3665,13 @@ pub(crate) async fn accept_external_observation_impl(
         }
     }
 
-    let info = analyze_and_prepare_carrier(
+    let info = analyze_and_prepare_carrier_opt_preparsed(
         &new_carrier,
         base_head.doc_class,
         &request.input.note,
         &base_head.slug,
         store.blob_codec(),
+        preparsed_hdr,
     )?;
     let ticket = store
         .stage_blob(
@@ -4267,13 +4501,27 @@ pub(crate) async fn get_note_impl(
     ctx: SpaceContext,
     request: GetNote,
 ) -> Result<NoteSnapshot, PortError> {
+    if store.is_sqlite_local() {
+        return crate::sqlite_fast::get_note_sqlite_local_fast(store, ctx, request).await;
+    }
     let scope = ctx.scope().clone();
     let auth = ctx.auth().clone();
     let req_note = request.note.clone();
     let req_rev_opt = request.revision.clone();
     let causal = request.causal.clone();
 
-    let (rev_id, live_facts, lifecycle, digest, parent_opt, byte_size, fields, diagnostics) = store
+    let store_in = store.clone();
+    let (
+        rev_id,
+        live_facts,
+        lifecycle,
+        digest,
+        parent_opt,
+        byte_size,
+        fields,
+        diagnostics,
+        fast_local_read,
+    ) = store
         .with_read_tx_budget(Some(&ctx.budget), |tx| {
             Box::pin(async move {
                 let space_rec = load_space_record(tx, &scope.space_id).await?;
@@ -4391,6 +4639,10 @@ pub(crate) async fn get_note_impl(
                         nm.evaluated_fields
                     };
 
+                let fast_local_read = store_in
+                    .try_prepare_local_blob_read_in_tx(tx, &scope.space_id, digest)
+                    .await?;
+
                 Ok((
                     target_rev_id,
                     live_facts,
@@ -4400,12 +4652,16 @@ pub(crate) async fn get_note_impl(
                     nm.byte_size,
                     fields,
                     nm.diagnostics,
+                    fast_local_read,
                 ))
             })
         })
         .await?;
 
-    let raw_bytes = store.read_verified_blob(ctx.scope(), digest).await?;
+    let raw_bytes = match fast_local_read {
+        Some(plan) => plan.read_verified_async().await?,
+        None => store.read_verified_blob(ctx.scope(), digest).await?,
+    };
     let content = String::from_utf8(raw_bytes)
         .map_err(|_| internal_not_committed("get_note_utf8", "note carrier is not valid UTF-8"))?;
 
@@ -4784,7 +5040,28 @@ fn enforce_protected_frontmatter_unchanged(
     after: &str,
     class: DocClass,
 ) -> Result<(), PortError> {
+    enforce_protected_frontmatter_unchanged_with_header(before, after, class).map(|_| ())
+}
+
+type PreparsedHeaderTuple = (
+    Option<BTreeMap<String, YamlValue>>,
+    Option<notarium_core::error::ValidationReason>,
+    usize,
+);
+
+fn enforce_protected_frontmatter_unchanged_with_header(
+    before: &str,
+    after: &str,
+    class: DocClass,
+) -> Result<Option<PreparsedHeaderTuple>, PortError> {
     let old_hdr = notarium_syntax::frontmatter::analyze(before, class)?;
+    let hdr_end = old_hdr.carrier.body.start();
+    if hdr_end > 0
+        && after.len() >= hdr_end
+        && before.as_bytes()[..hdr_end] == after.as_bytes()[..hdr_end]
+    {
+        return Ok(Some((old_hdr.fields, old_hdr.diagnostic, hdr_end)));
+    }
     let new_hdr = notarium_syntax::frontmatter::analyze(after, class)?;
     let empty = BTreeMap::new();
     let old_map = old_hdr.fields.as_ref().unwrap_or(&empty);
@@ -4794,7 +5071,8 @@ fn enforce_protected_frontmatter_unchanged(
             authorize_field_key(key)?;
         }
     }
-    Ok(())
+    let new_body_start = new_hdr.carrier.body.start();
+    Ok(Some((new_hdr.fields, new_hdr.diagnostic, new_body_start)))
 }
 
 async fn update_ability_package_slug_tx(

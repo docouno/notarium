@@ -97,6 +97,11 @@ impl JobReadRegistry {
         }
         guard.iter().find(|e| e.id == *id).cloned()
     }
+
+    pub(crate) fn remove_space(&self, space_id: &SpaceId) {
+        let mut guard = self.entries.lock().expect("job read registry mutex");
+        guard.retain(|e| e.scope.space_id != *space_id);
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

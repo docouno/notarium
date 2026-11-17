@@ -2,7 +2,7 @@ pub mod local;
 pub mod s3;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap, HashSet},
     io::{Cursor, Read},
     sync::Arc,
     time::Duration,
@@ -20,7 +20,9 @@ use sqlx::Row;
 pub use crate::blobs::local::PendingDirSyncs;
 use crate::{
     blobs::{
-        local::{LocalBlobStore, LocalSharedGuard},
+        local::{
+            DeferredLocalStaging, LocalBlobStore, LocalSharedGuard, PreparedLocalStagingEntry,
+        },
         s3::{S3BlobStore, S3Transport},
     },
     codec::{internal_not_committed, new_prefixed_hex_id, now_unix_ms, unavailable_retryable},
@@ -222,8 +224,24 @@ fn check_s3_frame_bounds(compressed_len: usize) -> Result<(), PortError> {
 }
 
 pub fn encode_zstd_level3(raw: &[u8]) -> Result<Vec<u8>, PortError> {
-    zstd::stream::encode_all(Cursor::new(raw), ZSTD_COMPRESSION_LEVEL)
-        .map_err(|err| internal_not_committed("zstd_encode_failed", err.to_string()))
+    thread_local! {
+        static ZSTD_ENC: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    ZSTD_ENC.with(|cell| {
+        if let Ok(mut borrow) = cell.try_borrow_mut() {
+            if borrow.is_none() {
+                *borrow = zstd::bulk::Compressor::new(ZSTD_COMPRESSION_LEVEL).ok();
+            }
+            if let Some(comp) = borrow.as_mut() {
+                return comp
+                    .compress(raw)
+                    .map_err(|err| internal_not_committed("zstd_encode_failed", err.to_string()));
+            }
+        }
+        zstd::stream::encode_all(Cursor::new(raw), ZSTD_COMPRESSION_LEVEL)
+            .map_err(|err| internal_not_committed("zstd_encode_failed", err.to_string()))
+    })
 }
 
 /// Bounded Zstd decompression + exact raw length + full BLAKE3 integrity check.
@@ -248,15 +266,43 @@ pub fn decode_zstd_verified(
     let cap = usize::try_from(expected_raw_size)
         .map_err(|_| internal_not_committed("corrupt_blob_raw_len", "raw_size exceeds usize"))?;
 
-    let decoder = zstd::stream::read::Decoder::new(compressed)
-        .map_err(|err| internal_not_committed("corrupt_blob_zstd_header", err.to_string()))?;
-
-    let max_read = expected_raw_size.saturating_add(1);
-    let mut limited = decoder.take(max_read);
-    let mut decoded = Vec::with_capacity(cap.min(64 * 1024));
-    limited
-        .read_to_end(&mut decoded)
-        .map_err(|err| internal_not_committed("corrupt_blob_zstd_stream", err.to_string()))?;
+    let decoded = if cap <= 8 * 1024 * 1024 {
+        thread_local! {
+            static ZSTD_DEC: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        ZSTD_DEC.with(|cell| -> Result<Vec<u8>, PortError> {
+            if let Ok(mut borrow) = cell.try_borrow_mut() {
+                if borrow.is_none() {
+                    *borrow = zstd::bulk::Decompressor::new().ok();
+                }
+                if let Some(dec) = borrow.as_mut() {
+                    return dec.decompress(compressed, cap).map_err(|err| {
+                        internal_not_committed("corrupt_blob_zstd_stream", err.to_string())
+                    });
+                }
+            }
+            let decoder = zstd::stream::read::Decoder::new(compressed).map_err(|err| {
+                internal_not_committed("corrupt_blob_zstd_header", err.to_string())
+            })?;
+            let mut limited = decoder.take(expected_raw_size.saturating_add(1));
+            let mut buf = Vec::with_capacity(cap.min(64 * 1024));
+            limited.read_to_end(&mut buf).map_err(|err| {
+                internal_not_committed("corrupt_blob_zstd_stream", err.to_string())
+            })?;
+            Ok(buf)
+        })?
+    } else {
+        let decoder = zstd::stream::read::Decoder::new(compressed)
+            .map_err(|err| internal_not_committed("corrupt_blob_zstd_header", err.to_string()))?;
+        let max_read = expected_raw_size.saturating_add(1);
+        let mut limited = decoder.take(max_read);
+        let mut buf = Vec::with_capacity(cap.min(64 * 1024));
+        limited
+            .read_to_end(&mut buf)
+            .map_err(|err| internal_not_committed("corrupt_blob_zstd_stream", err.to_string()))?;
+        buf
+    };
 
     if decoded.len() as u64 != expected_raw_size {
         return Err(internal_not_committed(
@@ -294,6 +340,22 @@ pub struct StagedBlobTicket {
     pub local_pending_dirs: PendingDirSyncs,
     /// Retains the shared per-`(SpaceId, ContentDigest)` guard until outer Phase-2 commit/rollback drops it.
     pub(crate) _local_guard: Option<Arc<LocalSharedGuard>>,
+    /// Key `(space_id, digest)` when this ticket requires a Wave-A local CAS durability barrier before SQL `COMMIT`.
+    pub(crate) deferred_local_key: Option<(String, ContentDigest)>,
+    /// Optional deferred local CAS staging descriptor materialized, synced, and renamed in `WriteBatchActor` Wave A.
+    pub(crate) deferred_local_publish: Option<Arc<std::sync::Mutex<Option<DeferredLocalStaging>>>>,
+}
+
+impl StagedBlobTicket {
+    pub(crate) fn requires_local_wave_barrier(&self) -> bool {
+        self.deferred_local_key.is_some()
+    }
+
+    pub(crate) fn take_deferred_local_staging(&self) -> Option<DeferredLocalStaging> {
+        self.deferred_local_publish
+            .as_ref()
+            .and_then(|slot| slot.lock().expect("deferred publish mutex").take())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -335,6 +397,43 @@ impl BlobBackendDriver {
     }
 }
 
+pub(crate) struct FastLocalBlobReadPlan {
+    local: Arc<LocalBlobStore>,
+    space_id: SpaceId,
+    digest: ContentDigest,
+    raw_size: u64,
+    _guard: Arc<LocalSharedGuard>,
+}
+
+impl FastLocalBlobReadPlan {
+    pub(crate) fn new(
+        local: Arc<LocalBlobStore>,
+        space_id: SpaceId,
+        digest: ContentDigest,
+        raw_size: u64,
+        guard: Arc<LocalSharedGuard>,
+    ) -> Self {
+        Self {
+            local,
+            space_id,
+            digest,
+            raw_size,
+            _guard: guard,
+        }
+    }
+
+    pub fn read_verified(self) -> Result<Vec<u8>, PortError> {
+        self.local
+            .read_verified(&self.space_id, self.digest, self.raw_size)
+    }
+
+    pub async fn read_verified_async(self) -> Result<Vec<u8>, PortError> {
+        tokio::task::spawn_blocking(move || self.read_verified())
+            .await
+            .map_err(|err| internal_not_committed("local_cas_fast_read_join", err.to_string()))?
+    }
+}
+
 /// Coordinates Phase-1 blob staging, Phase-2 SQL reference activation, verified reads, and retirement.
 impl crate::CanonicalStore {
     pub fn blob_codec(&self) -> BlobCodecTag {
@@ -368,6 +467,357 @@ impl crate::CanonicalStore {
             BlobBackendDriver::Local(local) => local.flush_dir_syncs(pending),
             BlobBackendDriver::S3(_) => Ok(()),
         }
+    }
+
+    /// Flushes deduplicated local CAS directories (`fsync`) concurrently across cached open directory
+    /// descriptors so ext4's JBD2 `jbd2_trans_will_send_data_barrier` coalesces all shard directory
+    /// syncs into a single journal commit + single hardware flush before SQL `COMMIT`.
+    pub async fn flush_pending_local_dirs_async(
+        &self,
+        pending: &PendingDirSyncs,
+    ) -> Result<(), PortError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        match &self.inner.blobs {
+            BlobBackendDriver::Local(local) => {
+                if pending.len() == 1 {
+                    let local_cl = Arc::clone(local);
+                    let dir_rel = pending.iter().next().unwrap().to_owned();
+                    return tokio::task::spawn_blocking(move || {
+                        local_cl.flush_single_dir(&dir_rel)
+                    })
+                    .await
+                    .map_err(|err| {
+                        internal_not_committed("local_cas_sync_dir_join", err.to_string())
+                    })?;
+                }
+                let mut set = tokio::task::JoinSet::new();
+                for dir_rel in pending.iter() {
+                    let local_cl = Arc::clone(local);
+                    let dir_owned = dir_rel.to_owned();
+                    set.spawn_blocking(move || local_cl.flush_single_dir(&dir_owned));
+                }
+                let mut first_err: Option<PortError> = None;
+                while let Some(res) = set.join_next().await {
+                    match res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            if first_err.is_none() {
+                                first_err = Some(err);
+                            }
+                        }
+                        Err(join_err) => {
+                            if first_err.is_none() {
+                                first_err = Some(internal_not_committed(
+                                    "local_cas_sync_dir_join",
+                                    join_err.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(err) = first_err {
+                    return Err(err);
+                }
+                Ok(())
+            }
+            BlobBackendDriver::S3(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn cleanup_unretained_local_files_async(
+        &self,
+        to_cleanup: Vec<(SpaceId, ContentDigest)>,
+    ) {
+        if to_cleanup.is_empty() {
+            return;
+        }
+        let BlobBackendDriver::Local(local) = &self.inner.blobs else {
+            return;
+        };
+        let local_cl = Arc::clone(local);
+        let _ = tokio::task::spawn_blocking(move || {
+            for (space_id, digest) in to_cleanup {
+                let _ = local_cl.delete_physical_file(&space_id, digest);
+            }
+        })
+        .await;
+    }
+
+    /// Wave A0 + A1: materializes unique `.staging/*.part` files and flushes `fdatasync` / `F_FULLFSYNC`
+    /// in parallel WITHOUT renaming into `blobs/`, allowing CPU-bound SQL Stage 1 to overlap safely.
+    pub(crate) async fn prepare_and_sync_local_stagings_async(
+        &self,
+        pending_stagings: Vec<DeferredLocalStaging>,
+    ) -> Result<Vec<PreparedLocalStagingEntry>, PortError> {
+        if pending_stagings.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut preopened = Vec::with_capacity(pending_stagings.len());
+        let mut remaining = Vec::new();
+        for item in pending_stagings {
+            if let Some(pre) = item.take_presynced() {
+                preopened.push(pre);
+            } else {
+                remaining.push(item);
+            }
+        }
+
+        let unique_stagings = DeferredLocalStaging::dedup_unique(remaining);
+        let mut entries = if unique_stagings.is_empty() {
+            preopened
+        } else if unique_stagings.len() <= 8 {
+            let mut opened = tokio::task::spawn_blocking(move || {
+                DeferredLocalStaging::open_and_write_chunk(unique_stagings)
+            })
+            .await
+            .map_err(|err| {
+                internal_not_committed("local_cas_open_batch_join", err.to_string())
+            })??;
+            opened.extend(preopened);
+            opened
+        } else {
+            let chunk_size = unique_stagings.len().div_ceil(4);
+            let mut open_set = tokio::task::JoinSet::new();
+            let mut iter = unique_stagings.into_iter();
+            loop {
+                let chunk: Vec<DeferredLocalStaging> = iter.by_ref().take(chunk_size).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                open_set.spawn_blocking(move || DeferredLocalStaging::open_and_write_chunk(chunk));
+            }
+            let mut merged = preopened;
+            let mut open_err: Option<PortError> = None;
+            while let Some(res) = open_set.join_next().await {
+                match res {
+                    Ok(Ok(part)) => merged.extend(part),
+                    Ok(Err(e)) => {
+                        if open_err.is_none() {
+                            open_err = Some(e);
+                        }
+                    }
+                    Err(je) => {
+                        if open_err.is_none() {
+                            open_err = Some(internal_not_committed(
+                                "local_cas_open_batch_join",
+                                je.to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some(err) = open_err {
+                drop(merged);
+                return Err(err);
+            }
+            merged
+        };
+
+        let open_count = entries.iter().filter(|e| e.temp_file.is_some()).count();
+        if open_count == 0 {
+            return Ok(entries);
+        }
+
+        if open_count == 1 {
+            let synced = tokio::task::spawn_blocking(move || -> Result<_, PortError> {
+                for entry in &mut entries {
+                    if let Some(tf) = &mut entry.temp_file {
+                        tf.sync_data_only()?;
+                    }
+                }
+                Ok(entries)
+            })
+            .await
+            .map_err(|err| internal_not_committed("local_cas_publish_join", err.to_string()))??;
+            return Ok(synced);
+        }
+
+        // Step A1: parallel `fdatasync` across all open `.part` files so ext4 JBD2 coalesces them into 1 commit!
+        let mut passthrough = Vec::new();
+        let mut join_set = tokio::task::JoinSet::new();
+        for mut entry in entries {
+            if entry.temp_file.is_some() {
+                join_set.spawn_blocking(move || {
+                    if let Some(tf) = &mut entry.temp_file {
+                        tf.sync_data_only()?;
+                    }
+                    Ok::<_, PortError>(entry)
+                });
+            } else {
+                passthrough.push(entry);
+            }
+        }
+
+        let mut synced_entries = passthrough;
+        let mut first_err: Option<PortError> = None;
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(Ok(entry)) => synced_entries.push(entry),
+                Ok(Err(err)) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+                Err(join_err) => {
+                    if first_err.is_none() {
+                        first_err = Some(internal_not_committed(
+                            "local_cas_publish_join",
+                            join_err.to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_err {
+            drop(synced_entries);
+            return Err(err);
+        }
+
+        Ok(synced_entries)
+    }
+
+    /// Wave A2: atomically renames ONLY `.staging/*.part` files whose `(space_id, digest)` succeeded
+    /// in SQL Stage 1 (`retained_keys`) into `blobs/`, dropping and unlinking any rolled-back items.
+    pub(crate) async fn rename_synced_local_entries_async(
+        &self,
+        synced_entries: Vec<PreparedLocalStagingEntry>,
+        retained_keys: &HashSet<(String, ContentDigest)>,
+    ) -> Result<PendingDirSyncs, PortError> {
+        let mut extra_dirs = PendingDirSyncs::default();
+        let mut to_rename = Vec::with_capacity(synced_entries.len());
+        let mut to_unlink = Vec::new();
+        let mut seen_renamed: HashSet<(String, ContentDigest)> =
+            HashSet::with_capacity(synced_entries.len());
+
+        for entry in synced_entries {
+            let key = (entry.space_id_str, entry.digest);
+            if retained_keys.contains(&key) {
+                extra_dirs.merge(&entry.item_dirs);
+                if let Some(tf) = entry.temp_file {
+                    if seen_renamed.insert(key) {
+                        to_rename.push(tf);
+                    } else {
+                        to_unlink.push(tf);
+                    }
+                }
+            } else if let Some(tf) = entry.temp_file {
+                to_unlink.push(tf);
+            }
+        }
+
+        if !to_unlink.is_empty() {
+            tokio::task::spawn_blocking(move || drop(to_unlink))
+                .await
+                .map_err(|err| {
+                    internal_not_committed("local_cas_unlink_batch_join", err.to_string())
+                })?;
+        }
+        if to_rename.len() <= 8 {
+            if !to_rename.is_empty() {
+                tokio::task::spawn_blocking(move || -> Result<(), PortError> {
+                    for tf in to_rename {
+                        tf.rename_into_place()?;
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(|err| {
+                    internal_not_committed("local_cas_rename_batch_join", err.to_string())
+                })??;
+            }
+        } else {
+            let chunk_size = to_rename.len().div_ceil(16);
+            let mut ren_set = tokio::task::JoinSet::new();
+            let mut iter = to_rename.into_iter();
+            loop {
+                let chunk: Vec<_> = iter.by_ref().take(chunk_size).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                ren_set.spawn_blocking(move || -> Result<(), PortError> {
+                    for tf in chunk {
+                        tf.rename_into_place()?;
+                    }
+                    Ok(())
+                });
+            }
+            let mut first_err: Option<PortError> = None;
+            while let Some(res) = ren_set.join_next().await {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                    Err(je) => {
+                        if first_err.is_none() {
+                            first_err = Some(internal_not_committed(
+                                "local_cas_rename_batch_join",
+                                je.to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+        }
+
+        Ok(extra_dirs)
+    }
+
+    /// Sequential Wave A0 + A1 + A2 helper used by async `execute_batch_on_conn`.
+    pub(crate) async fn publish_deferred_local_tickets_async(
+        &self,
+        tickets: &[StagedBlobTicket],
+    ) -> Result<PendingDirSyncs, PortError> {
+        let mut pending_stagings = Vec::new();
+        let mut retained_keys = HashSet::with_capacity(tickets.len());
+        for ticket in tickets {
+            if let Some(key) = &ticket.deferred_local_key {
+                retained_keys.insert(key.clone());
+            }
+            if let Some(deferred) = ticket.take_deferred_local_staging() {
+                pending_stagings.push(deferred);
+            }
+        }
+        if pending_stagings.is_empty() {
+            return Ok(PendingDirSyncs::default());
+        }
+        let synced = self
+            .prepare_and_sync_local_stagings_async(pending_stagings)
+            .await?;
+        self.rename_synced_local_entries_async(synced, &retained_keys)
+            .await
+    }
+
+    /// Attempts to prepare a verified local CAS read inside an already-open read transaction
+    /// without checking out a second pool connection.
+    pub(crate) async fn try_prepare_local_blob_read_in_tx(
+        &self,
+        tx: &mut BackendConn<'_>,
+        space_id: &SpaceId,
+        digest: ContentDigest,
+    ) -> Result<Option<FastLocalBlobReadPlan>, PortError> {
+        let BlobBackendDriver::Local(local) = &self.inner.blobs else {
+            return Ok(None);
+        };
+        let Some(guard) = local.try_acquire_shared_guard(space_id, digest) else {
+            return Ok(None);
+        };
+        let meta = load_active_blob_meta_tx(tx, space_id, digest).await?;
+        Ok(Some(FastLocalBlobReadPlan {
+            local: Arc::clone(local),
+            space_id: space_id.clone(),
+            digest,
+            raw_size: meta.raw_size,
+            _guard: guard,
+        }))
     }
 
     /// Stages multiple prepared blobs in canonical sorted `ContentDigest` lock order.
@@ -442,9 +892,204 @@ impl crate::CanonicalStore {
         }
     }
 
+    /// Stages a prepared CAS payload for execution inside `WriteBatchActor`, deferring local
+    /// `fdatasync` + atomic `rename` to the batch's coalesced Wave A before directory `fsync` and SQL `COMMIT`.
+    pub(crate) async fn stage_blob_for_batch(
+        &self,
+        scope: &HistoryScope,
+        active_epoch: LeaseEpoch,
+        prepared: &PreparedBlobSource,
+    ) -> Result<StagedBlobTicket, PortError> {
+        if prepared.codec != self.blob_codec() {
+            return Err(internal_not_committed(
+                "blob_codec_mismatch",
+                "PreparedBlobSource codec does not match store backend",
+            ));
+        }
+
+        match &self.inner.blobs {
+            BlobBackendDriver::Local(local) => {
+                let guard = local
+                    .acquire_shared_guard(&scope.space_id, prepared.digest)
+                    .await;
+                let scope_cl = scope.clone();
+                let digest = prepared.digest;
+                let raw_size = prepared.raw_size;
+                let comp_size = prepared.total_compressed_size;
+
+                let existing_pub: Option<String> = self
+                    .with_read_tx(|tx| {
+                        Box::pin(async move {
+                            let space_rec = load_space_record(tx, &scope_cl.space_id).await?;
+                            space_rec.scope.check(&scope_cl)?;
+                            if space_rec.active_epoch != active_epoch {
+                                return Err(DomainError::validation(
+                                    ValidationReason::InvalidAuthority,
+                                )
+                                .into());
+                            }
+                            check_local_catalog_open_read_tx(tx, &scope_cl.space_id, digest).await
+                        })
+                    })
+                    .await?;
+
+                let frame = Arc::clone(prepared.local_frame.as_ref().ok_or_else(|| {
+                    internal_not_committed("missing_local_frame", "local frame not prepared")
+                })?);
+                let presync_in_phase1 = comp_size <= 64 * 1024
+                    && self
+                        .inner
+                        .writer_coord
+                        .get()
+                        .is_some_and(|w| w.active_sqlite_ops_count() >= 32);
+
+                let deferred = if presync_in_phase1 {
+                    let sp_str = scope.space_id.as_str().to_owned();
+                    let (item_dirs, temp_file) = local.stage_physical_file_deferred(
+                        &scope.space_id,
+                        digest,
+                        raw_size,
+                        &frame,
+                    )?;
+                    DeferredLocalStaging::new_presynced(
+                        Arc::clone(local),
+                        scope.space_id.clone(),
+                        digest,
+                        raw_size,
+                        frame,
+                        PreparedLocalStagingEntry {
+                            space_id: scope.space_id.clone(),
+                            space_id_str: sp_str,
+                            digest,
+                            item_dirs,
+                            temp_file,
+                        },
+                    )
+                } else {
+                    DeferredLocalStaging::new(
+                        Arc::clone(local),
+                        scope.space_id.clone(),
+                        digest,
+                        raw_size,
+                        frame,
+                    )
+                };
+
+                let pub_id = match existing_pub {
+                    Some(id) => id,
+                    None => new_prefixed_hex_id("pub_")?,
+                };
+
+                Ok(StagedBlobTicket {
+                    space_id: scope.space_id.clone(),
+                    digest,
+                    raw_size,
+                    compressed_size: comp_size,
+                    publication_id: pub_id,
+                    codec: BlobCodecTag::LocalZstdV1,
+                    local_pending_dirs: PendingDirSyncs::default(),
+                    _local_guard: Some(guard),
+                    deferred_local_key: Some((scope.space_id.as_str().to_owned(), digest)),
+                    deferred_local_publish: Some(Arc::new(std::sync::Mutex::new(Some(deferred)))),
+                })
+            }
+            BlobBackendDriver::S3(s3) => {
+                self.stage_s3_blob(s3, scope, active_epoch, prepared).await
+            }
+        }
+    }
+
+    /// Stages a prepared CAS payload for `WriteBatchActor` when the caller has ALREADY validated
+    /// `SpaceRecord` (`scope` + `active_epoch`) in Phase 1. On `LocalZstdV1`, Phase 1 acquires
+    /// `LocalSharedGuard` in canonical lock order without blocking Tokio async worker threads on
+    /// filesystem `O_CREAT`, while Phase-2 SQL `activate_and_bind_blob_ref` authoritatively enforces
+    /// `active_epoch` and `admission_state = 'open'` before Wave A materializes, syncs, and renames `.part`.
+    pub(crate) async fn stage_blob_for_batch_prechecked(
+        &self,
+        scope: &HistoryScope,
+        active_epoch: LeaseEpoch,
+        prepared: &PreparedBlobSource,
+    ) -> Result<StagedBlobTicket, PortError> {
+        if prepared.codec != self.blob_codec() {
+            return Err(internal_not_committed(
+                "blob_codec_mismatch",
+                "PreparedBlobSource codec does not match store backend",
+            ));
+        }
+
+        match &self.inner.blobs {
+            BlobBackendDriver::Local(local) => {
+                let guard = local
+                    .acquire_shared_guard(&scope.space_id, prepared.digest)
+                    .await;
+                let digest = prepared.digest;
+                let raw_size = prepared.raw_size;
+                let comp_size = prepared.total_compressed_size;
+                let frame = Arc::clone(prepared.local_frame.as_ref().ok_or_else(|| {
+                    internal_not_committed("missing_local_frame", "local frame not prepared")
+                })?);
+                let presync_in_phase1 = comp_size <= 64 * 1024
+                    && self
+                        .inner
+                        .writer_coord
+                        .get()
+                        .is_some_and(|w| w.active_sqlite_ops_count() >= 32);
+
+                let deferred = if presync_in_phase1 {
+                    let sp_str = scope.space_id.as_str().to_owned();
+                    let (item_dirs, temp_file) = local.stage_physical_file_deferred(
+                        &scope.space_id,
+                        digest,
+                        raw_size,
+                        &frame,
+                    )?;
+                    DeferredLocalStaging::new_presynced(
+                        Arc::clone(local),
+                        scope.space_id.clone(),
+                        digest,
+                        raw_size,
+                        frame,
+                        PreparedLocalStagingEntry {
+                            space_id: scope.space_id.clone(),
+                            space_id_str: sp_str,
+                            digest,
+                            item_dirs,
+                            temp_file,
+                        },
+                    )
+                } else {
+                    DeferredLocalStaging::new(
+                        Arc::clone(local),
+                        scope.space_id.clone(),
+                        digest,
+                        raw_size,
+                        frame,
+                    )
+                };
+
+                let pub_id = new_prefixed_hex_id("pub_")?;
+                Ok(StagedBlobTicket {
+                    space_id: scope.space_id.clone(),
+                    digest,
+                    raw_size,
+                    compressed_size: comp_size,
+                    publication_id: pub_id,
+                    codec: BlobCodecTag::LocalZstdV1,
+                    local_pending_dirs: PendingDirSyncs::default(),
+                    _local_guard: Some(guard),
+                    deferred_local_key: Some((scope.space_id.as_str().to_owned(), digest)),
+                    deferred_local_publish: Some(Arc::new(std::sync::Mutex::new(Some(deferred)))),
+                })
+            }
+            BlobBackendDriver::S3(s3) => {
+                self.stage_s3_blob(s3, scope, active_epoch, prepared).await
+            }
+        }
+    }
+
     async fn stage_local_blob_with_guard(
         &self,
-        local: &LocalBlobStore,
+        local: &Arc<LocalBlobStore>,
         scope: &HistoryScope,
         active_epoch: LeaseEpoch,
         prepared: &PreparedBlobSource,
@@ -471,10 +1116,16 @@ impl crate::CanonicalStore {
             })
             .await?;
 
-        let frame = prepared.local_frame.as_ref().ok_or_else(|| {
+        let frame = Arc::clone(prepared.local_frame.as_ref().ok_or_else(|| {
             internal_not_committed("missing_local_frame", "local frame not prepared")
-        })?;
-        let pending_dirs = local.stage_physical_file(&scope.space_id, digest, raw_size, frame)?;
+        })?);
+        let local_cl = Arc::clone(local);
+        let space_id_cl = scope.space_id.clone();
+        let pending_dirs = tokio::task::spawn_blocking(move || {
+            local_cl.stage_physical_file(&space_id_cl, digest, raw_size, &frame)
+        })
+        .await
+        .map_err(|err| internal_not_committed("local_cas_stage_join", err.to_string()))??;
 
         let pub_id = match existing_pub {
             Some(id) => id,
@@ -490,6 +1141,8 @@ impl crate::CanonicalStore {
             codec: BlobCodecTag::LocalZstdV1,
             local_pending_dirs: pending_dirs,
             _local_guard: Some(guard),
+            deferred_local_key: None,
+            deferred_local_publish: None,
         })
     }
 
@@ -538,6 +1191,8 @@ impl crate::CanonicalStore {
                     codec: BlobCodecTag::S3ChunkedV1,
                     local_pending_dirs: PendingDirSyncs::default(),
                     _local_guard: None,
+                    deferred_local_key: None,
+                    deferred_local_publish: None,
                 });
             }
             S3StageRegistration::NewStaging { parts } => parts,
@@ -580,6 +1235,8 @@ impl crate::CanonicalStore {
             codec: BlobCodecTag::S3ChunkedV1,
             local_pending_dirs: PendingDirSyncs::default(),
             _local_guard: None,
+            deferred_local_key: None,
+            deferred_local_publish: None,
         })
     }
 
@@ -1352,6 +2009,7 @@ pub(crate) async fn activate_and_bind_blob_ref_tx(
         }
     };
 
+    let mut inserted_fresh_local_active = false;
     let current_pub_opt = match cat_row {
         Some((admission, _blob_state, pub_opt)) => {
             if admission != "open" {
@@ -1365,14 +2023,54 @@ pub(crate) async fn activate_and_bind_blob_ref_tx(
         }
         None => match claim.ticket.codec {
             BlobCodecTag::LocalZstdV1 => {
-                ensure_local_catalog_open_tx(
-                    tx,
-                    space_id,
-                    digest,
-                    claim.ticket.raw_size,
-                    claim.ticket.compressed_size,
-                )
-                .await?
+                // Fast path for brand-new LocalZstdV1 digest: insert active catalog row directly
+                // (with `ref_count = 0` incremented below, or `ref_count = 1` directly if reference inserts!)
+                let pub_id = &claim.ticket.publication_id;
+                match tx {
+                    BackendConn::Sqlite(conn) => {
+                        sqlx::query(
+                            "INSERT INTO blob_catalog (
+                                space_id, content_blake3, raw_size, compressed_size, ref_count,
+                                current_publication_id, admission_state, blob_state, touched_at_ms
+                            ) VALUES (?, ?, ?, ?, 1, ?, 'open', 'active', ?)",
+                        )
+                        .bind(space_id.as_str())
+                        .bind(digest.as_bytes().as_slice())
+                        .bind(claim.ticket.raw_size as i64)
+                        .bind(claim.ticket.compressed_size as i64)
+                        .bind(pub_id)
+                        .bind(now_ms)
+                        .execute(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed(
+                                "sqlite_insert_blob_catalog_fast",
+                                err.to_string(),
+                            )
+                        })?;
+                    }
+                    BackendConn::Postgres(conn) => {
+                        sqlx::query(
+                            "INSERT INTO blob_catalog (
+                                space_id, content_blake3, raw_size, compressed_size, ref_count,
+                                current_publication_id, admission_state, blob_state, touched_at_ms
+                            ) VALUES ($1, $2, $3, $4, 1, $5, 'open', 'active', $6)",
+                        )
+                        .bind(space_id.as_str())
+                        .bind(digest.as_bytes().as_slice())
+                        .bind(claim.ticket.raw_size as i64)
+                        .bind(claim.ticket.compressed_size as i64)
+                        .bind(pub_id)
+                        .bind(now_ms)
+                        .execute(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("pg_insert_blob_catalog_fast", err.to_string())
+                        })?;
+                    }
+                }
+                inserted_fresh_local_active = true;
+                None
             }
             BlobCodecTag::S3ChunkedV1 => {
                 return Err(internal_not_committed(
@@ -1497,37 +2195,43 @@ pub(crate) async fn activate_and_bind_blob_ref_tx(
         .rows_affected(),
     };
 
-    let ref_delta = inserted as i64;
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query(
-                "UPDATE blob_catalog
-                 SET ref_count = ref_count + ?, current_publication_id = ?, blob_state = 'active', touched_at_ms = ?
-                 WHERE space_id = ? AND content_blake3 = ?",
-            )
-            .bind(ref_delta)
-            .bind(&effective_pub_id)
-            .bind(now_ms)
-            .bind(space_id.as_str())
-            .bind(digest.as_bytes().as_slice())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_update_cat_active", err.to_string()))?;
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "UPDATE blob_catalog
-                 SET ref_count = ref_count + $1, current_publication_id = $2, blob_state = 'active', touched_at_ms = $3
-                 WHERE space_id = $4 AND content_blake3 = $5",
-            )
-            .bind(ref_delta)
-            .bind(&effective_pub_id)
-            .bind(now_ms)
-            .bind(space_id.as_str())
-            .bind(digest.as_bytes().as_slice())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_update_cat_active", err.to_string()))?;
+    if !inserted_fresh_local_active || inserted != 1 {
+        let ref_delta = if inserted_fresh_local_active {
+            (inserted as i64) - 1
+        } else {
+            inserted as i64
+        };
+        match tx {
+            BackendConn::Sqlite(conn) => {
+                sqlx::query(
+                    "UPDATE blob_catalog
+                     SET ref_count = ref_count + ?, current_publication_id = ?, blob_state = 'active', touched_at_ms = ?
+                     WHERE space_id = ? AND content_blake3 = ?",
+                )
+                .bind(ref_delta)
+                .bind(&effective_pub_id)
+                .bind(now_ms)
+                .bind(space_id.as_str())
+                .bind(digest.as_bytes().as_slice())
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("sqlite_update_cat_active", err.to_string()))?;
+            }
+            BackendConn::Postgres(conn) => {
+                sqlx::query(
+                    "UPDATE blob_catalog
+                     SET ref_count = ref_count + $1, current_publication_id = $2, blob_state = 'active', touched_at_ms = $3
+                     WHERE space_id = $4 AND content_blake3 = $5",
+                )
+                .bind(ref_delta)
+                .bind(&effective_pub_id)
+                .bind(now_ms)
+                .bind(space_id.as_str())
+                .bind(digest.as_bytes().as_slice())
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_update_cat_active", err.to_string()))?;
+            }
         }
     }
 
@@ -1673,6 +2377,325 @@ pub(crate) async fn bind_existing_active_blob_ref_tx(
             .map_err(|err| internal_not_committed("pg_rebind_cat_cnt", err.to_string()))?;
         }
     }
+    Ok(())
+}
+
+pub(crate) struct ExistingBlobRefItem {
+    pub owner_kind: BlobOwnerKind,
+    pub owner_id: String,
+    pub owner_rev_id: String,
+    pub resource_key: &'static str,
+    pub digest: ContentDigest,
+    pub created_seq: SpaceSeq,
+}
+
+/// Batch version of `bind_existing_active_blob_ref_tx` for brand-new revisions (`owner_rev_id` newly minted),
+/// reducing `3 * N` SQL round-trips down to `3` queries on both SQLite and PostgreSQL.
+pub(crate) async fn bind_existing_active_blob_refs_batch_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    items: &[ExistingBlobRefItem],
+) -> Result<(), PortError> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let now_ms = now_unix_ms()?;
+    let mut unique_digests: Vec<ContentDigest> = items.iter().map(|i| i.digest).collect();
+    unique_digests.sort_unstable();
+    unique_digests.dedup();
+
+    let mut pub_by_digest: HashMap<ContentDigest, String> =
+        HashMap::with_capacity(unique_digests.len());
+
+    for chunk in unique_digests.chunks(200) {
+        let rows: Vec<(Vec<u8>, String, String, Option<String>)> = match tx {
+            BackendConn::Sqlite(conn) => {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT content_blake3, admission_state, blob_state, current_publication_id
+                     FROM blob_catalog WHERE space_id = ",
+                );
+                qb.push_bind(space_id.as_str())
+                    .push(" AND content_blake3 IN (");
+                let mut sep = qb.separated(", ");
+                for d in chunk {
+                    sep.push_bind(d.as_bytes().as_slice());
+                }
+                sep.push_unseparated(")");
+                let fetched = qb.build().fetch_all(&mut **conn).await.map_err(|err| {
+                    internal_not_committed("sqlite_rebind_cat_batch", err.to_string())
+                })?;
+                fetched
+                    .into_iter()
+                    .map(|r| {
+                        (
+                            r.get("content_blake3"),
+                            r.get("admission_state"),
+                            r.get("blob_state"),
+                            r.get("current_publication_id"),
+                        )
+                    })
+                    .collect()
+            }
+            BackendConn::Postgres(conn) => {
+                let digest_slices: Vec<&[u8]> =
+                    chunk.iter().map(|d| d.as_bytes().as_slice()).collect();
+                let fetched = sqlx::query(
+                    "SELECT content_blake3, admission_state, blob_state, current_publication_id
+                     FROM blob_catalog WHERE space_id = $1 AND content_blake3 = ANY($2)",
+                )
+                .bind(space_id.as_str())
+                .bind(digest_slices)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_rebind_cat_batch", err.to_string()))?;
+                fetched
+                    .into_iter()
+                    .map(|r| {
+                        (
+                            r.get("content_blake3"),
+                            r.get("admission_state"),
+                            r.get("blob_state"),
+                            r.get("current_publication_id"),
+                        )
+                    })
+                    .collect()
+            }
+        };
+
+        for (d_bytes, admission, blob_state, pub_opt) in rows {
+            let arr: [u8; 32] = d_bytes
+                .try_into()
+                .map_err(|_| internal_not_committed("corrupt_cat_digest", "digest != 32B"))?;
+            let digest = ContentDigest::from_bytes(arr);
+            let Some(pub_id) = pub_opt else {
+                return Err(unavailable_retryable(
+                    "blob_missing_for_rebind",
+                    "existing blob publication missing during metadata revision bind",
+                    Duration::from_millis(25),
+                ));
+            };
+            if admission != "open" || blob_state != "active" {
+                return Err(unavailable_retryable(
+                    "blob_retiring_on_rebind",
+                    "existing blob entered retirement before metadata revision commit",
+                    Duration::from_millis(25),
+                ));
+            }
+            pub_by_digest.insert(digest, pub_id);
+        }
+    }
+
+    if pub_by_digest.len() != unique_digests.len() {
+        return Err(unavailable_retryable(
+            "blob_missing_for_rebind",
+            "existing blob publication missing during metadata revision bind",
+            Duration::from_millis(25),
+        ));
+    }
+
+    // Deduplicate `(owner_kind, owner_id, owner_rev_id, resource_key)` defensively before counting deltas.
+    let mut seen_refs = BTreeSet::new();
+    let mut dedup_items: Vec<(&ExistingBlobRefItem, &str)> = Vec::with_capacity(items.len());
+    let mut delta_by_digest: HashMap<ContentDigest, i64> =
+        HashMap::with_capacity(unique_digests.len());
+
+    for item in items {
+        let key = (
+            item.owner_kind.as_db_str(),
+            item.owner_id.as_str(),
+            item.owner_rev_id.as_str(),
+            item.resource_key,
+        );
+        if seen_refs.insert(key) {
+            let pub_id = pub_by_digest
+                .get(&item.digest)
+                .expect("verified digest present");
+            dedup_items.push((item, pub_id.as_str()));
+            *delta_by_digest.entry(item.digest).or_insert(0) += 1;
+        }
+    }
+
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            for chunk in dedup_items.chunks(100) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "INSERT INTO blob_references (
+                        space_id, owner_kind, owner_id, owner_rev_id, resource_key,
+                        content_blake3, publication_id, created_seq
+                    ) ",
+                );
+                qb.push_values(chunk, |mut b, (it, pub_id)| {
+                    b.push_bind(space_id.as_str())
+                        .push_bind(it.owner_kind.as_db_str())
+                        .push_bind(&it.owner_id)
+                        .push_bind(&it.owner_rev_id)
+                        .push_bind(it.resource_key)
+                        .push_bind(it.digest.as_bytes().as_slice())
+                        .push_bind(*pub_id)
+                        .push_bind(it.created_seq.get() as i64);
+                });
+                qb.build().execute(&mut **conn).await.map_err(|err| {
+                    internal_not_committed("sqlite_rebind_blob_refs_batch", err.to_string())
+                })?;
+            }
+        }
+        BackendConn::Postgres(conn) => {
+            let mut owner_kinds: Vec<&str> = Vec::with_capacity(dedup_items.len());
+            let mut owner_ids: Vec<&str> = Vec::with_capacity(dedup_items.len());
+            let mut owner_rev_ids: Vec<&str> = Vec::with_capacity(dedup_items.len());
+            let mut res_keys: Vec<&str> = Vec::with_capacity(dedup_items.len());
+            let mut digests: Vec<&[u8]> = Vec::with_capacity(dedup_items.len());
+            let mut pub_ids: Vec<&str> = Vec::with_capacity(dedup_items.len());
+            let mut created_seqs: Vec<i64> = Vec::with_capacity(dedup_items.len());
+
+            for (it, pub_id) in &dedup_items {
+                owner_kinds.push(it.owner_kind.as_db_str());
+                owner_ids.push(&it.owner_id);
+                owner_rev_ids.push(&it.owner_rev_id);
+                res_keys.push(it.resource_key);
+                digests.push(it.digest.as_bytes().as_slice());
+                pub_ids.push(*pub_id);
+                created_seqs.push(it.created_seq.get() as i64);
+            }
+
+            sqlx::query(
+                "INSERT INTO blob_references (
+                    space_id, owner_kind, owner_id, owner_rev_id, resource_key,
+                    content_blake3, publication_id, created_seq
+                )
+                SELECT $1, u.owner_kind, u.owner_id, u.owner_rev_id, u.res_key,
+                       u.digest, u.pub_id, u.cseq
+                FROM UNNEST(
+                    $2::TEXT[], $3::TEXT[], $4::TEXT[], $5::TEXT[],
+                    $6::BYTEA[], $7::TEXT[], $8::BIGINT[]
+                ) AS u(owner_kind, owner_id, owner_rev_id, res_key, digest, pub_id, cseq)",
+            )
+            .bind(space_id.as_str())
+            .bind(owner_kinds)
+            .bind(owner_ids)
+            .bind(owner_rev_ids)
+            .bind(res_keys)
+            .bind(digests)
+            .bind(pub_ids)
+            .bind(created_seqs)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_rebind_blob_refs_batch", err.to_string()))?;
+
+            let mut cat_digests: Vec<Vec<u8>> = Vec::with_capacity(delta_by_digest.len());
+            let mut cat_deltas: Vec<i64> = Vec::with_capacity(delta_by_digest.len());
+            for (d, delta) in &delta_by_digest {
+                if *delta > 0 {
+                    cat_digests.push(d.as_bytes().to_vec());
+                    cat_deltas.push(*delta);
+                }
+            }
+            if !cat_digests.is_empty() {
+                sqlx::query(
+                    "UPDATE blob_catalog AS bc
+                     SET ref_count = bc.ref_count + v.delta
+                     FROM UNNEST($2::BYTEA[], $3::BIGINT[]) AS v(digest, delta)
+                     WHERE bc.space_id = $1 AND bc.content_blake3 = v.digest",
+                )
+                .bind(space_id.as_str())
+                .bind(cat_digests)
+                .bind(cat_deltas)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("pg_rebind_cat_cnt_batch", err.to_string())
+                })?;
+            }
+            return Ok(());
+        }
+    }
+
+    let mut single_digests: Vec<ContentDigest> = Vec::new();
+    let mut multi_digests: Vec<(ContentDigest, i64)> = Vec::new();
+    for (d, delta) in delta_by_digest {
+        if delta == 1 {
+            single_digests.push(d);
+        } else if delta > 1 {
+            multi_digests.push((d, delta));
+        }
+    }
+
+    if !single_digests.is_empty() {
+        match tx {
+            BackendConn::Sqlite(conn) => {
+                for chunk in single_digests.chunks(200) {
+                    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                        "UPDATE blob_catalog SET ref_count = ref_count + 1, touched_at_ms = ",
+                    );
+                    qb.push_bind(now_ms)
+                        .push(" WHERE space_id = ")
+                        .push_bind(space_id.as_str())
+                        .push(" AND content_blake3 IN (");
+                    let mut sep = qb.separated(", ");
+                    for d in chunk {
+                        sep.push_bind(d.as_bytes().as_slice());
+                    }
+                    sep.push_unseparated(")");
+                    qb.build().execute(&mut **conn).await.map_err(|err| {
+                        internal_not_committed("sqlite_rebind_cat_cnt_batch", err.to_string())
+                    })?;
+                }
+            }
+            BackendConn::Postgres(conn) => {
+                for chunk in single_digests.chunks(200) {
+                    let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+                        "UPDATE blob_catalog SET ref_count = ref_count + 1, touched_at_ms = ",
+                    );
+                    qb.push_bind(now_ms)
+                        .push(" WHERE space_id = ")
+                        .push_bind(space_id.as_str())
+                        .push(" AND content_blake3 IN (");
+                    let mut sep = qb.separated(", ");
+                    for d in chunk {
+                        sep.push_bind(d.as_bytes().as_slice());
+                    }
+                    sep.push_unseparated(")");
+                    qb.build().execute(&mut **conn).await.map_err(|err| {
+                        internal_not_committed("pg_rebind_cat_cnt_batch", err.to_string())
+                    })?;
+                }
+            }
+        }
+    }
+
+    for (d, delta) in multi_digests {
+        match tx {
+            BackendConn::Sqlite(conn) => {
+                sqlx::query(
+                    "UPDATE blob_catalog
+                     SET ref_count = ref_count + ?, touched_at_ms = ?
+                     WHERE space_id = ? AND content_blake3 = ?",
+                )
+                .bind(delta)
+                .bind(now_ms)
+                .bind(space_id.as_str())
+                .bind(d.as_bytes().as_slice())
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("sqlite_rebind_cat_cnt", err.to_string()))?;
+            }
+            BackendConn::Postgres(conn) => {
+                sqlx::query(
+                    "UPDATE blob_catalog
+                     SET ref_count = ref_count + $1, touched_at_ms = $2
+                     WHERE space_id = $3 AND content_blake3 = $4",
+                )
+                .bind(delta)
+                .bind(now_ms)
+                .bind(space_id.as_str())
+                .bind(d.as_bytes().as_slice())
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_rebind_cat_cnt", err.to_string()))?;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2284,8 +3307,14 @@ pub(crate) async fn initiate_digest_retirement_tx(
         BackendConn::Sqlite(conn) => {
             let rows = sqlx::query(
                 "SELECT publication_id, codec FROM blob_publications
-                 WHERE space_id = ? AND content_blake3 = ? AND state IN ('staging', 'active', 'retiring')",
+                 WHERE space_id = ? AND content_blake3 = ? AND state = 'active'
+                 UNION ALL
+                 SELECT publication_id, codec FROM blob_publications
+                 WHERE space_id = ? AND content_blake3 = ? AND state <> 'active'
+                   AND state IN ('staging', 'retiring')",
             )
+            .bind(scope.space_id.as_str())
+            .bind(digest.as_bytes().as_slice())
             .bind(scope.space_id.as_str())
             .bind(digest.as_bytes().as_slice())
             .fetch_all(&mut **conn)
@@ -2298,7 +3327,11 @@ pub(crate) async fn initiate_digest_retirement_tx(
         BackendConn::Postgres(conn) => {
             let rows = sqlx::query(
                 "SELECT publication_id, codec FROM blob_publications
-                 WHERE space_id = $1 AND content_blake3 = $2 AND state IN ('staging', 'active', 'retiring')",
+                 WHERE space_id = $1 AND content_blake3 = $2 AND state = 'active'
+                 UNION ALL
+                 SELECT publication_id, codec FROM blob_publications
+                 WHERE space_id = $1 AND content_blake3 = $2 AND state <> 'active'
+                   AND state IN ('staging', 'retiring')",
             )
             .bind(scope.space_id.as_str())
             .bind(digest.as_bytes().as_slice())
@@ -2314,17 +3347,19 @@ pub(crate) async fn initiate_digest_retirement_tx(
     // Seal all candidate publications into `retiring`.
     match tx {
         BackendConn::Sqlite(conn) => {
-            sqlx::query(
-                "UPDATE blob_publications
-                 SET state = 'retiring', manifest_sealed = 1, updated_at_ms = ?
-                 WHERE space_id = ? AND content_blake3 = ? AND state IN ('staging', 'active')",
-            )
-            .bind(now_ms)
-            .bind(scope.space_id.as_str())
-            .bind(digest.as_bytes().as_slice())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_seal_ret_pubs", err.to_string()))?;
+            for (pub_id, _) in &pubs {
+                sqlx::query(
+                    "UPDATE blob_publications
+                     SET state = 'retiring', manifest_sealed = 1, updated_at_ms = ?
+                     WHERE space_id = ? AND publication_id = ? AND state IN ('staging', 'active')",
+                )
+                .bind(now_ms)
+                .bind(scope.space_id.as_str())
+                .bind(pub_id)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("sqlite_seal_ret_pubs", err.to_string()))?;
+            }
 
             sqlx::query(
                 "INSERT INTO blob_retirements (
@@ -2344,17 +3379,19 @@ pub(crate) async fn initiate_digest_retirement_tx(
             .map_err(|err| internal_not_committed("sqlite_insert_retirement", err.to_string()))?;
         }
         BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "UPDATE blob_publications
-                 SET state = 'retiring', manifest_sealed = 1, updated_at_ms = $1
-                 WHERE space_id = $2 AND content_blake3 = $3 AND state IN ('staging', 'active')",
-            )
-            .bind(now_ms)
-            .bind(scope.space_id.as_str())
-            .bind(digest.as_bytes().as_slice())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_seal_ret_pubs", err.to_string()))?;
+            for (pub_id, _) in &pubs {
+                sqlx::query(
+                    "UPDATE blob_publications
+                     SET state = 'retiring', manifest_sealed = 1, updated_at_ms = $1
+                     WHERE space_id = $2 AND publication_id = $3 AND state IN ('staging', 'active')",
+                )
+                .bind(now_ms)
+                .bind(scope.space_id.as_str())
+                .bind(pub_id)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_seal_ret_pubs", err.to_string()))?;
+            }
 
             sqlx::query(
                 "INSERT INTO blob_retirements (
@@ -2848,7 +3885,7 @@ async fn finalize_retirement_tx(
                 sqlx::query(
                     "UPDATE blob_publications
                      SET state = 'retired', updated_at_ms = ?
-                     WHERE space_id = ? AND content_blake3 = ? AND state = 'retiring'",
+                     WHERE space_id = ? AND content_blake3 = ? AND state <> 'active' AND state = 'retiring'",
                 )
                 .bind(now_ms)
                 .bind(space_id.as_str())
@@ -2873,7 +3910,7 @@ async fn finalize_retirement_tx(
                 sqlx::query(
                     "UPDATE blob_publications
                      SET state = 'retired', updated_at_ms = $1
-                     WHERE space_id = $2 AND content_blake3 = $3 AND state = 'retiring'",
+                     WHERE space_id = $2 AND content_blake3 = $3 AND state <> 'active' AND state = 'retiring'",
                 )
                 .bind(now_ms)
                 .bind(space_id.as_str())

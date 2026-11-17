@@ -19,12 +19,22 @@ use crate::{
 };
 
 pub const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+pub const SQLITE_FAST_READ_POOL_SIZE: usize = 4;
 
 pub async fn open_and_bootstrap_sqlite(
     data_root: &DataRoot,
     installation_id: &InstallationId,
     read_pool_size: u32,
-) -> Result<(SqliteConnection, SqlitePool, DatabaseWitness), PortError> {
+) -> Result<
+    (
+        SqliteConnection,
+        rusqlite::Connection,
+        Vec<rusqlite::Connection>,
+        SqlitePool,
+        DatabaseWitness,
+    ),
+    PortError,
+> {
     let db_path = data_root.canonical();
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)
@@ -41,8 +51,163 @@ pub async fn open_and_bootstrap_sqlite(
         let _ = dir_file.sync_all();
     }
 
+    let rusqlite_writer = open_rusqlite_writer_connection(&db_path)?;
+    let fast_reader_count = (read_pool_size as usize * 4).clamp(16, 32);
+    let mut fast_readers = Vec::with_capacity(fast_reader_count);
+    for _ in 0..fast_reader_count {
+        fast_readers.push(open_rusqlite_readonly_connection(&db_path)?);
+    }
+
     let read_pool = open_sqlite_read_pool(&db_path, read_pool_size).await?;
-    Ok((writer_conn, read_pool, witness))
+    Ok((
+        writer_conn,
+        rusqlite_writer,
+        fast_readers,
+        read_pool,
+        witness,
+    ))
+}
+
+pub fn open_rusqlite_writer_connection(db_path: &Path) -> Result<rusqlite::Connection, PortError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| internal_not_committed("rusqlite_writer_connect", err.to_string()))?;
+
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|err| internal_not_committed("rusqlite_writer_busy_timeout", err.to_string()))?;
+    conn.set_prepared_statement_cache_capacity(256);
+
+    conn.execute_batch(
+        "PRAGMA secure_delete = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = FULL;
+         PRAGMA wal_autocheckpoint = 0;
+         PRAGMA journal_size_limit = 67108864;
+         PRAGMA foreign_keys = ON;
+         PRAGMA cache_size = -524288;
+         PRAGMA mmap_size = 268435456;
+         PRAGMA temp_store = MEMORY;",
+    )
+    .map_err(|err| internal_not_committed("rusqlite_apply_pragma", err.to_string()))?;
+
+    let secure_delete: i64 = conn
+        .query_row("PRAGMA secure_delete", [], |r| r.get(0))
+        .map_err(|err| internal_not_committed("rusqlite_verify_secure_delete", err.to_string()))?;
+    if secure_delete != 1 {
+        return Err(internal_not_committed(
+            "sqlite_secure_delete_disabled",
+            format!("PRAGMA secure_delete={secure_delete}, expected 1"),
+        ));
+    }
+
+    let journal_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .map_err(|err| internal_not_committed("rusqlite_verify_journal_mode", err.to_string()))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        return Err(internal_not_committed(
+            "sqlite_journal_mode_invalid",
+            format!("PRAGMA journal_mode={journal_mode}, expected wal"),
+        ));
+    }
+
+    let synchronous: i64 = conn
+        .query_row("PRAGMA synchronous", [], |r| r.get(0))
+        .map_err(|err| internal_not_committed("rusqlite_verify_synchronous", err.to_string()))?;
+    if synchronous != 2 {
+        return Err(internal_not_committed(
+            "sqlite_synchronous_invalid",
+            format!("PRAGMA synchronous={synchronous}, expected 2 (FULL)"),
+        ));
+    }
+
+    let autocheckpoint: i64 = conn
+        .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+        .map_err(|err| internal_not_committed("rusqlite_verify_autocheckpoint", err.to_string()))?;
+    if autocheckpoint != 0 {
+        return Err(internal_not_committed(
+            "sqlite_autocheckpoint_invalid",
+            format!("PRAGMA wal_autocheckpoint={autocheckpoint}, expected 0"),
+        ));
+    }
+
+    let journal_limit: i64 = conn
+        .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+        .map_err(|err| internal_not_committed("rusqlite_verify_journal_limit", err.to_string()))?;
+    if journal_limit != SQLITE_JOURNAL_SIZE_LIMIT_BYTES {
+        return Err(internal_not_committed(
+            "sqlite_journal_limit_invalid",
+            format!(
+                "PRAGMA journal_size_limit={journal_limit}, expected {SQLITE_JOURNAL_SIZE_LIMIT_BYTES}"
+            ),
+        ));
+    }
+
+    let foreign_keys: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .map_err(|err| internal_not_committed("rusqlite_verify_foreign_keys", err.to_string()))?;
+    if foreign_keys != 1 {
+        return Err(internal_not_committed(
+            "sqlite_foreign_keys_disabled",
+            format!("PRAGMA foreign_keys={foreign_keys}, expected 1"),
+        ));
+    }
+
+    // Install `wal_hook` AFTER `PRAGMA wal_autocheckpoint = 0` (which calls `sqlite3_wal_hook(NULL)`!).
+    conn.wal_hook(Some(crate::wal::sqlite_writer_wal_hook));
+
+    Ok(conn)
+}
+
+pub fn open_rusqlite_readonly_connection(
+    db_path: &Path,
+) -> Result<rusqlite::Connection, PortError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| internal_not_committed("rusqlite_readonly_connect", err.to_string()))?;
+
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|err| internal_not_committed("rusqlite_readonly_busy_timeout", err.to_string()))?;
+    conn.set_prepared_statement_cache_capacity(64);
+    conn.execute_batch(
+        "PRAGMA query_only = ON;
+         PRAGMA foreign_keys = ON;
+         PRAGMA cache_size = -16384;
+         PRAGMA temp_store = MEMORY;",
+    )
+    .map_err(|err| internal_not_committed("rusqlite_readonly_pragmas", err.to_string()))?;
+    Ok(conn)
+}
+
+/// Opens a dedicated non-blocking checkpoint connection for `PRAGMA wal_checkpoint(PASSIVE)`
+/// so background `PASSIVE` checkpoints run concurrently with `WriteBatchActor` without contending on `writer.lock()`.
+pub fn open_rusqlite_checkpoint_connection(
+    db_path: &Path,
+) -> Result<rusqlite::Connection, PortError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| internal_not_committed("rusqlite_ckpt_connect", err.to_string()))?;
+
+    conn.busy_timeout(Duration::ZERO)
+        .map_err(|err| internal_not_committed("rusqlite_ckpt_busy_timeout", err.to_string()))?;
+    conn.execute_batch(
+        "PRAGMA secure_delete = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = FULL;
+         PRAGMA wal_autocheckpoint = 0;
+         PRAGMA foreign_keys = ON;
+         PRAGMA cache_size = -8192;
+         PRAGMA temp_store = MEMORY;",
+    )
+    .map_err(|err| internal_not_committed("rusqlite_ckpt_pragmas", err.to_string()))?;
+    Ok(conn)
 }
 
 pub async fn open_sqlite_writer_connection(db_path: &Path) -> Result<SqliteConnection, PortError> {
@@ -71,6 +236,8 @@ async fn apply_writer_pragmas(conn: &mut SqliteConnection) -> Result<(), PortErr
         "PRAGMA wal_autocheckpoint = 0",
         "PRAGMA journal_size_limit = 67108864",
         "PRAGMA foreign_keys = ON",
+        "PRAGMA cache_size = -65536",
+        "PRAGMA temp_store = MEMORY",
     ] {
         sqlx::query(stmt)
             .execute(&mut *conn)
@@ -172,6 +339,12 @@ pub async fn open_sqlite_read_pool(
                     .execute(&mut *conn)
                     .await?;
                 sqlx::query("PRAGMA foreign_keys = ON")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("PRAGMA cache_size = -8192")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query("PRAGMA temp_store = MEMORY")
                     .execute(&mut *conn)
                     .await?;
                 Ok(())

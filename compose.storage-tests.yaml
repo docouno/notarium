@@ -12,6 +12,7 @@ services:
       POSTGRES_USER: "${NOTARIUM_FIXTURE_PG_USER:?}"
       POSTGRES_PASSWORD: "${NOTARIUM_FIXTURE_PG_PASSWORD:?}"
       POSTGRES_DB: "${NOTARIUM_FIXTURE_PG_DB:?}"
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
       PGDATA: /pgdata/db
     command:
       - postgres
@@ -23,6 +24,14 @@ services:
       - fsync=on
       - -c
       - synchronous_commit=on
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - min_wal_size=256MB
+      - -c
+      - max_wal_size=4GB
       - -c
       - max_connections=64
     volumes:

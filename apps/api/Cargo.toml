@@ -53,7 +53,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = ["cors", "trace", "compression-gzip"] }
 utoipa = { version = "6", features = ["axum_extras"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "sqlite", "postgres", "macros", "migrate"] }
-rusqlite = { version = "0.39.0", default-features = false, features = ["backup"] }
+rusqlite = { version = "0.39.0", default-features = false, features = ["backup", "cache", "hooks"] }
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 blake3 = "1"
 zstd = "0.14"

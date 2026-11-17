@@ -107,6 +107,70 @@ pub fn csprng_16() -> Result<[u8; 16], PortError> {
     Ok(bytes)
 }
 
+static MONO_ID_SEQ: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// Generates a UUIDv7-style lexicographically monotonic 128-bit ID (`[48b unix_ms BE || 16b seq BE || 64b CSPRNG]`)
+/// so B-tree primary keys and secondary indexes append sequentially at the right edge while preserving 64-bit OS CSPRNG entropy.
+pub fn ordered_id_16() -> Result<[u8; 16], PortError> {
+    thread_local! {
+        static CSPRNG_POOL: std::cell::RefCell<([u8; 512], usize)> =
+            const { std::cell::RefCell::new(([0u8; 512], 512)) };
+    }
+    let mut bytes = [0u8; 16];
+    CSPRNG_POOL.with(|cell| -> Result<(), PortError> {
+        if let Ok(mut state) = cell.try_borrow_mut() {
+            if state.1 + 8 > state.0.len() {
+                getrandom::fill(&mut state.0)
+                    .map_err(|err| internal_not_committed("ordered_id_csprng", err.to_string()))?;
+                state.1 = 0;
+            }
+            let off = state.1;
+            bytes[8..16].copy_from_slice(&state.0[off..off + 8]);
+            state.1 = off + 8;
+            Ok(())
+        } else {
+            getrandom::fill(&mut bytes[8..16])
+                .map_err(|err| internal_not_committed("ordered_id_csprng", err.to_string()))
+        }
+    })?;
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let ms_be = ms.to_be_bytes();
+    bytes[0..6].copy_from_slice(&ms_be[2..8]);
+    let seq = MONO_ID_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    bytes[6..8].copy_from_slice(&seq.to_be_bytes());
+    Ok(bytes)
+}
+
+/// Generates `count` monotonic 128-bit IDs using a single CSPRNG syscall.
+pub fn ordered_ids_batch(count: usize) -> Result<Vec<[u8; 16]>, PortError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut rand_buf = vec![0u8; count * 8];
+    getrandom::fill(&mut rand_buf)
+        .map_err(|err| internal_not_committed("ordered_ids_batch_csprng", err.to_string()))?;
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let ms_be = ms.to_be_bytes();
+    let count_u16 = u16::try_from(count).unwrap_or(u16::MAX);
+    let base_seq = MONO_ID_SEQ.fetch_add(count_u16, std::sync::atomic::Ordering::Relaxed);
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let mut bytes = [0u8; 16];
+        bytes[0..6].copy_from_slice(&ms_be[2..8]);
+        let seq = base_seq.wrapping_add(i as u16);
+        bytes[6..8].copy_from_slice(&seq.to_be_bytes());
+        bytes[8..16].copy_from_slice(&rand_buf[i * 8..(i + 1) * 8]);
+        out.push(bytes);
+    }
+    Ok(out)
+}
+
 pub fn csprng_32() -> Result<[u8; 32], PortError> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes)
@@ -115,15 +179,15 @@ pub fn csprng_32() -> Result<[u8; 32], PortError> {
 }
 
 pub fn new_revision_id() -> Result<RevisionId, PortError> {
-    Ok(RevisionId::from_bytes(csprng_16()?))
+    Ok(RevisionId::from_bytes(ordered_id_16()?))
 }
 
 pub fn new_artifact_id() -> Result<ArtifactId, PortError> {
-    Ok(ArtifactId::from_bytes(csprng_16()?))
+    Ok(ArtifactId::from_bytes(ordered_id_16()?))
 }
 
 pub fn new_prefixed_hex_id(prefix: &str) -> Result<String, PortError> {
-    let bytes = csprng_16()?;
+    let bytes = ordered_id_16()?;
     Ok(format!("{prefix}{:032x}", u128::from_be_bytes(bytes)))
 }
 

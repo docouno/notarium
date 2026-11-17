@@ -71,6 +71,7 @@ type RawLookupPendingPurgeRow = (String, Vec<u8>, String, String, Vec<u8>);
 pub(crate) async fn resume_pending_purges_on_startup(
     store: &CanonicalStore,
 ) -> Result<(), PortError> {
+    store.inner.clear_pg_immutable_caches();
     let pending_rows: Vec<RawStartupPendingPurgeRow> = store
         .with_read_tx(|tx| {
             Box::pin(async move {
@@ -228,6 +229,7 @@ async fn purge_note_inner(
     run_steps_2_and_3: bool,
 ) -> Result<Committed<NoteRevision>, PortError> {
     debug_assert_eq!(request.input.disposition, DeleteDisposition::Purge);
+    store.inner.clear_pg_immutable_caches();
     validate_mutation_identity(&ctx, &request.identity)?;
     store.ensure_blob_backend_ready().await?;
 
@@ -433,6 +435,7 @@ pub(crate) async fn mint_and_purge_impl(
     ctx: SpaceContext,
     request: Mutation<MintAndPurge>,
 ) -> Result<Committed<MintAndPurgeResult>, PortError> {
+    store.inner.clear_pg_immutable_caches();
     validate_mutation_identity(&ctx, &request.identity)?;
     if request.input.old_note == request.input.new_note {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());

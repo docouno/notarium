@@ -156,7 +156,6 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             "uq_note_heads_active_sibling",
             "idx_note_heads_parent_lifecycle",
             "idx_note_heads_created_seq",
-            "idx_note_heads_updated_seq",
         ],
     },
     TableSpec {
@@ -227,7 +226,6 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("created_at_nsec", Int, false),
         ],
         indexes: &[
-            "idx_revisions_entity_space_seq",
             "idx_revisions_entity_vis_seq",
             "idx_revisions_agent_run",
             "idx_revisions_parent_rev",
@@ -324,7 +322,6 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("updated_at_ms", Int, false),
         ],
         indexes: &[
-            "uq_blob_publications_global_id",
             "uq_blob_publications_active_digest",
             "idx_blob_publications_digest_state",
         ],
@@ -350,8 +347,8 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
         primary_key: &[
             "space_id",
             "owner_kind",
-            "owner_id",
             "owner_rev_id",
+            "owner_id",
             "resource_key",
         ],
         columns: &[
@@ -364,7 +361,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("publication_id", Text, false),
             col("created_seq", Int, false),
         ],
-        indexes: &["idx_blob_references_digest", "idx_blob_references_owner"],
+        indexes: &["idx_blob_references_non_note_owner"],
     },
     TableSpec {
         name: "blob_retirements",
@@ -469,10 +466,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("payload_id", Text, true),
             col("committed_at_ms", Int, false),
         ],
-        indexes: &[
-            "uq_change_commands_last_seq",
-            "uq_change_commands_first_seq",
-        ],
+        indexes: &["uq_change_commands_last_seq"],
     },
     TableSpec {
         name: "change_log",
@@ -517,7 +511,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("payload_id", Text, false),
             col("note_id", Text, false),
         ],
-        indexes: &["idx_payload_owners_note"],
+        indexes: &[],
     },
     TableSpec {
         name: "agent_run_heads",
@@ -648,11 +642,11 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("lease_epoch", Int, false),
             col("lineage_epoch", Int, false),
             col("carrier_rev_id", Text, false),
-            col("yrs_snapshot_blob", Bytes, true),
             col("yrs_snapshot_blake3", Bytes, true),
             col("room_state", Text, false),
             col("owner_id", Text, true),
             col("updated_seq", Int, false),
+            col("yrs_snapshot_blob", Bytes, true),
         ],
         indexes: &[],
     },

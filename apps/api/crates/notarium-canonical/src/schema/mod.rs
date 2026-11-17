@@ -268,6 +268,7 @@ async fn bootstrap_postgres_inner(
         let witness =
             inspect_postgres_schema_meta(conn, expected_installation, expected_checksum).await?;
         verify_postgres_catalog(conn, schema_name).await?;
+        ensure_postgres_helper_routines(conn).await?;
         return Ok(witness);
     }
 
@@ -278,6 +279,7 @@ async fn bootstrap_postgres_inner(
             .await
             .map_err(|err| internal_not_committed("pg_ddl_exec", err.to_string()))?;
     }
+    ensure_postgres_helper_routines(conn).await?;
 
     sqlx::query(
         "INSERT INTO schema_meta (
@@ -305,6 +307,963 @@ async fn bootstrap_postgres_inner(
 
     inspect_postgres_schema_meta(conn, expected_installation, expected_checksum).await
 }
+
+async fn ensure_postgres_helper_routines(conn: &mut PgConnection) -> Result<(), PortError> {
+    const PG_FAST_ROLLBACK_FN_SQL: &str = r#"
+CREATE OR REPLACE FUNCTION notarium_pg_fast_rollback_prep_v1(
+    p_space_id TEXT,
+    p_inc BYTEA,
+    p_actor_id TEXT,
+    p_idemp_key TEXT,
+    p_run_id TEXT,
+    p_exp_nids TEXT[]
+) RETURNS TABLE (
+    o_kind INT4,
+    t1 TEXT, t2 TEXT, t3 TEXT, t4 TEXT, t5 TEXT, t6 TEXT, t7 TEXT, t8 TEXT, t9 TEXT,
+    t10 TEXT, t11 TEXT, t12 TEXT, t13 TEXT, t14 TEXT, t15 TEXT, t16 TEXT, t17 TEXT, t18 TEXT,
+    i1 BIGINT, i2 BIGINT, i3 INT4,
+    b1 BYTEA, b2 BYTEA, b3 BYTEA
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+BEGIN
+    RETURN QUERY
+    WITH sp_row AS (
+        SELECT
+            s.history_incarnation AS s_inc,
+            s.root_folder_id AS s_root,
+            s.space_kind AS s_kind,
+            s.lifecycle_state AS s_lc,
+            s.active_epoch AS s_epoch,
+            s.last_seq AS s_last_seq,
+            cr.command_hash AS cr_hash,
+            cr.status AS cr_status,
+            cr.response_payload_id AS cr_rpid,
+            CASE
+                WHEN cr.command_hash IS NULL THEN arh.history_incarnation
+                WHEN cr.response_payload_id IS NOT NULL
+                     AND COALESCE(cp.erased_by_purge, 1) = 0
+                     AND cp.effect_msgpack IS NOT NULL THEN cp.effect_msgpack
+                ELSE cr.sanitized_envelope_msgpack
+            END AS b3_payload,
+            (
+                (CASE WHEN EXISTS(SELECT 1 FROM board_move_history WHERE space_id = p_space_id) THEN 1 ELSE 0 END)
+                | (CASE WHEN EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = p_space_id) THEN 2 ELSE 0 END)
+                | (CASE WHEN EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = p_space_id) THEN 4 ELSE 0 END)
+                | (CASE WHEN EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = p_space_id) THEN 8 ELSE 0 END)
+                | (CASE WHEN EXISTS(SELECT 1 FROM space_field_schemas WHERE space_id = p_space_id AND is_current = 1) THEN 16 ELSE 0 END)
+                | (CASE WHEN COALESCE(rf.is_root, 0) <> 0 THEN 64 ELSE 0 END)
+                | (CASE WHEN COALESCE(rf.is_project, 0) <> 0 THEN 128 ELSE 0 END)
+                | (CASE WHEN EXISTS(
+                    SELECT 1 FROM revisions rx
+                    WHERE rx.space_id = p_space_id
+                      AND rx.agent_run_id = p_run_id
+                      AND rx.agent_run_id IS NOT NULL
+                      AND rx.entity_type = 'note'
+                      AND NOT (rx.entity_key = ANY(p_exp_nids))
+                ) THEN 512 ELSE 0 END)
+            )::INT4 AS flags,
+            arh.run_revision AS run_rev,
+            rf.folder_id AS rf_id,
+            rf.parent_folder_id AS rf_parent,
+            rf.slug AS rf_slug,
+            rf.slug_fold AS rf_slug_fold,
+            rf.display_name AS rf_display_name,
+            rf.project_slug AS rf_project_slug,
+            rf.project_slug_fold AS rf_project_slug_fold,
+            rf.description AS rf_description,
+            rf.cover_note_id AS rf_cover,
+            rf.write_lock_json AS rf_write_lock,
+            rf.lifecycle_state AS rf_lc,
+            rf.head_rev_id AS rf_head_rev
+        FROM spaces s
+        LEFT JOIN command_receipts cr
+            ON cr.space_id = s.space_id AND cr.history_incarnation = p_inc
+           AND cr.actor_id = p_actor_id AND cr.idempotency_key = p_idemp_key
+        LEFT JOIN LATERAL (
+            SELECT cp_inner.erased_by_purge, cp_inner.effect_msgpack
+            FROM change_payloads cp_inner
+            WHERE cr.response_payload_id IS NOT NULL
+              AND cp_inner.space_id = s.space_id
+              AND cp_inner.payload_id = cr.response_payload_id
+            LIMIT 1
+        ) cp ON TRUE
+        LEFT JOIN agent_run_heads arh
+            ON arh.space_id = s.space_id AND arh.run_id = p_run_id
+        LEFT JOIN folder_heads rf
+            ON rf.space_id = s.space_id AND rf.folder_id = s.root_folder_id
+        WHERE s.space_id = p_space_id
+    ),
+    rev_win AS (
+        SELECT
+            r.entity_key,
+            r.rev_id,
+            r.space_seq,
+            r.content_blake3,
+            r.metadata_msgpack,
+            MIN(r.space_seq) FILTER (WHERE r.agent_run_id = p_run_id) OVER (PARTITION BY r.entity_key) AS first_run_seq,
+            MAX(r.space_seq) FILTER (WHERE r.agent_run_id IS DISTINCT FROM p_run_id) OVER (PARTITION BY r.entity_key) AS max_other_seq
+        FROM sp_row sp
+        JOIN revisions r
+          ON r.space_id = p_space_id AND r.entity_type = 'note' AND r.entity_key = ANY(p_exp_nids)
+        WHERE sp.cr_hash IS NULL AND (sp.flags & 543) = 0
+    ),
+    note_revs AS (
+        SELECT DISTINCT ON (rw.entity_key)
+            rw.entity_key,
+            rw.first_run_seq,
+            (rw.max_other_seq IS NOT NULL AND rw.first_run_seq IS NOT NULL AND rw.max_other_seq > rw.first_run_seq) AS has_foreign,
+            CASE
+                WHEN rw.first_run_seq IS NOT NULL
+                 AND NOT (rw.max_other_seq IS NOT NULL AND rw.max_other_seq > rw.first_run_seq)
+                 AND rw.space_seq < rw.first_run_seq
+                THEN rw.rev_id
+                ELSE NULL
+            END AS pre_rev_id,
+            CASE
+                WHEN rw.first_run_seq IS NOT NULL
+                 AND NOT (rw.max_other_seq IS NOT NULL AND rw.max_other_seq > rw.first_run_seq)
+                 AND rw.space_seq < rw.first_run_seq
+                THEN rw.content_blake3
+                ELSE NULL
+            END AS pre_digest,
+            CASE
+                WHEN rw.first_run_seq IS NOT NULL
+                 AND NOT (rw.max_other_seq IS NOT NULL AND rw.max_other_seq > rw.first_run_seq)
+                 AND rw.space_seq < rw.first_run_seq
+                THEN rw.metadata_msgpack
+                ELSE NULL
+            END AS pre_meta
+        FROM rev_win rw
+        ORDER BY
+            rw.entity_key,
+            (rw.first_run_seq IS NOT NULL AND rw.space_seq < rw.first_run_seq) DESC,
+            rw.space_seq DESC
+    ),
+    heads AS (
+        SELECT nh.note_id, nh.parent_folder_id, nh.slug, nh.slug_fold, nh.title, nh.doc_class,
+               nh.ability_id, nh.head_rev_id, nh.content_blake3, nh.byte_size, nh.lifecycle_state, nh.visibility_mask
+        FROM sp_row sp
+        JOIN note_heads nh
+          ON nh.space_id = p_space_id AND nh.note_id = ANY(p_exp_nids)
+        WHERE sp.cr_hash IS NULL AND (sp.flags & 543) = 0
+    ),
+    digests AS (
+        SELECT pre_digest AS d FROM note_revs WHERE pre_digest IS NOT NULL
+        UNION
+        SELECT content_blake3 AS d FROM heads WHERE content_blake3 IS NOT NULL
+    ),
+    cat AS (
+        SELECT bc.content_blake3, bc.admission_state, bc.blob_state, bc.current_publication_id
+        FROM blob_catalog bc
+        JOIN digests dg ON bc.content_blake3 = dg.d
+        WHERE bc.space_id = p_space_id
+    )
+    SELECT
+        0::INT4,
+        s_root, s_kind, s_lc, cr_status, cr_rpid, run_rev,
+        rf_id, rf_parent, rf_slug, rf_slug_fold, rf_display_name,
+        rf_project_slug, rf_project_slug_fold, rf_description,
+        rf_cover, rf_write_lock, rf_lc, rf_head_rev,
+        s_epoch, s_last_seq, flags,
+        s_inc, cr_hash, b3_payload
+    FROM sp_row
+    UNION ALL
+    SELECT
+        1::INT4,
+        entity_key, pre_rev_id, NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT,
+        NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT,
+        NULL::TEXT, NULL::TEXT, NULL::TEXT,
+        NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT,
+        COALESCE(first_run_seq, -1)::BIGINT, 0::BIGINT, (CASE WHEN has_foreign THEN 1 ELSE 0 END)::INT4,
+        pre_digest, pre_meta, NULL::BYTEA
+    FROM note_revs
+    UNION ALL
+    SELECT
+        2::INT4,
+        note_id, parent_folder_id, slug, slug_fold, title, doc_class,
+        ability_id, head_rev_id, lifecycle_state, NULL::TEXT, NULL::TEXT,
+        NULL::TEXT, NULL::TEXT, NULL::TEXT,
+        NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT,
+        byte_size, 0::BIGINT, visibility_mask,
+        content_blake3, NULL::BYTEA, NULL::BYTEA
+    FROM heads
+    UNION ALL
+    SELECT
+        3::INT4,
+        admission_state, blob_state, current_publication_id, NULL::TEXT, NULL::TEXT, NULL::TEXT,
+        NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT,
+        NULL::TEXT, NULL::TEXT, NULL::TEXT,
+        NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT,
+        0::BIGINT, 0::BIGINT, 0::INT4,
+        content_blake3, NULL::BYTEA, NULL::BYTEA
+    FROM cat;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION notarium_pg_fast_rollback_apply_v1(
+    p_space_id TEXT,
+    p_inc BYTEA,
+    p_epoch BIGINT,
+    p_expected_before BIGINT,
+    p_max_allowed_before BIGINT,
+    p_delta BIGINT,
+    p_first_seq BIGINT,
+    p_vis_seq BIGINT,
+    p_sec BIGINT,
+    p_nsec INT4,
+    p_now_ms BIGINT,
+    p_expires_ms BIGINT,
+    p_actor_id TEXT,
+    p_idemp_key TEXT,
+    p_cmd_hash BYTEA,
+    p_cmd_id TEXT,
+    p_run_id TEXT,
+    p_new_run_rev TEXT,
+    p_run_meta BYTEA,
+    p_owner_key TEXT,
+    p_effect_pid TEXT,
+    p_effect_codec TEXT,
+    p_effect_blob BYTEA,
+    p_resp_pid TEXT,
+    p_resp_blob BYTEA,
+    p_sanitized_blob BYTEA,
+    p_noop_folder_id TEXT,
+    p_has_full BOOL,
+    p_has_trash BOOL,
+    p_owner_nids TEXT[],
+    p_chk_folders TEXT[],
+    p_chk_slug_folds TEXT[],
+    p_cat_digests BYTEA[],
+    p_cat_deltas BIGINT[],
+    p_m_is_full BOOL[],
+    p_m_nids TEXT[],
+    p_m_parents TEXT[],
+    p_m_slugs TEXT[],
+    p_m_slug_folds TEXT[],
+    p_m_titles TEXT[],
+    p_m_title_folds TEXT[],
+    p_m_doc_classes TEXT[],
+    p_m_abilities TEXT[],
+    p_m_revs TEXT[],
+    p_m_parent_revs TEXT[],
+    p_m_restored_revs TEXT[],
+    p_m_digests BYTEA[],
+    p_m_pub_ids TEXT[],
+    p_m_byte_sizes BIGINT[],
+    p_m_lifecycles TEXT[],
+    p_m_vis_masks INT4[],
+    p_m_sseqs BIGINT[],
+    p_m_metas BYTEA[],
+    p_m_op_kinds TEXT[]
+) RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_pre_code BIGINT;
+    v_cat_ok BIGINT;
+    v_bumped BIGINT;
+BEGIN
+    PERFORM 1
+    FROM spaces
+    WHERE space_id = p_space_id
+      AND history_incarnation = p_inc
+      AND active_epoch = p_epoch
+      AND last_seq = p_expected_before
+      AND last_seq <= p_max_allowed_before
+    FOR NO KEY UPDATE;
+    IF NOT FOUND THEN
+        RETURN 0;
+    END IF;
+
+    SELECT
+        CASE
+            WHEN EXISTS (
+                SELECT 1 FROM command_receipts
+                WHERE space_id = p_space_id
+                  AND history_incarnation = p_inc
+                  AND actor_id = p_actor_id
+                  AND idempotency_key = p_idemp_key
+            ) OR EXISTS (
+                SELECT 1 FROM collab_sessions WHERE space_id = p_space_id
+            ) OR EXISTS (
+                SELECT 1 FROM revision_purge_fences WHERE space_id = p_space_id
+            ) THEN 0::BIGINT
+            ELSE COALESCE((
+                SELECT -u.idx
+                FROM UNNEST(p_chk_folders, p_chk_slug_folds) WITH ORDINALITY AS u(parent_folder_id, slug_fold, idx)
+                JOIN note_heads nh
+                  ON nh.space_id = p_space_id
+                 AND nh.parent_folder_id = u.parent_folder_id
+                 AND nh.slug_fold = u.slug_fold
+                 AND nh.lifecycle_state = 'active'
+                WHERE NOT (nh.note_id = ANY(p_owner_nids))
+                ORDER BY u.idx
+                LIMIT 1
+            ), 1::BIGINT)
+        END
+    INTO v_pre_code;
+
+    IF v_pre_code <= 0 THEN
+        RETURN v_pre_code;
+    END IF;
+
+    IF p_has_full AND p_has_trash THEN
+        UPDATE note_heads AS nh
+        SET head_rev_id = u.rev_id,
+            lifecycle_state = 'trashed',
+            updated_seq = p_vis_seq,
+            updated_at_sec = p_sec,
+            updated_at_nsec = p_nsec,
+            last_actor_id = p_actor_id
+        FROM UNNEST(p_m_nids, p_m_revs, p_m_op_kinds) AS u(nid, rev_id, op_kind)
+        WHERE u.op_kind = 'trash'
+          AND nh.space_id = p_space_id
+          AND nh.note_id = u.nid;
+    END IF;
+
+    WITH muts AS MATERIALIZED (
+        SELECT *
+        FROM UNNEST(
+            p_m_is_full, p_m_nids, p_m_parents, p_m_slugs, p_m_slug_folds,
+            p_m_titles, p_m_title_folds, p_m_doc_classes, p_m_abilities,
+            p_m_revs, p_m_parent_revs, p_m_restored_revs, p_m_digests, p_m_pub_ids,
+            p_m_byte_sizes, p_m_lifecycles, p_m_vis_masks, p_m_sseqs, p_m_metas, p_m_op_kinds
+        ) AS t(
+            is_full, nid, parent_id, slug, slug_fold,
+            title, title_fold, doc_class, ability_id,
+            rev_id, parent_rev, restored_rev, digest, pub_id,
+            byte_size, lifecycle_state, vis_mask, sseq, meta, op_kind
+        )
+    ),
+    w_cat AS (
+        UPDATE blob_catalog AS bc
+        SET ref_count = bc.ref_count + u.delta,
+            touched_at_ms = p_now_ms
+        FROM UNNEST(p_cat_digests, p_cat_deltas) AS u(digest, delta)
+        WHERE bc.space_id = p_space_id
+          AND bc.content_blake3 = u.digest
+          AND bc.admission_state = 'open'
+          AND bc.blob_state = 'active'
+        RETURNING 1
+    ),
+    w_nh AS (
+        UPDATE note_heads AS nh
+        SET parent_folder_id = CASE WHEN m.is_full THEN m.parent_id ELSE nh.parent_folder_id END,
+            slug = CASE WHEN m.is_full THEN m.slug ELSE nh.slug END,
+            slug_fold = CASE WHEN m.is_full THEN m.slug_fold ELSE nh.slug_fold END,
+            title = m.title,
+            title_fold = m.title_fold,
+            doc_class = m.doc_class,
+            ability_id = m.ability_id,
+            head_rev_id = m.rev_id,
+            content_blake3 = m.digest,
+            byte_size = m.byte_size,
+            lifecycle_state = m.lifecycle_state,
+            visibility_mask = m.vis_mask,
+            updated_seq = p_vis_seq,
+            updated_at_sec = p_sec,
+            updated_at_nsec = p_nsec,
+            last_actor_id = p_actor_id
+        FROM muts m
+        WHERE (NOT (p_has_full AND p_has_trash) OR m.op_kind <> 'trash')
+          AND nh.space_id = p_space_id
+          AND nh.note_id = m.nid
+    ),
+    w_br AS (
+        INSERT INTO blob_references (
+            space_id, owner_kind, owner_id, owner_rev_id, resource_key,
+            content_blake3, publication_id, created_seq
+        )
+        SELECT p_space_id, 'note_revision', m.nid, m.rev_id, 'carrier',
+               m.digest, m.pub_id, m.sseq
+        FROM muts m
+        WHERE m.digest IS NOT NULL AND m.pub_id IS NOT NULL
+    ),
+    w_rv AS (
+        INSERT INTO revisions (
+            space_id, history_incarnation, rev_id, entity_type, entity_key,
+            space_seq, visibility_seq, parent_rev_id, their_rev_id, restored_from_rev_id,
+            content_blake3, metadata_msgpack, patch_meta_json, actor_id, session_id,
+            agent_run_id, quarantine_reason, created_at_sec, created_at_nsec
+        )
+        SELECT
+            p_space_id, p_inc, m.rev_id, 'note', m.nid,
+            m.sseq, p_vis_seq, m.parent_rev, NULL, m.restored_rev,
+            m.digest, m.meta, NULL, p_actor_id, NULL,
+            NULL, NULL, p_sec, p_nsec
+        FROM muts m
+        UNION ALL
+        SELECT
+            p_space_id, p_inc, p_new_run_rev, 'agent_run', p_run_id,
+            p_vis_seq, p_vis_seq, NULL, NULL, NULL,
+            NULL, p_run_meta, NULL, p_actor_id, NULL,
+            p_run_id, NULL, p_sec, p_nsec
+    ),
+    w_arh AS (
+        UPDATE agent_run_heads
+        SET history_incarnation = p_inc,
+            run_revision = p_new_run_rev,
+            last_seq = p_vis_seq,
+            updated_at_sec = p_sec,
+            updated_at_nsec = p_nsec
+        WHERE space_id = p_space_id AND run_id = p_run_id
+    ),
+    w_cp AS (
+        INSERT INTO change_payloads (space_id, payload_id, codec, erased_by_purge, effect_msgpack, created_seq)
+        VALUES
+            (p_space_id, p_effect_pid, p_effect_codec, 0, p_effect_blob, p_vis_seq),
+            (p_space_id, p_resp_pid, 'receipt_detail_v1', 0, p_resp_blob, p_vis_seq)
+    ),
+    w_cc AS (
+        INSERT INTO change_commands (
+            space_id, history_incarnation, command_id, first_seq, last_seq,
+            command_kind, payload_id, committed_at_ms
+        ) VALUES (
+            p_space_id, p_inc, p_cmd_id, p_first_seq, p_vis_seq,
+            'rollback_agent_run', p_effect_pid, p_now_ms
+        )
+    ),
+    w_cl AS (
+        INSERT INTO change_log (
+            space_id, space_seq, history_incarnation, command_id,
+            command_first_seq, command_last_seq, entity_type, entity_id,
+            op_kind, rev_id, lifecycle_state, doc_class, payload_id, committed_at_ms
+        )
+        SELECT
+            p_space_id, m.sseq, p_inc, p_cmd_id,
+            p_first_seq, p_vis_seq, 'note', m.nid,
+            m.op_kind, m.rev_id, m.lifecycle_state, m.doc_class, p_effect_pid, p_now_ms
+        FROM muts m
+        UNION ALL
+        SELECT
+            p_space_id, p_first_seq, p_inc, p_cmd_id,
+            p_first_seq, p_vis_seq, 'folder', p_noop_folder_id,
+            'edit', p_new_run_rev, 'active', NULL, p_effect_pid, p_now_ms
+        WHERE p_noop_folder_id IS NOT NULL
+    ),
+    w_cr AS (
+        INSERT INTO command_receipts (
+            space_id, history_incarnation, actor_id, idempotency_key, command_hash,
+            status, envelope_version, response_payload_id, sanitized_envelope_msgpack,
+            canonical_seq, expires_at_ms
+        ) VALUES (
+            p_space_id, p_inc, p_actor_id, p_idemp_key, p_cmd_hash,
+            'completed', 1, p_resp_pid, p_sanitized_blob,
+            p_vis_seq, p_expires_ms
+        )
+    ),
+    w_po AS (
+        INSERT INTO payload_owners (space_id, payload_kind, payload_id, note_id)
+        SELECT p_space_id, k.pkind, k.pid, u.nid
+        FROM UNNEST(p_owner_nids) AS u(nid)
+        CROSS JOIN (
+            VALUES
+                ('change_payload', p_effect_pid),
+                ('command_receipt', p_owner_key)
+        ) AS k(pkind, pid)
+    ),
+    w_sp AS (
+        UPDATE spaces
+        SET last_seq = last_seq + p_delta
+        WHERE space_id = p_space_id
+          AND history_incarnation = p_inc
+          AND active_epoch = p_epoch
+          AND last_seq = p_expected_before
+          AND last_seq <= p_max_allowed_before
+        RETURNING 1
+    )
+    SELECT
+        (SELECT count(*) FROM w_cat),
+        (SELECT count(*) FROM w_sp)
+    INTO v_cat_ok, v_bumped;
+
+    IF v_cat_ok <> COALESCE(cardinality(p_cat_digests), 0) THEN
+        RAISE EXCEPTION 'NOTARIUM_RB_FALLBACK_0';
+    END IF;
+
+    IF v_bumped <> 1 THEN
+        RAISE EXCEPTION 'notarium_pg_fast_rollback_space_bump_failed';
+    END IF;
+
+    RETURN 1;
+END;
+$$;
+"#;
+
+    let full_sql = format!("{PG_FAST_ROLLBACK_FN_SQL}\n{PG_LEAN_ROLLBACK_COMMIT_FN_SQL}");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(full_sql))
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_helper_routines_exec", err.to_string()))?;
+    Ok(())
+}
+
+pub(crate) const PG_LEAN_ROLLBACK_READ_SQL: &str = "
+WITH nh AS (
+    SELECT note_id, parent_folder_id, slug, slug_fold, title, title_fold,
+           head_rev_id, lifecycle_state, byte_size, visibility_mask,
+           doc_class, ability_id, content_blake3
+    FROM note_heads
+    WHERE space_id = $1 AND note_id = ANY($3::TEXT[])
+),
+r_first AS (
+    SELECT entity_key, MIN(space_seq) AS first_run_seq
+    FROM revisions
+    WHERE space_id = $1
+      AND agent_run_id = $2
+      AND agent_run_id IS NOT NULL
+      AND entity_type = 'note'
+    GROUP BY entity_key
+),
+r_pre AS (
+    SELECT rf.entity_key, rf.first_run_seq,
+           pr.rev_id, pr.space_seq, pr.content_blake3, pr.metadata_msgpack
+    FROM r_first rf
+    LEFT JOIN LATERAL (
+        SELECT r.rev_id, r.space_seq, r.content_blake3, r.metadata_msgpack
+        FROM revisions r
+        WHERE r.space_id = $1
+          AND r.entity_type = 'note'
+          AND r.entity_key = rf.entity_key
+          AND r.agent_run_id IS DISTINCT FROM $2
+        ORDER BY r.visibility_seq DESC, r.space_seq DESC
+        LIMIT 1
+    ) pr ON (rf.entity_key = ANY($3::TEXT[]))
+),
+digs AS (
+    SELECT content_blake3 AS d FROM nh WHERE content_blake3 IS NOT NULL
+    UNION
+    SELECT content_blake3 AS d FROM r_pre WHERE content_blake3 IS NOT NULL
+)
+SELECT
+    0::int2 AS kind,
+    s.root_folder_id AS t1,
+    s.space_kind AS t2,
+    s.lifecycle_state AS t3,
+    arh.run_revision AS t4,
+    NULL::text AS t5,
+    NULL::text AS t6,
+    NULL::text AS t7,
+    NULL::text AS t8,
+    s.active_epoch AS i1,
+    s.last_seq AS i2,
+    (SELECT COUNT(*)::int4 FROM r_first) AS i3,
+    s.history_incarnation AS b1,
+    arh.history_incarnation AS b2
+FROM spaces s
+LEFT JOIN agent_run_heads arh ON arh.space_id = s.space_id AND arh.run_id = $2
+WHERE s.space_id = $1
+UNION ALL
+SELECT
+    1::int2,
+    nh.note_id,
+    nh.parent_folder_id,
+    nh.slug,
+    nh.slug_fold,
+    nh.title,
+    nh.title_fold,
+    nh.head_rev_id,
+    nh.lifecycle_state,
+    nh.byte_size,
+    nh.visibility_mask::bigint,
+    (CASE WHEN nh.doc_class = 'user-doc' AND nh.ability_id IS NULL THEN 1 ELSE 0 END)::int4,
+    nh.content_blake3,
+    NULL::bytea
+FROM nh
+UNION ALL
+SELECT
+    2::int2,
+    rp.entity_key,
+    COALESCE(rp.rev_id, ''),
+    NULL::text,
+    NULL::text,
+    NULL::text,
+    NULL::text,
+    NULL::text,
+    NULL::text,
+    rp.first_run_seq,
+    COALESCE(rp.space_seq, -1)::bigint,
+    0::int4,
+    rp.metadata_msgpack,
+    NULL::bytea
+FROM r_pre rp
+UNION ALL
+SELECT
+    4::int2,
+    bc.current_publication_id,
+    '',
+    NULL::text,
+    NULL::text,
+    NULL::text,
+    NULL::text,
+    NULL::text,
+    NULL::text,
+    0::bigint,
+    0::bigint,
+    0::int4,
+    bc.content_blake3,
+    NULL::bytea
+FROM digs dg
+JOIN blob_catalog bc
+  ON bc.space_id = $1
+ AND bc.content_blake3 = dg.d
+ AND bc.admission_state = 'open'
+ AND bc.blob_state = 'active'
+ AND bc.current_publication_id IS NOT NULL
+";
+
+pub(crate) const PG_LEAN_ROLLBACK_COMMIT_CALL_SQL: &str = "
+SELECT notarium_pg_lean_commit_v3(
+    $1, $2, $3, $4, $5, $6, $7, $8,
+    $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+    $21, $22, $23, $24, $25, $26, $27::TEXT[],
+    $28::TEXT[], $29::TEXT[], $30::BYTEA[], $31::TEXT[], $32::BIGINT[],
+    $33::TEXT[], $34::TEXT[], $35::TEXT[], $36::TEXT[], $37::BYTEA[], $38::BIGINT[], $39::BYTEA[], $40::TEXT[], $41::TEXT[],
+    $42,
+    $43::BYTEA[], $44::BIGINT[],
+    $45::TEXT[], $46::TEXT[],
+    $47::TEXT[], $48::TEXT[], $49::TEXT[], $50::TEXT[], $51::BYTEA[], $52::BIGINT[], $53::INT4[],
+    $54::TEXT[], $55::TEXT[], $56::TEXT[], $57::TEXT[], $58::TEXT[], $59::TEXT[], $60::TEXT[], $61::BYTEA[], $62::BIGINT[], $63::TEXT[], $64::INT4[],
+    $65::TEXT[], $66::TEXT[], $67::TEXT[], $68::TEXT[], $69
+)
+";
+
+const PG_LEAN_ROLLBACK_COMMIT_FN_SQL: &str = r#"
+CREATE OR REPLACE FUNCTION notarium_pg_lean_commit_v3(
+    p_space_id TEXT,
+    p_inc BYTEA,
+    p_delta BIGINT,
+    p_off_run_vis INT4,
+    p_off_eff_first INT4,
+    p_off_eff_vis INT4,
+    p_off_resp_vis INT4,
+    p_off_san_vis INT4,
+    p_sec BIGINT,
+    p_nsec INT4,
+    p_now_ms BIGINT,
+    p_expires_ms BIGINT,
+    p_actor_id TEXT,
+    p_idemp_key TEXT,
+    p_cmd_hash BYTEA,
+    p_cmd_id TEXT,
+    p_run_id TEXT,
+    p_exp_run_rev TEXT,
+    p_new_run_rev TEXT,
+    p_run_meta BYTEA,
+    p_eff_pid TEXT,
+    p_eff_blob BYTEA,
+    p_resp_pid TEXT,
+    p_resp_blob BYTEA,
+    p_san_blob BYTEA,
+    p_noop_folder TEXT,
+    p_elig_nids TEXT[],
+    p_br_nids TEXT[],
+    p_br_revs TEXT[],
+    p_br_digs BYTEA[],
+    p_br_pubs TEXT[],
+    p_br_rel_seqs BIGINT[],
+    p_m_nids TEXT[],
+    p_m_revs TEXT[],
+    p_m_prev_revs TEXT[],
+    p_m_rest_revs TEXT[],
+    p_m_digs BYTEA[],
+    p_m_rel_seqs BIGINT[],
+    p_m_metas BYTEA[],
+    p_m_lc TEXT[],
+    p_m_ops TEXT[],
+    p_owner_key TEXT,
+    p_cat_digs BYTEA[],
+    p_cat_deltas BIGINT[],
+    p_tr_nids TEXT[],
+    p_tr_revs TEXT[],
+    p_hot_nids TEXT[],
+    p_hot_t TEXT[],
+    p_hot_tf TEXT[],
+    p_hot_revs TEXT[],
+    p_hot_digs BYTEA[],
+    p_hot_bs BIGINT[],
+    p_hot_vm INT4[],
+    p_fl_nids TEXT[],
+    p_fl_pf TEXT[],
+    p_fl_s TEXT[],
+    p_fl_sf TEXT[],
+    p_fl_t TEXT[],
+    p_fl_tf TEXT[],
+    p_fl_revs TEXT[],
+    p_fl_digs BYTEA[],
+    p_fl_bs BIGINT[],
+    p_fl_lc TEXT[],
+    p_fl_vm INT4[],
+    p_cat_pubs TEXT[],
+    p_all_nids TEXT[],
+    p_all_exp_revs TEXT[],
+    p_all_exp_lcs TEXT[],
+    p_root_folder_id TEXT
+) RETURNS BIGINT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_ok BOOL;
+    v_base_seq BIGINT;
+    v_exp_epoch BIGINT;
+    v_first_seq BIGINT;
+    v_vis_seq BIGINT;
+    v_first_be BYTEA;
+    v_vis_be BYTEA;
+    v_cat_cnt INT4;
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtextextended(p_space_id, 0));
+
+    SELECT
+        (
+            s.history_incarnation = p_inc
+            AND s.lifecycle_state = 'active'
+            AND s.active_epoch >= 1
+            AND s.last_seq >= 0
+            AND p_delta >= 1
+            AND s.last_seq <= (9223372036854775807 - p_delta)
+            AND arh.history_incarnation = p_inc
+            AND arh.run_revision = p_exp_run_rev
+            AND (
+                SELECT COUNT(*)
+                FROM UNNEST(p_all_nids, p_all_exp_revs, p_all_exp_lcs) AS e(nid, exp_rev, exp_lc)
+                JOIN note_heads nh ON nh.space_id = p_space_id AND nh.note_id = e.nid
+                WHERE nh.head_rev_id = e.exp_rev
+                  AND nh.lifecycle_state = e.exp_lc
+                  AND nh.parent_folder_id = p_root_folder_id
+                  AND nh.doc_class = 'user-doc'
+                  AND nh.ability_id IS NULL
+                  AND nh.visibility_mask >= 0
+            ) = cardinality(p_all_nids)
+            AND NOT EXISTS(SELECT 1 FROM command_receipts WHERE space_id = p_space_id AND history_incarnation = p_inc AND actor_id = p_actor_id AND idempotency_key = p_idemp_key)
+            AND NOT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = p_space_id)
+            AND NOT EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = p_space_id)
+            AND NOT EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = p_space_id)
+            AND NOT EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = p_space_id)
+            AND NOT EXISTS(SELECT 1 FROM space_field_schemas WHERE space_id = p_space_id)
+            AND NOT EXISTS(SELECT 1 FROM folder_heads WHERE space_id = p_space_id AND (is_root = 0 OR write_lock_json IS NOT NULL OR lifecycle_state <> 'active'))
+            AND NOT (
+                COALESCE(cardinality(p_fl_nids), 0) > 0 AND EXISTS (
+                    SELECT 1
+                    FROM UNNEST(p_fl_pf, p_fl_sf, p_fl_lc) AS c(pf, sf, lc)
+                    JOIN note_heads ox
+                      ON ox.space_id = p_space_id
+                     AND ox.parent_folder_id = c.pf
+                     AND ox.slug_fold = c.sf
+                     AND ox.lifecycle_state = 'active'
+                    WHERE c.lc = 'active' AND NOT (ox.note_id = ANY(p_elig_nids))
+                )
+            )
+        ),
+        s.last_seq,
+        s.active_epoch
+    INTO v_ok, v_base_seq, v_exp_epoch
+    FROM spaces s
+    LEFT JOIN agent_run_heads arh ON arh.space_id = s.space_id AND arh.run_id = p_run_id
+    WHERE s.space_id = p_space_id;
+
+    IF NOT COALESCE(v_ok, false) THEN
+        RETURN 0;
+    END IF;
+
+    v_first_seq := v_base_seq + 1;
+    v_vis_seq := v_base_seq + p_delta;
+    v_first_be := int8send(v_first_seq);
+    v_vis_be := int8send(v_vis_seq);
+
+    -- Phase A: Execute all 7 INSERTs in a single multi-CTE statement (1 SPI snapshot/executor cycle).
+    WITH ins_br AS (
+        INSERT INTO blob_references (
+            space_id, owner_kind, owner_id, owner_rev_id, resource_key,
+            content_blake3, publication_id, created_seq
+        )
+        SELECT p_space_id, 'note_revision', u.nid, u.rev, 'carrier',
+               u.dig, u.pub, v_base_seq + u.rel_seq
+        FROM UNNEST(p_br_nids, p_br_revs, p_br_digs, p_br_pubs, p_br_rel_seqs)
+             AS u(nid, rev, dig, pub, rel_seq)
+    ),
+    ins_rev AS (
+        INSERT INTO revisions (
+            space_id, history_incarnation, rev_id, entity_type, entity_key,
+            space_seq, visibility_seq, parent_rev_id, their_rev_id, restored_from_rev_id,
+            content_blake3, metadata_msgpack, patch_meta_json, actor_id, session_id,
+            agent_run_id, quarantine_reason, created_at_sec, created_at_nsec
+        )
+        SELECT p_space_id, p_inc, u.rev, 'note', u.nid,
+               v_base_seq + u.rel_seq, v_vis_seq, u.prev_rev, NULL, u.rest_rev,
+               u.dig, u.meta, NULL, p_actor_id, NULL,
+               NULL, NULL, p_sec, p_nsec
+        FROM UNNEST(p_m_nids, p_m_revs, p_m_prev_revs, p_m_rest_revs, p_m_digs, p_m_rel_seqs, p_m_metas)
+             AS u(nid, rev, prev_rev, rest_rev, dig, rel_seq, meta)
+        UNION ALL
+        SELECT p_space_id, p_inc, p_new_run_rev, 'agent_run', p_run_id,
+               v_vis_seq, v_vis_seq, NULL, NULL, NULL,
+               NULL, overlay(p_run_meta placing v_vis_be from p_off_run_vis for 8), NULL, p_actor_id, NULL,
+               p_run_id, NULL, p_sec, p_nsec
+    ),
+    ins_cp AS (
+        INSERT INTO change_payloads (space_id, payload_id, codec, erased_by_purge, effect_msgpack, created_seq)
+        VALUES
+            (
+                p_space_id,
+                p_eff_pid,
+                'effect_v1',
+                0,
+                overlay(
+                    overlay(p_eff_blob placing v_first_be from p_off_eff_first for 8)
+                    placing v_vis_be from p_off_eff_vis for 8
+                ),
+                v_vis_seq
+            ),
+            (
+                p_space_id,
+                p_resp_pid,
+                'receipt_detail_v1',
+                0,
+                overlay(p_resp_blob placing v_vis_be from p_off_resp_vis for 8),
+                v_vis_seq
+            )
+    ),
+    ins_cc AS (
+        INSERT INTO change_commands (
+            space_id, history_incarnation, command_id, first_seq, last_seq,
+            command_kind, payload_id, committed_at_ms
+        )
+        VALUES (p_space_id, p_inc, p_cmd_id, v_first_seq, v_vis_seq, 'rollback_agent_run', p_eff_pid, p_now_ms)
+    ),
+    ins_cl AS (
+        INSERT INTO change_log (
+            space_id, space_seq, history_incarnation, command_id,
+            command_first_seq, command_last_seq, entity_type, entity_id,
+            op_kind, rev_id, lifecycle_state, doc_class, payload_id, committed_at_ms
+        )
+        SELECT
+            p_space_id, v_first_seq, p_inc, p_cmd_id,
+            v_first_seq, v_vis_seq, 'folder', p_noop_folder,
+            'edit', p_new_run_rev, 'active', NULL, p_eff_pid, p_now_ms
+        WHERE p_noop_folder IS NOT NULL
+        UNION ALL
+        SELECT
+            p_space_id, v_base_seq + u.rel_seq, p_inc, p_cmd_id,
+            v_first_seq, v_vis_seq, 'note', u.nid,
+            u.op, u.rev, u.lc, 'user-doc', p_eff_pid, p_now_ms
+        FROM UNNEST(p_m_nids, p_m_revs, p_m_lc, p_m_rel_seqs, p_m_ops) AS u(nid, rev, lc, rel_seq, op)
+        WHERE p_noop_folder IS NULL
+    ),
+    ins_po AS (
+        INSERT INTO payload_owners (space_id, payload_kind, payload_id, note_id)
+        SELECT p_space_id, k.pkind, k.pid, u.nid
+        FROM (
+            VALUES
+                ('change_payload', p_eff_pid),
+                ('command_receipt', p_owner_key)
+        ) AS k(pkind, pid)
+        CROSS JOIN UNNEST(p_elig_nids) AS u(nid)
+    )
+    INSERT INTO command_receipts (
+        space_id, history_incarnation, actor_id, idempotency_key, command_hash,
+        status, envelope_version, response_payload_id, sanitized_envelope_msgpack,
+        canonical_seq, expires_at_ms
+    )
+    VALUES (
+        p_space_id, p_inc, p_actor_id, p_idemp_key, p_cmd_hash,
+        'completed', 1, p_resp_pid, overlay(p_san_blob placing v_vis_be from p_off_san_vis for 8),
+        v_vis_seq, p_expires_ms
+    );
+
+    -- Phase B: Execute pre-sliced UPDATEs last.
+    IF COALESCE(cardinality(p_cat_digs), 0) > 0 THEN
+        UPDATE blob_catalog AS bc
+        SET ref_count = bc.ref_count + u.delta,
+            touched_at_ms = p_now_ms
+        FROM UNNEST(p_cat_digs, p_cat_deltas, p_cat_pubs) AS u(dig, delta, pub)
+        WHERE bc.space_id = p_space_id
+          AND bc.content_blake3 = u.dig
+          AND bc.current_publication_id = u.pub
+          AND bc.admission_state = 'open'
+          AND bc.blob_state = 'active';
+        GET DIAGNOSTICS v_cat_cnt = ROW_COUNT;
+        IF v_cat_cnt <> cardinality(p_cat_digs) THEN
+            RAISE EXCEPTION 'NOTARIUM_RB_FALLBACK_0';
+        END IF;
+    END IF;
+
+    IF COALESCE(cardinality(p_tr_nids), 0) > 0 THEN
+        UPDATE note_heads AS nh
+        SET head_rev_id = u.rev,
+            lifecycle_state = 'trashed',
+            updated_seq = v_vis_seq,
+            updated_at_sec = p_sec,
+            updated_at_nsec = p_nsec,
+            last_actor_id = p_actor_id
+        FROM UNNEST(p_tr_nids, p_tr_revs) AS u(nid, rev)
+        WHERE nh.space_id = p_space_id AND nh.note_id = u.nid;
+    END IF;
+
+    IF COALESCE(cardinality(p_hot_nids), 0) > 0 THEN
+        UPDATE note_heads AS nh
+        SET title = u.t,
+            title_fold = u.tf,
+            head_rev_id = u.rev,
+            content_blake3 = u.dig,
+            byte_size = u.bs,
+            visibility_mask = u.vm,
+            updated_seq = v_vis_seq,
+            updated_at_sec = p_sec,
+            updated_at_nsec = p_nsec,
+            last_actor_id = p_actor_id
+        FROM UNNEST(p_hot_nids, p_hot_t, p_hot_tf, p_hot_revs, p_hot_digs, p_hot_bs, p_hot_vm)
+             AS u(nid, t, tf, rev, dig, bs, vm)
+        WHERE nh.space_id = p_space_id AND nh.note_id = u.nid;
+    END IF;
+
+    IF COALESCE(cardinality(p_fl_nids), 0) > 0 THEN
+        UPDATE note_heads AS nh
+        SET parent_folder_id = u.pf,
+            slug = u.s,
+            slug_fold = u.sf,
+            title = u.t,
+            title_fold = u.tf,
+            doc_class = 'user-doc',
+            ability_id = NULL,
+            head_rev_id = u.rev,
+            content_blake3 = u.dig,
+            byte_size = u.bs,
+            lifecycle_state = u.lc,
+            visibility_mask = u.vm,
+            updated_seq = v_vis_seq,
+            updated_at_sec = p_sec,
+            updated_at_nsec = p_nsec,
+            last_actor_id = p_actor_id
+        FROM UNNEST(p_fl_nids, p_fl_pf, p_fl_s, p_fl_sf, p_fl_t, p_fl_tf, p_fl_revs, p_fl_digs, p_fl_bs, p_fl_lc, p_fl_vm)
+             AS u(nid, pf, s, sf, t, tf, rev, dig, bs, lc, vm)
+        WHERE nh.space_id = p_space_id AND nh.note_id = u.nid;
+    END IF;
+
+    UPDATE agent_run_heads
+    SET history_incarnation = p_inc,
+        run_revision = p_new_run_rev,
+        last_seq = v_vis_seq,
+        updated_at_sec = p_sec,
+        updated_at_nsec = p_nsec
+    WHERE space_id = p_space_id AND run_id = p_run_id;
+
+    UPDATE spaces
+    SET last_seq = v_vis_seq
+    WHERE space_id = p_space_id
+      AND history_incarnation = p_inc
+      AND active_epoch = v_exp_epoch
+      AND last_seq = v_base_seq;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'NOTARIUM_RB_FALLBACK_0';
+    END IF;
+
+    RETURN v_vis_seq;
+END;
+$$;
+"#;
 
 async fn inspect_postgres_schema_meta(
     conn: &mut PgConnection,
@@ -669,27 +1628,37 @@ pub async fn verify_postgres_catalog(
         ));
     }
 
-    // Verify fillfactor=70 on spaces.
-    let reloptions: Option<Vec<String>> = sqlx::query_scalar(
-        "SELECT c.reloptions
-         FROM pg_class c
-         JOIN pg_namespace n ON n.oid = c.relnamespace
-         WHERE n.nspname = $1 AND c.relname = 'spaces'",
-    )
-    .bind(schema_name)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(|err| internal_not_committed("pg_spaces_reloptions", err.to_string()))?;
+    // Verify HOT-friendly fillfactor settings on spaces and note_heads.
+    for (relname, expected_opt, err_code) in [
+        ("spaces", "fillfactor=70", "pg_spaces_fillfactor_mismatch"),
+        (
+            "note_heads",
+            "fillfactor=80",
+            "pg_note_heads_fillfactor_mismatch",
+        ),
+    ] {
+        let reloptions: Option<Vec<String>> = sqlx::query_scalar(
+            "SELECT c.reloptions
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1 AND c.relname = $2",
+        )
+        .bind(schema_name)
+        .bind(relname)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_table_reloptions", err.to_string()))?;
 
-    let has_fillfactor_70 = reloptions
-        .unwrap_or_default()
-        .iter()
-        .any(|opt| opt == "fillfactor=70");
-    if !has_fillfactor_70 {
-        return Err(internal_not_committed(
-            "pg_spaces_fillfactor_mismatch",
-            "spaces table is missing fillfactor=70",
-        ));
+        let has_expected = reloptions
+            .unwrap_or_default()
+            .iter()
+            .any(|opt| opt == expected_opt);
+        if !has_expected {
+            return Err(internal_not_committed(
+                err_code,
+                format!("{relname} table is missing {expected_opt}"),
+            ));
+        }
     }
 
     Ok(())

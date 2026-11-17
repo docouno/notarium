@@ -62,23 +62,36 @@ pub struct StorageTestFixtures {
 impl StorageTestFixtures {
     /// Loads the active offline PostgreSQL 16 + MinIO CE fixture manifest, failing closed if absent.
     pub fn load_required() -> Self {
-        let container_manifest = Path::new("/workspace/.artifacts/storage-tests/current.json");
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(4)
-            .expect("repository root four levels above crate manifest");
-        let host_manifest = repo_root.join(".artifacts/storage-tests/current.json");
-
-        let manifest_path = if container_manifest.exists() {
-            container_manifest.to_path_buf()
-        } else if host_manifest.exists() {
-            host_manifest
+        let manifest_path = if let Some(explicit) =
+            std::env::var_os("NOTARIUM_STORAGE_FIXTURES_MANIFEST")
+        {
+            let p = PathBuf::from(explicit);
+            if !p.exists() {
+                panic!(
+                    "explicit NOTARIUM_STORAGE_FIXTURES_MANIFEST '{}' does not exist (fail-closed)",
+                    p.display()
+                );
+            }
+            p
         } else {
-            panic!(
-                "offline PostgreSQL 16 + S3 storage fixtures are not running (missing {}); \
-                 run via 'make test app=api' or './docker/storage-fixtures/with-storage-fixtures.sh exec-custom ...'",
-                host_manifest.display()
-            );
+            let container_manifest = Path::new("/workspace/.artifacts/storage-tests/current.json");
+            let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(4)
+                .expect("repository root four levels above crate manifest");
+            let host_manifest = repo_root.join(".artifacts/storage-tests/current.json");
+
+            if container_manifest.exists() {
+                container_manifest.to_path_buf()
+            } else if host_manifest.exists() {
+                host_manifest
+            } else {
+                panic!(
+                    "offline PostgreSQL 16 + S3 storage fixtures are not running (missing {}); \
+                     run via 'make test app=api' or './docker/storage-fixtures/with-storage-fixtures.sh exec-custom ...'",
+                    host_manifest.display()
+                );
+            }
         };
 
         let raw_bytes = fs::read(&manifest_path).unwrap_or_else(|err| {

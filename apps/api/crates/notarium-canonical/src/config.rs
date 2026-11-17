@@ -77,10 +77,10 @@ impl SqlBackendConfig {
         Self::Sqlite {
             data_root,
             read_pool_size: 8,
-            read_deadline: Duration::from_millis(200),
+            read_deadline: Duration::from_millis(248),
             passive_checkpoint_interval: Duration::from_millis(15),
-            wal_soft_watermark_bytes: 64 * 1024 * 1024,
-            wal_high_watermark_bytes: 128 * 1024 * 1024,
+            wal_soft_watermark_bytes: 512 * 1024 * 1024,
+            wal_high_watermark_bytes: 896 * 1024 * 1024,
             wal_reset_cycle_deadline: Duration::from_millis(250),
         }
     }
@@ -90,7 +90,7 @@ impl SqlBackendConfig {
             connect,
             schema: schema.into(),
             pool_size: 8,
-            statement_timeout: Duration::from_millis(200),
+            statement_timeout: Duration::from_millis(240),
         }
     }
 }
@@ -169,7 +169,7 @@ impl Default for WriterConfig {
         Self {
             mailbox_capacity: 4096,
             max_staged_bytes: 256 * 1024 * 1024,
-            batch_flush_window: Duration::from_micros(1500),
+            batch_flush_window: Duration::from_millis(2),
             max_batch_items: 64,
             receipt_ttl: Duration::from_secs(24 * 60 * 60),
         }

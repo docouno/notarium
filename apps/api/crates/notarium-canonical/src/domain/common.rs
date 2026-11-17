@@ -124,9 +124,41 @@ impl RoomFenceTable {
         }
     }
 
+    /// Synchronous equivalent of `is_room_active` for `spawn_blocking` SQLite fast-path workers.
+    pub fn is_room_active_blocking(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+    ) -> Result<bool, PortError> {
+        let map_opt = {
+            let map = self.fences.lock().expect("room fence table mutex");
+            map.get(&(scope.space_id.clone(), note.clone())).cloned()
+        };
+        let Some(lock) = map_opt else {
+            return Ok(false);
+        };
+        let probe_id = CommandIdentity {
+            scope: scope.clone(),
+            actor: PrincipalId::from_bytes([0u8; 16]),
+            key: notarium_core::ids::CommandKey::from_bytes([0u8; 16]),
+            hash: ContentDigest::from_bytes([0u8; 32]),
+        };
+        let guard = lock.blocking_lock();
+        match guard.reserve(probe_id) {
+            Ok(RollbackReservation::SkippedRoomActive) => Ok(true),
+            Ok(RollbackReservation::Closed(_)) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn remove_note(&self, space_id: &SpaceId, note: &NoteId) {
         let mut map = self.fences.lock().expect("room fence table mutex");
         map.remove(&(space_id.clone(), note.clone()));
+    }
+
+    pub fn remove_space(&self, space_id: &SpaceId) {
+        let mut map = self.fences.lock().expect("room fence table mutex");
+        map.retain(|(sid, _), _| sid != space_id);
     }
 
     pub async fn consume_reservation(
@@ -140,6 +172,99 @@ impl RoomFenceTable {
         let mut guard = lock.lock_owned().await;
         guard.consume(reservation, identity)?;
         Ok(guard)
+    }
+
+    /// Locks the per-note fence in ascending order and reserves a closed-room permit without mutating
+    /// the fence epoch until all pre-write validations pass and `guard.consume(...)` is invoked.
+    pub async fn try_lock_closed_for_rollback(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+        identity: &CommandIdentity,
+    ) -> Result<
+        Option<(
+            tokio::sync::OwnedMutexGuard<RoomFenceState>,
+            ClosedRoomReservation,
+        )>,
+        PortError,
+    > {
+        let lock = self.get_or_init(scope, note);
+        let guard = lock.lock_owned().await;
+        match guard.reserve(identity.clone())? {
+            RollbackReservation::SkippedRoomActive => Ok(None),
+            RollbackReservation::Closed(res) => Ok(Some((guard, res))),
+        }
+    }
+
+    /// Synchronous equivalent of `try_lock_closed_for_rollback` for `spawn_blocking` SQLite fast-path workers.
+    pub fn try_lock_closed_for_rollback_blocking(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+        identity: &CommandIdentity,
+    ) -> Result<
+        Option<(
+            tokio::sync::OwnedMutexGuard<RoomFenceState>,
+            ClosedRoomReservation,
+        )>,
+        PortError,
+    > {
+        let lock = self.get_or_init(scope, note);
+        let guard = lock.blocking_lock_owned();
+        match guard.reserve(identity.clone())? {
+            RollbackReservation::SkippedRoomActive => Ok(None),
+            RollbackReservation::Closed(res) => Ok(Some((guard, res))),
+        }
+    }
+
+    /// Non-blocking batch lock + reservation in ascending `NoteId` order using a single map critical section.
+    /// Returns `Ok(None)` on any per-note mutex contention so the caller can fall back to async locking.
+    #[allow(clippy::type_complexity)]
+    pub fn try_lock_batch_for_rollback_sync(
+        &self,
+        scope: &HistoryScope,
+        sorted_notes: &[&NoteId],
+        identity: &CommandIdentity,
+    ) -> Result<
+        Option<
+            Vec<
+                Option<(
+                    tokio::sync::OwnedMutexGuard<RoomFenceState>,
+                    ClosedRoomReservation,
+                )>,
+            >,
+        >,
+        PortError,
+    > {
+        let mut locks = Vec::with_capacity(sorted_notes.len());
+        {
+            let mut map = self.fences.lock().expect("room fence table mutex");
+            for &note in sorted_notes {
+                let arc = Arc::clone(
+                    map.entry((scope.space_id.clone(), note.clone()))
+                        .or_insert_with(|| {
+                            Arc::new(Mutex::new(RoomFenceState::new(
+                                note.clone(),
+                                scope.clone(),
+                                LeaseEpoch::ZERO,
+                            )))
+                        }),
+                );
+                locks.push(arc);
+            }
+        }
+
+        let mut out = Vec::with_capacity(locks.len());
+        for lock in locks {
+            let Ok(guard) = lock.try_lock_owned() else {
+                return Ok(None);
+            };
+            match guard.reserve(identity.clone())? {
+                RollbackReservation::SkippedRoomActive => out.push(None),
+                RollbackReservation::Closed(res) => out.push(Some((guard, res))),
+            }
+        }
+        Ok(Some(out))
     }
 
     pub async fn seed_persisted_room(
@@ -499,6 +624,225 @@ pub(crate) async fn load_note_head_row_tx(
         .ok_or_else(|| DomainError::ResourceNotFound.into())
 }
 
+#[allow(clippy::type_complexity)]
+pub(crate) async fn load_note_heads_batch_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    note_ids: &[NoteId],
+) -> Result<BTreeMap<NoteId, NoteHeadRow>, PortError> {
+    let mut out = BTreeMap::new();
+    if note_ids.is_empty() {
+        return Ok(out);
+    }
+    type RawBatchTuple = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<Vec<u8>>,
+        i64,
+        String,
+        i32,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        i32,
+        i64,
+        i32,
+        String,
+    );
+    for chunk in note_ids.chunks(200) {
+        let rows: Vec<RawBatchTuple> = match tx {
+            BackendConn::Sqlite(conn) => {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT note_id, parent_folder_id, slug, slug_fold, title, title_fold, doc_class,
+                            ability_id, head_rev_id, content_blake3, byte_size, lifecycle_state,
+                            visibility_mask, settlement_successor_id, created_seq, updated_seq,
+                            created_at_sec, created_at_nsec, updated_at_sec, updated_at_nsec, last_actor_id
+                     FROM note_heads WHERE space_id = ",
+                );
+                qb.push_bind(space_id.as_str()).push(" AND note_id IN (");
+                let mut sep = qb.separated(", ");
+                for nid in chunk {
+                    sep.push_bind(nid.as_str());
+                }
+                sep.push_unseparated(")");
+                let fetched = qb.build().fetch_all(&mut **conn).await.map_err(|err| {
+                    internal_not_committed("sqlite_load_note_heads_batch", err.to_string())
+                })?;
+                fetched
+                    .into_iter()
+                    .map(|r| {
+                        (
+                            r.get("note_id"),
+                            r.get("parent_folder_id"),
+                            r.get("slug"),
+                            r.get("slug_fold"),
+                            r.get("title"),
+                            r.get("title_fold"),
+                            r.get("doc_class"),
+                            r.get("ability_id"),
+                            r.get("head_rev_id"),
+                            r.get("content_blake3"),
+                            r.get("byte_size"),
+                            r.get("lifecycle_state"),
+                            r.get::<i64, _>("visibility_mask") as i32,
+                            r.get("settlement_successor_id"),
+                            r.get("created_seq"),
+                            r.get("updated_seq"),
+                            r.get("created_at_sec"),
+                            r.get::<i64, _>("created_at_nsec") as i32,
+                            r.get("updated_at_sec"),
+                            r.get::<i64, _>("updated_at_nsec") as i32,
+                            r.get("last_actor_id"),
+                        )
+                    })
+                    .collect()
+            }
+            BackendConn::Postgres(conn) => {
+                let note_strs: Vec<&str> = chunk.iter().map(NoteId::as_str).collect();
+                let fetched = sqlx::query(
+                    "SELECT note_id, parent_folder_id, slug, slug_fold, title, title_fold, doc_class,
+                            ability_id, head_rev_id, content_blake3, byte_size, lifecycle_state,
+                            visibility_mask, settlement_successor_id, created_seq, updated_seq,
+                            created_at_sec, created_at_nsec, updated_at_sec, updated_at_nsec, last_actor_id
+                     FROM note_heads WHERE space_id = $1 AND note_id = ANY($2)",
+                )
+                .bind(space_id.as_str())
+                .bind(note_strs)
+                .fetch_all(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("pg_load_note_heads_batch", err.to_string())
+                })?;
+                fetched
+                    .into_iter()
+                    .map(|r| {
+                        (
+                            r.get("note_id"),
+                            r.get("parent_folder_id"),
+                            r.get("slug"),
+                            r.get("slug_fold"),
+                            r.get("title"),
+                            r.get("title_fold"),
+                            r.get("doc_class"),
+                            r.get("ability_id"),
+                            r.get("head_rev_id"),
+                            r.get("content_blake3"),
+                            r.get("byte_size"),
+                            r.get("lifecycle_state"),
+                            r.get("visibility_mask"),
+                            r.get("settlement_successor_id"),
+                            r.get("created_seq"),
+                            r.get("updated_seq"),
+                            r.get("created_at_sec"),
+                            r.get("created_at_nsec"),
+                            r.get("updated_at_sec"),
+                            r.get("updated_at_nsec"),
+                            r.get("last_actor_id"),
+                        )
+                    })
+                    .collect()
+            }
+        };
+        for (
+            nid_raw,
+            parent_raw,
+            slug,
+            slug_fold,
+            title,
+            title_fold,
+            class_raw,
+            ability_raw,
+            head_rev_raw,
+            digest_raw,
+            byte_size_raw,
+            lc_raw,
+            visibility_mask,
+            succ_raw,
+            created_seq_raw,
+            updated_seq_raw,
+            c_sec,
+            c_nsec,
+            u_sec,
+            u_nsec,
+            actor_raw,
+        ) in rows
+        {
+            let nid = NoteId::parse(&nid_raw)
+                .map_err(|_| internal_not_committed("corrupt_note_id", "invalid note_id"))?;
+            let parent_folder_id = FolderId::parse(&parent_raw).map_err(|_| {
+                internal_not_committed("corrupt_note_parent", "invalid parent_folder_id")
+            })?;
+            let doc_class = doc_class_from_db(&class_raw)?;
+            let ability_id = match ability_raw {
+                Some(s) => Some(AbilityId::parse(&s).map_err(|_| {
+                    internal_not_committed("corrupt_ability_id", "invalid ability_id")
+                })?),
+                None => None,
+            };
+            let head_rev_id = RevisionId::parse(&head_rev_raw)
+                .map_err(|_| internal_not_committed("corrupt_note_rev", "invalid head_rev_id"))?;
+            let content_digest = match digest_raw {
+                Some(b) => {
+                    let arr: [u8; 32] = b.try_into().map_err(|_| {
+                        internal_not_committed("corrupt_note_digest", "content_blake3 != 32B")
+                    })?;
+                    Some(ContentDigest::from_bytes(arr))
+                }
+                None => None,
+            };
+            let byte_size = u64::try_from(byte_size_raw)
+                .map_err(|_| internal_not_committed("corrupt_byte_size", "negative byte_size"))?;
+            let lifecycle = lifecycle_from_db(&lc_raw)?;
+            let settlement_successor_id = match succ_raw {
+                Some(s) => Some(NoteId::parse(&s).map_err(|_| {
+                    internal_not_committed("corrupt_successor_id", "invalid successor")
+                })?),
+                None => None,
+            };
+            let created_seq = i64_to_space_seq(created_seq_raw)?;
+            let updated_seq = i64_to_space_seq(updated_seq_raw)?;
+            let created_at = decode_timestamp_parts(c_sec, c_nsec)?;
+            let updated_at = decode_timestamp_parts(u_sec, u_nsec)?;
+            let last_actor_id = PrincipalId::parse(&actor_raw).map_err(|_| {
+                internal_not_committed("corrupt_last_actor", "invalid last_actor_id")
+            })?;
+            out.insert(
+                nid.clone(),
+                NoteHeadRow {
+                    note_id: nid,
+                    parent_folder_id,
+                    slug,
+                    slug_fold,
+                    title,
+                    title_fold,
+                    doc_class,
+                    ability_id,
+                    head_rev_id,
+                    content_digest,
+                    byte_size,
+                    lifecycle,
+                    visibility_mask,
+                    settlement_successor_id,
+                    created_seq,
+                    updated_seq,
+                    created_at,
+                    updated_at,
+                    last_actor_id,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct FolderAncestryFacts {
     pub ancestors: Vec<FolderId>,
@@ -517,6 +861,10 @@ pub(crate) struct FolderAncestryCache {
 }
 
 impl FolderAncestryCache {
+    pub(crate) fn insert_preloaded_row(&mut self, row: crate::runtime::FolderHeadRow) {
+        self.rows.insert(row.folder_id.clone(), row);
+    }
+
     pub(crate) async fn load_ancestry_tx(
         &mut self,
         tx: &mut BackendConn<'_>,
@@ -1046,14 +1394,21 @@ pub(crate) async fn check_collab_preconditions_tx(
     Ok(())
 }
 
-pub(crate) async fn is_note_room_active_tx(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NoteRoomDirectWriteState {
+    NoSessionRow,
+    ClosedSessionRow,
+    ActiveOrFenced,
+}
+
+pub(crate) async fn check_note_room_direct_write_tx(
     tx: &mut BackendConn<'_>,
     room_fences: &RoomFenceTable,
     scope: &HistoryScope,
     note_id: &NoteId,
-) -> Result<bool, PortError> {
+) -> Result<NoteRoomDirectWriteState, PortError> {
     if room_fences.is_room_active(scope, note_id).await? {
-        return Ok(true);
+        return Ok(NoteRoomDirectWriteState::ActiveOrFenced);
     }
     let state_opt: Option<String> = match tx {
         BackendConn::Sqlite(conn) => sqlx::query_scalar(
@@ -1073,7 +1428,23 @@ pub(crate) async fn is_note_room_active_tx(
         .await
         .map_err(|err| internal_not_committed("pg_check_room_active", err.to_string()))?,
     };
-    Ok(matches!(state_opt.as_deref(), Some("active" | "fenced")))
+    Ok(match state_opt.as_deref() {
+        None => NoteRoomDirectWriteState::NoSessionRow,
+        Some("active" | "fenced") => NoteRoomDirectWriteState::ActiveOrFenced,
+        Some(_) => NoteRoomDirectWriteState::ClosedSessionRow,
+    })
+}
+
+pub(crate) async fn is_note_room_active_tx(
+    tx: &mut BackendConn<'_>,
+    room_fences: &RoomFenceTable,
+    scope: &HistoryScope,
+    note_id: &NoteId,
+) -> Result<bool, PortError> {
+    Ok(matches!(
+        check_note_room_direct_write_tx(tx, room_fences, scope, note_id).await?,
+        NoteRoomDirectWriteState::ActiveOrFenced
+    ))
 }
 
 pub(crate) async fn sync_closed_collab_session_on_direct_write_tx(

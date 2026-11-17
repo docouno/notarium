@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -35,7 +35,8 @@ use crate::{
     },
     config::WriterConfig,
     runtime::{
-        CanonicalInner, SpaceRecord, SqlDriverState, is_note_purge_fenced_tx, load_space_record,
+        CanonicalInner, SpaceRecord, SqlDriverState, are_any_notes_purge_fenced_tx,
+        load_space_record_for_update_opt,
     },
     sql_exec::BackendConn,
 };
@@ -86,6 +87,7 @@ pub struct ItemCommitArtifacts {
 
 pub struct ItemExecCtx {
     pub scope: HistoryScope,
+    pub space: notarium_core::auth::Space,
     pub active_epoch: LeaseEpoch,
     pub root_folder_id: FolderId,
     effective_cut_before: SpaceSeq,
@@ -153,6 +155,44 @@ impl ItemExecCtx {
     pub fn retain_until_batch_commit<G: Send + 'static>(&mut self, guard: G) {
         self.retained_guards.push(Box::new(guard));
     }
+
+    pub(crate) fn new_for_batch(
+        scope: HistoryScope,
+        space: notarium_core::auth::Space,
+        active_epoch: LeaseEpoch,
+        root_folder_id: FolderId,
+        current_effective_cut: SpaceSeq,
+    ) -> Self {
+        Self {
+            scope,
+            space,
+            active_epoch,
+            root_folder_id,
+            effective_cut_before: current_effective_cut,
+            current_seq: current_effective_cut,
+            allocated_count: 0,
+            receipt_status: "completed",
+            pending_dir_syncs: PendingDirSyncs::default(),
+            retained_tickets: Vec::new(),
+            retained_guards: Vec::new(),
+        }
+    }
+
+    pub(crate) fn into_batch_parts(
+        self,
+    ) -> (
+        &'static str,
+        PendingDirSyncs,
+        Vec<StagedBlobTicket>,
+        Vec<Box<dyn Send>>,
+    ) {
+        (
+            self.receipt_status,
+            self.pending_dir_syncs,
+            self.retained_tickets,
+            self.retained_guards,
+        )
+    }
 }
 
 pub type ItemExecuteFn = Box<
@@ -160,6 +200,21 @@ pub type ItemExecuteFn = Box<
             &'a mut BackendConn<'_>,
             &'a mut ItemExecCtx,
         ) -> BoxFuture<'a, Result<ItemCommitArtifacts, PortError>>
+        + Send,
+>;
+
+pub(crate) enum PgSingleFastAttempt {
+    Handled(BatchExecOutcome),
+    FallbackToStandard,
+}
+
+pub(crate) type PgSingleItemFastFn = Box<
+    dyn for<'a> FnOnce(
+            &'a crate::CanonicalStore,
+            &'a mut sqlx::PgConnection,
+            WriterConfig,
+            &'a WriterFaultState,
+        ) -> BoxFuture<'a, PgSingleFastAttempt>
         + Send,
 >;
 
@@ -178,6 +233,8 @@ type BatchGroupReply = Result<(Vec<Result<Vec<u8>, PortError>>, SpaceSeq), PortE
 enum QueuedWriteEntry {
     Single {
         intent: PreparedWriteIntent,
+        sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
+        pg_fast_plan: Option<PgSingleItemFastFn>,
         staged_bytes_reserved: u64,
         reply_tx: oneshot::Sender<Result<Vec<u8>, PortError>>,
     },
@@ -194,6 +251,35 @@ enum QueuedWriteEntry {
 pub struct WriterFaultState {
     pub drop_commit_response_once: AtomicBool,
     pub pre_commit_space_delays: Mutex<HashMap<SpaceId, Duration>>,
+}
+
+/// Opt-in Phase-2 batch commit latency recorder (`(duration_ns, logical_items)`).
+#[derive(Default)]
+pub struct BatchCommitTelemetry {
+    enabled: AtomicBool,
+    samples: std::sync::Mutex<Vec<(u64, u32)>>,
+}
+
+impl BatchCommitTelemetry {
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
+        if enabled {
+            let mut guard = self.samples.lock().unwrap_or_else(|p| p.into_inner());
+            guard.clear();
+        }
+    }
+
+    pub fn take_samples(&self) -> Vec<(u64, u32)> {
+        let mut guard = self.samples.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut *guard)
+    }
+
+    fn record(&self, duration_ns: u64, items: u32) {
+        if self.enabled.load(Ordering::Relaxed) {
+            let mut guard = self.samples.lock().unwrap_or_else(|p| p.into_inner());
+            guard.push((duration_ns, items));
+        }
+    }
 }
 
 struct StagedByteLimiter {
@@ -279,13 +365,39 @@ pub struct WriterSafePointGuard {
     _guard: OwnedRwLockWriteGuard<()>,
 }
 
+#[derive(Default)]
+pub(crate) struct ActiveWriteOpTracker {
+    active_ops: AtomicUsize,
+    in_phase2_items: AtomicUsize,
+    notify: Notify,
+    phase1_drained_notify: Notify,
+}
+
+pub(crate) struct ActiveWriteOpGuard {
+    tracker: Arc<ActiveWriteOpTracker>,
+    weight: usize,
+}
+
+impl Drop for ActiveWriteOpGuard {
+    fn drop(&mut self) {
+        if self.weight > 0 {
+            self.tracker
+                .active_ops
+                .fetch_sub(self.weight, Ordering::Release);
+            self.tracker.notify.notify_waiters();
+        }
+    }
+}
+
 enum CoordinatorMode {
     Sqlite {
-        tx: Mutex<Option<mpsc::Sender<QueuedWriteEntry>>>,
+        tx: std::sync::Mutex<Option<mpsc::Sender<QueuedWriteEntry>>>,
         worker: Mutex<Option<JoinHandle<()>>>,
+        tracker: Arc<ActiveWriteOpTracker>,
     },
     Postgres {
         spaces: Mutex<HashMap<SpaceId, SpaceQueueHandle>>,
+        trackers: std::sync::Mutex<HashMap<SpaceId, Arc<ActiveWriteOpTracker>>>,
     },
 }
 
@@ -300,6 +412,7 @@ pub struct WriteCoordinator {
     byte_limiter: Arc<StagedByteLimiter>,
     commit_gate: Arc<RwLock<()>>,
     faults: Arc<WriterFaultState>,
+    batch_telemetry: Arc<BatchCommitTelemetry>,
     mode: CoordinatorMode,
 }
 
@@ -309,25 +422,33 @@ impl WriteCoordinator {
         let byte_limiter = Arc::new(StagedByteLimiter::new(cfg.max_staged_bytes));
         let commit_gate = Arc::new(RwLock::new(()));
         let faults = Arc::new(WriterFaultState::default());
+        let batch_telemetry = Arc::new(BatchCommitTelemetry::default());
 
         let mode = match &inner.sql {
             SqlDriverState::Sqlite { .. } => {
                 let (tx, rx) = mpsc::channel(cfg.mailbox_capacity.max(1));
+                let tracker = Arc::new(ActiveWriteOpTracker::default());
+                let tracker_cl = Arc::clone(&tracker);
                 let inner_weak = Arc::downgrade(inner);
                 let limiter_cl = Arc::clone(&byte_limiter);
                 let gate_cl = Arc::clone(&commit_gate);
                 let faults_cl = Arc::clone(&faults);
+                let telem_cl = Arc::clone(&batch_telemetry);
                 let worker = tokio::spawn(async move {
-                    run_batch_worker_loop(inner_weak, rx, cfg, limiter_cl, gate_cl, faults_cl)
-                        .await;
+                    run_batch_worker_loop(
+                        inner_weak, rx, cfg, limiter_cl, gate_cl, faults_cl, telem_cl, tracker_cl,
+                    )
+                    .await;
                 });
                 CoordinatorMode::Sqlite {
-                    tx: Mutex::new(Some(tx)),
+                    tx: std::sync::Mutex::new(Some(tx)),
                     worker: Mutex::new(Some(worker)),
+                    tracker,
                 }
             }
             SqlDriverState::Postgres { .. } => CoordinatorMode::Postgres {
                 spaces: Mutex::new(HashMap::new()),
+                trackers: std::sync::Mutex::new(HashMap::new()),
             },
         };
 
@@ -337,18 +458,96 @@ impl WriteCoordinator {
             byte_limiter,
             commit_gate,
             faults,
+            batch_telemetry,
             mode,
         })
+    }
+
+    pub(crate) fn enter_write_op(&self, space_id: &SpaceId, weight: usize) -> ActiveWriteOpGuard {
+        let w = weight.max(1);
+        let tracker = match &self.mode {
+            CoordinatorMode::Sqlite { tracker, .. } => Arc::clone(tracker),
+            CoordinatorMode::Postgres { trackers, .. } => {
+                let mut map = trackers.lock().expect("pg write trackers mutex");
+                Arc::clone(
+                    map.entry(space_id.clone())
+                        .or_insert_with(|| Arc::new(ActiveWriteOpTracker::default())),
+                )
+            }
+        };
+        tracker.active_ops.fetch_add(w, Ordering::AcqRel);
+        ActiveWriteOpGuard { tracker, weight: w }
     }
 
     pub fn faults(&self) -> &Arc<WriterFaultState> {
         &self.faults
     }
 
+    pub(crate) fn has_active_sqlite_ops(&self) -> bool {
+        self.active_sqlite_ops_count() > 0
+    }
+
+    pub(crate) fn active_sqlite_ops_count(&self) -> usize {
+        match &self.mode {
+            CoordinatorMode::Sqlite { tracker, .. } => tracker.active_ops.load(Ordering::Relaxed),
+            CoordinatorMode::Postgres { .. } => 0,
+        }
+    }
+
+    pub(crate) async fn yield_during_sqlite_phase1_burst(&self, budget: &CallBudget) {
+        let CoordinatorMode::Sqlite { tracker, .. } = &self.mode else {
+            return;
+        };
+        if tracker.active_ops.load(Ordering::Acquire) < 8
+            || tracker.in_phase2_items.load(Ordering::Acquire) > 0
+        {
+            return;
+        }
+        let notified = tracker.phase1_drained_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if tracker.active_ops.load(Ordering::Acquire) < 8
+            || tracker.in_phase2_items.load(Ordering::Acquire) > 0
+        {
+            return;
+        }
+        let cap = budget.remaining.min(Duration::from_millis(4));
+        if cap.is_zero() {
+            return;
+        }
+        let _ = tokio::time::timeout(cap, notified).await;
+    }
+
+    pub fn batch_telemetry(&self) -> &Arc<BatchCommitTelemetry> {
+        &self.batch_telemetry
+    }
+
+    pub(crate) fn config(&self) -> WriterConfig {
+        self.cfg
+    }
+
+    pub(crate) fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_batch_telemetry_enabled(&self) -> bool {
+        self.batch_telemetry.enabled.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_batch_telemetry(&self, duration_ns: u64, items: u32) {
+        self.batch_telemetry.record(duration_ns, items);
+    }
+
     /// Acquires an exclusive writer safe point between Phase-2 batch commits without dropping queued items.
     pub async fn acquire_safe_point(&self) -> WriterSafePointGuard {
         let guard = Arc::clone(&self.commit_gate).write_owned().await;
         WriterSafePointGuard { _guard: guard }
+    }
+
+    pub(crate) fn try_acquire_commit_read_guard(
+        &self,
+    ) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+        self.commit_gate.try_read().ok()
     }
 
     /// Acquires a shared commit-gate read guard for auxiliary SQL writes that must pause during safe points.
@@ -363,6 +562,23 @@ impl WriteCoordinator {
         budget: &CallBudget,
         intent: PreparedWriteIntent,
     ) -> Result<Vec<u8>, PortError> {
+        self.submit_raw_opt_fast(inner, budget, intent, None, None, None)
+            .await
+    }
+
+    pub(crate) async fn submit_raw_opt_fast(
+        &self,
+        inner: &Arc<CanonicalInner>,
+        budget: &CallBudget,
+        intent: PreparedWriteIntent,
+        sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
+        pg_fast_plan: Option<PgSingleItemFastFn>,
+        pretracked_guard: Option<ActiveWriteOpGuard>,
+    ) -> Result<Vec<u8>, PortError> {
+        let _active_guard = match pretracked_guard {
+            Some(g) => g,
+            None => self.enter_write_op(&intent.scope.space_id, 1),
+        };
         // Pre-admission checks: cancellation or expired deadline BEFORE admission => NotCommitted!
         if budget.cancellation.is_cancelled() {
             return Err(cancelled_not_committed(
@@ -397,25 +613,38 @@ impl WriteCoordinator {
             }
         };
 
-        let enqueue_deadline = tokio::time::Instant::now() + budget.remaining;
-        let permit = tokio::select! {
-            res = sender.reserve() => match res {
-                Ok(p) => p,
-                Err(_) => {
-                    self.byte_limiter.release(reserved_bytes);
-                    return Err(unavailable_retryable(
-                        "writer_channel_closed",
-                        "canonical WriteBatchActor channel closed",
-                        Duration::from_millis(100),
-                    ));
-                }
-            },
-            _ = tokio::time::sleep_until(enqueue_deadline) => {
+        let permit = match sender.try_reserve() {
+            Ok(p) => p,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.byte_limiter.release(reserved_bytes);
-                return Err(deadline_not_committed(
-                    "writer_mailbox_enqueue_deadline",
-                    "write deadline exceeded waiting for mailbox slot",
+                return Err(unavailable_retryable(
+                    "writer_channel_closed",
+                    "canonical WriteBatchActor channel closed",
+                    Duration::from_millis(100),
                 ));
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let enqueue_deadline = tokio::time::Instant::now() + budget.remaining;
+                tokio::select! {
+                    res = sender.reserve() => match res {
+                        Ok(p) => p,
+                        Err(_) => {
+                            self.byte_limiter.release(reserved_bytes);
+                            return Err(unavailable_retryable(
+                                "writer_channel_closed",
+                                "canonical WriteBatchActor channel closed",
+                                Duration::from_millis(100),
+                            ));
+                        }
+                    },
+                    _ = tokio::time::sleep_until(enqueue_deadline) => {
+                        self.byte_limiter.release(reserved_bytes);
+                        return Err(deadline_not_committed(
+                            "writer_mailbox_enqueue_deadline",
+                            "write deadline exceeded waiting for mailbox slot",
+                        ));
+                    }
+                }
             }
         };
 
@@ -435,6 +664,8 @@ impl WriteCoordinator {
         // Once sent through `permit.send(...)`, the item is admitted: caller drop/cancel NEVER aborts commit!
         permit.send(QueuedWriteEntry::Single {
             intent,
+            sqlite_fast_plan,
+            pg_fast_plan,
             staged_bytes_reserved: reserved_bytes,
             reply_tx,
         });
@@ -466,6 +697,7 @@ impl WriteCoordinator {
         space_id: &SpaceId,
         intents: Vec<PreparedWriteIntent>,
     ) -> Result<(Vec<Result<Vec<u8>, PortError>>, SpaceSeq), PortError> {
+        let _active_guard = self.enter_write_op(space_id, intents.len().max(1));
         if budget.cancellation.is_cancelled() {
             return Err(cancelled_not_committed(
                 "writer_cancelled_pre_enqueue",
@@ -499,25 +731,38 @@ impl WriteCoordinator {
             }
         };
 
-        let enqueue_deadline = tokio::time::Instant::now() + budget.remaining;
-        let permit = tokio::select! {
-            res = sender.reserve() => match res {
-                Ok(p) => p,
-                Err(_) => {
-                    self.byte_limiter.release(reserved_bytes);
-                    return Err(unavailable_retryable(
-                        "writer_channel_closed",
-                        "canonical WriteBatchActor channel closed",
-                        Duration::from_millis(100),
-                    ));
-                }
-            },
-            _ = tokio::time::sleep_until(enqueue_deadline) => {
+        let permit = match sender.try_reserve() {
+            Ok(p) => p,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.byte_limiter.release(reserved_bytes);
-                return Err(deadline_not_committed(
-                    "writer_mailbox_enqueue_deadline",
-                    "write deadline exceeded waiting for mailbox slot",
+                return Err(unavailable_retryable(
+                    "writer_channel_closed",
+                    "canonical WriteBatchActor channel closed",
+                    Duration::from_millis(100),
                 ));
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let enqueue_deadline = tokio::time::Instant::now() + budget.remaining;
+                tokio::select! {
+                    res = sender.reserve() => match res {
+                        Ok(p) => p,
+                        Err(_) => {
+                            self.byte_limiter.release(reserved_bytes);
+                            return Err(unavailable_retryable(
+                                "writer_channel_closed",
+                                "canonical WriteBatchActor channel closed",
+                                Duration::from_millis(100),
+                            ));
+                        }
+                    },
+                    _ = tokio::time::sleep_until(enqueue_deadline) => {
+                        self.byte_limiter.release(reserved_bytes);
+                        return Err(deadline_not_committed(
+                            "writer_mailbox_enqueue_deadline",
+                            "write deadline exceeded waiting for mailbox slot",
+                        ));
+                    }
+                }
             }
         };
 
@@ -564,7 +809,7 @@ impl WriteCoordinator {
     ) -> Result<mpsc::Sender<QueuedWriteEntry>, PortError> {
         match &self.mode {
             CoordinatorMode::Sqlite { tx, .. } => {
-                let guard = tx.lock().await;
+                let guard = tx.lock().expect("sqlite writer tx mutex");
                 guard.clone().ok_or_else(|| {
                     unavailable_retryable(
                         "sqlite_writer_drained",
@@ -573,7 +818,7 @@ impl WriteCoordinator {
                     )
                 })
             }
-            CoordinatorMode::Postgres { spaces } => {
+            CoordinatorMode::Postgres { spaces, trackers } => {
                 let mut map = spaces.lock().await;
                 if !self.accepting.load(Ordering::SeqCst) {
                     return Err(unavailable_retryable(
@@ -587,15 +832,25 @@ impl WriteCoordinator {
                 {
                     return Ok(existing.tx.clone());
                 }
+                let tracker = {
+                    let mut tmap = trackers.lock().expect("pg write trackers mutex");
+                    Arc::clone(
+                        tmap.entry(space_id.clone())
+                            .or_insert_with(|| Arc::new(ActiveWriteOpTracker::default())),
+                    )
+                };
                 let (tx, rx) = mpsc::channel(self.cfg.mailbox_capacity.max(1));
                 let inner_weak = Arc::downgrade(inner);
                 let limiter_cl = Arc::clone(&self.byte_limiter);
                 let gate_cl = Arc::clone(&self.commit_gate);
                 let faults_cl = Arc::clone(&self.faults);
+                let telem_cl = Arc::clone(&self.batch_telemetry);
                 let cfg = self.cfg;
                 let worker = tokio::spawn(async move {
-                    run_batch_worker_loop(inner_weak, rx, cfg, limiter_cl, gate_cl, faults_cl)
-                        .await;
+                    run_batch_worker_loop(
+                        inner_weak, rx, cfg, limiter_cl, gate_cl, faults_cl, telem_cl, tracker,
+                    )
+                    .await;
                 });
                 map.insert(
                     space_id.clone(),
@@ -613,14 +868,14 @@ impl WriteCoordinator {
     pub async fn drain_and_shutdown(&self) {
         self.accepting.store(false, Ordering::SeqCst);
         match &self.mode {
-            CoordinatorMode::Sqlite { tx, worker } => {
-                let sender = tx.lock().await.take();
+            CoordinatorMode::Sqlite { tx, worker, .. } => {
+                let sender = tx.lock().expect("sqlite writer tx mutex").take();
                 drop(sender);
                 if let Some(handle) = worker.lock().await.take() {
                     let _ = handle.await;
                 }
             }
-            CoordinatorMode::Postgres { spaces } => {
+            CoordinatorMode::Postgres { spaces, .. } => {
                 let drained: Vec<SpaceQueueHandle> = {
                     let mut map = spaces.lock().await;
                     map.drain().map(|(_, v)| v).collect()
@@ -635,10 +890,18 @@ impl WriteCoordinator {
                 }
             }
         }
+        let _ = self.commit_gate.write().await;
     }
 }
 
 impl crate::CanonicalStore {
+    pub(crate) fn enter_write_op(
+        &self,
+        space_id: &SpaceId,
+    ) -> Result<ActiveWriteOpGuard, PortError> {
+        Ok(self.inner.writer()?.enter_write_op(space_id, 1))
+    }
+
     /// Submits a typed idempotent or non-idempotent canonical mutation through `WriteBatchActor`,
     /// automatically handling MessagePack receipt serialization and replay.
     pub async fn submit_write_command<R>(
@@ -651,6 +914,56 @@ impl crate::CanonicalStore {
     {
         let writer = self.inner.writer()?;
         let raw_bytes = writer.submit_raw(&self.inner, budget, intent).await?;
+        rmp_serde::from_slice(&raw_bytes)
+            .map_err(|err| internal_not_committed("decode_writer_command_outcome", err.to_string()))
+    }
+
+    pub(crate) async fn submit_write_command_tracked<R>(
+        &self,
+        budget: &CallBudget,
+        intent: PreparedWriteIntent,
+        sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
+        pretracked_guard: ActiveWriteOpGuard,
+    ) -> Result<R, PortError>
+    where
+        R: Serialize + DeserializeOwned + Send + 'static,
+    {
+        let writer = self.inner.writer()?;
+        let raw_bytes = writer
+            .submit_raw_opt_fast(
+                &self.inner,
+                budget,
+                intent,
+                sqlite_fast_plan,
+                None,
+                Some(pretracked_guard),
+            )
+            .await?;
+        rmp_serde::from_slice(&raw_bytes)
+            .map_err(|err| internal_not_committed("decode_writer_command_outcome", err.to_string()))
+    }
+
+    pub(crate) async fn submit_write_command_tracked_pg<R>(
+        &self,
+        budget: &CallBudget,
+        intent: PreparedWriteIntent,
+        pg_fast_plan: Option<PgSingleItemFastFn>,
+        pretracked_guard: ActiveWriteOpGuard,
+    ) -> Result<R, PortError>
+    where
+        R: Serialize + DeserializeOwned + Send + 'static,
+    {
+        let writer = self.inner.writer()?;
+        let raw_bytes = writer
+            .submit_raw_opt_fast(
+                &self.inner,
+                budget,
+                intent,
+                None,
+                pg_fast_plan,
+                Some(pretracked_guard),
+            )
+            .await?;
         rmp_serde::from_slice(&raw_bytes)
             .map_err(|err| internal_not_committed("decode_writer_command_outcome", err.to_string()))
     }
@@ -700,6 +1013,17 @@ impl crate::CanonicalStore {
     pub async fn acquire_writer_safe_point(&self) -> Result<WriterSafePointGuard, PortError> {
         Ok(self.inner.writer()?.acquire_safe_point().await)
     }
+
+    /// Enables or resets opt-in Phase-2 batch commit latency collection (`(duration_ns, logical_items)`).
+    pub fn set_writer_batch_telemetry(&self, enabled: bool) -> Result<(), PortError> {
+        self.inner.writer()?.batch_telemetry().set_enabled(enabled);
+        Ok(())
+    }
+
+    /// Drains collected Phase-2 batch commit samples (`(duration_ns, logical_items)`).
+    pub fn take_writer_batch_samples(&self) -> Result<Vec<(u64, u32)>, PortError> {
+        Ok(self.inner.writer()?.batch_telemetry().take_samples())
+    }
 }
 
 fn entry_logical_len(entry: &QueuedWriteEntry) -> usize {
@@ -730,6 +1054,10 @@ fn reject_queued_entry(entry: QueuedWriteEntry, byte_limiter: &StagedByteLimiter
     }
 }
 
+fn compute_pipelined_batch_target(active_ops: usize, max_items: usize) -> usize {
+    active_ops.clamp(1, max_items)
+}
+
 async fn run_batch_worker_loop(
     inner_weak: std::sync::Weak<CanonicalInner>,
     mut rx: mpsc::Receiver<QueuedWriteEntry>,
@@ -737,17 +1065,46 @@ async fn run_batch_worker_loop(
     byte_limiter: Arc<StagedByteLimiter>,
     commit_gate: Arc<RwLock<()>>,
     faults: Arc<WriterFaultState>,
+    batch_telemetry: Arc<BatchCommitTelemetry>,
+    tracker: Arc<ActiveWriteOpTracker>,
 ) {
     let max_items = cfg.max_batch_items.max(1);
     let flush_window = cfg.batch_flush_window;
+    let mut cached_pg_conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>> = None;
 
-    while let Some(first) = rx.recv().await {
+    loop {
+        let first = if cached_pg_conn.is_some() {
+            tokio::select! {
+                biased;
+                maybe = rx.recv() => match maybe {
+                    Some(entry) => entry,
+                    None => break,
+                },
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    cached_pg_conn = None;
+                    match rx.recv().await {
+                        Some(entry) => entry,
+                        None => break,
+                    }
+                }
+            }
+        } else {
+            match rx.recv().await {
+                Some(entry) => entry,
+                None => break,
+            }
+        };
+
         let mut item_count = entry_logical_len(&first);
         let mut batch = Vec::with_capacity(max_items.min(64));
         batch.push(first);
 
-        // Drain any immediately queued entries without waiting (never splitting a Group).
-        while item_count < max_items {
+        let initial_target =
+            compute_pipelined_batch_target(tracker.active_ops.load(Ordering::Acquire), max_items);
+
+        // Drain up to `initial_target` so high-concurrency writer cohorts naturally split into
+        // two double-buffered platoons (zero idle gap between Phase 2 and Phase 1!).
+        while item_count < initial_target {
             match rx.try_recv() {
                 Ok(entry) => {
                     item_count += entry_logical_len(&entry);
@@ -757,10 +1114,30 @@ async fn run_batch_worker_loop(
             }
         }
 
-        // Coalesce micro-batch up to `flush_window` (1.5 ms) or `max_items` (64), never stalling for min 8!
-        if item_count < max_items && !flush_window.is_zero() {
+        if item_count < initial_target && !flush_window.is_zero() {
             let deadline = tokio::time::Instant::now() + flush_window;
             while item_count < max_items {
+                let notified = tracker.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                let active_target = compute_pipelined_batch_target(
+                    tracker.active_ops.load(Ordering::Acquire),
+                    max_items,
+                );
+                while item_count < active_target {
+                    match rx.try_recv() {
+                        Ok(entry) => {
+                            item_count += entry_logical_len(&entry);
+                            batch.push(entry);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if item_count >= active_target {
+                    break;
+                }
+
                 tokio::select! {
                     biased;
                     maybe_entry = rx.recv() => {
@@ -772,6 +1149,7 @@ async fn run_batch_worker_loop(
                             None => break,
                         }
                     }
+                    _ = notified => {}
                     _ = tokio::time::sleep_until(deadline) => break,
                 }
             }
@@ -793,13 +1171,41 @@ async fn run_batch_worker_loop(
         };
 
         // Respect safe-point pauses (WAL reset / paired backup) cleanly between batches!
-        let _commit_read_guard = commit_gate.read().await;
-        flush_single_batch(&inner, batch, cfg, &byte_limiter, &faults).await;
+        let _commit_read_guard = match commit_gate.try_read() {
+            Ok(g) => g,
+            Err(_) => {
+                cached_pg_conn = None;
+                commit_gate.read().await
+            }
+        };
+        let record_telem = batch_telemetry.enabled.load(Ordering::Relaxed);
+        let phase2_start = record_telem.then(std::time::Instant::now);
+        let logical_items_u32 = u32::try_from(item_count).unwrap_or(u32::MAX);
+        tracker.in_phase2_items.store(item_count, Ordering::Release);
+        tracker.phase1_drained_notify.notify_waiters();
+        flush_single_batch(
+            &inner,
+            batch,
+            cfg,
+            &byte_limiter,
+            &faults,
+            &mut cached_pg_conn,
+        )
+        .await;
+        tracker.in_phase2_items.store(0, Ordering::Release);
+        if let Some(t0) = phase2_start {
+            let dur_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            batch_telemetry.record(dur_ns, logical_items_u32);
+        }
+        drop(_commit_read_guard);
+        if rx.is_empty() {
+            tokio::task::yield_now().await;
+        }
     }
 }
 
 #[derive(Clone, Debug)]
-enum SpaceBatchEntry {
+pub(crate) enum SpaceBatchEntry {
     Missing,
     Loaded {
         record: Box<SpaceRecord>,
@@ -809,7 +1215,7 @@ enum SpaceBatchEntry {
     },
 }
 
-enum ItemOutcomeSlot {
+pub(crate) enum ItemOutcomeSlot {
     Succeeded {
         response_bytes: Vec<u8>,
         has_idempotency: bool,
@@ -835,6 +1241,7 @@ async fn flush_single_batch(
     cfg: WriterConfig,
     byte_limiter: &StagedByteLimiter,
     faults: &WriterFaultState,
+    cached_pg_conn: &mut Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
 ) {
     let store = crate::CanonicalStore {
         inner: Arc::clone(inner),
@@ -843,18 +1250,24 @@ async fn flush_single_batch(
     let mut reserved_list = Vec::with_capacity(batch.len());
     let mut reply_targets = Vec::with_capacity(batch.len());
     let mut group_spaces = Vec::new();
-    let mut intents = Vec::with_capacity(batch.len());
+    let mut items: Vec<(
+        PreparedWriteIntent,
+        Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
+        Option<PgSingleItemFastFn>,
+    )> = Vec::with_capacity(batch.len());
 
     for entry in batch {
         match entry {
             QueuedWriteEntry::Single {
                 intent,
+                sqlite_fast_plan,
+                pg_fast_plan,
                 staged_bytes_reserved,
                 reply_tx,
             } => {
                 reserved_list.push(staged_bytes_reserved);
                 reply_targets.push(ReplyTarget::Single { reply_tx });
-                intents.push(intent);
+                items.push((intent, sqlite_fast_plan, pg_fast_plan));
             }
             QueuedWriteEntry::Group {
                 space_id,
@@ -872,19 +1285,52 @@ async fn flush_single_batch(
                     all_idempotent,
                     reply_tx,
                 });
-                intents.extend(group_intents);
+                items.extend(group_intents.into_iter().map(|it| (it, None, None)));
             }
         }
     }
 
     let exec_result = match &inner.sql {
         SqlDriverState::Sqlite { writer, .. } => {
+            let can_fast = group_spaces.is_empty()
+                && items.iter().all(|(_, fp, _)| fp.is_some())
+                && faults.pre_commit_space_delays.lock().await.is_empty();
             let mut guard = writer.lock().await;
             match guard.as_mut() {
-                Some(conn) => {
-                    let mut backend = BackendConn::Sqlite(conn);
-                    execute_batch_on_conn(&store, &mut backend, intents, &group_spaces, cfg, faults)
+                Some(pair) => {
+                    if can_fast {
+                        let sq_items = items.into_iter().map(|(it, fp, _)| (it, fp)).collect();
+                        crate::sqlite_fast::execute_sqlite_fast_batch(
+                            &store, pair, sq_items, cfg, faults,
+                        )
                         .await
+                    } else {
+                        let intents: Vec<PreparedWriteIntent> = items
+                            .into_iter()
+                            .map(|(mut intent, fp_opt, _)| {
+                                if let Some(fp) = fp_opt {
+                                    intent.execute = fp.into_async_exec();
+                                }
+                                intent
+                            })
+                            .collect();
+                        let mut backend = BackendConn::Sqlite(&mut pair.sqlx_conn);
+                        let out = execute_batch_on_conn(
+                            &store,
+                            &mut backend,
+                            intents,
+                            &group_spaces,
+                            cfg,
+                            faults,
+                        )
+                        .await;
+                        inner.latch_sqlite_aux_tables_populated();
+                        inner
+                            .sqlite_writer_commit_gen
+                            .fetch_add(1, Ordering::Release);
+                        inner.sqlite_purge_fence_gen.fetch_add(1, Ordering::Release);
+                        out
+                    }
                 }
                 None => BatchExecOutcome::AbortedBeforeCommit(unavailable_retryable(
                     "sqlite_writer_closed",
@@ -893,19 +1339,77 @@ async fn flush_single_batch(
                 )),
             }
         }
-        SqlDriverState::Postgres { pool, .. } => match pool.acquire().await {
-            Ok(mut pooled) => {
-                let conn: &mut sqlx::PgConnection = &mut pooled;
-                let mut backend = BackendConn::Postgres(conn);
-                execute_batch_on_conn(&store, &mut backend, intents, &group_spaces, cfg, faults)
-                    .await
+        SqlDriverState::Postgres { pool, .. } => {
+            let can_pg_fast = group_spaces.is_empty()
+                && items.len() == 1
+                && items[0].2.is_some()
+                && faults.pre_commit_space_delays.lock().await.is_empty();
+            let conn_res = match cached_pg_conn.take() {
+                Some(c) => Ok(c),
+                None => pool.acquire().await,
+            };
+            match conn_res {
+                Ok(mut pooled) => {
+                    let conn: &mut sqlx::PgConnection = &mut pooled;
+                    let out = if can_pg_fast {
+                        let (mut intent, fp_opt, pg_fast_opt) = items.pop().expect("len == 1");
+                        if let Some(fp) = fp_opt {
+                            intent.execute = fp.into_async_exec();
+                        }
+                        let pg_fast = pg_fast_opt.expect("is_some");
+                        match pg_fast(&store, conn, cfg, faults).await {
+                            PgSingleFastAttempt::Handled(out) => out,
+                            PgSingleFastAttempt::FallbackToStandard => {
+                                let mut backend = BackendConn::Postgres(conn);
+                                execute_batch_on_conn(
+                                    &store,
+                                    &mut backend,
+                                    vec![intent],
+                                    &group_spaces,
+                                    cfg,
+                                    faults,
+                                )
+                                .await
+                            }
+                        }
+                    } else {
+                        let intents: Vec<PreparedWriteIntent> = items
+                            .into_iter()
+                            .map(|(mut intent, fp_opt, _)| {
+                                if let Some(fp) = fp_opt {
+                                    intent.execute = fp.into_async_exec();
+                                }
+                                intent
+                            })
+                            .collect();
+                        let mut backend = BackendConn::Postgres(conn);
+                        execute_batch_on_conn(
+                            &store,
+                            &mut backend,
+                            intents,
+                            &group_spaces,
+                            cfg,
+                            faults,
+                        )
+                        .await
+                    };
+                    if matches!(out, BatchExecOutcome::Committed { .. }) {
+                        *cached_pg_conn = Some(pooled);
+                    } else {
+                        let raw = pooled.detach();
+                        tokio::spawn(async move {
+                            let _ = sqlx::Connection::close(raw).await;
+                        });
+                    }
+                    out
+                }
+                Err(err) => BatchExecOutcome::AbortedBeforeCommit(unavailable_retryable(
+                    "pg_acquire_batch_conn",
+                    err.to_string(),
+                    Duration::from_millis(50),
+                )),
             }
-            Err(err) => BatchExecOutcome::AbortedBeforeCommit(unavailable_retryable(
-                "pg_acquire_batch_conn",
-                err.to_string(),
-                Duration::from_millis(50),
-            )),
-        },
+        }
     };
 
     for bytes in reserved_list {
@@ -1041,7 +1545,7 @@ async fn flush_single_batch(
     }
 }
 
-enum BatchExecOutcome {
+pub(crate) enum BatchExecOutcome {
     Committed {
         slots: Vec<ItemOutcomeSlot>,
         space_effective_cuts: BTreeMap<SpaceId, SpaceSeq>,
@@ -1108,6 +1612,8 @@ async fn execute_batch_on_conn(
         }
     }
 
+    let use_savepoints = intents.len() > 1;
+
     for (idx, intent) in intents.into_iter().enumerate() {
         let space_id = intent.scope.space_id.clone();
 
@@ -1137,7 +1643,7 @@ async fn execute_batch_on_conn(
             }
         }
 
-        if let Err(err) = tx.savepoint(idx).await {
+        if use_savepoints && let Err(err) = tx.savepoint(idx).await {
             tx.rollback_best_effort().await;
             return BatchExecOutcome::AbortedBeforeCommit(err);
         }
@@ -1161,7 +1667,7 @@ async fn execute_batch_on_conn(
                 retained_tickets,
                 retained_guards,
             }) => {
-                if let Err(err) = tx.release_savepoint(idx).await {
+                if use_savepoints && let Err(err) = tx.release_savepoint(idx).await {
                     tx.rollback_best_effort().await;
                     return BatchExecOutcome::AbortedBeforeCommit(err);
                 }
@@ -1185,6 +1691,19 @@ async fn execute_batch_on_conn(
                 });
             }
             Err(item_err) => {
+                if !use_savepoints {
+                    tx.rollback_best_effort().await;
+                    let mut space_effective_cuts = BTreeMap::new();
+                    for (sid, entry) in &space_states {
+                        if let SpaceBatchEntry::Loaded { effective_cut, .. } = entry {
+                            space_effective_cuts.insert(sid.clone(), *effective_cut);
+                        }
+                    }
+                    return BatchExecOutcome::Committed {
+                        slots: vec![ItemOutcomeSlot::Failed(item_err)],
+                        space_effective_cuts,
+                    };
+                }
                 // Rollback ONLY this item's savepoint; virtual `effective_cut` stays unchanged!
                 if let Err(rb_err) = tx.rollback_to_savepoint(idx).await {
                     tx.rollback_best_effort().await;
@@ -1236,8 +1755,23 @@ async fn execute_batch_on_conn(
         }
     }
 
-    // Coalesced local CAS directory fsync BEFORE SQL COMMIT!
-    if let Err(sync_err) = store.flush_pending_local_dirs(&batch_dir_syncs) {
+    // Coalesced Wave A: flush blob data durability (`fdatasync` / `F_FULLFSYNC`) + atomic `rename`
+    // for all batch-staged local CAS temp files BEFORE directory `fsync` and SQL `COMMIT`!
+    match store
+        .publish_deferred_local_tickets_async(&batch_retained_tickets)
+        .await
+    {
+        Ok(extra_dirs) => batch_dir_syncs.merge(&extra_dirs),
+        Err(pub_err) => {
+            tx.rollback_best_effort().await;
+            drop(batch_retained_tickets);
+            drop(batch_retained_guards);
+            return BatchExecOutcome::AbortedBeforeCommit(pub_err);
+        }
+    }
+
+    // Coalesced Wave B: local CAS directory fsync BEFORE SQL COMMIT!
+    if let Err(sync_err) = store.flush_pending_local_dirs_async(&batch_dir_syncs).await {
         tx.rollback_best_effort().await;
         drop(batch_retained_tickets);
         drop(batch_retained_guards);
@@ -1247,6 +1781,9 @@ async fn execute_batch_on_conn(
     // Commit outer SQL transaction!
     match tx.commit_write().await {
         Ok(()) => {
+            if let Some(wal) = store.inner.wal_coord.get() {
+                wal.note_writer_commit();
+            }
             drop(batch_retained_tickets);
             drop(batch_retained_guards);
             let mut space_effective_cuts = BTreeMap::new();
@@ -1331,9 +1868,14 @@ async fn execute_single_item_in_savepoint(
 
     // 1. HistoryIncarnation + LeaseEpoch authority check BEFORE receipt lookup and head CAS!
     space_rec.scope.check(&intent.scope)?;
-    if space_rec.active_epoch != intent.active_epoch {
-        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
-    }
+    let effective_epoch = if intent.active_epoch == LeaseEpoch::ZERO && intent.staged_bytes == 0 {
+        space_rec.active_epoch
+    } else {
+        if space_rec.active_epoch != intent.active_epoch {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+        }
+        intent.active_epoch
+    };
 
     // 2. Idempotent command receipt lookup (`command_receipts`) BEFORE purge fence and stale head CAS
     //    so idempotent retries of Purge / MintAndPurge replay their sanitized receipt rather than ResourceNotFound!
@@ -1362,10 +1904,8 @@ async fn execute_single_item_in_savepoint(
     }
 
     // 3. Purge fence check on all declared source note identities.
-    for note_id in &intent.source_note_ids {
-        if is_note_purge_fenced_tx(tx, &intent.scope.space_id, note_id.as_str()).await? {
-            return Err(DomainError::ResourceNotFound.into());
-        }
+    if are_any_notes_purge_fenced_tx(tx, &intent.scope.space_id, &intent.source_note_ids).await? {
+        return Err(DomainError::ResourceNotFound.into());
     }
 
     // 4. Intra-batch semantic snapshot cut check against `current_effective_cut` (NOT stale pre-batch `last_seq`!).
@@ -1385,7 +1925,8 @@ async fn execute_single_item_in_savepoint(
     // 5. Execute item domain mutation inside savepoint!
     let mut item_ctx = ItemExecCtx {
         scope: intent.scope.clone(),
-        active_epoch: intent.active_epoch,
+        space: space_rec.space.clone(),
+        active_epoch: effective_epoch,
         root_folder_id: space_rec.root_folder_id.clone(),
         effective_cut_before: current_effective_cut,
         current_seq: current_effective_cut,
@@ -1438,13 +1979,10 @@ async fn execute_single_item_in_savepoint(
         .as_ref()
         .map(|p| p.payload_id.as_str());
 
-    if let Some(cp) = &artifacts.change_payload {
-        insert_change_payload_tx(tx, &intent.scope, cp, last_seq).await?;
-    }
-
-    insert_change_command_and_events_tx(
+    persist_payloads_command_events_and_receipt_tx(
         tx,
         &intent.scope,
+        artifacts.change_payload.as_ref(),
         &artifacts.command_id,
         &artifacts.command_kind,
         first_seq,
@@ -1452,23 +1990,14 @@ async fn execute_single_item_in_savepoint(
         payload_id_opt,
         &artifacts.events,
         committed_at_ms,
+        intent.idempotency.as_ref(),
+        item_ctx.receipt_status,
+        artifacts.receipt_detail_blob.as_deref(),
+        &artifacts.receipt_sanitized_blob,
+        &artifacts.receipt_owner_note_ids,
+        expires_at_ms,
     )
     .await?;
-
-    if let Some(idemp) = &intent.idempotency {
-        insert_receipt_tx(
-            tx,
-            &intent.scope,
-            idemp,
-            item_ctx.receipt_status,
-            last_seq,
-            artifacts.receipt_detail_blob.as_deref(),
-            &artifacts.receipt_sanitized_blob,
-            &artifacts.receipt_owner_note_ids,
-            expires_at_ms,
-        )
-        .await?;
-    }
 
     let item_purge_seq = artifacts
         .events
@@ -1491,22 +2020,7 @@ async fn lock_and_load_space_outer_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
 ) -> Result<Option<SpaceRecord>, PortError> {
-    if let BackendConn::Postgres(conn) = tx {
-        let locked: Option<i64> =
-            sqlx::query_scalar("SELECT active_epoch FROM spaces WHERE space_id = $1 FOR UPDATE")
-                .bind(space_id.as_str())
-                .fetch_optional(&mut **conn)
-                .await
-                .map_err(|err| internal_not_committed("pg_batch_lock_space", err.to_string()))?;
-        if locked.is_none() {
-            return Ok(None);
-        }
-    }
-    match load_space_record(tx, space_id).await {
-        Ok(rec) => Ok(Some(rec)),
-        Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(None),
-        Err(other) => Err(other),
-    }
+    load_space_record_for_update_opt(tx, space_id).await
 }
 
 pub(crate) struct StoredReceiptRow {
@@ -1623,76 +2137,252 @@ pub(crate) async fn lookup_command_receipt_tx(
     }))
 }
 
-async fn insert_change_payload_tx(
+#[allow(clippy::too_many_arguments)]
+async fn persist_payloads_command_events_and_receipt_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
-    cp: &ChangePayloadDraft,
-    created_seq: SpaceSeq,
+    cp_opt: Option<&ChangePayloadDraft>,
+    command_id: &str,
+    command_kind: &str,
+    first_seq: SpaceSeq,
+    last_seq: SpaceSeq,
+    payload_id_opt: Option<&str>,
+    events: &[BatchEventDraft],
+    committed_at_ms: i64,
+    idemp_opt: Option<&CommandIdentitySpec>,
+    receipt_status: &str,
+    receipt_detail_blob: Option<&[u8]>,
+    receipt_sanitized_blob: &[u8],
+    receipt_owner_note_ids: &[NoteId],
+    expires_at_ms: i64,
 ) -> Result<(), PortError> {
-    let seq_i64 = created_seq.get() as i64;
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query(
-                "INSERT INTO change_payloads (
-                    space_id, payload_id, codec, erased_by_purge, effect_msgpack, created_seq
-                ) VALUES (?, ?, ?, 0, ?, ?)",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(&cp.payload_id)
-            .bind(&cp.codec)
-            .bind(&cp.effect_msgpack)
-            .bind(seq_i64)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| {
-                internal_not_committed("sqlite_insert_change_payload", err.to_string())
-            })?;
+    let seq_i64 = last_seq.get() as i64;
+    let rcpt_meta = idemp_opt.map(|idemp| {
+        let owner_key = format!("{}:{}", idemp.actor.as_str(), idemp.command_key.as_str());
+        let resp_pid = receipt_detail_blob.map(|_| format!("rcpt_pay:{owner_key}"));
+        (idemp, owner_key, resp_pid)
+    });
 
-            for note_id in &cp.owner_note_ids {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO payload_owners (
-                        space_id, payload_kind, payload_id, note_id
-                    ) VALUES (?, 'change_payload', ?, ?)",
-                )
-                .bind(scope.space_id.as_str())
-                .bind(&cp.payload_id)
-                .bind(note_id.as_str())
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| internal_not_committed("sqlite_insert_cp_owner", err.to_string()))?;
-            }
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "INSERT INTO change_payloads (
-                    space_id, payload_id, codec, erased_by_purge, effect_msgpack, created_seq
-                ) VALUES ($1, $2, $3, 0, $4, $5)",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(&cp.payload_id)
-            .bind(&cp.codec)
-            .bind(&cp.effect_msgpack)
-            .bind(seq_i64)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_insert_change_payload", err.to_string()))?;
+    let mut payloads: Vec<(&str, &str, &[u8])> = Vec::with_capacity(2);
+    if let Some(cp) = cp_opt {
+        payloads.push((&cp.payload_id, &cp.codec, &cp.effect_msgpack));
+    }
+    if let (Some((_, _, Some(rpid))), Some(detail)) = (&rcpt_meta, receipt_detail_blob) {
+        payloads.push((rpid.as_str(), "receipt_detail_v1", detail));
+    }
 
-            for note_id in &cp.owner_note_ids {
-                sqlx::query(
-                    "INSERT INTO payload_owners (
-                        space_id, payload_kind, payload_id, note_id
-                    ) VALUES ($1, 'change_payload', $2, $3)
-                    ON CONFLICT DO NOTHING",
-                )
-                .bind(scope.space_id.as_str())
-                .bind(&cp.payload_id)
-                .bind(note_id.as_str())
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| internal_not_committed("pg_insert_cp_owner", err.to_string()))?;
-            }
+    let mut all_owners: Vec<(&str, &str, &str)> = Vec::new();
+    if let Some(cp) = cp_opt {
+        for nid in &cp.owner_note_ids {
+            all_owners.push(("change_payload", cp.payload_id.as_str(), nid.as_str()));
         }
     }
+    if let Some((_, ref owner_key, Some(_))) = rcpt_meta {
+        for nid in receipt_owner_note_ids {
+            all_owners.push(("command_receipt", owner_key.as_str(), nid.as_str()));
+        }
+    }
+    all_owners.sort_unstable_by_key(|&(pkind, pid, nid)| (nid, pkind, pid));
+    all_owners.dedup();
+
+    // On PostgreSQL, none of `change_payloads`, `change_commands`, `change_log`,
+    // `command_receipts`, or `payload_owners` have cross-table foreign keys (each only
+    // references `spaces(space_id)`). Persist all 5 tables in 1 single Data-Modifying CTE!
+    if let BackendConn::Postgres(conn) = tx {
+        let first_i64 = first_seq.get() as i64;
+        let pay_pids: Vec<&str> = payloads.iter().map(|(pid, _, _)| *pid).collect();
+        let pay_codecs: Vec<&str> = payloads.iter().map(|(_, c, _)| *c).collect();
+        let pay_blobs: Vec<&[u8]> = payloads.iter().map(|(_, _, b)| *b).collect();
+
+        let mut ev_seqs: Vec<i64> = Vec::with_capacity(events.len());
+        let mut ev_etypes: Vec<&str> = Vec::with_capacity(events.len());
+        let mut ev_eids: Vec<&str> = Vec::with_capacity(events.len());
+        let mut ev_op_kinds: Vec<&str> = Vec::with_capacity(events.len());
+        let mut ev_rev_ids: Vec<&str> = Vec::with_capacity(events.len());
+        let mut ev_lcs: Vec<&str> = Vec::with_capacity(events.len());
+        let mut ev_dclasses: Vec<Option<&str>> = Vec::with_capacity(events.len());
+        for ev in events {
+            ev_seqs.push(ev.space_seq.get() as i64);
+            ev_etypes.push(&ev.entity_type);
+            ev_eids.push(&ev.entity_id);
+            ev_op_kinds.push(&ev.op_kind);
+            ev_rev_ids.push(ev.rev_id.as_str());
+            ev_lcs.push(lifecycle_to_db(ev.lifecycle));
+            ev_dclasses.push(ev.doc_class.map(doc_class_to_db));
+        }
+
+        let zero_hash = [0u8; 32];
+        let (has_rcpt, rcpt_actor, rcpt_key, rcpt_hash, rcpt_resp_pid) = match &rcpt_meta {
+            Some((idemp, _, resp_pid)) => (
+                true,
+                idemp.actor.as_str(),
+                idemp.command_key.as_str(),
+                idemp.command_hash.as_bytes().as_slice(),
+                resp_pid.as_deref(),
+            ),
+            None => (false, "", "", zero_hash.as_slice(), None),
+        };
+
+        let own_pkinds: Vec<&str> = all_owners.iter().map(|(k, _, _)| *k).collect();
+        let own_pids: Vec<&str> = all_owners.iter().map(|(_, p, _)| *p).collect();
+        let own_nids: Vec<&str> = all_owners.iter().map(|(_, _, n)| *n).collect();
+
+        sqlx::query(
+            "WITH ins_pay AS (
+                INSERT INTO change_payloads (
+                    space_id, payload_id, codec, erased_by_purge, effect_msgpack, created_seq
+                )
+                SELECT $1, u.pid, u.codec, 0, u.blob, $5
+                FROM UNNEST($7::TEXT[], $8::TEXT[], $9::BYTEA[]) AS u(pid, codec, blob)
+            ),
+            ins_cmd AS (
+                INSERT INTO change_commands (
+                    space_id, history_incarnation, command_id, first_seq, last_seq,
+                    command_kind, payload_id, committed_at_ms
+                )
+                VALUES ($1, $2, $3, $4, $5, $10, $11, $6)
+            ),
+            ins_log AS (
+                INSERT INTO change_log (
+                    space_id, space_seq, history_incarnation, command_id,
+                    command_first_seq, command_last_seq, entity_type, entity_id,
+                    op_kind, rev_id, lifecycle_state, doc_class, payload_id, committed_at_ms
+                )
+                SELECT
+                    $1, u.seq, $2, $3,
+                    $4, $5, u.etype, u.eid,
+                    u.op_kind, u.rev_id, u.lc, u.dclass, $11, $6
+                FROM UNNEST(
+                    $12::BIGINT[], $13::TEXT[], $14::TEXT[], $15::TEXT[],
+                    $16::TEXT[], $17::TEXT[], $18::TEXT[]
+                ) AS u(seq, etype, eid, op_kind, rev_id, lc, dclass)
+            ),
+            ins_rcpt AS (
+                INSERT INTO command_receipts (
+                    space_id, history_incarnation, actor_id, idempotency_key, command_hash,
+                    status, envelope_version, response_payload_id, sanitized_envelope_msgpack,
+                    canonical_seq, expires_at_ms
+                )
+                SELECT $1, $2, $20, $21, $22, $23, 1, $24, $25, $5, $26
+                WHERE $19::BOOLEAN
+            )
+            INSERT INTO payload_owners (space_id, payload_kind, payload_id, note_id)
+            SELECT $1, u.pkind, u.pid, u.nid
+            FROM UNNEST($27::TEXT[], $28::TEXT[], $29::TEXT[]) AS u(pkind, pid, nid)",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(scope.incarnation.as_bytes().as_slice())
+        .bind(command_id)
+        .bind(first_i64)
+        .bind(seq_i64)
+        .bind(committed_at_ms)
+        .bind(pay_pids)
+        .bind(pay_codecs)
+        .bind(pay_blobs)
+        .bind(command_kind)
+        .bind(payload_id_opt)
+        .bind(ev_seqs)
+        .bind(ev_etypes)
+        .bind(ev_eids)
+        .bind(ev_op_kinds)
+        .bind(ev_rev_ids)
+        .bind(ev_lcs)
+        .bind(ev_dclasses)
+        .bind(has_rcpt)
+        .bind(rcpt_actor)
+        .bind(rcpt_key)
+        .bind(rcpt_hash)
+        .bind(receipt_status)
+        .bind(rcpt_resp_pid)
+        .bind(receipt_sanitized_blob)
+        .bind(expires_at_ms)
+        .bind(own_pkinds)
+        .bind(own_pids)
+        .bind(own_nids)
+        .execute(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_persist_cmd_cte", err.to_string()))?;
+
+        return Ok(());
+    }
+
+    if !payloads.is_empty()
+        && let BackendConn::Sqlite(conn) = tx
+    {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "INSERT INTO change_payloads (space_id, payload_id, codec, erased_by_purge, effect_msgpack, created_seq) ",
+        );
+        qb.push_values(&payloads, |mut b, (pid, codec, blob)| {
+            b.push_bind(scope.space_id.as_str())
+                .push_bind(*pid)
+                .push_bind(*codec)
+                .push_bind(0_i64)
+                .push_bind(*blob)
+                .push_bind(seq_i64);
+        });
+        qb.build().execute(&mut **conn).await.map_err(|err| {
+            internal_not_committed("sqlite_insert_change_payloads", err.to_string())
+        })?;
+    }
+
+    // 2. Insert `change_commands` + `change_log`.
+    insert_change_command_and_events_tx(
+        tx,
+        scope,
+        command_id,
+        command_kind,
+        first_seq,
+        last_seq,
+        payload_id_opt,
+        events,
+        committed_at_ms,
+    )
+    .await?;
+
+    // 3. Insert `command_receipts` (if idempotent).
+    if let (Some((idemp, _, resp_payload_id)), BackendConn::Sqlite(conn)) = (&rcpt_meta, &mut *tx) {
+        sqlx::query(
+            "INSERT INTO command_receipts (
+                space_id, history_incarnation, actor_id, idempotency_key, command_hash,
+                status, envelope_version, response_payload_id, sanitized_envelope_msgpack,
+                canonical_seq, expires_at_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(scope.incarnation.as_bytes().as_slice())
+        .bind(idemp.actor.as_str())
+        .bind(idemp.command_key.as_str())
+        .bind(idemp.command_hash.as_bytes().as_slice())
+        .bind(receipt_status)
+        .bind(resp_payload_id)
+        .bind(receipt_sanitized_blob)
+        .bind(seq_i64)
+        .bind(expires_at_ms)
+        .execute(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_insert_receipt", err.to_string()))?;
+    }
+
+    // 4. Coalesce ALL `payload_owners` rows (`change_payload` + `rcpt_pay` + `command_receipt`) into 1 batch!
+    if !all_owners.is_empty()
+        && let BackendConn::Sqlite(conn) = tx
+    {
+        for chunk in all_owners.chunks(200) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT OR IGNORE INTO payload_owners (space_id, payload_kind, payload_id, note_id) ",
+            );
+            qb.push_values(chunk, |mut b, (pkind, pid, nid)| {
+                b.push_bind(scope.space_id.as_str())
+                    .push_bind(*pkind)
+                    .push_bind(*pid)
+                    .push_bind(*nid);
+            });
+            qb.build().execute(&mut **conn).await.map_err(|err| {
+                internal_not_committed("sqlite_batch_insert_owners", err.to_string())
+            })?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1731,33 +2421,33 @@ async fn insert_change_command_and_events_tx(
             .await
             .map_err(|err| internal_not_committed("sqlite_batch_insert_cmd", err.to_string()))?;
 
-            for ev in events {
-                let lc_str = lifecycle_to_db(ev.lifecycle);
-                let dc_str = ev.doc_class.map(doc_class_to_db);
-                sqlx::query(
+            for chunk in events.chunks(60) {
+                let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
                     "INSERT INTO change_log (
                         space_id, space_seq, history_incarnation, command_id,
                         command_first_seq, command_last_seq, entity_type, entity_id,
                         op_kind, rev_id, lifecycle_state, doc_class, payload_id, committed_at_ms
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(scope.space_id.as_str())
-                .bind(ev.space_seq.get() as i64)
-                .bind(scope.incarnation.as_bytes().as_slice())
-                .bind(command_id)
-                .bind(first_i64)
-                .bind(last_i64)
-                .bind(&ev.entity_type)
-                .bind(&ev.entity_id)
-                .bind(&ev.op_kind)
-                .bind(ev.rev_id.as_str())
-                .bind(lc_str)
-                .bind(dc_str)
-                .bind(payload_id)
-                .bind(committed_at_ms)
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| internal_not_committed("sqlite_batch_insert_ev", err.to_string()))?;
+                    ) ",
+                );
+                qb.push_values(chunk, |mut b, ev| {
+                    b.push_bind(scope.space_id.as_str())
+                        .push_bind(ev.space_seq.get() as i64)
+                        .push_bind(scope.incarnation.as_bytes().as_slice())
+                        .push_bind(command_id)
+                        .push_bind(first_i64)
+                        .push_bind(last_i64)
+                        .push_bind(&ev.entity_type)
+                        .push_bind(&ev.entity_id)
+                        .push_bind(&ev.op_kind)
+                        .push_bind(ev.rev_id.as_str())
+                        .push_bind(lifecycle_to_db(ev.lifecycle))
+                        .push_bind(ev.doc_class.map(doc_class_to_db))
+                        .push_bind(payload_id)
+                        .push_bind(committed_at_ms);
+                });
+                qb.build().execute(&mut **conn).await.map_err(|err| {
+                    internal_not_committed("sqlite_batch_insert_ev", err.to_string())
+                })?;
             }
         }
         BackendConn::Postgres(conn) => {
@@ -1779,143 +2469,56 @@ async fn insert_change_command_and_events_tx(
             .await
             .map_err(|err| internal_not_committed("pg_batch_insert_cmd", err.to_string()))?;
 
+            let mut seqs: Vec<i64> = Vec::with_capacity(events.len());
+            let mut etypes: Vec<&str> = Vec::with_capacity(events.len());
+            let mut eids: Vec<&str> = Vec::with_capacity(events.len());
+            let mut op_kinds: Vec<&str> = Vec::with_capacity(events.len());
+            let mut rev_ids: Vec<&str> = Vec::with_capacity(events.len());
+            let mut lcs: Vec<&str> = Vec::with_capacity(events.len());
+            let mut dclasses: Vec<Option<&str>> = Vec::with_capacity(events.len());
+
             for ev in events {
-                let lc_str = lifecycle_to_db(ev.lifecycle);
-                let dc_str = ev.doc_class.map(doc_class_to_db);
-                sqlx::query(
-                    "INSERT INTO change_log (
-                        space_id, space_seq, history_incarnation, command_id,
-                        command_first_seq, command_last_seq, entity_type, entity_id,
-                        op_kind, rev_id, lifecycle_state, doc_class, payload_id, committed_at_ms
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
-                )
-                .bind(scope.space_id.as_str())
-                .bind(ev.space_seq.get() as i64)
-                .bind(scope.incarnation.as_bytes().as_slice())
-                .bind(command_id)
-                .bind(first_i64)
-                .bind(last_i64)
-                .bind(&ev.entity_type)
-                .bind(&ev.entity_id)
-                .bind(&ev.op_kind)
-                .bind(ev.rev_id.as_str())
-                .bind(lc_str)
-                .bind(dc_str)
-                .bind(payload_id)
-                .bind(committed_at_ms)
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| internal_not_committed("pg_batch_insert_ev", err.to_string()))?;
+                seqs.push(ev.space_seq.get() as i64);
+                etypes.push(&ev.entity_type);
+                eids.push(&ev.entity_id);
+                op_kinds.push(&ev.op_kind);
+                rev_ids.push(ev.rev_id.as_str());
+                lcs.push(lifecycle_to_db(ev.lifecycle));
+                dclasses.push(ev.doc_class.map(doc_class_to_db));
             }
-        }
-    }
-    Ok(())
-}
 
-#[allow(clippy::too_many_arguments)]
-async fn insert_receipt_tx(
-    tx: &mut BackendConn<'_>,
-    scope: &HistoryScope,
-    idemp: &CommandIdentitySpec,
-    status: &str,
-    canonical_seq: SpaceSeq,
-    detail_blob: Option<&[u8]>,
-    sanitized_blob: &[u8],
-    owner_note_ids: &[NoteId],
-    expires_at_ms: i64,
-) -> Result<(), PortError> {
-    let seq_i64 = canonical_seq.get() as i64;
-    let receipt_owner_key = format!("{}:{}", idemp.actor.as_str(), idemp.command_key.as_str());
-
-    let resp_payload_id = if let Some(detail) = detail_blob {
-        let pid = format!("rcpt_pay:{receipt_owner_key}");
-        let draft = ChangePayloadDraft {
-            payload_id: pid.clone(),
-            codec: "receipt_detail_v1".to_owned(),
-            effect_msgpack: detail.to_vec(),
-            owner_note_ids: owner_note_ids.to_vec(),
-        };
-        insert_change_payload_tx(tx, scope, &draft, canonical_seq).await?;
-        Some(pid)
-    } else {
-        None
-    };
-
-    match tx {
-        BackendConn::Sqlite(conn) => {
             sqlx::query(
-                "INSERT INTO command_receipts (
-                    space_id, history_incarnation, actor_id, idempotency_key, command_hash,
-                    status, envelope_version, response_payload_id, sanitized_envelope_msgpack,
-                    canonical_seq, expires_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+                "INSERT INTO change_log (
+                    space_id, space_seq, history_incarnation, command_id,
+                    command_first_seq, command_last_seq, entity_type, entity_id,
+                    op_kind, rev_id, lifecycle_state, doc_class, payload_id, committed_at_ms
+                )
+                SELECT
+                    $1, u.seq, $2, $3,
+                    $4, $5, u.etype, u.eid,
+                    u.op_kind, u.rev_id, u.lc, u.dclass, $6, $7
+                FROM UNNEST(
+                    $8::BIGINT[], $9::TEXT[], $10::TEXT[], $11::TEXT[],
+                    $12::TEXT[], $13::TEXT[], $14::TEXT[]
+                ) AS u(seq, etype, eid, op_kind, rev_id, lc, dclass)",
             )
             .bind(scope.space_id.as_str())
             .bind(scope.incarnation.as_bytes().as_slice())
-            .bind(idemp.actor.as_str())
-            .bind(idemp.command_key.as_str())
-            .bind(idemp.command_hash.as_bytes().as_slice())
-            .bind(status)
-            .bind(&resp_payload_id)
-            .bind(sanitized_blob)
-            .bind(seq_i64)
-            .bind(expires_at_ms)
+            .bind(command_id)
+            .bind(first_i64)
+            .bind(last_i64)
+            .bind(payload_id)
+            .bind(committed_at_ms)
+            .bind(seqs)
+            .bind(etypes)
+            .bind(eids)
+            .bind(op_kinds)
+            .bind(rev_ids)
+            .bind(lcs)
+            .bind(dclasses)
             .execute(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("sqlite_insert_receipt", err.to_string()))?;
-
-            for note_id in owner_note_ids {
-                sqlx::query(
-                    "INSERT OR IGNORE INTO payload_owners (
-                        space_id, payload_kind, payload_id, note_id
-                    ) VALUES (?, 'command_receipt', ?, ?)",
-                )
-                .bind(scope.space_id.as_str())
-                .bind(&receipt_owner_key)
-                .bind(note_id.as_str())
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("sqlite_insert_rcpt_owner", err.to_string())
-                })?;
-            }
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "INSERT INTO command_receipts (
-                    space_id, history_incarnation, actor_id, idempotency_key, command_hash,
-                    status, envelope_version, response_payload_id, sanitized_envelope_msgpack,
-                    canonical_seq, expires_at_ms
-                ) VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $9, $10)",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(scope.incarnation.as_bytes().as_slice())
-            .bind(idemp.actor.as_str())
-            .bind(idemp.command_key.as_str())
-            .bind(idemp.command_hash.as_bytes().as_slice())
-            .bind(status)
-            .bind(&resp_payload_id)
-            .bind(sanitized_blob)
-            .bind(seq_i64)
-            .bind(expires_at_ms)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_insert_receipt", err.to_string()))?;
-
-            for note_id in owner_note_ids {
-                sqlx::query(
-                    "INSERT INTO payload_owners (
-                        space_id, payload_kind, payload_id, note_id
-                    ) VALUES ($1, 'command_receipt', $2, $3)
-                    ON CONFLICT DO NOTHING",
-                )
-                .bind(scope.space_id.as_str())
-                .bind(&receipt_owner_key)
-                .bind(note_id.as_str())
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| internal_not_committed("pg_insert_rcpt_owner", err.to_string()))?;
-            }
+            .map_err(|err| internal_not_committed("pg_batch_insert_ev", err.to_string()))?;
         }
     }
     Ok(())
