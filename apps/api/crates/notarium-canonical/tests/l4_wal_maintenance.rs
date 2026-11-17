@@ -313,7 +313,7 @@ async fn stuck_query_is_interrupted_at_deadline_and_dropped_future_closes_worker
         .stage_blob(&space.scope, LeaseEpoch::new(1).unwrap(), &prep)
         .await
         .expect("stage CAS blob");
-    assert_eq!(staged.raw_size, 8);
+    assert_eq!(staged.raw_size(), 8);
 
     runtime.shutdown().await.expect("clean shutdown");
 }

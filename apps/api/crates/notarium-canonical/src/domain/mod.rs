@@ -458,7 +458,7 @@ async fn filter_change_result_for_space_caller(
     Ok(ChangeReadResult::Log(page))
 }
 
-async fn lookup_thread_visibility_tx(
+pub(crate) async fn lookup_thread_visibility_tx(
     tx: &mut BackendConn<'_>,
     space_id: &notarium_core::ids::SpaceId,
     thread_id: &str,

@@ -5,7 +5,7 @@ use std::sync::{
 
 use notarium_core::{
     DomainError,
-    auth::{EngineAuthContext, Space, SpaceKind, SpaceLifecycle, SpaceRole},
+    auth::{EngineAuthContext, Space, SpaceKind, SpaceLifecycle},
     error::{PortError, ValidationReason},
     ids::{
         AgentRunId, ChatThreadId, CommandKey, ContentDigest, FolderId, PendingInputId, PrincipalId,
@@ -469,6 +469,7 @@ impl CanonicalStore {
                 }
                 activate_and_bind_blob_ref_tx(
                     tx,
+                    &live_space.scope,
                     live_space.active_epoch,
                     &BlobReferenceClaim {
                         ticket,
@@ -489,17 +490,29 @@ impl CanonicalStore {
 }
 
 fn authorize_chat_write_on_space(auth: &EngineAuthContext, space: &Space) -> Result<(), PortError> {
-    let grant = auth
-        .spaces()
-        .get(&space.id)
-        .ok_or(DomainError::ResourceNotFound)?;
-    if space.lifecycle != SpaceLifecycle::Active
-        || grant.role == SpaceRole::Viewer
-        || grant.project_root.is_some()
-    {
+    auth.authorize_write_space_pin(space)?;
+    if auth.spaces()[&space.id].project_root.is_some() {
         return Err(DomainError::SpaceReadOnly.into());
     }
     Ok(())
+}
+
+pub(crate) async fn authorize_chat_replay_tx(
+    tx: &mut BackendConn<'_>,
+    space: &Space,
+    auth: &EngineAuthContext,
+    thread: &ChatThreadId,
+) -> Result<(), PortError> {
+    authorize_chat_write_on_space(auth, space)?;
+    let th = load_thread_head_opt_tx(tx, &space.id, thread)
+        .await?
+        .ok_or(DomainError::ResourceNotFound)?;
+    if (auth.taint().is_tainted() || th.tainted_mask != 0)
+        && (th.kind == ChatThreadKind::SpaceGroup || space.kind == SpaceKind::Shared)
+    {
+        return Err(DomainError::CrossSpaceTainted.into());
+    }
+    Ok(auth.authorize_chat_read(space, th.project_folder.as_ref(), th.tainted_mask != 0)?)
 }
 
 #[derive(Clone, Debug)]
@@ -1051,13 +1064,21 @@ async fn read_chat_impl(
     let auth = ctx.auth().clone();
 
     if store.is_postgres() && request.before.is_none() && request.leaf != ThreadEntrySeq::ZERO {
-        return store
+        let probe_scope = scope.clone();
+        let probe_auth = auth.clone();
+        let probe_request = request.clone();
+        if let Some(branch) = store
             .with_pg_autocommit_read_budget(Some(&ctx.budget), |conn| {
-                Box::pin(
-                    async move { read_chat_pg_single_query(conn, &scope, &auth, &request).await },
-                )
+                Box::pin(async move {
+                    read_chat_pg_single_query(conn, &probe_scope, &probe_auth, &probe_request).await
+                })
             })
-            .await;
+            .await?
+        {
+            return Ok(branch);
+        }
+        // A sparse branch did not fit in one statement. Re-read the entire
+        // branch in the repeatable-read transaction below.
     }
 
     // Every table lookup in `read_chat` (`spaces`, `chat_threads`, `chat_entries`) is an exact
@@ -1410,11 +1431,13 @@ async fn read_chat_pg_single_query(
     scope: &HistoryScope,
     auth: &EngineAuthContext,
     request: &ChatRead,
-) -> Result<ChatBranch, PortError> {
+) -> Result<Option<ChatBranch>, PortError> {
     let tip_i64 = request.leaf.get() as i64;
     let max_n = usize::from(request.max_entries.get());
-    let scan_limit =
-        i64::try_from((max_n.saturating_mul(2)).clamp(max_n.max(1), 128)).unwrap_or(128);
+    let scan_limit = i64::from(request.max_entries.get())
+        .saturating_mul(2)
+        .min(128)
+        .max(max_n as i64);
 
     // Fast 1-RT path: single `Index Scan Backward` on `chat_entries_pkey` (`ORDER BY ce.entry_seq DESC LIMIT $4`)
     // plus `spaces` + `chat_threads` PK lookups. Because `parent_seq < entry_seq` holds monotonically,
@@ -1471,84 +1494,15 @@ async fn read_chat_pg_single_query(
     .await
     .map_err(|err| internal_not_committed("pg_read_chat_single", err.to_string()))?;
 
-    let Some(first) = rows.first() else {
+    if rows.is_empty() {
         return Err(DomainError::ResourceNotFound.into());
-    };
-    // If `request.leaf` does not exist in `chat_entries` (either 0 entry rows or highest `entry_seq < tip_i64`),
-    // row 0 might have `rn = 2` (so header cols were suppressed) only if `entry_seq < tip_i64` existed.
-    // Wait: if `request.leaf` is absent, we still must check `HistoryIncarnation` and `authorize_chat_read` BEFORE returning `ResourceNotFound`!
-    let hdr = match rows
+    }
+    let Some(hdr) = rows
         .iter()
         .find(|r| r.get::<Option<&[u8]>, usize>(0).is_some())
-    {
-        Some(h) => h,
-        None => {
-            // `space` and `thread` exist, `chat_entries` had rows `< tip_i64` but `tip_i64` itself is absent:
-            // verify space incarnation + thread auth before returning `ResourceNotFound`.
-            let hrow = sqlx::query(
-                "SELECT s.history_incarnation, s.space_kind, s.lifecycle_state,
-                        ct.thread_id, ct.kind, ct.owner_id, ct.project_folder_id,
-                        ct.head_leaf_seq, ct.head_rev_id, ct.ext_space_tainted_mask
-                 FROM spaces s
-                 LEFT JOIN chat_threads ct ON ct.space_id = s.space_id AND ct.thread_id = $2
-                 WHERE s.space_id = $1",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(request.thread.as_str())
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_read_chat_hdr_miss", err.to_string()))?
-            .ok_or(DomainError::ResourceNotFound)?;
-
-            let inc_b: &[u8] = hrow.get::<&[u8], usize>(0);
-            let inc_a: [u8; 16] = inc_b
-                .try_into()
-                .map_err(|_| internal_not_committed("corrupt_incarnation", "incarnation != 16B"))?;
-            HistoryScope {
-                space_id: scope.space_id.clone(),
-                incarnation: notarium_core::ids::HistoryIncarnation::from_bytes(inc_a),
-            }
-            .check(scope)?;
-            let sk = match hrow.get::<&str, usize>(1) {
-                "personal" => SpaceKind::Personal,
-                "shared" => SpaceKind::Shared,
-                o => {
-                    return Err(internal_not_committed(
-                        "corrupt_space_kind",
-                        format!("unexpected space_kind '{o}'"),
-                    ));
-                }
-            };
-            let slc = match hrow.get::<&str, usize>(2) {
-                "active" => SpaceLifecycle::Active,
-                "closing" => SpaceLifecycle::Closing,
-                "archived" => SpaceLifecycle::Archived,
-                o => {
-                    return Err(internal_not_committed(
-                        "corrupt_space_lifecycle",
-                        format!("unexpected space lifecycle '{o}'"),
-                    ));
-                }
-            };
-            if hrow.get::<Option<&str>, usize>(3).is_none() {
-                return Err(DomainError::ResourceNotFound.into());
-            }
-            let sp = Space {
-                id: scope.space_id.clone(),
-                lifecycle: slc,
-                kind: sk,
-            };
-            let t_taint = hrow.get::<i32, usize>(9) != 0;
-            let project = hrow
-                .get::<Option<&str>, _>(6)
-                .map(FolderId::parse)
-                .transpose()
-                .map_err(|_| internal_not_committed("corrupt_thread_proj", "invalid FolderId"))?;
-            auth.authorize_chat_read(&sp, project.as_ref(), t_taint)?;
-            return Err(DomainError::ResourceNotFound.into());
-        }
+    else {
+        return Ok(None);
     };
-    let _ = first;
 
     let inc_bytes: &[u8] = hdr
         .get::<Option<&[u8]>, usize>(0)
@@ -1763,59 +1717,19 @@ async fn read_chat_pg_single_query(
         entries.push(entry);
     }
 
-    if entries.len() < max_n
-        && let Some(rem_start) = want_i64
-    {
-        let rem_n = i32::try_from(max_n - entries.len()).unwrap_or(i32::MAX);
-        let tail_rows = sqlx::query(
-            "WITH RECURSIVE win(
-                 entry_seq, parent_seq, kind, tool_call_id, author_id,
-                 agent_run_id, inline_text, payload_blake3, referenced_notes_json,
-                 ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq, n
-             ) AS (
-                 SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
-                        agent_run_id, inline_text, payload_blake3, referenced_notes_json,
-                        ext_space_tainted, is_chain_node, branch_depth,
-                        anc_16_seq, anc_256_seq, 1::INT4
-                 FROM chat_entries
-                 WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3
-                 UNION ALL
-                 SELECT e.entry_seq, e.parent_seq, e.kind, e.tool_call_id, e.author_id,
-                        e.agent_run_id, e.inline_text, e.payload_blake3, e.referenced_notes_json,
-                        e.ext_space_tainted, e.is_chain_node, e.branch_depth,
-                        e.anc_16_seq, e.anc_256_seq, w2.n + 1
-                 FROM (SELECT parent_seq, n FROM win LIMIT 1) w2
-                 JOIN chat_entries e
-                   ON e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = w2.parent_seq
-                 WHERE w2.parent_seq IS NOT NULL AND w2.n < $4
-             )
-             SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
-                    agent_run_id, inline_text, payload_blake3, referenced_notes_json,
-                    ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq
-             FROM win",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(request.thread.as_str())
-        .bind(rem_start)
-        .bind(rem_n)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_read_chat_gap_tail", err.to_string()))?;
-
-        for tr in &tail_rows {
-            entries.push(decode_entry_row(tr, 0)?);
-        }
+    if entries.len() < max_n && want_i64.is_some() {
+        return Ok(None);
     }
 
     entries.reverse();
     entries.sort_unstable_by_key(|e| e.depth);
 
     let next_ancestor = entries.first().and_then(|oldest| oldest.parent);
-    Ok(ChatBranch {
+    Ok(Some(ChatBranch {
         thread: thread_out,
         entries,
         next_ancestor,
-    })
+    }))
 }
 
 fn read_chat_rusqlite(
@@ -2215,7 +2129,8 @@ async fn create_chat_impl(
     fp.update(&[0]);
     fp.update(request.input.title.as_bytes());
     let idemp =
-        derive_command_identity_spec(&request.identity, "create_chat", fp.finalize().as_bytes());
+        derive_command_identity_spec(&request.identity, "create_chat", fp.finalize().as_bytes())
+            .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
     let scope = space_rec.scope.clone();
     let active_epoch = space_rec.active_epoch;
@@ -2427,7 +2342,8 @@ async fn fork_chat_impl(
         request.input.thread.as_str(),
         request.input.parent.get()
     );
-    let idemp = derive_command_identity_spec(&request.identity, "fork_chat", fp.as_bytes());
+    let idemp = derive_command_identity_spec(&request.identity, "fork_chat", fp.as_bytes())
+        .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
     let scope = space_rec.scope.clone();
     let active_epoch = space_rec.active_epoch;
@@ -2682,7 +2598,12 @@ async fn append_chat_impl(
     }
     fp.update(&[u8::from(request.input.tainted)]);
     let idemp =
-        derive_command_identity_spec(&request.identity, "append_chat", fp.finalize().as_bytes());
+        derive_command_identity_spec(&request.identity, "append_chat", fp.finalize().as_bytes())
+            .for_chat(
+                ctx.auth(),
+                &request.input.thread,
+                request.input.referenced_notes.clone(),
+            );
 
     if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedChatEntryV1>(
         store,
@@ -3143,7 +3064,8 @@ async fn queue_chat_input_impl(
         &request.identity,
         "queue_chat_input",
         fp.finalize().as_bytes(),
-    );
+    )
+    .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
     if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedQueuedInputV1>(
         store,
@@ -3302,6 +3224,7 @@ async fn queue_chat_input_impl(
                         let owner_id = format!("{}:{}", input.thread.as_str(), input.id.as_str());
                         activate_and_bind_blob_ref_tx(
                             tx,
+                            &item_ctx.scope,
                             item_ctx.active_epoch,
                             &BlobReferenceClaim {
                                 ticket,
@@ -3326,8 +3249,8 @@ async fn queue_chat_input_impl(
                             "INSERT INTO chat_pending_inputs (
                                 space_id, thread_id, input_id, ordinal, author_id,
                                 inline_text, payload_blake3, queued_base_leaf_seq,
-                                in_flight_run_id, mentions_agent, status, enqueued_seq, consumed_entry_seq
-                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL)",
+                                in_flight_run_id, mentions_agent, status, enqueued_seq, consumed_entry_seq, ext_space_tainted
+                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, ?)",
                         )
                         .bind(scope.space_id.as_str())
                         .bind(input.thread.as_str())
@@ -3340,6 +3263,7 @@ async fn queue_chat_input_impl(
                         .bind(input.in_flight_run.as_str())
                         .bind(mentions_i32)
                         .bind(seq_i64)
+                        .bind(i32::from(auth.taint().is_tainted()))
                         .execute(&mut **conn)
                         .await
                         .map_err(|err| internal_not_committed("sqlite_ins_pending", err.to_string()))?;
@@ -3349,8 +3273,8 @@ async fn queue_chat_input_impl(
                             "INSERT INTO chat_pending_inputs (
                                 space_id, thread_id, input_id, ordinal, author_id,
                                 inline_text, payload_blake3, queued_base_leaf_seq,
-                                in_flight_run_id, mentions_agent, status, enqueued_seq, consumed_entry_seq
-                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, NULL)",
+                                in_flight_run_id, mentions_agent, status, enqueued_seq, consumed_entry_seq, ext_space_tainted
+                             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, NULL, $12)",
                         )
                         .bind(scope.space_id.as_str())
                         .bind(input.thread.as_str())
@@ -3363,6 +3287,7 @@ async fn queue_chat_input_impl(
                         .bind(input.in_flight_run.as_str())
                         .bind(i16::try_from(mentions_i32).unwrap_or(0))
                         .bind(seq_i64)
+                        .bind(i32::from(auth.taint().is_tainted()))
                         .execute(&mut **conn)
                         .await
                         .map_err(|err| internal_not_committed("pg_ins_pending", err.to_string()))?;
@@ -3443,7 +3368,8 @@ async fn consume_chat_input_impl(
         request.input.current_leaf.get()
     );
     let idemp =
-        derive_command_identity_spec(&request.identity, "consume_chat_input", fp.as_bytes());
+        derive_command_identity_spec(&request.identity, "consume_chat_input", fp.as_bytes())
+            .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
     if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedConsumedPendingV1>(
         store,
@@ -3493,11 +3419,12 @@ async fn consume_chat_input_impl(
                     i64,
                     String,
                     String,
+                    i32,
                 )> = match tx {
                     BackendConn::Sqlite(conn) => {
                         let r = sqlx::query(
                             "SELECT author_id, inline_text, payload_blake3, queued_base_leaf_seq,
-                                    in_flight_run_id, status
+                                    in_flight_run_id, status, ext_space_tainted
                              FROM chat_pending_inputs
                              WHERE space_id = ? AND thread_id = ? AND input_id = ?",
                         )
@@ -3517,13 +3444,14 @@ async fn consume_chat_input_impl(
                                 row.get("queued_base_leaf_seq"),
                                 row.get("in_flight_run_id"),
                                 row.get("status"),
+                                row.get("ext_space_tainted"),
                             )
                         })
                     }
                     BackendConn::Postgres(conn) => {
                         let r = sqlx::query(
                             "SELECT author_id, inline_text, payload_blake3, queued_base_leaf_seq,
-                                    in_flight_run_id, status
+                                    in_flight_run_id, status, ext_space_tainted
                              FROM chat_pending_inputs
                              WHERE space_id = $1 AND thread_id = $2 AND input_id = $3",
                         )
@@ -3543,13 +3471,21 @@ async fn consume_chat_input_impl(
                                 row.get("queued_base_leaf_seq"),
                                 row.get("in_flight_run_id"),
                                 row.get("status"),
+                                row.get("ext_space_tainted"),
                             )
                         })
                     }
                 };
 
-                let Some((author_raw, inline_opt, blob_opt, queued_raw, run_raw, status)) =
-                    pending_row
+                let Some((
+                    author_raw,
+                    inline_opt,
+                    blob_opt,
+                    queued_raw,
+                    run_raw,
+                    status,
+                    queued_taint,
+                )) = pending_row
                 else {
                     return Err(DomainError::ResourceNotFound.into());
                 };
@@ -3695,7 +3631,8 @@ async fn consume_chat_input_impl(
                     )
                     .await?;
 
-                let effective_tainted = auth.taint().is_tainted() || parent_tainted;
+                let effective_tainted =
+                    queued_taint != 0 || auth.taint().is_tainted() || parent_tainted;
                 if effective_tainted
                     && (th.kind == ChatThreadKind::SpaceGroup
                         || live_space.space.kind == SpaceKind::Shared)
@@ -3703,6 +3640,11 @@ async fn consume_chat_input_impl(
                     return Err(DomainError::CrossSpaceTainted.into());
                 }
 
+                auth.authorize_chat_read(
+                    &live_space.space,
+                    th.project_folder.as_ref(),
+                    effective_tainted,
+                )?;
                 let author = PrincipalId::parse(&author_raw).map_err(|_| {
                     internal_not_committed("corrupt_pending_author", "invalid PrincipalId")
                 })?;
@@ -3777,7 +3719,7 @@ async fn consume_chat_input_impl(
                     BackendConn::Sqlite(conn) => {
                         sqlx::query(
                             "UPDATE chat_pending_inputs
-                             SET status = 'consumed', consumed_entry_seq = ?
+                             SET status = 'consumed', inline_text = '', payload_blake3 = NULL, consumed_entry_seq = ?
                              WHERE space_id = ? AND thread_id = ? AND input_id = ?",
                         )
                         .bind(entry_seq.get() as i64)
@@ -3793,7 +3735,7 @@ async fn consume_chat_input_impl(
                     BackendConn::Postgres(conn) => {
                         sqlx::query(
                             "UPDATE chat_pending_inputs
-                             SET status = 'consumed', consumed_entry_seq = $1
+                             SET status = 'consumed', inline_text = '', payload_blake3 = NULL, consumed_entry_seq = $1
                              WHERE space_id = $2 AND thread_id = $3 AND input_id = $4",
                         )
                         .bind(entry_seq.get() as i64)
@@ -3934,7 +3876,8 @@ async fn redact_chat_entry_impl(
         request.input.entry.get(),
         request.input.expected_thread_revision.as_str()
     );
-    let idemp = derive_command_identity_spec(&request.identity, "redact_chat_entry", fp.as_bytes());
+    let idemp = derive_command_identity_spec(&request.identity, "redact_chat_entry", fp.as_bytes())
+        .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
     if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedRedactedChatV1>(
         store,

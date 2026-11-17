@@ -442,6 +442,10 @@ impl RoomFenceState {
             active: false,
         }
     }
+    /// Current runtime fence, including epochs consumed by direct-write reservations.
+    pub fn epoch(&self) -> LeaseEpoch {
+        self.epoch
+    }
     pub fn open(&mut self) -> DomainResult<()> {
         self.epoch = self.epoch.checked_next()?;
         self.active = true;

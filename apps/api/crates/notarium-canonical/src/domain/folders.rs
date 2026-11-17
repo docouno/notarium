@@ -53,7 +53,14 @@ pub(crate) async fn move_folder_impl(
             .map(FolderId::as_str)
             .unwrap_or("<root>")
     );
-    let idemp = derive_command_identity_spec(&request.identity, "move_folder", fp.as_bytes());
+    let idemp = derive_command_identity_spec(&request.identity, "move_folder", fp.as_bytes())
+        .with_policy(
+            ctx.auth(),
+            crate::writer::replay::ReplayPolicy::Documents(vec![
+                crate::writer::replay::ReplayResource::WriteFolder(Some(request.input.folder.clone())),
+                crate::writer::replay::ReplayResource::WriteFolder(request.input.new_parent.clone()),
+            ]),
+        );
 
     let auth = ctx.auth().clone();
     let preconditions = request.preconditions.clone();
@@ -116,7 +123,7 @@ pub(crate) async fn move_folder_impl(
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
 
-                let target_write_class = choose_folder_auth_class(&auth);
+                let target_write_class = choose_folder_auth_class(&auth,&scope.space_id);
                 let before_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
@@ -335,7 +342,13 @@ pub(crate) async fn rename_folder_impl(
         request.input.folder.as_str(),
         request.input.name
     );
-    let idemp = derive_command_identity_spec(&request.identity, "rename_folder", fp.as_bytes());
+    let idemp = derive_command_identity_spec(&request.identity, "rename_folder", fp.as_bytes())
+        .with_policy(
+            ctx.auth(),
+            crate::writer::replay::ReplayPolicy::Documents(vec![
+                crate::writer::replay::ReplayResource::WriteFolder(Some(request.input.folder.clone())),
+            ]),
+        );
 
     let auth = ctx.auth().clone();
     let preconditions = request.preconditions.clone();
@@ -370,7 +383,7 @@ pub(crate) async fn rename_folder_impl(
                 }
 
                 let anc = load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
-                let target_write_class = choose_folder_auth_class(&auth);
+                let target_write_class = choose_folder_auth_class(&auth,&scope.space_id);
                 let facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
@@ -587,7 +600,13 @@ pub(crate) async fn rename_project_impl(
         request.input.name,
         request.input.display_name
     );
-    let idemp = derive_command_identity_spec(&request.identity, "rename_project", fp.as_bytes());
+    let idemp = derive_command_identity_spec(&request.identity, "rename_project", fp.as_bytes())
+        .with_policy(
+            ctx.auth(),
+            crate::writer::replay::ReplayPolicy::Documents(vec![
+                crate::writer::replay::ReplayResource::WriteFolder(Some(request.input.folder.clone())),
+            ]),
+        );
 
     let auth = ctx.auth().clone();
     let preconditions = request.preconditions.clone();
@@ -622,10 +641,10 @@ pub(crate) async fn rename_project_impl(
                 }
 
                 let anc = load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
-                if !anc.is_root_child {
+                if folder_row.parent_folder_id.as_ref() != Some(&live_space.root_folder_id) {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
-                let target_write_class = choose_folder_auth_class(&auth);
+                let target_write_class = choose_folder_auth_class(&auth,&scope.space_id);
                 let facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
@@ -1239,7 +1258,7 @@ pub(crate) async fn set_folder_write_lock_impl(
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 let anc = load_folder_ancestry_tx(tx, &scope.space_id, &folder_cl, true).await?;
-                let target_write_class = choose_folder_auth_class(&auth);
+                let target_write_class = choose_folder_auth_class(&auth,&scope.space_id);
                 // Unlocking checks write permission without failing on the folder's own existing lock!
                 let check_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
@@ -1370,8 +1389,8 @@ pub(crate) async fn set_folder_write_lock_impl(
     store.submit_write_command(&ctx.budget, intent).await
 }
 
-fn choose_folder_auth_class(auth: &notarium_core::auth::EngineAuthContext) -> DocClass {
-    for grant in auth.spaces().values() {
+pub(crate) fn choose_folder_auth_class(auth: &notarium_core::auth::EngineAuthContext, space: &notarium_core::ids::SpaceId) -> DocClass {
+    if let Some(grant) = auth.spaces().get(space) {
         if grant.write_classes.contains(&DocClass::UserDoc) {
             return DocClass::UserDoc;
         }

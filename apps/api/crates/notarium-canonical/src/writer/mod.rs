@@ -38,14 +38,28 @@ use crate::{
         CanonicalInner, SpaceRecord, SqlDriverState, are_any_notes_purge_fenced_tx,
         load_space_record_for_update_opt,
     },
-    sql_exec::BackendConn,
+    sql_exec::{BackendConn, PgTransactionLease, WriteTransaction},
 };
+
+pub(crate) mod replay;
 
 #[derive(Clone, Debug)]
 pub struct CommandIdentitySpec {
     pub actor: PrincipalId,
     pub command_key: CommandKey,
     pub command_hash: ContentDigest,
+    pub(crate) authority:
+        Option<Arc<(notarium_core::auth::EngineAuthContext, replay::ReplayPolicy)>>,
+}
+impl CommandIdentitySpec {
+    pub fn new(actor: PrincipalId, command_key: CommandKey, command_hash: ContentDigest) -> Self {
+        Self {
+            actor,
+            command_key,
+            command_hash,
+            authority: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +111,7 @@ pub struct ItemExecCtx {
     pending_dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
+    after_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl ItemExecCtx {
@@ -156,6 +171,10 @@ impl ItemExecCtx {
         self.retained_guards.push(Box::new(guard));
     }
 
+    pub(crate) fn on_commit(&mut self, action: impl FnOnce() + Send + 'static) {
+        self.after_commit = Some(Box::new(action));
+    }
+
     pub(crate) fn new_for_batch(
         scope: HistoryScope,
         space: notarium_core::auth::Space,
@@ -175,6 +194,7 @@ impl ItemExecCtx {
             pending_dir_syncs: PendingDirSyncs::default(),
             retained_tickets: Vec::new(),
             retained_guards: Vec::new(),
+            after_commit: None,
         }
     }
 
@@ -186,6 +206,10 @@ impl ItemExecCtx {
         Vec<StagedBlobTicket>,
         Vec<Box<dyn Send>>,
     ) {
+        debug_assert!(
+            self.after_commit.is_none(),
+            "native items have no post-commit side effects"
+        );
         (
             self.receipt_status,
             self.pending_dir_syncs,
@@ -235,13 +259,13 @@ enum QueuedWriteEntry {
         intent: PreparedWriteIntent,
         sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         pg_fast_plan: Option<PgSingleItemFastFn>,
-        staged_bytes_reserved: u64,
+        staged_bytes_reserved: StagedByteReservation,
         reply_tx: oneshot::Sender<Result<Vec<u8>, PortError>>,
     },
     Group {
         space_id: SpaceId,
         intents: Vec<PreparedWriteIntent>,
-        staged_bytes_reserved: u64,
+        staged_bytes_reserved: StagedByteReservation,
         reply_tx: oneshot::Sender<BatchGroupReply>,
     },
 }
@@ -288,6 +312,22 @@ struct StagedByteLimiter {
     notify: Notify,
 }
 
+struct StagedByteReservation {
+    limiter: Arc<StagedByteLimiter>,
+    bytes: u64,
+}
+
+impl Drop for StagedByteReservation {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            self.limiter
+                .in_flight
+                .fetch_sub(self.bytes, Ordering::Release);
+            self.limiter.notify.notify_waiters();
+        }
+    }
+}
+
 impl StagedByteLimiter {
     fn new(max_bytes: u64) -> Self {
         Self {
@@ -297,10 +337,12 @@ impl StagedByteLimiter {
         }
     }
 
-    async fn acquire(&self, bytes: u64, budget: &CallBudget) -> Result<u64, PortError> {
-        if bytes == 0 {
-            return Ok(0);
-        }
+    async fn acquire(
+        self: &Arc<Self>,
+        bytes: u64,
+        budget: &CallBudget,
+        deadline: tokio::time::Instant,
+    ) -> Result<StagedByteReservation, PortError> {
         if bytes > self.max_bytes {
             return Err(unavailable_retryable(
                 "writer_staged_bytes_exceeds_max",
@@ -312,7 +354,6 @@ impl StagedByteLimiter {
             ));
         }
 
-        let deadline = tokio::time::Instant::now() + budget.remaining;
         loop {
             if budget.cancellation.is_cancelled() {
                 return Err(cancelled_not_committed(
@@ -320,19 +361,24 @@ impl StagedByteLimiter {
                     "write cancelled while waiting for staged byte budget",
                 ));
             }
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let cur = self.in_flight.load(Ordering::Acquire);
-            if cur.saturating_add(bytes) <= self.max_bytes {
+            if bytes <= self.max_bytes.saturating_sub(cur) {
                 if self
                     .in_flight
                     .compare_exchange_weak(cur, cur + bytes, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    return Ok(bytes);
+                    return Ok(StagedByteReservation {
+                        limiter: Arc::clone(self),
+                        bytes,
+                    });
                 }
                 continue;
             }
 
-            let notified = self.notify.notified();
             if tokio::time::Instant::now() >= deadline {
                 return Err(deadline_not_committed(
                     "writer_byte_backpressure_deadline",
@@ -340,6 +386,7 @@ impl StagedByteLimiter {
                 ));
             }
             tokio::select! {
+                _ = budget.cancellation.cancelled() => continue,
                 _ = notified => {}
                 _ = tokio::time::sleep_until(deadline) => {
                     return Err(deadline_not_committed(
@@ -348,13 +395,6 @@ impl StagedByteLimiter {
                     ));
                 }
             }
-        }
-    }
-
-    fn release(&self, bytes: u64) {
-        if bytes > 0 {
-            self.in_flight.fetch_sub(bytes, Ordering::Release);
-            self.notify.notify_waiters();
         }
     }
 }
@@ -376,14 +416,26 @@ pub(crate) struct ActiveWriteOpTracker {
 pub(crate) struct ActiveWriteOpGuard {
     tracker: Arc<ActiveWriteOpTracker>,
     weight: usize,
+    pg_space: Option<(SpaceId, Arc<PgSpaces>)>,
 }
 
 impl Drop for ActiveWriteOpGuard {
     fn drop(&mut self) {
         if self.weight > 0 {
-            self.tracker
+            let previous = self
+                .tracker
                 .active_ops
-                .fetch_sub(self.weight, Ordering::Release);
+                .fetch_sub(self.weight, Ordering::AcqRel);
+            if previous == self.weight
+                && let Some((space_id, spaces)) = &self.pg_space
+            {
+                let mut map = spaces.lock().expect("pg spaces");
+                if map.get(space_id).is_some_and(|s| {
+                    s.queue.is_none() && s.tracker.active_ops.load(Ordering::Acquire) == 0
+                }) {
+                    map.remove(space_id);
+                }
+            }
             self.tracker.notify.notify_waiters();
         }
     }
@@ -396,9 +448,16 @@ enum CoordinatorMode {
         tracker: Arc<ActiveWriteOpTracker>,
     },
     Postgres {
-        spaces: Mutex<HashMap<SpaceId, SpaceQueueHandle>>,
-        trackers: std::sync::Mutex<HashMap<SpaceId, Arc<ActiveWriteOpTracker>>>,
+        spaces: Arc<PgSpaces>,
     },
+}
+
+type PgSpaces = std::sync::Mutex<HashMap<SpaceId, PgSpace>>;
+
+#[derive(Default)]
+struct PgSpace {
+    tracker: Arc<ActiveWriteOpTracker>,
+    queue: Option<SpaceQueueHandle>,
 }
 
 struct SpaceQueueHandle {
@@ -430,13 +489,12 @@ impl WriteCoordinator {
                 let tracker = Arc::new(ActiveWriteOpTracker::default());
                 let tracker_cl = Arc::clone(&tracker);
                 let inner_weak = Arc::downgrade(inner);
-                let limiter_cl = Arc::clone(&byte_limiter);
                 let gate_cl = Arc::clone(&commit_gate);
                 let faults_cl = Arc::clone(&faults);
                 let telem_cl = Arc::clone(&batch_telemetry);
                 let worker = tokio::spawn(async move {
                     run_batch_worker_loop(
-                        inner_weak, rx, cfg, limiter_cl, gate_cl, faults_cl, telem_cl, tracker_cl,
+                        inner_weak, rx, cfg, gate_cl, faults_cl, telem_cl, tracker_cl, None,
                     )
                     .await;
                 });
@@ -447,8 +505,7 @@ impl WriteCoordinator {
                 }
             }
             SqlDriverState::Postgres { .. } => CoordinatorMode::Postgres {
-                spaces: Mutex::new(HashMap::new()),
-                trackers: std::sync::Mutex::new(HashMap::new()),
+                spaces: Arc::default(),
             },
         };
 
@@ -465,18 +522,26 @@ impl WriteCoordinator {
 
     pub(crate) fn enter_write_op(&self, space_id: &SpaceId, weight: usize) -> ActiveWriteOpGuard {
         let w = weight.max(1);
-        let tracker = match &self.mode {
-            CoordinatorMode::Sqlite { tracker, .. } => Arc::clone(tracker),
-            CoordinatorMode::Postgres { trackers, .. } => {
-                let mut map = trackers.lock().expect("pg write trackers mutex");
-                Arc::clone(
-                    map.entry(space_id.clone())
-                        .or_insert_with(|| Arc::new(ActiveWriteOpTracker::default())),
+        let (tracker, pg_space) = match &self.mode {
+            CoordinatorMode::Sqlite { tracker, .. } => {
+                tracker.active_ops.fetch_add(w, Ordering::AcqRel);
+                (Arc::clone(tracker), None)
+            }
+            CoordinatorMode::Postgres { spaces } => {
+                let mut map = spaces.lock().expect("pg spaces");
+                let state = map.entry(space_id.clone()).or_default();
+                state.tracker.active_ops.fetch_add(w, Ordering::AcqRel);
+                (
+                    Arc::clone(&state.tracker),
+                    Some((space_id.clone(), Arc::clone(spaces))),
                 )
             }
         };
-        tracker.active_ops.fetch_add(w, Ordering::AcqRel);
-        ActiveWriteOpGuard { tracker, weight: w }
+        ActiveWriteOpGuard {
+            tracker,
+            weight: w,
+            pg_space,
+        }
     }
 
     pub fn faults(&self) -> &Arc<WriterFaultState> {
@@ -575,89 +640,14 @@ impl WriteCoordinator {
         pg_fast_plan: Option<PgSingleItemFastFn>,
         pretracked_guard: Option<ActiveWriteOpGuard>,
     ) -> Result<Vec<u8>, PortError> {
+        inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)?;
         let _active_guard = match pretracked_guard {
             Some(g) => g,
             None => self.enter_write_op(&intent.scope.space_id, 1),
         };
-        // Pre-admission checks: cancellation or expired deadline BEFORE admission => NotCommitted!
-        if budget.cancellation.is_cancelled() {
-            return Err(cancelled_not_committed(
-                "writer_cancelled_pre_enqueue",
-                "write cancelled prior to mailbox admission",
-            ));
-        }
-        if budget.remaining.is_zero() {
-            return Err(deadline_not_committed(
-                "writer_deadline_zero_pre_enqueue",
-                "write call budget expired prior to mailbox admission",
-            ));
-        }
-        if !self.accepting.load(Ordering::SeqCst) || inner.shutting_down.load(Ordering::SeqCst) {
-            return Err(unavailable_retryable(
-                "writer_shutting_down",
-                "canonical WriteBatchActor is draining for shutdown",
-                Duration::from_millis(100),
-            ));
-        }
-
-        let reserved_bytes = self
-            .byte_limiter
-            .acquire(intent.staged_bytes, budget)
+        let (permit, reserved_bytes) = self
+            .reserve_entry(inner, &intent.scope.space_id, budget, intent.staged_bytes)
             .await?;
-
-        let sender = match self.sender_for_space(inner, &intent.scope.space_id).await {
-            Ok(s) => s,
-            Err(err) => {
-                self.byte_limiter.release(reserved_bytes);
-                return Err(err);
-            }
-        };
-
-        let permit = match sender.try_reserve() {
-            Ok(p) => p,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.byte_limiter.release(reserved_bytes);
-                return Err(unavailable_retryable(
-                    "writer_channel_closed",
-                    "canonical WriteBatchActor channel closed",
-                    Duration::from_millis(100),
-                ));
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                let enqueue_deadline = tokio::time::Instant::now() + budget.remaining;
-                tokio::select! {
-                    res = sender.reserve() => match res {
-                        Ok(p) => p,
-                        Err(_) => {
-                            self.byte_limiter.release(reserved_bytes);
-                            return Err(unavailable_retryable(
-                                "writer_channel_closed",
-                                "canonical WriteBatchActor channel closed",
-                                Duration::from_millis(100),
-                            ));
-                        }
-                    },
-                    _ = tokio::time::sleep_until(enqueue_deadline) => {
-                        self.byte_limiter.release(reserved_bytes);
-                        return Err(deadline_not_committed(
-                            "writer_mailbox_enqueue_deadline",
-                            "write deadline exceeded waiting for mailbox slot",
-                        ));
-                    }
-                }
-            }
-        };
-
-        // Re-check cancellation one final time BEFORE handing ownership to the writer permit!
-        if budget.cancellation.is_cancelled() {
-            drop(permit);
-            self.byte_limiter.release(reserved_bytes);
-            return Err(cancelled_not_committed(
-                "writer_cancelled_before_commit_handoff",
-                "write cancelled prior to permit handoff",
-            ));
-        }
-
         let is_idempotent = intent.idempotency.is_some();
 
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -697,84 +687,16 @@ impl WriteCoordinator {
         space_id: &SpaceId,
         intents: Vec<PreparedWriteIntent>,
     ) -> Result<(Vec<Result<Vec<u8>, PortError>>, SpaceSeq), PortError> {
+        for intent in &intents {
+            inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)?;
+        }
         let _active_guard = self.enter_write_op(space_id, intents.len().max(1));
-        if budget.cancellation.is_cancelled() {
-            return Err(cancelled_not_committed(
-                "writer_cancelled_pre_enqueue",
-                "batch write cancelled prior to mailbox admission",
-            ));
-        }
-        if budget.remaining.is_zero() {
-            return Err(deadline_not_committed(
-                "writer_deadline_zero_pre_enqueue",
-                "batch write call budget expired prior to mailbox admission",
-            ));
-        }
-        if !self.accepting.load(Ordering::SeqCst) || inner.shutting_down.load(Ordering::SeqCst) {
-            return Err(unavailable_retryable(
-                "writer_shutting_down",
-                "canonical WriteBatchActor is draining for shutdown",
-                Duration::from_millis(100),
-            ));
-        }
-
-        let total_staged: u64 = intents
+        let total_staged = intents
             .iter()
-            .fold(0u64, |acc, it| acc.saturating_add(it.staged_bytes));
-        let reserved_bytes = self.byte_limiter.acquire(total_staged, budget).await?;
-
-        let sender = match self.sender_for_space(inner, space_id).await {
-            Ok(s) => s,
-            Err(err) => {
-                self.byte_limiter.release(reserved_bytes);
-                return Err(err);
-            }
-        };
-
-        let permit = match sender.try_reserve() {
-            Ok(p) => p,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.byte_limiter.release(reserved_bytes);
-                return Err(unavailable_retryable(
-                    "writer_channel_closed",
-                    "canonical WriteBatchActor channel closed",
-                    Duration::from_millis(100),
-                ));
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                let enqueue_deadline = tokio::time::Instant::now() + budget.remaining;
-                tokio::select! {
-                    res = sender.reserve() => match res {
-                        Ok(p) => p,
-                        Err(_) => {
-                            self.byte_limiter.release(reserved_bytes);
-                            return Err(unavailable_retryable(
-                                "writer_channel_closed",
-                                "canonical WriteBatchActor channel closed",
-                                Duration::from_millis(100),
-                            ));
-                        }
-                    },
-                    _ = tokio::time::sleep_until(enqueue_deadline) => {
-                        self.byte_limiter.release(reserved_bytes);
-                        return Err(deadline_not_committed(
-                            "writer_mailbox_enqueue_deadline",
-                            "write deadline exceeded waiting for mailbox slot",
-                        ));
-                    }
-                }
-            }
-        };
-
-        if budget.cancellation.is_cancelled() {
-            drop(permit);
-            self.byte_limiter.release(reserved_bytes);
-            return Err(cancelled_not_committed(
-                "writer_cancelled_before_commit_handoff",
-                "batch write cancelled prior to permit handoff",
-            ));
-        }
-
+            .fold(0u64, |sum, item| sum.saturating_add(item.staged_bytes));
+        let (permit, reserved_bytes) = self
+            .reserve_entry(inner, space_id, budget, total_staged)
+            .await?;
         let all_idempotent = intents.iter().all(|i| i.idempotency.is_some());
         let (reply_tx, reply_rx) = oneshot::channel();
         permit.send(QueuedWriteEntry::Group {
@@ -802,7 +724,55 @@ impl WriteCoordinator {
         }
     }
 
-    async fn sender_for_space(
+    async fn reserve_entry(
+        &self,
+        inner: &Arc<CanonicalInner>,
+        space: &SpaceId,
+        budget: &CallBudget,
+        bytes: u64,
+    ) -> Result<(mpsc::OwnedPermit<QueuedWriteEntry>, StagedByteReservation), PortError> {
+        if !self.accepting.load(Ordering::Acquire) || inner.shutting_down.load(Ordering::Acquire) {
+            return Err(unavailable_retryable(
+                "writer_shutting_down",
+                "canonical writer is draining",
+                Duration::from_millis(100),
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + budget.remaining;
+        let bytes = self.byte_limiter.acquire(bytes, budget, deadline).await?;
+        let sender = self.sender_for_space(inner, space)?;
+        let closed = || {
+            unavailable_retryable(
+                "writer_channel_closed",
+                "canonical writer is closed",
+                Duration::from_millis(100),
+            )
+        };
+        let permit = match sender.try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(closed()),
+            Err(mpsc::error::TrySendError::Full(sender)) => tokio::select! {
+                result = sender.reserve_owned() => result.map_err(|_| closed())?,
+                _ = budget.cancellation.cancelled() => return Err(cancelled_not_committed("writer_cancelled_pre_enqueue", "write cancelled before mailbox admission")),
+                _ = tokio::time::sleep_until(deadline) => return Err(deadline_not_committed("writer_mailbox_enqueue_deadline", "deadline while waiting for mailbox admission")),
+            },
+        };
+        if budget.cancellation.is_cancelled() {
+            return Err(cancelled_not_committed(
+                "writer_cancelled_pre_enqueue",
+                "write cancelled before mailbox admission",
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(deadline_not_committed(
+                "writer_mailbox_enqueue_deadline",
+                "deadline before mailbox admission",
+            ));
+        }
+        Ok((permit, bytes))
+    }
+
+    fn sender_for_space(
         &self,
         inner: &Arc<CanonicalInner>,
         space_id: &SpaceId,
@@ -818,8 +788,8 @@ impl WriteCoordinator {
                     )
                 })
             }
-            CoordinatorMode::Postgres { spaces, trackers } => {
-                let mut map = spaces.lock().await;
+            CoordinatorMode::Postgres { spaces } => {
+                let mut map = spaces.lock().expect("pg spaces");
                 if !self.accepting.load(Ordering::SeqCst) {
                     return Err(unavailable_retryable(
                         "pg_writer_drained",
@@ -827,38 +797,37 @@ impl WriteCoordinator {
                         Duration::from_millis(100),
                     ));
                 }
-                if let Some(existing) = map.get(space_id)
+                let state = map.entry(space_id.clone()).or_default();
+                if let Some(existing) = &state.queue
                     && !existing.tx.is_closed()
                 {
                     return Ok(existing.tx.clone());
                 }
-                let tracker = {
-                    let mut tmap = trackers.lock().expect("pg write trackers mutex");
-                    Arc::clone(
-                        tmap.entry(space_id.clone())
-                            .or_insert_with(|| Arc::new(ActiveWriteOpTracker::default())),
-                    )
-                };
+                let tracker = Arc::clone(&state.tracker);
+                let registration = Some((space_id.clone(), Arc::downgrade(spaces)));
                 let (tx, rx) = mpsc::channel(self.cfg.mailbox_capacity.max(1));
                 let inner_weak = Arc::downgrade(inner);
-                let limiter_cl = Arc::clone(&self.byte_limiter);
                 let gate_cl = Arc::clone(&self.commit_gate);
                 let faults_cl = Arc::clone(&self.faults);
                 let telem_cl = Arc::clone(&self.batch_telemetry);
                 let cfg = self.cfg;
                 let worker = tokio::spawn(async move {
                     run_batch_worker_loop(
-                        inner_weak, rx, cfg, limiter_cl, gate_cl, faults_cl, telem_cl, tracker,
+                        inner_weak,
+                        rx,
+                        cfg,
+                        gate_cl,
+                        faults_cl,
+                        telem_cl,
+                        tracker,
+                        registration,
                     )
                     .await;
                 });
-                map.insert(
-                    space_id.clone(),
-                    SpaceQueueHandle {
-                        tx: tx.clone(),
-                        worker,
-                    },
-                );
+                state.queue = Some(SpaceQueueHandle {
+                    tx: tx.clone(),
+                    worker,
+                });
                 Ok(tx)
             }
         }
@@ -877,8 +846,8 @@ impl WriteCoordinator {
             }
             CoordinatorMode::Postgres { spaces, .. } => {
                 let drained: Vec<SpaceQueueHandle> = {
-                    let mut map = spaces.lock().await;
-                    map.drain().map(|(_, v)| v).collect()
+                    let mut map = spaces.lock().expect("pg spaces");
+                    map.drain().filter_map(|(_, v)| v.queue).collect()
                 };
                 let mut handles = Vec::with_capacity(drained.len());
                 for SpaceQueueHandle { tx, worker } in drained {
@@ -904,7 +873,7 @@ impl crate::CanonicalStore {
 
     /// Submits a typed idempotent or non-idempotent canonical mutation through `WriteBatchActor`,
     /// automatically handling MessagePack receipt serialization and replay.
-    pub async fn submit_write_command<R>(
+    pub(crate) async fn submit_write_command<R>(
         &self,
         budget: &CallBudget,
         intent: PreparedWriteIntent,
@@ -916,6 +885,18 @@ impl crate::CanonicalStore {
         let raw_bytes = writer.submit_raw(&self.inner, budget, intent).await?;
         rmp_serde::from_slice(&raw_bytes)
             .map_err(|err| internal_not_committed("decode_writer_command_outcome", err.to_string()))
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn submit_fixture_write_command<R>(
+        &self,
+        budget: &CallBudget,
+        intent: PreparedWriteIntent,
+    ) -> Result<R, PortError>
+    where
+        R: Serialize + DeserializeOwned + Send + 'static,
+    {
+        self.submit_write_command(budget, intent).await
     }
 
     pub(crate) async fn submit_write_command_tracked<R>(
@@ -1004,12 +985,20 @@ impl crate::CanonicalStore {
             .map_err(|err| internal_not_committed("encode_writer_command_outcome", err.to_string()))
     }
 
-    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub fn writer_faults(&self) -> Result<Arc<WriterFaultState>, PortError> {
         Ok(Arc::clone(self.inner.writer()?.faults()))
     }
 
-    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
+    pub fn retained_pg_writer_spaces_for_test(&self) -> Result<usize, PortError> {
+        let CoordinatorMode::Postgres { spaces } = &self.inner.writer()?.mode else {
+            return Ok(0);
+        };
+        Ok(spaces.lock().expect("pg spaces").len())
+    }
+
+    #[cfg(feature = "test-support")]
     pub async fn acquire_writer_safe_point(&self) -> Result<WriterSafePointGuard, PortError> {
         Ok(self.inner.writer()?.acquire_safe_point().await)
     }
@@ -1033,22 +1022,12 @@ fn entry_logical_len(entry: &QueuedWriteEntry) -> usize {
     }
 }
 
-fn reject_queued_entry(entry: QueuedWriteEntry, byte_limiter: &StagedByteLimiter, err: PortError) {
+fn reject_queued_entry(entry: QueuedWriteEntry, err: PortError) {
     match entry {
-        QueuedWriteEntry::Single {
-            staged_bytes_reserved,
-            reply_tx,
-            ..
-        } => {
-            byte_limiter.release(staged_bytes_reserved);
+        QueuedWriteEntry::Single { reply_tx, .. } => {
             let _ = reply_tx.send(Err(err));
         }
-        QueuedWriteEntry::Group {
-            staged_bytes_reserved,
-            reply_tx,
-            ..
-        } => {
-            byte_limiter.release(staged_bytes_reserved);
+        QueuedWriteEntry::Group { reply_tx, .. } => {
             let _ = reply_tx.send(Err(err));
         }
     }
@@ -1063,37 +1042,49 @@ async fn run_batch_worker_loop(
     inner_weak: std::sync::Weak<CanonicalInner>,
     mut rx: mpsc::Receiver<QueuedWriteEntry>,
     cfg: WriterConfig,
-    byte_limiter: Arc<StagedByteLimiter>,
     commit_gate: Arc<RwLock<()>>,
     faults: Arc<WriterFaultState>,
     batch_telemetry: Arc<BatchCommitTelemetry>,
     tracker: Arc<ActiveWriteOpTracker>,
+    pg_space: Option<(SpaceId, std::sync::Weak<PgSpaces>)>,
 ) {
     let max_items = cfg.max_batch_items.max(1);
     let flush_window = cfg.batch_flush_window;
     let mut cached_pg_conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>> = None;
 
     loop {
-        let first = if cached_pg_conn.is_some() {
-            tokio::select! {
-                biased;
-                maybe = rx.recv() => match maybe {
-                    Some(entry) => entry,
-                    None => break,
-                },
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+        let next = if let Some((id, registry)) = &pg_space {
+            match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(entry) => entry,
+                Err(_) => {
                     cached_pg_conn = None;
-                    match rx.recv().await {
-                        Some(entry) => entry,
-                        None => break,
+                    let Some(spaces) = registry.upgrade() else {
+                        break;
+                    };
+                    let mut map = spaces.lock().expect("pg spaces");
+                    // Admission clones the sender under this mutex. No sender or pending item
+                    // may be stranded by retiring the worker.
+                    if let Some(state) = map.get_mut(id)
+                        && rx.is_empty()
+                        && state
+                            .queue
+                            .as_ref()
+                            .is_some_and(|q| q.tx.strong_count() == 1)
+                    {
+                        state.queue.take();
+                        if state.tracker.active_ops.load(Ordering::Acquire) == 0 {
+                            map.remove(id);
+                        }
+                        break;
                     }
+                    continue;
                 }
             }
         } else {
-            match rx.recv().await {
-                Some(entry) => entry,
-                None => break,
-            }
+            rx.recv().await
+        };
+        let Some(first) = next else {
+            break;
         };
 
         let mut item_count = entry_logical_len(&first);
@@ -1160,7 +1151,6 @@ async fn run_batch_worker_loop(
             for entry in batch {
                 reject_queued_entry(
                     entry,
-                    &byte_limiter,
                     unavailable_retryable(
                         "canonical_runtime_dropped",
                         "canonical runtime dropped before batch execution",
@@ -1184,15 +1174,7 @@ async fn run_batch_worker_loop(
         let logical_items_u32 = u32::try_from(item_count).unwrap_or(u32::MAX);
         tracker.in_phase2_items.store(item_count, Ordering::Release);
         tracker.phase1_drained_notify.notify_waiters();
-        flush_single_batch(
-            &inner,
-            batch,
-            cfg,
-            &byte_limiter,
-            &faults,
-            &mut cached_pg_conn,
-        )
-        .await;
+        flush_single_batch(&inner, batch, cfg, &faults, &mut cached_pg_conn).await;
         tracker.in_phase2_items.store(0, Ordering::Release);
         if let Some(t0) = phase2_start {
             let dur_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1240,7 +1222,6 @@ async fn flush_single_batch(
     inner: &Arc<CanonicalInner>,
     batch: Vec<QueuedWriteEntry>,
     cfg: WriterConfig,
-    byte_limiter: &StagedByteLimiter,
     faults: &WriterFaultState,
     cached_pg_conn: &mut Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
 ) {
@@ -1330,7 +1311,6 @@ async fn flush_single_batch(
                         inner
                             .sqlite_writer_commit_gen
                             .fetch_add(1, Ordering::Release);
-                        inner.sqlite_purge_fence_gen.fetch_add(1, Ordering::Release);
                         out
                     }
                 }
@@ -1352,7 +1332,8 @@ async fn flush_single_batch(
             };
             match conn_res {
                 Ok(mut pooled) => {
-                    let conn: &mut sqlx::PgConnection = &mut pooled;
+                    let mut lease = PgTransactionLease::new(&mut pooled);
+                    let conn = lease.conn();
                     let out = if can_pg_fast {
                         let (mut intent, fp_opt, pg_fast_opt) = items.pop().expect("len == 1");
                         if let Some(fp) = fp_opt {
@@ -1396,12 +1377,8 @@ async fn flush_single_batch(
                         .await
                     };
                     if matches!(out, BatchExecOutcome::Committed { .. }) {
+                        lease.complete();
                         *cached_pg_conn = Some(pooled);
-                    } else {
-                        let raw = pooled.detach();
-                        tokio::spawn(async move {
-                            let _ = sqlx::Connection::close(raw).await;
-                        });
                     }
                     out
                 }
@@ -1414,9 +1391,7 @@ async fn flush_single_batch(
         }
     };
 
-    for bytes in reserved_list {
-        byte_limiter.release(bytes);
-    }
+    drop(reserved_list);
 
     match exec_result {
         BatchExecOutcome::Committed {
@@ -1567,12 +1542,15 @@ async fn execute_batch_on_conn(
     cfg: WriterConfig,
     faults: &WriterFaultState,
 ) -> BatchExecOutcome {
-    if let Err(err) = tx.begin_write().await {
-        return BatchExecOutcome::AbortedBeforeCommit(err);
-    }
+    let mut transaction = match WriteTransaction::begin(tx).await {
+        Ok(transaction) => transaction,
+        Err(err) => return BatchExecOutcome::AbortedBeforeCommit(err),
+    };
+    let tx = &mut transaction.conn();
 
     let mut space_states: BTreeMap<SpaceId, SpaceBatchEntry> = BTreeMap::new();
     let mut batch_dir_syncs = PendingDirSyncs::default();
+    let mut after_commit = Vec::new();
     // Retain all StagedBlobTickets and runtime lock guards until AFTER outer COMMIT/ROLLBACK!
     let mut batch_retained_tickets: Vec<StagedBlobTicket> = Vec::new();
     let mut batch_retained_guards: Vec<Box<dyn Send>> = Vec::new();
@@ -1581,7 +1559,7 @@ async fn execute_batch_on_conn(
     let committed_at_ms = match now_unix_ms() {
         Ok(ms) => ms,
         Err(err) => {
-            tx.rollback_best_effort().await;
+            transaction.rollback().await;
             return BatchExecOutcome::AbortedBeforeCommit(err);
         }
     };
@@ -1607,7 +1585,7 @@ async fn execute_batch_on_conn(
                     space_states.insert(gspace.clone(), SpaceBatchEntry::Missing);
                 }
                 Err(err) => {
-                    tx.rollback_best_effort().await;
+                    transaction.rollback().await;
                     return BatchExecOutcome::AbortedBeforeCommit(err);
                 }
             }
@@ -1639,14 +1617,14 @@ async fn execute_batch_on_conn(
                     space_states.insert(space_id.clone(), SpaceBatchEntry::Missing);
                 }
                 Err(err) => {
-                    tx.rollback_best_effort().await;
+                    transaction.rollback().await;
                     return BatchExecOutcome::AbortedBeforeCommit(err);
                 }
             }
         }
 
         if use_savepoints && let Err(err) = tx.savepoint(idx).await {
-            tx.rollback_best_effort().await;
+            transaction.rollback().await;
             return BatchExecOutcome::AbortedBeforeCommit(err);
         }
 
@@ -1668,9 +1646,10 @@ async fn execute_batch_on_conn(
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
+                after_commit: item_after_commit,
             }) => {
                 if use_savepoints && let Err(err) = tx.release_savepoint(idx).await {
-                    tx.rollback_best_effort().await;
+                    transaction.rollback().await;
                     return BatchExecOutcome::AbortedBeforeCommit(err);
                 }
                 if let Some(SpaceBatchEntry::Loaded {
@@ -1687,6 +1666,7 @@ async fn execute_batch_on_conn(
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
                 batch_retained_guards.extend(retained_guards);
+                after_commit.extend(item_after_commit);
                 slots.push(ItemOutcomeSlot::Succeeded {
                     response_bytes,
                     has_idempotency: has_idemp,
@@ -1694,7 +1674,7 @@ async fn execute_batch_on_conn(
             }
             Err(item_err) => {
                 if !use_savepoints {
-                    tx.rollback_best_effort().await;
+                    transaction.rollback().await;
                     let mut space_effective_cuts = BTreeMap::new();
                     for (sid, entry) in &space_states {
                         if let SpaceBatchEntry::Loaded { effective_cut, .. } = entry {
@@ -1708,7 +1688,7 @@ async fn execute_batch_on_conn(
                 }
                 // Rollback ONLY this item's savepoint; virtual `effective_cut` stays unchanged!
                 if let Err(rb_err) = tx.rollback_to_savepoint(idx).await {
-                    tx.rollback_best_effort().await;
+                    transaction.rollback().await;
                     return BatchExecOutcome::AbortedBeforeCommit(rb_err);
                 }
                 slots.push(ItemOutcomeSlot::Failed(item_err));
@@ -1749,7 +1729,7 @@ async fn execute_batch_on_conn(
             .await
             {
                 // Epoch fence or concurrent modification invalidated the Space batch: rollback ALL mutations!
-                tx.rollback_best_effort().await;
+                transaction.rollback().await;
                 drop(batch_retained_tickets);
                 drop(batch_retained_guards);
                 return BatchExecOutcome::AbortedBeforeCommit(bump_err);
@@ -1765,7 +1745,7 @@ async fn execute_batch_on_conn(
     {
         Ok(extra_dirs) => batch_dir_syncs.merge(&extra_dirs),
         Err(pub_err) => {
-            tx.rollback_best_effort().await;
+            transaction.rollback().await;
             drop(batch_retained_tickets);
             drop(batch_retained_guards);
             return BatchExecOutcome::AbortedBeforeCommit(pub_err);
@@ -1774,15 +1754,18 @@ async fn execute_batch_on_conn(
 
     // Coalesced Wave B: local CAS directory fsync BEFORE SQL COMMIT!
     if let Err(sync_err) = store.flush_pending_local_dirs_async(&batch_dir_syncs).await {
-        tx.rollback_best_effort().await;
+        transaction.rollback().await;
         drop(batch_retained_tickets);
         drop(batch_retained_guards);
         return BatchExecOutcome::AbortedBeforeCommit(sync_err);
     }
 
     // Commit outer SQL transaction!
-    match tx.commit_write().await {
+    match transaction.commit().await {
         Ok(()) => {
+            for action in after_commit {
+                action();
+            }
             if let Some(wal) = store.inner.wal_coord.get() {
                 wal.note_writer_commit();
             }
@@ -1850,6 +1833,7 @@ struct SingleItemSuccess {
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
+    after_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
 async fn execute_single_item_in_savepoint(
@@ -1870,14 +1854,10 @@ async fn execute_single_item_in_savepoint(
 
     // 1. HistoryIncarnation + LeaseEpoch authority check BEFORE receipt lookup and head CAS!
     space_rec.scope.check(&intent.scope)?;
-    let effective_epoch = if intent.active_epoch == LeaseEpoch::ZERO && intent.staged_bytes == 0 {
-        space_rec.active_epoch
-    } else {
-        if space_rec.active_epoch != intent.active_epoch {
-            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
-        }
-        intent.active_epoch
-    };
+    if space_rec.active_epoch != intent.active_epoch {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
+    let effective_epoch = intent.active_epoch;
 
     // 2. Idempotent command receipt lookup (`command_receipts`) BEFORE purge fence and stale head CAS
     //    so idempotent retries of Purge / MintAndPurge replay their sanitized receipt rather than ResourceNotFound!
@@ -1896,6 +1876,7 @@ async fn execute_single_item_in_savepoint(
                 dir_syncs: PendingDirSyncs::default(),
                 retained_tickets: Vec::new(),
                 retained_guards: Vec::new(),
+                after_commit: None,
             }),
             _ => Err(unavailable_retryable(
                 "command_receipt_pending",
@@ -1937,6 +1918,7 @@ async fn execute_single_item_in_savepoint(
         pending_dir_syncs: PendingDirSyncs::default(),
         retained_tickets: Vec::new(),
         retained_guards: Vec::new(),
+        after_commit: None,
     };
 
     let artifacts = (intent.execute)(tx, &mut item_ctx).await?;
@@ -2015,6 +1997,7 @@ async fn execute_single_item_in_savepoint(
         dir_syncs: item_ctx.pending_dir_syncs,
         retained_tickets: item_ctx.retained_tickets,
         retained_guards: item_ctx.retained_guards,
+        after_commit: item_ctx.after_commit,
     })
 }
 
@@ -2088,6 +2071,7 @@ pub(crate) async fn lookup_command_receipt_tx(
     let Some((hash_bytes, status, resp_payload_id, sanitized_blob)) = raw else {
         return Ok(None);
     };
+    idemp.authorize_replay(tx, scope).await?;
     let arr: [u8; 32] = hash_bytes
         .try_into()
         .map_err(|_| internal_not_committed("corrupt_receipt_hash", "command_hash != 32B"))?;
@@ -2586,4 +2570,143 @@ async fn bump_space_seq_exact_tx(
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
     Ok(new_last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CanonicalConfig, CanonicalRuntime, CanonicalStore};
+    use notarium_core::{
+        epoch::DataRoot,
+        ids::{HistoryIncarnation, InstallationId, RequestId},
+        ports::Cancellation,
+    };
+
+    #[tokio::test]
+    async fn abandoned_admission_and_auxiliary_transactions_release_their_resources() {
+        let root =
+            std::env::temp_dir().join(crate::codec::new_prefixed_hex_id("writer-test-").unwrap());
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = CanonicalConfig::local_default(
+            InstallationId::from_bytes([1; 16]),
+            DataRoot::new(&root),
+        );
+        config.writer.mailbox_capacity = 1;
+        config.writer.max_staged_bytes = 1024;
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        let writer = store.inner.writer().unwrap();
+        let scope = HistoryScope {
+            space_id: SpaceId::from_bytes([2; 16]),
+            incarnation: HistoryIncarnation::from_bytes([3; 16]),
+        };
+        let budget = CallBudget {
+            request: RequestId::from_bytes([4; 16]),
+            remaining: Duration::from_secs(5),
+            cancellation: Cancellation::default(),
+        };
+        let occupied = writer
+            .sender_for_space(&store.inner, &scope.space_id)
+            .unwrap()
+            .reserve_owned()
+            .await
+            .unwrap();
+        let intent = || PreparedWriteIntent {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::ZERO,
+            idempotency: None,
+            source_note_ids: Vec::new(),
+            staged_bytes: 1024,
+            required_semantic_cut: None,
+            execute: Box::new(|_, _| Box::pin(async { panic!("unadmitted item executed") })),
+        };
+        {
+            let mut single = Box::pin(writer.submit_raw(&store.inner, &budget, intent()));
+            assert!(futures_util::poll!(&mut single).is_pending());
+            assert_eq!(writer.byte_limiter.in_flight.load(Ordering::Acquire), 1024);
+        }
+        assert_eq!(writer.byte_limiter.in_flight.load(Ordering::Acquire), 0);
+        {
+            let mut group = Box::pin(writer.submit_batch_raw(
+                &store.inner,
+                &budget,
+                &scope.space_id,
+                vec![intent()],
+            ));
+            assert!(futures_util::poll!(&mut group).is_pending());
+            assert_eq!(writer.byte_limiter.in_flight.load(Ordering::Acquire), 1024);
+        }
+        assert_eq!(writer.byte_limiter.in_flight.load(Ordering::Acquire), 0);
+        drop(occupied);
+
+        async fn setup(store: &CanonicalStore) -> Result<(), PortError> {
+            store.with_write_tx(|tx| Box::pin(async move {
+                let BackendConn::Sqlite(conn) = tx else { unreachable!() };
+                sqlx::raw_sql("CREATE TEMP TABLE parent (id INTEGER PRIMARY KEY);
+                    CREATE TEMP TABLE child (id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)")
+                    .execute(&mut **conn).await.unwrap();
+                Ok(())
+            })).await
+        }
+        setup(&store).await.unwrap();
+        let (sent, ack) = oneshot::channel();
+        let partial = store.with_write_tx(|tx| {
+            Box::pin(async move {
+                let BackendConn::Sqlite(conn) = tx else {
+                    unreachable!()
+                };
+                sqlx::query("INSERT INTO parent VALUES (1)")
+                    .execute(&mut **conn)
+                    .await
+                    .unwrap();
+                sent.send(()).unwrap();
+                std::future::pending::<Result<(), PortError>>().await
+            })
+        });
+        {
+            tokio::pin!(partial);
+            tokio::select! { _ = ack => {}, _ = &mut partial => panic!("partial write completed") }
+        }
+        let failed = store
+            .with_write_tx(|tx| {
+                Box::pin(async move {
+                    let BackendConn::Sqlite(conn) = tx else {
+                        unreachable!()
+                    };
+                    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM parent")
+                        .fetch_one(&mut **conn)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        count, 0,
+                        "cancelled operation must roll back before the next writer"
+                    );
+                    sqlx::query("INSERT INTO child VALUES (7)")
+                        .execute(&mut **conn)
+                        .await
+                        .unwrap();
+                    Ok(())
+                })
+            })
+            .await;
+        assert!(failed.is_err(), "deferred foreign key must fail at commit");
+        store
+            .with_write_tx(|tx| {
+                Box::pin(async move {
+                    let BackendConn::Sqlite(conn) = tx else {
+                        unreachable!()
+                    };
+                    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM child")
+                        .fetch_one(&mut **conn)
+                        .await
+                        .unwrap();
+                    assert_eq!(count, 0);
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        drop(store);
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

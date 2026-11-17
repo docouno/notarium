@@ -41,16 +41,26 @@ pub enum PgTransport {
     Tcp {
         host: String,
         port: u16,
-        require_tls: bool,
+        /// Optional PEM trust anchor for servers with a private CA.
+        root_cert: Option<PathBuf>,
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PgConnectConfig {
     pub transport: PgTransport,
     pub username: String,
     pub password: String,
     pub database: String,
+}
+
+impl std::fmt::Debug for PgConnectConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgConnectConfig")
+            .field("transport", &self.transport)
+            .field("database", &self.database)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]

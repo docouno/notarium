@@ -680,11 +680,18 @@ impl S3BlobStore {
             .await?;
 
         // Step 1: Write unconditional normal-object terminal marker (fences any future If-None-Match:* PUT).
-        self.put_terminal_marker(&target.physical_key, marker_bytes.clone())
+        let marker_version = self
+            .put_terminal_marker(&target.physical_key, marker_bytes.clone())
             .await?;
 
         match self.bucket_mode {
             S3BucketMode::NeverVersioned => {
+                if marker_version.is_some() {
+                    return Err(internal_not_committed(
+                        "s3_bucket_mode_drift",
+                        "versioned marker on a NeverVersioned bucket",
+                    ));
+                }
                 // Verify origin GET returns the terminal marker (never data bytes or 404).
                 let head_bytes = self.get_object_bytes(&target.physical_key, None).await?;
                 if !TerminalMarkerMeta::is_terminal_marker(&head_bytes) {
@@ -695,6 +702,7 @@ impl S3BlobStore {
                     ));
                 }
 
+                self.verify_runtime_bucket_mode().await?;
                 let scope_done = scope.clone();
                 let ret_done = retirement_id.to_owned();
                 let pub_done = target.publication_id.clone();
@@ -829,6 +837,7 @@ impl S3BlobStore {
                     ));
                 }
 
+                self.verify_runtime_bucket_mode().await?;
                 let scope_done = scope.clone();
                 let ret_done = retirement_id.to_owned();
                 let pub_done = target.publication_id.clone();
@@ -856,7 +865,7 @@ impl S3BlobStore {
         &self,
         physical_key: &str,
         marker_bytes: Bytes,
-    ) -> Result<(), PortError> {
+    ) -> Result<Option<String>, PortError> {
         let resp = self
             .transport
             .send(S3RawRequest {
@@ -878,7 +887,7 @@ impl S3BlobStore {
                 Duration::from_millis(50),
             ));
         }
-        Ok(())
+        Ok(resp.version_id())
     }
 
     async fn get_object_bytes(
@@ -916,10 +925,10 @@ impl S3BlobStore {
         physical_key: &str,
         version_id: &str,
     ) -> Result<(), PortError> {
-        if version_id.is_empty() || version_id == "null" {
+        if version_id.is_empty() {
             return Err(internal_not_committed(
                 "s3_invalid_exact_version_delete",
-                "refusing S3 DeleteObject without a concrete non-null versionId",
+                "refusing S3 DeleteObject without an explicit versionId",
             ));
         }
         let resp = self
@@ -1243,7 +1252,12 @@ fn parse_list_object_versions_xml(xml: &str) -> Result<ParsedVersionsPage, PortE
                     let key = cur_key.take().ok_or_else(|| {
                         internal_not_committed("s3_versions_xml_missing_key", "entry missing Key")
                     })?;
-                    let version_id = cur_vid.take().unwrap_or_else(|| "null".to_owned());
+                    let version_id = cur_vid.take().filter(|v| !v.is_empty()).ok_or_else(|| {
+                        internal_not_committed(
+                            "s3_versions_xml_missing_id",
+                            "entry missing VersionId",
+                        )
+                    })?;
                     entries.push(S3ObjectVersionEntry {
                         key,
                         version_id,

@@ -93,7 +93,7 @@ impl Worker {
                 Source::Sqlite(Box::new(SqliteCut::prepare(source, &path, &self.session)?))
             }
             Backend::Postgres { pool, .. } => {
-                Source::Postgres(PostgresCut::prepare(pool, &self.session).await?)
+                Source::Postgres(PostgresCut::prepare(pool, &self.session, &self.witness).await?)
             }
         });
         self.session.check()?;
@@ -148,19 +148,14 @@ impl Worker {
         if !matches!(self.phase, Phase::Paused | Phase::Pinned) {
             return Err(failure());
         }
-        let unlocked_conn = if let Some(Source::Postgres(source)) = &mut self.source {
-            Some(source.unlock().await?)
-        } else {
-            None
-        };
+        if let Some(Source::Postgres(source)) = &mut self.source {
+            source.unlock().await?;
+        }
         if let Some(fence) = self.file_pause.take() {
             fence.release()?;
         }
         self.local_pause.take();
         self.metrics.pause = self.pause_started.ok_or_else(failure)?.elapsed();
-        if let Some(connection) = unlocked_conn {
-            PostgresCut::close_unlocked_connection(connection).await?;
-        }
         if self.phase == Phase::Paused {
             // A coordinator may resume after another participant fails before pin.
             self.close_source().await?;

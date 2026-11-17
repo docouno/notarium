@@ -26,9 +26,10 @@ use notarium_canonical::{
 use notarium_core::{
     auth::SpaceKind,
     error::{PortError, ValidationReason},
-    ids::{LeaseEpoch, SpaceSeq},
+    ids::{LeaseEpoch, NoteId, SpaceSeq},
     model::HistoryScope,
-    ports::ServicePurpose,
+    ports::{ChangeBroadcast, ChangeRead, ChangeReadResult, EntityId, PageLimit, ServicePurpose},
+    receipt::ChangeCursor,
 };
 
 use crate::support::{
@@ -47,6 +48,7 @@ struct AuditingFaultS3Transport {
     unversioned_cas_deletes: AtomicUsize,
     strip_if_none_match: AtomicBool,
     drop_next_cas_put_response: AtomicBool,
+    versioning_on_next_marker: Mutex<Option<notarium_canonical::S3Config>>,
     recorded_cas_put_keys: Mutex<Vec<String>>,
 }
 
@@ -59,6 +61,7 @@ impl AuditingFaultS3Transport {
             unversioned_cas_deletes: AtomicUsize::new(0),
             strip_if_none_match: AtomicBool::new(false),
             drop_next_cas_put_response: AtomicBool::new(false),
+            versioning_on_next_marker: Mutex::new(None),
             recorded_cas_put_keys: Mutex::new(Vec::new()),
         })
     }
@@ -95,6 +98,12 @@ impl S3Transport for AuditingFaultS3Transport {
 
             if is_cas_key && req.method == Method::PUT {
                 let is_marker = TerminalMarkerMeta::is_terminal_marker(&req.body);
+                if is_marker {
+                    let change = self.versioning_on_next_marker.lock().unwrap().take();
+                    if let Some(cfg) = change {
+                        admin_set_bucket_versioning(&cfg, "Enabled").await?;
+                    }
+                }
                 let has_if_none_match = req
                     .headers
                     .iter()
@@ -111,7 +120,7 @@ impl S3Transport for AuditingFaultS3Transport {
                 let has_vid = req
                     .query
                     .iter()
-                    .any(|(qk, qv)| qk == "versionId" && !qv.is_empty() && qv != "null");
+                    .any(|(qk, qv)| qk == "versionId" && !qv.is_empty());
                 if !has_vid {
                     self.unversioned_cas_deletes.fetch_add(1, Ordering::SeqCst);
                 }
@@ -170,6 +179,89 @@ fn deterministic_large_payload(len: usize, tag: u8) -> Vec<u8> {
 async fn run_cas_roundtrip_and_refcount_suite(store: &CanonicalStore, seed: u8) {
     let (scope, epoch) = init_test_space(store, seed).await;
 
+    let (other_scope, _) = init_test_space(store, seed + 100).await;
+    let ticket = store
+        .stage_blob(&scope, epoch, &store.prepare_blob(b"scoped claim").unwrap())
+        .await
+        .unwrap();
+    let misplaced = store
+        .commit_blob_reference_claim(
+            &other_scope,
+            epoch,
+            BlobReferenceClaim {
+                owner_kind: BlobOwnerKind::AbilityResource,
+                owner_id: notarium_core::ids::AbilityId::from_bytes([seed; 16]).to_string(),
+                owner_rev_id: "resource-revision".into(),
+                resource_key: "readme".into(),
+                ticket: ticket.clone(),
+            },
+            None,
+            None,
+        )
+        .await;
+    assert!(matches!(
+        misplaced,
+        Err(PortError::Domain(
+            notarium_core::DomainError::ResourceNotFound
+        ))
+    ));
+    assert_eq!(
+        store
+            .get_space(&other_scope.space_id)
+            .await
+            .unwrap()
+            .last_seq,
+        SpaceSeq::ZERO
+    );
+    let ability = notarium_core::ids::AbilityId::from_bytes([seed; 16]);
+    store
+        .commit_blob_reference_claim(
+            &scope,
+            epoch,
+            BlobReferenceClaim {
+                owner_kind: BlobOwnerKind::AbilityResource,
+                owner_id: ability.to_string(),
+                owner_rev_id: "resource-revision".into(),
+                resource_key: "readme".into(),
+                ticket,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let before = store.get_space(&scope.space_id).await.unwrap().last_seq;
+    assert!(
+        store
+            .release_blob_owner_references(&scope, epoch, BlobOwnerKind::AbilityResource, "absent")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.get_space(&scope.space_id).await.unwrap().last_seq,
+        before
+    );
+    let ChangeReadResult::Log(page) = store
+        .catch_up(
+            maintenance_ctx(ServicePurpose::Projection),
+            ChangeRead::Log {
+                after: ChangeCursor {
+                    scope: scope.clone(),
+                    after: SpaceSeq::ZERO,
+                },
+                through: before,
+                limit: PageLimit::new(8).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected a change log page")
+    };
+    assert_eq!(page.changes.len(), 1);
+    assert_eq!(page.changes[0].entity, EntityId::Ability(ability));
+
     // 1. Empty 0B frame, 511B/512B/513B boundaries, and >4 MiB (9 MiB = 3 S3ChunkedV1 parts).
     let payloads: Vec<(&str, Vec<u8>)> = vec![
         ("empty_0b", Vec::new()),
@@ -182,12 +274,16 @@ async fn run_cas_roundtrip_and_refcount_suite(store: &CanonicalStore, seed: u8) 
         ),
     ];
 
-    for (label, raw) in &payloads {
+    for (idx, (label, raw)) in payloads.iter().enumerate() {
         let prepared = store.prepare_blob(raw).expect("prepare blob");
         let expected_digest =
             notarium_core::ids::ContentDigest::from_bytes(*blake3::hash(raw).as_bytes());
-        assert_eq!(prepared.digest, expected_digest, "{label} digest mismatch");
-        assert_eq!(prepared.raw_size, raw.len() as u64);
+        assert_eq!(
+            prepared.digest(),
+            expected_digest,
+            "{label} digest mismatch"
+        );
+        assert_eq!(prepared.raw_size(), raw.len() as u64);
 
         let ticket = store
             .stage_blob(&scope, epoch, &prepared)
@@ -200,7 +296,7 @@ async fn run_cas_roundtrip_and_refcount_suite(store: &CanonicalStore, seed: u8) 
                 epoch,
                 BlobReferenceClaim {
                     owner_kind: BlobOwnerKind::NoteRevision,
-                    owner_id: format!("note_{label}"),
+                    owner_id: NoteId::from_bytes([idx as u8; 16]).to_string(),
                     owner_rev_id: format!("rev_{label}_1"),
                     resource_key: "carrier".to_owned(),
                     ticket,
@@ -221,10 +317,10 @@ async fn run_cas_roundtrip_and_refcount_suite(store: &CanonicalStore, seed: u8) 
     // 2. Concurrent duplicate writers + shared refcount preservation + retirement when refs reach 0.
     let shared_payload = deterministic_large_payload(64 * 1024, 42);
     let shared_prepared = store.prepare_blob(&shared_payload).unwrap();
-    let shared_digest = shared_prepared.digest;
+    let shared_digest = shared_prepared.digest();
 
     let mut handles = Vec::new();
-    for idx in 0..8usize {
+    for idx in 0..8u8 {
         let st = store.clone();
         let sc = scope.clone();
         let prep = shared_prepared.clone();
@@ -238,7 +334,7 @@ async fn run_cas_roundtrip_and_refcount_suite(store: &CanonicalStore, seed: u8) 
                 epoch,
                 BlobReferenceClaim {
                     owner_kind: BlobOwnerKind::NoteRevision,
-                    owner_id: format!("shared_owner_{idx}"),
+                    owner_id: NoteId::from_bytes([100 + idx; 16]).to_string(),
                     owner_rev_id: format!("rev_{idx}"),
                     resource_key: "carrier".to_owned(),
                     ticket,
@@ -255,13 +351,13 @@ async fn run_cas_roundtrip_and_refcount_suite(store: &CanonicalStore, seed: u8) 
     }
 
     // Release 7 of the 8 owners; shared digest still has 1 live ref -> retirement MUST keep it intact!
-    for idx in 0..7usize {
+    for idx in 0..7u8 {
         let zero = store
             .release_blob_owner_references(
                 &scope,
                 epoch,
                 BlobOwnerKind::NoteRevision,
-                &format!("shared_owner_{idx}"),
+                &NoteId::from_bytes([100 + idx; 16]).to_string(),
             )
             .await
             .unwrap();
@@ -291,7 +387,12 @@ async fn run_cas_roundtrip_and_refcount_suite(store: &CanonicalStore, seed: u8) 
 
     // Release final 8th owner -> ref_count drops to 0 -> retirement removes/fences it!
     let zero_final = store
-        .release_blob_owner_references(&scope, epoch, BlobOwnerKind::NoteRevision, "shared_owner_7")
+        .release_blob_owner_references(
+            &scope,
+            epoch,
+            BlobOwnerKind::NoteRevision,
+            NoteId::from_bytes([107; 16]).as_str(),
+        )
         .await
         .unwrap();
     assert_eq!(zero_final, vec![shared_digest]);
@@ -301,6 +402,17 @@ async fn run_cas_roundtrip_and_refcount_suite(store: &CanonicalStore, seed: u8) 
         .await
         .unwrap();
     assert_eq!(retired_ids.len(), 1);
+    assert!(
+        store
+            .retire_zero_ref_digests(&scope, epoch, &zero_final, RetirementReason::Gc, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .drive_retirement_to_completion(&scope, epoch, &retired_ids[0])
+        .await
+        .unwrap();
     assert!(
         matches!(
             store.read_verified_blob(&scope, shared_digest).await,
@@ -318,7 +430,7 @@ async fn l2_local_cas_sqlite_and_pg_parity_corruption_quarantine_and_symlinks() 
     let sqlite_root = TempDataRoot::new("l2-sqlite-local");
     let sqlite_cfg =
         CanonicalConfig::local_default(sample_installation_id(10), sqlite_root.data_root());
-    let (sqlite_store, sqlite_rt) = CanonicalRuntime::open(sqlite_cfg).await.unwrap();
+    let (sqlite_store, sqlite_rt) = CanonicalRuntime::open(sqlite_cfg.clone()).await.unwrap();
     run_cas_roundtrip_and_refcount_suite(&sqlite_store, 10).await;
 
     // Test corruption detection, missing file detection, quarantine resurrection, and symlink rejection.
@@ -332,7 +444,7 @@ async fn l2_local_cas_sqlite_and_pg_parity_corruption_quarantine_and_symlinks() 
             epoch,
             BlobReferenceClaim {
                 owner_kind: BlobOwnerKind::NoteRevision,
-                owner_id: "note_corrupt".to_owned(),
+                owner_id: NoteId::from_bytes([43; 16]).to_string(),
                 owner_rev_id: "rev_1".to_owned(),
                 resource_key: "carrier".to_owned(),
                 ticket,
@@ -343,7 +455,7 @@ async fn l2_local_cas_sqlite_and_pg_parity_corruption_quarantine_and_symlinks() 
         .await
         .unwrap();
 
-    let physical_path = sqlite_root.data_root().blob(&scope.space_id, prep.digest);
+    let physical_path = sqlite_root.data_root().blob(&scope.space_id, prep.digest());
     assert!(physical_path.exists());
 
     // Tamper physical .zst bytes -> read_verified_blob MUST fail closed!
@@ -351,7 +463,7 @@ async fn l2_local_cas_sqlite_and_pg_parity_corruption_quarantine_and_symlinks() 
     fs::write(&physical_path, b"corrupted-not-zstd").unwrap();
     assert!(
         sqlite_store
-            .read_verified_blob(&scope, prep.digest)
+            .read_verified_blob(&scope, prep.digest())
             .await
             .is_err(),
         "corrupted local .zst must fail verification"
@@ -361,12 +473,19 @@ async fn l2_local_cas_sqlite_and_pg_parity_corruption_quarantine_and_symlinks() 
     let _restaged = sqlite_store.stage_blob(&scope, epoch, &prep).await.unwrap();
     assert_eq!(
         sqlite_store
-            .read_verified_blob(&scope, prep.digest)
+            .read_verified_blob(&scope, prep.digest())
             .await
             .unwrap(),
         payload
     );
+    drop(_restaged);
     let quarantine_dir = sqlite_root.path().join("blobs/.quarantine");
+    let quarantined = quarantine_dir.join(format!(
+        "{}.{}.corrupt",
+        scope.space_id,
+        prep.digest().to_hex()
+    ));
+    assert!(quarantined.is_file());
     let quarantined_count = fs::read_dir(&quarantine_dir).unwrap().count();
     assert!(
         quarantined_count >= 1,
@@ -377,7 +496,7 @@ async fn l2_local_cas_sqlite_and_pg_parity_corruption_quarantine_and_symlinks() 
     fs::remove_file(&physical_path).unwrap();
     assert!(
         sqlite_store
-            .read_verified_blob(&scope, prep.digest)
+            .read_verified_blob(&scope, prep.digest())
             .await
             .is_err(),
         "missing physical local .zst must fail closed"
@@ -391,7 +510,7 @@ async fn l2_local_cas_sqlite_and_pg_parity_corruption_quarantine_and_symlinks() 
         std::os::unix::fs::symlink(&decoy, &physical_path).unwrap();
         assert!(
             sqlite_store
-                .read_verified_blob(&scope, prep.digest)
+                .read_verified_blob(&scope, prep.digest())
                 .await
                 .is_err(),
             "symlinked CAS blob must be rejected"
@@ -403,8 +522,40 @@ async fn l2_local_cas_sqlite_and_pg_parity_corruption_quarantine_and_symlinks() 
         fs::remove_file(&physical_path).unwrap();
     }
 
+    let zero = sqlite_store
+        .release_blob_owner_references(
+            &scope,
+            epoch,
+            BlobOwnerKind::NoteRevision,
+            NoteId::from_bytes([43; 16]).as_str(),
+        )
+        .await
+        .unwrap();
+    fs::create_dir(&physical_path).unwrap();
+    assert!(
+        sqlite_store
+            .retire_zero_ref_digests(&scope, epoch, &zero, RetirementReason::Gc, None)
+            .await
+            .is_err()
+    );
+    fs::remove_dir(&physical_path).unwrap();
+    fs::write(&physical_path, &good_compressed).unwrap();
     drop(sqlite_store);
     sqlite_rt.shutdown().await.unwrap();
+    let (recovered, runtime) = CanonicalRuntime::open(sqlite_cfg).await.unwrap();
+    assert_eq!(
+        recovered
+            .execute_diagnostic_read_sql_for_test(
+                None,
+                "SELECT COUNT(*) FROM blob_retirements WHERE status = 'pending'"
+            )
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(!physical_path.exists());
+    assert!(!quarantined.exists());
+    runtime.shutdown().await.unwrap();
 
     // 2. PostgreSQL 16 + Local CAS parity
     let fixtures = StorageTestFixtures::load_required();
@@ -488,7 +639,7 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
             s3_cfg.clone(),
         );
         let (store, rt) =
-            CanonicalRuntime::open_with_s3_transport(cfg, Some(audit_transport.clone()))
+            CanonicalRuntime::open_with_s3_transport(cfg.clone(), Some(audit_transport.clone()))
                 .await
                 .expect("open PG + MinIO CE canonical runtime");
 
@@ -514,7 +665,7 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
                 epoch1,
                 BlobReferenceClaim {
                     owner_kind: BlobOwnerKind::NoteRevision,
-                    owner_id: "lost_resp_owner".to_owned(),
+                    owner_id: NoteId::from_bytes([44; 16]).to_string(),
                     owner_rev_id: "rev_lost_1".to_owned(),
                     resource_key: "carrier".to_owned(),
                     ticket: lost_ticket,
@@ -526,7 +677,7 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
             .unwrap();
         assert_eq!(
             store
-                .read_verified_blob(&scope, lost_prep.digest)
+                .read_verified_blob(&scope, lost_prep.digest())
                 .await
                 .unwrap(),
             lost_payload
@@ -535,7 +686,7 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
         // 3. Registered-but-unsent part + delayed stale PUT before/after marker + takeover + same-digest restage!
         let secret_payload = deterministic_large_payload(5 * 1024 * 1024 + 128, 77 + mode_idx); // 2 parts!
         let secret_prep = store.prepare_blob(&secret_payload).unwrap();
-        assert_eq!(secret_prep.s3_parts.len(), 2);
+        assert_eq!(secret_prep.s3_parts().len(), 2);
 
         // Simulate a crashed staging attempt that registered publication + 2 parts in PG, uploaded part 0,
         // and NEVER uploaded part 1 (`upload_confirmed = 0`).
@@ -563,9 +714,9 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
                 ) VALUES ($1, $2, $3, $4, 0, NULL, 'open', 'staging', 1000)",
             )
             .bind(scope.space_id.as_str())
-            .bind(secret_prep.digest.as_bytes().as_slice())
-            .bind(secret_prep.raw_size as i64)
-            .bind(secret_prep.total_compressed_size as i64)
+            .bind(secret_prep.digest().as_bytes().as_slice())
+            .bind(secret_prep.raw_size() as i64)
+            .bind(secret_prep.compressed_size() as i64)
             .execute(&mut pg)
             .await
             .unwrap();
@@ -579,16 +730,16 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
             )
             .bind(scope.space_id.as_str())
             .bind(&manual_pub_id)
-            .bind(secret_prep.digest.as_bytes().as_slice())
-            .bind(secret_prep.raw_size as i64)
-            .bind(secret_prep.total_compressed_size as i64)
+            .bind(secret_prep.digest().as_bytes().as_slice())
+            .bind(secret_prep.raw_size() as i64)
+            .bind(secret_prep.compressed_size() as i64)
             .execute(&mut pg)
             .await
             .unwrap();
 
             for (part, key) in [
-                (&secret_prep.s3_parts[0], &part0_key),
-                (&secret_prep.s3_parts[1], &part1_key),
+                (&secret_prep.s3_parts()[0], &part0_key),
+                (&secret_prep.s3_parts()[1], &part1_key),
             ] {
                 sqlx::query(
                     "INSERT INTO blob_parts (
@@ -617,7 +768,7 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
                 key: Some(part0_key.clone()),
                 query: Vec::new(),
                 headers: vec![("if-none-match".to_owned(), "*".to_owned())],
-                body: Bytes::copy_from_slice(&secret_prep.s3_parts[0].compressed),
+                body: Bytes::copy_from_slice(&secret_prep.s3_parts()[0].compressed),
             })
             .await
             .unwrap();
@@ -638,7 +789,7 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
             .retire_zero_ref_digests(
                 &scope,
                 epoch2,
-                &[secret_prep.digest],
+                &[secret_prep.digest()],
                 RetirementReason::Purge,
                 None,
             )
@@ -653,7 +804,7 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
                 key: Some(part1_key.clone()),
                 query: Vec::new(),
                 headers: vec![("if-none-match".to_owned(), "*".to_owned())],
-                body: Bytes::copy_from_slice(&secret_prep.s3_parts[1].compressed),
+                body: Bytes::copy_from_slice(&secret_prep.s3_parts()[1].compressed),
             })
             .await
             .unwrap();
@@ -707,7 +858,8 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
             .await
             .expect("re-stage same digest after retirement");
         assert_ne!(
-            restaged_ticket.publication_id, manual_pub_id,
+            restaged_ticket.publication_id(),
+            manual_pub_id,
             "new lifetime of same digest must never reuse retired publication_id"
         );
         store
@@ -716,7 +868,7 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
                 epoch2,
                 BlobReferenceClaim {
                     owner_kind: BlobOwnerKind::NoteRevision,
-                    owner_id: "fresh_note_after_purge".to_owned(),
+                    owner_id: NoteId::from_bytes([45; 16]).to_string(),
                     owner_rev_id: "rev_fresh_1".to_owned(),
                     resource_key: "carrier".to_owned(),
                     ticket: restaged_ticket,
@@ -745,7 +897,7 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
         // New live publication remains 100% intact!
         assert_eq!(
             store
-                .read_verified_blob(&scope, secret_prep.digest)
+                .read_verified_blob(&scope, secret_prep.digest())
                 .await
                 .unwrap(),
             secret_payload
@@ -787,8 +939,69 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
             );
         }
 
-        drop(store);
-        rt.shutdown().await.unwrap();
+        if expected_mode == S3BucketMode::NeverVersioned {
+            let zero = store
+                .release_blob_owner_references(
+                    &scope,
+                    epoch2,
+                    BlobOwnerKind::NoteRevision,
+                    NoteId::from_bytes([44; 16]).as_str(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(zero, vec![lost_prep.digest()]);
+            *audit_transport.versioning_on_next_marker.lock().unwrap() = Some(s3_cfg.clone());
+            assert!(
+                store
+                    .retire_zero_ref_digests(&scope, epoch2, &zero, RetirementReason::Gc, None)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .execute_diagnostic_read_sql_for_test(
+                        None,
+                        "SELECT COUNT(*) FROM blob_retirements WHERE status = 'pending'"
+                    )
+                    .await
+                    .unwrap(),
+                1
+            );
+            drop(store);
+            rt.shutdown().await.unwrap();
+            let (reopened, runtime) =
+                CanonicalRuntime::open_with_s3_transport(cfg, Some(audit_transport.clone()))
+                    .await
+                    .unwrap();
+            reopened
+                .advance_space_lease(
+                    &maintenance_ctx(ServicePurpose::Revocation),
+                    &scope,
+                    epoch2.checked_next().unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened
+                    .execute_diagnostic_read_sql_for_test(
+                        None,
+                        "SELECT COUNT(*) FROM blob_retirements WHERE status = 'pending'"
+                    )
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                audit_transport
+                    .unversioned_cas_deletes
+                    .load(Ordering::SeqCst),
+                0
+            );
+            runtime.shutdown().await.unwrap();
+        } else {
+            drop(store);
+            rt.shutdown().await.unwrap();
+        }
         fixtures.drop_pg_schema(&pg_schema).await;
     }
 }

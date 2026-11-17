@@ -9,6 +9,9 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 notarium-core = { workspace = true }
 notarium-syntax = { workspace = true }
@@ -40,4 +43,5 @@ cap-std = { workspace = true }
 time = { workspace = true }
 
 [dev-dependencies]
+notarium-canonical = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }

@@ -10,11 +10,19 @@ use crate::{
 };
 use notarium_core::{
     error::{CommitEffect, PortError},
-    ids::InstallationId,
     ports::BackupWitness,
 };
-use sqlx::{PgPool, Postgres, pool::PoolConnection, postgres::PgPoolOptions};
+use sqlx::{Executor, PgPool, Postgres, pool::PoolConnection, postgres::PgPoolOptions};
 use std::{io::Write, time::Duration};
+const LOCK_SQL: &str = "SELECT pg_advisory_lock($1)";
+const UNLOCK_SQL: &str = "SELECT pg_advisory_unlock($1)";
+const PIN_SQL: &str =
+    "SELECT k.key_id,k.key_hash,k.generation,k.state,k.canary,k.created_at,k.retired_at
+    FROM v1_control.secret_keyring k
+    WHERE k.retired_at IS NULL AND EXISTS (
+        SELECT 1 FROM v1_control.v1_storage_epoch
+        WHERE singleton=1 AND epoch_version=$1 AND state='ready' AND installation_id=$2)
+    ORDER BY k.generation LIMIT 4097";
 const CLEANUP_GRACE: Duration = Duration::from_secs(5);
 pub(crate) struct PostgresCut {
     pool: PgPool,
@@ -24,7 +32,11 @@ pub(crate) struct PostgresCut {
     locked: bool,
 }
 impl PostgresCut {
-    pub(crate) async fn prepare(parent: &PgPool, session: &Session) -> Result<Self, PortError> {
+    pub(crate) async fn prepare(
+        parent: &PgPool,
+        session: &Session,
+        expected: &BackupWitness,
+    ) -> Result<Self, PortError> {
         // Never return a session-level advisory lock or backup-specific timeouts to
         // the ordinary request pool. Closing this private pool also waits for SQLx
         // owners created by cancellation of BEGIN to relinquish their connections.
@@ -39,14 +51,18 @@ impl PostgresCut {
             tx: None,
             locked: false,
         };
-        let result = value.prepare_connections(session).await;
+        let result = value.prepare_connections(session, expected).await;
         if let Err(error) = result {
             value.close().await?;
             return Err(error);
         }
         Ok(value)
     }
-    async fn prepare_connections(&mut self, session: &Session) -> Result<(), PortError> {
+    async fn prepare_connections(
+        &mut self,
+        session: &Session,
+        expected: &BackupWitness,
+    ) -> Result<(), PortError> {
         self.lock = Some(
             session
                 .operation
@@ -77,14 +93,43 @@ impl PostgresCut {
     Ok(())
    },CommitEffect::NotCommitted).await?;
         }
-        // Prepare and warm source metadata outside the measured pause. This is an
-        // ordinary autocommit read; no source transaction exists yet.
-        session.operation.run(async{
-            let conn = self.source.as_mut().ok_or_else(failure)?;
-            sqlx::query("SELECT epoch_version,state,installation_id FROM v1_control.v1_storage_epoch WHERE singleton=1").fetch_optional(&mut **conn).await.map_err(database)?;
-            sqlx::query("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM v1_control.secret_keyring WHERE retired_at IS NULL ORDER BY generation LIMIT 4097").fetch_all(&mut **conn).await.map_err(database)?;
-            Ok(())
-        },CommitEffect::NotCommitted).await
+        session
+            .operation
+            .run(
+                async {
+                    let lock = self.lock.as_mut().ok_or_else(failure)?;
+                    lock.prepare(sqlx::SqlStr::from_static(LOCK_SQL))
+                        .await
+                        .map_err(database)?;
+                    lock.prepare(sqlx::SqlStr::from_static(UNLOCK_SQL))
+                        .await
+                        .map_err(database)?;
+                    let mut source = self.source.take().ok_or_else(failure)?;
+                    // Parse/Describe alone does not produce a reusable executor
+                    // plan. Execute the same statement before the snapshot begins.
+                    sqlx::raw_sql("SET plan_cache_mode TO force_generic_plan")
+                        .execute(&mut *source).await.map_err(database)?;
+                    sqlx::query(PIN_SQL)
+                        .bind(i64::from(TARGET_SCHEMA_VERSION))
+                        .bind(expected.installation.as_str())
+                        .execute(&mut *source).await.map_err(database)?;
+                    // PostgreSQL takes the RR snapshot on its first data query. Until pin()
+                    // executes PIN_SQL, this idle transaction has no snapshot or backend_xmin.
+                    self.tx = Some(Transaction::Postgres(
+                        sqlx::Transaction::begin(
+                            source,
+                            Some(sqlx::SqlStr::from_static(
+                                "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+                            )),
+                        )
+                        .await
+                        .map_err(database)?,
+                    ));
+                    Ok(())
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await
     }
     pub(crate) async fn pause(&mut self, session: &Session) -> Result<(), PortError> {
         session.check()?;
@@ -93,7 +138,7 @@ impl PostgresCut {
             .operation
             .run(
                 async {
-                    sqlx::query("SELECT pg_advisory_lock($1)")
+                    sqlx::query(LOCK_SQL)
                         .bind(BACKUP_LOCK)
                         .execute(&mut **connection)
                         .await
@@ -112,79 +157,51 @@ impl PostgresCut {
         keys: &[KeyringWitness],
         session: &Session,
     ) -> Result<BackupWitness, PortError> {
-        if !self.locked || self.tx.is_some() {
+        if !self.locked || keys.is_empty() {
             return Err(failure());
         }
-        let source = self.source.take().ok_or_else(failure)?;
-        self.tx = Some(Transaction::Postgres(
-            session
-                .operation
-                .run(
-                    async {
-                        sqlx::Transaction::begin(
-                            source,
-                            Some(sqlx::SqlStr::from_static(
-                                "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
-                            )),
-                        )
-                        .await
-                        .map_err(database)
-                    },
-                    CommitEffect::NotCommitted,
-                )
-                .await?,
-        ));
         let Transaction::Postgres(tx) = self.tx.as_mut().ok_or_else(failure)? else {
             return Err(failure());
         };
         // Start age conservatively before the real pin request, not when its reply
         // reaches the caller. No SELECT 1 or lock acquisition substitutes for this read.
         session.mark_pinned()?;
-        let (version,state,installation):(i64,String,String)=session.operation.run(async{sqlx::query_as("SELECT epoch_version,state,installation_id FROM v1_control.v1_storage_epoch WHERE singleton=1").fetch_one(&mut **tx).await.map_err(database)},CommitEffect::NotCommitted).await?;
-        if version != i64::from(TARGET_SCHEMA_VERSION)
-            || state != "ready"
-            || InstallationId::parse(&installation)? != expected.installation
-        {
-            return Err(failure());
-        }
-        let rows:Vec<SecretKeyringRow>=session.operation.run(async{sqlx::query_as("SELECT key_id,key_hash,generation,state,canary,created_at,retired_at FROM v1_control.secret_keyring WHERE retired_at IS NULL ORDER BY generation LIMIT 4097").fetch_all(&mut **tx).await.map_err(database)},CommitEffect::NotCommitted).await?;
+        // inspect() requires one active key. A missing or mismatched epoch therefore
+        // yields no rows and cannot be mistaken for a matching keyring.
+        let rows: Vec<SecretKeyringRow> = session
+            .operation
+            .run(
+                async {
+                    sqlx::query_as(PIN_SQL)
+                        .bind(i64::from(TARGET_SCHEMA_VERSION))
+                        .bind(expected.installation.as_str())
+                        .fetch_all(&mut **tx)
+                        .await
+                        .map_err(database)
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
         if rows.len() != keys.len() || !rows.iter().zip(keys).all(|(row, key)| key.matches(row)) {
             return Err(failure());
         }
         Ok(expected.clone())
     }
-    pub(crate) async fn unlock(&mut self) -> Result<PoolConnection<Postgres>, PortError> {
-        let Some(mut connection) = self.lock.take() else {
-            return Err(failure());
-        };
-        let unlocked = tokio::time::timeout(CLEANUP_GRACE, async {
-            sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+    pub(crate) async fn unlock(&mut self) -> Result<(), PortError> {
+        let connection = self.lock.as_mut().ok_or_else(failure)?;
+        let unlocked = tokio::time::timeout(
+            CLEANUP_GRACE,
+            sqlx::query_scalar::<_, bool>(UNLOCK_SQL)
                 .bind(BACKUP_LOCK)
-                .fetch_one(&mut *connection)
-                .await
-                .map_err(database)
-        })
+                .fetch_one(&mut **connection),
+        )
         .await;
-        match unlocked {
-            Ok(Ok(true)) => {
-                self.locked = false;
-                Ok(connection)
-            }
-            _ => {
-                let _ = tokio::time::timeout(CLEANUP_GRACE, connection.close()).await;
-                self.locked = false;
-                Err(failure())
-            }
+        if !matches!(unlocked, Ok(Ok(true))) {
+            return Err(failure());
         }
-    }
-    pub(crate) async fn close_unlocked_connection(
-        connection: PoolConnection<Postgres>,
-    ) -> Result<(), PortError> {
-        tokio::time::timeout(CLEANUP_GRACE, async {
-            connection.close().await.map_err(database)
-        })
-        .await
-        .unwrap_or_else(|_| Err(failure()))
+        self.locked = false;
+        // Keep the unlocked private socket with the snapshot until close().
+        Ok(())
     }
     pub(crate) async fn spool<W: Write>(
         &mut self,
@@ -256,7 +273,7 @@ impl PostgresCut {
         }
         if let Some(mut lock) = self.lock.take() {
             if self.locked {
-                let unlock = sqlx::query("SELECT pg_advisory_unlock($1)")
+                let unlock = sqlx::query(UNLOCK_SQL)
                     .bind(BACKUP_LOCK)
                     .execute(&mut *lock)
                     .await

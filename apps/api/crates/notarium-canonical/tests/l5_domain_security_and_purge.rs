@@ -2,7 +2,14 @@
 
 mod support;
 
-use std::collections::{BTreeMap, BTreeSet};
+use notarium_canonical::blobs::s3::{ReqwestS3Transport, S3RawRequest, S3RawResponse, S3Transport};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use notarium_canonical::{
     CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec,
@@ -148,7 +155,35 @@ async fn seed_default_space(
     (rec.scope, root_folder_id)
 }
 
-async fn run_domain_and_security_suite(store: &CanonicalStore) {
+/// Stops one real object GET after receiving its bytes, before the reader can return them.
+#[derive(Debug)]
+struct PausedObjectRead {
+    transport: ReqwestS3Transport,
+    armed: AtomicBool,
+    received: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+impl S3Transport for PausedObjectRead {
+    fn send<'a>(
+        &'a self,
+        request: S3RawRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<S3RawResponse, PortError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let object_get = request.method == http::Method::GET && request.key.is_some();
+            let response = self.transport.send(request).await?;
+            if object_get && self.armed.swap(false, Ordering::SeqCst) {
+                self.received.notify_one();
+                self.resume.notified().await;
+            }
+            Ok(response)
+        })
+    }
+}
+
+async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&PausedObjectRead>) {
     let owner = sample_principal_id(10);
     let viewer = sample_principal_id(11);
     let (scope, _root_folder) = seed_default_space(
@@ -404,6 +439,69 @@ async fn run_domain_and_security_suite(store: &CanonicalStore) {
         .await
         .expect("read note_1 updated_seq");
 
+    for (id, parent) in [(91, None), (92, Some(proj_a.clone()))] {
+        let note = sample_note_id(id);
+        store
+            .create_note(
+                ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        note: note.clone(),
+                        parent: parent.clone(),
+                        slug: format!("parent-{id}"),
+                        class: DocClass::UserDoc,
+                        carrier: format!("# Parent {id}\n"),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let snapshot = store
+            .get_note(
+                ctx.clone(),
+                GetNote {
+                    note: note.clone(),
+                    revision: None,
+                    causal: CausalBasis::Exact(ReceiptSet::default()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.parent, parent);
+        let ChangeReadResult::Seed(seed) = store
+            .read_changes(
+                ctx.clone(),
+                ChangeRead::Seed {
+                    scope: scope.clone(),
+                    cutoff: None,
+                    limit: PageLimit::new(20).unwrap(),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected seed")
+        };
+        assert_eq!(
+            seed.notes
+                .iter()
+                .find(|item| item.document.reference().note_id == note)
+                .unwrap()
+                .parent,
+            parent
+        );
+        assert_eq!(
+            seed.notes
+                .iter()
+                .find(|item| item.document.reference().note_id == note_1)
+                .unwrap()
+                .parent,
+            Some(sub_folder.clone())
+        );
+    }
+
     // Move `docs_folder` under `archive_root`: O(1) folder head update, 0 descendant note_heads writes!
     store
         .move_folder(
@@ -435,6 +533,60 @@ async fn run_domain_and_security_suite(store: &CanonicalStore) {
         note_1_updated_seq_before_folder_move, note_1_updated_seq_after_folder_move,
         "moving ancestor folder must rewrite 0 descendant note_heads rows"
     );
+
+    // The note has not changed. Its ancestors and path at the old cut still belong to alpha.
+    let cut = SnapshotCut {
+        scope: scope.clone(),
+        generation: ProjectionGeneration::new(1).unwrap(),
+        canonical_seq: c1.receipt.seq(),
+        projected_seq: c1.receipt.seq(),
+    };
+    let historical = store
+        .hydrate_cards(ctx.clone(), cut.clone(), vec![note_1.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        historical[0].as_ref().unwrap().path,
+        "alpha-prime/docs/specs/arch-overview.md"
+    );
+    for root in [&proj_a, &archive_root] {
+        let pinned = make_human_ctx(
+            &scope,
+            owner.clone(),
+            SpaceGrant {
+                role: SpaceRole::Viewer,
+                read_classes: DocClass::all(),
+                write_classes: BTreeSet::new(),
+                project_root: Some(root.clone()),
+            },
+            false,
+            false,
+        );
+        let cards = store
+            .hydrate_cards(pinned.clone(), cut.clone(), vec![note_1.clone()])
+            .await
+            .unwrap();
+        assert!(cards[0].is_none());
+        let ChangeReadResult::Seed(seed) = store
+            .read_changes(
+                pinned,
+                ChangeRead::Seed {
+                    scope: scope.clone(),
+                    cutoff: Some(cut.canonical_seq),
+                    limit: PageLimit::new(20).unwrap(),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected seed")
+        };
+        assert!(
+            seed.notes
+                .iter()
+                .all(|note| note.document.reference().note_id != note_1)
+        );
+    }
 
     // Folder alias under old parent `proj_a` resolves to `docs_folder`, and rename_folder records alias too.
     let resolved_moved_folder = store
@@ -851,27 +1003,19 @@ async fn run_domain_and_security_suite(store: &CanonicalStore) {
     );
 
     // 6. `append_memory`, `link` & `link_many`, `accept_external_observation`, `update_space_schema`.
-    let mem_note = sample_note_id(25);
-    store
-        .create_note(
-            ctx.clone(),
-            next_mutation(
-                &scope,
-                &owner,
-                CreateNote {
-                    note: mem_note.clone(),
-                    parent: Some(proj_a.clone()),
-                    slug: "project-memory".to_owned(),
-                    class: DocClass::AgentMemory,
-                    carrier:
-                        "---\nclass: agent-memory\ntitle: Project Memory\n---\n# Project Memory\n"
-                            .to_owned(),
-                },
-            ),
-        )
-        .await
-        .expect("create AgentMemory note");
-
+    let memory = notarium_core::ports::ControlCatalogPort::resolve_or_ensure_memory_target(
+        store,
+        notarium_core::ports::AccountContext::new(ctx.auth().clone(), ctx.budget.clone()),
+        MemoryTarget::Project {
+            folder: FolderRef {
+                space_id: scope.space_id.clone(),
+                folder_id: proj_a.clone(),
+            },
+        },
+        "architecture".to_owned(),
+    )
+    .await
+    .expect("resolve project memory");
     store
         .append_memory(
             ctx.clone(),
@@ -879,19 +1023,7 @@ async fn run_domain_and_security_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 AppendMemory {
-                    target: ResolvedMemoryTarget {
-                        target: MemoryTarget::Project {
-                            folder: FolderRef {
-                                space_id: scope.space_id.clone(),
-                                folder_id: proj_a.clone(),
-                            },
-                        },
-                        note: NoteRef {
-                            space_id: scope.space_id.clone(),
-                            note_id: mem_note.clone(),
-                        },
-                        category: "Architecture".to_owned(),
-                    },
+                    target: memory,
                     text: "Canonical store owns CAS references.".to_owned(),
                 },
             ),
@@ -1290,7 +1422,7 @@ async fn run_domain_and_security_suite(store: &CanonicalStore) {
         .read_ability_resource(
             ctx.clone(),
             ReadAbilityResource {
-                ability: ability_id,
+                ability: ability_id.clone(),
                 package_revision: pkg_v2.value.revision,
                 resource: AbilityResourceName::Auxiliary("scripts/helper.py".to_owned()),
             },
@@ -1332,11 +1464,36 @@ async fn run_domain_and_security_suite(store: &CanonicalStore) {
         .await;
     assert!(viewer_write.is_err(), "Viewer must not create notes");
 
+    let replay_note = sample_note_id(92);
+    let create_again = next_mutation(&scope,&owner,CreateNote {
+        note: replay_note.clone(), parent: Some(proj_a.clone()), slug: "receipt-authority".into(),
+        class: DocClass::UserDoc, carrier: "# Receipt authority\n".into(),
+    });
+    let original = store.create_note(ctx.clone(),create_again.clone()).await.unwrap();
+    let rename_again = next_mutation(&scope,&owner,RenameNote {
+        note: replay_note.clone(), slug: "receipt-authority-updated".into(), title: Some("Updated".into()),
+    });
+    let renamed = store.rename_note(ctx.clone(),rename_again.clone()).await.unwrap();
+    assert_eq!(store.create_note(ctx.clone(),create_again.clone()).await.unwrap().receipt,original.receipt);
+    assert_eq!(store.rename_note(ctx.clone(),rename_again.clone()).await.unwrap().receipt,renamed.receipt);
+    let reduced = make_human_ctx(&scope,owner.clone(),SpaceGrant {
+        role: SpaceRole::Viewer, read_classes: DocClass::all(), write_classes: BTreeSet::new(), project_root: None,
+    },false,false);
+    assert!(matches!(store.create_note(reduced.clone(),create_again.clone()).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
+    assert!(matches!(store.rename_note(reduced,rename_again).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
+
     // Folder write lock blocks descendant writes until unlocked!
     store
         .set_folder_write_lock(ctx.clone(), proj_a.clone(), true)
         .await
         .expect("lock proj_a");
+    assert!(matches!(store.create_note(ctx.clone(),create_again).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
+    let schema_relocation = next_mutation(&scope,&owner,UpdateSpaceSchema {
+        schema_note: replay_note, parent: None, slug: "schema-relocation".into(),
+        carrier: "# Schema relocation\n".into(), schema: BTreeMap::new(),
+        expected_schema_revision: Some(schema_committed.value.schema_revision.clone()),
+    });
+    assert!(matches!(store.update_space_schema(ctx.clone(),schema_relocation.clone()).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
     let locked_write = store
         .create_note(
             ctx.clone(),
@@ -1378,6 +1535,9 @@ async fn run_domain_and_security_suite(store: &CanonicalStore) {
         false,
         false,
     );
+    let mut pinned_schema = schema_relocation;
+    pinned_schema.input.parent = Some(proj_a.clone());
+    assert!(matches!(store.update_space_schema(pinned_ctx.clone(),pinned_schema).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
     let outside_proj_write = store
         .create_note(
             pinned_ctx,
@@ -1459,6 +1619,221 @@ async fn run_domain_and_security_suite(store: &CanonicalStore) {
         ),
         "viewer without EncryptedNote/Skill read grant must not see protected classes in recent_activity"
     );
+
+    if let Some(gate) = gate {
+        let container = sample_folder_id(93);
+        store
+            .create_folder(CreateFolderSpec {
+                scope: scope.clone(),
+                active_epoch: epoch,
+                folder_id: container.clone(),
+                parent: Some(proj_a.clone()),
+                slug: "read-race".into(),
+                display_name: "Read race".into(),
+                is_project: false,
+                project_slug: None,
+                actor: owner.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+        store
+            .move_note(
+                ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    MoveNote {
+                        note: skill_entry_note.clone(),
+                        parent: Some(container.clone()),
+                        slug: "audit-skill".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let restricted = make_human_ctx(
+            &scope,
+            owner.clone(),
+            SpaceGrant {
+                role: SpaceRole::Viewer,
+                read_classes: DocClass::all(),
+                write_classes: BTreeSet::new(),
+                project_root: Some(proj_a.clone()),
+            },
+            false,
+            false,
+        );
+        #[derive(Clone, Copy, Debug)]
+        enum Reader {
+            Note,
+            Seed,
+            Ability,
+        }
+        for operation in [Reader::Note, Reader::Seed, Reader::Ability] {
+            gate.armed.store(true, Ordering::SeqCst);
+            let read = async {
+                match operation {
+                    Reader::Note => store
+                        .get_note(
+                            restricted.clone(),
+                            GetNote {
+                                note: skill_entry_note.clone(),
+                                revision: None,
+                                causal: CausalBasis::Exact(ReceiptSet::default()),
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    Reader::Seed => store
+                        .read_changes(
+                            restricted.clone(),
+                            ChangeRead::Seed {
+                                scope: scope.clone(),
+                                cutoff: None,
+                                limit: PageLimit::new(200).unwrap(),
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    Reader::Ability => store
+                        .read_ability_resource(
+                            restricted.clone(),
+                            ReadAbilityResource {
+                                ability: ability_id.clone(),
+                                package_revision: pkg_v1.value.revision.clone(),
+                                resource: AbilityResourceName::Auxiliary(
+                                    "scripts/helper.py".into(),
+                                ),
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                }
+            };
+            let move_while_reading = async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), gate.received.notified())
+                    .await
+                    .expect("CAS read must reach the barrier");
+                store
+                    .move_folder(
+                        ctx.clone(),
+                        next_mutation(
+                            &scope,
+                            &owner,
+                            MoveFolder {
+                                folder: container.clone(),
+                                new_parent: Some(archive_root.clone()),
+                            },
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                gate.resume.notify_one();
+            };
+            let (result, ()) = tokio::join!(read, move_while_reading);
+            assert!(
+                matches!(
+                    result,
+                    Err(PortError::Domain(DomainError::ResourceNotFound))
+                ),
+                "{operation:?}: {result:?}"
+            );
+            store
+                .move_folder(
+                    ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        MoveFolder {
+                            folder: container.clone(),
+                            new_parent: Some(proj_a.clone()),
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        // Only the doomed note is visible to this reader. Its S3 bytes are already
+        // in memory when purge commits, so CAS read failure cannot satisfy this test.
+        let isolated = sample_folder_id(94);
+        store
+            .create_folder(CreateFolderSpec {
+                scope: scope.clone(),
+                active_epoch: epoch,
+                folder_id: isolated.clone(),
+                parent: None,
+                slug: "purge-read-race".into(),
+                display_name: "Purge read race".into(),
+                is_project: true,
+                project_slug: Some("purge-read-race".into()),
+                actor: owner.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+        let doomed = sample_note_id(94);
+        let created = store
+            .create_note(
+                ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        note: doomed.clone(),
+                        parent: Some(isolated.clone()),
+                        slug: "purge-target".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "# Purge during seed\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let isolated_reader = make_human_ctx(
+            &scope,
+            owner.clone(),
+            SpaceGrant {
+                role: SpaceRole::Viewer,
+                read_classes: DocClass::all(),
+                write_classes: BTreeSet::new(),
+                project_root: Some(isolated),
+            },
+            false,
+            false,
+        );
+        gate.armed.store(true, Ordering::SeqCst);
+        let seed = store.read_changes(
+            isolated_reader,
+            ChangeRead::Seed {
+                scope: scope.clone(),
+                cutoff: Some(created.receipt.seq()),
+                limit: PageLimit::new(200).unwrap(),
+            },
+        );
+        let purge = async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), gate.received.notified())
+                .await
+                .expect("seed must load the note before purge");
+            store
+                .delete_note(
+                    ctx.clone(),
+                    next_mutation(
+                        &scope,
+                        &owner,
+                        DeleteNote {
+                            note: doomed,
+                            disposition: DeleteDisposition::Purge,
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+            gate.resume.notify_one();
+        };
+        let (result, ()) = tokio::join!(seed, purge);
+        assert_validation_err(&result, ValidationReason::CursorStale);
+    }
 }
 
 #[tokio::test]
@@ -1468,7 +1843,7 @@ async fn l5_domain_crud_batches_packages_and_security_parity() {
         let root = TempDataRoot::new("l5-domain-sqlite");
         let cfg = CanonicalConfig::local_default(sample_installation_id(1), root.data_root());
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
-        run_domain_and_security_suite(&store).await;
+        run_domain_and_security_suite(&store, None).await;
         runtime.shutdown().await.expect("shutdown sqlite");
     }
 
@@ -1481,9 +1856,17 @@ async fn l5_domain_crud_batches_packages_and_security_parity() {
         admin_ensure_bucket(&s3_cfg, Some("Enabled"))
             .await
             .expect("ensure versioned S3 bucket");
+        let gate = Arc::new(PausedObjectRead {
+            transport: ReqwestS3Transport::new(&s3_cfg).unwrap(),
+            armed: AtomicBool::new(false),
+            received: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
         let cfg = fixtures.pg_s3_config(sample_installation_id(2), &schema, s3_cfg);
-        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
-        run_domain_and_security_suite(&store).await;
+        let (store, runtime) = CanonicalRuntime::open_with_s3_transport(cfg, Some(gate.clone()))
+            .await
+            .expect("open pg+s3");
+        run_domain_and_security_suite(&store, Some(&gate)).await;
         runtime.shutdown().await.expect("shutdown pg+s3");
         fixtures.drop_pg_schema(&schema).await;
     }
@@ -1530,7 +1913,7 @@ async fn run_purge_and_mint_suite(
         .await
         .expect("create note_keep");
 
-    let note_purge = sample_note_id(72);
+    let note_purge = notarium_core::ids::NoteId::parse("Legacy_A0001").unwrap();
     let created_purge = store
         .create_note(
             ctx.clone(),
@@ -1548,6 +1931,26 @@ async fn run_purge_and_mint_suite(
         )
         .await
         .expect("create note_purge");
+
+    // Rank membership uses both ends of view:key:target. Legacy IDs are case-sensitive
+    // and an underscore is part of the identifier.
+    let neighbor_keys = ["LegacyXA0001:view:other", "other:view:legacy_A0001"];
+    let owned_keys = ["Legacy_A0001:view:other", "other:view:Legacy_A0001"];
+    for (i, key) in neighbor_keys.iter().chain(&owned_keys).enumerate() {
+        store
+            .execute_diagnostic_write_sql_for_test(&format!(
+                "INSERT INTO revisions (space_id,history_incarnation,rev_id,entity_type,entity_key,
+                space_seq,visibility_seq,metadata_msgpack,actor_id,created_at_sec,created_at_nsec)
+             SELECT space_id,history_incarnation,'{}','rank','{key}',space_seq,visibility_seq,
+                metadata_msgpack,actor_id,created_at_sec,created_at_nsec
+             FROM revisions WHERE space_id = '{}' AND rev_id = '{}'",
+                RevisionId::from_bytes([150 + i as u8; 16]),
+                scope.space_id,
+                created_purge.value.revision
+            ))
+            .await
+            .unwrap();
+    }
 
     // Advance `note_purge` to a unique secret revision + external observation row.
     let unique_secret = "---\ntitle: Secret Purge Target\n---\n# Secret Purge Target\n\nTOP_SECRET_PURGE_TOKEN_9911\n";
@@ -1631,6 +2034,15 @@ async fn run_purge_and_mint_suite(
         )
         .await
         .expect("Purge note_purge after hold release");
+
+    for (keys, count) in [(&neighbor_keys, 1), (&owned_keys, 0)] {
+        for key in keys {
+            assert_eq!(store.execute_diagnostic_read_sql_for_test(None, &format!(
+                "SELECT COUNT(*) FROM revisions WHERE space_id = '{}' AND entity_type = 'rank' AND entity_key = '{key}'",
+                scope.space_id
+            )).await.unwrap(), count, "rank revision {key}");
+        }
+    }
 
     // Shared digest is retained and readable; unique secret digest is physically retired and unreadable!
     let kept_bytes = store
@@ -1957,6 +2369,19 @@ async fn l5_purge_and_mint_and_purge_erasure_and_crash_recovery_parity() {
             .expect("shutdown pg+s3 before reopen");
 
         let (store2, runtime2) = CanonicalRuntime::open(cfg).await.expect("reopen pg+s3");
+        let current_epoch = store2
+            .read_space(&scope.space_id)
+            .await
+            .unwrap()
+            .active_epoch;
+        store2
+            .advance_space_lease(
+                &support::maintenance_ctx(notarium_core::ports::ServicePurpose::Revocation),
+                &scope,
+                current_epoch.checked_next().unwrap(),
+            )
+            .await
+            .expect("take over the pending purge");
         let pending_left = store2
             .execute_diagnostic_read_sql_for_test(
                 None,

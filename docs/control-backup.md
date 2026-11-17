@@ -10,9 +10,11 @@ registrations before serving restored state.
 ## Snapshot protocol
 
 1. `prepare` admits one active control backup per `ControlBackup` instance. It opens files and
-   dedicated connections, warms metadata statements, attempts a best-effort SQLite WAL
+   dedicated connections, executes the PostgreSQL witness query in autocommit to warm its plan, attempts a best-effort SQLite WAL
    truncating checkpoint and validates key canaries before pausing writes. An owner lock
-   serializes artifact recovery across processes.
+   serializes artifact recovery across processes. PostgreSQL starts its read-only
+   repeatable-read transaction here. Its first data query runs in `open_cut`,
+   so preparation does not acquire the source snapshot.
 2. `acquire_hold` returns validated metadata. Control has no CAS blob hold; raw
    key material does not cross into the backup worker.
 3. `pause_writes` blocks new admitted control writers and drains existing writers.
@@ -23,9 +25,8 @@ registrations before serving restored state.
    keyring witness. SQLite first drains its native writer lock with a prepared
    write connection, covering driver cleanup after an async runtime disappears.
 5. `resume` releases the writer pause while retaining the source snapshot.
-   PostgreSQL unlocks its advisory lock and releases local writer admission before
-   closing the lock connection, retaining `REPEATABLE READ READ ONLY` on the source
-   connection; SQLite retains its read transaction on the same native connection.
+   PostgreSQL confirms the advisory unlock and releases local writer admission.
+   The source transaction and the unlocked private socket remain owned until cleanup; SQLite retains its read transaction on the same native connection.
    Later commits cannot change the cut.
 6. `spool` produces a complete local artifact, checks it, fsyncs it and computes a
    streaming BLAKE3 digest before releasing the source. `close` waits for actual
@@ -131,6 +132,7 @@ concurrent writes. They report prepare, drain, pause and spool separately, with
 p50/p95/p99/max and raw samples in `apps/api/target/backup-latency-*.json`.
 Pause includes writer drain through actual resume; reporting excludes neither
 slow commits nor outliers. PostgreSQL uses an isolated local Unix socket, not a
-production network profile. These measurements do not certify the target paired
-pause below one millisecond. That requires the real canonical participant and
-the intended storage and network environment.
+production network profile. The paired release benchmark uses both control and canonical participants. It
+reports the inclusive coordination interval and the interval from the first
+acknowledged safe point through both resume acknowledgements. The latter has
+a p95 target below one millisecond. See [Canonical storage and CAS](storage.md).

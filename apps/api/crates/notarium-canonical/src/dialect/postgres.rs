@@ -14,22 +14,24 @@ use crate::{
 
 pub fn build_pg_connect_options(cfg: &PgConnectConfig) -> PgConnectOptions {
     let base = match &cfg.transport {
-        PgTransport::UnixSocket { socket_dir, port } => PgConnectOptions::new()
+        PgTransport::UnixSocket { socket_dir, port } => PgConnectOptions::new_without_pgpass()
             .socket(socket_dir)
             .port(*port)
             .ssl_mode(PgSslMode::Disable),
         PgTransport::Tcp {
             host,
             port,
-            require_tls,
-        } => PgConnectOptions::new()
-            .host(host)
-            .port(*port)
-            .ssl_mode(if *require_tls {
-                PgSslMode::Require
-            } else {
-                PgSslMode::Prefer
-            }),
+            root_cert,
+        } => {
+            let options = PgConnectOptions::new_without_pgpass()
+                .host(host)
+                .port(*port)
+                .ssl_mode(PgSslMode::VerifyFull);
+            match root_cert {
+                Some(cert) => options.ssl_root_cert(cert),
+                None => options,
+            }
+        }
     };
     base.username(&cfg.username)
         .password(&cfg.password)

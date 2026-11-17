@@ -129,21 +129,44 @@ pub(crate) async fn rollback_agent_run_impl(
     request: Mutation<RollbackAgentRun>,
 ) -> Result<Committed<RollbackResult>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
-    let idemp = build_rollback_identity_spec(&request)?;
+    let idemp = build_rollback_identity_spec(&request)?.with_policy(
+        ctx.auth(),
+        crate::writer::replay::ReplayPolicy::Documents(
+            request
+                .input
+                .expected_entities
+                .iter()
+                .map(|entry| crate::writer::replay::ReplayResource::Write(entry.note.clone()))
+                .collect(),
+        ),
+    );
 
     if request.input.associated_board_expectations.is_empty()
         && store.inner.collab_interceptor.get().is_none()
     {
         let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
+        let writer_epoch = match &store.inner.sql {
+            crate::runtime::SqlDriverState::Postgres { .. } => {
+                store.inner.writer_epoch(&ctx.scope().space_id)?
+            }
+            crate::runtime::SqlDriverState::Sqlite { .. } => {
+                store
+                    .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+                    .await?
+                    .active_epoch
+            }
+        };
         if !store.is_sqlite_local()
             && let Some(direct_res) =
-                try_execute_pg_rollback_1rt_direct(store, &ctx, &idemp, &request).await
+                try_execute_pg_rollback_1rt_direct(store, &ctx, &idemp, &request, writer_epoch)
+                    .await
         {
             return direct_res;
         }
         let single_res: Result<StoredCommittedRollbackV1, PortError> = if store.is_sqlite_local() {
             let (intent, fast_plan) = crate::sqlite_fast::build_rollback_direct_sqlite_fast_intent(
                 ctx.scope(),
+                writer_epoch,
                 idemp.clone(),
                 ctx.auth().clone(),
                 request.identity.clone(),
@@ -162,9 +185,11 @@ pub(crate) async fn rollback_agent_run_impl(
                 request.identity.clone(),
                 request.input.clone(),
                 store.inner.room_fences.clone(),
+                writer_epoch,
             );
             let intent = build_rollback_direct_single_tx_intent(
                 ctx.scope().clone(),
+                writer_epoch,
                 idemp.clone(),
                 ctx.auth().clone(),
                 request.identity.clone(),
@@ -408,6 +433,7 @@ pub(crate) async fn rollback_agent_run_impl(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_rollback_direct_single_tx_intent(
     scope: HistoryScope,
+    active_epoch: notarium_core::ids::LeaseEpoch,
     idemp: crate::writer::CommandIdentitySpec,
     auth: notarium_core::auth::EngineAuthContext,
     req_id: notarium_core::receipt::CommandIdentity,
@@ -416,7 +442,7 @@ pub(crate) fn build_rollback_direct_single_tx_intent(
 ) -> PreparedWriteIntent {
     PreparedWriteIntent {
         scope: scope.clone(),
-        active_epoch: notarium_core::ids::LeaseEpoch::ZERO,
+        active_epoch,
         idempotency: Some(idemp),
         source_note_ids: Vec::new(),
         staged_bytes: 0,
@@ -2254,7 +2280,7 @@ fn build_rollback_execute_fn(
 
 fn build_rollback_identity_spec(
     request: &Mutation<RollbackAgentRun>,
-) -> Result<crate::writer::CommandIdentitySpec, PortError> {
+) -> Result<crate::writer::replay::UnboundCommand, PortError> {
     let mut fp = blake3::Hasher::new();
     fp.update(request.input.run.as_str().as_bytes());
     fp.update(&[0]);
@@ -3929,6 +3955,7 @@ fn build_rollback_pg_single_item_fast(
     req_id: notarium_core::receipt::CommandIdentity,
     input: RollbackAgentRun,
     room_fences: std::sync::Arc<crate::domain::RoomFenceTable>,
+    writer_epoch: notarium_core::ids::LeaseEpoch,
 ) -> crate::writer::PgSingleItemFastFn {
     Box::new(move |store, conn, cfg, faults| {
         Box::pin(async move {
@@ -3943,6 +3970,7 @@ fn build_rollback_pg_single_item_fast(
                 &req_id,
                 &input,
                 &room_fences,
+                writer_epoch,
             )
             .await
         })
@@ -3951,10 +3979,6 @@ fn build_rollback_pg_single_item_fast(
 
 enum PgFastInnerResult {
     FallbackToStandard,
-    Replay {
-        response_bytes: Vec<u8>,
-        effective_cut: SpaceSeq,
-    },
     Failed {
         err: PortError,
         effective_cut: Option<SpaceSeq>,
@@ -3981,6 +4005,7 @@ async fn execute_pg_fast_rollback_on_conn(
     req_id: &notarium_core::receipt::CommandIdentity,
     input: &RollbackAgentRun,
     room_fences: &std::sync::Arc<crate::domain::RoomFenceTable>,
+    writer_epoch: notarium_core::ids::LeaseEpoch,
 ) -> crate::writer::PgSingleFastAttempt {
     use crate::writer::{BatchExecOutcome, ItemOutcomeSlot, PgSingleFastAttempt};
 
@@ -3993,25 +4018,12 @@ async fn execute_pg_fast_rollback_on_conn(
         req_id,
         input,
         room_fences,
+        writer_epoch,
     )
     .await;
 
     match inner_res {
         PgFastInnerResult::FallbackToStandard => PgSingleFastAttempt::FallbackToStandard,
-        PgFastInnerResult::Replay {
-            response_bytes,
-            effective_cut,
-        } => {
-            let mut cuts = BTreeMap::new();
-            cuts.insert(scope_cl.space_id.clone(), effective_cut);
-            PgSingleFastAttempt::Handled(BatchExecOutcome::Committed {
-                slots: vec![ItemOutcomeSlot::Succeeded {
-                    response_bytes,
-                    has_idempotency: true,
-                }],
-                space_effective_cuts: cuts,
-            })
-        }
         PgFastInnerResult::Failed { err, effective_cut } => {
             let mut cuts = BTreeMap::new();
             if let Some(c) = effective_cut {
@@ -4096,6 +4108,7 @@ async fn try_execute_pg_rollback_1rt_direct(
     ctx: &SpaceContext,
     idemp: &crate::writer::CommandIdentitySpec,
     request: &Mutation<RollbackAgentRun>,
+    writer_epoch: notarium_core::ids::LeaseEpoch,
 ) -> Option<Result<Committed<RollbackResult>, PortError>> {
     use crate::{
         codec::{
@@ -5321,6 +5334,7 @@ async fn try_execute_pg_rollback_1rt_direct(
         .bind(&sorted_exp_rev_strs)
         .bind(&all_exp_lcs)
         .bind(root_folder_str)
+        .bind(writer_epoch.get() as i64)
         .fetch_one(&mut *pooled)
         .await;
 
@@ -5427,6 +5441,7 @@ async fn execute_pg_fast_rollback_inner(
     req_id: &notarium_core::receipt::CommandIdentity,
     input: &RollbackAgentRun,
     room_fences: &std::sync::Arc<crate::domain::RoomFenceTable>,
+    writer_epoch: notarium_core::ids::LeaseEpoch,
 ) -> PgFastInnerResult {
     use crate::codec::{doc_class_from_db, ordered_ids_batch};
     use notarium_core::{
@@ -5517,37 +5532,16 @@ async fn execute_pg_fast_rollback_inner(
         };
     }
 
-    // Idempotent replay check BEFORE domain checks!
-    let cr_hash_opt: Option<Vec<u8>> = r1.get::<Option<Vec<u8>>, usize>(23);
-    if let Some(hbytes) = cr_hash_opt {
-        let Ok(harr) = <[u8; 32]>::try_from(hbytes) else {
-            return PgFastInnerResult::Failed {
-                err: internal_not_committed("corrupt_receipt_hash", "hash != 32B"),
-                effective_cut: Some(current_effective_cut),
-            };
+    if r1.get::<i64, usize>(19) != writer_epoch.get() as i64 {
+        return PgFastInnerResult::Failed {
+            err: DomainError::validation(ValidationReason::InvalidAuthority).into(),
+            effective_cut: Some(current_effective_cut),
         };
-        if ContentDigest::from_bytes(harr) != idemp.command_hash {
-            return PgFastInnerResult::Failed {
-                err: DomainError::IdempotencyKeyReused.into(),
-                effective_cut: Some(current_effective_cut),
-            };
-        }
-        let cr_status: Option<String> = r1.get::<Option<String>, usize>(4);
-        if cr_status.as_deref() != Some("completed") {
-            return PgFastInnerResult::Failed {
-                err: unavailable_retryable(
-                    "command_receipt_pending",
-                    "idempotent command is currently pending crash recovery",
-                    std::time::Duration::from_millis(25),
-                ),
-                effective_cut: Some(current_effective_cut),
-            };
-        }
-        let resp: Vec<u8> = r1.get::<Option<Vec<u8>>, usize>(24).unwrap_or_default();
-        return PgFastInnerResult::Replay {
-            response_bytes: resp,
-            effective_cut: current_effective_cut,
-        };
+    }
+
+    // Deliver receipts from the standard writer transaction, which checks live resource authority.
+    if r1.get::<Option<Vec<u8>>, usize>(23).is_some() {
+        return PgFastInnerResult::FallbackToStandard;
     }
 
     let flags: i32 = r1.get::<i32, usize>(21);

@@ -625,6 +625,7 @@ CREATE TABLE IF NOT EXISTS chat_pending_inputs (
     status TEXT NOT NULL CHECK (status IN ('pending', 'consumed', 'cancelled')),
     enqueued_seq INTEGER NOT NULL CHECK (enqueued_seq >= 1),
     consumed_entry_seq INTEGER,
+    ext_space_tainted INTEGER NOT NULL DEFAULT 0 CHECK (ext_space_tainted IN (0, 1)),
     PRIMARY KEY (space_id, thread_id, input_id),
     CHECK (
         (inline_text IS NOT NULL AND length(CAST(inline_text AS BLOB)) <= 512 AND payload_blake3 IS NULL)
@@ -729,3 +730,12 @@ CREATE TABLE IF NOT EXISTS pending_purges (
 
 CREATE INDEX IF NOT EXISTS idx_pending_purges_phase
     ON pending_purges (space_id, phase);
+
+CREATE TABLE IF NOT EXISTS account_catalog_receipts (
+    owner_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    command_key TEXT NOT NULL,
+    request_hash BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
+    result_msgpack BLOB CHECK (result_msgpack IS NULL OR (typeof(result_msgpack) = 'blob' AND length(result_msgpack) BETWEEN 1 AND 4096)),
+    PRIMARY KEY (owner_id, actor_id, command_key)
+);

@@ -1414,6 +1414,9 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 name = "fitness-gates"
 version = "1.0.0-dev.0"
 dependencies = [
+ "blake3",
+ "getrandom 0.4.3",
+ "hex",
  "notarium-agents",
  "notarium-canonical",
  "notarium-collab",
@@ -1426,7 +1429,11 @@ dependencies = [
  "notarium-syntax",
  "notarium-vault",
  "proptest",
+ "rusqlite",
+ "serde",
  "serde_json",
+ "sqlx",
+ "tokio",
  "toml 0.9.12+spec-1.1.0",
 ]
 
@@ -2870,6 +2877,7 @@ dependencies = [
  "hmac 0.13.0",
  "http",
  "libsqlite3-sys",
+ "notarium-canonical",
  "notarium-core",
  "notarium-syntax",
  "percent-encoding",

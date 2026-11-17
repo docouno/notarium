@@ -625,6 +625,7 @@ CREATE TABLE IF NOT EXISTS chat_pending_inputs (
     status TEXT NOT NULL CHECK (status IN ('pending', 'consumed', 'cancelled')),
     enqueued_seq BIGINT NOT NULL CHECK (enqueued_seq >= 1),
     consumed_entry_seq BIGINT,
+    ext_space_tainted INTEGER NOT NULL DEFAULT 0 CHECK (ext_space_tainted IN (0, 1)),
     PRIMARY KEY (space_id, thread_id, input_id),
     CHECK (
         (inline_text IS NOT NULL AND octet_length(inline_text) <= 512 AND payload_blake3 IS NULL)
@@ -680,7 +681,7 @@ CREATE TABLE IF NOT EXISTS content_jobs (
     completed_units BIGINT NOT NULL DEFAULT 0 CHECK (completed_units >= 0),
     total_units BIGINT CHECK (total_units IS NULL OR total_units >= 0),
     artifacts_json TEXT NOT NULL,
-    result_msgpack BYTEA,
+    result_msgpack BYTEA CHECK (length(result_msgpack) BETWEEN 1 AND 4096),
     error_ref BYTEA CHECK (error_ref IS NULL OR octet_length(error_ref) = 32),
     created_seq BIGINT NOT NULL CHECK (created_seq >= 1),
     updated_seq BIGINT NOT NULL CHECK (updated_seq >= 1),
@@ -729,3 +730,12 @@ CREATE TABLE IF NOT EXISTS pending_purges (
 
 CREATE INDEX IF NOT EXISTS idx_pending_purges_phase
     ON pending_purges (space_id, phase);
+
+CREATE TABLE IF NOT EXISTS account_catalog_receipts (
+    owner_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    command_key TEXT NOT NULL,
+    request_hash BYTEA NOT NULL CHECK (length(request_hash) = 32),
+    result_msgpack BYTEA,
+    PRIMARY KEY (owner_id, actor_id, command_key)
+);

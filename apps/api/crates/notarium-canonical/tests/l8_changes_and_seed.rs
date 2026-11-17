@@ -953,6 +953,312 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
     );
 }
 
+// Exercise real command entrypoints in both directions, including a retry after the base head moved.
+async fn install_v1_note_hash(
+    store: &CanonicalStore,
+    postgres: bool,
+    identity: &notarium_core::receipt::CommandIdentity,
+    kind: &str,
+    payload: blake3::Hasher,
+) {
+    let mut outer = blake3::Hasher::new();
+    outer.update(b"notarium-cmd-v1:");
+    outer.update(kind.as_bytes());
+    outer.update(&[0]);
+    outer.update(identity.hash.as_bytes());
+    outer.update(&[0]);
+    outer.update(payload.finalize().as_bytes());
+    let hash = outer.finalize().to_hex();
+    let literal = if postgres { format!("decode('{hash}','hex')") } else { format!("X'{hash}'") };
+    let changed = store.execute_diagnostic_write_sql_for_test(&format!(
+        "UPDATE command_receipts SET command_hash={literal} WHERE space_id='{}' AND actor_id='{}' AND idempotency_key='{}'",
+        identity.scope.space_id.as_str(), identity.actor.as_str(), identity.key.as_str()
+    )).await.unwrap();
+    assert_eq!(changed, 1);
+}
+
+async fn check_note_effects_and_replay(store: &CanonicalStore, postgres: bool) -> [SpaceSeq; 2] {
+    use notarium_core::{
+        auth::{EngineAuthContext, SpaceGrant, SpaceRole, VerifiedHuman},
+        ids::{CommandKey, ContentDigest, GrantId},
+        ports::{
+            AcceptBatch, BatchItem, CreateNote, EditNote, Mutation, NoteWritePort, Preconditions,
+            SpaceContext,
+        },
+        receipt::CommandIdentity,
+    };
+    let actor = sample_principal_id(0x62);
+    let space = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(0x62),
+            incarnation: sample_incarnation(0x62),
+            root_folder_id: sample_folder_id(0x62),
+            slug: "real-effects".into(),
+            kind: SpaceKind::Shared,
+            owner: actor.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    let grant = SpaceGrant {
+        role: SpaceRole::Owner,
+        read_classes: DocClass::all(),
+        write_classes: DocClass::all(),
+        project_root: None,
+    };
+    let auth = EngineAuthContext::for_human(VerifiedHuman::attest(
+        actor.clone(),
+        GrantId::from_bytes([1; 16]),
+        BTreeMap::from([(space.scope.space_id.clone(), grant)]),
+        true,
+    ));
+    let ctx = SpaceContext::new(
+        auth,
+        space.scope.clone(),
+        maintenance_ctx(ServicePurpose::Projection).budget,
+    )
+    .unwrap();
+    let identity = |n| CommandIdentity {
+        scope: space.scope.clone(),
+        actor: actor.clone(),
+        key: CommandKey::from_bytes([n; 16]),
+        hash: ContentDigest::from_bytes([n; 32]),
+    };
+    let original = CreateNote {
+        note: note_id_seq(0x62, 1),
+        parent: None,
+        slug: "first".into(),
+        class: DocClass::UserDoc,
+        carrier: "---\ntitle: First\nremove_me: yes\n---\n# First\n".into(),
+    };
+    let created = store
+        .create_note(
+            ctx.clone(),
+            Mutation {
+                identity: identity(1),
+                preconditions: Preconditions::default(),
+                input: original.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut equivalent = original.clone();
+    equivalent.parent = Some(space.root_folder_id.clone());
+    let replay_create = Mutation {
+        identity: identity(1),
+        preconditions: Preconditions::default(),
+        input: BatchItem::Create(equivalent.clone()),
+    };
+    let edit = EditNote {
+        note: original.note.clone(),
+        plan: notarium_syntax::extract::finalize_document(
+            &original.carrier,
+            original.class,
+            &original.note,
+            &[
+                notarium_syntax::frontmatter::FieldEdit::Unset {
+                    key: "remove_me".into(),
+                },
+                notarium_syntax::frontmatter::FieldEdit::Set {
+                    key: "added".into(),
+                    value: notarium_core::value::YamlValue::Null,
+                },
+            ],
+        )
+        .unwrap(),
+    };
+    let after_first_edit = notarium_syntax::patch::apply(&original.carrier, &edit.plan).unwrap();
+    let edit_command = Mutation {
+        identity: identity(2),
+        preconditions: Preconditions::default(),
+        input: edit.clone(),
+    };
+    let batch = AcceptBatch {
+        items: vec![
+            replay_create,
+            Mutation {
+                identity: identity(2),
+                preconditions: Preconditions::default(),
+                input: BatchItem::Edit(edit),
+            },
+        ],
+    };
+    let first = store
+        .accept_batch(ctx.clone(), batch.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.items[0].as_ref().unwrap().receipt, created.receipt);
+    let edited = first.items[1].as_ref().unwrap();
+    let single = store.edit_note(ctx.clone(), edit_command.clone()).await.unwrap();
+    let retry = store.accept_batch(ctx.clone(), batch.clone()).await.unwrap();
+    assert_eq!(single.receipt, edited.receipt);
+    assert_eq!(single.value, edited.value);
+    assert_eq!(retry.items[1].as_ref().unwrap().receipt, edited.receipt);
+    assert_eq!(retry.committed_high_watermark, edited.receipt.seq());
+
+    let next_edit = EditNote {
+        note: original.note.clone(),
+        plan: notarium_syntax::extract::finalize_document(
+            &after_first_edit,
+            original.class,
+            &original.note,
+            &[
+                notarium_syntax::frontmatter::FieldEdit::Unset {
+                    key: "added".into(),
+                },
+                notarium_syntax::frontmatter::FieldEdit::Set {
+                    key: "replacement".into(),
+                    value: notarium_core::value::YamlValue::Null,
+                },
+            ],
+        )
+        .unwrap(),
+    };
+    let next = store
+        .edit_note(
+            ctx.clone(),
+            Mutation {
+                identity: identity(3),
+                preconditions: Preconditions::default(),
+                input: next_edit.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let again = store
+        .accept_batch(
+            ctx.clone(),
+            AcceptBatch {
+                items: vec![Mutation {
+                    identity: identity(3),
+                    preconditions: Preconditions::default(),
+                    input: BatchItem::Edit(next_edit),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.items[0].as_ref().unwrap().value, next.value);
+    assert_eq!(again.committed_high_watermark, next.receipt.seq());
+    store
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: space.scope.clone(),
+            active_epoch: space.active_epoch,
+            folder_id: sample_folder_id(0x63),
+            parent: None,
+            slug: "other".into(),
+            display_name: "Other".into(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let head_before_legacy_retries = store.get_space(&space.scope.space_id).await.unwrap().last_seq;
+    // Persist the exact v1 encodings. Historical edits must replay after a newer edit.
+    let mut old_create = blake3::Hasher::new();
+    old_create.update(original.note.as_str().as_bytes());
+    old_create.update(&[0]);
+    old_create.update(original.slug.as_bytes());
+    old_create.update(&[0]);
+    old_create.update(notarium_syntax::content_digest(&original.carrier).as_bytes());
+    install_v1_note_hash(store, postgres, &identity(1), "create_note", old_create).await;
+    let old_creation = store.create_note(ctx.clone(), Mutation {
+        identity: identity(1),
+        preconditions: Preconditions::default(),
+        input: original.clone(),
+    }).await.unwrap();
+    assert_eq!(old_creation.value, created.value);
+    assert_eq!(old_creation.receipt, created.receipt);
+    let mut prefix = blake3::Hasher::new();
+    prefix.update(original.note.as_str().as_bytes());
+    prefix.update(&[0]);
+    prefix.update(edit_command.input.plan.base_content_hash.as_bytes());
+    let mut old_batch = prefix.clone();
+    old_batch.update(&[0]);
+    old_batch.update(notarium_syntax::content_digest(&after_first_edit).as_bytes());
+    let mut old_single = prefix;
+    for splice in &edit_command.input.plan.edits {
+        old_single.update(&[0]);
+        old_single.update(&splice.bytes.0.start().to_be_bytes());
+        old_single.update(&splice.bytes.0.end().to_be_bytes());
+        old_single.update(splice.replacement.as_bytes());
+    }
+    for legacy in [old_single, old_batch] {
+        install_v1_note_hash(store, postgres, &identity(2), "edit_note", legacy).await;
+        let replay = store.edit_note(ctx.clone(), edit_command.clone()).await.unwrap();
+        assert_eq!(replay.receipt, edited.receipt);
+        assert_eq!(replay.value, edited.value);
+        let replay = store.accept_batch(ctx.clone(), batch.clone()).await.unwrap();
+        assert_eq!(replay.items[0].as_ref().unwrap().value, created.value);
+        assert_eq!(replay.items[0].as_ref().unwrap().receipt, created.receipt);
+        assert_eq!(replay.items[1].as_ref().unwrap().receipt, edited.receipt);
+        assert_eq!(replay.items[1].as_ref().unwrap().value, edited.value);
+        let mut conditioned = edit_command.clone();
+        conditioned.preconditions.revision = Some(created.value.revision.clone());
+        assert_eq!(store.edit_note(ctx.clone(), conditioned.clone()).await.unwrap().value, edited.value);
+        conditioned.preconditions.lease = Some(space.active_epoch);
+        assert!(matches!(store.edit_note(ctx.clone(), conditioned).await,
+            Err(notarium_core::error::PortError::Domain(notarium_core::DomainError::IdempotencyKeyReused))));
+        let mut altered = edit_command.clone();
+        altered.input.plan.edits[0].replacement_utf16_len += 1;
+        assert!(matches!(store.edit_note(ctx.clone(), altered).await,
+            Err(notarium_core::error::PortError::Domain(notarium_core::DomainError::IdempotencyKeyReused))));
+    }
+    for forged in [
+        CreateNote {
+            class: DocClass::AgentMemory,
+            ..equivalent.clone()
+        },
+        CreateNote {
+            parent: Some(sample_folder_id(0x63)),
+            ..equivalent
+        },
+    ] {
+        let attempt = store
+            .accept_batch(
+                ctx.clone(),
+                AcceptBatch {
+                    items: vec![Mutation {
+                        identity: identity(1),
+                        preconditions: Preconditions::default(),
+                        input: BatchItem::Create(forged),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            attempt.items[0],
+            Err(notarium_core::DomainError::IdempotencyKeyReused)
+        ));
+    }
+    assert_eq!(store.get_space(&space.scope.space_id).await.unwrap().last_seq, head_before_legacy_retries);
+    [edited.receipt.seq(), next.receipt.seq()]
+}
+
+fn assert_real_field_delta(bytes: &[u8], added: &str, removed: &str) {
+    let env = EffectEnvelopeV1::decode(bytes).unwrap();
+    let notarium_canonical::EffectBodyV1::Notes { notes } = env.body else {
+        panic!("expected note effect")
+    };
+    assert_eq!(notes.len(), 1);
+    assert_eq!(
+        notes[0].changed_fields,
+        BTreeMap::from([
+            (
+                added.into(),
+                FieldObservation::Ok(FieldValue::Scalar(ScalarValue::Null))
+            ),
+            (removed.into(), FieldObservation::Absent),
+        ])
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sqlite_changes_effects_broadcast_and_seed_parity() {
     let temp = TempDataRoot::new("l8-sqlite");
@@ -960,6 +1266,15 @@ async fn sqlite_changes_effects_broadcast_and_seed_parity() {
     let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
 
     run_changes_and_seed_suite(&store, 0x81).await;
+    let seqs = check_note_effects_and_replay(&store, false).await;
+    for (seq, (added, removed)) in seqs
+        .into_iter()
+        .zip([("added", "remove_me"), ("replacement", "added")])
+    {
+        let bytes: Vec<u8> = sqlx::query_scalar("SELECT effect_msgpack FROM change_payloads WHERE space_id=? AND created_seq=? AND codec='effect_v1'")
+        .bind(sample_space_id(0x62).as_str()).bind(seq.get() as i64).fetch_one(&mut temp.open_raw_sqlite().await).await.unwrap();
+        assert_real_field_delta(&bytes, added, removed);
+    }
 
     runtime.shutdown().await.expect("shutdown sqlite");
 }
@@ -975,10 +1290,125 @@ async fn postgres_s3_changes_effects_broadcast_and_seed_parity() {
         .expect("create versioned S3 bucket");
 
     let cfg = fixtures.pg_s3_config(sample_installation_id(0x82), &schema, s3_cfg);
-    let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
+    let (store, runtime) = CanonicalRuntime::open(cfg.clone())
+        .await
+        .expect("open pg+s3");
 
     run_changes_and_seed_suite(&store, 0x85).await;
+    let seqs = check_note_effects_and_replay(&store, true).await;
+    for (seq, (added, removed)) in seqs
+        .into_iter()
+        .zip([("added", "remove_me"), ("replacement", "added")])
+    {
+        let bytes: Vec<u8> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT effect_msgpack FROM {schema}.change_payloads WHERE space_id=$1 AND created_seq=$2 AND codec='effect_v1'")))
+        .bind(sample_space_id(0x62).as_str()).bind(seq.get() as i64).fetch_one(&mut fixtures.open_raw_pg().await).await.unwrap();
+        assert_real_field_delta(&bytes, added, removed);
+    }
 
+    // The subscriber and the writer have independent process-local broadcast rings.
+    let (peer, peer_runtime) = CanonicalRuntime::open(cfg).await.expect("open PG reader");
+    let owner = sample_principal_id(0x91);
+    let record = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(0x91),
+            incarnation: sample_incarnation(0x91),
+            root_folder_id: sample_folder_id(0x91),
+            slug: "remote-notices".to_owned(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    let mut sub = peer
+        .subscribe(
+            maintenance_ctx(ServicePurpose::Projection),
+            ChangeCursor {
+                scope: record.scope.clone(),
+                after: SpaceSeq::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        sub.next().await.unwrap(),
+        Some(ChangeNotice::SeedRequired { .. })
+    ));
+    let (_, _, seq) = store
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: record.scope.clone(),
+            active_epoch: record.active_epoch,
+            folder_id: sample_folder_id(0x92),
+            parent: None,
+            slug: "remote-folder".into(),
+            display_name: "Remote folder".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next())
+        .await
+        .expect("remote commit wakes subscriber")
+        .unwrap();
+    let cursor = ChangeCursor {
+        scope: record.scope.clone(),
+        after: seq,
+    };
+    assert!(matches!(notice, Some(ChangeNotice::Advanced(observed)) if observed == cursor));
+    sub.acknowledge(cursor).await.unwrap();
+
+    // The consumer has already processed the note. Its purge still invalidates
+    // the projection on the peer even when all erased payloads precede its cursor.
+    let note = note_id_seq(0x91, 1);
+    let (created, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &record.scope,
+            record.active_epoch,
+            &owner,
+            vec![SyntheticNoteSpec {
+                note_id: note.clone(),
+                parent_folder: None,
+                slug: "remote-note".into(),
+                title: "Remote note".into(),
+                doc_class: DocClass::UserDoc,
+                lifecycle: Lifecycle::Active,
+                carrier: "# Remote note".into(),
+                fields: BTreeMap::new(),
+            }],
+        )
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next())
+        .await
+        .expect("remote note wakes subscriber")
+        .unwrap();
+    assert!(
+        matches!(observed, Some(ChangeNotice::Advanced(ref cursor)) if cursor.after == created.last_seq)
+    );
+    sub.acknowledge(ChangeCursor {
+        scope: record.scope.clone(),
+        after: created.last_seq,
+    })
+    .await
+    .unwrap();
+    let purged = store
+        .commit_synthetic_note_purge_for_test(&record.scope, record.active_epoch, &note)
+        .await
+        .unwrap();
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next())
+        .await
+        .expect("remote purge wakes subscriber")
+        .unwrap();
+    assert!(
+        matches!(observed, Some(ChangeNotice::PurgeResync { cutoff }) if cutoff.after == purged)
+    );
+    drop(sub);
+    peer_runtime.shutdown().await.unwrap();
     runtime.shutdown().await.expect("shutdown pg+s3");
     fixtures.drop_pg_schema(&schema).await;
 }

@@ -160,12 +160,31 @@ pub fn validate_metadata(metadata: &Value, root: &Path) -> Result<(), String> {
             }
             let local = dep["path"].as_str();
             if expected.contains(target) {
-                if !allowed.contains(&target)
+                // Cargo builds this package's own integration tests as downstream crates.
+                // Its self dev-dependency selects fixture methods only for test targets.
+                let canonical_test_harness = source == "notarium-canonical"
+                    && target == source
+                    && dep["kind"] == "dev"
+                    && dep["features"] == serde_json::json!(["test-support"])
+                    && dep["rename"].is_null()
+                    && dep["target"].is_null()
+                    && dep["optional"] == false;
+                if (!allowed.contains(&target) && !canonical_test_harness)
                     || local.map(Path::new) != Some(root.join("crates").join(target).as_path())
                 {
                     return Err(format!(
                         "forbidden edge {source} -> {target} (alias={}, kind={}, target={})",
                         dep["rename"], dep["kind"], dep["target"]
+                    ));
+                }
+                if target == "notarium-canonical"
+                    && dep["kind"] != "dev"
+                    && dep["features"]
+                        .as_array()
+                        .is_some_and(|features| features.iter().any(|f| f == "test-support"))
+                {
+                    return Err(format!(
+                        "fixture API enabled by dependency {source} -> {target}"
                     ));
                 }
             } else if local.is_some() {

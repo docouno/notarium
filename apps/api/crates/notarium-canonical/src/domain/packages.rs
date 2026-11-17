@@ -38,11 +38,12 @@ use crate::{
 };
 
 pub const ABILITY_ENTRYPOINT_KEY: &str = "SKILL.md";
-pub const MAX_ABILITY_AUX_FILES: usize = 256;
+pub use notarium_core::ports::MAX_ABILITY_AUX_FILES;
 pub const MAX_ABILITY_PACKAGE_RAW_BYTES: u64 = 8 * 1024 * 1024;
 
 fn validate_ability_aux_path(rel_path: &str) -> Result<(), PortError> {
-    if rel_path.is_empty()
+    if rel_path.len() > notarium_core::ports::MAX_ABILITY_AUX_PATH_BYTES
+        || rel_path.is_empty()
         || rel_path.starts_with('/')
         || rel_path.ends_with('/')
         || rel_path.contains('\\')
@@ -130,7 +131,8 @@ pub(crate) async fn publish_ability_package_impl(
         &request.identity,
         "publish_ability_package",
         fp_hasher.finalize().as_bytes(),
-    );
+    )
+    .for_note(ctx.auth(), &request.input.entrypoint);
 
     let auth = ctx.auth().clone();
     let input_ability = request.input.ability.clone();
@@ -269,6 +271,7 @@ pub(crate) async fn publish_ability_package_impl(
                     item_ctx.record_staged_ticket(ticket.clone());
                     activate_and_bind_blob_ref_tx(
                         tx,
+                        &item_ctx.scope,
                         item_ctx.active_epoch,
                         &BlobReferenceClaim {
                             ticket,
@@ -543,44 +546,11 @@ pub(crate) async fn read_ability_resource_impl(
     let req_pkg_rev = request.package_revision.clone();
     let key_owned = manifest_key.to_owned();
 
-    let (entrypoint_note, facts, digest) = store
+    let (entrypoint_note, digest) = store
         .with_read_tx_budget(Some(&ctx.budget), |tx| {
             Box::pin(async move {
-                let space_rec = load_space_record(tx, &scope.space_id).await?;
-                space_rec.scope.check(&scope)?;
-                if space_rec.space.lifecycle != SpaceLifecycle::Active {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
+                let (entrypoint_note_id, _) = authorize_ability_read_tx(tx, &scope, &auth, &req_ability).await?;
 
-                let Some((pkg_lc, _, entrypoint_note_id)) =
-                    load_ability_package_row_opt_tx(tx, &scope.space_id, &req_ability).await?
-                else {
-                    return Err(DomainError::ResourceNotFound.into());
-                };
-                if pkg_lc != Lifecycle::Active {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                if is_note_purge_fenced_tx(tx, &scope.space_id, entrypoint_note_id.as_str()).await?
-                {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-
-                let entry_head =
-                    load_note_head_row_tx(tx, &scope.space_id, &entrypoint_note_id).await?;
-                if entry_head.lifecycle != Lifecycle::Active {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-
-                let (facts, _) = build_resource_facts_tx(
-                    tx,
-                    &space_rec.space,
-                    &entry_head.parent_folder_id,
-                    DocClass::Skill,
-                    Some(req_ability.clone()),
-                    true,
-                )
-                .await?;
-                auth.authorize_read(&facts)?;
 
                 // Strictly resolve the exact requested `package_revision`; NEVER fall back to latest!
                 let meta_bytes: Option<Vec<u8>> = match tx {
@@ -620,13 +590,13 @@ pub(crate) async fn read_ability_resource_impl(
                         "expected Ability metadata payload",
                     ));
                 };
-                if ab_meta.lifecycle != Lifecycle::Active {
+                if ab_meta.lifecycle != Lifecycle::Active || ab_meta.entrypoint_note_id != entrypoint_note_id {
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 let Some(digest) = ab_meta.resources.get(&key_owned).copied() else {
                     return Err(DomainError::ResourceNotFound.into());
                 };
-                Ok((entrypoint_note_id, facts, digest))
+                Ok((entrypoint_note_id, digest))
             })
         })
         .await?;
@@ -641,15 +611,17 @@ pub(crate) async fn read_ability_resource_impl(
     })?;
 
     let scope_recheck = ctx.scope().clone();
-    store
+    let auth = ctx.auth().clone();
+    let ability = request.ability.clone();
+    let facts = store
         .with_read_tx_budget(Some(&ctx.budget), |tx| {
             Box::pin(async move {
-                if is_note_purge_fenced_tx(tx, &scope_recheck.space_id, entrypoint_note.as_str())
-                    .await?
-                {
+                let (current_entrypoint, facts) =
+                    authorize_ability_read_tx(tx, &scope_recheck, &auth, &ability).await?;
+                if current_entrypoint != entrypoint_note {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                Ok(())
+                Ok(facts)
             })
         })
         .await?;
@@ -668,6 +640,57 @@ pub(crate) async fn read_ability_resource_impl(
         digest,
     )
     .map_err(PortError::from)
+}
+
+async fn authorize_ability_read_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &notarium_core::model::HistoryScope,
+    auth: &notarium_core::auth::EngineAuthContext,
+    ability: &AbilityId,
+) -> Result<
+    (
+        notarium_core::ids::NoteId,
+        notarium_core::auth::ResourceFacts,
+    ),
+    PortError,
+> {
+    let space_rec = load_space_record(tx, &scope.space_id).await?;
+    space_rec.scope.check(scope)?;
+    if space_rec.space.lifecycle != SpaceLifecycle::Active {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+
+    let Some((pkg_lc, _, entrypoint_note_id)) =
+        load_ability_package_row_opt_tx(tx, &scope.space_id, ability).await?
+    else {
+        return Err(DomainError::ResourceNotFound.into());
+    };
+    if pkg_lc != Lifecycle::Active {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if is_note_purge_fenced_tx(tx, &scope.space_id, entrypoint_note_id.as_str()).await? {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+
+    let entry_head = load_note_head_row_tx(tx, &scope.space_id, &entrypoint_note_id).await?;
+    if entry_head.lifecycle != Lifecycle::Active
+        || entry_head.doc_class != DocClass::Skill
+        || entry_head.ability_id.as_ref() != Some(ability)
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+
+    let (facts, _) = build_resource_facts_tx(
+        tx,
+        &space_rec.space,
+        &entry_head.parent_folder_id,
+        DocClass::Skill,
+        Some(ability.clone()),
+        true,
+    )
+    .await?;
+    auth.authorize_read(&facts)?;
+    Ok((entrypoint_note_id, facts))
 }
 
 async fn load_ability_package_row_opt_tx(

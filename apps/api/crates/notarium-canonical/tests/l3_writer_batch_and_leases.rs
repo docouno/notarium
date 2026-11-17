@@ -39,6 +39,53 @@ fn default_budget() -> CallBudget {
     }
 }
 
+async fn cancel_pg_write_during_begin(
+    store: &CanonicalStore,
+    fixtures: &StorageTestFixtures,
+    schema: &str,
+) {
+    let pid = store
+        .execute_diagnostic_read_sql_for_test(None, "SELECT pg_backend_pid()::bigint")
+        .await
+        .unwrap();
+    let mut barrier = fixtures.open_raw_pg().await;
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 7311229))")
+        .bind(schema)
+        .execute(&mut barrier)
+        .await
+        .unwrap();
+    let caller = store.clone();
+    let task = tokio::spawn(async move {
+        caller
+            .execute_diagnostic_write_sql_for_test("SELECT 1")
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted)"
+            ).bind(i32::try_from(pid).unwrap()).fetch_one(&mut barrier).await.unwrap();
+            if blocked { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("writer must reach the backup barrier inside BEGIN");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 7311229))")
+        .bind(schema)
+        .execute(&mut barrier)
+        .await
+        .unwrap();
+    let next = store
+        .execute_diagnostic_read_sql_for_test(None, "SELECT pg_backend_pid()::bigint")
+        .await
+        .unwrap();
+    assert_ne!(
+        pid, next,
+        "a connection with an interrupted BEGIN must leave the pool"
+    );
+}
+
 fn make_simple_intent(
     scope: HistoryScope,
     active_epoch: LeaseEpoch,
@@ -109,11 +156,7 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
     // 1. 64 concurrent duplicate idempotent commands -> 1 effect & 1 receipt!
     let dup_key = CommandKey::from_bytes([seed; 16]);
     let dup_hash = ContentDigest::from_bytes([seed.wrapping_add(1); 32]);
-    let idemp = CommandIdentitySpec {
-        actor: actor.clone(),
-        command_key: dup_key.clone(),
-        command_hash: dup_hash,
-    };
+    let idemp = CommandIdentitySpec::new(actor.clone(), dup_key.clone(), dup_hash);
 
     let blob_raw = format!("deduped-batch-blob-{seed}").into_bytes();
     let prep = store.prepare_blob(&blob_raw).unwrap();
@@ -131,7 +174,9 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
                 epoch,
                 BlobReferenceClaim {
                     owner_kind: BlobOwnerKind::NoteRevision,
-                    owner_id: format!("dup_note_{seed}"),
+                    owner_id: notarium_core::ids::NoteId::from_bytes([seed; 16])
+                        .as_str()
+                        .to_owned(),
                     owner_rev_id: format!("rev_{worker_idx}"),
                     resource_key: "carrier".to_owned(),
                     ticket,
@@ -162,13 +207,13 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
     );
 
     // 2. Same key + different command hash -> IdempotencyKeyReused!
-    let mismatched_idemp = CommandIdentitySpec {
-        actor: actor.clone(),
-        command_key: dup_key.clone(),
-        command_hash: ContentDigest::from_bytes([0xEE; 32]),
-    };
+    let mismatched_idemp = CommandIdentitySpec::new(
+        actor.clone(),
+        dup_key.clone(),
+        ContentDigest::from_bytes([0xEE; 32]),
+    );
     let hash_mismatch_res: Result<u64, PortError> = store
-        .submit_write_command(
+        .submit_fixture_write_command(
             &default_budget(),
             make_simple_intent(
                 scope.clone(),
@@ -194,7 +239,7 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
         incarnation: sample_incarnation(seed.wrapping_add(99)),
     };
     let stale_hist_res: Result<u64, PortError> = store
-        .submit_write_command(
+        .submit_fixture_write_command(
             &default_budget(),
             make_simple_intent(
                 stale_scope,
@@ -219,7 +264,7 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
         let st1 = store.clone();
         let sc1 = scope.clone();
         let h_a = tokio::spawn(async move {
-            st1.submit_write_command::<u64>(
+            st1.submit_fixture_write_command::<u64>(
                 &default_budget(),
                 make_simple_intent(sc1, epoch, None, None, false, "intra_a"),
             )
@@ -231,7 +276,7 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
         let st2 = store.clone();
         let sc2 = scope.clone();
         let h_b = tokio::spawn(async move {
-            st2.submit_write_command::<u64>(
+            st2.submit_fixture_write_command::<u64>(
                 &default_budget(),
                 make_simple_intent(
                     sc2,
@@ -270,7 +315,7 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
         let st1 = store.clone();
         let sc1 = scope.clone();
         let h_c = tokio::spawn(async move {
-            st1.submit_write_command::<u64>(
+            st1.submit_fixture_write_command::<u64>(
                 &default_budget(),
                 make_simple_intent(sc1, epoch, None, None, true, "intra_c_fails"),
             )
@@ -281,7 +326,7 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
         let st2 = store.clone();
         let sc2 = scope.clone();
         let h_d = tokio::spawn(async move {
-            st2.submit_write_command::<u64>(
+            st2.submit_fixture_write_command::<u64>(
                 &default_budget(),
                 make_simple_intent(
                     sc2,
@@ -318,11 +363,11 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
     }
 
     // 5. Unknown commit outcome (lost response after COMMIT) + idempotent replay without duplicate effect!
-    let unk_idemp = CommandIdentitySpec {
-        actor: actor.clone(),
-        command_key: CommandKey::from_bytes([seed.wrapping_add(50); 16]),
-        command_hash: ContentDigest::from_bytes([seed.wrapping_add(51); 32]),
-    };
+    let unk_idemp = CommandIdentitySpec::new(
+        actor.clone(),
+        CommandKey::from_bytes([seed.wrapping_add(50); 16]),
+        ContentDigest::from_bytes([seed.wrapping_add(51); 32]),
+    );
     store
         .writer_faults()
         .unwrap()
@@ -330,7 +375,7 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
         .store(true, Ordering::SeqCst);
 
     let first_attempt: Result<u64, PortError> = store
-        .submit_write_command(
+        .submit_fixture_write_command(
             &default_budget(),
             make_simple_intent(
                 scope.clone(),
@@ -353,7 +398,7 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
 
     // Retry with the exact same idempotency identity -> replays seq 4 without advancing to 5!
     let replay_seq: u64 = store
-        .submit_write_command(
+        .submit_fixture_write_command(
             &default_budget(),
             make_simple_intent(
                 scope.clone(),
@@ -382,7 +427,7 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
         remaining: Duration::from_secs(10),
     };
     let cancel_res: Result<u64, PortError> = store
-        .submit_write_command(
+        .submit_fixture_write_command(
             &cancelled_budget,
             make_simple_intent(scope.clone(), epoch, None, None, false, "never_admitted"),
         )
@@ -412,7 +457,7 @@ async fn run_core_writer_batch_suite(store: &CanonicalStore, seed: u8) {
         .await
         .unwrap();
     let overflow_res: Result<u64, PortError> = store
-        .submit_write_command(
+        .submit_fixture_write_command(
             &default_budget(),
             make_simple_intent(
                 max_space.scope.clone(),
@@ -504,7 +549,7 @@ async fn l3_postgres_and_s3_writer_cross_space_independence_and_epoch_takeover()
     let st_a = pg_store.clone();
     let sc_a = space_a.scope.clone();
     let slow_task = tokio::spawn(async move {
-        st_a.submit_write_command::<u64>(
+        st_a.submit_fixture_write_command::<u64>(
             &default_budget(),
             make_simple_intent(sc_a, epoch1, None, None, false, "slow_a_1"),
         )
@@ -517,7 +562,7 @@ async fn l3_postgres_and_s3_writer_cross_space_independence_and_epoch_takeover()
     let fast_start = Instant::now();
     for idx in 0..5usize {
         let seq: u64 = pg_store
-            .submit_write_command(
+            .submit_fixture_write_command(
                 &default_budget(),
                 make_simple_intent(
                     space_b.scope.clone(),
@@ -558,7 +603,7 @@ async fn l3_postgres_and_s3_writer_cross_space_independence_and_epoch_takeover()
 
     // Old-epoch batch of multiple items submitted after lease turnover -> ALL rolled back!
     let stale_ep_res: Result<u64, PortError> = pg_store
-        .submit_write_command(
+        .submit_fixture_write_command(
             &default_budget(),
             make_simple_intent(
                 space_a.scope.clone(),
@@ -583,7 +628,7 @@ async fn l3_postgres_and_s3_writer_cross_space_independence_and_epoch_takeover()
 
     // New-epoch write (`epoch2`) succeeds cleanly at seq 2!
     let ep2_seq: u64 = pg_store
-        .submit_write_command(
+        .submit_fixture_write_command(
             &default_budget(),
             make_simple_intent(
                 space_a.scope.clone(),
@@ -597,6 +642,96 @@ async fn l3_postgres_and_s3_writer_cross_space_independence_and_epoch_takeover()
         .await
         .unwrap();
     assert_eq!(ep2_seq, 2);
+
+    // A different runtime must obtain its own grant. Reading spaces.active_epoch does
+    // not authorize the original process to continue using NoteWritePort after takeover.
+    let other_root = TempDataRoot::new("l3-pg-takeover");
+    let mut successor_cfg = fixtures.pg_local_config(
+        sample_installation_id(70),
+        &pg_schema,
+        other_root.data_root(),
+    );
+    let notarium_canonical::SqlBackendConfig::Postgres { pool_size, .. } = &mut successor_cfg.sql
+    else {
+        unreachable!()
+    };
+    *pool_size = 1;
+    let (successor, successor_rt) = CanonicalRuntime::open(successor_cfg).await.unwrap();
+    cancel_pg_write_during_begin(&successor, &fixtures, &pg_schema).await;
+    use notarium_core::{
+        auth::{EngineAuthContext, SpaceGrant, SpaceRole, VerifiedHuman},
+        classes::DocClass,
+        ids::{GrantId, NoteId},
+        ports::{CreateNote, Mutation, NoteWritePort, Preconditions, SpaceContext},
+        receipt::CommandIdentity,
+    };
+    let owner = space_a.owner.clone();
+    let auth = EngineAuthContext::for_human(VerifiedHuman::attest(
+        owner.clone(),
+        GrantId::from_bytes([1; 16]),
+        std::collections::BTreeMap::from([(
+            space_a.scope.space_id.clone(),
+            SpaceGrant {
+                role: SpaceRole::Owner,
+                read_classes: DocClass::all(),
+                write_classes: DocClass::all(),
+                project_root: None,
+            },
+        )]),
+        false,
+    ));
+    let ctx = SpaceContext::new(auth, space_a.scope.clone(), default_budget()).unwrap();
+    let request = Mutation {
+        identity: CommandIdentity {
+            scope: space_a.scope.clone(),
+            actor: owner,
+            key: CommandKey::from_bytes([201; 16]),
+            hash: ContentDigest::from_bytes([201; 32]),
+        },
+        input: CreateNote {
+            note: NoteId::from_bytes([201; 16]),
+            parent: None,
+            slug: "successor".into(),
+            class: DocClass::UserDoc,
+            carrier: "# Successor".into(),
+        },
+        preconditions: Preconditions::default(),
+    };
+    let lower = maintenance_ctx(ServicePurpose::Revocation);
+    let higher = maintenance_ctx(ServicePurpose::Revocation);
+    let high_epoch = LeaseEpoch::new(4).unwrap();
+    let (_, high) = tokio::join!(
+        pg_store.advance_space_lease(&lower, &space_a.scope, LeaseEpoch::new(3).unwrap()),
+        successor.advance_space_lease(&higher, &space_a.scope, high_epoch),
+    );
+    assert_eq!(high.unwrap(), high_epoch);
+    assert_eq!(
+        pg_store
+            .get_space(&space_a.scope.space_id)
+            .await
+            .unwrap()
+            .active_epoch,
+        high_epoch
+    );
+    assert_validation_err(
+        &pg_store.create_note(ctx.clone(), request.clone()).await,
+        ValidationReason::InvalidAuthority,
+    );
+    successor
+        .create_note(ctx, request)
+        .await
+        .expect("granted writer commits");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while pg_store.retained_pg_writer_spaces_for_test().unwrap() != 0
+            || successor.retained_pg_writer_spaces_for_test().unwrap() != 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all inactive Space workers and trackers must retire");
+    drop(successor);
+    successor_rt.shutdown().await.unwrap();
 
     drop(pg_store);
     pg_rt.shutdown().await.unwrap();

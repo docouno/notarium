@@ -9,7 +9,7 @@ use std::{
 use notarium_canonical::{
     BlobBackendConfig, CanonicalConfig, PgConnectConfig, PgTransport, S3AddressingStyle,
     S3BucketModePolicy, S3Config, S3Credentials, SqlBackendConfig, WriterConfig,
-    dialect::postgres::build_pg_connect_options,
+    build_pg_connect_options,
 };
 use notarium_core::{
     epoch::DataRoot,

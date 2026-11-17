@@ -1,3 +1,5 @@
+mod v1_receipts;
+
 use std::collections::{BTreeMap, HashMap};
 
 use notarium_core::{
@@ -65,6 +67,66 @@ pub(crate) struct PreparedCarrierInfo {
     pub title_fold: String,
     pub byte_size: u64,
     pub prepared_blob: PreparedBlobSource,
+}
+
+pub(crate) type EvaluatedFields = BTreeMap<String, FieldObservation<FieldValue>>;
+
+pub(crate) fn revision_fields(bytes: &[u8]) -> Result<EvaluatedFields, PortError> {
+    match RevisionMetadataEnvelope::decode(bytes)?.payload {
+        RevisionMetadataPayload::Note(note) => Ok(note.evaluated_fields),
+        _ => Err(internal_not_committed(
+            "invalid_note_revision",
+            "expected note fields",
+        )),
+    }
+}
+
+pub(crate) fn changed_note_fields(
+    previous: &EvaluatedFields,
+    current: &EvaluatedFields,
+) -> EvaluatedFields {
+    let mut changes = EvaluatedFields::new();
+    for (key, value) in current {
+        if previous.get(key).unwrap_or(&FieldObservation::Absent) != value {
+            changes.insert(key.clone(), value.clone());
+        }
+    }
+    for (key, value) in previous {
+        if *value != FieldObservation::Absent && !current.contains_key(key) {
+            changes.insert(key.clone(), FieldObservation::Absent);
+        }
+    }
+    changes
+}
+
+pub(crate) async fn changed_revision_fields_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &notarium_core::model::HistoryScope,
+    previous_rev: &RevisionId,
+    current: &EvaluatedFields,
+) -> Result<EvaluatedFields, PortError> {
+    let bytes: Vec<u8> = match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_scalar(
+                "SELECT metadata_msgpack FROM revisions WHERE space_id = ? AND rev_id = ?",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(previous_rev.as_str())
+            .fetch_one(&mut **conn)
+            .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_scalar(
+                "SELECT metadata_msgpack FROM revisions WHERE space_id = $1 AND rev_id = $2",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(previous_rev.as_str())
+            .fetch_one(&mut **conn)
+            .await
+        }
+    }
+    .map_err(|e| internal_not_committed("read_note_effect_base", e.to_string()))?;
+    Ok(changed_note_fields(&revision_fields(&bytes)?, current))
 }
 
 pub(crate) fn analyze_and_prepare_carrier(
@@ -178,6 +240,83 @@ fn build_collab_edit_payload(
     Ok((body_plan, header_mut))
 }
 
+fn create_note_identity(
+    ctx: &SpaceContext,
+    identity: &CommandIdentity,
+    input: &CreateNote,
+    root: &notarium_core::ids::FolderId,
+    digest: ContentDigest,
+) -> crate::writer::CommandIdentitySpec {
+    let parent = input
+        .parent
+        .as_ref()
+        .filter(|id| *id != root)
+        .map_or("", |id| id.as_str());
+    let mut hash = blake3::Hasher::new();
+    for part in [
+        input.note.as_str(),
+        parent,
+        &input.slug,
+        doc_class_to_db(input.class),
+    ] {
+        hash.update(part.as_bytes());
+        hash.update(&[0]);
+    }
+    hash.update(digest.as_bytes());
+    derive_command_identity_spec(identity, "create_note", hash.finalize().as_bytes()).for_create(
+        ctx.auth(),
+        &input.note,
+        input.parent.as_ref(),
+        input.class,
+    )
+}
+
+fn edit_note_identity(
+    ctx: &SpaceContext,
+    identity: &CommandIdentity,
+    input: &EditNote,
+    preconditions: &Preconditions,
+) -> crate::writer::CommandIdentitySpec {
+    let mut hash = blake3::Hasher::new();
+    hash.update(input.note.as_str().as_bytes());
+    hash.update(input.plan.base_content_hash.as_bytes());
+    hash.update(&(input.plan.body_range.start() as u64).to_be_bytes());
+    hash.update(&(input.plan.body_range.end() as u64).to_be_bytes());
+    hash.update(&(input.plan.edits.len() as u64).to_be_bytes());
+    for edit in &input.plan.edits {
+        hash.update(&[match edit.origin {
+            CarrierEditOrigin::Header => 0,
+            CarrierEditOrigin::Body => 1,
+        }]);
+        for offset in [
+            edit.bytes.0.start(),
+            edit.bytes.0.end(),
+            edit.utf16.0.start(),
+            edit.utf16.0.end(),
+            edit.replacement_utf16_len,
+            edit.replacement.len(),
+        ] {
+            hash.update(&(offset as u64).to_be_bytes());
+        }
+        hash.update(edit.replacement.as_bytes());
+    }
+    hash.update(
+        preconditions
+            .revision
+            .as_ref()
+            .map_or("", RevisionId::as_str)
+            .as_bytes(),
+    );
+    for epoch in [
+        preconditions.lease.map(|v| v.get()),
+        preconditions.lineage.map(|v| v.get()),
+    ] {
+        hash.update(&epoch.unwrap_or(u64::MAX).to_be_bytes());
+    }
+    derive_command_identity_spec(identity, "edit_note", hash.finalize().as_bytes())
+        .for_note(ctx.auth(), &input.note)
+}
+
 pub(crate) async fn create_note_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -211,53 +350,61 @@ pub(crate) async fn create_note_impl(
         )
         .await?;
 
-    let mut fp = blake3::Hasher::new();
-    fp.update(request.input.note.as_str().as_bytes());
-    fp.update(&[0]);
-    if let Some(p) = &request.input.parent {
-        fp.update(p.as_str().as_bytes());
-    }
-    fp.update(&[0]);
-    fp.update(request.input.slug.as_bytes());
-    fp.update(&[0]);
-    fp.update(doc_class_to_db(request.input.class).as_bytes());
-    fp.update(&[0]);
-    fp.update(info.prepared_blob.digest.as_bytes());
-    let idemp =
-        derive_command_identity_spec(&request.identity, "create_note", fp.finalize().as_bytes());
-
-    if store.is_sqlite_local() {
-        let (intent, fast_plan) = crate::sqlite_fast::build_create_note_fast_intent(
+    let created = v1_receipts::CreatedNote::from_input(
+        &request.input,
+        &space_rec.root_folder_id,
+        info.prepared_blob.digest,
+    );
+    let idemp = create_note_identity(
+        &ctx,
+        &request.identity,
+        &request.input,
+        &space_rec.root_folder_id,
+        info.prepared_blob.digest,
+    );
+    let (intent, fast_plan) = if store.is_sqlite_local() {
+        let (intent, plan) = crate::sqlite_fast::build_create_note_fast_intent(
             &space_rec.scope,
             space_rec.active_epoch,
-            Some(idemp),
+            Some(idemp.clone()),
             ctx.auth().clone(),
             request.input,
             slug_fold,
             info,
             ticket,
         )?;
-        let stored: StoredCommittedNoteRevV1 = store
-            .submit_write_command_tracked(&ctx.budget, intent, Some(fast_plan), active_op_guard)
-            .await?;
-        return Ok(stored.into_committed());
+        (intent, Some(plan))
+    } else {
+        (
+            build_create_note_intent(
+                &space_rec.scope,
+                space_rec.active_epoch,
+                Some(idemp.clone()),
+                ctx.auth().clone(),
+                request.input,
+                slug_fold,
+                info,
+                ticket,
+            ),
+            None,
+        )
+    };
+    match store
+        .submit_write_command_tracked::<StoredCommittedNoteRevV1>(
+            &ctx.budget,
+            intent,
+            fast_plan,
+            active_op_guard,
+        )
+        .await
+    {
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => {
+            v1_receipts::LegacyNoteCommand::Create(created)
+                .replay(store, &ctx, &request.identity, &idemp)
+                .await
+        }
+        other => other.map(StoredCommittedNoteRevV1::into_committed),
     }
-
-    let intent = build_create_note_intent(
-        &space_rec.scope,
-        space_rec.active_epoch,
-        Some(idemp),
-        ctx.auth().clone(),
-        request.input,
-        slug_fold,
-        info,
-        ticket,
-    );
-
-    let stored: StoredCommittedNoteRevV1 = store
-        .submit_write_command_tracked(&ctx.budget, intent, None, active_op_guard)
-        .await?;
-    Ok(stored.into_committed())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -343,6 +490,7 @@ pub(crate) fn build_create_note_intent(
                 item_ctx.record_staged_ticket(ticket.clone());
                 activate_and_bind_blob_ref_tx(
                     tx,
+                    &item_ctx.scope,
                     item_ctx.active_epoch,
                     &BlobReferenceClaim {
                         ticket,
@@ -436,6 +584,7 @@ pub(crate) fn build_create_note_intent(
                 };
 
                 let run_opt = extract_agent_run_from_auth(&auth);
+                let changed_fields = changed_note_fields(&EvaluatedFields::new(), &eval_fields);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
                         note_id: input.note.clone(),
@@ -504,7 +653,7 @@ pub(crate) fn build_create_note_intent(
                             rank_version: note_rank_version_digest(&rev_id, None),
                             lifecycle: Lifecycle::Active,
                             doc_class: input.class,
-                            changed_fields: BTreeMap::new(),
+                            changed_fields,
                         }],
                     },
                     vec![input.note.clone()],
@@ -550,20 +699,11 @@ pub(crate) async fn edit_note_impl(
 ) -> Result<Committed<NoteRevision>, PortError> {
     let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
     validate_mutation_identity(&ctx, &request.identity)?;
-    let mut fp_hasher = blake3::Hasher::new();
-    fp_hasher.update(request.input.note.as_str().as_bytes());
-    fp_hasher.update(&[0]);
-    fp_hasher.update(request.input.plan.base_content_hash.as_bytes());
-    for edit in &request.input.plan.edits {
-        fp_hasher.update(&[0]);
-        fp_hasher.update(&edit.bytes.0.start().to_be_bytes());
-        fp_hasher.update(&edit.bytes.0.end().to_be_bytes());
-        fp_hasher.update(edit.replacement.as_bytes());
-    }
-    let idemp = derive_command_identity_spec(
+    let idemp = edit_note_identity(
+        &ctx,
         &request.identity,
-        "edit_note",
-        fp_hasher.finalize().as_bytes(),
+        &request.input,
+        &request.preconditions,
     );
 
     let phase1 = if store.is_sqlite_local() {
@@ -575,7 +715,7 @@ pub(crate) async fn edit_note_impl(
             request.input.plan.base_content_hash,
             &idemp,
         )
-        .await?
+        .await
     } else {
         let scope_p1 = ctx.scope().clone();
         let auth_p1 = ctx.auth().clone();
@@ -592,6 +732,9 @@ pub(crate) async fn edit_note_impl(
                     srec.scope.check(&scope_p1)?;
 
                     // Check idempotency receipt BEFORE reading live head so replayed edits work even if head moved on!
+                    store_p1
+                        .inner
+                        .check_writer_epoch(&srec.scope.space_id, srec.active_epoch)?;
                     if let Some(existing) =
                         crate::writer::lookup_command_receipt_tx(tx, &scope_p1, &idemp_p1).await?
                     {
@@ -666,7 +809,16 @@ pub(crate) async fn edit_note_impl(
                     })
                 })
             })
-            .await?
+            .await
+    };
+
+    let phase1 = match phase1 {
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => {
+            return v1_receipts::LegacyNoteCommand::Edit(&request.input, &request.preconditions)
+                .replay(store, &ctx, &request.identity, &idemp)
+                .await;
+        }
+        other => other?,
     };
 
     let (
@@ -1021,6 +1173,7 @@ pub(crate) fn build_carrier_replacement_intent(
                 item_ctx.record_staged_ticket(ticket.clone());
                 activate_and_bind_blob_ref_tx(
                     tx,
+                    &item_ctx.scope,
                     item_ctx.active_epoch,
                     &BlobReferenceClaim {
                         ticket,
@@ -1125,6 +1278,9 @@ pub(crate) fn build_carrier_replacement_intent(
                 };
 
                 let run_opt = extract_agent_run_from_auth(&auth);
+                let changed_fields =
+                    changed_revision_fields_tx(tx, &scope_cl, &head.head_rev_id, &eval_fields)
+                        .await?;
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
                         note_id: note_id.clone(),
@@ -1199,7 +1355,7 @@ pub(crate) fn build_carrier_replacement_intent(
                             rank_version: note_rank_version_digest(&new_rev, None),
                             lifecycle: Lifecycle::Active,
                             doc_class: head.doc_class,
-                            changed_fields: BTreeMap::new(),
+                            changed_fields,
                         }],
                     },
                     vec![note_id.clone()],
@@ -1257,7 +1413,8 @@ pub(crate) async fn delete_note_impl(
         DeleteDisposition::Purge => unreachable!(),
     };
     let fp = format!("{disp_tag}={}", request.input.note.as_str());
-    let idemp = derive_command_identity_spec(&request.identity, disp_tag, fp.as_bytes());
+    let idemp = derive_command_identity_spec(&request.identity, disp_tag, fp.as_bytes())
+        .for_note(ctx.auth(), &request.input.note);
 
     let intent = build_trash_or_restore_intent(
         store,
@@ -1638,7 +1795,12 @@ pub(crate) async fn move_note_impl(
             .unwrap_or("<root>"),
         request.input.slug
     );
-    let idemp = derive_command_identity_spec(&request.identity, "move_note", fp.as_bytes());
+    let idemp = derive_command_identity_spec(&request.identity, "move_note", fp.as_bytes())
+        .for_move(
+            ctx.auth(),
+            &request.input.note,
+            request.input.parent.as_ref(),
+        );
 
     let intent = build_move_note_intent(
         &space_rec.scope,
@@ -1999,7 +2161,8 @@ pub(crate) async fn rename_note_impl(
         request.input.slug,
         request.input.title.as_deref().unwrap_or("<none>")
     );
-    let idemp = derive_command_identity_spec(&request.identity, "rename_note", fp.as_bytes());
+    let idemp = derive_command_identity_spec(&request.identity, "rename_note", fp.as_bytes())
+        .for_note(ctx.auth(), &request.input.note);
 
     if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
         store,
@@ -2156,6 +2319,41 @@ struct VirtualNoteState {
     carrier: String,
 }
 
+// Only find candidate receipts here. The writer checks the current authority, hash, and
+// status before returning a stored outcome at the item's position in the batch.
+async fn batch_carrier_receipt_keys(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    request: &AcceptBatch,
+) -> Result<HashMap<String, Vec<u8>>, PortError> {
+    let keys: Vec<_> = request
+        .items
+        .iter()
+        .filter(|item| matches!(item.input, BatchItem::Create(_) | BatchItem::Edit(_)))
+        .map(|item| item.identity.key.as_str().to_owned())
+        .collect();
+    if keys.is_empty() {
+        return Ok(Default::default());
+    }
+    let scope = ctx.scope().clone();
+    let actor = ctx.auth().principal().clone();
+    store.with_read_tx_budget(Some(&ctx.budget), |tx| Box::pin(async move {
+        let rows: Vec<(String, Vec<u8>)> = match tx {
+            BackendConn::Sqlite(conn) => sqlx::query_as(
+                "SELECT idempotency_key,command_hash FROM command_receipts WHERE space_id=? AND history_incarnation=? AND actor_id=?
+                 AND idempotency_key IN (SELECT value FROM json_each(?))",
+            ).bind(scope.space_id.as_str()).bind(scope.incarnation.as_bytes().as_slice()).bind(actor.as_str())
+             .bind(serde_json::to_string(&keys).map_err(|e| internal_not_committed("encode_batch_receipt_keys", e.to_string()))?).fetch_all(&mut **conn).await,
+            BackendConn::Postgres(conn) => sqlx::query_as(
+                "SELECT idempotency_key,command_hash FROM command_receipts WHERE space_id=$1 AND history_incarnation=$2 AND actor_id=$3
+                 AND idempotency_key=ANY($4)",
+            ).bind(scope.space_id.as_str()).bind(scope.incarnation.as_bytes().as_slice()).bind(actor.as_str())
+             .bind(&keys).fetch_all(&mut **conn).await,
+        }.map_err(|err| internal_not_committed("lookup_batch_receipt_keys", err.to_string()))?;
+        Ok(rows.into_iter().collect())
+    })).await
+}
+
 pub(crate) async fn accept_batch_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -2171,17 +2369,17 @@ pub(crate) async fn accept_batch_impl(
         });
     }
 
-    // Preload base carriers for any existing notes edited inside the batch so sequential intra-batch
-    // edits (`Create(N)` -> `Edit(N)` or `Edit(N)` -> `Edit(N)`) compose cleanly in Phase 1!
-    let mut referenced_edits = Vec::new();
-    for item in &request.items {
-        if let BatchItem::Edit(ed) = &item.input
-            && !referenced_edits.contains(&ed.note)
-        {
-            referenced_edits.push(ed.note.clone());
-        }
-    }
-
+    let receipts = batch_carrier_receipt_keys(store, &ctx, &request).await?;
+    let referenced_edits: std::collections::BTreeSet<_> = request
+        .items
+        .iter()
+        .filter_map(|item| match &item.input {
+            BatchItem::Edit(ed) if !receipts.contains_key(item.identity.key.as_str()) => {
+                Some(ed.note.clone())
+            }
+            _ => None,
+        })
+        .collect();
     let mut virtual_notes: HashMap<NoteId, VirtualNoteState> = HashMap::new();
     for nid in referenced_edits {
         let scope_in = space_rec.scope.clone();
@@ -2223,6 +2421,62 @@ pub(crate) async fn accept_batch_impl(
             ));
             continue;
         }
+        let idemp = match &item_mut.input {
+            BatchItem::Create(cr) => Some(create_note_identity(
+                &ctx,
+                &item_mut.identity,
+                cr,
+                &space_rec.root_folder_id,
+                notarium_syntax::content_digest(&cr.carrier),
+            )),
+            BatchItem::Edit(ed) => Some(edit_note_identity(
+                &ctx,
+                &item_mut.identity,
+                ed,
+                &item_mut.preconditions,
+            )),
+            _ => None,
+        };
+        if let (Some(spec), Some(stored_hash)) =
+            (&idemp, receipts.get(item_mut.identity.key.as_str()))
+        {
+            let checked = if spec.command_hash.as_bytes().as_slice() == stored_hash {
+                Ok(spec.clone())
+            } else {
+                let command = match &item_mut.input {
+                    BatchItem::Create(cr) => v1_receipts::LegacyNoteCommand::Create(
+                        v1_receipts::CreatedNote::from_input(
+                            cr,
+                            &space_rec.root_folder_id,
+                            notarium_syntax::content_digest(&cr.carrier),
+                        ),
+                    ),
+                    BatchItem::Edit(ed) => {
+                        v1_receipts::LegacyNoteCommand::Edit(ed, &item_mut.preconditions)
+                    }
+                    _ => unreachable!("only carrier items have a receipt candidate"),
+                };
+                command
+                    .verified_identity(store, &ctx, &item_mut.identity, spec)
+                    .await
+            };
+            let replay = match checked {
+                Ok(authenticated) => {
+                    let mut replay = build_failing_item_intent(
+                        &space_rec.scope,
+                        space_rec.active_epoch,
+                        DomainError::ResourceNotFound.into(),
+                    );
+                    replay.idempotency = Some(authenticated);
+                    replay
+                }
+                Err(err) => {
+                    build_failing_item_intent(&space_rec.scope, space_rec.active_epoch, err)
+                }
+            };
+            intents.push(replay);
+            continue;
+        }
         match item_mut.input {
             BatchItem::Create(cr) => {
                 let res: Result<PreparedWriteIntent, PortError> = async {
@@ -2244,17 +2498,6 @@ pub(crate) async fn accept_batch_impl(
                             &info.prepared_blob,
                         )
                         .await?;
-                    let mut fp = blake3::Hasher::new();
-                    fp.update(cr.note.as_str().as_bytes());
-                    fp.update(&[0]);
-                    fp.update(cr.slug.as_bytes());
-                    fp.update(&[0]);
-                    fp.update(info.prepared_blob.digest.as_bytes());
-                    let idemp = derive_command_identity_spec(
-                        &item_mut.identity,
-                        "create_note",
-                        fp.finalize().as_bytes(),
-                    );
                     virtual_notes.insert(
                         cr.note.clone(),
                         VirtualNoteState {
@@ -2266,7 +2509,7 @@ pub(crate) async fn accept_batch_impl(
                     Ok(build_create_note_intent(
                         &space_rec.scope,
                         space_rec.active_epoch,
-                        Some(idemp),
+                        idemp.clone(),
                         ctx.auth().clone(),
                         cr,
                         slug_fold,
@@ -2277,11 +2520,15 @@ pub(crate) async fn accept_batch_impl(
                 .await;
                 match res {
                     Ok(intent) => intents.push(intent),
-                    Err(err) => intents.push(build_failing_item_intent(
-                        &space_rec.scope,
-                        space_rec.active_epoch,
-                        err,
-                    )),
+                    Err(err) => {
+                        let mut failed = build_failing_item_intent(
+                            &space_rec.scope,
+                            space_rec.active_epoch,
+                            err,
+                        );
+                        failed.idempotency = idemp;
+                        intents.push(failed);
+                    }
                 }
             }
             BatchItem::Edit(ed) => {
@@ -2311,17 +2558,6 @@ pub(crate) async fn accept_batch_impl(
                             &info.prepared_blob,
                         )
                         .await?;
-                    let mut fp = blake3::Hasher::new();
-                    fp.update(ed.note.as_str().as_bytes());
-                    fp.update(&[0]);
-                    fp.update(ed.plan.base_content_hash.as_bytes());
-                    fp.update(&[0]);
-                    fp.update(info.prepared_blob.digest.as_bytes());
-                    let idemp = derive_command_identity_spec(
-                        &item_mut.identity,
-                        "edit_note",
-                        fp.finalize().as_bytes(),
-                    );
                     virtual_notes.insert(
                         ed.note.clone(),
                         VirtualNoteState {
@@ -2334,7 +2570,7 @@ pub(crate) async fn accept_batch_impl(
                         store,
                         &space_rec.scope,
                         space_rec.active_epoch,
-                        Some(idemp),
+                        idemp.clone(),
                         ctx.auth().clone(),
                         item_mut.preconditions,
                         ed.note,
@@ -2346,11 +2582,15 @@ pub(crate) async fn accept_batch_impl(
                 .await;
                 match res {
                     Ok(intent) => intents.push(intent),
-                    Err(err) => intents.push(build_failing_item_intent(
-                        &space_rec.scope,
-                        space_rec.active_epoch,
-                        err,
-                    )),
+                    Err(err) => {
+                        let mut failed = build_failing_item_intent(
+                            &space_rec.scope,
+                            space_rec.active_epoch,
+                            err,
+                        );
+                        failed.idempotency = idemp;
+                        intents.push(failed);
+                    }
                 }
             }
             BatchItem::Delete(del) => {
@@ -2372,7 +2612,8 @@ pub(crate) async fn accept_batch_impl(
                 };
                 let fp = format!("{disp_tag}={}", del.note.as_str());
                 let idemp =
-                    derive_command_identity_spec(&item_mut.identity, disp_tag, fp.as_bytes());
+                    derive_command_identity_spec(&item_mut.identity, disp_tag, fp.as_bytes())
+                        .for_note(ctx.auth(), &del.note);
                 intents.push(build_trash_or_restore_intent(
                     store,
                     &space_rec.scope,
@@ -2398,7 +2639,8 @@ pub(crate) async fn accept_batch_impl(
                         &item_mut.identity,
                         "move_note",
                         fp.as_bytes(),
-                    );
+                    )
+                    .for_move(ctx.auth(), &mv.note, mv.parent.as_ref());
                     intents.push(build_move_note_intent(
                         &space_rec.scope,
                         space_rec.active_epoch,
@@ -2519,6 +2761,7 @@ fn build_batch_edit_intent(
                 item_ctx.record_staged_ticket(ticket.clone());
                 activate_and_bind_blob_ref_tx(
                     tx,
+                    &item_ctx.scope,
                     item_ctx.active_epoch,
                     &BlobReferenceClaim {
                         ticket,
@@ -2613,6 +2856,9 @@ fn build_batch_edit_intent(
                 };
 
                 let run_opt = extract_agent_run_from_auth(&auth);
+                let changed_fields =
+                    changed_revision_fields_tx(tx, &scope_cl, &head.head_rev_id, &eval_fields)
+                        .await?;
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
                         note_id: note_id.clone(),
@@ -2681,7 +2927,7 @@ fn build_batch_edit_intent(
                             rank_version: note_rank_version_digest(&new_rev, None),
                             lifecycle: Lifecycle::Active,
                             doc_class: head.doc_class,
-                            changed_fields: BTreeMap::new(),
+                            changed_fields,
                         }],
                     },
                     vec![note_id.clone()],
@@ -2745,10 +2991,14 @@ pub(crate) async fn append_memory_impl(
     if request.input.target.note.space_id != ctx.scope().space_id {
         return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
     }
-    let category = request.input.target.category.trim();
-    let text = request.input.text.trim();
-    if category.is_empty() || text.is_empty() || category.contains('\r') || category.contains('\n')
+    let category = request.input.target.category.as_str();
+    if request.input.target.note.note_id
+        != crate::catalog::memory::fixed_note_id(&request.input.target.target, category)?
     {
+        return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+    }
+    let text = request.input.text.trim();
+    if text.is_empty() {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
 
@@ -2756,18 +3006,8 @@ pub(crate) async fn append_memory_impl(
         "note={}\0cat={category}\0text={text}",
         request.input.target.note.note_id.as_str()
     );
-    let idemp = derive_command_identity_spec(&request.identity, "append_memory", fp.as_bytes());
-    if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
-        store,
-        ctx.scope(),
-        &idemp,
-        Some(&ctx.budget),
-    )
-    .await?
-    {
-        return Ok(replayed.into_committed());
-    }
-
+    let idemp = derive_command_identity_spec(&request.identity, "append_memory", fp.as_bytes())
+        .for_note(ctx.auth(), &request.input.target.note.note_id);
     let note_id = request.input.target.note.note_id.clone();
     let target_spec = request.input.target.target.clone();
 
@@ -2790,7 +3030,7 @@ pub(crate) async fn append_memory_impl(
                 if head.doc_class != DocClass::AgentMemory {
                     return Err(DomainError::validation(ValidationReason::ClassMismatch).into());
                 }
-                let (facts, anc) = build_resource_facts_tx(
+                let (facts, _) = build_resource_facts_tx(
                     tx,
                     &srec.space,
                     &head.parent_folder_id,
@@ -2804,7 +3044,11 @@ pub(crate) async fn append_memory_impl(
                 // Re-verify ResolvedMemoryTarget provenance!
                 match &target_in {
                     MemoryTarget::User { owner } => {
-                        if owner != auth_in.principal() {
+                        if owner != auth_in.principal()
+                            || owner != &srec.owner
+                            || srec.space.kind != notarium_core::auth::SpaceKind::Personal
+                            || head.parent_folder_id != srec.root_folder_id
+                        {
                             return Err(DomainError::validation(
                                 ValidationReason::InvalidAuthority,
                             )
@@ -2824,7 +3068,7 @@ pub(crate) async fn append_memory_impl(
                                 DomainError::validation(ValidationReason::ScopeMismatch).into()
                             );
                         }
-                        if !anc.ancestors.contains(&folder.folder_id) {
+                        if head.parent_folder_id != folder.folder_id {
                             return Err(
                                 DomainError::validation(ValidationReason::ScopeMismatch).into()
                             );
@@ -2835,6 +3079,17 @@ pub(crate) async fn append_memory_impl(
             })
         })
         .await?;
+
+    if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
+        store,
+        ctx.scope(),
+        &idemp,
+        Some(&ctx.budget),
+    )
+    .await?
+    {
+        return Ok(replayed.into_committed());
+    }
 
     if let Some(prec_rev) = &request.preconditions.revision
         && *prec_rev != base_head.head_rev_id
@@ -2951,7 +3206,11 @@ pub(crate) async fn link_impl(
     let link_line = validate_and_format_link_line(&request.input)?;
 
     let fp = format!("src={}\0line={link_line}", request.input.source.as_str());
-    let idemp = derive_command_identity_spec(&request.identity, "link", fp.as_bytes());
+    let idemp = derive_command_identity_spec(&request.identity, "link", fp.as_bytes()).for_link(
+        ctx.auth(),
+        &request.input.source,
+        &request.input.target,
+    );
     if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedLinkV1>(
         store,
         ctx.scope(),
@@ -3092,7 +3351,8 @@ pub(crate) async fn link_many_impl(
                 item_mut.input.source.as_str(),
                 cur_digest.to_hex()
             );
-            let idemp = derive_command_identity_spec(&item_mut.identity, "link", fp.as_bytes());
+            let idemp = derive_command_identity_spec(&item_mut.identity, "link", fp.as_bytes())
+                .for_link(ctx.auth(), &item_mut.input.source, &item_mut.input.target);
             virtual_sources.insert(
                 item_mut.input.source.clone(),
                 (doc_class, slug, new_carrier, new_digest),
@@ -3292,6 +3552,7 @@ fn build_link_item_intent(
                 item_ctx.record_staged_ticket(ticket.clone());
                 activate_and_bind_blob_ref_tx(
                     tx,
+                    &item_ctx.scope,
                     item_ctx.active_epoch,
                     &BlobReferenceClaim {
                         ticket,
@@ -3368,6 +3629,9 @@ fn build_link_item_intent(
                     current_schema.as_ref().map(|s| &s.fields),
                 );
                 let run_opt = extract_agent_run_from_auth(&auth);
+                let changed_fields =
+                    changed_revision_fields_tx(tx, &scope_cl, &head.head_rev_id, &eval_fields)
+                        .await?;
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
                         note_id: source_id.clone(),
@@ -3436,7 +3700,7 @@ fn build_link_item_intent(
                             rank_version: note_rank_version_digest(&new_rev, None),
                             lifecycle: Lifecycle::Active,
                             doc_class: head.doc_class,
-                            changed_fields: BTreeMap::new(),
+                            changed_fields,
                         }],
                     },
                     owner_notes.clone(),
@@ -3499,7 +3763,8 @@ pub(crate) async fn accept_external_observation_impl(
         &request.identity,
         "accept_external_observation",
         fp.finalize().as_bytes(),
-    );
+    )
+    .for_note(ctx.auth(), &request.input.note);
 
     if let Some(replayed) = try_replay_completed_receipt::<StoredExternalObsOutcomeV1>(
         store,
@@ -3745,6 +4010,7 @@ pub(crate) async fn accept_external_observation_impl(
                 item_ctx.record_staged_ticket(ticket.clone());
                 activate_and_bind_blob_ref_tx(
                     tx,
+                    &item_ctx.scope,
                     item_ctx.active_epoch,
                     &BlobReferenceClaim {
                         ticket,
@@ -3900,6 +4166,9 @@ pub(crate) async fn accept_external_observation_impl(
                     )
                 };
                 let run_opt = extract_agent_run_from_auth(&auth);
+                let changed_fields =
+                    changed_revision_fields_tx(tx, &scope_cl, &head.head_rev_id, &eval_fields)
+                        .await?;
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
                         note_id: obs_input.note.clone(),
@@ -3968,7 +4237,7 @@ pub(crate) async fn accept_external_observation_impl(
                             rank_version: note_rank_version_digest(&new_rev, None),
                             lifecycle: Lifecycle::Active,
                             doc_class: head.doc_class,
-                            changed_fields: BTreeMap::new(),
+                            changed_fields,
                         }],
                     },
                     vec![obs_input.note.clone()],
@@ -4050,6 +4319,8 @@ pub(crate) async fn update_space_schema_impl(
     let space_rec = store.read_space(&ctx.scope().space_id).await?;
     space_rec.scope.check(ctx.scope())?;
 
+    crate::writer::replay::authorize_schema_space(ctx.auth(), &space_rec.space)?;
+
     let ticket = store
         .stage_blob(
             &space_rec.scope,
@@ -4069,6 +4340,16 @@ pub(crate) async fn update_space_schema_impl(
         &request.identity,
         "update_space_schema",
         fp_hasher.finalize().as_bytes(),
+    )
+    .with_policy(
+        ctx.auth(),
+        crate::writer::replay::ReplayPolicy::Schema(vec![
+            crate::writer::replay::ReplayResource::Create(
+                request.input.schema_note.clone(),
+                request.input.parent.clone(),
+                DocClass::UserDoc,
+            ),
+        ]),
     );
 
     let scope_cl = space_rec.scope.clone();
@@ -4099,7 +4380,23 @@ pub(crate) async fn update_space_schema_impl(
                     true,
                 )
                 .await?;
-                auth.authorize_direct_write(&facts, &facts)?;
+                crate::writer::replay::authorize_schema_space(&auth, &live_space.space)?;
+                let existing_note =
+                    load_note_head_row_opt_tx(tx, &scope_cl.space_id, &input.schema_note).await?;
+                if let Some(head) = &existing_note {
+                    let (before, _) = build_resource_facts_tx(
+                        tx,
+                        &live_space.space,
+                        &head.parent_folder_id,
+                        head.doc_class,
+                        head.ability_id.clone(),
+                        true,
+                    )
+                    .await?;
+                    auth.authorize_direct_write(&before, &facts)?;
+                } else {
+                    auth.authorize_direct_write(&facts, &facts)?;
+                }
 
                 let current_schema = load_current_space_schema_tx(tx, &scope_cl.space_id).await?;
                 match (&current_schema, &input.expected_schema_revision) {
@@ -4120,8 +4417,6 @@ pub(crate) async fn update_space_schema_impl(
                     _ => {}
                 }
 
-                let existing_note =
-                    load_note_head_row_opt_tx(tx, &scope_cl.space_id, &input.schema_note).await?;
                 if let Some(ex) = &existing_note {
                     if ex.lifecycle != Lifecycle::Active {
                         return Err(DomainError::ResourceNotFound.into());
@@ -4168,6 +4463,7 @@ pub(crate) async fn update_space_schema_impl(
                 item_ctx.record_staged_ticket(ticket.clone());
                 activate_and_bind_blob_ref_tx(
                     tx,
+                    &item_ctx.scope,
                     item_ctx.active_epoch,
                     &BlobReferenceClaim {
                         ticket,
@@ -4497,7 +4793,7 @@ pub(crate) async fn get_note_impl(
     ctx: SpaceContext,
     request: GetNote,
 ) -> Result<NoteSnapshot, PortError> {
-    if store.is_sqlite_local() {
+    if store.is_sqlite_local() && request.revision.is_none() {
         return crate::sqlite_fast::get_note_sqlite_local_fast(store, ctx, request).await;
     }
     let scope = ctx.scope().clone();
@@ -4571,10 +4867,11 @@ pub(crate) async fn get_note_impl(
                 .await?;
                 auth.authorize_read(&live_facts)?;
 
+                let historical = req_rev_opt.is_some();
                 let target_rev_id = req_rev_opt.unwrap_or_else(|| live_head.head_rev_id.clone());
-                let meta_bytes: Option<Vec<u8>> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                        "SELECT metadata_msgpack FROM revisions
+                let revision: Option<(Vec<u8>, i64)> = match tx {
+                    BackendConn::Sqlite(conn) => sqlx::query_as(
+                        "SELECT metadata_msgpack, visibility_seq FROM revisions
                          WHERE space_id = ? AND rev_id = ? AND entity_type = 'note' AND entity_key = ?",
                     )
                     .bind(scope.space_id.as_str())
@@ -4585,8 +4882,8 @@ pub(crate) async fn get_note_impl(
                     .map_err(|err| {
                         internal_not_committed("sqlite_get_note_rev", err.to_string())
                     })?,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(
-                        "SELECT metadata_msgpack FROM revisions
+                    BackendConn::Postgres(conn) => sqlx::query_as(
+                        "SELECT metadata_msgpack, visibility_seq FROM revisions
                          WHERE space_id = $1 AND rev_id = $2 AND entity_type = 'note' AND entity_key = $3",
                     )
                     .bind(scope.space_id.as_str())
@@ -4597,7 +4894,7 @@ pub(crate) async fn get_note_impl(
                     .map_err(|err| internal_not_committed("pg_get_note_rev", err.to_string()))?,
                 };
 
-                let Some(raw_meta) = meta_bytes else {
+                let Some((raw_meta, visibility_seq)) = revision else {
                     return Err(DomainError::ResourceNotFound.into());
                 };
                 let env = RevisionMetadataEnvelope::decode(&raw_meta)?;
@@ -4613,7 +4910,17 @@ pub(crate) async fn get_note_impl(
                 let digest = nm.content_digest.ok_or_else(|| {
                     internal_not_committed("note_rev_missing_digest", "note revision lacks digest")
                 })?;
-                let parent_opt = (!nm.is_root_child).then_some(nm.parent_folder_id);
+                let facts = if historical {
+                    let cutoff = crate::codec::i64_to_space_seq(visibility_seq)?;
+                    let (facts, _) = FolderAncestryCache::at_cut(&scope, cutoff)
+                        .build_resource_facts_tx(tx, &space_rec.space, &nm.parent_folder_id,
+                            nm.doc_class, nm.ability_id.clone(), false).await?;
+                    auth.authorize_read(&facts)?;
+                    facts
+                } else {
+                    live_facts
+                };
+                let parent_opt = (nm.parent_folder_id != space_rec.root_folder_id).then_some(nm.parent_folder_id);
                 let effective_lc = if target_rev_id == live_head.head_rev_id {
                     live_head.lifecycle
                 } else {
@@ -4641,7 +4948,7 @@ pub(crate) async fn get_note_impl(
 
                 Ok((
                     target_rev_id,
-                    live_facts,
+                    facts,
                     effective_lc,
                     digest,
                     parent_opt,
@@ -4661,21 +4968,15 @@ pub(crate) async fn get_note_impl(
     let content = String::from_utf8(raw_bytes)
         .map_err(|_| internal_not_committed("get_note_utf8", "note carrier is not valid UTF-8"))?;
 
-    // Re-check live purge fence AFTER CAS read so a concurrent purge never leaks purged content!
-    let scope_recheck = ctx.scope().clone();
-    let note_recheck = request.note.clone();
-    store
-        .with_read_tx_budget(Some(&ctx.budget), |tx| {
-            Box::pin(async move {
-                if is_note_purge_fenced_tx(tx, &scope_recheck.space_id, note_recheck.as_str())
-                    .await?
-                {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                Ok(())
-            })
-        })
-        .await?;
+    let current = recheck_note_read(store, &ctx, &request.note).await?;
+    let facts = if request.revision.is_some() {
+        live_facts
+    } else {
+        if current.class != live_facts.class {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        current
+    };
 
     let document = ClassifiedDocument::from_canonical(
         NoteRef {
@@ -4683,7 +4984,7 @@ pub(crate) async fn get_note_impl(
             note_id: request.note,
         },
         rev_id,
-        live_facts,
+        facts,
         lifecycle,
         content,
         digest,
@@ -4696,6 +4997,34 @@ pub(crate) async fn get_note_impl(
         fields,
         diagnostics,
     })
+}
+
+/// Authorize the current owner and location after immutable CAS bytes have arrived.
+pub(crate) async fn recheck_note_read(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    note: &NoteId,
+) -> Result<notarium_core::auth::ResourceFacts, PortError> {
+    let scope = ctx.scope().clone();
+    let auth = ctx.auth().clone();
+    let note = note.clone();
+    store
+        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+            Box::pin(async move {
+                let space = load_space_record(tx, &scope.space_id).await?;
+                space.scope.check(&scope)?;
+                if space.space.lifecycle != SpaceLifecycle::Active {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let facts = FolderAncestryCache::default()
+                    .live_note_facts(tx, &space.space, &note, false)
+                    .await?
+                    .ok_or(DomainError::ResourceNotFound)?;
+                auth.authorize_read(&facts)?;
+                Ok(facts)
+            })
+        })
+        .await
 }
 
 pub(crate) async fn is_live_visible_impl(
@@ -4763,6 +5092,7 @@ pub(crate) async fn hydrate_cards_impl(
                 }
                 let valid_cut = validate_snapshot_cutoff_tx(tx, &scope, Some(cut_seq)).await?;
                 let mut folder_cache = FolderAncestryCache::default();
+                let mut historical = FolderAncestryCache::at_cut(&scope, valid_cut);
 
                 let mut out = Vec::with_capacity(notes_in.len());
                 for nid in notes_in {
@@ -4782,7 +5112,7 @@ pub(crate) async fn hydrate_cards_impl(
                         out.push(None);
                         continue;
                     }
-                    let Ok((live_facts, live_anc)) = folder_cache
+                    let Ok((live_facts, _)) = folder_cache
                         .build_resource_facts_tx(
                             tx,
                             &space_rec.space,
@@ -4818,13 +5148,31 @@ pub(crate) async fn hydrate_cards_impl(
                         continue;
                     };
 
+                    if auth.can_view_resource(&live_facts).is_err() {
+                        out.push(None);
+                        continue;
+                    }
+                    let Ok((snap_facts, ancestors)) = historical
+                        .build_resource_facts_tx(
+                            tx,
+                            &space_rec.space,
+                            &nm.parent_folder_id,
+                            nm.doc_class,
+                            nm.ability_id,
+                            true,
+                        )
+                        .await
+                    else {
+                        out.push(None);
+                        continue;
+                    };
                     let Ok(cmeta) = ClassifiedMetadata::from_canonical(
                         NoteRef {
                             space_id: scope.space_id.clone(),
                             note_id: nid.clone(),
                         },
                         hist_rev.revision_id,
-                        live_facts,
+                        snap_facts,
                         Lifecycle::Active,
                         digest,
                     ) else {
@@ -4836,10 +5184,10 @@ pub(crate) async fn hydrate_cards_impl(
                         continue;
                     };
 
-                    let path = if live_anc.folder_path.is_empty() {
+                    let path = if ancestors.folder_path.is_empty() {
                         format!("{}.md", nm.slug)
                     } else {
-                        format!("{}/{}.md", live_anc.folder_path, nm.slug)
+                        format!("{}/{}.md", ancestors.folder_path, nm.slug)
                     };
                     out.push(Some((
                         nid,
@@ -4998,11 +5346,13 @@ pub(crate) async fn try_replay_completed_receipt<R: serde::de::DeserializeOwned>
 ) -> Result<Option<R>, PortError> {
     let scope_cl = scope.clone();
     let idemp_cl = idemp.clone();
+    let inner = std::sync::Arc::clone(&store.inner);
     let blob_opt = store
         .with_read_tx_budget(budget, |tx| {
             Box::pin(async move {
                 let srec = load_space_record(tx, &scope_cl.space_id).await?;
                 srec.scope.check(&scope_cl)?;
+                inner.check_writer_epoch(&srec.scope.space_id, srec.active_epoch)?;
                 let Some(existing) =
                     crate::writer::lookup_command_receipt_tx(tx, &scope_cl, &idemp_cl).await?
                 else {

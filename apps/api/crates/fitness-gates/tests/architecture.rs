@@ -147,6 +147,54 @@ fn workspace_dependencies_are_bound_locked_and_lints_inherited() {
 }
 
 #[test]
+fn canonical_fixture_methods_are_only_enabled_for_tests() {
+    let actual = metadata();
+    let packages = actual["packages"].as_array().unwrap();
+    let index = packages
+        .iter()
+        .position(|p| p["name"] == "notarium-canonical")
+        .unwrap();
+    let canonical = &packages[index];
+    let dependencies = canonical["dependencies"].as_array().unwrap();
+    let own_tests = dependencies
+        .iter()
+        .position(|dep| dep["name"] == "notarium-canonical")
+        .unwrap();
+    assert_eq!(dependencies[own_tests]["features"], json!(["test-support"]));
+    assert!(
+        canonical["features"]["default"].is_null() || canonical["features"]["default"] == json!([])
+    );
+    for kind in [Value::Null, json!("build")] {
+        let mut altered = actual.clone();
+        altered["packages"][index]["dependencies"][own_tests]["kind"] = kind;
+        assert!(
+            validate_metadata(&altered, &root())
+                .unwrap_err()
+                .contains("forbidden edge")
+        );
+    }
+    let mut altered = actual;
+    let bin = altered["packages"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|p| p["name"] == "notarium-bin")
+        .unwrap();
+    let dep = bin["dependencies"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|dep| dep["name"] == "notarium-canonical")
+        .unwrap();
+    dep["features"] = json!(["test-support"]);
+    assert!(
+        validate_metadata(&altered, &root())
+            .unwrap_err()
+            .contains("fixture API")
+    );
+}
+
+#[test]
 fn banned_package_names_are_checked_exactly() {
     for name in BANNED {
         let lock = document(&format!(

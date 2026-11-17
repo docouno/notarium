@@ -37,7 +37,7 @@ use notarium_core::{
         RollbackBoardFactsRequest, SemanticPlacement, SpaceContext, ViewRef,
     },
     query::{FieldObservation, FieldValue},
-    receipt::{CausalBasis, CommandIdentity, ReceiptSet},
+    receipt::{AwaitReason, CausalBasis, CommandIdentity, MutationEffect, ReceiptSet},
     value::{ScalarValue, YamlValue},
 };
 use notarium_syntax::{extract, frontmatter::FieldEdit};
@@ -579,7 +579,14 @@ fn l6_ten_thousand_first_slot_board_moves_rank_bound_and_strict_ordering() {
     );
 }
 
-async fn run_move_board_card_suite(store: &CanonicalStore) {
+struct BoardEffects {
+    scope: HistoryScope,
+    materialized: ReceiptSet,
+    neighbor_rank: notarium_core::ids::RevisionId,
+    column_change: SpaceSeq,
+}
+
+async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
     let owner = sample_principal_id(30);
     let (scope, _root) = seed_space(
         store,
@@ -759,6 +766,20 @@ async fn run_move_board_card_suite(store: &CanonicalStore) {
     assert!(overlays[&card_1].sort_rank_lexo < overlays[&card_2].sort_rank_lexo);
     assert_eq!(moved_first.value.rank, overlays[&card_3].sort_rank_lexo);
 
+    let materialized = ReceiptSet::new([moved_first.receipt.clone()]).unwrap();
+    let effects = store
+        .resolve_receipt_effects(&scope, &materialized)
+        .await
+        .unwrap();
+    let MutationEffect::Notes { versions, .. } = &effects[0].effect else {
+        panic!("expected materialized neighbors")
+    };
+    let actual: BTreeMap<_, _> = versions
+        .iter()
+        .map(|v| (v.note_id.clone(), v.revision.clone()))
+        .collect();
+    assert_eq!(actual, revs);
+
     // Cross-column move (`todo -> doing`) updates frontmatter `status: doing` AND rank overlay atomically!
     let cross_col = store
         .move_board_card(
@@ -777,7 +798,7 @@ async fn run_move_board_card_suite(store: &CanonicalStore) {
                         Some(YamlValue::String("doing".to_owned())),
                     )]),
                     expected_note: moved_first.value.revision.revision.clone(),
-                    expected_view: view_created.value.revision,
+                    expected_view: view_created.value.revision.clone(),
                     expected_rank: RankExpectation::Existing(moved_first.value.rank_revision),
                 },
             ),
@@ -787,7 +808,7 @@ async fn run_move_board_card_suite(store: &CanonicalStore) {
     assert_eq!(cross_col.value.group, doing_grp);
     let snap_card_3 = store
         .get_note(
-            ctx,
+            ctx.clone(),
             GetNote {
                 note: card_3,
                 revision: None,
@@ -799,10 +820,98 @@ async fn run_move_board_card_suite(store: &CanonicalStore) {
     assert!(
         snap_card_3
             .document
-            .explicit_read(&owner_ctx(&scope, owner).auth().clone())
+            .explicit_read(ctx.auth())
             .expect("read")
             .contains("status: doing")
     );
+    // A group of nine unranked cards exceeds the exact-overlay bound on its first move.
+    let mut large_cards = Vec::new();
+    for id in 112..121 {
+        let note = sample_note_id(id);
+        let created = store
+            .create_note(
+                ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        note: note.clone(),
+                        parent: None,
+                        slug: format!("large-{id}"),
+                        class: DocClass::UserDoc,
+                        carrier: format!("---\ntitle: Large {id}\nstatus: large\n---\n"),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        planner.tracked_notes.lock().unwrap().insert(note);
+        large_cards.push(created.value);
+    }
+    let last = large_cards.pop().unwrap();
+    let moved = store
+        .move_board_card(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveBoardCard {
+                    view,
+                    note: last.note,
+                    expected_note: last.revision,
+                    expected_view: view_created.value.revision,
+                    group: GroupKey::Value(ScalarValue::String("large".into())),
+                    before: None,
+                    after: None,
+                    expected_rank: RankExpectation::Absent,
+                    fields: BTreeMap::new(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let effects = store
+        .resolve_receipt_effects(&scope, &ReceiptSet::new([moved.receipt]).unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        effects[0].effect,
+        MutationEffect::AwaitProjection {
+            reason: AwaitReason::TooManyNotes
+        }
+    ));
+
+    BoardEffects {
+        scope,
+        materialized,
+        neighbor_rank: overlays[&card_1].rank_rev_id.clone(),
+        column_change: cross_col.receipt.seq(),
+    }
+}
+
+async fn verify_board_effects(store: &CanonicalStore, evidence: BoardEffects, bytes: &[u8]) {
+    let env = notarium_canonical::changes::EffectEnvelopeV1::decode(bytes).unwrap();
+    let notarium_canonical::EffectBodyV1::Notes { notes } = env.body else {
+        panic!("expected a cross-column note effect")
+    };
+    assert_eq!(notes.len(), 1);
+    assert_eq!(
+        notes[0].changed_fields,
+        BTreeMap::from([(
+            "status".into(),
+            FieldObservation::Ok(FieldValue::Scalar(ScalarValue::String("doing".into())))
+        )])
+    );
+    let effects = store
+        .resolve_receipt_effects(&evidence.scope, &evidence.materialized)
+        .await
+        .unwrap();
+    assert!(matches!(
+        effects[0].effect,
+        MutationEffect::AwaitProjection {
+            reason: AwaitReason::UnavailableVersion
+        }
+    ));
 }
 
 async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
@@ -1470,7 +1579,21 @@ async fn l6_move_board_card_planner_cutoff_and_pma_dual_dialect_parity() {
         let root = TempDataRoot::new("l6-move-sqlite");
         let cfg = CanonicalConfig::local_default(sample_installation_id(1), root.data_root());
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
-        run_move_board_card_suite(&store).await;
+        let evidence = run_move_board_card_suite(&store).await;
+        let mut conn = root.open_raw_sqlite().await;
+        let bytes: Vec<u8> = sqlx::query_scalar(
+            "SELECT effect_msgpack FROM change_payloads WHERE created_seq=? AND codec='effect_v1'",
+        )
+        .bind(evidence.column_change.get() as i64)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM revisions WHERE rev_id=?")
+            .bind(evidence.neighbor_rank.as_str())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        verify_board_effects(&store, evidence, &bytes).await;
         runtime.shutdown().await.expect("shutdown sqlite");
     }
 
@@ -1484,7 +1607,18 @@ async fn l6_move_board_card_planner_cutoff_and_pma_dual_dialect_parity() {
             .expect("ensure S3 bucket");
         let cfg = fixtures.pg_s3_config(sample_installation_id(2), &schema, s3_cfg);
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
-        run_move_board_card_suite(&store).await;
+        let evidence = run_move_board_card_suite(&store).await;
+        let mut conn = fixtures.open_raw_pg().await;
+        let bytes: Vec<u8> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT effect_msgpack FROM {schema}.change_payloads WHERE created_seq=$1 AND codec='effect_v1'")))
+            .bind(evidence.column_change.get() as i64).fetch_one(&mut conn).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {schema}.revisions WHERE rev_id=$1"
+        )))
+        .bind(evidence.neighbor_rank.as_str())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        verify_board_effects(&store, evidence, &bytes).await;
         runtime.shutdown().await.expect("shutdown pg+s3");
         fixtures.drop_pg_schema(&schema).await;
     }

@@ -1,3 +1,6 @@
+mod ownership;
+use ownership::{ArtifactLease, HoldOwnership};
+
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
@@ -27,7 +30,7 @@ use notarium_core::{
     receipt::ChangeCursor,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{Connection, Postgres, Row, pool::PoolConnection};
+use sqlx::{Connection, PgConnection, Row};
 
 use crate::{
     CanonicalStore, RoomFenceTable,
@@ -185,7 +188,14 @@ fn ensure_private_dir(path: &Path) -> Result<(), PortError> {
         builder
             .create(path)
             .map_err(|err| internal_not_committed("create_backup_spool_dir", err.to_string()))?;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|err| internal_not_committed("stat_backup_spool_dir", err.to_string()))?;
+        if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(internal_not_committed(
+                "private_backup_spool_required",
+                "backup spool directory must be private",
+            ));
+        }
     }
     #[cfg(not(unix))]
     {
@@ -265,6 +275,26 @@ fn tighten_budget(a: BackupBudget, b: BackupBudget) -> Result<BackupBudget, Port
     Ok(budget)
 }
 
+async fn wait_for_phase<T>(
+    remaining: Duration,
+    cancellation: &Cancellation,
+    operation: impl std::future::Future<Output = Result<T, PortError>>,
+) -> Result<T, PortError> {
+    if cancellation.is_cancelled() {
+        return Err(cancelled_not_committed(
+            "backup_cancelled",
+            "backup cancelled",
+        ));
+    }
+    if remaining.is_zero() {
+        return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+    }
+    tokio::select! {
+        () = cancellation.cancelled() => Err(cancelled_not_committed("backup_cancelled", "backup cancelled")),
+        result = tokio::time::timeout(remaining, operation) => result.map_err(|_| DomainError::validation(ValidationReason::BudgetExceeded))?,
+    }
+}
+
 fn validate_backup_budget(budget: BackupBudget) -> Result<(), PortError> {
     if budget.deadline.is_zero()
         || budget.max_spool_bytes == 0
@@ -273,6 +303,12 @@ fn validate_backup_budget(budget: BackupBudget) -> Result<(), PortError> {
         return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
     }
     Ok(())
+}
+
+pub(crate) async fn recover_backup_state(store: &CanonicalStore) -> Result<(), PortError> {
+    ownership::recover_holds(store).await?;
+    let dir = resolve_spool_dir(&store.inner)?;
+    ownership::recover_directory(store, &dir).await
 }
 
 impl CanonicalStore {
@@ -296,7 +332,7 @@ impl CanonicalStore {
             .expect("backup memory stats mutex")
     }
 
-    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub fn set_backup_step_delay_for_test(&self, delay: Duration) {
         let us = u64::try_from(delay.as_micros()).unwrap_or(u64::MAX);
         self.inner.backup_step_delay_us.store(us, Ordering::SeqCst);
@@ -307,8 +343,7 @@ impl CanonicalStore {
         artifact_id: &ArtifactId,
     ) -> Result<BackupArtifactRecord, PortError> {
         let aid = artifact_id.clone();
-        let spool_dir = resolve_spool_dir(&self.inner)?;
-        self.with_read_tx(|tx| {
+        let mut record = self.with_read_tx(|tx| {
             Box::pin(async move {
                 type RawBackupArtifactRow = (
                     String,
@@ -426,7 +461,7 @@ impl CanonicalStore {
                     installation_id,
                     encoding,
                     schema_version,
-                    artifact_path: spool_dir.join(rel_path),
+                    artifact_path: PathBuf::from(rel_path),
                     byte_size,
                     digest: ContentDigest::from_bytes(digest_arr),
                     witness,
@@ -435,7 +470,23 @@ impl CanonicalStore {
                 })
             })
         })
+        .await?;
+        let key = record
+            .artifact_path
+            .to_str()
+            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?
+            .to_owned();
+        let store = self.clone();
+        let id = artifact_id.clone();
+        let encoding = record.encoding;
+        let size = record.byte_size;
+        let digest = record.digest;
+        record.artifact_path = tokio::task::spawn_blocking(move || {
+            ownership::locate(&store, &id, encoding, &key, size, digest)
+        })
         .await
+        .map_err(|err| internal_not_committed("locate_backup_artifact", err.to_string()))??;
+        Ok(record)
     }
 }
 
@@ -451,12 +502,14 @@ struct SqliteSpoolSuccess {
 
 enum SqliteWorkerCmd {
     OpenCut {
+        wal_pin: BackupWalPinGuard,
+        shutdown: Cancellation,
+        remaining: Duration,
         expected_installation: InstallationId,
         reply: tokio::sync::oneshot::Sender<Result<BackupWitness, PortError>>,
     },
     Spool {
         budget: BackupBudget,
-        wal_pin: BackupWalPinGuard,
         expected_witness: BackupWitness,
         final_path: PathBuf,
         step_delay_us: u64,
@@ -473,6 +526,21 @@ struct SqliteBackupWorkerHandle {
     interrupt_handle: Arc<rusqlite::InterruptHandle>,
     join_handle: Option<std::thread::JoinHandle<()>>,
     tmp_path: PathBuf,
+}
+
+struct AbortBackupWatcher(tokio::task::AbortHandle);
+impl Drop for AbortBackupWatcher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for SqliteBackupWorkerHandle {
+    fn drop(&mut self) {
+        self.cancel_flag.store(true, Ordering::Release);
+        self.interrupt_handle.interrupt();
+        self.cmd_tx.take();
+    }
 }
 
 impl SqliteBackupWorkerHandle {
@@ -622,9 +690,33 @@ fn sqlite_backup_worker_loop(
     let mut pinned = false;
     let mut published = false;
 
-    while let Ok(cmd) = cmd_rx.recv() {
+    let mut pin: Option<(BackupWalPinGuard, Instant, Duration, Cancellation)> = None;
+    loop {
+        let cmd = if let Some((guard, start, lifetime, shutdown)) = &pin {
+            if shutdown.is_cancelled()
+                || start.elapsed() >= *lifetime
+                || guard.is_aborted_by_coordinator()
+            {
+                break;
+            }
+            match cmd_rx.recv_timeout(
+                Duration::from_millis(5).min(lifetime.saturating_sub(start.elapsed())),
+            ) {
+                Ok(cmd) => cmd,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match cmd_rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            }
+        };
         match cmd {
             SqliteWorkerCmd::OpenCut {
+                wal_pin,
+                remaining,
+                shutdown,
                 expected_installation,
                 reply,
             } => {
@@ -632,6 +724,7 @@ fn sqlite_backup_worker_loop(
                     match pin_and_read_sqlite_witness(src_conn, &expected_installation) {
                         Ok(w) => {
                             pinned = true;
+                            pin = Some((wal_pin, Instant::now(), remaining, shutdown));
                             Ok(w)
                         }
                         Err(err) => {
@@ -653,12 +746,18 @@ fn sqlite_backup_worker_loop(
             }
             SqliteWorkerCmd::Spool {
                 budget,
-                wal_pin,
                 expected_witness,
                 final_path,
                 step_delay_us,
                 reply,
             } => {
+                let Some((wal_pin, _, _, _)) = pin.take() else {
+                    let _ = reply
+                        .send(Err(
+                            DomainError::validation(ValidationReason::InvalidState).into()
+                        ));
+                    break;
+                };
                 let res = run_sqlite_spool_on_owner_thread(
                     &mut src_opt,
                     &mut dst_opt,
@@ -674,7 +773,9 @@ fn sqlite_backup_worker_loop(
                 if res.is_ok() {
                     published = true;
                 }
-                let _ = reply.send(res);
+                if reply.send(res).is_err() && published {
+                    let _ = fs::remove_file(&final_path);
+                }
                 break;
             }
             SqliteWorkerCmd::Abort { reply } => {
@@ -728,7 +829,7 @@ fn read_and_verify_sqlite_conn_witness(
         .query_row(
             "SELECT schema_version, installation_id, manifest_checksum
              FROM schema_meta
-             WHERE singleton_id = 1",
+             WHERE singleton_id = 1 AND epoch_version = 1 AND migration_state = 'ready'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -802,7 +903,7 @@ fn run_sqlite_spool_on_owner_thread(
     pinned: &mut bool,
     wal_pin: BackupWalPinGuard,
     budget: BackupBudget,
-    cancel_flag: &AtomicBool,
+    cancel_flag: &Arc<AtomicBool>,
     expected_witness: &BackupWitness,
     tmp_path: &Path,
     final_path: &Path,
@@ -819,10 +920,11 @@ fn run_sqlite_spool_on_owner_thread(
     let mut step_count = 0u64;
     let mut src_page_size = 4096u64;
 
+    let src = src_opt.take().ok_or_else(|| {
+        internal_not_committed("sqlite_backup_missing_src", "missing source connection")
+    })?;
+    *pinned = false;
     let step_res: Result<(), PortError> = (|| {
-        let src = src_opt.as_ref().ok_or_else(|| {
-            internal_not_committed("sqlite_backup_missing_src", "missing source connection")
-        })?;
         if let Ok(ps) = src.query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))
             && ps >= 512
         {
@@ -835,7 +937,7 @@ fn run_sqlite_spool_on_owner_thread(
             )
         })?;
 
-        let backup = rusqlite::backup::Backup::new(src, dst)
+        let backup = rusqlite::backup::Backup::new(&src, dst)
             .map_err(|err| internal_not_committed("rusqlite_backup_init", err.to_string()))?;
 
         loop {
@@ -931,17 +1033,6 @@ fn run_sqlite_spool_on_owner_thread(
         Ok(())
     })();
 
-    // ALWAYS release `src` transaction and `wal_pin` immediately after page copy finishes or aborts,
-    // BEFORE verifying/hashing/fsyncing destination!
-    if let Some(src_conn) = src_opt.take() {
-        if *pinned {
-            let _ = src_conn.execute_batch("ROLLBACK;");
-            *pinned = false;
-        }
-        let _ = src_conn.close();
-    }
-    drop(wal_pin);
-
     if let Err(err) = step_res {
         if let Some(dst_conn) = dst_opt.take() {
             let _ = dst_conn.close();
@@ -955,6 +1046,17 @@ fn run_sqlite_spool_on_owner_thread(
         let dst = dst_opt.take().ok_or_else(|| {
             internal_not_committed("sqlite_backup_dst_gone", "destination connection missing")
         })?;
+        let abort = Arc::clone(&wal_pin.abort_flag);
+        let cancelled = Arc::clone(cancel_flag);
+        dst.progress_handler(
+            1000,
+            Some(move || {
+                cancelled.load(Ordering::Acquire)
+                    || abort.load(Ordering::Acquire)
+                    || started.elapsed() > budget.deadline
+            }),
+        )
+        .map_err(|err| internal_not_committed("sqlite_verify_progress", err.to_string()))?;
         // Holds protect source CAS objects until the backup owner releases them.
         // Normalize the private copy before hashing and publishing its single database file.
         dst.execute_batch("PRAGMA journal_mode = DELETE; DELETE FROM backup_holds;")
@@ -987,6 +1089,15 @@ fn run_sqlite_spool_on_owner_thread(
 
     if let Err(err) = verify_res {
         remove_tmp_artifacts_best_effort(tmp_path);
+        if cancel_flag.load(Ordering::Acquire) {
+            return Err(cancelled_not_committed(
+                "backup_verification_cancelled",
+                "SQLite backup cancelled",
+            ));
+        }
+        if wal_pin.is_aborted_by_coordinator() || started.elapsed() >= budget.deadline {
+            return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+        }
         return Err(err);
     }
 
@@ -996,11 +1107,19 @@ fn run_sqlite_spool_on_owner_thread(
     let total_bytes = final_meta.len();
     budget.check(BackupProgress {
         elapsed: started.elapsed(),
-        retention: BackupRetentionProgress::SqliteWal { pinned_bytes: 0 },
+        retention: BackupRetentionProgress::SqliteWal {
+            pinned_bytes: wal_pin.current_pinned_wal_bytes(),
+        },
         spool_bytes: total_bytes,
     })?;
 
-    let digest = match stream_file_blake3_and_sync(tmp_path, cancel_flag) {
+    let digest = match stream_file_blake3_and_sync(
+        tmp_path,
+        cancel_flag,
+        &wal_pin,
+        started,
+        budget.deadline,
+    ) {
         Ok(d) => d,
         Err(err) => {
             remove_tmp_artifacts_best_effort(tmp_path);
@@ -1016,6 +1135,9 @@ fn run_sqlite_spool_on_owner_thread(
         ));
     }
     fsync_parent_dir(final_path)?;
+    // Release the source after the verified destination and its directory are durable.
+    drop(src);
+    drop(wal_pin);
 
     let page_step_bytes = (SQLITE_BACKUP_PAGES_PER_STEP as usize) * (src_page_size as usize);
     let working_bytes = STREAM_IO_BUF_BYTES + 2 * (SQLITE_CACHE_KIB as usize) * 1024;
@@ -1063,6 +1185,9 @@ fn sleep_interruptible(
 fn stream_file_blake3_and_sync(
     path: &Path,
     cancel_flag: &AtomicBool,
+    wal_pin: &BackupWalPinGuard,
+    started: Instant,
+    deadline: Duration,
 ) -> Result<ContentDigest, PortError> {
     let file = OpenOptions::new()
         .read(true)
@@ -1081,6 +1206,9 @@ fn stream_file_blake3_and_sync(
                 "backup_hash_cancelled",
                 "backup hashing cancelled",
             ));
+        }
+        if wal_pin.is_aborted_by_coordinator() || started.elapsed() >= deadline {
+            return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
         }
         let n = reader
             .read(&mut buf)
@@ -1103,54 +1231,75 @@ fn witnesses_equal(a: &BackupWitness, b: &BackupWitness) -> bool {
 // PostgreSQL prepared / pinned connection state (`PostgresSpoolV1`)
 // ============================================================================
 
+async fn open_backup_connection(store: &CanonicalStore) -> Result<PgConnection, PortError> {
+    let SqlBackendConfig::Postgres {
+        connect, schema, ..
+    } = &store.inner.config.sql
+    else {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    };
+    let options = crate::dialect::postgres::build_pg_connect_options(connect);
+    let mut conn = PgConnection::connect_with(&options)
+        .await
+        .map_err(|err| internal_not_committed("pg_backup_connect", err.to_string()))?;
+    sqlx::query("SELECT set_config('search_path', quote_ident($1), false)")
+        .bind(schema)
+        .execute(&mut conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_backup_schema", err.to_string()))?;
+    Ok(conn)
+}
+
 struct PgPreparedSource {
-    pool: sqlx::PgPool,
-    pooled: Option<PoolConnection<Postgres>>,
+    source: Option<PgConnection>,
+    store: CanonicalStore,
     backend_pid: i32,
-    in_tx: bool,
+    barrier: Option<PgConnection>,
     pinned_at: Option<Instant>,
     tmp_path: PathBuf,
 }
 
+impl Drop for PgPreparedSource {
+    fn drop(&mut self) {
+        // Dedicated sockets never return a cancelled transaction to a caller's pool.
+        remove_tmp_artifacts_best_effort(&self.tmp_path);
+    }
+}
+
 impl PgPreparedSource {
     async fn abort_cleanly(&mut self) {
-        if let Some(mut conn) = self.pooled.take()
-            && self.in_tx
-        {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-            self.in_tx = false;
+        if let Some(mut conn) = self.source.take() {
+            let _ = sqlx::raw_sql("ROLLBACK").execute(&mut conn).await;
+            let _ = conn.close().await;
         }
-        remove_tmp_artifacts_best_effort(&self.tmp_path);
+    }
+
+    async fn cancel_and_close(&mut self) {
+        if self.source.is_some()
+            && let Ok(Ok(mut cancel)) =
+                tokio::time::timeout(Duration::from_secs(1), open_backup_connection(&self.store))
+                    .await
+        {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                sqlx::query("SELECT pg_cancel_backend($1)")
+                    .bind(self.backend_pid)
+                    .execute(&mut cancel),
+            )
+            .await;
+        }
+        self.abort_cleanly().await;
     }
 
     fn detach_abort_cleanup(&mut self, inner: &CanonicalInner) {
-        let tmp = self.tmp_path.clone();
-        if let Some(pooled) = self.pooled.take() {
-            let mut raw = pooled.detach();
-            let pool = self.pool.clone();
-            let pid = self.backend_pid;
-            let in_tx = self.in_tx;
-            self.in_tx = false;
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                let handle = rt.spawn(async move {
-                    if let Ok(mut cancel_conn) = pool.acquire().await {
-                        let _ = sqlx::query("SELECT pg_cancel_backend($1)")
-                            .bind(pid)
-                            .execute(&mut *cancel_conn)
-                            .await;
-                    }
-                    if in_tx {
-                        let _ = sqlx::query("ROLLBACK").execute(&mut raw).await;
-                    }
-                    let _ = raw.close().await;
-                    remove_tmp_artifacts_best_effort(&tmp);
-                });
-                register_cleanup_task(inner, handle);
-                return;
-            }
-            drop(raw);
+        if let Some(conn) = self.source.take() {
+            register_cleanup_task(
+                inner,
+                inner.backup_executor.spawn(async move {
+                    let _ = conn.close().await;
+                }),
+            );
         }
-        remove_tmp_artifacts_best_effort(&tmp);
     }
 }
 
@@ -1175,7 +1324,7 @@ async fn warm_pg_backup_connection(conn: &mut sqlx::PgConnection) -> Result<i32,
             "PREPARE {PG_PIN_WITNESS_STMT} AS
              SELECT 0::int2 AS kind, schema_version::bigint AS num_col, installation_id AS txt_col, manifest_checksum AS bin_col
              FROM schema_meta
-             WHERE singleton_id = 1
+             WHERE singleton_id = 1 AND epoch_version = 1 AND migration_state = 'ready'
              UNION ALL
              SELECT 1::int2 AS kind, last_seq AS num_col, space_id AS txt_col, history_incarnation AS bin_col
              FROM spaces
@@ -1366,7 +1515,11 @@ where
     if rem.is_zero() {
         return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
     }
-    match tokio::time::timeout(rem, fut).await {
+    let result = tokio::select! {
+        result = tokio::time::timeout(rem, fut) => result,
+        () = cancellation.cancelled() => return Err(cancelled_not_committed("pg_backup_cancelled", "PostgreSQL backup spool cancelled")),
+    };
+    match result {
         Ok(Ok(v)) => {
             if cancellation.is_cancelled() {
                 return Err(cancelled_not_committed(
@@ -1429,7 +1582,7 @@ async fn stream_postgres_spool_v1(
     let mut slice_or_row_ops = 0u64;
 
     let stream_res: Result<(File, u64, ContentDigest), PortError> = async {
-        let conn = pg.pooled.as_mut().ok_or_else(|| {
+        let conn = pg.source.as_mut().ok_or_else(|| {
             internal_not_committed("pg_backup_conn_missing", "PostgreSQL pinned connection missing")
         })?;
 
@@ -1441,7 +1594,7 @@ async fn stream_postgres_spool_v1(
                 "SET LOCAL statement_timeout = {timeout_ms}"
             )))
             .persistent(false)
-            .execute(&mut **conn),
+            .execute(&mut *conn),
         )
         .await?;
 
@@ -1457,7 +1610,7 @@ async fn stream_postgres_spool_v1(
         spool_writer.write_body(&witness_len.to_be_bytes())?;
         spool_writer.write_body(&witness_bytes)?;
 
-        let table_count = u32::try_from(CANONICAL_TABLES.len()).expect("34 tables fit in u32");
+        let table_count = u32::try_from(CANONICAL_TABLES.len()).expect("table count fits in u32");
         spool_writer.write_body(&table_count.to_be_bytes())?;
 
         for (t_idx, table) in CANONICAL_TABLES.iter().enumerate() {
@@ -1519,7 +1672,7 @@ async fn stream_postgres_spool_v1(
                 cancellation,
                 sqlx::query(sqlx::AssertSqlSafe(declare_sql))
                     .persistent(false)
-                    .execute(&mut **conn),
+                    .execute(&mut *conn),
             )
             .await?;
 
@@ -1541,7 +1694,7 @@ async fn stream_postgres_spool_v1(
                     cancellation,
                     sqlx::query_scalar(sqlx::AssertSqlSafe(fetch_sql.clone()))
                         .persistent(false)
-                        .fetch_optional(&mut **conn),
+                        .fetch_optional(&mut *conn),
                 )
                 .await?;
 
@@ -1561,7 +1714,7 @@ async fn stream_postgres_spool_v1(
                     sqlx::query(sqlx::AssertSqlSafe(meta_sql.clone()))
                         .bind(&ctid_str)
                         .persistent(false)
-                        .fetch_one(&mut **conn),
+                        .fetch_one(&mut *conn),
                 )
                 .await?;
 
@@ -1639,7 +1792,7 @@ async fn stream_postgres_spool_v1(
                                             .bind(start_1based)
                                             .bind(want_i32)
                                             .persistent(false)
-                                            .fetch_one(&mut **conn),
+                                            .fetch_one(&mut *conn),
                                     )
                                     .await?;
 
@@ -1677,7 +1830,7 @@ async fn stream_postgres_spool_v1(
                 cancellation,
                 sqlx::query(sqlx::AssertSqlSafe(close_sql))
                     .persistent(false)
-                    .execute(&mut **conn),
+                    .execute(&mut *conn),
             )
             .await?;
         }
@@ -1686,37 +1839,13 @@ async fn stream_postgres_spool_v1(
     }
     .await;
 
-    // Close the REPEATABLE READ source transaction BEFORE fsync/publish or on error!
-    match &stream_res {
-        Ok(_) => {
-            if let Some(mut conn) = pg.pooled.take()
-                && pg.in_tx
-            {
-                let _ = sqlx::query("COMMIT").execute(&mut *conn).await;
-                pg.in_tx = false;
-            }
+    let (file, total_bytes, whole_digest) = match stream_res {
+        Ok(complete) => complete,
+        Err(error) => {
+            pg.cancel_and_close().await;
+            return Err(error);
         }
-        Err(_) => {
-            if let Some(pooled) = pg.pooled.take() {
-                let mut raw = pooled.detach();
-                let pool = pg.pool.clone();
-                let pid = pg.backend_pid;
-                pg.in_tx = false;
-                if let Ok(mut cancel_conn) = pool.acquire().await {
-                    let _ = sqlx::query("SELECT pg_cancel_backend($1)")
-                        .bind(pid)
-                        .execute(&mut *cancel_conn)
-                        .await;
-                }
-                let _ = sqlx::query("ROLLBACK").execute(&mut raw).await;
-                let _ = raw.close().await;
-            }
-            remove_tmp_artifacts_best_effort(&pg.tmp_path);
-        }
-    }
-
-    let (file, total_bytes, whole_digest) = stream_res?;
-
+    };
     if let Err(err) = file.sync_all() {
         drop(file);
         remove_tmp_artifacts_best_effort(&pg.tmp_path);
@@ -1732,6 +1861,8 @@ async fn stream_postgres_spool_v1(
         return Err(internal_not_committed("pg_spool_rename", err.to_string()));
     }
     fsync_parent_dir(final_path)?;
+
+    pg.abort_cleanly().await;
 
     let max_chunk = max_slice_seen.max(STREAM_IO_BUF_BYTES);
     let working_bytes = STREAM_IO_BUF_BYTES + PG_SLICE_MAX_BYTES;
@@ -1772,14 +1903,35 @@ async fn sleep_async_interruptible(
     Ok(())
 }
 
-/// Streaming independent decoder and verifier for `PostgresSpoolV1` artifacts.
+/// Materializes a verified spool for offline inspection within the default backup budget.
 pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, PortError> {
+    decode_postgres_spool_v1_bounded(
+        path,
+        crate::config::default_postgres_backup_budget().max_spool_bytes,
+    )
+}
+
+/// Limits both the encoded file and the decoded table, row and variable-value allocations.
+pub fn decode_postgres_spool_v1_bounded(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<DecodedPostgresSpoolV1, PortError> {
     let file = File::open(path)
         .map_err(|err| internal_not_committed("open_pg_spool_decode", err.to_string()))?;
     let total_file_len = file
         .metadata()
         .map_err(|err| internal_not_committed("stat_pg_spool_decode", err.to_string()))?
         .len();
+    if total_file_len > max_bytes {
+        return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+    }
+    let mut remaining_capacity = max_bytes;
+    let mut charge = |bytes: u64| -> Result<(), PortError> {
+        remaining_capacity = remaining_capacity
+            .checked_sub(bytes)
+            .ok_or_else(|| DomainError::validation(ValidationReason::BudgetExceeded))?;
+        Ok(())
+    };
     if total_file_len < (POSTGRES_SPOOL_V1_MAGIC.len() as u64 + 4 + 32 + 4 + 4 + 32) {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
@@ -1836,6 +1988,7 @@ pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, P
     if witness_len > MAX_MSGPACK_DECODE_BYTES {
         return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
     }
+    charge(witness_len as u64)?;
     let mut witness_bytes = vec![0u8; witness_len];
     reader.read_exact_body(&mut witness_bytes, body_limit)?;
     let witness: BackupWitness = decode_msgpack_bounded(&witness_bytes, MAX_MSGPACK_DECODE_BYTES)?;
@@ -1846,6 +1999,7 @@ pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, P
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
 
+    charge((table_count * std::mem::size_of::<DecodedPostgresSpoolTable>()) as u64)?;
     let mut tables = Vec::with_capacity(table_count);
     let mut u16_buf = [0u8; 2];
     let mut u64_buf = [0u8; 8];
@@ -1874,6 +2028,11 @@ pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, P
             match tag_buf[0] {
                 0 => break,
                 1 => {
+                    charge(
+                        (std::mem::size_of::<Vec<PostgresSpoolValue>>()
+                            + col_count * std::mem::size_of::<PostgresSpoolValue>())
+                            as u64,
+                    )?;
                     let mut row_vals = Vec::with_capacity(col_count);
                     for col_spec in expected_table.columns {
                         reader.read_exact_body(&mut tag_buf, body_limit)?;
@@ -1896,10 +2055,20 @@ pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, P
                                 LogicalColKind::Text | LogicalColKind::Bytes => {
                                     reader.read_exact_body(&mut u64_buf, body_limit)?;
                                     let total_len = u64::from_be_bytes(u64_buf);
+                                    if total_len > body_limit.saturating_sub(reader.pos) {
+                                        return Err(DomainError::validation(
+                                            ValidationReason::InvalidState,
+                                        )
+                                        .into());
+                                    }
                                     let cap = usize::try_from(total_len).map_err(|_| {
                                         DomainError::validation(ValidationReason::BudgetExceeded)
                                     })?;
-                                    let mut assembled = Vec::with_capacity(cap);
+                                    charge(total_len)?;
+                                    let mut assembled = Vec::new();
+                                    assembled.try_reserve_exact(cap).map_err(|_| {
+                                        DomainError::validation(ValidationReason::BudgetExceeded)
+                                    })?;
                                     let mut read_so_far = 0u64;
                                     while read_so_far < total_len {
                                         reader.read_exact_body(&mut u32_buf, body_limit)?;
@@ -1994,13 +2163,6 @@ enum PreparedBackendDriver {
 }
 
 impl PreparedBackendDriver {
-    fn encoding(&self) -> BackupArtifactEncoding {
-        match self {
-            Self::Sqlite(_) => BackupArtifactEncoding::SqliteSnapshotV1,
-            Self::Postgres(_) => BackupArtifactEncoding::PostgresSpoolV1,
-        }
-    }
-
     fn detach_abort_cleanup(&mut self, inner: &CanonicalInner) {
         match self {
             Self::Sqlite(w) => w.detach_abort_cleanup(inner),
@@ -2014,9 +2176,12 @@ struct CanonicalPreparedBackup {
     backup_id: BackupId,
     artifact_id: ArtifactId,
     prepare_budget: BackupBudget,
+    caller_cancel: Cancellation,
     prepared_at: Instant,
     spool_dir: PathBuf,
+    artifact_lease: Option<ArtifactLease>,
     driver: Option<PreparedBackendDriver>,
+    held_histories: Option<(HoldProof, Vec<ChangeCursor>)>,
 }
 
 impl Drop for CanonicalPreparedBackup {
@@ -2027,28 +2192,21 @@ impl Drop for CanonicalPreparedBackup {
     }
 }
 
+#[derive(Clone)]
+struct HoldProof {
+    release: Cancellation,
+    copying: Arc<tokio::sync::RwLock<()>>,
+}
+
 struct CanonicalBackupHold {
-    store: CanonicalStore,
-    backup_id: BackupId,
     witness: BackupWitness,
-    released: bool,
+    proof: HoldProof,
+    finished: tokio::sync::oneshot::Receiver<Result<(), PortError>>,
 }
 
 impl Drop for CanonicalBackupHold {
     fn drop(&mut self) {
-        if self.released {
-            return;
-        }
-        self.released = true;
-        let store = self.store.clone();
-        let backup_id = self.backup_id.clone();
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            let inner_cl = Arc::clone(&store.inner);
-            let handle = rt.spawn(async move {
-                let _ = delete_backup_hold_rows(&store, &backup_id).await;
-            });
-            register_cleanup_task(&inner_cl, handle);
-        }
+        self.proof.release.cancel();
     }
 }
 
@@ -2058,11 +2216,18 @@ impl BackupHold for CanonicalBackupHold {
     }
 
     fn release(mut self: Box<Self>) -> PortFuture<'static, ()> {
-        self.released = true;
-        let store = self.store.clone();
-        let backup_id = self.backup_id.clone();
-        Box::pin(async move { delete_backup_hold_rows(&store, &backup_id).await })
+        self.proof.release.cancel();
+        Box::pin(async move {
+            (&mut self.finished)
+                .await
+                .map_err(|err| internal_not_committed("backup_release_owner", err.to_string()))?
+        })
     }
+}
+
+struct PauseLocks {
+    _local: WriterSafePointGuard,
+    database: Option<PgConnection>,
 }
 
 struct CanonicalPausedBackup {
@@ -2070,16 +2235,41 @@ struct CanonicalPausedBackup {
     backup_id: BackupId,
     artifact_id: ArtifactId,
     prepare_budget: BackupBudget,
+    caller_cancel: Cancellation,
     prepared_at: Instant,
     spool_dir: PathBuf,
-    safe_point: Option<WriterSafePointGuard>,
+    artifact_lease: Option<ArtifactLease>,
+    locks: Arc<std::sync::Mutex<Option<PauseLocks>>>,
+    watchdog: tokio::task::AbortHandle,
+    held_histories: Option<(HoldProof, Vec<ChangeCursor>)>,
     unpinned_driver: Option<PreparedBackendDriver>,
+}
+
+impl CanonicalPausedBackup {
+    fn validate_cut(&self, witness: &BackupWitness) -> Result<(), PortError> {
+        if self.locks.lock().expect("backup pause").is_none() {
+            return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+        }
+        if let Some((proof, histories)) = &self.held_histories {
+            let held = histories.iter().map(|cursor| &cursor.scope);
+            let pinned = witness.histories.iter().map(|cursor| &cursor.scope);
+            if proof.release.is_cancelled() || !held.eq(pinned) {
+                return Err(unavailable_retryable(
+                    "backup_hold_scope_changed",
+                    "Space membership changed since the CAS hold",
+                    Duration::from_millis(10),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for CanonicalPausedBackup {
     fn drop(&mut self) {
         // Release writer safe point first so concurrent writers are never stranded.
-        drop(self.safe_point.take());
+        self.watchdog.abort();
+        self.locks.lock().expect("backup pause").take();
         if let Some(mut drv) = self.unpinned_driver.take() {
             drv.detach_abort_cleanup(&self.store.inner);
         }
@@ -2089,7 +2279,7 @@ impl Drop for CanonicalPausedBackup {
 impl PausedBackup for CanonicalPausedBackup {
     fn open_cut(&mut self) -> PortFuture<'_, Box<dyn BackupSnapshot>> {
         Box::pin(async move {
-            if self.safe_point.is_none() {
+            if self.locks.lock().expect("backup pause").is_none() {
                 return Err(internal_not_committed(
                     "backup_pause_already_resumed",
                     "open_cut called after writer pause was released",
@@ -2130,7 +2320,12 @@ impl PausedBackup for CanonicalPausedBackup {
                         )
                     })?;
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    let abort_flag = Arc::clone(&wal_pin.abort_flag);
+                    let abort_notify = Arc::clone(&wal_pin.abort_notify);
                     tx.send(SqliteWorkerCmd::OpenCut {
+                        wal_pin,
+                        remaining,
+                        shutdown: self.store.inner.backup_shutdown.clone(),
                         expected_installation: expected_inst,
                         reply: reply_tx,
                     })
@@ -2138,42 +2333,49 @@ impl PausedBackup for CanonicalPausedBackup {
                         internal_not_committed("sqlite_backup_send_open_cut", err.to_string())
                     })?;
 
-                    let witness = match reply_rx.await {
-                        Ok(Ok(w)) => w,
-                        Ok(Err(err)) => {
-                            drop(wal_pin);
+                    let result = wait_for_phase(remaining, &self.caller_cancel, async {
+                        reply_rx.await.map_err(|err| {
+                            internal_not_committed("sqlite_backup_open_cut_eof", err.to_string())
+                        })?
+                    })
+                    .await;
+                    let witness = match result {
+                        Ok(witness) => witness,
+                        Err(error) => {
                             worker.abort_and_join().await;
-                            return Err(err);
-                        }
-                        Err(err) => {
-                            drop(wal_pin);
-                            worker.abort_and_join().await;
-                            return Err(internal_not_committed(
-                                "sqlite_backup_open_cut_eof",
-                                err.to_string(),
-                            ));
+                            return Err(error);
                         }
                     };
-
+                    self.validate_cut(&witness)?;
                     Ok(Box::new(CanonicalBackupSnapshot {
                         store: self.store.clone(),
                         backup_id: self.backup_id.clone(),
                         artifact_id: self.artifact_id.clone(),
                         prepare_budget: self.prepare_budget,
+                        caller_cancel: self.caller_cancel.clone(),
                         prepared_at: self.prepared_at,
                         spool_dir: self.spool_dir.clone(),
+                        artifact_lease: self.artifact_lease.take(),
                         witness,
+                        active: None,
+                        hold: self
+                            .held_histories
+                            .as_ref()
+                            .expect("pause owns hold")
+                            .0
+                            .clone(),
                         state: Some(PinnedSnapshotDriver::Sqlite {
                             worker: match drv {
                                 PreparedBackendDriver::Sqlite(w) => w,
                                 PreparedBackendDriver::Postgres(_) => unreachable!(),
                             },
-                            wal_pin,
+                            abort_flag,
+                            abort_notify,
                         }),
                     }) as Box<dyn BackupSnapshot>)
                 }
                 PreparedBackendDriver::Postgres(pg) => {
-                    let conn = pg.pooled.as_mut().ok_or_else(|| {
+                    let conn = pg.source.as_mut().ok_or_else(|| {
                         internal_not_committed(
                             "pg_backup_conn_missing",
                             "PostgreSQL backup connection missing",
@@ -2186,9 +2388,12 @@ impl PausedBackup for CanonicalPausedBackup {
                     };
                     let remaining = remaining.min(max_age);
                     pg.pinned_at = Some(Instant::now());
-                    let pin_res =
-                        pin_and_read_pg_witness(&mut *conn, &expected_inst, remaining).await;
-                    pg.in_tx = true;
+                    let pin_res = wait_for_phase(
+                        remaining,
+                        &self.caller_cancel,
+                        pin_and_read_pg_witness(&mut *conn, &expected_inst, remaining),
+                    )
+                    .await;
                     let witness = match pin_res {
                         Ok(w) => w,
                         Err(err) => {
@@ -2197,14 +2402,24 @@ impl PausedBackup for CanonicalPausedBackup {
                         }
                     };
 
+                    self.validate_cut(&witness)?;
                     Ok(Box::new(CanonicalBackupSnapshot {
                         store: self.store.clone(),
                         backup_id: self.backup_id.clone(),
                         artifact_id: self.artifact_id.clone(),
                         prepare_budget: self.prepare_budget,
+                        caller_cancel: self.caller_cancel.clone(),
                         prepared_at: self.prepared_at,
                         spool_dir: self.spool_dir.clone(),
+                        artifact_lease: self.artifact_lease.take(),
                         witness,
+                        active: None,
+                        hold: self
+                            .held_histories
+                            .as_ref()
+                            .expect("pause owns hold")
+                            .0
+                            .clone(),
                         state: Some(PinnedSnapshotDriver::Postgres(match drv {
                             PreparedBackendDriver::Postgres(p) => p,
                             PreparedBackendDriver::Sqlite(_) => unreachable!(),
@@ -2216,9 +2431,22 @@ impl PausedBackup for CanonicalPausedBackup {
     }
 
     fn resume(mut self: Box<Self>) -> PortFuture<'static, ()> {
-        drop(self.safe_point.take());
-        let unpinned = self.unpinned_driver.take();
         Box::pin(async move {
+            self.watchdog.abort();
+            let locks = self
+                .locks
+                .lock()
+                .expect("backup pause")
+                .take()
+                .ok_or_else(|| DomainError::validation(ValidationReason::BudgetExceeded))?;
+            let unpinned = self.unpinned_driver.take();
+            if let Some(mut conn) = locks.database {
+                sqlx::raw_sql("ROLLBACK")
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|err| internal_not_committed("pg_resume_backup", err.to_string()))?;
+            }
+            drop(locks._local);
             if let Some(drv) = unpinned {
                 match drv {
                     PreparedBackendDriver::Sqlite(mut w) => w.abort_and_join().await,
@@ -2233,7 +2461,8 @@ impl PausedBackup for CanonicalPausedBackup {
 enum PinnedSnapshotDriver {
     Sqlite {
         worker: SqliteBackupWorkerHandle,
-        wal_pin: BackupWalPinGuard,
+        abort_flag: Arc<AtomicBool>,
+        abort_notify: Arc<tokio::sync::Notify>,
     },
     Postgres(PgPreparedSource),
 }
@@ -2243,46 +2472,42 @@ struct CanonicalBackupSnapshot {
     backup_id: BackupId,
     artifact_id: ArtifactId,
     prepare_budget: BackupBudget,
+    caller_cancel: Cancellation,
     prepared_at: Instant,
     spool_dir: PathBuf,
+    artifact_lease: Option<ArtifactLease>,
     witness: BackupWitness,
+    hold: HoldProof,
     state: Option<PinnedSnapshotDriver>,
+    active: Option<ActiveSpool>,
+}
+
+struct ActiveSpool {
+    cancel: Cancellation,
+    task: tokio::task::JoinHandle<Result<BackupSpool, PortError>>,
+}
+struct CancelOnDrop(Cancellation);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 impl Drop for CanonicalBackupSnapshot {
     fn drop(&mut self) {
+        if let Some(active) = self.active.take() {
+            active.cancel.cancel();
+            register_cleanup_task(
+                &self.store.inner,
+                self.store.inner.backup_executor.spawn(async move {
+                    let _ = active.task.await;
+                }),
+            );
+        }
         if let Some(st) = self.state.take() {
             match st {
-                PinnedSnapshotDriver::Sqlite {
-                    mut worker,
-                    wal_pin,
-                } => {
-                    // Drop wal_pin inside worker cleanup after source closes.
-                    worker.cancel_flag.store(true, Ordering::SeqCst);
-                    worker.interrupt_handle.interrupt();
-                    if let Some(tx) = worker.cmd_tx.take() {
-                        let _ = tx.try_send(SqliteWorkerCmd::Abort { reply: None });
-                        drop(tx);
-                    }
-                    let tmp = worker.tmp_path.clone();
-                    if let Some(jh) = worker.join_handle.take() {
-                        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                            let inner_cl = Arc::clone(&self.store.inner);
-                            let handle = rt.spawn_blocking(move || {
-                                let _ = jh.join();
-                                drop(wal_pin);
-                                remove_tmp_artifacts_best_effort(&tmp);
-                            });
-                            register_cleanup_task(&inner_cl, handle);
-                        } else {
-                            let _ = jh.join();
-                            drop(wal_pin);
-                            remove_tmp_artifacts_best_effort(&tmp);
-                        }
-                    } else {
-                        drop(wal_pin);
-                        remove_tmp_artifacts_best_effort(&tmp);
-                    }
+                PinnedSnapshotDriver::Sqlite { mut worker, .. } => {
+                    worker.detach_abort_cleanup(&self.store.inner);
                 }
                 PinnedSnapshotDriver::Postgres(mut pg) => {
                     pg.detach_abort_cleanup(&self.store.inner);
@@ -2292,12 +2517,8 @@ impl Drop for CanonicalBackupSnapshot {
     }
 }
 
-impl BackupSnapshot for CanonicalBackupSnapshot {
-    fn witness(&self) -> &BackupWitness {
-        &self.witness
-    }
-
-    fn spool(
+impl CanonicalBackupSnapshot {
+    fn run_spool(
         &mut self,
         budget: BackupBudget,
         cancellation: Cancellation,
@@ -2329,12 +2550,18 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
                 }
             };
 
+            let lease = self
+                .artifact_lease
+                .as_mut()
+                .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
+            lease.begin_publication();
             let step_delay_us = self.store.inner.backup_step_delay_us.load(Ordering::SeqCst);
 
             let (encoding, rel_name, bytes, digest, stats) = match pinned {
                 PinnedSnapshotDriver::Sqlite {
                     mut worker,
-                    wal_pin,
+                    abort_flag,
+                    abort_notify,
                 } => {
                     let rel_name = format!(
                         "{}.{}",
@@ -2347,7 +2574,13 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
                     let cancel_bridge_stop_cl = Arc::clone(&cancel_bridge_stop);
                     let worker_cancel_cl = Arc::clone(&worker.cancel_flag);
                     let interrupt_cl = Arc::clone(&worker.interrupt_handle);
-                    let abort_notify_cl = Arc::clone(&wal_pin.abort_notify);
+                    if abort_flag.load(Ordering::Acquire) {
+                        worker.abort_and_join().await;
+                        return Err(
+                            DomainError::validation(ValidationReason::BudgetExceeded).into()
+                        );
+                    }
+                    let abort_notify_cl = abort_notify;
                     let caller_cancel_cl = cancellation.clone();
 
                     let watcher = tokio::spawn(async move {
@@ -2370,6 +2603,7 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
                         }
                     });
 
+                    let _stop_on_drop = AbortBackupWatcher(watcher.abort_handle());
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                     let send_res = worker
                         .cmd_tx
@@ -2383,7 +2617,6 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
                         .and_then(|tx| {
                             tx.send(SqliteWorkerCmd::Spool {
                                 budget: eff_budget,
-                                wal_pin,
                                 expected_witness: self.witness.clone(),
                                 final_path: final_path.clone(),
                                 step_delay_us,
@@ -2398,6 +2631,11 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
                         cancel_bridge_stop.store(true, Ordering::SeqCst);
                         let _ = watcher.await;
                         worker.abort_and_join().await;
+                        if abort_flag.load(Ordering::Acquire) {
+                            return Err(
+                                DomainError::validation(ValidationReason::BudgetExceeded).into()
+                            );
+                        }
                         return Err(err);
                     }
 
@@ -2474,17 +2712,24 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
                 .lock()
                 .expect("backup memory stats mutex") = Some(stats);
 
+            if cancellation.is_cancelled() {
+                return Err(cancelled_not_committed(
+                    "backup_cancelled_before_publish",
+                    "spool cancelled",
+                ));
+            }
             persist_backup_artifact_ready(
                 &self.store,
                 &self.artifact_id,
                 &self.backup_id,
                 encoding,
-                &rel_name,
+                &lease.key(&rel_name),
                 bytes,
                 digest,
                 &self.witness,
             )
             .await?;
+            lease.accepted()?;
 
             Ok(BackupSpool {
                 kind: match encoding {
@@ -2500,11 +2745,100 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
             })
         })
     }
+}
+
+impl BackupSnapshot for CanonicalBackupSnapshot {
+    fn witness(&self) -> &BackupWitness {
+        &self.witness
+    }
+
+    fn spool(
+        &mut self,
+        budget: BackupBudget,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, BackupSpool> {
+        Box::pin(async move {
+            let pinned = self
+                .state
+                .take()
+                .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
+            let mut job = CanonicalBackupSnapshot {
+                store: self.store.clone(),
+                backup_id: self.backup_id.clone(),
+                artifact_id: self.artifact_id.clone(),
+                prepare_budget: self.prepare_budget,
+                caller_cancel: self.caller_cancel.clone(),
+                prepared_at: self.prepared_at,
+                spool_dir: self.spool_dir.clone(),
+                artifact_lease: self.artifact_lease.take(),
+                witness: self.witness.clone(),
+                state: Some(pinned),
+                active: None,
+                hold: self.hold.clone(),
+            };
+            let owner_cancel = Cancellation::default();
+            if cancellation.is_cancelled() {
+                owner_cancel.cancel();
+            }
+            let _cancel_on_drop = CancelOnDrop(owner_cancel.clone());
+            let worker_cancel = owner_cancel.clone();
+            let shutdown = self.store.inner.backup_shutdown.clone();
+            let hold = self.hold.clone();
+            let caller_cancel = self.caller_cancel.clone();
+            let (done, completion) = tokio::sync::oneshot::channel::<()>();
+            register_cleanup_task(
+                &self.store.inner,
+                self.store.inner.backup_executor.spawn(async move {
+                    let _ = completion.await;
+                }),
+            );
+            let task = self.store.inner.backup_executor.spawn(async move {
+                let _done = done;
+                let _copy_guard = hold.copying.read().await;
+                if hold.release.is_cancelled() {
+                    worker_cancel.cancel();
+                }
+                let result = {
+                    let work = job.run_spool(budget, worker_cancel.clone());
+                    tokio::pin!(work);
+                    tokio::select! {
+                        result = &mut work => result,
+                        () = hold.release.cancelled() => { worker_cancel.cancel(); work.await },
+                        () = caller_cancel.cancelled() => { worker_cancel.cancel(); work.await },
+                        () = shutdown.cancelled() => { worker_cancel.cancel(); work.await }
+                    }
+                };
+                if result.is_err()
+                    && let Some(lease) = job.artifact_lease.as_ref()
+                {
+                    lease.reconcile_pending().await?;
+                }
+                result
+            });
+            let active = self.active.insert(ActiveSpool {
+                cancel: owner_cancel,
+                task,
+            });
+            let result = tokio::select! {
+                result = &mut active.task => result,
+                () = cancellation.cancelled() => {
+                    active.cancel.cancel();
+                    (&mut active.task).await
+                }
+            };
+            self.active.take();
+            result.map_err(|err| internal_not_committed("backup_spool_worker", err.to_string()))?
+        })
+    }
 
     fn close(mut self: Box<Self>) -> PortFuture<'static, ()> {
-        let state = self.state.take();
         Box::pin(async move {
-            if let Some(st) = state {
+            if let Some(active) = self.active.as_mut() {
+                active.cancel.cancel();
+                let _ = (&mut active.task).await;
+                self.active.take();
+            }
+            if let Some(st) = self.state.take() {
                 abort_pinned_driver(st).await;
             }
             Ok(())
@@ -2514,30 +2848,10 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
 
 async fn abort_pinned_driver(st: PinnedSnapshotDriver) {
     match st {
-        PinnedSnapshotDriver::Sqlite {
-            mut worker,
-            wal_pin,
-        } => {
+        PinnedSnapshotDriver::Sqlite { mut worker, .. } => {
             worker.abort_and_join().await;
-            drop(wal_pin);
         }
-        PinnedSnapshotDriver::Postgres(mut pg) => {
-            if let Some(pooled) = pg.pooled.take() {
-                let mut raw = pooled.detach();
-                let pool = pg.pool.clone();
-                let pid = pg.backend_pid;
-                pg.in_tx = false;
-                if let Ok(mut cancel_conn) = pool.acquire().await {
-                    let _ = sqlx::query("SELECT pg_cancel_backend($1)")
-                        .bind(pid)
-                        .execute(&mut *cancel_conn)
-                        .await;
-                }
-                let _ = sqlx::query("ROLLBACK").execute(&mut raw).await;
-                let _ = raw.close().await;
-            }
-            remove_tmp_artifacts_best_effort(&pg.tmp_path);
-        }
+        PinnedSnapshotDriver::Postgres(mut pg) => pg.abort_cleanly().await,
     }
 }
 
@@ -2547,33 +2861,128 @@ impl PreparedBackup for CanonicalPreparedBackup {
             if self.driver.is_none() {
                 return Err(DomainError::validation(ValidationReason::InvalidState).into());
             }
-            let witness = acquire_durable_backup_holds(&self.store, &self.backup_id).await?;
-            Ok(Box::new(CanonicalBackupHold {
-                store: self.store.clone(),
-                backup_id: self.backup_id.clone(),
-                witness,
-                released: false,
-            }) as Box<dyn BackupHold>)
+            if self.held_histories.is_some() {
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            }
+            let backup_id = self.backup_id.clone();
+            let store = self.store.clone();
+            // The worker keeps ownership through SQL commit even if its caller drops the await.
+            let worker = self.store.inner.backup_executor.spawn(async move {
+                let owner = HoldOwnership::acquire(&store, &backup_id).await?;
+                // The exclusive owner may safely replace rows from an interrupted earlier attempt.
+                delete_backup_hold_rows(&store, &backup_id).await?;
+                let witness = acquire_durable_backup_holds(&store, &backup_id).await?;
+                let (done, finished) = tokio::sync::oneshot::channel();
+                let proof = HoldProof {
+                    release: Cancellation::default(),
+                    copying: Default::default(),
+                };
+                let hold = CanonicalBackupHold {
+                    witness,
+                    proof: proof.clone(),
+                    finished,
+                };
+                let inner = Arc::clone(&store.inner);
+                let cleanup = inner.backup_executor.spawn(async move {
+                    tokio::select! {
+                        () = proof.release.cancelled() => {},
+                        () = store.inner.backup_shutdown.cancelled() => {},
+                    }
+                    proof.release.cancel();
+                    let _drained = proof.copying.write().await;
+                    let result = delete_backup_hold_rows(&store, &backup_id).await;
+                    drop(owner);
+                    let _ = done.send(result);
+                });
+                register_cleanup_task(&inner, cleanup);
+                Ok::<_, PortError>(hold)
+            });
+            let remaining = self
+                .prepare_budget
+                .deadline
+                .saturating_sub(self.prepared_at.elapsed());
+            let hold = wait_for_phase(remaining, &self.caller_cancel, async move {
+                worker
+                    .await
+                    .map_err(|err| internal_not_committed("backup_hold_worker", err.to_string()))?
+            })
+            .await?;
+            self.held_histories = Some((hold.proof.clone(), hold.witness.histories.clone()));
+            Ok(Box::new(hold) as Box<dyn BackupHold>)
         })
     }
 
     fn pause_writes(&mut self) -> PortFuture<'_, Box<dyn PausedBackup>> {
         Box::pin(async move {
-            let drv = self
+            if self
+                .held_histories
+                .as_ref()
+                .is_none_or(|(proof, _)| proof.release.is_cancelled())
+            {
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            }
+
+            let mut drv = self
                 .driver
                 .take()
                 .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
 
-            let safe_point = self.store.inner.writer()?.acquire_safe_point().await;
+            let remaining = self
+                .prepare_budget
+                .deadline
+                .saturating_sub(self.prepared_at.elapsed());
+            let (safe_point, pg_barrier) = wait_for_phase(remaining, &self.caller_cancel, async {
+                let guard = self.store.inner.writer()?.acquire_safe_point().await;
+                let mut barrier = match &mut drv {
+                    PreparedBackendDriver::Postgres(pg) => pg.barrier.take(),
+                    PreparedBackendDriver::Sqlite(_) => None,
+                };
+                if let Some(conn) = barrier.as_mut() {
+                    sqlx::raw_sql("BEGIN; SELECT pg_advisory_xact_lock(hashtextextended(current_schema(), 7311229))")
+                        .execute(conn).await
+                        .map_err(|err| internal_not_committed("pg_backup_barrier", err.to_string()))?;
+                }
+                Ok::<_, PortError>((guard, barrier))
+            }).await?;
 
+            let locks = Arc::new(std::sync::Mutex::new(Some(PauseLocks {
+                _local: safe_point,
+                database: pg_barrier,
+            })));
+            let weak = Arc::downgrade(&locks);
+            let lifetime = self
+                .prepare_budget
+                .deadline
+                .saturating_sub(self.prepared_at.elapsed());
+            let shutdown = self.store.inner.backup_shutdown.clone();
+            let cancel = self.caller_cancel.clone();
+            let watchdog = self
+                .store
+                .inner
+                .backup_executor
+                .spawn(async move {
+                    tokio::select! {
+                        () = tokio::time::sleep(lifetime) => {},
+                        () = cancel.cancelled() => {},
+                        () = shutdown.cancelled() => {},
+                    }
+                    if let Some(locks) = weak.upgrade() {
+                        locks.lock().expect("backup pause").take();
+                    }
+                })
+                .abort_handle();
             Ok(Box::new(CanonicalPausedBackup {
                 store: self.store.clone(),
                 backup_id: self.backup_id.clone(),
                 artifact_id: self.artifact_id.clone(),
                 prepare_budget: self.prepare_budget,
+                caller_cancel: self.caller_cancel.clone(),
                 prepared_at: self.prepared_at,
                 spool_dir: self.spool_dir.clone(),
-                safe_point: Some(safe_point),
+                artifact_lease: self.artifact_lease.take(),
+                locks,
+                watchdog,
+                held_histories: self.held_histories.take(),
                 unpinned_driver: Some(drv),
             }) as Box<dyn PausedBackup>)
         })
@@ -2616,45 +3025,66 @@ impl BackupParticipantPort for CanonicalStore {
             store.ensure_open()?;
 
             let spool_dir = resolve_spool_dir(&store.inner)?;
+            wait_for_phase(
+                budget.deadline,
+                &ctx.budget.cancellation,
+                ownership::recover_directory(&store, &spool_dir),
+            )
+            .await?;
             let artifact_id = mint_artifact_id()?;
+            let artifact_lease = ArtifactLease::create(&store, &spool_dir, &artifact_id)?;
+            {
+                let mut roots = store
+                    .inner
+                    .backup_spool_roots
+                    .lock()
+                    .expect("backup spool roots");
+                if !roots.contains(&spool_dir) {
+                    roots.push(spool_dir.clone());
+                }
+            }
             let tmp_path = spool_dir.join(format!("{}.tmp", artifact_id.as_str()));
 
-            let driver = match (&store.inner.config.sql, &store.inner.sql) {
+            let (driver, artifact_lease) = match (&store.inner.config.sql, &store.inner.sql) {
                 (SqlBackendConfig::Sqlite { data_root, .. }, SqlDriverState::Sqlite { .. }) => {
                     let src_path = data_root.canonical();
-                    let worker = SqliteBackupWorkerHandle::spawn(src_path, tmp_path)?;
-                    PreparedBackendDriver::Sqlite(worker)
-                }
-                (_, SqlDriverState::Postgres { pool, .. }) => {
-                    let pre_file = create_private_tmp_file(&tmp_path)?;
-                    drop(pre_file);
-
-                    let mut pooled = match pool.acquire().await {
-                        Ok(c) => c,
-                        Err(err) => {
-                            remove_tmp_artifacts_best_effort(&tmp_path);
-                            return Err(unavailable_retryable(
-                                "pg_backup_prepare_acquire",
-                                err.to_string(),
-                                Duration::from_millis(50),
-                            ));
-                        }
-                    };
-                    let backend_pid: i32 = match warm_pg_backup_connection(&mut pooled).await {
-                        Ok(pid) => pid,
-                        Err(err) => {
-                            remove_tmp_artifacts_best_effort(&tmp_path);
-                            return Err(err);
-                        }
-                    };
-                    PreparedBackendDriver::Postgres(PgPreparedSource {
-                        pool: pool.clone(),
-                        pooled: Some(pooled),
-                        backend_pid,
-                        in_tx: false,
-                        pinned_at: None,
-                        tmp_path,
+                    let remaining = budget.deadline.saturating_sub(prepared_at.elapsed());
+                    wait_for_phase(remaining, &ctx.budget.cancellation, async move {
+                        tokio::task::spawn_blocking(move || {
+                            let worker = SqliteBackupWorkerHandle::spawn(src_path, tmp_path)?;
+                            Ok((PreparedBackendDriver::Sqlite(worker), artifact_lease))
+                        })
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("sqlite_prepare_worker", err.to_string())
+                        })?
                     })
+                    .await?
+                }
+                (_, SqlDriverState::Postgres { .. }) => {
+                    let remaining = budget.deadline.saturating_sub(prepared_at.elapsed());
+                    let (source, barrier, backend_pid) =
+                        wait_for_phase(remaining, &ctx.budget.cancellation, async {
+                            let (mut source, barrier) = tokio::try_join!(
+                                open_backup_connection(&store),
+                                open_backup_connection(&store)
+                            )?;
+                            let backend_pid = warm_pg_backup_connection(&mut source).await?;
+                            Ok((source, barrier, backend_pid))
+                        })
+                        .await?;
+                    create_private_tmp_file(&tmp_path)?;
+                    (
+                        PreparedBackendDriver::Postgres(PgPreparedSource {
+                            source: Some(source),
+                            store: store.clone(),
+                            backend_pid,
+                            barrier: Some(barrier),
+                            pinned_at: None,
+                            tmp_path,
+                        }),
+                        artifact_lease,
+                    )
                 }
                 _ => {
                     remove_tmp_artifacts_best_effort(&tmp_path);
@@ -2665,16 +3095,17 @@ impl BackupParticipantPort for CanonicalStore {
                 }
             };
 
-            let _ = driver.encoding();
-
             Ok(Box::new(CanonicalPreparedBackup {
                 store,
                 backup_id: backup,
                 artifact_id,
                 prepared_at,
                 prepare_budget: budget,
+                caller_cancel: ctx.budget.cancellation.clone(),
                 spool_dir,
+                artifact_lease: Some(artifact_lease),
                 driver: Some(driver),
+                held_histories: None,
             }) as Box<dyn PreparedBackup>)
         })
     }
@@ -2718,7 +3149,7 @@ impl BackupParticipantPort for CanonicalStore {
             let _safe_point = store.inner.writer()?.acquire_safe_point().await;
 
             let restored_cl = restored.clone();
-            let fences = store
+            let (fences, epochs) = store
                 .with_write_tx_unfenced(|tx| {
                     Box::pin(async move {
                         let mut epochs = Vec::with_capacity(restored_cl.len());
@@ -2726,11 +3157,11 @@ impl BackupParticipantPort for CanonicalStore {
                             epochs.push(validate_restore_cursor_tx(tx, cur).await?);
                         }
                         let fences = RoomFenceTable::default();
-                        for (cur, epoch) in restored_cl.iter().zip(epochs) {
+                        for (cur, epoch) in restored_cl.iter().zip(epochs.iter().copied()) {
                             apply_restore_cursor_tx(tx, cur, epoch).await?;
                             load_restored_room_fences(tx, &cur.scope, &fences).await?;
                         }
-                        Ok(fences)
+                        Ok((fences, epochs))
                     })
                 })
                 .await?;
@@ -2742,7 +3173,8 @@ impl BackupParticipantPort for CanonicalStore {
                 .room_fences
                 .replace_restored_spaces(&spaces, fences);
             store.inner.clear_pg_immutable_caches();
-            for cur in &restored {
+            for (cur, epoch) in restored.iter().zip(epochs) {
+                store.inner.grant_writer_epoch(&cur.scope.space_id, epoch);
                 store.inner.job_reads.remove_space(&cur.scope.space_id);
                 store
                     .inner
@@ -2869,12 +3301,7 @@ async fn acquire_durable_backup_holds(
                                 "INSERT INTO backup_holds (
                                     backup_id, space_id, history_incarnation, owner_installation_id,
                                     phase, cutoff_seq, witness_json, created_at_ms
-                                ) VALUES (?, ?, ?, ?, 'holding', ?, ?, ?)
-                                ON CONFLICT (backup_id, space_id) DO UPDATE SET
-                                    history_incarnation = excluded.history_incarnation,
-                                    phase = 'holding',
-                                    cutoff_seq = excluded.cutoff_seq,
-                                    witness_json = excluded.witness_json",
+                                ) VALUES (?, ?, ?, ?, 'holding', ?, ?, ?)",
                             )
                             .bind(bid.as_str())
                             .bind(cur.scope.space_id.as_str())
@@ -2894,12 +3321,7 @@ async fn acquire_durable_backup_holds(
                                 "INSERT INTO backup_holds (
                                     backup_id, space_id, history_incarnation, owner_installation_id,
                                     phase, cutoff_seq, witness_json, created_at_ms
-                                ) VALUES ($1, $2, $3, $4, 'holding', $5, $6, $7)
-                                ON CONFLICT (backup_id, space_id) DO UPDATE SET
-                                    history_incarnation = EXCLUDED.history_incarnation,
-                                    phase = 'holding',
-                                    cutoff_seq = EXCLUDED.cutoff_seq,
-                                    witness_json = EXCLUDED.witness_json",
+                                ) VALUES ($1, $2, $3, $4, 'holding', $5, $6, $7)",
                             )
                             .bind(bid.as_str())
                             .bind(cur.scope.space_id.as_str())

@@ -6,7 +6,7 @@ use std::{
 
 use notarium_core::{
     DomainError,
-    auth::{EngineAuthContext, Space, SpaceLifecycle, SpaceRole},
+    auth::{EngineAuthContext, Space, SpaceLifecycle},
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{
@@ -43,9 +43,12 @@ use crate::{
             FolderAncestryCache, derive_command_identity_spec, load_current_space_schema_tx,
             load_note_head_row_tx, note_rank_version_digest, validate_mutation_identity,
         },
-        notes::analyze_and_prepare_carrier,
+        notes::{analyze_and_prepare_carrier, changed_revision_fields_tx},
     },
-    runtime::{insert_revision_row, is_note_purge_fenced_tx, load_space_record},
+    runtime::{
+        CanonicalInner, SpaceRecord, insert_revision_row, is_note_purge_fenced_tx,
+        load_space_record, load_space_record_for_update_opt,
+    },
     sql_exec::BackendConn,
     writer::{BatchEventDraft, ItemCommitArtifacts, PreparedWriteIntent},
 };
@@ -60,6 +63,7 @@ struct RetainedJobRead {
     principal: PrincipalId,
     fingerprint: ContentDigest,
     base_cut: SpaceSeq,
+    progress_digest: Option<ContentDigest>,
     states: Vec<JobState>,
     limit: PageLimit,
     created_at: Instant,
@@ -352,7 +356,7 @@ pub struct AppendCollabUpdate {
 /// Optional canonical carrier settlement written during collaborative checkpoint or room close.
 #[derive(Clone, Debug)]
 pub struct CollabCarrierSettlement {
-    pub actor: PrincipalId,
+    pub auth: EngineAuthContext,
     pub carrier: String,
 }
 
@@ -378,6 +382,8 @@ pub struct CloseCollabSession {
     pub expected_lease: LeaseEpoch,
     pub expected_lineage: LineageEpoch,
     pub final_yrs_snapshot: Option<Vec<u8>>,
+    /// Inclusive prefix covered by the supplied final snapshot in this room lease.
+    pub compacted_through_update_seq: Option<u64>,
     pub carrier_settlement: Option<CollabCarrierSettlement>,
 }
 
@@ -485,7 +491,15 @@ impl CanonicalStore {
         budget: &CallBudget,
         spec: OpenCollabSession,
     ) -> Result<CollabSessionRecord, PortError> {
-        open_collab_session_impl(self, budget, spec).await
+        let store = self.clone();
+        let budget = budget.clone();
+        // The runtime fence must be synchronized even if the requester drops its
+        // future while the database is committing the room transition.
+        tokio::spawn(async move { open_collab_session_impl(&store, &budget, spec).await })
+            .await
+            .map_err(|err| {
+                crate::codec::unknown_commit_outcome("open_room_task", err.to_string())
+            })?
     }
 
     /// Appends an incremental Yrs update to `collab_update_log` under exact `(lease_epoch, lineage_epoch)`.
@@ -514,8 +528,36 @@ impl CanonicalStore {
         budget: &CallBudget,
         spec: CloseCollabSession,
     ) -> Result<CollabSessionRecord, PortError> {
-        close_collab_session_impl(self, budget, spec).await
+        let store = self.clone();
+        let budget = budget.clone();
+        // The runtime fence must be synchronized even if the requester drops its
+        // future while the database is committing the room transition.
+        tokio::spawn(async move { close_collab_session_impl(&store, &budget, spec).await })
+            .await
+            .map_err(|err| {
+                crate::codec::unknown_commit_outcome("close_room_task", err.to_string())
+            })?
     }
+}
+
+/// A PostgreSQL writer takeover revokes leases from the previous runtime in the
+/// same transaction as the Space epoch change. Uncompacted updates remain durable.
+pub(crate) async fn fence_rooms_on_takeover_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+) -> Result<(), PortError> {
+    if let BackendConn::Postgres(conn) = tx {
+        sqlx::query(
+            "UPDATE collab_sessions SET room_state = 'fenced',
+             lease_epoch = lease_epoch + 1, owner_id = NULL
+             WHERE space_id = $1 AND room_state = 'active'",
+        )
+        .bind(scope.space_id.as_str())
+        .execute(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_fence_takeover_rooms", err.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Startup fenced recovery: on single-writer SQLite, transitions any leftover `'active'`
@@ -686,17 +728,12 @@ fn authorize_job_write_on_space(
     auth: &EngineAuthContext,
     space: &Space,
 ) -> Result<(), DomainError> {
-    if auth.taint().is_tainted() {
-        return Err(DomainError::CrossSpaceTainted);
-    }
+    auth.authorize_space_write(space)?;
     let grant = auth
         .spaces()
         .get(&space.id)
         .ok_or(DomainError::ResourceNotFound)?;
-    if space.lifecycle != SpaceLifecycle::Active
-        || grant.role == SpaceRole::Viewer
-        || grant.project_root.is_some()
-    {
+    if grant.project_root.is_some() {
         return Err(DomainError::SpaceReadOnly);
     }
     Ok(())
@@ -908,6 +945,55 @@ async fn load_job_row_opt_tx(
     )))
 }
 
+async fn authorize_export_notes_tx(
+    tx: &mut BackendConn<'_>,
+    space: &Space,
+    auth: &EngineAuthContext,
+    notes: &[NoteId],
+) -> Result<(), PortError> {
+    let mut folders = FolderAncestryCache::default();
+    for note in notes {
+        if is_note_purge_fenced_tx(tx, &space.id, note.as_str()).await? {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        let head = load_note_head_row_tx(tx, &space.id, note).await?;
+        if head.lifecycle != Lifecycle::Active {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        let (facts, _) = folders
+            .build_resource_facts_tx(
+                tx,
+                space,
+                &head.parent_folder_id,
+                head.doc_class,
+                head.ability_id,
+                true,
+            )
+            .await?;
+        auth.authorize_read(&facts)?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn authorize_job_replay_tx(
+    tx: &mut BackendConn<'_>,
+    space: &Space,
+    auth: &EngineAuthContext,
+    job: Option<&JobId>,
+    notes: &[NoteId],
+) -> Result<(), PortError> {
+    authorize_job_write_on_space(auth, space)?;
+    if let Some(id) = job {
+        let (current, ..) = load_job_row_opt_tx(tx, &space.id, id)
+            .await?
+            .ok_or(DomainError::ResourceNotFound)?;
+        if let ContentJobKind::Export { notes, .. } = current.kind {
+            authorize_export_notes_tx(tx, space, auth, &notes).await?;
+        }
+    }
+    authorize_export_notes_tx(tx, space, auth, notes).await
+}
+
 async fn create_job_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -919,7 +1005,12 @@ async fn create_job_impl(
 
     let payload_wire = StoredJobPayloadV1::from(&request.input);
     let payload_bytes = encode_msgpack(&payload_wire)?;
-    let idemp = derive_command_identity_spec(&request.identity, "create_job", &payload_bytes);
+    let export_notes = match &request.input {
+        ContentJobKind::Export { notes, .. } => notes.as_slice(),
+        _ => &[],
+    };
+    let idemp = derive_command_identity_spec(&request.identity, "create_job", &payload_bytes)
+        .for_job(ctx.auth(), None, export_notes);
 
     let scope = space_rec.scope.clone();
     let active_epoch = space_rec.active_epoch;
@@ -942,31 +1033,9 @@ async fn create_job_impl(
                 let mut total_units: Option<u64> = None;
 
                 if let ContentJobKind::Export { notes, .. } = &input {
+                    authorize_export_notes_tx(tx, &live_space.space, &auth, notes).await?;
                     let mut seen = BTreeSet::new();
-                    let mut anc_cache = FolderAncestryCache::default();
-                    for nid in notes {
-                        if is_note_purge_fenced_tx(tx, &scope.space_id, nid.as_str()).await? {
-                            return Err(DomainError::ResourceNotFound.into());
-                        }
-                        let head = load_note_head_row_tx(tx, &scope.space_id, nid).await?;
-                        if head.lifecycle != Lifecycle::Active {
-                            return Err(DomainError::ResourceNotFound.into());
-                        }
-                        let (rfacts, _) = anc_cache
-                            .build_resource_facts_tx(
-                                tx,
-                                &live_space.space,
-                                &head.parent_folder_id,
-                                head.doc_class,
-                                head.ability_id,
-                                true,
-                            )
-                            .await?;
-                        auth.authorize_read(&rfacts)?;
-                        if seen.insert(nid.clone()) {
-                            owner_notes.push(nid.clone());
-                        }
-                    }
+                    owner_notes.extend(notes.iter().filter(|note| seen.insert(*note)).cloned());
                     total_units = Some(notes.len() as u64);
                 }
 
@@ -1272,6 +1341,19 @@ async fn list_jobs_impl(
                                 overlay: Vec::new(),
                             };
                             cursor.check(&eff)?;
+                            if retained.base_cut != srec.last_seq
+                                || retained.progress_digest
+                                    != job_progress_digest(
+                                        tx,
+                                        &srec.scope.space_id,
+                                        &retained.states,
+                                    )
+                                    .await?
+                            {
+                                return Err(
+                                    DomainError::validation(ValidationReason::CursorStale).into()
+                                );
+                            }
                             if cursor.last.cells.len() != 1 {
                                 return Err(DomainError::validation(
                                     ValidationReason::CursorScopeMismatch,
@@ -1329,6 +1411,8 @@ async fn list_jobs_impl(
                             principal: auth.principal().clone(),
                             fingerprint,
                             base_cut,
+                            progress_digest: job_progress_digest(tx, &srec.scope.space_id, &states)
+                                .await?,
                             states,
                             limit,
                             created_at: Instant::now(),
@@ -1355,14 +1439,52 @@ async fn list_jobs_impl(
                     items,
                     next,
                     scope: srec.scope,
-                    canonical_seq: srec.last_seq,
-                    projected_seq: srec.last_seq,
+                    canonical_seq: base_cut,
+                    projected_seq: base_cut,
                     incomplete: false,
                     diagnostics: Vec::new(),
                 })
             })
         })
         .await
+}
+
+/// Heartbeats can change the visible progress of a running job without a SpaceSeq.
+async fn job_progress_digest(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    states: &[JobState],
+) -> Result<Option<ContentDigest>, PortError> {
+    if !states.is_empty() && !states.contains(&JobState::Running) {
+        return Ok(None);
+    }
+    use futures_util::TryStreamExt;
+    type Progress = (String, i64, Option<i64>);
+    let mut rows = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_as::<_, Progress>(
+            "SELECT job_id, completed_units, total_units FROM content_jobs
+             WHERE space_id = ? AND state = 'running' ORDER BY job_id",
+        )
+        .bind(space.as_str())
+        .fetch(&mut **conn),
+        BackendConn::Postgres(conn) => sqlx::query_as::<_, Progress>(
+            "SELECT job_id, completed_units, total_units FROM content_jobs
+             WHERE space_id = $1 AND state = 'running' ORDER BY job_id",
+        )
+        .bind(space.as_str())
+        .fetch(&mut **conn),
+    };
+    let mut hash = blake3::Hasher::new();
+    while let Some((id, done, total)) = rows
+        .try_next()
+        .await
+        .map_err(|err| internal_not_committed("job_progress_digest", err.to_string()))?
+    {
+        hash.update(id.as_bytes());
+        hash.update(&done.to_be_bytes());
+        hash.update(&total.unwrap_or(-1).to_be_bytes());
+    }
+    Ok(Some(ContentDigest::from_bytes(*hash.finalize().as_bytes())))
 }
 
 async fn query_jobs_page_tx(
@@ -1568,7 +1690,8 @@ async fn cancel_job_impl(
         request.input.job.as_str(),
         request.input.expected_lease.get()
     );
-    let idemp = derive_command_identity_spec(&request.identity, "cancel_job", fp.as_bytes());
+    let idemp = derive_command_identity_spec(&request.identity, "cancel_job", fp.as_bytes())
+        .for_job(ctx.auth(), Some(&request.input.job), &[]);
 
     let scope = space_rec.scope.clone();
     let active_epoch = space_rec.active_epoch;
@@ -1592,6 +1715,10 @@ async fn cancel_job_impl(
                 else {
                     return Err(DomainError::ResourceNotFound.into());
                 };
+
+                if let ContentJobKind::Export { notes, .. } = &cur_job.kind {
+                    authorize_export_notes_tx(tx, &live_space.space, &auth, notes).await?;
+                }
 
                 if cur_job.lease != input.expected_lease {
                     return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
@@ -1973,11 +2100,11 @@ async fn heartbeat_job_lease_impl(
     let worker_owned = worker_id.to_owned();
     let dur_ms = i64::try_from(lease_duration.as_millis().max(1)).unwrap_or(60_000);
 
+    let inner = std::sync::Arc::clone(&store.inner);
     store
         .with_fenced_auxiliary_write_tx(|tx| {
             Box::pin(async move {
-                let srec = load_space_record(tx, &scope_cl.space_id).await?;
-                srec.scope.check(&scope_cl)?;
+                lock_peer_space(tx, &inner, &scope_cl).await?;
 
                 let Some((mut cur_job, cur_owner, ..)) =
                     load_job_row_opt_tx(tx, &scope_cl.space_id, &jid).await?
@@ -2349,6 +2476,9 @@ async fn read_collab_session_impl(
             Box::pin(async move {
                 let srec = load_space_record(tx, &scope_cl.space_id).await?;
                 srec.scope.check(&scope_cl)?;
+                if is_note_purge_fenced_tx(tx, &scope_cl.space_id, nid.as_str()).await? {
+                    return Ok(None);
+                }
                 let Some(session) =
                     load_collab_session_opt_tx(tx, &scope_cl.space_id, &nid).await?
                 else {
@@ -2430,6 +2560,20 @@ async fn read_collab_session_impl(
         .await
 }
 
+/// Serialize auxiliary writes with the batch writer and with other database clients.
+async fn lock_peer_space(
+    tx: &mut BackendConn<'_>,
+    inner: &CanonicalInner,
+    scope: &HistoryScope,
+) -> Result<SpaceRecord, PortError> {
+    let space = load_space_record_for_update_opt(tx, &scope.space_id)
+        .await?
+        .ok_or(DomainError::ResourceNotFound)?;
+    space.scope.check(scope)?;
+    inner.check_writer_epoch(&scope.space_id, space.active_epoch)?;
+    Ok(space)
+}
+
 async fn open_collab_session_impl(
     store: &CanonicalStore,
     budget: &CallBudget,
@@ -2446,16 +2590,14 @@ async fn open_collab_session_impl(
     }
 
     let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
-    let fence_lock = room_fences.get_or_init(&spec.scope, &spec.note);
-    // Hold the per-note runtime fence lock across the entire SQL write transaction!
-    let mut fence_guard = fence_lock.lock_owned().await;
 
-    let res = store
+    let inner = std::sync::Arc::clone(&store.inner);
+    let (res, mut fence_guard) = store
         .with_fenced_auxiliary_write_tx(|tx| {
             let spec_cl = spec.clone();
             Box::pin(async move {
-                let srec = load_space_record(tx, &spec_cl.scope.space_id).await?;
-                srec.scope.check(&spec_cl.scope)?;
+                let srec = lock_peer_space(tx, &inner, &spec_cl.scope).await?;
+                let fence_guard = room_fences.lock_for_write(&spec_cl.scope, &spec_cl.note)?;
                 if is_note_purge_fenced_tx(tx, &srec.scope.space_id, spec_cl.note.as_str()).await? {
                     return Err(DomainError::ResourceNotFound.into());
                 }
@@ -2535,7 +2677,7 @@ async fn open_collab_session_impl(
                     }
                 };
 
-                let new_lease = base_lease.checked_next()?;
+                let new_lease = base_lease.max(fence_guard.epoch()).checked_next()?;
                 let (yrs_blob, yrs_digest) = match spec_cl.initial_yrs_snapshot {
                     Some(bytes) => {
                         let d = ContentDigest::from_bytes(*blake3::hash(&bytes).as_bytes());
@@ -2612,7 +2754,7 @@ async fn open_collab_session_impl(
                     }
                 }
 
-                Ok(CollabSessionRecord {
+                Ok((CollabSessionRecord {
                     note: spec_cl.note,
                     lease_epoch: new_lease,
                     lineage_epoch: lineage,
@@ -2622,7 +2764,7 @@ async fn open_collab_session_impl(
                     room_state: CollabRoomState::Active,
                     owner_id: Some(spec_cl.owner_id),
                     updated_seq,
-                })
+                }, fence_guard))
             })
         })
         .await?;
@@ -2648,15 +2790,18 @@ async fn append_collab_update_impl(
             "append_collab_update cancelled",
         ));
     }
-    if spec.update_seq == 0 {
+    if spec.update_seq == 0 || spec.update_seq > i64::MAX as u64 {
         return Err(DomainError::validation(ValidationReason::InvalidRange).into());
     }
 
+    let inner = std::sync::Arc::clone(&store.inner);
     store
         .with_fenced_auxiliary_write_tx(|tx| {
             Box::pin(async move {
-                let srec = load_space_record(tx, &spec.scope.space_id).await?;
-                srec.scope.check(&spec.scope)?;
+                let srec = lock_peer_space(tx, &inner, &spec.scope).await?;
+                if is_note_purge_fenced_tx(tx, &srec.scope.space_id, spec.note.as_str()).await? {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
 
                 let Some(cur) =
                     load_collab_session_opt_tx(tx, &srec.scope.space_id, &spec.note).await?
@@ -2774,6 +2919,46 @@ impl TryFrom<StoredCollabSessionV1> for CollabSessionRecord {
     }
 }
 
+async fn compact_collab_prefix(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    note: &NoteId,
+    lease: LeaseEpoch,
+    through: Option<u64>,
+) -> Result<(), PortError> {
+    let Some(through) = through else {
+        return Ok(());
+    };
+    let through = i64::try_from(through)
+        .map_err(|_| DomainError::validation(ValidationReason::InvalidRange))?;
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query(
+            "DELETE FROM collab_update_log WHERE space_id = ? AND note_id = ?
+             AND (lease_epoch < ? OR (lease_epoch = ? AND update_seq <= ?))",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(note.as_str())
+        .bind(lease.get() as i64)
+        .bind(lease.get() as i64)
+        .bind(through)
+        .execute(&mut **conn)
+        .await
+        .map(|_| ()),
+        BackendConn::Postgres(conn) => sqlx::query(
+            "DELETE FROM collab_update_log WHERE space_id = $1 AND note_id = $2
+             AND (lease_epoch < $3 OR (lease_epoch = $3 AND update_seq <= $4))",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(note.as_str())
+        .bind(lease.get() as i64)
+        .bind(through)
+        .execute(&mut **conn)
+        .await
+        .map(|_| ()),
+    }
+    .map_err(|err| internal_not_committed("compact_collab_log", err.to_string()))
+}
+
 async fn checkpoint_collab_session_impl(
     store: &CanonicalStore,
     budget: &CallBudget,
@@ -2803,11 +2988,14 @@ async fn checkpoint_collab_session_impl(
         ));
     }
 
+    let inner = std::sync::Arc::clone(&store.inner);
     store
         .with_fenced_auxiliary_write_tx(|tx| {
             Box::pin(async move {
-                let srec = load_space_record(tx, &spec.scope.space_id).await?;
-                srec.scope.check(&spec.scope)?;
+                let srec = lock_peer_space(tx, &inner, &spec.scope).await?;
+                if is_note_purge_fenced_tx(tx, &srec.scope.space_id, spec.note.as_str()).await? {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
 
                 let Some(mut cur) =
                     load_collab_session_opt_tx(tx, &srec.scope.space_id, &spec.note).await?
@@ -2828,7 +3016,14 @@ async fn checkpoint_collab_session_impl(
 
                 let yrs_digest =
                     ContentDigest::from_bytes(*blake3::hash(&spec.yrs_snapshot).as_bytes());
-                let compact_through = spec.compacted_through_update_seq.unwrap_or(u64::MAX);
+                compact_collab_prefix(
+                    tx,
+                    &spec.scope,
+                    &spec.note,
+                    spec.expected_lease,
+                    spec.compacted_through_update_seq,
+                )
+                .await?;
 
                 match tx {
                     BackendConn::Sqlite(conn) => {
@@ -2847,22 +3042,6 @@ async fn checkpoint_collab_session_impl(
                         .map_err(|err| {
                             internal_not_committed("sqlite_ckpt_collab", err.to_string())
                         })?;
-
-                        sqlx::query(
-                            "DELETE FROM collab_update_log
-                             WHERE space_id = ? AND note_id = ?
-                               AND (lease_epoch < ? OR (lease_epoch = ? AND update_seq <= ?))",
-                        )
-                        .bind(srec.scope.space_id.as_str())
-                        .bind(spec.note.as_str())
-                        .bind(spec.expected_lease.get() as i64)
-                        .bind(spec.expected_lease.get() as i64)
-                        .bind(compact_through.min(i64::MAX as u64) as i64)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_ckpt_prune_log", err.to_string())
-                        })?;
                     }
                     BackendConn::Postgres(conn) => {
                         sqlx::query(
@@ -2878,21 +3057,6 @@ async fn checkpoint_collab_session_impl(
                         .execute(&mut **conn)
                         .await
                         .map_err(|err| internal_not_committed("pg_ckpt_collab", err.to_string()))?;
-
-                        sqlx::query(
-                            "DELETE FROM collab_update_log
-                             WHERE space_id = $1 AND note_id = $2
-                               AND (lease_epoch < $3 OR (lease_epoch = $3 AND update_seq <= $4))",
-                        )
-                        .bind(srec.scope.space_id.as_str())
-                        .bind(spec.note.as_str())
-                        .bind(spec.expected_lease.get() as i64)
-                        .bind(compact_through.min(i64::MAX as u64) as i64)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("pg_ckpt_prune_log", err.to_string())
-                        })?;
                     }
                 }
 
@@ -2909,6 +3073,9 @@ async fn close_collab_session_impl(
     budget: &CallBudget,
     spec: CloseCollabSession,
 ) -> Result<CollabSessionRecord, PortError> {
+    if spec.final_yrs_snapshot.is_none() && spec.compacted_through_update_seq.is_some() {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
     if let Some(settlement) = spec.carrier_settlement {
         return settle_and_update_collab_session(
             store,
@@ -2919,7 +3086,7 @@ async fn close_collab_session_impl(
             spec.expected_lease,
             spec.expected_lineage,
             spec.final_yrs_snapshot,
-            None,
+            spec.compacted_through_update_seq,
             settlement,
             true,
         )
@@ -2934,15 +3101,17 @@ async fn close_collab_session_impl(
     }
 
     let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
-    let fence_lock = room_fences.get_or_init(&spec.scope, &spec.note);
-    let mut fence_guard = fence_lock.lock_owned().await;
 
-    let res = store
+    let inner = std::sync::Arc::clone(&store.inner);
+    let (res, mut fence_guard) = store
         .with_fenced_auxiliary_write_tx(|tx| {
             let spec_cl = spec.clone();
             Box::pin(async move {
-                let srec = load_space_record(tx, &spec_cl.scope.space_id).await?;
-                srec.scope.check(&spec_cl.scope)?;
+                let srec = lock_peer_space(tx, &inner, &spec_cl.scope).await?;
+                if is_note_purge_fenced_tx(tx, &srec.scope.space_id, spec_cl.note.as_str()).await? {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let fence_guard = room_fences.lock_for_write(&spec_cl.scope, &spec_cl.note)?;
 
                 let Some(mut cur) =
                     load_collab_session_opt_tx(tx, &srec.scope.space_id, &spec_cl.note).await?
@@ -2962,7 +3131,15 @@ async fn close_collab_session_impl(
                     return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
                 }
 
-                let new_lease = cur.lease_epoch.checked_next()?;
+                compact_collab_prefix(
+                    tx,
+                    &spec_cl.scope,
+                    &spec_cl.note,
+                    cur.lease_epoch,
+                    spec_cl.compacted_through_update_seq,
+                )
+                .await?;
+                let new_lease = cur.lease_epoch.max(fence_guard.epoch()).checked_next()?;
                 let (yrs_blob, yrs_digest) = match spec_cl.final_yrs_snapshot {
                     Some(bytes) => {
                         let d = ContentDigest::from_bytes(*blake3::hash(&bytes).as_bytes());
@@ -2974,16 +3151,6 @@ async fn close_collab_session_impl(
 
                 match tx {
                     BackendConn::Sqlite(conn) => {
-                        sqlx::query(
-                            "DELETE FROM collab_update_log WHERE space_id = ? AND note_id = ?",
-                        )
-                        .bind(srec.scope.space_id.as_str())
-                        .bind(spec_cl.note.as_str())
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_close_clear_log", err.to_string())
-                        })?;
                         sqlx::query(
                             "UPDATE collab_sessions
                              SET room_state = 'closed',
@@ -3005,16 +3172,6 @@ async fn close_collab_session_impl(
                         })?;
                     }
                     BackendConn::Postgres(conn) => {
-                        sqlx::query(
-                            "DELETE FROM collab_update_log WHERE space_id = $1 AND note_id = $2",
-                        )
-                        .bind(srec.scope.space_id.as_str())
-                        .bind(spec_cl.note.as_str())
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("pg_close_clear_log", err.to_string())
-                        })?;
                         sqlx::query(
                             "UPDATE collab_sessions
                              SET room_state = 'closed',
@@ -3042,7 +3199,7 @@ async fn close_collab_session_impl(
                 cur.lease_epoch = new_lease;
                 cur.yrs_snapshot_blob = yrs_blob;
                 cur.yrs_snapshot_digest = yrs_digest;
-                Ok(cur)
+                Ok((cur, fence_guard))
             })
         })
         .await?;
@@ -3071,12 +3228,23 @@ async fn settle_and_update_collab_session(
     let (space_rec, base_head) = {
         let sc = scope.clone();
         let nid = note.clone();
+        let auth = settlement.auth.clone();
         store
             .with_read_tx_budget(Some(budget), |tx| {
                 Box::pin(async move {
                     let srec = load_space_record(tx, &sc.space_id).await?;
                     srec.scope.check(&sc)?;
                     let head = load_note_head_row_tx(tx, &srec.scope.space_id, &nid).await?;
+                    let (facts, _) = crate::domain::common::build_resource_facts_tx(
+                        tx,
+                        &srec.space,
+                        &head.parent_folder_id,
+                        head.doc_class,
+                        head.ability_id.clone(),
+                        true,
+                    )
+                    .await?;
+                    auth.authorize_direct_write(&facts, &facts)?;
                     Ok((srec, head))
                 })
             })
@@ -3113,13 +3281,34 @@ async fn settle_and_update_collab_session(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                let fence_lock = room_fences.get_or_init(&scope_cl, &note);
-                let mut fence_guard = fence_lock.lock_owned().await;
+                let fence_guard = if close_room {
+                    Some(room_fences.lock_for_write(&scope_cl, &note)?)
+                } else {
+                    None
+                };
 
                 let head = load_note_head_row_tx(tx, &scope_cl.space_id, &note).await?;
                 if head.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+
+                if head.head_rev_id != base_head.head_rev_id {
+                    return Err(DomainError::RevisionConflict {
+                        current: head.head_rev_id,
+                        lineage: None,
+                    }
+                    .into());
+                }
+                let (facts, anc) = crate::domain::common::build_resource_facts_tx(
+                    tx,
+                    &item_ctx.space,
+                    &head.parent_folder_id,
+                    head.doc_class,
+                    head.ability_id.clone(),
+                    true,
+                )
+                .await?;
+                settlement.auth.authorize_direct_write(&facts, &facts)?;
 
                 let Some(cur) = load_collab_session_opt_tx(tx, &scope_cl.space_id, &note).await?
                 else {
@@ -3161,6 +3350,7 @@ async fn settle_and_update_collab_session(
                 item_ctx.record_staged_ticket(ticket.clone());
                 activate_and_bind_blob_ref_tx(
                     tx,
+                    &item_ctx.scope,
                     item_ctx.active_epoch,
                     &BlobReferenceClaim {
                         ticket,
@@ -3192,7 +3382,7 @@ async fn settle_and_update_collab_session(
                         .bind(seq_i64)
                         .bind(sec)
                         .bind(nsec)
-                        .bind(settlement.actor.as_str())
+                        .bind(settlement.auth.principal().as_str())
                         .bind(scope_cl.space_id.as_str())
                         .bind(note.as_str())
                         .execute(&mut **conn)
@@ -3218,7 +3408,7 @@ async fn settle_and_update_collab_session(
                         .bind(seq_i64)
                         .bind(sec)
                         .bind(nsec)
-                        .bind(settlement.actor.as_str())
+                        .bind(settlement.auth.principal().as_str())
                         .bind(scope_cl.space_id.as_str())
                         .bind(note.as_str())
                         .execute(&mut **conn)
@@ -3235,10 +3425,9 @@ async fn settle_and_update_collab_session(
                     info.diagnostics.first(),
                     current_schema.as_ref().map(|s| &s.fields),
                 );
-                let mut anc_cache = FolderAncestryCache::default();
-                let anc = anc_cache
-                    .load_ancestry_tx(tx, &scope_cl.space_id, &head.parent_folder_id, false)
-                    .await?;
+                let changed_fields =
+                    changed_revision_fields_tx(tx, &scope_cl, &head.head_rev_id, &eval_fields)
+                        .await?;
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
                         note_id: note.clone(),
@@ -3273,14 +3462,14 @@ async fn settle_and_update_collab_session(
                     None,
                     Some(digest),
                     &meta,
-                    &settlement.actor,
+                    settlement.auth.principal(),
                     None,
                     now_ts,
                 )
                 .await?;
 
-                let new_lease = if close_room {
-                    cur.lease_epoch.checked_next()?
+                let new_lease = if let Some(guard) = &fence_guard {
+                    cur.lease_epoch.max(guard.epoch()).checked_next()?
                 } else {
                     cur.lease_epoch
                 };
@@ -3298,39 +3487,11 @@ async fn settle_and_update_collab_session(
                     None => (cur.yrs_snapshot_blob, cur.yrs_snapshot_digest),
                 };
                 let digest_slice = final_yrs_digest.as_ref().map(|d| d.as_bytes().as_slice());
-                let compact_to = compacted_through.unwrap_or(u64::MAX);
+                compact_collab_prefix(tx, &scope_cl, &note, expected_lease, compacted_through)
+                    .await?;
 
                 match tx {
                     BackendConn::Sqlite(conn) => {
-                        if close_room {
-                            sqlx::query(
-                                "DELETE FROM collab_update_log WHERE space_id = ? AND note_id = ?",
-                            )
-                            .bind(scope_cl.space_id.as_str())
-                            .bind(note.as_str())
-                            .execute(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                internal_not_committed("sqlite_settle_clear_log", err.to_string())
-                            })?;
-                        } else {
-                            sqlx::query(
-                                "DELETE FROM collab_update_log
-                                 WHERE space_id = ? AND note_id = ?
-                                   AND (lease_epoch < ? OR (lease_epoch = ? AND update_seq <= ?))",
-                            )
-                            .bind(scope_cl.space_id.as_str())
-                            .bind(note.as_str())
-                            .bind(expected_lease.get() as i64)
-                            .bind(expected_lease.get() as i64)
-                            .bind(compact_to.min(i64::MAX as u64) as i64)
-                            .execute(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                internal_not_committed("sqlite_settle_prune_log", err.to_string())
-                            })?;
-                        }
-
                         sqlx::query(
                             "UPDATE collab_sessions
                              SET lease_epoch = ?,
@@ -3358,34 +3519,6 @@ async fn settle_and_update_collab_session(
                         })?;
                     }
                     BackendConn::Postgres(conn) => {
-                        if close_room {
-                            sqlx::query(
-                                "DELETE FROM collab_update_log WHERE space_id = $1 AND note_id = $2",
-                            )
-                            .bind(scope_cl.space_id.as_str())
-                            .bind(note.as_str())
-                            .execute(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                internal_not_committed("pg_settle_clear_log", err.to_string())
-                            })?;
-                        } else {
-                            sqlx::query(
-                                "DELETE FROM collab_update_log
-                                 WHERE space_id = $1 AND note_id = $2
-                                   AND (lease_epoch < $3 OR (lease_epoch = $3 AND update_seq <= $4))",
-                            )
-                            .bind(scope_cl.space_id.as_str())
-                            .bind(note.as_str())
-                            .bind(expected_lease.get() as i64)
-                            .bind(compact_to.min(i64::MAX as u64) as i64)
-                            .execute(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                internal_not_committed("pg_settle_prune_log", err.to_string())
-                            })?;
-                        }
-
                         sqlx::query(
                             "UPDATE collab_sessions
                              SET lease_epoch = $1,
@@ -3414,14 +3547,14 @@ async fn settle_and_update_collab_session(
                     }
                 }
 
-                if close_room {
-                    *fence_guard = notarium_core::ports::RoomFenceState::new(
+                if let Some(mut guard) = fence_guard {
+                    let closed = notarium_core::ports::RoomFenceState::new(
                         note.clone(),
                         scope_cl.clone(),
                         new_lease,
                     );
+                    item_ctx.on_commit(move || *guard = closed);
                 }
-                item_ctx.retain_until_batch_commit(fence_guard);
 
                 let out_rec = CollabSessionRecord {
                     note: note.clone(),
@@ -3452,7 +3585,7 @@ async fn settle_and_update_collab_session(
                             rank_version: note_rank_version_digest(&new_rev, None),
                             lifecycle: Lifecycle::Active,
                             doc_class: head.doc_class,
-                            changed_fields: Default::default(),
+                            changed_fields,
                         }],
                     },
                     vec![note.clone()],

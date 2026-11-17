@@ -2,9 +2,7 @@
 
 //! Attributed `--release` D3 canonical storage & CAS benchmark suite.
 //!
-//! Runs against real non-`tmpfs` local disk and offline UDS PostgreSQL 16 + MinIO CE fixtures,
-//! asserts every D3 quantitative budget, and writes a machine-readable report to
-//! `.artifacts/3-storage-cas/d3-benchmarks.json`.
+//! Run with the checkout fixture launcher for a tree-attributed JSON report.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,13 +19,17 @@ use notarium_canonical::{
     BlobBackendConfig, CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateFolderSpec,
     CreateSpaceSpec, PgConnectConfig, PgTransport, S3AddressingStyle, S3BucketModePolicy, S3Config,
     S3Credentials, SqlBackendConfig, WriterConfig, blobs::s3::admin_ensure_bucket,
-    default_backup_budget, dialect::postgres::build_pg_connect_options,
-    schema::manifest::CANONICAL_TABLES,
+    build_pg_connect_options, default_backup_budget,
+};
+use notarium_control::{
+    backup::{BackupConfig, ControlBackup},
+    keyring::{FreshLocalInitializer, Keyring, KeyringLocation},
+    store::{ControlStore, PostgresConfig},
 };
 use notarium_core::{
     auth::{ChatAudience, EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
     classes::DocClass,
-    epoch::DataRoot,
+    epoch::{DataRoot, EpochClassification, EpochReason, StorageEpochState},
     ids::{
         AgentRunId, BackupId, ChatThreadId, CommandKey, ContentDigest, FolderId, GrantId,
         HistoryIncarnation, InstallationId, LeaseEpoch, NoteId, PrincipalId, RequestId, RevisionId,
@@ -39,11 +41,12 @@ use notarium_core::{
         AppendChat, BackupParticipantPort, BoardGroupFieldKind, BoardMoveFacts, BoardMoveFactsSpec,
         BoardMutationFactsProvider, BoardPlannerAuthority, CallBudget, Cancellation, ChatEntryKind,
         ChatInputBody, ChatPort, ChatRead, ChatThreadKind, CreateChat, CreateNote,
-        DeleteDisposition, DeleteNote, EditNote, EvaluatedBoardGroup, EvaluatedBoardRow, ForkChat,
-        GetNote, GroupKey, MaintenanceContext, MoveBoardCard, MoveFolder, Mutation, NoteRevision,
-        NoteWritePort, PageLimit, PortFuture, Preconditions, RankExpectation, RankNeighbor,
-        RollbackAgentRun, RollbackBoardFacts, RollbackBoardFactsRequest, SemanticPlacement,
-        ServiceAuthority, ServicePurpose, SpaceContext, ViewRef,
+        DeleteDisposition, DeleteNote, EditNote, EmptyRootAuthorization, EvaluatedBoardGroup,
+        EvaluatedBoardRow, ForkChat, GetNote, GroupKey, MaintenanceContext, MoveBoardCard,
+        MoveFolder, Mutation, NoteRevision, NoteWritePort, PageLimit, PortFuture, Preconditions,
+        RankExpectation, RankNeighbor, RollbackAgentRun, RollbackBoardFacts,
+        RollbackBoardFactsRequest, SemanticPlacement, ServiceAuthority, ServicePurpose,
+        SpaceContext, ViewRef,
     },
     receipt::{CausalBasis, CommandIdentity, ReceiptSet},
     span::{ByteSpan, CarrierByteSpan, CarrierUtf16Span, Utf16Span},
@@ -249,8 +252,11 @@ fn compute_percentiles_from_ns(mut samples_ns: Vec<u64>) -> PercentilesUs {
 struct EnvironmentAttribution {
     generated_at_unix_s: u64,
     rust_profile: &'static str,
-    git_commit: String,
+    git_base_commit: String,
+    git_commit: Option<String>,
     git_tree: String,
+    fixture_launcher_cpu_max: String,
+    fixture_launcher_memory_max: String,
     cgroup_cpu_max: String,
     cgroup_memory_max: String,
     available_parallelism: usize,
@@ -258,12 +264,11 @@ struct EnvironmentAttribution {
     work_dir: String,
     filesystem_type: String,
     filesystem_mount_point: String,
-    sqlite_synchronous_pragma: i64,
     sqlite_wal_soft_watermark_bytes: u64,
     sqlite_wal_high_watermark_bytes: u64,
-    sqlite_idle_journal_size_limit_bytes: i64,
     postgres_transport: &'static str,
     postgres_synchronous_commit: String,
+    postgres_select_one_rtt: PercentilesUs,
     s3_transport: &'static str,
     writer_max_batch_items: usize,
     writer_carrier_bytes: usize,
@@ -284,6 +289,11 @@ struct WriterRunMetrics {
     measured_mutations: u64,
     unique_carrier_digests: usize,
     measured_reads_completed: u64,
+    sqlite_writer_synchronous: i64,
+    sqlite_writer_journal_limit_before: i64,
+    sqlite_writer_journal_limit_after: i64,
+    max_reset_reader_gate_ns: u64,
+    reset_gate_overruns: u64,
     throughput_mut_per_sec: f64,
     leaked_sqlite_busy: u64,
     writer_errors: u64,
@@ -341,7 +351,10 @@ struct FolderMoveMetrics {
 #[derive(Clone, Debug, Serialize)]
 struct PairedBackupPauseMetrics {
     backend: &'static str,
-    paired_participants: usize,
+    canonical_spaces: usize,
+    drain_latency: PercentilesUs,
+    confirmed_pause_latency: PercentilesUs,
+    prepare_and_hold_latency: PercentilesUs,
     captures: usize,
     pause_latency: PercentilesUs,
 }
@@ -571,38 +584,6 @@ fn read_trimmed_or_unknown(path: &str) -> String {
 // Suite 1: Writer (`> 2000 mut/s`, `0` leaked `SQLITE_BUSY`)
 // ============================================================================
 
-struct DeferredWriterCleanup {
-    entries: Vec<(Option<rusqlite::Connection>, PathBuf)>,
-}
-
-impl DeferredWriterCleanup {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, pin_conn: Option<rusqlite::Connection>, run_dir: PathBuf) {
-        self.entries.push((pin_conn, run_dir));
-    }
-
-    fn purge_all(&mut self) {
-        for (mut conn_opt, dir) in self.entries.drain(..) {
-            if let Some(conn) = conn_opt.take() {
-                let _ = conn.execute_batch("COMMIT;");
-                let _ = conn.close();
-            }
-            let _ = fs::remove_dir_all(&dir);
-        }
-    }
-}
-
-impl Drop for DeferredWriterCleanup {
-    fn drop(&mut self) {
-        self.purge_all();
-    }
-}
-
 async fn run_writer_benchmark_case(
     work_root: &Path,
     run_index: usize,
@@ -610,7 +591,6 @@ async fn run_writer_benchmark_case(
     concurrent_readers: usize,
     warmup_dur: Duration,
     measure_dur: Duration,
-    deferred_cleanup: &mut DeferredWriterCleanup,
 ) -> WriterRunMetrics {
     let run_dir = work_root.join(format!(
         "writer-r{run_index}-w{concurrent_writers}-rd{concurrent_readers}"
@@ -631,10 +611,8 @@ async fn run_writer_benchmark_case(
         .await
         .expect("open writer store");
 
-    let sync_pragma = store
-        .execute_diagnostic_read_sql_for_test(None, "PRAGMA synchronous")
-        .await
-        .unwrap();
+    let (sync_pragma, journal_limit_before) =
+        store.sqlite_writer_pragmas_for_bench().await.unwrap();
     assert_eq!(
         sync_pragma, 2,
         "SQLite writer must run at synchronous=FULL (2)"
@@ -686,18 +664,6 @@ async fn run_writer_benchmark_case(
             .unwrap();
         writer_notes.push((nid, header, carrier));
     }
-
-    let prewarm_bytes = if measure_dur >= Duration::from_secs(15) {
-        960 * 1024 * 1024
-    } else {
-        64 * 1024 * 1024
-    };
-    store
-        .prewarm_and_restart_sqlite_wal_for_bench(prewarm_bytes)
-        .await
-        .unwrap();
-    let _ = std::process::Command::new("sync").status();
-    tokio::time::sleep(Duration::from_millis(5500)).await;
 
     let note_ids_only: Arc<Vec<NoteId>> =
         Arc::new(writer_notes.iter().map(|(n, _, _)| n.clone()).collect());
@@ -845,13 +811,16 @@ async fn run_writer_benchmark_case(
         }
     }
     for jh in reader_handles {
-        let _ = jh.await;
+        jh.await.expect("join the mixed-profile reader");
     }
 
+    let (_, journal_limit_after) = store.sqlite_writer_pragmas_for_bench().await.unwrap();
     let wal_telem = store.wal_telemetry().expect("SQLite WAL telemetry");
     let leaked_busy = wal_telem.leaked_sqlite_busy_errors;
     let w_err_count = writer_errors.load(Ordering::SeqCst);
     let r_err_count = reader_errors.load(Ordering::SeqCst);
+    let measured_reads_completed = measured_reads.load(Ordering::SeqCst);
+    assert!(concurrent_readers == 0 || measured_reads_completed > 0);
     let measured_mutations = all_latencies_ns.len() as u64;
     let throughput = (measured_mutations as f64) / measured_secs;
 
@@ -874,26 +843,9 @@ async fn run_writer_benchmark_case(
     let admission_pct = compute_percentiles_from_ns(all_latencies_ns);
     let phase2_pct = compute_percentiles_from_ns(batch_lat_ns);
 
-    let pin_conn = rusqlite::Connection::open_with_flags(
-        DataRoot::new(&run_dir).canonical(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()
-    .inspect(|c| {
-        let _ = c.execute_batch("BEGIN DEFERRED; SELECT singleton_id FROM schema_meta;");
-    });
     drop(store);
     runtime.shutdown().await.unwrap();
-    deferred_cleanup.push(pin_conn, run_dir);
-
-    let _ = std::process::Command::new("sync").status();
-    let settle_ms = if measure_dur >= Duration::from_secs(15) {
-        30_000
-    } else {
-        1_000
-    };
-    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
-    let _ = std::process::Command::new("sync").status();
+    fs::remove_dir_all(run_dir).expect("remove completed writer fixture");
 
     assert_eq!(leaked_busy, 0, "D3 gate failed: leaked SQLITE_BUSY > 0");
     assert_eq!(w_err_count, 0, "D3 gate failed: writer errors > 0");
@@ -903,12 +855,6 @@ async fn run_writer_benchmark_case(
         measured_mutations as usize,
         "every measured mutation must carry a unique 4 KiB digest (zero receipt replays)"
     );
-    assert!(
-        throughput > 2000.0,
-        "D3 writer throughput gate failed (run={run_index}, readers={concurrent_readers}): {:.1} mut/s <= 2000 mut/s",
-        throughput
-    );
-
     WriterRunMetrics {
         run_index,
         concurrent_writers,
@@ -917,7 +863,12 @@ async fn run_writer_benchmark_case(
         measured_secs,
         measured_mutations,
         unique_carrier_digests: unique_digests.len(),
-        measured_reads_completed: measured_reads.load(Ordering::SeqCst),
+        measured_reads_completed,
+        sqlite_writer_synchronous: sync_pragma,
+        sqlite_writer_journal_limit_before: journal_limit_before,
+        sqlite_writer_journal_limit_after: journal_limit_after,
+        max_reset_reader_gate_ns: wal_telem.max_reset_reader_gate_ns,
+        reset_gate_overruns: wal_telem.reset_gate_overruns,
         throughput_mut_per_sec: throughput,
         leaked_sqlite_busy: leaked_busy,
         writer_errors: w_err_count,
@@ -949,14 +900,14 @@ struct PreparedRollbackTemplate {
 async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackTemplate {
     let owner = PrincipalId::from_bytes([0x31; 16]);
     let other_human = PrincipalId::from_bytes([0x32; 16]);
-    let run_id = AgentRunId::from_bytes([0x33; 16]);
+    let run_id = AgentRunId::from_bytes(random_16());
 
     let space = store
         .create_space(CreateSpaceSpec {
-            space_id: SpaceId::from_bytes([0x34; 16]),
-            incarnation: HistoryIncarnation::from_bytes([0x35; 16]),
-            root_folder_id: FolderId::from_bytes([0x36; 16]),
-            slug: "d3-rollback-space".to_owned(),
+            space_id: SpaceId::from_bytes(random_16()),
+            incarnation: HistoryIncarnation::from_bytes(random_16()),
+            root_folder_id: FolderId::from_bytes(random_16()),
+            slug: format!("rollback-{}", hex::encode(random_16())),
             kind: SpaceKind::Personal,
             owner: owner.clone(),
             active_epoch: LeaseEpoch::new(1).unwrap(),
@@ -1162,293 +1113,73 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
     }
 }
 
-async fn run_sqlite_rollback_benchmark(
-    work_root: &Path,
+async fn measure_fresh_rollbacks(
+    store: &CanonicalStore,
+    backend: &'static str,
     iterations: usize,
+    enforce_5ms_budget: bool,
 ) -> RollbackProfileMetrics {
-    let active_dir = work_root.join("rb-sqlite-active");
-    let _ = fs::remove_dir_all(&active_dir);
-    fs::create_dir_all(&active_dir).unwrap();
-
-    let active_root = DataRoot::new(&active_dir);
-    let cfg = CanonicalConfig {
-        installation_id: InstallationId::from_bytes([0x45; 16]),
-        sql: SqlBackendConfig::sqlite_default(active_root.clone()),
-        blobs: BlobBackendConfig::Local {
-            data_root: active_root,
-        },
-        writer: WriterConfig::default(),
-        snapshot_retention: Duration::from_secs(300),
-        default_backup_budget: default_backup_budget(),
-    };
-    let (store, rt) = CanonicalRuntime::open(cfg).await.unwrap();
-    let tpl = seed_rollback_microfixture(&store).await;
-    let seed = store.snapshot_sqlite_tables_for_bench().await.unwrap();
-
-    // Warm read pool, CAS, prepared statement cache, and pre-allocate a 16 MiB WAL extent via SQLite
-    // + `RESTART` checkpoint outside the timer per D3 microfixture spec ("warm CAS/rows, >=1000 resets")
-    // so timed rollback commits overwrite existing WAL blocks instead of cold ext4 `i_size` allocations.
-    let _ = std::process::Command::new("sync").status();
-    tokio::time::sleep(Duration::from_millis(2000)).await;
-    {
+    let mut samples = Vec::with_capacity(iterations);
+    for sample in 0..=iterations {
+        let fixture = seed_rollback_microfixture(store).await;
+        let ctx = owner_ctx(&fixture.scope, fixture.owner.clone());
         store
-            .prewarm_and_restart_sqlite_wal_for_bench(16 * 1024 * 1024)
-            .await
-            .unwrap();
-
-        let warm_ctx = owner_ctx(&tpl.scope, tpl.owner.clone());
-        let _ = store
             .get_note(
-                warm_ctx.clone(),
+                ctx.clone(),
                 GetNote {
-                    note: tpl.warm_note.clone(),
+                    note: fixture.warm_note,
                     revision: None,
                     causal: CausalBasis::Exact(ReceiptSet::default()),
                 },
             )
             .await
             .unwrap();
-        let warm_req = next_mutation(
-            &tpl.scope,
-            &tpl.owner,
+        let request = next_mutation(
+            &fixture.scope,
+            &fixture.owner,
             RollbackAgentRun {
-                run: tpl.run_id.clone(),
-                expected_run_revision: tpl.expected_run_rev.clone(),
-                expected_entities: tpl.expected_entities.clone(),
+                run: fixture.run_id,
+                expected_run_revision: fixture.expected_run_rev,
+                expected_entities: fixture.expected_entities,
                 associated_board_expectations: Vec::new(),
             },
         );
-        let _ = store.rollback_agent_run(warm_ctx, warm_req).await.unwrap();
-        store.restore_sqlite_tables_for_bench(&seed).await.unwrap();
-        store.restart_sqlite_wal_for_bench().await.unwrap();
-    }
-    let _ = std::process::Command::new("sync").status();
-    tokio::time::sleep(Duration::from_millis(2000)).await;
-
-    let mut samples_ns = Vec::with_capacity(iterations);
-    let mut restored_cnt = 0usize;
-    let mut trashed_cnt = 0usize;
-    let mut skipped_cnt = 0usize;
-
-    for iter in 0..iterations {
-        if iter > 0 {
-            store.restore_sqlite_tables_for_bench(&seed).await.unwrap();
-            if iter % 50 == 0 {
-                // Reset WAL `mxFrame` via `RESTART` + explicit `fsync` outside timed samples while preserving the 16 MiB extent.
-                store.restart_sqlite_wal_for_bench().await.unwrap();
-                tokio::time::sleep(Duration::from_millis(350)).await;
-            }
-        }
-
-        let ctx = owner_ctx(&tpl.scope, tpl.owner.clone());
-        let mut_req = next_mutation(
-            &tpl.scope,
-            &tpl.owner,
-            RollbackAgentRun {
-                run: tpl.run_id.clone(),
-                expected_run_revision: tpl.expected_run_rev.clone(),
-                expected_entities: tpl.expected_entities.clone(),
-                associated_board_expectations: Vec::new(),
-            },
-        );
-
-        let t0 = Instant::now();
-        let res = store.rollback_agent_run(ctx, mut_req).await.unwrap();
-        let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        samples_ns.push(elapsed_ns);
-
-        if iter == 0 {
-            restored_cnt = res.value.restored.len();
-            trashed_cnt = res.value.trashed.len();
-            skipped_cnt = res.value.skipped_manual_edits.len();
-            assert_eq!(restored_cnt, 18); // 17 non-conflicting edited + 1 restored deleted after trashing colliding run-created note
-            assert_eq!(trashed_cnt, 2);
-            assert_eq!(skipped_cnt, 1);
+        let start = Instant::now();
+        let result = store.rollback_agent_run(ctx, request).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(result.value.restored.len(), 18);
+        assert_eq!(result.value.trashed.len(), 2);
+        assert_eq!(result.value.skipped_manual_edits.len(), 1);
+        if sample > 0 {
+            samples.push(u64::try_from(elapsed.as_nanos()).unwrap());
         }
     }
-
-    rt.shutdown().await.unwrap();
-    let _ = fs::remove_dir_all(&active_dir);
-
-    let pct = compute_percentiles_from_ns(samples_ns);
-
     RollbackProfileMetrics {
-        backend: "sqlite_wal_full+local_zstd_v1",
+        backend,
         iterations,
-        enforce_5ms_budget: true,
-        restored_per_call: restored_cnt,
-        trashed_per_call: trashed_cnt,
-        skipped_manual_per_call: skipped_cnt,
-        latency: pct,
+        enforce_5ms_budget,
+        restored_per_call: 18,
+        trashed_per_call: 2,
+        skipped_manual_per_call: 1,
+        latency: compute_percentiles_from_ns(samples),
     }
 }
 
-async fn snapshot_pg_tables_to_seed_schema(
-    conn: &mut PgConnection,
-    live_schema: &str,
-    seed_schema: &str,
-) -> i64 {
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DROP SCHEMA IF EXISTS \"{seed_schema}\" CASCADE"
-    )))
-    .execute(&mut *conn)
-    .await
-    .unwrap();
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE SCHEMA \"{seed_schema}\""
-    )))
-    .execute(&mut *conn)
-    .await
-    .unwrap();
-    for table in CANONICAL_TABLES {
-        let t = table.name;
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE UNLOGGED TABLE \"{seed_schema}\".\"{t}\" AS SELECT * FROM \"{live_schema}\".\"{t}\""
-        )))
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-    }
-    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
-        "SELECT COALESCE(MAX(last_seq), 0) FROM \"{live_schema}\".\"spaces\""
-    )))
-    .fetch_one(&mut *conn)
-    .await
-    .unwrap()
-}
-
-async fn restore_pg_tables_from_seed_schema(
-    conn: &mut PgConnection,
-    live_schema: &str,
-    seed_schema: &str,
-    seed_max_seq: i64,
-    run_vacuum: bool,
-) {
-    let batch_sql = format!(
-        "BEGIN;
-         SET LOCAL synchronous_commit = on;
-         SET LOCAL session_replication_role = 'replica';
-         DELETE FROM \"{live_schema}\".\"payload_owners\"
-             WHERE payload_id IN (SELECT payload_id FROM \"{live_schema}\".\"change_payloads\" WHERE created_seq > {seed_max_seq})
-                OR payload_kind = 'command_receipt';
-         DELETE FROM \"{live_schema}\".\"change_payloads\" WHERE created_seq > {seed_max_seq};
-         DELETE FROM \"{live_schema}\".\"change_log\" WHERE space_seq > {seed_max_seq};
-         DELETE FROM \"{live_schema}\".\"change_commands\" WHERE first_seq > {seed_max_seq};
-         DELETE FROM \"{live_schema}\".\"command_receipts\" WHERE canonical_seq > {seed_max_seq};
-         DELETE FROM \"{live_schema}\".\"blob_references\" WHERE created_seq > {seed_max_seq};
-         DELETE FROM \"{live_schema}\".\"revisions\" WHERE space_seq > {seed_max_seq};
-         UPDATE \"{live_schema}\".\"spaces\" AS sp
-             SET last_seq = s.last_seq, active_epoch = s.active_epoch
-             FROM \"{seed_schema}\".\"spaces\" AS s
-             WHERE sp.space_id = s.space_id AND sp.last_seq <> s.last_seq;
-         UPDATE \"{live_schema}\".\"agent_run_heads\" AS ar
-             SET run_revision = s.run_revision, last_seq = s.last_seq,
-                 updated_at_sec = s.updated_at_sec, updated_at_nsec = s.updated_at_nsec
-             FROM \"{seed_schema}\".\"agent_run_heads\" AS s
-             WHERE ar.space_id = s.space_id AND ar.run_id = s.run_id AND ar.last_seq <> s.last_seq;
-         UPDATE \"{live_schema}\".\"note_heads\" AS nh
-             SET parent_folder_id = s.parent_folder_id, slug = s.slug, slug_fold = s.slug_fold,
-                 title = s.title, title_fold = s.title_fold, doc_class = s.doc_class,
-                 ability_id = s.ability_id, head_rev_id = s.head_rev_id,
-                 content_blake3 = s.content_blake3, byte_size = s.byte_size,
-                 lifecycle_state = s.lifecycle_state, visibility_mask = s.visibility_mask,
-                 updated_seq = s.updated_seq, updated_at_sec = s.updated_at_sec,
-                 updated_at_nsec = s.updated_at_nsec, last_actor_id = s.last_actor_id
-             FROM \"{seed_schema}\".\"note_heads\" AS s
-             WHERE nh.space_id = s.space_id AND nh.note_id = s.note_id
-               AND s.lifecycle_state <> 'active' AND nh.updated_seq > {seed_max_seq};
-         UPDATE \"{live_schema}\".\"note_heads\" AS nh
-             SET parent_folder_id = s.parent_folder_id, slug = s.slug, slug_fold = s.slug_fold,
-                 title = s.title, title_fold = s.title_fold, doc_class = s.doc_class,
-                 ability_id = s.ability_id, head_rev_id = s.head_rev_id,
-                 content_blake3 = s.content_blake3, byte_size = s.byte_size,
-                 lifecycle_state = s.lifecycle_state, visibility_mask = s.visibility_mask,
-                 updated_seq = s.updated_seq, updated_at_sec = s.updated_at_sec,
-                 updated_at_nsec = s.updated_at_nsec, last_actor_id = s.last_actor_id
-             FROM \"{seed_schema}\".\"note_heads\" AS s
-             WHERE nh.space_id = s.space_id AND nh.note_id = s.note_id
-               AND s.lifecycle_state = 'active' AND nh.updated_seq > {seed_max_seq};
-         UPDATE \"{live_schema}\".\"blob_catalog\" AS bc
-             SET ref_count = s.ref_count
-             FROM \"{seed_schema}\".\"blob_catalog\" AS s
-             WHERE bc.space_id = s.space_id AND bc.content_blake3 = s.content_blake3
-               AND bc.ref_count <> s.ref_count;
-         COMMIT;"
+async fn run_sqlite_rollback_benchmark(
+    work_root: &Path,
+    iterations: usize,
+) -> RollbackProfileMetrics {
+    let directory = work_root.join("rollback-sqlite");
+    let config = CanonicalConfig::local_default(
+        InstallationId::from_bytes(random_16()),
+        DataRoot::new(&directory),
     );
-    sqlx::raw_sql(sqlx::AssertSqlSafe(batch_sql))
-        .execute(&mut *conn)
-        .await
-        .unwrap();
-
-    if run_vacuum {
-        let vac_sql = format!(
-            "VACUUM (INDEX_CLEANUP ON, TRUNCATE false)
-                \"{live_schema}\".\"spaces\",
-                \"{live_schema}\".\"agent_run_heads\",
-                \"{live_schema}\".\"note_heads\",
-                \"{live_schema}\".\"blob_catalog\",
-                \"{live_schema}\".\"revisions\",
-                \"{live_schema}\".\"blob_references\",
-                \"{live_schema}\".\"change_payloads\",
-                \"{live_schema}\".\"payload_owners\",
-                \"{live_schema}\".\"change_commands\",
-                \"{live_schema}\".\"change_log\",
-                \"{live_schema}\".\"command_receipts\""
-        );
-        sqlx::raw_sql(sqlx::AssertSqlSafe(vac_sql))
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-    }
-}
-
-async fn preallocate_and_analyze_pg_rollback_fsm(
-    conn: &mut PgConnection,
-    live_schema: &str,
-    _iterations: usize,
-) {
-    for tbl in [
-        "spaces",
-        "folder_heads",
-        "agent_run_heads",
-        "note_heads",
-        "blob_catalog",
-        "blob_publications",
-        "revisions",
-        "blob_references",
-        "change_payloads",
-        "payload_owners",
-        "change_commands",
-        "change_log",
-        "command_receipts",
-    ] {
-        let alter_sql =
-            format!("ALTER TABLE \"{live_schema}\".\"{tbl}\" SET (autovacuum_enabled = false)");
-        sqlx::raw_sql(sqlx::AssertSqlSafe(alter_sql))
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-    }
-    let vac_ana_sql = format!(
-        "VACUUM (ANALYZE)
-            \"{live_schema}\".\"spaces\",
-            \"{live_schema}\".\"folder_heads\",
-            \"{live_schema}\".\"agent_run_heads\",
-            \"{live_schema}\".\"note_heads\",
-            \"{live_schema}\".\"blob_catalog\",
-            \"{live_schema}\".\"blob_publications\",
-            \"{live_schema}\".\"revisions\",
-            \"{live_schema}\".\"blob_references\",
-            \"{live_schema}\".\"change_payloads\",
-            \"{live_schema}\".\"payload_owners\",
-            \"{live_schema}\".\"change_commands\",
-            \"{live_schema}\".\"change_log\",
-            \"{live_schema}\".\"command_receipts\""
-    );
-    sqlx::raw_sql(sqlx::AssertSqlSafe(vac_ana_sql))
-        .execute(&mut *conn)
-        .await
-        .unwrap();
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let result =
+        measure_fresh_rollbacks(&store, "sqlite_wal_full+local_zstd_v1", iterations, true).await;
+    runtime.shutdown().await.unwrap();
+    fs::remove_dir_all(directory).unwrap();
+    result
 }
 
 async fn run_pg_rollback_benchmark(
@@ -1459,7 +1190,6 @@ async fn run_pg_rollback_benchmark(
 ) -> RollbackProfileMetrics {
     let tag = if use_s3 { "rbs3" } else { "rbloc" };
     let live_schema = fixtures.fresh_pg_schema(tag);
-    let seed_schema = format!("{live_schema}_seed");
     let local_dir = work_root.join(format!("pg-{tag}-cas"));
     let _ = fs::remove_dir_all(&local_dir);
     fs::create_dir_all(&local_dir).unwrap();
@@ -1487,167 +1217,16 @@ async fn run_pg_rollback_benchmark(
     };
 
     let (store, rt) = CanonicalRuntime::open(cfg).await.unwrap();
-    let tpl = seed_rollback_microfixture(&store).await;
-
-    let mut reset_conn = fixtures.open_raw_pg().await;
-    let seed_max_seq =
-        snapshot_pg_tables_to_seed_schema(&mut reset_conn, &live_schema, &seed_schema).await;
-
-    // Pre-allocate FSM pages + analyze live schema ONCE BEFORE pool connections cache generic plans,
-    // and pre-recycle 4 WAL segments + checkpoint BEFORE warmup so zero `VACUUM` plan invalidations,
-    // `smgrextend` block allocations, or cold WAL `XLogFileInit` faults occur during timed iterations.
-    preallocate_and_analyze_pg_rollback_fsm(&mut reset_conn, &live_schema, iterations).await;
-    let wal_switches = if iterations >= 500 { 16usize } else { 4usize };
-    for _ in 0..wal_switches {
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "UPDATE \"{live_schema}\".\"schema_meta\" SET singleton_id = 1; SELECT pg_switch_wal();"
-        )))
-        .execute(&mut reset_conn)
-        .await
-        .unwrap();
-    }
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "VACUUM \"{live_schema}\".\"schema_meta\""
-    )))
-    .execute(&mut reset_conn)
-    .await
-    .unwrap();
-    sqlx::raw_sql("CHECKPOINT")
-        .execute(&mut reset_conn)
-        .await
-        .unwrap();
-    let _ = std::process::Command::new("sync").status();
-    tokio::time::sleep(Duration::from_millis(2000)).await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
-
-    // Warm all opened pool connections, CAS, hint bits, FPI pages post-CHECKPOINT, and generic prepared plans
-    let warm_iters = if iterations >= 500 { 48usize } else { 16usize };
-    for w in 0..warm_iters {
-        let warm_ctx = owner_ctx(&tpl.scope, tpl.owner.clone());
-        if w == 0 {
-            let _ = store
-                .get_note(
-                    warm_ctx.clone(),
-                    GetNote {
-                        note: tpl.warm_note.clone(),
-                        revision: None,
-                        causal: CausalBasis::Exact(ReceiptSet::default()),
-                    },
-                )
-                .await
-                .unwrap();
-        }
-        let warm_req = next_mutation(
-            &tpl.scope,
-            &tpl.owner,
-            RollbackAgentRun {
-                run: tpl.run_id.clone(),
-                expected_run_revision: tpl.expected_run_rev.clone(),
-                expected_entities: tpl.expected_entities.clone(),
-                associated_board_expectations: Vec::new(),
-            },
-        );
-        let _ = store.rollback_agent_run(warm_ctx, warm_req).await.unwrap();
-        let warm_vac = (w + 1) % 12 == 0 && (w + 1) < warm_iters;
-        restore_pg_tables_from_seed_schema(
-            &mut reset_conn,
-            &live_schema,
-            &seed_schema,
-            seed_max_seq,
-            warm_vac,
-        )
-        .await;
-    }
-    let _ = std::process::Command::new("sync").status();
-    tokio::time::sleep(Duration::from_millis(2000)).await;
-
-    let mut samples_ns = Vec::with_capacity(iterations);
-    let mut restored_cnt = 0usize;
-    let mut trashed_cnt = 0usize;
-    let mut skipped_cnt = 0usize;
-
-    for iter in 0..iterations {
-        if iter > 0 {
-            let need_vac = iter % 12 == 0;
-            restore_pg_tables_from_seed_schema(
-                &mut reset_conn,
-                &live_schema,
-                &seed_schema,
-                seed_max_seq,
-                need_vac,
-            )
-            .await;
-            if need_vac {
-                // Re-warm `CachedPlan` outside the timer after `VACUUM` relcache invalidation!
-                let warm_ctx = owner_ctx(&tpl.scope, tpl.owner.clone());
-                let warm_req = next_mutation(
-                    &tpl.scope,
-                    &tpl.owner,
-                    RollbackAgentRun {
-                        run: tpl.run_id.clone(),
-                        expected_run_revision: tpl.expected_run_rev.clone(),
-                        expected_entities: tpl.expected_entities.clone(),
-                        associated_board_expectations: Vec::new(),
-                    },
-                );
-                let _ = store.rollback_agent_run(warm_ctx, warm_req).await.unwrap();
-                restore_pg_tables_from_seed_schema(
-                    &mut reset_conn,
-                    &live_schema,
-                    &seed_schema,
-                    seed_max_seq,
-                    false,
-                )
-                .await;
-            }
-        }
-        let ctx = owner_ctx(&tpl.scope, tpl.owner.clone());
-        let mut_req = next_mutation(
-            &tpl.scope,
-            &tpl.owner,
-            RollbackAgentRun {
-                run: tpl.run_id.clone(),
-                expected_run_revision: tpl.expected_run_rev.clone(),
-                expected_entities: tpl.expected_entities.clone(),
-                associated_board_expectations: Vec::new(),
-            },
-        );
-        let t0 = Instant::now();
-        let res = store.rollback_agent_run(ctx, mut_req).await.unwrap();
-        let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        samples_ns.push(elapsed_ns);
-
-        if iter == 0 {
-            restored_cnt = res.value.restored.len();
-            trashed_cnt = res.value.trashed.len();
-            skipped_cnt = res.value.skipped_manual_edits.len();
-            assert_eq!(restored_cnt, 18);
-            assert_eq!(trashed_cnt, 2);
-            assert_eq!(skipped_cnt, 1);
-        }
-    }
-
-    let _ = reset_conn.close().await;
+    let backend = if use_s3 {
+        "postgres16_sync+s3_chunked_v1_uds"
+    } else {
+        "postgres16_sync+local_zstd_v1"
+    };
+    let metrics = measure_fresh_rollbacks(&store, backend, iterations, !use_s3).await;
     rt.shutdown().await.unwrap();
-    fixtures.drop_pg_schema(&seed_schema).await;
     fixtures.drop_pg_schema(&live_schema).await;
-    let _ = fs::remove_dir_all(&local_dir);
-
-    let pct = compute_percentiles_from_ns(samples_ns);
-
-    RollbackProfileMetrics {
-        backend: if use_s3 {
-            "postgres16_sync+s3_chunked_v1_uds"
-        } else {
-            "postgres16_sync+local_zstd_v1"
-        },
-        iterations,
-        enforce_5ms_budget: !use_s3,
-        restored_per_call: restored_cnt,
-        trashed_per_call: trashed_cnt,
-        skipped_manual_per_call: skipped_cnt,
-        latency: pct,
-    }
+    fs::remove_dir_all(local_dir).unwrap();
+    metrics
 }
 
 // ============================================================================
@@ -1927,12 +1506,6 @@ async fn run_chat_read_benchmarks_for_store(
         );
 
         let pct = compute_percentiles_from_ns(lat_ns);
-        assert!(
-            pct.p95_us < 1_000.0,
-            "D3 chat read p95 budget exceeded ({backend_label}, {topology}): {:.1} us >= 1000 us",
-            pct.p95_us
-        );
-
         results.push(ChatReadProfileMetrics {
             backend: backend_label,
             topology,
@@ -2538,91 +2111,218 @@ async fn run_folder_100k_move_benchmark(
 // Suite 5: Paired Backup Pause (`p95 < 1 ms` across >= 1,000 captures)
 // ============================================================================
 
-async fn run_paired_backup_pause_benchmark(
-    participant_a: &CanonicalStore,
-    participant_b: &CanonicalStore,
-    backend_label: &'static str,
+async fn measure_paired_cuts(
+    control: &ControlBackup,
+    canonical: &CanonicalStore,
+    backend: &'static str,
+    spaces: usize,
     captures: usize,
 ) -> PairedBackupPauseMetrics {
-    let budget = participant_a.default_backup_budget();
-
-    // Warm one capture before timing
-    {
-        let mut pa = participant_a
-            .prepare(
-                maintenance_ctx(ServicePurpose::Backup),
-                BackupId::from_bytes(random_16()),
-                budget,
-            )
+    let budget = canonical.default_backup_budget();
+    let mut pause = Vec::with_capacity(captures);
+    let mut drain = Vec::with_capacity(captures);
+    let mut confirmed_pause = Vec::with_capacity(captures);
+    let mut prepare = Vec::with_capacity(captures);
+    for iteration in 0..=captures {
+        let id = BackupId::from_bytes(random_16());
+        let start = Instant::now();
+        let mut a = control
+            .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
             .await
             .unwrap();
-        let mut pb = participant_b
-            .prepare(
-                maintenance_ctx(ServicePurpose::Backup),
-                BackupId::from_bytes(random_16()),
-                budget,
-            )
+        let mut b = canonical
+            .prepare(maintenance_ctx(ServicePurpose::Backup), id, budget)
             .await
             .unwrap();
-        let mut pause_a = pa.pause_writes().await.unwrap();
-        let mut pause_b = pb.pause_writes().await.unwrap();
-        let (sa_res, sb_res) = tokio::join!(pause_a.open_cut(), pause_b.open_cut());
-        let sa = sa_res.unwrap();
-        let sb = sb_res.unwrap();
-        pause_b.resume().await.unwrap();
-        pause_a.resume().await.unwrap();
-        sb.close().await.unwrap();
-        sa.close().await.unwrap();
+        let control_hold = a.acquire_hold().await.unwrap();
+        let canonical_hold = b.acquire_hold().await.unwrap();
+        let prepared = start.elapsed();
+        let waiting = Instant::now();
+        let mut paused_control = a.pause_writes().await.unwrap();
+        // Control is already paused while canonical drains to its safe point.
+        let pause_started = Instant::now();
+        let mut paused_canonical = b.pause_writes().await.unwrap();
+        let both_paused = waiting.elapsed();
+        let (control_snapshot, canonical_snapshot) =
+            tokio::join!(paused_control.open_cut(), paused_canonical.open_cut());
+        let control_snapshot = control_snapshot.unwrap();
+        let canonical_snapshot = canonical_snapshot.unwrap();
+        let (canonical_resumed, control_resumed) =
+            tokio::join!(paused_canonical.resume(), paused_control.resume());
+        canonical_resumed.unwrap();
+        control_resumed.unwrap();
+        let resumed = Instant::now();
+        let dwell = resumed.duration_since(waiting);
+        let confirmed_dwell = resumed.duration_since(pause_started);
+        assert_eq!(
+            control_snapshot.witness().installation,
+            canonical_snapshot.witness().installation
+        );
+        assert_eq!(control_snapshot.witness().canaries.len(), 1);
+        assert_eq!(canonical_snapshot.witness().histories.len(), spaces);
+        canonical_snapshot.close().await.unwrap();
+        control_snapshot.close().await.unwrap();
+        canonical_hold.release().await.unwrap();
+        control_hold.release().await.unwrap();
+        if iteration != 0 {
+            pause.push(u64::try_from(dwell.as_nanos()).unwrap());
+            drain.push(u64::try_from(both_paused.as_nanos()).unwrap());
+            confirmed_pause.push(u64::try_from(confirmed_dwell.as_nanos()).unwrap());
+            prepare.push(u64::try_from(prepared.as_nanos()).unwrap());
+        }
     }
-
-    let mut samples_ns = Vec::with_capacity(captures);
-    for _ in 0..captures {
-        // Prepare BOTH participants OUTSIDE the writer pause timer per D3 & BackupParticipantPort protocol!
-        let mut prep_a = participant_a
-            .prepare(
-                maintenance_ctx(ServicePurpose::Backup),
-                BackupId::from_bytes(random_16()),
-                budget,
-            )
-            .await
-            .unwrap();
-        let mut prep_b = participant_b
-            .prepare(
-                maintenance_ctx(ServicePurpose::Backup),
-                BackupId::from_bytes(random_16()),
-                budget,
-            )
-            .await
-            .unwrap();
-
-        // Measure exact writer pause window: acquire safe points -> pin both cuts -> release safe points!
-        let t0 = Instant::now();
-        let mut paused_a = prep_a.pause_writes().await.unwrap();
-        let mut paused_b = prep_b.pause_writes().await.unwrap();
-        let (snap_a_res, snap_b_res) = tokio::join!(paused_a.open_cut(), paused_b.open_cut());
-        let snap_a = snap_a_res.unwrap();
-        let snap_b = snap_b_res.unwrap();
-        paused_b.resume().await.unwrap();
-        paused_a.resume().await.unwrap();
-        let pause_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        samples_ns.push(pause_ns);
-
-        snap_b.close().await.unwrap();
-        snap_a.close().await.unwrap();
-    }
-
-    let pct = compute_percentiles_from_ns(samples_ns);
-    assert!(
-        pct.p95_us < 1_000.0,
-        "D3 paired backup pause p95 budget exceeded ({backend_label}): {:.1} us >= 1000 us",
-        pct.p95_us
-    );
-
     PairedBackupPauseMetrics {
-        backend: backend_label,
-        paired_participants: 2,
+        backend,
+        canonical_spaces: spaces,
         captures,
-        pause_latency: pct,
+        pause_latency: compute_percentiles_from_ns(pause),
+        drain_latency: compute_percentiles_from_ns(drain),
+        confirmed_pause_latency: compute_percentiles_from_ns(confirmed_pause),
+        prepare_and_hold_latency: compute_percentiles_from_ns(prepare),
+    }
+}
+
+async fn paired_profiles(
+    fixtures: &BenchFixtures,
+    work_root: &Path,
+    postgres: bool,
+    captures: usize,
+) -> Vec<PairedBackupPauseMetrics> {
+    let backend = if postgres {
+        "postgres16_control_canonical"
+    } else {
+        "sqlite_control_canonical"
+    };
+    let data_root = DataRoot::new(work_root.join(backend));
+    fs::create_dir_all(data_root.control().parent().unwrap()).unwrap();
+    let installation = InstallationId::from_bytes(random_16());
+    let mut cfg = CanonicalConfig::local_default(installation.clone(), data_root.clone());
+    let schema = fixtures.fresh_pg_schema("paired");
+    let (control_db, keyring) = if postgres {
+        cfg.sql = SqlBackendConfig::postgres_default(fixtures.pg_connect(), &schema);
+        cfg.default_backup_budget = notarium_canonical::config::default_postgres_backup_budget();
+        let db = ControlStore::postgres(PostgresConfig::unix_socket(
+            fixtures.pg_socket_dir.clone(),
+            &fixtures.pg_database,
+            &fixtures.pg_user,
+        ))
+        .await
+        .unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../notarium-control/tests/fixtures/keyring");
+        let keys: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.join("vectors.json")).unwrap()).unwrap();
+        let mut conn = fixtures.open_raw_pg().await;
+        sqlx::query("INSERT INTO v1_control.v1_storage_epoch(singleton,epoch_version,state,installation_id) VALUES(1,1,'ready',$1)")
+            .bind(installation.as_str()).execute(&mut conn).await.unwrap();
+        sqlx::query("INSERT INTO v1_control.secret_keyring(key_id,key_hash,generation,state,canary,created_at) VALUES($1,$2,1,'active',$3,0)")
+            .bind(keys["keyId"].as_str().unwrap()).bind(keys["keyHash"].as_str().unwrap())
+            .bind(keys["canaryEnvelope"].as_str().unwrap()).execute(&mut conn).await.unwrap();
+        conn.close().await.unwrap();
+        let keyring = Keyring::open(
+            db.clone(),
+            KeyringLocation::External(fixture.join("native")),
+            make_budget(),
+        )
+        .await
+        .unwrap();
+        (db, keyring)
+    } else {
+        let db = ControlStore::sqlite(&data_root).await.unwrap();
+        let empty = EmptyRootAuthorization::from_classification(
+            installation.clone(),
+            EpochClassification {
+                state: StorageEpochState::EmptyRoot,
+                reason: EpochReason::ConfirmedEmpty,
+            },
+        )
+        .unwrap();
+        let keyring =
+            FreshLocalInitializer::initialize(db.clone(), data_root.clone(), empty, make_budget())
+                .await
+                .unwrap();
+        rusqlite::Connection::open(data_root.control())
+            .unwrap()
+            .execute(
+                "UPDATE v1_storage_epoch SET state='ready' WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        (db, keyring)
+    };
+    let control = ControlBackup::new(
+        control_db.clone(),
+        keyring,
+        data_root,
+        BackupConfig::default(),
+    )
+    .unwrap();
+    let (canonical, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+    let mut metrics = Vec::new();
+    let mut seeded = 0;
+    for spaces in [1, 64] {
+        for n in seeded..spaces {
+            canonical
+                .create_space(CreateSpaceSpec {
+                    space_id: SpaceId::from_bytes(random_16()),
+                    incarnation: HistoryIncarnation::from_bytes(random_16()),
+                    root_folder_id: FolderId::from_bytes(random_16()),
+                    slug: format!("paired-{n}"),
+                    kind: SpaceKind::Shared,
+                    owner: PrincipalId::from_bytes(random_16()),
+                    active_epoch: LeaseEpoch::new(1).unwrap(),
+                    initial_last_seq: SpaceSeq::ZERO,
+                    created_at: None,
+                })
+                .await
+                .unwrap();
+        }
+        seeded = spaces;
+        metrics.push(measure_paired_cuts(&control, &canonical, backend, spaces, captures).await);
+    }
+    runtime.shutdown().await.unwrap();
+    drop(control);
+    control_db.close().await;
+    if postgres {
+        fixtures.drop_pg_schema(&schema).await;
+    }
+    metrics
+}
+
+async fn run_paired_profiles(
+    fixtures: &BenchFixtures,
+    work_root: &Path,
+    backup_captures: usize,
+) -> Vec<PairedBackupPauseMetrics> {
+    eprintln!("[D3] paired control/canonical backup ({backup_captures} captures per profile)...");
+    let mut paired_backup_pause_profiles =
+        paired_profiles(fixtures, work_root, false, backup_captures).await;
+    paired_backup_pause_profiles
+        .extend(paired_profiles(fixtures, work_root, true, backup_captures).await);
+    for pp in &paired_backup_pause_profiles {
+        eprintln!(
+            "[D3]   -> {} ({} spaces): confirmed p50/p95={:.1}/{:.1} us; inclusive p50/p95={:.1}/{:.1} us",
+            pp.backend,
+            pp.canonical_spaces,
+            pp.confirmed_pause_latency.p50_us,
+            pp.confirmed_pause_latency.p95_us,
+            pp.pause_latency.p50_us,
+            pp.pause_latency.p95_us
+        );
+    }
+
+    paired_backup_pause_profiles
+}
+
+fn write_report(report: &impl Serialize, path: &Path, met_targets: bool) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create output parent directory");
+    }
+    let json = serde_json::to_string_pretty(report).expect("serialize D3 report");
+    fs::write(path, format!("{json}\n")).expect("write D3 report JSON");
+    println!("{}", path.display());
+    if !met_targets {
+        std::process::exit(1);
     }
 }
 
@@ -2634,10 +2334,27 @@ async fn run_paired_backup_pause_benchmark(
 async fn main() {
     let args: Vec<String> = env::args().collect();
     let smoke_mode = args.iter().any(|a| a == "--smoke");
-    let explicit_output = args
+    let hash_arg = |key: &str| {
+        let value = args
+            .windows(2)
+            .find(|w| w[0] == key)
+            .map(|w| w[1].clone())
+            .expect("run through with-storage-fixtures.sh benchmark");
+        assert!(
+            value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid {key}"
+        );
+        value
+    };
+    let git_base_commit = hash_arg("--git-base");
+    let head_tree = hash_arg("--head-tree");
+    let git_tree = hash_arg("--git-tree");
+    let git_commit = (head_tree == git_tree).then(|| git_base_commit.clone());
+    let out_file = args
         .windows(2)
         .find(|w| w[0] == "--output")
-        .map(|w| PathBuf::from(&w[1]));
+        .map(|w| PathBuf::from(&w[1]))
+        .expect("path for --output");
 
     if cfg!(debug_assertions) && !smoke_mode {
         panic!("d3_benchmarks must be compiled and run with `--release`");
@@ -2671,18 +2388,28 @@ async fn main() {
     let fixtures = BenchFixtures::load_required(repo_root);
 
     // Verify PostgreSQL `synchronous_commit = on`
-    let pg_sync_commit = {
+    let (pg_sync_commit, postgres_select_one_rtt) = {
         let mut conn = fixtures.open_raw_pg().await;
         let val: String = sqlx::query_scalar("SHOW synchronous_commit")
             .fetch_one(&mut conn)
             .await
             .unwrap();
+        let mut rtt = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let start = Instant::now();
+            let one: i32 = sqlx::query_scalar("SELECT 1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+            rtt.push(u64::try_from(start.elapsed().as_nanos()).unwrap());
+            assert_eq!(one, 1);
+        }
         let _ = conn.close().await;
         assert_eq!(
             val, "on",
             "PostgreSQL fixture must enforce synchronous_commit=on"
         );
-        val
+        (val, compute_percentiles_from_ns(rtt))
     };
 
     let writer_runs = if smoke_mode { 1usize } else { 3usize };
@@ -2702,6 +2429,69 @@ async fn main() {
     let _ = std::process::Command::new("sync").status();
     tokio::time::sleep(Duration::from_millis(500)).await;
     eprintln!("[D3] starting benchmark suite (smoke={smoke_mode}, fs={fstype} on {mount_point})");
+
+    let environment = EnvironmentAttribution {
+        generated_at_unix_s: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        rust_profile: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        git_base_commit,
+        git_commit,
+        git_tree,
+        fixture_launcher_cpu_max: args
+            .windows(2)
+            .find(|w| w[0] == "--caller-cgroup-cpu")
+            .map(|w| w[1].clone())
+            .unwrap_or_else(|| "unknown".into()),
+        fixture_launcher_memory_max: args
+            .windows(2)
+            .find(|w| w[0] == "--caller-cgroup-memory")
+            .map(|w| w[1].clone())
+            .unwrap_or_else(|| "unknown".into()),
+        cgroup_cpu_max: read_trimmed_or_unknown("/sys/fs/cgroup/cpu.max"),
+        cgroup_memory_max: read_trimmed_or_unknown("/sys/fs/cgroup/memory.max"),
+        available_parallelism: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        kernel_release: read_trimmed_or_unknown("/proc/sys/kernel/osrelease"),
+        work_dir: work_root.to_string_lossy().into_owned(),
+        filesystem_type: fstype,
+        filesystem_mount_point: mount_point,
+        sqlite_wal_soft_watermark_bytes: 512 * 1024 * 1024,
+        sqlite_wal_high_watermark_bytes: 896 * 1024 * 1024,
+        postgres_transport: "local_unix_domain_socket",
+        postgres_synchronous_commit: pg_sync_commit,
+        postgres_select_one_rtt,
+        s3_transport: "local_unix_domain_socket_bridge_to_loopback_minio_ce",
+        writer_max_batch_items: WriterConfig::default().max_batch_items,
+        writer_carrier_bytes: CARRIER_TARGET_BYTES,
+        cache_warmth_policy: "writer warmup, fresh previously unrolled run per rollback, warm chat windows",
+        fixture_run_id: fixtures.run_id.clone(),
+        minio_release_tag: fixtures.minio_release_tag.clone(),
+        minio_source_commit: fixtures.minio_source_commit.clone(),
+        smoke_mode,
+    };
+
+    if args.iter().any(|arg| arg == "--paired-only") {
+        let profiles = run_paired_profiles(&fixtures, &work_root, backup_captures).await;
+        let met_targets = profiles
+            .iter()
+            .all(|p| p.confirmed_pause_latency.p95_us < 1_000.0);
+        let report = serde_json::json!({
+            "suite": "paired_backup",
+            "status": if !met_targets { "FAIL" } else if smoke_mode { "SMOKE" } else { "PASS" },
+            "environment": environment,
+            "paired_backup_pause_profiles": profiles,
+        });
+        fs::remove_dir_all(&work_root).unwrap();
+        write_report(&report, &out_file, met_targets);
+        return;
+    }
 
     // 1. Rollback microfixture (run first on clean filesystem before 500k+ CAS file churn)
     eprintln!("[D3] rollback microfixture ({rb_iters} independent resets)...");
@@ -2733,24 +2523,6 @@ async fn main() {
         rb_pg_s3.latency.p99_us,
         rb_pg_s3.latency.max_us,
     );
-    assert!(
-        rb_sqlite.latency.p95_us < 5_000.0,
-        "D3 SQLite+Local rollback p95 budget exceeded: min={:.1} us p50={:.1} us p95={:.1} us p99={:.1} us max={:.1} us >= 5000 us",
-        rb_sqlite.latency.min_us,
-        rb_sqlite.latency.p50_us,
-        rb_sqlite.latency.p95_us,
-        rb_sqlite.latency.p99_us,
-        rb_sqlite.latency.max_us,
-    );
-    assert!(
-        rb_pg_local.latency.p95_us < 5_000.0,
-        "D3 PG16+Local rollback p95 budget exceeded: min={:.1} us p50={:.1} us p95={:.1} us p99={:.1} us max={:.1} us >= 5000 us",
-        rb_pg_local.latency.min_us,
-        rb_pg_local.latency.p50_us,
-        rb_pg_local.latency.p95_us,
-        rb_pg_local.latency.p99_us,
-        rb_pg_local.latency.max_us,
-    );
     let rollback_profiles = vec![rb_sqlite, rb_pg_local, rb_pg_s3];
 
     // 2. Writer 50w/0r & 50w/200r
@@ -2760,19 +2532,9 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut writer_50w_0r_runs = Vec::with_capacity(writer_runs);
     let mut writer_50w_200r_runs = Vec::with_capacity(writer_runs);
-    let mut deferred_writer_cleanup = DeferredWriterCleanup::new();
     for r in 1..=writer_runs {
         eprintln!("[D3] writer 50w/0r run {r}/{writer_runs}...");
-        let m = run_writer_benchmark_case(
-            &work_root,
-            r,
-            50,
-            0,
-            warmup_dur,
-            measure_dur,
-            &mut deferred_writer_cleanup,
-        )
-        .await;
+        let m = run_writer_benchmark_case(&work_root, r, 50, 0, warmup_dur, measure_dur).await;
         eprintln!(
             "[D3]   -> {:.1} mut/s, p95={:.1} us, phase2_p95={:.1} us (mean batch {:.1})",
             m.throughput_mut_per_sec,
@@ -2785,16 +2547,7 @@ async fn main() {
 
     for r in 1..=writer_runs {
         eprintln!("[D3] writer 50w/200r run {r}/{writer_runs}...");
-        let m = run_writer_benchmark_case(
-            &work_root,
-            r,
-            50,
-            200,
-            warmup_dur,
-            measure_dur,
-            &mut deferred_writer_cleanup,
-        )
-        .await;
+        let m = run_writer_benchmark_case(&work_root, r, 50, 200, warmup_dur, measure_dur).await;
         eprintln!(
             "[D3]   -> {:.1} mut/s ({} reads), p95={:.1} us, phase2_p95={:.1} us",
             m.throughput_mut_per_sec,
@@ -3001,150 +2754,32 @@ async fn main() {
         );
     }
 
-    // 5. Paired Backup Pause (`p95 < 1 ms` across 1,000 captures)
-    eprintln!("[D3] paired backup pause ({backup_captures} captures)...");
-    let mut paired_backup_pause_profiles = Vec::new();
-    {
-        let dir_a = work_root.join("bkp-sq-a");
-        let dir_b = work_root.join("bkp-sq-b");
-        fs::create_dir_all(&dir_a).unwrap();
-        fs::create_dir_all(&dir_b).unwrap();
-        let dra = DataRoot::new(&dir_a);
-        let drb = DataRoot::new(&dir_b);
-        let inst = InstallationId::from_bytes([0x88; 16]);
-        let (sta, rta) = CanonicalRuntime::open(CanonicalConfig {
-            installation_id: inst.clone(),
-            sql: SqlBackendConfig::sqlite_default(dra.clone()),
-            blobs: BlobBackendConfig::Local { data_root: dra },
-            writer: WriterConfig::default(),
-            snapshot_retention: Duration::from_secs(300),
-            default_backup_budget: default_backup_budget(),
-        })
-        .await
-        .unwrap();
-        let (stb, rtb) = CanonicalRuntime::open(CanonicalConfig {
-            installation_id: inst,
-            sql: SqlBackendConfig::sqlite_default(drb.clone()),
-            blobs: BlobBackendConfig::Local { data_root: drb },
-            writer: WriterConfig::default(),
-            snapshot_retention: Duration::from_secs(300),
-            default_backup_budget: default_backup_budget(),
-        })
-        .await
-        .unwrap();
-        paired_backup_pause_profiles.push(
-            run_paired_backup_pause_benchmark(
-                &sta,
-                &stb,
-                "sqlite_wal_full_paired",
-                backup_captures,
-            )
-            .await,
-        );
-        rtb.shutdown().await.unwrap();
-        rta.shutdown().await.unwrap();
-        let _ = fs::remove_dir_all(&dir_a);
-        let _ = fs::remove_dir_all(&dir_b);
-    }
-    {
-        let sch_a = fixtures.fresh_pg_schema("bkpa");
-        let sch_b = fixtures.fresh_pg_schema("bkpb");
-        let dir_a = work_root.join("bkp-pg-a");
-        let dir_b = work_root.join("bkp-pg-b");
-        fs::create_dir_all(&dir_a).unwrap();
-        fs::create_dir_all(&dir_b).unwrap();
-        let inst = InstallationId::from_bytes([0x89; 16]);
-        let (sta, rta) = CanonicalRuntime::open(CanonicalConfig {
-            installation_id: inst.clone(),
-            sql: SqlBackendConfig::postgres_default(fixtures.pg_connect(), &sch_a),
-            blobs: BlobBackendConfig::Local {
-                data_root: DataRoot::new(&dir_a),
-            },
-            writer: WriterConfig::default(),
-            snapshot_retention: Duration::from_secs(300),
-            default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
-        })
-        .await
-        .unwrap();
-        let (stb, rtb) = CanonicalRuntime::open(CanonicalConfig {
-            installation_id: inst,
-            sql: SqlBackendConfig::postgres_default(fixtures.pg_connect(), &sch_b),
-            blobs: BlobBackendConfig::Local {
-                data_root: DataRoot::new(&dir_b),
-            },
-            writer: WriterConfig::default(),
-            snapshot_retention: Duration::from_secs(300),
-            default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
-        })
-        .await
-        .unwrap();
-        paired_backup_pause_profiles.push(
-            run_paired_backup_pause_benchmark(
-                &sta,
-                &stb,
-                "postgres16_sync_paired",
-                backup_captures,
-            )
-            .await,
-        );
-        rtb.shutdown().await.unwrap();
-        rta.shutdown().await.unwrap();
-        fixtures.drop_pg_schema(&sch_b).await;
-        fixtures.drop_pg_schema(&sch_a).await;
-        let _ = fs::remove_dir_all(&dir_a);
-        let _ = fs::remove_dir_all(&dir_b);
-    }
-    for pp in &paired_backup_pause_profiles {
-        eprintln!(
-            "[D3]   -> {}: p50={:.1} us, p95={:.1} us, p99={:.1} us",
-            pp.backend, pp.pause_latency.p50_us, pp.pause_latency.p95_us, pp.pause_latency.p99_us
-        );
-    }
-
-    deferred_writer_cleanup.purge_all();
+    let paired_backup_pause_profiles =
+        run_paired_profiles(&fixtures, &work_root, backup_captures).await;
     let _ = fs::remove_dir_all(&work_root);
 
+    let met_targets = rollback_profiles
+        .iter()
+        .all(|r| !r.enforce_5ms_budget || r.latency.p95_us < 5_000.0)
+        && writer_50w_0r_runs
+            .iter()
+            .chain(&writer_50w_200r_runs)
+            .all(|w| w.throughput_mut_per_sec > 2_000.0)
+        && chat_read_profiles
+            .iter()
+            .all(|c| c.latency.p95_us < 1_000.0)
+        && paired_backup_pause_profiles
+            .iter()
+            .all(|p| p.confirmed_pause_latency.p95_us < 1_000.0);
     let report = D3BenchmarkReport {
-        status: "PASS",
-        environment: EnvironmentAttribution {
-            generated_at_unix_s: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            rust_profile: if cfg!(debug_assertions) {
-                "debug"
-            } else {
-                "release"
-            },
-            git_commit: env::var("NOTARIUM_BENCH_GIT_COMMIT")
-                .unwrap_or_else(|_| "working-tree".to_owned()),
-            git_tree: env::var("NOTARIUM_BENCH_GIT_TREE")
-                .unwrap_or_else(|_| "working-tree".to_owned()),
-            cgroup_cpu_max: read_trimmed_or_unknown("/sys/fs/cgroup/cpu.max"),
-            cgroup_memory_max: read_trimmed_or_unknown("/sys/fs/cgroup/memory.max"),
-            available_parallelism: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
-            kernel_release: read_trimmed_or_unknown("/proc/sys/kernel/osrelease"),
-            work_dir: work_root.to_string_lossy().into_owned(),
-            filesystem_type: fstype,
-            filesystem_mount_point: mount_point,
-            sqlite_synchronous_pragma: 2,
-            sqlite_wal_soft_watermark_bytes: 512 * 1024 * 1024,
-            sqlite_wal_high_watermark_bytes: 896 * 1024 * 1024,
-            sqlite_idle_journal_size_limit_bytes:
-                notarium_canonical::dialect::sqlite::SQLITE_JOURNAL_SIZE_LIMIT_BYTES,
-            postgres_transport: "local_unix_domain_socket",
-            postgres_synchronous_commit: pg_sync_commit,
-            s3_transport: "local_unix_domain_socket_bridge_to_loopback_minio_ce",
-            writer_max_batch_items: WriterConfig::default().max_batch_items,
-            writer_carrier_bytes: CARRIER_TARGET_BYTES,
-            cache_warmth_policy: "10s_warmup_writer_48_warmups_rollback_warm_chat",
-            fixture_run_id: fixtures.run_id,
-            minio_release_tag: fixtures.minio_release_tag,
-            minio_source_commit: fixtures.minio_source_commit,
-            smoke_mode,
+        status: if !met_targets {
+            "FAIL"
+        } else if smoke_mode {
+            "SMOKE"
+        } else {
+            "PASS"
         },
+        environment,
         writer_50w_0r_runs,
         writer_50w_200r_runs,
         rollback_profiles,
@@ -3154,17 +2789,5 @@ async fn main() {
         paired_backup_pause_profiles,
     };
 
-    let out_file = explicit_output.unwrap_or_else(|| {
-        if smoke_mode {
-            artifact_dir.join("d3-benchmarks-smoke.json")
-        } else {
-            artifact_dir.join("d3-benchmarks.json")
-        }
-    });
-    if let Some(parent) = out_file.parent() {
-        fs::create_dir_all(parent).expect("create output parent directory");
-    }
-    let json = serde_json::to_string_pretty(&report).expect("serialize D3 report");
-    fs::write(&out_file, format!("{json}\n")).expect("write D3 report JSON");
-    println!("{}", out_file.display());
+    write_report(&report, &out_file, met_targets);
 }

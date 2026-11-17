@@ -1,4 +1,5 @@
 pub mod manifest;
+pub(crate) mod migrate;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -116,6 +117,7 @@ async fn bootstrap_sqlite_inner(
     }
 
     if has_schema_meta {
+        migrate::sqlite(conn, expected_installation, expected_checksum).await?;
         let witness =
             inspect_sqlite_schema_meta(conn, expected_installation, expected_checksum).await?;
         verify_sqlite_catalog(conn).await?;
@@ -198,6 +200,7 @@ pub async fn bootstrap_postgres_schema(
     schema_name: &str,
     expected_installation: &InstallationId,
 ) -> Result<DatabaseWitness, PortError> {
+    let schema_name = crate::config::validate_pg_schema_name(schema_name)?;
     let expected_checksum = manifest_checksum();
 
     sqlx::query("BEGIN")
@@ -229,6 +232,11 @@ async fn bootstrap_postgres_inner(
     expected_installation: &InstallationId,
     expected_checksum: ContentDigest,
 ) -> Result<DatabaseWitness, PortError> {
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 7311229))")
+        .bind(schema_name)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_bootstrap_snapshot_fence", err.to_string()))?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 20261115))")
         .bind(schema_name)
         .execute(&mut *conn)
@@ -265,6 +273,7 @@ async fn bootstrap_postgres_inner(
     }
 
     if has_schema_meta {
+        migrate::postgres(conn, expected_installation, expected_checksum).await?;
         let witness =
             inspect_postgres_schema_meta(conn, expected_installation, expected_checksum).await?;
         verify_postgres_catalog(conn, schema_name).await?;
@@ -565,6 +574,7 @@ DECLARE
     v_cat_ok BIGINT;
     v_bumped BIGINT;
 BEGIN
+    PERFORM pg_advisory_xact_lock_shared(hashtextextended(current_schema(), 7311229));
     PERFORM 1
     FROM spaces
     WHERE space_id = p_space_id
@@ -926,11 +936,21 @@ SELECT notarium_pg_lean_commit_v3(
     $45::TEXT[], $46::TEXT[],
     $47::TEXT[], $48::TEXT[], $49::TEXT[], $50::TEXT[], $51::BYTEA[], $52::BIGINT[], $53::INT4[],
     $54::TEXT[], $55::TEXT[], $56::TEXT[], $57::TEXT[], $58::TEXT[], $59::TEXT[], $60::TEXT[], $61::BYTEA[], $62::BIGINT[], $63::TEXT[], $64::INT4[],
-    $65::TEXT[], $66::TEXT[], $67::TEXT[], $68::TEXT[], $69
+    $65::TEXT[], $66::TEXT[], $67::TEXT[], $68::TEXT[], $69, $70
 )
 ";
 
 const PG_LEAN_ROLLBACK_COMMIT_FN_SQL: &str = r#"
+DO $cleanup$
+DECLARE old_signature regprocedure;
+BEGIN
+    SELECT p.oid::regprocedure INTO old_signature
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = current_schema() AND p.proname = 'notarium_pg_lean_commit_v3' AND p.pronargs = 69;
+    IF old_signature IS NOT NULL THEN EXECUTE format('DROP FUNCTION %s', old_signature); END IF;
+END;
+$cleanup$;
+
 CREATE OR REPLACE FUNCTION notarium_pg_lean_commit_v3(
     p_space_id TEXT,
     p_inc BYTEA,
@@ -1000,7 +1020,8 @@ CREATE OR REPLACE FUNCTION notarium_pg_lean_commit_v3(
     p_all_nids TEXT[],
     p_all_exp_revs TEXT[],
     p_all_exp_lcs TEXT[],
-    p_root_folder_id TEXT
+    p_root_folder_id TEXT,
+    p_writer_epoch BIGINT
 ) RETURNS BIGINT
 LANGUAGE plpgsql
 AS $$
@@ -1014,13 +1035,17 @@ DECLARE
     v_vis_be BYTEA;
     v_cat_cnt INT4;
 BEGIN
-    PERFORM pg_advisory_xact_lock(hashtextextended(p_space_id, 0));
+    PERFORM pg_advisory_xact_lock_shared(hashtextextended(current_schema(), 7311229));
+    PERFORM 1 FROM spaces WHERE space_id = p_space_id AND active_epoch = p_writer_epoch FOR NO KEY UPDATE;
+    IF NOT FOUND THEN
+        RETURN 0;
+    END IF;
 
     SELECT
         (
             s.history_incarnation = p_inc
             AND s.lifecycle_state = 'active'
-            AND s.active_epoch >= 1
+            AND s.active_epoch = p_writer_epoch
             AND s.last_seq >= 0
             AND p_delta >= 1
             AND s.last_seq <= (9223372036854775807 - p_delta)

@@ -149,7 +149,14 @@ impl CanonicalStore {
                             ticket,
                         };
                         let claim_ticket = claim.ticket.clone();
-                        activate_and_bind_blob_ref_tx(tx, ctx.active_epoch, &claim, seq).await?;
+                        activate_and_bind_blob_ref_tx(
+                            tx,
+                            &ctx.scope,
+                            ctx.active_epoch,
+                            &claim,
+                            seq,
+                        )
+                        .await?;
                         ctx.record_staged_ticket(claim_ticket);
 
                         let dc_str = doc_class_to_db(spec.doc_class);

@@ -14,20 +14,17 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::{
         AgentRunId, ContentDigest, FolderId, HistoryIncarnation, InstallationId, LeaseEpoch,
-        NoteId, PrincipalId, RequestId, RevisionId, SpaceId, SpaceSeq,
+        NoteId, PrincipalId, RevisionId, SpaceId, SpaceSeq,
     },
     model::{FolderRef, HistoryScope, Lifecycle, NoteRef, PathTarget},
-    ports::{CallBudget, Cancellation, MaintenanceContext, ServicePurpose},
+    ports::{CallBudget, MaintenanceContext, ServicePurpose},
     value::Timestamp,
 };
 use sqlx::{Connection, PgPool, Row, SqlitePool};
 use tokio::sync::Mutex;
 
 use crate::{
-    blobs::{
-        BlobBackendDriver, BlobOwnerKind, BlobReferenceClaim, activate_and_bind_blob_ref_tx,
-        release_owner_blob_refs_tx, s3::S3Transport,
-    },
+    blobs::{BlobBackendDriver, s3::S3Transport},
     changes::{BroadcastHub, BroadcastSignal, DEFAULT_BROADCAST_CAPACITY},
     codec::{
         FolderRevisionMetadata, NoteRevisionMetadata, RevisionMetadataEnvelope,
@@ -41,13 +38,21 @@ use crate::{
     dialect::{
         DataRootOwnerLock, postgres::open_and_bootstrap_postgres, sqlite::open_and_bootstrap_sqlite,
     },
-    sql_exec::BackendConn,
+    sql_exec::{BackendConn, PgTransactionLease, WriteTransaction},
     wal::{SqliteWalCoordinator, WalTelemetrySnapshot},
-    writer::{
-        BatchEventDraft, CommandIdentitySpec, ItemCommitArtifacts, PreparedWriteIntent,
-        WriteCoordinator,
-    },
+    writer::WriteCoordinator,
 };
+
+#[cfg(feature = "test-support")]
+use crate::{
+    blobs::{
+        BlobOwnerKind, BlobReferenceClaim, activate_and_bind_blob_ref_tx,
+        release_owner_blob_refs_tx,
+    },
+    writer::{BatchEventDraft, CommandIdentitySpec, ItemCommitArtifacts, PreparedWriteIntent},
+};
+#[cfg(feature = "test-support")]
+use notarium_core::{ids::RequestId, ports::Cancellation};
 
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum SqlDriverState {
@@ -123,6 +128,7 @@ pub(crate) struct CanonicalInner {
     pub witness: DatabaseWitness,
     pub sql: SqlDriverState,
     pub blobs: BlobBackendDriver,
+    writer_leases: std::sync::Mutex<std::collections::HashMap<SpaceId, LeaseEpoch>>,
     pub writer_coord: OnceLock<Arc<WriteCoordinator>>,
     pub wal_coord: OnceLock<Arc<SqliteWalCoordinator>>,
     pub broadcast_hub: BroadcastHub,
@@ -134,13 +140,17 @@ pub(crate) struct CanonicalInner {
     pub room_fences: Arc<crate::domain::RoomFenceTable>,
     pub job_reads: crate::peers::JobReadRegistry,
     pub pg_imm_cache: Arc<std::sync::RwLock<PgImmutableRollbackCache>>,
+    pub backup_shutdown: notarium_core::ports::Cancellation,
+    pub backup_executor: tokio::runtime::Handle,
+    pub backup_local_holds:
+        std::sync::Mutex<std::collections::HashSet<notarium_core::ids::BackupId>>,
+    pub backup_spool_roots: std::sync::Mutex<Vec<std::path::PathBuf>>,
     pub backup_spool_override: std::sync::Mutex<Option<std::path::PathBuf>>,
     pub backup_cleanups: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pub last_backup_memory_stats:
         std::sync::Mutex<Option<crate::backup::BackupExporterMemoryStats>>,
     pub backup_step_delay_us: std::sync::atomic::AtomicU64,
     pub sqlite_writer_commit_gen: std::sync::atomic::AtomicU64,
-    pub sqlite_purge_fence_gen: std::sync::atomic::AtomicU64,
     pub sqlite_has_any_purge_fences: AtomicBool,
     pub sqlite_has_any_space_schemas: AtomicBool,
     pub sqlite_has_any_collab_sessions: AtomicBool,
@@ -149,6 +159,40 @@ pub(crate) struct CanonicalInner {
 }
 
 impl CanonicalInner {
+    /// PostgreSQL write authority is granted only by provisioning, takeover, or restore.
+    pub(crate) fn grant_writer_epoch(&self, space: &SpaceId, epoch: LeaseEpoch) {
+        if matches!(&self.sql, SqlDriverState::Postgres { .. }) {
+            self.writer_leases
+                .lock()
+                .expect("writer leases")
+                .entry(space.clone())
+                .and_modify(|current| *current = (*current).max(epoch))
+                .or_insert(epoch);
+        }
+    }
+
+    pub(crate) fn writer_epoch(&self, space: &SpaceId) -> Result<LeaseEpoch, PortError> {
+        self.writer_leases
+            .lock()
+            .expect("writer leases")
+            .get(space)
+            .copied()
+            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidAuthority).into())
+    }
+
+    pub(crate) fn check_writer_epoch(
+        &self,
+        space: &SpaceId,
+        epoch: LeaseEpoch,
+    ) -> Result<(), PortError> {
+        if matches!(&self.sql, SqlDriverState::Postgres { .. })
+            && self.writer_epoch(space)? != epoch
+        {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn writer(&self) -> Result<&Arc<WriteCoordinator>, PortError> {
         self.writer_coord.get().ok_or_else(|| {
             internal_not_committed(
@@ -181,20 +225,6 @@ impl CanonicalInner {
 }
 
 /// Cloneable canonical storage facade. Never exposes raw SQL pools or connections.
-#[derive(Clone, Debug)]
-struct SqliteSeedTable {
-    name: String,
-    insert_sql: String,
-    rows: Vec<Vec<rusqlite::types::Value>>,
-}
-
-#[doc(hidden)]
-#[derive(Clone, Debug)]
-pub struct SqliteBenchSeed {
-    max_space_seq: i64,
-    tables: Vec<SqliteSeedTable>,
-}
-
 #[derive(Clone)]
 pub struct CanonicalStore {
     pub(crate) inner: Arc<CanonicalInner>,
@@ -390,6 +420,7 @@ impl CanonicalRuntime {
             witness,
             sql,
             blobs,
+            writer_leases: Default::default(),
             writer_coord: OnceLock::new(),
             wal_coord: OnceLock::new(),
             broadcast_hub: BroadcastHub::new(DEFAULT_BROADCAST_CAPACITY),
@@ -398,12 +429,15 @@ impl CanonicalRuntime {
             room_fences: Arc::new(crate::domain::RoomFenceTable::default()),
             job_reads: crate::peers::JobReadRegistry::default(),
             pg_imm_cache: Arc::new(std::sync::RwLock::new(PgImmutableRollbackCache::default())),
+            backup_shutdown: Default::default(),
+            backup_executor: tokio::runtime::Handle::current(),
+            backup_local_holds: Default::default(),
+            backup_spool_roots: Default::default(),
             backup_spool_override: std::sync::Mutex::new(None),
             backup_cleanups: std::sync::Mutex::new(Vec::new()),
             last_backup_memory_stats: std::sync::Mutex::new(None),
             backup_step_delay_us: std::sync::atomic::AtomicU64::new(0),
             sqlite_writer_commit_gen: std::sync::atomic::AtomicU64::new(0),
-            sqlite_purge_fence_gen: std::sync::atomic::AtomicU64::new(0),
             sqlite_has_any_purge_fences: AtomicBool::new(init_has_purge_fences),
             sqlite_has_any_space_schemas: AtomicBool::new(init_has_space_schemas),
             sqlite_has_any_collab_sessions: AtomicBool::new(init_has_collab_sessions),
@@ -439,6 +473,7 @@ impl CanonicalRuntime {
         let store = CanonicalStore {
             inner: Arc::clone(&inner),
         };
+        crate::backup::recover_backup_state(&store).await?;
         crate::peers::reconcile_collab_fences_on_startup(&store).await?;
         crate::domain::purge::resume_pending_purges_on_startup(&store).await?;
 
@@ -454,6 +489,7 @@ impl CanonicalRuntime {
     }
 
     pub async fn shutdown(self) -> Result<(), PortError> {
+        self.inner.backup_shutdown.cancel();
         let pending_backup_cleanups: Vec<tokio::task::JoinHandle<()>> = {
             let mut guard = self
                 .inner
@@ -567,6 +603,7 @@ impl CanonicalStore {
 
     /// Commits an explicit CAS reference claim through `WriteBatchActor`, ensuring local directory `fsync`
     /// and atomic `blob_catalog` / `blob_publications` / `blob_references` activation.
+    #[cfg(feature = "test-support")]
     pub async fn commit_blob_reference_claim(
         &self,
         scope: &HistoryScope,
@@ -575,6 +612,36 @@ impl CanonicalStore {
         idempotency: Option<CommandIdentitySpec>,
         budget: Option<CallBudget>,
     ) -> Result<SpaceSeq, PortError> {
+        self.inner
+            .check_writer_epoch(&scope.space_id, active_epoch)?;
+        claim.ticket.check_authority(scope, active_epoch)?;
+        let (entity_type, entity_id) = match claim.owner_kind {
+            BlobOwnerKind::NoteRevision | BlobOwnerKind::CollabSnapshot => {
+                ("note", NoteId::parse(&claim.owner_id)?.as_str().to_owned())
+            }
+            BlobOwnerKind::AbilityResource => (
+                "ability",
+                notarium_core::ids::AbilityId::parse(&claim.owner_id)?
+                    .as_str()
+                    .to_owned(),
+            ),
+            BlobOwnerKind::ChatEntry | BlobOwnerKind::ChatPendingInput => {
+                let (thread, _) = claim
+                    .owner_id
+                    .split_once(':')
+                    .ok_or_else(|| DomainError::validation(ValidationReason::InvalidId))?;
+                (
+                    "thread",
+                    notarium_core::ids::ChatThreadId::parse(thread)?
+                        .as_str()
+                        .to_owned(),
+                )
+            }
+            // Staging only has a principal, not a committed change-stream entity.
+            BlobOwnerKind::StagedChat => {
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            }
+        };
         let mut random_req = [0u8; 16];
         getrandom::fill(&mut random_req)
             .map_err(|err| internal_not_committed("csprng_req_id", err.to_string()))?;
@@ -597,8 +664,8 @@ impl CanonicalStore {
             execute: Box::new(move |tx, ctx| {
                 Box::pin(async move {
                     let seq = ctx.alloc_next_seq()?;
-                    activate_and_bind_blob_ref_tx(tx, ctx.active_epoch, &claim, seq).await?;
-                    let owner_id = claim.owner_id.clone();
+                    activate_and_bind_blob_ref_tx(tx, &ctx.scope, ctx.active_epoch, &claim, seq)
+                        .await?;
                     let ev_rev = new_revision_id()?;
                     ctx.record_staged_ticket(claim.ticket);
                     let resp_bytes = Self::encode_command_outcome(&seq.get())?;
@@ -607,8 +674,8 @@ impl CanonicalStore {
                         command_kind: "bind_blob_ref".to_owned(),
                         events: vec![BatchEventDraft {
                             space_seq: seq,
-                            entity_type: "note".to_owned(),
-                            entity_id: owner_id,
+                            entity_type: entity_type.to_owned(),
+                            entity_id,
                             op_kind: "edit".to_owned(),
                             rev_id: ev_rev,
                             lifecycle: Lifecycle::Active,
@@ -628,8 +695,8 @@ impl CanonicalStore {
         Ok(SpaceSeq::new(seq_u64)?)
     }
 
-    /// Releases all CAS references owned by `(owner_kind, owner_id)` inside `WriteBatchActor`,
-    /// returning digests whose reachable reference count dropped to `0`.
+    /// Releases storage ownership without manufacturing a domain mutation or consuming a sequence.
+    #[cfg(feature = "test-support")]
     pub async fn release_blob_owner_references(
         &self,
         scope: &HistoryScope,
@@ -637,71 +704,17 @@ impl CanonicalStore {
         owner_kind: BlobOwnerKind,
         owner_id: &str,
     ) -> Result<Vec<ContentDigest>, PortError> {
-        let mut random_req = [0u8; 16];
-        getrandom::fill(&mut random_req)
-            .map_err(|err| internal_not_committed("csprng_req_id", err.to_string()))?;
-        let eff_budget = CallBudget {
-            request: RequestId::from_bytes(random_req),
-            cancellation: Cancellation::default(),
-            remaining: Duration::from_secs(30),
-        };
-        let cmd_id = new_prefixed_hex_id("cmd_")?;
-        let owner_id_owned = owner_id.to_owned();
-        let scope_cl = scope.clone();
-
-        let intent = PreparedWriteIntent {
-            scope: scope_cl,
-            active_epoch,
-            idempotency: None,
-            source_note_ids: Vec::new(),
-            staged_bytes: 0,
-            required_semantic_cut: None,
-            execute: Box::new(move |tx, ctx| {
-                Box::pin(async move {
-                    let seq = ctx.alloc_next_seq()?;
-                    let zero_digests = release_owner_blob_refs_tx(
-                        tx,
-                        &ctx.scope.space_id,
-                        owner_kind,
-                        &owner_id_owned,
-                    )
-                    .await?;
-                    let hex_list: Vec<String> = zero_digests.iter().map(|d| d.to_hex()).collect();
-                    let ev_rev = new_revision_id()?;
-                    let resp_bytes = Self::encode_command_outcome(&hex_list)?;
-                    Ok(ItemCommitArtifacts {
-                        command_id: cmd_id,
-                        command_kind: "release_blob_refs".to_owned(),
-                        events: vec![BatchEventDraft {
-                            space_seq: seq,
-                            entity_type: "note".to_owned(),
-                            entity_id: owner_id_owned,
-                            op_kind: "trash".to_owned(),
-                            rev_id: ev_rev,
-                            lifecycle: Lifecycle::Trashed,
-                            doc_class: None,
-                        }],
-                        change_payload: None,
-                        receipt_detail_blob: None,
-                        receipt_sanitized_blob: resp_bytes.clone(),
-                        receipt_owner_note_ids: Vec::new(),
-                        response_bytes: resp_bytes,
-                    })
-                })
-            }),
-        };
-
-        let hex_list: Vec<String> = self.submit_write_command(&eff_budget, intent).await?;
-        let mut digests = Vec::with_capacity(hex_list.len());
-        for h in hex_list {
-            let bytes = hex::decode(&h)
-                .map_err(|err| internal_not_committed("decode_zero_digest_hex", err.to_string()))?;
-            let arr: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| internal_not_committed("decode_zero_digest_len", "digest != 32B"))?;
-            digests.push(ContentDigest::from_bytes(arr));
-        }
-        Ok(digests)
+        self.inner
+            .check_writer_epoch(&scope.space_id, active_epoch)?;
+        let scope = scope.clone();
+        let owner_id = owner_id.to_owned();
+        self.with_fenced_auxiliary_write_tx(|tx| {
+            Box::pin(async move {
+                crate::blobs::lock_and_check_space_tx(tx, &scope, active_epoch).await?;
+                release_owner_blob_refs_tx(tx, &scope.space_id, owner_kind, &owner_id).await
+            })
+        })
+        .await
     }
 
     pub(crate) fn ensure_open(&self) -> Result<(), PortError> {
@@ -740,7 +753,7 @@ impl CanonicalStore {
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
         self.ensure_open()?;
-        match &self.inner.sql {
+        let value = match &self.inner.sql {
             SqlDriverState::Sqlite { writer, .. } => {
                 let mut guard = writer.lock().await;
                 let pair = guard.as_mut().ok_or_else(|| {
@@ -750,27 +763,17 @@ impl CanonicalStore {
                         Duration::from_millis(100),
                     )
                 })?;
-                let mut backend = BackendConn::Sqlite(&mut pair.sqlx_conn);
-                backend.begin_write().await?;
-                match op(&mut backend).await {
-                    Ok(value) => {
-                        backend.commit_write().await?;
-                        self.inner
-                            .sqlite_writer_commit_gen
-                            .fetch_add(1, Ordering::Release);
-                        self.inner
-                            .sqlite_purge_fence_gen
-                            .fetch_add(1, Ordering::Release);
-                        if let Some(wal) = self.inner.wal_coord.get() {
-                            wal.note_writer_commit();
-                        }
-                        Ok(value)
-                    }
-                    Err(err) => {
-                        backend.rollback_best_effort().await;
-                        Err(err)
-                    }
+                let mut conn = BackendConn::Sqlite(&mut pair.sqlx_conn);
+                let mut transaction = WriteTransaction::begin(&mut conn).await?;
+                let value = op(&mut transaction.conn()).await?;
+                transaction.commit().await?;
+                self.inner
+                    .sqlite_writer_commit_gen
+                    .fetch_add(1, Ordering::Release);
+                if let Some(wal) = self.inner.wal_coord.get() {
+                    wal.note_writer_commit();
                 }
+                value
             }
             SqlDriverState::Postgres { pool, .. } => {
                 let mut pooled = pool.acquire().await.map_err(|err| {
@@ -780,30 +783,24 @@ impl CanonicalStore {
                         Duration::from_millis(50),
                     )
                 })?;
-                let conn: &mut sqlx::PgConnection = &mut pooled;
-                let mut backend = BackendConn::Postgres(conn);
-                backend.begin_write().await?;
-                match op(&mut backend).await {
-                    Ok(value) => {
-                        backend.commit_write().await?;
-                        self.inner
-                            .sqlite_writer_commit_gen
-                            .fetch_add(1, Ordering::Release);
-                        self.inner
-                            .sqlite_purge_fence_gen
-                            .fetch_add(1, Ordering::Release);
-                        if let Some(wal) = self.inner.wal_coord.get() {
-                            wal.note_writer_commit();
-                        }
-                        Ok(value)
-                    }
+                let mut lease = PgTransactionLease::new(&mut pooled);
+                let mut conn = BackendConn::Postgres(lease.conn());
+                let mut transaction = WriteTransaction::begin(&mut conn).await?;
+                let value = match op(&mut transaction.conn()).await {
+                    Ok(value) => value,
                     Err(err) => {
-                        backend.rollback_best_effort().await;
-                        Err(err)
+                        if transaction.rollback().await {
+                            lease.complete();
+                        }
+                        return Err(err);
                     }
-                }
+                };
+                transaction.commit().await?;
+                lease.complete();
+                value
             }
-        }
+        };
+        Ok(value)
     }
 
     pub fn wal_telemetry(&self) -> Option<WalTelemetrySnapshot> {
@@ -816,7 +813,7 @@ impl CanonicalStore {
         }
     }
 
-    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub async fn execute_diagnostic_read_sql_for_test(
         &self,
         budget: Option<&CallBudget>,
@@ -840,7 +837,7 @@ impl CanonicalStore {
         .await
     }
 
-    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub async fn execute_diagnostic_write_sql_for_test(&self, sql: &str) -> Result<u64, PortError> {
         self.inner.latch_sqlite_aux_tables_populated();
         self.inner.clear_pg_immutable_caches();
@@ -864,397 +861,6 @@ impl CanonicalStore {
             })
         })
         .await
-    }
-
-    #[doc(hidden)]
-    pub async fn snapshot_sqlite_tables_for_bench(&self) -> Result<SqliteBenchSeed, PortError> {
-        self.ensure_open()?;
-        let SqlDriverState::Sqlite { writer, .. } = &self.inner.sql else {
-            return Err(internal_not_committed(
-                "bench_seed_not_sqlite",
-                "expected SQLite backend",
-            ));
-        };
-        let mut guard = writer.lock().await;
-        let pair = guard.as_mut().ok_or_else(|| {
-            unavailable_retryable(
-                "sqlite_writer_closed",
-                "SQLite writer connection closed",
-                Duration::from_millis(50),
-            )
-        })?;
-        let rconn = pair.rusqlite_conn.take().ok_or_else(|| {
-            internal_not_committed("sqlite_rconn_missing", "rusqlite writer connection missing")
-        })?;
-        let (rconn, res) = tokio::task::spawn_blocking(move || {
-            let out: Result<SqliteBenchSeed, PortError> = (|| {
-                let mut tables =
-                    Vec::with_capacity(crate::schema::manifest::CANONICAL_TABLES.len());
-                for tspec in crate::schema::manifest::CANONICAL_TABLES {
-                    let col_names: Vec<String> =
-                        tspec.columns.iter().map(|c| c.name.to_owned()).collect();
-                    let select_sql = format!(
-                        "SELECT {} FROM \"{}\"",
-                        col_names
-                            .iter()
-                            .map(|c| format!("\"{c}\""))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        tspec.name
-                    );
-                    let mut stmt = rconn
-                        .prepare(&select_sql)
-                        .map_err(|e| internal_not_committed("bench_seed_prepare", e.to_string()))?;
-                    let ncols = col_names.len();
-                    let mut rows_iter = stmt
-                        .query([])
-                        .map_err(|e| internal_not_committed("bench_seed_query", e.to_string()))?;
-                    let mut captured_rows = Vec::new();
-                    while let Some(row) = rows_iter
-                        .next()
-                        .map_err(|e| internal_not_committed("bench_seed_next", e.to_string()))?
-                    {
-                        let mut vals = Vec::with_capacity(ncols);
-                        for idx in 0..ncols {
-                            let v: rusqlite::types::Value = row.get(idx).map_err(|e| {
-                                internal_not_committed("bench_seed_val", e.to_string())
-                            })?;
-                            vals.push(v);
-                        }
-                        captured_rows.push(vals);
-                    }
-                    let insert_sql = if col_names.is_empty() {
-                        String::new()
-                    } else {
-                        let cols_joined = col_names
-                            .iter()
-                            .map(|c| format!("\"{c}\""))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let placeholders = std::iter::repeat_n("?", ncols)
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!(
-                            "INSERT INTO \"{}\" ({cols_joined}) VALUES ({placeholders})",
-                            tspec.name
-                        )
-                    };
-                    tables.push(SqliteSeedTable {
-                        name: tspec.name.to_owned(),
-                        insert_sql,
-                        rows: captured_rows,
-                    });
-                }
-                let max_space_seq: i64 = rconn
-                    .query_row("SELECT COALESCE(MAX(last_seq), 0) FROM spaces", [], |r| {
-                        r.get(0)
-                    })
-                    .map_err(|e| internal_not_committed("bench_seed_max_seq", e.to_string()))?;
-                Ok(SqliteBenchSeed {
-                    max_space_seq,
-                    tables,
-                })
-            })();
-            (rconn, out)
-        })
-        .await
-        .map_err(|e| internal_not_committed("bench_seed_join", e.to_string()))?;
-        pair.rusqlite_conn = Some(rconn);
-        res
-    }
-
-    #[doc(hidden)]
-    pub async fn restore_sqlite_tables_for_bench(
-        &self,
-        seed: &SqliteBenchSeed,
-    ) -> Result<(), PortError> {
-        self.ensure_open()?;
-        let _maint_guard = match self.inner.wal_coord.get() {
-            Some(w) => Some(w.lock_maintenance().await),
-            None => None,
-        };
-        let _commit_guard = self.inner.writer()?.acquire_commit_read_guard().await;
-        let SqlDriverState::Sqlite { writer, .. } = &self.inner.sql else {
-            return Err(internal_not_committed(
-                "bench_restore_not_sqlite",
-                "expected SQLite backend",
-            ));
-        };
-        let mut guard = writer.lock().await;
-        let pair = guard.as_mut().ok_or_else(|| {
-            unavailable_retryable(
-                "sqlite_writer_closed",
-                "SQLite writer connection closed",
-                Duration::from_millis(50),
-            )
-        })?;
-        let rconn = pair.rusqlite_conn.take().ok_or_else(|| {
-            internal_not_committed("bench_restore_no_rconn", "rusqlite handle missing")
-        })?;
-        let seed_cl = seed.clone();
-        let (rconn, res) = tokio::task::spawn_blocking(move || {
-            let out = (|| -> Result<(), PortError> {
-                // Reset directly on `pair.rusqlite_conn` without toggling any `PRAGMA`s so both
-                // its SQLite `PCache` (zero `pager_reset`) and prepared statement cache stay hot.
-                let seq = seed_cl.max_space_seq;
-                let prune_sql = format!(
-                    "BEGIN IMMEDIATE;
-                     DELETE FROM payload_owners
-                         WHERE payload_id IN (SELECT payload_id FROM change_payloads WHERE created_seq > {seq})
-                            OR payload_kind = 'command_receipt';
-                     DELETE FROM command_receipts WHERE canonical_seq > {seq};
-                     DELETE FROM change_log WHERE space_seq > {seq};
-                     DELETE FROM change_commands WHERE first_seq > {seq};
-                     DELETE FROM change_payloads WHERE created_seq > {seq};
-                     DELETE FROM blob_references WHERE created_seq > {seq};
-                     DELETE FROM revisions WHERE space_seq > {seq};
-                     DELETE FROM board_move_history WHERE command_end_seq > {seq};
-                     DELETE FROM view_rank_overlays;"
-                );
-                rconn
-                    .execute_batch(&prune_sql)
-                    .map_err(|e| internal_not_committed("bench_restore_begin", e.to_string()))?;
-
-                for tbl in &seed_cl.tables {
-                    match tbl.name.as_str() {
-                        "blob_catalog" => {
-                            let mut ustmt = rconn
-                                .prepare_cached(
-                                    "UPDATE blob_catalog SET ref_count = ?1
-                                     WHERE space_id = ?2 AND content_blake3 = ?3 AND ref_count <> ?1",
-                                )
-                                .map_err(|e| {
-                                    internal_not_committed("bench_restore_bc_prep", e.to_string())
-                                })?;
-                            for row in &tbl.rows {
-                                ustmt
-                                    .execute(rusqlite::params![&row[4], &row[0], &row[1]])
-                                    .map_err(|e| {
-                                        internal_not_committed(
-                                            "bench_restore_bc_upd",
-                                            e.to_string(),
-                                        )
-                                    })?;
-                            }
-                        }
-                        "spaces" => {
-                            let mut ustmt = rconn
-                                .prepare_cached(
-                                    "UPDATE spaces SET active_epoch = ?1, last_seq = ?2
-                                     WHERE space_id = ?3 AND (active_epoch <> ?1 OR last_seq <> ?2)",
-                                )
-                                .map_err(|e| {
-                                    internal_not_committed("bench_restore_sp_prep", e.to_string())
-                                })?;
-                            for row in &tbl.rows {
-                                ustmt
-                                    .execute(rusqlite::params![&row[8], &row[9], &row[0]])
-                                    .map_err(|e| {
-                                        internal_not_committed(
-                                            "bench_restore_sp_upd",
-                                            e.to_string(),
-                                        )
-                                    })?;
-                            }
-                        }
-                        "agent_run_heads" => {
-                            let mut ustmt = rconn
-                                .prepare_cached(
-                                    "UPDATE agent_run_heads
-                                     SET run_revision = ?1, last_seq = ?2, updated_at_sec = ?3, updated_at_nsec = ?4
-                                     WHERE space_id = ?5 AND run_id = ?6 AND last_seq <> ?2",
-                                )
-                                .map_err(|e| {
-                                    internal_not_committed("bench_restore_ar_prep", e.to_string())
-                                })?;
-                            for row in &tbl.rows {
-                                ustmt
-                                    .execute(rusqlite::params![
-                                        &row[3], &row[4], &row[5], &row[6], &row[0], &row[2]
-                                    ])
-                                    .map_err(|e| {
-                                        internal_not_committed(
-                                            "bench_restore_ar_upd",
-                                            e.to_string(),
-                                        )
-                                    })?;
-                            }
-                        }
-                        "note_heads" => {
-                            let mut ustmt = rconn
-                                .prepare_cached(
-                                    "UPDATE note_heads
-                                     SET parent_folder_id = ?3, slug = ?4, slug_fold = ?5,
-                                         title = ?6, title_fold = ?7, doc_class = ?8,
-                                         ability_id = ?9, head_rev_id = ?10, content_blake3 = ?11,
-                                         byte_size = ?12, lifecycle_state = ?13, visibility_mask = ?14,
-                                         settlement_successor_id = ?15, updated_seq = ?16,
-                                         updated_at_sec = ?17, updated_at_nsec = ?18, last_actor_id = ?19
-                                     WHERE space_id = ?1 AND note_id = ?2 AND updated_seq > ?20",
-                                )
-                                .map_err(|e| {
-                                    internal_not_committed("bench_restore_nh_prep", e.to_string())
-                                })?;
-                            for want_active in [false, true] {
-                                for row in &tbl.rows {
-                                    let is_active = matches!(
-                                        &row[12],
-                                        rusqlite::types::Value::Text(s) if s == "active"
-                                    );
-                                    if is_active != want_active {
-                                        continue;
-                                    }
-                                    ustmt
-                                        .execute(rusqlite::params![
-                                            &row[0], &row[1], &row[2], &row[3], &row[4], &row[5],
-                                            &row[6], &row[7], &row[8], &row[9], &row[10], &row[11],
-                                            &row[12], &row[13], &row[14], &row[16], &row[19],
-                                            &row[20], &row[21], seq
-                                        ])
-                                        .map_err(|e| {
-                                            internal_not_committed(
-                                                "bench_restore_nh_upd",
-                                                e.to_string(),
-                                            )
-                                        })?;
-                                }
-                            }
-                        }
-                        "view_rank_overlays" if !tbl.rows.is_empty() => {
-                            let mut stmt = rconn.prepare_cached(&tbl.insert_sql).map_err(|e| {
-                                internal_not_committed("bench_restore_vro_prep", e.to_string())
-                            })?;
-                            for row in &tbl.rows {
-                                stmt.execute(rusqlite::params_from_iter(row.iter()))
-                                    .map_err(|e| {
-                                        internal_not_committed(
-                                            "bench_restore_vro_ins",
-                                            e.to_string(),
-                                        )
-                                    })?;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                rconn
-                    .execute_batch("COMMIT;")
-                    .map_err(|e| internal_not_committed("bench_restore_commit", e.to_string()))?;
-                Ok(())
-            })();
-            if out.is_err() {
-                let _ = rconn.execute_batch("ROLLBACK;");
-            }
-            (rconn, out)
-        })
-        .await
-        .map_err(|e| internal_not_committed("bench_restore_join", e.to_string()))?;
-        pair.rusqlite_conn = Some(rconn);
-        res?;
-        drop(guard);
-        let mut has_pf = false;
-        let mut has_ss = false;
-        let mut has_cs = false;
-        for tbl in &seed.tables {
-            if !tbl.rows.is_empty() {
-                match tbl.name.as_str() {
-                    "revision_purge_fences" => has_pf = true,
-                    "space_field_schemas" => has_ss = true,
-                    "collab_sessions" => has_cs = true,
-                    _ => {}
-                }
-            }
-        }
-        self.inner
-            .sqlite_has_any_purge_fences
-            .store(has_pf, Ordering::Release);
-        self.inner
-            .sqlite_has_any_space_schemas
-            .store(has_ss, Ordering::Release);
-        self.inner
-            .sqlite_has_any_collab_sessions
-            .store(has_cs, Ordering::Release);
-        self.inner
-            .sqlite_writer_commit_gen
-            .fetch_add(1, Ordering::Release);
-        Ok(())
-    }
-
-    #[doc(hidden)]
-    pub async fn restart_sqlite_wal_for_bench(&self) -> Result<(), PortError> {
-        self.prewarm_and_restart_sqlite_wal_for_bench(0).await
-    }
-
-    #[doc(hidden)]
-    pub async fn prewarm_and_restart_sqlite_wal_for_bench(
-        &self,
-        min_wal_bytes: usize,
-    ) -> Result<(), PortError> {
-        self.ensure_open()?;
-        let _maint_guard = match self.inner.wal_coord.get() {
-            Some(w) => Some(w.lock_maintenance().await),
-            None => None,
-        };
-        let _commit_guard = self.inner.writer()?.acquire_commit_read_guard().await;
-        let SqlDriverState::Sqlite { writer, .. } = &self.inner.sql else {
-            return Err(internal_not_committed(
-                "bench_wal_restart_not_sqlite",
-                "expected SQLite backend",
-            ));
-        };
-        let mut guard = writer.lock().await;
-        let pair = guard.as_mut().ok_or_else(|| {
-            unavailable_retryable(
-                "sqlite_writer_closed",
-                "SQLite writer connection closed",
-                Duration::from_millis(50),
-            )
-        })?;
-        let db_path = pair.db_path.clone();
-        let rconn = pair.rusqlite_conn.take().ok_or_else(|| {
-            internal_not_committed("bench_wal_no_rconn", "rusqlite handle missing")
-        })?;
-        let (rconn, res) = tokio::task::spawn_blocking(move || {
-            let out = (|| -> Result<(), PortError> {
-                let target_journal_limit = i64::try_from(min_wal_bytes)
-                    .unwrap_or(crate::dialect::sqlite::SQLITE_JOURNAL_SIZE_LIMIT_BYTES)
-                    .max(crate::dialect::sqlite::SQLITE_JOURNAL_SIZE_LIMIT_BYTES);
-                rconn
-                    .execute_batch(&format!(
-                        "PRAGMA journal_size_limit = {target_journal_limit};
-                         PRAGMA wal_checkpoint(RESTART);
-                         BEGIN IMMEDIATE;
-                         UPDATE schema_meta SET schema_version = schema_version WHERE singleton_id = 1;
-                         COMMIT;"
-                    ))
-                    .map_err(|e| internal_not_committed("bench_wal_restart", e.to_string()))?;
-
-                let mut wal_os = db_path.as_os_str().to_os_string();
-                wal_os.push("-wal");
-                let wal_path = std::path::PathBuf::from(wal_os);
-                if let Ok(wf) = std::fs::File::open(&wal_path) {
-                    let _ = wf.sync_all();
-                }
-                if let Ok(df) = std::fs::File::open(&db_path) {
-                    let _ = df.sync_all();
-                }
-                Ok(())
-            })();
-            if out.is_err() {
-                let _ = rconn.execute_batch("ROLLBACK;");
-            }
-            (rconn, out)
-        })
-        .await
-        .map_err(|e| internal_not_committed("bench_wal_restart_join", e.to_string()))?;
-        pair.rusqlite_conn = Some(rconn);
-        drop(guard);
-        if res.is_ok()
-            && let Some(wal) = self.inner.wal_coord.get()
-        {
-            wal.note_external_wal_restart();
-        }
-        res
     }
 
     pub(crate) fn is_postgres(&self) -> bool {
@@ -1429,6 +1035,13 @@ impl CanonicalStore {
                 }
                 let eff_timeout = caller_rem.min(*statement_timeout);
                 let deadline_tokio = tokio::time::Instant::now() + eff_timeout;
+                let cancelled = async {
+                    match budget {
+                        Some(b) => b.cancellation.cancelled().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::pin!(cancelled);
 
                 let mut pooled = tokio::select! {
                     res = pool.acquire() => res.map_err(|err| {
@@ -1438,6 +1051,9 @@ impl CanonicalStore {
                             Duration::from_millis(50),
                         )
                     })?,
+                    _ = &mut cancelled => {
+                        return Err(cancelled_not_committed("pg_read_cancelled", "PostgreSQL read cancelled"));
+                    }
                     _ = tokio::time::sleep_until(deadline_tokio) => {
                         return Err(deadline_not_committed(
                             "pg_acquire_read_deadline",
@@ -1452,19 +1068,33 @@ impl CanonicalStore {
                     .max(1);
                 let timeout_ms = u64::try_from(rem_ms).unwrap_or(200);
 
+                let mut lease = PgTransactionLease::new(&mut pooled);
                 let run_res: Result<T, PortError> = {
-                    let conn: &mut sqlx::PgConnection = &mut pooled;
-                    let mut backend = BackendConn::Postgres(conn);
+                    let conn = lease.conn();
                     let fut = async {
-                        backend
-                            .begin_read_with_pg_local_sql(Some(timeout_ms), extra_pg_sql)
-                            .await?;
-                        let val = op(&mut backend).await?;
-                        backend.commit_read().await?;
+                        let mut settings = format!(
+                            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout = '{timeout_ms}ms'"
+                        );
+                        if let Some(sql) = extra_pg_sql {
+                            settings.push_str("; ");
+                            settings.push_str(sql);
+                        }
+                        let mut transaction = conn
+                            .begin_with(sqlx::AssertSqlSafe(settings))
+                            .await
+                            .map_err(|e| internal_not_committed("pg_begin_read", e.to_string()))?;
+                        let val = op(&mut BackendConn::Postgres(&mut transaction)).await?;
+                        transaction
+                            .commit()
+                            .await
+                            .map_err(|e| internal_not_committed("pg_commit_read", e.to_string()))?;
                         Ok(val)
                     };
                     tokio::select! {
                         res = fut => res,
+                        _ = &mut cancelled => {
+                            Err(cancelled_not_committed("pg_read_cancelled", "PostgreSQL read cancelled"))
+                        }
                         _ = tokio::time::sleep_until(deadline_tokio) => {
                             Err(deadline_not_committed(
                                 "pg_read_tx_deadline",
@@ -1475,22 +1105,11 @@ impl CanonicalStore {
                 };
 
                 match run_res {
-                    Ok(val) => Ok(val),
-                    Err(err) => {
-                        // Detach timed-out or failed connection if needed so clean pool invariants hold.
-                        let mut raw_conn = pooled.detach();
-                        tokio::spawn(async move {
-                            let _ = sqlx::raw_sql("ROLLBACK").execute(&mut raw_conn).await;
-                            let _ = raw_conn.close().await;
-                        });
-                        if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
-                            return Err(cancelled_not_committed(
-                                "pg_read_cancelled",
-                                "PostgreSQL read cancelled",
-                            ));
-                        }
-                        Err(err)
+                    Ok(val) => {
+                        lease.complete();
+                        Ok(val)
                     }
+                    Err(err) => Err(err),
                 }
             }
         }
@@ -1498,204 +1117,12 @@ impl CanonicalStore {
 
     /// Initializes a canonical Space row and its permanent root folder atomically.
     pub async fn create_space(&self, spec: CreateSpaceSpec) -> Result<SpaceRecord, PortError> {
-        let slug_fold = normalize_slug_key(&spec.slug)?;
-        let created_at = match spec.created_at {
-            Some(ts) => ts,
-            None => now_utc_timestamp()?,
-        };
-        let (sec, nsec) = encode_timestamp_parts(created_at);
-        let root_rev_id = new_revision_id()?;
-        let root_meta =
-            RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(FolderRevisionMetadata {
-                folder_id: spec.root_folder_id.clone(),
-                parent_folder_id: None,
-                is_root: true,
-                slug: "root".to_owned(),
-                slug_fold: "root".to_owned(),
-                display_name: "/".to_owned(),
-                is_project: false,
-                project_slug: None,
-                description: None,
-                cover_note_id: None,
-                write_locked: false,
-                lifecycle: Lifecycle::Active,
-            }))
-            .encode()?;
-
-        let kind_str = match spec.kind {
-            SpaceKind::Personal => "personal",
-            SpaceKind::Shared => "shared",
-        };
-        let active_epoch_i64 = spec.active_epoch.get() as i64;
-        let last_seq_i64 = spec.initial_last_seq.get() as i64;
-
-        self.with_write_tx(|tx| {
-            let spec_cl = spec.clone();
-            let slug_fold_cl = slug_fold.clone();
-            let root_rev_cl = root_rev_id.clone();
-            let root_meta_cl = root_meta.clone();
-            Box::pin(async move {
-                let existing = fetch_space_by_id_or_slug(tx, &spec_cl.space_id, &slug_fold_cl).await?;
-                if existing {
-                    return Err(DomainError::PathConflict {
-                        target: PathTarget {
-                            space_id: spec_cl.space_id.clone(),
-                            parent: None,
-                            component: spec_cl.slug.clone(),
-                        },
-                    }
-                    .into());
-                }
-
-                match tx {
-                    BackendConn::Sqlite(conn) => {
-                        sqlx::query(
-                            "INSERT INTO spaces (
-                                space_id, history_incarnation, root_folder_id, slug, slug_fold,
-                                space_kind, owner_id, lifecycle_state, active_epoch, last_seq,
-                                settings_json, created_at_sec, created_at_nsec
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, '{}', ?, ?)",
-                        )
-                        .bind(spec_cl.space_id.as_str())
-                        .bind(spec_cl.incarnation.as_bytes().as_slice())
-                        .bind(spec_cl.root_folder_id.as_str())
-                        .bind(&spec_cl.slug)
-                        .bind(&slug_fold_cl)
-                        .bind(kind_str)
-                        .bind(spec_cl.owner.as_str())
-                        .bind(active_epoch_i64)
-                        .bind(last_seq_i64)
-                        .bind(sec)
-                        .bind(nsec)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("sqlite_insert_space", err.to_string()))?;
-
-                        sqlx::query(
-                            "INSERT INTO folder_heads (
-                                space_id, folder_id, parent_folder_id, is_root, slug, slug_fold,
-                                display_name, is_project, project_slug, project_slug_fold,
-                                description, cover_note_id, write_lock_json, lifecycle_state,
-                                rev_seq, head_rev_id, created_seq, updated_seq,
-                                updated_at_sec, updated_at_nsec
-                            ) VALUES (?, ?, NULL, 1, 'root', 'root', '/', 0, NULL, NULL, NULL, NULL, NULL, 'active', 0, ?, 0, 0, ?, ?)",
-                        )
-                        .bind(spec_cl.space_id.as_str())
-                        .bind(spec_cl.root_folder_id.as_str())
-                        .bind(root_rev_cl.as_str())
-                        .bind(sec)
-                        .bind(nsec)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("sqlite_insert_root_folder", err.to_string()))?;
-
-                        sqlx::query(
-                            "INSERT INTO revisions (
-                                space_id, history_incarnation, rev_id, entity_type, entity_key,
-                                space_seq, visibility_seq, parent_rev_id, their_rev_id,
-                                restored_from_rev_id, content_blake3, metadata_msgpack,
-                                patch_meta_json, actor_id, session_id, agent_run_id,
-                                quarantine_reason, created_at_sec, created_at_nsec
-                            ) VALUES (?, ?, ?, 'folder', ?, 0, 0, NULL, NULL, NULL, NULL, ?, NULL, ?, NULL, NULL, NULL, ?, ?)",
-                        )
-                        .bind(spec_cl.space_id.as_str())
-                        .bind(spec_cl.incarnation.as_bytes().as_slice())
-                        .bind(root_rev_cl.as_str())
-                        .bind(spec_cl.root_folder_id.as_str())
-                        .bind(&root_meta_cl)
-                        .bind(spec_cl.owner.as_str())
-                        .bind(sec)
-                        .bind(nsec)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("sqlite_insert_root_rev", err.to_string()))?;
-                    }
-                    BackendConn::Postgres(conn) => {
-                        sqlx::query(
-                            "INSERT INTO spaces (
-                                space_id, history_incarnation, root_folder_id, slug, slug_fold,
-                                space_kind, owner_id, lifecycle_state, active_epoch, last_seq,
-                                settings_json, created_at_sec, created_at_nsec
-                            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, '{}', $10, $11)",
-                        )
-                        .bind(spec_cl.space_id.as_str())
-                        .bind(spec_cl.incarnation.as_bytes().as_slice())
-                        .bind(spec_cl.root_folder_id.as_str())
-                        .bind(&spec_cl.slug)
-                        .bind(&slug_fold_cl)
-                        .bind(kind_str)
-                        .bind(spec_cl.owner.as_str())
-                        .bind(active_epoch_i64)
-                        .bind(last_seq_i64)
-                        .bind(sec)
-                        .bind(nsec)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("pg_insert_space", err.to_string()))?;
-
-                        sqlx::query(
-                            "INSERT INTO folder_heads (
-                                space_id, folder_id, parent_folder_id, is_root, slug, slug_fold,
-                                display_name, is_project, project_slug, project_slug_fold,
-                                description, cover_note_id, write_lock_json, lifecycle_state,
-                                rev_seq, head_rev_id, created_seq, updated_seq,
-                                updated_at_sec, updated_at_nsec
-                            ) VALUES ($1, $2, NULL, 1, 'root', 'root', '/', 0, NULL, NULL, NULL, NULL, NULL, 'active', 0, $3, 0, 0, $4, $5)",
-                        )
-                        .bind(spec_cl.space_id.as_str())
-                        .bind(spec_cl.root_folder_id.as_str())
-                        .bind(root_rev_cl.as_str())
-                        .bind(sec)
-                        .bind(nsec)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("pg_insert_root_folder", err.to_string()))?;
-
-                        sqlx::query(
-                            "INSERT INTO revisions (
-                                space_id, history_incarnation, rev_id, entity_type, entity_key,
-                                space_seq, visibility_seq, parent_rev_id, their_rev_id,
-                                restored_from_rev_id, content_blake3, metadata_msgpack,
-                                patch_meta_json, actor_id, session_id, agent_run_id,
-                                quarantine_reason, created_at_sec, created_at_nsec
-                            ) VALUES ($1, $2, $3, 'folder', $4, 0, 0, NULL, NULL, NULL, NULL, $5, NULL, $6, NULL, NULL, NULL, $7, $8)",
-                        )
-                        .bind(spec_cl.space_id.as_str())
-                        .bind(spec_cl.incarnation.as_bytes().as_slice())
-                        .bind(root_rev_cl.as_str())
-                        .bind(spec_cl.root_folder_id.as_str())
-                        .bind(&root_meta_cl)
-                        .bind(spec_cl.owner.as_str())
-                        .bind(sec)
-                        .bind(nsec)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("pg_insert_root_rev", err.to_string()))?;
-                    }
-                }
-
-                Ok(())
-            })
-        })
-        .await?;
-
-        Ok(SpaceRecord {
-            space: Space {
-                id: spec.space_id.clone(),
-                lifecycle: SpaceLifecycle::Active,
-                kind: spec.kind,
-            },
-            scope: HistoryScope {
-                space_id: spec.space_id,
-                incarnation: spec.incarnation,
-            },
-            root_folder_id: spec.root_folder_id,
-            slug: spec.slug,
-            owner: spec.owner,
-            active_epoch: spec.active_epoch,
-            last_seq: spec.initial_last_seq,
-            created_at,
-        })
+        let record = self
+            .with_write_tx(|tx| Box::pin(create_space_tx(tx, spec)))
+            .await?;
+        self.inner
+            .grant_writer_epoch(&record.space.id, record.active_epoch);
+        Ok(record)
     }
 
     pub async fn get_space(&self, space_id: &SpaceId) -> Result<SpaceRecord, PortError> {
@@ -1716,11 +1143,19 @@ impl CanonicalStore {
     ) -> Result<LeaseEpoch, PortError> {
         ctx.authority.require(ServicePurpose::Revocation)?;
         let scope_cl = scope.clone();
+        let retry_own_epoch = self
+            .inner
+            .check_writer_epoch(&scope.space_id, new_epoch)
+            .is_ok();
         self.with_write_tx(|tx| {
             let scope_inner = scope_cl.clone();
             Box::pin(async move {
-                let current = load_space_record(tx, &scope_inner.space_id).await?;
+                let current = load_space_record_for_update_opt(tx, &scope_inner.space_id).await?
+                    .ok_or(DomainError::ResourceNotFound)?;
                 current.scope.check(&scope_inner)?;
+                if new_epoch == current.active_epoch && retry_own_epoch {
+                    return Ok(new_epoch);
+                }
                 if new_epoch <= current.active_epoch {
                     return Err(
                         DomainError::validation(ValidationReason::InvalidState).into()
@@ -1752,10 +1187,23 @@ impl CanonicalStore {
                 if affected != 1 {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                if tx.is_postgres() {
+                    crate::peers::fence_rooms_on_takeover_tx(tx, &scope_inner).await?;
+                }
                 Ok(new_epoch)
             })
         })
-        .await
+        .await?;
+        self.inner.grant_writer_epoch(&scope.space_id, new_epoch);
+        self.resume_pending_storage_for_space(scope, new_epoch)
+            .await
+            .map_err(|err| {
+                crate::codec::unknown_commit_outcome(
+                    "lease_recovery_incomplete",
+                    format!("storage recovery after lease turnover: {err:?}"),
+                )
+            })?;
+        Ok(new_epoch)
     }
 
     /// Creates a canonical folder inside `spec.scope` (normalizing `parent = None` to `root_folder_id`).
@@ -1763,6 +1211,8 @@ impl CanonicalStore {
         &self,
         spec: CreateFolderSpec,
     ) -> Result<(FolderRef, RevisionId, SpaceSeq), PortError> {
+        self.inner
+            .check_writer_epoch(&spec.scope.space_id, spec.active_epoch)?;
         let slug_fold = normalize_slug_key(&spec.slug)?;
         let project_slug_fold = match (&spec.is_project, &spec.project_slug) {
             (false, None) => None,
@@ -2010,6 +1460,8 @@ impl CanonicalStore {
         actor: &PrincipalId,
         timestamp: Option<Timestamp>,
     ) -> Result<(RevisionId, SpaceSeq), PortError> {
+        self.inner
+            .check_writer_epoch(&scope.space_id, active_epoch)?;
         if target_lifecycle == Lifecycle::Purged {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
@@ -2352,6 +1804,213 @@ async fn fetch_space_by_id_or_slug(
             .map_err(|err| internal_not_committed("pg_check_space_exists", err.to_string()))?,
         };
     Ok(exists.is_some())
+}
+
+pub(crate) async fn create_space_tx(
+    tx: &mut BackendConn<'_>,
+    spec: CreateSpaceSpec,
+) -> Result<SpaceRecord, PortError> {
+    let slug_fold = normalize_slug_key(&spec.slug)?;
+    let created_at = match spec.created_at {
+        Some(ts) => ts,
+        None => now_utc_timestamp()?,
+    };
+    let (sec, nsec) = encode_timestamp_parts(created_at);
+    let root_rev_id = new_revision_id()?;
+    let root_meta =
+        RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Folder(FolderRevisionMetadata {
+            folder_id: spec.root_folder_id.clone(),
+            parent_folder_id: None,
+            is_root: true,
+            slug: "root".to_owned(),
+            slug_fold: "root".to_owned(),
+            display_name: "/".to_owned(),
+            is_project: false,
+            project_slug: None,
+            description: None,
+            cover_note_id: None,
+            write_locked: false,
+            lifecycle: Lifecycle::Active,
+        }))
+        .encode()?;
+
+    let kind_str = match spec.kind {
+        SpaceKind::Personal => "personal",
+        SpaceKind::Shared => "shared",
+    };
+    let active_epoch_i64 = spec.active_epoch.get() as i64;
+    let last_seq_i64 = spec.initial_last_seq.get() as i64;
+
+    if let BackendConn::Postgres(conn) = tx {
+        // A new Space has no row to lock yet. Lock identity before slug in
+        // both creation paths so conflicting inserts report PathConflict.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 2831101))")
+            .bind(spec.space_id.as_str())
+            .execute(&mut **conn)
+            .await
+            .map_err(|e| internal_not_committed("lock_space_id", e.to_string()))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 2831102))")
+            .bind(&slug_fold)
+            .execute(&mut **conn)
+            .await
+            .map_err(|e| internal_not_committed("lock_space_slug", e.to_string()))?;
+    }
+    let existing = fetch_space_by_id_or_slug(tx, &spec.space_id, &slug_fold).await?;
+    if existing {
+        return Err(DomainError::PathConflict {
+            target: PathTarget {
+                space_id: spec.space_id.clone(),
+                parent: None,
+                component: spec.slug.clone(),
+            },
+        }
+        .into());
+    }
+
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query(
+                "INSERT INTO spaces (
+                        space_id, history_incarnation, root_folder_id, slug, slug_fold,
+                        space_kind, owner_id, lifecycle_state, active_epoch, last_seq,
+                        settings_json, created_at_sec, created_at_nsec
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, '{}', ?, ?)",
+            )
+            .bind(spec.space_id.as_str())
+            .bind(spec.incarnation.as_bytes().as_slice())
+            .bind(spec.root_folder_id.as_str())
+            .bind(&spec.slug)
+            .bind(&slug_fold)
+            .bind(kind_str)
+            .bind(spec.owner.as_str())
+            .bind(active_epoch_i64)
+            .bind(last_seq_i64)
+            .bind(sec)
+            .bind(nsec)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_insert_space", err.to_string()))?;
+
+            sqlx::query(
+                    "INSERT INTO folder_heads (
+                        space_id, folder_id, parent_folder_id, is_root, slug, slug_fold,
+                        display_name, is_project, project_slug, project_slug_fold,
+                        description, cover_note_id, write_lock_json, lifecycle_state,
+                        rev_seq, head_rev_id, created_seq, updated_seq,
+                        updated_at_sec, updated_at_nsec
+                    ) VALUES (?, ?, NULL, 1, 'root', 'root', '/', 0, NULL, NULL, NULL, NULL, NULL, 'active', 0, ?, 0, 0, ?, ?)",
+                )
+                .bind(spec.space_id.as_str())
+                .bind(spec.root_folder_id.as_str())
+                .bind(root_rev_id.as_str())
+                .bind(sec)
+                .bind(nsec)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("sqlite_insert_root_folder", err.to_string()))?;
+
+            sqlx::query(
+                    "INSERT INTO revisions (
+                        space_id, history_incarnation, rev_id, entity_type, entity_key,
+                        space_seq, visibility_seq, parent_rev_id, their_rev_id,
+                        restored_from_rev_id, content_blake3, metadata_msgpack,
+                        patch_meta_json, actor_id, session_id, agent_run_id,
+                        quarantine_reason, created_at_sec, created_at_nsec
+                    ) VALUES (?, ?, ?, 'folder', ?, 0, 0, NULL, NULL, NULL, NULL, ?, NULL, ?, NULL, NULL, NULL, ?, ?)",
+                )
+                .bind(spec.space_id.as_str())
+                .bind(spec.incarnation.as_bytes().as_slice())
+                .bind(root_rev_id.as_str())
+                .bind(spec.root_folder_id.as_str())
+                .bind(&root_meta)
+                .bind(spec.owner.as_str())
+                .bind(sec)
+                .bind(nsec)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("sqlite_insert_root_rev", err.to_string()))?;
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query(
+                "INSERT INTO spaces (
+                        space_id, history_incarnation, root_folder_id, slug, slug_fold,
+                        space_kind, owner_id, lifecycle_state, active_epoch, last_seq,
+                        settings_json, created_at_sec, created_at_nsec
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, '{}', $10, $11)",
+            )
+            .bind(spec.space_id.as_str())
+            .bind(spec.incarnation.as_bytes().as_slice())
+            .bind(spec.root_folder_id.as_str())
+            .bind(&spec.slug)
+            .bind(&slug_fold)
+            .bind(kind_str)
+            .bind(spec.owner.as_str())
+            .bind(active_epoch_i64)
+            .bind(last_seq_i64)
+            .bind(sec)
+            .bind(nsec)
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_insert_space", err.to_string()))?;
+
+            sqlx::query(
+                    "INSERT INTO folder_heads (
+                        space_id, folder_id, parent_folder_id, is_root, slug, slug_fold,
+                        display_name, is_project, project_slug, project_slug_fold,
+                        description, cover_note_id, write_lock_json, lifecycle_state,
+                        rev_seq, head_rev_id, created_seq, updated_seq,
+                        updated_at_sec, updated_at_nsec
+                    ) VALUES ($1, $2, NULL, 1, 'root', 'root', '/', 0, NULL, NULL, NULL, NULL, NULL, 'active', 0, $3, 0, 0, $4, $5)",
+                )
+                .bind(spec.space_id.as_str())
+                .bind(spec.root_folder_id.as_str())
+                .bind(root_rev_id.as_str())
+                .bind(sec)
+                .bind(nsec)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_insert_root_folder", err.to_string()))?;
+
+            sqlx::query(
+                    "INSERT INTO revisions (
+                        space_id, history_incarnation, rev_id, entity_type, entity_key,
+                        space_seq, visibility_seq, parent_rev_id, their_rev_id,
+                        restored_from_rev_id, content_blake3, metadata_msgpack,
+                        patch_meta_json, actor_id, session_id, agent_run_id,
+                        quarantine_reason, created_at_sec, created_at_nsec
+                    ) VALUES ($1, $2, $3, 'folder', $4, 0, 0, NULL, NULL, NULL, NULL, $5, NULL, $6, NULL, NULL, NULL, $7, $8)",
+                )
+                .bind(spec.space_id.as_str())
+                .bind(spec.incarnation.as_bytes().as_slice())
+                .bind(root_rev_id.as_str())
+                .bind(spec.root_folder_id.as_str())
+                .bind(&root_meta)
+                .bind(spec.owner.as_str())
+                .bind(sec)
+                .bind(nsec)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_insert_root_rev", err.to_string()))?;
+        }
+    }
+
+    Ok(SpaceRecord {
+        space: Space {
+            id: spec.space_id.clone(),
+            lifecycle: SpaceLifecycle::Active,
+            kind: spec.kind,
+        },
+        scope: HistoryScope {
+            space_id: spec.space_id,
+            incarnation: spec.incarnation,
+        },
+        root_folder_id: spec.root_folder_id,
+        slug: spec.slug,
+        owner: spec.owner,
+        active_epoch: spec.active_epoch,
+        last_seq: spec.initial_last_seq,
+        created_at,
+    })
 }
 
 pub(crate) async fn load_space_record(

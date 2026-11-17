@@ -57,7 +57,10 @@ use crate::{
             NoteRoomDirectWriteState, StoredCommittedNoteRevV1, StoredCommittedRollbackV1,
             extract_agent_run_from_auth, note_rank_version_digest,
         },
-        notes::{PreparedCarrierInfo, build_carrier_replacement_intent, build_create_note_intent},
+        notes::{
+            EvaluatedFields, PreparedCarrierInfo, build_carrier_replacement_intent,
+            build_create_note_intent, changed_note_fields, revision_fields,
+        },
         rollback::{
             CandidateAction, build_rollback_direct_single_tx_exec,
             rollback_fallback_board_present_err,
@@ -674,7 +677,6 @@ pub(crate) async fn get_note_sqlite_local_fast(
     let req_rev_opt = request.revision.clone();
     let causal = request.causal.clone();
     let wal_for_err = Arc::clone(wal);
-    let purge_gen_before = store.inner.sqlite_purge_fence_gen.load(Ordering::Acquire);
     let has_any_purge_fences = store
         .inner
         .sqlite_has_any_purge_fences
@@ -686,7 +688,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
 
     let (
         rev_id,
-        live_facts,
+        initial_facts,
         lifecycle,
         digest,
         parent_opt,
@@ -821,7 +823,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
             let digest = nm.content_digest.ok_or_else(|| {
                 internal_not_committed("note_rev_missing_digest", "note revision lacks digest")
             })?;
-            let parent_opt = (!nm.is_root_child).then_some(nm.parent_folder_id);
+            let parent_opt = (nm.parent_folder_id != space_rec.root_folder_id).then_some(nm.parent_folder_id);
             let effective_lc = if target_rev_id == live_head.head_rev_id {
                 live_head.lifecycle
             } else {
@@ -918,21 +920,9 @@ pub(crate) async fn get_note_sqlite_local_fast(
     let content = String::from_utf8(raw_bytes)
         .map_err(|_| internal_not_committed("get_note_utf8", "note carrier is not valid UTF-8"))?;
 
-    if store.inner.sqlite_purge_fence_gen.load(Ordering::Acquire) != purge_gen_before {
-        let scope_recheck = ctx.scope().clone();
-        let note_recheck = request.note.clone();
-        fast_read_pool
-            .with_read_conn(wal, Some(&ctx.budget), move |conn| {
-                if is_note_purge_fenced_rusqlite(
-                    conn,
-                    &scope_recheck.space_id,
-                    note_recheck.as_str(),
-                )? {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                Ok(())
-            })
-            .await?;
+    let live_facts = crate::domain::notes::recheck_note_read(store, &ctx, &request.note).await?;
+    if live_facts.class != initial_facts.class {
+        return Err(DomainError::ResourceNotFound.into());
     }
 
     let document = ClassifiedDocument::from_canonical(
@@ -2461,16 +2451,12 @@ fn execute_single_fast_item(
         .scope
         .check(&meta.scope)
         .map_err(|e| FastItemExecError::PreWrite(e.into()))?;
-    let effective_epoch = if meta.active_epoch == LeaseEpoch::ZERO {
-        space_rec.active_epoch
-    } else {
-        if space_rec.active_epoch != meta.active_epoch {
-            return Err(FastItemExecError::PreWrite(
-                DomainError::validation(ValidationReason::InvalidAuthority).into(),
-            ));
-        }
-        meta.active_epoch
-    };
+    if space_rec.active_epoch != meta.active_epoch {
+        return Err(FastItemExecError::PreWrite(
+            DomainError::validation(ValidationReason::InvalidAuthority).into(),
+        ));
+    }
+    let effective_epoch = meta.active_epoch;
 
     if let Some(idemp) = &meta.idempotency {
         let rcpt_key = (
@@ -2480,6 +2466,8 @@ fn execute_single_fast_item(
             idemp.command_key.clone(),
         );
         let existing_opt = if let Some(in_batch) = cache.in_batch_receipts.get(&rcpt_key) {
+            authorize_replay_rusqlite(conn, &meta.scope, idemp)
+                .map_err(FastItemExecError::PreWrite)?;
             Some(StoredReceiptRow {
                 command_hash: in_batch.command_hash,
                 status: in_batch.status.clone(),
@@ -2962,6 +2950,7 @@ impl SqliteSyncItemPlan for CreateNoteFastPlan {
             )
         };
 
+        let changed_fields = changed_note_fields(&EvaluatedFields::new(), &eval_fields);
         let run_opt = extract_agent_run_from_auth(auth);
         let meta =
             RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(NoteRevisionMetadata {
@@ -3000,7 +2989,7 @@ impl SqliteSyncItemPlan for CreateNoteFastPlan {
                     rank_version: note_rank_version_digest(&rev_id, None),
                     lifecycle: Lifecycle::Active,
                     doc_class: input.class,
-                    changed_fields: BTreeMap::new(),
+                    changed_fields,
                 }],
             },
             vec![input.note.clone()],
@@ -3027,6 +3016,7 @@ impl SqliteSyncItemPlan for CreateNoteFastPlan {
         bind_local_blob_ref_after_open_check_rusqlite(
             conn,
             cache,
+            &item_ctx.scope,
             item_ctx.active_epoch,
             &BlobReferenceClaim {
                 ticket: self.ticket.clone(),
@@ -3190,7 +3180,7 @@ struct CarrierReplacementFastPlan {
     prealloc_rev_id: RevisionId,
     prealloc_cmd_id: String,
     precomputed_rank_version: ContentDigest,
-    preencoded_meta_msgpack: Option<Vec<u8>>,
+    preencoded_meta_msgpack: Option<(Vec<u8>, EvaluatedFields)>,
     phase1_receipt_checked_gen: Option<u64>,
     phase1_cached: Option<(NoteHeadRow, FolderAncestryFacts)>,
 }
@@ -3243,11 +3233,12 @@ pub(crate) fn build_carrier_replacement_fast_intent(
             content_digest: Some(info.prepared_blob.digest),
             schema_revision: None,
             raw_fields: info.raw_fields.clone(),
-            evaluated_fields: eval_fields,
+            evaluated_fields: eval_fields.clone(),
             diagnostics: info.diagnostics.clone(),
         }))
         .encode()
         .ok()
+        .map(|bytes| (bytes, eval_fields))
     } else {
         None
     };
@@ -3487,7 +3478,7 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
         let prev_head_rev = head.head_rev_id.clone();
         let head_doc_class = head.doc_class;
 
-        let meta = if used_phase1_cache
+        let (meta, evaluated) = if used_phase1_cache
             && current_schema.is_none()
             && explicit_slug_override.is_none()
             && let Some(pre_meta) = &self.preencoded_meta_msgpack
@@ -3504,27 +3495,34 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
                     current_schema.as_deref().map(|s| &s.fields),
                 )
             };
-            RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(NoteRevisionMetadata {
-                note_id: note_id.clone(),
-                parent_folder_id: head.parent_folder_id,
-                is_root_child: anc.is_root_child,
-                slug: final_slug.clone(),
-                slug_fold: final_slug_fold.clone(),
-                title: info.title.clone(),
-                doc_class: head_doc_class,
-                ability_id: head.ability_id,
-                lifecycle: Lifecycle::Active,
-                visibility_mask: head.visibility_mask,
-                byte_size: info.byte_size,
-                content_digest: Some(digest),
-                schema_revision: current_schema_rev,
-                raw_fields: info.raw_fields.clone(),
-                evaluated_fields: eval_fields,
-                diagnostics: info.diagnostics.clone(),
-            }))
-            .encode()
-            .map_err(FastItemExecError::PreWrite)?
+            let bytes =
+                RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(NoteRevisionMetadata {
+                    note_id: note_id.clone(),
+                    parent_folder_id: head.parent_folder_id,
+                    is_root_child: anc.is_root_child,
+                    slug: final_slug.clone(),
+                    slug_fold: final_slug_fold.clone(),
+                    title: info.title.clone(),
+                    doc_class: head_doc_class,
+                    ability_id: head.ability_id,
+                    lifecycle: Lifecycle::Active,
+                    visibility_mask: head.visibility_mask,
+                    byte_size: info.byte_size,
+                    content_digest: Some(digest),
+                    schema_revision: current_schema_rev,
+                    raw_fields: info.raw_fields.clone(),
+                    evaluated_fields: eval_fields.clone(),
+                    diagnostics: info.diagnostics.clone(),
+                }))
+                .encode()
+                .map_err(FastItemExecError::PreWrite)?;
+            (bytes, eval_fields)
         };
+
+        let previous = load_revision_meta_bytes_rusqlite(conn, &scope_cl.space_id, &prev_head_rev)
+            .and_then(|bytes| revision_fields(&bytes))
+            .map_err(FastItemExecError::PreWrite)?;
+        let changed_fields = changed_note_fields(&previous, &evaluated);
 
         let op_kind = if explicit_slug_override.is_some() {
             "rename"
@@ -3547,7 +3545,7 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
                     rank_version: self.precomputed_rank_version,
                     lifecycle: Lifecycle::Active,
                     doc_class: head_doc_class,
-                    changed_fields: BTreeMap::new(),
+                    changed_fields,
                 }],
             },
             vec![note_id.clone()],
@@ -3582,6 +3580,7 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
         bind_local_blob_ref_after_open_check_rusqlite(
             conn,
             cache,
+            &item_ctx.scope,
             item_ctx.active_epoch,
             &BlobReferenceClaim {
                 ticket: self.ticket.clone(),
@@ -3907,6 +3906,72 @@ pub(crate) fn map_interrupt_or_internal(err: rusqlite::Error, code: &'static str
     internal_not_committed(code, err.to_string())
 }
 
+fn authorize_replay_rusqlite(
+    conn: &rusqlite::Connection,
+    scope: &HistoryScope,
+    idemp: &CommandIdentitySpec,
+) -> Result<(), PortError> {
+    use crate::writer::replay::{ReplayPolicy, ReplayResource, authorize_head, destination};
+    let Some((auth, policy)) = idemp.authority.as_deref() else {
+        return Ok(());
+    };
+    let srec = load_space_record_rusqlite(conn, &scope.space_id)?;
+    srec.scope.check(scope)?;
+    let ReplayPolicy::Documents(targets) = policy else {
+        return Err(internal_not_committed(
+            "unsupported_fast_replay",
+            "command requires the general writer",
+        ));
+    };
+    auth.authorize_space_write(&srec.space)?;
+    for target in targets {
+        let note = match target {
+            ReplayResource::WriteFolder(folder) => {
+                let folder = folder.as_ref().unwrap_or(&srec.root_folder_id);
+                let (facts, _) = build_resource_facts_rusqlite(conn,&srec.space,folder,crate::domain::folders::choose_folder_auth_class(auth,&srec.space.id),None,true)?;
+                auth.authorize_direct_write(&facts,&facts)?;
+                continue;
+            }
+            ReplayResource::ReadLinkFolder(folder,source) => {
+                let head = load_note_head_row_rusqlite(conn,&srec.space.id,source)?;
+                let (facts,_) = build_resource_facts_rusqlite(conn,&srec.space,folder,head.doc_class,None,true)?;
+                auth.authorize_read(&facts)?;
+                continue;
+            }
+            ReplayResource::Write(note)
+            | ReplayResource::Read(note)
+            | ReplayResource::Create(note, ..)
+            | ReplayResource::Move(note, ..) => note,
+        };
+        let head = load_note_head_row_opt_rusqlite(conn, &scope.space_id, note)?;
+        if let Some((parent, class)) = destination(target, head.as_ref().map(|h| h.doc_class)) {
+            let (facts, _) = build_resource_facts_rusqlite(
+                conn,
+                &srec.space,
+                parent.unwrap_or(&srec.root_folder_id),
+                class,
+                None,
+                true,
+            )?;
+            auth.authorize_direct_write(&facts, &facts)?;
+        }
+        if let Some(head) = head {
+            let (facts, _) = build_resource_facts_rusqlite(
+                conn,
+                &srec.space,
+                &head.parent_folder_id,
+                head.doc_class,
+                head.ability_id,
+                true,
+            )?;
+            authorize_head(auth, target, &facts)?;
+        } else if !matches!(target, ReplayResource::Create(..)) {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+    }
+    Ok(())
+}
+
 fn lookup_command_receipt_rusqlite(
     conn: &rusqlite::Connection,
     scope: &HistoryScope,
@@ -3944,6 +4009,7 @@ fn lookup_command_receipt_rusqlite(
     let Some((hash_bytes, status, resp_payload_id, sanitized_blob)) = raw_opt else {
         return Ok(None);
     };
+    authorize_replay_rusqlite(conn, scope, idemp)?;
     let arr: [u8; 32] = hash_bytes
         .try_into()
         .map_err(|_| internal_not_committed("corrupt_receipt_hash", "command_hash != 32B"))?;
@@ -4285,7 +4351,7 @@ fn load_folder_ancestry_rusqlite(
             } else {
                 segments_rev.join("/")
             };
-            let is_root_child = ancestors.len() == 2;
+            let is_root_child = ancestors.len() == 1;
             return Ok(FolderAncestryFacts {
                 ancestors,
                 write_locked,
@@ -4695,6 +4761,7 @@ fn check_local_blob_catalog_open_rusqlite(
 fn bind_local_blob_ref_after_open_check_rusqlite(
     conn: &rusqlite::Connection,
     cache: &mut FastBatchSqlCache,
+    scope: &HistoryScope,
     active_epoch: LeaseEpoch,
     claim: &BlobReferenceClaim,
     created_seq: SpaceSeq,
@@ -4702,6 +4769,7 @@ fn bind_local_blob_ref_after_open_check_rusqlite(
     existing_cat: ExistingBlobCat,
     defer_append: Option<&mut DeferredAppendRows>,
 ) -> Result<(), PortError> {
+    claim.ticket.check_authority(scope, active_epoch)?;
     let epoch_i64 = active_epoch.get() as i64;
     let space_id = &claim.ticket.space_id;
     let digest = claim.ticket.digest;
@@ -5530,8 +5598,10 @@ struct RollbackDirectSqliteFastPlan {
     imm_cache: Arc<std::sync::RwLock<crate::runtime::PgImmutableRollbackCache>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_rollback_direct_sqlite_fast_intent(
     scope: &HistoryScope,
+    active_epoch: LeaseEpoch,
     idemp: CommandIdentitySpec,
     auth: EngineAuthContext,
     request_identity: CommandIdentity,
@@ -5541,7 +5611,7 @@ pub(crate) fn build_rollback_direct_sqlite_fast_intent(
 ) -> (PreparedWriteIntent, Box<dyn SqliteSyncItemPlan>) {
     let intent = PreparedWriteIntent {
         scope: scope.clone(),
-        active_epoch: LeaseEpoch::ZERO,
+        active_epoch,
         idempotency: Some(idemp),
         source_note_ids: Vec::new(),
         staged_bytes: 0,

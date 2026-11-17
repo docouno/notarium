@@ -365,6 +365,10 @@ impl BackendCase {
     }
 
     async fn open_pg_s3() -> Self {
+        Self::open_pg_s3_with_pool(8).await
+    }
+
+    async fn open_pg_s3_with_pool(pool_size: u32) -> Self {
         let fixtures = StorageTestFixtures::load_required();
         let schema = fixtures.fresh_pg_schema();
         let bucket = fixtures.fresh_s3_bucket("l4-backup");
@@ -374,7 +378,15 @@ impl BackendCase {
             .expect("create versioned MinIO CE bucket");
         let temp_root = TempDataRoot::new("l4-backup-pg-spool");
         let spool_dir = temp_root.path().join("pg-backups");
-        let cfg = fixtures.pg_s3_config(sample_installation_id(0x62), &schema, s3_cfg);
+        let mut cfg = fixtures.pg_s3_config(sample_installation_id(0x62), &schema, s3_cfg);
+        if let SqlBackendConfig::Postgres {
+            pool_size: configured,
+            ..
+        } = &mut cfg.sql
+        {
+            *configured = pool_size;
+        }
+
         let (store, runtime) = CanonicalRuntime::open(cfg.clone())
             .await
             .expect("open PG+S3");
@@ -537,6 +549,299 @@ impl BackendCase {
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn backup_test_space(byte: u8) -> CreateSpaceSpec {
+    CreateSpaceSpec {
+        space_id: sample_space_id(byte),
+        incarnation: sample_incarnation(byte),
+        root_folder_id: sample_folder_id(byte),
+        slug: format!("backup-{byte}"),
+        kind: SpaceKind::Personal,
+        owner: sample_principal_id(byte),
+        active_epoch: LeaseEpoch::new(1).unwrap(),
+        initial_last_seq: SpaceSeq::ZERO,
+        created_at: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backup_scope_ownership_and_remote_writer_admission() {
+    for case in [
+        BackendCase::open_sqlite().await,
+        BackendCase::open_pg_s3_with_pool(1).await,
+    ] {
+        let store = &case.store;
+        let budget = store.default_backup_budget();
+        let id = BackupId::from_bytes([0xA2; 16]);
+        let mut prepared = store
+            .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
+            .await
+            .unwrap();
+        assert!(
+            prepared.pause_writes().await.is_err(),
+            "a CAS hold must precede writer pause"
+        );
+        let hold = tokio::time::timeout(Duration::from_secs(5), prepared.acquire_hold())
+            .await
+            .expect("a prepared PostgreSQL source must leave the request pool available")
+            .unwrap();
+        assert!(prepared.acquire_hold().await.is_err());
+        let mut repeated = store
+            .prepare(maintenance_ctx(ServicePurpose::Backup), id, budget)
+            .await
+            .unwrap();
+        assert!(matches!(
+            repeated.acquire_hold().await,
+            Err(PortError::Unavailable(_))
+        ));
+        store.create_space(backup_test_space(0xB2)).await.unwrap();
+        let mut pause = prepared.pause_writes().await.unwrap();
+        assert!(matches!(
+            pause.open_cut().await,
+            Err(PortError::Unavailable(_))
+        ));
+        pause.resume().await.unwrap();
+        drop(hold.release()); // The caller can cancel even before the first poll.
+        let hold = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match repeated.acquire_hold().await {
+                    Ok(hold) => break hold,
+                    Err(PortError::Unavailable(_)) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                    Err(other) => panic!("unexpected readmission failure: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if !case.is_sqlite {
+            let (other, owner) = CanonicalRuntime::open(case.config.clone()).await.unwrap();
+            assert_eq!(
+                other
+                    .execute_diagnostic_read_sql_for_test(None, "SELECT COUNT(*) FROM backup_holds")
+                    .await
+                    .unwrap(),
+                1,
+                "remote startup must preserve a live owner"
+            );
+            let mut paused = repeated.pause_writes().await.unwrap();
+            let (started, waiting) = tokio::sync::oneshot::channel();
+            let remote_writer = other.clone();
+            let mut writer = tokio::spawn(async move {
+                started.send(()).unwrap();
+                remote_writer.create_space(backup_test_space(0xB3)).await
+            });
+            waiting.await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(80), &mut writer)
+                    .await
+                    .is_err()
+            );
+            let mut snapshot = paused.open_cut().await.unwrap();
+            assert_eq!(snapshot.witness().histories.len(), 1);
+            paused.resume().await.unwrap();
+            writer.await.unwrap().unwrap();
+            let receipt = snapshot
+                .spool(budget, Cancellation::default())
+                .await
+                .unwrap();
+            snapshot.close().await.unwrap();
+            assert!(matches!(
+                other.get_backup_artifact(&receipt.artifact).await,
+                Err(PortError::Unavailable(_))
+            ));
+            other.set_backup_spool_dir(case.spool_dir.clone());
+            let record = other.get_backup_artifact(&receipt.artifact).await.unwrap();
+            assert_eq!(record.digest, receipt.digest);
+            let undersized = notarium_canonical::backup::decode_postgres_spool_v1_bounded(
+                &record.artifact_path,
+                receipt.bytes - 1,
+            );
+            assert_validation_err(&undersized, ValidationReason::BudgetExceeded);
+            owner.shutdown().await.unwrap();
+        }
+        if case.is_sqlite {
+            let mut paused = repeated.pause_writes().await.unwrap();
+            let mut pinned = paused.open_cut().await.unwrap();
+            paused.resume().await.unwrap();
+            hold.release().await.unwrap();
+            assert!(pinned.spool(budget, Cancellation::default()).await.is_err());
+        } else {
+            hold.release().await.unwrap();
+        }
+        drop(repeated);
+        drop(prepared);
+        case.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_sqlite_cut_closes_its_source_on_deadline() {
+    let case = BackendCase::open_sqlite().await;
+    let budget = BackupBudget {
+        deadline: Duration::from_millis(200),
+        ..case.store.default_backup_budget()
+    };
+    let mut ready = case
+        .store
+        .prepare(
+            maintenance_ctx(ServicePurpose::Backup),
+            BackupId::from_bytes([0xA3; 16]),
+            budget,
+        )
+        .await
+        .unwrap();
+    let _hold = ready.acquire_hold().await.unwrap();
+    let mut pause = ready.pause_writes().await.unwrap();
+    let mut snapshot = pause.open_cut().await.unwrap();
+    pause.resume().await.unwrap();
+    assert_eq!(case.store.wal_telemetry().unwrap().active_backups, 1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while case.store.wal_telemetry().unwrap().active_backups != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the source must release WAL even when the caller never starts spool");
+    assert_validation_err(
+        &snapshot.spool(budget, Cancellation::default()).await,
+        ValidationReason::BudgetExceeded,
+    );
+    snapshot.close().await.unwrap();
+    drop(ready);
+    case.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_polled_spool_then_closing_waits_for_cleanup() {
+    for case in [
+        BackendCase::open_sqlite().await,
+        BackendCase::open_pg_s3().await,
+    ] {
+        let store = &case.store;
+        store.create_space(backup_test_space(0xB4)).await.unwrap();
+        let budget = store.default_backup_budget();
+        let mut prepared = store
+            .prepare(
+                maintenance_ctx(ServicePurpose::Backup),
+                BackupId::from_bytes([0xA4; 16]),
+                budget,
+            )
+            .await
+            .unwrap();
+        let _hold = prepared.acquire_hold().await.unwrap();
+        let mut pause = prepared.pause_writes().await.unwrap();
+        let mut snapshot = pause.open_cut().await.unwrap();
+        pause.resume().await.unwrap();
+        store.set_backup_step_delay_for_test(Duration::from_millis(200));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                snapshot.spool(budget, Cancellation::default())
+            )
+            .await
+            .is_err()
+        );
+        snapshot.close().await.unwrap();
+        let count = store
+            .execute_diagnostic_read_sql_for_test(None, "SELECT COUNT(*) FROM backup_artifacts")
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(
+            fs::read_dir(&case.spool_dir)
+                .unwrap()
+                .all(|e| e.unwrap().file_name() == ".spool-id")
+        );
+        if case.is_sqlite {
+            assert_eq!(store.wal_telemetry().unwrap().active_backups, 0);
+        }
+        drop(prepared);
+        case.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exit_during_backup_reconciles_the_hold_and_owned_artifact() {
+    const CHILD_ROOT: &str = "NOTARIUM_BACKUP_EXIT_TEST_ROOT";
+    let installation = sample_installation_id(0xD2);
+    if let Some(path) = env::var_os(CHILD_ROOT) {
+        let root = DataRoot::new(PathBuf::from(path));
+        let (store, _owner) =
+            CanonicalRuntime::open(CanonicalConfig::local_default(installation, root.clone()))
+                .await
+                .unwrap();
+        store.create_space(backup_test_space(0xD2)).await.unwrap();
+        let mut prepared = store
+            .prepare(
+                maintenance_ctx(ServicePurpose::Backup),
+                BackupId::from_bytes([0xD2; 16]),
+                store.default_backup_budget(),
+            )
+            .await
+            .unwrap();
+        let _hold = prepared.acquire_hold().await.unwrap();
+        let directory = root.staging().join("backups");
+        let pending = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "pending"))
+            .unwrap();
+        // Model the file rename just before publication's SQL COMMIT then exit without destructors.
+        fs::write(pending.with_extension("sqlite"), b"unacknowledged snapshot").unwrap();
+        std::process::exit(37);
+    }
+    let fixture = TempDataRoot::new("l4-exit-during-backup");
+    let root = fixture.data_root();
+    let status = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "exit_during_backup_reconciles_the_hold_and_owned_artifact",
+        ])
+        .env(CHILD_ROOT, root.root())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(37));
+    let directory = root.staging().join("backups");
+    assert!(
+        fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|ext| ext == "pending"))
+    );
+    {
+        let db = rusqlite::Connection::open_with_flags(
+            root.canonical(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM backup_holds", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    let (store, runtime) =
+        CanonicalRuntime::open(CanonicalConfig::local_default(installation, root))
+            .await
+            .unwrap();
+    assert_eq!(
+        store
+            .execute_diagnostic_read_sql_for_test(None, "SELECT COUNT(*) FROM backup_holds")
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        fs::read_dir(directory)
+            .unwrap()
+            .all(|e| e.unwrap().file_name() == ".spool-id")
+    );
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -809,6 +1114,18 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             spool_canon.digest
         );
 
+        let temporary = case.temp_root.path().join("alternate-spool-volume");
+        store.set_backup_spool_dir(temporary);
+        assert_eq!(
+            store
+                .get_backup_artifact(&spool_canon.artifact)
+                .await
+                .unwrap()
+                .artifact_path,
+            reg.artifact_path
+        );
+        store.set_backup_spool_dir(case.spool_dir.clone());
+
         if case.is_sqlite {
             assert_eq!(reg.encoding, BackupArtifactEncoding::SqliteSnapshotV1);
             // Source WAL must NOT remain pinned while `hold_canon` is still held for simulated slow CAS upload!
@@ -883,7 +1200,10 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             );
             let decoded = decode_postgres_spool_v1(&reg.artifact_path)
                 .expect("independent streaming decode of PostgresSpoolV1");
-            assert_eq!(decoded.tables.len(), 34);
+            assert_eq!(
+                decoded.tables.len(),
+                notarium_canonical::CANONICAL_TABLES.len()
+            );
             assert!(
                 decoded
                     .tables
@@ -1240,6 +1560,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             )
             .await
             .unwrap();
+        let p_c_hold = p_c.acquire_hold().await.unwrap();
         let mut pause_c = p_c.pause_writes().await.unwrap();
         let mut pause_k = p_k.pause_writes().await.unwrap();
         let snap_c = pause_c.open_cut().await.unwrap();
@@ -1248,6 +1569,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
         drop(snap_c);
         drop(pause_c);
         drop(pause_k);
+        p_c_hold.release().await.unwrap();
 
         // Verify writes immediately work again!
         let note_after_abort = NoteId::from_bytes([0x25; 16]);
@@ -1283,6 +1605,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             )
             .await
             .unwrap();
+        let prep_tiny_hold = prep_tiny.acquire_hold().await.unwrap();
         let mut paused_tiny = prep_tiny.pause_writes().await.unwrap();
         let mut snap_tiny = paused_tiny.open_cut().await.unwrap();
         paused_tiny.resume().await.unwrap();
@@ -1290,6 +1613,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             .spool(tiny_spool_budget, Cancellation::default())
             .await;
         assert_validation_err(&tiny_err, ValidationReason::BudgetExceeded);
+        prep_tiny_hold.release().await.unwrap();
 
         // BudgetExceeded: deadline = 8 ms under step delay = 25 ms
         store.set_backup_step_delay_for_test(Duration::from_millis(25));
@@ -1306,6 +1630,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             )
             .await
             .unwrap();
+        let prep_slow_hold = prep_slow.acquire_hold().await.unwrap();
         let mut paused_slow = prep_slow.pause_writes().await.unwrap();
         let mut snap_slow = paused_slow.open_cut().await.unwrap();
         paused_slow.resume().await.unwrap();
@@ -1313,6 +1638,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             .spool(tiny_time_budget, Cancellation::default())
             .await;
         assert_validation_err(&slow_err, ValidationReason::BudgetExceeded);
+        prep_slow_hold.release().await.unwrap();
 
         // Cancellation mid-spool
         let cancel_tok = Cancellation::default();
@@ -1325,6 +1651,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             )
             .await
             .unwrap();
+        let prep_can_hold = prep_can.acquire_hold().await.unwrap();
         let mut paused_can = prep_can.pause_writes().await.unwrap();
         let mut snap_can = paused_can.open_cut().await.unwrap();
         paused_can.resume().await.unwrap();
@@ -1333,6 +1660,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             cancel_bg.cancel();
         });
         let can_err = snap_can.spool(budget, cancel_tok).await;
+        prep_can_hold.release().await.unwrap();
         assert!(
             matches!(
                 can_err,
@@ -1358,6 +1686,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                 )
                 .await
                 .unwrap();
+            let prep_wal_hold = prep_wal.acquire_hold().await.unwrap();
             let mut paused_wal = prep_wal.pause_writes().await.unwrap();
             let mut snap_wal = paused_wal.open_cut().await.unwrap();
             paused_wal.resume().await.unwrap();
@@ -1394,6 +1723,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                 .spool(tiny_wal_budget, Cancellation::default())
                 .await;
             let _ = wal_writer.await;
+            prep_wal_hold.release().await.unwrap();
             assert_validation_err(&wal_err, ValidationReason::BudgetExceeded);
         } else {
             // Tightening the snapshot age at spool includes time spent idle after pin.
@@ -1405,6 +1735,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                 )
                 .await
                 .unwrap();
+            let _hold = prep.acquire_hold().await.unwrap();
             let mut paused = prep.pause_writes().await.unwrap();
             let mut snapshot = paused.open_cut().await.unwrap();
             paused.resume().await.unwrap();
@@ -1506,6 +1837,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     expected_lease: opened_sec.lease_epoch,
                     expected_lineage: opened_sec.lineage_epoch,
                     final_yrs_snapshot: Some(secret_token.as_bytes().to_vec()),
+                    compacted_through_update_seq: None,
                     carrier_settlement: None,
                 },
             )
@@ -1548,6 +1880,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             )
             .await
             .unwrap();
+        let prep_clean_hold = prep_clean.acquire_hold().await.unwrap();
         let mut paused_clean = prep_clean.pause_writes().await.unwrap();
         let mut snap_clean = paused_clean.open_cut().await.unwrap();
         paused_clean.resume().await.unwrap();
@@ -1556,6 +1889,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             .await
             .unwrap();
         snap_clean.close().await.unwrap();
+        prep_clean_hold.release().await.unwrap();
         let clean_rec = store
             .get_backup_artifact(&spool_clean.artifact)
             .await
@@ -1898,6 +2232,7 @@ async fn run_memory_subprocess_mode(mode: &str) {
                 )
                 .await
                 .unwrap();
+            let _hold = prep.acquire_hold().await.unwrap();
             let mut paused = prep.pause_writes().await.unwrap();
             let mut snap = paused.open_cut().await.unwrap();
             paused.resume().await.unwrap();
@@ -1995,6 +2330,7 @@ async fn run_memory_subprocess_mode(mode: &str) {
                 )
                 .await
                 .unwrap();
+            let _hold = prep.acquire_hold().await.unwrap();
             let mut paused = prep.pause_writes().await.unwrap();
             let mut snap = paused.open_cut().await.unwrap();
             paused.resume().await.unwrap();

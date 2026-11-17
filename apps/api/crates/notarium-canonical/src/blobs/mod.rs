@@ -138,15 +138,29 @@ pub struct PreparedBlobPart {
 /// Immutable, replayable prepared CAS payload computed before any external I/O.
 #[derive(Clone, Debug)]
 pub struct PreparedBlobSource {
-    pub digest: ContentDigest,
-    pub raw_size: u64,
-    pub codec: BlobCodecTag,
-    pub total_compressed_size: u64,
-    pub local_frame: Option<Arc<[u8]>>,
-    pub s3_parts: Vec<PreparedBlobPart>,
+    pub(crate) digest: ContentDigest,
+    pub(crate) raw_size: u64,
+    pub(crate) codec: BlobCodecTag,
+    pub(crate) total_compressed_size: u64,
+    pub(crate) local_frame: Option<Arc<[u8]>>,
+    pub(crate) s3_parts: Vec<PreparedBlobPart>,
 }
 
 impl PreparedBlobSource {
+    pub fn digest(&self) -> ContentDigest {
+        self.digest
+    }
+    pub fn raw_size(&self) -> u64 {
+        self.raw_size
+    }
+    pub fn compressed_size(&self) -> u64 {
+        self.total_compressed_size
+    }
+    #[cfg(feature = "test-support")]
+    pub fn s3_parts(&self) -> &[PreparedBlobPart] {
+        &self.s3_parts
+    }
+
     pub fn prepare(raw: &[u8], codec: BlobCodecTag) -> Result<Self, PortError> {
         let digest = ContentDigest::from_bytes(*blake3::hash(raw).as_bytes());
         let raw_size = raw.len() as u64;
@@ -331,13 +345,15 @@ pub fn decode_zstd_verified(
 
 #[derive(Clone, Debug)]
 pub struct StagedBlobTicket {
-    pub space_id: SpaceId,
-    pub digest: ContentDigest,
-    pub raw_size: u64,
-    pub compressed_size: u64,
-    pub publication_id: String,
-    pub codec: BlobCodecTag,
-    pub local_pending_dirs: PendingDirSyncs,
+    pub(crate) space_id: SpaceId,
+    incarnation: notarium_core::ids::HistoryIncarnation,
+    epoch: LeaseEpoch,
+    pub(crate) digest: ContentDigest,
+    pub(crate) raw_size: u64,
+    pub(crate) compressed_size: u64,
+    pub(crate) publication_id: String,
+    pub(crate) codec: BlobCodecTag,
+    pub(crate) local_pending_dirs: PendingDirSyncs,
     /// Retains the shared per-`(SpaceId, ContentDigest)` guard until outer Phase-2 commit/rollback drops it.
     pub(crate) _local_guard: Option<Arc<LocalSharedGuard>>,
     /// Key `(space_id, digest)` when this ticket requires a Wave-A local CAS durability barrier before SQL `COMMIT`.
@@ -347,6 +363,39 @@ pub struct StagedBlobTicket {
 }
 
 impl StagedBlobTicket {
+    pub fn digest(&self) -> ContentDigest {
+        self.digest
+    }
+    pub fn raw_size(&self) -> u64 {
+        self.raw_size
+    }
+    pub fn pending_directory_syncs(&self) -> &PendingDirSyncs {
+        &self.local_pending_dirs
+    }
+
+    pub fn publication_id(&self) -> &str {
+        &self.publication_id
+    }
+
+    pub(crate) fn check_authority(
+        &self,
+        scope: &HistoryScope,
+        epoch: LeaseEpoch,
+    ) -> Result<(), PortError> {
+        if self.space_id != scope.space_id {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+        if self.incarnation != scope.incarnation {
+            return Err(
+                DomainError::validation(ValidationReason::HistoryIncarnationMismatch).into(),
+            );
+        }
+        if self.epoch != epoch {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn requires_local_wave_barrier(&self) -> bool {
         self.deferred_local_key.is_some()
     }
@@ -827,6 +876,8 @@ impl crate::CanonicalStore {
         active_epoch: LeaseEpoch,
         prepared_items: &[PreparedBlobSource],
     ) -> Result<Vec<StagedBlobTicket>, PortError> {
+        self.inner
+            .check_writer_epoch(&scope.space_id, active_epoch)?;
         for item in prepared_items {
             if item.codec != self.blob_codec() {
                 return Err(internal_not_committed(
@@ -871,6 +922,8 @@ impl crate::CanonicalStore {
         active_epoch: LeaseEpoch,
         prepared: &PreparedBlobSource,
     ) -> Result<StagedBlobTicket, PortError> {
+        self.inner
+            .check_writer_epoch(&scope.space_id, active_epoch)?;
         if prepared.codec != self.blob_codec() {
             return Err(internal_not_committed(
                 "blob_codec_mismatch",
@@ -900,6 +953,8 @@ impl crate::CanonicalStore {
         active_epoch: LeaseEpoch,
         prepared: &PreparedBlobSource,
     ) -> Result<StagedBlobTicket, PortError> {
+        self.inner
+            .check_writer_epoch(&scope.space_id, active_epoch)?;
         if prepared.codec != self.blob_codec() {
             return Err(internal_not_committed(
                 "blob_codec_mismatch",
@@ -982,6 +1037,8 @@ impl crate::CanonicalStore {
 
                 Ok(StagedBlobTicket {
                     space_id: scope.space_id.clone(),
+                    incarnation: scope.incarnation,
+                    epoch: active_epoch,
                     digest,
                     raw_size,
                     compressed_size: comp_size,
@@ -1010,6 +1067,8 @@ impl crate::CanonicalStore {
         active_epoch: LeaseEpoch,
         prepared: &PreparedBlobSource,
     ) -> Result<StagedBlobTicket, PortError> {
+        self.inner
+            .check_writer_epoch(&scope.space_id, active_epoch)?;
         if prepared.codec != self.blob_codec() {
             return Err(internal_not_committed(
                 "blob_codec_mismatch",
@@ -1070,6 +1129,8 @@ impl crate::CanonicalStore {
                 let pub_id = new_prefixed_hex_id("pub_")?;
                 Ok(StagedBlobTicket {
                     space_id: scope.space_id.clone(),
+                    incarnation: scope.incarnation,
+                    epoch: active_epoch,
                     digest,
                     raw_size,
                     compressed_size: comp_size,
@@ -1134,6 +1195,8 @@ impl crate::CanonicalStore {
 
         Ok(StagedBlobTicket {
             space_id: scope.space_id.clone(),
+            incarnation: scope.incarnation,
+            epoch: active_epoch,
             digest,
             raw_size,
             compressed_size: comp_size,
@@ -1184,6 +1247,8 @@ impl crate::CanonicalStore {
             S3StageRegistration::ReusedActive { publication_id } => {
                 return Ok(StagedBlobTicket {
                     space_id: scope.space_id.clone(),
+                    incarnation: scope.incarnation,
+                    epoch: active_epoch,
                     digest: prepared.digest,
                     raw_size: prepared.raw_size,
                     compressed_size: prepared.total_compressed_size,
@@ -1228,6 +1293,8 @@ impl crate::CanonicalStore {
 
         Ok(StagedBlobTicket {
             space_id: scope.space_id.clone(),
+            incarnation: scope.incarnation,
+            epoch: active_epoch,
             digest: prepared.digest,
             raw_size: prepared.raw_size,
             compressed_size: prepared.total_compressed_size,
@@ -1304,6 +1371,8 @@ impl crate::CanonicalStore {
         reason: RetirementReason,
         purge_id: Option<&str>,
     ) -> Result<Vec<String>, PortError> {
+        self.inner
+            .check_writer_epoch(&scope.space_id, active_epoch)?;
         let mut unique_digests = BTreeSet::new();
         for d in digests {
             unique_digests.insert(*d);
@@ -1373,9 +1442,8 @@ impl crate::CanonicalStore {
         active_epoch: LeaseEpoch,
         retirement_id: &str,
     ) -> Result<(), PortError> {
-        if let BlobBackendDriver::S3(s3) = &self.inner.blobs {
-            s3.verify_runtime_bucket_mode().await?;
-        }
+        self.inner
+            .check_writer_epoch(&scope.space_id, active_epoch)?;
 
         let scope_cl = scope.clone();
         let ret_cl = retirement_id.to_owned();
@@ -1385,18 +1453,23 @@ impl crate::CanonicalStore {
                 let ret_in = ret_cl.clone();
                 Box::pin(async move {
                     lock_and_check_space_tx(tx, &scope_in, active_epoch).await?;
-                    ensure_no_backup_holds_tx(tx, &scope_in.space_id).await?;
-                    load_pending_retirement_targets_tx(
-                        tx,
-                        &scope_in.space_id,
-                        active_epoch,
-                        &ret_in,
-                    )
-                    .await
+                    let result =
+                        load_pending_retirement_targets_tx(tx, &scope_in, active_epoch, &ret_in)
+                            .await?;
+                    if !result.1.is_empty() {
+                        ensure_no_backup_holds_tx(tx, &scope_in.space_id).await?;
+                    }
+                    Ok(result)
                 })
             })
             .await?;
 
+        if targets.is_empty() {
+            return Ok(());
+        }
+        if let BlobBackendDriver::S3(s3) = &self.inner.blobs {
+            s3.verify_runtime_bucket_mode().await?;
+        }
         for target in targets {
             if target.target_completed {
                 continue;
@@ -1409,13 +1482,34 @@ impl crate::CanonicalStore {
                     // Re-verify zero refs & zero holds while holding exclusive local guard!
                     let scope_chk = scope.clone();
                     let digest = target.digest;
-                    self.with_read_tx(|tx| {
-                        Box::pin(async move {
-                            ensure_no_backup_holds_tx(tx, &scope_chk.space_id).await?;
-                            ensure_zero_reachable_refs_tx(tx, &scope_chk.space_id, digest).await
+                    let target_retirement = retirement_id.to_owned();
+                    let still_pending = self
+                        .with_read_tx(|tx| {
+                            Box::pin(async move {
+                                let space = load_space_record(tx, &scope_chk.space_id).await?;
+                                space.scope.check(&scope_chk)?;
+                                if space.active_epoch != active_epoch {
+                                    return Err(DomainError::validation(
+                                        ValidationReason::InvalidAuthority,
+                                    )
+                                    .into());
+                                }
+                                let current =
+                                    pending_retirement_for_digest_tx(tx, &scope_chk, digest)
+                                        .await?;
+                                if current.as_deref() != Some(target_retirement.as_str()) {
+                                    return Ok(false);
+                                }
+                                ensure_no_backup_holds_tx(tx, &scope_chk.space_id).await?;
+                                ensure_zero_reachable_refs_tx(tx, &scope_chk.space_id, digest)
+                                    .await?;
+                                Ok(true)
+                            })
                         })
-                    })
-                    .await?;
+                        .await?;
+                    if !still_pending {
+                        continue;
+                    }
 
                     local.delete_physical_file(&scope.space_id, target.digest)?;
                     drop(guard);
@@ -1456,6 +1550,27 @@ impl crate::CanonicalStore {
                         &marker,
                     )
                     .await?;
+                }
+                (BlobBackendDriver::S3(_), BlobCodecTag::LocalZstdV1)
+                    if target.publication_id == "local_unstaged" =>
+                {
+                    // Older duplicate GC attempts recorded a local placeholder after every S3
+                    // publication had already been retired. Accept only that proven empty case.
+                    let scope_done = scope.clone();
+                    let ret_done = retirement_id.to_owned();
+                    self.with_write_tx(|tx| Box::pin(async move {
+                        lock_and_check_space_tx(tx, &scope_done, active_epoch).await?;
+                        const OWNERS: &str = "SELECT COUNT(*), COUNT(*) FILTER (WHERE codec <> 's3_chunked_v1' OR state <> 'retired')
+                            FROM blob_publications WHERE space_id = $1 AND content_blake3 = $2";
+                        let (total, mismatches): (i64, i64) = match tx {
+                            BackendConn::Sqlite(conn) => sqlx::query_as(OWNERS).bind(scope_done.space_id.as_str()).bind(target.digest.as_bytes().as_slice()).fetch_one(&mut **conn).await,
+                            BackendConn::Postgres(conn) => sqlx::query_as(OWNERS).bind(scope_done.space_id.as_str()).bind(target.digest.as_bytes().as_slice()).fetch_one(&mut **conn).await,
+                        }.map_err(|err| internal_not_committed("verify_empty_retirement",err.to_string()))?;
+                        if total == 0 || mismatches != 0 {
+                            return Err(internal_not_committed("retirement_backend_mismatch", "local placeholder lacks a retired S3 publication history"));
+                        }
+                        mark_retirement_target_completed_tx(tx, &scope_done.space_id, &ret_done, &target.publication_id, target.part_index).await
+                    })).await?;
                 }
                 _ => {
                     return Err(internal_not_committed(
@@ -1960,10 +2075,12 @@ async fn confirm_s3_part_uploaded_tx(
 /// Activates a staged blob ticket and binds an explicit `blob_references` row inside Phase 2 SQL tx.
 pub(crate) async fn activate_and_bind_blob_ref_tx(
     tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
     active_epoch: LeaseEpoch,
     claim: &BlobReferenceClaim,
     created_seq: SpaceSeq,
 ) -> Result<(), PortError> {
+    claim.ticket.check_authority(scope, active_epoch)?;
     let now_ms = now_unix_ms()?;
     let epoch_i64 = active_epoch.get() as i64;
     let space_id = &claim.ticket.space_id;
@@ -3193,6 +3310,36 @@ async fn load_s3_manifest_parts_tx(
     Ok(out)
 }
 
+async fn pending_retirement_for_digest_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    digest: ContentDigest,
+) -> Result<Option<String>, PortError> {
+    const SQL: &str = "SELECT r.retirement_id FROM blob_retirements r
+        JOIN blob_retirement_targets t ON t.space_id = r.space_id AND t.retirement_id = r.retirement_id
+        WHERE r.space_id = $1 AND r.history_incarnation = $2 AND t.content_blake3 = $3 AND r.status = 'pending'
+        ORDER BY r.created_at_ms, r.retirement_id LIMIT 1";
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_scalar(SQL)
+                .bind(scope.space_id.as_str())
+                .bind(scope.incarnation.as_bytes().as_slice())
+                .bind(digest.as_bytes().as_slice())
+                .fetch_optional(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_scalar(SQL)
+                .bind(scope.space_id.as_str())
+                .bind(scope.incarnation.as_bytes().as_slice())
+                .bind(digest.as_bytes().as_slice())
+                .fetch_optional(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|err| internal_not_committed("find_pending_digest_retirement", err.to_string()))
+}
+
 pub(crate) async fn initiate_digest_retirement_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
@@ -3208,99 +3355,13 @@ pub(crate) async fn initiate_digest_retirement_tx(
         return Ok(None);
     }
 
+    if let Some(pending) = pending_retirement_for_digest_tx(tx, scope, digest).await? {
+        return Ok(Some(pending));
+    }
+
     let now_ms = now_unix_ms()?;
     let ret_id = new_prefixed_hex_id("ret_")?;
     let epoch_i64 = active_epoch.get() as i64;
-
-    // Check if catalog entry exists.
-    let cat_exists: Option<String> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT admission_state FROM blob_catalog WHERE space_id = ? AND content_blake3 = ?",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(digest.as_bytes().as_slice())
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_retire_cat_check", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT admission_state FROM blob_catalog WHERE space_id = $1 AND content_blake3 = $2",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(digest.as_bytes().as_slice())
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_retire_cat_check", err.to_string()))?,
-    };
-    if cat_exists.is_none() {
-        let Some(local) = local_store else {
-            return Ok(None);
-        };
-        if !local.has_physical_file(&scope.space_id, digest)? {
-            return Ok(None);
-        }
-        match tx {
-            BackendConn::Sqlite(conn) => {
-                sqlx::query(
-                    "INSERT INTO blob_catalog (
-                        space_id, content_blake3, raw_size, compressed_size, ref_count,
-                        current_publication_id, admission_state, blob_state, touched_at_ms
-                    ) VALUES (?, ?, 0, 0, 0, NULL, 'retiring', 'staging', ?)",
-                )
-                .bind(scope.space_id.as_str())
-                .bind(digest.as_bytes().as_slice())
-                .bind(now_ms)
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("sqlite_insert_retiring_cat", err.to_string())
-                })?;
-            }
-            BackendConn::Postgres(conn) => {
-                sqlx::query(
-                    "INSERT INTO blob_catalog (
-                        space_id, content_blake3, raw_size, compressed_size, ref_count,
-                        current_publication_id, admission_state, blob_state, touched_at_ms
-                    ) VALUES ($1, $2, 0, 0, 0, NULL, 'retiring', 'staging', $3)",
-                )
-                .bind(scope.space_id.as_str())
-                .bind(digest.as_bytes().as_slice())
-                .bind(now_ms)
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| internal_not_committed("pg_insert_retiring_cat", err.to_string()))?;
-            }
-        }
-    }
-
-    // Close admission on catalog and clear current_publication_id.
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query(
-                "UPDATE blob_catalog
-                 SET admission_state = 'retiring', current_publication_id = NULL, ref_count = 0, touched_at_ms = ?
-                 WHERE space_id = ? AND content_blake3 = ?",
-            )
-            .bind(now_ms)
-            .bind(scope.space_id.as_str())
-            .bind(digest.as_bytes().as_slice())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_close_cat_adm", err.to_string()))?;
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "UPDATE blob_catalog
-                 SET admission_state = 'retiring', current_publication_id = NULL, ref_count = 0, touched_at_ms = $1
-                 WHERE space_id = $2 AND content_blake3 = $3",
-            )
-            .bind(now_ms)
-            .bind(scope.space_id.as_str())
-            .bind(digest.as_bytes().as_slice())
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_close_cat_adm", err.to_string()))?;
-        }
-    }
 
     // Collect all non-retired publications (`staging`, `active`, `retiring`) for this digest.
     let pubs: Vec<(String, String)> = match tx {
@@ -3343,6 +3404,79 @@ pub(crate) async fn initiate_digest_retirement_tx(
                 .collect()
         }
     };
+
+    // A local staging operation may have published its file before allocating SQL metadata.
+    // In S3 every physical key belongs to a registered publication.
+    if pubs.is_empty() {
+        let Some(local) = local_store else {
+            return Ok(None);
+        };
+        if !local.has_physical_file(&scope.space_id, digest)? {
+            return Ok(None);
+        }
+        match tx {
+            BackendConn::Sqlite(conn) => {
+                sqlx::query(
+                    "INSERT INTO blob_catalog (
+                        space_id, content_blake3, raw_size, compressed_size, ref_count,
+                        current_publication_id, admission_state, blob_state, touched_at_ms
+                    ) VALUES (?, ?, 0, 0, 0, NULL, 'retiring', 'staging', ?) ON CONFLICT (space_id, content_blake3) DO NOTHING",
+                )
+                .bind(scope.space_id.as_str())
+                .bind(digest.as_bytes().as_slice())
+                .bind(now_ms)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("sqlite_insert_retiring_cat", err.to_string())
+                })?;
+            }
+            BackendConn::Postgres(conn) => {
+                sqlx::query(
+                    "INSERT INTO blob_catalog (
+                        space_id, content_blake3, raw_size, compressed_size, ref_count,
+                        current_publication_id, admission_state, blob_state, touched_at_ms
+                    ) VALUES ($1, $2, 0, 0, 0, NULL, 'retiring', 'staging', $3) ON CONFLICT (space_id, content_blake3) DO NOTHING",
+                )
+                .bind(scope.space_id.as_str())
+                .bind(digest.as_bytes().as_slice())
+                .bind(now_ms)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_insert_retiring_cat", err.to_string()))?;
+            }
+        }
+    }
+
+    // Close admission on catalog and clear current_publication_id.
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query(
+                "UPDATE blob_catalog
+                 SET admission_state = 'retiring', current_publication_id = NULL, ref_count = 0, touched_at_ms = ?
+                 WHERE space_id = ? AND content_blake3 = ?",
+            )
+            .bind(now_ms)
+            .bind(scope.space_id.as_str())
+            .bind(digest.as_bytes().as_slice())
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_close_cat_adm", err.to_string()))?;
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query(
+                "UPDATE blob_catalog
+                 SET admission_state = 'retiring', current_publication_id = NULL, ref_count = 0, touched_at_ms = $1
+                 WHERE space_id = $2 AND content_blake3 = $3",
+            )
+            .bind(now_ms)
+            .bind(scope.space_id.as_str())
+            .bind(digest.as_bytes().as_slice())
+            .execute(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_close_cat_adm", err.to_string()))?;
+        }
+    }
 
     // Seal all candidate publications into `retiring`.
     match tx {
@@ -3572,57 +3706,37 @@ async fn insert_retirement_target_tx(
 #[allow(clippy::type_complexity)]
 async fn load_pending_retirement_targets_tx(
     tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
+    scope: &HistoryScope,
     active_epoch: LeaseEpoch,
     retirement_id: &str,
 ) -> Result<(RetirementReason, Vec<RetirementTargetRow>), PortError> {
-    let epoch_i64 = active_epoch.get() as i64;
+    let space_id = &scope.space_id;
+    const ADOPT: &str = "UPDATE blob_retirements
+        SET owner_epoch = CASE WHEN status = 'pending' THEN $1 ELSE owner_epoch END
+        WHERE space_id = $2 AND history_incarnation = $3 AND retirement_id = $4 RETURNING reason, status";
+    let epoch = active_epoch.get() as i64;
+    let incarnation = scope.incarnation.as_bytes().as_slice();
     let reason_raw: Option<(String, String)> = match tx {
         BackendConn::Sqlite(conn) => {
-            let r = sqlx::query(
-                "SELECT reason, status FROM blob_retirements WHERE space_id = ? AND retirement_id = ?",
-            )
-            .bind(space_id.as_str())
-            .bind(retirement_id)
-            .fetch_optional(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_load_ret_hdr", err.to_string()))?;
-            if r.is_some() {
-                sqlx::query(
-                    "UPDATE blob_retirements SET owner_epoch = ? WHERE space_id = ? AND retirement_id = ?",
-                )
-                .bind(epoch_i64)
+            sqlx::query_as(ADOPT)
+                .bind(epoch)
                 .bind(space_id.as_str())
+                .bind(incarnation)
                 .bind(retirement_id)
-                .execute(&mut **conn)
+                .fetch_optional(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("sqlite_adopt_ret", err.to_string()))?;
-            }
-            r.map(|row| (row.get("reason"), row.get("status")))
         }
         BackendConn::Postgres(conn) => {
-            let r = sqlx::query(
-                "SELECT reason, status FROM blob_retirements WHERE space_id = $1 AND retirement_id = $2",
-            )
-            .bind(space_id.as_str())
-            .bind(retirement_id)
-            .fetch_optional(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_load_ret_hdr", err.to_string()))?;
-            if r.is_some() {
-                sqlx::query(
-                    "UPDATE blob_retirements SET owner_epoch = $1 WHERE space_id = $2 AND retirement_id = $3",
-                )
-                .bind(epoch_i64)
+            sqlx::query_as(ADOPT)
+                .bind(epoch)
                 .bind(space_id.as_str())
+                .bind(incarnation)
                 .bind(retirement_id)
-                .execute(&mut **conn)
+                .fetch_optional(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("pg_adopt_ret", err.to_string()))?;
-            }
-            r.map(|row| (row.get("reason"), row.get("status")))
         }
-    };
+    }
+    .map_err(|err| internal_not_committed("adopt_blob_retirement", err.to_string()))?;
 
     let Some((reason_str, status_str)) = reason_raw else {
         return Err(DomainError::ResourceNotFound.into());
@@ -3712,6 +3826,12 @@ async fn load_pending_retirement_targets_tx(
         }
     };
 
+    if raw_targets.is_empty() {
+        return Err(internal_not_committed(
+            "missing_retirement_targets",
+            "pending blob retirement has no registered targets",
+        ));
+    }
     let mut targets = Vec::with_capacity(raw_targets.len());
     for (pub_id, p_idx, d_bytes, c_str, key, mv, vids_json, vd, tc) in raw_targets {
         let arr: [u8; 32] = d_bytes
@@ -3830,6 +3950,27 @@ async fn finalize_retirement_tx(
     space_id: &SpaceId,
     retirement_id: &str,
 ) -> Result<(), PortError> {
+    const PENDING: &str = "SELECT retirement_id FROM blob_retirements WHERE space_id = $1 AND retirement_id = $2 AND status = 'pending'";
+    let pending: Option<String> = match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_scalar(PENDING)
+                .bind(space_id.as_str())
+                .bind(retirement_id)
+                .fetch_optional(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_scalar(PENDING)
+                .bind(space_id.as_str())
+                .bind(retirement_id)
+                .fetch_optional(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|err| internal_not_committed("check_retirement_status", err.to_string()))?;
+    if pending.is_none() {
+        return Ok(());
+    }
     let incomplete: i64 = match tx {
         BackendConn::Sqlite(conn) => sqlx::query_scalar(
             "SELECT COUNT(*) FROM blob_retirement_targets

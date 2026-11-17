@@ -20,13 +20,20 @@ same behavioral parity suites:
   `spaces` and `fillfactor = 80` on `note_heads` to preserve PostgreSQL HOT
   updates without indexing `last_seq` or `updated_seq`) paired with
   `S3ChunkedV1` over `rustls` (`ring`) and pure-Rust `AWS4-HMAC-SHA256`.
+  PostgreSQL TCP connections verify the server certificate against WebPKI trust
+  roots and match its identity to the configured host, including loopback.
+  Set the TCP transport's `root_cert` field to a PEM CA file to trust a private
+  issuer. Local PostgreSQL fixtures connect through a Unix socket.
 
 `CanonicalRuntime::open` acquires lifetime `DataRootOwnerLock` guards where
 local storage is used, verifies or bootstraps the schema transactionally,
 reconciles interrupted collaboration room fences and resumes any interrupted
 purge closure before returning `(CanonicalStore, CanonicalRuntime)`.
 `CanonicalStore` is a cloneable handle that never exposes raw SQL pools or
-connections. It implements `NoteWritePort`, `ChatPort`, `ContentJobPort`,
+connections. Integration tests use a development dependency on their own package
+to enable the `test-support` Cargo feature for raw diagnostics and fault injection.
+The store implements
+`NoteWritePort`, `ChatPort`, `ContentJobPort`,
 `ChangeBroadcast` and `BackupParticipantPort`, alongside canonical point reads
 (`get_note`, `hydrate_cards`, `read_ability_resource`, `read_changes`,
 `recent_activity`), `move_board_card`, `rollback_agent_run`,
@@ -34,13 +41,51 @@ connections. It implements `NoteWritePort`, `ChatPort`, `ContentJobPort`,
 planning (`NoteReadPort::list_notes`), `ViewGraphPort` and `SearchPort` remain
 owned by downstream projection and search crates.
 
+In PostgreSQL, creating a Space grants its initial writer epoch to the
+provisioning runtime. Opening an existing database permits reads. To take over
+writes after a restart or failover, the trusted lease owner calls
+`advance_space_lease` with `ServicePurpose::Revocation` and an epoch greater
+than the persisted one. The successful transition grants that epoch to the
+calling runtime and resumes pending storage erasure for the Space. A restore
+grants the epoch of the new history to its restoring runtime. A process that
+lost its grant must obtain a new one before writing again. Local SQLite
+recovers writes under its exclusive DataRoot owner lock.
+
 ## Dual-dialect schema and history model
 
-Both SQL dialects materialize the same 34 ordinary B-tree tables under schema
-version `1` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+Both SQL dialects materialize the same ordinary B-tree tables in schema
+version `2` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
+
+The canonical store implements `ControlCatalogPort`. Account provisioning and
+lifecycle changes store a compact receipt keyed by owner, actor and command key
+in the transaction that changes the Space. Receipts retain the request digest
+and resulting Space identity, history and cutoff, including after restart.
+The caller can replay a pending control operation after losing the canonical
+response. Reusing the key with a different payload is rejected. Rebinding a
+Space's history invalidates receipts issued for its earlier incarnation.
+
+Catalog reads use current grants and canonical folder ancestry. Keyset cursors
+bind the catalog revision and filters. Account and project memory categories
+identify stable AgentMemory notes in the personal root or project folder.
+Published ability manifests expose up to 256 auxiliary names of at most 1024
+UTF-8 bytes each. Catalog lookups return metadata and keep branch taint unchanged.
+
+Upgrading the recognized version 1 manifest adds the receipt ledger and queued
+chat-input provenance in one transaction. Existing pending private inputs are
+conservatively marked as externally tainted and consumed input bodies are cleared.
+The upgrade preserves existing command hashes and responses. Both note-write
+entry points can return the original receipt for a version 1 create or edit.
+For an old batch create, the immutable creation revision supplies the parent
+and document class omitted from its hash. For an edit, the store validates
+the patch against its recorded base and checks the resulting content digest.
+The old batch format identifies the edit by its note and before/after digests.
+A supplied revision must match the recorded parent revision. Old edits have
+no witness for lease or lineage preconditions, so a retry that supplies either
+is rejected. Replaying a retained receipt requires current authorization and
+the historical evidence above. The note head keeps its current revision.
 
 - **Scoped history:** Every Space owns `(SpaceId, HistoryIncarnation)` and a
   stable root `FolderId` (`parent = None` normalizes to `root_folder_id`).
@@ -57,6 +102,9 @@ migration states fail closed.
   ID-only envelopes across `[1, last_seq]`. Bounded semantic overlays
   (`EffectEnvelopeV1`, at most 8 notes and `<= 64 KiB`) live in erasable
   `change_payloads` indexed by `payload_owners (space_id, payload_kind, payload_id, note_id)`.
+- PostgreSQL subscribers check their Space's durable head once per second while
+  waiting for a notice. Local commits still wake subscribers immediately. A
+  changed incarnation or erased payload directs the subscriber to resynchronize.
 - **Trailing large BLOBs:** `collab_sessions` places `yrs_snapshot_blob` as the
   final column so room-state and lease precondition checks read inline tuple
   headers without traversing overflow pages.
@@ -80,7 +128,9 @@ rejection on every component):
 
 Reads verify regular-file metadata, compressed frame integrity, uncompressed
 byte length and full `BLAKE3` digest; unreferenced corrupt staging remnants are
-quarantined under `blobs/.quarantine/`.
+quarantined under `blobs/.quarantine/<space_id>.<digest>.corrupt`. Retirement
+erases the live file and its quarantined copy. A directory enters the shard cache
+only after its parent directory has been synced.
 
 ### `S3ChunkedV1`
 
@@ -90,7 +140,7 @@ retirements and re-uploads never collide:
 - Raw payloads are split into independently Zstd-3-compressed chunks of at most
   `4 MiB` raw bytes (an empty payload produces one valid 0-byte Zstd frame).
 - Each publication receives a unique `publication_id` and registers immutable
-  part keys (`<prefix>/spaces/<space_id>/pubs/<pub_id>/part-<idx>.zst`) in
+  part keys (`<prefix>spaces/<space_id>/cas-v1/<publication_id>/<part_index>`) in
   PostgreSQL *before* issuing external `PUT` requests.
 - Every data `PUT` requires `If-None-Match: *` with signed `Content-Length` and
   `x-amz-content-sha256`. Multipart upload APIs and `CopyObject` are never used.
@@ -106,6 +156,14 @@ retirements and re-uploads never collide:
   `Enabled` buckets—enumerates `ListObjectVersions` to issue exact `versionId`
   `DELETE` calls for prior data versions while preserving the terminal marker.
 
+If versioning changes during retirement, the operation stays pending. After a
+restart with the detected `Enabled` mode, the writer resumes from the durable
+retirement record and verifies removal of every data version. Objects written
+before versioning was enabled can have the explicit S3 version ID `null`; their
+removal uses `DELETE ?versionId=null` and preserves the terminal marker.
+An explicit never-versioned policy requires reconfiguration before takeover of
+a bucket that has since enabled versioning.
+
 ### `Purge` and `MintAndPurge`
 
 Irreversible erasure executes as a crash-recoverable 3-phase protocol:
@@ -120,8 +178,10 @@ Irreversible erasure executes as a crash-recoverable 3-phase protocol:
    continuity), sanitize `command_receipts`, and complete local unlink +
    `secure_delete = ON` overwrite or S3 retirement fencing.
 3. Mark `pending_purges` completed (`revision_purge_fences` remain permanently
-   enforced ahead of historical reads, cold seeds and card hydration). Startup
-   automatically finishes phase 2/3 if a process crashed mid-purge.
+   enforced ahead of historical reads, cold seeds and card hydration). SQLite
+   startup resumes pending purges and standalone blob retirements. For an
+   existing PostgreSQL Space, the incoming writer must acquire a higher epoch
+   with `advance_space_lease`; that call resumes pending work before returning.
 
 Shared blobs that remain referenced by independent live notes or chat entries
 retain their active references, and historical external backups created prior to
@@ -170,9 +230,11 @@ same example against an isolated prefix.
   with a monotonic `< 250 ms` progress-handler deadline (`248 ms` default) and
   guaranteed worker-snapshot rollback/close if a caller drops its future. A
   background loop runs `PASSIVE` checkpoints during idle ticks (`15 ms` cadence)
-  and executes a `< 250 ms` reader-gated `RESTART`/`TRUNCATE` reset when WAL
-  growth crosses operational watermarks (`512 MiB` soft / `896 MiB` high,
-  retaining `64 MiB` `journal_size_limit` at idle).
+  and uses a 250 ms budget to drain readers and acquire the writer for a
+  `RESTART`/`TRUNCATE` checkpoint (512 MiB soft / 896 MiB high watermarks).
+  Once the filesystem flush starts, SQLite holds the gate until I/O completes.
+  `WalTelemetrySnapshot.max_reset_reader_gate_ns` records the longest actual
+  closure and `reset_gate_overruns` counts closures over budget.
 - **Hierarchy, boards and semantic rollback:** `MoveFolder` updates only the
   moved folder row (`0` descendant row writes) under cycle checks and per-Space
   serialization. `move_board_card` maintains `<= 16`-byte `sort_rank_lexo` keys
@@ -182,6 +244,15 @@ same example against an isolated prefix.
   before planning, simulates inverse board moves in reverse command order over
   recorded semantic before-anchors, and applies `Trash`-first slug deconfliction
   atomically.
+- **Collaboration room ownership.** A PostgreSQL writer takeover fences active
+  rooms in the same transaction that advances the Space writer epoch. The
+  successor can reopen a fenced room with its new lease and replay its durable
+  updates. Checkpoint and close compact the update log only when the caller
+  supplies a snapshot and its inclusive `compacted_through_update_seq`. Omitting
+  the watermark preserves the log, including updates accepted before a close.
+- **Job pagination.** `list_jobs` binds each cursor to the original Space cut.
+  Continuation returns `CursorStale` if the cut advances or a heartbeat changes
+  progress visible to the query. Consumers can open a new read at the current cut.
 - **Chat DAG and pending queue:** `chat_entries` stores `<= 512`-byte UTF-8
   messages inline and `> 512`-byte payloads in verified CAS (`stage_chat_blob`),
   maintaining deterministic skip pointers at `depth - 16` and `depth - 256` so
@@ -190,21 +261,18 @@ same example against an isolated prefix.
   without a mutation receipt on the 17th item). `redact_chat_entry` erases
   target entry content while preserving DAG ancestry and invalidating only
   descendant `Compaction` entries; `tainted` is monotonic and irreversible.
-- **Paired backup (`BackupParticipantPort`):** `prepare` opens backup resources
-  outside the writer pause (spawning a dedicated `rusqlite` backup owner thread
-  for `SQLiteSnapshotV1` or pre-warming `PREPARE __notarium_pin_witness_v1` on a
-  dedicated PostgreSQL connection for `PostgresSpoolV1`). `pause_writes` +
-  `open_cut` pins database snapshots before resuming writers. The paired pause
-  target is p95 below 1 ms. `SQLiteSnapshotV1` copies `16` pages per
-  step while monitoring pinned-WAL (`256 MiB` default), deadline (`30 s`) and
-  spool (`8 GiB`) budgets; `PostgresSpoolV1` streams `NO SCROLL CURSOR` rows via
-  `FETCH 1` and `substr` slices `<= 64 KiB` within `<= 8 MiB` working buffers.
-  Holds protect source CAS objects through copy. Both canonical formats publish
-  an empty `backup_holds` table. PostgreSQL retains its V1 table frame.
-- **Canonical restore.** Open the materialized backup with its CAS objects. Before
-  serving reads or writes, rebind each restored Space to a fresh history at its
-  stored `last_seq`. A smaller or larger cutoff returns `InvalidCutoff` for the
-  entire request. To recover an earlier state, materialize the backup at that height.
+- **Paired backup (`BackupParticipantPort`).** Prepare both participants and acquire
+  their holds before pausing control, then canonical. PostgreSQL uses a dedicated
+  connection to fence writers across runtimes sharing the canonical schema. Pin
+  both snapshots before resuming either writer. A Space created between hold
+  acquisition and pin requires a new backup attempt. Keep the canonical hold
+  through the CAS copy. Source-local holds expire with their owner and are omitted
+  from restored data. SQLite copies 16 pages per step and releases an idle cut
+  when its deadline or WAL retention budget expires. PostgreSQL streams cursor
+  rows in slices of up to 64 KiB. Both participants release their source after
+  durable spool or abort. A canonical artifact ID resolves on its original spool
+  volume, where lookup checks file size and BLAKE3 before returning the path.
+  Startup reconciles abandoned holds and pending local artifacts.
 
 ## Offline fixture lifecycle and attributed benchmarks
 
@@ -217,33 +285,36 @@ mounted over `.artifacts/storage-tests/<run>/` Unix domain sockets and tears it
 down automatically via signal/exit traps. Integration tests fail closed if
 fixtures are absent.
 
-To run the attributed `--release` storage benchmark suite and write
-`.artifacts/3-storage-cas/d3-benchmarks.json`:
+The test and benchmark commands hold one checkout-wide fixture lock from startup
+through cleanup. Other checkouts can run independently.
+
+### Reproduce the storage measurements
+
+Run the full release suite with
 
 ```sh
-sh .devkit/runtime/devkit.sh cli exec --component apps/api --write --network none -- \
-  cargo build --offline --locked --release -p notarium-canonical --example d3_benchmarks
-sh docker/storage-fixtures/with-storage-fixtures.sh exec-custom \
-  sh .devkit/runtime/devkit.sh cli exec --component apps/api --write --network none -- \
-  ./target/release/examples/d3_benchmarks --output /workspace/.artifacts/3-storage-cas/d3-benchmarks.json
+sh docker/storage-fixtures/with-storage-fixtures.sh benchmark
 ```
 
-### Attributed `--release` reference results
+The command builds `fitness-gates` with the `storage-bench` feature, checks the
+source tree before and after measurement, and writes
+`.artifacts/3-storage-cas/d3-benchmarks-<tree>.json`. Use
+`benchmark --smoke` for a shorter diagnostic run or `benchmark --paired-only`
+to measure just the paired backup participants. A run with uncommitted source
+records the exact Git tree and base commit. Its `git_commit` is null.
+The JSON records launcher and
+benchmark-container cgroup limits separately, alongside observed PostgreSQL
+socket round-trip latency, filesystem, database settings, cardinalities and
+p50/p95/p99. An unavailable controller is recorded as `unknown`. A completed measurement that misses a target writes a report
+with `FAIL` and returns a nonzero status.
 
-Measured on Linux `6.8.0-147-generic` x86_64 (`8` CPU / `16 GiB` cgroup quota,
-`ext4` virtual block volume, `SQLite` `synchronous = FULL` (`2`), `PostgreSQL 16`
-`synchronous_commit = on` over local UDS, `MinIO CE` `9e49d5e7a648` over local
-UDS bridge, `4 KiB` unique note carriers):
-
-| Workload | Target | Measured result |
-| --- | --- | --- |
-| Writer `50w / 0r` (`10s` warmup + `30s` measured, 3 runs) | `> 2,000 mut/s`, `0` `SQLITE_BUSY` | `2,153.5`, `2,247.2`, `2,286.1 mut/s` (`p95 = 25.1–32.5 ms`, `Phase-2 p95 = 20.2–24.2 ms`, `0` `SQLITE_BUSY`) |
-| Writer mixed `50w / 200r` (`10s` warmup + `30s` measured, 3 runs) | `> 2,000 mut/s`, `0` `SQLITE_BUSY` | `2,219.6`, `2,190.4`, `2,004.8 mut/s` (`133,958–151,799` concurrent verified reads/run, `0` `SQLITE_BUSY`) |
-| Rollback 20-entity microfixture (`1,000` independent resets) | `p95 < 5,000 us` (local CAS) | `SQLite+Local`: `p50 = 3,190.9 us`, `p95 = 3,724.4 us`; `PG16+Local`: `p50 = 3,504.6 us`, `p95 = 4,167.6 us`; `PG16+S3 (UDS, 200 resets)`: `p50 = 3,687.9 us`, `p95 = 4,371.9 us` |
-| Chat 50-entry branch window in `10,000`-turn linear & branched DAG (`10,000` reads) | `p95 < 1,000 us`, `0` writes | `SQLite`: `p95 = 226.3 us` (linear) / `227.0 us` (branched), `0` writes; `PG16`: `p95 = 509.6 us` (linear) / `503.2 us` (branched), `0` writes |
-| Board `10,000` consecutive first-slot moves | `rank <= 16 B` | `max_rank = 12 B` (`324` windowed PMA rebalances, mean `1.62` overlays/move; `SQLite p95 = 9.42 ms`, `PG16 p95 = 16.20 ms`) |
-| Folder `MoveFolder` over `100,000` descendants (`1,000` moves) | `0` descendant writes | `0` descendant rows modified (`SQLite` & `PG16`) |
-| Paired backup writer pause (`1,000` captures across two empty canonical databases) | `p95 < 1,000 us` | `SQLite paired`: `p50 = 162.0 us`, `p95 = 324.6 us`; `PG16 paired`: `p50 = 313.8 us`, `p95 = 434.7 us` |
+| Workload | Release profile and target |
+| --- | --- |
+| SQLite writer | 50 writers with either 0 or 200 readers, unique 4 KiB edits, 10 s warmup + 30 s measurement, 3 runs each. Every run must exceed 2,000 mutations/s and return zero busy errors. The report samples the active batch writer's synchronous setting and journal size limit and records reader gate dwell. |
+| Rollback | Fresh run, history and revisions for every sample. Seed 18 edited notes, 2 creations, 1 deletion with a slug collision and 1 subsequent manual edit through the public ports before starting the timer. SQLite and PostgreSQL with local CAS each require p95 below 5 ms across 1,000 samples. A separate 200-sample PostgreSQL/S3 profile reports local UDS latency. |
+| Chat window | 10,000 reads of 50 entries on linear and branched 10,000-turn threads, p95 below 1 ms. |
+| Board and folder | 10,000 first-slot board moves with ranks at most 16 bytes. Moving a folder over 100,000 descendants must preserve descendant rows. |
+| Paired backup | The control and canonical participants share an installation. Test 1 and 64 canonical Spaces separately on SQLite and PostgreSQL. For each profile, prepare both participants, acquire both holds, pause control then canonical, pin both snapshots, and resume both writers. Report prepare/holds, safe-point acquisition, confirmed pause after control acknowledges its safe point, and the inclusive interval from the first pause call through the last resume. The confirmed pause from the first safe point through both resume acknowledgements must reach p95 below 1 ms across 1,000 captures per profile. |
 
 ### Proof boundaries
 

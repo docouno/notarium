@@ -131,6 +131,11 @@ impl Session {
         self.in_memory_spool_bytes.store(true, Ordering::SeqCst);
     }
     pub(crate) fn track(&self, file: File) -> Result<(), PortError> {
+        if self.wal.is_none() {
+            // The PG exporter owns this private file and publishes every write
+            // to the byte counter. Its size is stable until spooling starts.
+            self.set_spool_bytes(file.metadata().map_err(|_| failure())?.len());
+        }
         *self.file.lock().map_err(|_| failure())? = Some(file);
         Ok(())
     }

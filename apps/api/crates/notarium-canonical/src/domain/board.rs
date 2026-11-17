@@ -21,9 +21,11 @@ use sqlx::Row;
 use crate::{
     CanonicalStore,
     blobs::{BlobOwnerKind, BlobReferenceClaim, activate_and_bind_blob_ref_tx},
-    changes::{ChangedNoteSummaryV1, EffectBodyV1, build_effect_payload_draft},
+    changes::{
+        ChangedNoteSummaryV1, EffectBodyV1, StoredAwaitReasonV1, build_effect_payload_draft,
+    },
     codec::{
-        MAX_MSGPACK_DECODE_BYTES, NoteRevisionMetadata, RankRevisionMetadata,
+        EFFECT_MAX_NOTES, MAX_MSGPACK_DECODE_BYTES, NoteRevisionMetadata, RankRevisionMetadata,
         RevisionMetadataEnvelope, RevisionMetadataPayload, decode_msgpack_bounded, encode_msgpack,
         encode_timestamp_parts, evaluate_fields_with_schema, group_key_hex, internal_not_committed,
         new_prefixed_hex_id, new_revision_id, now_utc_timestamp, unavailable_retryable,
@@ -35,7 +37,9 @@ use crate::{
             load_current_space_schema_tx, load_note_head_row_tx, note_rank_version_digest,
             upsert_agent_run_head_tx, validate_mutation_identity,
         },
-        notes::{analyze_and_prepare_carrier, try_replay_completed_receipt},
+        notes::{
+            analyze_and_prepare_carrier, changed_revision_fields_tx, try_replay_completed_receipt,
+        },
     },
     runtime::{insert_revision_row, is_note_purge_fenced_tx, load_space_record},
     sql_exec::BackendConn,
@@ -308,7 +312,7 @@ pub struct OverlayRow {
 }
 
 impl CanonicalStore {
-    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub async fn inspect_view_overlays_for_test(
         &self,
         space_id: &SpaceId,
@@ -320,7 +324,7 @@ impl CanonicalStore {
             .await
     }
 
-    #[doc(hidden)]
+    #[cfg(feature = "test-support")]
     pub async fn inspect_agent_run_revision_for_test(
         &self,
         space_id: &SpaceId,
@@ -785,7 +789,12 @@ pub(crate) async fn move_board_card_impl(
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
 
-    let idemp = build_move_board_card_identity_spec(&request)?;
+    let idemp = build_move_board_card_identity_spec(&request)?.with_policy(
+        ctx.auth(),
+        crate::writer::replay::ReplayPolicy::Documents(vec![
+            crate::writer::replay::ReplayResource::Write(request.input.note.clone()),
+        ]),
+    );
     if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedBoardMoveV1>(
         store,
         ctx.scope(),
@@ -1111,6 +1120,7 @@ pub(crate) async fn move_board_card_impl(
                         .unwrap_or(&[]);
 
                     // Verify every row in `eval_group_rows` still matches its `expected_note` & `expected_rank`.
+                    let mut verified_neighbors = HashMap::with_capacity(eval_group_rows.len());
                     for row in eval_group_rows {
                         let rhead =
                             load_note_head_row_tx(tx, &scope_cl.space_id, &row.note).await?;
@@ -1123,6 +1133,7 @@ pub(crate) async fn move_board_card_impl(
                             }
                             .into());
                         }
+                        verified_neighbors.insert(&row.note, (&row.expected_note, rhead.doc_class));
                         verify_rank_expectation(
                             &row.expected_rank,
                             overlays.get(&row.note),
@@ -1297,6 +1308,9 @@ pub(crate) async fn move_board_card_impl(
                     let mut events = Vec::with_capacity(seq_count as usize);
 
                     // 1. Apply target note carrier revision if fields changed, else keep `head.head_rev_id`.
+                    let overlay_eligible = neighbor_final_ranks.len() < EFFECT_MAX_NOTES;
+                    let mut summaries = Vec::new();
+                    let mut changed_fields = BTreeMap::new();
                     let final_note_rev = if let Some((info, ticket)) = prepared_info_opt {
                         let note_seq = item_ctx.alloc_next_seq()?;
                         let new_rev = new_revision_id()?;
@@ -1309,8 +1323,14 @@ pub(crate) async fn move_board_card_impl(
                             ticket: ticket.clone(),
                         };
                         item_ctx.record_staged_ticket(ticket);
-                        activate_and_bind_blob_ref_tx(tx, item_ctx.active_epoch, &claim, note_seq)
-                            .await?;
+                        activate_and_bind_blob_ref_tx(
+                            tx,
+                            &item_ctx.scope,
+                            item_ctx.active_epoch,
+                            &claim,
+                            note_seq,
+                        )
+                        .await?;
                         crate::domain::common::sync_closed_collab_session_on_direct_write_tx(
                             tx,
                             &scope_cl.space_id,
@@ -1379,6 +1399,15 @@ pub(crate) async fn move_board_card_impl(
                             info.diagnostics.first(),
                             current_schema.as_ref().map(|s| &s.fields),
                         );
+                        if overlay_eligible {
+                            changed_fields = changed_revision_fields_tx(
+                                tx,
+                                &scope_cl,
+                                &head.head_rev_id,
+                                &eval_fields,
+                            )
+                            .await?;
+                        }
                         let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                             NoteRevisionMetadata {
                                 note_id: input.note.clone(),
@@ -1468,6 +1497,26 @@ pub(crate) async fn move_board_card_impl(
                             now_ts,
                         )
                         .await?;
+                        if overlay_eligible {
+                            let &(revision, doc_class) =
+                                verified_neighbors.get(nbr_id).ok_or_else(|| {
+                                    DomainError::validation(ValidationReason::InvalidState)
+                                })?;
+                            let rank = format!(
+                                "{}:{}:{}",
+                                input.view.note.as_str(),
+                                input.view.key.as_str(),
+                                nbr_rank_rev.as_str()
+                            );
+                            summaries.push(ChangedNoteSummaryV1 {
+                                note_id: nbr_id.clone(),
+                                revision: revision.clone(),
+                                rank_version: note_rank_version_digest(revision, Some(&rank)),
+                                lifecycle: Lifecycle::Active,
+                                doc_class,
+                                changed_fields: BTreeMap::new(),
+                            });
+                        }
                         events.push(BatchEventDraft {
                             space_seq: nbr_seq,
                             entity_type: "note".to_owned(),
@@ -1593,22 +1642,30 @@ pub(crate) async fn move_board_card_impl(
                     let rank_ver = note_rank_version_digest(&final_note_rev, Some(&extra_digest));
                     let cmd_range =
                         notarium_core::ports::CommandSeqRange::new(first_seq, visibility_seq)?;
+                    let effect_body = if overlay_eligible {
+                        summaries.push(ChangedNoteSummaryV1 {
+                            note_id: input.note.clone(),
+                            revision: final_note_rev.clone(),
+                            rank_version: rank_ver,
+                            lifecycle: Lifecycle::Active,
+                            doc_class: head.doc_class,
+                            changed_fields,
+                        });
+                        EffectBodyV1::Notes { notes: summaries }
+                    } else {
+                        EffectBodyV1::AwaitProjection {
+                            reason: StoredAwaitReasonV1::TooManyNotes,
+                        }
+                    };
+                    let mut owners: Vec<_> = neighbor_final_ranks.into_keys().collect();
+                    owners.extend([input.note.clone(), input.view.note.clone()]);
                     let effect_draft = build_effect_payload_draft(
                         new_prefixed_hex_id("pay_")?,
                         scope_cl.clone(),
                         cmd_range,
                         "move_board_card",
-                        EffectBodyV1::Notes {
-                            notes: vec![ChangedNoteSummaryV1 {
-                                note_id: input.note.clone(),
-                                revision: final_note_rev.clone(),
-                                rank_version: rank_ver,
-                                lifecycle: Lifecycle::Active,
-                                doc_class: head.doc_class,
-                                changed_fields: BTreeMap::new(),
-                            }],
-                        },
-                        vec![input.note.clone(), input.view.note.clone()],
+                        effect_body,
+                        owners,
                     )?;
 
                     let receipt_token =
@@ -1678,7 +1735,7 @@ pub(crate) async fn move_board_card_impl(
 
 fn build_move_board_card_identity_spec(
     request: &Mutation<MoveBoardCard>,
-) -> Result<crate::writer::CommandIdentitySpec, PortError> {
+) -> Result<crate::writer::replay::UnboundCommand, PortError> {
     let mut fp = blake3::Hasher::new();
     fp.update(request.input.view.note.as_str().as_bytes());
     fp.update(&[0]);

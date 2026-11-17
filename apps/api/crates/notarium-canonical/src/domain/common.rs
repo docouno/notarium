@@ -116,7 +116,7 @@ impl RoomFenceTable {
             key: notarium_core::ids::CommandKey::from_bytes([0u8; 16]),
             hash: ContentDigest::from_bytes([0u8; 32]),
         };
-        let guard = lock.lock().await;
+        let guard = lock.try_lock().map_err(|_| Self::busy_fence())?;
         match guard.reserve(probe_id) {
             Ok(RollbackReservation::SkippedRoomActive) => Ok(true),
             Ok(RollbackReservation::Closed(_)) => Ok(false),
@@ -143,7 +143,7 @@ impl RoomFenceTable {
             key: notarium_core::ids::CommandKey::from_bytes([0u8; 16]),
             hash: ContentDigest::from_bytes([0u8; 32]),
         };
-        let guard = lock.blocking_lock();
+        let guard = lock.try_lock().map_err(|_| Self::busy_fence())?;
         match guard.reserve(probe_id) {
             Ok(RollbackReservation::SkippedRoomActive) => Ok(true),
             Ok(RollbackReservation::Closed(_)) => Ok(false),
@@ -176,6 +176,26 @@ impl RoomFenceTable {
         );
     }
 
+    /// Writer transactions must never wait for a room guard retained by an earlier
+    /// item in their own batch. A busy fence can be retried after the batch commits.
+    pub(crate) fn lock_for_write(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+    ) -> Result<tokio::sync::OwnedMutexGuard<RoomFenceState>, PortError> {
+        self.get_or_init(scope, note)
+            .try_lock_owned()
+            .map_err(|_| Self::busy_fence())
+    }
+
+    fn busy_fence() -> PortError {
+        crate::codec::unavailable_retryable(
+            "collab_fence_busy",
+            "another operation holds the room fence",
+            std::time::Duration::from_millis(5),
+        )
+    }
+
     pub async fn consume_reservation(
         &self,
         scope: &HistoryScope,
@@ -183,8 +203,7 @@ impl RoomFenceTable {
         reservation: ClosedRoomReservation,
         identity: &CommandIdentity,
     ) -> Result<tokio::sync::OwnedMutexGuard<RoomFenceState>, PortError> {
-        let lock = self.get_or_init(scope, note);
-        let mut guard = lock.lock_owned().await;
+        let mut guard = self.lock_for_write(scope, note)?;
         guard.consume(reservation, identity)?;
         Ok(guard)
     }
@@ -203,8 +222,7 @@ impl RoomFenceTable {
         )>,
         PortError,
     > {
-        let lock = self.get_or_init(scope, note);
-        let guard = lock.lock_owned().await;
+        let guard = self.lock_for_write(scope, note)?;
         match guard.reserve(identity.clone())? {
             RollbackReservation::SkippedRoomActive => Ok(None),
             RollbackReservation::Closed(res) => Ok(Some((guard, res))),
@@ -224,8 +242,7 @@ impl RoomFenceTable {
         )>,
         PortError,
     > {
-        let lock = self.get_or_init(scope, note);
-        let guard = lock.blocking_lock_owned();
+        let guard = self.lock_for_write(scope, note)?;
         match guard.reserve(identity.clone())? {
             RollbackReservation::SkippedRoomActive => Ok(None),
             RollbackReservation::Closed(res) => Ok(Some((guard, res))),
@@ -365,7 +382,7 @@ pub(crate) fn derive_command_identity_spec(
     identity: &CommandIdentity,
     command_kind: &str,
     canonical_payload_fingerprint: &[u8],
-) -> CommandIdentitySpec {
+) -> crate::writer::replay::UnboundCommand {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"notarium-cmd-v1:");
     hasher.update(command_kind.as_bytes());
@@ -373,11 +390,11 @@ pub(crate) fn derive_command_identity_spec(
     hasher.update(identity.hash.as_bytes());
     hasher.update(&[0]);
     hasher.update(canonical_payload_fingerprint);
-    CommandIdentitySpec {
-        actor: identity.actor.clone(),
-        command_key: identity.key.clone(),
-        command_hash: ContentDigest::from_bytes(*hasher.finalize().as_bytes()),
-    }
+    crate::writer::replay::UnboundCommand(CommandIdentitySpec::new(
+        identity.actor.clone(),
+        identity.key.clone(),
+        ContentDigest::from_bytes(*hasher.finalize().as_bytes()),
+    ))
 }
 
 pub(crate) fn extract_agent_run_from_auth(auth: &EngineAuthContext) -> Option<AgentRunId> {
@@ -862,6 +879,7 @@ pub(crate) async fn load_note_heads_batch_tx(
 pub(crate) struct FolderAncestryFacts {
     pub ancestors: Vec<FolderId>,
     pub write_locked: bool,
+    /// Whether a note placed directly in this folder is a logical root child.
     pub is_root_child: bool,
     pub folder_path: String,
 }
@@ -871,13 +889,78 @@ pub(crate) struct FolderAncestryFacts {
 /// resolve 256-deep folder chains in `O(unique folders)` instead of `O(items * depth)` SQL queries.
 #[derive(Default)]
 pub(crate) struct FolderAncestryCache {
-    rows: HashMap<FolderId, crate::runtime::FolderHeadRow>,
+    rows: HashMap<FolderId, AncestryRow>,
+    snapshot: Option<(HistoryScope, SpaceSeq)>,
     resolved: HashMap<(FolderId, bool), FolderAncestryFacts>,
 }
 
+#[derive(Clone)]
+struct AncestryRow {
+    folder_id: FolderId,
+    parent_folder_id: Option<FolderId>,
+    is_root: bool,
+    slug: String,
+    write_locked: bool,
+    lifecycle: Lifecycle,
+}
+
+impl From<crate::runtime::FolderHeadRow> for AncestryRow {
+    fn from(row: crate::runtime::FolderHeadRow) -> Self {
+        Self {
+            folder_id: row.folder_id,
+            parent_folder_id: row.parent_folder_id,
+            is_root: row.is_root,
+            slug: row.slug,
+            write_locked: row.write_locked,
+            lifecycle: row.lifecycle,
+        }
+    }
+}
+
 impl FolderAncestryCache {
+    pub(crate) fn at_cut(scope: &HistoryScope, cutoff: SpaceSeq) -> Self {
+        Self {
+            snapshot: Some((scope.clone(), cutoff)),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn insert_preloaded_row(&mut self, row: crate::runtime::FolderHeadRow) {
-        self.rows.insert(row.folder_id.clone(), row);
+        self.rows.insert(row.folder_id.clone(), row.into());
+    }
+
+    async fn load_row(
+        &self,
+        tx: &mut BackendConn<'_>,
+        space: &SpaceId,
+        folder: &FolderId,
+    ) -> Result<AncestryRow, PortError> {
+        let Some((scope, cutoff)) = &self.snapshot else {
+            return Ok(load_folder_head_row(tx, space, folder).await?.into());
+        };
+        let rev = crate::runtime::read_immutable_revision_tx(
+            tx,
+            scope,
+            "folder",
+            folder.as_str(),
+            *cutoff,
+        )
+        .await?
+        .ok_or_else(|| DomainError::validation(ValidationReason::CursorStale))?;
+        let RevisionMetadataPayload::Folder(row) = rev.metadata.payload else {
+            return Err(internal_not_committed(
+                "corrupt_folder_revision",
+                "expected folder metadata",
+            ));
+        };
+        Ok(AncestryRow {
+            folder_id: row.folder_id,
+            parent_folder_id: row.parent_folder_id,
+            is_root: row.is_root,
+            slug: row.slug,
+            write_locked: row.write_locked,
+            lifecycle: row.lifecycle,
+        })
     }
 
     pub(crate) async fn load_ancestry_tx(
@@ -891,7 +974,7 @@ impl FolderAncestryCache {
             return Ok(cached.clone());
         }
 
-        let mut chain: Vec<crate::runtime::FolderHeadRow> = Vec::new();
+        let mut chain: Vec<AncestryRow> = Vec::new();
         let mut visited = BTreeSet::new();
         let mut current = folder_id.clone();
 
@@ -915,7 +998,7 @@ impl FolderAncestryCache {
             let row = if let Some(existing) = self.rows.get(&current) {
                 existing.clone()
             } else {
-                let fetched = load_folder_head_row(tx, space_id, &current).await?;
+                let fetched = self.load_row(tx, space_id, &current).await?;
                 self.rows.insert(current.clone(), fetched.clone());
                 fetched
             };
@@ -928,7 +1011,7 @@ impl FolderAncestryCache {
                 let root_facts = FolderAncestryFacts {
                     ancestors: vec![row.folder_id.clone()],
                     write_locked: row.write_locked,
-                    is_root_child: false,
+                    is_root_child: true,
                     folder_path: String::new(),
                 };
                 self.resolved.insert(
@@ -970,11 +1053,10 @@ impl FolderAncestryCache {
             } else {
                 format!("{}/{}", acc.folder_path, child_row.slug)
             };
-            let next_is_root_child = next_anc.len() == 2;
             acc = FolderAncestryFacts {
                 ancestors: next_anc,
                 write_locked: next_locked,
-                is_root_child: next_is_root_child,
+                is_root_child: false,
                 folder_path: next_path,
             };
             self.resolved
@@ -982,6 +1064,37 @@ impl FolderAncestryCache {
         }
 
         Ok(acc)
+    }
+
+    pub(crate) async fn live_note_facts(
+        &mut self,
+        tx: &mut BackendConn<'_>,
+        space: &Space,
+        note: &NoteId,
+        active_only: bool,
+    ) -> Result<Option<ResourceFacts>, PortError> {
+        if crate::runtime::is_note_purge_fenced_tx(tx, &space.id, note.as_str()).await? {
+            return Ok(None);
+        }
+        let Some(head) = load_note_head_row_opt_tx(tx, &space.id, note).await? else {
+            return Ok(None);
+        };
+        if head.lifecycle == Lifecycle::Purged
+            || (active_only && head.lifecycle != Lifecycle::Active)
+        {
+            return Ok(None);
+        }
+        let (facts, _) = self
+            .build_resource_facts_tx(
+                tx,
+                space,
+                &head.parent_folder_id,
+                head.doc_class,
+                head.ability_id,
+                active_only,
+            )
+            .await?;
+        Ok(Some(facts))
     }
 
     pub(crate) async fn build_resource_facts_tx(
@@ -1043,7 +1156,7 @@ pub(crate) async fn load_folder_ancestry_tx(
             } else {
                 segments_rev.join("/")
             };
-            let is_root_child = ancestors.len() == 2;
+            let is_root_child = ancestors.len() == 1;
             return Ok(FolderAncestryFacts {
                 ancestors,
                 write_locked,

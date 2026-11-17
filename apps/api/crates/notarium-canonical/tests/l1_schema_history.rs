@@ -4,6 +4,7 @@ mod support;
 
 use notarium_canonical::{
     CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec,
+    PgConnectConfig, PgTransport, SqlBackendConfig, build_pg_connect_options,
     observe_sqlite_canonical_witness,
 };
 use notarium_core::{
@@ -23,6 +24,47 @@ use crate::support::{
     sample_incarnation, sample_installation_id, sample_note_id, sample_principal_id,
     sample_space_id,
 };
+
+#[tokio::test]
+async fn postgres_tcp_requires_a_verified_server_and_redacts_credentials() {
+    use sqlx::postgres::PgSslMode;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let config = PgConnectConfig {
+        transport: PgTransport::Tcp {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+            root_cert: None,
+        },
+        username: "fixture-user-marker".into(),
+        password: "fixture-password-marker".into(),
+        database: "canonical".into(),
+    };
+    let sql = SqlBackendConfig::postgres_default(config.clone(), "v1_canonical");
+    let diagnostic = format!("{sql:?}");
+    assert!(!diagnostic.contains(&config.password));
+    assert!(!diagnostic.contains(&config.username));
+    let options = build_pg_connect_options(&config);
+    assert!(matches!(options.get_ssl_mode(), PgSslMode::VerifyFull));
+    assert_eq!(options.get_host(), "127.0.0.1");
+
+    // A PostgreSQL server can decline the initial SSL request before authentication.
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut ssl_request = [0u8; 8];
+        stream.read_exact(&mut ssl_request).await.unwrap();
+        assert_eq!(ssl_request, [0, 0, 0, 8, 4, 210, 22, 47]);
+        stream.write_all(b"N").await.unwrap();
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+    });
+    let connection = sqlx::PgConnection::connect_with(&options).await;
+    assert!(matches!(connection, Err(sqlx::Error::Tls(_))));
+    server.await.unwrap();
+}
 
 #[tokio::test]
 async fn l1_sqlite_bootstrap_witness_owner_lock_and_fail_closed_guards() {
@@ -91,8 +133,9 @@ async fn l1_sqlite_bootstrap_witness_owner_lock_and_fail_closed_guards() {
     {
         let mut raw = temp.open_raw_sqlite().await;
         sqlx::query(
-            "UPDATE schema_meta SET schema_version = 1, migration_state = 'migrating' WHERE singleton_id = 1",
+            "UPDATE schema_meta SET schema_version = $1, migration_state = 'migrating' WHERE singleton_id = 1",
         )
+        .bind(i64::from(notarium_canonical::CANONICAL_SCHEMA_VERSION))
         .execute(&mut raw)
         .await
         .expect("set migrating");
@@ -163,6 +206,26 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     assert_eq!(runtime.witness().state, DatabaseState::Ready);
     runtime.shutdown().await.expect("clean PG shutdown");
 
+    // Reopen the recognized previous manifest through the startup migration.
+    {
+        let mut raw = fixtures.open_raw_pg().await;
+        let path = format!("SET search_path TO \"{schema}\"");
+        sqlx::query(sqlx::AssertSqlSafe(path))
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE account_catalog_receipts")
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE chat_pending_inputs DROP COLUMN ext_space_tainted")
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE schema_meta SET schema_version=1, manifest_checksum=decode('3992ad6e8c888cc7ed98c9dd45e9463bf3334c5617b9c7c416334bc312398c69','hex') WHERE singleton_id=1").execute(&mut raw).await.unwrap();
+        raw.close().await.unwrap();
+    }
+
     // Reopen same schema idempotently.
     let blob_temp2 = TempDataRoot::new("l1-pg-blobs-2");
     let cfg2 = fixtures.pg_local_config(install.clone(), &schema, blob_temp2.data_root());
@@ -204,9 +267,10 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     {
         let mut raw = fixtures.open_raw_pg().await;
         let sql = format!(
-            "UPDATE \"{schema}\".schema_meta SET schema_version = 1, migration_state = 'migrating' WHERE singleton_id = 1"
+            "UPDATE \"{schema}\".schema_meta SET schema_version = $1, migration_state = 'migrating' WHERE singleton_id = 1"
         );
         sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(notarium_canonical::CANONICAL_SCHEMA_VERSION as i32)
             .execute(&mut raw)
             .await
             .expect("set PG migrating");

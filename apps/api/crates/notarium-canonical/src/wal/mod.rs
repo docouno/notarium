@@ -38,6 +38,8 @@ pub struct WalTelemetrySnapshot {
     pub passive_checkpoints: u64,
     pub reset_attempts: u64,
     pub reset_successes: u64,
+    pub max_reset_reader_gate_ns: u64,
+    pub reset_gate_overruns: u64,
     pub timed_out_reads: u64,
     pub cancelled_or_dropped_reads: u64,
     pub leaked_sqlite_busy_errors: u64,
@@ -95,6 +97,8 @@ struct WalAtomicCounters {
     passive_checkpoints: AtomicU64,
     reset_attempts: AtomicU64,
     reset_successes: AtomicU64,
+    max_reset_reader_gate_ns: AtomicU64,
+    reset_gate_overruns: AtomicU64,
     timed_out_reads: AtomicU64,
     cancelled_or_dropped_reads: AtomicU64,
     leaked_sqlite_busy_errors: AtomicU64,
@@ -117,6 +121,8 @@ pub struct SqliteWalCoordinator {
     counters: WalAtomicCounters,
     maintenance_lock: Mutex<()>,
     passive_conn: Mutex<Option<rusqlite::Connection>>,
+    #[cfg(test)]
+    checkpoint_io_delay_ms: AtomicU64,
     bg_stop: AtomicBool,
     bg_wake: Notify,
     bg_task: Mutex<Option<JoinHandle<()>>>,
@@ -153,13 +159,22 @@ impl Drop for BackupWalPinGuard {
 
 struct GateReopenGuard<'a> {
     coord: &'a SqliteWalCoordinator,
-    reopened: bool,
+    closed_at: Instant,
 }
 
 impl Drop for GateReopenGuard<'_> {
     fn drop(&mut self) {
-        if !self.reopened {
-            self.coord.reopen_reader_gate();
+        self.coord.reopen_reader_gate();
+        let dwell = self.closed_at.elapsed();
+        self.coord.counters.max_reset_reader_gate_ns.fetch_max(
+            u64::try_from(dwell.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if dwell > self.coord.wal_reset_cycle_deadline {
+            self.coord
+                .counters
+                .reset_gate_overruns
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -274,6 +289,28 @@ pub fn sqlite_wal_path_for(db_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+#[cfg(feature = "test-support")]
+impl crate::CanonicalStore {
+    /// Observes connection-local settings on the handle used for SQLite batch commits.
+    pub async fn sqlite_writer_pragmas_for_bench(&self) -> Result<(i64, i64), PortError> {
+        let SqlDriverState::Sqlite { writer, .. } = &self.inner.sql else {
+            return Err(internal_not_committed(
+                "wal_pragmas",
+                "SQLite writer required",
+            ));
+        };
+        let guard = writer.lock().await;
+        let conn = guard
+            .as_ref()
+            .and_then(|p| p.rusqlite_conn.as_ref())
+            .ok_or_else(|| internal_not_committed("wal_pragmas", "SQLite writer closed"))?;
+        conn.query_row(
+            "SELECT synchronous, journal_size_limit FROM pragma_synchronous, pragma_journal_size_limit",
+            [], |row| Ok((row.get(0)?, row.get(1)?))
+        ).map_err(|err| internal_not_committed("wal_pragmas", err.to_string()))
+    }
+}
+
 impl SqliteWalCoordinator {
     pub(crate) fn start(
         inner: &Arc<CanonicalInner>,
@@ -328,6 +365,8 @@ impl SqliteWalCoordinator {
             },
             maintenance_lock: Mutex::new(()),
             passive_conn: Mutex::new(None),
+            #[cfg(test)]
+            checkpoint_io_delay_ms: AtomicU64::new(0),
             bg_stop: AtomicBool::new(false),
             bg_wake: Notify::new(),
             bg_task: Mutex::new(None),
@@ -407,34 +446,6 @@ impl SqliteWalCoordinator {
         self.read_deadline
     }
 
-    pub(crate) async fn lock_maintenance(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.maintenance_lock.lock().await
-    }
-
-    pub(crate) fn note_external_wal_restart(&self) {
-        let disk_bytes = self.observe_wal_file_bytes();
-        self.counters
-            .last_commit_elapsed_ns
-            .store(self.now_elapsed_ns(), Ordering::Relaxed);
-        self.counters.log_frames.store(0, Ordering::Relaxed);
-        self.counters
-            .checkpointed_frames
-            .store(0, Ordering::Relaxed);
-        self.counters.logical_wal_bytes.store(0, Ordering::Relaxed);
-        self.counters
-            .retained_wal_bytes
-            .store(disk_bytes, Ordering::Relaxed);
-        self.counters
-            .last_passive_wal_bytes
-            .store(0, Ordering::Relaxed);
-        self.counters
-            .commits_since_passive
-            .store(0, Ordering::Release);
-        self.counters
-            .commits_since_reset
-            .store(0, Ordering::Release);
-    }
-
     pub fn record_busy_if_any(&self, err_msg: &str) {
         let lower = err_msg.to_ascii_lowercase();
         if lower.contains("database is locked") || lower.contains("sqlite_busy") {
@@ -479,6 +490,11 @@ impl SqliteWalCoordinator {
             passive_checkpoints: self.counters.passive_checkpoints.load(Ordering::Relaxed),
             reset_attempts: self.counters.reset_attempts.load(Ordering::Relaxed),
             reset_successes: self.counters.reset_successes.load(Ordering::Relaxed),
+            max_reset_reader_gate_ns: self
+                .counters
+                .max_reset_reader_gate_ns
+                .load(Ordering::Relaxed),
+            reset_gate_overruns: self.counters.reset_gate_overruns.load(Ordering::Relaxed),
             timed_out_reads: self.counters.timed_out_reads.load(Ordering::Relaxed),
             cancelled_or_dropped_reads: self
                 .counters
@@ -1155,9 +1171,9 @@ impl SqliteWalCoordinator {
 
         // Close ordinary reader admission and ensure an RAII guard ALWAYS reopens it!
         self.close_reader_gate();
-        let mut reopen_guard = GateReopenGuard {
+        let reopen_guard = GateReopenGuard {
             coord: self,
-            reopened: false,
+            closed_at: Instant::now(),
         };
 
         // 1. Wait for active ordinary readers to drain by their monotonic deadlines.
@@ -1211,15 +1227,15 @@ impl SqliteWalCoordinator {
         let high_limit_i64 = i64::try_from(self.wal_high_watermark_bytes).unwrap_or(134_217_728);
 
         if let Some(pair) = writer_guard.as_mut() {
-            let rem_ms = u64::try_from(
-                cycle_deadline
-                    .saturating_duration_since(tokio::time::Instant::now())
-                    .as_millis()
-                    .clamp(5, 250),
-            )
-            .unwrap_or(250);
+            let remaining = cycle_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            let rem_ms = u64::try_from(remaining.as_millis().clamp(1, 250)).unwrap_or(250);
 
             let trunc_tuple = if let Some(rconn) = pair.rusqlite_conn.take() {
+                #[cfg(test)]
+                let io_delay_ms = self.checkpoint_io_delay_ms.load(Ordering::Relaxed);
                 let join_res = tokio::task::spawn_blocking(move || {
                     let _ = rconn.busy_timeout(Duration::from_millis(rem_ms));
                     let target_journal_limit = if burst_active {
@@ -1230,6 +1246,10 @@ impl SqliteWalCoordinator {
                     let _ = rconn.execute_batch(&format!(
                         "PRAGMA journal_size_limit = {target_journal_limit};"
                     ));
+                    // SQLite's busy timeout limits lock waits. The OS can take longer
+                    // to flush dirty pages, and the connection remains owned until it returns.
+                    #[cfg(test)]
+                    std::thread::sleep(Duration::from_millis(io_delay_ms));
                     let res = rconn.query_row(ckpt_sql, [], |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
@@ -1310,8 +1330,7 @@ impl SqliteWalCoordinator {
         drop(safe_point);
 
         // Immediately reopen reader admission before filesystem stat!
-        self.reopen_reader_gate();
-        reopen_guard.reopened = true;
+        drop(reopen_guard);
         let _ = self.observe_wal_file_bytes();
     }
 
@@ -1364,5 +1383,40 @@ async fn run_background_wal_loop(
             break;
         };
         coord.run_maintenance_tick(&inner, false).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CanonicalConfig, CanonicalRuntime, SqlBackendConfig};
+    use notarium_core::{epoch::DataRoot, ids::InstallationId};
+
+    #[tokio::test]
+    async fn checkpoint_io_overrun_counts_actual_reader_gate_dwell() {
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).unwrap();
+        let path = std::env::temp_dir().join(format!("notarium-wal-dwell-{}", hex::encode(id)));
+        fs::create_dir_all(&path).unwrap();
+        let mut config =
+            CanonicalConfig::local_default(InstallationId::from_bytes(id), DataRoot::new(&path));
+        let SqlBackendConfig::Sqlite {
+            wal_reset_cycle_deadline,
+            ..
+        } = &mut config.sql
+        else {
+            unreachable!()
+        };
+        *wal_reset_cycle_deadline = Duration::from_millis(20);
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        let wal = store.inner.wal_coord.get().unwrap();
+        wal.checkpoint_io_delay_ms.store(75, Ordering::Relaxed);
+        wal.run_maintenance_tick(&store.inner, true).await;
+        let snapshot = wal.telemetry();
+        assert!(snapshot.max_reset_reader_gate_ns >= 75_000_000);
+        assert!(snapshot.reset_gate_overruns >= 1);
+        assert!(wal.gate.lock().unwrap().open);
+        runtime.shutdown().await.unwrap();
+        fs::remove_dir_all(path).unwrap();
     }
 }

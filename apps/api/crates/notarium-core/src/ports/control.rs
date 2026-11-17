@@ -126,6 +126,10 @@ impl AbilityRef {
         }
     }
 }
+/// Maximum number of auxiliary resource names in a published ability descriptor.
+pub const MAX_ABILITY_AUX_FILES: usize = 256;
+pub const MAX_ABILITY_AUX_PATH_BYTES: usize = 1024;
+
 #[derive(Clone, Debug)]
 pub struct AbilityDescriptor {
     pub reference: AbilityRef,

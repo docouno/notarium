@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 1;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {
@@ -627,6 +627,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("status", Text, false),
             col("enqueued_seq", Int, false),
             col("consumed_entry_seq", Int, true),
+            col("ext_space_tainted", Int, false),
         ],
         indexes: &[
             "uq_chat_pending_inputs_ordinal",
@@ -726,6 +727,18 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("updated_at_ms", Int, false),
         ],
         indexes: &["idx_pending_purges_phase"],
+    },
+    TableSpec {
+        name: "account_catalog_receipts",
+        primary_key: &["owner_id", "actor_id", "command_key"],
+        columns: &[
+            col("owner_id", Text, false),
+            col("actor_id", Text, false),
+            col("command_key", Text, false),
+            col("request_hash", Bytes, false),
+            col("result_msgpack", Bytes, true),
+        ],
+        indexes: &[],
     },
 ];
 

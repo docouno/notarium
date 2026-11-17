@@ -6,11 +6,12 @@ use std::{future::Future, pin::Pin};
 
 pub mod backup;
 pub mod blobs;
+mod catalog;
 pub mod changes;
 pub mod chats;
 pub mod codec;
 pub mod config;
-pub mod dialect;
+mod dialect;
 pub mod domain;
 pub mod peers;
 pub mod runtime;
@@ -37,6 +38,8 @@ pub use config::{
     S3BucketMode, S3BucketModePolicy, S3Config, S3Credentials, SqlBackendConfig, WriterConfig,
     default_backup_budget, validate_pg_schema_name,
 };
+#[cfg(feature = "test-support")]
+pub use dialect::postgres::build_pg_connect_options;
 pub use dialect::{DataRootOwnerLock, sqlite::observe_sqlite_canonical_witness};
 pub use domain::{RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
 pub use peers::{
@@ -46,7 +49,7 @@ pub use peers::{
 };
 pub use runtime::{
     CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec, SpaceRecord,
-    SqliteBenchSeed, StoredRevisionRecord,
+    StoredRevisionRecord,
 };
 pub use schema::manifest::{CANONICAL_SCHEMA_VERSION, CANONICAL_TABLES, manifest_checksum};
 pub use wal::WalTelemetrySnapshot;
@@ -59,7 +62,7 @@ mod tests {
         config::validate_pg_schema_name,
         schema::{
             POSTGRES_BASELINE_DDL, SQLITE_BASELINE_DDL,
-            manifest::{CANONICAL_TABLES, expected_index_names, expected_table_names},
+            manifest::{expected_index_names, expected_table_names},
             split_sql_statements,
         },
     };
@@ -117,6 +120,6 @@ mod tests {
                 "{label} indexes differ from manifest"
             );
         }
-        assert_eq!(CANONICAL_TABLES.len(), 34);
+        assert!(expected_table_names().contains("account_catalog_receipts"));
     }
 }

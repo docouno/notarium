@@ -543,6 +543,15 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         cur_a = ea.seq;
     }
 
+    for limit in [128,129,200] {
+        let page = store.read_chat(owner_ctx(&scope,owner.clone()),ChatRead {
+            thread: thread.clone(), leaf: cur_a, before: None, max_entries: PageLimit::new(limit).unwrap(),
+        }).await.unwrap();
+        let from = chain_a.len()-usize::from(limit);
+        assert_eq!(page.entries.iter().map(|entry|entry.seq).collect::<Vec<_>>(),chain_a[from..]);
+        assert_eq!(page.next_ancestor,Some(chain_a[from-1]));
+    }
+
     // Verify `read_chat` performs ZERO writes (`spaces.last_seq` and SQLite WAL unchanged)
     // while paginating multi-page windows and switching between branch A and branch B!
     let space_before_reads = store.read_space(&scope.space_id).await.unwrap();
@@ -669,8 +678,10 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             } else {
                 format!("inline-pending-{idx}")
             };
+            let submitter = owner_ctx(&sc,own.clone());
+            submitter.auth().taint().mark_external_read();
             st.queue_chat_input(
-                owner_ctx(&sc, own.clone()),
+                submitter,
                 next_mutation(
                     &sc,
                     &own,
@@ -760,9 +771,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     ));
 
     // `Appended` when `current_leaf == cur_a` transfers CAS ref `ChatPendingInput -> ChatEntry`!
+    let consumer = owner_ctx(&scope,owner.clone());
+    assert!(!consumer.auth().taint().is_tainted());
     let consumed_ok = store
         .consume_chat_input(
-            owner_ctx(&scope, owner.clone()),
+            consumer.clone(),
             next_mutation(
                 &scope,
                 &owner,
@@ -782,6 +795,12 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         other => panic!("expected Appended, got {other:?}"),
     };
     assert!(matches!(appended_from_queue.body, ChatBody::Blob(_)));
+    assert!(appended_from_queue.tainted);
+    assert!(consumer.auth().taint().is_tainted());
+    let retained = store.execute_diagnostic_read_sql_for_test(None,
+        "SELECT COUNT(*) FROM chat_pending_inputs WHERE status = 'consumed' AND (inline_text <> '' OR payload_blake3 IS NOT NULL)"
+    ).await.unwrap();
+    assert_eq!(retained,0);
     cur_a = appended_from_queue.seq;
 
     // Second `consume_chat_input` on same item returns `AlreadyConsumed` without duplicating!
@@ -1321,7 +1340,121 @@ async fn run_ten_thousand_entry_chat_dag_read_suite(store: &CanonicalStore) {
     );
 }
 
-async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore) {
+async fn check_reopened_room_concurrency(
+    store: &CanonicalStore,
+    scope: &HistoryScope,
+    owner: &PrincipalId,
+    note: &NoteId,
+    closed: &notarium_canonical::CollabSessionRecord,
+) {
+    let open = |owner_id: &str| OpenCollabSession {
+        scope: scope.clone(),
+        note: note.clone(),
+        owner_id: owner_id.to_owned(),
+        expected_carrier_rev: closed.carrier_rev_id.clone(),
+        expected_lease: Some(closed.lease_epoch),
+        expected_lineage: Some(closed.lineage_epoch),
+        initial_yrs_snapshot: None,
+        allow_fenced_recovery: false,
+    };
+    let budget = make_budget();
+    let (a, b) = tokio::join!(
+        store.open_collab_session(&budget, open("writer-a")),
+        store.open_collab_session(&budget, open("writer-b")),
+    );
+    assert_ne!(a.is_ok(), b.is_ok(), "a single room has one writer");
+    let active = a.or(b).unwrap();
+    let writer = active.owner_id.unwrap();
+    let append = |seq: u64| AppendCollabUpdate {
+        scope: scope.clone(),
+        note: note.clone(),
+        owner_id: writer.clone(),
+        expected_lease: active.lease_epoch,
+        expected_lineage: active.lineage_epoch,
+        update_seq: seq,
+        update_bytes: vec![seq as u8],
+    };
+    store
+        .append_collab_update(&budget, append(1))
+        .await
+        .unwrap();
+    let close = CloseCollabSession {
+        scope: scope.clone(),
+        note: note.clone(),
+        owner_id: Some(writer.clone()),
+        expected_lease: active.lease_epoch,
+        expected_lineage: active.lineage_epoch,
+        final_yrs_snapshot: None,
+        compacted_through_update_seq: None,
+        carrier_settlement: None,
+    };
+    let close_and_append = tokio::join!(
+        store.close_collab_session(&budget, close),
+        store.append_collab_update(&budget, append(2)),
+    );
+    let closed_again = close_and_append.0.unwrap();
+    let mut reopen = open("writer-c");
+    reopen.expected_lease = Some(closed_again.lease_epoch);
+    let active = store.open_collab_session(&budget, reopen).await.unwrap();
+    let snapshot = store
+        .read_collab_session(None, scope, note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.session.yrs_snapshot_blob, closed.yrs_snapshot_blob);
+    assert_eq!(snapshot.updates[0].update_bytes, vec![1]);
+    assert_eq!(
+        snapshot.updates.len(),
+        1 + usize::from(close_and_append.1.is_ok())
+    );
+
+    let checkpoint = || CheckpointCollabSession {
+        scope: scope.clone(),
+        note: note.clone(),
+        owner_id: "writer-c".into(),
+        expected_lease: active.lease_epoch,
+        expected_lineage: active.lineage_epoch,
+        yrs_snapshot: vec![1, 2],
+        compacted_through_update_seq: Some(0),
+        carrier_settlement: Some(CollabCarrierSettlement {
+            auth: owner_ctx(scope, owner.clone()).auth().clone(),
+            carrier: "# Collab Doc\n\nClosed settled.\n".into(),
+        }),
+    };
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            store.checkpoint_collab_session(&budget, checkpoint()),
+            store.checkpoint_collab_session(&budget, checkpoint())
+        )
+    })
+    .await
+    .expect("overlapping settlements must release the writer");
+    assert!(completed.0.is_ok() || completed.1.is_ok());
+    let close = CloseCollabSession {
+        scope: scope.clone(),
+        note: note.clone(),
+        owner_id: Some("writer-c".into()),
+        expected_lease: active.lease_epoch,
+        expected_lineage: active.lineage_epoch,
+        final_yrs_snapshot: None,
+        compacted_through_update_seq: None,
+        carrier_settlement: None,
+    };
+    let (closed, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            store.close_collab_session(&budget, close),
+            store.checkpoint_collab_session(&budget, checkpoint())
+        )
+    })
+    .await
+    .expect("checkpoint and close must complete without a lock cycle");
+    assert_eq!(closed.unwrap().room_state, CollabRoomState::Closed);
+}
+
+async fn run_jobs_and_collab_lifecycle_suite(
+    store: &CanonicalStore,
+    local_root: Option<notarium_core::epoch::DataRoot>,
+) {
     let scope = HistoryScope {
         space_id: sample_space_id(0x74),
         incarnation: sample_incarnation(0x74),
@@ -1342,6 +1475,47 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore) {
         })
         .await
         .unwrap();
+
+    let pinned = sample_space_id(0x75);
+    let owner_context = owner_ctx(&scope, owner.clone());
+    let grant = owner_context.auth().spaces()[&scope.space_id].clone();
+    let grants = BTreeMap::from([
+        (scope.space_id.clone(), grant.clone()),
+        (pinned.clone(), grant),
+    ]);
+    let human = EngineAuthContext::for_human(VerifiedHuman::attest(
+        owner.clone(),
+        GrantId::from_bytes([8; 16]),
+        grants.clone(),
+        true,
+    ));
+    let branch = human
+        .for_agent_run(
+            sample_run_id(7),
+            pinned,
+            notarium_core::auth::ChatAudience::Personal,
+            grants,
+        )
+        .unwrap();
+    let scoped_agent = SpaceContext::new(branch, scope.clone(), make_budget()).unwrap();
+    let chat_request = next_mutation(&scope,&owner, CreateChat {
+        thread: sample_thread_id(0x7a), kind: ChatThreadKind::Personal, owner: owner.clone(),
+        project_folder: None, title: "Pinned writes".into(),
+    });
+    assert!(matches!(store.create_chat(scoped_agent.clone(),chat_request.clone()).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
+    let committed_chat = store.create_chat(owner_context,chat_request.clone()).await.unwrap();
+    assert_eq!(committed_chat.value.id,chat_request.input.thread);
+    assert!(matches!(store.create_chat(scoped_agent.clone(),chat_request).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
+    let outside_pin = store
+        .create_job(
+            scoped_agent,
+            next_mutation(&scope, &owner, ContentJobKind::Reindex),
+        )
+        .await;
+    assert!(matches!(
+        outside_pin,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
 
     // 1. `ContentJobPort` lifecycle + worker lease steal + purge sanitization:
     let secret_note = sample_note_id(0xB1);
@@ -1446,6 +1620,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore) {
         .await;
     assert_validation_err(&bad_cursor_res, ValidationReason::CursorScopeMismatch);
 
+    let retained_cursor = cursor.clone();
     let page2 = store
         .list_jobs(
             owner_ctx(&scope, owner.clone()),
@@ -1479,6 +1654,15 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore) {
     assert_eq!(claim1.job.id, job_export.id);
     assert_eq!(claim1.job.state, JobState::Running);
     assert_eq!(claim1.attempts, 1);
+    let stale = store
+        .list_jobs(
+            owner_ctx(&scope, owner.clone()),
+            ReadRequest::Continue {
+                cursor: retained_cursor,
+            },
+        )
+        .await;
+    assert_validation_err(&stale, ValidationReason::CursorStale);
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -1543,6 +1727,21 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore) {
     assert!(claim2.job.lease > claim1.job.lease);
 
     // `heartbeat_job_lease` updates progress without advancing `spaces.last_seq`!
+    let progress_cursor = store
+        .list_jobs(
+            owner_ctx(&scope, owner.clone()),
+            ReadRequest::Open {
+                query: JobQuery {
+                    states: Vec::new(),
+                    limit: PageLimit::new(1).unwrap(),
+                },
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap()
+        .next
+        .unwrap();
     let seq_before_hb = store.read_space(&scope.space_id).await.unwrap().last_seq;
     let hb_job = store
         .heartbeat_job_lease(
@@ -1564,6 +1763,15 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore) {
     );
     assert_eq!(hb_job.completed_units, 5);
     assert_eq!(hb_job.total_units, Some(10));
+    let stale = store
+        .list_jobs(
+            owner_ctx(&scope, owner.clone()),
+            ReadRequest::Continue {
+                cursor: progress_cursor,
+            },
+        )
+        .await;
+    assert_validation_err(&stale, ValidationReason::CursorStale);
 
     // Complete `job_export` as `Succeeded`:
     let art_id = ArtifactId::from_bytes([0xCC; 16]);
@@ -1749,6 +1957,76 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore) {
         .await;
     assert!(bad_lease_upd.is_err());
 
+    let locked_checkpoint = CheckpointCollabSession {
+        scope: scope.clone(),
+        note: collab_note.clone(),
+        owner_id: "room-worker-1".into(),
+        expected_lease: opened.lease_epoch,
+        expected_lineage: opened.lineage_epoch,
+        yrs_snapshot: vec![9],
+        compacted_through_update_seq: Some(1),
+        carrier_settlement: Some(CollabCarrierSettlement {
+            auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+            carrier: "# Locked settlement\n".into(),
+        }),
+    };
+    if let Some(root) = local_root {
+        // The new CAS file witnesses completion of Phase 1 while the SQL writer is paused.
+        let pause = store.acquire_writer_safe_point().await.unwrap();
+        let mut late = locked_checkpoint.clone();
+        let settlement = late.carrier_settlement.as_mut().unwrap();
+        settlement.auth = owner_ctx(&scope, owner.clone()).auth().clone();
+        settlement.carrier = "# Settlement revoked after staging\n".into();
+        let staged = root.blob(
+            &scope.space_id,
+            ContentDigest::from_bytes(*blake3::hash(settlement.carrier.as_bytes()).as_bytes()),
+        );
+        let taint = settlement.auth.taint().clone();
+        let task_store = store.clone();
+        let pending = tokio::spawn(async move {
+            task_store
+                .checkpoint_collab_session(&make_budget(), late)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !staged.exists() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("settlement reached Phase 1");
+        taint.mark_external_read();
+        drop(pause);
+        let denied = pending.await.unwrap();
+        assert!(matches!(
+            denied,
+            Err(PortError::Domain(DomainError::CrossSpaceTainted))
+        ));
+    }
+    let folder = sample_folder_id(0x04);
+    store
+        .set_folder_write_lock(owner_ctx(&scope, owner.clone()), folder.clone(), true)
+        .await
+        .unwrap();
+    let denied = store
+        .checkpoint_collab_session(&make_budget(), locked_checkpoint)
+        .await;
+    assert!(matches!(
+        denied,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    store
+        .set_folder_write_lock(owner_ctx(&scope, owner.clone()), folder, false)
+        .await
+        .unwrap();
+    let persisted = store
+        .read_collab_session(None, &scope, &collab_note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.session.carrier_rev_id, c_rev0);
+    assert_eq!(persisted.updates.len(), 2);
+
     // Checkpoint session compacting through `update_seq = 1` + settling canonical carrier!
     let settled_carrier_1 = "# Collab Doc\n\nCheckpoint settled.\n".to_owned();
     let ckpt = store
@@ -1763,7 +2041,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore) {
                 yrs_snapshot: vec![9, 9, 9],
                 compacted_through_update_seq: Some(1),
                 carrier_settlement: Some(CollabCarrierSettlement {
-                    actor: owner.clone(),
+                    auth: owner_ctx(&scope, owner.clone()).auth().clone(),
                     carrier: settled_carrier_1.clone(),
                 }),
             },
@@ -1792,8 +2070,9 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore) {
                 expected_lease: ckpt.lease_epoch,
                 expected_lineage: ckpt.lineage_epoch,
                 final_yrs_snapshot: Some(vec![7, 7]),
+                compacted_through_update_seq: Some(2),
                 carrier_settlement: Some(CollabCarrierSettlement {
-                    actor: owner.clone(),
+                    auth: owner_ctx(&scope, owner.clone()).auth().clone(),
                     carrier: settled_carrier_2.clone(),
                 }),
             },
@@ -1801,6 +2080,8 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore) {
         .await
         .expect("close_collab_session");
     assert_eq!(closed.room_state, CollabRoomState::Closed);
+
+    check_reopened_room_concurrency(store, &scope, &owner, &collab_note, &closed).await;
 
     // Simulate open-room race AFTER `ClosedRoomReservation` is minted -> direct edit MUST fail closed!
     interceptor
@@ -1932,7 +2213,7 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
 
         run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(&store, true).await;
         run_ten_thousand_entry_chat_dag_read_suite(&store).await;
-        run_jobs_and_collab_lifecycle_suite(&store).await;
+        run_jobs_and_collab_lifecycle_suite(&store, Some(temp.data_root())).await;
 
         // Leave an active collaborative session open and shut down WITHOUT closing the room
         // to simulate a single-writer SQLite process restart after an unclean termination!
@@ -2075,8 +2356,9 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
                 expected_lease: recovered.lease_epoch,
                 expected_lineage: recovered.lineage_epoch,
                 final_yrs_snapshot: Some(vec![42, 43]),
+                compacted_through_update_seq: None,
                 carrier_settlement: Some(CollabCarrierSettlement {
-                    actor: owner.clone(),
+                    auth: owner_ctx(&crash_scope, owner.clone()).auth().clone(),
                     carrier: "# Crash Doc\n\nRecovered cleanly.\n".to_owned(),
                 }),
             },
@@ -2118,14 +2400,91 @@ async fn l7_postgres_s3_chats_jobs_and_collab_parity() {
         .expect("provision versioned S3 bucket");
 
     let config = fixtures.pg_s3_config(sample_installation_id(0x78), &pg_schema, s3_cfg);
-    let (store, runtime) = CanonicalRuntime::open(config)
+    let (store, runtime) = CanonicalRuntime::open(config.clone())
         .await
         .expect("open PG16 + MinIO CE S3 canonical runtime");
 
     run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(&store, false).await;
     run_ten_thousand_entry_chat_dag_read_suite(&store).await;
-    run_jobs_and_collab_lifecycle_suite(&store).await;
+    run_jobs_and_collab_lifecycle_suite(&store, None).await;
 
+    let (successor, successor_runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let scope = HistoryScope {
+        space_id: sample_space_id(0x74),
+        incarnation: sample_incarnation(0x74),
+    };
+    let note = sample_note_id(0xc1);
+    let session = store
+        .read_collab_session(None, &scope, &note)
+        .await
+        .unwrap()
+        .unwrap()
+        .session;
+    let spec = OpenCollabSession {
+        scope: scope.clone(),
+        note: note.clone(),
+        owner_id: "previous".into(),
+        expected_carrier_rev: session.carrier_rev_id,
+        expected_lineage: Some(session.lineage_epoch),
+        expected_lease: Some(session.lease_epoch),
+        initial_yrs_snapshot: None,
+        allow_fenced_recovery: false,
+    };
+    let active = store
+        .open_collab_session(&make_budget(), spec.clone())
+        .await
+        .unwrap();
+    let old_update = AppendCollabUpdate {
+        scope: scope.clone(),
+        note: note.clone(),
+        owner_id: "previous".into(),
+        expected_lease: active.lease_epoch,
+        expected_lineage: active.lineage_epoch,
+        update_seq: 1,
+        update_bytes: vec![42],
+    };
+    store
+        .append_collab_update(&make_budget(), old_update.clone())
+        .await
+        .unwrap();
+    successor
+        .advance_space_lease(
+            &support::maintenance_ctx(notarium_core::ports::ServicePurpose::Revocation),
+            &scope,
+            LeaseEpoch::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+    let stale = store
+        .append_collab_update(
+            &make_budget(),
+            AppendCollabUpdate {
+                update_seq: 2,
+                ..old_update
+            },
+        )
+        .await;
+    assert_validation_err(&stale, ValidationReason::InvalidAuthority);
+    let persisted = successor
+        .read_collab_session(None, &scope, &note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.session.room_state, CollabRoomState::Fenced);
+    assert_eq!(persisted.updates.last().unwrap().update_bytes, vec![42]);
+    successor
+        .open_collab_session(
+            &make_budget(),
+            OpenCollabSession {
+                owner_id: "successor".into(),
+                expected_lease: Some(persisted.session.lease_epoch),
+                allow_fenced_recovery: true,
+                ..spec
+            },
+        )
+        .await
+        .unwrap();
+    successor_runtime.shutdown().await.unwrap();
     runtime.shutdown().await.expect("shutdown PG+S3 runtime");
     fixtures.drop_pg_schema(&pg_schema).await;
 }

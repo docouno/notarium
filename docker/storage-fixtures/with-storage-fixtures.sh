@@ -23,6 +23,17 @@ random_hex() {
   od -An -N16 -tx1 /dev/urandom | tr -d ' \n'
 }
 
+source_tree() (
+  # Snapshot tracked and non-ignored source without modifying the developer's index.
+  GIT_INDEX_FILE="$FIXTURES_BASE/benchmark.index"
+  export GIT_INDEX_FILE
+  trap 'rm -f -- "$GIT_INDEX_FILE" "$GIT_INDEX_FILE.lock"' EXIT
+  rm -f -- "$GIT_INDEX_FILE" "$GIT_INDEX_FILE.lock"
+  git -C "$ROOT" read-tree HEAD
+  git -C "$ROOT" add -A -- .
+  git -C "$ROOT" write-tree
+)
+
 sweep_stale_runs() {
   stale_containers=$(docker ps -aq --filter "label=io.notarium.storage-fixture.checkout=$CHECKOUT_HASH" 2>/dev/null || true)
   if [ -n "$stale_containers" ]; then
@@ -61,7 +72,7 @@ if [ "${1:-}" = "setup-images" ]; then
   exit 0
 fi
 
-if [ "${1:-}" != "test" ] && [ "${1:-}" != "exec-custom" ]; then
+if [ "${1:-}" != "test" ] && [ "${1:-}" != "exec-custom" ] && [ "${1:-}" != "benchmark" ]; then
   exec sh "$ROOT/.devkit/runtime/devkit.sh" "$@"
 fi
 
@@ -72,6 +83,24 @@ for required_image in "$PG_IMAGE" "$MINIO_IMAGE" "$BRIDGE_IMAGE"; do
 done
 
 mkdir -p -- "$FIXTURES_BASE"
+# The manifest and stale-run sweep belong to one checkout. Keep ownership
+# through teardown so a waiting test cannot erase the active fixture.
+exec 9>"$FIXTURES_BASE/lifecycle.lock"
+flock -x 9
+if [ "$1" = "benchmark" ]; then
+  case "$*" in
+    benchmark) report=d3-benchmarks ;;
+    'benchmark --smoke') report=d3-benchmarks-smoke ;;
+    'benchmark --paired-only') report=d3-paired ;;
+    'benchmark --paired-only --smoke') report=d3-paired-smoke ;;
+    *) fail "usage: benchmark [--paired-only] [--smoke]" ;;
+  esac
+  commit=$(git -C "$ROOT" rev-parse HEAD)
+  head_tree=$(git -C "$ROOT" rev-parse 'HEAD^{tree}')
+  tree=$(source_tree)
+  sh "$ROOT/.devkit/runtime/devkit.sh" cli exec --component apps/api --network none -- \
+    cargo build --offline --locked --release -p fitness-gates --features storage-bench --example d3_benchmarks
+fi
 sweep_stale_runs
 
 RUN_ID="run-$$-$(date +%s)"
@@ -184,7 +213,22 @@ EOF
 chmod 0644 "$TMP_MANIFEST"
 mv -f "$TMP_MANIFEST" "$ACTIVE_MANIFEST"
 
-if [ "${1:-}" = "exec-custom" ]; then
+if [ "$1" = "benchmark" ]; then
+  shift
+  mkdir -p "$ROOT/.artifacts/3-storage-cas"
+  status=0
+  caller_cpu=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || printf unknown)
+  caller_memory=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || printf unknown)
+  sh "$ROOT/.devkit/runtime/devkit.sh" cli exec --component apps/api --write --network none -- \
+    ./target/release/examples/d3_benchmarks "$@" --git-base "$commit" --head-tree "$head_tree" --git-tree "$tree" \
+    --caller-cgroup-cpu "$caller_cpu" --caller-cgroup-memory "$caller_memory" \
+    --output "/workspace/.artifacts/storage-tests/$RUN_ID/report.json" || status=$?
+  [ "$tree" = "$(source_tree)" ] || fail "benchmark source changed during measurement"
+  [ -f "$RUN_DIR/report.json" ] || fail "benchmark did not finish its measurements"
+  mv "$RUN_DIR/report.json" "$ROOT/.artifacts/3-storage-cas/$report-$tree.json"
+  printf '%s\n' "$ROOT/.artifacts/3-storage-cas/$report-$tree.json"
+  exit "$status"
+elif [ "${1:-}" = "exec-custom" ]; then
   shift
   "$@"
 else

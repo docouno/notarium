@@ -495,26 +495,41 @@ impl EngineAuthContext {
         }
         Ok(())
     }
+    /// Confines every write, including personal chat, to the run's admitted Space.
+    pub fn authorize_write_space_pin(&self, space: &Space) -> DomainResult<()> {
+        let grant = self
+            .spaces
+            .get(&space.id)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if space.lifecycle != SpaceLifecycle::Active
+            || grant.role == SpaceRole::Viewer
+            || self
+                .write_space
+                .as_ref()
+                .is_some_and(|pin| pin != &space.id)
+        {
+            return Err(DomainError::SpaceReadOnly);
+        }
+        Ok(())
+    }
+
+    /// Admission shared by direct document mutations and whole-Space jobs.
+    pub fn authorize_space_write(&self, space: &Space) -> DomainResult<()> {
+        if self.taint.is_tainted() {
+            return Err(DomainError::CrossSpaceTainted);
+        }
+        self.authorize_write_space_pin(space)
+    }
+
     pub fn authorize_direct_write(
         &self,
         before: &ResourceFacts,
         after: &ResourceFacts,
     ) -> DomainResult<()> {
-        if self.taint.is_tainted() {
-            return Err(DomainError::CrossSpaceTainted);
-        }
         for resource in [before, after] {
-            let grant = self
-                .spaces
-                .get(&resource.space.id)
-                .ok_or(DomainError::ResourceNotFound)?;
-            if self
-                .write_space
-                .as_ref()
-                .is_some_and(|space| space != &resource.space.id)
-                || resource.space.lifecycle != SpaceLifecycle::Active
-                || grant.role == SpaceRole::Viewer
-                || resource.folder_write_locked
+            self.authorize_space_write(&resource.space)?;
+            let grant = &self.spaces[&resource.space.id];
+            if resource.folder_write_locked
                 || !grant.write_classes.contains(&resource.class)
                 || grant
                     .project_root

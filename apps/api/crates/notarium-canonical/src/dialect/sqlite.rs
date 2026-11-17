@@ -19,7 +19,6 @@ use crate::{
 };
 
 pub const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
-pub const SQLITE_FAST_READ_POOL_SIZE: usize = 4;
 
 pub async fn open_and_bootstrap_sqlite(
     data_root: &DataRoot,
@@ -391,10 +390,11 @@ pub async fn observe_sqlite_canonical_witness(
     let state_raw: String = row.get("migration_state");
     let checksum_bytes: Vec<u8> = row.get("manifest_checksum");
 
-    if schema_raw != i64::from(CANONICAL_SCHEMA_VERSION) {
-        return MarkerObservation::Invalid;
-    }
-    if checksum_bytes.as_slice() != manifest_checksum().as_bytes() {
+    let current = schema_raw == i64::from(CANONICAL_SCHEMA_VERSION)
+        && checksum_bytes.as_slice() == manifest_checksum().as_bytes();
+    let recognized_predecessor =
+        schema_raw == 1 && hex::encode(&checksum_bytes) == crate::schema::migrate::V1_HASH;
+    if !current && !recognized_predecessor {
         return MarkerObservation::Invalid;
     }
 
