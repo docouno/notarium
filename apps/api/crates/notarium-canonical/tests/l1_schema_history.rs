@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod support;
 
 use notarium_canonical::{

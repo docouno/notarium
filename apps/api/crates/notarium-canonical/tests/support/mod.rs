@@ -68,7 +68,8 @@ impl StorageTestFixtures {
             let p = PathBuf::from(explicit);
             if !p.exists() {
                 panic!(
-                    "explicit NOTARIUM_STORAGE_FIXTURES_MANIFEST '{}' does not exist (fail-closed)",
+                    "explicit NOTARIUM_STORAGE_FIXTURES_MANIFEST '{}' does not exist (fail-closed); \
+                     run via 'make test app=api' or './docker/storage-fixtures/with-storage-fixtures.sh exec-custom ...'",
                     p.display()
                 );
             }

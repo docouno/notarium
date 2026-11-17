@@ -333,7 +333,7 @@ impl CanonicalStore {
         let spool_dir = resolve_spool_dir(&self.inner)?;
         self.with_read_tx(|tx| {
             Box::pin(async move {
-                let row_opt: Option<(
+                type RawBackupArtifactRow = (
                     String,
                     String,
                     String,
@@ -344,7 +344,8 @@ impl CanonicalStore {
                     String,
                     String,
                     i64,
-                )> = match tx {
+                );
+                let row_opt: Option<RawBackupArtifactRow> = match tx {
                     BackendConn::Sqlite(conn) => {
                         let r = sqlx::query(
                             "SELECT backup_id, installation_id, encoding, schema_version,
@@ -1126,11 +1127,11 @@ struct PgPreparedSource {
 
 impl PgPreparedSource {
     async fn abort_cleanly(&mut self) {
-        if let Some(mut conn) = self.pooled.take() {
-            if self.in_tx {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                self.in_tx = false;
-            }
+        if let Some(mut conn) = self.pooled.take()
+            && self.in_tx
+        {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            self.in_tx = false;
         }
         remove_tmp_artifacts_best_effort(&self.tmp_path);
     }
@@ -1677,11 +1678,11 @@ async fn stream_postgres_spool_v1(
     // Close the REPEATABLE READ source transaction BEFORE fsync/publish or on error!
     match &stream_res {
         Ok(_) => {
-            if let Some(mut conn) = pg.pooled.take() {
-                if pg.in_tx {
-                    let _ = sqlx::query("COMMIT").execute(&mut *conn).await;
-                    pg.in_tx = false;
-                }
+            if let Some(mut conn) = pg.pooled.take()
+                && pg.in_tx
+            {
+                let _ = sqlx::query("COMMIT").execute(&mut *conn).await;
+                pg.in_tx = false;
             }
         }
         Err(_) => {
@@ -2583,7 +2584,7 @@ impl BackupParticipantPort for CanonicalStore {
                             ));
                         }
                     };
-                    let backend_pid: i32 = match warm_pg_backup_connection(&mut *pooled).await {
+                    let backend_pid: i32 = match warm_pg_backup_connection(&mut pooled).await {
                         Ok(pid) => pid,
                         Err(err) => {
                             remove_tmp_artifacts_best_effort(&tmp_path);

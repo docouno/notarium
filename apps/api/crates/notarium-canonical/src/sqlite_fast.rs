@@ -454,6 +454,7 @@ fn map_rusqlite_read_err(
     internal_not_committed(stage, err.to_string())
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum EditPhase1Read {
     Replayed(StoredCommittedNoteRevV1),
     Proceed {
@@ -5592,7 +5593,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
         cache: &mut FastBatchSqlCache,
         batch_now_ts: Timestamp,
         batch_now_ms: i64,
-        mut defer_append: Option<&mut DeferredAppendRows>,
+        defer_append: Option<&mut DeferredAppendRows>,
     ) -> Result<ItemCommitArtifacts, FastItemExecError> {
         let scope_cl = &self.scope;
         let auth = &self.auth;
@@ -6559,7 +6560,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
         }
 
         // 2c. Rebind existing active CAS blobs + append revision rows + bump `agent_run_heads`.
-        if let Some(buf) = defer_append.as_deref_mut() {
+        if let Some(buf) = defer_append {
             let mut delta_persisted: HashMap<ContentDigest, i64> =
                 HashMap::with_capacity(pub_by_digest.len());
             for (nid, rev_id, digest, cseq) in &pending_blob_rebinds {

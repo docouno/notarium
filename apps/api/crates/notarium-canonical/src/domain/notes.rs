@@ -83,11 +83,7 @@ fn analyze_and_prepare_carrier_opt_preparsed(
     _note_id: &NoteId,
     slug: &str,
     codec: BlobCodecTag,
-    preparsed_hdr: Option<(
-        Option<BTreeMap<String, YamlValue>>,
-        Option<notarium_core::error::ValidationReason>,
-        usize,
-    )>,
+    preparsed_hdr: Option<PreparsedHeaderTuple>,
 ) -> Result<PreparedCarrierInfo, PortError> {
     let (raw_fields, diagnostics, headings) = if class == DocClass::EncryptedNote {
         notarium_syntax::encrypted::validate(carrier)?;

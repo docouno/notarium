@@ -1,8 +1,10 @@
 # Core contracts
 
 `notarium-core` implements pure domain values, authorization checks and the port
-interfaces below. Storage, collaboration, transports and backup adapters belong
-to later deliveries. The [crate dependency matrix](architecture.md) stays in force.
+interfaces below. Canonical SQL and CAS persistence lives in
+[canonical storage](storage.md); control, projections, search, live collaboration
+and transports belong to their respective runtime owners. The
+[crate dependency matrix](architecture.md) stays in force.
 
 ## Values and admission
 
@@ -222,8 +224,9 @@ close after the stable database spool; the reference-counted CAS hold lasts
 through blob copying. Uploading a spool does not retain source snapshots.
 Cancellation or failure of either participant releases all pauses, snapshots
 and holds; incomplete artifacts are never successful backups. Numeric budgets,
-adapter compatibility, crash recovery and the target pause below 1 ms require
-proof in the storage/backup deliveries, not core test doubles.
+adapter compatibility, crash recovery and the target pause below 1 ms are
+verified in the storage/backup deliveries (see [canonical storage](storage.md)),
+not core test doubles.
 
 ## Port operation coverage
 

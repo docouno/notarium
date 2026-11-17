@@ -49,6 +49,7 @@ use crate::{
     },
 };
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum SqlDriverState {
     Sqlite {
         writer: Mutex<Option<crate::sqlite_fast::SqliteWriterPair>>,

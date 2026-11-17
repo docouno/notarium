@@ -436,14 +436,10 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
         Box::pin(async move {
             let mut folder_cache = FolderAncestryCache::default();
             // 1. Consolidated Space + Run + RootFolder state probe (1 single query on PostgreSQL!).
-            let (has_bmh, has_pf, has_cs, has_ov, has_schema, run_head_opt): (
-                bool,
-                bool,
-                bool,
-                bool,
-                bool,
-                Option<(Vec<u8>, String)>,
-            ) = match tx {
+            type RollbackStateProbeTuple =
+                (bool, bool, bool, bool, bool, Option<(Vec<u8>, String)>);
+            let (has_bmh, has_pf, has_cs, has_ov, has_schema, run_head_opt): RollbackStateProbeTuple =
+                match tx {
                 BackendConn::Postgres(conn) => {
                     let r = sqlx::query(
                         "SELECT
@@ -4252,8 +4248,8 @@ async fn try_execute_pg_rollback_1rt_direct(
         pre_meta_bytes: Option<Vec<u8>>,
     }
 
-    let mut warm_hydrated: Option<(FolderId, SpaceKind, Vec<Option<LeanHead>>, Vec<LeanRevAcc>)> =
-        None;
+    type WarmHydratedTuple = (FolderId, SpaceKind, Vec<Option<LeanHead>>, Vec<LeanRevAcc>);
+    let mut warm_hydrated: Option<WarmHydratedTuple> = None;
     if use_warm_read {
         let mut heads: Vec<Option<LeanHead>> = (0..n).map(|_| None).collect();
         let mut revs: Vec<LeanRevAcc> = (0..n).map(|_| LeanRevAcc::default()).collect();

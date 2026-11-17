@@ -879,9 +879,8 @@ async fn run_writer_benchmark_case(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()
-    .map(|c| {
+    .inspect(|c| {
         let _ = c.execute_batch("BEGIN DEFERRED; SELECT singleton_id FROM schema_meta;");
-        c
     });
     drop(store);
     runtime.shutdown().await.unwrap();

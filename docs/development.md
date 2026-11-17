@@ -4,9 +4,14 @@ Use Linux x86_64, a local Docker Engine, Docker Compose **5.0.0+**, Git and GNU
 Make. Devkit 0.4.1 pins the container toolchains. Host Node/Rust SDKs do not replace
 them. Optional npm CLI entry points need Node 24.22.1 on the host.
 
-`make setup` downloads images and caches dependencies and requires networking.
-Subsequent check/test/build commands use `--network none`, read-only sources,
-manifests and lockfiles, with writable declared cache/output paths.
+`make setup` downloads images and caches dependencies, including the digest-pinned
+PostgreSQL 16 image and the source-built MinIO Community storage test fixture
+(`compose.storage-tests.yaml`), and requires networking. Subsequent check/test/build
+commands use `--network none`, read-only sources, manifests and lockfiles, with
+writable declared cache/output paths. `make test` automatically launches and tears
+down isolated Unix-domain-socket PostgreSQL 16 and MinIO Community fixtures for
+`apps/api` without network access; integration tests fail closed if fixtures are
+absent (see [canonical storage](storage.md)).
 
 | Command | Purpose |
 | --- | --- |

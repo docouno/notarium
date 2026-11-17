@@ -1058,6 +1058,7 @@ fn compute_pipelined_batch_target(active_ops: usize, max_items: usize) -> usize 
     active_ops.clamp(1, max_items)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_batch_worker_loop(
     inner_weak: std::sync::Weak<CanonicalInner>,
     mut rx: mpsc::Receiver<QueuedWriteEntry>,
@@ -1250,11 +1251,12 @@ async fn flush_single_batch(
     let mut reserved_list = Vec::with_capacity(batch.len());
     let mut reply_targets = Vec::with_capacity(batch.len());
     let mut group_spaces = Vec::new();
-    let mut items: Vec<(
+    type UnpackedBatchItem = (
         PreparedWriteIntent,
         Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         Option<PgSingleItemFastFn>,
-    )> = Vec::with_capacity(batch.len());
+    );
+    let mut items: Vec<UnpackedBatchItem> = Vec::with_capacity(batch.len());
 
     for entry in batch {
         match entry {
