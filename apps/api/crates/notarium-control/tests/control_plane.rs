@@ -257,14 +257,25 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
         .await
         .unwrap();
     assert_eq!(spaces_page.items.len(), 2);
-    let projects_page = plane
-        .list_projects(
-            agent_ctx.clone(),
-            ControlPageRequest::new(20, None).unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(projects_page.items.len(), 1);
+    // Each Space contributes one catalog page in this fixture. Either Space can sort first.
+    let mut projects = Vec::new();
+    let mut continuation = None;
+    for _ in &spaces_page.items {
+        let page = plane
+            .list_projects(
+                agent_ctx.clone(),
+                ControlPageRequest::new(20, continuation.take()).unwrap(),
+            )
+            .await
+            .unwrap();
+        projects.extend(page.items.into_iter().map(|item| item.folder));
+        continuation = page.continuation;
+        if continuation.is_none() {
+            break;
+        }
+    }
+    assert!(continuation.is_none());
+    assert_eq!(projects, [project.clone()]);
     let abilities_page = plane
         .discover_abilities(
             agent_ctx.clone(),
