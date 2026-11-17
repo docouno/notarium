@@ -478,6 +478,15 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version == 1 {
+                sqlx::raw_sql(
+                    "DROP TABLE account_catalog_receipts;
+                     ALTER TABLE chat_pending_inputs DROP COLUMN ext_space_tainted",
+                )
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
             for table in decoded.tables {
                 // The independent decoder validates identifiers and column order against the manifest.
                 let insert = format!("INSERT INTO {} ({}) ", table.name, table.columns.join(", "));
@@ -506,6 +515,7 @@ impl BackendCase {
             }
             tx.commit().await.unwrap();
             let mut config = self.config.clone();
+            config.installation_id = decoded.witness.installation;
             config.sql = SqlBackendConfig::postgres_default(fixtures.pg_connect_config(), &schema);
             return config;
         }
@@ -563,6 +573,87 @@ fn backup_test_space(byte: u8) -> CreateSpaceSpec {
         initial_last_seq: SpaceSeq::ZERO,
         created_at: None,
     }
+}
+
+#[tokio::test]
+async fn restores_a_postgres_schema_v1_spool_and_rejects_invalid_headers() {
+    // Output of the schema 1 PostgreSQL participant with one synthetic shared Space and root.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/schema-v1.pgspool");
+    let decoded = decode_postgres_spool_v1(&fixture).unwrap();
+    assert_eq!(decoded.schema_version, 1);
+    assert_eq!(decoded.witness.installation, sample_installation_id(1));
+    assert_eq!(decoded.tables.len(), 34);
+    let queue = decoded
+        .tables
+        .iter()
+        .find(|t| t.name == "chat_pending_inputs")
+        .unwrap();
+    assert_eq!(queue.columns.len(), 13);
+    assert_eq!(queue.columns.last().unwrap(), "consumed_entry_seq");
+    let cut = decoded.witness.histories.first().unwrap();
+    assert_eq!(cut.scope.space_id, sample_space_id(11));
+
+    let case = BackendCase::open_pg_s3().await;
+    let config = case
+        .restored_config(&fixture, &case.temp_root.data_root())
+        .await;
+    let (restored, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
+    let space = restored.get_space(&cut.scope.space_id).await.unwrap();
+    assert_eq!(space.scope, cut.scope);
+    assert_eq!(space.last_seq, cut.after);
+    assert_eq!(space.slug, "review-space");
+    runtime.shutdown().await.unwrap();
+    if let SqlBackendConfig::Postgres { schema, .. } = config.sql {
+        case.pg_cleanup
+            .as_ref()
+            .unwrap()
+            .0
+            .drop_pg_schema(&schema)
+            .await;
+    }
+
+    let original = fs::read(&fixture).unwrap();
+    let invalid = case.temp_root.path().join("invalid.pgspool");
+    let version_offset = notarium_canonical::backup::POSTGRES_SPOOL_V1_MAGIC.len();
+    let checksum_offset = version_offset + 4;
+    let witness_len_offset = checksum_offset + 32;
+    let witness_start = witness_len_offset + 4;
+    let witness_len = u32::from_be_bytes(
+        original[witness_len_offset..witness_start]
+            .try_into()
+            .unwrap(),
+    );
+    let first_name_len = witness_start + witness_len as usize + 4;
+    for (offset, replacement, reason) in [
+        (
+            version_offset,
+            3u32.to_be_bytes().to_vec(),
+            ValidationReason::InvalidState,
+        ),
+        (
+            checksum_offset,
+            vec![0; 32],
+            ValidationReason::InvalidDigest,
+        ),
+        (
+            witness_len_offset,
+            8192u32.to_be_bytes().to_vec(),
+            ValidationReason::InvalidState,
+        ),
+        (
+            first_name_len,
+            u16::MAX.to_be_bytes().to_vec(),
+            ValidationReason::InvalidState,
+        ),
+    ] {
+        let mut bytes = original.clone();
+        bytes[offset..offset + replacement.len()].copy_from_slice(&replacement);
+        let (body, trailer) = bytes.split_at_mut(original.len() - 32);
+        trailer.copy_from_slice(blake3::hash(body).as_bytes());
+        fs::write(&invalid, bytes).unwrap();
+        assert_validation_err(&decode_postgres_spool_v1(&invalid), reason);
+    }
+    case.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -673,6 +764,23 @@ async fn backup_scope_ownership_and_remote_writer_admission() {
         }
         drop(repeated);
         drop(prepared);
+        let mut ready = store
+            .prepare(
+                maintenance_ctx(ServicePurpose::Backup),
+                BackupId::from_bytes([0xBC; 16]),
+                budget,
+            )
+            .await
+            .unwrap();
+        let hold = ready.acquire_hold().await.unwrap();
+        let mut paused = ready.pause_writes().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), hold.release())
+            .await
+            .expect("releasing a hold must revoke an outstanding pause")
+            .unwrap();
+        assert!(paused.open_cut().await.is_err());
+        drop(paused);
+        drop(ready);
         case.shutdown().await;
     }
 }

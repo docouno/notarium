@@ -543,13 +543,28 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         cur_a = ea.seq;
     }
 
-    for limit in [128,129,200] {
-        let page = store.read_chat(owner_ctx(&scope,owner.clone()),ChatRead {
-            thread: thread.clone(), leaf: cur_a, before: None, max_entries: PageLimit::new(limit).unwrap(),
-        }).await.unwrap();
-        let from = chain_a.len()-usize::from(limit);
-        assert_eq!(page.entries.iter().map(|entry|entry.seq).collect::<Vec<_>>(),chain_a[from..]);
-        assert_eq!(page.next_ancestor,Some(chain_a[from-1]));
+    for limit in [128, 129, 200] {
+        let page = store
+            .read_chat(
+                owner_ctx(&scope, owner.clone()),
+                ChatRead {
+                    thread: thread.clone(),
+                    leaf: cur_a,
+                    before: None,
+                    max_entries: PageLimit::new(limit).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let from = chain_a.len() - usize::from(limit);
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            chain_a[from..]
+        );
+        assert_eq!(page.next_ancestor, Some(chain_a[from - 1]));
     }
 
     // Verify `read_chat` performs ZERO writes (`spaces.last_seq` and SQLite WAL unchanged)
@@ -678,7 +693,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             } else {
                 format!("inline-pending-{idx}")
             };
-            let submitter = owner_ctx(&sc,own.clone());
+            let submitter = owner_ctx(&sc, own.clone());
             submitter.auth().taint().mark_external_read();
             st.queue_chat_input(
                 submitter,
@@ -771,7 +786,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     ));
 
     // `Appended` when `current_leaf == cur_a` transfers CAS ref `ChatPendingInput -> ChatEntry`!
-    let consumer = owner_ctx(&scope,owner.clone());
+    let consumer = owner_ctx(&scope, owner.clone());
     assert!(!consumer.auth().taint().is_tainted());
     let consumed_ok = store
         .consume_chat_input(
@@ -800,7 +815,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     let retained = store.execute_diagnostic_read_sql_for_test(None,
         "SELECT COUNT(*) FROM chat_pending_inputs WHERE status = 'consumed' AND (inline_text <> '' OR payload_blake3 IS NOT NULL)"
     ).await.unwrap();
-    assert_eq!(retained,0);
+    assert_eq!(retained, 0);
     cur_a = appended_from_queue.seq;
 
     // Second `consume_chat_input` on same item returns `AlreadyConsumed` without duplicating!
@@ -813,7 +828,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 ConsumePending {
                     thread: thread.clone(),
                     input: target_pending,
-                    expected_run: run_id,
+                    expected_run: run_id.clone(),
                     current_leaf: cur_a,
                 },
             ),
@@ -822,6 +837,44 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .expect("consume AlreadyConsumed")
         .value;
     assert!(matches!(already, ConsumedPending::AlreadyConsumed));
+
+    let inline_pending = queued_ids
+        .iter()
+        .find(|id| !large_candidates.contains(*id))
+        .unwrap();
+    let inline_request = next_mutation(
+        &scope,
+        &owner,
+        ConsumePending {
+            thread: thread.clone(),
+            input: inline_pending.clone(),
+            expected_run: run_id,
+            current_leaf: cur_a,
+        },
+    );
+    let added = store
+        .consume_chat_input(owner_ctx(&scope, owner.clone()), inline_request.clone())
+        .await
+        .unwrap();
+    let ConsumedPending::Appended(inline_entry) = added.value else {
+        panic!("expected inline entry");
+    };
+    assert!(matches!(inline_entry.body, ChatBody::Inline(_)));
+    let replay_reader = owner_ctx(&scope, owner.clone());
+    assert_eq!(
+        store
+            .consume_chat_input(replay_reader.clone(), inline_request)
+            .await
+            .unwrap()
+            .receipt,
+        added.receipt
+    );
+    assert!(replay_reader.auth().taint().is_tainted());
+    cur_a = inline_entry.seq;
+    let retained = store.execute_diagnostic_read_sql_for_test(None,
+        "SELECT COUNT(*) FROM chat_pending_inputs WHERE status = 'consumed' AND (inline_text <> '' OR payload_blake3 IS NOT NULL)"
+    ).await.unwrap();
+    assert_eq!(retained, 0);
 
     // 4. Redaction (`redact_chat_entry`):
     // Append a Compaction entry on branch A (descendant of `e2`) AND a Compaction entry on sibling
@@ -1498,14 +1551,32 @@ async fn run_jobs_and_collab_lifecycle_suite(
         )
         .unwrap();
     let scoped_agent = SpaceContext::new(branch, scope.clone(), make_budget()).unwrap();
-    let chat_request = next_mutation(&scope,&owner, CreateChat {
-        thread: sample_thread_id(0x7a), kind: ChatThreadKind::Personal, owner: owner.clone(),
-        project_folder: None, title: "Pinned writes".into(),
-    });
-    assert!(matches!(store.create_chat(scoped_agent.clone(),chat_request.clone()).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
-    let committed_chat = store.create_chat(owner_context,chat_request.clone()).await.unwrap();
-    assert_eq!(committed_chat.value.id,chat_request.input.thread);
-    assert!(matches!(store.create_chat(scoped_agent.clone(),chat_request).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
+    let chat_request = next_mutation(
+        &scope,
+        &owner,
+        CreateChat {
+            thread: sample_thread_id(0x7a),
+            kind: ChatThreadKind::Personal,
+            owner: owner.clone(),
+            project_folder: None,
+            title: "Pinned writes".into(),
+        },
+    );
+    assert!(matches!(
+        store
+            .create_chat(scoped_agent.clone(), chat_request.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    let committed_chat = store
+        .create_chat(owner_context, chat_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(committed_chat.value.id, chat_request.input.thread);
+    assert!(matches!(
+        store.create_chat(scoped_agent.clone(), chat_request).await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
     let outside_pin = store
         .create_job(
             scoped_agent,
@@ -2206,6 +2277,8 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
     let temp = TempDataRoot::new("l7-sqlite");
     let config = CanonicalConfig::local_default(sample_installation_id(0x70), temp.data_root());
 
+    let staging_thread = sample_thread_id(0xd4);
+    let staged_pair;
     {
         let (store, runtime) = CanonicalRuntime::open(config.clone())
             .await
@@ -2260,7 +2333,7 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
             .open_collab_session(
                 &make_budget(),
                 OpenCollabSession {
-                    scope: crash_scope,
+                    scope: crash_scope.clone(),
                     note: crash_note,
                     owner_id: "crashed-worker".to_owned(),
                     expected_carrier_rev: rev0,
@@ -2272,6 +2345,37 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
             )
             .await
             .unwrap();
+
+        store
+            .create_chat(
+                owner_ctx(&crash_scope, owner.clone()),
+                next_mutation(
+                    &crash_scope,
+                    &owner,
+                    CreateChat {
+                        thread: staging_thread.clone(),
+                        kind: ChatThreadKind::Personal,
+                        owner: owner.clone(),
+                        project_folder: None,
+                        title: "Staging provenance".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let content = "same staged body".repeat(70);
+        let tainted_writer = owner_ctx(&crash_scope, owner.clone());
+        tainted_writer.auth().taint().mark_external_read();
+        let tainted = store
+            .stage_chat_blob(tainted_writer, &content)
+            .await
+            .unwrap();
+        let clean = store
+            .stage_chat_blob(owner_ctx(&crash_scope, owner.clone()), &content)
+            .await
+            .unwrap();
+        assert_eq!(clean.digest(), tainted.digest());
+        staged_pair = [(clean, false), (tainted, true)];
 
         runtime.shutdown().await.expect("shutdown SQLite runtime");
     }
@@ -2286,6 +2390,33 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
     };
     let owner = sample_principal_id(0x19);
     let crash_note = sample_note_id(0xD9);
+
+    for (staged, expected_taint) in staged_pair {
+        let reader = owner_ctx(&crash_scope, owner.clone());
+        let request = next_mutation(
+            &crash_scope,
+            &owner,
+            AppendChat {
+                thread: staging_thread.clone(),
+                parent: ThreadEntrySeq::ZERO,
+                kind: ChatEntryKind::Human,
+                body: ChatInputBody::Staged(staged),
+                referenced_notes: Vec::new(),
+                tainted: false,
+            },
+        );
+        let result = store2
+            .append_chat(reader.clone(), request.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.value.tainted, expected_taint);
+        assert_eq!(reader.auth().taint().is_tainted(), expected_taint);
+        let fresh = owner_ctx(&crash_scope, owner.clone());
+        let replay = store2.append_chat(fresh.clone(), request).await.unwrap();
+        assert_eq!(replay.receipt, result.receipt);
+        assert_eq!(replay.value.tainted, expected_taint);
+        assert_eq!(fresh.auth().taint().is_tainted(), expected_taint);
+    }
 
     let fenced_snap = store2
         .read_collab_session(None, &crash_scope, &crash_note)

@@ -33,7 +33,7 @@ pub(crate) enum ReplayResource {
 pub(crate) enum ReplayPolicy {
     Documents(Vec<ReplayResource>),
     Schema(Vec<ReplayResource>),
-    Chat(ChatThreadId, Vec<NoteRef>),
+    Chat(ChatThreadId, Vec<NoteRef>, bool),
     Job(Option<JobId>, Vec<NoteId>),
 }
 
@@ -105,7 +105,7 @@ impl UnboundCommand {
         thread: &ChatThreadId,
         reads: Vec<NoteRef>,
     ) -> CommandIdentitySpec {
-        self.with_policy(auth, ReplayPolicy::Chat(thread.clone(), reads))
+        self.with_policy(auth, ReplayPolicy::Chat(thread.clone(), reads, false))
     }
 
     pub(crate) fn for_link(
@@ -117,9 +117,10 @@ impl UnboundCommand {
         let mut resources = vec![ReplayResource::Write(source.clone())];
         match target {
             LinkTarget::Note(note) => resources.push(ReplayResource::Read(note.clone())),
-            LinkTarget::Folder(folder) => {
-                resources.push(ReplayResource::ReadLinkFolder(folder.clone(), source.clone()))
-            }
+            LinkTarget::Folder(folder) => resources.push(ReplayResource::ReadLinkFolder(
+                folder.clone(),
+                source.clone(),
+            )),
             LinkTarget::AuthoredName(_) => {}
         }
         self.with_policy(auth, ReplayPolicy::Documents(resources))
@@ -138,8 +139,15 @@ impl CommandIdentitySpec {
         let srec = load_space_record(tx, &scope.space_id).await?;
         srec.scope.check(scope)?;
         match policy {
-            ReplayPolicy::Chat(thread, reads) => {
-                crate::chats::authorize_chat_replay_tx(tx, &srec.space, auth, thread).await?;
+            ReplayPolicy::Chat(thread, reads, legacy_staged) => {
+                crate::chats::authorize_chat_replay_tx(
+                    tx,
+                    &srec.space,
+                    auth,
+                    thread,
+                    *legacy_staged,
+                )
+                .await?;
                 for note in reads {
                     if note.space_id == srec.space.id {
                         authorize_resource(
@@ -195,12 +203,23 @@ async fn authorize_resource(
     let note = match target {
         ReplayResource::WriteFolder(folder) => {
             let folder = folder.as_ref().unwrap_or(&srec.root_folder_id);
-            let (facts, _) = build_resource_facts_tx(tx,&srec.space,folder,choose_folder_auth_class(auth,&srec.space.id),None,true).await?;
-            return Ok(auth.authorize_direct_write(&facts,&facts)?);
+            let (facts, _) = build_resource_facts_tx(
+                tx,
+                &srec.space,
+                folder,
+                choose_folder_auth_class(auth, &srec.space.id),
+                None,
+                true,
+            )
+            .await?;
+            return Ok(auth.authorize_direct_write(&facts, &facts)?);
         }
-        ReplayResource::ReadLinkFolder(folder,source) => {
-            let head = crate::domain::common::load_note_head_row_tx(tx,&srec.space.id,source).await?;
-            let (facts, _) = build_resource_facts_tx(tx,&srec.space,folder,head.doc_class,None,true).await?;
+        ReplayResource::ReadLinkFolder(folder, source) => {
+            let head =
+                crate::domain::common::load_note_head_row_tx(tx, &srec.space.id, source).await?;
+            let (facts, _) =
+                build_resource_facts_tx(tx, &srec.space, folder, head.doc_class, None, true)
+                    .await?;
             return Ok(auth.authorize_read(&facts)?);
         }
         ReplayResource::Read(note)

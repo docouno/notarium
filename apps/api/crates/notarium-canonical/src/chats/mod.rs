@@ -451,7 +451,9 @@ impl CanonicalStore {
         let staged_epoch = space_rec.active_epoch;
         let auth_cl = ctx.auth().clone();
         let owner_id = ctx.auth().principal().as_str().to_owned();
-        let staging_lease = new_prefixed_hex_id("stg_")?;
+        let mut lease = [0u8; 16];
+        getrandom::fill(&mut lease)
+            .map_err(|err| internal_not_committed("chat_staging_lease", err.to_string()))?;
         let resource_key = prepared.digest.to_hex();
         let _retained_ticket = ticket.clone();
 
@@ -475,7 +477,7 @@ impl CanonicalStore {
                         ticket,
                         owner_kind: BlobOwnerKind::StagedChat,
                         owner_id,
-                        owner_rev_id: staging_lease,
+                        owner_rev_id: staged_chat_lease_key(lease, auth_cl.taint().is_tainted()),
                         resource_key,
                     },
                     live_space.last_seq,
@@ -485,7 +487,7 @@ impl CanonicalStore {
         })
         .await?;
 
-        Ok(attested)
+        Ok(attested.with_lease(lease))
     }
 }
 
@@ -502,17 +504,19 @@ pub(crate) async fn authorize_chat_replay_tx(
     space: &Space,
     auth: &EngineAuthContext,
     thread: &ChatThreadId,
+    legacy_staged: bool,
 ) -> Result<(), PortError> {
     authorize_chat_write_on_space(auth, space)?;
     let th = load_thread_head_opt_tx(tx, &space.id, thread)
         .await?
         .ok_or(DomainError::ResourceNotFound)?;
-    if (auth.taint().is_tainted() || th.tainted_mask != 0)
+    let tainted = th.tainted_mask != 0 || legacy_staged;
+    if (auth.taint().is_tainted() || tainted)
         && (th.kind == ChatThreadKind::SpaceGroup || space.kind == SpaceKind::Shared)
     {
         return Err(DomainError::CrossSpaceTainted.into());
     }
-    Ok(auth.authorize_chat_read(space, th.project_folder.as_ref(), th.tainted_mask != 0)?)
+    Ok(auth.authorize_chat_read(space, th.project_folder.as_ref(), tainted)?)
 }
 
 #[derive(Clone, Debug)]
@@ -898,15 +902,25 @@ fn build_ancestors_vec(
     v
 }
 
-async fn consume_one_staged_chat_ref_and_bind_entry_tx(
+fn staged_chat_lease_key(lease: [u8; 16], tainted: bool) -> String {
+    let prefix = if tainted { "st2t_" } else { "st2c_" };
+    format!("{prefix}{:032x}", u128::from_be_bytes(lease))
+}
+
+async fn lookup_staged_chat_lease_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
     staged: &StagedChatBlob,
-    thread_id: &ChatThreadId,
-    entry_seq: ThreadEntrySeq,
-    entry_rev_id: &RevisionId,
-    seq: SpaceSeq,
-) -> Result<(), PortError> {
+) -> Result<String, PortError> {
+    let legacy = i32::from(staged.lease().is_none());
+    let clean_key = staged
+        .lease()
+        .map(|lease| staged_chat_lease_key(lease, false))
+        .unwrap_or_default();
+    let tainted_key = staged
+        .lease()
+        .map(|lease| staged_chat_lease_key(lease, true))
+        .unwrap_or_default();
     let digest = staged.digest();
     let res_key = digest.to_hex();
     let lease_opt: Option<(String, i64)> = match tx {
@@ -917,14 +931,20 @@ async fn consume_one_staged_chat_ref_and_bind_entry_tx(
                  JOIN blob_catalog c
                    ON c.space_id = r.space_id AND c.content_blake3 = r.content_blake3
                  WHERE r.space_id = ? AND r.owner_kind = 'staged_chat'
-                   AND r.owner_id = ? AND r.resource_key = ?
+                   AND r.owner_id = ?2 AND r.resource_key = ?3 AND r.content_blake3 = ?4
+                   AND ((?5 = 1 AND substr(r.owner_rev_id,1,4) = 'stg_')
+                   OR (?5 = 0 AND r.owner_rev_id IN (?6,?7)))
                    AND c.blob_state = 'active' AND c.admission_state = 'open'
-                 ORDER BY r.created_seq ASC
+                 ORDER BY r.created_seq, r.owner_rev_id
                  LIMIT 1",
             )
             .bind(space_id.as_str())
             .bind(staged.owner().as_str())
             .bind(&res_key)
+            .bind(digest.as_bytes().as_slice())
+            .bind(legacy)
+            .bind(&clean_key)
+            .bind(&tainted_key)
             .fetch_optional(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("sqlite_check_staged_chat", err.to_string()))?;
@@ -937,14 +957,20 @@ async fn consume_one_staged_chat_ref_and_bind_entry_tx(
                  JOIN blob_catalog c
                    ON c.space_id = r.space_id AND c.content_blake3 = r.content_blake3
                  WHERE r.space_id = $1 AND r.owner_kind = 'staged_chat'
-                   AND r.owner_id = $2 AND r.resource_key = $3
+                   AND r.owner_id = $2 AND r.resource_key = $3 AND r.content_blake3 = $4
+                   AND (($5::int = 1 AND substr(r.owner_rev_id,1,4) = 'stg_')
+                   OR ($5::int = 0 AND r.owner_rev_id IN ($6,$7)))
                    AND c.blob_state = 'active' AND c.admission_state = 'open'
-                 ORDER BY r.created_seq ASC
+                 ORDER BY r.created_seq, r.owner_rev_id
                  LIMIT 1",
             )
             .bind(space_id.as_str())
             .bind(staged.owner().as_str())
             .bind(&res_key)
+            .bind(digest.as_bytes().as_slice())
+            .bind(legacy)
+            .bind(&clean_key)
+            .bind(&tainted_key)
             .fetch_optional(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("pg_check_staged_chat", err.to_string()))?;
@@ -959,6 +985,22 @@ async fn consume_one_staged_chat_ref_and_bind_entry_tx(
         return Err(DomainError::validation(ValidationReason::InvalidRange).into());
     }
 
+    Ok(staging_lease)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn consume_one_staged_chat_ref_and_bind_entry_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    staged: &StagedChatBlob,
+    staging_lease: &str,
+    thread_id: &ChatThreadId,
+    entry_seq: ThreadEntrySeq,
+    entry_rev_id: &RevisionId,
+    seq: SpaceSeq,
+) -> Result<(), PortError> {
+    let digest = staged.digest();
+    let res_key = digest.to_hex();
     let entry_owner_id = format!("{}:{}", thread_id.as_str(), entry_seq.get());
     bind_existing_active_blob_ref_tx(
         tx,
@@ -983,7 +1025,7 @@ async fn consume_one_staged_chat_ref_and_bind_entry_tx(
             )
             .bind(space_id.as_str())
             .bind(staged.owner().as_str())
-            .bind(&staging_lease)
+            .bind(staging_lease)
             .bind(&res_key)
             .execute(&mut **conn)
             .await
@@ -997,7 +1039,7 @@ async fn consume_one_staged_chat_ref_and_bind_entry_tx(
             )
             .bind(space_id.as_str())
             .bind(staged.owner().as_str())
-            .bind(&staging_lease)
+            .bind(staging_lease)
             .bind(&res_key)
             .execute(&mut **conn)
             .await
@@ -2590,6 +2632,9 @@ async fn append_chat_impl(
         ChatInputBody::Staged(st) => {
             fp.update(&[2]);
             fp.update(st.digest().as_bytes());
+            if let Some(lease) = st.lease() {
+                fp.update(&lease);
+            }
         }
     }
     for r in &request.input.referenced_notes {
@@ -2597,15 +2642,20 @@ async fn append_chat_impl(
         fp.update(r.note_id.as_str().as_bytes());
     }
     fp.update(&[u8::from(request.input.tainted)]);
+    let legacy_staged =
+        matches!(&request.input.body,ChatInputBody::Staged(st) if st.lease().is_none());
     let idemp =
         derive_command_identity_spec(&request.identity, "append_chat", fp.finalize().as_bytes())
-            .for_chat(
+            .with_policy(
                 ctx.auth(),
-                &request.input.thread,
-                request.input.referenced_notes.clone(),
+                crate::writer::replay::ReplayPolicy::Chat(
+                    request.input.thread.clone(),
+                    request.input.referenced_notes.clone(),
+                    legacy_staged,
+                ),
             );
 
-    if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedChatEntryV1>(
+    if let Some(mut replayed) = try_replay_completed_receipt::<StoredCommittedChatEntryV1>(
         store,
         &space_rec.scope,
         &idemp,
@@ -2613,6 +2663,7 @@ async fn append_chat_impl(
     )
     .await?
     {
+        replayed.value.tainted |= legacy_staged;
         return Ok(replayed.into_committed());
     }
 
@@ -2695,6 +2746,17 @@ async fn append_chat_impl(
                     effective_tainted = true;
                 }
 
+                let staging_lease = if let ChatInputBody::Staged(staged) = &input.body {
+                    let lease = lookup_staged_chat_lease_tx(tx, &scope.space_id, staged).await?;
+                    // Legacy references carried no provenance. Only a verified v2 clean lease is clean.
+                    if !lease.starts_with("st2c_") {
+                        effective_tainted = true;
+                    }
+                    Some(lease)
+                } else {
+                    None
+                };
+
                 if effective_tainted
                     && (th.kind == ChatThreadKind::SpaceGroup
                         || live_space.space.kind == SpaceKind::Shared)
@@ -2702,6 +2764,9 @@ async fn append_chat_impl(
                     return Err(DomainError::CrossSpaceTainted.into());
                 }
 
+                if staging_lease.is_some() && effective_tainted {
+                    auth.taint().mark_external_read();
+                }
                 let entry_seq = th.next_entry_seq;
                 let next_entry_seq = entry_seq.checked_next()?;
                 let seq = item_ctx.alloc_next_seq()?;
@@ -2718,6 +2783,9 @@ async fn append_chat_impl(
                             tx,
                             &scope.space_id,
                             staged,
+                            staging_lease
+                                .as_deref()
+                                .ok_or(DomainError::ResourceNotFound)?,
                             &input.thread,
                             entry_seq,
                             &entry_rev,
@@ -2875,8 +2943,9 @@ async fn append_chat_impl(
         }),
     };
 
-    let stored: StoredCommittedChatEntryV1 =
+    let mut stored: StoredCommittedChatEntryV1 =
         store.submit_write_command(&ctx.budget, intent).await?;
+    stored.value.tainted |= legacy_staged;
     Ok(stored.into_committed())
 }
 

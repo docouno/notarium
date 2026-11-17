@@ -253,14 +253,9 @@ impl Worker {
                 return Ok(());
             }
             self.session.check()?;
-            let cancel = self
-                .session
-                .operation
-                .context(notarium_core::ids::RequestId::from_bytes([0; 16]))
-                .cancellation;
             let command = tokio::select! {
                 cmd = commands.recv() => cmd,
-                _ = cancel.cancelled() => {
+                _ = self.session.operation.cancellation().cancelled() => {
                     return self.session.check();
                 }
             };

@@ -4295,6 +4295,41 @@ pub(crate) async fn accept_external_observation_impl(
     }
 }
 
+async fn authorize_schema_placement_tx(
+    tx: &mut BackendConn<'_>,
+    space: &crate::SpaceRecord,
+    auth: &notarium_core::auth::EngineAuthContext,
+    note: &NoteId,
+    destination: &notarium_core::ids::FolderId,
+) -> Result<
+    (
+        Option<crate::domain::common::NoteHeadRow>,
+        crate::domain::common::FolderAncestryFacts,
+    ),
+    PortError,
+> {
+    crate::writer::replay::authorize_schema_space(auth, &space.space)?;
+    let (after, anc) =
+        build_resource_facts_tx(tx, &space.space, destination, DocClass::UserDoc, None, true)
+            .await?;
+    let head = load_note_head_row_opt_tx(tx, &space.space.id, note).await?;
+    if let Some(head) = &head {
+        let (before, _) = build_resource_facts_tx(
+            tx,
+            &space.space,
+            &head.parent_folder_id,
+            head.doc_class,
+            head.ability_id.clone(),
+            true,
+        )
+        .await?;
+        auth.authorize_direct_write(&before, &after)?;
+    } else {
+        auth.authorize_direct_write(&after, &after)?;
+    }
+    Ok((head, anc))
+}
+
 pub(crate) async fn update_space_schema_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -4316,10 +4351,26 @@ pub(crate) async fn update_space_schema_impl(
         store.blob_codec(),
     )?;
 
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
-    space_rec.scope.check(ctx.scope())?;
-
-    crate::writer::replay::authorize_schema_space(ctx.auth(), &space_rec.space)?;
+    let admission = ctx.clone();
+    let schema_note = request.input.schema_note.clone();
+    let destination = request.input.parent.clone();
+    let space_rec = store
+        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+            Box::pin(async move {
+                let srec = load_space_record(tx, &admission.scope().space_id).await?;
+                srec.scope.check(admission.scope())?;
+                authorize_schema_placement_tx(
+                    tx,
+                    &srec,
+                    admission.auth(),
+                    &schema_note,
+                    destination.as_ref().unwrap_or(&srec.root_folder_id),
+                )
+                .await?;
+                Ok(srec)
+            })
+        })
+        .await?;
 
     let ticket = store
         .stage_blob(
@@ -4371,32 +4422,14 @@ pub(crate) async fn update_space_schema_impl(
                     .parent
                     .clone()
                     .unwrap_or_else(|| item_ctx.root_folder_id.clone());
-                let (facts, anc) = build_resource_facts_tx(
+                let (existing_note, anc) = authorize_schema_placement_tx(
                     tx,
-                    &live_space.space,
+                    &live_space,
+                    &auth,
+                    &input.schema_note,
                     &parent_id,
-                    DocClass::UserDoc,
-                    None,
-                    true,
                 )
                 .await?;
-                crate::writer::replay::authorize_schema_space(&auth, &live_space.space)?;
-                let existing_note =
-                    load_note_head_row_opt_tx(tx, &scope_cl.space_id, &input.schema_note).await?;
-                if let Some(head) = &existing_note {
-                    let (before, _) = build_resource_facts_tx(
-                        tx,
-                        &live_space.space,
-                        &head.parent_folder_id,
-                        head.doc_class,
-                        head.ability_id.clone(),
-                        true,
-                    )
-                    .await?;
-                    auth.authorize_direct_write(&before, &facts)?;
-                } else {
-                    auth.authorize_direct_write(&facts, &facts)?;
-                }
 
                 let current_schema = load_current_space_schema_tx(tx, &scope_cl.space_id).await?;
                 match (&current_schema, &input.expected_schema_revision) {

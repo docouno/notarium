@@ -254,8 +254,11 @@ same example against an isolated prefix.
   Continuation returns `CursorStale` if the cut advances or a heartbeat changes
   progress visible to the query. Consumers can open a new read at the current cut.
 - **Chat DAG and pending queue:** `chat_entries` stores `<= 512`-byte UTF-8
-  messages inline and `> 512`-byte payloads in verified CAS (`stage_chat_blob`),
-  maintaining deterministic skip pointers at `depth - 16` and `depth - 256` so
+  messages inline and `> 512`-byte payloads in verified CAS. Each
+  `stage_chat_blob` call records a per-author lease with its provenance, including
+  when several calls stage the same digest. Append consumes the specific lease.
+  Legacy leases with unknown provenance count as externally tainted. The DAG
+  maintains deterministic skip pointers at `depth - 16` and `depth - 256` so
   50-entry branch context reads execute in `O(window + log depth)` with `0`
   writes. `chat_pending_inputs` enforces a 16-item per-thread queue (`Full`
   without a mutation receipt on the 17th item). `redact_chat_entry` erases
@@ -273,6 +276,15 @@ same example against an isolated prefix.
   durable spool or abort. A canonical artifact ID resolves on its original spool
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
+  The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
+  API verifies the trailer and recognizes the exact schema 1 and 2 manifests.
+  It returns typed rows in the original table and column order within the
+  caller's byte budget. To materialize schema 1, create an empty target using
+  `schema::POSTGRES_BASELINE_DDL`, then drop `account_catalog_receipts` and
+  the `chat_pending_inputs.ext_space_tainted` column before importing the
+  verified rows in the same transaction. Opening the target with the original
+  installation ID applies the version 2 migration. The canonical L4 backup
+  suite exercises this procedure with an artifact from the schema 1 exporter.
 
 ## Offline fixture lifecycle and attributed benchmarks
 

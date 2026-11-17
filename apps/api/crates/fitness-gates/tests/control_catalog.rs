@@ -316,10 +316,16 @@ async fn exercise(pg: bool) {
         )
         .await
         .unwrap();
-    let current = canonical.current_ability(account.clone(), previous.identity()).await.unwrap();
+    let current = canonical
+        .current_ability(account.clone(), previous.identity())
+        .await
+        .unwrap();
     assert_eq!(current.reference.revision, updated.value.revision);
     assert!(current.auxiliary_files.is_empty());
-    let exact = canonical.ability(account.clone(), previous.clone()).await.unwrap();
+    let exact = canonical
+        .ability(account.clone(), previous.clone())
+        .await
+        .unwrap();
     assert_eq!(exact.reference, previous);
     assert_eq!(exact.auxiliary_files.len(), MAX_ABILITY_AUX_FILES);
     assert!(!account.auth().taint().is_tainted());

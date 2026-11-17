@@ -108,11 +108,15 @@ impl PostgresCut {
                     // Parse/Describe alone does not produce a reusable executor
                     // plan. Execute the same statement before the snapshot begins.
                     sqlx::raw_sql("SET plan_cache_mode TO force_generic_plan")
-                        .execute(&mut *source).await.map_err(database)?;
+                        .execute(&mut *source)
+                        .await
+                        .map_err(database)?;
                     sqlx::query(PIN_SQL)
                         .bind(i64::from(TARGET_SCHEMA_VERSION))
                         .bind(expected.installation.as_str())
-                        .execute(&mut *source).await.map_err(database)?;
+                        .execute(&mut *source)
+                        .await
+                        .map_err(database)?;
                     // PostgreSQL takes the RR snapshot on its first data query. Until pin()
                     // executes PIN_SQL, this idle transaction has no snapshot or backend_xmin.
                     self.tx = Some(Transaction::Postgres(
@@ -213,6 +217,22 @@ impl PostgresCut {
             return Err(failure());
         }
         let tx = self.tx.as_mut().ok_or_else(failure)?;
+        let Transaction::Postgres(source) = tx else {
+            return Err(failure());
+        };
+        // Subsequent export pages use the connection's configured plan policy.
+        session
+            .operation
+            .run(
+                async {
+                    sqlx::raw_sql("RESET plan_cache_mode")
+                        .execute(&mut **source)
+                        .await
+                        .map_err(database)
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
         let mut stream = SpoolWriter::new(writer, witness)?;
         session.set_spool_bytes(stream.written_bytes());
         session.check()?;

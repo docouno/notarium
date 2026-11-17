@@ -46,7 +46,8 @@ use crate::{
         CanonicalInner, SqlDriverState, load_space_record_for_update_opt, require_command_end_tx,
     },
     schema::manifest::{
-        CANONICAL_SCHEMA_VERSION, CANONICAL_TABLES, LogicalColKind, manifest_checksum,
+        CANONICAL_SCHEMA_VERSION, CANONICAL_TABLES, LogicalColKind, TableSpec, checksum_tables,
+        manifest_checksum,
     },
     sql_exec::BackendConn,
     wal::BackupWalPinGuard,
@@ -1903,7 +1904,26 @@ async fn sleep_async_interruptible(
     Ok(())
 }
 
-/// Materializes a verified spool for offline inspection within the default backup budget.
+fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone {
+    CANONICAL_TABLES
+        .iter()
+        .copied()
+        .filter_map(move |mut table| {
+            if schema_version == 1 {
+                match table.name {
+                    "account_catalog_receipts" => return None,
+                    "chat_pending_inputs" => {
+                        // Version 2 appended ext_space_tainted after consumed_entry_seq.
+                        table.columns = &table.columns[..13];
+                    }
+                    _ => {}
+                }
+            }
+            Some(table)
+        })
+}
+
+/// Materializes a verified schema 1 or 2 spool for offline inspection within the default budget.
 pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, PortError> {
     decode_postgres_spool_v1_bounded(
         path,
@@ -1972,14 +1992,22 @@ pub fn decode_postgres_spool_v1_bounded(
     let mut u32_buf = [0u8; 4];
     reader.read_exact_body(&mut u32_buf, body_limit)?;
     let schema_version = u32::from_be_bytes(u32_buf);
-    if schema_version != CANONICAL_SCHEMA_VERSION {
-        return Err(DomainError::validation(ValidationReason::InvalidState).into());
-    }
-
+    let expected_tables = spool_tables(schema_version);
+    let expected_checksum = match schema_version {
+        CANONICAL_SCHEMA_VERSION => manifest_checksum(),
+        1 => {
+            let digest = checksum_tables(1, expected_tables.clone());
+            if digest.to_hex() != crate::schema::migrate::V1_HASH {
+                return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
+            }
+            digest
+        }
+        _ => return Err(DomainError::validation(ValidationReason::InvalidState).into()),
+    };
     let mut checksum_buf = [0u8; 32];
     reader.read_exact_body(&mut checksum_buf, body_limit)?;
     let observed_checksum = ContentDigest::from_bytes(checksum_buf);
-    if observed_checksum != manifest_checksum() {
+    if observed_checksum != expected_checksum {
         return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
     }
 
@@ -1988,14 +2016,20 @@ pub fn decode_postgres_spool_v1_bounded(
     if witness_len > MAX_MSGPACK_DECODE_BYTES {
         return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
     }
+    if witness_len as u64 > body_limit.saturating_sub(reader.pos) {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
     charge(witness_len as u64)?;
     let mut witness_bytes = vec![0u8; witness_len];
     reader.read_exact_body(&mut witness_bytes, body_limit)?;
     let witness: BackupWitness = decode_msgpack_bounded(&witness_bytes, MAX_MSGPACK_DECODE_BYTES)?;
+    if witness.schema_version != schema_version {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
 
     reader.read_exact_body(&mut u32_buf, body_limit)?;
     let table_count = u32::from_be_bytes(u32_buf) as usize;
-    if table_count != CANONICAL_TABLES.len() {
+    if table_count != expected_tables.clone().count() {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
 
@@ -2005,10 +2039,14 @@ pub fn decode_postgres_spool_v1_bounded(
     let mut u64_buf = [0u8; 8];
     let mut tag_buf = [0u8; 1];
 
-    for expected_table in CANONICAL_TABLES {
+    for expected_table in expected_tables {
         reader.read_exact_body(&mut u16_buf, body_limit)?;
         let name_len = u16::from_be_bytes(u16_buf) as usize;
-        let mut name_bytes = vec![0u8; name_len];
+        if name_len != expected_table.name.len() {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+        charge(expected_table.name.len() as u64)?;
+        let mut name_bytes = vec![0u8; expected_table.name.len()];
         reader.read_exact_body(&mut name_bytes, body_limit)?;
         let table_name = String::from_utf8(name_bytes)
             .map_err(|_| DomainError::validation(ValidationReason::InvalidState))?;
@@ -2020,6 +2058,9 @@ pub fn decode_postgres_spool_v1_bounded(
         let col_count = u16::from_be_bytes(u16_buf) as usize;
         if col_count != expected_table.columns.len() {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+        for col in expected_table.columns {
+            charge((std::mem::size_of::<String>() + col.name.len()) as u64)?;
         }
 
         let mut rows = Vec::new();
@@ -2914,11 +2955,12 @@ impl PreparedBackup for CanonicalPreparedBackup {
 
     fn pause_writes(&mut self) -> PortFuture<'_, Box<dyn PausedBackup>> {
         Box::pin(async move {
-            if self
+            let (hold, _) = self
                 .held_histories
                 .as_ref()
-                .is_none_or(|(proof, _)| proof.release.is_cancelled())
-            {
+                .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
+            let hold_release = hold.release.clone();
+            if hold_release.is_cancelled() {
                 return Err(DomainError::validation(ValidationReason::InvalidState).into());
             }
 
@@ -2965,6 +3007,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
                         () = tokio::time::sleep(lifetime) => {},
                         () = cancel.cancelled() => {},
                         () = shutdown.cancelled() => {},
+                        () = hold_release.cancelled() => {},
                     }
                     if let Some(locks) = weak.upgrade() {
                         locks.lock().expect("backup pause").take();

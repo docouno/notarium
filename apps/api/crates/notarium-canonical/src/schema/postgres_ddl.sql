@@ -681,7 +681,7 @@ CREATE TABLE IF NOT EXISTS content_jobs (
     completed_units BIGINT NOT NULL DEFAULT 0 CHECK (completed_units >= 0),
     total_units BIGINT CHECK (total_units IS NULL OR total_units >= 0),
     artifacts_json TEXT NOT NULL,
-    result_msgpack BYTEA CHECK (length(result_msgpack) BETWEEN 1 AND 4096),
+    result_msgpack BYTEA,
     error_ref BYTEA CHECK (error_ref IS NULL OR octet_length(error_ref) = 32),
     created_seq BIGINT NOT NULL CHECK (created_seq >= 1),
     updated_seq BIGINT NOT NULL CHECK (updated_seq >= 1),
@@ -736,6 +736,6 @@ CREATE TABLE IF NOT EXISTS account_catalog_receipts (
     actor_id TEXT NOT NULL,
     command_key TEXT NOT NULL,
     request_hash BYTEA NOT NULL CHECK (length(request_hash) = 32),
-    result_msgpack BYTEA,
+    result_msgpack BYTEA CHECK (length(result_msgpack) BETWEEN 1 AND 4096),
     PRIMARY KEY (owner_id, actor_id, command_key)
 );

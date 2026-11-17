@@ -969,7 +969,11 @@ async fn install_v1_note_hash(
     outer.update(&[0]);
     outer.update(payload.finalize().as_bytes());
     let hash = outer.finalize().to_hex();
-    let literal = if postgres { format!("decode('{hash}','hex')") } else { format!("X'{hash}'") };
+    let literal = if postgres {
+        format!("decode('{hash}','hex')")
+    } else {
+        format!("X'{hash}'")
+    };
     let changed = store.execute_diagnostic_write_sql_for_test(&format!(
         "UPDATE command_receipts SET command_hash={literal} WHERE space_id='{}' AND actor_id='{}' AND idempotency_key='{}'",
         identity.scope.space_id.as_str(), identity.actor.as_str(), identity.key.as_str()
@@ -1092,8 +1096,14 @@ async fn check_note_effects_and_replay(store: &CanonicalStore, postgres: bool) -
         .unwrap();
     assert_eq!(first.items[0].as_ref().unwrap().receipt, created.receipt);
     let edited = first.items[1].as_ref().unwrap();
-    let single = store.edit_note(ctx.clone(), edit_command.clone()).await.unwrap();
-    let retry = store.accept_batch(ctx.clone(), batch.clone()).await.unwrap();
+    let single = store
+        .edit_note(ctx.clone(), edit_command.clone())
+        .await
+        .unwrap();
+    let retry = store
+        .accept_batch(ctx.clone(), batch.clone())
+        .await
+        .unwrap();
     assert_eq!(single.receipt, edited.receipt);
     assert_eq!(single.value, edited.value);
     assert_eq!(retry.items[1].as_ref().unwrap().receipt, edited.receipt);
@@ -1158,7 +1168,11 @@ async fn check_note_effects_and_replay(store: &CanonicalStore, postgres: bool) -
         })
         .await
         .unwrap();
-    let head_before_legacy_retries = store.get_space(&space.scope.space_id).await.unwrap().last_seq;
+    let head_before_legacy_retries = store
+        .get_space(&space.scope.space_id)
+        .await
+        .unwrap()
+        .last_seq;
     // Persist the exact v1 encodings. Historical edits must replay after a newer edit.
     let mut old_create = blake3::Hasher::new();
     old_create.update(original.note.as_str().as_bytes());
@@ -1167,11 +1181,17 @@ async fn check_note_effects_and_replay(store: &CanonicalStore, postgres: bool) -
     old_create.update(&[0]);
     old_create.update(notarium_syntax::content_digest(&original.carrier).as_bytes());
     install_v1_note_hash(store, postgres, &identity(1), "create_note", old_create).await;
-    let old_creation = store.create_note(ctx.clone(), Mutation {
-        identity: identity(1),
-        preconditions: Preconditions::default(),
-        input: original.clone(),
-    }).await.unwrap();
+    let old_creation = store
+        .create_note(
+            ctx.clone(),
+            Mutation {
+                identity: identity(1),
+                preconditions: Preconditions::default(),
+                input: original.clone(),
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(old_creation.value, created.value);
     assert_eq!(old_creation.receipt, created.receipt);
     let mut prefix = blake3::Hasher::new();
@@ -1190,24 +1210,45 @@ async fn check_note_effects_and_replay(store: &CanonicalStore, postgres: bool) -
     }
     for legacy in [old_single, old_batch] {
         install_v1_note_hash(store, postgres, &identity(2), "edit_note", legacy).await;
-        let replay = store.edit_note(ctx.clone(), edit_command.clone()).await.unwrap();
+        let replay = store
+            .edit_note(ctx.clone(), edit_command.clone())
+            .await
+            .unwrap();
         assert_eq!(replay.receipt, edited.receipt);
         assert_eq!(replay.value, edited.value);
-        let replay = store.accept_batch(ctx.clone(), batch.clone()).await.unwrap();
+        let replay = store
+            .accept_batch(ctx.clone(), batch.clone())
+            .await
+            .unwrap();
         assert_eq!(replay.items[0].as_ref().unwrap().value, created.value);
         assert_eq!(replay.items[0].as_ref().unwrap().receipt, created.receipt);
         assert_eq!(replay.items[1].as_ref().unwrap().receipt, edited.receipt);
         assert_eq!(replay.items[1].as_ref().unwrap().value, edited.value);
         let mut conditioned = edit_command.clone();
         conditioned.preconditions.revision = Some(created.value.revision.clone());
-        assert_eq!(store.edit_note(ctx.clone(), conditioned.clone()).await.unwrap().value, edited.value);
+        assert_eq!(
+            store
+                .edit_note(ctx.clone(), conditioned.clone())
+                .await
+                .unwrap()
+                .value,
+            edited.value
+        );
         conditioned.preconditions.lease = Some(space.active_epoch);
-        assert!(matches!(store.edit_note(ctx.clone(), conditioned).await,
-            Err(notarium_core::error::PortError::Domain(notarium_core::DomainError::IdempotencyKeyReused))));
+        assert!(matches!(
+            store.edit_note(ctx.clone(), conditioned).await,
+            Err(notarium_core::error::PortError::Domain(
+                notarium_core::DomainError::IdempotencyKeyReused
+            ))
+        ));
         let mut altered = edit_command.clone();
         altered.input.plan.edits[0].replacement_utf16_len += 1;
-        assert!(matches!(store.edit_note(ctx.clone(), altered).await,
-            Err(notarium_core::error::PortError::Domain(notarium_core::DomainError::IdempotencyKeyReused))));
+        assert!(matches!(
+            store.edit_note(ctx.clone(), altered).await,
+            Err(notarium_core::error::PortError::Domain(
+                notarium_core::DomainError::IdempotencyKeyReused
+            ))
+        ));
     }
     for forged in [
         CreateNote {
@@ -1237,7 +1278,14 @@ async fn check_note_effects_and_replay(store: &CanonicalStore, postgres: bool) -
             Err(notarium_core::DomainError::IdempotencyKeyReused)
         ));
     }
-    assert_eq!(store.get_space(&space.scope.space_id).await.unwrap().last_seq, head_before_legacy_retries);
+    assert_eq!(
+        store
+            .get_space(&space.scope.space_id)
+            .await
+            .unwrap()
+            .last_seq,
+        head_before_legacy_retries
+    );
     [edited.receipt.seq(), next.receipt.seq()]
 }
 

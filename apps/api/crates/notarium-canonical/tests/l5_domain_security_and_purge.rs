@@ -1465,35 +1465,100 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
     assert!(viewer_write.is_err(), "Viewer must not create notes");
 
     let replay_note = sample_note_id(92);
-    let create_again = next_mutation(&scope,&owner,CreateNote {
-        note: replay_note.clone(), parent: Some(proj_a.clone()), slug: "receipt-authority".into(),
-        class: DocClass::UserDoc, carrier: "# Receipt authority\n".into(),
-    });
-    let original = store.create_note(ctx.clone(),create_again.clone()).await.unwrap();
-    let rename_again = next_mutation(&scope,&owner,RenameNote {
-        note: replay_note.clone(), slug: "receipt-authority-updated".into(), title: Some("Updated".into()),
-    });
-    let renamed = store.rename_note(ctx.clone(),rename_again.clone()).await.unwrap();
-    assert_eq!(store.create_note(ctx.clone(),create_again.clone()).await.unwrap().receipt,original.receipt);
-    assert_eq!(store.rename_note(ctx.clone(),rename_again.clone()).await.unwrap().receipt,renamed.receipt);
-    let reduced = make_human_ctx(&scope,owner.clone(),SpaceGrant {
-        role: SpaceRole::Viewer, read_classes: DocClass::all(), write_classes: BTreeSet::new(), project_root: None,
-    },false,false);
-    assert!(matches!(store.create_note(reduced.clone(),create_again.clone()).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
-    assert!(matches!(store.rename_note(reduced,rename_again).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
+    let create_again = next_mutation(
+        &scope,
+        &owner,
+        CreateNote {
+            note: replay_note.clone(),
+            parent: Some(proj_a.clone()),
+            slug: "receipt-authority".into(),
+            class: DocClass::UserDoc,
+            carrier: "# Receipt authority\n".into(),
+        },
+    );
+    let original = store
+        .create_note(ctx.clone(), create_again.clone())
+        .await
+        .unwrap();
+    let rename_again = next_mutation(
+        &scope,
+        &owner,
+        RenameNote {
+            note: replay_note.clone(),
+            slug: "receipt-authority-updated".into(),
+            title: Some("Updated".into()),
+        },
+    );
+    let renamed = store
+        .rename_note(ctx.clone(), rename_again.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .create_note(ctx.clone(), create_again.clone())
+            .await
+            .unwrap()
+            .receipt,
+        original.receipt
+    );
+    assert_eq!(
+        store
+            .rename_note(ctx.clone(), rename_again.clone())
+            .await
+            .unwrap()
+            .receipt,
+        renamed.receipt
+    );
+    let reduced = make_human_ctx(
+        &scope,
+        owner.clone(),
+        SpaceGrant {
+            role: SpaceRole::Viewer,
+            read_classes: DocClass::all(),
+            write_classes: BTreeSet::new(),
+            project_root: None,
+        },
+        false,
+        false,
+    );
+    assert!(matches!(
+        store
+            .create_note(reduced.clone(), create_again.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    assert!(matches!(
+        store.rename_note(reduced, rename_again).await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
 
     // Folder write lock blocks descendant writes until unlocked!
     store
         .set_folder_write_lock(ctx.clone(), proj_a.clone(), true)
         .await
         .expect("lock proj_a");
-    assert!(matches!(store.create_note(ctx.clone(),create_again).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
-    let schema_relocation = next_mutation(&scope,&owner,UpdateSpaceSchema {
-        schema_note: replay_note, parent: None, slug: "schema-relocation".into(),
-        carrier: "# Schema relocation\n".into(), schema: BTreeMap::new(),
-        expected_schema_revision: Some(schema_committed.value.schema_revision.clone()),
-    });
-    assert!(matches!(store.update_space_schema(ctx.clone(),schema_relocation.clone()).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
+    assert!(matches!(
+        store.create_note(ctx.clone(), create_again).await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    let schema_relocation = next_mutation(
+        &scope,
+        &owner,
+        UpdateSpaceSchema {
+            schema_note: replay_note,
+            parent: None,
+            slug: "schema-relocation".into(),
+            carrier: "# Schema relocation\n".into(),
+            schema: BTreeMap::new(),
+            expected_schema_revision: Some(schema_committed.value.schema_revision.clone()),
+        },
+    );
+    assert!(matches!(
+        store
+            .update_space_schema(ctx.clone(), schema_relocation.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
     let locked_write = store
         .create_note(
             ctx.clone(),
@@ -1537,7 +1602,12 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
     );
     let mut pinned_schema = schema_relocation;
     pinned_schema.input.parent = Some(proj_a.clone());
-    assert!(matches!(store.update_space_schema(pinned_ctx.clone(),pinned_schema).await,Err(PortError::Domain(DomainError::SpaceReadOnly))));
+    assert!(matches!(
+        store
+            .update_space_schema(pinned_ctx.clone(), pinned_schema)
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
     let outside_proj_write = store
         .create_note(
             pinned_ctx,

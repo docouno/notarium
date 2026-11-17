@@ -414,6 +414,7 @@ pub struct StagedChatBlob {
     owner: PrincipalId,
     digest: ContentDigest,
     byte_len: u64,
+    lease: Option<[u8; 16]>,
 }
 impl StagedChatBlob {
     pub const INLINE_MAX_BYTES: u64 = 512;
@@ -431,7 +432,16 @@ impl StagedChatBlob {
             owner,
             digest,
             byte_len,
+            lease: None,
         })
+    }
+    /// Selects a specific durable staging reference; canonical verifies it on consumption.
+    pub fn with_lease(mut self, lease: [u8; 16]) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+    pub fn lease(&self) -> Option<[u8; 16]> {
+        self.lease
     }
     pub fn space(&self) -> &SpaceId {
         &self.space

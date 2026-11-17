@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
@@ -743,10 +743,20 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
 ];
 
 pub fn manifest_checksum() -> ContentDigest {
+    static CHECKSUM: LazyLock<ContentDigest> = LazyLock::new(|| {
+        checksum_tables(CANONICAL_SCHEMA_VERSION, CANONICAL_TABLES.iter().copied())
+    });
+    *CHECKSUM
+}
+
+pub(crate) fn checksum_tables(
+    version: u32,
+    tables: impl Iterator<Item = TableSpec>,
+) -> ContentDigest {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"notarium-canonical-schema-manifest-v1\n");
-    hasher.update(&CANONICAL_SCHEMA_VERSION.to_be_bytes());
-    for table in CANONICAL_TABLES {
+    hasher.update(&version.to_be_bytes());
+    for table in tables {
         hasher.update(b"T:");
         hasher.update(table.name.as_bytes());
         hasher.update(b"\nPK:");
