@@ -510,6 +510,15 @@ pub(crate) async fn authorize_chat_replay_tx(
     let th = load_thread_head_opt_tx(tx, &space.id, thread)
         .await?
         .ok_or(DomainError::ResourceNotFound)?;
+    authorize_thread_mutation(auth, space, &th, legacy_staged)
+}
+
+fn authorize_thread_mutation(
+    auth: &EngineAuthContext,
+    space: &Space,
+    th: &ThreadHeadRow,
+    legacy_staged: bool,
+) -> Result<(), PortError> {
     let tainted = th.tainted_mask != 0 || legacy_staged;
     if (auth.taint().is_tainted() || tainted)
         && (th.kind == ChatThreadKind::SpaceGroup || space.kind == SpaceKind::Shared)
@@ -3103,6 +3112,54 @@ async fn update_thread_after_append_tx(
     Ok(())
 }
 
+async fn check_queue_admission_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    auth: &EngineAuthContext,
+    thread: &ChatThreadId,
+    id: &PendingInputId,
+    base: ThreadEntrySeq,
+) -> Result<i64, PortError> {
+    let live_space = load_space_record(tx, &scope.space_id).await?;
+    live_space.scope.check(scope)?;
+    authorize_chat_replay_tx(tx, &live_space.space, auth, thread, false).await?;
+
+    if base != ThreadEntrySeq::ZERO
+        && load_entry_depth_and_taint_tx(tx, &scope.space_id, thread, base)
+            .await?
+            .is_none()
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+
+    const COUNTS: &str = "SELECT
+        (SELECT COUNT(*) FROM chat_pending_inputs WHERE space_id=$1 AND thread_id=$2 AND input_id=$3),
+        (SELECT COUNT(*) FROM chat_pending_inputs WHERE space_id=$1 AND thread_id=$2 AND status='pending')";
+    let (duplicates, pending): (i64, i64) = match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_as(COUNTS)
+                .bind(scope.space_id.as_str())
+                .bind(thread.as_str())
+                .bind(id.as_str())
+                .fetch_one(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_as(COUNTS)
+                .bind(scope.space_id.as_str())
+                .bind(thread.as_str())
+                .bind(id.as_str())
+                .fetch_one(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|err| internal_not_committed("queue_admission_counts", err.to_string()))?;
+    if duplicates != 0 {
+        return Err(DomainError::validation(ValidationReason::DuplicateKey).into());
+    }
+    Ok(pending)
+}
+
 async fn queue_chat_input_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -3136,6 +3193,28 @@ async fn queue_chat_input_impl(
     )
     .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
+    // A concurrent retry can commit between these reads. Resolve its receipt before
+    // returning a duplicate or full result from admission.
+    let check_scope = space_rec.scope.clone();
+    let check_auth = ctx.auth().clone();
+    let check_thread = request.input.thread.clone();
+    let check_id = request.input.id.clone();
+    let base = request.input.queued_base_leaf;
+    let admission = store
+        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+            Box::pin(async move {
+                check_queue_admission_tx(
+                    tx,
+                    &check_scope,
+                    &check_auth,
+                    &check_thread,
+                    &check_id,
+                    base,
+                )
+                .await
+            })
+        })
+        .await;
     if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedQueuedInputV1>(
         store,
         &space_rec.scope,
@@ -3147,17 +3226,27 @@ async fn queue_chat_input_impl(
         return Ok(QueueInputOutcome::Queued(replayed.into_committed()));
     }
 
+    if admission? >= i64::from(PENDING_CHAT_QUEUE_LIMIT) {
+        return Ok(QueueInputOutcome::Full {
+            limit: PENDING_CHAT_QUEUE_LIMIT,
+        });
+    }
+
     let staged_opt = if (request.input.body.len() as u64) > StagedChatBlob::INLINE_MAX_BYTES {
         let prepared =
             PreparedBlobSource::prepare(request.input.body.as_bytes(), store.blob_codec())?;
         let ticket = store
-            .stage_blob(&space_rec.scope, space_rec.active_epoch, &prepared)
+            .stage_queue_body(&space_rec.scope, space_rec.active_epoch, &prepared)
             .await?;
         Some((prepared.digest, ticket))
     } else {
         None
     };
 
+    let discard_id = staged_opt
+        .as_ref()
+        .and_then(|(_, ticket)| ticket.queue_discard_id())
+        .map(str::to_owned);
     let queue_full_flag = Arc::new(AtomicBool::new(false));
     let flag_cl = Arc::clone(&queue_full_flag);
     let scope = space_rec.scope.clone();
@@ -3178,81 +3267,15 @@ async fn queue_chat_input_impl(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                let live_space = load_space_record(tx, &scope.space_id).await?;
-                authorize_chat_write_on_space(&auth, &live_space.space)?;
-
-                let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
-                if auth.taint().is_tainted()
-                    && (th.kind == ChatThreadKind::SpaceGroup
-                        || live_space.space.kind == SpaceKind::Shared)
-                {
-                    return Err(DomainError::CrossSpaceTainted.into());
-                }
-
-                if input.queued_base_leaf != ThreadEntrySeq::ZERO
-                    && load_entry_depth_and_taint_tx(
-                        tx,
-                        &scope.space_id,
-                        &input.thread,
-                        input.queued_base_leaf,
-                    )
-                    .await?
-                    .is_none()
-                {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-
-                // Check duplicate `input_id` first before active count check.
-                let existing_input: Option<i64> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                        "SELECT 1 FROM chat_pending_inputs
-                         WHERE space_id = ? AND thread_id = ? AND input_id = ?",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(input.thread.as_str())
-                    .bind(input.id.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| {
-                        internal_not_committed("sqlite_chk_dup_pending", err.to_string())
-                    })?,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(
-                        "SELECT 1::BIGINT FROM chat_pending_inputs
-                         WHERE space_id = $1 AND thread_id = $2 AND input_id = $3",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(input.thread.as_str())
-                    .bind(input.id.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| internal_not_committed("pg_chk_dup_pending", err.to_string()))?,
-                };
-                if existing_input.is_some() {
-                    return Err(DomainError::validation(ValidationReason::DuplicateKey).into());
-                }
-
-                // Under Space write lock: enforce active pending queue bound <= 16 BEFORE any seq/ref allocation!
-                let active_pending: i64 = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM chat_pending_inputs
-                         WHERE space_id = ? AND thread_id = ? AND status = 'pending'",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(input.thread.as_str())
-                    .fetch_one(&mut **conn)
-                    .await
-                    .map_err(|err| internal_not_committed("sqlite_cnt_pending", err.to_string()))?,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(
-                        "SELECT COUNT(*)::BIGINT FROM chat_pending_inputs
-                         WHERE space_id = $1 AND thread_id = $2 AND status = 'pending'",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(input.thread.as_str())
-                    .fetch_one(&mut **conn)
-                    .await
-                    .map_err(|err| internal_not_committed("pg_cnt_pending", err.to_string()))?,
-                };
-
+                let active_pending = check_queue_admission_tx(
+                    tx,
+                    &scope,
+                    &auth,
+                    &input.thread,
+                    &input.id,
+                    input.queued_base_leaf,
+                )
+                .await?;
                 if active_pending >= i64::from(PENDING_CHAT_QUEUE_LIMIT) {
                     flag_cl.store(true, Ordering::SeqCst);
                     return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
@@ -3408,14 +3431,42 @@ async fn queue_chat_input_impl(
         }),
     };
 
-    match store
+    let result = store
         .submit_write_command::<StoredCommittedQueuedInputV1>(&ctx.budget, intent)
-        .await
-    {
+        .await;
+    if let Some(publication) = discard_id {
+        // A pending writer may still commit after an ambiguous response. Its durable
+        // discard intent is recovered on takeover if it does not acquire this publication.
+        let definitive = match &result {
+            Ok(_) | Err(PortError::Domain(_)) => true,
+            Err(
+                PortError::Cancelled(f)
+                | PortError::DeadlineExceeded(f)
+                | PortError::Unavailable(f)
+                | PortError::Internal(f),
+            ) => f.effect() == notarium_core::error::CommitEffect::NotCommitted,
+        };
+        if definitive {
+            let cleanup = store
+                .discard_queue_publication(&space_rec.scope, active_epoch, &publication)
+                .await;
+            // The accepted receipt is already durable. A failed cleanup of an unused
+            // private upload stays recorded for recovery.
+            if result.is_err() {
+                cleanup?;
+            }
+        }
+    }
+    match result {
         Ok(stored) => Ok(QueueInputOutcome::Queued(stored.into_committed())),
-        Err(_) if queue_full_flag.load(Ordering::SeqCst) => Ok(QueueInputOutcome::Full {
-            limit: PENDING_CHAT_QUEUE_LIMIT,
-        }),
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == ValidationReason::InvalidLimit
+                && queue_full_flag.load(Ordering::SeqCst) =>
+        {
+            Ok(QueueInputOutcome::Full {
+                limit: PENDING_CHAT_QUEUE_LIMIT,
+            })
+        }
         Err(other) => Err(other),
     }
 }
@@ -3990,6 +4041,7 @@ async fn redact_chat_entry_impl(
                 authorize_chat_write_on_space(&auth, &live_space.space)?;
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
+                authorize_thread_mutation(&auth, &live_space.space, &th, false)?;
                 if input.expected_thread_revision != th.head_rev_id {
                     return Err(DomainError::RevisionConflict {
                         current: th.head_rev_id,

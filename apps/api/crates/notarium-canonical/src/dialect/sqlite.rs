@@ -393,7 +393,7 @@ pub async fn observe_sqlite_canonical_witness(
     let current = schema_raw == i64::from(CANONICAL_SCHEMA_VERSION)
         && checksum_bytes.as_slice() == manifest_checksum().as_bytes();
     let recognized_predecessor =
-        schema_raw == 1 && hex::encode(&checksum_bytes) == crate::schema::migrate::V1_HASH;
+        crate::schema::migrate::recognized_predecessor(schema_raw, &checksum_bytes);
     if !current && !recognized_predecessor {
         return MarkerObservation::Invalid;
     }

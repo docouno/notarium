@@ -353,6 +353,7 @@ pub struct StagedBlobTicket {
     pub(crate) compressed_size: u64,
     pub(crate) publication_id: String,
     pub(crate) codec: BlobCodecTag,
+    queue_discard: bool,
     pub(crate) local_pending_dirs: PendingDirSyncs,
     /// Retains the shared per-`(SpaceId, ContentDigest)` guard until outer Phase-2 commit/rollback drops it.
     pub(crate) _local_guard: Option<Arc<LocalSharedGuard>>,
@@ -363,6 +364,10 @@ pub struct StagedBlobTicket {
 }
 
 impl StagedBlobTicket {
+    pub(crate) fn queue_discard_id(&self) -> Option<&str> {
+        self.queue_discard.then_some(self.publication_id.as_str())
+    }
+
     pub fn digest(&self) -> ContentDigest {
         self.digest
     }
@@ -1044,6 +1049,7 @@ impl crate::CanonicalStore {
                     compressed_size: comp_size,
                     publication_id: pub_id,
                     codec: BlobCodecTag::LocalZstdV1,
+                    queue_discard: false,
                     local_pending_dirs: PendingDirSyncs::default(),
                     _local_guard: Some(guard),
                     deferred_local_key: Some((scope.space_id.as_str().to_owned(), digest)),
@@ -1136,6 +1142,7 @@ impl crate::CanonicalStore {
                     compressed_size: comp_size,
                     publication_id: pub_id,
                     codec: BlobCodecTag::LocalZstdV1,
+                    queue_discard: false,
                     local_pending_dirs: PendingDirSyncs::default(),
                     _local_guard: Some(guard),
                     deferred_local_key: Some((scope.space_id.as_str().to_owned(), digest)),
@@ -1202,6 +1209,7 @@ impl crate::CanonicalStore {
             compressed_size: comp_size,
             publication_id: pub_id,
             codec: BlobCodecTag::LocalZstdV1,
+            queue_discard: false,
             local_pending_dirs: pending_dirs,
             _local_guard: Some(guard),
             deferred_local_key: None,
@@ -1216,9 +1224,68 @@ impl crate::CanonicalStore {
         active_epoch: LeaseEpoch,
         prepared: &PreparedBlobSource,
     ) -> Result<StagedBlobTicket, PortError> {
+        self.stage_s3_publication(s3, scope, active_epoch, prepared, None)
+            .await
+    }
+
+    pub(crate) async fn stage_queue_body(
+        &self,
+        scope: &HistoryScope,
+        active_epoch: LeaseEpoch,
+        prepared: &PreparedBlobSource,
+    ) -> Result<StagedBlobTicket, PortError> {
+        self.inner
+            .check_writer_epoch(&scope.space_id, active_epoch)?;
+        match &self.inner.blobs {
+            BlobBackendDriver::Local(_) => {
+                self.stage_blob_for_batch(scope, active_epoch, prepared)
+                    .await
+            }
+            BlobBackendDriver::S3(s3) => {
+                let publication = new_prefixed_hex_id("pub_")?;
+                let staged = self
+                    .stage_s3_publication(s3, scope, active_epoch, prepared, Some(&publication))
+                    .await;
+                if staged.is_err() {
+                    self.discard_queue_publication(scope, active_epoch, &publication)
+                        .await?;
+                }
+                staged
+            }
+        }
+    }
+
+    pub(crate) async fn discard_queue_publication(
+        &self,
+        scope: &HistoryScope,
+        epoch: LeaseEpoch,
+        publication: &str,
+    ) -> Result<(), PortError> {
+        match self
+            .drive_retirement_to_completion(scope, epoch, publication)
+            .await
+        {
+            // A successful bind removed the provisional discard in the same transaction.
+            Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(()),
+            result => result,
+        }
+    }
+
+    async fn stage_s3_publication(
+        &self,
+        s3: &S3BlobStore,
+        scope: &HistoryScope,
+        active_epoch: LeaseEpoch,
+        prepared: &PreparedBlobSource,
+        provisional_publication: Option<&str>,
+    ) -> Result<StagedBlobTicket, PortError> {
         s3.verify_runtime_bucket_mode().await?;
 
-        let pub_id = new_prefixed_hex_id("pub_")?;
+        let queue_discard = provisional_publication.is_some();
+        let pub_id = match provisional_publication {
+            Some(id) => id.to_owned(),
+            None => new_prefixed_hex_id("pub_")?,
+        };
         let scope_cl = scope.clone();
         let prepared_cl = prepared.clone();
         let pub_id_cl = pub_id.clone();
@@ -1230,7 +1297,7 @@ impl crate::CanonicalStore {
             .with_write_tx(|tx| {
                 Box::pin(async move {
                     lock_and_check_space_tx(tx, &scope_cl, active_epoch).await?;
-                    register_s3_staging_or_reuse_tx(
+                    let registration = register_s3_staging_or_reuse_tx(
                         tx,
                         &scope_cl.space_id,
                         active_epoch,
@@ -1238,7 +1305,15 @@ impl crate::CanonicalStore {
                         &pub_id_cl,
                         &app_prefix,
                     )
-                    .await
+                    .await?;
+                    if queue_discard
+                        && matches!(registration, S3StageRegistration::NewStaging { .. })
+                    {
+                        // Keep a pinned backup from capturing an unresolved, private upload.
+                        ensure_no_backup_holds_tx(tx, &scope_cl.space_id).await?;
+                        record_queue_discard_tx(tx, &scope_cl, active_epoch, &pub_id_cl).await?;
+                    }
+                    Ok(registration)
                 })
             })
             .await?;
@@ -1254,6 +1329,7 @@ impl crate::CanonicalStore {
                     compressed_size: prepared.total_compressed_size,
                     publication_id,
                     codec: BlobCodecTag::S3ChunkedV1,
+                    queue_discard: false,
                     local_pending_dirs: PendingDirSyncs::default(),
                     _local_guard: None,
                     deferred_local_key: None,
@@ -1300,6 +1376,7 @@ impl crate::CanonicalStore {
             compressed_size: prepared.total_compressed_size,
             publication_id: pub_id,
             codec: BlobCodecTag::S3ChunkedV1,
+            queue_discard,
             local_pending_dirs: PendingDirSyncs::default(),
             _local_guard: None,
             deferred_local_key: None,
@@ -1458,6 +1535,34 @@ impl crate::CanonicalStore {
                             .await?;
                     if !result.1.is_empty() {
                         ensure_no_backup_holds_tx(tx, &scope_in.space_id).await?;
+                    }
+                    if result
+                        .1
+                        .first()
+                        .is_some_and(|part| part.publication_id == ret_in)
+                    {
+                        const SEAL: &str = "UPDATE blob_publications SET state='retiring'
+                            WHERE space_id=$1 AND publication_id=$2 AND state='staging'";
+                        match tx {
+                            BackendConn::Sqlite(conn) => sqlx::query(SEAL)
+                                .bind(scope_in.space_id.as_str())
+                                .bind(&ret_in)
+                                .execute(&mut **conn)
+                                .await
+                                .map(|_| ()),
+                            BackendConn::Postgres(conn) => sqlx::query(SEAL)
+                                .bind(scope_in.space_id.as_str())
+                                .bind(&ret_in)
+                                .execute(&mut **conn)
+                                .await
+                                .map(|_| ()),
+                        }
+                        .map_err(|err| {
+                            internal_not_committed(
+                                "seal_discarded_queue_publication",
+                                err.to_string(),
+                            )
+                        })?;
                     }
                     Ok(result)
                 })
@@ -2270,6 +2375,10 @@ pub(crate) async fn activate_and_bind_blob_ref_tx(
             }
         }
     };
+
+    if claim.ticket.queue_discard && effective_pub_id == claim.ticket.publication_id {
+        disarm_queue_discard_tx(tx, space_id, &effective_pub_id).await?;
+    }
 
     // Insert explicit blob_references row (ignoring exact duplicate owner tuple within the same command).
     let inserted = match tx {
@@ -3310,6 +3419,93 @@ async fn load_s3_manifest_parts_tx(
     Ok(out)
 }
 
+// A provisional discard uses its unique publication ID as retirement ID. It owns
+// exactly those immutable part keys; digest-wide GC may run independently.
+async fn record_queue_discard_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    epoch: LeaseEpoch,
+    publication: &str,
+) -> Result<(), PortError> {
+    const PLAN: &str = "INSERT INTO blob_retirements
+        (space_id,retirement_id,history_incarnation,owner_epoch,reason,purge_id,status,created_at_ms,completed_at_ms)
+        VALUES ($1,$2,$3,$4,'gc',NULL,'pending',$5,NULL)";
+    const PARTS: &str = "INSERT INTO blob_retirement_targets
+        (space_id,retirement_id,publication_id,part_index,content_blake3,codec,physical_key,marker_verified,data_version_ids_json,versions_deleted,target_completed)
+        SELECT p.space_id,p.publication_id,p.publication_id,b.part_index,p.content_blake3,p.codec,b.physical_key,0,NULL,0,0
+        FROM blob_publications p JOIN blob_parts b ON b.space_id=p.space_id AND b.publication_id=p.publication_id
+        WHERE p.space_id=$1 AND p.publication_id=$2";
+    let now = now_unix_ms()?;
+    let sid = scope.space_id.as_str();
+    let inc = scope.incarnation.as_bytes().as_slice();
+    let epoch = epoch.get() as i64;
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query(PLAN)
+                .bind(sid)
+                .bind(publication)
+                .bind(inc)
+                .bind(epoch)
+                .bind(now)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("plan_queue_discard", err.to_string()))?;
+            sqlx::query(PARTS)
+                .bind(sid)
+                .bind(publication)
+                .execute(&mut **conn)
+                .await
+                .map(|_| ())
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query(PLAN)
+                .bind(sid)
+                .bind(publication)
+                .bind(inc)
+                .bind(epoch)
+                .bind(now)
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("plan_queue_discard", err.to_string()))?;
+            sqlx::query(PARTS)
+                .bind(sid)
+                .bind(publication)
+                .execute(&mut **conn)
+                .await
+                .map(|_| ())
+        }
+    }
+    .map_err(|err| internal_not_committed("plan_queue_discard_parts", err.to_string()))
+}
+
+async fn disarm_queue_discard_tx(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    publication: &str,
+) -> Result<(), PortError> {
+    for sql in [
+        "DELETE FROM blob_retirement_targets WHERE space_id=$1 AND retirement_id=$2",
+        "DELETE FROM blob_retirements WHERE space_id=$1 AND retirement_id=$2",
+    ] {
+        match tx {
+            BackendConn::Sqlite(conn) => sqlx::query(sql)
+                .bind(space.as_str())
+                .bind(publication)
+                .execute(&mut **conn)
+                .await
+                .map(|_| ()),
+            BackendConn::Postgres(conn) => sqlx::query(sql)
+                .bind(space.as_str())
+                .bind(publication)
+                .execute(&mut **conn)
+                .await
+                .map(|_| ()),
+        }
+        .map_err(|err| internal_not_committed("disarm_queue_discard", err.to_string()))?;
+    }
+    Ok(())
+}
+
 async fn pending_retirement_for_digest_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
@@ -3318,6 +3514,7 @@ async fn pending_retirement_for_digest_tx(
     const SQL: &str = "SELECT r.retirement_id FROM blob_retirements r
         JOIN blob_retirement_targets t ON t.space_id = r.space_id AND t.retirement_id = r.retirement_id
         WHERE r.space_id = $1 AND r.history_incarnation = $2 AND t.content_blake3 = $3 AND r.status = 'pending'
+        AND r.retirement_id <> t.publication_id
         ORDER BY r.created_at_ms, r.retirement_id LIMIT 1";
     match tx {
         BackendConn::Sqlite(conn) => {
@@ -3999,9 +4196,9 @@ async fn finalize_retirement_tx(
     }
 
     let now_ms = now_unix_ms()?;
-    let target_digests: Vec<Vec<u8>> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT DISTINCT content_blake3 FROM blob_retirement_targets
+    let target_digests: Vec<(Vec<u8>, i32)> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_as(
+            "SELECT DISTINCT content_blake3, CASE WHEN publication_id = retirement_id THEN 1 ELSE 0 END FROM blob_retirement_targets
              WHERE space_id = ? AND retirement_id = ?",
         )
         .bind(space_id.as_str())
@@ -4009,8 +4206,8 @@ async fn finalize_retirement_tx(
         .fetch_all(&mut **conn)
         .await
         .map_err(|err| internal_not_committed("sqlite_ret_digests", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT DISTINCT content_blake3 FROM blob_retirement_targets
+        BackendConn::Postgres(conn) => sqlx::query_as(
+            "SELECT DISTINCT content_blake3, CASE WHEN publication_id = retirement_id THEN 1 ELSE 0 END FROM blob_retirement_targets
              WHERE space_id = $1 AND retirement_id = $2",
         )
         .bind(space_id.as_str())
@@ -4020,20 +4217,26 @@ async fn finalize_retirement_tx(
         .map_err(|err| internal_not_committed("pg_ret_digests", err.to_string()))?,
     };
 
-    for d_bytes in target_digests {
+    for (d_bytes, publication_only) in target_digests {
         match tx {
             BackendConn::Sqlite(conn) => {
                 sqlx::query(
                     "UPDATE blob_publications
-                     SET state = 'retired', updated_at_ms = ?
-                     WHERE space_id = ? AND content_blake3 = ? AND state <> 'active' AND state = 'retiring'",
+                     SET state = 'retired', updated_at_ms = $1
+                     WHERE space_id = $2 AND content_blake3 = $3 AND state <> 'active' AND state = 'retiring'
+                       AND publication_id IN (SELECT t.publication_id FROM blob_retirement_targets t
+                           WHERE t.space_id=blob_publications.space_id AND t.retirement_id=$4)",
                 )
                 .bind(now_ms)
                 .bind(space_id.as_str())
                 .bind(&d_bytes)
+                .bind(retirement_id)
                 .execute(&mut **conn)
                 .await
                 .map_err(|err| internal_not_committed("sqlite_retire_pubs", err.to_string()))?;
+                if publication_only != 0 {
+                    continue;
+                }
 
                 sqlx::query(
                     "UPDATE blob_catalog
@@ -4051,14 +4254,20 @@ async fn finalize_retirement_tx(
                 sqlx::query(
                     "UPDATE blob_publications
                      SET state = 'retired', updated_at_ms = $1
-                     WHERE space_id = $2 AND content_blake3 = $3 AND state <> 'active' AND state = 'retiring'",
+                     WHERE space_id = $2 AND content_blake3 = $3 AND state <> 'active' AND state = 'retiring'
+                       AND publication_id IN (SELECT t.publication_id FROM blob_retirement_targets t
+                           WHERE t.space_id=blob_publications.space_id AND t.retirement_id=$4)",
                 )
                 .bind(now_ms)
                 .bind(space_id.as_str())
                 .bind(&d_bytes)
+                .bind(retirement_id)
                 .execute(&mut **conn)
                 .await
                 .map_err(|err| internal_not_committed("pg_retire_pubs", err.to_string()))?;
+                if publication_only != 0 {
+                    continue;
+                }
 
                 sqlx::query(
                     "UPDATE blob_catalog

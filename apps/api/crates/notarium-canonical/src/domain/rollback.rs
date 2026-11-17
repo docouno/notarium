@@ -158,8 +158,7 @@ pub(crate) async fn rollback_agent_run_impl(
         };
         if !store.is_sqlite_local()
             && let Some(direct_res) =
-                try_execute_pg_rollback_1rt_direct(store, &ctx, &idemp, &request, writer_epoch)
-                    .await
+                try_execute_pg_root_rollback(store, &ctx, &idemp, &request, writer_epoch).await
         {
             return direct_res;
         }
@@ -172,7 +171,6 @@ pub(crate) async fn rollback_agent_run_impl(
                 request.identity.clone(),
                 request.input.clone(),
                 store.inner.room_fences.clone(),
-                std::sync::Arc::clone(&store.inner.pg_imm_cache),
             );
             store
                 .submit_write_command_tracked(&ctx.budget, intent, Some(fast_plan), active_op_guard)
@@ -388,7 +386,6 @@ pub(crate) async fn rollback_agent_run_impl(
             required_semantic_cut: required_cut,
             execute: build_rollback_execute_fn(
                 space_rec.scope.clone(),
-                space_rec.space.clone(),
                 ctx.auth().clone(),
                 request.identity.clone(),
                 request.input.clone(),
@@ -726,10 +723,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     continue;
                 }
 
-                if matches!(
-                    collab_states.get(&nid).map(String::as_str),
-                    Some("active" | "fenced")
-                ) {
+                if collab_states.get(&nid) == Some(&true) {
                     skipped_room_active.push(nid);
                     continue;
                 }
@@ -813,15 +807,14 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     ..
                 } = action
                 {
-                    let require_active_folder = pre_meta.lifecycle == Lifecycle::Active;
-                    let anc = folder_cache
-                        .load_ancestry_tx(
-                            tx,
-                            &scope_cl.space_id,
-                            &pre_meta.parent_folder_id,
-                            require_active_folder,
-                        )
-                        .await?;
+                    let anc = authorize_rollback_destination_tx(
+                        tx,
+                        &mut folder_cache,
+                        &item_ctx.space,
+                        &auth,
+                        pre_meta,
+                    )
+                    .await?;
                     restored_ancestries.insert(nid.clone(), anc.is_root_child);
 
                     if pre_meta.lifecycle == Lifecycle::Active {
@@ -1352,7 +1345,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
 #[allow(clippy::too_many_arguments)]
 fn build_rollback_execute_fn(
     scope_cl: HistoryScope,
-    space_obj: notarium_core::auth::Space,
     auth: notarium_core::auth::EngineAuthContext,
     req_id: notarium_core::receipt::CommandIdentity,
     input: RollbackAgentRun,
@@ -1374,10 +1366,7 @@ fn build_rollback_execute_fn(
                     .consume_reservation(&scope_cl, &nid, res, &req_id)
                     .await?;
                 // Double-check durable `collab_sessions` did not become `'active'` or `'fenced'` concurrently.
-                if matches!(
-                    collab_states.get(&nid).map(String::as_str),
-                    Some("active" | "fenced")
-                ) {
+                if collab_states.get(&nid) == Some(&true) {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
                 item_ctx.retain_until_batch_commit(guard);
@@ -1388,7 +1377,7 @@ fn build_rollback_execute_fn(
             let _ = verify_run_and_entity_preconditions_tx(
                 tx,
                 &scope_cl,
-                &space_obj,
+                &item_ctx.space,
                 &auth,
                 &input,
                 &mut folder_cache,
@@ -1411,15 +1400,14 @@ fn build_rollback_execute_fn(
 
             for (nid, action) in &eligible_notes {
                 if let CandidateAction::RestorePreExisting { pre_meta, .. } = action {
-                    let require_active_folder = pre_meta.lifecycle == Lifecycle::Active;
-                    let anc = folder_cache
-                        .load_ancestry_tx(
-                            tx,
-                            &scope_cl.space_id,
-                            &pre_meta.parent_folder_id,
-                            require_active_folder,
-                        )
-                        .await?;
+                    let anc = authorize_rollback_destination_tx(
+                        tx,
+                        &mut folder_cache,
+                        &item_ctx.space,
+                        &auth,
+                        pre_meta,
+                    )
+                    .await?;
                     restored_ancestries.insert(nid.clone(), anc.is_root_child);
 
                     if pre_meta.lifecycle == Lifecycle::Active {
@@ -2308,6 +2296,29 @@ fn build_rollback_identity_spec(
 }
 
 #[allow(clippy::type_complexity)]
+// The current head is authorized when verifying the run's expected entities. The
+// restored revision can name a different folder, document class, or ability.
+async fn authorize_rollback_destination_tx(
+    tx: &mut BackendConn<'_>,
+    cache: &mut FolderAncestryCache,
+    space: &notarium_core::auth::Space,
+    auth: &notarium_core::auth::EngineAuthContext,
+    meta: &NoteRevisionMetadata,
+) -> Result<crate::domain::common::FolderAncestryFacts, PortError> {
+    let (after, anc) = cache
+        .build_resource_facts_tx(
+            tx,
+            space,
+            &meta.parent_folder_id,
+            meta.doc_class,
+            meta.ability_id.clone(),
+            meta.lifecycle == Lifecycle::Active,
+        )
+        .await?;
+    auth.authorize_direct_write(&after, &after)?;
+    Ok(anc)
+}
+
 async fn discover_rollback_state_tx(
     tx: &mut BackendConn<'_>,
     ctx: &SpaceContext,
@@ -2398,10 +2409,7 @@ async fn discover_rollback_state_tx(
             continue;
         }
 
-        if matches!(
-            collab_states.get(&nid).map(String::as_str),
-            Some("active" | "fenced")
-        ) {
+        if collab_states.get(&nid) == Some(&true) {
             durable_active_rooms.insert(nid.clone());
         }
 
@@ -2437,6 +2445,14 @@ async fn discover_rollback_state_tx(
                         "expected NoteRevisionMetadata",
                     ));
                 };
+                authorize_rollback_destination_tx(
+                    tx,
+                    &mut folder_cache,
+                    &srec.space,
+                    ctx.auth(),
+                    &pre_meta,
+                )
+                .await?;
                 let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
                     && head.parent_folder_id == pre_meta.parent_folder_id
                     && head.slug == pre_meta.slug
@@ -3079,11 +3095,12 @@ async fn load_space_purged_notes_tx(
 async fn load_space_collab_states_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
-) -> Result<HashMap<NoteId, String>, PortError> {
-    let rows: Vec<(String, String)> = match tx {
+) -> Result<HashMap<NoteId, bool>, PortError> {
+    let rows: Vec<(String, bool)> = match tx {
         BackendConn::Sqlite(conn) => {
             let fetched =
-                sqlx::query("SELECT note_id, room_state FROM collab_sessions WHERE space_id = ?")
+                sqlx::query("SELECT note_id, (room_state <> 'closed' OR COALESCE(carrier_dirty, 0) <> 0) AS blocked
+                     FROM collab_sessions LEFT JOIN collab_checkpoints USING (space_id, note_id) WHERE space_id = ?")
                     .bind(space_id.as_str())
                     .fetch_all(&mut **conn)
                     .await
@@ -3092,19 +3109,20 @@ async fn load_space_collab_states_tx(
                     })?;
             fetched
                 .into_iter()
-                .map(|r| (r.get("note_id"), r.get("room_state")))
+                .map(|r| (r.get("note_id"), r.get("blocked")))
                 .collect()
         }
         BackendConn::Postgres(conn) => {
             let fetched =
-                sqlx::query("SELECT note_id, room_state FROM collab_sessions WHERE space_id = $1")
+                sqlx::query("SELECT note_id, (room_state <> 'closed' OR COALESCE(carrier_dirty, 0) <> 0) AS blocked
+                     FROM collab_sessions LEFT JOIN collab_checkpoints USING (space_id, note_id) WHERE space_id = $1")
                     .bind(space_id.as_str())
                     .fetch_all(&mut **conn)
                     .await
                     .map_err(|err| internal_not_committed("pg_collab_states", err.to_string()))?;
             fetched
                 .into_iter()
-                .map(|r| (r.get("note_id"), r.get("room_state")))
+                .map(|r| (r.get("note_id"), r.get("blocked")))
                 .collect()
         }
     };
@@ -4103,7 +4121,7 @@ impl Drop for PendingRollbackFencesGuard<'_> {
     }
 }
 
-async fn try_execute_pg_rollback_1rt_direct(
+async fn try_execute_pg_root_rollback(
     store: &CanonicalStore,
     ctx: &SpaceContext,
     idemp: &crate::writer::CommandIdentitySpec,
@@ -4233,410 +4251,132 @@ async fn try_execute_pg_rollback_1rt_direct(
         }
     };
 
-    // Step 1: Hydrate immutable space/head/revision-tip metadata directly from `pg_imm_cache`
-    // with ZERO SQL read round-trips when warmed, falling back to `PG_LEAN_ROLLBACK_READ_SQL` on cold fill.
-    let use_warm_read = store
-        .inner
-        .pg_imm_cache
-        .read()
-        .is_ok_and(|g| g.warmed_spaces.contains(&scope.space_id));
-
-    struct LeanHead {
-        pf: String,
-        s: String,
-        sf: String,
-        t: String,
+    // Read each run entity and the publication of the content it could restore together.
+    // The commit rechecks the grant, heads and live publication before applying any writes.
+    struct RollbackHead {
+        slug: String,
+        folded_slug: String,
+        title: String,
         head_rev: String,
-        lc: Lifecycle,
+        lifecycle: Lifecycle,
         byte_size: u64,
-        vmask: i32,
-        dig: Option<ContentDigest>,
+        visibility_mask: i32,
+        digest: Option<ContentDigest>,
     }
-
-    #[derive(Default)]
-    struct LeanRevAcc {
-        first_run_seq: Option<i64>,
+    struct RestoredMetadata {
+        pre_meta: NoteRevisionMetadata,
+        normalized_title_fold: String,
+        canonical_root_meta_msgpack: Vec<u8>,
+    }
+    struct RunHistory {
+        first_run_seq: i64,
         max_other_seq: Option<i64>,
         pre_rev_id: Option<String>,
-        pre_meta_bytes: Option<Vec<u8>>,
+        metadata: Option<RestoredMetadata>,
     }
-
-    type WarmHydratedTuple = (FolderId, SpaceKind, Vec<Option<LeanHead>>, Vec<LeanRevAcc>);
-    let mut warm_hydrated: Option<WarmHydratedTuple> = None;
-    if use_warm_read {
-        let mut heads: Vec<Option<LeanHead>> = (0..n).map(|_| None).collect();
-        let mut revs: Vec<LeanRevAcc> = (0..n).map(|_| LeanRevAcc::default()).collect();
-        let run_id_owned = request.input.run.as_str().to_owned();
-        let run_rev_owned = request.input.expected_run_revision.as_str().to_owned();
-        let exp_n_i32 = i32::try_from(n).unwrap_or(-1);
-        let meta_opt = store.inner.pg_imm_cache.read().ok().and_then(|g| {
-            let (rfid, skind) = g
-                .space_meta
-                .get(&(scope.space_id.clone(), scope.incarnation))?
-                .clone();
-            if g.run_note_counts.get(&(
-                scope.space_id.clone(),
-                scope.incarnation,
-                run_id_owned.clone(),
-                run_rev_owned,
-            )) != Some(&exp_n_i32)
-            {
-                return None;
-            }
-            for i in 0..n {
-                let nid_owned = sorted_note_strs[i].to_owned();
-                let exp_rev_owned = sorted_exp_rev_strs[i].to_owned();
-                let snap = g.head_snapshots.get(&(
-                    scope.space_id.clone(),
-                    scope.incarnation,
-                    nid_owned.clone(),
-                    exp_rev_owned.clone(),
-                ))?;
-                heads[i] = Some(LeanHead {
-                    pf: snap.pf.clone(),
-                    s: snap.s.clone(),
-                    sf: snap.sf.clone(),
-                    t: snap.t.clone(),
-                    head_rev: exp_rev_owned.clone(),
-                    lc: snap.lc,
-                    byte_size: snap.byte_size,
-                    vmask: snap.vmask,
-                    dig: snap.dig,
-                });
-                let h = heads[i].as_ref()?;
-                let tip = g.tips.get(&(
-                    scope.space_id.clone(),
-                    scope.incarnation,
-                    run_id_owned.clone(),
-                    nid_owned,
-                    exp_rev_owned,
-                ))?;
-                revs[i].first_run_seq = Some(tip.first_run_seq);
-                revs[i].max_other_seq = tip.max_other_seq;
-                revs[i].pre_rev_id = tip.pre_rev_id.clone();
-
-                let fseq = tip.first_run_seq;
-                if tip.max_other_seq.is_some_and(|mo| mo >= fseq) {
-                    continue;
-                }
-                if tip.max_other_seq.is_none() {
-                    if h.lc != Lifecycle::Trashed
-                        && let Some(d) = h.dig
-                        && !g
-                            .pubs
-                            .contains_key(&(scope.space_id.clone(), *d.as_bytes()))
-                    {
-                        return None;
-                    }
-                } else {
-                    let prev_id = tip.pre_rev_id.as_ref()?;
-                    let cached_rev = g.revs.get(&(
-                        scope.space_id.clone(),
-                        scope.incarnation,
-                        prev_id.clone(),
-                    ))?;
-                    if let Some(d) = cached_rev.pre_meta.content_digest
-                        && !g
-                            .pubs
-                            .contains_key(&(scope.space_id.clone(), *d.as_bytes()))
-                    {
-                        return None;
-                    }
-                }
-            }
-            Some((rfid, skind))
-        });
-        if let Some((rfid, skind)) = meta_opt {
-            warm_hydrated = Some((rfid, skind, heads, revs));
+    let rows = sqlx::query(crate::schema::PG_LEAN_ROLLBACK_READ_SQL)
+        .bind(scope.space_id.as_str())
+        .bind(request.input.run.as_str())
+        .bind(&sorted_note_strs)
+        .bind(scope.incarnation.as_bytes().as_slice())
+        .bind(writer_epoch.get() as i64)
+        .bind(request.input.expected_run_revision.as_str())
+        .fetch_all(&mut *pooled)
+        .await;
+    let Ok(rows) = rows else { return None };
+    let hydrated = (|| {
+        if rows.len() != n {
+            return None;
         }
-    }
-
-    let (root_folder_id, space_kind, heads, mut revs) = match warm_hydrated {
-        Some(warm) => warm,
-        None => {
-            let read_rows = match sqlx::query(crate::schema::PG_LEAN_ROLLBACK_READ_SQL)
-                .bind(scope.space_id.as_str())
-                .bind(request.input.run.as_str())
-                .bind(&sorted_note_strs)
-                .fetch_all(&mut *pooled)
-                .await
+        let first = rows.first()?;
+        let folder = FolderId::parse(first.get("root_folder_id")).ok()?;
+        let kind = match first.get::<&str, _>("space_kind") {
+            "personal" => SpaceKind::Personal,
+            "shared" => SpaceKind::Shared,
+            _ => return None,
+        };
+        let mut heads = Vec::with_capacity(n);
+        let mut history = Vec::with_capacity(n);
+        let mut pubs = std::collections::BTreeMap::new();
+        for (idx, row) in rows.iter().enumerate() {
+            if row.get::<&str, _>("note_id") != sorted_note_strs[idx]
+                || row.get::<&str, _>("head_rev_id") != sorted_exp_rev_strs[idx]
             {
-                Ok(rows) => rows,
-                Err(_err) => {
-                    drop(pooled);
-                    return None;
-                }
-            };
-
-            let mut space_meta: Option<(FolderId, SpaceKind, i32)> = None;
-            let mut heads: Vec<Option<LeanHead>> = (0..n).map(|_| None).collect();
-            let mut revs: Vec<LeanRevAcc> = (0..n).map(|_| LeanRevAcc::default()).collect();
-            let mut cold_pubs: Vec<([u8; 32], String)> = Vec::new();
-
-            for row in &read_rows {
-                let kind: i16 = row.get::<i16, usize>(0);
-                if kind == 0 {
-                    let s_inc: Option<&[u8]> = row.get::<Option<&[u8]>, usize>(12);
-                    let arh_inc: Option<&[u8]> = row.get::<Option<&[u8]>, usize>(13);
-                    let inc_slice = scope.incarnation.as_bytes().as_slice();
-                    if s_inc != Some(inc_slice) || arh_inc != Some(inc_slice) {
-                        park_pooled(pooled);
-                        return None;
-                    }
-                    let s_lc: Option<&str> = row.get::<Option<&str>, usize>(3);
-                    if s_lc != Some("active") {
-                        park_pooled(pooled);
-                        return None;
-                    }
-                    let arh_rev: Option<&str> = row.get::<Option<&str>, usize>(4);
-                    if arh_rev != Some(request.input.expected_run_revision.as_str()) {
-                        park_pooled(pooled);
-                        return None;
-                    }
-                    let s_kind_str: &str = row.get::<&str, usize>(2);
-                    let s_kind = match s_kind_str {
-                        "personal" => SpaceKind::Personal,
-                        "shared" => SpaceKind::Shared,
-                        _ => {
-                            park_pooled(pooled);
-                            return None;
-                        }
-                    };
-                    let s_root_str: &str = row.get::<&str, usize>(1);
-                    let exp_epoch: i64 = row.get::<i64, usize>(9);
-                    let exp_last_seq_i64: i64 = row.get::<i64, usize>(10);
-                    let distinct_run_notes: i32 = row.get::<i32, usize>(11);
-                    let (Ok(root_fid), Ok(_exp_cut), true) = (
-                        FolderId::parse(s_root_str),
-                        i64_to_space_seq(exp_last_seq_i64),
-                        exp_epoch >= 1,
-                    ) else {
-                        park_pooled(pooled);
-                        return None;
-                    };
-                    space_meta = Some((root_fid, s_kind, distinct_run_notes));
-                } else if kind == 1 {
-                    let nid_str: &str = row.get::<&str, usize>(1);
-                    let Ok(idx) = sorted_note_strs.binary_search(&nid_str) else {
-                        park_pooled(pooled);
-                        return None;
-                    };
-                    let user_doc_ok: i32 = row.get::<i32, usize>(11);
-                    let head_rev_opt: Option<&str> = row.get::<Option<&str>, usize>(7);
-                    let lc_opt: Option<&str> = row.get::<Option<&str>, usize>(8);
-                    let bs_raw: i64 = row.get::<i64, usize>(9);
-                    let vmask_raw: i64 = row.get::<i64, usize>(10);
-                    if user_doc_ok != 1 || head_rev_opt != Some(sorted_exp_rev_strs[idx]) {
-                        park_pooled(pooled);
-                        return None;
-                    }
-                    let (Some(lc_str), Ok(byte_size), Ok(vmask)) =
-                        (lc_opt, u64::try_from(bs_raw), i32::try_from(vmask_raw))
-                    else {
-                        park_pooled(pooled);
-                        return None;
-                    };
-                    if vmask < 0 {
-                        park_pooled(pooled);
-                        return None;
-                    }
-                    let Ok(lc) = lifecycle_from_db(lc_str) else {
-                        park_pooled(pooled);
-                        return None;
-                    };
-                    let dig = match row.get::<Option<&[u8]>, usize>(12) {
-                        Some(b) => match <[u8; 32]>::try_from(b) {
-                            Ok(arr) => Some(ContentDigest::from_bytes(arr)),
-                            Err(_) => {
-                                park_pooled(pooled);
-                                return None;
-                            }
-                        },
-                        None => None,
-                    };
-                    heads[idx] = Some(LeanHead {
-                        pf: row.get::<&str, usize>(2).to_owned(),
-                        s: row
-                            .get::<Option<&str>, usize>(3)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        sf: row
-                            .get::<Option<&str>, usize>(4)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        t: row
-                            .get::<Option<&str>, usize>(5)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        head_rev: head_rev_opt.unwrap_or_default().to_owned(),
-                        lc,
-                        byte_size,
-                        vmask,
-                        dig,
-                    });
-                } else if kind == 2 {
-                    let ekey_str: &str = row.get::<&str, usize>(1);
-                    let Ok(idx) = sorted_note_strs.binary_search(&ekey_str) else {
-                        park_pooled(pooled);
-                        return None;
-                    };
-                    let first_run_seq: i64 = row.get::<i64, usize>(9);
-                    let other_seq: i64 = row.get::<i64, usize>(10);
-                    let acc = &mut revs[idx];
-                    acc.first_run_seq = Some(first_run_seq);
-                    if other_seq >= 0 {
-                        acc.max_other_seq = Some(other_seq);
-                        acc.pre_rev_id = Some(row.get::<&str, usize>(2).to_owned());
-                        acc.pre_meta_bytes =
-                            row.get::<Option<&[u8]>, usize>(12).map(|b| b.to_vec());
-                    }
-                } else if kind == 4
-                    && let Some(b) = row.get::<Option<&[u8]>, usize>(12)
-                    && let Ok(arr) = <[u8; 32]>::try_from(b)
-                {
-                    cold_pubs.push((arr, row.get::<&str, usize>(1).to_owned()));
-                }
-            }
-            drop(read_rows);
-
-            let Some((rfid, skind, distinct_run_notes)) = space_meta else {
-                park_pooled(pooled);
-                return None;
-            };
-            if distinct_run_notes != i32::try_from(n).unwrap_or(-1) {
-                park_pooled(pooled);
                 return None;
             }
-            if let Ok(mut g) = store.inner.pg_imm_cache.write() {
-                if g.space_meta.len() > 4096
-                    || g.revs.len() > 4096
-                    || g.head_snapshots.len() > 4096
-                    || g.tips.len() > 4096
-                    || g.run_note_counts.len() > 4096
-                    || g.pubs.len() > 4096
-                {
-                    g.space_meta.clear();
-                    g.revs.clear();
-                    g.head_snapshots.clear();
-                    g.tips.clear();
-                    g.run_note_counts.clear();
-                    g.pubs.clear();
-                    g.warmed_spaces.clear();
-                }
-                g.space_meta.insert(
-                    (scope.space_id.clone(), scope.incarnation),
-                    (rfid.clone(), skind),
-                );
-                for (arr, pub_id) in cold_pubs {
-                    g.pubs
-                        .insert((scope.space_id.clone(), arr), std::sync::Arc::from(pub_id));
-                }
-                let run_id_owned = request.input.run.as_str().to_owned();
-                g.run_note_counts.insert(
-                    (
-                        scope.space_id.clone(),
-                        scope.incarnation,
-                        run_id_owned.clone(),
-                        request.input.expected_run_revision.as_str().to_owned(),
-                    ),
-                    distinct_run_notes,
-                );
-                for i in 0..n {
-                    if let (Some(h), Some(fseq)) = (heads[i].as_ref(), revs[i].first_run_seq) {
-                        g.head_snapshots.insert(
-                            (
-                                scope.space_id.clone(),
-                                scope.incarnation,
-                                sorted_note_strs[i].to_owned(),
-                                h.head_rev.clone(),
-                            ),
-                            crate::runtime::CachedPgHeadSnapshot {
-                                pf: h.pf.clone(),
-                                s: h.s.clone(),
-                                sf: h.sf.clone(),
-                                t: h.t.clone(),
-                                lc: h.lc,
-                                byte_size: h.byte_size,
-                                vmask: h.vmask,
-                                dig: h.dig,
-                            },
-                        );
-                        g.tips.insert(
-                            (
-                                scope.space_id.clone(),
-                                scope.incarnation,
-                                run_id_owned.clone(),
-                                sorted_note_strs[i].to_owned(),
-                                h.head_rev.clone(),
-                            ),
-                            crate::runtime::CachedPgRollbackTip {
-                                first_run_seq: fseq,
-                                max_other_seq: revs[i].max_other_seq,
-                                pre_rev_id: revs[i].pre_rev_id.clone(),
-                            },
-                        );
-                    }
-                    if let (Some(first_seq_r), Some(other_seq_r)) =
-                        (revs[i].first_run_seq, revs[i].max_other_seq)
-                        && other_seq_r < first_seq_r
-                        && let (Some(prev_id), Some(mbytes)) =
-                            (revs[i].pre_rev_id.as_ref(), revs[i].pre_meta_bytes.as_ref())
-                        && let Ok(env) = RevisionMetadataEnvelope::decode(mbytes)
-                        && let RevisionMetadataPayload::Note(pm) = env.payload
+            let dig = |col: &str| -> Option<Option<ContentDigest>> {
+                row.get::<Option<&[u8]>, _>(col)
+                    .map(|bytes| <[u8; 32]>::try_from(bytes).map(ContentDigest::from_bytes))
+                    .transpose()
+                    .ok()
+            };
+            let head = RollbackHead {
+                slug: row.get("slug"),
+                folded_slug: row.get("slug_fold"),
+                title: row.get("title"),
+                head_rev: row.get("head_rev_id"),
+                lifecycle: lifecycle_from_db(row.get("lifecycle_state")).ok()?,
+                byte_size: u64::try_from(row.get::<i64, _>("byte_size")).ok()?,
+                visibility_mask: row.get("visibility_mask"),
+                digest: dig("content_blake3")?,
+            };
+            if let Some(pub_id) = row.get::<Option<&str>, _>("current_publication_id") {
+                pubs.insert(*dig("publication_digest")??.as_bytes(), pub_id.to_owned());
+            }
+            let metadata = match row.get::<Option<&[u8]>, _>("prior_metadata") {
+                Some(bytes) => {
+                    let env = RevisionMetadataEnvelope::decode(bytes).ok()?;
+                    let RevisionMetadataPayload::Note(mut pm) = env.payload else {
+                        return None;
+                    };
+                    if pm.note_id != *sorted_note_refs[idx]
+                        || pm.doc_class != DocClass::UserDoc
+                        || pm.ability_id.is_some()
+                        || pm.visibility_mask < 0
+                        || pm.parent_folder_id != folder
                     {
-                        let tf = normalize_title_key(&pm.title);
-                        let canonical_bytes = if !pm.is_root_child
-                            && pm.schema_revision.is_none()
-                            && pm.raw_fields.is_none()
-                            && pm.evaluated_fields.is_empty()
-                        {
-                            mbytes.clone()
-                        } else {
-                            let eval_fields = evaluate_fields_with_schema(
-                                pm.raw_fields.as_ref(),
-                                pm.diagnostics.first(),
-                                None,
-                            );
-                            match RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
-                                NoteRevisionMetadata {
-                                    note_id: sorted_note_refs[i].clone(),
-                                    parent_folder_id: pm.parent_folder_id.clone(),
-                                    is_root_child: false,
-                                    slug: pm.slug.clone(),
-                                    slug_fold: pm.slug_fold.clone(),
-                                    title: pm.title.clone(),
-                                    doc_class: DocClass::UserDoc,
-                                    ability_id: None,
-                                    lifecycle: pm.lifecycle,
-                                    visibility_mask: pm.visibility_mask,
-                                    byte_size: pm.byte_size,
-                                    content_digest: pm.content_digest,
-                                    schema_revision: None,
-                                    raw_fields: pm.raw_fields.clone(),
-                                    evaluated_fields: eval_fields,
-                                    diagnostics: pm.diagnostics.clone(),
-                                },
-                            ))
+                        return None;
+                    }
+                    let normalized_title_fold = normalize_title_key(&pm.title);
+                    let fields = evaluate_fields_with_schema(
+                        pm.raw_fields.as_ref(),
+                        pm.diagnostics.first(),
+                        None,
+                    );
+                    let encoded = if !pm.is_root_child
+                        && pm.schema_revision.is_none()
+                        && pm.evaluated_fields == fields
+                    {
+                        bytes.to_vec()
+                    } else {
+                        pm.is_root_child = false;
+                        pm.schema_revision = None;
+                        pm.evaluated_fields = fields;
+                        RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(pm.clone()))
                             .encode()
-                            {
-                                Ok(b) => b,
-                                Err(_) => continue,
-                            }
-                        };
-                        g.revs.insert(
-                            (scope.space_id.clone(), scope.incarnation, prev_id.clone()),
-                            std::sync::Arc::new(crate::runtime::CachedPgImmutableNoteRev {
-                                pre_meta: pm,
-                                normalized_title_fold: tf,
-                                canonical_root_meta_msgpack: canonical_bytes,
-                            }),
-                        );
-                    }
+                            .ok()?
+                    };
+                    Some(RestoredMetadata {
+                        pre_meta: pm,
+                        normalized_title_fold,
+                        canonical_root_meta_msgpack: encoded,
+                    })
                 }
-                g.warmed_spaces.insert(scope.space_id.clone());
-            }
-            (rfid, skind, heads, revs)
+                None => None,
+            };
+            heads.push(head);
+            history.push(RunHistory {
+                first_run_seq: row.get("first_seq"),
+                max_other_seq: row.get("space_seq"),
+                pre_rev_id: row.get("rev_id"),
+                metadata,
+            });
         }
+        Some((folder, kind, heads, history, pubs))
+    })();
+    let Some((root_folder_id, space_kind, heads, mut revs, active_pubs)) = hydrated else {
+        park_pooled(pooled);
+        return None;
     };
 
     let root_facts = notarium_core::auth::ResourceFacts {
@@ -4660,16 +4400,6 @@ async fn try_execute_pg_rollback_1rt_direct(
     }
 
     let root_folder_str = root_folder_id.as_str();
-    for i in 0..n {
-        let Some(ref h) = heads[i] else {
-            park_pooled(pooled);
-            return None;
-        };
-        if h.pf != root_folder_str || revs[i].first_run_seq.is_none() {
-            park_pooled(pooled);
-            return None;
-        }
-    }
 
     // Step 2: Acquire room fences only for non-manual-skip notes (matching `execute_pg_fast_rollback_inner`),
     // classify actions in memory, and encode metadata + receipt MsgPack payloads in compiled Rust.
@@ -4711,7 +4441,7 @@ async fn try_execute_pg_rollback_1rt_direct(
 
     struct DecodedRestore {
         pre_rev_id: String,
-        cached: std::sync::Arc<crate::runtime::CachedPgImmutableNoteRev>,
+        metadata: RestoredMetadata,
         is_full: bool,
     }
 
@@ -4721,18 +4451,11 @@ async fn try_execute_pg_rollback_1rt_direct(
         std::collections::BTreeSet::new();
     let mut trash_mut_cnt: usize = 0;
     let mut restore_mut_cnt: usize = 0;
-    let mut active_pubs: std::collections::BTreeMap<[u8; 32], std::sync::Arc<str>> =
-        std::collections::BTreeMap::new();
-
     {
-        let Ok(cache_guard) = store.inner.pg_imm_cache.read() else {
-            park_pooled(pooled);
-            return None;
-        };
         for i in 0..n {
-            let head = heads[i].as_ref().expect("verified head");
+            let head = &heads[i];
             let r_acc = &mut revs[i];
-            let first_run_seq = r_acc.first_run_seq.expect("verified first_run_seq");
+            let first_run_seq = r_acc.first_run_seq;
             if r_acc.max_other_seq.is_some_and(|mo| mo >= first_run_seq) {
                 // Release unused fence immediately for manual-edit skipped notes.
                 let _ = fences_guard.slots[i].take();
@@ -4744,77 +4467,35 @@ async fn try_execute_pg_rollback_1rt_direct(
                 continue;
             }
             if r_acc.max_other_seq.is_none() {
-                if head.lc == Lifecycle::Trashed {
+                if head.lifecycle == Lifecycle::Trashed {
                     acts[i] = 2;
                 } else {
-                    if let Some(d) = head.dig {
-                        let Some(p) = cache_guard
-                            .pubs
-                            .get(&(scope.space_id.clone(), *d.as_bytes()))
-                        else {
-                            drop(cache_guard);
-                            park_pooled(pooled);
-                            return None;
-                        };
-                        active_pubs
-                            .entry(*d.as_bytes())
-                            .or_insert_with(|| std::sync::Arc::clone(p));
-                    }
                     acts[i] = 3;
                     trash_mut_cnt += 1;
                 }
             } else {
                 let Some(pre_rev_id) = r_acc.pre_rev_id.take() else {
-                    drop(cache_guard);
                     park_pooled(pooled);
                     return None;
                 };
-                let Some(cached_arc) = cache_guard.revs.get(&(
-                    scope.space_id.clone(),
-                    scope.incarnation,
-                    pre_rev_id.clone(),
-                )) else {
-                    drop(cache_guard);
+                let Some(cached) = r_acc.metadata.take() else {
                     park_pooled(pooled);
                     return None;
                 };
-                let pre_meta = &cached_arc.pre_meta;
-                if pre_meta.doc_class != DocClass::UserDoc
-                    || pre_meta.ability_id.is_some()
-                    || pre_meta.visibility_mask < 0
-                    || pre_meta.parent_folder_id != root_folder_id
-                {
-                    drop(cache_guard);
-                    park_pooled(pooled);
-                    return None;
-                }
-                let unchanged_placement = head.lc == pre_meta.lifecycle
-                    && head.pf == pre_meta.parent_folder_id.as_str()
-                    && head.s == pre_meta.slug
-                    && head.sf == pre_meta.slug_fold;
+                let pre_meta = &cached.pre_meta;
+                let unchanged_placement = head.lifecycle == pre_meta.lifecycle
+                    && head.slug == pre_meta.slug
+                    && head.folded_slug == pre_meta.slug_fold;
                 let needs_mut = head.head_rev != pre_rev_id || !unchanged_placement;
                 if !needs_mut {
                     acts[i] = 4;
                 } else {
-                    if let Some(d) = pre_meta.content_digest {
-                        let Some(p) = cache_guard
-                            .pubs
-                            .get(&(scope.space_id.clone(), *d.as_bytes()))
-                        else {
-                            drop(cache_guard);
-                            park_pooled(pooled);
-                            return None;
-                        };
-                        active_pubs
-                            .entry(*d.as_bytes())
-                            .or_insert_with(|| std::sync::Arc::clone(p));
-                    }
                     acts[i] = 5;
                     restore_mut_cnt += 1;
                 }
                 decoded_restores[i] = Some(DecodedRestore {
                     pre_rev_id,
-                    cached: std::sync::Arc::clone(cached_arc),
+                    metadata: cached,
                     is_full: !unchanged_placement,
                 });
             }
@@ -4826,7 +4507,7 @@ async fn try_execute_pg_rollback_1rt_direct(
         std::collections::BTreeSet::new();
     for i in 0..n {
         if let Some(ref dr) = decoded_restores[i] {
-            let pm = &dr.cached.pre_meta;
+            let pm = &dr.metadata.pre_meta;
             if pm.lifecycle == Lifecycle::Active
                 && !planned_active_slots.insert(pm.slug_fold.as_str())
             {
@@ -4834,9 +4515,9 @@ async fn try_execute_pg_rollback_1rt_direct(
                 return None;
             }
             if acts[i] == 5 && dr.is_full {
-                let h = heads[i].as_ref().expect("verified head");
-                if h.lc == Lifecycle::Active {
-                    current_full_active_slugs.insert(h.sf.as_str());
+                let h = &heads[i];
+                if h.lifecycle == Lifecycle::Active {
+                    current_full_active_slugs.insert(h.folded_slug.as_str());
                 }
             }
         }
@@ -4845,8 +4526,8 @@ async fn try_execute_pg_rollback_1rt_direct(
         if acts[i] == 5
             && let Some(ref dr) = decoded_restores[i]
             && dr.is_full
-            && dr.cached.pre_meta.lifecycle == Lifecycle::Active
-            && current_full_active_slugs.contains(dr.cached.pre_meta.slug_fold.as_str())
+            && dr.metadata.pre_meta.lifecycle == Lifecycle::Active
+            && current_full_active_slugs.contains(dr.metadata.pre_meta.slug_fold.as_str())
         {
             // Guard against intra-statement active slug swaps between two `is_full` restores.
             park_pooled(pooled);
@@ -4947,17 +4628,17 @@ async fn try_execute_pg_rollback_1rt_direct(
             3 => {
                 owner_vec.push(nid_ref.clone());
                 elig_nids.push(nid_ref.as_str());
-                let head = heads[i].as_ref().expect("verified head");
+                let head = &heads[i];
                 rel_seq += 1;
                 let trel = rel_seq;
                 let trev = next_rev();
                 let rev_idx = m_rev_ids.len();
-                if let Some(d) = head.dig {
+                if let Some(d) = head.digest {
                     let Some(pub_arc) = active_pubs.get(d.as_bytes()) else {
                         park_pooled(pooled);
                         return None;
                     };
-                    let pub_s: &str = pub_arc.as_ref();
+                    let pub_s = pub_arc.as_str();
                     delta_by_digest.entry(*d.as_bytes()).or_insert((0, pub_s)).0 += 1;
                     pending_brs.push(PendingBr {
                         nid: nid_ref.as_str(),
@@ -4972,15 +4653,15 @@ async fn try_execute_pg_rollback_1rt_direct(
                         note_id: nid_ref.clone(),
                         parent_folder_id: root_folder_id.clone(),
                         is_root_child: false,
-                        slug: head.s.clone(),
-                        slug_fold: head.sf.clone(),
-                        title: head.t.clone(),
+                        slug: head.slug.clone(),
+                        slug_fold: head.folded_slug.clone(),
+                        title: head.title.clone(),
                         doc_class: DocClass::UserDoc,
                         ability_id: None,
                         lifecycle: Lifecycle::Trashed,
-                        visibility_mask: head.vmask,
+                        visibility_mask: head.visibility_mask,
                         byte_size: head.byte_size,
-                        content_digest: head.dig,
+                        content_digest: head.digest,
                         schema_revision: None,
                         raw_fields: None,
                         evaluated_fields: BTreeMap::new(),
@@ -4994,7 +4675,7 @@ async fn try_execute_pg_rollback_1rt_direct(
                 m_nids.push(nid_ref.as_str());
                 m_prev_revs.push(head.head_rev.as_str());
                 m_rest_revs.push(None);
-                m_digs_owned.push(head.dig);
+                m_digs_owned.push(head.digest);
                 m_lc.push("trashed");
                 m_rel_seqs.push(trel);
                 trash_metas_owned.push(meta);
@@ -5025,11 +4706,11 @@ async fn try_execute_pg_rollback_1rt_direct(
             continue;
         }
         let nid_ref = sorted_note_refs[i];
-        let head = heads[i].as_ref().expect("verified head");
+        let head = &heads[i];
         let dr = decoded_restores[i]
             .as_ref()
             .expect("verified decoded_restore");
-        let pm = &dr.cached.pre_meta;
+        let pm = &dr.metadata.pre_meta;
         rel_seq += 1;
         let rrel = rel_seq;
         let rrev = next_rev();
@@ -5039,7 +4720,7 @@ async fn try_execute_pg_rollback_1rt_direct(
                 park_pooled(pooled);
                 return None;
             };
-            let pub_s: &str = pub_arc.as_ref();
+            let pub_s = pub_arc.as_str();
             delta_by_digest.entry(*d.as_bytes()).or_insert((0, pub_s)).0 += 1;
             pending_brs.push(PendingBr {
                 nid: nid_ref.as_str(),
@@ -5056,7 +4737,7 @@ async fn try_execute_pg_rollback_1rt_direct(
         m_digs_owned.push(pm.content_digest);
         m_lc.push(lc_str);
         m_rel_seqs.push(rrel);
-        m_metas.push(dr.cached.canonical_root_meta_msgpack.as_slice());
+        m_metas.push(dr.metadata.canonical_root_meta_msgpack.as_slice());
         m_ops.push("restore");
         if dr.is_full {
             fl_nids.push(nid_ref.as_str());
@@ -5064,7 +4745,7 @@ async fn try_execute_pg_rollback_1rt_direct(
             fl_s.push(pm.slug.as_str());
             fl_sf.push(pm.slug_fold.as_str());
             fl_t.push(pm.title.as_str());
-            fl_tf.push(dr.cached.normalized_title_fold.as_str());
+            fl_tf.push(dr.metadata.normalized_title_fold.as_str());
             fl_rev_idxs.push(rev_idx);
             fl_digs_owned.push(pm.content_digest);
             fl_bs.push(pm.byte_size as i64);
@@ -5073,7 +4754,7 @@ async fn try_execute_pg_rollback_1rt_direct(
         } else {
             hot_nids.push(nid_ref.as_str());
             hot_t.push(pm.title.as_str());
-            hot_tf.push(dr.cached.normalized_title_fold.as_str());
+            hot_tf.push(dr.metadata.normalized_title_fold.as_str());
             hot_rev_idxs.push(rev_idx);
             hot_digs_owned.push(pm.content_digest);
             hot_bs.push(pm.byte_size as i64);
@@ -5253,10 +4934,8 @@ async fn try_execute_pg_rollback_1rt_direct(
     let cat_pubs: Vec<&str> = delta_by_digest.values().map(|(_, p)| *p).collect();
     let cat_digs: Vec<&[u8]> = cat_digs_owned.iter().map(|a| a.as_slice()).collect();
 
-    let all_exp_lcs: Vec<&'static str> = heads
-        .iter()
-        .map(|h| lifecycle_to_db(h.as_ref().expect("verified head").lc))
-        .collect();
+    let all_exp_lcs: Vec<&'static str> =
+        heads.iter().map(|h| lifecycle_to_db(h.lifecycle)).collect();
 
     // Step 3: Commit in 1 lean PL/pgSQL transaction (all INSERTs in PK order before pre-sliced UPDATEs).
     let phase2_start = writer
@@ -5264,6 +4943,10 @@ async fn try_execute_pg_rollback_1rt_direct(
         .then(std::time::Instant::now);
 
     fences_guard.armed_for_drop_consume = true;
+    if let Err(err) = ctx.auth().authorize_direct_write(&root_facts, &root_facts) {
+        park_pooled(pooled);
+        return Some(Err(err.into()));
+    }
     let commit_res = sqlx::query(crate::schema::PG_LEAN_ROLLBACK_COMMIT_CALL_SQL)
         .bind(scope.space_id.as_str())
         .bind(scope.incarnation.as_bytes().as_slice())
@@ -6018,15 +5701,14 @@ async fn execute_pg_fast_rollback_inner(
                     head_unchanged_placement,
                     ..
                 } => {
-                    let require_active_folder = pre_meta.lifecycle == Lifecycle::Active;
-                    let anc = match folder_cache
-                        .load_ancestry_tx(
-                            &mut bconn,
-                            &scope_cl.space_id,
-                            &pre_meta.parent_folder_id,
-                            require_active_folder,
-                        )
-                        .await
+                    let anc = match authorize_rollback_destination_tx(
+                        &mut bconn,
+                        &mut folder_cache,
+                        &space_obj,
+                        auth,
+                        pre_meta,
+                    )
+                    .await
                     {
                         Ok(a) => a,
                         Err(err) => {
@@ -6499,6 +6181,7 @@ async fn execute_pg_fast_rollback_inner(
         let first_i64 = first_seq.get() as i64;
 
         // Round-Trip 2: Single autocommit PL/pgSQL call executing unified single-CTE writes + synchronous WAL flush!
+        auth.authorize_space_write(&space_obj)?;
         let apply_res = sqlx::query_scalar::<_, i64>(
             "SELECT notarium_pg_fast_rollback_apply_v1(
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,

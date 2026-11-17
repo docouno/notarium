@@ -36,6 +36,7 @@ toml = { workspace = true }
 blake3.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+mimalloc.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 sqlx.workspace = true

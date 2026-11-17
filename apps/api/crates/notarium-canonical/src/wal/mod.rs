@@ -86,7 +86,6 @@ struct WalAtomicCounters {
     wal_bytes: AtomicU64,
     logical_wal_bytes: AtomicU64,
     has_wal_hook_frames: AtomicBool,
-    retained_wal_bytes: AtomicU64,
     last_passive_wal_bytes: AtomicU64,
     commits_since_passive: AtomicU64,
     commits_since_reset: AtomicU64,
@@ -932,7 +931,8 @@ impl SqliteWalCoordinator {
         }
 
         let disk_wal_bytes = self.observe_wal_file_bytes();
-        let pre_wal_bytes = if self.counters.has_wal_hook_frames.load(Ordering::Relaxed) {
+        let has_hook_frames = self.counters.has_wal_hook_frames.load(Ordering::Relaxed);
+        let pre_wal_bytes = if has_hook_frames {
             self.counters.logical_wal_bytes.load(Ordering::Relaxed)
         } else {
             disk_wal_bytes
@@ -994,18 +994,27 @@ impl SqliteWalCoordinator {
             .is_empty();
 
         let commits_since_reset = self.counters.commits_since_reset.load(Ordering::Acquire);
-        let has_hook_frames = self.counters.has_wal_hook_frames.load(Ordering::Relaxed);
-        let retained_floor = if has_hook_frames {
-            0
+        // A RESTART keeps the physical WAL allocation for reuse. SQLx commits do not
+        // report frames through the writer hook. Check the live WAL index before
+        // using a large file as grounds for closing admission.
+        let active_wal_bytes = if !has_hook_frames
+            && disk_wal_bytes >= self.wal_soft_watermark_bytes
+            && commits_since_reset > 0
+        {
+            match self
+                .checkpoint_status("PRAGMA main.wal_checkpoint(NOOP)")
+                .await
+            {
+                Some((0, frames, _)) => u64::try_from(frames)
+                    .ok()
+                    .map(|frames| frames.saturating_mul(self.wal_frame_bytes)),
+                _ => None,
+            }
         } else {
-            self.counters.retained_wal_bytes.load(Ordering::Relaxed)
+            Some(pre_wal_bytes)
         };
-
-        // Per design/03: force bounded `RESTART` immediately at `wal_high_watermark_bytes` (`128 MiB`),
-        // while `wal_soft_watermark_bytes` (`64 MiB`) triggers background `PASSIVE` and only escalates
-        // to an exclusive reset when `passive_busy` or `writer_idle`.
-        let reset_threshold = self.wal_high_watermark_bytes;
-        let threshold_hit = commits_since_reset > 0 && pre_wal_bytes >= reset_threshold;
+        let threshold_hit = commits_since_reset > 0
+            && active_wal_bytes.is_some_and(|bytes| bytes >= self.wal_high_watermark_bytes);
 
         if active_backups_empty && (force_reset || threshold_hit) {
             self.run_bounded_wal_reset(inner, force_reset).await;
@@ -1037,14 +1046,6 @@ impl SqliteWalCoordinator {
         } else {
             None
         };
-        let wal_bytes = if has_hook_frames {
-            self.counters.logical_wal_bytes.load(Ordering::Relaxed)
-        } else if passive_res.is_some() {
-            self.observe_wal_file_bytes()
-        } else {
-            pre_wal_bytes
-        };
-
         if !active_backups_empty {
             return;
         }
@@ -1055,8 +1056,8 @@ impl SqliteWalCoordinator {
         };
 
         let needs_soft_reset = commits_since_reset > 0
-            && wal_bytes >= self.wal_soft_watermark_bytes
-            && (passive_busy || (writer_idle && wal_bytes > retained_floor));
+            && active_wal_bytes.is_some_and(|bytes| bytes >= self.wal_soft_watermark_bytes)
+            && (passive_busy || writer_idle);
 
         if needs_soft_reset {
             self.run_bounded_wal_reset(inner, false).await;
@@ -1080,6 +1081,27 @@ impl SqliteWalCoordinator {
         self.counters
             .commits_since_passive
             .store(0, Ordering::Release);
+        let (busy, log_frames, ckpt_frames) = self
+            .checkpoint_status("PRAGMA main.wal_checkpoint(PASSIVE)")
+            .await?;
+        self.counters
+            .passive_checkpoints
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .last_passive_wal_bytes
+            .store(pre_wal_bytes, Ordering::Relaxed);
+        self.counters.log_frames.store(
+            u64::try_from(log_frames.max(0)).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        self.counters.checkpointed_frames.store(
+            u64::try_from(ckpt_frames.max(0)).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        Some((busy, log_frames, ckpt_frames))
+    }
+
+    async fn checkpoint_status(&self, pragma: &'static str) -> Option<(i64, i64, i64)> {
         let conn = {
             let mut slot = self.passive_conn.lock().await;
             match slot.take() {
@@ -1095,7 +1117,7 @@ impl SqliteWalCoordinator {
         };
 
         let ckpt_join = tokio::task::spawn_blocking(move || {
-            let res = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            let res = conn.query_row(pragma, [], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
@@ -1111,30 +1133,7 @@ impl SqliteWalCoordinator {
         };
         *self.passive_conn.lock().await = Some(conn);
 
-        match ckpt_res {
-            Ok((busy, log_frames, ckpt_frames)) => {
-                self.counters
-                    .passive_checkpoints
-                    .fetch_add(1, Ordering::Relaxed);
-                self.counters
-                    .last_passive_wal_bytes
-                    .store(pre_wal_bytes, Ordering::Relaxed);
-                self.counters.log_frames.store(
-                    u64::try_from(log_frames.max(0)).unwrap_or(0),
-                    Ordering::Relaxed,
-                );
-                self.counters.checkpointed_frames.store(
-                    u64::try_from(ckpt_frames.max(0)).unwrap_or(0),
-                    Ordering::Relaxed,
-                );
-                Some((busy, log_frames, ckpt_frames))
-            }
-            Err(err) => {
-                // Note: `PASSIVE` never blocks writers/readers; do not count internal ckpt-lock busy as leaked caller busy.
-                let _ = err;
-                None
-            }
-        }
+        ckpt_res.ok()
     }
 
     async fn run_bounded_wal_reset(&self, inner: &Arc<CanonicalInner>, force_truncate: bool) {
@@ -1150,7 +1149,7 @@ impl SqliteWalCoordinator {
         // keeps committing during the bulk copy and the exclusive `RESTART`/`TRUNCATE` pause only flushes <= ~3 MiB!
         for _ in 0..3 {
             let pre_bytes = self.observe_wal_file_bytes();
-            let Some((busy, _log_f, ckpt_f)) = self.run_passive_checkpoint(pre_bytes, true).await
+            let Some((busy, log_f, ckpt_f)) = self.run_passive_checkpoint(pre_bytes, true).await
             else {
                 break;
             };
@@ -1158,7 +1157,7 @@ impl SqliteWalCoordinator {
                 self.counters.logical_wal_bytes.load(Ordering::Relaxed)
                     / self.wal_frame_bytes.max(1)
             } else {
-                self.observe_wal_file_bytes() / self.wal_frame_bytes.max(1)
+                u64::try_from(log_f.max(0)).unwrap_or(0)
             };
             let ckpt_u64 = u64::try_from(ckpt_f.max(0)).unwrap_or(0);
             if busy == 0 && live_frames.saturating_sub(ckpt_u64) <= 768 {
@@ -1304,9 +1303,6 @@ impl SqliteWalCoordinator {
                         .checkpointed_frames
                         .store(0, Ordering::Relaxed);
                     self.counters.logical_wal_bytes.store(0, Ordering::Relaxed);
-                    self.counters
-                        .retained_wal_bytes
-                        .store(post_bytes, Ordering::Relaxed);
                     let next_passive_base =
                         if self.counters.has_wal_hook_frames.load(Ordering::Relaxed) {
                             0

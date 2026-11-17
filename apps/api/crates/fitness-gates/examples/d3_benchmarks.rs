@@ -55,6 +55,9 @@ use notarium_core::{
 use serde::{Deserialize, Serialize};
 use sqlx::{Connection, PgConnection};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const CARRIER_TARGET_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -250,6 +253,7 @@ fn compute_percentiles_from_ns(mut samples_ns: Vec<u64>) -> PercentilesUs {
 
 #[derive(Clone, Debug, Serialize)]
 struct EnvironmentAttribution {
+    process_allocator: &'static str,
     generated_at_unix_s: u64,
     rust_profile: &'static str,
     git_base_commit: String,
@@ -322,6 +326,7 @@ struct ChatReadProfileMetrics {
     seeded_turns: usize,
     window_entries: usize,
     measured_reads: usize,
+    measured_leaves: usize,
     sql_writes_during_reads: u64,
     latency: PercentilesUs,
 }
@@ -917,6 +922,23 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
         .await
         .unwrap();
 
+    // The rollback targets are root children in a Space that also contains an unrelated folder.
+    store
+        .create_folder(CreateFolderSpec {
+            scope: space.scope.clone(),
+            active_epoch: space.active_epoch,
+            folder_id: FolderId::from_bytes(random_16()),
+            parent: None,
+            slug: "unrelated".into(),
+            display_name: "Unrelated".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+
     let human_ctx = owner_ctx(&space.scope, owner.clone());
     let foreign_ctx = owner_ctx(&space.scope, other_human.clone());
     let run_ctx = agent_run_ctx(&human_ctx, run_id.clone());
@@ -1233,6 +1255,57 @@ async fn run_pg_rollback_benchmark(
 // Suite 3: Chat (`p95 < 1 ms`, `0` writes across 10k-turn linear & branched DAG)
 // ============================================================================
 
+// Triggers on the isolated benchmark schema observe actual writes, including no-op updates.
+// The counter and its triggers are installed after seeding, outside all timed operations.
+async fn install_row_write_counter(store: &CanonicalStore, sqlite: bool, tables: &[(&str, &str)]) {
+    for statement in [
+        "CREATE TABLE d3_row_writes (writes BIGINT NOT NULL)",
+        "INSERT INTO d3_row_writes VALUES (0)",
+    ] {
+        store
+            .execute_diagnostic_write_sql_for_test(statement)
+            .await
+            .unwrap();
+    }
+    let increment = "UPDATE d3_row_writes SET writes = writes + 1";
+    if !sqlite {
+        store
+            .execute_diagnostic_write_sql_for_test(&format!(
+                "CREATE FUNCTION d3_count_write() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN {increment}; RETURN NULL; END; $$"
+            ))
+            .await
+            .unwrap();
+    }
+    for (table, predicate) in tables {
+        for (action, row) in [("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")] {
+            let condition = predicate.replace("ROW_ALIAS", row);
+            let trigger = format!("CREATE TRIGGER d3_{table}_{action} AFTER {action} ON {table}");
+            let statement = if sqlite {
+                format!("{trigger} WHEN {condition} BEGIN {increment}; END")
+            } else {
+                format!(
+                    "{trigger} FOR EACH ROW WHEN ({condition}) EXECUTE FUNCTION d3_count_write()"
+                )
+            };
+            store
+                .execute_diagnostic_write_sql_for_test(&statement)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+async fn observed_row_writes(store: &CanonicalStore) -> u64 {
+    u64::try_from(
+        store
+            .execute_diagnostic_read_sql_for_test(None, "SELECT writes FROM d3_row_writes")
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+}
+
 async fn run_chat_read_benchmarks_for_store(
     store: &CanonicalStore,
     backend_label: &'static str,
@@ -1337,6 +1410,7 @@ async fn run_chat_read_benchmarks_for_store(
     let br_tid_cl = branched_tid.clone();
     let br_seeder = tokio::spawn(async move {
         let mut main_spine = ThreadEntrySeq::ZERO;
+        let mut side_tips = Vec::new();
         let mut count = 0usize;
         while count < turns_to_seed {
             // Advance spine by 3 turns
@@ -1406,48 +1480,42 @@ async fn run_chat_read_benchmarks_for_store(
                         .unwrap();
                     side_parent = side.value.seq;
                 }
+                side_tips.push(side_parent);
             }
         }
-        main_spine
+        // Measure switching between actual leaves, each with a full context window.
+        let mut leaves = vec![main_spine];
+        leaves.extend(side_tips.into_iter().rev().take(8));
+        leaves
     });
 
     let linear_leaf = lin_seeder.await.unwrap();
-    let branched_leaf = br_seeder.await.unwrap();
+    let branched_leaves = br_seeder.await.unwrap();
+    assert!(branched_leaves.len() > 1);
 
     if let Some((fixtures, pg_schema)) = pg_settle {
-        let mut raw_pg = fixtures.open_raw_pg().await;
-        for stmt in [
-            format!(
-                "ALTER TABLE \"{pg_schema}\".\"chat_threads\" SET (autovacuum_enabled = false)"
-            ),
-            format!(
-                "ALTER TABLE \"{pg_schema}\".\"chat_entries\" SET (autovacuum_enabled = false)"
-            ),
-            format!(
-                "VACUUM \"{pg_schema}\".\"spaces\", \"{pg_schema}\".\"chat_threads\", \"{pg_schema}\".\"chat_entries\""
-            ),
-            "CHECKPOINT".to_owned(),
-        ] {
-            sqlx::raw_sql(sqlx::AssertSqlSafe(stmt))
-                .execute(&mut raw_pg)
-                .await
-                .unwrap();
-        }
-        let _ = raw_pg.close().await;
+        let mut conn = fixtures.open_raw_pg().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "VACUUM (ANALYZE) \"{pg_schema}\".spaces, \"{pg_schema}\".chat_threads, \"{pg_schema}\".chat_entries"
+        ))).execute(&mut conn).await.unwrap();
+        conn.close().await.unwrap();
     }
-    let _ = std::process::Command::new("sync").status();
-    tokio::time::sleep(Duration::from_millis(2000)).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let tables: Vec<_> = notarium_canonical::CANONICAL_TABLES
+        .iter()
+        .map(|t| (t.name, "TRUE"))
+        .collect();
+    install_row_write_counter(store, pg_settle.is_none(), &tables).await;
 
     let limit_50 = PageLimit::new(50).unwrap();
     let mut results = Vec::with_capacity(2);
 
-    for (topology, tid, leaf) in [
-        ("linear_10k", linear_tid, linear_leaf),
-        ("branched_dag_10k", branched_tid, branched_leaf),
+    for (topology, tid, leaves) in [
+        ("linear_10k", linear_tid, vec![linear_leaf]),
+        ("branched_dag_10k", branched_tid, branched_leaves),
     ] {
         // Warm cache across all opened pool connections (`>= 6` executions/conn for generic plan)
-        for _ in 0..96 {
+        for sample in 0..96 {
+            let leaf = leaves[sample % leaves.len()];
             let warm = store
                 .read_chat(
                     owner_ctx(&space.scope, owner.clone()),
@@ -1463,18 +1531,11 @@ async fn run_chat_read_benchmarks_for_store(
             assert_eq!(warm.entries.len(), 50.min(turns_to_seed));
         }
 
-        let seq_before = store
-            .read_space(&space.scope.space_id)
-            .await
-            .unwrap()
-            .last_seq;
-        let change_rows_before = store
-            .execute_diagnostic_read_sql_for_test(None, "SELECT COUNT(*) FROM change_log")
-            .await
-            .unwrap();
+        let before = observed_row_writes(store).await;
 
         let mut lat_ns = Vec::with_capacity(read_samples);
-        for _ in 0..read_samples {
+        for sample in 0..read_samples {
+            let leaf = leaves[sample % leaves.len()];
             let rctx = owner_ctx(&space.scope, owner.clone());
             let req = ChatRead {
                 thread: tid.clone(),
@@ -1486,23 +1547,14 @@ async fn run_chat_read_benchmarks_for_store(
             let branch = store.read_chat(rctx, req).await.unwrap();
             let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
             assert_eq!(branch.entries.len(), 50.min(turns_to_seed));
+            assert_eq!(branch.entries.last().unwrap().seq, leaf);
             lat_ns.push(elapsed_ns);
         }
 
-        let seq_after = store
-            .read_space(&space.scope.space_id)
-            .await
-            .unwrap()
-            .last_seq;
-        let change_rows_after = store
-            .execute_diagnostic_read_sql_for_test(None, "SELECT COUNT(*) FROM change_log")
-            .await
-            .unwrap();
-        let writes_delta = (seq_after.get() - seq_before.get())
-            + (change_rows_after.saturating_sub(change_rows_before) as u64);
+        let writes_delta = observed_row_writes(store).await - before;
         assert_eq!(
             writes_delta, 0,
-            "chat branch reads must perform 0 SQL writes"
+            "chat reads must perform zero SQL row writes"
         );
 
         let pct = compute_percentiles_from_ns(lat_ns);
@@ -1512,6 +1564,7 @@ async fn run_chat_read_benchmarks_for_store(
             seeded_turns: turns_to_seed,
             window_entries: 50.min(turns_to_seed),
             measured_reads: read_samples,
+            measured_leaves: leaves.len(),
             sql_writes_during_reads: writes_delta,
             latency: pct,
         });
@@ -2024,8 +2077,6 @@ async fn run_folder_100k_move_benchmark(
         .await
         .unwrap();
 
-    let baseline_seq = seq_cursor;
-
     let total_folders_db = store
         .execute_diagnostic_read_sql_for_test(
             None,
@@ -2049,6 +2100,20 @@ async fn run_folder_100k_move_benchmark(
     assert_eq!(total_folders_db as usize, descendant_folders);
     assert_eq!(total_notes_db as usize, descendant_notes);
 
+    let exclude_ancestors = format!(
+        "ROW_ALIAS.folder_id NOT IN ('{}','{}','{}','{}')",
+        space.root_folder_id.as_str(),
+        parent_a.as_str(),
+        parent_b.as_str(),
+        moving_folder.as_str(),
+    );
+    install_row_write_counter(
+        store,
+        backend_label.starts_with("sqlite"),
+        &[("folder_heads", &exclude_ancestors), ("note_heads", "TRUE")],
+    )
+    .await;
+
     let mut lat_ns = Vec::with_capacity(move_iters);
     for iter in 0..move_iters {
         let dst = if iter % 2 == 0 {
@@ -2071,30 +2136,20 @@ async fn run_folder_100k_move_benchmark(
         lat_ns.push(elapsed_ns);
     }
 
-    let touched_descendant_folders = store
-        .execute_diagnostic_read_sql_for_test(
-            None,
-            &format!(
-                "SELECT COUNT(*) FROM folder_heads WHERE space_id = '{sid}' AND folder_id <> '{}' AND updated_seq > {baseline_seq}",
-                moving_folder.as_str()
-            ),
-        )
-        .await
-        .unwrap();
-    let touched_descendant_notes = store
-        .execute_diagnostic_read_sql_for_test(
-            None,
-            &format!(
-                "SELECT COUNT(*) FROM note_heads WHERE space_id = '{sid}' AND updated_seq > {baseline_seq}"
-            ),
-        )
-        .await
-        .unwrap();
-    let descendant_writes = (touched_descendant_folders + touched_descendant_notes) as u64;
+    let descendant_writes = observed_row_writes(store).await;
     assert_eq!(
         descendant_writes, 0,
-        "MoveFolder must touch 0 descendant folder/note rows"
+        "MoveFolder must touch 0 descendant rows"
     );
+    // Even an UPDATE that leaves the stored values unchanged must increment the probe.
+    store
+        .execute_diagnostic_write_sql_for_test(&format!(
+            "UPDATE note_heads SET updated_seq = updated_seq WHERE space_id = '{sid}'
+         AND note_id = (SELECT MIN(note_id) FROM note_heads WHERE space_id = '{sid}')",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(observed_row_writes(store).await, 1);
 
     FolderMoveMetrics {
         backend: backend_label,
@@ -2424,13 +2479,12 @@ async fn main() {
     let backup_captures = if smoke_mode { 50usize } else { 1_000usize };
 
     // Settle any prior build/container writeback past ext4's 5s `jbd2` commit interval before timing.
-    let _ = std::process::Command::new("sync").status();
     tokio::time::sleep(Duration::from_millis(5500)).await;
-    let _ = std::process::Command::new("sync").status();
     tokio::time::sleep(Duration::from_millis(500)).await;
     eprintln!("[D3] starting benchmark suite (smoke={smoke_mode}, fs={fstype} on {mount_point})");
 
     let environment = EnvironmentAttribution {
+        process_allocator: "mimalloc",
         generated_at_unix_s: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2526,9 +2580,7 @@ async fn main() {
     let rollback_profiles = vec![rb_sqlite, rb_pg_local, rb_pg_s3];
 
     // 2. Writer 50w/0r & 50w/200r
-    let _ = std::process::Command::new("sync").status();
     tokio::time::sleep(Duration::from_millis(5500)).await;
-    let _ = std::process::Command::new("sync").status();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut writer_50w_0r_runs = Vec::with_capacity(writer_runs);
     let mut writer_50w_200r_runs = Vec::with_capacity(writer_runs);
@@ -2558,7 +2610,6 @@ async fn main() {
         writer_50w_200r_runs.push(m);
     }
 
-    let _ = std::process::Command::new("sync").status();
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
     // 3. Chat 50-entry window in 10k linear & branched DAG

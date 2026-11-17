@@ -3334,19 +3334,9 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
 
         // --- 1. Read-only preconditions & pure serialization (zero SQL mutations) ---
         let has_closed_collab_session =
-            match check_note_room_direct_write_cached(conn, cache, room_fences, scope_cl, note_id)
-                .map_err(FastItemExecError::PreWrite)?
-            {
-                NoteRoomDirectWriteState::ActiveOrFenced => {
-                    return Err(FastItemExecError::PreWrite(unavailable_retryable(
-                        "collab_room_not_closed",
-                        "note collaborative session is active or fenced awaiting recovery",
-                        Duration::from_millis(50),
-                    )));
-                }
-                NoteRoomDirectWriteState::ClosedSessionRow => true,
-                NoteRoomDirectWriteState::NoSessionRow => false,
-            };
+            check_note_room_direct_write_cached(conn, cache, room_fences, scope_cl, note_id)
+                .and_then(NoteRoomDirectWriteState::require_writable)
+                .map_err(FastItemExecError::PreWrite)?;
 
         let note_cache_key = (scope_cl.space_id.clone(), note_id.clone());
         let (used_phase1_cache, head, anc) = if self.phase1_receipt_checked_gen
@@ -4548,22 +4538,25 @@ fn check_note_room_direct_write_cached(
     if !space_has_any_collab_session_cached(conn, cache, &scope.space_id)? {
         return Ok(NoteRoomDirectWriteState::NoSessionRow);
     }
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT room_state FROM collab_sessions WHERE space_id = ?1 AND note_id = ?2",
-        )
-        .map_err(|err| internal_not_committed("sqlite_check_room_active", err.to_string()))?;
-    let state_opt: Option<String> = stmt
-        .query_row(params![scope.space_id.as_str(), note_id.as_str()], |r| {
-            r.get(0)
+    durable_note_room_state_rusqlite(conn, &scope.space_id, note_id)
+}
+
+fn durable_note_room_state_rusqlite(
+    conn: &rusqlite::Connection,
+    space_id: &SpaceId,
+    note_id: &NoteId,
+) -> Result<NoteRoomDirectWriteState, PortError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT room_state, COALESCE(carrier_dirty, 0) FROM collab_sessions LEFT JOIN collab_checkpoints USING(space_id, note_id)
+         WHERE space_id = ?1 AND note_id = ?2",
+    ).map_err(|err| internal_not_committed("sqlite_check_room_active", err.to_string()))?;
+    let row = stmt
+        .query_row(params![space_id.as_str(), note_id.as_str()], |r| {
+            Ok((r.get(0)?, r.get(1)?))
         })
         .optional()
         .map_err(|err| map_interrupt_or_internal(err, "sqlite_check_room_active"))?;
-    Ok(match state_opt.as_deref() {
-        None => NoteRoomDirectWriteState::NoSessionRow,
-        Some("active" | "fenced") => NoteRoomDirectWriteState::ActiveOrFenced,
-        Some(_) => NoteRoomDirectWriteState::ClosedSessionRow,
-    })
+    Ok(NoteRoomDirectWriteState::from_row(row))
 }
 
 fn active_note_sibling_exists_rusqlite(
@@ -4961,16 +4954,19 @@ fn sync_closed_collab_session_on_direct_write_rusqlite(
     new_carrier_rev: &RevisionId,
     updated_seq: SpaceSeq,
 ) -> Result<(), PortError> {
+    if !durable_note_room_state_rusqlite(conn, space_id, note_id)?.require_writable()? {
+        return Ok(());
+    }
     let seq_i64 = updated_seq.get() as i64;
     {
         let mut del = conn
-            .prepare_cached("DELETE FROM collab_update_log WHERE space_id = ?1 AND note_id = ?2")
+            .prepare_cached("DELETE FROM collab_checkpoints WHERE space_id = ?1 AND note_id = ?2")
             .map_err(|err| {
-                internal_not_committed("sqlite_sync_clear_collab_log", err.to_string())
+                internal_not_committed("sqlite_sync_clear_collab_checkpoint", err.to_string())
             })?;
         del.execute(params![space_id.as_str(), note_id.as_str()])
             .map_err(|err| {
-                internal_not_committed("sqlite_sync_clear_collab_log", err.to_string())
+                internal_not_committed("sqlite_sync_clear_collab_checkpoint", err.to_string())
             })?;
     }
     let affected = {
@@ -5609,7 +5605,6 @@ struct RollbackDirectSqliteFastPlan {
     request_identity: CommandIdentity,
     input: RollbackAgentRun,
     room_fences: Arc<RoomFenceTable>,
-    imm_cache: Arc<std::sync::RwLock<crate::runtime::PgImmutableRollbackCache>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5621,7 +5616,6 @@ pub(crate) fn build_rollback_direct_sqlite_fast_intent(
     request_identity: CommandIdentity,
     input: RollbackAgentRun,
     room_fences: Arc<RoomFenceTable>,
-    imm_cache: Arc<std::sync::RwLock<crate::runtime::PgImmutableRollbackCache>>,
 ) -> (PreparedWriteIntent, Box<dyn SqliteSyncItemPlan>) {
     let intent = PreparedWriteIntent {
         scope: scope.clone(),
@@ -5645,7 +5639,6 @@ pub(crate) fn build_rollback_direct_sqlite_fast_intent(
         request_identity,
         input,
         room_fences,
-        imm_cache,
     });
     (intent, plan)
 }
@@ -5695,7 +5688,6 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
         let mut heads_map = verify_run_and_entity_preconditions_note_only_rusqlite(
             conn,
             cache,
-            &self.imm_cache,
             scope_cl,
             &item_ctx.space,
             auth,
@@ -5712,311 +5704,114 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             HashMap::new()
         };
 
-        let touched_sorted: Vec<NoteId> = heads_map.keys().cloned().collect();
         let mut skipped_manual_edits = Vec::new();
         let mut skipped_room_active = Vec::new();
-        let mut candidates: BTreeMap<NoteId, CandidateAction> = BTreeMap::new();
-        let mut sqlite_cached_restores: HashMap<
-            NoteId,
-            Arc<crate::runtime::CachedPgImmutableNoteRev>,
-        > = HashMap::with_capacity(touched_sorted.len());
-
-        let run_str_owned = input.run.as_str().to_owned();
-        for nid in touched_sorted {
-            let head = heads_map
-                .remove(&nid)
-                .ok_or_else(|| FastItemExecError::PreWrite(DomainError::ResourceNotFound.into()))?;
-
-            let cached_hit = self.imm_cache.read().ok().and_then(|g| {
-                let tip = g
-                    .tips
-                    .get(&(
-                        scope_cl.space_id.clone(),
-                        scope_cl.incarnation,
-                        run_str_owned.clone(),
-                        nid.as_str().to_owned(),
-                        head.head_rev_id.as_str().to_owned(),
-                    ))?
-                    .clone();
-                let cached_rev = match &tip.pre_rev_id {
-                    Some(prev_str) => Some(Arc::clone(g.revs.get(&(
-                        scope_cl.space_id.clone(),
-                        scope_cl.incarnation,
-                        prev_str.clone(),
-                    ))?)),
-                    None => None,
-                };
-                Some((tip, cached_rev))
-            });
-
-            if let Some((tip, cached_rev_opt)) = cached_hit {
-                if tip.max_other_seq.is_some_and(|mo| mo >= tip.first_run_seq) {
-                    skipped_manual_edits.push(nid);
-                    continue;
-                }
-                if matches!(
-                    collab_states.get(&nid).map(String::as_str),
-                    Some("active" | "fenced")
-                ) {
-                    skipped_room_active.push(nid);
-                    continue;
-                }
-                match (tip.pre_rev_id, cached_rev_opt) {
-                    (None, _) => {
-                        candidates.insert(
-                            nid,
-                            CandidateAction::TrashCreated {
-                                current_rev: head.head_rev_id,
-                                current_lifecycle: head.lifecycle,
-                                doc_class: head.doc_class,
-                                parent_folder_id: head.parent_folder_id,
-                                slug: head.slug,
-                                slug_fold: head.slug_fold,
-                                title: head.title,
-                                ability_id: head.ability_id,
-                                visibility_mask: head.visibility_mask,
-                                byte_size: head.byte_size,
-                                content_digest: head.content_digest,
-                            },
-                        );
-                    }
-                    (Some(prev_str), Some(cached_arc)) => {
-                        let pre_rev_id = RevisionId::parse(&prev_str).map_err(|_| {
-                            FastItemExecError::PreWrite(internal_not_committed(
-                                "corrupt_rev_id",
-                                "invalid cached pre_rev_id",
-                            ))
-                        })?;
-                        let pm = &cached_arc.pre_meta;
-                        let head_unchanged_placement = head.lifecycle == pm.lifecycle
-                            && head.parent_folder_id == pm.parent_folder_id
-                            && head.slug == pm.slug
-                            && head.slug_fold == pm.slug_fold;
-                        let needs_note_mutation =
-                            head.head_rev_id != pre_rev_id || !head_unchanged_placement;
-                        let pm_box = Box::new(pm.clone());
-                        sqlite_cached_restores.insert(nid.clone(), cached_arc);
-                        candidates.insert(
-                            nid,
-                            CandidateAction::RestorePreExisting {
-                                current_rev: head.head_rev_id,
-                                pre_rev_id,
-                                pre_meta: pm_box,
-                                pre_carrier: None,
-                                needs_note_mutation,
-                                head_unchanged_placement,
-                            },
-                        );
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
-            let note_revs =
-                load_note_revisions_for_rollback_rusqlite(conn, &scope_cl.space_id, &nid)
-                    .map_err(FastItemExecError::PreWrite)?;
-
-            let first_run_seq = note_revs
-                .iter()
-                .filter(|r| r.2.as_ref() == Some(&input.run))
-                .map(|r| r.1)
-                .min()
-                .ok_or_else(|| {
-                    FastItemExecError::PreWrite(
-                        DomainError::validation(ValidationReason::SourceMismatch).into(),
-                    )
+        let mut candidates = BTreeMap::new();
+        let mut original_metadata = HashMap::with_capacity(heads_map.len());
+        // Command ends are monotonic. Within each command space_seq orders its events.
+        let mut history = conn.prepare_cached(
+            "WITH touched AS (
+                 SELECT entity_key, MIN(space_seq) AS first_run_seq
+                 FROM revisions
+                 WHERE space_id = ?1 AND entity_type = 'note' AND agent_run_id = ?2
+                 GROUP BY entity_key
+             )
+             SELECT t.entity_key, EXISTS (
+                        SELECT 1 FROM revisions r
+                        WHERE r.space_id = ?1 AND r.entity_type = 'note' AND r.entity_key = t.entity_key
+                          AND r.visibility_seq > t.first_run_seq AND r.space_seq > t.first_run_seq
+                          AND r.agent_run_id IS NOT ?2
+                    ), pre.rev_id, pre.metadata_msgpack
+             FROM touched t LEFT JOIN revisions pre ON pre.rowid = (
+                 SELECT r.rowid FROM revisions r
+                 WHERE r.space_id = ?1 AND r.entity_type = 'note' AND r.entity_key = t.entity_key
+                   AND r.space_seq < t.first_run_seq
+                 ORDER BY r.visibility_seq DESC, r.space_seq DESC LIMIT 1
+             )
+             ORDER BY t.entity_key"
+        ).map_err(|err| FastItemExecError::PreWrite(internal_not_committed("sqlite_rollback_history", err.to_string())))?;
+        let map_history_error = |err| {
+            FastItemExecError::PreWrite(map_interrupt_or_internal(err, "sqlite_rollback_history"))
+        };
+        let mut rows = history
+            .query(params![scope_cl.space_id.as_str(), input.run.as_str()])
+            .map_err(map_history_error)?;
+        while let Some(row) = rows.next().map_err(map_history_error)? {
+            let key: &str = row
+                .get_ref(0)
+                .map_err(map_history_error)?
+                .as_str()
+                .map_err(|err| {
+                    FastItemExecError::PreWrite(internal_not_committed(
+                        "sqlite_rollback_note_id",
+                        err.to_string(),
+                    ))
                 })?;
-
-            let max_other_seq = note_revs
-                .iter()
-                .filter(|r| r.2.as_ref() != Some(&input.run))
-                .map(|r| r.1.get() as i64)
-                .max();
-            let has_foreign_note_edit =
-                max_other_seq.is_some_and(|mo| mo > first_run_seq.get() as i64);
-            let pre_rev_opt = note_revs
-                .iter()
-                .filter(|r| r.1 < first_run_seq)
-                .max_by_key(|r| r.1);
-
-            if has_foreign_note_edit {
-                if let Ok(mut g) = self.imm_cache.write() {
-                    g.tips.insert(
-                        (
-                            scope_cl.space_id.clone(),
-                            scope_cl.incarnation,
-                            run_str_owned.clone(),
-                            nid.as_str().to_owned(),
-                            head.head_rev_id.as_str().to_owned(),
-                        ),
-                        crate::runtime::CachedPgRollbackTip {
-                            first_run_seq: first_run_seq.get() as i64,
-                            max_other_seq,
-                            pre_rev_id: None,
-                        },
-                    );
-                }
+            let nid = NoteId::parse(key).map_err(|e| FastItemExecError::PreWrite(e.into()))?;
+            let head = heads_map.remove(&nid).ok_or_else(|| {
+                FastItemExecError::PreWrite(
+                    DomainError::validation(ValidationReason::SourceMismatch).into(),
+                )
+            })?;
+            if row.get::<_, bool>(1).map_err(map_history_error)? {
                 skipped_manual_edits.push(nid);
                 continue;
             }
-
-            if matches!(
-                collab_states.get(&nid).map(String::as_str),
-                Some("active" | "fenced")
-            ) {
+            if collab_states.get(&nid) == Some(&true) {
                 skipped_room_active.push(nid);
                 continue;
             }
-
-            match pre_rev_opt {
-                None => {
-                    if let Ok(mut g) = self.imm_cache.write() {
-                        g.tips.insert(
-                            (
-                                scope_cl.space_id.clone(),
-                                scope_cl.incarnation,
-                                run_str_owned.clone(),
-                                nid.as_str().to_owned(),
-                                head.head_rev_id.as_str().to_owned(),
-                            ),
-                            crate::runtime::CachedPgRollbackTip {
-                                first_run_seq: first_run_seq.get() as i64,
-                                max_other_seq: None,
-                                pre_rev_id: None,
-                            },
-                        );
-                    }
-                    candidates.insert(
-                        nid,
-                        CandidateAction::TrashCreated {
-                            current_rev: head.head_rev_id,
-                            current_lifecycle: head.lifecycle,
-                            doc_class: head.doc_class,
-                            parent_folder_id: head.parent_folder_id,
-                            slug: head.slug,
-                            slug_fold: head.slug_fold,
-                            title: head.title,
-                            ability_id: head.ability_id,
-                            visibility_mask: head.visibility_mask,
-                            byte_size: head.byte_size,
-                            content_digest: head.content_digest,
-                        },
-                    );
-                }
-                Some((pre_rev_id, _, _)) => {
-                    let meta_bytes =
-                        load_revision_meta_bytes_rusqlite(conn, &scope_cl.space_id, pre_rev_id)
-                            .map_err(FastItemExecError::PreWrite)?;
-                    let env = RevisionMetadataEnvelope::decode(&meta_bytes)
-                        .map_err(FastItemExecError::PreWrite)?;
-                    let RevisionMetadataPayload::Note(pre_meta) = env.payload else {
-                        return Err(FastItemExecError::PreWrite(internal_not_committed(
-                            "corrupt_note_rev_meta",
-                            "expected NoteRevisionMetadata",
-                        )));
-                    };
-                    let tf = if pre_meta.doc_class == DocClass::EncryptedNote {
-                        normalize_title_key(&pre_meta.slug)
-                    } else {
-                        normalize_title_key(&pre_meta.title)
-                    };
-                    let canonical_bytes = if !pre_meta.is_root_child
-                        && pre_meta.schema_revision.is_none()
-                        && pre_meta.raw_fields.is_none()
-                        && pre_meta.evaluated_fields.is_empty()
-                    {
-                        meta_bytes
-                    } else {
-                        let eval_f = if pre_meta.doc_class == DocClass::EncryptedNote {
-                            BTreeMap::new()
-                        } else {
-                            evaluate_fields_with_schema(
-                                pre_meta.raw_fields.as_ref(),
-                                pre_meta.diagnostics.first(),
-                                None,
-                            )
-                        };
-                        RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
-                            NoteRevisionMetadata {
-                                note_id: nid.clone(),
-                                parent_folder_id: pre_meta.parent_folder_id.clone(),
-                                is_root_child: false,
-                                slug: pre_meta.slug.clone(),
-                                slug_fold: pre_meta.slug_fold.clone(),
-                                title: pre_meta.title.clone(),
-                                doc_class: pre_meta.doc_class,
-                                ability_id: pre_meta.ability_id.clone(),
-                                lifecycle: pre_meta.lifecycle,
-                                visibility_mask: pre_meta.visibility_mask,
-                                byte_size: pre_meta.byte_size,
-                                content_digest: pre_meta.content_digest,
-                                schema_revision: None,
-                                raw_fields: pre_meta.raw_fields.clone(),
-                                evaluated_fields: eval_f,
-                                diagnostics: pre_meta.diagnostics.clone(),
-                            },
-                        ))
-                        .encode()
-                        .map_err(FastItemExecError::PreWrite)?
-                    };
-                    let cached_arc = Arc::new(crate::runtime::CachedPgImmutableNoteRev {
-                        pre_meta: pre_meta.clone(),
-                        normalized_title_fold: tf,
-                        canonical_root_meta_msgpack: canonical_bytes,
-                    });
-                    if let Ok(mut g) = self.imm_cache.write() {
-                        if g.revs.len() > 4096 || g.tips.len() > 4096 {
-                            g.revs.clear();
-                            g.tips.clear();
-                            g.run_note_counts.clear();
-                            g.pubs.clear();
-                            g.warmed_spaces.clear();
-                        }
-                        g.tips.insert(
-                            (
-                                scope_cl.space_id.clone(),
-                                scope_cl.incarnation,
-                                run_str_owned.clone(),
-                                nid.as_str().to_owned(),
-                                head.head_rev_id.as_str().to_owned(),
-                            ),
-                            crate::runtime::CachedPgRollbackTip {
-                                first_run_seq: first_run_seq.get() as i64,
-                                max_other_seq,
-                                pre_rev_id: Some(pre_rev_id.as_str().to_owned()),
-                            },
-                        );
-                        g.revs.insert(
-                            (
-                                scope_cl.space_id.clone(),
-                                scope_cl.incarnation,
-                                pre_rev_id.as_str().to_owned(),
-                            ),
-                            Arc::clone(&cached_arc),
-                        );
-                    }
-                    sqlite_cached_restores.insert(nid.clone(), cached_arc);
-                    let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
-                        && head.parent_folder_id == pre_meta.parent_folder_id
-                        && head.slug == pre_meta.slug
-                        && head.slug_fold == pre_meta.slug_fold;
-                    let needs_note_mutation =
-                        head.head_rev_id != *pre_rev_id || !head_unchanged_placement;
-                    candidates.insert(
-                        nid,
-                        CandidateAction::RestorePreExisting {
-                            current_rev: head.head_rev_id,
-                            pre_rev_id: pre_rev_id.clone(),
-                            pre_meta: Box::new(pre_meta),
-                            pre_carrier: None,
-                            needs_note_mutation,
-                            head_unchanged_placement,
-                        },
-                    );
-                }
-            }
+            let pre_raw: Option<String> = row.get(2).map_err(map_history_error)?;
+            let Some(pre_raw) = pre_raw else {
+                candidates.insert(
+                    nid,
+                    CandidateAction::TrashCreated {
+                        current_rev: head.head_rev_id,
+                        current_lifecycle: head.lifecycle,
+                        doc_class: head.doc_class,
+                        parent_folder_id: head.parent_folder_id,
+                        slug: head.slug,
+                        slug_fold: head.slug_fold,
+                        title: head.title,
+                        ability_id: head.ability_id,
+                        visibility_mask: head.visibility_mask,
+                        byte_size: head.byte_size,
+                        content_digest: head.content_digest,
+                    },
+                );
+                continue;
+            };
+            let pre_rev_id =
+                RevisionId::parse(&pre_raw).map_err(|e| FastItemExecError::PreWrite(e.into()))?;
+            let bytes: Vec<u8> = row.get(3).map_err(map_history_error)?;
+            let envelope =
+                RevisionMetadataEnvelope::decode(&bytes).map_err(FastItemExecError::PreWrite)?;
+            let RevisionMetadataPayload::Note(pre_meta) = envelope.payload else {
+                return Err(FastItemExecError::PreWrite(internal_not_committed(
+                    "corrupt_note_rev_meta",
+                    "expected note revision metadata",
+                )));
+            };
+            let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
+                && head.parent_folder_id == pre_meta.parent_folder_id
+                && head.slug == pre_meta.slug
+                && head.slug_fold == pre_meta.slug_fold;
+            let needs_note_mutation = head.head_rev_id != pre_rev_id || !head_unchanged_placement;
+            original_metadata.insert(nid.clone(), bytes);
+            candidates.insert(
+                nid,
+                CandidateAction::RestorePreExisting {
+                    current_rev: head.head_rev_id,
+                    pre_rev_id,
+                    pre_meta: Box::new(pre_meta),
+                    pre_carrier: None,
+                    needs_note_mutation,
+                    head_unchanged_placement,
+                },
+            );
         }
+        drop(rows);
+        drop(history);
 
         // Lock per-note fences in ascending NoteId order before collision checks so no room can open/close
         // concurrently and any PreWrite error drops the guards without bumping fence epochs.
@@ -6051,7 +5846,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             } = action
             {
                 let require_active_folder = pre_meta.lifecycle == Lifecycle::Active;
-                let (_, anc) = build_resource_facts_cached(
+                let (after, anc) = build_resource_facts_cached(
                     conn,
                     cache,
                     &item_ctx.space,
@@ -6061,6 +5856,8 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     require_active_folder,
                 )
                 .map_err(FastItemExecError::PreWrite)?;
+                auth.authorize_direct_write(&after, &after)
+                    .map_err(|err| FastItemExecError::PreWrite(err.into()))?;
                 restored_ancestries.insert(nid.clone(), anc.is_root_child);
 
                 if pre_meta.lifecycle == Lifecycle::Active {
@@ -6487,16 +6284,11 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     pending_blob_rebinds.push((nid.clone(), rrev.clone(), digest, rseq));
                 }
 
-                let cached_restore_opt = sqlite_cached_restores.get(nid);
-                let title_fold_cow: std::borrow::Cow<'_, str> = if let Some(cr) = cached_restore_opt
-                {
-                    std::borrow::Cow::Borrowed(cr.normalized_title_fold.as_str())
-                } else if pre_meta.doc_class == DocClass::EncryptedNote {
-                    std::borrow::Cow::Owned(normalize_title_key(&pre_meta.slug))
+                let title_fold = if pre_meta.doc_class == DocClass::EncryptedNote {
+                    normalize_title_key(&pre_meta.slug)
                 } else {
-                    std::borrow::Cow::Owned(normalize_title_key(&pre_meta.title))
+                    normalize_title_key(&pre_meta.title)
                 };
-                let title_fold: &str = title_fold_cow.as_ref();
                 let digest_slice = pre_meta
                     .content_digest
                     .as_ref()
@@ -6576,45 +6368,33 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                         .map_err(FastItemExecError::PostWrite)?;
                 }
 
-                let meta = if !is_root_child
-                    && current_schema.is_none()
-                    && let Some(cr) = cached_restore_opt
-                {
-                    cr.canonical_root_meta_msgpack.clone()
+                let schema_revision = current_schema.as_ref().map(|s| &s.schema_revision);
+                let evaluated_fields = if pre_meta.doc_class == DocClass::EncryptedNote {
+                    BTreeMap::new()
                 } else {
-                    let eval_fields = if pre_meta.doc_class == DocClass::EncryptedNote {
-                        BTreeMap::new()
-                    } else {
-                        evaluate_fields_with_schema(
-                            pre_meta.raw_fields.as_ref(),
-                            pre_meta.diagnostics.first(),
-                            current_schema.as_ref().map(|s| &s.fields),
-                        )
-                    };
-                    RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
-                        NoteRevisionMetadata {
-                            note_id: nid.clone(),
-                            parent_folder_id: pre_meta.parent_folder_id.clone(),
-                            is_root_child,
-                            slug: pre_meta.slug.clone(),
-                            slug_fold: pre_meta.slug_fold.clone(),
-                            title: pre_meta.title.clone(),
-                            doc_class: pre_meta.doc_class,
-                            ability_id: pre_meta.ability_id.clone(),
-                            lifecycle: pre_meta.lifecycle,
-                            visibility_mask: pre_meta.visibility_mask,
-                            byte_size: pre_meta.byte_size,
-                            content_digest: pre_meta.content_digest,
-                            schema_revision: current_schema
-                                .as_ref()
-                                .map(|s| s.schema_revision.clone()),
-                            raw_fields: pre_meta.raw_fields.clone(),
-                            evaluated_fields: eval_fields,
-                            diagnostics: pre_meta.diagnostics.clone(),
-                        },
-                    ))
-                    .encode()
-                    .map_err(FastItemExecError::PostWrite)?
+                    evaluate_fields_with_schema(
+                        pre_meta.raw_fields.as_ref(),
+                        pre_meta.diagnostics.first(),
+                        current_schema.as_ref().map(|s| &s.fields),
+                    )
+                };
+                let meta = if pre_meta.is_root_child == is_root_child
+                    && pre_meta.schema_revision.as_ref() == schema_revision
+                    && pre_meta.note_id == *nid
+                    && pre_meta.evaluated_fields == evaluated_fields
+                {
+                    original_metadata
+                        .remove(nid)
+                        .expect("loaded pre-run revision")
+                } else {
+                    let mut restored = pre_meta.as_ref().clone();
+                    restored.note_id = nid.clone();
+                    restored.is_root_child = is_root_child;
+                    restored.schema_revision = schema_revision.cloned();
+                    restored.evaluated_fields = evaluated_fields;
+                    RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(restored))
+                        .encode()
+                        .map_err(FastItemExecError::PostWrite)?
                 };
 
                 pending_rev_rows.push(PendingFastRev {
@@ -6954,7 +6734,6 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
 fn verify_run_and_entity_preconditions_note_only_rusqlite(
     conn: &rusqlite::Connection,
     cache: &mut FastBatchSqlCache,
-    imm_cache: &std::sync::RwLock<crate::runtime::PgImmutableRollbackCache>,
     scope: &HistoryScope,
     space: &Space,
     auth: &EngineAuthContext,
@@ -7009,68 +6788,30 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
         }
     }
 
-    let warm_set_verified = imm_cache.read().ok().is_some_and(|g| {
-        let exp_len = i32::try_from(caller_notes.len()).unwrap_or(-1);
-        if g.run_note_counts.get(&(
-            scope.space_id.clone(),
-            scope.incarnation,
-            input.run.as_str().to_owned(),
-            input.expected_run_revision.as_str().to_owned(),
-        )) != Some(&exp_len)
-        {
-            return false;
+    let mut touched_set: BTreeSet<NoteId> = BTreeSet::new();
+    {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT DISTINCT entity_key FROM revisions
+                 WHERE space_id = ?1 AND agent_run_id = ?2 AND agent_run_id IS NOT NULL AND entity_type = 'note'",
+            )
+            .map_err(|err| internal_not_committed("sqlite_run_touched_notes", err.to_string()))?;
+        let rows = stmt
+            .query_map(params![scope.space_id.as_str(), input.run.as_str()], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|err| map_interrupt_or_internal(err, "sqlite_run_touched_notes"))?;
+        for item in rows {
+            let raw =
+                item.map_err(|err| map_interrupt_or_internal(err, "sqlite_run_touched_notes"))?;
+            let nid = NoteId::parse(&raw)
+                .map_err(|_| internal_not_committed("corrupt_touched_note_id", "invalid NoteId"))?;
+            touched_set.insert(nid);
         }
-        caller_notes.iter().all(|(nid, rev)| {
-            g.tips.contains_key(&(
-                scope.space_id.clone(),
-                scope.incarnation,
-                input.run.as_str().to_owned(),
-                nid.as_str().to_owned(),
-                rev.as_str().to_owned(),
-            ))
-        })
-    });
-
-    if !warm_set_verified {
-        let mut touched_set: BTreeSet<NoteId> = BTreeSet::new();
-        {
-            let mut stmt = conn
-                .prepare_cached(
-                    "SELECT DISTINCT entity_key FROM revisions
-                     WHERE space_id = ?1 AND agent_run_id = ?2 AND agent_run_id IS NOT NULL AND entity_type = 'note'",
-                )
-                .map_err(|err| internal_not_committed("sqlite_run_touched_notes", err.to_string()))?;
-            let rows = stmt
-                .query_map(params![scope.space_id.as_str(), input.run.as_str()], |r| {
-                    r.get::<_, String>(0)
-                })
-                .map_err(|err| map_interrupt_or_internal(err, "sqlite_run_touched_notes"))?;
-            for item in rows {
-                let raw =
-                    item.map_err(|err| map_interrupt_or_internal(err, "sqlite_run_touched_notes"))?;
-                let nid = NoteId::parse(&raw).map_err(|_| {
-                    internal_not_committed("corrupt_touched_note_id", "invalid NoteId")
-                })?;
-                touched_set.insert(nid);
-            }
-        }
-        let caller_set: BTreeSet<NoteId> = caller_notes.keys().cloned().collect();
-        if caller_set != touched_set {
-            return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-        }
-        if let Ok(mut g) = imm_cache.write()
-            && let Ok(cnt) = i32::try_from(touched_set.len())
-        {
-            g.run_note_counts.insert(
-                (
-                    scope.space_id.clone(),
-                    scope.incarnation,
-                    input.run.as_str().to_owned(),
-                    input.expected_run_revision.as_str().to_owned(),
-                ),
-                cnt,
-            );
-        }
+    }
+    let caller_set: BTreeSet<NoteId> = caller_notes.keys().cloned().collect();
+    if caller_set != touched_set {
+        return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
     }
 
     let mut heads_map = BTreeMap::new();
@@ -7099,48 +6840,6 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
     Ok(heads_map)
 }
 
-#[allow(clippy::type_complexity)]
-fn load_note_revisions_for_rollback_rusqlite(
-    conn: &rusqlite::Connection,
-    space_id: &SpaceId,
-    note_id: &NoteId,
-) -> Result<Vec<(RevisionId, SpaceSeq, Option<AgentRunId>)>, PortError> {
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT rev_id, space_seq, agent_run_id
-             FROM revisions
-             WHERE space_id = ?1 AND entity_type = 'note' AND entity_key = ?2",
-        )
-        .map_err(|err| internal_not_committed("sqlite_load_note_revs_fast", err.to_string()))?;
-    let rows = stmt
-        .query_map(params![space_id.as_str(), note_id.as_str()], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, Option<String>>(2)?,
-            ))
-        })
-        .map_err(|err| map_interrupt_or_internal(err, "sqlite_load_note_revs_fast"))?;
-
-    let mut out = Vec::with_capacity(4);
-    for item in rows {
-        let (rev_raw, seq_raw, run_raw) =
-            item.map_err(|err| map_interrupt_or_internal(err, "sqlite_load_note_revs_fast"))?;
-        let rev = RevisionId::parse(&rev_raw)
-            .map_err(|_| internal_not_committed("corrupt_rev_id", "invalid rev_id"))?;
-        let seq = i64_to_space_seq(seq_raw)?;
-        let run = match run_raw {
-            Some(s) => Some(
-                AgentRunId::parse(&s)
-                    .map_err(|_| internal_not_committed("corrupt_rev_run", "invalid run_id"))?,
-            ),
-            None => None,
-        };
-        out.push((rev, seq, run));
-    }
-    Ok(out)
-}
-
 fn load_revision_meta_bytes_rusqlite(
     conn: &rusqlite::Connection,
     space_id: &SpaceId,
@@ -7160,13 +6859,14 @@ fn load_revision_meta_bytes_rusqlite(
 fn load_space_collab_states_rusqlite(
     conn: &rusqlite::Connection,
     space_id: &SpaceId,
-) -> Result<HashMap<NoteId, String>, PortError> {
+) -> Result<HashMap<NoteId, bool>, PortError> {
     let mut stmt = conn
-        .prepare_cached("SELECT note_id, room_state FROM collab_sessions WHERE space_id = ?1")
+        .prepare_cached("SELECT note_id, (room_state <> 'closed' OR COALESCE(carrier_dirty, 0) <> 0) AS blocked
+                     FROM collab_sessions LEFT JOIN collab_checkpoints USING (space_id, note_id) WHERE space_id = ?1")
         .map_err(|err| internal_not_committed("sqlite_collab_states", err.to_string()))?;
     let rows = stmt
         .query_map(params![space_id.as_str()], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
         })
         .map_err(|err| map_interrupt_or_internal(err, "sqlite_collab_states"))?;
     let mut out = HashMap::new();

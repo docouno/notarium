@@ -103,11 +103,29 @@ async fn l1_sqlite_bootstrap_witness_owner_lock_and_fail_closed_guards() {
 
     runtime.shutdown().await.expect("clean SQLite shutdown");
 
-    // Restart idempotence: reopening same DataRoot succeeds without DDL drift.
+    {
+        let mut raw = temp.open_raw_sqlite().await;
+        sqlx::raw_sql("DROP TABLE collab_checkpoints;
+            ALTER TABLE backup_holds DROP COLUMN owner_generation;
+            UPDATE schema_meta SET schema_version=2,
+                manifest_checksum=X'4375964FA9CF7DE29749E52C6387A9F72D1A4538FB9F97240A9FE356061BDBDF'")
+            .execute(&mut raw).await.unwrap();
+        raw.close().await.unwrap();
+    }
+    assert_eq!(
+        observe_sqlite_canonical_witness(&temp.data_root()).await,
+        observed
+    );
+
+    // Opening the older DataRoot through the normal runtime upgrades it in place.
     let (_store2, runtime2) = CanonicalRuntime::open(cfg.clone())
         .await
-        .expect("reopen SQLite idempotently");
-    runtime2.shutdown().await.expect("second shutdown");
+        .expect("upgrade SQLite predecessor");
+    runtime2.shutdown().await.expect("shutdown after upgrade");
+    let (_, reopened) = CanonicalRuntime::open(cfg.clone())
+        .await
+        .expect("reopen current SQLite schema");
+    reopened.shutdown().await.unwrap();
 
     // Installation mismatch must fail closed.
     let wrong_install_cfg =
@@ -206,7 +224,11 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     assert_eq!(runtime.witness().state, DatabaseState::Ready);
     runtime.shutdown().await.expect("clean PG shutdown");
 
+    const CONSTRAINTS: &str = "SELECT t.relname::text, c.conname::text, pg_get_constraintdef(c.oid)
+        FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
+        WHERE t.relnamespace=current_schema()::regnamespace ORDER BY t.relname, c.conname";
     // Reopen the recognized previous manifest through the startup migration.
+    let fresh_constraints: Vec<(String, String, String)>;
     {
         let mut raw = fixtures.open_raw_pg().await;
         let path = format!("SET search_path TO \"{schema}\"");
@@ -214,6 +236,16 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
             .execute(&mut raw)
             .await
             .unwrap();
+        fresh_constraints = sqlx::query_as(CONSTRAINTS)
+            .fetch_all(&mut raw)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "DROP TABLE collab_checkpoints; ALTER TABLE backup_holds DROP COLUMN owner_generation",
+        )
+        .execute(&mut raw)
+        .await
+        .unwrap();
         sqlx::query("DROP TABLE account_catalog_receipts")
             .execute(&mut raw)
             .await
@@ -233,6 +265,70 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
         .await
         .expect("idempotent PG reopen");
     runtime2.shutdown().await.expect("second PG shutdown");
+
+    // Exercise the v2 predecessor with its early misplaced size constraint.
+    let mut raw = fixtures.open_raw_pg().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET search_path TO \"{schema}\""
+    )))
+    .execute(&mut raw)
+    .await
+    .unwrap();
+    sqlx::raw_sql("DROP TABLE collab_checkpoints;
+        ALTER TABLE backup_holds DROP COLUMN owner_generation;
+        ALTER TABLE account_catalog_receipts DROP CONSTRAINT account_catalog_receipts_result_msgpack_check;
+        ALTER TABLE content_jobs ADD CHECK (length(result_msgpack) BETWEEN 1 AND 4096);
+        UPDATE schema_meta SET schema_version=2,
+            manifest_checksum=decode('4375964fa9cf7de29749e52c6387a9f72d1a4538fb9f97240a9fe356061bdbdf','hex')")
+        .execute(&mut raw).await.unwrap();
+    sqlx::raw_sql(include_str!("fixtures/legacy-collab.sql"))
+        .execute(&mut raw)
+        .await
+        .unwrap();
+    // Bootstrap directly so ordinary runtime recovery does not reconcile the old hold.
+    notarium_canonical::schema::bootstrap_postgres_schema(&mut raw, &schema, &install)
+        .await
+        .unwrap();
+    let upgraded_constraints: Vec<(String, String, String)> = sqlx::query_as(CONSTRAINTS)
+        .fetch_all(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(upgraded_constraints, fresh_constraints);
+    let checkpoints: Vec<(String,i64,i64,i64)> = sqlx::query_as(
+        "SELECT note_id,snapshot_lease_epoch,snapshot_update_seq,carrier_dirty FROM collab_checkpoints ORDER BY note_id"
+    ).fetch_all(&mut raw).await.unwrap();
+    assert_eq!(
+        checkpoints,
+        vec![
+            ("checkpoint".into(), 7, i64::MAX, 1),
+            ("delta-only".into(), 0, 0, 1)
+        ]
+    );
+    let delta_count: i64 = sqlx::query_scalar("SELECT count(*) FROM collab_update_log")
+        .fetch_one(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(delta_count, 2);
+    let generation: String = sqlx::query_scalar("SELECT owner_generation FROM backup_holds")
+        .fetch_one(&mut raw)
+        .await
+        .unwrap();
+    assert!(generation.is_empty());
+    sqlx::raw_sql("INSERT INTO content_jobs(space_id,job_id,job_kind,state,lease_epoch,artifacts_json,result_msgpack,created_seq,updated_seq)
+        VALUES ('legacy-collab','j','backup','queued',0,'[]',decode(repeat('aa',8192),'hex'),1,1);
+        INSERT INTO account_catalog_receipts VALUES ('owner','actor','key',decode(repeat('00',32),'hex'),decode(repeat('aa',4096),'hex'))")
+        .execute(&mut raw).await.unwrap();
+    let oversized = sqlx::query(
+        "UPDATE account_catalog_receipts SET result_msgpack=decode(repeat('aa',4097),'hex')",
+    )
+    .execute(&mut raw)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        oversized.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
+    );
+    raw.close().await.unwrap();
 
     // Wrong installation fails closed.
     let blob_temp3 = TempDataRoot::new("l1-pg-blobs-3");

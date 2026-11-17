@@ -307,6 +307,10 @@ pub struct CollabSessionRecord {
     pub carrier_rev_id: RevisionId,
     pub yrs_snapshot_blob: Option<Vec<u8>>,
     pub yrs_snapshot_digest: Option<ContentDigest>,
+    /// Inclusive (lease, update sequence) already represented by the snapshot.
+    pub snapshot_coverage: Option<(LeaseEpoch, u64)>,
+    /// The canonical carrier still requires reconciliation with collaborative state.
+    pub carrier_dirty: bool,
     pub room_state: CollabRoomState,
     pub owner_id: Option<String>,
     pub updated_seq: SpaceSeq,
@@ -2370,12 +2374,18 @@ async fn load_collab_session_opt_tx(
         String,
         Option<String>,
         i64,
+        i64,
+        i64,
+        i64,
     )> = match tx {
         BackendConn::Sqlite(conn) => {
             let r = sqlx::query(
                 "SELECT lease_epoch, lineage_epoch, carrier_rev_id, yrs_snapshot_blob,
-                        yrs_snapshot_blake3, room_state, owner_id, updated_seq
-                 FROM collab_sessions
+                        yrs_snapshot_blake3, room_state, owner_id, updated_seq,
+                        COALESCE(snapshot_lease_epoch, 0) AS snapshot_lease_epoch,
+                        COALESCE(snapshot_update_seq, 0) AS snapshot_update_seq,
+                        COALESCE(carrier_dirty, 0) AS carrier_dirty
+                 FROM collab_sessions LEFT JOIN collab_checkpoints USING (space_id, note_id)
                  WHERE space_id = ? AND note_id = ?",
             )
             .bind(space_id.as_str())
@@ -2393,14 +2403,20 @@ async fn load_collab_session_opt_tx(
                     row.get("room_state"),
                     row.get("owner_id"),
                     row.get("updated_seq"),
+                    row.get("snapshot_lease_epoch"),
+                    row.get("snapshot_update_seq"),
+                    row.get("carrier_dirty"),
                 )
             })
         }
         BackendConn::Postgres(conn) => {
             let r = sqlx::query(
                 "SELECT lease_epoch, lineage_epoch, carrier_rev_id, yrs_snapshot_blob,
-                        yrs_snapshot_blake3, room_state, owner_id, updated_seq
-                 FROM collab_sessions
+                        yrs_snapshot_blake3, room_state, owner_id, updated_seq,
+                        COALESCE(snapshot_lease_epoch, 0) AS snapshot_lease_epoch,
+                        COALESCE(snapshot_update_seq, 0) AS snapshot_update_seq,
+                        COALESCE(carrier_dirty, 0) AS carrier_dirty
+                 FROM collab_sessions LEFT JOIN collab_checkpoints USING (space_id, note_id)
                  WHERE space_id = $1 AND note_id = $2",
             )
             .bind(space_id.as_str())
@@ -2418,12 +2434,27 @@ async fn load_collab_session_opt_tx(
                     row.get("room_state"),
                     row.get("owner_id"),
                     row.get("updated_seq"),
+                    row.get("snapshot_lease_epoch"),
+                    row.get("snapshot_update_seq"),
+                    row.get("carrier_dirty"),
                 )
             })
         }
     };
 
-    let Some((le_raw, li_raw, crev_raw, yrs_blob, yrs_hash, rstate_raw, owner_opt, useq_raw)) = raw
+    let Some((
+        le_raw,
+        li_raw,
+        crev_raw,
+        yrs_blob,
+        yrs_hash,
+        rstate_raw,
+        owner_opt,
+        useq_raw,
+        covered_lease,
+        covered_seq,
+        dirty,
+    )) = raw
     else {
         return Ok(None);
     };
@@ -2449,6 +2480,12 @@ async fn load_collab_session_opt_tx(
     let room_state = CollabRoomState::from_db(&rstate_raw)?;
     let updated_seq = i64_to_space_seq(useq_raw)?;
 
+    let snapshot_coverage = if covered_lease == 0 {
+        None
+    } else {
+        Some((LeaseEpoch::new(covered_lease as u64)?, covered_seq as u64))
+    };
+
     Ok(Some(CollabSessionRecord {
         note: note_id.clone(),
         lease_epoch,
@@ -2456,6 +2493,8 @@ async fn load_collab_session_opt_tx(
         carrier_rev_id,
         yrs_snapshot_blob: yrs_blob,
         yrs_snapshot_digest,
+        snapshot_coverage,
+        carrier_dirty: dirty != 0,
         room_state,
         owner_id: owner_opt,
         updated_seq,
@@ -2619,7 +2658,7 @@ async fn open_collab_session_impl(
 
                 let existing =
                     load_collab_session_opt_tx(tx, &srec.scope.space_id, &spec_cl.note).await?;
-                let (base_lease, lineage, preserved_snapshot, preserved_digest) = match existing {
+                let (base_lease, lineage, preserved_snapshot, preserved_digest, coverage, dirty) = match existing {
                     None => {
                         if let Some(exp_le) = spec_cl.expected_lease
                             && exp_le != LeaseEpoch::ZERO
@@ -2635,7 +2674,7 @@ async fn open_collab_session_impl(
                                 DomainError::validation(ValidationReason::SourceMismatch).into()
                             );
                         }
-                        (LeaseEpoch::ZERO, LineageEpoch::ZERO, None, None)
+                        (LeaseEpoch::ZERO, LineageEpoch::ZERO, None, None, None, false)
                     }
                     Some(cur) => {
                         match cur.room_state {
@@ -2673,11 +2712,19 @@ async fn open_collab_session_impl(
                             cur.lineage_epoch,
                             cur.yrs_snapshot_blob,
                             cur.yrs_snapshot_digest,
+                            cur.snapshot_coverage,
+                            cur.carrier_dirty,
                         )
                     }
                 };
 
                 let new_lease = base_lease.max(fence_guard.epoch()).checked_next()?;
+                let installs_snapshot = spec_cl.initial_yrs_snapshot.is_some() && preserved_snapshot.is_none();
+                if let (Some(current), Some(initial)) = (&preserved_snapshot, &spec_cl.initial_yrs_snapshot)
+                    && current != initial
+                {
+                    return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+                }
                 let (yrs_blob, yrs_digest) = match spec_cl.initial_yrs_snapshot {
                     Some(bytes) => {
                         let d = ContentDigest::from_bytes(*blake3::hash(&bytes).as_bytes());
@@ -2754,6 +2801,9 @@ async fn open_collab_session_impl(
                     }
                 }
 
+                if installs_snapshot {
+                    write_collab_checkpoint_state_tx(tx, &spec_cl.scope.space_id, &spec_cl.note, coverage, true).await?;
+                }
                 Ok((CollabSessionRecord {
                     note: spec_cl.note,
                     lease_epoch: new_lease,
@@ -2761,6 +2811,8 @@ async fn open_collab_session_impl(
                     carrier_rev_id: head.head_rev_id,
                     yrs_snapshot_blob: yrs_blob,
                     yrs_snapshot_digest: yrs_digest,
+                    snapshot_coverage: coverage,
+                    carrier_dirty: dirty || installs_snapshot,
                     room_state: CollabRoomState::Active,
                     owner_id: Some(spec_cl.owner_id),
                     updated_seq,
@@ -2820,6 +2872,9 @@ async fn append_collab_update_impl(
                     return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
                 }
 
+                if cur.snapshot_coverage.is_some_and(|coverage| (spec.expected_lease, spec.update_seq) <= coverage) {
+                    return Err(DomainError::validation(ValidationReason::DuplicateKey).into());
+                }
                 let now_ms = now_unix_ms()?;
                 match tx {
                     BackendConn::Sqlite(conn) => {
@@ -2867,6 +2922,9 @@ async fn append_collab_update_impl(
                         })?;
                     }
                 }
+                if !cur.carrier_dirty {
+                    write_collab_checkpoint_state_tx(tx, &spec.scope.space_id, &spec.note, cur.snapshot_coverage, true).await?;
+                }
                 Ok(spec.update_seq)
             })
         })
@@ -2884,6 +2942,10 @@ struct StoredCollabSessionV1 {
     room_state: String,
     owner_id: Option<String>,
     updated_seq: SpaceSeq,
+    #[serde(default)]
+    snapshot_coverage: Option<(LeaseEpoch, u64)>,
+    #[serde(default)]
+    carrier_dirty: bool,
 }
 
 impl From<&CollabSessionRecord> for StoredCollabSessionV1 {
@@ -2898,6 +2960,8 @@ impl From<&CollabSessionRecord> for StoredCollabSessionV1 {
             room_state: r.room_state.as_db().to_owned(),
             owner_id: r.owner_id.clone(),
             updated_seq: r.updated_seq,
+            snapshot_coverage: r.snapshot_coverage,
+            carrier_dirty: r.carrier_dirty,
         }
     }
 }
@@ -2915,8 +2979,128 @@ impl TryFrom<StoredCollabSessionV1> for CollabSessionRecord {
             room_state: CollabRoomState::from_db(&w.room_state)?,
             owner_id: w.owner_id,
             updated_seq: w.updated_seq,
+            snapshot_coverage: w.snapshot_coverage,
+            carrier_dirty: w.carrier_dirty,
         })
     }
+}
+
+async fn write_collab_checkpoint_state_tx(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    note: &NoteId,
+    coverage: Option<(LeaseEpoch, u64)>,
+    dirty: bool,
+) -> Result<(), PortError> {
+    let (lease, seq) = coverage.unwrap_or((LeaseEpoch::ZERO, 0));
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query(
+            "INSERT INTO collab_checkpoints (space_id, note_id, snapshot_lease_epoch, snapshot_update_seq, carrier_dirty)
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT(space_id, note_id) DO UPDATE SET
+             snapshot_lease_epoch = excluded.snapshot_lease_epoch, snapshot_update_seq = excluded.snapshot_update_seq,
+             carrier_dirty = excluded.carrier_dirty",
+        )
+            .bind(space.as_str())
+            .bind(note.as_str())
+            .bind(lease.get() as i64)
+            .bind(seq as i64)
+            .bind(i64::from(dirty))
+            .execute(&mut **conn)
+            .await
+            .map(|_| ()),
+        BackendConn::Postgres(conn) => sqlx::query(
+            "INSERT INTO collab_checkpoints (space_id, note_id, snapshot_lease_epoch, snapshot_update_seq, carrier_dirty)
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT(space_id, note_id) DO UPDATE SET
+             snapshot_lease_epoch = excluded.snapshot_lease_epoch, snapshot_update_seq = excluded.snapshot_update_seq,
+             carrier_dirty = excluded.carrier_dirty",
+        )
+            .bind(space.as_str())
+            .bind(note.as_str())
+            .bind(lease.get() as i64)
+            .bind(seq as i64)
+            .bind(i64::from(dirty))
+            .execute(&mut **conn)
+            .await
+            .map(|_| ()),
+    }
+        .map_err(|err| internal_not_committed("write_collab_checkpoint", err.to_string()))
+}
+
+async fn advance_collab_snapshot_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    cur: &mut CollabSessionRecord,
+    snapshot: Option<&[u8]>,
+    through: Option<u64>,
+    settling: bool,
+) -> Result<(), PortError> {
+    let changed = snapshot.is_some_and(|s| cur.yrs_snapshot_blob.as_deref() != Some(s));
+    let mut coverage = cur.snapshot_coverage;
+    if let Some(through) = through {
+        let next = (cur.lease_epoch, through);
+        if coverage.is_some_and(|old| next < old || (next == old && changed)) {
+            return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+        }
+        // Only acknowledged updates in this lease can advance its watermark. Zero
+        // covers prior leases after recovery, before the first update of this lease.
+        let acknowledged: i64 = match tx {
+            BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                "SELECT COALESCE(MAX(update_seq), 0) FROM collab_update_log WHERE space_id = ? AND note_id = ? AND lease_epoch = ?",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(cur.note.as_str())
+            .bind(cur.lease_epoch.get() as i64)
+            .fetch_one(&mut **conn)
+            .await,
+            BackendConn::Postgres(conn) => sqlx::query_scalar(
+                "SELECT COALESCE(MAX(update_seq), 0) FROM collab_update_log WHERE space_id = $1 AND note_id = $2 AND lease_epoch = $3",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(cur.note.as_str())
+            .bind(cur.lease_epoch.get() as i64)
+            .fetch_one(&mut **conn)
+            .await,
+        }
+        .map_err(|err| internal_not_committed("collab_accepted_prefix", err.to_string()))?;
+        let already_covered = coverage
+            .filter(|(lease, _)| *lease == cur.lease_epoch)
+            .map_or(0, |(_, seq)| seq);
+        if through > already_covered.max(acknowledged as u64) {
+            return Err(DomainError::validation(ValidationReason::InvalidRange).into());
+        }
+        if Some(next) != coverage {
+            compact_collab_prefix(tx, scope, &cur.note, cur.lease_epoch, through).await?;
+        }
+        coverage = Some(next);
+    } else if changed && cur.yrs_snapshot_blob.is_some() {
+        return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+    }
+    let mut dirty = cur.carrier_dirty || changed;
+    if settling && snapshot.is_some() {
+        dirty = match tx {
+            BackendConn::Sqlite(conn) => sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM collab_update_log WHERE space_id = ? AND note_id = ?)",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(cur.note.as_str())
+            .fetch_one(&mut **conn)
+            .await,
+            BackendConn::Postgres(conn) => sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM collab_update_log WHERE space_id = $1 AND note_id = $2)",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(cur.note.as_str())
+            .fetch_one(&mut **conn)
+            .await,
+        }
+        .map_err(|err| internal_not_committed("collab_pending_updates", err.to_string()))?;
+    }
+    if dirty != cur.carrier_dirty || coverage != cur.snapshot_coverage {
+        write_collab_checkpoint_state_tx(tx, &scope.space_id, &cur.note, coverage, dirty).await?;
+    }
+    cur.carrier_dirty = dirty;
+    cur.snapshot_coverage = coverage;
+    Ok(())
 }
 
 async fn compact_collab_prefix(
@@ -2924,11 +3108,8 @@ async fn compact_collab_prefix(
     scope: &HistoryScope,
     note: &NoteId,
     lease: LeaseEpoch,
-    through: Option<u64>,
+    through: u64,
 ) -> Result<(), PortError> {
-    let Some(through) = through else {
-        return Ok(());
-    };
     let through = i64::try_from(through)
         .map_err(|_| DomainError::validation(ValidationReason::InvalidRange))?;
     match tx {
@@ -3016,12 +3197,13 @@ async fn checkpoint_collab_session_impl(
 
                 let yrs_digest =
                     ContentDigest::from_bytes(*blake3::hash(&spec.yrs_snapshot).as_bytes());
-                compact_collab_prefix(
+                advance_collab_snapshot_tx(
                     tx,
                     &spec.scope,
-                    &spec.note,
-                    spec.expected_lease,
+                    &mut cur,
+                    Some(&spec.yrs_snapshot),
                     spec.compacted_through_update_seq,
+                    false,
                 )
                 .await?;
 
@@ -3131,12 +3313,13 @@ async fn close_collab_session_impl(
                     return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
                 }
 
-                compact_collab_prefix(
+                advance_collab_snapshot_tx(
                     tx,
                     &spec_cl.scope,
-                    &spec_cl.note,
-                    cur.lease_epoch,
+                    &mut cur,
+                    spec_cl.final_yrs_snapshot.as_deref(),
                     spec_cl.compacted_through_update_seq,
+                    false,
                 )
                 .await?;
                 let new_lease = cur.lease_epoch.max(fence_guard.epoch()).checked_next()?;
@@ -3310,7 +3493,8 @@ async fn settle_and_update_collab_session(
                 .await?;
                 settlement.auth.authorize_direct_write(&facts, &facts)?;
 
-                let Some(cur) = load_collab_session_opt_tx(tx, &scope_cl.space_id, &note).await?
+                let Some(mut cur) =
+                    load_collab_session_opt_tx(tx, &scope_cl.space_id, &note).await?
                 else {
                     return Err(DomainError::ResourceNotFound.into());
                 };
@@ -3340,6 +3524,15 @@ async fn settle_and_update_collab_session(
                     return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
                 }
 
+                advance_collab_snapshot_tx(
+                    tx,
+                    &scope_cl,
+                    &mut cur,
+                    yrs_snapshot.as_deref(),
+                    compacted_through,
+                    true,
+                )
+                .await?;
                 let seq = item_ctx.alloc_next_seq()?;
                 let new_rev = new_revision_id()?;
                 let now_ts = now_utc_timestamp()?;
@@ -3487,8 +3680,6 @@ async fn settle_and_update_collab_session(
                     None => (cur.yrs_snapshot_blob, cur.yrs_snapshot_digest),
                 };
                 let digest_slice = final_yrs_digest.as_ref().map(|d| d.as_bytes().as_slice());
-                compact_collab_prefix(tx, &scope_cl, &note, expected_lease, compacted_through)
-                    .await?;
 
                 match tx {
                     BackendConn::Sqlite(conn) => {
@@ -3563,6 +3754,8 @@ async fn settle_and_update_collab_session(
                     carrier_rev_id: new_rev.clone(),
                     yrs_snapshot_blob: final_yrs,
                     yrs_snapshot_digest: final_yrs_digest,
+                    snapshot_coverage: cur.snapshot_coverage,
+                    carrier_dirty: cur.carrier_dirty,
                     room_state: new_state,
                     owner_id: new_owner,
                     updated_seq: seq,

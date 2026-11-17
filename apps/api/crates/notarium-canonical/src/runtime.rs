@@ -16,7 +16,7 @@ use notarium_core::{
         AgentRunId, ContentDigest, FolderId, HistoryIncarnation, InstallationId, LeaseEpoch,
         NoteId, PrincipalId, RevisionId, SpaceId, SpaceSeq,
     },
-    model::{FolderRef, HistoryScope, Lifecycle, NoteRef, PathTarget},
+    model::{FolderRef, HistoryScope, Lifecycle, PathTarget},
     ports::{CallBudget, MaintenanceContext, ServicePurpose},
     value::Timestamp,
 };
@@ -27,12 +27,11 @@ use crate::{
     blobs::{BlobBackendDriver, s3::S3Transport},
     changes::{BroadcastHub, BroadcastSignal, DEFAULT_BROADCAST_CAPACITY},
     codec::{
-        FolderRevisionMetadata, NoteRevisionMetadata, RevisionMetadataEnvelope,
-        RevisionMetadataPayload, cancelled_not_committed, deadline_not_committed,
-        decode_timestamp_parts, doc_class_to_db, encode_timestamp_parts, i64_to_space_seq,
-        internal_not_committed, lifecycle_from_db, lifecycle_to_db, new_prefixed_hex_id,
-        new_revision_id, normalize_slug_key, normalize_title_key, now_unix_ms, now_utc_timestamp,
-        unavailable_retryable,
+        FolderRevisionMetadata, RevisionMetadataEnvelope, RevisionMetadataPayload,
+        cancelled_not_committed, deadline_not_committed, decode_timestamp_parts, doc_class_to_db,
+        encode_timestamp_parts, i64_to_space_seq, internal_not_committed, lifecycle_from_db,
+        lifecycle_to_db, new_prefixed_hex_id, new_revision_id, normalize_slug_key, now_unix_ms,
+        now_utc_timestamp, unavailable_retryable,
     },
     config::{BlobBackendConfig, CanonicalConfig, SqlBackendConfig},
     dialect::{
@@ -74,55 +73,6 @@ pub(crate) enum SqlDriverState {
     },
 }
 
-#[derive(Clone)]
-pub(crate) struct CachedPgHeadSnapshot {
-    pub pf: String,
-    pub s: String,
-    pub sf: String,
-    pub t: String,
-    pub lc: Lifecycle,
-    pub byte_size: u64,
-    pub vmask: i32,
-    pub dig: Option<ContentDigest>,
-}
-
-#[derive(Clone)]
-pub(crate) struct CachedPgRollbackTip {
-    pub first_run_seq: i64,
-    pub max_other_seq: Option<i64>,
-    pub pre_rev_id: Option<String>,
-}
-
-pub(crate) struct CachedPgImmutableNoteRev {
-    pub pre_meta: NoteRevisionMetadata,
-    pub normalized_title_fold: String,
-    pub canonical_root_meta_msgpack: Vec<u8>,
-}
-
-#[derive(Default)]
-pub(crate) struct PgImmutableRollbackCache {
-    pub space_meta: std::collections::HashMap<
-        (SpaceId, HistoryIncarnation),
-        (FolderId, notarium_core::auth::SpaceKind),
-    >,
-    pub revs: std::collections::HashMap<
-        (SpaceId, HistoryIncarnation, String),
-        Arc<CachedPgImmutableNoteRev>,
-    >,
-    pub head_snapshots: std::collections::HashMap<
-        (SpaceId, HistoryIncarnation, String, String),
-        CachedPgHeadSnapshot,
-    >,
-    pub tips: std::collections::HashMap<
-        (SpaceId, HistoryIncarnation, String, String, String),
-        CachedPgRollbackTip,
-    >,
-    pub run_note_counts:
-        std::collections::HashMap<(SpaceId, HistoryIncarnation, String, String), i32>,
-    pub pubs: std::collections::HashMap<(SpaceId, [u8; 32]), Arc<str>>,
-    pub warmed_spaces: std::collections::HashSet<SpaceId>,
-}
-
 pub(crate) struct CanonicalInner {
     pub config: CanonicalConfig,
     pub witness: DatabaseWitness,
@@ -139,7 +89,6 @@ pub(crate) struct CanonicalInner {
     pub collab_interceptor: OnceLock<Arc<dyn notarium_core::ports::LiveCollabInterceptor>>,
     pub room_fences: Arc<crate::domain::RoomFenceTable>,
     pub job_reads: crate::peers::JobReadRegistry,
-    pub pg_imm_cache: Arc<std::sync::RwLock<PgImmutableRollbackCache>>,
     pub backup_shutdown: notarium_core::ports::Cancellation,
     pub backup_executor: tokio::runtime::Handle,
     pub backup_local_holds:
@@ -209,18 +158,6 @@ impl CanonicalInner {
             .store(true, Ordering::Release);
         self.sqlite_has_any_collab_sessions
             .store(true, Ordering::Release);
-    }
-
-    pub(crate) fn clear_pg_immutable_caches(&self) {
-        if let Ok(mut g) = self.pg_imm_cache.write() {
-            g.space_meta.clear();
-            g.revs.clear();
-            g.head_snapshots.clear();
-            g.tips.clear();
-            g.run_note_counts.clear();
-            g.pubs.clear();
-            g.warmed_spaces.clear();
-        }
     }
 }
 
@@ -428,7 +365,6 @@ impl CanonicalRuntime {
             collab_interceptor: OnceLock::new(),
             room_fences: Arc::new(crate::domain::RoomFenceTable::default()),
             job_reads: crate::peers::JobReadRegistry::default(),
-            pg_imm_cache: Arc::new(std::sync::RwLock::new(PgImmutableRollbackCache::default())),
             backup_shutdown: Default::default(),
             backup_executor: tokio::runtime::Handle::current(),
             backup_local_holds: Default::default(),
@@ -840,7 +776,6 @@ impl CanonicalStore {
     #[cfg(feature = "test-support")]
     pub async fn execute_diagnostic_write_sql_for_test(&self, sql: &str) -> Result<u64, PortError> {
         self.inner.latch_sqlite_aux_tables_populated();
-        self.inner.clear_pg_immutable_caches();
         let owned = sql.to_owned();
         self.with_write_tx(|tx| {
             Box::pin(async move {
@@ -3177,10 +3112,6 @@ pub(crate) async fn read_immutable_revision_tx(
         None => None,
     };
     let created_at = decode_timestamp_parts(sec, nsec)?;
-
-    // Eliminate dead-code warnings on NoteRef/NoteRevisionMetadata imports until I2/I4 wire notes.
-    let _ = std::marker::PhantomData::<(NoteRef, NoteRevisionMetadata, fn(&str) -> String)>;
-    let _ = normalize_title_key;
 
     Ok(Some(StoredRevisionRecord {
         revision_id,

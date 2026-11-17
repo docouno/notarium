@@ -699,6 +699,8 @@ pub trait PreparedBackup: Send {
 }
 pub trait BackupHold: Send {
     fn witness(&self) -> &BackupWitness;
+    /// Release after the external CAS copy. The coordinator may publish the paired
+    /// backup once both participants acknowledge release. A lost hold invalidates the copy.
     fn release(self: Box<Self>) -> PortFuture<'static, ()>;
 }
 pub trait PausedBackup: Send {

@@ -54,7 +54,7 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `2` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `3` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
@@ -67,11 +67,21 @@ The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
 
+Schema version 3 adds a backup hold generation and a collaboration checkpoint
+row keyed by Space and note. Upgrading from schema 1 or 2 keeps every stored
+collaboration delta. A legacy snapshot has unknown coverage through its last
+lease, so recovery establishes a new lease before advancing the checkpoint.
+Rooms with legacy deltas or snapshots require carrier settlement. Both upgrades
+run within the startup transaction and preserve the trailing snapshot BLOB.
+
 Catalog reads use current grants and canonical folder ancestry. Keyset cursors
 bind the catalog revision and filters. Account and project memory categories
 identify stable AgentMemory notes in the personal root or project folder.
 Published ability manifests expose up to 256 auxiliary names of at most 1024
-UTF-8 bytes each. Catalog lookups return metadata and keep branch taint unchanged.
+UTF-8 bytes each. Access to an exact package revision requires visibility at
+publication and at its current location. Resource reads check both locations
+again after fetching the content. Catalog lookups return metadata and keep
+branch taint unchanged.
 
 Upgrading the recognized version 1 manifest adds the receipt ledger and queued
 chat-input provenance in one transaction. Existing pending private inputs are
@@ -226,6 +236,12 @@ same example against an isolated prefix.
   item without creating `SpaceSeq` gaps. Preceding items in the same batch
   advance a virtual per-Space `effective_cut` immediately, preventing intra-batch
   semantic phantoms.
+  A batch note edit uses its requested base digest and the head visible at its
+  savepoint. Link appends derive their base from the current source. `link_many`
+  submits distinct sources together and starts a new transaction when a source
+  repeats. If a batch encounters an operational error after any successful
+  item, or an item's commit outcome is unknown, retry with the same command keys.
+  The returned commit effect is `Unknown` in both cases.
 - **`SqliteWalCoordinator`:** Ordinary reads enter through a bounded reader gate
   with a monotonic `< 250 ms` progress-handler deadline (`248 ms` default) and
   guaranteed worker-snapshot rollback/close if a caller drops its future. A
@@ -243,13 +259,25 @@ same example against an isolated prefix.
   `rollback_agent_run` freezes eligible targets and closed-room reservations
   before planning, simulates inverse board moves in reverse command order over
   recorded semantic before-anchors, and applies `Trash`-first slug deconfliction
-  atomically.
+  atomically. Restoring a note to a different folder requires write access to
+  both its current and restored placement and document class. For user
+  documents directly under the root, PostgreSQL reads each current head
+  alongside its pre-run revision and candidate blob publication. The commit
+  locks the Space and rechecks the writer epoch, run revision, expected
+  heads, root permissions and live publications.
 - **Collaboration room ownership.** A PostgreSQL writer takeover fences active
   rooms in the same transaction that advances the Space writer epoch. The
   successor can reopen a fenced room with its new lease and replay its durable
   updates. Checkpoint and close compact the update log only when the caller
   supplies a snapshot and its inclusive `compacted_through_update_seq`. Omitting
   the watermark preserves the log, including updates accepted before a close.
+  A watermark advances in lease and update sequence order. An equal watermark
+  accepts only the same snapshot bytes. Reopening preserves the stored snapshot.
+  After recovery, sequence zero in the new lease can cover all updates from
+  earlier leases. The room owner must first replay those updates into its snapshot.
+  Direct carrier changes, including schema-note changes, wait until an authorized
+  settlement pairs the snapshot with the canonical carrier and covers the last
+  pending update. A clean close permits direct changes to start a new lineage.
 - **Job pagination.** `list_jobs` binds each cursor to the original Space cut.
   Continuation returns `CursorStale` if the cut advances or a heartbeat changes
   progress visible to the query. Consumers can open a new read at the current cut.
@@ -261,15 +289,25 @@ same example against an isolated prefix.
   maintains deterministic skip pointers at `depth - 16` and `depth - 256` so
   50-entry branch context reads execute in `O(window + log depth)` with `0`
   writes. `chat_pending_inputs` enforces a 16-item per-thread queue (`Full`
-  without a mutation receipt on the 17th item). `redact_chat_entry` erases
-  target entry content while preserving DAG ancestry and invalidating only
-  descendant `Compaction` entries; `tainted` is monotonic and irreversible.
+  without a mutation receipt on the 17th item). Queue admission checks the
+  thread, write authority and available space before staging a large body and
+  again at commit. Local publication follows admission. For S3, each new upload
+  records its own cleanup intent before the first conditional PUT. The winning
+  bind removes that intent atomically. A losing request or a replacement writer
+  fences its registered keys while preserving other publications of the same digest.
+  `redact_chat_entry` applies the same thread and taint checks on first execution
+  and replay. It erases target entry content, preserves DAG ancestry and
+  invalidates only descendant `Compaction` entries. Taint is monotonic.
 - **Paired backup (`BackupParticipantPort`).** Prepare both participants and acquire
   their holds before pausing control, then canonical. PostgreSQL uses a dedicated
   connection to fence writers across runtimes sharing the canonical schema. Pin
   both snapshots before resuming either writer. A Space created between hold
   acquisition and pin requires a new backup attempt. Keep the canonical hold
-  through the CAS copy. Source-local holds expire with their owner and are omitted
+  through the CAS copy and await successful hold release before committing the
+  paired backup. Losing the PostgreSQL hold session invalidates the attempt,
+  including an external CAS copy already in progress. Each acquisition uses
+  a new generation, so a disconnected owner cannot release its successor.
+  Source-local holds expire with their owner and are omitted
   from restored data. SQLite copies 16 pages per step and releases an idle cut
   when its deadline or WAL retention budget expires. PostgreSQL streams cursor
   rows in slices of up to 64 KiB. Both participants release their source after
@@ -277,14 +315,15 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact schema 1 and 2 manifests.
+  API verifies the trailer and recognizes the exact schema 1, 2 and 3 manifests.
   It returns typed rows in the original table and column order within the
-  caller's byte budget. To materialize schema 1, create an empty target using
-  `schema::POSTGRES_BASELINE_DDL`, then drop `account_catalog_receipts` and
-  the `chat_pending_inputs.ext_space_tainted` column before importing the
-  verified rows in the same transaction. Opening the target with the original
-  installation ID applies the version 2 migration. The canonical L4 backup
-  suite exercises this procedure with an artifact from the schema 1 exporter.
+  caller's byte budget. To materialize a historical spool, create an empty
+  target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 and 2, drop
+  `collab_checkpoints` and `backup_holds.owner_generation`. For version 1,
+  also drop `account_catalog_receipts` and `chat_pending_inputs.ext_space_tainted`.
+  Import the verified rows in the same transaction. Opening the target with
+  the original installation ID applies the version 3 migration. The canonical
+  L4 backup suite exercises this procedure with archives from both exporters.
 
 ## Offline fixture lifecycle and attributed benchmarks
 
@@ -308,8 +347,9 @@ Run the full release suite with
 sh docker/storage-fixtures/with-storage-fixtures.sh benchmark
 ```
 
-The command builds `fitness-gates` with the `storage-bench` feature, checks the
-source tree before and after measurement, and writes
+The command builds `fitness-gates` with the `storage-bench` feature and the
+same `mimalloc` allocator as both runtime binaries. It checks the source tree
+before and after measurement and writes
 `.artifacts/3-storage-cas/d3-benchmarks-<tree>.json`. Use
 `benchmark --smoke` for a shorter diagnostic run or `benchmark --paired-only`
 to measure just the paired backup participants. A run with uncommitted source
@@ -323,9 +363,9 @@ with `FAIL` and returns a nonzero status.
 | Workload | Release profile and target |
 | --- | --- |
 | SQLite writer | 50 writers with either 0 or 200 readers, unique 4 KiB edits, 10 s warmup + 30 s measurement, 3 runs each. Every run must exceed 2,000 mutations/s and return zero busy errors. The report samples the active batch writer's synchronous setting and journal size limit and records reader gate dwell. |
-| Rollback | Fresh run, history and revisions for every sample. Seed 18 edited notes, 2 creations, 1 deletion with a slug collision and 1 subsequent manual edit through the public ports before starting the timer. SQLite and PostgreSQL with local CAS each require p95 below 5 ms across 1,000 samples. A separate 200-sample PostgreSQL/S3 profile reports local UDS latency. |
-| Chat window | 10,000 reads of 50 entries on linear and branched 10,000-turn threads, p95 below 1 ms. |
-| Board and folder | 10,000 first-slot board moves with ranks at most 16 bytes. Moving a folder over 100,000 descendants must preserve descendant rows. |
+| Rollback | Fresh run, history and revisions for every sample. The Space also has an unrelated folder. Seed 18 edited notes, 2 creations, 1 deletion with a slug collision and 1 subsequent manual edit through the public ports before starting the timer. SQLite and PostgreSQL with local CAS each require p95 below 5 ms across 1,000 samples. A separate 200-sample PostgreSQL/S3 profile reports local UDS latency. |
+| Chat window | 10,000 reads of 50 entries on each 10,000-turn thread, p95 below 1 ms. The branched profile rotates across nine tips and checks that each result ends at the selected tip. Row triggers count writes across the canonical tables. |
+| Board and folder | 10,000 first-slot board moves with ranks at most 16 bytes. Moving a folder over 100,000 seeded descendant heads must perform zero row writes to descendants. Triggers observe inserts, updates and deletes. A no-op update to one descendant verifies the counter. |
 | Paired backup | The control and canonical participants share an installation. Test 1 and 64 canonical Spaces separately on SQLite and PostgreSQL. For each profile, prepare both participants, acquire both holds, pause control then canonical, pin both snapshots, and resume both writers. Report prepare/holds, safe-point acquisition, confirmed pause after control acknowledges its safe point, and the inclusive interval from the first pause call through the last resume. The confirmed pause from the first safe point through both resume acknowledgements must reach p95 below 1 ms across 1,000 captures per profile. |
 
 ### Proof boundaries

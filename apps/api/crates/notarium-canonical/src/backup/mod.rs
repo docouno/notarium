@@ -229,17 +229,17 @@ fn fsync_parent_dir(path: &Path) -> Result<(), PortError> {
     Ok(())
 }
 
-fn remove_tmp_artifacts_best_effort(tmp_path: &Path) {
-    let _ = fs::remove_file(tmp_path);
-    let mut journal = tmp_path.as_os_str().to_os_string();
-    journal.push("-journal");
-    let _ = fs::remove_file(PathBuf::from(journal));
-    let mut wal = tmp_path.as_os_str().to_os_string();
-    wal.push("-wal");
-    let _ = fs::remove_file(PathBuf::from(wal));
-    let mut shm = tmp_path.as_os_str().to_os_string();
-    shm.push("-shm");
-    let _ = fs::remove_file(PathBuf::from(shm));
+fn remove_tmp_artifacts(tmp: &Path) -> Result<(), PortError> {
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut path = tmp.as_os_str().to_owned();
+        path.push(suffix);
+        ownership::remove_if_present(Path::new(&path))?;
+    }
+    Ok(())
+}
+
+fn remove_tmp_artifacts_best_effort(tmp: &Path) {
+    let _ = remove_tmp_artifacts(tmp);
 }
 
 fn mint_artifact_id() -> Result<ArtifactId, PortError> {
@@ -1304,122 +1304,131 @@ impl PgPreparedSource {
     }
 }
 
-const PG_PIN_WITNESS_STMT: &str = "__notarium_pin_witness_v1";
+const PG_BACKUP_BARRIER_SQL: &str =
+    "SELECT pg_advisory_xact_lock(hashtextextended(current_schema(), 7311229)) WHERE $1";
 
-async fn warm_pg_backup_connection(conn: &mut sqlx::PgConnection) -> Result<i32, PortError> {
-    let row = sqlx::query(
-        "SELECT pg_backend_pid(),
-                EXISTS(SELECT 1 FROM pg_prepared_statements WHERE name = $1)",
+async fn warm_pg_backup_barrier(
+    conn: &mut PgConnection,
+    remaining: Duration,
+) -> Result<(), PortError> {
+    let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128);
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "SET plan_cache_mode TO force_generic_plan;
+         SET statement_timeout = {timeout_ms};
+         SET idle_in_transaction_session_timeout = {timeout_ms}"
+    )))
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| internal_not_committed("pg_backup_configure_barrier", err.to_string()))?;
+    // The false predicate prepares and plans the statement without taking the
+    // writer lock. Only pause_writes executes its true predicate.
+    sqlx::query(PG_BACKUP_BARRIER_SQL)
+        .bind(false)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_backup_warm_barrier", err.to_string()))?;
+    sqlx::raw_sql("BEGIN")
+        .execute(conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_backup_begin_barrier", err.to_string()))?;
+    Ok(())
+}
+
+const PG_PIN_WITNESS_SQL: &str =
+    "SELECT 0::int2 AS kind, schema_version::bigint AS num_col, installation_id AS id_col,
+            manifest_checksum AS bytes_col,
+            set_config('statement_timeout', $1, true), set_config('idle_in_transaction_session_timeout', $1, true)
+     FROM schema_meta
+     WHERE singleton_id = 1 AND epoch_version = 1 AND migration_state = 'ready'
+     UNION ALL
+     SELECT 1::int2, last_seq, space_id, history_incarnation, NULL, NULL FROM spaces
+     ORDER BY kind, id_col";
+
+async fn warm_pg_backup_connection(
+    conn: &mut PgConnection,
+    remaining: Duration,
+    max_age: Duration,
+) -> Result<i32, PortError> {
+    let idle_ms = remaining.as_millis().clamp(1, i32::MAX as u128);
+    let statement_ms = remaining
+        .min(max_age)
+        .as_millis()
+        .clamp(1, i32::MAX as u128);
+    let pid = sqlx::query_scalar(
+        "SELECT pg_backend_pid(), set_config('plan_cache_mode', 'force_generic_plan', false)",
     )
-    .bind(PG_PIN_WITNESS_STMT)
     .fetch_one(&mut *conn)
     .await
     .map_err(|err| internal_not_committed("pg_backup_backend_pid", err.to_string()))?;
-
-    let pid: i32 = row.get(0);
-    let already_prepared: bool = row.get(1);
-    let warm_sql = if already_prepared {
-        format!("EXECUTE {PG_PIN_WITNESS_STMT}")
-    } else {
-        format!(
-            "PREPARE {PG_PIN_WITNESS_STMT} AS
-             SELECT 0::int2 AS kind, schema_version::bigint AS num_col, installation_id AS txt_col, manifest_checksum AS bin_col
-             FROM schema_meta
-             WHERE singleton_id = 1 AND epoch_version = 1 AND migration_state = 'ready'
-             UNION ALL
-             SELECT 1::int2 AS kind, last_seq AS num_col, space_id AS txt_col, history_incarnation AS bin_col
-             FROM spaces
-             ORDER BY 1 ASC, 3 ASC;
-             EXECUTE {PG_PIN_WITNESS_STMT}"
-        )
-    };
-    sqlx::raw_sql(sqlx::AssertSqlSafe(warm_sql))
+    // Use the same binary prepared statement on this socket for the pin. Its
+    // autocommit snapshot and transaction-local settings end before BEGIN.
+    sqlx::query(PG_PIN_WITNESS_SQL)
+        .bind(format!("{idle_ms}ms"))
         .execute(&mut *conn)
         .await
         .map_err(|err| internal_not_committed("pg_backup_warm_stmt", err.to_string()))?;
+    // Before pin the idle transaction is bounded by the overall deadline. The
+    // first data query restricts its subsequent idle time to the snapshot budget.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "SET statement_timeout = {statement_ms};
+         SET idle_in_transaction_session_timeout = {idle_ms};
+         BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+    )))
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| internal_not_committed("pg_backup_begin", err.to_string()))?;
     Ok(pid)
 }
 
 async fn pin_and_read_pg_witness(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut PgConnection,
     expected_installation: &InstallationId,
-    deadline: Duration,
+    remaining: Duration,
 ) -> Result<BackupWitness, PortError> {
-    let timeout_ms = u64::try_from(deadline.as_millis().max(1)).unwrap_or(30_000);
-    // Execute `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`, `SET LOCAL statement_timeout`,
-    // and the pre-prepared `EXECUTE __notarium_pin_witness_v1` in a single PostgreSQL Simple Query
-    // round-trip (`1` UDS write/read, zero parser/planner/relcache cold misses) so paired writer pauses stay `< 1 ms`.
-    let sql = format!(
-        "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
-         SET LOCAL statement_timeout = {timeout_ms};
-         SET LOCAL idle_in_transaction_session_timeout = {timeout_ms};
-         EXECUTE {PG_PIN_WITNESS_STMT}"
-    );
-    let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_backup_pin_and_read_witness", err.to_string()))?;
+    use futures_util::TryStreamExt;
 
-    let meta_row = rows
-        .iter()
-        .find(|r| r.get::<i16, usize>(0) == 0)
-        .ok_or_else(|| {
-            internal_not_committed("pg_backup_read_schema_meta", "missing schema_meta row")
-        })?;
-    let schema_version: i64 = meta_row
-        .try_get::<i64, usize>(1)
-        .map_err(|err| internal_not_committed("pg_backup_decode_schema_ver", err.to_string()))?;
-    let installation_raw: String = meta_row
-        .try_get::<String, usize>(2)
-        .map_err(|err| internal_not_committed("pg_backup_decode_inst", err.to_string()))?;
-    let checksum_bytes: Vec<u8> = meta_row
-        .try_get::<Vec<u8>, usize>(3)
-        .map_err(|err| internal_not_committed("pg_backup_decode_checksum", err.to_string()))?;
-
-    if schema_version != i64::from(CANONICAL_SCHEMA_VERSION) {
+    let timeout_ms = remaining.as_millis().clamp(1, i32::MAX as u128);
+    let mut rows = sqlx::query(PG_PIN_WITNESS_SQL)
+        .bind(format!("{timeout_ms}ms"))
+        .fetch(conn);
+    let read_error =
+        |err: sqlx::Error| internal_not_committed("pg_backup_pin_witness", err.to_string());
+    let meta = rows.try_next().await.map_err(read_error)?.ok_or_else(|| {
+        internal_not_committed("pg_backup_read_schema_meta", "missing schema_meta row")
+    })?;
+    if meta.try_get::<i16, _>(0).map_err(read_error)? != 0
+        || meta.try_get::<i64, _>(1).map_err(read_error)? != i64::from(CANONICAL_SCHEMA_VERSION)
+    {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
-    if installation_raw != expected_installation.as_str() {
+    if meta.try_get::<&str, _>(2).map_err(read_error)? != expected_installation.as_str() {
         return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
     }
-    if checksum_bytes.as_slice() != manifest_checksum().as_bytes().as_slice() {
+    if meta.try_get::<&[u8], _>(3).map_err(read_error)? != manifest_checksum().as_bytes() {
         return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
     }
 
-    let mut histories = Vec::with_capacity(rows.len().saturating_sub(1));
-    for row in &rows {
-        let kind: i16 = row
-            .try_get::<i16, usize>(0)
-            .map_err(|err| internal_not_committed("pg_backup_decode_kind", err.to_string()))?;
-        if kind != 1 {
-            continue;
-        }
-        let last_seq_i64: i64 = row
-            .try_get::<i64, usize>(1)
-            .map_err(|err| internal_not_committed("pg_backup_decode_seq", err.to_string()))?;
-        let sid_raw: String = row
-            .try_get::<String, usize>(2)
-            .map_err(|err| internal_not_committed("pg_backup_decode_sid", err.to_string()))?;
-        let inc_bytes: Vec<u8> = row
-            .try_get::<Vec<u8>, usize>(3)
-            .map_err(|err| internal_not_committed("pg_backup_decode_inc", err.to_string()))?;
-
-        let space_id = SpaceId::parse(&sid_raw).map_err(|_| {
+    let mut histories = Vec::new();
+    while let Some(row) = rows.try_next().await.map_err(read_error)? {
+        let after = i64_to_space_seq(row.try_get(1).map_err(read_error)?)?;
+        let space_id = SpaceId::parse(row.try_get(2).map_err(read_error)?).map_err(|_| {
             internal_not_committed("corrupt_pg_backup_space_id", "invalid SpaceId in spaces")
         })?;
-        let inc_arr: [u8; 16] = inc_bytes.try_into().map_err(|_| {
-            internal_not_committed("corrupt_pg_backup_inc", "history_incarnation != 16B")
-        })?;
-        let after = i64_to_space_seq(last_seq_i64)?;
+        let incarnation = row
+            .try_get::<&[u8], _>(3)
+            .map_err(read_error)?
+            .try_into()
+            .map_err(|_| {
+                internal_not_committed("corrupt_pg_backup_inc", "history_incarnation != 16B")
+            })?;
         histories.push(ChangeCursor {
             scope: HistoryScope {
                 space_id,
-                incarnation: HistoryIncarnation::from_bytes(inc_arr),
+                incarnation: HistoryIncarnation::from_bytes(incarnation),
             },
             after,
         });
     }
-
     Ok(BackupWitness {
         installation: expected_installation.clone(),
         schema_version: CANONICAL_SCHEMA_VERSION,
@@ -1591,10 +1600,9 @@ async fn stream_postgres_spool_v1(
             started,
             budget,
             cancellation,
-            sqlx::query(sqlx::AssertSqlSafe(format!(
-                "SET LOCAL statement_timeout = {timeout_ms}"
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "RESET plan_cache_mode; SET LOCAL statement_timeout = {timeout_ms}"
             )))
-            .persistent(false)
             .execute(&mut *conn),
         )
         .await?;
@@ -1909,6 +1917,13 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         .iter()
         .copied()
         .filter_map(move |mut table| {
+            if schema_version < 3 {
+                match table.name {
+                    "collab_checkpoints" => return None,
+                    "backup_holds" => table.columns = &table.columns[..8],
+                    _ => {}
+                }
+            }
             if schema_version == 1 {
                 match table.name {
                     "account_catalog_receipts" => return None,
@@ -1923,7 +1938,7 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         })
 }
 
-/// Materializes a verified schema 1 or 2 spool for offline inspection within the default budget.
+/// Materializes a verified schema 1, 2 or 3 spool for offline inspection within the default budget.
 pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, PortError> {
     decode_postgres_spool_v1_bounded(
         path,
@@ -1995,9 +2010,12 @@ pub fn decode_postgres_spool_v1_bounded(
     let expected_tables = spool_tables(schema_version);
     let expected_checksum = match schema_version {
         CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1 => {
-            let digest = checksum_tables(1, expected_tables.clone());
-            if digest.to_hex() != crate::schema::migrate::V1_HASH {
+        1 | 2 => {
+            let digest = checksum_tables(schema_version, expected_tables.clone());
+            if !crate::schema::migrate::recognized_predecessor(
+                i64::from(schema_version),
+                digest.as_bytes(),
+            ) {
                 return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
             }
             digest
@@ -2235,8 +2253,20 @@ impl Drop for CanonicalPreparedBackup {
 
 #[derive(Clone)]
 struct HoldProof {
+    generation: ArtifactId,
+    owner: Arc<tokio::sync::Mutex<Option<HoldOwnership>>>,
     release: Cancellation,
     copying: Arc<tokio::sync::RwLock<()>>,
+}
+
+impl HoldProof {
+    async fn verify(&self) -> Result<(), PortError> {
+        let mut guard = self.owner.lock().await;
+        let owner = guard
+            .as_mut()
+            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
+        owner.verify().await
+    }
 }
 
 struct CanonicalBackupHold {
@@ -2429,16 +2459,19 @@ impl PausedBackup for CanonicalPausedBackup {
                     };
                     let remaining = remaining.min(max_age);
                     pg.pinned_at = Some(Instant::now());
-                    let pin_res = wait_for_phase(
-                        remaining,
-                        &self.caller_cancel,
-                        pin_and_read_pg_witness(&mut *conn, &expected_inst, remaining),
-                    )
+                    let pin_res = wait_for_phase(remaining, &self.caller_cancel, async {
+                        let hold = &self.held_histories.as_ref().expect("pause owns hold").0;
+                        let (witness, ()) = tokio::try_join!(
+                            pin_and_read_pg_witness(&mut *conn, &expected_inst, remaining),
+                            hold.verify()
+                        )?;
+                        Ok(witness)
+                    })
                     .await;
                     let witness = match pin_res {
                         Ok(w) => w,
                         Err(err) => {
-                            pg.abort_cleanly().await;
+                            pg.cancel_and_close().await;
                             return Err(err);
                         }
                     };
@@ -2763,6 +2796,7 @@ impl CanonicalBackupSnapshot {
                 &self.store,
                 &self.artifact_id,
                 &self.backup_id,
+                &self.hold,
                 encoding,
                 &lease.key(&rel_name),
                 bytes,
@@ -2836,6 +2870,7 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
             let task = self.store.inner.backup_executor.spawn(async move {
                 let _done = done;
                 let _copy_guard = hold.copying.read().await;
+                hold.verify().await?;
                 if hold.release.is_cancelled() {
                     worker_cancel.cancel();
                 }
@@ -2909,12 +2944,16 @@ impl PreparedBackup for CanonicalPreparedBackup {
             let store = self.store.clone();
             // The worker keeps ownership through SQL commit even if its caller drops the await.
             let worker = self.store.inner.backup_executor.spawn(async move {
-                let owner = HoldOwnership::acquire(&store, &backup_id).await?;
-                // The exclusive owner may safely replace rows from an interrupted earlier attempt.
-                delete_backup_hold_rows(&store, &backup_id).await?;
-                let witness = acquire_durable_backup_holds(&store, &backup_id).await?;
+                let generation = mint_artifact_id()?;
+                let mut owner = HoldOwnership::acquire(&store, &backup_id, &generation).await?;
+                let witness =
+                    acquire_durable_backup_holds(&store, &mut owner, &backup_id, &generation)
+                        .await?;
+                let held_count = witness.histories.len() as u64;
                 let (done, finished) = tokio::sync::oneshot::channel();
                 let proof = HoldProof {
+                    generation,
+                    owner: Arc::new(tokio::sync::Mutex::new(Some(owner))),
                     release: Cancellation::default(),
                     copying: Default::default(),
                 };
@@ -2931,7 +2970,15 @@ impl PreparedBackup for CanonicalPreparedBackup {
                     }
                     proof.release.cancel();
                     let _drained = proof.copying.write().await;
-                    let result = delete_backup_hold_rows(&store, &backup_id).await;
+                    let mut owner = proof.owner.lock().await.take().expect("hold owns session");
+                    let result = delete_backup_hold_rows(
+                        &store,
+                        &mut owner,
+                        &backup_id,
+                        &proof.generation,
+                        held_count,
+                    )
+                    .await;
                     drop(owner);
                     let _ = done.send(result);
                 });
@@ -2980,12 +3027,17 @@ impl PreparedBackup for CanonicalPreparedBackup {
                     PreparedBackendDriver::Sqlite(_) => None,
                 };
                 if let Some(conn) = barrier.as_mut() {
-                    sqlx::raw_sql("BEGIN; SELECT pg_advisory_xact_lock(hashtextextended(current_schema(), 7311229))")
-                        .execute(conn).await
-                        .map_err(|err| internal_not_committed("pg_backup_barrier", err.to_string()))?;
+                    sqlx::query(PG_BACKUP_BARRIER_SQL)
+                        .bind(true)
+                        .execute(conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("pg_backup_barrier", err.to_string())
+                        })?;
                 }
                 Ok::<_, PortError>((guard, barrier))
-            }).await?;
+            })
+            .await?;
 
             let locks = Arc::new(std::sync::Mutex::new(Some(PauseLocks {
                 _local: safe_point,
@@ -3108,11 +3160,22 @@ impl BackupParticipantPort for CanonicalStore {
                     let remaining = budget.deadline.saturating_sub(prepared_at.elapsed());
                     let (source, barrier, backend_pid) =
                         wait_for_phase(remaining, &ctx.budget.cancellation, async {
-                            let (mut source, barrier) = tokio::try_join!(
+                            let (mut source, mut barrier) = tokio::try_join!(
                                 open_backup_connection(&store),
                                 open_backup_connection(&store)
                             )?;
-                            let backend_pid = warm_pg_backup_connection(&mut source).await?;
+                            let BackupRetentionBudget::PostgresSnapshot { max_age } =
+                                budget.retention
+                            else {
+                                return Err(DomainError::validation(
+                                    ValidationReason::ScopeMismatch,
+                                )
+                                .into());
+                            };
+                            let (backend_pid, ()) = tokio::try_join!(
+                                warm_pg_backup_connection(&mut source, remaining, max_age),
+                                warm_pg_backup_barrier(&mut barrier, remaining)
+                            )?;
                             Ok((source, barrier, backend_pid))
                         })
                         .await?;
@@ -3215,7 +3278,6 @@ impl BackupParticipantPort for CanonicalStore {
                 .inner
                 .room_fences
                 .replace_restored_spaces(&spaces, fences);
-            store.inner.clear_pg_immutable_caches();
             for (cur, epoch) in restored.iter().zip(epochs) {
                 store.inner.grant_writer_epoch(&cur.scope.space_id, epoch);
                 store.inner.job_reads.remove_space(&cur.scope.space_id);
@@ -3243,15 +3305,32 @@ impl BackupParticipantPort for CanonicalStore {
 
 async fn acquire_durable_backup_holds(
     store: &CanonicalStore,
+    owner: &mut HoldOwnership,
     backup_id: &BackupId,
+    generation: &ArtifactId,
 ) -> Result<BackupWitness, PortError> {
     let bid = backup_id.clone();
     let inst_id = store.inner.config.installation_id.clone();
     let now_ms = now_unix_ms()?;
 
-    store
-        .with_write_tx(|tx| {
+    let generation = generation.clone();
+    owner.with_write_tx(store, |tx| {
             Box::pin(async move {
+                // Under the same session lock, only remnants of a disconnected predecessor may exist.
+                let stale = "DELETE FROM backup_holds WHERE backup_id = $1";
+                match tx {
+                    BackendConn::Sqlite(conn) => sqlx::query(stale)
+                        .bind(bid.as_str())
+                        .execute(&mut **conn)
+                        .await
+                        .map(|_| ()),
+                    BackendConn::Postgres(conn) => sqlx::query(stale)
+                        .bind(bid.as_str())
+                        .execute(&mut **conn)
+                        .await
+                        .map(|_| ()),
+                }
+                .map_err(|err| internal_not_committed("replace_abandoned_backup_hold", err.to_string()))?;
                 let spaces: Vec<(String, Vec<u8>, i64)> = match tx {
                     BackendConn::Sqlite(conn) => {
                         let rows = sqlx::query(
@@ -3343,8 +3422,8 @@ async fn acquire_durable_backup_holds(
                             sqlx::query(
                                 "INSERT INTO backup_holds (
                                     backup_id, space_id, history_incarnation, owner_installation_id,
-                                    phase, cutoff_seq, witness_json, created_at_ms
-                                ) VALUES (?, ?, ?, ?, 'holding', ?, ?, ?)",
+                                    phase, cutoff_seq, witness_json, created_at_ms, owner_generation
+                                ) VALUES (?, ?, ?, ?, 'holding', ?, ?, ?, ?)",
                             )
                             .bind(bid.as_str())
                             .bind(cur.scope.space_id.as_str())
@@ -3353,6 +3432,7 @@ async fn acquire_durable_backup_holds(
                             .bind(cutoff_i64)
                             .bind(&witness_json)
                             .bind(now_ms)
+                            .bind(generation.as_str())
                             .execute(&mut **conn)
                             .await
                             .map_err(|err| {
@@ -3363,8 +3443,8 @@ async fn acquire_durable_backup_holds(
                             sqlx::query(
                                 "INSERT INTO backup_holds (
                                     backup_id, space_id, history_incarnation, owner_installation_id,
-                                    phase, cutoff_seq, witness_json, created_at_ms
-                                ) VALUES ($1, $2, $3, $4, 'holding', $5, $6, $7)",
+                                    phase, cutoff_seq, witness_json, created_at_ms, owner_generation
+                                ) VALUES ($1, $2, $3, $4, 'holding', $5, $6, $7, $8)",
                             )
                             .bind(bid.as_str())
                             .bind(cur.scope.space_id.as_str())
@@ -3373,6 +3453,7 @@ async fn acquire_durable_backup_holds(
                             .bind(cutoff_i64)
                             .bind(&witness_json)
                             .bind(now_ms)
+                            .bind(generation.as_str())
                             .execute(&mut **conn)
                             .await
                             .map_err(|err| {
@@ -3413,31 +3494,36 @@ async fn has_pending_blob_retirements_tx(
 
 async fn delete_backup_hold_rows(
     store: &CanonicalStore,
+    owner: &mut HoldOwnership,
     backup_id: &BackupId,
+    generation: &ArtifactId,
+    expected_count: u64,
 ) -> Result<(), PortError> {
     let bid = backup_id.clone();
-    store
-        .with_write_tx(|tx| {
+    let generation = generation.clone();
+    owner
+        .with_write_tx(store, |tx| {
             Box::pin(async move {
-                match tx {
-                    BackendConn::Sqlite(conn) => {
-                        sqlx::query("DELETE FROM backup_holds WHERE backup_id = ?")
-                            .bind(bid.as_str())
-                            .execute(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                internal_not_committed("sqlite_delete_backup_hold", err.to_string())
-                            })?;
-                    }
-                    BackendConn::Postgres(conn) => {
-                        sqlx::query("DELETE FROM backup_holds WHERE backup_id = $1")
-                            .bind(bid.as_str())
-                            .execute(&mut **conn)
-                            .await
-                            .map_err(|err| {
-                                internal_not_committed("pg_delete_backup_hold", err.to_string())
-                            })?;
-                    }
+                let sql = "DELETE FROM backup_holds WHERE backup_id = $1 AND owner_generation = $2";
+                let deleted = match tx {
+                    BackendConn::Sqlite(conn) => sqlx::query(sql)
+                        .bind(bid.as_str())
+                        .bind(generation.as_str())
+                        .execute(&mut **conn)
+                        .await
+                        .map(|r| r.rows_affected()),
+                    BackendConn::Postgres(conn) => sqlx::query(sql)
+                        .bind(bid.as_str())
+                        .bind(generation.as_str())
+                        .execute(&mut **conn)
+                        .await
+                        .map(|r| r.rows_affected()),
+                }
+                .map_err(|err| {
+                    internal_not_committed("delete_owned_backup_hold", err.to_string())
+                })?;
+                if deleted != expected_count {
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
                 Ok(())
             })
@@ -3450,6 +3536,7 @@ async fn persist_backup_artifact_ready(
     store: &CanonicalStore,
     artifact_id: &ArtifactId,
     backup_id: &BackupId,
+    proof: &HoldProof,
     encoding: BackupArtifactEncoding,
     rel_path: &str,
     byte_size: u64,
@@ -3466,8 +3553,12 @@ async fn persist_backup_artifact_ready(
         .map_err(|_| DomainError::validation(ValidationReason::BudgetExceeded))?;
     let histories = witness.histories.clone();
 
-    store
-        .with_write_tx(|tx| {
+    let generation = proof.generation.clone();
+    let mut guard = proof.owner.lock().await;
+    let owner = guard
+        .as_mut()
+        .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
+    owner.with_write_tx(store, |tx| {
             Box::pin(async move {
                 match tx {
                     BackendConn::Sqlite(conn) => {
@@ -3494,20 +3585,24 @@ async fn persist_backup_artifact_ready(
                         })?;
 
                         for cur in &histories {
-                            sqlx::query(
+                            let updated = sqlx::query(
                                 "UPDATE backup_holds
                                  SET phase = 'spooled', cutoff_seq = ?, witness_json = ?
-                                 WHERE backup_id = ? AND space_id = ?",
+                                 WHERE backup_id = ? AND space_id = ? AND owner_generation = ?",
                             )
                             .bind(cur.after.get() as i64)
                             .bind(&witness_json)
                             .bind(bid.as_str())
                             .bind(cur.scope.space_id.as_str())
+                            .bind(generation.as_str())
                             .execute(&mut **conn)
                             .await
                             .map_err(|err| {
                                 internal_not_committed("sqlite_update_hold_spooled", err.to_string())
                             })?;
+                            if updated.rows_affected() != 1 {
+                                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                            }
                         }
                     }
                     BackendConn::Postgres(conn) => {
@@ -3534,20 +3629,24 @@ async fn persist_backup_artifact_ready(
                         })?;
 
                         for cur in &histories {
-                            sqlx::query(
+                            let updated = sqlx::query(
                                 "UPDATE backup_holds
                                  SET phase = 'spooled', cutoff_seq = $1, witness_json = $2
-                                 WHERE backup_id = $3 AND space_id = $4",
+                                 WHERE backup_id = $3 AND space_id = $4 AND owner_generation = $5",
                             )
                             .bind(cur.after.get() as i64)
                             .bind(&witness_json)
                             .bind(bid.as_str())
                             .bind(cur.scope.space_id.as_str())
+                            .bind(generation.as_str())
                             .execute(&mut **conn)
                             .await
                             .map_err(|err| {
                                 internal_not_committed("pg_update_hold_spooled", err.to_string())
                             })?;
+                            if updated.rows_affected() != 1 {
+                                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                            }
                         }
                     }
                 }

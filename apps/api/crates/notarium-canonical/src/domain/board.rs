@@ -999,30 +999,13 @@ pub(crate) async fn move_board_card_impl(
                             let g = room_fences
                                 .consume_reservation(&scope_cl, &input.note, res, &req_id)
                                 .await?;
-                            let dstate: Option<String> = match tx {
-                                BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                                    "SELECT room_state FROM collab_sessions WHERE space_id = ? AND note_id = ?",
-                                )
-                                .bind(scope_cl.space_id.as_str())
-                                .bind(input.note.as_str())
-                                .fetch_optional(&mut **conn)
-                                .await
-                                .map_err(|err| internal_not_committed("sqlite_bm_collab_state", err.to_string()))?,
-                                BackendConn::Postgres(conn) => sqlx::query_scalar(
-                                    "SELECT room_state FROM collab_sessions WHERE space_id = $1 AND note_id = $2",
-                                )
-                                .bind(scope_cl.space_id.as_str())
-                                .bind(input.note.as_str())
-                                .fetch_optional(&mut **conn)
-                                .await
-                                .map_err(|err| internal_not_committed("pg_bm_collab_state", err.to_string()))?,
-                            };
-                            if matches!(dstate.as_deref(), Some("active" | "fenced")) {
-                                return Err(DomainError::validation(
-                                    ValidationReason::InvalidState,
-                                )
-                                .into());
-                            }
+                            crate::domain::common::durable_note_room_state_tx(
+                                tx,
+                                &scope_cl.space_id,
+                                &input.note,
+                            )
+                            .await?
+                            .require_writable()?;
                             item_ctx.retain_until_batch_commit(g);
                         }
                         None => {

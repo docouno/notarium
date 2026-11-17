@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use notarium_core::{
     DomainError,
-    auth::SpaceLifecycle,
-    classes::{AbilityKind, ClassifiedAbilityResource, DocClass},
+    classes::{ClassifiedAbilityResource, DocClass},
     error::{PortError, ValidationReason},
     ids::{AbilityId, ContentDigest, RevisionId},
     model::{AbilityResourceName, AbilityResourceRef, Lifecycle, PathTarget},
@@ -32,7 +31,7 @@ use crate::{
         StoredCommittedAbilityRevV1, build_resource_facts_tx, derive_command_identity_spec,
         load_note_head_row_tx, note_rank_version_digest, validate_mutation_identity,
     },
-    runtime::{insert_revision_row, is_note_purge_fenced_tx, load_space_record},
+    runtime::{insert_revision_row, load_space_record},
     sql_exec::BackendConn,
     writer::{BatchEventDraft, ItemCommitArtifacts, PreparedWriteIntent},
 };
@@ -540,93 +539,26 @@ pub(crate) async fn read_ability_resource_impl(
         }
     };
 
-    let scope = ctx.scope().clone();
-    let auth = ctx.auth().clone();
-    let req_ability = request.ability.clone();
-    let req_pkg_rev = request.package_revision.clone();
-    let key_owned = manifest_key.to_owned();
-
-    let (entrypoint_note, digest) = store
-        .with_read_tx_budget(Some(&ctx.budget), |tx| {
-            Box::pin(async move {
-                let (entrypoint_note_id, _) = authorize_ability_read_tx(tx, &scope, &auth, &req_ability).await?;
-
-
-                // Strictly resolve the exact requested `package_revision`; NEVER fall back to latest!
-                let meta_bytes: Option<Vec<u8>> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                        "SELECT metadata_msgpack FROM revisions
-                         WHERE space_id = ? AND rev_id = ? AND entity_type = 'ability' AND entity_key = ?",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(req_pkg_rev.as_str())
-                    .bind(req_ability.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| {
-                        internal_not_committed("sqlite_read_ability_rev", err.to_string())
-                    })?,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(
-                        "SELECT metadata_msgpack FROM revisions
-                         WHERE space_id = $1 AND rev_id = $2 AND entity_type = 'ability' AND entity_key = $3",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(req_pkg_rev.as_str())
-                    .bind(req_ability.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| {
-                        internal_not_committed("pg_read_ability_rev", err.to_string())
-                    })?,
-                };
-
-                let Some(raw_meta) = meta_bytes else {
-                    return Err(DomainError::ResourceNotFound.into());
-                };
-                let env = RevisionMetadataEnvelope::decode(&raw_meta)?;
-                let RevisionMetadataPayload::Ability(ab_meta) = env.payload else {
-                    return Err(internal_not_committed(
-                        "corrupt_ability_rev_payload",
-                        "expected Ability metadata payload",
-                    ));
-                };
-                if ab_meta.lifecycle != Lifecycle::Active || ab_meta.entrypoint_note_id != entrypoint_note_id {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                let Some(digest) = ab_meta.resources.get(&key_owned).copied() else {
-                    return Err(DomainError::ResourceNotFound.into());
-                };
-                Ok((entrypoint_note_id, digest))
-            })
+    let budget = &ctx.budget;
+    let lookup = || {
+        let ctx = ctx.clone();
+        let request = request.clone();
+        let key = manifest_key.to_owned();
+        store.with_read_tx_budget(Some(budget), move |tx| {
+            Box::pin(
+                async move { crate::catalog::resource_digest_tx(tx, &ctx, &request, &key).await },
+            )
         })
-        .await?;
-
-    // Load verified CAS bytes outside SQL read transaction, then re-check live purge fence!
+    };
+    let (digest, _) = lookup().await?;
     let raw_bytes = store.read_verified_blob(ctx.scope(), digest).await?;
-    let content = String::from_utf8(raw_bytes).map_err(|_| {
-        internal_not_committed(
-            "ability_resource_utf8",
-            "ability resource is not valid UTF-8",
-        )
-    })?;
+    let content = String::from_utf8(raw_bytes)
+        .map_err(|err| internal_not_committed("ability_resource_utf8", err.to_string()))?;
 
-    let scope_recheck = ctx.scope().clone();
-    let auth = ctx.auth().clone();
-    let ability = request.ability.clone();
-    let facts = store
-        .with_read_tx_budget(Some(&ctx.budget), |tx| {
-            Box::pin(async move {
-                let (current_entrypoint, facts) =
-                    authorize_ability_read_tx(tx, &scope_recheck, &auth, &ability).await?;
-                if current_entrypoint != entrypoint_note {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                Ok(facts)
-            })
-        })
-        .await?;
-
-    let _ = AbilityKind::Skill;
+    let (checked_digest, facts) = lookup().await?;
+    if checked_digest != digest {
+        return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
+    }
     ClassifiedAbilityResource::from_canonical(
         AbilityResourceRef {
             space: ctx.scope().space_id.clone(),
@@ -640,57 +572,6 @@ pub(crate) async fn read_ability_resource_impl(
         digest,
     )
     .map_err(PortError::from)
-}
-
-async fn authorize_ability_read_tx(
-    tx: &mut BackendConn<'_>,
-    scope: &notarium_core::model::HistoryScope,
-    auth: &notarium_core::auth::EngineAuthContext,
-    ability: &AbilityId,
-) -> Result<
-    (
-        notarium_core::ids::NoteId,
-        notarium_core::auth::ResourceFacts,
-    ),
-    PortError,
-> {
-    let space_rec = load_space_record(tx, &scope.space_id).await?;
-    space_rec.scope.check(scope)?;
-    if space_rec.space.lifecycle != SpaceLifecycle::Active {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-
-    let Some((pkg_lc, _, entrypoint_note_id)) =
-        load_ability_package_row_opt_tx(tx, &scope.space_id, ability).await?
-    else {
-        return Err(DomainError::ResourceNotFound.into());
-    };
-    if pkg_lc != Lifecycle::Active {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-    if is_note_purge_fenced_tx(tx, &scope.space_id, entrypoint_note_id.as_str()).await? {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-
-    let entry_head = load_note_head_row_tx(tx, &scope.space_id, &entrypoint_note_id).await?;
-    if entry_head.lifecycle != Lifecycle::Active
-        || entry_head.doc_class != DocClass::Skill
-        || entry_head.ability_id.as_ref() != Some(ability)
-    {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-
-    let (facts, _) = build_resource_facts_tx(
-        tx,
-        &space_rec.space,
-        &entry_head.parent_folder_id,
-        DocClass::Skill,
-        Some(ability.clone()),
-        true,
-    )
-    .await?;
-    auth.authorize_read(&facts)?;
-    Ok((entrypoint_note_id, facts))
 }
 
 async fn load_ability_package_row_opt_tx(

@@ -34,6 +34,7 @@ macro_rules! db {
     }}
 }
 mod abilities;
+pub(crate) use abilities::resource_digest_tx;
 mod commands;
 pub(crate) mod memory;
 

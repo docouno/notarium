@@ -257,3 +257,61 @@ impl LegacyNoteCommand<'_> {
             .ok_or(DomainError::IdempotencyKeyReused.into())
     }
 }
+
+// Old link batches included the pre-append carrier digest in their command hash.
+// Retrieve it from the immutable parent so retrying never relies on the live head.
+pub(super) async fn link_batch_identity(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    item: &Mutation<Link>,
+    line: &str,
+    mut spec: CommandIdentitySpec,
+) -> Result<CommandIdentitySpec, PortError> {
+    if item.preconditions.lease.is_some() || item.preconditions.lineage.is_some() {
+        return Err(DomainError::IdempotencyKeyReused.into());
+    }
+    let scope = ctx.scope().clone();
+    let current = spec.clone();
+    let link = item.input.clone();
+    let (stored_hash, parent_revision, base): (ContentDigest, String, Vec<u8>) = store.with_read_tx_budget(Some(&ctx.budget), |tx| Box::pin(async move {
+        let mismatch = || PortError::from(DomainError::IdempotencyKeyReused);
+        let row = crate::writer::lookup_command_receipt_tx(tx, &scope, &current).await?.ok_or_else(mismatch)?;
+        let result: StoredCommittedLinkV1 = rmp_serde::from_slice(&row.response_blob).map_err(|_| mismatch())?;
+        let result = result.into_committed();
+        if row.status != "completed" || result.receipt.scope() != &scope || result.value != link {
+            return Err(mismatch());
+        }
+        const BASE: &str = "SELECT p.rev_id, p.content_blake3 FROM revisions r JOIN revisions p
+            ON p.space_id=r.space_id AND p.rev_id=r.parent_rev_id AND p.history_incarnation=r.history_incarnation
+            AND p.entity_type=r.entity_type AND p.entity_key=r.entity_key
+            WHERE r.space_id=$1 AND r.entity_type='note' AND r.entity_key=$2 AND r.visibility_seq=$3 AND r.history_incarnation=$4
+            AND p.content_blake3 IS NOT NULL";
+        let (parent_revision, digest) = match tx {
+            BackendConn::Sqlite(conn) => sqlx::query_as(BASE).bind(scope.space_id.as_str()).bind(link.source.as_str())
+                .bind(result.receipt.seq().get() as i64).bind(scope.incarnation.as_bytes().as_slice()).fetch_optional(&mut **conn).await,
+            BackendConn::Postgres(conn) => sqlx::query_as(BASE).bind(scope.space_id.as_str()).bind(link.source.as_str())
+                .bind(result.receipt.seq().get() as i64).bind(scope.incarnation.as_bytes().as_slice()).fetch_optional(&mut **conn).await,
+        }.map_err(|e| internal_not_committed("read_link_receipt_base", e.to_string()))?.ok_or_else(mismatch)?;
+        Ok((row.command_hash, parent_revision, digest))
+    })).await?;
+    if item
+        .preconditions
+        .revision
+        .as_ref()
+        .is_some_and(|rev| rev.as_str() != parent_revision)
+    {
+        return Err(DomainError::IdempotencyKeyReused.into());
+    }
+    let fp = format!(
+        "src={}\0base={}\0line={line}",
+        item.input.source.as_str(),
+        hex::encode(base)
+    );
+    if derive_command_identity_spec(&item.identity, "link", fp.as_bytes()).command_hash()
+        != stored_hash
+    {
+        return Err(DomainError::IdempotencyKeyReused.into());
+    }
+    spec.command_hash = stored_hash;
+    Ok(spec)
+}

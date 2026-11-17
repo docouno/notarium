@@ -1526,7 +1526,42 @@ pub(crate) async fn check_collab_preconditions_tx(
 pub(crate) enum NoteRoomDirectWriteState {
     NoSessionRow,
     ClosedSessionRow,
+    NeedsSettlement,
     ActiveOrFenced,
+}
+
+impl NoteRoomDirectWriteState {
+    pub(crate) fn from_row(row: Option<(String, i64)>) -> Self {
+        match row {
+            None => Self::NoSessionRow,
+            Some((state, dirty)) if state == "closed" => {
+                if dirty == 0 {
+                    Self::ClosedSessionRow
+                } else {
+                    Self::NeedsSettlement
+                }
+            }
+            Some(_) => Self::ActiveOrFenced,
+        }
+    }
+
+    /// Returns whether a closed lineage must be advanced with the carrier.
+    pub(crate) fn require_writable(self) -> Result<bool, PortError> {
+        match self {
+            Self::NoSessionRow => Ok(false),
+            Self::ClosedSessionRow => Ok(true),
+            Self::NeedsSettlement => Err(crate::codec::unavailable_retryable(
+                "collab_carrier_needs_settlement",
+                "reconcile the closed room snapshot and remaining updates before replacing its carrier",
+                std::time::Duration::from_millis(50),
+            )),
+            Self::ActiveOrFenced => Err(crate::codec::unavailable_retryable(
+                "collab_room_not_closed",
+                "note collaborative session is active or fenced awaiting recovery",
+                std::time::Duration::from_millis(50),
+            )),
+        }
+    }
 }
 
 pub(crate) async fn check_note_room_direct_write_tx(
@@ -1538,29 +1573,33 @@ pub(crate) async fn check_note_room_direct_write_tx(
     if room_fences.is_room_active(scope, note_id).await? {
         return Ok(NoteRoomDirectWriteState::ActiveOrFenced);
     }
-    let state_opt: Option<String> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT room_state FROM collab_sessions WHERE space_id = ? AND note_id = ?",
+    durable_note_room_state_tx(tx, &scope.space_id, note_id).await
+}
+
+pub(crate) async fn durable_note_room_state_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    note_id: &NoteId,
+) -> Result<NoteRoomDirectWriteState, PortError> {
+    let row = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_as::<_, (String, i64)>(
+            "SELECT room_state, COALESCE(carrier_dirty, 0) FROM collab_sessions LEFT JOIN collab_checkpoints USING (space_id, note_id)
+             WHERE space_id = ? AND note_id = ?",
         )
-        .bind(scope.space_id.as_str())
+        .bind(space_id.as_str())
         .bind(note_id.as_str())
         .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_check_room_active", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT room_state FROM collab_sessions WHERE space_id = $1 AND note_id = $2",
+        .await,
+        BackendConn::Postgres(conn) => sqlx::query_as::<_, (String, i64)>(
+            "SELECT room_state, COALESCE(carrier_dirty, 0) FROM collab_sessions LEFT JOIN collab_checkpoints USING (space_id, note_id)
+             WHERE space_id = $1 AND note_id = $2",
         )
-        .bind(scope.space_id.as_str())
+        .bind(space_id.as_str())
         .bind(note_id.as_str())
         .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_check_room_active", err.to_string()))?,
-    };
-    Ok(match state_opt.as_deref() {
-        None => NoteRoomDirectWriteState::NoSessionRow,
-        Some("active" | "fenced") => NoteRoomDirectWriteState::ActiveOrFenced,
-        Some(_) => NoteRoomDirectWriteState::ClosedSessionRow,
-    })
+        .await,
+    }.map_err(|err| internal_not_committed("check_durable_room", err.to_string()))?;
+    Ok(NoteRoomDirectWriteState::from_row(row))
 }
 
 pub(crate) async fn is_note_room_active_tx(
@@ -1582,16 +1621,22 @@ pub(crate) async fn sync_closed_collab_session_on_direct_write_tx(
     new_carrier_rev: &RevisionId,
     updated_seq: SpaceSeq,
 ) -> Result<(), PortError> {
+    if !durable_note_room_state_tx(tx, space_id, note_id)
+        .await?
+        .require_writable()?
+    {
+        return Ok(());
+    }
     let seq_i64 = updated_seq.get() as i64;
     let affected = match tx {
         BackendConn::Sqlite(conn) => {
-            sqlx::query("DELETE FROM collab_update_log WHERE space_id = ? AND note_id = ?")
+            sqlx::query("DELETE FROM collab_checkpoints WHERE space_id = ? AND note_id = ?")
                 .bind(space_id.as_str())
                 .bind(note_id.as_str())
                 .execute(&mut **conn)
                 .await
                 .map_err(|err| {
-                    internal_not_committed("sqlite_sync_clear_collab_log", err.to_string())
+                    internal_not_committed("sqlite_sync_clear_collab_checkpoint", err.to_string())
                 })?;
             sqlx::query(
                 "UPDATE collab_sessions
@@ -1612,13 +1657,13 @@ pub(crate) async fn sync_closed_collab_session_on_direct_write_tx(
             .rows_affected()
         }
         BackendConn::Postgres(conn) => {
-            sqlx::query("DELETE FROM collab_update_log WHERE space_id = $1 AND note_id = $2")
+            sqlx::query("DELETE FROM collab_checkpoints WHERE space_id = $1 AND note_id = $2")
                 .bind(space_id.as_str())
                 .bind(note_id.as_str())
                 .execute(&mut **conn)
                 .await
                 .map_err(|err| {
-                    internal_not_committed("pg_sync_clear_collab_log", err.to_string())
+                    internal_not_committed("pg_sync_clear_collab_checkpoint", err.to_string())
                 })?;
             sqlx::query(
                 "UPDATE collab_sessions

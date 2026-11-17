@@ -1,6 +1,7 @@
 mod v1_receipts;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use notarium_core::{
     DomainError,
@@ -9,7 +10,7 @@ use notarium_core::{
         ClassEgressFence, ClassifiedDocument, ClassifiedMetadata, DocClass, authorize_field_key,
     },
     error::{Diagnostic, PortError, ValidationReason},
-    ids::{BodyIdentity, ContentDigest, HeaderIdentity, NoteId, RevisionId, SpaceSeq},
+    ids::{BodyIdentity, ContentDigest, HeaderIdentity, NoteId, RevisionId, SpaceId, SpaceSeq},
     model::{FolderRef, Lifecycle, NoteRef, PathTarget, SnapshotCut},
     patch::{CarrierEditOrigin, CarrierPatchPlan, HeaderMutation},
     ports::{
@@ -147,6 +148,18 @@ fn analyze_and_prepare_carrier_opt_preparsed(
     codec: BlobCodecTag,
     preparsed_hdr: Option<PreparsedHeaderTuple>,
 ) -> Result<PreparedCarrierInfo, PortError> {
+    analyze_carrier_metadata(carrier, class, slug, preparsed_hdr, || {
+        PreparedBlobSource::prepare(carrier.as_bytes(), codec)
+    })
+}
+
+fn analyze_carrier_metadata(
+    carrier: &str,
+    class: DocClass,
+    slug: &str,
+    preparsed_hdr: Option<PreparsedHeaderTuple>,
+    prepared: impl FnOnce() -> Result<PreparedBlobSource, PortError>,
+) -> Result<PreparedCarrierInfo, PortError> {
     let (raw_fields, diagnostics, headings) = if class == DocClass::EncryptedNote {
         notarium_syntax::encrypted::validate(carrier)?;
         (None, Vec::new(), Vec::new())
@@ -181,7 +194,7 @@ fn analyze_and_prepare_carrier_opt_preparsed(
     } else {
         normalize_title_key(&title)
     };
-    let prepared_blob = PreparedBlobSource::prepare(carrier.as_bytes(), codec)?;
+    let prepared_blob = prepared()?;
     Ok(PreparedCarrierInfo {
         raw_fields,
         diagnostics,
@@ -300,6 +313,12 @@ fn edit_note_identity(
         }
         hash.update(edit.replacement.as_bytes());
     }
+    hash_preconditions(&mut hash, preconditions);
+    derive_command_identity_spec(identity, "edit_note", hash.finalize().as_bytes())
+        .for_note(ctx.auth(), &input.note)
+}
+
+fn hash_preconditions(hash: &mut blake3::Hasher, preconditions: &Preconditions) {
     hash.update(
         preconditions
             .revision
@@ -313,8 +332,6 @@ fn edit_note_identity(
     ] {
         hash.update(&epoch.unwrap_or(u64::MAX).to_be_bytes());
     }
-    derive_command_identity_spec(identity, "edit_note", hash.finalize().as_bytes())
-        .for_note(ctx.auth(), &input.note)
 }
 
 pub(crate) async fn create_note_impl(
@@ -1032,55 +1049,22 @@ pub(crate) fn build_carrier_replacement_intent(
                     let g = room_fences
                         .consume_reservation(&scope_cl, &note_id, res, &identity)
                         .await?;
-                    let dstate: Option<String> = match tx {
-                        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                            "SELECT room_state FROM collab_sessions WHERE space_id = ? AND note_id = ?",
-                        )
-                        .bind(scope_cl.space_id.as_str())
-                        .bind(note_id.as_str())
-                        .fetch_optional(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("sqlite_note_collab_state", err.to_string()))?,
-                        BackendConn::Postgres(conn) => sqlx::query_scalar(
-                            "SELECT room_state FROM collab_sessions WHERE space_id = $1 AND note_id = $2",
-                        )
-                        .bind(scope_cl.space_id.as_str())
-                        .bind(note_id.as_str())
-                        .fetch_optional(&mut **conn)
-                        .await
-                        .map_err(|err| internal_not_committed("pg_note_collab_state", err.to_string()))?,
-                    };
-                    if matches!(dstate.as_deref(), Some("active" | "fenced")) {
-                        return Err(unavailable_retryable(
-                            "collab_room_not_closed",
-                            "note collaborative session is active or fenced awaiting recovery",
-                            std::time::Duration::from_millis(50),
-                        ));
-                    }
-                    (Some(g), dstate.is_some())
+                    let state = crate::domain::common::durable_note_room_state_tx(
+                        tx,
+                        &scope_cl.space_id,
+                        &note_id,
+                    )
+                    .await?;
+                    (Some(g), state.require_writable()?)
                 } else {
-                    match crate::domain::common::check_note_room_direct_write_tx(
+                    let state = crate::domain::common::check_note_room_direct_write_tx(
                         tx,
                         &room_fences,
                         &scope_cl,
                         &note_id,
                     )
-                    .await?
-                    {
-                        crate::domain::common::NoteRoomDirectWriteState::ActiveOrFenced => {
-                            return Err(unavailable_retryable(
-                                "collab_room_not_closed",
-                                "note collaborative session is active or fenced awaiting recovery",
-                                std::time::Duration::from_millis(50),
-                            ));
-                        }
-                        crate::domain::common::NoteRoomDirectWriteState::ClosedSessionRow => {
-                            (None, true)
-                        }
-                        crate::domain::common::NoteRoomDirectWriteState::NoSessionRow => {
-                            (None, false)
-                        }
-                    }
+                    .await?;
+                    (None, state.require_writable()?)
                 };
                 if let Some(g) = fence_guard {
                     item_ctx.retain_until_batch_commit(g);
@@ -1430,6 +1414,44 @@ pub(crate) async fn delete_note_impl(
     Ok(stored.into_committed())
 }
 
+/// A relocation or lifecycle revision keeps the carrier bytes and collaborative lineage.
+async fn advance_collab_metadata_revision_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    note_id: &NoteId,
+    previous: &RevisionId,
+    next: &RevisionId,
+    seq: SpaceSeq,
+) -> Result<(), PortError> {
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query(
+            "UPDATE collab_sessions SET carrier_rev_id = ?, updated_seq = ?
+             WHERE space_id = ? AND note_id = ? AND carrier_rev_id = ?",
+        )
+        .bind(next.as_str())
+        .bind(seq.get() as i64)
+        .bind(space_id.as_str())
+        .bind(note_id.as_str())
+        .bind(previous.as_str())
+        .execute(&mut **conn)
+        .await
+        .map(|_| ()),
+        BackendConn::Postgres(conn) => sqlx::query(
+            "UPDATE collab_sessions SET carrier_rev_id = $1, updated_seq = $2
+             WHERE space_id = $3 AND note_id = $4 AND carrier_rev_id = $5",
+        )
+        .bind(next.as_str())
+        .bind(seq.get() as i64)
+        .bind(space_id.as_str())
+        .bind(note_id.as_str())
+        .bind(previous.as_str())
+        .execute(&mut **conn)
+        .await
+        .map(|_| ()),
+    }
+    .map_err(|err| internal_not_committed("advance_collab_metadata_revision", err.to_string()))
+}
+
 fn build_trash_or_restore_intent(
     store: &CanonicalStore,
     scope: &notarium_core::model::HistoryScope,
@@ -1566,6 +1588,16 @@ fn build_trash_or_restore_intent(
                     new_rev.as_str(),
                     "carrier",
                     digest,
+                    seq,
+                )
+                .await?;
+
+                advance_collab_metadata_revision_tx(
+                    tx,
+                    &scope_cl.space_id,
+                    &note_id,
+                    &head.head_rev_id,
+                    &new_rev,
                     seq,
                 )
                 .await?;
@@ -1960,6 +1992,16 @@ fn build_move_note_intent(
                 )
                 .await?;
 
+                advance_collab_metadata_revision_tx(
+                    tx,
+                    &scope_cl.space_id,
+                    &note_id,
+                    &head.head_rev_id,
+                    &new_rev,
+                    seq,
+                )
+                .await?;
+
                 match tx {
                     BackendConn::Sqlite(conn) => {
                         sqlx::query(
@@ -2312,26 +2354,53 @@ fn apply_title_surgery_to_carrier(
     notarium_syntax::patch::apply(carrier, &plan).map_err(PortError::from)
 }
 
-#[derive(Clone)]
-struct VirtualNoteState {
-    class: DocClass,
-    slug: String,
-    carrier: String,
+// Retain only carrier versions named by a remaining edit. Each savepoint decides
+// whether that version and class are the current head after preceding outcomes.
+#[derive(Default)]
+struct BatchEditSources {
+    bytes: HashMap<(NoteId, ContentDigest), RequestedCarrier>,
+    classes: HashMap<NoteId, BTreeSet<DocClass>>,
+}
+
+#[derive(Default)]
+struct RequestedCarrier {
+    remaining: usize,
+    carrier: Option<Arc<str>>,
+}
+
+impl BatchEditSources {
+    fn take_base(&mut self, note: &NoteId, digest: ContentDigest) -> Option<Arc<str>> {
+        use std::collections::hash_map::Entry;
+        let Entry::Occupied(mut entry) = self.bytes.entry((note.clone(), digest)) else {
+            return None;
+        };
+        entry.get_mut().remaining -= 1;
+        if entry.get().remaining == 0 {
+            entry.remove().carrier
+        } else {
+            entry.get().carrier.clone()
+        }
+    }
+
+    fn remember(&mut self, note: &NoteId, digest: ContentDigest, carrier: &str) {
+        if let Some(slot) = self.bytes.get_mut(&(note.clone(), digest)) {
+            slot.carrier.get_or_insert_with(|| Arc::from(carrier));
+        }
+    }
+}
+
+struct PreparedBatchEdit {
+    variants: BTreeMap<DocClass, Result<PreparedCarrierInfo, PortError>>,
+    ticket: Option<crate::blobs::StagedBlobTicket>,
 }
 
 // Only find candidate receipts here. The writer checks the current authority, hash, and
 // status before returning a stored outcome at the item's position in the batch.
-async fn batch_carrier_receipt_keys(
+async fn batch_receipt_hashes(
     store: &CanonicalStore,
     ctx: &SpaceContext,
-    request: &AcceptBatch,
+    keys: Vec<String>,
 ) -> Result<HashMap<String, Vec<u8>>, PortError> {
-    let keys: Vec<_> = request
-        .items
-        .iter()
-        .filter(|item| matches!(item.input, BatchItem::Create(_) | BatchItem::Edit(_)))
-        .map(|item| item.identity.key.as_str().to_owned())
-        .collect();
     if keys.is_empty() {
         return Ok(Default::default());
     }
@@ -2369,45 +2438,65 @@ pub(crate) async fn accept_batch_impl(
         });
     }
 
-    let receipts = batch_carrier_receipt_keys(store, &ctx, &request).await?;
-    let referenced_edits: std::collections::BTreeSet<_> = request
+    let keys = request
         .items
         .iter()
-        .filter_map(|item| match &item.input {
-            BatchItem::Edit(ed) if !receipts.contains_key(item.identity.key.as_str()) => {
-                Some(ed.note.clone())
-            }
-            _ => None,
-        })
+        .filter(|item| matches!(item.input, BatchItem::Create(_) | BatchItem::Edit(_)))
+        .map(|item| item.identity.key.as_str().to_owned())
         .collect();
-    let mut virtual_notes: HashMap<NoteId, VirtualNoteState> = HashMap::new();
-    for nid in referenced_edits {
-        let scope_in = space_rec.scope.clone();
-        let nid_in = nid.clone();
-        let loaded_opt = store
+    let receipts = batch_receipt_hashes(store, &ctx, keys).await?;
+    let mut sources = BatchEditSources::default();
+    let mut edited_notes = BTreeSet::new();
+    for item in &request.items {
+        match &item.input {
+            BatchItem::Create(create) => {
+                sources
+                    .classes
+                    .entry(create.note.clone())
+                    .or_default()
+                    .insert(create.class);
+            }
+            BatchItem::Edit(edit) if !receipts.contains_key(item.identity.key.as_str()) => {
+                sources
+                    .bytes
+                    .entry((edit.note.clone(), edit.plan.base_content_hash))
+                    .or_default()
+                    .remaining += 1;
+                edited_notes.insert(edit.note.clone());
+            }
+            _ => {}
+        }
+    }
+    for nid in edited_notes {
+        let scope = space_rec.scope.clone();
+        let note = nid.clone();
+        let head = store
             .with_read_tx_budget(Some(&ctx.budget), |tx| {
                 Box::pin(async move {
-                    if is_note_purge_fenced_tx(tx, &scope_in.space_id, nid_in.as_str()).await? {
+                    if is_note_purge_fenced_tx(tx, &scope.space_id, note.as_str()).await? {
                         return Ok(None);
                     }
-                    load_note_head_row_opt_tx(tx, &scope_in.space_id, &nid_in).await
+                    load_note_head_row_opt_tx(tx, &scope.space_id, &note).await
                 })
             })
             .await?;
-        if let Some(head) = loaded_opt
-            && head.lifecycle == Lifecycle::Active
-            && let Some(digest) = head.content_digest
-            && let Ok(bytes) = store.read_verified_blob(&space_rec.scope, digest).await
-            && let Ok(carrier) = String::from_utf8(bytes)
-        {
-            virtual_notes.insert(
-                nid,
-                VirtualNoteState {
-                    class: head.doc_class,
-                    slug: head.slug,
-                    carrier,
-                },
-            );
+        if let Some(head) = head {
+            sources
+                .classes
+                .entry(nid.clone())
+                .or_default()
+                .insert(head.doc_class);
+            // A preceding restore can reactivate a trashed head without changing its carrier.
+            if let Some(digest) = head.content_digest
+                && let Some(slot) = sources.bytes.get_mut(&(nid, digest))
+            {
+                let bytes = store.read_verified_blob(&space_rec.scope, digest).await?;
+                slot.carrier = Some(
+                    String::from_utf8(bytes)
+                        .map_err(|e| internal_not_committed("batch_edit_base_utf8", e.to_string()))?
+                        .into(),
+                );
+            }
         }
     }
 
@@ -2498,14 +2587,7 @@ pub(crate) async fn accept_batch_impl(
                             &info.prepared_blob,
                         )
                         .await?;
-                    virtual_notes.insert(
-                        cr.note.clone(),
-                        VirtualNoteState {
-                            class: cr.class,
-                            slug: cr.slug.clone(),
-                            carrier: cr.carrier.clone(),
-                        },
-                    );
+                    sources.remember(&cr.note, info.prepared_blob.digest, &cr.carrier);
                     Ok(build_create_note_intent(
                         &space_rec.scope,
                         space_rec.active_epoch,
@@ -2532,66 +2614,51 @@ pub(crate) async fn accept_batch_impl(
                 }
             }
             BatchItem::Edit(ed) => {
-                let res: Result<PreparedWriteIntent, PortError> = async {
-                    let Some(vstate) = virtual_notes.get(&ed.note).cloned() else {
-                        return Err(DomainError::ResourceNotFound.into());
-                    };
-                    let new_carrier = notarium_syntax::patch::apply(&vstate.carrier, &ed.plan)?;
-                    if vstate.class != DocClass::EncryptedNote {
-                        enforce_protected_frontmatter_unchanged(
-                            &vstate.carrier,
-                            &new_carrier,
-                            vstate.class,
-                        )?;
+                let prepared: Result<PreparedBatchEdit, PortError> = async {
+                    let base = sources
+                        .take_base(&ed.note, ed.plan.base_content_hash)
+                        .ok_or_else(|| DomainError::validation(ValidationReason::SourceMismatch))?;
+                    let next = notarium_syntax::patch::apply(&base, &ed.plan)?;
+                    let blob = PreparedBlobSource::prepare(next.as_bytes(), store.blob_codec())?;
+                    let mut variants = BTreeMap::new();
+                    for &class in sources.classes.get(&ed.note).into_iter().flatten() {
+                        let variant = (|| {
+                            let header = if class == DocClass::EncryptedNote {
+                                None
+                            } else {
+                                enforce_protected_frontmatter_unchanged_with_header(
+                                    &base, &next, class,
+                                )?
+                            };
+                            // An empty fallback marks a title derived from the slug. The
+                            // savepoint fills it from the actual head after any move.
+                            analyze_carrier_metadata(&next, class, "", header, || Ok(blob.clone()))
+                        })();
+                        variants.insert(class, variant);
                     }
-                    let info = analyze_and_prepare_carrier(
-                        &new_carrier,
-                        vstate.class,
-                        &ed.note,
-                        &vstate.slug,
-                        store.blob_codec(),
-                    )?;
-                    let ticket = store
-                        .stage_blob(
-                            &space_rec.scope,
-                            space_rec.active_epoch,
-                            &info.prepared_blob,
-                        )
-                        .await?;
-                    virtual_notes.insert(
-                        ed.note.clone(),
-                        VirtualNoteState {
-                            class: vstate.class,
-                            slug: vstate.slug,
-                            carrier: new_carrier,
-                        },
-                    );
-                    Ok(build_batch_edit_intent(
-                        store,
-                        &space_rec.scope,
-                        space_rec.active_epoch,
-                        idemp.clone(),
-                        ctx.auth().clone(),
-                        item_mut.preconditions,
-                        ed.note,
-                        ed.plan.base_content_hash,
-                        info,
-                        ticket,
-                    ))
+                    let ticket = if variants.values().any(Result::is_ok) {
+                        let ticket = store
+                            .stage_blob(&space_rec.scope, space_rec.active_epoch, &blob)
+                            .await?;
+                        sources.remember(&ed.note, blob.digest, &next);
+                        Some(ticket)
+                    } else {
+                        None
+                    };
+                    Ok(PreparedBatchEdit { variants, ticket })
                 }
                 .await;
-                match res {
-                    Ok(intent) => intents.push(intent),
-                    Err(err) => {
-                        let mut failed = build_failing_item_intent(
-                            &space_rec.scope,
-                            space_rec.active_epoch,
-                            err,
-                        );
-                        failed.idempotency = idemp;
-                        intents.push(failed);
-                    }
-                }
+                intents.push(build_batch_edit_intent(
+                    store,
+                    &space_rec.scope,
+                    space_rec.active_epoch,
+                    idemp,
+                    ctx.auth().clone(),
+                    item_mut.preconditions,
+                    ed.note,
+                    ed.plan.base_content_hash,
+                    prepared,
+                ));
             }
             BatchItem::Delete(del) => {
                 if del.disposition == DeleteDisposition::Purge {
@@ -2601,9 +2668,6 @@ pub(crate) async fn accept_batch_impl(
                         DomainError::validation(ValidationReason::InvalidState).into(),
                     ));
                     continue;
-                }
-                if del.disposition == DeleteDisposition::Trash {
-                    virtual_notes.remove(&del.note);
                 }
                 let disp_tag = match del.disposition {
                     DeleteDisposition::Trash => "trash_note",
@@ -2626,9 +2690,6 @@ pub(crate) async fn accept_batch_impl(
             }
             BatchItem::Move(mv) => match normalize_slug_key(&mv.slug) {
                 Ok(sf) => {
-                    if let Some(vs) = virtual_notes.get_mut(&mv.note) {
-                        vs.slug = mv.slug.clone();
-                    }
                     let fp = format!(
                         "note={}\0parent={}\0slug={}",
                         mv.note.as_str(),
@@ -2666,21 +2727,14 @@ pub(crate) async fn accept_batch_impl(
             &space_rec.scope.space_id,
             intents,
         )
-        .await?;
+        .await
+        .map_err(|error| batch_error(error, false))?;
 
-    let mut out_items = Vec::with_capacity(raw_outcomes.len());
-    for res in raw_outcomes {
-        match res {
-            Ok(stored) => out_items.push(Ok(stored.into_committed())),
-            Err(PortError::Domain(d)) => out_items.push(Err(d)),
-            Err(operational) => return Err(operational),
-        }
-    }
-
-    Ok(BatchResult {
-        items: out_items,
+    batch_results(
+        raw_outcomes,
         committed_high_watermark,
-    })
+        StoredCommittedNoteRevV1::into_committed,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2693,12 +2747,15 @@ fn build_batch_edit_intent(
     preconditions: Preconditions,
     note_id: NoteId,
     expected_base_digest: ContentDigest,
-    info: PreparedCarrierInfo,
-    ticket: crate::blobs::StagedBlobTicket,
+    prepared: Result<PreparedBatchEdit, PortError>,
 ) -> PreparedWriteIntent {
     let scope_cl = scope.clone();
     let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
-    let staged_bytes = ticket.compressed_size;
+    let staged_bytes = prepared
+        .as_ref()
+        .ok()
+        .and_then(|edit| edit.ticket.as_ref())
+        .map_or(0, |ticket| ticket.compressed_size);
 
     PreparedWriteIntent {
         scope: scope.clone(),
@@ -2717,13 +2774,6 @@ fn build_batch_edit_intent(
                 if let Some(prec_rev) = &preconditions.revision
                     && *prec_rev != head.head_rev_id
                 {
-                    return Err(DomainError::RevisionConflict {
-                        current: head.head_rev_id,
-                        lineage: None,
-                    }
-                    .into());
-                }
-                if head.content_digest != Some(expected_base_digest) {
                     return Err(DomainError::RevisionConflict {
                         current: head.head_rev_id,
                         lineage: None,
@@ -2750,6 +2800,30 @@ fn build_batch_edit_intent(
                 )
                 .await?;
                 auth.authorize_direct_write(&facts, &facts)?;
+
+                if head.content_digest != Some(expected_base_digest) {
+                    return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+                }
+                let PreparedBatchEdit {
+                    mut variants,
+                    ticket,
+                } = prepared?;
+                let mut info = variants.remove(&head.doc_class).ok_or_else(|| {
+                    DomainError::RevisionConflict {
+                        current: head.head_rev_id.clone(),
+                        lineage: None,
+                    }
+                })??;
+                let ticket = ticket.ok_or_else(|| {
+                    internal_not_committed(
+                        "missing_batch_edit_ticket",
+                        "valid carrier variant lacks CAS ticket",
+                    )
+                })?;
+                if info.title.is_empty() {
+                    info.title.clone_from(&head.slug);
+                    info.title_fold = normalize_title_key(&head.slug);
+                }
 
                 let seq = item_ctx.alloc_next_seq()?;
                 let new_rev = new_revision_id()?;
@@ -3222,9 +3296,25 @@ pub(crate) async fn link_impl(
         return Ok(replayed.into_committed());
     }
 
+    let intent = prepare_link_intent(store, &ctx, request, &link_line, idemp, None).await?;
+    let stored: StoredCommittedLinkV1 = store.submit_write_command(&ctx.budget, intent).await?;
+    Ok(stored.into_committed())
+}
+
+async fn prepare_link_intent(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    request: Mutation<Link>,
+    link_line: &str,
+    idemp: crate::writer::CommandIdentitySpec,
+    expected_epoch: Option<notarium_core::ids::LeaseEpoch>,
+) -> Result<PreparedWriteIntent, PortError> {
     let (space_rec, base_head) =
-        read_active_note_for_mutation(store, &ctx, &request.input.source, &request.preconditions)
+        read_active_note_for_mutation(store, ctx, &request.input.source, &request.preconditions)
             .await?;
+    if expected_epoch.is_some_and(|epoch| epoch != space_rec.active_epoch) {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     if base_head.doc_class == DocClass::EncryptedNote {
         return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
     }
@@ -3239,7 +3329,7 @@ pub(crate) async fn link_impl(
         internal_not_committed("link_source_utf8", "source carrier not valid UTF-8")
     })?;
 
-    let new_carrier = append_link_line_to_carrier(&base_carrier, base_head.doc_class, &link_line)?;
+    let new_carrier = append_link_line_to_carrier(&base_carrier, base_head.doc_class, link_line)?;
     let info = analyze_and_prepare_carrier(
         &new_carrier,
         base_head.doc_class,
@@ -3255,7 +3345,7 @@ pub(crate) async fn link_impl(
         )
         .await?;
 
-    let intent = build_link_item_intent(
+    Ok(build_link_item_intent(
         store,
         &space_rec.scope,
         space_rec.active_epoch,
@@ -3266,143 +3356,190 @@ pub(crate) async fn link_impl(
         base_digest,
         info,
         ticket,
-    );
+    ))
+}
 
-    let stored: StoredCommittedLinkV1 = store.submit_write_command(&ctx.budget, intent).await?;
-    Ok(stored.into_committed())
+// Preserve the underlying diagnostic and error category. A failed item cannot speak
+// for a neighbor which committed, replayed, or has an unknown commit outcome.
+fn batch_error(error: PortError, has_other_outcome: bool) -> PortError {
+    use notarium_core::error::{CommitEffect, OperationalFailure, RetryAdvice};
+    if !has_other_outcome && !has_commit_outcome::<()>(&Err(error.clone())) {
+        return error;
+    }
+    let change = |failure: OperationalFailure| {
+        OperationalFailure::new(
+            failure.diagnostic_ref(),
+            CommitEffect::Unknown,
+            RetryAdvice::RetrySameCommand,
+            true,
+        )
+        .expect("batch items carry stable command identities")
+    };
+    match error {
+        PortError::Unavailable(failure) => PortError::Unavailable(change(failure)),
+        PortError::Internal(failure) => PortError::Internal(change(failure)),
+        PortError::Cancelled(failure) => PortError::Cancelled(change(failure)),
+        PortError::DeadlineExceeded(failure) => PortError::DeadlineExceeded(change(failure)),
+        PortError::Domain(error) => {
+            crate::codec::unknown_commit_outcome("batch_interrupted", error.code())
+        }
+    }
+}
+
+fn has_commit_outcome<T>(item: &Result<T, PortError>) -> bool {
+    use notarium_core::error::CommitEffect;
+    match item {
+        Ok(_) => true,
+        Err(PortError::Domain(_)) => false,
+        Err(
+            PortError::Unavailable(f)
+            | PortError::Internal(f)
+            | PortError::Cancelled(f)
+            | PortError::DeadlineExceeded(f),
+        ) => f.effect() == CommitEffect::Unknown,
+    }
+}
+
+fn batch_results<S, T>(
+    raw: Vec<Result<S, PortError>>,
+    committed_high_watermark: SpaceSeq,
+    convert: impl Fn(S) -> Committed<T>,
+) -> Result<BatchResult<T>, PortError> {
+    let may_have_committed = raw.iter().any(has_commit_outcome);
+    let mut items = Vec::with_capacity(raw.len());
+    for result in raw {
+        items.push(match result {
+            Ok(row) => Ok(convert(row)),
+            Err(PortError::Domain(domain)) => Err(domain),
+            Err(error) => return Err(batch_error(error, may_have_committed)),
+        });
+    }
+    Ok(BatchResult {
+        items,
+        committed_high_watermark,
+    })
 }
 
 pub(crate) async fn link_many_impl(
     store: &CanonicalStore,
-    ctx: SpaceContext,
+    mut ctx: SpaceContext,
     request: LinkBatch,
 ) -> Result<BatchResult<Link>, PortError> {
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
-    space_rec.scope.check(ctx.scope())?;
-
-    if request.items.is_empty() {
-        return Ok(BatchResult {
-            items: Vec::new(),
-            committed_high_watermark: space_rec.last_seq,
-        });
-    }
-
-    let mut virtual_sources: HashMap<NoteId, (DocClass, String, String, ContentDigest)> =
-        HashMap::new();
-    for item in &request.items {
-        if !virtual_sources.contains_key(&item.input.source) {
-            let scope_in = space_rec.scope.clone();
-            let src_id = item.input.source.clone();
-            let head_opt = store
-                .with_read_tx_budget(Some(&ctx.budget), |tx| {
-                    Box::pin(async move {
-                        if is_note_purge_fenced_tx(tx, &scope_in.space_id, src_id.as_str()).await? {
-                            return Ok(None);
-                        }
-                        load_note_head_row_opt_tx(tx, &scope_in.space_id, &src_id).await
-                    })
-                })
-                .await?;
-            if let Some(head) = head_opt
-                && head.lifecycle == Lifecycle::Active
-                && let Some(digest) = head.content_digest
-                && let Ok(bytes) = store.read_verified_blob(&space_rec.scope, digest).await
-                && let Ok(carrier) = String::from_utf8(bytes)
-            {
-                virtual_sources.insert(
-                    item.input.source.clone(),
-                    (head.doc_class, head.slug, carrier, digest),
-                );
+    let deadline = tokio::time::Instant::now() + ctx.budget.remaining;
+    let space = store.read_space(&ctx.scope().space_id).await?;
+    space.scope.check(ctx.scope())?;
+    let keys = request
+        .items
+        .iter()
+        .map(|item| item.identity.key.as_str().to_owned())
+        .collect();
+    let receipts = batch_receipt_hashes(store, &ctx, keys).await?;
+    let mut pending = request.items.into_iter().peekable();
+    let mut outcomes = Vec::with_capacity(pending.len());
+    let mut high_watermark = space.last_seq;
+    while pending.peek().is_some() {
+        let mut sources = HashSet::new();
+        let mut intents = Vec::new();
+        while let Some(next) = pending.peek() {
+            // Appending a link has an implicit base. Only a repeated source needs
+            // the preceding savepoint's durable result before it can stage its bytes.
+            if !sources.insert(next.input.source.clone()) {
+                break;
             }
+            let item = pending.next().expect("peeked");
+            let result = prepare_link_batch_item(store, &ctx, &space, item, &receipts).await;
+            intents.push(match result {
+                Ok(intent) => intent,
+                Err(error) => build_failing_item_intent(&space.scope, space.active_epoch, error),
+            });
         }
-    }
-
-    let mut intents = Vec::with_capacity(request.items.len());
-    for item_mut in request.items {
-        let res: Result<PreparedWriteIntent, PortError> = async {
-            validate_mutation_identity(&ctx, &item_mut.identity)?;
-            let link_line = validate_and_format_link_line(&item_mut.input)?;
-            let Some((doc_class, slug, cur_carrier, cur_digest)) =
-                virtual_sources.get(&item_mut.input.source).cloned()
-            else {
-                return Err(DomainError::ResourceNotFound.into());
-            };
-            if doc_class == DocClass::EncryptedNote {
-                return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
+        ctx.budget.remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if ctx.budget.remaining.is_zero() {
+            return Err(batch_error(
+                crate::codec::deadline_not_committed(
+                    "link_many_deadline",
+                    "deadline before group admission",
+                ),
+                outcomes.iter().any(has_commit_outcome),
+            ));
+        }
+        let group = store
+            .submit_write_batch::<StoredCommittedLinkV1>(
+                &ctx.budget,
+                &space.scope.space_id,
+                intents,
+            )
+            .await;
+        match group {
+            Ok((items, cut)) => {
+                high_watermark = cut;
+                outcomes.extend(items);
             }
-            let new_carrier = append_link_line_to_carrier(&cur_carrier, doc_class, &link_line)?;
-            let info = analyze_and_prepare_carrier(
-                &new_carrier,
-                doc_class,
-                &item_mut.input.source,
-                &slug,
-                store.blob_codec(),
-            )?;
-            let new_digest = info.prepared_blob.digest;
-            let ticket = store
-                .stage_blob(
-                    &space_rec.scope,
-                    space_rec.active_epoch,
-                    &info.prepared_blob,
-                )
-                .await?;
-            let fp = format!(
-                "src={}\0base={}\0line={link_line}",
-                item_mut.input.source.as_str(),
-                cur_digest.to_hex()
-            );
-            let idemp = derive_command_identity_spec(&item_mut.identity, "link", fp.as_bytes())
-                .for_link(ctx.auth(), &item_mut.input.source, &item_mut.input.target);
-            virtual_sources.insert(
-                item_mut.input.source.clone(),
-                (doc_class, slug, new_carrier, new_digest),
-            );
-            Ok(build_link_item_intent(
-                store,
-                &space_rec.scope,
-                space_rec.active_epoch,
-                Some(idemp),
-                ctx.auth().clone(),
-                item_mut.preconditions,
-                item_mut.input,
-                cur_digest,
-                info,
-                ticket,
-            ))
-        }
-        .await;
-
-        match res {
-            Ok(intent) => intents.push(intent),
-            Err(err) => intents.push(build_failing_item_intent(
-                &space_rec.scope,
-                space_rec.active_epoch,
-                err,
-            )),
+            Err(error) => return Err(batch_error(error, outcomes.iter().any(has_commit_outcome))),
         }
     }
+    batch_results(
+        outcomes,
+        high_watermark,
+        StoredCommittedLinkV1::into_committed,
+    )
+}
 
-    let (raw_outcomes, committed_high_watermark) = store
-        .submit_write_batch::<StoredCommittedLinkV1>(
-            &ctx.budget,
-            &space_rec.scope.space_id,
-            intents,
+async fn prepare_link_batch_item(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    space: &crate::runtime::SpaceRecord,
+    item: Mutation<Link>,
+    receipts: &HashMap<String, Vec<u8>>,
+) -> Result<PreparedWriteIntent, PortError> {
+    validate_mutation_identity(ctx, &item.identity)?;
+    let line = validate_and_format_link_line(&item.input)?;
+    let kind = match item.input.target {
+        LinkTarget::Note(_) => "note",
+        LinkTarget::Folder(_) => "folder",
+        LinkTarget::AuthoredName(_) => "authored",
+    };
+    let mut hash = blake3::Hasher::new();
+    for part in [item.input.source.as_str(), kind, &line] {
+        hash.update(part.as_bytes());
+        hash.update(&[0]);
+    }
+    hash_preconditions(&mut hash, &item.preconditions);
+    let spec = derive_command_identity_spec(&item.identity, "link", hash.finalize().as_bytes())
+        .for_link(ctx.auth(), &item.input.source, &item.input.target);
+    if let Some(hash) = receipts.get(item.identity.key.as_str()) {
+        let spec = if hash == spec.command_hash.as_bytes().as_slice() {
+            spec
+        } else {
+            v1_receipts::link_batch_identity(store, ctx, &item, &line, spec).await?
+        };
+        let mut replay = build_failing_item_intent(
+            &space.scope,
+            space.active_epoch,
+            DomainError::ResourceNotFound.into(),
+        );
+        replay.idempotency = Some(spec);
+        return Ok(replay);
+    }
+    Ok(
+        match prepare_link_intent(
+            store,
+            ctx,
+            item,
+            &line,
+            spec.clone(),
+            Some(space.active_epoch),
         )
-        .await?;
-
-    let mut out_items = Vec::with_capacity(raw_outcomes.len());
-    for res in raw_outcomes {
-        match res {
-            Ok(stored) => out_items.push(Ok(stored.into_committed())),
-            Err(PortError::Domain(d)) => out_items.push(Err(d)),
-            Err(operational) => return Err(operational),
-        }
-    }
-
-    Ok(BatchResult {
-        items: out_items,
-        committed_high_watermark,
-    })
+        .await
+        {
+            Ok(intent) => intent,
+            Err(error) => {
+                let mut failed = build_failing_item_intent(&space.scope, space.active_epoch, error);
+                failed.idempotency = Some(spec);
+                failed
+            }
+        },
+    )
 }
 
 fn append_link_line_to_carrier(
@@ -3959,15 +4096,27 @@ pub(crate) async fn accept_external_observation_impl(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                let _fence_guard = if let Some(res) = reservation_opt {
-                    Some(
-                        room_fences
-                            .consume_reservation(&scope_cl, &obs_input.note, res, &identity)
-                            .await?,
+                let room_state = if let Some(res) = reservation_opt {
+                    let guard = room_fences
+                        .consume_reservation(&scope_cl, &obs_input.note, res, &identity)
+                        .await?;
+                    item_ctx.retain_until_batch_commit(guard);
+                    crate::domain::common::durable_note_room_state_tx(
+                        tx,
+                        &scope_cl.space_id,
+                        &obs_input.note,
                     )
+                    .await?
                 } else {
-                    None
+                    crate::domain::common::check_note_room_direct_write_tx(
+                        tx,
+                        &room_fences,
+                        &scope_cl,
+                        &obs_input.note,
+                    )
+                    .await?
                 };
+                let has_closed_room = room_state.require_writable()?;
 
                 let live_space = load_space_record(tx, &scope_cl.space_id).await?;
                 let head = load_note_head_row_tx(tx, &scope_cl.space_id, &obs_input.note).await?;
@@ -4023,6 +4172,16 @@ pub(crate) async fn accept_external_observation_impl(
                 )
                 .await?;
 
+                if has_closed_room {
+                    crate::domain::common::sync_closed_collab_session_on_direct_write_tx(
+                        tx,
+                        &scope_cl.space_id,
+                        &obs_input.note,
+                        &new_rev,
+                        seq,
+                    )
+                    .await?;
+                }
                 let rel_path = if anc.folder_path.is_empty() {
                     format!("{}.md", head.slug)
                 } else {
@@ -4408,6 +4567,8 @@ pub(crate) async fn update_space_schema_impl(
     let preconditions = request.preconditions.clone();
     let input = request.input;
 
+    let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
+    let schema_identity = request.identity;
     let intent = PreparedWriteIntent {
         scope: scope_cl.clone(),
         active_epoch: space_rec.active_epoch,
@@ -4431,6 +4592,32 @@ pub(crate) async fn update_space_schema_impl(
                 )
                 .await?;
 
+                let (mut guard, reservation) = room_fences
+                    .try_lock_closed_for_rollback(&scope_cl, &input.schema_note, &schema_identity)
+                    .await?
+                    .ok_or_else(|| {
+                        unavailable_retryable(
+                            "collab_room_not_closed",
+                            "schema note has an active collaborative room",
+                            std::time::Duration::from_millis(50),
+                        )
+                    })?;
+                guard.consume(reservation, &schema_identity)?;
+                item_ctx.retain_until_batch_commit(guard);
+                let has_closed_room = crate::domain::common::durable_note_room_state_tx(
+                    tx,
+                    &scope_cl.space_id,
+                    &input.schema_note,
+                )
+                .await?
+                .require_writable()?;
+                check_collab_preconditions_tx(
+                    tx,
+                    &scope_cl.space_id,
+                    &input.schema_note,
+                    &preconditions,
+                )
+                .await?;
                 let current_schema = load_current_space_schema_tx(tx, &scope_cl.space_id).await?;
                 match (&current_schema, &input.expected_schema_revision) {
                     (Some(cur), exp_opt) if exp_opt.as_ref() != Some(&cur.schema_revision) => {
@@ -4638,6 +4825,16 @@ pub(crate) async fn update_space_schema_impl(
                     "create"
                 };
 
+                if has_closed_room {
+                    crate::domain::common::sync_closed_collab_session_on_direct_write_tx(
+                        tx,
+                        &scope_cl.space_id,
+                        &input.schema_note,
+                        &note_rev,
+                        seq,
+                    )
+                    .await?;
+                }
                 // Atomically flip `space_field_schemas` current head!
                 match tx {
                     BackendConn::Sqlite(conn) => {
@@ -5412,14 +5609,6 @@ pub(crate) async fn try_replay_completed_receipt<R: serde::de::DeserializeOwned>
         }
         None => Ok(None),
     }
-}
-
-fn enforce_protected_frontmatter_unchanged(
-    before: &str,
-    after: &str,
-    class: DocClass,
-) -> Result<(), PortError> {
-    enforce_protected_frontmatter_unchanged_with_header(before, after, class).map(|_| ())
 }
 
 type PreparsedHeaderTuple = (

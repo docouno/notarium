@@ -478,6 +478,15 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version < 3 {
+                sqlx::raw_sql(
+                    "DROP TABLE collab_checkpoints;
+                     ALTER TABLE backup_holds DROP COLUMN owner_generation",
+                )
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
             if decoded.schema_version == 1 {
                 sqlx::raw_sql(
                     "DROP TABLE account_catalog_receipts;
@@ -576,43 +585,193 @@ fn backup_test_space(byte: u8) -> CreateSpaceSpec {
 }
 
 #[tokio::test]
-async fn restores_a_postgres_schema_v1_spool_and_rejects_invalid_headers() {
-    // Output of the schema 1 PostgreSQL participant with one synthetic shared Space and root.
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/schema-v1.pgspool");
-    let decoded = decode_postgres_spool_v1(&fixture).unwrap();
-    assert_eq!(decoded.schema_version, 1);
-    assert_eq!(decoded.witness.installation, sample_installation_id(1));
-    assert_eq!(decoded.tables.len(), 34);
-    let queue = decoded
-        .tables
-        .iter()
-        .find(|t| t.name == "chat_pending_inputs")
+async fn disconnected_pg_hold_cannot_confirm_or_release_its_successor() {
+    let case = BackendCase::open_pg_s3_with_pool(1).await;
+    case.store
+        .create_space(backup_test_space(0xC4))
+        .await
         .unwrap();
-    assert_eq!(queue.columns.len(), 13);
-    assert_eq!(queue.columns.last().unwrap(), "consumed_entry_seq");
-    let cut = decoded.witness.histories.first().unwrap();
-    assert_eq!(cut.scope.space_id, sample_space_id(11));
+    let (fixtures, schema) = case.pg_cleanup.as_ref().unwrap();
+    let mut sql = fixtures.open_raw_pg().await;
+    let read_generation =
+        format!("SELECT owner_generation FROM {schema}.backup_holds WHERE backup_id=$1");
+    let budget = case.store.default_backup_budget();
+    let id = BackupId::from_bytes([0xC4; 16]);
+    for phase in ["before_pin", "before_spool", "during_copy"] {
+        let mut old = case
+            .store
+            .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
+            .await
+            .unwrap();
+        let old_hold = old.acquire_hold().await.unwrap();
+        let mut snapshot = if phase == "before_pin" {
+            None
+        } else {
+            let mut pause = old.pause_writes().await.unwrap();
+            let mut snapshot = pause.open_cut().await.unwrap();
+            pause.resume().await.unwrap();
+            if phase == "during_copy" {
+                snapshot
+                    .spool(budget, Cancellation::default())
+                    .await
+                    .unwrap();
+            }
+            Some(snapshot)
+        };
+        let generation: String = sqlx::query_scalar(sqlx::AssertSqlSafe(&*read_generation))
+            .bind(id.as_str())
+            .fetch_one(&mut sql)
+            .await
+            .unwrap();
+        assert!(ArtifactId::parse_v1(&generation).is_ok());
+        // Only terminate the dedicated backend tagged with this test's freshly minted generation.
+        let terminated: Vec<bool> = sqlx::query_scalar(
+            "SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity
+             WHERE application_name = $1 AND datname = current_database() AND usename = current_user",
+        ).bind(&generation).fetch_all(&mut sql).await.unwrap();
+        assert_eq!(terminated, [true]);
 
-    let case = BackendCase::open_pg_s3().await;
-    let config = case
-        .restored_config(&fixture, &case.temp_root.data_root())
-        .await;
-    let (restored, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
-    let space = restored.get_space(&cut.scope.space_id).await.unwrap();
-    assert_eq!(space.scope, cut.scope);
-    assert_eq!(space.last_seq, cut.after);
-    assert_eq!(space.slug, "review-space");
-    runtime.shutdown().await.unwrap();
-    if let SqlBackendConfig::Postgres { schema, .. } = config.sql {
-        case.pg_cleanup
-            .as_ref()
-            .unwrap()
-            .0
-            .drop_pg_schema(&schema)
-            .await;
+        let (peer, runtime) = CanonicalRuntime::open(case.config.clone()).await.unwrap();
+        let mut next = peer
+            .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
+            .await
+            .unwrap();
+        let next_hold = next.acquire_hold().await.unwrap();
+        let next_generation: String = sqlx::query_scalar(sqlx::AssertSqlSafe(&*read_generation))
+            .bind(id.as_str())
+            .fetch_one(&mut sql)
+            .await
+            .unwrap();
+        assert_ne!(generation, next_generation);
+        match snapshot.as_mut() {
+            None => {
+                let mut pause = old.pause_writes().await.unwrap();
+                assert!(pause.open_cut().await.is_err());
+                pause.resume().await.unwrap();
+            }
+            Some(snapshot) if phase == "before_spool" => {
+                assert!(
+                    snapshot
+                        .spool(budget, Cancellation::default())
+                        .await
+                        .is_err()
+                );
+            }
+            Some(_) => {}
+        }
+        if let Some(snapshot) = snapshot {
+            snapshot.close().await.unwrap();
+        }
+        assert!(
+            old_hold.release().await.is_err(),
+            "an external CAS copy may only commit after the original owner confirms"
+        );
+        let remaining: String = sqlx::query_scalar(sqlx::AssertSqlSafe(&*read_generation))
+            .bind(id.as_str())
+            .fetch_one(&mut sql)
+            .await
+            .unwrap();
+        assert_eq!(remaining, next_generation);
+        let mut paused = next.pause_writes().await.unwrap();
+        let snap = paused.open_cut().await.unwrap();
+        paused.resume().await.unwrap();
+        snap.close().await.unwrap();
+        next_hold.release().await.unwrap();
+        drop(next);
+        drop(old);
+        runtime.shutdown().await.unwrap();
     }
+    case.shutdown().await;
+}
 
-    let original = fs::read(&fixture).unwrap();
+#[tokio::test]
+async fn failed_temp_unlink_retains_its_recovery_marker() {
+    let case = BackendCase::open_pg_s3().await;
+    let id = BackupId::from_bytes([0xCA; 16]);
+    let budget = case.store.default_backup_budget();
+    for ext in ["tmp", "tmp-journal", "tmp-wal", "tmp-shm"] {
+        let prepared = case
+            .store
+            .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
+            .await
+            .unwrap();
+        let marker = fs::read_dir(&case.spool_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "pending"))
+            .unwrap();
+        let blocker = marker.with_extension(ext);
+        if blocker.exists() {
+            fs::remove_file(&blocker).unwrap();
+        }
+        // unlink on a directory fails without relying on effective user privileges.
+        fs::create_dir(&blocker).unwrap();
+        drop(prepared);
+        assert!(marker.exists(), "drop lost its retry marker for {ext}");
+        assert!(
+            case.store
+                .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
+                .await
+                .is_err()
+        );
+        assert!(marker.exists(), "recovery lost its retry marker for {ext}");
+        fs::remove_dir(&blocker).unwrap();
+        fs::write(&blocker, b"interrupted sensitive spill").unwrap();
+        let recovered = case
+            .store
+            .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
+            .await
+            .unwrap();
+        assert!(!marker.exists() && !blocker.exists());
+        drop(recovered);
+    }
+    case.shutdown().await;
+}
+
+#[tokio::test]
+async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
+    // Both files came from their version's PostgreSQL participant with a single synthetic Space.
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let case = BackendCase::open_pg_s3().await;
+    for (version, install, space_id, slug, table_count, queue_columns) in [
+        (1, 1, 11, "review-space", 34, 13),
+        (2, 0x62, 0xB2, "backup-178", 35, 14),
+    ] {
+        let fixture = directory.join(format!("schema-v{version}.pgspool"));
+        let decoded = decode_postgres_spool_v1(&fixture).unwrap();
+        assert_eq!(decoded.schema_version, version);
+        assert_eq!(
+            decoded.witness.installation,
+            sample_installation_id(install)
+        );
+        assert_eq!(decoded.tables.len(), table_count);
+        let queue = decoded
+            .tables
+            .iter()
+            .find(|t| t.name == "chat_pending_inputs")
+            .unwrap();
+        assert_eq!(queue.columns.len(), queue_columns);
+        let cut = decoded.witness.histories.first().unwrap();
+        assert_eq!(cut.scope.space_id, sample_space_id(space_id));
+        let config = case
+            .restored_config(&fixture, &case.temp_root.data_root())
+            .await;
+        let (restored, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
+        let space = restored.get_space(&cut.scope.space_id).await.unwrap();
+        assert_eq!(space.scope, cut.scope);
+        assert_eq!(space.last_seq, cut.after);
+        assert_eq!(space.slug, slug);
+        runtime.shutdown().await.unwrap();
+        if let SqlBackendConfig::Postgres { schema, .. } = config.sql {
+            case.pg_cleanup
+                .as_ref()
+                .unwrap()
+                .0
+                .drop_pg_schema(&schema)
+                .await;
+        }
+    }
+    let original = fs::read(directory.join("schema-v1.pgspool")).unwrap();
     let invalid = case.temp_root.path().join("invalid.pgspool");
     let version_offset = notarium_canonical::backup::POSTGRES_SPOOL_V1_MAGIC.len();
     let checksum_offset = version_offset + 4;
@@ -627,7 +786,7 @@ async fn restores_a_postgres_schema_v1_spool_and_rejects_invalid_headers() {
     for (offset, replacement, reason) in [
         (
             version_offset,
-            3u32.to_be_bytes().to_vec(),
+            u32::MAX.to_be_bytes().to_vec(),
             ValidationReason::InvalidState,
         ),
         (

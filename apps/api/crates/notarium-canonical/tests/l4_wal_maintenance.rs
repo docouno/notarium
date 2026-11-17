@@ -29,6 +29,47 @@ use crate::support::{
 const STUCK_RECURSIVE_SQL: &str = "WITH RECURSIVE spin(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM spin WHERE x < 500000000) \
      SELECT count(*) FROM spin";
 
+#[tokio::test]
+async fn sqlx_commit_after_restart_reuses_wal_without_closing_admission_again() {
+    let temp = TempDataRoot::new("l4-retained-wal");
+    let mut config = CanonicalConfig::local_default(sample_installation_id(0x49), temp.data_root());
+    let SqlBackendConfig::Sqlite {
+        passive_checkpoint_interval,
+        wal_soft_watermark_bytes,
+        wal_high_watermark_bytes,
+        ..
+    } = &mut config.sql
+    else {
+        unreachable!()
+    };
+    const HIGH: u64 = 3 * 1024 * 1024;
+    *passive_checkpoint_interval = Duration::from_secs(600);
+    *wal_soft_watermark_bytes = 2 * 1024 * 1024;
+    *wal_high_watermark_bytes = HIGH;
+
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    store
+        .execute_diagnostic_write_sql_for_test(
+            "CREATE TABLE wal_reuse AS SELECT zeroblob(4194304) AS payload",
+        )
+        .await
+        .unwrap();
+    store.run_wal_maintenance_now(false).await;
+    let after_restart = store.wal_telemetry().unwrap();
+    assert_eq!(after_restart.reset_successes, 1);
+    assert!(after_restart.wal_bytes >= HIGH);
+
+    store
+        .execute_diagnostic_write_sql_for_test("INSERT INTO wal_reuse VALUES (X'01')")
+        .await
+        .unwrap();
+    store.run_wal_maintenance_now(false).await;
+    let reused = store.wal_telemetry().unwrap();
+    assert!(reused.wal_bytes >= HIGH);
+    assert_eq!(reused.reset_attempts, after_restart.reset_attempts);
+    runtime.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn overlapping_readers_and_heavy_writes_trigger_bounded_wal_reset_with_zero_busy() {
     let temp = TempDataRoot::new("l4-wal-overlap");

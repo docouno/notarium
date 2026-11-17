@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 2;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {
@@ -409,6 +409,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("cutoff_seq", Int, false),
             col("witness_json", Text, false),
             col("created_at_ms", Int, false),
+            col("owner_generation", Text, false),
         ],
         indexes: &["idx_backup_holds_space"],
     },
@@ -737,6 +738,18 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("command_key", Text, false),
             col("request_hash", Bytes, false),
             col("result_msgpack", Bytes, true),
+        ],
+        indexes: &[],
+    },
+    TableSpec {
+        name: "collab_checkpoints",
+        primary_key: &["space_id", "note_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("note_id", Text, false),
+            col("snapshot_lease_epoch", Int, false),
+            col("snapshot_update_seq", Int, false),
+            col("carrier_dirty", Int, false),
         ],
         indexes: &[],
     },

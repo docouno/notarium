@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+#[path = "l5_domain_security_and_purge/batch.rs"]
+mod batch;
+#[path = "l5_domain_security_and_purge/collab_schema.rs"]
+mod collab_schema;
 mod support;
 
 use notarium_canonical::blobs::s3::{ReqwestS3Transport, S3RawRequest, S3RawResponse, S3Transport};
@@ -22,7 +26,8 @@ use notarium_core::{
     error::{CommitEffect, PortError, ValidationReason},
     ids::{
         AbilityId, AgentRunId, CommandKey, ContentDigest, FolderId, GrantId, HistoryIncarnation,
-        LeaseEpoch, NoteId, PrincipalId, ProjectionGeneration, RequestId, RevisionId, SpaceId, SpaceSeq,
+        LeaseEpoch, NoteId, PrincipalId, ProjectionGeneration, RequestId, RevisionId, SpaceId,
+        SpaceSeq,
     },
     model::{AbilityResourceName, FolderRef, HistoryScope, NoteRef, SnapshotCut},
     ports::{
@@ -917,6 +922,8 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
         "forged identical caller hash on distinct input must trigger IdempotencyKeyReused, got {forged_res:?}"
     );
 
+    batch::check(store, &ctx, &scope, &owner, gate.is_some()).await;
+
     // 5. `accept_batch`: intra-batch `Create(N) -> Edit(N)` + per-item savepoint isolation.
     let batch_note = sample_note_id(24);
     let batch_carrier = "---\ntitle: Batch Item\n---\n# Batch Item\n\nStep one.\n";
@@ -1203,25 +1210,16 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
             nullable: true,
         },
     );
-    let schema_committed: notarium_core::ports::Committed<SpaceSchemaRevision> = store
-        .update_space_schema(
-            ctx.clone(),
-            next_mutation(
-                &scope,
-                &owner,
-                UpdateSpaceSchema {
-                    schema_note: schema_note_id,
-                    parent: None,
-                    slug: "space-schema".to_owned(),
-                    carrier: "---\ntitle: Space Schema\n---\n# Space Schema\n".to_owned(),
-                    schema: schema_map,
-                    expected_schema_revision: None,
-                },
-            ),
-        )
-        .await
-        .expect("update_space_schema");
-
+    let schema_input = UpdateSpaceSchema {
+        schema_note: schema_note_id,
+        parent: None,
+        slug: "space-schema".to_owned(),
+        carrier: "---\ntitle: Space Schema\n---\n# Space Schema\n".to_owned(),
+        schema: schema_map,
+        expected_schema_revision: None,
+    };
+    let schema_committed =
+        collab_schema::write_and_reconcile_schema(store, &ctx, &scope, &owner, schema_input).await;
     let resolved_eff = store
         .resolve_receipt_effects(
             &scope,
@@ -1367,6 +1365,98 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
         .await
         .expect("publish_ability_package v1");
 
+    let project_b = sample_folder_id(95);
+    store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: epoch,
+            folder_id: project_b.clone(),
+            parent: None,
+            slug: "ability-project-b".into(),
+            display_name: "Ability Project B".into(),
+            is_project: true,
+            project_slug: Some("ability-project-b".into()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let relocate = |parent: &FolderId| {
+        store.move_note(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveNote {
+                    note: skill_entry_note.clone(),
+                    parent: Some(parent.clone()),
+                    slug: "audit-skill".into(),
+                },
+            ),
+        )
+    };
+    relocate(&project_b).await.unwrap();
+
+    let project_reader = |project: &FolderId| {
+        make_human_ctx(
+            &scope,
+            viewer.clone(),
+            SpaceGrant {
+                role: SpaceRole::Viewer,
+                read_classes: BTreeSet::from([DocClass::Skill]),
+                write_classes: BTreeSet::new(),
+                project_root: Some(project.clone()),
+            },
+            false,
+            false,
+        )
+    };
+    let b_reader = project_reader(&project_b);
+    let placed = |revision: &RevisionId| notarium_core::ports::AbilityRef {
+        id: ability_id.clone(),
+        revision: revision.clone(),
+        placement: notarium_core::ports::AbilityPlacement::OwnedProject(FolderRef {
+            space_id: scope.space_id.clone(),
+            folder_id: project_b.clone(),
+        }),
+    };
+    let account = |reader: &SpaceContext| {
+        notarium_core::ports::AccountContext::new(reader.auth().clone(), make_budget())
+    };
+    let historical_resource = ReadAbilityResource {
+        ability: ability_id.clone(),
+        package_revision: pkg_v1.value.revision.clone(),
+        resource: AbilityResourceName::Auxiliary("scripts/helper.py".into()),
+    };
+    let authorized = store
+        .read_ability_resource(ctx.clone(), historical_resource.clone())
+        .await
+        .unwrap();
+    assert_eq!(authorized.explicit_read(ctx.auth()).unwrap(), helper_v1);
+    for reader in [project_reader(&proj_a), b_reader.clone()] {
+        let descriptor = notarium_core::ports::ControlCatalogPort::ability(
+            store,
+            account(&reader),
+            placed(&pkg_v1.value.revision),
+        )
+        .await;
+        assert!(matches!(
+            descriptor,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+        let denied = store
+            .read_ability_resource(reader.clone(), historical_resource.clone())
+            .await;
+        assert!(matches!(
+            denied,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+        assert!(matches!(
+            authorized.explicit_read(reader.auth()),
+            Err(DomainError::ResourceNotFound)
+        ));
+    }
+
     let pkg_v2 = store
         .publish_ability_package(
             ctx.clone(),
@@ -1384,6 +1474,27 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
         )
         .await
         .expect("publish_ability_package v2 without helper.py");
+
+    notarium_core::ports::ControlCatalogPort::ability(
+        store,
+        account(&b_reader),
+        placed(&pkg_v2.value.revision),
+    )
+    .await
+    .unwrap();
+    let current = store
+        .read_ability_resource(
+            b_reader.clone(),
+            ReadAbilityResource {
+                ability: ability_id.clone(),
+                package_revision: pkg_v2.value.revision.clone(),
+                resource: AbilityResourceName::Entrypoint,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.explicit_read(b_reader.auth()).unwrap(), skill_md_v1);
+    relocate(&proj_a).await.unwrap();
 
     // Exact package_revision read: v1 serves Entrypoint + `scripts/helper.py`, while v2 returns `ResourceNotFound` for `scripts/helper.py`!
     let res_v1_entry = store
@@ -1545,7 +1656,7 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
         &scope,
         &owner,
         UpdateSpaceSchema {
-            schema_note: replay_note,
+            schema_note: replay_note.clone(),
             parent: None,
             slug: "schema-relocation".into(),
             carrier: "# Schema relocation\n".into(),
@@ -1627,6 +1738,76 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
     assert!(
         outside_proj_write.is_err(),
         "project_root pin must block outside writes"
+    );
+
+    let mover = sample_run_id(208);
+    let move_auth = ctx
+        .auth()
+        .for_agent_run(
+            mover.clone(),
+            scope.space_id.clone(),
+            ChatAudience::Personal,
+            ctx.auth().spaces().clone(),
+        )
+        .unwrap();
+    let moved = store
+        .move_note(
+            SpaceContext::new(move_auth, scope.clone(), make_budget()).unwrap(),
+            next_mutation(
+                &scope,
+                &owner,
+                MoveNote {
+                    note: replay_note,
+                    parent: Some(archive_root.clone()),
+                    slug: "current-rollback-authority".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let revision = store
+        .inspect_agent_run_revision_for_test(&scope.space_id, &mover)
+        .await
+        .unwrap()
+        .unwrap();
+    let rollback = next_mutation(
+        &scope,
+        &owner,
+        notarium_core::ports::RollbackAgentRun {
+            run: mover,
+            expected_run_revision: revision,
+            expected_entities: vec![moved.value],
+            associated_board_expectations: Vec::new(),
+        },
+    );
+    store
+        .set_folder_write_lock(ctx.clone(), archive_root.clone(), true)
+        .await
+        .unwrap();
+    let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    assert!(matches!(
+        store
+            .rollback_agent_run(ctx.clone(), rollback.clone())
+            .await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        before
+    );
+    store
+        .set_folder_write_lock(ctx.clone(), archive_root.clone(), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .rollback_agent_run(ctx.clone(), rollback)
+            .await
+            .unwrap()
+            .value
+            .restored
+            .len(),
+        1
     );
 
     // Tainted agent run (`CrossSpaceTainted`) cannot write!

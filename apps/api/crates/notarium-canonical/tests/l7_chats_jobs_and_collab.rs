@@ -5,7 +5,7 @@ mod support;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -15,7 +15,10 @@ use notarium_canonical::{
     AppendCollabUpdate, CanonicalConfig, CanonicalRuntime, CanonicalStore, CheckpointCollabSession,
     CloseCollabSession, CollabCarrierSettlement, CollabRoomState, CreateFolderSpec,
     CreateSpaceSpec, JobCompletionOutcome, OpenCollabSession, RoomFenceTable, S3BucketModePolicy,
-    blobs::s3::admin_ensure_bucket,
+    blobs::{
+        TerminalMarkerMeta,
+        s3::{ReqwestS3Transport, S3RawRequest, S3RawResponse, S3Transport, admin_ensure_bucket},
+    },
 };
 use notarium_core::{
     DomainError,
@@ -200,10 +203,132 @@ impl LiveCollabInterceptor for TestCollabInterceptor {
     }
 }
 
+#[derive(Debug)]
+struct QueueS3Audit {
+    origin: ReqwestS3Transport,
+    puts: Mutex<Vec<(blake3::Hash, String)>>,
+    pause: Mutex<Option<(blake3::Hash, Arc<tokio::sync::Barrier>)>>,
+    takeover: Mutex<Option<PausedQueuePut>>,
+}
+
+#[derive(Debug)]
+struct PausedQueuePut {
+    hash: blake3::Hash,
+    uploaded: bool,
+    reached: tokio::sync::oneshot::Sender<(String, Option<String>)>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl QueueS3Audit {
+    fn new(config: &notarium_canonical::S3Config) -> Self {
+        Self {
+            origin: ReqwestS3Transport::new(config).unwrap(),
+            puts: Mutex::default(),
+            pause: Mutex::default(),
+            takeover: Mutex::default(),
+        }
+    }
+}
+
+impl S3Transport for QueueS3Audit {
+    fn send<'a>(&'a self, req: S3RawRequest) -> PortFuture<'a, S3RawResponse> {
+        if req.method == http::Method::PUT
+            && let Some(key) = &req.key
+            && key.contains("/cas-v1/")
+            && !TerminalMarkerMeta::is_terminal_marker(&req.body)
+        {
+            let hash = blake3::hash(&req.body);
+            self.puts.lock().unwrap().push((hash, key.clone()));
+            let pause = self.takeover.lock().unwrap().take_if(|p| p.hash == hash);
+            if let Some(pause) = pause {
+                let key = key.clone();
+                return Box::pin(async move {
+                    if pause.uploaded {
+                        let response = self.origin.send(req).await?;
+                        pause.reached.send((key, response.version_id())).unwrap();
+                        pause.resume.await.unwrap();
+                        Ok(response)
+                    } else {
+                        pause.reached.send((key, None)).unwrap();
+                        pause.resume.await.unwrap();
+                        self.origin.send(req).await
+                    }
+                });
+            }
+            let barrier = self
+                .pause
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(target, _)| *target == hash)
+                .map(|(_, barrier)| barrier.clone());
+            if let Some(barrier) = barrier {
+                return Box::pin(async move {
+                    tokio::time::timeout(Duration::from_secs(10), barrier.wait())
+                        .await
+                        .expect("two independent S3 publication keys reached PUT");
+                    self.origin.send(req).await
+                });
+            }
+        }
+        self.origin.send(req)
+    }
+}
+
+enum QueuePhysical<'a> {
+    Local(notarium_core::epoch::DataRoot),
+    S3(&'a QueueS3Audit),
+}
+
+impl QueuePhysical<'_> {
+    async fn assert_discarded(
+        &self,
+        store: &CanonicalStore,
+        scope: &HistoryScope,
+        body: &str,
+        preflight: bool,
+    ) {
+        let prepared = store.prepare_blob(body.as_bytes()).unwrap();
+        match self {
+            Self::Local(root) => assert!(!root.blob(&scope.space_id, prepared.digest()).exists()),
+            Self::S3(audit) => {
+                let hash = blake3::hash(&prepared.s3_parts()[0].compressed);
+                let keys: Vec<_> = audit
+                    .puts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(sent, _)| *sent == hash)
+                    .map(|(_, key)| key.clone())
+                    .collect();
+                if preflight {
+                    assert!(keys.is_empty(), "rejected input reached S3");
+                }
+                for key in keys {
+                    let observed = audit
+                        .origin
+                        .send(S3RawRequest {
+                            method: http::Method::GET,
+                            key: Some(key),
+                            query: Vec::new(),
+                            headers: Vec::new(),
+                            body: bytes::Bytes::new(),
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(observed.status, 200);
+                    assert!(TerminalMarkerMeta::is_terminal_marker(&observed.body));
+                }
+            }
+        }
+    }
+}
+
 async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     store: &CanonicalStore,
-    is_sqlite: bool,
+    physical: QueuePhysical<'_>,
 ) {
+    let is_sqlite = matches!(physical, QueuePhysical::Local(_));
     let scope = HistoryScope {
         space_id: sample_space_id(0x71),
         incarnation: sample_incarnation(0x71),
@@ -718,7 +843,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
 
     let mut queued_ids = Vec::new();
     let mut full_count = 0usize;
-    for h in handles {
+    for (idx, h) in handles.into_iter().enumerate() {
         match h.await.unwrap() {
             QueueInputOutcome::Queued(c) => {
                 assert!((1..=16).contains(&c.value.position));
@@ -727,6 +852,16 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             QueueInputOutcome::Full { limit } => {
                 assert_eq!(limit, 16);
                 full_count += 1;
+                if idx % 2 == 0 {
+                    physical
+                        .assert_discarded(
+                            store,
+                            &scope,
+                            &format!("large-pending-{idx}-{}", "x".repeat(600)),
+                            false,
+                        )
+                        .await;
+                }
             }
         }
     }
@@ -760,6 +895,72 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .find(|id| large_candidates.contains(*id))
         .cloned()
         .expect("at least one >512B pending item queued");
+
+    let shared_idx = (0..17u8)
+        .find(|idx| PendingInputId::from_bytes([0x80 + *idx; 16]) == target_pending)
+        .unwrap();
+    let shared = format!("large-pending-{shared_idx}-{}", "x".repeat(600));
+    let never_staged = "always-full".repeat(75);
+    let fresh_input = |body: String, id| {
+        next_mutation(
+            &scope,
+            &owner,
+            PendingChatInput {
+                id: PendingInputId::from_bytes([id; 16]),
+                thread: thread.clone(),
+                sender: owner.clone(),
+                body,
+                queued_base_leaf: cur_a,
+                in_flight_run: run_id.clone(),
+                mentions_agent: false,
+            },
+        )
+    };
+    let head = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    for request in [
+        fresh_input(never_staged.clone(), 0xec),
+        fresh_input("inline full".into(), 0xed),
+        fresh_input(shared.clone(), 0xee),
+    ] {
+        for _ in 0..2 {
+            assert!(matches!(
+                store
+                    .queue_chat_input(owner_ctx(&scope, owner.clone()), request.clone())
+                    .await
+                    .unwrap(),
+                QueueInputOutcome::Full { limit: 16 }
+            ));
+        }
+    }
+    physical
+        .assert_discarded(store, &scope, &never_staged, true)
+        .await;
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        head
+    );
+    assert_eq!(
+        store
+            .read_verified_blob(
+                &scope,
+                store.prepare_blob(shared.as_bytes()).unwrap().digest()
+            )
+            .await
+            .unwrap(),
+        shared.as_bytes()
+    );
+    let denied_body = "missing-thread".repeat(80);
+    let mut missing = fresh_input(denied_body.clone(), 0xef);
+    missing.input.thread = sample_thread_id(0xde);
+    assert!(matches!(
+        store
+            .queue_chat_input(owner_ctx(&scope, owner.clone()), missing)
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    physical
+        .assert_discarded(store, &scope, &denied_body, true)
+        .await;
 
     // `BranchChanged` when `current_leaf != queued_base_leaf` preserves `'pending'` status!
     let branch_changed = store
@@ -816,6 +1017,79 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         "SELECT COUNT(*) FROM chat_pending_inputs WHERE status = 'consumed' AND (inline_text <> '' OR payload_blake3 IS NOT NULL)"
     ).await.unwrap();
     assert_eq!(retained, 0);
+    // Both requests may pass preflight for the last slot. The enabled-bucket
+    // fixture holds their data PUTs until both private publications are registered.
+    let race_body = "concurrent final queue slot".repeat(40);
+    let prepared = store.prepare_blob(race_body.as_bytes()).unwrap();
+    if let QueuePhysical::S3(audit) = &physical {
+        let hash = blake3::hash(&prepared.s3_parts()[0].compressed);
+        *audit.pause.lock().unwrap() = Some((hash, Arc::new(tokio::sync::Barrier::new(2))));
+    }
+    let first = fresh_input(race_body.clone(), 0xf1);
+    let second = fresh_input(race_body.clone(), 0xf2);
+    let (left, right) = tokio::join!(
+        store.queue_chat_input(owner_ctx(&scope, owner.clone()), first.clone()),
+        store.queue_chat_input(owner_ctx(&scope, owner.clone()), second.clone())
+    );
+    let (accepted, receipt) = match (left.unwrap(), right.unwrap()) {
+        (QueueInputOutcome::Queued(a), QueueInputOutcome::Full { limit: 16 }) => (first, a.receipt),
+        (QueueInputOutcome::Full { limit: 16 }, QueueInputOutcome::Queued(b)) => {
+            (second, b.receipt)
+        }
+        other => panic!("expected one queued input and one full result: {other:?}"),
+    };
+    let QueueInputOutcome::Queued(replayed) = store
+        .queue_chat_input(owner_ctx(&scope, owner.clone()), accepted)
+        .await
+        .unwrap()
+    else {
+        panic!("expected the accepted input receipt while full")
+    };
+    assert_eq!(replayed.receipt, receipt);
+    assert_eq!(
+        store
+            .read_verified_blob(&scope, prepared.digest())
+            .await
+            .unwrap(),
+        race_body.as_bytes()
+    );
+    if let QueuePhysical::S3(audit) = &physical {
+        *audit.pause.lock().unwrap() = None;
+        let hash = blake3::hash(&prepared.s3_parts()[0].compressed);
+        let keys: Vec<_> = audit
+            .puts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(sent, _)| *sent == hash)
+            .map(|(_, key)| key.clone())
+            .collect();
+        assert_eq!(keys.len(), 2);
+        let mut markers = 0;
+        for key in keys {
+            let response = audit
+                .origin
+                .send(S3RawRequest {
+                    method: http::Method::GET,
+                    key: Some(key),
+                    query: vec![],
+                    headers: vec![],
+                    body: bytes::Bytes::new(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.status, 200);
+            if TerminalMarkerMeta::is_terminal_marker(&response.body) {
+                markers += 1;
+            } else {
+                assert_eq!(
+                    response.body.as_ref(),
+                    prepared.s3_parts()[0].compressed.as_ref()
+                );
+            }
+        }
+        assert_eq!(markers, 1);
+    }
     cur_a = appended_from_queue.seq;
 
     // Second `consume_chat_input` on same item returns `AlreadyConsumed` without duplicating!
@@ -1198,7 +1472,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &shared_scope,
                 &owner,
                 AppendChat {
-                    thread: group_thread,
+                    thread: group_thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Model,
                     body: ChatInputBody::Text("forbidden cross-space taint".to_owned()),
@@ -1216,6 +1490,94 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         ),
         "SpaceGroup thread must block tainted append, got {group_taint_res:?}"
     );
+
+    for (chat_scope, kind, id) in [
+        (&scope, ChatThreadKind::SpaceGroup, 0x36),
+        (&shared_scope, ChatThreadKind::Personal, 0x37),
+    ] {
+        let clean = owner_ctx(chat_scope, owner.clone());
+        let redact_thread = sample_thread_id(id);
+        store
+            .create_chat(
+                clean.clone(),
+                next_mutation(
+                    chat_scope,
+                    &owner,
+                    CreateChat {
+                        thread: redact_thread.clone(),
+                        kind,
+                        owner: owner.clone(),
+                        project_folder: None,
+                        title: "Redaction authority".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let entry = store
+            .append_chat(
+                clean.clone(),
+                next_mutation(
+                    chat_scope,
+                    &owner,
+                    AppendChat {
+                        thread: redact_thread.clone(),
+                        parent: ThreadEntrySeq::ZERO,
+                        kind: ChatEntryKind::Human,
+                        body: ChatInputBody::Text("retained until authorized redaction".into()),
+                        referenced_notes: Vec::new(),
+                        tainted: false,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .value;
+        let read = ChatRead {
+            thread: redact_thread.clone(),
+            leaf: entry.seq,
+            before: None,
+            max_entries: PageLimit::new(1).unwrap(),
+        };
+        let before = store.read_chat(clean.clone(), read.clone()).await.unwrap();
+        let redact = next_mutation(
+            chat_scope,
+            &owner,
+            RedactChatEntry {
+                thread: redact_thread,
+                entry: entry.seq,
+                expected_thread_revision: before.thread.revision,
+            },
+        );
+        let tainted = owner_ctx(chat_scope, owner.clone());
+        tainted.auth().taint().mark_external_read();
+        assert!(matches!(
+            store
+                .redact_chat_entry(tainted.clone(), redact.clone())
+                .await,
+            Err(PortError::Domain(DomainError::CrossSpaceTainted))
+        ));
+        assert_eq!(
+            store.read_chat(clean.clone(), read).await.unwrap().entries[0].body,
+            entry.body
+        );
+        let committed = store
+            .redact_chat_entry(clean.clone(), redact.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .redact_chat_entry(clean, redact.clone())
+                .await
+                .unwrap()
+                .receipt,
+            committed.receipt
+        );
+        assert!(matches!(
+            store.redact_chat_entry(tainted, redact).await,
+            Err(PortError::Domain(DomainError::CrossSpaceTainted))
+        ));
+    }
 }
 
 async fn run_ten_thousand_entry_chat_dag_read_suite(store: &CanonicalStore) {
@@ -1446,8 +1808,51 @@ async fn check_reopened_room_concurrency(
         store.append_collab_update(&budget, append(2)),
     );
     let closed_again = close_and_append.0.unwrap();
+    assert!(closed_again.carrier_dirty);
+    let carrier = "# Collab Doc\n\nClosed settled.\n";
+    let edit = patch::plan(
+        carrier,
+        frontmatter::analyze(carrier, DocClass::UserDoc)
+            .unwrap()
+            .carrier
+            .body,
+        vec![(
+            CarrierEditOrigin::Body,
+            ByteSpan::new(carrier.len(), carrier.len()).unwrap(),
+            "unsettled edit".into(),
+        )],
+    )
+    .unwrap();
+    assert!(
+        store
+            .edit_note(
+                owner_ctx(scope, owner.clone()),
+                next_mutation(
+                    scope,
+                    owner,
+                    EditNote {
+                        note: note.clone(),
+                        plan: edit
+                    }
+                )
+            )
+            .await
+            .is_err()
+    );
     let mut reopen = open("writer-c");
     reopen.expected_lease = Some(closed_again.lease_epoch);
+    assert!(
+        store
+            .open_collab_session(
+                &budget,
+                OpenCollabSession {
+                    initial_yrs_snapshot: Some(vec![0]),
+                    ..reopen.clone()
+                }
+            )
+            .await
+            .is_err()
+    );
     let active = store.open_collab_session(&budget, reopen).await.unwrap();
     let snapshot = store
         .read_collab_session(None, scope, note)
@@ -1501,7 +1906,9 @@ async fn check_reopened_room_concurrency(
     })
     .await
     .expect("checkpoint and close must complete without a lock cycle");
-    assert_eq!(closed.unwrap().room_state, CollabRoomState::Closed);
+    let closed = closed.unwrap();
+    assert_eq!(closed.room_state, CollabRoomState::Closed);
+    assert!(!closed.carrier_dirty);
 }
 
 async fn run_jobs_and_collab_lifecycle_suite(
@@ -2129,6 +2536,62 @@ async fn run_jobs_and_collab_lifecycle_suite(
     assert_eq!(snap_after_ckpt.updates.len(), 1);
     assert_eq!(snap_after_ckpt.updates[0].update_seq, 2);
 
+    let newest = CheckpointCollabSession {
+        scope: scope.clone(),
+        note: collab_note.clone(),
+        owner_id: "room-worker-1".into(),
+        expected_lease: ckpt.lease_epoch,
+        expected_lineage: ckpt.lineage_epoch,
+        yrs_snapshot: vec![7, 7],
+        compacted_through_update_seq: Some(2),
+        carrier_settlement: None,
+    };
+    let covered = store
+        .checkpoint_collab_session(&make_budget(), newest.clone())
+        .await
+        .unwrap();
+    assert_eq!(covered.snapshot_coverage, Some((ckpt.lease_epoch, 2)));
+    assert!(covered.carrier_dirty);
+    for through in [Some(1), Some(2), None] {
+        let stale = CheckpointCollabSession {
+            yrs_snapshot: vec![9, 9, 9],
+            compacted_through_update_seq: through,
+            ..newest.clone()
+        };
+        assert!(
+            store
+                .checkpoint_collab_session(&make_budget(), stale)
+                .await
+                .is_err()
+        );
+    }
+    let stale_close = CloseCollabSession {
+        scope: scope.clone(),
+        note: collab_note.clone(),
+        owner_id: Some("room-worker-1".into()),
+        expected_lease: ckpt.lease_epoch,
+        expected_lineage: ckpt.lineage_epoch,
+        final_yrs_snapshot: Some(vec![9, 9, 9]),
+        compacted_through_update_seq: Some(1),
+        carrier_settlement: Some(CollabCarrierSettlement {
+            auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+            carrier: "# Stale snapshot\n".to_owned(),
+        }),
+    };
+    assert!(
+        store
+            .close_collab_session(&make_budget(), stale_close)
+            .await
+            .is_err()
+    );
+    let persisted = store
+        .read_collab_session(None, &scope, &collab_note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.session, covered);
+    assert!(persisted.updates.is_empty());
+
     // Close collaborative session settling final carrier -> `room_state == Closed`, updates cleared!
     let settled_carrier_2 = "# Collab Doc\n\nClosed settled.\n".to_owned();
     let closed = store
@@ -2284,7 +2747,11 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
             .await
             .expect("open SQLite canonical runtime");
 
-        run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(&store, true).await;
+        run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
+            &store,
+            QueuePhysical::Local(temp.data_root()),
+        )
+        .await;
         run_ten_thousand_entry_chat_dag_read_suite(&store).await;
         run_jobs_and_collab_lifecycle_suite(&store, Some(temp.data_root())).await;
 
@@ -2469,7 +2936,7 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
                 expected_carrier_rev: fenced_snap.session.carrier_rev_id,
                 expected_lease: Some(fenced_snap.session.lease_epoch),
                 expected_lineage: Some(fenced_snap.session.lineage_epoch),
-                initial_yrs_snapshot: Some(vec![42, 43]),
+                initial_yrs_snapshot: None,
                 allow_fenced_recovery: true,
             },
         )
@@ -2487,7 +2954,7 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
                 expected_lease: recovered.lease_epoch,
                 expected_lineage: recovered.lineage_epoch,
                 final_yrs_snapshot: Some(vec![42, 43]),
-                compacted_through_update_seq: None,
+                compacted_through_update_seq: Some(0),
                 carrier_settlement: Some(CollabCarrierSettlement {
                     auth: owner_ctx(&crash_scope, owner.clone()).auth().clone(),
                     carrier: "# Crash Doc\n\nRecovered cleanly.\n".to_owned(),
@@ -2530,12 +2997,15 @@ async fn l7_postgres_s3_chats_jobs_and_collab_parity() {
         .await
         .expect("provision versioned S3 bucket");
 
+    let audit = Arc::new(QueueS3Audit::new(&s3_cfg));
     let config = fixtures.pg_s3_config(sample_installation_id(0x78), &pg_schema, s3_cfg);
-    let (store, runtime) = CanonicalRuntime::open(config.clone())
-        .await
-        .expect("open PG16 + MinIO CE S3 canonical runtime");
+    let (store, runtime) =
+        CanonicalRuntime::open_with_s3_transport(config.clone(), Some(audit.clone()))
+            .await
+            .expect("open PG16 + MinIO CE S3 canonical runtime");
 
-    run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(&store, false).await;
+    run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(&store, QueuePhysical::S3(&audit))
+        .await;
     run_ten_thousand_entry_chat_dag_read_suite(&store).await;
     run_jobs_and_collab_lifecycle_suite(&store, None).await;
 
@@ -2618,4 +3088,167 @@ async fn l7_postgres_s3_chats_jobs_and_collab_parity() {
     successor_runtime.shutdown().await.unwrap();
     runtime.shutdown().await.expect("shutdown PG+S3 runtime");
     fixtures.drop_pg_schema(&pg_schema).await;
+}
+
+#[tokio::test]
+async fn l7_queue_takeover_fences_delayed_s3_uploads_and_preserves_new_owner() {
+    let fixtures = StorageTestFixtures::load_required();
+    for (versioned, uploaded, enable_at_cut) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, false),
+        (false, true, true),
+    ] {
+        let schema = fixtures.fresh_pg_schema();
+        let bucket = fixtures.fresh_s3_bucket("queue-takeover");
+        let s3 = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
+        admin_ensure_bucket(&s3, versioned.then_some("Enabled"))
+            .await
+            .unwrap();
+        let audit = Arc::new(QueueS3Audit::new(&s3));
+        let cfg = fixtures.pg_s3_config(sample_installation_id(0xad), &schema, s3.clone());
+        let (old, rt) = CanonicalRuntime::open_with_s3_transport(cfg.clone(), Some(audit.clone()))
+            .await
+            .unwrap();
+        let actor = sample_principal_id(0xad);
+        let epoch = LeaseEpoch::new(1).unwrap();
+        let scope = old
+            .create_space(CreateSpaceSpec {
+                space_id: sample_space_id(0xad),
+                incarnation: sample_incarnation(0xad),
+                root_folder_id: sample_folder_id(0xad),
+                slug: "queued".into(),
+                kind: SpaceKind::Personal,
+                owner: actor.clone(),
+                active_epoch: epoch,
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap()
+            .scope;
+        let thread = sample_thread_id(0xad);
+        old.create_chat(
+            owner_ctx(&scope, actor.clone()),
+            next_mutation(
+                &scope,
+                &actor,
+                CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: actor.clone(),
+                    project_folder: None,
+                    title: "Queue".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let body = "payload spanning queue takeover".repeat(24);
+        let prepared = old.prepare_blob(body.as_bytes()).unwrap();
+        let (reached, until_put) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        *audit.takeover.lock().unwrap() = Some(PausedQueuePut {
+            hash: blake3::hash(&prepared.s3_parts()[0].compressed),
+            uploaded,
+            reached,
+            resume,
+        });
+        let input = |id| {
+            next_mutation(
+                &scope,
+                &actor,
+                PendingChatInput {
+                    id: PendingInputId::from_bytes([id; 16]),
+                    thread: thread.clone(),
+                    sender: actor.clone(),
+                    body: body.clone(),
+                    queued_base_leaf: ThreadEntrySeq::ZERO,
+                    in_flight_run: sample_run_id(0xad),
+                    mentions_agent: false,
+                },
+            )
+        };
+        let old_ctx = owner_ctx(&scope, actor.clone());
+        let old_req = input(0xe1);
+        let old_task = tokio::spawn(async move { old.queue_chat_input(old_ctx, old_req).await });
+        let (key, version_id) = tokio::time::timeout(Duration::from_secs(10), until_put)
+            .await
+            .unwrap()
+            .unwrap();
+        if enable_at_cut {
+            notarium_canonical::blobs::s3::admin_set_bucket_versioning(&s3, "Enabled")
+                .await
+                .unwrap();
+        }
+        let (current, current_rt) =
+            CanonicalRuntime::open_with_s3_transport(cfg, Some(audit.clone()))
+                .await
+                .unwrap();
+        current
+            .advance_space_lease(
+                &support::maintenance_ctx(notarium_core::ports::ServicePurpose::Revocation),
+                &scope,
+                epoch.checked_next().unwrap(),
+            )
+            .await
+            .unwrap();
+        let accepted = current
+            .queue_chat_input(owner_ctx(&scope, actor.clone()), input(0xe2))
+            .await
+            .unwrap();
+        assert!(matches!(accepted, QueueInputOutcome::Queued(_)));
+        release.send(()).unwrap();
+        assert!(old_task.await.unwrap().is_err());
+        let get = |version: Option<String>| S3RawRequest {
+            method: http::Method::GET,
+            key: Some(key.clone()),
+            query: version
+                .into_iter()
+                .map(|v| ("versionId".into(), v))
+                .collect(),
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        };
+        let marker = audit.origin.send(get(None)).await.unwrap();
+        assert_eq!(marker.status, 200);
+        assert!(TerminalMarkerMeta::is_terminal_marker(&marker.body));
+        if uploaded && (versioned || enable_at_cut) {
+            let old_version = if enable_at_cut {
+                "null".to_owned()
+            } else {
+                version_id.unwrap()
+            };
+            assert_eq!(
+                audit
+                    .origin
+                    .send(get(Some(old_version)))
+                    .await
+                    .unwrap()
+                    .status,
+                404
+            );
+        }
+        assert_eq!(
+            current
+                .read_verified_blob(&scope, prepared.digest())
+                .await
+                .unwrap(),
+            body.as_bytes()
+        );
+        assert_eq!(
+            current
+                .execute_diagnostic_read_sql_for_test(
+                    None,
+                    "SELECT COUNT(*) FROM blob_references WHERE owner_kind='chat_pending_input'"
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        current_rt.shutdown().await.unwrap();
+        rt.shutdown().await.unwrap();
+        fixtures.drop_pg_schema(&schema).await;
+    }
 }

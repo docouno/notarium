@@ -14,15 +14,22 @@ const LIST_PACKAGES: &str = "SELECT ability_id
     LIMIT $5";
 
 use super::*;
-use crate::codec::{RevisionMetadataEnvelope, RevisionMetadataPayload};
+use crate::codec::{AbilityRevisionMetadata, RevisionMetadataEnvelope, RevisionMetadataPayload};
 
-async fn descriptor(
+struct ResolvedAbility {
+    reference: AbilityRef,
+    entrypoint: NoteRef,
+    metadata: AbilityRevisionMetadata,
+    facts: ResourceFacts,
+}
+
+async fn resolve(
     tx: &mut BackendConn<'_>,
     auth: &EngineAuthContext,
     space: &SpaceRecord,
     id: &AbilityId,
     exact: Option<&RevisionId>,
-) -> Result<AbilityDescriptor, PortError> {
+) -> Result<ResolvedAbility, PortError> {
     let (entry, tip, state): (String, String, String) = db!(
         tx,
         sqlx::query_as(READ_PACKAGE),
@@ -82,6 +89,7 @@ async fn descriptor(
     if meta.entrypoint_note_id != entrypoint.note_id || meta.ability_id != *id {
         return Err(DomainError::ResourceNotFound.into());
     }
+    let mut facts = note.facts;
     if exact.is_some() {
         let cutoff = crate::codec::i64_to_space_seq(visibility)?;
         let entry = crate::runtime::read_immutable_revision_tx(
@@ -102,24 +110,51 @@ async fn descriptor(
         {
             return Err(DomainError::ResourceNotFound.into());
         }
-        let (facts, _) = crate::domain::common::FolderAncestryCache::at_cut(&space.scope, cutoff)
-            .build_resource_facts_tx(
-                tx,
-                &space.space,
-                &snapshot.parent_folder_id,
-                snapshot.doc_class,
-                Some(id.clone()),
-                true,
-            )
-            .await?;
-        auth.can_view_resource(&facts)?;
+        let (historical, _) =
+            crate::domain::common::FolderAncestryCache::at_cut(&space.scope, cutoff)
+                .build_resource_facts_tx(
+                    tx,
+                    &space.space,
+                    &snapshot.parent_folder_id,
+                    snapshot.doc_class,
+                    Some(id.clone()),
+                    true,
+                )
+                .await?;
+        auth.can_view_resource(&historical)?;
+        // A classified resource can be handed to another reader. A project
+        // grant must cover both locations when that reader opens the content.
+        facts
+            .ancestor_folders
+            .retain(|folder| historical.ancestor_folders.contains(folder));
     }
-    Ok(AbilityDescriptor {
+    Ok(ResolvedAbility {
         reference: AbilityRef {
             id: id.clone(),
             placement,
             revision,
         },
+        entrypoint,
+        metadata: meta,
+        facts,
+    })
+}
+
+async fn descriptor(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    space: &SpaceRecord,
+    id: &AbilityId,
+    exact: Option<&RevisionId>,
+) -> Result<AbilityDescriptor, PortError> {
+    let ResolvedAbility {
+        reference,
+        entrypoint,
+        metadata: meta,
+        ..
+    } = resolve(tx, auth, space, id, exact).await?;
+    Ok(AbilityDescriptor {
+        reference,
         kind: meta.kind,
         name: meta.slug_fold,
         enabled: true,
@@ -132,6 +167,35 @@ async fn descriptor(
             .filter(|p| p != crate::domain::packages::ABILITY_ENTRYPOINT_KEY)
             .collect(),
     })
+}
+
+pub(crate) async fn resource_digest_tx(
+    tx: &mut BackendConn<'_>,
+    ctx: &SpaceContext,
+    request: &ReadAbilityResource,
+    key: &str,
+) -> Result<(ContentDigest, ResourceFacts), PortError> {
+    let space = load_space_record(tx, &ctx.scope().space_id).await?;
+    space.scope.check(ctx.scope())?;
+    let package = resolve(
+        tx,
+        ctx.auth(),
+        &space,
+        &request.ability,
+        Some(&request.package_revision),
+    )
+    .await?;
+    if package.metadata.lifecycle != Lifecycle::Active {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let digest = package
+        .metadata
+        .resources
+        .get(key)
+        .copied()
+        .ok_or(DomainError::ResourceNotFound)?;
+    ctx.auth().authorize_read(&package.facts)?;
+    Ok((digest, package.facts))
 }
 
 pub(super) async fn lookup(

@@ -580,6 +580,7 @@ BEGIN
     WHERE space_id = p_space_id
       AND history_incarnation = p_inc
       AND active_epoch = p_epoch
+      AND lifecycle_state = 'active'
       AND last_seq = p_expected_before
       AND last_seq <= p_max_allowed_before
     FOR NO KEY UPDATE;
@@ -810,119 +811,44 @@ $$;
     Ok(())
 }
 
-pub(crate) const PG_LEAN_ROLLBACK_READ_SQL: &str = "
-WITH nh AS (
-    SELECT note_id, parent_folder_id, slug, slug_fold, title, title_fold,
-           head_rev_id, lifecycle_state, byte_size, visibility_mask,
-           doc_class, ability_id, content_blake3
-    FROM note_heads
-    WHERE space_id = $1 AND note_id = ANY($3::TEXT[])
-),
-r_first AS (
-    SELECT entity_key, MIN(space_seq) AS first_run_seq
+pub(crate) const PG_LEAN_ROLLBACK_READ_SQL: &str = r#"
+WITH run_notes AS MATERIALIZED (
+    SELECT entity_key, MIN(space_seq) AS first_seq
     FROM revisions
-    WHERE space_id = $1
-      AND agent_run_id = $2
-      AND agent_run_id IS NOT NULL
-      AND entity_type = 'note'
+    WHERE space_id = $1 AND agent_run_id = $2 AND entity_type = 'note'
     GROUP BY entity_key
-),
-r_pre AS (
-    SELECT rf.entity_key, rf.first_run_seq,
-           pr.rev_id, pr.space_seq, pr.content_blake3, pr.metadata_msgpack
-    FROM r_first rf
-    LEFT JOIN LATERAL (
-        SELECT r.rev_id, r.space_seq, r.content_blake3, r.metadata_msgpack
-        FROM revisions r
-        WHERE r.space_id = $1
-          AND r.entity_type = 'note'
-          AND r.entity_key = rf.entity_key
-          AND r.agent_run_id IS DISTINCT FROM $2
-        ORDER BY r.visibility_seq DESC, r.space_seq DESC
-        LIMIT 1
-    ) pr ON (rf.entity_key = ANY($3::TEXT[]))
-),
-digs AS (
-    SELECT content_blake3 AS d FROM nh WHERE content_blake3 IS NOT NULL
-    UNION
-    SELECT content_blake3 AS d FROM r_pre WHERE content_blake3 IS NOT NULL
 )
-SELECT
-    0::int2 AS kind,
-    s.root_folder_id AS t1,
-    s.space_kind AS t2,
-    s.lifecycle_state AS t3,
-    arh.run_revision AS t4,
-    NULL::text AS t5,
-    NULL::text AS t6,
-    NULL::text AS t7,
-    NULL::text AS t8,
-    s.active_epoch AS i1,
-    s.last_seq AS i2,
-    (SELECT COUNT(*)::int4 FROM r_first) AS i3,
-    s.history_incarnation AS b1,
-    arh.history_incarnation AS b2
+SELECT s.root_folder_id, s.space_kind, h.note_id, h.slug, h.slug_fold, h.title,
+       h.head_rev_id, h.lifecycle_state, h.byte_size, h.visibility_mask, h.content_blake3,
+       r.first_seq, prior.space_seq, prior.rev_id,
+       CASE WHEN prior.space_seq < r.first_seq THEN prior.metadata_msgpack END AS prior_metadata,
+       b.content_blake3 AS publication_digest, b.current_publication_id
 FROM spaces s
-LEFT JOIN agent_run_heads arh ON arh.space_id = s.space_id AND arh.run_id = $2
-WHERE s.space_id = $1
-UNION ALL
-SELECT
-    1::int2,
-    nh.note_id,
-    nh.parent_folder_id,
-    nh.slug,
-    nh.slug_fold,
-    nh.title,
-    nh.title_fold,
-    nh.head_rev_id,
-    nh.lifecycle_state,
-    nh.byte_size,
-    nh.visibility_mask::bigint,
-    (CASE WHEN nh.doc_class = 'user-doc' AND nh.ability_id IS NULL THEN 1 ELSE 0 END)::int4,
-    nh.content_blake3,
-    NULL::bytea
-FROM nh
-UNION ALL
-SELECT
-    2::int2,
-    rp.entity_key,
-    COALESCE(rp.rev_id, ''),
-    NULL::text,
-    NULL::text,
-    NULL::text,
-    NULL::text,
-    NULL::text,
-    NULL::text,
-    rp.first_run_seq,
-    COALESCE(rp.space_seq, -1)::bigint,
-    0::int4,
-    rp.metadata_msgpack,
-    NULL::bytea
-FROM r_pre rp
-UNION ALL
-SELECT
-    4::int2,
-    bc.current_publication_id,
-    '',
-    NULL::text,
-    NULL::text,
-    NULL::text,
-    NULL::text,
-    NULL::text,
-    NULL::text,
-    0::bigint,
-    0::bigint,
-    0::int4,
-    bc.content_blake3,
-    NULL::bytea
-FROM digs dg
-JOIN blob_catalog bc
-  ON bc.space_id = $1
- AND bc.content_blake3 = dg.d
- AND bc.admission_state = 'open'
- AND bc.blob_state = 'active'
- AND bc.current_publication_id IS NOT NULL
-";
+JOIN agent_run_heads a ON a.space_id = s.space_id AND a.run_id = $2
+JOIN run_notes r ON r.entity_key = ANY($3::text[])
+JOIN LATERAL (
+    SELECT nh.* FROM note_heads nh WHERE nh.space_id = $1 AND nh.note_id = r.entity_key LIMIT 1
+) h ON h.parent_folder_id = s.root_folder_id
+LEFT JOIN LATERAL (
+    SELECT v.space_seq, v.rev_id, v.metadata_msgpack, v.content_blake3
+    FROM revisions v
+    WHERE v.space_id = $1 AND v.entity_type = 'note' AND v.entity_key = r.entity_key
+      AND v.agent_run_id IS DISTINCT FROM $2
+    ORDER BY v.visibility_seq DESC, v.space_seq DESC
+    LIMIT 1
+) prior ON true
+LEFT JOIN blob_catalog b ON b.space_id = s.space_id
+      AND b.content_blake3 = CASE
+          WHEN prior.space_seq IS NULL THEN h.content_blake3
+          WHEN prior.space_seq < r.first_seq THEN prior.content_blake3 END
+      AND b.admission_state = 'open' AND b.blob_state = 'active'
+WHERE s.space_id = $1 AND s.history_incarnation = $4 AND s.active_epoch = $5
+  AND s.lifecycle_state = 'active'
+  AND a.history_incarnation = $4 AND a.run_revision = $6
+  AND (SELECT count(*) FROM run_notes) = cardinality($3::text[])
+  AND h.doc_class = 'user-doc' AND h.ability_id IS NULL AND h.visibility_mask >= 0
+ORDER BY r.entity_key COLLATE "C"
+"#;
 
 pub(crate) const PG_LEAN_ROLLBACK_COMMIT_CALL_SQL: &str = "
 SELECT notarium_pg_lean_commit_v3(
@@ -1046,6 +972,8 @@ BEGIN
             s.history_incarnation = p_inc
             AND s.lifecycle_state = 'active'
             AND s.active_epoch = p_writer_epoch
+            AND s.root_folder_id = p_root_folder_id
+            AND NOT EXISTS(SELECT 1 FROM UNNEST(p_fl_pf) AS dest(folder) WHERE dest.folder IS DISTINCT FROM p_root_folder_id)
             AND s.last_seq >= 0
             AND p_delta >= 1
             AND s.last_seq <= (9223372036854775807 - p_delta)
@@ -1068,7 +996,8 @@ BEGIN
             AND NOT EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = p_space_id)
             AND NOT EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = p_space_id)
             AND NOT EXISTS(SELECT 1 FROM space_field_schemas WHERE space_id = p_space_id)
-            AND NOT EXISTS(SELECT 1 FROM folder_heads WHERE space_id = p_space_id AND (is_root = 0 OR write_lock_json IS NOT NULL OR lifecycle_state <> 'active'))
+            AND EXISTS(SELECT 1 FROM folder_heads WHERE space_id = p_space_id AND folder_id = p_root_folder_id
+                AND is_root = 1 AND lifecycle_state = 'active' AND write_lock_json IS NULL)
             AND NOT (
                 COALESCE(cardinality(p_fl_nids), 0) > 0 AND EXISTS (
                     SELECT 1

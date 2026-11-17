@@ -1571,6 +1571,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         seq_before_abort, seq_after_abort,
         "aborted RollbackAgentRun must leave last_seq untouched"
     );
+    check_rollback_destination_authority(store, &scope, &owner).await;
 }
 
 #[tokio::test]
@@ -1648,6 +1649,132 @@ async fn l6_rollback_agent_run_ordering_trash_first_and_atomicity_dual_dialect_p
         runtime.shutdown().await.expect("shutdown pg+s3");
         fixtures.drop_pg_schema(&schema).await;
     }
+}
+
+async fn check_rollback_destination_authority(
+    store: &CanonicalStore,
+    scope: &HistoryScope,
+    owner: &PrincipalId,
+) {
+    let human = owner_ctx(scope, owner.clone());
+    let destination = sample_folder_id(208);
+    let current = sample_folder_id(209);
+    for (id, slug) in [
+        (&destination, "rollback-source"),
+        (&current, "rollback-current"),
+    ] {
+        store
+            .create_folder(notarium_canonical::CreateFolderSpec {
+                scope: scope.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                folder_id: id.clone(),
+                parent: None,
+                slug: slug.into(),
+                display_name: slug.into(),
+                is_project: true,
+                project_slug: Some(slug.into()),
+                actor: owner.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+    }
+    let note = sample_note_id(208);
+    store
+        .create_note(
+            human.clone(),
+            next_mutation(
+                scope,
+                owner,
+                CreateNote {
+                    note: note.clone(),
+                    parent: Some(destination.clone()),
+                    slug: "moved-between-projects".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Original placement\n".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let run = sample_run_id(208);
+    let moved = store
+        .move_note(
+            agent_run_ctx(&human, run.clone()),
+            next_mutation(
+                scope,
+                owner,
+                notarium_core::ports::MoveNote {
+                    note: note.clone(),
+                    parent: Some(current.clone()),
+                    slug: "moved-between-projects".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let revision = store
+        .inspect_agent_run_revision_for_test(&scope.space_id, &run)
+        .await
+        .unwrap()
+        .unwrap();
+    let rollback = next_mutation(
+        scope,
+        owner,
+        RollbackAgentRun {
+            run,
+            expected_run_revision: revision,
+            expected_entities: vec![moved.value],
+            associated_board_expectations: vec![],
+        },
+    );
+    store
+        .set_folder_write_lock(human.clone(), destination.clone(), true)
+        .await
+        .unwrap();
+    let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let denied = store
+        .rollback_agent_run(human.clone(), rollback.clone())
+        .await;
+    assert!(
+        matches!(denied, Err(PortError::Domain(DomainError::SpaceReadOnly))),
+        "locked rollback destination: {denied:?}"
+    );
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        before
+    );
+    store
+        .set_folder_write_lock(human.clone(), destination, false)
+        .await
+        .unwrap();
+
+    let mut grants = human.auth().spaces().clone();
+    grants.get_mut(&scope.space_id).unwrap().project_root = Some(current);
+    let pinned = SpaceContext::new(
+        EngineAuthContext::for_human(VerifiedHuman::attest(
+            owner.clone(),
+            GrantId::from_bytes([7; 16]),
+            grants,
+            true,
+        )),
+        scope.clone(),
+        make_budget(),
+    )
+    .unwrap();
+    let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let denied = store.rollback_agent_run(pinned, rollback.clone()).await;
+    assert!(
+        matches!(denied, Err(PortError::Domain(DomainError::SpaceReadOnly))),
+        "out-of-project rollback destination: {denied:?}"
+    );
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        before
+    );
+    let restored = store.rollback_agent_run(human, rollback).await.unwrap();
+    assert_eq!(restored.value.restored.len(), 1);
+    assert_eq!(restored.value.restored[0].note, note);
 }
 
 async fn run_note_only_rollback_suite(store: &CanonicalStore) {
@@ -1775,6 +1902,7 @@ async fn run_note_only_rollback_suite(store: &CanonicalStore) {
         got.document.explicit_read(human_ctx.auth()).expect("read"),
         cur_c
     );
+    check_rollback_destination_authority(store, &scope, &owner).await;
 }
 
 #[tokio::test]

@@ -16,20 +16,23 @@ use sqlx::PgConnection;
 use super::{
     BackendConn, BackupArtifactEncoding, CanonicalInner, CanonicalStore, SqlDriverState,
     create_private_tmp_file, fsync_parent_dir, internal_not_committed, mint_artifact_id,
-    open_backup_connection, register_cleanup_task, remove_tmp_artifacts_best_effort,
-    resolve_spool_dir, unavailable_retryable,
+    open_backup_connection, register_cleanup_task, remove_tmp_artifacts, resolve_spool_dir,
+    unavailable_retryable,
 };
 
-const HOLD_LOCK_SQL: &str =
-    "SELECT pg_try_advisory_lock(hashtextextended(current_schema() || ':' || $1, 7311230))";
+const HOLD_LOCK_SQL: &str = "SELECT pg_try_advisory_lock(hashtextextended(current_schema() || ':' || $1, 7311230)), set_config('application_name', $2, false)";
 
 pub(super) enum HoldOwnership {
     Local(Weak<CanonicalInner>, BackupId),
-    Postgres { _connection: Box<PgConnection> },
+    Postgres { connection: Box<PgConnection> },
 }
 
 impl HoldOwnership {
-    pub(super) async fn acquire(store: &CanonicalStore, id: &BackupId) -> Result<Self, PortError> {
+    pub(super) async fn acquire(
+        store: &CanonicalStore,
+        id: &BackupId,
+        generation: &ArtifactId,
+    ) -> Result<Self, PortError> {
         match &store.inner.sql {
             SqlDriverState::Sqlite { .. } => {
                 if store
@@ -46,12 +49,13 @@ impl HoldOwnership {
                 let mut conn = open_backup_connection(store).await?;
                 let acquired: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(HOLD_LOCK_SQL))
                     .bind(id.as_str())
+                    .bind(generation.as_str())
                     .fetch_one(&mut conn)
                     .await
                     .map_err(|err| internal_not_committed("pg_backup_owner", err.to_string()))?;
                 if acquired {
                     return Ok(Self::Postgres {
-                        _connection: Box::new(conn),
+                        connection: Box::new(conn),
                     });
                 }
             }
@@ -61,6 +65,43 @@ impl HoldOwnership {
             "another hold owns this BackupId",
             Duration::from_millis(50),
         ))
+    }
+
+    // PostgreSQL never reconnects this socket. Transactions on it belong only to the
+    // session which took this BackupId's advisory lock, including the empty-Space case.
+    pub(super) async fn with_write_tx<F, T>(
+        &mut self,
+        store: &CanonicalStore,
+        op: F,
+    ) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        let Self::Postgres { connection } = self else {
+            return store.with_write_tx(op).await;
+        };
+        let _gate = store.inner.writer()?.acquire_commit_read_guard().await;
+        let mut backend = BackendConn::Postgres(connection);
+        let mut transaction = crate::sql_exec::WriteTransaction::begin(&mut backend).await?;
+        let value = op(&mut transaction.conn()).await?;
+        transaction.commit().await?;
+        Ok(value)
+    }
+
+    pub(super) async fn verify(&mut self) -> Result<(), PortError> {
+        if let Self::Postgres { connection } = self {
+            sqlx::raw_sql("SELECT 1")
+                .execute(&mut **connection)
+                .await
+                .map_err(|err| {
+                    unavailable_retryable(
+                        "pg_backup_hold_lost",
+                        err.to_string(),
+                        Duration::from_millis(50),
+                    )
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -215,12 +256,14 @@ impl ArtifactLease {
 
     pub(super) fn accepted(&self) -> Result<(), PortError> {
         let marker = self.directory.join(format!("{}.pending", self.id.as_str()));
+        remove_tmp_artifacts(&self.directory.join(format!("{}.tmp", self.id.as_str())))?;
+        fsync_parent_dir(&marker)?;
         remove_if_present(&marker)?;
         fsync_parent_dir(&marker)
     }
 }
 
-fn remove_if_present(path: &Path) -> Result<(), PortError> {
+pub(super) fn remove_if_present(path: &Path) -> Result<(), PortError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -232,10 +275,10 @@ impl Drop for ArtifactLease {
     fn drop(&mut self) {
         let marker = self.directory.join(format!("{}.pending", self.id.as_str()));
         if !self.publishing {
-            remove_tmp_artifacts_best_effort(
-                &self.directory.join(format!("{}.tmp", self.id.as_str())),
-            );
-            let _ = remove_if_present(&marker);
+            let tmp = self.directory.join(format!("{}.tmp", self.id.as_str()));
+            if remove_tmp_artifacts(&tmp).is_ok() && fsync_parent_dir(&marker).is_ok() {
+                let _ = remove_if_present(&marker);
+            }
             return;
         }
         if !marker.exists() {
@@ -271,7 +314,7 @@ async fn reconcile(
                 .bind(lookup.as_str()).fetch_one(&mut **conn).await.map_err(|e|internal_not_committed("recover_pg_artifact", e.to_string())),
         }
     })).await?;
-    remove_tmp_artifacts_best_effort(&dir.join(format!("{}.tmp", id.as_str())));
+    remove_tmp_artifacts(&dir.join(format!("{}.tmp", id.as_str())))?;
     if !ready {
         for kind in [
             BackupArtifactEncoding::SqliteSnapshotV1,
@@ -281,6 +324,7 @@ async fn reconcile(
         }
     }
     let marker = dir.join(format!("{}.pending", id.as_str()));
+    fsync_parent_dir(&marker)?;
     remove_if_present(&marker)?;
     fsync_parent_dir(&marker)
 }

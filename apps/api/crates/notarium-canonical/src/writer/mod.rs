@@ -969,7 +969,7 @@ impl crate::CanonicalStore {
             match raw_res {
                 Ok(bytes) => {
                     let val = rmp_serde::from_slice(&bytes).map_err(|err| {
-                        internal_not_committed("decode_writer_batch_item_outcome", err.to_string())
+                        unknown_commit_outcome("decode_writer_batch_item_outcome", err.to_string())
                     })?;
                     decoded.push(Ok(val));
                 }

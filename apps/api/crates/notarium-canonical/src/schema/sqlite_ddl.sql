@@ -394,6 +394,7 @@ CREATE TABLE IF NOT EXISTS backup_holds (
     cutoff_seq INTEGER NOT NULL CHECK (cutoff_seq >= 0),
     witness_json TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL,
+    owner_generation TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (backup_id, space_id),
     FOREIGN KEY (space_id) REFERENCES spaces (space_id)
 );
@@ -738,4 +739,14 @@ CREATE TABLE IF NOT EXISTS account_catalog_receipts (
     request_hash BLOB NOT NULL CHECK (typeof(request_hash) = 'blob' AND length(request_hash) = 32),
     result_msgpack BLOB CHECK (result_msgpack IS NULL OR (typeof(result_msgpack) = 'blob' AND length(result_msgpack) BETWEEN 1 AND 4096)),
     PRIMARY KEY (owner_id, actor_id, command_key)
+);
+
+CREATE TABLE IF NOT EXISTS collab_checkpoints (
+    space_id TEXT NOT NULL,
+    note_id TEXT NOT NULL,
+    snapshot_lease_epoch INTEGER NOT NULL DEFAULT 0 CHECK (snapshot_lease_epoch >= 0),
+    snapshot_update_seq INTEGER NOT NULL DEFAULT 0 CHECK (snapshot_update_seq >= 0),
+    carrier_dirty INTEGER NOT NULL DEFAULT 0 CHECK (carrier_dirty IN (0, 1)),
+    PRIMARY KEY (space_id, note_id),
+    FOREIGN KEY (space_id, note_id) REFERENCES collab_sessions (space_id, note_id) ON DELETE CASCADE
 );

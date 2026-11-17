@@ -1417,6 +1417,7 @@ dependencies = [
  "blake3",
  "getrandom 0.4.3",
  "hex",
+ "mimalloc",
  "notarium-agents",
  "notarium-canonical",
  "notarium-collab",
