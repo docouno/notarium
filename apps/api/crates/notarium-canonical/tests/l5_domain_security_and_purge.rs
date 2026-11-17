@@ -22,7 +22,7 @@ use notarium_core::{
     error::{CommitEffect, PortError, ValidationReason},
     ids::{
         AbilityId, AgentRunId, CommandKey, ContentDigest, FolderId, GrantId, HistoryIncarnation,
-        LeaseEpoch, PrincipalId, ProjectionGeneration, RequestId, RevisionId, SpaceId, SpaceSeq,
+        LeaseEpoch, NoteId, PrincipalId, ProjectionGeneration, RequestId, RevisionId, SpaceId, SpaceSeq,
     },
     model::{AbilityResourceName, FolderRef, HistoryScope, NoteRef, SnapshotCut},
     ports::{
@@ -1464,7 +1464,7 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
         .await;
     assert!(viewer_write.is_err(), "Viewer must not create notes");
 
-    let replay_note = sample_note_id(92);
+    let replay_note = NoteId::from_bytes(*b"receipt-authz-v1");
     let create_again = next_mutation(
         &scope,
         &owner,
