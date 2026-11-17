@@ -610,20 +610,23 @@ fn budget() -> CallBudget {
     }
 }
 fn auth() -> EngineAuthContext {
-    EngineAuthContext::for_human(VerifiedHuman::attest(
-        PrincipalId::from_bytes([1; 16]),
-        GrantId::from_bytes([1; 16]),
-        BTreeMap::from([(
-            scope(1).space_id,
-            SpaceGrant {
-                role: SpaceRole::Owner,
-                read_classes: DocClass::all(),
-                write_classes: DocClass::all(),
-                project_root: None,
-            },
-        )]),
-        true,
-    ))
+    EngineAuthContext::for_human(
+        VerifiedHuman::attest(
+            PrincipalId::from_bytes([1; 16]),
+            GrantId::from_bytes([1; 16]),
+            BTreeMap::from([(
+                scope(1).space_id,
+                SpaceGrant {
+                    role: SpaceRole::Owner,
+                    read_classes: DocClass::all(),
+                    write_classes: DocClass::all(),
+                    project_root: None,
+                },
+            )]),
+            true,
+        )
+        .with_human_management(true),
+    )
 }
 fn context() -> SpaceContext {
     SpaceContext::new(auth(), scope(1), budget()).unwrap()
@@ -819,6 +822,8 @@ fn completion_accepts_authorized_chat_provenance_without_inventing_a_note() {
         ThreadEntrySeq::new(1).unwrap(),
         false,
         "hello-provider".into(),
+        ContentDigest::from_bytes([1; 32]),
+        None,
     );
     assert!(!format!("{entry:?}").contains("hello-provider"));
     let admitted = ClassEgressFence::chat(entry.clone(), &auth(), &policy).unwrap();
@@ -835,6 +840,8 @@ fn completion_accepts_authorized_chat_provenance_without_inventing_a_note() {
         ThreadEntrySeq::new(2).unwrap(),
         true,
         "external".into(),
+        ContentDigest::from_bytes([2; 32]),
+        None,
     );
     assert!(ClassEgressFence::chat(tainted, &auth(), &policy).is_err());
 }
@@ -1478,6 +1485,7 @@ impl Drop for PhaseGuard {
 fn witness() -> BackupWitness {
     BackupWitness {
         installation: InstallationId::from_bytes([1; 16]),
+        schema_version: 1,
         histories: vec![cursor(10)],
         canaries: vec![],
     }
@@ -1537,7 +1545,7 @@ impl BackupSnapshot for SnapshotFixture {
             assert_eq!(self.guard.state.lock().unwrap().pauses, 0);
             budget.check(BackupProgress {
                 elapsed: Duration::from_millis(10),
-                pinned_wal_bytes: 20,
+                retention: BackupRetentionProgress::SqliteWal { pinned_bytes: 20 },
                 spool_bytes: 30,
             })?;
             if cancellation.is_cancelled() {
@@ -1545,6 +1553,7 @@ impl BackupSnapshot for SnapshotFixture {
             }
             Ok(BackupSpool {
                 artifact: ArtifactId::from_bytes([1; 16]),
+                kind: BackupArtifactKind::SqliteSnapshotV1,
                 bytes: 30,
                 digest: ContentDigest::from_bytes([1; 32]),
                 witness: self.witness.clone(),
@@ -1583,7 +1592,9 @@ impl PreparedBackup for PreparedFixture {
 fn backup_budget() -> BackupBudget {
     BackupBudget {
         deadline: Duration::from_secs(1),
-        max_pinned_wal_bytes: 100,
+        retention: BackupRetentionBudget::SqliteWal {
+            max_pinned_bytes: 100,
+        },
         max_spool_bytes: 100,
     }
 }
@@ -1641,7 +1652,9 @@ fn backup_guards_release_every_phase_on_second_participant_failure_budget_or_can
             ..backup_budget()
         },
         BackupBudget {
-            max_pinned_wal_bytes: 0,
+            retention: BackupRetentionBudget::SqliteWal {
+                max_pinned_bytes: 0,
+            },
             ..backup_budget()
         },
         BackupBudget {

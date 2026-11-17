@@ -188,5 +188,5 @@ if [ "${1:-}" = "exec-custom" ]; then
   shift
   "$@"
 else
-  sh "$ROOT/.devkit/runtime/devkit.sh" "$@"
+  sh "$ROOT/scripts/devkit-with-control-db.sh" "$@"
 fi

@@ -190,6 +190,7 @@ impl PausedBackup for MockPaused {
         let fail = self.fail_on_open_cut;
         let seq = self.current_seq.load(Ordering::SeqCst);
         let witness = BackupWitness {
+            schema_version: 1,
             installation: self.installation.clone(),
             histories: vec![ChangeCursor {
                 scope: self.scope.clone(),
@@ -233,6 +234,7 @@ impl BackupSnapshot for MockSnapshot {
         let w = self.witness.clone();
         Box::pin(async move {
             Ok(BackupSpool {
+                kind: notarium_core::ports::BackupArtifactKind::SqliteSnapshotV1,
                 artifact: ArtifactId::from_bytes([0xCC; 16]),
                 bytes: 64,
                 digest: ContentDigest::from_bytes([0xDD; 32]),
@@ -249,6 +251,7 @@ impl PreparedBackup for MockPrepared {
     fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
         let seq = self.current_seq.load(Ordering::SeqCst);
         let witness = BackupWitness {
+            schema_version: 1,
             installation: self.installation.clone(),
             histories: vec![ChangeCursor {
                 scope: self.scope.clone(),
@@ -426,7 +429,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             .prepare(
                 maintenance_ctx(ServicePurpose::Projection),
                 BackupId::from_bytes([1u8; 16]),
-                default_backup_budget(),
+                store.default_backup_budget(),
             )
             .await;
         assert_validation_err(&wrong_prep.map(|_| ()), ValidationReason::InvalidAuthority);
@@ -501,7 +504,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
         assert_eq!(control_peer.advance_revision(), 1);
 
         let backup_id = BackupId::from_bytes([0x20; 16]);
-        let budget = default_backup_budget();
+        let budget = store.default_backup_budget();
         let mut prep_canon = store
             .prepare(
                 maintenance_ctx(ServicePurpose::Backup),
@@ -949,7 +952,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
         // BudgetExceeded: max_spool_bytes = 64 bytes
         let tiny_spool_budget = BackupBudget {
             deadline: Duration::from_secs(10),
-            max_pinned_wal_bytes: 256 * 1024 * 1024,
+            retention: budget.retention,
             max_spool_bytes: 64,
         };
         let mut prep_tiny = store
@@ -972,7 +975,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
         store.set_backup_step_delay_for_test(Duration::from_millis(25));
         let tiny_time_budget = BackupBudget {
             deadline: Duration::from_millis(8),
-            max_pinned_wal_bytes: 256 * 1024 * 1024,
+            retention: budget.retention,
             max_spool_bytes: 1024 * 1024 * 1024,
         };
         let mut prep_slow = store
@@ -1022,7 +1025,9 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
         if case.is_sqlite {
             let tiny_wal_budget = BackupBudget {
                 deadline: Duration::from_secs(10),
-                max_pinned_wal_bytes: 2048,
+                retention: notarium_core::ports::BackupRetentionBudget::SqliteWal {
+                    max_pinned_bytes: 2048,
+                },
                 max_spool_bytes: 1024 * 1024 * 1024,
             };
             let mut prep_wal = store
@@ -1070,6 +1075,32 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                 .await;
             let _ = wal_writer.await;
             assert_validation_err(&wal_err, ValidationReason::BudgetExceeded);
+        } else {
+            // Tightening the snapshot age at spool includes time spent idle after pin.
+            let mut prep = store
+                .prepare(
+                    maintenance_ctx(ServicePurpose::Backup),
+                    BackupId::from_bytes([0x39; 16]),
+                    budget,
+                )
+                .await
+                .unwrap();
+            let mut paused = prep.pause_writes().await.unwrap();
+            let mut snapshot = paused.open_cut().await.unwrap();
+            paused.resume().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let aged = snapshot
+                .spool(
+                    BackupBudget {
+                        retention: notarium_core::ports::BackupRetentionBudget::PostgresSnapshot {
+                            max_age: Duration::from_millis(5),
+                        },
+                        ..budget
+                    },
+                    Cancellation::default(),
+                )
+                .await;
+            assert_validation_err(&aged, ValidationReason::BudgetExceeded);
         }
         store.set_backup_step_delay_for_test(Duration::ZERO);
 
@@ -1561,7 +1592,7 @@ async fn run_memory_subprocess_mode(mode: &str) {
             let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
             let before_hwm = read_proc_vm_hwm_kib();
 
-            let budget = default_backup_budget();
+            let budget = store.default_backup_budget();
             let mut prep = store
                 .prepare(
                     maintenance_ctx(ServicePurpose::Backup),
@@ -1658,7 +1689,7 @@ async fn run_memory_subprocess_mode(mode: &str) {
             let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
             let before_hwm = read_proc_vm_hwm_kib();
 
-            let budget = default_backup_budget();
+            let budget = store.default_backup_budget();
             let mut prep = store
                 .prepare(
                     maintenance_ctx(ServicePurpose::Backup),

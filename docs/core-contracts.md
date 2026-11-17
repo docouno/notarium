@@ -18,6 +18,10 @@ The domain accepts UTC years 0000–9999 and at most nine fractional digits.
 Out-of-range UTC conversions and leap seconds return `InvalidTimestamp`; they
 are never clamped to a different instant.
 
+Credential key IDs have a separate native grammar: `ck_` followed by 24 lowercase
+hexadecimal digits derived from twelve HKDF output bytes. They do not use the
+generic ID minting or legacy-ID parser.
+
 `StorageEpochFacts` describes observations made by the runtime. The pure
 classifier distinguishes an evidenced empty root, ready v1, migration in progress,
 incompatible and damaged states. Missing, invalid and unreadable observations
@@ -25,11 +29,18 @@ remain different; an I/O error cannot authorize initialization. `DataRoot` only
 constructs the shared layout from a supplied path.
 
 Verified authority enters through trusted owners, not deserialization of an auth
-context. Delegation intersects role, class and project grants. Agent, Keeper and
-OAuth contexts cannot obtain human `AbilityWrite`. Both old and new resource facts
+context. Delegation intersects role, class and project grants. Interactive
+`human_management` attestation is separate from `Cap::AbilityWrite`:
+`human_management` does not grant `Cap::AbilityWrite`, while `Cap::AbilityWrite`
+additionally requires `human_management`; Agent, Keeper, OAuth and PAT contexts
+can obtain neither. Both old and new resource facts
 are checked on direct writes, including auxiliary ability files. A run pins its
-write Space; an external read taints already-existing clones before content returns.
-Shared chat limits reads to its Space and excludes the sender's profile.
+write Space; non-tainting metadata visibility checks (`can_view_resource`,
+`can_view_folder`) filter listings and references without tainting the branch,
+whereas content-bearing `authorize_read` / `authorize_folder_read` taint
+already-existing clones before external content returns. Shared chat limits reads
+to its Space (and to matching project-scoped threads when a Keeper is pinned to a
+`project_root`) and excludes the sender's profile.
 Nested Keeper runs can retain or drop approved package read exceptions; they
 cannot add exceptions outside their parent's project authority.
 
@@ -41,6 +52,25 @@ content from committed chat entries; chat has its own provenance and taint check
 These constructors are trusted in-process boundaries, not isolation from malicious
 Rust code that controls the canonical/admission owner. Adapters must recheck live
 visibility and revocation at use time.
+
+Provider dispatch uses `ProviderEgressCatalogPort` to pin current metadata for
+every origin and the selected active project. Its lease excludes changes to class,
+lifecycle, provenance and project ancestry until release, or cancels the call and
+waits for release. Chat origins include their canonical digest and optional project;
+current taint remains authoritative. `ClassEgressFence::revalidate` checks these
+fresh facts against the exact source and current provider disclosure. No document
+bodies or SQL handles cross the metadata port.
+
+Completion messages retain roles, classified parts and ordered tool-call/result
+associations. `ProviderInstruction` carries trusted orchestration text on `System`,
+`User` (such as scheduled `init_prompt`) or `Tool` (control-plane tool outputs and
+structured validation errors); copied note text still needs classified provenance.
+Tool schemas are a bounded closed subset, and `ProviderToolCallId` accepts standard
+alphanumeric, `_`, `-`, `.` and `:` characters. `ProviderUsage::Unknown` is distinct
+from exact zero; interrupted streams cannot claim measured usage from an estimate.
+Provider selection and preferences distinguish `PreferenceModelKind::Completion`
+from `Embedding` and retain the explicit project, and embedding requests carry it
+through the same boundary.
 
 Explicit snapshots expose lifecycle. Listings select active, trashed or both
 through `LifecycleMask` and return `NoteListCard` metadata, including encrypted
@@ -215,8 +245,10 @@ database read is required. Both snapshots must retain the same original cut.
 The ordinary read-transaction budget remains below 250 ms. Backup source
 snapshots have a bounded exception until a stable local database spool exists
 or the backup aborts. Incremental backup steps do not shorten this lifetime or
-eliminate its WAL checkpoint impact. Budgets specify a deadline, pinned WAL
-bytes and spool bytes. Exceeding a budget aborts the backup with cleanup;
+eliminate its WAL checkpoint impact. Budgets specify a deadline, spool bytes and
+backend-specific retention: pinned WAL bytes for SQLite or snapshot age for
+PostgreSQL. A budget/progress backend mismatch fails closed. PostgreSQL does not
+report a synthetic WAL metric. Exceeding a budget aborts the backup with cleanup;
 interactive writes are not automatically throttled to preserve a backup.
 
 Resume releases the writer pause, not snapshots or the CAS hold. Source snapshots
@@ -228,9 +260,45 @@ adapter compatibility, crash recovery and the target pause below 1 ms are
 verified in the storage/backup deliveries (see [canonical storage](storage.md)),
 not core test doubles.
 
+`BackupWitness` carries installation and schema version, canonical history cursors
+when owned by that participant, and key ID/generation/active/readable/canary-digest
+metadata. `BackupSpool` adds a typed artifact ID, explicit `SqliteSnapshotV1` or
+`PostgresSpoolV1` kind, byte count and complete-file digest. These DTOs contain no
+database handles, raw keys or arbitrary filesystem paths. The implemented control
+adapter and its qualification limits are documented in [control backups](control-backup.md).
+
 ## Port operation coverage
 
-All nine named boundaries use object-safe traits and `Send` futures. Streams expose
+Control inventory uses explicit pages of 1–200 items. Continuations belong to
+the producer and must remain bound to authorization scope, filters and relevant
+revisions. `ControlCatalogPort` provides canonical metadata and idempotent
+lifecycle coordination without exposing note bodies or database handles.
+
+`AuthPort` owns bootstrap, password login, native bearer resolution, trusted-none
+perimeter admission, account changes, one-time credentials and PATs. Raw secrets
+use a non-serializable, redacted zeroizing wrapper. Verified contexts retain
+credential lineage, and revalidation can only narrow existing delegation.
+Interactive human management requires explicit admission. Membership and lifecycle
+changes carry stable command keys; removing a member returns an optional role.
+Owner management admission can target an archived Space without granting content
+read/write access. Revocation callbacks receive the durable event request ID for
+idempotent delivery; a committed mutation cannot return success before their ACK.
+
+Schedule claims carry the next slot computed by the scheduler. A committed claim
+advances that slot atomically; repeated claims return an inspection receipt,
+without permission to dispatch again. Terminal run results are typed and do not
+carry a next slot. Only a new winning claim returns a non-deserializable
+ScheduledRun/Keeper context. Scheduler maintenance authority owns claims and
+terminal audit; human schedule edits use account commands and configuration CAS.
+Run limits are separate from per-call completion budgets. The ticker and tool loop
+remain consumer responsibilities.
+
+`ContextAdminPort` owns reference preferences and typed Note/Folder favorites.
+`AgentTelemetryPort` accepts finite enums, typed references and counters, with no
+raw content fields. Canonical catalog lookups distinguish immutable ability refs
+from current tips and provide note/folder authorization facts without bodies.
+
+Owner boundaries use object-safe traits and `Send` futures. Streams expose
 typed `next` calls. No runtime channel, database transaction, model session or
 collaboration document occurs in a signature. `EnginePort` composes note read/write,
 chat, view/graph, search and content-job subports. Control owns authentication,

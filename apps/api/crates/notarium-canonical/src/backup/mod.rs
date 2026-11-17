@@ -14,15 +14,14 @@ use std::{
 use notarium_core::{
     DomainError,
     error::{PortError, ValidationReason},
-    ids::{
-        ArtifactId, BackupId, ContentDigest, HistoryIncarnation, InstallationId, KeyId, SpaceId,
-    },
+    ids::{ArtifactId, BackupId, ContentDigest, HistoryIncarnation, InstallationId, SpaceId},
     model::HistoryScope,
     ports::{
-        BackupBudget, BackupHold, BackupParticipantPort, BackupProgress, BackupSnapshot,
-        BackupSpool, BackupWitness, Cancellation, KeyCanary, MaintenanceContext, PausedBackup,
+        BackupArtifactKind, BackupBudget, BackupHold, BackupParticipantPort, BackupProgress,
+        BackupSnapshot, BackupSpool, BackupWitness, Cancellation, MaintenanceContext, PausedBackup,
         PortFuture, PreparedBackup, ServicePurpose,
     },
+    ports::{BackupRetentionBudget, BackupRetentionProgress},
     receipt::ChangeCursor,
 };
 use serde::{Deserialize, Serialize};
@@ -134,66 +133,14 @@ pub struct DecodedPostgresSpoolV1 {
     pub tables: Vec<DecodedPostgresSpoolTable>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct WireKeyCanaryV1 {
-    key: KeyId,
-    digest: ContentDigest,
-    readable: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct WireBackupWitnessV1 {
-    installation: InstallationId,
-    histories: Vec<ChangeCursor>,
-    canaries: Vec<WireKeyCanaryV1>,
-}
-
-impl From<&BackupWitness> for WireBackupWitnessV1 {
-    fn from(w: &BackupWitness) -> Self {
-        Self {
-            installation: w.installation.clone(),
-            histories: w.histories.clone(),
-            canaries: w
-                .canaries
-                .iter()
-                .map(|c| WireKeyCanaryV1 {
-                    key: c.key.clone(),
-                    digest: c.digest,
-                    readable: c.readable,
-                })
-                .collect(),
-        }
-    }
-}
-
-impl From<WireBackupWitnessV1> for BackupWitness {
-    fn from(w: WireBackupWitnessV1) -> Self {
-        Self {
-            installation: w.installation,
-            histories: w.histories,
-            canaries: w
-                .canaries
-                .into_iter()
-                .map(|c| KeyCanary {
-                    key: c.key,
-                    digest: c.digest,
-                    readable: c.readable,
-                })
-                .collect(),
-        }
-    }
-}
-
 fn encode_witness_json(w: &BackupWitness) -> Result<String, PortError> {
-    let wire = WireBackupWitnessV1::from(w);
-    serde_json::to_string(&wire)
+    serde_json::to_string(w)
         .map_err(|err| internal_not_committed("encode_backup_witness_json", err.to_string()))
 }
 
 fn decode_witness_json(raw: &str) -> Result<BackupWitness, PortError> {
-    let wire: WireBackupWitnessV1 = serde_json::from_str(raw)
-        .map_err(|err| internal_not_committed("decode_backup_witness_json", err.to_string()))?;
-    Ok(wire.into())
+    serde_json::from_str(raw)
+        .map_err(|err| internal_not_committed("decode_backup_witness_json", err.to_string()))
 }
 
 fn register_cleanup_task(inner: &CanonicalInner, handle: tokio::task::JoinHandle<()>) {
@@ -287,22 +234,48 @@ fn mint_artifact_id() -> Result<ArtifactId, PortError> {
     Ok(ArtifactId::from_bytes(raw))
 }
 
-fn tighten_budget(a: BackupBudget, b: BackupBudget) -> BackupBudget {
-    BackupBudget {
+fn tighten_budget(a: BackupBudget, b: BackupBudget) -> Result<BackupBudget, PortError> {
+    let retention = match (a.retention, b.retention) {
+        (
+            BackupRetentionBudget::SqliteWal {
+                max_pinned_bytes: a,
+            },
+            BackupRetentionBudget::SqliteWal {
+                max_pinned_bytes: b,
+            },
+        ) => BackupRetentionBudget::SqliteWal {
+            max_pinned_bytes: a.min(b),
+        },
+        (
+            BackupRetentionBudget::PostgresSnapshot { max_age: a },
+            BackupRetentionBudget::PostgresSnapshot { max_age: b },
+        ) => BackupRetentionBudget::PostgresSnapshot { max_age: a.min(b) },
+        _ => return Err(DomainError::validation(ValidationReason::ScopeMismatch).into()),
+    };
+    let budget = BackupBudget {
         deadline: a.deadline.min(b.deadline),
-        max_pinned_wal_bytes: a.max_pinned_wal_bytes.min(b.max_pinned_wal_bytes),
+        retention,
         max_spool_bytes: a.max_spool_bytes.min(b.max_spool_bytes),
-    }
+    };
+    validate_backup_budget(budget)?;
+    Ok(budget)
 }
 
 fn validate_backup_budget(budget: BackupBudget) -> Result<(), PortError> {
-    if budget.deadline.is_zero() || budget.max_spool_bytes == 0 {
+    if budget.deadline.is_zero()
+        || budget.max_spool_bytes == 0
+        || matches!(budget.retention, BackupRetentionBudget::PostgresSnapshot { max_age } if max_age.is_zero())
+    {
         return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
     }
     Ok(())
 }
 
 impl CanonicalStore {
+    pub fn default_backup_budget(&self) -> BackupBudget {
+        self.inner.config.default_backup_budget
+    }
+
     pub fn set_backup_spool_dir(&self, dir: PathBuf) {
         *self
             .inner
@@ -812,6 +785,7 @@ fn read_and_verify_sqlite_conn_witness(
 
     Ok(BackupWitness {
         installation: expected_installation.clone(),
+        schema_version: CANONICAL_SCHEMA_VERSION,
         histories,
         canaries: Vec::new(),
     })
@@ -877,7 +851,9 @@ fn run_sqlite_spool_on_owner_thread(
             let est_bytes = disk_bytes.max(copied_pages.saturating_mul(src_page_size));
             budget.check(BackupProgress {
                 elapsed: started.elapsed(),
-                pinned_wal_bytes: wal_pin.current_pinned_wal_bytes(),
+                retention: BackupRetentionProgress::SqliteWal {
+                    pinned_bytes: wal_pin.current_pinned_wal_bytes(),
+                },
                 spool_bytes: est_bytes,
             })?;
 
@@ -1010,7 +986,7 @@ fn run_sqlite_spool_on_owner_thread(
     let total_bytes = final_meta.len();
     budget.check(BackupProgress {
         elapsed: started.elapsed(),
-        pinned_wal_bytes: 0,
+        retention: BackupRetentionProgress::SqliteWal { pinned_bytes: 0 },
         spool_bytes: total_bytes,
     })?;
 
@@ -1122,6 +1098,7 @@ struct PgPreparedSource {
     pooled: Option<PoolConnection<Postgres>>,
     backend_pid: i32,
     in_tx: bool,
+    pinned_at: Option<Instant>,
     tmp_path: PathBuf,
 }
 
@@ -1215,6 +1192,7 @@ async fn pin_and_read_pg_witness(
     let sql = format!(
         "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
          SET LOCAL statement_timeout = {timeout_ms};
+         SET LOCAL idle_in_transaction_session_timeout = {timeout_ms};
          EXECUTE {PG_PIN_WITNESS_STMT}"
     );
     let rows = sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
@@ -1284,6 +1262,7 @@ async fn pin_and_read_pg_witness(
 
     Ok(BackupWitness {
         installation: expected_installation.clone(),
+        schema_version: CANONICAL_SCHEMA_VERSION,
         histories,
         canaries: Vec::new(),
     })
@@ -1314,7 +1293,9 @@ impl HashingSpoolWriter {
         let next_bytes = self.bytes_written.saturating_add(bytes.len() as u64);
         self.budget.check(BackupProgress {
             elapsed: self.started.elapsed(),
-            pinned_wal_bytes: 0,
+            retention: BackupRetentionProgress::PostgresSnapshot {
+                age: self.started.elapsed(),
+            },
             spool_bytes: next_bytes,
         })?;
         self.writer
@@ -1331,7 +1312,9 @@ impl HashingSpoolWriter {
         let next_bytes = self.bytes_written.saturating_add(32);
         self.budget.check(BackupProgress {
             elapsed: self.started.elapsed(),
-            pinned_wal_bytes: 0,
+            retention: BackupRetentionProgress::PostgresSnapshot {
+                age: self.started.elapsed(),
+            },
             spool_bytes: next_bytes,
         })?;
         self.writer
@@ -1405,12 +1388,24 @@ where
 async fn stream_postgres_spool_v1(
     pg: &mut PgPreparedSource,
     witness: &BackupWitness,
-    budget: BackupBudget,
+    mut budget: BackupBudget,
     cancellation: &Cancellation,
     final_path: &Path,
     step_delay_us: u64,
 ) -> Result<(u64, ContentDigest, BackupExporterMemoryStats), PortError> {
-    let started = Instant::now();
+    let started = pg
+        .pinned_at
+        .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
+    let BackupRetentionBudget::PostgresSnapshot { max_age } = budget.retention else {
+        return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+    };
+    // The spool deadline is the remaining overall time. Queries and writes use
+    // the earlier of that deadline and the retention limit measured from pin.
+    budget.deadline = budget
+        .deadline
+        .saturating_add(started.elapsed())
+        .min(max_age);
+
     let timeout_ms = u64::try_from(budget.deadline.as_millis().max(1)).unwrap_or(30_000);
 
     let tmp_file = OpenOptions::new()
@@ -1445,8 +1440,7 @@ async fn stream_postgres_spool_v1(
         spool_writer.write_body(&CANONICAL_SCHEMA_VERSION.to_be_bytes())?;
         spool_writer.write_body(manifest_checksum().as_bytes())?;
 
-        let witness_wire = WireBackupWitnessV1::from(witness);
-        let witness_bytes = encode_msgpack(&witness_wire)?;
+        let witness_bytes = encode_msgpack(witness)?;
         let witness_len = u32::try_from(witness_bytes.len()).map_err(|_| {
             internal_not_committed("pg_spool_witness_too_large", "witness > u32::MAX")
         })?;
@@ -1827,9 +1821,7 @@ pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, P
     }
     let mut witness_bytes = vec![0u8; witness_len];
     reader.read_exact_body(&mut witness_bytes, body_limit)?;
-    let wire_witness: WireBackupWitnessV1 =
-        decode_msgpack_bounded(&witness_bytes, MAX_MSGPACK_DECODE_BYTES)?;
-    let witness: BackupWitness = wire_witness.into();
+    let witness: BackupWitness = decode_msgpack_bounded(&witness_bytes, MAX_MSGPACK_DECODE_BYTES)?;
 
     reader.read_exact_body(&mut u32_buf, body_limit)?;
     let table_count = u32::from_be_bytes(u32_buf) as usize;
@@ -2005,6 +1997,7 @@ struct CanonicalPreparedBackup {
     backup_id: BackupId,
     artifact_id: ArtifactId,
     prepare_budget: BackupBudget,
+    prepared_at: Instant,
     spool_dir: PathBuf,
     driver: Option<PreparedBackendDriver>,
 }
@@ -2060,6 +2053,7 @@ struct CanonicalPausedBackup {
     backup_id: BackupId,
     artifact_id: ArtifactId,
     prepare_budget: BackupBudget,
+    prepared_at: Instant,
     spool_dir: PathBuf,
     safe_point: Option<WriterSafePointGuard>,
     unpinned_driver: Option<PreparedBackendDriver>,
@@ -2084,6 +2078,13 @@ impl PausedBackup for CanonicalPausedBackup {
                     "open_cut called after writer pause was released",
                 ));
             }
+            let remaining = self
+                .prepare_budget
+                .deadline
+                .saturating_sub(self.prepared_at.elapsed());
+            if remaining.is_zero() {
+                return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+            }
             let mut drv = self
                 .unpinned_driver
                 .take()
@@ -2098,7 +2099,12 @@ impl PausedBackup for CanonicalPausedBackup {
                             "SqliteWalCoordinator missing on SQLite store",
                         )
                     })?;
-                    let wal_pin = wal.register_backup_pin(self.prepare_budget.max_pinned_wal_bytes);
+                    let BackupRetentionBudget::SqliteWal { max_pinned_bytes } =
+                        self.prepare_budget.retention
+                    else {
+                        return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+                    };
+                    let wal_pin = wal.register_backup_pin(max_pinned_bytes);
 
                     let tx = worker.cmd_tx.as_ref().ok_or_else(|| {
                         internal_not_committed(
@@ -2137,6 +2143,7 @@ impl PausedBackup for CanonicalPausedBackup {
                         backup_id: self.backup_id.clone(),
                         artifact_id: self.artifact_id.clone(),
                         prepare_budget: self.prepare_budget,
+                        prepared_at: self.prepared_at,
                         spool_dir: self.spool_dir.clone(),
                         witness,
                         state: Some(PinnedSnapshotDriver::Sqlite {
@@ -2155,12 +2162,15 @@ impl PausedBackup for CanonicalPausedBackup {
                             "PostgreSQL backup connection missing",
                         )
                     })?;
-                    let pin_res = pin_and_read_pg_witness(
-                        &mut *conn,
-                        &expected_inst,
-                        self.prepare_budget.deadline,
-                    )
-                    .await;
+                    let BackupRetentionBudget::PostgresSnapshot { max_age } =
+                        self.prepare_budget.retention
+                    else {
+                        return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+                    };
+                    let remaining = remaining.min(max_age);
+                    pg.pinned_at = Some(Instant::now());
+                    let pin_res =
+                        pin_and_read_pg_witness(&mut *conn, &expected_inst, remaining).await;
                     pg.in_tx = true;
                     let witness = match pin_res {
                         Ok(w) => w,
@@ -2175,6 +2185,7 @@ impl PausedBackup for CanonicalPausedBackup {
                         backup_id: self.backup_id.clone(),
                         artifact_id: self.artifact_id.clone(),
                         prepare_budget: self.prepare_budget,
+                        prepared_at: self.prepared_at,
                         spool_dir: self.spool_dir.clone(),
                         witness,
                         state: Some(PinnedSnapshotDriver::Postgres(match drv {
@@ -2215,6 +2226,7 @@ struct CanonicalBackupSnapshot {
     backup_id: BackupId,
     artifact_id: ArtifactId,
     prepare_budget: BackupBudget,
+    prepared_at: Instant,
     spool_dir: PathBuf,
     witness: BackupWitness,
     state: Option<PinnedSnapshotDriver>,
@@ -2283,11 +2295,21 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
                     "backup spool cancelled before start",
                 ));
             }
-            validate_backup_budget(budget)?;
-            let eff_budget = tighten_budget(self.prepare_budget, budget);
-
             let Some(pinned) = self.state.take() else {
                 return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            };
+            let remaining_budget =
+                tighten_budget(self.prepare_budget, budget).and_then(|mut limit| {
+                    limit.deadline = limit.deadline.saturating_sub(self.prepared_at.elapsed());
+                    validate_backup_budget(limit)?;
+                    Ok(limit)
+                });
+            let eff_budget = match remaining_budget {
+                Ok(limit) => limit,
+                Err(err) => {
+                    abort_pinned_driver(pinned).await;
+                    return Err(err);
+                }
             };
 
             let step_delay_us = self.store.inner.backup_step_delay_us.load(Ordering::SeqCst);
@@ -2448,6 +2470,12 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
             .await?;
 
             Ok(BackupSpool {
+                kind: match encoding {
+                    BackupArtifactEncoding::SqliteSnapshotV1 => {
+                        BackupArtifactKind::SqliteSnapshotV1
+                    }
+                    BackupArtifactEncoding::PostgresSpoolV1 => BackupArtifactKind::PostgresSpoolV1,
+                },
                 artifact: self.artifact_id.clone(),
                 bytes,
                 digest,
@@ -2526,6 +2554,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
                 backup_id: self.backup_id.clone(),
                 artifact_id: self.artifact_id.clone(),
                 prepare_budget: self.prepare_budget,
+                prepared_at: self.prepared_at,
                 spool_dir: self.spool_dir.clone(),
                 safe_point: Some(safe_point),
                 unpinned_driver: Some(drv),
@@ -2556,7 +2585,17 @@ impl BackupParticipantPort for CanonicalStore {
                     "backup prepare call budget expired",
                 ));
             }
-            validate_backup_budget(budget)?;
+            let prepared_at = Instant::now();
+            let mut budget = tighten_budget(store.default_backup_budget(), budget)?;
+            budget.deadline = budget.deadline.min(ctx.budget.remaining);
+            match (&store.inner.sql, budget.retention) {
+                (SqlDriverState::Sqlite { .. }, BackupRetentionBudget::SqliteWal { .. })
+                | (
+                    SqlDriverState::Postgres { .. },
+                    BackupRetentionBudget::PostgresSnapshot { .. },
+                ) => {}
+                _ => return Err(DomainError::validation(ValidationReason::ScopeMismatch).into()),
+            }
             store.ensure_open()?;
 
             let spool_dir = resolve_spool_dir(&store.inner)?;
@@ -2596,6 +2635,7 @@ impl BackupParticipantPort for CanonicalStore {
                         pooled: Some(pooled),
                         backend_pid,
                         in_tx: false,
+                        pinned_at: None,
                         tmp_path,
                     })
                 }
@@ -2614,6 +2654,7 @@ impl BackupParticipantPort for CanonicalStore {
                 store,
                 backup_id: backup,
                 artifact_id,
+                prepared_at,
                 prepare_budget: budget,
                 spool_dir,
                 driver: Some(driver),
@@ -2786,6 +2827,7 @@ async fn acquire_durable_backup_holds(
 
                 let witness = BackupWitness {
                     installation: inst_id.clone(),
+                    schema_version: CANONICAL_SCHEMA_VERSION,
                     histories,
                     canaries: Vec::new(),
                 };

@@ -1307,7 +1307,13 @@ impl CanonicalStore {
                                 };
 
                                 if let Some(auth) = &auth_in
-                                    && auth.authorize_chat_read(&space_rec.space, tainted).is_err()
+                                    && auth
+                                        .authorize_chat_read(
+                                            &space_rec.space,
+                                            project_folder_id.as_ref(),
+                                            tainted,
+                                        )
+                                        .is_err()
                                 {
                                     continue;
                                 }

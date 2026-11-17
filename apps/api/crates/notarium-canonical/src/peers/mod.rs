@@ -678,8 +678,8 @@ fn authorize_job_read_on_space(auth: &EngineAuthContext, space: &Space) -> Resul
         return Err(DomainError::ResourceNotFound);
     }
     // Note: EngineAuthContext::authorize_chat_read marks external read taint when reading outside write_space;
-    // mirror that whole-Space read check via authorize_chat_read(space, false).
-    auth.authorize_chat_read(space, false)
+    // mirror that whole-Space read check for unscoped job metadata.
+    auth.authorize_chat_read(space, None, false)
 }
 
 fn authorize_job_write_on_space(

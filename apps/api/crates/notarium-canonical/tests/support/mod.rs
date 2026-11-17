@@ -9,7 +9,7 @@ use std::{
 use notarium_canonical::{
     BlobBackendConfig, CanonicalConfig, PgConnectConfig, PgTransport, S3AddressingStyle,
     S3BucketModePolicy, S3Config, S3Credentials, SqlBackendConfig, WriterConfig,
-    default_backup_budget, dialect::postgres::build_pg_connect_options,
+    dialect::postgres::build_pg_connect_options,
 };
 use notarium_core::{
     epoch::DataRoot,
@@ -201,7 +201,7 @@ impl StorageTestFixtures {
             },
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
-            default_backup_budget: default_backup_budget(),
+            default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
         }
     }
 
@@ -242,7 +242,7 @@ impl StorageTestFixtures {
             blobs: BlobBackendConfig::S3(Box::new(s3_cfg)),
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
-            default_backup_budget: default_backup_budget(),
+            default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
         }
     }
 }

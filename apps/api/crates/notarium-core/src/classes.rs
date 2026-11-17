@@ -428,6 +428,8 @@ pub struct CanonicalChatContent {
     pub entry: ThreadEntrySeq,
     tainted: bool,
     text: String,
+    digest: ContentDigest,
+    project: Option<crate::ids::FolderId>,
 }
 impl CanonicalChatContent {
     pub fn from_canonical(
@@ -436,6 +438,8 @@ impl CanonicalChatContent {
         entry: ThreadEntrySeq,
         tainted: bool,
         text: String,
+        digest: ContentDigest,
+        project: Option<crate::ids::FolderId>,
     ) -> Self {
         Self {
             space,
@@ -443,6 +447,8 @@ impl CanonicalChatContent {
             entry,
             tainted,
             text,
+            digest,
+            project,
         }
     }
 }
@@ -478,6 +484,135 @@ pub enum ProviderMessage {
     Chat(ProviderChatContent),
     Ability(ProviderAbilityContent),
 }
+/// A metadata-only identity for acquiring current canonical egress authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProviderOrigin {
+    Note {
+        reference: NoteRef,
+        revision: RevisionId,
+        digest: ContentDigest,
+    },
+    Ability {
+        reference: AbilityResourceRef,
+        digest: ContentDigest,
+    },
+    Chat {
+        space: SpaceId,
+        thread: ChatThreadId,
+        entry: ThreadEntrySeq,
+        digest: ContentDigest,
+        project: Option<crate::ids::FolderId>,
+    },
+}
+#[derive(Clone, Debug)]
+pub enum ProviderCurrentContent {
+    Note(ClassifiedMetadata),
+    Ability {
+        reference: AbilityResourceRef,
+        digest: ContentDigest,
+        facts: ResourceFacts,
+        lifecycle: Lifecycle,
+    },
+    Chat {
+        space: Space,
+        thread: ChatThreadId,
+        entry: ThreadEntrySeq,
+        digest: ContentDigest,
+        project: Option<crate::ids::FolderId>,
+        lifecycle: Lifecycle,
+        tainted: bool,
+    },
+}
+impl ProviderCurrentContent {
+    pub fn origin(&self) -> ProviderOrigin {
+        match self {
+            Self::Note(value) => ProviderOrigin::Note {
+                reference: value.reference.clone(),
+                revision: value.revision.clone(),
+                digest: value.digest,
+            },
+            Self::Ability {
+                reference, digest, ..
+            } => ProviderOrigin::Ability {
+                reference: reference.clone(),
+                digest: *digest,
+            },
+            Self::Chat {
+                space,
+                thread,
+                entry,
+                digest,
+                project,
+                ..
+            } => ProviderOrigin::Chat {
+                space: space.id.clone(),
+                thread: thread.clone(),
+                entry: *entry,
+                digest: *digest,
+                project: project.clone(),
+            },
+        }
+    }
+    pub fn space(&self) -> &Space {
+        match self {
+            Self::Note(value) => &value.facts.space,
+            Self::Ability { facts, .. } => &facts.space,
+            Self::Chat { space, .. } => space,
+        }
+    }
+    /// Project-only consent is usable only with current canonical placement.
+    pub fn in_project(&self, project: &crate::model::FolderRef) -> bool {
+        if self.space().id != project.space_id {
+            return false;
+        }
+        match self {
+            Self::Note(value) => value.facts.ancestor_folders.contains(&project.folder_id),
+            Self::Ability { facts, .. } => facts.ancestor_folders.contains(&project.folder_id),
+            Self::Chat {
+                project: current, ..
+            } => current.as_ref() == Some(&project.folder_id),
+        }
+    }
+}
+impl ProviderMessage {
+    pub fn origin(&self) -> ProviderOrigin {
+        match self {
+            Self::Document(value) => {
+                ProviderCurrentContent::Note(value.provenance().metadata()).origin()
+            }
+            Self::Part(value) => {
+                ProviderCurrentContent::Note(value.part().provenance().metadata()).origin()
+            }
+            Self::Ability(value) => ProviderOrigin::Ability {
+                reference: value.resource.reference.clone(),
+                digest: value.resource.digest,
+            },
+            Self::Chat(value) => ProviderOrigin::Chat {
+                space: value.entry.space.id.clone(),
+                thread: value.entry.thread.clone(),
+                entry: value.entry.entry,
+                digest: value.entry.digest,
+                project: value.entry.project.clone(),
+            },
+        }
+    }
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Document(value) => value.text(),
+            Self::Part(value) => value.text(),
+            Self::Chat(value) => value.text(),
+            Self::Ability(value) => value.text(),
+        }
+    }
+    pub fn provider(&self) -> &ProviderResourceId {
+        match self {
+            Self::Document(value) => value.provider(),
+            Self::Part(value) => value.provider(),
+            Self::Chat(value) => value.provider(),
+            Self::Ability(value) => value.provider(),
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct ProviderAbilityContent {
     resource: ClassifiedAbilityResource,
@@ -495,6 +630,67 @@ impl ProviderAbilityContent {
     }
 }
 impl ClassEgressFence {
+    /// The caller holds a canonical egress lease and dispatch registration,
+    /// and supplies freshly verified control authority and disclosure consent.
+    pub fn revalidate(
+        message: &ProviderMessage,
+        auth: &EngineAuthContext,
+        policy: &ProviderPolicy,
+        current: &ProviderCurrentContent,
+    ) -> DomainResult<()> {
+        if message.provider() != &policy.provider || message.origin() != current.origin() {
+            return Err(DomainError::validation(ValidationReason::SourceMismatch));
+        }
+        match (message, current) {
+            (
+                ProviderMessage::Document(_) | ProviderMessage::Part(_),
+                ProviderCurrentContent::Note(value),
+            ) => {
+                Self::check_metadata(&value.facts, value.lifecycle, auth)?;
+                Self::provider_policy(&value.facts.space, value.facts.class, policy)
+            }
+            (
+                ProviderMessage::Ability(_),
+                ProviderCurrentContent::Ability {
+                    reference,
+                    facts,
+                    lifecycle,
+                    ..
+                },
+            ) => {
+                Self::check_metadata(facts, *lifecycle, auth)?;
+                if facts.class != DocClass::Skill
+                    || facts.ability_package.as_ref() != Some(&reference.ability)
+                    || facts.space.id != reference.space
+                {
+                    return Err(DomainError::validation(ValidationReason::ClassMismatch));
+                }
+                Self::provider_policy(&facts.space, facts.class, policy)
+            }
+            (
+                ProviderMessage::Chat(value),
+                ProviderCurrentContent::Chat {
+                    space,
+                    project,
+                    lifecycle,
+                    tainted,
+                    ..
+                },
+            ) => {
+                if *lifecycle != Lifecycle::Active {
+                    return Err(DomainError::ResourceNotFound);
+                }
+                Self::check_chat(
+                    space,
+                    project.as_ref(),
+                    value.entry.tainted || *tainted,
+                    auth,
+                    policy,
+                )
+            }
+            _ => Err(DomainError::validation(ValidationReason::SourceMismatch)),
+        }
+    }
     pub fn search_part(part: ContentPart, auth: &EngineAuthContext) -> DomainResult<SearchPart> {
         Self::check(part.provenance(), auth)?;
         Ok(SearchPart(part))
@@ -531,10 +727,29 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
         policy: &ProviderPolicy,
     ) -> DomainResult<ProviderChatContent> {
-        auth.authorize_chat_read(&entry.space, entry.tainted)?;
+        Self::check_chat(
+            &entry.space,
+            entry.project.as_ref(),
+            entry.tainted,
+            auth,
+            policy,
+        )?;
+        Ok(ProviderChatContent {
+            entry,
+            provider: policy.provider.clone(),
+        })
+    }
+    fn check_chat(
+        current: &Space,
+        project: Option<&crate::ids::FolderId>,
+        tainted: bool,
+        auth: &EngineAuthContext,
+        policy: &ProviderPolicy,
+    ) -> DomainResult<()> {
+        auth.authorize_chat_read(current, project, tainted)?;
         let permitted = match &policy.audience {
             ProviderAudience::Personal { consented } => {
-                *consented && entry.space.kind == SpaceKind::Personal
+                *consented && current.kind == SpaceKind::Personal
             }
             ProviderAudience::Shared {
                 space,
@@ -545,8 +760,8 @@ impl ClassEgressFence {
                 *attached
                     && *space_consented
                     && *sender_consented
-                    && space == &entry.space.id
-                    && !entry.tainted
+                    && space == &current.id
+                    && !tainted
             }
         };
         if !permitted {
@@ -554,10 +769,7 @@ impl ClassEgressFence {
                 ValidationReason::ProviderConsentRequired,
             ));
         }
-        Ok(ProviderChatContent {
-            entry,
-            provider: policy.provider.clone(),
-        })
+        Ok(())
     }
     fn check(document: &ClassifiedDocument, auth: &EngineAuthContext) -> DomainResult<()> {
         Self::check_metadata(&document.facts, document.lifecycle, auth)

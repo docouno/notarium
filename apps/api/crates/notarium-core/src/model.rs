@@ -59,13 +59,13 @@ impl LifecycleMask {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum AbilityResourceName {
     Entrypoint,
     /// An exact package manifest key, never a filesystem path to resolve.
     Auxiliary(String),
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AbilityResourceRef {
     pub space: SpaceId,
     pub ability: AbilityId,

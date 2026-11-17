@@ -5,7 +5,7 @@ use notarium_core::{
     epoch::{CLOUD_CANONICAL_SCHEMA, DataRoot},
     error::ValidationReason,
     ids::InstallationId,
-    ports::BackupBudget,
+    ports::{BackupBudget, BackupRetentionBudget},
 };
 
 /// Validates an internal PostgreSQL schema identifier before DDL or `search_path` use.
@@ -202,7 +202,18 @@ impl CanonicalConfig {
 pub fn default_backup_budget() -> BackupBudget {
     BackupBudget {
         deadline: Duration::from_secs(30),
-        max_pinned_wal_bytes: 256 * 1024 * 1024,
+        retention: BackupRetentionBudget::SqliteWal {
+            max_pinned_bytes: 256 * 1024 * 1024,
+        },
         max_spool_bytes: 8 * 1024 * 1024 * 1024,
+    }
+}
+
+pub fn default_postgres_backup_budget() -> BackupBudget {
+    BackupBudget {
+        retention: BackupRetentionBudget::PostgresSnapshot {
+            max_age: Duration::from_secs(30),
+        },
+        ..default_backup_budget()
     }
 }

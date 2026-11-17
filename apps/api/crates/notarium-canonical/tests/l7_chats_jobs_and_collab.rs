@@ -13,8 +13,8 @@ use std::{
 
 use notarium_canonical::{
     AppendCollabUpdate, CanonicalConfig, CanonicalRuntime, CanonicalStore, CheckpointCollabSession,
-    CloseCollabSession, CollabCarrierSettlement, CollabRoomState, CreateSpaceSpec,
-    JobCompletionOutcome, OpenCollabSession, RoomFenceTable, S3BucketModePolicy,
+    CloseCollabSession, CollabCarrierSettlement, CollabRoomState, CreateFolderSpec,
+    CreateSpaceSpec, JobCompletionOutcome, OpenCollabSession, RoomFenceTable, S3BucketModePolicy,
     blobs::s3::admin_ensure_bucket,
 };
 use notarium_core::{
@@ -247,6 +247,23 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .await
         .expect("create referenced note");
 
+    let project = sample_folder_id(0x70);
+    store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: project.clone(),
+            parent: None,
+            slug: "chat-project".to_owned(),
+            display_name: "Chat Project".to_owned(),
+            is_project: true,
+            project_slug: Some("chat-project".to_owned()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .expect("create project");
+
     // 1. Create Personal chat thread and test 512B vs 513B multi-byte UTF-8 inline/CAS boundary.
     let thread = sample_thread_id(0x31);
     let created = store
@@ -259,7 +276,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     thread: thread.clone(),
                     kind: ChatThreadKind::Personal,
                     owner: owner.clone(),
-                    project_folder: None,
+                    project_folder: Some(project.clone()),
                     title: "Skip Pointer & Queue Suite".to_owned(),
                 },
             ),
@@ -571,6 +588,37 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     assert_eq!(page_b.entries.first().unwrap().seq, e1.seq);
     assert_eq!(page_b.entries.last().unwrap().seq, branch_b_tip);
     assert!(!page_b.entries.iter().any(|e| e.seq == e2.seq));
+
+    let project_ctx = |pin| {
+        let owner = owner_ctx(&scope, owner.clone());
+        let mut grants = owner.auth().spaces().clone();
+        grants.get_mut(&scope.space_id).unwrap().project_root = Some(pin);
+        SpaceContext::new(
+            owner.auth().for_pat(grants).unwrap(),
+            scope.clone(),
+            make_budget(),
+        )
+        .unwrap()
+    };
+    for before in [None, Some(e1.seq)] {
+        let read = ChatRead {
+            thread: thread.clone(),
+            leaf: branch_b_tip,
+            before,
+            max_entries: PageLimit::new(4).unwrap(),
+        };
+        let branch = store
+            .read_chat(project_ctx(project.clone()), read.clone())
+            .await
+            .unwrap();
+        assert_eq!(branch.thread.project_folder, Some(project.clone()));
+        assert!(matches!(
+            store
+                .read_chat(project_ctx(sample_folder_id(0x76)), read)
+                .await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+    }
 
     // Passing a `before` cursor from sibling branch B while reading leaf `cur_a` MUST fail closed!
     let cross_fork_read = store

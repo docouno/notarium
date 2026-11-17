@@ -332,7 +332,7 @@ async fn filter_change_result_for_space_caller(
                 srec.scope.check(&scope)?;
                 let mut folder_cache = FolderAncestryCache::default();
                 let mut note_cache: HashMap<NoteId, Option<NoteHeadRow>> = HashMap::new();
-                let mut thread_taint_cache: HashMap<String, Option<bool>> = HashMap::new();
+                let mut thread_visibility = HashMap::new();
                 let mut kept = Vec::with_capacity(changes_in.len());
 
                 for ch in changes_in {
@@ -362,10 +362,14 @@ async fn filter_change_result_for_space_caller(
                                     Err(_) => false,
                                 }
                             } else if let Some(cls) = ch.class {
-                                auth.spaces()
-                                    .get(&scope.space_id)
-                                    .map(|g| g.read_classes.contains(&cls))
-                                    .unwrap_or(false)
+                                auth.authorize_read(&notarium_core::auth::ResourceFacts {
+                                    space: srec.space.clone(),
+                                    class: cls,
+                                    ancestor_folders: Vec::new(),
+                                    folder_write_locked: false,
+                                    ability_package: None,
+                                })
+                                .is_ok()
                             } else {
                                 false
                             }
@@ -376,20 +380,8 @@ async fn filter_change_result_for_space_caller(
                                 .await
                             {
                                 Ok(anc) => auth
-                                    .spaces()
-                                    .get(&scope.space_id)
-                                    .and_then(|g| g.read_classes.iter().copied().next())
-                                    .map(|cls| {
-                                        auth.authorize_read(&notarium_core::auth::ResourceFacts {
-                                            space: srec.space.clone(),
-                                            class: cls,
-                                            ancestor_folders: anc.ancestors,
-                                            folder_write_locked: anc.write_locked,
-                                            ability_package: None,
-                                        })
-                                        .is_ok()
-                                    })
-                                    .unwrap_or(false),
+                                    .authorize_folder_read(&srec.space, fid, &anc.ancestors)
+                                    .is_ok(),
                                 Err(_) => false,
                             }
                         }
@@ -432,28 +424,25 @@ async fn filter_change_result_for_space_caller(
                             }
                         }
                         EntityId::Thread(tid) => {
-                            let taint_opt =
-                                if let Some(cached) = thread_taint_cache.get(tid.as_str()) {
-                                    *cached
-                                } else {
-                                    let loaded =
-                                        lookup_thread_tainted_tx(tx, &scope.space_id, tid.as_str())
-                                            .await?;
-                                    thread_taint_cache.insert(tid.as_str().to_owned(), loaded);
-                                    loaded
-                                };
-                            match taint_opt {
-                                Some(tainted) => {
-                                    auth.authorize_chat_read(&srec.space, tainted).is_ok()
-                                }
-                                None => auth.spaces().contains_key(&scope.space_id),
+                            if let Some(allowed) = thread_visibility.get(tid) {
+                                *allowed
+                            } else {
+                                let facts =
+                                    lookup_thread_visibility_tx(tx, &scope.space_id, tid.as_str())
+                                        .await?;
+                                let allowed = facts.is_some_and(|(project, tainted)| {
+                                    auth.authorize_chat_read(&srec.space, project.as_ref(), tainted)
+                                        .is_ok()
+                                });
+                                thread_visibility.insert(tid.clone(), allowed);
+                                allowed
                             }
                         }
                         EntityId::Job(_) => {
                             auth.spaces()
                                 .get(&scope.space_id)
                                 .is_some_and(|g| g.project_root.is_none())
-                                && auth.authorize_chat_read(&srec.space, false).is_ok()
+                                && auth.authorize_chat_read(&srec.space, None, false).is_ok()
                         }
                     };
                     if allowed {
@@ -469,22 +458,22 @@ async fn filter_change_result_for_space_caller(
     Ok(ChangeReadResult::Log(page))
 }
 
-async fn lookup_thread_tainted_tx(
+async fn lookup_thread_visibility_tx(
     tx: &mut BackendConn<'_>,
     space_id: &notarium_core::ids::SpaceId,
     thread_id: &str,
-) -> Result<Option<bool>, PortError> {
-    let mask_opt: Option<i64> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT ext_space_tainted_mask FROM chat_threads WHERE space_id = ? AND thread_id = ?",
+) -> Result<Option<(Option<FolderId>, bool)>, PortError> {
+    let row: Option<(Option<String>, i64)> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_as(
+            "SELECT project_folder_id, ext_space_tainted_mask FROM chat_threads WHERE space_id = ? AND thread_id = ?",
         )
         .bind(space_id.as_str())
         .bind(thread_id)
         .fetch_optional(&mut **conn)
         .await
         .map_err(|err| internal_not_committed("sqlite_lookup_thread_taint", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT ext_space_tainted_mask::BIGINT FROM chat_threads WHERE space_id = $1 AND thread_id = $2",
+        BackendConn::Postgres(conn) => sqlx::query_as(
+            "SELECT project_folder_id, ext_space_tainted_mask::BIGINT FROM chat_threads WHERE space_id = $1 AND thread_id = $2",
         )
         .bind(space_id.as_str())
         .bind(thread_id)
@@ -492,7 +481,15 @@ async fn lookup_thread_tainted_tx(
         .await
         .map_err(|err| internal_not_committed("pg_lookup_thread_taint", err.to_string()))?,
     };
-    Ok(mask_opt.map(|m| m != 0))
+    row.map(|(project, mask)| {
+        let project = project
+            .as_deref()
+            .map(FolderId::parse)
+            .transpose()
+            .map_err(|_| internal_not_committed("corrupt_thread_proj", "invalid FolderId"))?;
+        Ok((project, mask != 0))
+    })
+    .transpose()
 }
 
 async fn lookup_ability_entrypoint_tx(

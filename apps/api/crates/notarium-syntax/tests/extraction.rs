@@ -573,6 +573,7 @@ fn selected_chunks_reach_embedding_and_recall_with_original_provenance() {
     assert_eq!(selected.provenance().digest(), document.digest());
     assert!(!format!("{part:?}").contains("hello world"));
     let request = EmbeddingRequest {
+        project: None,
         intent: CommandKey::from_bytes([1; 16]),
         model,
         provider: policy.provider.clone(),
@@ -604,7 +605,10 @@ fn selected_chunks_reach_embedding_and_recall_with_original_provenance() {
                     model: request.model,
                     dimension: 1,
                     vectors: vec![Ok(vec![1.0])],
-                    used_tokens: request.declared_tokens,
+                    usage: ProviderUsage::Exact {
+                        input_tokens: u64::from(request.declared_tokens),
+                        output_tokens: 0,
+                    },
                 })
             })
         }
@@ -632,7 +636,13 @@ fn selected_chunks_reach_embedding_and_recall_with_original_provenance() {
     else {
         panic!()
     };
-    assert_eq!(result.used_tokens, descriptor.tokens);
+    assert_eq!(
+        result.usage,
+        ProviderUsage::Exact {
+            input_tokens: u64::from(descriptor.tokens),
+            output_tokens: 0,
+        }
+    );
     let hit = SearchHit {
         card: NoteCard {
             document: ClassEgressFence::search_metadata(document.metadata(), &auth).unwrap(),

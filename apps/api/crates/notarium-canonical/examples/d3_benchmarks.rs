@@ -1483,7 +1483,7 @@ async fn run_pg_rollback_benchmark(
         blobs: blobs_cfg,
         writer: WriterConfig::default(),
         snapshot_retention: Duration::from_secs(300),
-        default_backup_budget: default_backup_budget(),
+        default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
     };
 
     let (store, rt) = CanonicalRuntime::open(cfg).await.unwrap();
@@ -2544,7 +2544,7 @@ async fn run_paired_backup_pause_benchmark(
     backend_label: &'static str,
     captures: usize,
 ) -> PairedBackupPauseMetrics {
-    let budget = default_backup_budget();
+    let budget = participant_a.default_backup_budget();
 
     // Warm one capture before timing
     {
@@ -2850,7 +2850,7 @@ async fn main() {
             },
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
-            default_backup_budget: default_backup_budget(),
+            default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
         })
         .await
         .unwrap();
@@ -2914,7 +2914,7 @@ async fn main() {
             },
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
-            default_backup_budget: default_backup_budget(),
+            default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
         })
         .await
         .unwrap();
@@ -2976,7 +2976,7 @@ async fn main() {
             },
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
-            default_backup_budget: default_backup_budget(),
+            default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
         })
         .await
         .unwrap();
@@ -3062,7 +3062,7 @@ async fn main() {
             },
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
-            default_backup_budget: default_backup_budget(),
+            default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
         })
         .await
         .unwrap();
@@ -3074,7 +3074,7 @@ async fn main() {
             },
             writer: WriterConfig::default(),
             snapshot_retention: Duration::from_secs(300),
-            default_backup_budget: default_backup_budget(),
+            default_backup_budget: notarium_canonical::config::default_postgres_backup_budget(),
         })
         .await
         .unwrap();

@@ -12,13 +12,14 @@ published through ArcSwap. Cloud delivery pairs PostgreSQL 16 with S3-compatible
 CAS. Search targets pure Rust i8 mmap CSR-HNSW with `std::arch` SIMD. ONNX is
 loaded dynamically through `ort`, never downloaded during offline builds.
 
-The core, syntax and canonical libraries implement [domain contracts](core-contracts.md),
-[document syntax](syntax.md) and [canonical storage and CAS](storage.md),
-including authority/egress checks, typed ports, history-scoped receipts,
-byte-preserving edits, dual-dialect SQLite/PostgreSQL 16 persistence, local and
-S3 CAS, crash-safe purge, chat DAG storage and paired backup snapshots. Control,
-rebuildable projections, search, live collaboration, background workers and
-transport integration remain separate work.
+The core, syntax, canonical and control libraries implement [domain contracts](core-contracts.md),
+[document syntax](syntax.md) and [control-plane services](control.md), including
+authority/egress checks, typed ports, history-scoped receipts, exact comparisons,
+byte-preserving edits, SQLite/PostgreSQL control storage, authentication, OAuth/OIDC,
+the native keyring, guarded outbound HTTP, the AI provider gateway and the
+[control backup participant](control-backup.md). [Canonical storage](storage.md) provides SQLite and PostgreSQL persistence, CAS,
+chat history and a backup participant. Projections,
+search, collaboration and HTTP/MCP transport integration remain separate work.
 
 ## Internal dependency allowlist
 
@@ -58,9 +59,27 @@ locked for offline setup. `Cargo.lock` must contain none of `openssl-sys`,
 
 TLS uses rustls 0.23 with ring, reqwest 0.13 with `rustls-no-provider`, and tonic
 0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
-C++/OpenSSL tools. Core, syntax and canonical tests exercise domain, document and
-dual-dialect storage behavior; remaining per-crate scaffold tests are compile
+C++/OpenSSL tools. Core/syntax tests exercise domain and document behavior;
+Canonical tests exercise dual-dialect storage and CAS. Control storage tests its SQL schema, target import/export, authentication,
+Space authority and crash recovery. Remaining per-crate scaffold tests are compile
 smoke checks.
+
+`notarium-control` owns a 45-table baseline in SQLite and the PostgreSQL
+`v1_control` schema. Its typed target records support offline import and paged
+export from a retained read snapshot. `ControlService` implements `AuthPort` and
+Space membership/lifecycle operations with durable revocation and canonical
+coordination. Its native keyring and guarded HTTP transport provide credential
+storage and bounded network primitives. `OAuthService` implements the local
+authorization server, and `OidcService` verifies external identity and issues
+native sessions through explicit account bindings. `ProviderService` implements
+encrypted provider configuration, current disclosure admission, bounded completion
+and embedding calls, and durable spending reservations. `ControlPlane` composes that provider with
+its matching account-state service. Episodes, reference contexts, ability overlays,
+schedule claims and content-free telemetry are implemented without a tool loop
+or ticker. `ControlBackup` implements the control participant's writer fence,
+pinned snapshots, stable artifacts and cursor rebinding. A paired canonical/control
+backup and archive coordinator remains a separate integration. See
+[control services](control.md).
 
 ## Client and delivery boundaries
 

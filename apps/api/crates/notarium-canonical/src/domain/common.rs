@@ -368,7 +368,7 @@ pub(crate) fn derive_command_identity_spec(
 pub(crate) fn extract_agent_run_from_auth(auth: &EngineAuthContext) -> Option<AgentRunId> {
     match auth.kind() {
         PrincipalKind::AgentRun(run) | PrincipalKind::Keeper(run) => Some(run.clone()),
-        PrincipalKind::DirectHuman | PrincipalKind::OAuth { .. } => None,
+        PrincipalKind::DirectHuman | PrincipalKind::Pat | PrincipalKind::OAuth { .. } => None,
     }
 }
 

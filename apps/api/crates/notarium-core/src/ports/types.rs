@@ -174,7 +174,7 @@ pub struct BatchResult<T> {
     pub items: Vec<Result<Committed<T>, DomainError>>,
     pub committed_high_watermark: SpaceSeq,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MemoryTarget {
     User { owner: PrincipalId },
     Project { folder: FolderRef },

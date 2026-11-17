@@ -1,26 +1,133 @@
 use crate::{
-    DomainError, DomainResult, auth::EngineAuthContext, error::ValidationReason, ids::*,
+    DomainError, DomainResult,
+    auth::{EngineAuthContext, SecretString},
+    error::ValidationReason,
+    ids::*,
     model::HistoryScope,
 };
 use std::{
     fmt,
+    future::Future,
+    pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
-#[derive(Clone, Debug, Default)]
-pub struct Cancellation(Arc<AtomicBool>);
+#[derive(Default)]
+struct WakerSlab {
+    entries: Vec<Option<Waker>>,
+    free: Vec<usize>,
+}
+
+#[derive(Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    wakers: Mutex<WakerSlab>,
+}
+
+#[derive(Clone, Default)]
+pub struct Cancellation(Arc<CancellationState>);
 impl Cancellation {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        let entries = {
+            let mut guard = self.0.wakers.lock().unwrap_or_else(|e| e.into_inner());
+            if self.0.cancelled.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            guard.free.clear();
+            std::mem::take(&mut guard.entries)
+        };
+        for waker in entries.into_iter().flatten() {
+            waker.wake();
+        }
     }
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+    pub fn cancelled(&self) -> Cancelled<'_> {
+        Cancelled {
+            cancellation: self,
+            slot: None,
+        }
     }
 }
+impl fmt::Debug for Cancellation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Cancellation")
+            .field(&self.is_cancelled())
+            .finish()
+    }
+}
+pub struct Cancelled<'a> {
+    cancellation: &'a Cancellation,
+    slot: Option<usize>,
+}
+impl Unpin for Cancelled<'_> {}
+impl Future for Cancelled<'_> {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.cancellation.is_cancelled() {
+            return Poll::Ready(());
+        }
+        let mut guard = self
+            .cancellation
+            .0
+            .wakers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.cancellation.is_cancelled() {
+            self.slot = None;
+            return Poll::Ready(());
+        }
+        let waker = cx.waker();
+        match self.slot {
+            Some(idx) => {
+                if let Some(entry) = guard.entries.get_mut(idx) {
+                    match entry {
+                        Some(existing) if existing.will_wake(waker) => {}
+                        _ => *entry = Some(waker.clone()),
+                    }
+                }
+            }
+            None => {
+                let idx = if let Some(free_idx) = guard.free.pop() {
+                    guard.entries[free_idx] = Some(waker.clone());
+                    free_idx
+                } else {
+                    let idx = guard.entries.len();
+                    guard.entries.push(Some(waker.clone()));
+                    idx
+                };
+                self.slot = Some(idx);
+            }
+        }
+        Poll::Pending
+    }
+}
+impl Drop for Cancelled<'_> {
+    fn drop(&mut self) {
+        if let Some(idx) = self.slot.take()
+            && !self.cancellation.is_cancelled()
+        {
+            let mut guard = self
+                .cancellation
+                .0
+                .wakers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = guard.entries.get_mut(idx)
+                && entry.take().is_some()
+            {
+                guard.free.push(idx);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CallBudget {
     pub request: RequestId,
@@ -31,7 +138,9 @@ pub struct CallBudget {
 /// Credentials are consumed by the authentication owner, never formatted in errors.
 pub struct AuthEvidence {
     kind: AuthEvidenceKind,
-    secret: String,
+    secret: SecretString,
+    human_management: bool,
+    ability_write: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthEvidenceKind {
@@ -42,13 +151,36 @@ pub enum AuthEvidenceKind {
 }
 impl AuthEvidence {
     pub fn new(kind: AuthEvidenceKind, secret: String) -> Self {
-        Self { kind, secret }
+        Self {
+            kind,
+            secret: SecretString::new(secret),
+            human_management: false,
+            ability_write: false,
+        }
     }
     pub fn kind(&self) -> AuthEvidenceKind {
         self.kind
     }
     pub fn secret(&self) -> &str {
-        &self.secret
+        self.secret.expose()
+    }
+    /// Trusted interactive transport explicitly admits human management after
+    /// checking its perimeter and CSRF policy. Delegated bearers ignore this bit.
+    pub fn with_human_management(mut self) -> Self {
+        self.human_management = true;
+        self
+    }
+    pub fn human_management(&self) -> bool {
+        self.human_management
+    }
+    /// Trusted interactive transport explicitly admits ability package authoring
+    /// independently from ordinary account/Space management mutations.
+    pub fn with_ability_write(mut self) -> Self {
+        self.ability_write = true;
+        self
+    }
+    pub fn ability_write(&self) -> bool {
+        self.ability_write
     }
 }
 impl fmt::Debug for AuthEvidence {
@@ -118,6 +250,9 @@ pub enum ServicePurpose {
     Search,
     EventPublication,
     Revocation,
+    ProviderRecovery,
+    Scheduler,
+    Telemetry,
     Backup,
     Restore,
 }
