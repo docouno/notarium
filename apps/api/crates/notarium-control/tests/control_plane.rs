@@ -275,7 +275,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
         }
     }
     assert!(continuation.is_none());
-    assert_eq!(projects, [project.clone()]);
+    assert_eq!(projects.as_slice(), std::slice::from_ref(&project));
     let abilities_page = plane
         .discover_abilities(
             agent_ctx.clone(),
