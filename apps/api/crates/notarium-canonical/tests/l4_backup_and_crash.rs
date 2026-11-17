@@ -391,6 +391,63 @@ impl BackendCase {
         }
     }
 
+    // Read all rows in PK order through a separate connection while the cut is stable.
+    // Compare native row encodings only within the same backend.
+    async fn snapshot_rows(&self, config: &CanonicalConfig) -> BTreeMap<&'static str, Vec<String>> {
+        let mut rows = BTreeMap::new();
+        match &config.sql {
+            SqlBackendConfig::Sqlite { data_root, .. } => {
+                let db = rusqlite::Connection::open_with_flags(
+                    data_root.canonical(),
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                for t in notarium_canonical::CANONICAL_TABLES {
+                    let columns = t
+                        .columns
+                        .iter()
+                        .map(|c| match c.kind {
+                            notarium_canonical::schema::manifest::LogicalColKind::Bytes => {
+                                format!("CASE WHEN {0} IS NOT NULL THEN hex({0}) END", c.name)
+                            }
+                            _ => c.name.to_owned(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT json_array({columns}) FROM {} ORDER BY {}",
+                        t.name,
+                        t.primary_key.join(", ")
+                    );
+                    let mut stmt = db.prepare(&sql).unwrap();
+                    let values = stmt
+                        .query_map([], |r| r.get(0))
+                        .unwrap()
+                        .collect::<Result<Vec<String>, _>>()
+                        .unwrap();
+                    rows.insert(t.name, values);
+                }
+            }
+            SqlBackendConfig::Postgres { schema, .. } => {
+                let (fixtures, _) = self.pg_cleanup.as_ref().unwrap();
+                let mut conn = fixtures.open_raw_pg().await;
+                for t in notarium_canonical::CANONICAL_TABLES {
+                    let sql = format!(
+                        "SELECT row_to_json(r)::text FROM {schema}.{} r ORDER BY {}",
+                        t.name,
+                        t.primary_key.join(", ")
+                    );
+                    let values = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                        .fetch_all(&mut conn)
+                        .await
+                        .unwrap();
+                    rows.insert(t.name, values);
+                }
+            }
+        }
+        rows
+    }
+
     // Materialize the participant's artifact in an independent database before opening a runtime.
     async fn restored_config(&self, artifact: &Path, target: &DataRoot) -> CanonicalConfig {
         let installation = self.store.installation_id().clone();
@@ -715,6 +772,9 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
         assert_eq!(snap_canon.witness().histories[0].after, cut_seq);
         assert_eq!(snap_ctrl.witness().histories[0].after.get(), 2);
 
+        let mut expected_rows = case.snapshot_rows(&case.config).await;
+        assert_eq!(expected_rows.remove("backup_holds").unwrap().len(), 2);
+
         // Resume BOTH participants BEFORE spooling!
         paused_canon.resume().await.expect("resume canonical");
         paused_ctrl.resume().await.expect("resume control");
@@ -893,6 +953,12 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
         let config = case
             .restored_config(&reg.artifact_path, &restored_root.data_root())
             .await;
+        let mut restored_rows = case.snapshot_rows(&config).await;
+        assert!(restored_rows.remove("backup_holds").unwrap().is_empty());
+        assert_eq!(
+            restored_rows, expected_rows,
+            "[{label}] portable rows changed during backup"
+        );
         let (target_store, target_runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
         let target_before = target_store.read_space(&scope.space_id).await.unwrap();
         assert_eq!(target_before.last_seq, cut_seq);
@@ -920,6 +986,33 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             )
             .await;
         assert_validation_err(&same_inc, ValidationReason::InvalidState);
+        // An unavailable room-fence table must abort the whole cutover and allow retry.
+        target_store
+            .execute_diagnostic_write_sql_for_test(
+                "ALTER TABLE collab_sessions RENAME TO collab_sessions_offline",
+            )
+            .await
+            .unwrap();
+        let unavailable = target_store
+            .restore_cursors(
+                maintenance_ctx(ServicePurpose::Restore),
+                vec![ChangeCursor {
+                    scope: new_scope.clone(),
+                    after: cut_seq,
+                }],
+            )
+            .await;
+        assert!(unavailable.is_err());
+        assert_eq!(
+            target_store.read_space(&scope.space_id).await.unwrap(),
+            target_before
+        );
+        target_store
+            .execute_diagnostic_write_sql_for_test(
+                "ALTER TABLE collab_sessions_offline RENAME TO collab_sessions",
+            )
+            .await
+            .unwrap();
         target_store
             .restore_cursors(
                 maintenance_ctx(ServicePurpose::Restore),
@@ -982,6 +1075,19 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             .expect("commit new note at same numeric seq under new incarnation");
         assert_eq!(new_at_same_seq.receipt.seq(), post_committed.receipt.seq());
 
+        let mut old_cursor = target_store
+            .subscribe(
+                maintenance_ctx(ServicePurpose::Projection),
+                ChangeCursor {
+                    scope: scope.clone(),
+                    after: post_committed.receipt.seq(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(old_cursor.next().await.unwrap(), Some(ChangeNotice::Resync {scope: observed}) if observed == new_scope)
+        );
         // Using the old `post_committed.receipt` (same numeric seq, old incarnation) MUST fail with HistoryIncarnationMismatch!
         let stale_read = target_store
             .get_note(
@@ -1517,6 +1623,41 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                 .unwrap()
                 .scope,
             empty_cursor.scope
+        );
+
+        let unmaterialized = store
+            .create_space(CreateSpaceSpec {
+                space_id: sample_space_id(0x71),
+                incarnation: sample_incarnation(0x71),
+                root_folder_id: sample_folder_id(0x71),
+                slug: "unmaterialized-boundary".to_owned(),
+                kind: SpaceKind::Personal,
+                owner: actor.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                initial_last_seq: SpaceSeq::new(5).unwrap(),
+                created_at: None,
+            })
+            .await
+            .unwrap();
+        let rejected = store
+            .restore_cursors(
+                maintenance_ctx(ServicePurpose::Restore),
+                vec![ChangeCursor {
+                    scope: HistoryScope {
+                        space_id: unmaterialized.scope.space_id.clone(),
+                        incarnation: sample_incarnation(0x72),
+                    },
+                    after: unmaterialized.last_seq,
+                }],
+            )
+            .await;
+        assert_validation_err(&rejected, ValidationReason::InvalidCutoff);
+        assert_eq!(
+            store
+                .read_space(&unmaterialized.scope.space_id)
+                .await
+                .unwrap(),
+            unmaterialized
         );
 
         case.shutdown().await;

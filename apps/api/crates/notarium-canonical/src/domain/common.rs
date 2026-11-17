@@ -161,6 +161,21 @@ impl RoomFenceTable {
         map.retain(|(sid, _), _| sid != space_id);
     }
 
+    pub(crate) fn replace_restored_spaces(
+        &self,
+        spaces: &BTreeSet<&SpaceId>,
+        restored: RoomFenceTable,
+    ) {
+        let mut fences = self.fences.lock().expect("room fence table mutex");
+        fences.retain(|(id, _), _| !spaces.contains(id));
+        fences.extend(
+            restored
+                .fences
+                .into_inner()
+                .expect("restored room fence table"),
+        );
+    }
+
     pub async fn consume_reservation(
         &self,
         scope: &HistoryScope,

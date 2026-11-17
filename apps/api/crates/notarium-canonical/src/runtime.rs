@@ -3252,6 +3252,19 @@ pub(crate) async fn validate_snapshot_cutoff_tx(
     if requested > space_rec.last_seq {
         return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
     }
+    require_command_end_tx(tx, scope, requested).await?;
+    Ok(requested)
+}
+
+/// Zero is the initial boundary; every nonzero cursor must end a durable command.
+pub(crate) async fn require_command_end_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    requested: SpaceSeq,
+) -> Result<(), PortError> {
+    if requested == SpaceSeq::ZERO {
+        return Ok(());
+    }
     let req_i64 = requested.get() as i64;
     let found_end: Option<i64> = match tx {
         BackendConn::Sqlite(conn) => sqlx::query_scalar(
@@ -3280,7 +3293,7 @@ pub(crate) async fn validate_snapshot_cutoff_tx(
     if found_end.is_none() {
         return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
     }
-    Ok(requested)
+    Ok(())
 }
 
 pub(crate) async fn is_note_purge_fenced_tx(

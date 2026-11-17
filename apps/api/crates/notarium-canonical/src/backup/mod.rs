@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Connection, Postgres, Row, pool::PoolConnection};
 
 use crate::{
-    CanonicalStore,
+    CanonicalStore, RoomFenceTable,
     changes::BroadcastSignal,
     codec::{
         MAX_MSGPACK_DECODE_BYTES, cancelled_not_committed, deadline_not_committed,
@@ -39,7 +39,9 @@ use crate::{
     },
     config::{BlobBackendConfig, SqlBackendConfig},
     domain::purge::has_incomplete_pending_purges_tx,
-    runtime::{CanonicalInner, SqlDriverState, load_space_record_for_update_opt},
+    runtime::{
+        CanonicalInner, SqlDriverState, load_space_record_for_update_opt, require_command_end_tx,
+    },
     schema::manifest::{
         CANONICAL_SCHEMA_VERSION, CANONICAL_TABLES, LogicalColKind, manifest_checksum,
     },
@@ -2716,25 +2718,31 @@ impl BackupParticipantPort for CanonicalStore {
             let _safe_point = store.inner.writer()?.acquire_safe_point().await;
 
             let restored_cl = restored.clone();
-            store
+            let fences = store
                 .with_write_tx_unfenced(|tx| {
                     Box::pin(async move {
                         let mut epochs = Vec::with_capacity(restored_cl.len());
                         for cur in &restored_cl {
                             epochs.push(validate_restore_cursor_tx(tx, cur).await?);
                         }
+                        let fences = RoomFenceTable::default();
                         for (cur, epoch) in restored_cl.iter().zip(epochs) {
                             apply_restore_cursor_tx(tx, cur, epoch).await?;
+                            load_restored_room_fences(tx, &cur.scope, &fences).await?;
                         }
-                        Ok(())
+                        Ok(fences)
                     })
                 })
                 .await?;
 
             // Clear per-Space in-memory caches, clamp watermarks, re-seed collab fences, and notify subscribers.
+            let spaces = restored.iter().map(|cur| &cur.scope.space_id).collect();
+            store
+                .inner
+                .room_fences
+                .replace_restored_spaces(&spaces, fences);
             store.inner.clear_pg_immutable_caches();
             for cur in &restored {
-                store.inner.room_fences.remove_space(&cur.scope.space_id);
                 store.inner.job_reads.remove_space(&cur.scope.space_id);
                 store
                     .inner
@@ -2749,7 +2757,6 @@ impl BackupParticipantPort for CanonicalStore {
                     });
             }
 
-            reseed_collab_fences_after_restore(&store).await?;
             Ok(())
         })
     }
@@ -3102,6 +3109,8 @@ async fn validate_restore_cursor_tx(
         return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
     }
 
+    require_command_end_tx(tx, &space_rec.scope, target.after).await?;
+
     // Check no active backup hold on this Space.
     let hold_exists: Option<i64> = match tx {
         BackendConn::Sqlite(conn) => {
@@ -3271,83 +3280,38 @@ async fn apply_restore_cursor_tx(
     Ok(())
 }
 
-async fn reseed_collab_fences_after_restore(store: &CanonicalStore) -> Result<(), PortError> {
-    let rows: Vec<(String, Vec<u8>, String, i64, String)> = store
-        .with_read_tx(|tx| {
-            Box::pin(async move {
-                match tx {
-                    BackendConn::Sqlite(conn) => {
-                        let r = sqlx::query(
-                            "SELECT c.space_id, s.history_incarnation, c.note_id, c.lease_epoch, c.room_state
-                             FROM collab_sessions c
-                             JOIN spaces s ON s.space_id = c.space_id",
-                        )
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_reseed_collab_restore", err.to_string())
-                        })?;
-                        Ok(r.into_iter()
-                            .map(|row| {
-                                (
-                                    row.get("space_id"),
-                                    row.get("history_incarnation"),
-                                    row.get("note_id"),
-                                    row.get("lease_epoch"),
-                                    row.get("room_state"),
-                                )
-                            })
-                            .collect())
-                    }
-                    BackendConn::Postgres(conn) => {
-                        let r = sqlx::query(
-                            "SELECT c.space_id, s.history_incarnation, c.note_id, c.lease_epoch, c.room_state
-                             FROM collab_sessions c
-                             JOIN spaces s ON s.space_id = c.space_id",
-                        )
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("pg_reseed_collab_restore", err.to_string())
-                        })?;
-                        Ok(r.into_iter()
-                            .map(|row| {
-                                (
-                                    row.get("space_id"),
-                                    row.get("history_incarnation"),
-                                    row.get("note_id"),
-                                    row.get("lease_epoch"),
-                                    row.get("room_state"),
-                                )
-                            })
-                            .collect())
-                    }
-                }
-            })
-        })
-        .await?;
+// Stage the replacement in private memory. A read or validation error must roll
+// back the SQL rotation before any subscriber can observe the new history.
+async fn load_restored_room_fences(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    fences: &RoomFenceTable,
+) -> Result<(), PortError> {
+    let rows: Vec<(String, i64, String)> =
+        match tx {
+            BackendConn::Sqlite(conn) => sqlx::query_as(
+                "SELECT note_id, lease_epoch, room_state FROM collab_sessions WHERE space_id = ?",
+            )
+            .bind(scope.space_id.as_str())
+            .fetch_all(&mut **conn)
+            .await,
+            BackendConn::Postgres(conn) => sqlx::query_as(
+                "SELECT note_id, lease_epoch, room_state FROM collab_sessions WHERE space_id = $1",
+            )
+            .bind(scope.space_id.as_str())
+            .fetch_all(&mut **conn)
+            .await,
+        }
+        .map_err(|err| internal_not_committed("restore_load_room_fences", err.to_string()))?;
 
-    for (space_raw, inc_bytes, note_raw, lease_raw, state_raw) in rows {
-        let space_id = SpaceId::parse(&space_raw)
-            .map_err(|_| internal_not_committed("corrupt_collab_space", "invalid SpaceId"))?;
-        let inc_arr: [u8; 16] = inc_bytes.try_into().map_err(|_| {
-            internal_not_committed("corrupt_collab_inc", "history_incarnation != 16B")
-        })?;
-        let note_id = notarium_core::ids::NoteId::parse(&note_raw)
+    for (note, epoch, state) in rows {
+        let note = notarium_core::ids::NoteId::parse(&note)
             .map_err(|_| internal_not_committed("corrupt_collab_note", "invalid NoteId"))?;
-        let epoch =
-            notarium_core::ids::LeaseEpoch::new(u64::try_from(lease_raw).map_err(|_| {
-                internal_not_committed("corrupt_collab_lease", "negative lease_epoch")
-            })?)?;
-        let scope = HistoryScope {
-            space_id,
-            incarnation: HistoryIncarnation::from_bytes(inc_arr),
-        };
-        let active = state_raw == "active";
-        store
-            .inner
-            .room_fences
-            .seed_persisted_room(&scope, &note_id, epoch, active)
+        let epoch = LeaseEpoch::new(u64::try_from(epoch).map_err(|_| {
+            internal_not_committed("corrupt_collab_lease", "negative lease_epoch")
+        })?)?;
+        fences
+            .seed_persisted_room(scope, &note, epoch, state == "active")
             .await?;
     }
     Ok(())

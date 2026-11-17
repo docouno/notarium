@@ -121,7 +121,8 @@ lookup. A mismatch returns a typed `history_incarnation_mismatch` validation
 reason requiring resynchronization. It never silently restarts pagination.
 
 Canonical rebind accepts the exact head of each materialized Space, including
-zero. A cutoff mismatch leaves every requested Space unchanged.
+zero. Each nonzero head must match a durable command boundary. A cutoff
+mismatch leaves every requested Space unchanged.
 After restoring a backup at sequence 100, a client's old token for 101 stays
 invalid even when a different mutation reaches 101. Restore invalidates old
 snapshot handles, streams and idempotency namespaces. Internal saved ack cursors
