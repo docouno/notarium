@@ -59,37 +59,38 @@ fn make_budget() -> CallBudget {
 fn make_human_ctx(
     scope: &HistoryScope,
     principal: PrincipalId,
-    role: SpaceRole,
-    read_classes: BTreeSet<DocClass>,
-    write_classes: BTreeSet<DocClass>,
-    project_root: Option<FolderId>,
+    grant: SpaceGrant,
     ability_write: bool,
+    human_management: bool,
 ) -> SpaceContext {
-    let grant = SpaceGrant {
-        role,
-        read_classes,
-        write_classes,
-        project_root,
-    };
     let verified = VerifiedHuman::attest(
         principal,
         GrantId::from_bytes([7u8; 16]),
         BTreeMap::from([(scope.space_id.clone(), grant)]),
         ability_write,
-    );
+    )
+    .with_human_management(human_management);
     let auth = EngineAuthContext::for_human(verified);
     SpaceContext::new(auth, scope.clone(), make_budget()).expect("valid human SpaceContext")
 }
 
-fn owner_ctx(scope: &HistoryScope, principal: PrincipalId, ability_write: bool) -> SpaceContext {
+fn owner_ctx(
+    scope: &HistoryScope,
+    principal: PrincipalId,
+    ability_write: bool,
+    human_management: bool,
+) -> SpaceContext {
     make_human_ctx(
         scope,
         principal,
-        SpaceRole::Owner,
-        DocClass::all(),
-        DocClass::all(),
-        None,
+        SpaceGrant {
+            role: SpaceRole::Owner,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: None,
+        },
         ability_write,
+        human_management,
     )
 }
 
@@ -158,7 +159,7 @@ async fn run_domain_and_security_suite(store: &CanonicalStore) {
     )
     .await;
     let epoch = LeaseEpoch::new(1).expect("epoch 1");
-    let ctx = owner_ctx(&scope, owner.clone(), true);
+    let ctx = owner_ctx(&scope, owner.clone(), true, true);
 
     // 1. Folder & project invariants: root-child project check, depth <= 256, cycle check, O(1) subtree move.
     let proj_a = sample_folder_id(10);
@@ -1165,28 +1166,29 @@ async fn run_domain_and_security_suite(store: &CanonicalStore) {
         .await
         .expect("create DocClass::Skill entrypoint note");
 
-    // Human WITHOUT `ability_write` capability is forbidden!
-    let no_ability_ctx = owner_ctx(&scope, owner.clone(), false);
-    let denied_pub = store
-        .publish_ability_package(
-            no_ability_ctx,
-            next_mutation(
-                &scope,
-                &owner,
-                PublishAbilityPackage {
-                    ability: ability_id.clone(),
-                    kind: AbilityKind::Skill,
-                    entrypoint: skill_entry_note.clone(),
-                    files: vec![],
-                    expected_package_revision: None,
-                },
-            ),
-        )
-        .await;
-    assert!(matches!(
-        denied_pub,
-        Err(PortError::Domain(DomainError::AbilityWriteForbidden))
-    ));
+    // Both independent attestations are required to publish an ability.
+    for (ability_write, human_management) in [(false, true), (true, false)] {
+        let denied_pub = store
+            .publish_ability_package(
+                owner_ctx(&scope, owner.clone(), ability_write, human_management),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    PublishAbilityPackage {
+                        ability: ability_id.clone(),
+                        kind: AbilityKind::Skill,
+                        entrypoint: skill_entry_note.clone(),
+                        files: vec![],
+                        expected_package_revision: None,
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(
+            denied_pub,
+            Err(PortError::Domain(DomainError::AbilityWriteForbidden))
+        ));
+    }
 
     // Path traversal in auxiliary file must be rejected!
     let traversal_pub = store
@@ -1303,10 +1305,13 @@ async fn run_domain_and_security_suite(store: &CanonicalStore) {
     let viewer_ctx = make_human_ctx(
         &scope,
         viewer.clone(),
-        SpaceRole::Viewer,
-        BTreeSet::from([DocClass::UserDoc]),
-        BTreeSet::new(),
-        None,
+        SpaceGrant {
+            role: SpaceRole::Viewer,
+            read_classes: BTreeSet::from([DocClass::UserDoc]),
+            write_classes: BTreeSet::new(),
+            project_root: None,
+        },
+        false,
         false,
     );
     let viewer_write = store
@@ -1364,10 +1369,13 @@ async fn run_domain_and_security_suite(store: &CanonicalStore) {
     let pinned_ctx = make_human_ctx(
         &scope,
         owner.clone(),
-        SpaceRole::Editor,
-        DocClass::all(),
-        DocClass::all(),
-        Some(proj_a.clone()),
+        SpaceGrant {
+            role: SpaceRole::Editor,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: Some(proj_a.clone()),
+        },
+        false,
         false,
     );
     let outside_proj_write = store
@@ -1498,7 +1506,7 @@ async fn run_purge_and_mint_suite(
         owner.clone(),
     )
     .await;
-    let ctx = owner_ctx(&scope, owner.clone(), true);
+    let ctx = owner_ctx(&scope, owner.clone(), true, true);
 
     let shared_carrier = "---\ntitle: Shared Carrier\n---\n# Shared Carrier\n\nCommon text.\n";
     let shared_digest = notarium_syntax::content_digest(shared_carrier);

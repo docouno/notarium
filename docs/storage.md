@@ -194,11 +194,17 @@ same example against an isolated prefix.
   outside the writer pause (spawning a dedicated `rusqlite` backup owner thread
   for `SQLiteSnapshotV1` or pre-warming `PREPARE __notarium_pin_witness_v1` on a
   dedicated PostgreSQL connection for `PostgresSpoolV1`). `pause_writes` +
-  `open_cut` pins consistent database snapshots across paired participants in
-  `< 1 ms` before resuming writers. `SQLiteSnapshotV1` copies `16` pages per
+  `open_cut` pins database snapshots before resuming writers. The paired pause
+  target is p95 below 1 ms. `SQLiteSnapshotV1` copies `16` pages per
   step while monitoring pinned-WAL (`256 MiB` default), deadline (`30 s`) and
   spool (`8 GiB`) budgets; `PostgresSpoolV1` streams `NO SCROLL CURSOR` rows via
   `FETCH 1` and `substr` slices `<= 64 KiB` within `<= 8 MiB` working buffers.
+  Holds protect source CAS objects through copy. Both canonical formats publish
+  an empty `backup_holds` table. PostgreSQL retains its V1 table frame.
+- **Canonical restore.** Open the materialized backup with its CAS objects. Before
+  serving reads or writes, rebind each restored Space to a fresh history at its
+  stored `last_seq`. A smaller or larger cutoff returns `InvalidCutoff` for the
+  entire request. To recover an earlier state, materialize the backup at that height.
 
 ## Offline fixture lifecycle and attributed benchmarks
 
@@ -237,7 +243,7 @@ UDS bridge, `4 KiB` unique note carriers):
 | Chat 50-entry branch window in `10,000`-turn linear & branched DAG (`10,000` reads) | `p95 < 1,000 us`, `0` writes | `SQLite`: `p95 = 226.3 us` (linear) / `227.0 us` (branched), `0` writes; `PG16`: `p95 = 509.6 us` (linear) / `503.2 us` (branched), `0` writes |
 | Board `10,000` consecutive first-slot moves | `rank <= 16 B` | `max_rank = 12 B` (`324` windowed PMA rebalances, mean `1.62` overlays/move; `SQLite p95 = 9.42 ms`, `PG16 p95 = 16.20 ms`) |
 | Folder `MoveFolder` over `100,000` descendants (`1,000` moves) | `0` descendant writes | `0` descendant rows modified (`SQLite` & `PG16`) |
-| Paired backup writer pause (`1,000` captures across 2 participants) | `p95 < 1,000 us` | `SQLite paired`: `p50 = 162.0 us`, `p95 = 324.6 us`; `PG16 paired`: `p50 = 313.8 us`, `p95 = 434.7 us` |
+| Paired backup writer pause (`1,000` captures across two empty canonical databases) | `p95 < 1,000 us` | `SQLite paired`: `p50 = 162.0 us`, `p95 = 324.6 us`; `PG16 paired`: `p50 = 313.8 us`, `p95 = 434.7 us` |
 
 ### Proof boundaries
 

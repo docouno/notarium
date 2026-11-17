@@ -680,6 +680,9 @@ pub trait BackupParticipantPort: Send + Sync {
         backup: BackupId,
         budget: BackupBudget,
     ) -> PortFuture<'_, Box<dyn PreparedBackup>>;
+    /// Rebind restored Spaces before serving the materialized backup. Canonical
+    /// requires each cutoff to equal that Space's stored head, including zero.
+    /// Control clamps saved acknowledgements to those ceilings in the new histories.
     fn restore_cursors(
         &self,
         ctx: MaintenanceContext,

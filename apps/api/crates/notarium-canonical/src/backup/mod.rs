@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -14,7 +13,10 @@ use std::{
 use notarium_core::{
     DomainError,
     error::{PortError, ValidationReason},
-    ids::{ArtifactId, BackupId, ContentDigest, HistoryIncarnation, InstallationId, SpaceId},
+    ids::{
+        ArtifactId, BackupId, ContentDigest, HistoryIncarnation, InstallationId, LeaseEpoch,
+        SpaceId,
+    },
     model::HistoryScope,
     ports::{
         BackupArtifactKind, BackupBudget, BackupHold, BackupParticipantPort, BackupProgress,
@@ -37,7 +39,7 @@ use crate::{
     },
     config::{BlobBackendConfig, SqlBackendConfig},
     domain::purge::has_incomplete_pending_purges_tx,
-    runtime::{CanonicalInner, SqlDriverState, load_space_record},
+    runtime::{CanonicalInner, SqlDriverState, load_space_record_for_update_opt},
     schema::manifest::{
         CANONICAL_SCHEMA_VERSION, CANONICAL_TABLES, LogicalColKind, manifest_checksum,
     },
@@ -951,6 +953,12 @@ fn run_sqlite_spool_on_owner_thread(
         let dst = dst_opt.take().ok_or_else(|| {
             internal_not_committed("sqlite_backup_dst_gone", "destination connection missing")
         })?;
+        // Holds protect source CAS objects until the backup owner releases them.
+        // Normalize the private copy before hashing and publishing its single database file.
+        dst.execute_batch("PRAGMA journal_mode = DELETE; DELETE FROM backup_holds;")
+            .map_err(|err| {
+                internal_not_committed("sqlite_backup_clear_source_holds", err.to_string())
+            })?;
         let dst_witness =
             read_and_verify_sqlite_conn_witness(&dst, &expected_witness.installation)?;
         if !witnesses_equal(&dst_witness, expected_witness) {
@@ -1458,6 +1466,13 @@ async fn stream_postgres_spool_v1(
 
             let col_count = u16::try_from(table.columns.len()).expect("col count fits in u16");
             spool_writer.write_body(&col_count.to_be_bytes())?;
+
+            if table.name == "backup_holds" {
+                // V1 requires every table frame. Source-local holds have no owner on restore.
+                spool_writer.write_body(&[0])?;
+                spool_writer.write_body(&0u64.to_be_bytes())?;
+                continue;
+            }
 
             let pk_order = table
                 .primary_key
@@ -2665,7 +2680,7 @@ impl BackupParticipantPort for CanonicalStore {
     fn restore_cursors(
         &self,
         ctx: MaintenanceContext,
-        restored: Vec<ChangeCursor>,
+        mut restored: Vec<ChangeCursor>,
     ) -> PortFuture<'_, ()> {
         let store = self.clone();
         Box::pin(async move {
@@ -2688,11 +2703,13 @@ impl BackupParticipantPort for CanonicalStore {
                 return Ok(());
             }
 
-            let mut seen_spaces = BTreeSet::new();
-            for cur in &restored {
-                if !seen_spaces.insert(cur.scope.space_id.clone()) {
-                    return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
-                }
+            // Lock Spaces in a stable order across independent PostgreSQL runtimes.
+            restored.sort_unstable_by(|a, b| a.scope.space_id.cmp(&b.scope.space_id));
+            if restored
+                .windows(2)
+                .any(|pair| pair[0].scope.space_id == pair[1].scope.space_id)
+            {
+                return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
             }
 
             // Acquire exclusive writer safe point so zero concurrent batch or auxiliary writes race restore_cursors.
@@ -2702,8 +2719,12 @@ impl BackupParticipantPort for CanonicalStore {
             store
                 .with_write_tx_unfenced(|tx| {
                     Box::pin(async move {
+                        let mut epochs = Vec::with_capacity(restored_cl.len());
                         for cur in &restored_cl {
-                            apply_restore_cursor_tx(tx, cur).await?;
+                            epochs.push(validate_restore_cursor_tx(tx, cur).await?);
+                        }
+                        for (cur, epoch) in restored_cl.iter().zip(epochs) {
+                            apply_restore_cursor_tx(tx, cur, epoch).await?;
                         }
                         Ok(())
                     })
@@ -3064,18 +3085,20 @@ async fn persist_backup_artifact_ready(
         .await
 }
 
-async fn apply_restore_cursor_tx(
+async fn validate_restore_cursor_tx(
     tx: &mut BackendConn<'_>,
     target: &ChangeCursor,
-) -> Result<(), PortError> {
-    let space_rec = load_space_record(tx, &target.scope.space_id).await?;
+) -> Result<LeaseEpoch, PortError> {
+    let space_rec = load_space_record_for_update_opt(tx, &target.scope.space_id)
+        .await?
+        .ok_or(DomainError::ResourceNotFound)?;
 
     // Restore MUST rotate HistoryIncarnation so old external tokens/receipts at >= ceiling are invalidated.
     if target.scope.incarnation == space_rec.scope.incarnation {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
 
-    if target.after > space_rec.last_seq {
+    if target.after != space_rec.last_seq {
         return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
     }
 
@@ -3106,38 +3129,14 @@ async fn apply_restore_cursor_tx(
         ));
     }
 
-    let ceiling_i64 = target.after.get() as i64;
-    if ceiling_i64 > 0 {
-        let valid_cut: Option<i64> = match tx {
-            BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                "SELECT 1 FROM change_commands
-                 WHERE space_id = ? AND history_incarnation = ? AND last_seq = ?
-                 LIMIT 1",
-            )
-            .bind(target.scope.space_id.as_str())
-            .bind(space_rec.scope.incarnation.as_bytes().as_slice())
-            .bind(ceiling_i64)
-            .fetch_optional(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_restore_check_cut", err.to_string()))?,
-            BackendConn::Postgres(conn) => sqlx::query_scalar(
-                "SELECT 1::BIGINT FROM change_commands
-                 WHERE space_id = $1 AND history_incarnation = $2 AND last_seq = $3
-                 LIMIT 1",
-            )
-            .bind(target.scope.space_id.as_str())
-            .bind(space_rec.scope.incarnation.as_bytes().as_slice())
-            .bind(ceiling_i64)
-            .fetch_optional(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_restore_check_cut", err.to_string()))?,
-        };
-        if valid_cut.is_none() {
-            return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
-        }
-    }
+    Ok(space_rec.active_epoch.checked_next()?)
+}
 
-    let next_epoch = space_rec.active_epoch.checked_next()?;
+async fn apply_restore_cursor_tx(
+    tx: &mut BackendConn<'_>,
+    target: &ChangeCursor,
+    next_epoch: LeaseEpoch,
+) -> Result<(), PortError> {
     let next_epoch_i64 = next_epoch.get() as i64;
     let sid = target.scope.space_id.as_str();
     let new_inc = target.scope.incarnation.as_bytes().as_slice();
@@ -3186,62 +3185,6 @@ async fn apply_restore_cursor_tx(
                 internal_not_committed("sqlite_restore_clear_receipt_payloads", err.to_string())
             })?;
 
-            sqlx::query(
-                "DELETE FROM payload_owners
-                 WHERE space_id = ? AND payload_kind = 'change_payload' AND payload_id IN (
-                     SELECT payload_id FROM change_payloads WHERE space_id = ? AND created_seq > ?
-                 )",
-            )
-            .bind(sid)
-            .bind(sid)
-            .bind(ceiling_i64)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| {
-                internal_not_committed("sqlite_restore_prune_payload_owners", err.to_string())
-            })?;
-
-            sqlx::query("DELETE FROM change_log WHERE space_id = ? AND space_seq > ?")
-                .bind(sid)
-                .bind(ceiling_i64)
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("sqlite_restore_prune_change_log", err.to_string())
-                })?;
-
-            sqlx::query(
-                "DELETE FROM change_commands WHERE space_id = ? AND last_seq > ? AND first_seq > ?",
-            )
-            .bind(sid)
-            .bind(ceiling_i64)
-            .bind(ceiling_i64)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| {
-                internal_not_committed("sqlite_restore_prune_change_commands", err.to_string())
-            })?;
-
-            sqlx::query("DELETE FROM change_payloads WHERE space_id = ? AND created_seq > ?")
-                .bind(sid)
-                .bind(ceiling_i64)
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("sqlite_restore_prune_change_payloads", err.to_string())
-                })?;
-
-            sqlx::query(
-                "DELETE FROM board_move_history WHERE space_id = ? AND command_end_seq > ?",
-            )
-            .bind(sid)
-            .bind(ceiling_i64)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| {
-                internal_not_committed("sqlite_restore_prune_board_moves", err.to_string())
-            })?;
-
             for table in history_scoped_tables {
                 sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE {table} SET history_incarnation = ? WHERE space_id = ?"
@@ -3257,12 +3200,11 @@ async fn apply_restore_cursor_tx(
 
             sqlx::query(
                 "UPDATE spaces
-                 SET history_incarnation = ?, active_epoch = ?, last_seq = ?
+                 SET history_incarnation = ?, active_epoch = ?
                  WHERE space_id = ?",
             )
             .bind(new_inc)
             .bind(next_epoch_i64)
-            .bind(ceiling_i64)
             .bind(sid)
             .execute(&mut **conn)
             .await
@@ -3301,60 +3243,6 @@ async fn apply_restore_cursor_tx(
                 internal_not_committed("pg_restore_clear_receipt_payloads", err.to_string())
             })?;
 
-            sqlx::query(
-                "DELETE FROM payload_owners
-                 WHERE space_id = $1 AND payload_kind = 'change_payload' AND payload_id IN (
-                     SELECT payload_id FROM change_payloads WHERE space_id = $1 AND created_seq > $2
-                 )",
-            )
-            .bind(sid)
-            .bind(ceiling_i64)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| {
-                internal_not_committed("pg_restore_prune_payload_owners", err.to_string())
-            })?;
-
-            sqlx::query("DELETE FROM change_log WHERE space_id = $1 AND space_seq > $2")
-                .bind(sid)
-                .bind(ceiling_i64)
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("pg_restore_prune_change_log", err.to_string())
-                })?;
-
-            sqlx::query(
-                "DELETE FROM change_commands WHERE space_id = $1 AND last_seq > $2 AND first_seq > $2",
-            )
-            .bind(sid)
-            .bind(ceiling_i64)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| {
-                internal_not_committed("pg_restore_prune_change_commands", err.to_string())
-            })?;
-
-            sqlx::query("DELETE FROM change_payloads WHERE space_id = $1 AND created_seq > $2")
-                .bind(sid)
-                .bind(ceiling_i64)
-                .execute(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("pg_restore_prune_change_payloads", err.to_string())
-                })?;
-
-            sqlx::query(
-                "DELETE FROM board_move_history WHERE space_id = $1 AND command_end_seq > $2",
-            )
-            .bind(sid)
-            .bind(ceiling_i64)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| {
-                internal_not_committed("pg_restore_prune_board_moves", err.to_string())
-            })?;
-
             for table in history_scoped_tables {
                 sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE {table} SET history_incarnation = $1 WHERE space_id = $2"
@@ -3368,12 +3256,11 @@ async fn apply_restore_cursor_tx(
 
             sqlx::query(
                 "UPDATE spaces
-                 SET history_incarnation = $1, active_epoch = $2, last_seq = $3
-                 WHERE space_id = $4",
+                 SET history_incarnation = $1, active_epoch = $2
+                 WHERE space_id = $3",
             )
             .bind(new_inc)
             .bind(next_epoch_i64)
-            .bind(ceiling_i64)
             .bind(sid)
             .execute(&mut **conn)
             .await

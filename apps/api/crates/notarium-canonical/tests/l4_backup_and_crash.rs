@@ -41,6 +41,8 @@ use notarium_core::{
     receipt::{CausalBasis, ChangeCursor, CommandIdentity, ReceiptSet},
 };
 
+use sqlx::Connection;
+
 use crate::support::{
     StorageTestFixtures, TempDataRoot, assert_validation_err, maintenance_ctx, random_bytes_16,
     sample_folder_id, sample_incarnation, sample_installation_id, sample_note_id,
@@ -323,6 +325,7 @@ struct BackendCase {
     spool_dir: PathBuf,
     temp_root: TempDataRoot,
     pg_cleanup: Option<(StorageTestFixtures, String)>,
+    config: CanonicalConfig,
 }
 
 impl BackendCase {
@@ -346,7 +349,9 @@ impl BackendCase {
             snapshot_retention: Duration::from_secs(300),
             default_backup_budget: default_backup_budget(),
         };
-        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open SQLite");
+        let (store, runtime) = CanonicalRuntime::open(cfg.clone())
+            .await
+            .expect("open SQLite");
         Self {
             label: "sqlite_local",
             is_sqlite: true,
@@ -354,6 +359,7 @@ impl BackendCase {
             runtime: Some(runtime),
             spool_dir,
             temp_root,
+            config: cfg,
             pg_cleanup: None,
         }
     }
@@ -369,7 +375,9 @@ impl BackendCase {
         let temp_root = TempDataRoot::new("l4-backup-pg-spool");
         let spool_dir = temp_root.path().join("pg-backups");
         let cfg = fixtures.pg_s3_config(sample_installation_id(0x62), &schema, s3_cfg);
-        let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open PG+S3");
+        let (store, runtime) = CanonicalRuntime::open(cfg.clone())
+            .await
+            .expect("open PG+S3");
         store.set_backup_spool_dir(spool_dir.clone());
         Self {
             label: "postgres_s3",
@@ -378,8 +386,86 @@ impl BackendCase {
             runtime: Some(runtime),
             spool_dir,
             temp_root,
+            config: cfg,
             pg_cleanup: Some((fixtures, schema)),
         }
+    }
+
+    // Materialize the participant's artifact in an independent database before opening a runtime.
+    async fn restored_config(&self, artifact: &Path, target: &DataRoot) -> CanonicalConfig {
+        let installation = self.store.installation_id().clone();
+        if let Some((fixtures, _)) = &self.pg_cleanup {
+            let decoded = decode_postgres_spool_v1(artifact).unwrap();
+            let schema = fixtures.fresh_pg_schema();
+            let mut conn = fixtures.open_raw_pg().await;
+            let mut tx = conn.begin().await.unwrap();
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "CREATE SCHEMA {schema}; SET LOCAL search_path TO {schema}"
+            )))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::raw_sql(include_str!("../src/schema/postgres_ddl.sql"))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            for table in decoded.tables {
+                // The independent decoder validates identifiers and column order against the manifest.
+                let insert = format!("INSERT INTO {} ({}) ", table.name, table.columns.join(", "));
+                for row in table.rows {
+                    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(insert.clone());
+                    query.push_values([row], |mut args, row| {
+                        for value in row {
+                            match value {
+                                PostgresSpoolValue::Null => {
+                                    args.push("NULL");
+                                }
+                                PostgresSpoolValue::Int(v) => {
+                                    args.push_bind(v);
+                                }
+                                PostgresSpoolValue::Text(v) => {
+                                    args.push_bind(v);
+                                }
+                                PostgresSpoolValue::Bytes(v) => {
+                                    args.push_bind(v);
+                                }
+                            }
+                        }
+                    });
+                    query.build().execute(&mut *tx).await.unwrap();
+                }
+            }
+            tx.commit().await.unwrap();
+            let mut config = self.config.clone();
+            config.sql = SqlBackendConfig::postgres_default(fixtures.pg_connect_config(), &schema);
+            return config;
+        }
+
+        fs::create_dir_all(target.canonical().parent().unwrap()).unwrap();
+        fs::copy(artifact, target.canonical()).unwrap();
+        // Copy the CAS objects referenced by this fixture while its source holds are active.
+        let db = rusqlite::Connection::open_with_flags(
+            artifact,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut stmt = db
+            .prepare("SELECT space_id, content_blake3 FROM blob_catalog WHERE ref_count > 0")
+            .unwrap();
+        let refs = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, [u8; 32]>(1)?))
+            })
+            .unwrap();
+        for row in refs {
+            let (space, hash) = row.unwrap();
+            let space = notarium_core::ids::SpaceId::parse(&space).unwrap();
+            let digest = ContentDigest::from_bytes(hash);
+            let dst = target.blob(&space, digest);
+            fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            fs::copy(self.temp_root.data_root().blob(&space, digest), dst).unwrap();
+        }
+        CanonicalConfig::local_default(installation, target.clone())
     }
 
     async fn shutdown(mut self) {
@@ -530,6 +616,20 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             .acquire_hold()
             .await
             .expect("acquire control hold");
+
+        let mut prep_second = store
+            .prepare(
+                maintenance_ctx(ServicePurpose::Backup),
+                BackupId::from_bytes([0x21; 16]),
+                budget,
+            )
+            .await
+            .expect("prepare second concurrent backup");
+        let hold_second = prep_second
+            .acquire_hold()
+            .await
+            .expect("acquire second concurrent hold");
+        drop(prep_second);
 
         // Write BETWEEN prepare and pause_writes -> MUST appear in both snapshots!
         // Include a 4-byte emoji ("🦀" = 4 bytes) straddling byte offset 65_536 in `folder_heads.description`!
@@ -691,6 +791,10 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                 .query_row("SELECT last_seq FROM spaces LIMIT 1", [], |r| r.get(0))
                 .unwrap();
             assert_eq!(spooled_last_seq, 2);
+            let holds: i64 = ind
+                .query_row("SELECT count(*) FROM backup_holds", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(holds, 0);
             let post_exists: Option<i64> = ind
                 .query_row(
                     "SELECT 1 FROM note_heads WHERE note_id = ?1",
@@ -720,6 +824,15 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             let decoded = decode_postgres_spool_v1(&reg.artifact_path)
                 .expect("independent streaming decode of PostgresSpoolV1");
             assert_eq!(decoded.tables.len(), 34);
+            assert!(
+                decoded
+                    .tables
+                    .iter()
+                    .find(|t| t.name == "backup_holds")
+                    .unwrap()
+                    .rows
+                    .is_empty()
+            );
             assert_eq!(decoded.witness.histories[0].after.get(), 2);
 
             let spaces_tbl = decoded
@@ -776,21 +889,122 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             );
         }
 
-        // 3. Concurrent independent BackupHold reference counting + Purge mutual exclusion.
-        let mut prep_second = store
-            .prepare(
-                maintenance_ctx(ServicePurpose::Backup),
-                BackupId::from_bytes([0x21; 16]),
-                budget,
+        let restored_root = TempDataRoot::new("l4-restore-target");
+        let config = case
+            .restored_config(&reg.artifact_path, &restored_root.data_root())
+            .await;
+        let (target_store, target_runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
+        let target_before = target_store.read_space(&scope.space_id).await.unwrap();
+        assert_eq!(target_before.last_seq, cut_seq);
+        let new_scope = HistoryScope {
+            space_id: scope.space_id.clone(),
+            incarnation: sample_incarnation(0x99),
+        };
+        let mut sub = target_store
+            .subscribe(
+                maintenance_ctx(ServicePurpose::Projection),
+                ChangeCursor {
+                    scope: scope.clone(),
+                    after: cut_seq,
+                },
             )
             .await
-            .expect("prepare second concurrent backup");
-        let hold_second = prep_second
-            .acquire_hold()
+            .unwrap();
+        let same_inc = target_store
+            .restore_cursors(
+                maintenance_ctx(ServicePurpose::Restore),
+                vec![ChangeCursor {
+                    scope: scope.clone(),
+                    after: cut_seq,
+                }],
+            )
+            .await;
+        assert_validation_err(&same_inc, ValidationReason::InvalidState);
+        target_store
+            .restore_cursors(
+                maintenance_ctx(ServicePurpose::Restore),
+                vec![ChangeCursor {
+                    scope: new_scope.clone(),
+                    after: cut_seq,
+                }],
+            )
             .await
-            .expect("acquire second concurrent hold");
-        drop(prep_second);
+            .unwrap();
+        let ctx_new = owner_ctx(&new_scope, actor.clone());
+        let recovered = target_store
+            .get_note(
+                ctx_new.clone(),
+                GetNote {
+                    note: note_pre_pause.clone(),
+                    revision: None,
+                    causal: CausalBasis::Exact(ReceiptSet::default()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.document.explicit_read(ctx_new.auth()).unwrap(),
+            "---\ntitle: Included Pre Pause\n---\n# Pre Pause\nIncluded in cut.\n"
+        );
+        // Subscriber must observe `ChangeNotice::Resync { scope: new_scope }`!
+        let mut saw_resync = false;
+        for _ in 0..4 {
+            if let Some(notice) = sub.next().await.expect("sub next")
+                && let ChangeNotice::Resync { scope: observed } = notice
+            {
+                assert_eq!(observed, new_scope);
+                saw_resync = true;
+                break;
+            }
+        }
+        assert!(
+            saw_resync,
+            "[{label}] subscriber must receive ChangeNotice::Resync after restore_cursors"
+        );
 
+        // Reuse the numeric position of the source write made just after the cut.
+        let new_at_same_seq = target_store
+            .create_note(
+                ctx_new.clone(),
+                next_mutation(
+                    &new_scope,
+                    &actor,
+                    CreateNote {
+                        note: NoteId::from_bytes([0x39; 16]),
+                        parent: None,
+                        slug: "new-incarnation-same-seq".to_owned(),
+                        class: DocClass::UserDoc,
+                        carrier: "---\ntitle: Fresh Incarnation\n---\n# Fresh\n".to_owned(),
+                    },
+                ),
+            )
+            .await
+            .expect("commit new note at same numeric seq under new incarnation");
+        assert_eq!(new_at_same_seq.receipt.seq(), post_committed.receipt.seq());
+
+        // Using the old `post_committed.receipt` (same numeric seq, old incarnation) MUST fail with HistoryIncarnationMismatch!
+        let stale_read = target_store
+            .get_note(
+                ctx_new.clone(),
+                GetNote {
+                    note: note_pre_pause.clone(),
+                    revision: None,
+                    causal: CausalBasis::Exact(
+                        ReceiptSet::new(vec![post_committed.receipt]).unwrap(),
+                    ),
+                },
+            )
+            .await;
+        assert_validation_err(&stale_read, ValidationReason::HistoryIncarnationMismatch);
+
+        target_runtime.shutdown().await.unwrap();
+        if let (Some((fixtures, _)), SqlBackendConfig::Postgres { schema, .. }) =
+            (&case.pg_cleanup, &config.sql)
+        {
+            fixtures.drop_pg_schema(schema).await;
+        }
+
+        // 3. Concurrent independent BackupHold reference counting + Purge mutual exclusion.
         // Purge while BOTH holds are active -> blocked!
         let purge_blocked_1 = store
             .delete_note(
@@ -1247,121 +1461,63 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
             "[{label}] fresh backup artifact must contain zero bytes of purged secret token"
         );
 
-        // 6. `restore_cursors` rotates HistoryIncarnation, emits Resync, and rejects stale seq=N receipt even after new seq=N!
-        let pre_restore_space = store.read_space(&scope.space_id).await.unwrap();
-        let cut_before_extra = pre_restore_space.last_seq;
-
-        let mut sub = store
-            .subscribe(
-                maintenance_ctx(ServicePurpose::Projection),
-                ChangeCursor {
-                    scope: scope.clone(),
-                    after: cut_before_extra,
-                },
-            )
+        let zero_space = store
+            .create_space(CreateSpaceSpec {
+                space_id: sample_space_id(0x01),
+                incarnation: sample_incarnation(1),
+                root_folder_id: sample_folder_id(1),
+                slug: "empty-restore-space".to_owned(),
+                kind: SpaceKind::Personal,
+                owner: actor.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
             .await
-            .expect("subscribe before restore_cursors");
-
-        // Commit one extra note at `cut_before_extra + 1` (`stale_seq`) and keep its receipt!
-        let note_keep = NoteId::from_bytes([0x11; 16]);
-        let stale_committed = store
-            .rename_note(
-                ctx.clone(),
-                next_mutation(
-                    &scope,
-                    &actor,
-                    RenameNote {
-                        note: note_keep.clone(),
-                        slug: "note-select1-control-ephemeral".to_owned(),
-                        title: None,
-                    },
-                ),
-            )
-            .await
-            .expect("commit post-cut rename before restore");
-        let stale_seq = stale_committed.receipt.seq();
-        assert_eq!(stale_seq.get(), cut_before_extra.get() + 1);
-
-        // Reject restore_cursors with the SAME incarnation (`InvalidState` per AcknowledgedCursor::restore)!
-        let same_inc_err = store
-            .restore_cursors(
-                maintenance_ctx(ServicePurpose::Restore),
-                vec![ChangeCursor {
-                    scope: scope.clone(),
-                    after: cut_before_extra,
-                }],
-            )
-            .await;
-        assert_validation_err(&same_inc_err, ValidationReason::InvalidState);
-
-        // Rotate to `new_inc` at `cut_before_extra`!
-        let new_inc = sample_incarnation(0x99);
-        let new_scope = HistoryScope {
-            space_id: scope.space_id.clone(),
-            incarnation: new_inc,
+            .unwrap();
+        let empty_cursor = ChangeCursor {
+            scope: HistoryScope {
+                space_id: zero_space.scope.space_id.clone(),
+                incarnation: sample_incarnation(2),
+            },
+            after: SpaceSeq::ZERO,
         };
+        let before = store.read_space(&scope.space_id).await.unwrap();
+        for invalid in [cut_seq, SpaceSeq::new(before.last_seq.get() + 1).unwrap()] {
+            let attempted = store
+                .restore_cursors(
+                    maintenance_ctx(ServicePurpose::Restore),
+                    vec![
+                        empty_cursor.clone(),
+                        ChangeCursor {
+                            scope: new_scope.clone(),
+                            after: invalid,
+                        },
+                    ],
+                )
+                .await;
+            assert_validation_err(&attempted, ValidationReason::InvalidCutoff);
+            assert_eq!(store.read_space(&scope.space_id).await.unwrap(), before);
+            assert_eq!(
+                store.read_space(&zero_space.scope.space_id).await.unwrap(),
+                zero_space
+            );
+        }
         store
             .restore_cursors(
                 maintenance_ctx(ServicePurpose::Restore),
-                vec![ChangeCursor {
-                    scope: new_scope.clone(),
-                    after: cut_before_extra,
-                }],
+                vec![empty_cursor.clone()],
             )
             .await
-            .expect("restore_cursors to cut_before_extra");
-
-        // Subscriber must observe `ChangeNotice::Resync { scope: new_scope }`!
-        let mut saw_resync = false;
-        for _ in 0..4 {
-            if let Some(notice) = sub.next().await.expect("sub next")
-                && let ChangeNotice::Resync { scope: observed } = notice
-            {
-                assert_eq!(observed, new_scope);
-                saw_resync = true;
-                break;
-            }
-        }
-        assert!(
-            saw_resync,
-            "[{label}] subscriber must receive ChangeNotice::Resync after restore_cursors"
+            .unwrap();
+        assert_eq!(
+            store
+                .read_space(&zero_space.scope.space_id)
+                .await
+                .unwrap()
+                .scope,
+            empty_cursor.scope
         );
-
-        // Commit a brand-new note under `new_scope` so `last_seq` reaches `stale_seq` AGAIN!
-        let ctx_new = owner_ctx(&new_scope, actor.clone());
-        let new_at_same_seq = store
-            .create_note(
-                ctx_new.clone(),
-                next_mutation(
-                    &new_scope,
-                    &actor,
-                    CreateNote {
-                        note: NoteId::from_bytes([0x39; 16]),
-                        parent: None,
-                        slug: "new-incarnation-same-seq".to_owned(),
-                        class: DocClass::UserDoc,
-                        carrier: "---\ntitle: Fresh Incarnation\n---\n# Fresh\n".to_owned(),
-                    },
-                ),
-            )
-            .await
-            .expect("commit new note at same numeric seq under new incarnation");
-        assert_eq!(new_at_same_seq.receipt.seq(), stale_seq);
-
-        // Using the old `stale_committed.receipt` (same numeric seq, old incarnation) MUST fail with HistoryIncarnationMismatch!
-        let stale_read = store
-            .get_note(
-                ctx_new.clone(),
-                GetNote {
-                    note: note_keep,
-                    revision: None,
-                    causal: CausalBasis::Exact(
-                        ReceiptSet::new(vec![stale_committed.receipt]).unwrap(),
-                    ),
-                },
-            )
-            .await;
-        assert_validation_err(&stale_read, ValidationReason::HistoryIncarnationMismatch);
 
         case.shutdown().await;
     }
