@@ -173,7 +173,7 @@ pub enum ChatAudience {
 }
 
 /// Canonical resource facts, including ancestry, are supplied by the storage owner.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResourceFacts {
     pub space: Space,
     pub class: DocClass,
@@ -364,6 +364,9 @@ impl EngineAuthContext {
     }
     pub fn kind(&self) -> &PrincipalKind {
         &self.kind
+    }
+    pub fn readonly_abilities(&self) -> &BTreeSet<AbilityId> {
+        &self.readonly_abilities
     }
     pub fn spaces(&self) -> &BTreeMap<SpaceId, SpaceGrant> {
         &self.spaces

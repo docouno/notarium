@@ -421,6 +421,8 @@ BEGIN
     note_revs AS (
         SELECT DISTINCT ON (rw.entity_key)
             rw.entity_key,
+            rw.rev_id AS source_rev_id,
+            rw.metadata_msgpack AS source_meta,
             rw.first_run_seq,
             (rw.max_other_seq IS NOT NULL AND rw.first_run_seq IS NOT NULL AND rw.max_other_seq > rw.first_run_seq) AS has_foreign,
             CASE
@@ -481,12 +483,12 @@ BEGIN
     UNION ALL
     SELECT
         1::INT4,
-        entity_key, pre_rev_id, NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT,
+        entity_key, pre_rev_id, CASE WHEN pre_rev_id IS NULL AND NOT has_foreign THEN source_rev_id END, NULL::TEXT, NULL::TEXT, NULL::TEXT,
         NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT,
         NULL::TEXT, NULL::TEXT, NULL::TEXT,
         NULL::TEXT, NULL::TEXT, NULL::TEXT, NULL::TEXT,
         COALESCE(first_run_seq, -1)::BIGINT, 0::BIGINT, (CASE WHEN has_foreign THEN 1 ELSE 0 END)::INT4,
-        pre_digest, pre_meta, NULL::BYTEA
+        pre_digest, pre_meta, CASE WHEN pre_rev_id IS NULL AND NOT has_foreign THEN source_meta END
     FROM note_revs
     UNION ALL
     SELECT
@@ -818,17 +820,28 @@ WITH run_notes AS MATERIALIZED (
     WHERE space_id = $1 AND agent_run_id = $2 AND entity_type = 'note'
     GROUP BY entity_key
 )
-SELECT s.root_folder_id, s.space_kind, h.note_id, h.slug, h.slug_fold, h.title,
-       h.head_rev_id, h.lifecycle_state, h.byte_size, h.visibility_mask, h.content_blake3,
+SELECT s.root_folder_id, s.space_kind, h.note_id, h.slug, h.slug_fold,
+       h.head_rev_id, h.lifecycle_state, h.content_blake3,
+       CASE WHEN prior.space_seq IS NULL THEN (
+           SELECT cur.metadata_msgpack FROM revisions cur
+           WHERE cur.space_id = $1 AND cur.rev_id = h.head_rev_id
+             AND cur.entity_type = 'note' AND cur.entity_key = h.note_id
+       ) END AS created_metadata,
        r.first_seq, prior.space_seq, prior.rev_id,
        CASE WHEN prior.space_seq < r.first_seq THEN prior.metadata_msgpack END AS prior_metadata,
-       b.content_blake3 AS publication_digest, b.current_publication_id
+       b.content_blake3 AS publication_digest, b.current_publication_id,
+       cs.lease_epoch AS room_lease, cs.lineage_epoch AS room_lineage,
+       (cs.note_id IS NULL OR (cs.room_state = 'closed' AND cs.owner_id IS NULL
+           AND cs.carrier_rev_id = h.head_rev_id AND COALESCE(ck.carrier_dirty, 0) = 0
+           AND NOT EXISTS(SELECT 1 FROM collab_update_log u WHERE u.space_id = cs.space_id AND u.note_id = cs.note_id))) AS room_writable
 FROM spaces s
 JOIN agent_run_heads a ON a.space_id = s.space_id AND a.run_id = $2
 JOIN run_notes r ON r.entity_key = ANY($3::text[])
 JOIN LATERAL (
     SELECT nh.* FROM note_heads nh WHERE nh.space_id = $1 AND nh.note_id = r.entity_key LIMIT 1
 ) h ON h.parent_folder_id = s.root_folder_id
+LEFT JOIN collab_sessions cs ON cs.space_id = s.space_id AND cs.note_id = h.note_id
+LEFT JOIN collab_checkpoints ck ON ck.space_id = cs.space_id AND ck.note_id = cs.note_id
 LEFT JOIN LATERAL (
     SELECT v.space_seq, v.rev_id, v.metadata_msgpack, v.content_blake3
     FROM revisions v
@@ -862,7 +875,7 @@ SELECT notarium_pg_lean_commit_v3(
     $45::TEXT[], $46::TEXT[],
     $47::TEXT[], $48::TEXT[], $49::TEXT[], $50::TEXT[], $51::BYTEA[], $52::BIGINT[], $53::INT4[],
     $54::TEXT[], $55::TEXT[], $56::TEXT[], $57::TEXT[], $58::TEXT[], $59::TEXT[], $60::TEXT[], $61::BYTEA[], $62::BIGINT[], $63::TEXT[], $64::INT4[],
-    $65::TEXT[], $66::TEXT[], $67::TEXT[], $68::TEXT[], $69, $70
+    $65::TEXT[], $66::TEXT[], $67::TEXT[], $68::TEXT[], $69, $70, $71::BIGINT[], $72::BIGINT[]
 )
 ";
 
@@ -870,10 +883,13 @@ const PG_LEAN_ROLLBACK_COMMIT_FN_SQL: &str = r#"
 DO $cleanup$
 DECLARE old_signature regprocedure;
 BEGIN
-    SELECT p.oid::regprocedure INTO old_signature
-    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-    WHERE n.nspname = current_schema() AND p.proname = 'notarium_pg_lean_commit_v3' AND p.pronargs = 69;
-    IF old_signature IS NOT NULL THEN EXECUTE format('DROP FUNCTION %s', old_signature); END IF;
+    FOR old_signature IN
+        SELECT p.oid::regprocedure FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = current_schema() AND p.proname = 'notarium_pg_lean_commit_v3'
+          AND p.pronargs IN (69, 70)
+    LOOP
+        EXECUTE format('DROP FUNCTION %s', old_signature);
+    END LOOP;
 END;
 $cleanup$;
 
@@ -947,7 +963,9 @@ CREATE OR REPLACE FUNCTION notarium_pg_lean_commit_v3(
     p_all_exp_revs TEXT[],
     p_all_exp_lcs TEXT[],
     p_root_folder_id TEXT,
-    p_writer_epoch BIGINT
+    p_writer_epoch BIGINT,
+    p_room_leases BIGINT[],
+    p_room_lineages BIGINT[]
 ) RETURNS BIGINT
 LANGUAGE plpgsql
 AS $$
@@ -960,6 +978,9 @@ DECLARE
     v_first_be BYTEA;
     v_vis_be BYTEA;
     v_cat_cnt INT4;
+    v_mutated_rooms TEXT[];
+    v_released_digests BYTEA[];
+    v_room_count BIGINT;
 BEGIN
     PERFORM pg_advisory_xact_lock_shared(hashtextextended(current_schema(), 7311229));
     PERFORM 1 FROM spaces WHERE space_id = p_space_id AND active_epoch = p_writer_epoch FOR NO KEY UPDATE;
@@ -981,9 +1002,17 @@ BEGIN
             AND arh.run_revision = p_exp_run_rev
             AND (
                 SELECT COUNT(*)
-                FROM UNNEST(p_all_nids, p_all_exp_revs, p_all_exp_lcs) AS e(nid, exp_rev, exp_lc)
+                FROM UNNEST(p_all_nids, p_all_exp_revs, p_all_exp_lcs, p_room_leases, p_room_lineages)
+                     AS e(nid, exp_rev, exp_lc, room_lease, room_lineage)
                 JOIN note_heads nh ON nh.space_id = p_space_id AND nh.note_id = e.nid
+                LEFT JOIN collab_sessions cs ON cs.space_id = nh.space_id AND cs.note_id = nh.note_id
+                LEFT JOIN collab_checkpoints ck ON ck.space_id = cs.space_id AND ck.note_id = cs.note_id
                 WHERE nh.head_rev_id = e.exp_rev
+                  AND cs.lease_epoch IS NOT DISTINCT FROM e.room_lease
+                  AND cs.lineage_epoch IS NOT DISTINCT FROM e.room_lineage
+                  AND (cs.note_id IS NULL OR (cs.room_state = 'closed' AND cs.owner_id IS NULL
+                       AND cs.carrier_rev_id = e.exp_rev AND COALESCE(ck.carrier_dirty, 0) = 0
+                       AND NOT EXISTS(SELECT 1 FROM collab_update_log u WHERE u.space_id = cs.space_id AND u.note_id = cs.note_id)))
                   AND nh.lifecycle_state = e.exp_lc
                   AND nh.parent_folder_id = p_root_folder_id
                   AND nh.doc_class = 'user-doc'
@@ -991,11 +1020,11 @@ BEGIN
                   AND nh.visibility_mask >= 0
             ) = cardinality(p_all_nids)
             AND NOT EXISTS(SELECT 1 FROM command_receipts WHERE space_id = p_space_id AND history_incarnation = p_inc AND actor_id = p_actor_id AND idempotency_key = p_idemp_key)
-            AND NOT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = p_space_id)
-            AND NOT EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = p_space_id)
-            AND NOT EXISTS(SELECT 1 FROM collab_sessions WHERE space_id = p_space_id)
-            AND NOT EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = p_space_id)
-            AND NOT EXISTS(SELECT 1 FROM space_field_schemas WHERE space_id = p_space_id)
+            AND NOT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = p_space_id AND agent_run_id = p_run_id)
+            AND NOT EXISTS(SELECT 1 FROM board_move_history WHERE space_id = p_space_id AND target_note_id = ANY(p_all_nids))
+            AND NOT EXISTS(SELECT 1 FROM revision_purge_fences WHERE space_id = p_space_id AND note_id = ANY(p_all_nids))
+            AND NOT EXISTS(SELECT 1 FROM view_rank_overlays WHERE space_id = p_space_id AND target_note_id = ANY(p_all_nids))
+            AND NOT EXISTS(SELECT 1 FROM space_field_schemas WHERE space_id = p_space_id AND is_current = 1)
             AND EXISTS(SELECT 1 FROM folder_heads WHERE space_id = p_space_id AND folder_id = p_root_folder_id
                 AND is_root = 1 AND lifecycle_state = 'active' AND write_lock_json IS NULL)
             AND NOT (
@@ -1194,6 +1223,48 @@ BEGIN
         FROM UNNEST(p_fl_nids, p_fl_pf, p_fl_s, p_fl_sf, p_fl_t, p_fl_tf, p_fl_revs, p_fl_digs, p_fl_bs, p_fl_lc, p_fl_vm)
              AS u(nid, pf, s, sf, t, tf, rev, dig, bs, lc, vm)
         WHERE nh.space_id = p_space_id AND nh.note_id = u.nid;
+    END IF;
+
+    -- A direct carrier revision starts a new lineage for each existing closed room.
+    -- No-ops, skipped notes and notes without a session have no durable room effect.
+    SELECT ARRAY(
+        SELECT r.nid FROM unnest(p_all_nids, p_room_leases) AS r(nid, lease)
+        WHERE r.lease IS NOT NULL AND r.nid = ANY(p_m_nids)
+    ) INTO v_mutated_rooms;
+    IF cardinality(v_mutated_rooms) > 0 THEN
+        UPDATE collab_sessions AS cs
+        SET lineage_epoch = cs.lineage_epoch + 1, carrier_rev_id = m.rev,
+            updated_seq = v_vis_seq, yrs_snapshot_blob = NULL, yrs_snapshot_blake3 = NULL
+        FROM unnest(p_m_nids, p_m_revs) AS m(nid, rev)
+        WHERE cs.space_id = p_space_id AND cs.note_id = m.nid
+          AND cs.note_id = ANY(v_mutated_rooms);
+        GET DIAGNOSTICS v_room_count = ROW_COUNT;
+        IF v_room_count <> cardinality(v_mutated_rooms) THEN
+            RAISE EXCEPTION 'NOTARIUM_RB_FALLBACK_0';
+        END IF;
+
+        DELETE FROM collab_checkpoints WHERE space_id = p_space_id AND note_id = ANY(v_mutated_rooms);
+        WITH released AS (
+            DELETE FROM blob_references
+            WHERE space_id = p_space_id AND owner_kind = 'collab_snapshot' AND owner_id = ANY(v_mutated_rooms)
+            RETURNING content_blake3
+        )
+        SELECT ARRAY(SELECT DISTINCT content_blake3 FROM released) INTO v_released_digests;
+
+        -- Use a new statement snapshot after both new revision refs and released snapshot refs.
+        IF cardinality(v_released_digests) > 0 THEN
+            WITH remaining AS MATERIALIZED (
+                SELECT r.content_blake3, count(*) AS refs
+                FROM blob_references r
+                WHERE r.space_id = p_space_id AND r.content_blake3 = ANY(v_released_digests)
+                GROUP BY r.content_blake3
+            )
+            UPDATE blob_catalog AS b
+            SET ref_count = COALESCE(t.refs, 0), touched_at_ms = p_now_ms
+            FROM unnest(v_released_digests) AS d(digest)
+            LEFT JOIN remaining t ON t.content_blake3 = d.digest
+            WHERE b.space_id = p_space_id AND b.content_blake3 = d.digest;
+        END IF;
     END IF;
 
     UPDATE agent_run_heads
@@ -1423,6 +1494,19 @@ pub async fn verify_sqlite_catalog(conn: &mut SqliteConnection) -> Result<(), Po
                 ),
             ));
         }
+    }
+
+    let without_rowid: i64 = sqlx::query_scalar(
+        "SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = 'blob_catalog'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|err| internal_not_committed("sqlite_catalog_layout", err.to_string()))?;
+    if without_rowid != 1 {
+        return Err(internal_not_committed(
+            "sqlite_catalog_layout",
+            "blob_catalog requires WITHOUT ROWID",
+        ));
     }
 
     let idx_rows: Vec<String> = sqlx::query_scalar(

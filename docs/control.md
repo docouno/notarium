@@ -594,6 +594,8 @@ personal, then System. A disabled, unhealthy or wrong-kind candidate shadows low
 precedence; equal-precedence ambiguity fails rather than choosing arbitrarily.
 Exact selections and `get_ability` accept an optional contextual `project` so
 selected-project Space abilities resolve consistently, and reject stale revisions.
+Both paths enforce canonical visibility at publication and at the current location
+before returning the descriptor or its auxiliary file names.
 Trails bind exact typed references, stop
 at 16 hops and reject cycles. Discovery preserves continuation across filtered
 pages and never emits a lower candidate as a duplicate of the selected winner.

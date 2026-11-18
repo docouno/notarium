@@ -41,6 +41,7 @@ rustls = { workspace = true }
 reqwest = { workspace = true }
 cap-std = { workspace = true }
 time = { workspace = true }
+cap-fs-ext.workspace = true
 
 [dev-dependencies]
 notarium-canonical = { workspace = true, features = ["test-support"] }

@@ -146,6 +146,18 @@ fn encode_witness_json(w: &BackupWitness) -> Result<String, PortError> {
         .map_err(|err| internal_not_committed("encode_backup_witness_json", err.to_string()))
 }
 
+fn encode_hold_witness(
+    installation: &InstallationId,
+    cursor: &ChangeCursor,
+) -> Result<String, PortError> {
+    encode_witness_json(&BackupWitness {
+        installation: installation.clone(),
+        schema_version: CANONICAL_SCHEMA_VERSION,
+        histories: vec![cursor.clone()],
+        canaries: Vec::new(),
+    })
+}
+
 fn decode_witness_json(raw: &str) -> Result<BackupWitness, PortError> {
     serde_json::from_str(raw)
         .map_err(|err| internal_not_committed("decode_backup_witness_json", err.to_string()))
@@ -641,12 +653,11 @@ fn sqlite_backup_worker_loop(
     init_tx: mpsc::SyncSender<Result<rusqlite::InterruptHandle, PortError>>,
     cmd_rx: mpsc::Receiver<SqliteWorkerCmd>,
 ) {
-    let open_res = (|| -> Result<(rusqlite::Connection, rusqlite::Connection), PortError> {
-        let src = rusqlite::Connection::open_with_flags(
-            &src_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|err| internal_not_committed("rusqlite_open_backup_src", err.to_string()))?;
+    let open_res = (|| -> Result<_, PortError> {
+        let read_only =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let src = rusqlite::Connection::open_with_flags(&src_path, read_only)
+            .map_err(|err| internal_not_committed("rusqlite_open_backup_src", err.to_string()))?;
         src.busy_timeout(Duration::from_millis(250))
             .map_err(|err| internal_not_committed("rusqlite_src_busy_timeout", err.to_string()))?;
         src.execute_batch(&format!(
@@ -666,10 +677,15 @@ fn sqlite_backup_worker_loop(
         ))
         .map_err(|err| internal_not_committed("rusqlite_dst_pragmas", err.to_string()))?;
 
-        Ok((src, dst))
+        // SQLite requires the WAL-status query to run outside the pinned transaction.
+        let observer =
+            rusqlite::Connection::open_with_flags(&src_path, read_only).map_err(|err| {
+                internal_not_committed("rusqlite_open_backup_wal_observer", err.to_string())
+            })?;
+        Ok((src, dst, observer))
     })();
 
-    let (src, dst) = match open_res {
+    let (src, dst, observer) = match open_res {
         Ok(pair) => {
             let handle = pair.0.get_interrupt_handle();
             if init_tx.send(Ok(handle)).is_err() {
@@ -722,7 +738,12 @@ fn sqlite_backup_worker_loop(
                 reply,
             } => {
                 let res = if let Some(src_conn) = src_opt.as_ref() {
-                    match pin_and_read_sqlite_witness(src_conn, &expected_installation) {
+                    match pin_and_read_sqlite_witness(src_conn, &expected_installation).and_then(
+                        |witness| {
+                            wal_pin.mark_cut(&observer)?;
+                            Ok(witness)
+                        },
+                    ) {
                         Ok(w) => {
                             pinned = true;
                             pin = Some((wal_pin, Instant::now(), remaining, shutdown));
@@ -763,6 +784,7 @@ fn sqlite_backup_worker_loop(
                     &mut src_opt,
                     &mut dst_opt,
                     &mut pinned,
+                    &observer,
                     wal_pin,
                     budget,
                     &cancel_flag,
@@ -819,7 +841,26 @@ fn pin_and_read_sqlite_witness(
     src.execute_batch("BEGIN DEFERRED;")
         .map_err(|err| internal_not_committed("sqlite_backup_begin", err.to_string()))?;
 
-    read_and_verify_sqlite_conn_witness(src, expected_installation)
+    let witness = read_and_verify_sqlite_conn_witness(src, expected_installation)?;
+    let pending: bool = src
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM blob_retirements WHERE status = 'pending')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| internal_not_committed("sqlite_backup_pin_retirements", err.to_string()))?;
+    if pending {
+        return Err(pending_retirement_at_cut());
+    }
+    Ok(witness)
+}
+
+fn pending_retirement_at_cut() -> PortError {
+    unavailable_retryable(
+        "backup_cut_pending_retirement",
+        "a CAS retirement is pending in the backup snapshot",
+        Duration::from_millis(100),
+    )
 }
 
 fn read_and_verify_sqlite_conn_witness(
@@ -902,6 +943,7 @@ fn run_sqlite_spool_on_owner_thread(
     src_opt: &mut Option<rusqlite::Connection>,
     dst_opt: &mut Option<rusqlite::Connection>,
     pinned: &mut bool,
+    observer: &rusqlite::Connection,
     wal_pin: BackupWalPinGuard,
     budget: BackupBudget,
     cancel_flag: &Arc<AtomicBool>,
@@ -959,7 +1001,7 @@ fn run_sqlite_spool_on_owner_thread(
             budget.check(BackupProgress {
                 elapsed: started.elapsed(),
                 retention: BackupRetentionProgress::SqliteWal {
-                    pinned_bytes: wal_pin.current_pinned_wal_bytes(),
+                    pinned_bytes: wal_pin.current_pinned_wal_bytes(observer)?,
                 },
                 spool_bytes: est_bytes,
             })?;
@@ -1109,7 +1151,7 @@ fn run_sqlite_spool_on_owner_thread(
     budget.check(BackupProgress {
         elapsed: started.elapsed(),
         retention: BackupRetentionProgress::SqliteWal {
-            pinned_bytes: wal_pin.current_pinned_wal_bytes(),
+            pinned_bytes: wal_pin.current_pinned_wal_bytes(observer)?,
         },
         spool_bytes: total_bytes,
     })?;
@@ -1128,6 +1170,13 @@ fn run_sqlite_spool_on_owner_thread(
         }
     };
 
+    budget.check(BackupProgress {
+        elapsed: started.elapsed(),
+        retention: BackupRetentionProgress::SqliteWal {
+            pinned_bytes: wal_pin.current_pinned_wal_bytes(observer)?,
+        },
+        spool_bytes: total_bytes,
+    })?;
     if let Err(err) = fs::rename(tmp_path, final_path) {
         remove_tmp_artifacts_best_effort(tmp_path);
         return Err(internal_not_committed(
@@ -1342,6 +1391,9 @@ const PG_PIN_WITNESS_SQL: &str =
      WHERE singleton_id = 1 AND epoch_version = 1 AND migration_state = 'ready'
      UNION ALL
      SELECT 1::int2, last_seq, space_id, history_incarnation, NULL, NULL FROM spaces
+     UNION ALL
+     SELECT 2::int2, NULL, NULL, NULL, NULL, NULL
+     WHERE EXISTS (SELECT 1 FROM blob_retirements WHERE status = 'pending')
      ORDER BY kind, id_col";
 
 async fn warm_pg_backup_connection(
@@ -1410,6 +1462,9 @@ async fn pin_and_read_pg_witness(
 
     let mut histories = Vec::new();
     while let Some(row) = rows.try_next().await.map_err(read_error)? {
+        if row.try_get::<i16, _>(0).map_err(read_error)? == 2 {
+            return Err(pending_retirement_at_cut());
+        }
         let after = i64_to_space_seq(row.try_get(1).map_err(read_error)?)?;
         let space_id = SpaceId::parse(row.try_get(2).map_err(read_error)?).map_err(|_| {
             internal_not_committed("corrupt_pg_backup_space_id", "invalid SpaceId in spaces")
@@ -1917,6 +1972,9 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         .iter()
         .copied()
         .filter_map(move |mut table| {
+            if schema_version < 4 && table.name == "blob_references" {
+                table.indexes = &["idx_blob_references_non_note_owner"];
+            }
             if schema_version < 3 {
                 match table.name {
                     "collab_checkpoints" => return None,
@@ -1938,7 +1996,7 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         })
 }
 
-/// Materializes a verified schema 1, 2 or 3 spool for offline inspection within the default budget.
+/// Materializes a verified schema 1 through 4 spool for offline inspection within the default budget.
 pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, PortError> {
     decode_postgres_spool_v1_bounded(
         path,
@@ -2010,7 +2068,7 @@ pub fn decode_postgres_spool_v1_bounded(
     let expected_tables = spool_tables(schema_version);
     let expected_checksum = match schema_version {
         CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1 | 2 => {
+        1..=3 => {
             let digest = checksum_tables(schema_version, expected_tables.clone());
             if !crate::schema::migrate::recognized_predecessor(
                 i64::from(schema_version),
@@ -2942,13 +3000,26 @@ impl PreparedBackup for CanonicalPreparedBackup {
             }
             let backup_id = self.backup_id.clone();
             let store = self.store.clone();
-            // The worker keeps ownership through SQL commit even if its caller drops the await.
+            let caller = self.caller_cancel.clone();
+            let deadline = tokio::time::Instant::now()
+                + self
+                    .prepare_budget
+                    .deadline
+                    .saturating_sub(self.prepared_at.elapsed());
+            let abandoned = Cancellation::default();
+            let _cancel_on_drop = CancelOnDrop(abandoned.clone());
             let worker = self.store.inner.backup_executor.spawn(async move {
                 let generation = mint_artifact_id()?;
-                let mut owner = HoldOwnership::acquire(&store, &backup_id, &generation).await?;
-                let witness =
-                    acquire_durable_backup_holds(&store, &mut owner, &backup_id, &generation)
-                        .await?;
+                let stop = async {
+                    tokio::select! {
+                        () = tokio::time::sleep_until(deadline) =>
+                            DomainError::validation(ValidationReason::BudgetExceeded).into(),
+                        () = caller.cancelled() => cancelled_not_committed("backup_cancelled", "backup cancelled"),
+                        () = abandoned.cancelled() => cancelled_not_committed("backup_hold_abandoned", "hold acquisition dropped"),
+                        () = store.inner.backup_shutdown.cancelled() => cancelled_not_committed("backup_shutdown", "backup shutting down"),
+                    }
+                };
+                let (owner, witness) = acquire_owned_hold(&store, &backup_id, &generation, deadline, stop).await?;
                 let held_count = witness.histories.len() as u64;
                 let (done, finished) = tokio::sync::oneshot::channel();
                 let proof = HoldProof {
@@ -2985,16 +3056,9 @@ impl PreparedBackup for CanonicalPreparedBackup {
                 register_cleanup_task(&inner, cleanup);
                 Ok::<_, PortError>(hold)
             });
-            let remaining = self
-                .prepare_budget
-                .deadline
-                .saturating_sub(self.prepared_at.elapsed());
-            let hold = wait_for_phase(remaining, &self.caller_cancel, async move {
-                worker
-                    .await
-                    .map_err(|err| internal_not_committed("backup_hold_worker", err.to_string()))?
-            })
-            .await?;
+            let hold = worker
+                .await
+                .map_err(|err| internal_not_committed("backup_hold_worker", err.to_string()))??;
             self.held_histories = Some((hold.proof.clone(), hold.witness.histories.clone()));
             Ok(Box::new(hold) as Box<dyn BackupHold>)
         })
@@ -3255,7 +3319,7 @@ impl BackupParticipantPort for CanonicalStore {
             let _safe_point = store.inner.writer()?.acquire_safe_point().await;
 
             let restored_cl = restored.clone();
-            let (fences, epochs) = store
+            let (fences, epochs, retirements) = store
                 .with_write_tx_unfenced(|tx| {
                     Box::pin(async move {
                         let mut epochs = Vec::with_capacity(restored_cl.len());
@@ -3263,11 +3327,14 @@ impl BackupParticipantPort for CanonicalStore {
                             epochs.push(validate_restore_cursor_tx(tx, cur).await?);
                         }
                         let fences = RoomFenceTable::default();
+                        let mut retirements = Vec::new();
                         for (cur, epoch) in restored_cl.iter().zip(epochs.iter().copied()) {
-                            apply_restore_cursor_tx(tx, cur, epoch).await?;
+                            if apply_restore_cursor_tx(tx, cur, epoch).await? {
+                                retirements.push((cur.scope.clone(), epoch));
+                            }
                             load_restored_room_fences(tx, &cur.scope, &fences).await?;
                         }
-                        Ok((fences, epochs))
+                        Ok((fences, epochs, retirements))
                     })
                 })
                 .await?;
@@ -3293,7 +3360,21 @@ impl BackupParticipantPort for CanonicalStore {
                         ceiling: cur.after,
                     });
             }
-
+            // The cutover has committed. A failed CAS unlink must not report a
+            // failed rotation, and cancelling the caller must not abandon GC.
+            if !retirements.is_empty() {
+                let shutdown = store.inner.backup_shutdown.clone();
+                let worker = store.clone();
+                register_cleanup_task(
+                    &store.inner,
+                    store.inner.backup_executor.spawn(async move {
+                        tokio::select! {
+                            () = shutdown.cancelled() => {}
+                            () = recover_restored_gc(worker, retirements) => {}
+                        }
+                    }),
+                );
+            }
             Ok(())
         })
     }
@@ -3303,11 +3384,81 @@ impl BackupParticipantPort for CanonicalStore {
 // Durable SQL helpers for `backup_holds`, `backup_artifacts`, `restore_cursors`
 // ============================================================================
 
+async fn recover_restored_gc(store: CanonicalStore, spaces: Vec<(HistoryScope, LeaseEpoch)>) {
+    use futures_util::StreamExt;
+    futures_util::stream::iter(spaces)
+        .for_each_concurrent(4, |(scope, epoch)| {
+            let store = store.clone();
+            async move {
+                let mut backoff = Duration::from_millis(50);
+                loop {
+                    match store.resume_blob_retirements(&scope, epoch, true).await {
+                        Ok(()) | Err(PortError::Domain(_)) => return,
+                        Err(_) => tokio::time::sleep(backoff).await,
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+            }
+        })
+        .await;
+}
+
+async fn acquire_owned_hold(
+    store: &CanonicalStore,
+    id: &BackupId,
+    generation: &ArtifactId,
+    deadline: tokio::time::Instant,
+    stop: impl std::future::Future<Output = PortError>,
+) -> Result<(HoldOwnership, BackupWitness), PortError> {
+    tokio::pin!(stop);
+    let mut owner = tokio::select! {
+        biased;
+        reason = &mut stop => return Err(reason),
+        result = HoldOwnership::acquire(store, id, generation, deadline) => result?,
+    };
+
+    let committing = Arc::new(AtomicBool::new(false));
+    let mut write = Box::pin(acquire_durable_backup_holds(
+        store,
+        &mut owner,
+        id,
+        generation,
+        Arc::clone(&committing),
+    ));
+    let reason = tokio::select! {
+        biased;
+        reason = &mut stop => reason,
+        result = &mut write => {
+            let witness = result?;
+            drop(write);
+            return Ok((owner, witness));
+        }
+    };
+    if committing.load(Ordering::Acquire) {
+        // An issued COMMIT may already be durable. Retain its owner and delete
+        // exactly this generation once its outcome is known.
+        let witness = write.await?;
+        delete_backup_hold_rows(
+            store,
+            &mut owner,
+            id,
+            generation,
+            witness.histories.len() as u64,
+        )
+        .await?;
+    } else {
+        drop(write);
+        owner.interrupt_acquisition(store, generation).await?;
+    }
+    Err(reason)
+}
+
 async fn acquire_durable_backup_holds(
     store: &CanonicalStore,
     owner: &mut HoldOwnership,
     backup_id: &BackupId,
     generation: &ArtifactId,
+    committing: Arc<AtomicBool>,
 ) -> Result<BackupWitness, PortError> {
     let bid = backup_id.clone();
     let inst_id = store.inner.config.installation_id.clone();
@@ -3413,9 +3564,8 @@ async fn acquire_durable_backup_holds(
                     histories,
                     canaries: Vec::new(),
                 };
-                let witness_json = encode_witness_json(&witness)?;
-
                 for cur in &witness.histories {
+                    let witness_json = encode_hold_witness(&inst_id, cur)?;
                     let cutoff_i64 = cur.after.get() as i64;
                     match tx {
                         BackendConn::Sqlite(conn) => {
@@ -3463,6 +3613,11 @@ async fn acquire_durable_backup_holds(
                     }
                 }
 
+                if let BackendConn::Postgres(conn) = tx {
+                    sqlx::raw_sql("SET statement_timeout = 0").execute(&mut **conn).await
+                        .map_err(|err| internal_not_committed("pg_backup_owner_timeout", err.to_string()))?;
+                }
+                committing.store(true, Ordering::Release);
                 Ok(witness)
             })
         })
@@ -3585,13 +3740,14 @@ async fn persist_backup_artifact_ready(
                         })?;
 
                         for cur in &histories {
+                            let hold_witness = encode_hold_witness(&inst, cur)?;
                             let updated = sqlx::query(
                                 "UPDATE backup_holds
                                  SET phase = 'spooled', cutoff_seq = ?, witness_json = ?
                                  WHERE backup_id = ? AND space_id = ? AND owner_generation = ?",
                             )
                             .bind(cur.after.get() as i64)
-                            .bind(&witness_json)
+                            .bind(hold_witness)
                             .bind(bid.as_str())
                             .bind(cur.scope.space_id.as_str())
                             .bind(generation.as_str())
@@ -3629,13 +3785,14 @@ async fn persist_backup_artifact_ready(
                         })?;
 
                         for cur in &histories {
+                            let hold_witness = encode_hold_witness(&inst, cur)?;
                             let updated = sqlx::query(
                                 "UPDATE backup_holds
                                  SET phase = 'spooled', cutoff_seq = $1, witness_json = $2
                                  WHERE backup_id = $3 AND space_id = $4 AND owner_generation = $5",
                             )
                             .bind(cur.after.get() as i64)
-                            .bind(&witness_json)
+                            .bind(hold_witness)
                             .bind(bid.as_str())
                             .bind(cur.scope.space_id.as_str())
                             .bind(generation.as_str())
@@ -3709,11 +3866,12 @@ async fn apply_restore_cursor_tx(
     tx: &mut BackendConn<'_>,
     target: &ChangeCursor,
     next_epoch: LeaseEpoch,
-) -> Result<(), PortError> {
+) -> Result<bool, PortError> {
     let next_epoch_i64 = next_epoch.get() as i64;
     let sid = target.scope.space_id.as_str();
     let new_inc = target.scope.incarnation.as_bytes().as_slice();
 
+    let mut rebound_retirements = false;
     let history_scoped_tables = [
         "revisions",
         "revision_purge_fences",
@@ -3759,7 +3917,7 @@ async fn apply_restore_cursor_tx(
             })?;
 
             for table in history_scoped_tables {
-                sqlx::query(sqlx::AssertSqlSafe(format!(
+                let result = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE {table} SET history_incarnation = ? WHERE space_id = ?"
                 )))
                 .bind(new_inc)
@@ -3769,6 +3927,9 @@ async fn apply_restore_cursor_tx(
                 .map_err(|err| {
                     internal_not_committed("sqlite_restore_rebind_inc", err.to_string())
                 })?;
+                if table == "blob_retirements" {
+                    rebound_retirements = result.rows_affected() > 0;
+                }
             }
 
             sqlx::query(
@@ -3817,7 +3978,7 @@ async fn apply_restore_cursor_tx(
             })?;
 
             for table in history_scoped_tables {
-                sqlx::query(sqlx::AssertSqlSafe(format!(
+                let result = sqlx::query(sqlx::AssertSqlSafe(format!(
                     "UPDATE {table} SET history_incarnation = $1 WHERE space_id = $2"
                 )))
                 .bind(new_inc)
@@ -3825,6 +3986,9 @@ async fn apply_restore_cursor_tx(
                 .execute(&mut **conn)
                 .await
                 .map_err(|err| internal_not_committed("pg_restore_rebind_inc", err.to_string()))?;
+                if table == "blob_retirements" {
+                    rebound_retirements = result.rows_affected() > 0;
+                }
             }
 
             sqlx::query(
@@ -3841,7 +4005,7 @@ async fn apply_restore_cursor_tx(
         }
     }
 
-    Ok(())
+    Ok(rebound_retirements)
 }
 
 // Stage the replacement in private memory. A read or validation error must roll

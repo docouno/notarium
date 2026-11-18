@@ -1,14 +1,21 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     io::{self, Read, Write},
-    path::Path,
     sync::{
         Arc, Mutex, RwLock as StdRwLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
 
-use cap_std::{ambient_authority, fs::Dir};
+use cap_fs_ext::{
+    DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt, OpenOptionsMaybeDirExt,
+    OpenOptionsSyncExt,
+};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions},
+};
+
 use notarium_core::{
     epoch::DataRoot,
     error::PortError,
@@ -146,14 +153,31 @@ pub struct PreparedLocalStagingEntry {
     pub temp_file: Option<DeferredLocalTempFile>,
 }
 
-pub(crate) struct CachedRelDir {
-    pub(crate) dir: Dir,
-    pub(crate) sync_file: cap_std::fs::File,
+#[derive(Debug)]
+struct PinnedDir {
+    dir: Dir,
+    identity: (u64, u64),
+}
+
+impl PinnedDir {
+    fn new(dir: Dir) -> io::Result<Self> {
+        // open_dir_nofollow can return O_PATH on Linux. Open "." through that
+        // descriptor to get an fsync-capable handle to the very same directory.
+        let file = dir.open_with(".", OpenOptions::new().read(true).maybe_dir(true))?;
+        let metadata = file.metadata()?;
+        Ok(Self {
+            identity: (metadata.dev(), metadata.ino()),
+            dir: Dir::from_std_file(file.into_std()),
+        })
+    }
+    fn sync(&self) -> io::Result<()> {
+        self.dir.try_clone()?.into_std_file().sync_all()
+    }
 }
 
 pub struct DeferredLocalTempFile {
-    staging_dir: Arc<Dir>,
-    shard_dir: Arc<CachedRelDir>,
+    staging_dir: Arc<PinnedDir>,
+    shard_dir: Arc<PinnedDir>,
     free_slots: Arc<Mutex<Vec<u32>>>,
     slot: Option<u32>,
     tmp_file: Option<cap_std::fs::File>,
@@ -189,6 +213,7 @@ impl DeferredLocalTempFile {
             drop(file);
         }
         self.staging_dir
+            .dir
             .rename(&self.tmp_name, &self.shard_dir.dir, &self.file_name)
             .map_err(|err| internal_not_committed("local_cas_rename", err.to_string()))?;
         self.published = true;
@@ -200,7 +225,7 @@ impl Drop for DeferredLocalTempFile {
     fn drop(&mut self) {
         self.tmp_file.take();
         if !self.published {
-            let _ = self.staging_dir.remove_file(&self.tmp_name);
+            let _ = self.staging_dir.dir.remove_file(&self.tmp_name);
         }
         if let Some(slot) = self.slot.take() {
             self.free_slots
@@ -211,43 +236,96 @@ impl Drop for DeferredLocalTempFile {
     }
 }
 
-/// Relative directory paths inside `DataRoot` that require durable `fsync` before SQL metadata commit.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Directory barriers retain the exact parent object changed by the publication.
+/// The path-only variant remains available for explicit callers.
+#[derive(Clone, Debug, Default)]
 pub struct PendingDirSyncs {
-    dirs: BTreeSet<String>,
+    dirs: BTreeMap<DirectoryKey, Option<Arc<PinnedDir>>>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DirectoryKey {
+    path: String,
+    identity: Option<(u64, u64)>,
+}
+
+pub(super) struct DirectoryBarrier {
+    key: DirectoryKey,
+    pinned: Option<Arc<PinnedDir>>,
+}
+
+impl DirectoryBarrier {
+    pub(super) fn sync(self, store: &LocalBlobStore) -> Result<(), PortError> {
+        if let Some(pinned) = self.pinned {
+            let current = store.resolve_dir(&self.key.path, false)?;
+            if current.identity != pinned.identity {
+                return Err(internal_not_committed(
+                    "local_cas_directory_replaced",
+                    &self.key.path,
+                ));
+            }
+            pinned
+                .sync()
+                .map_err(|e| internal_not_committed("local_cas_sync_dir", e.to_string()))
+        } else {
+            store.flush_single_dir(&self.key.path)
+        }
+    }
+}
+
+impl PartialEq for PendingDirSyncs {
+    fn eq(&self, other: &Self) -> bool {
+        self.dirs.keys().eq(other.dirs.keys())
+    }
+}
+impl Eq for PendingDirSyncs {}
 
 impl PendingDirSyncs {
     pub fn is_empty(&self) -> bool {
         self.dirs.is_empty()
     }
-
     pub fn insert(&mut self, rel_dir: impl Into<String>) {
-        self.dirs.insert(rel_dir.into());
+        self.dirs.insert(
+            DirectoryKey {
+                path: rel_dir.into(),
+                identity: None,
+            },
+            None,
+        );
     }
-
+    fn pin(&mut self, rel: &str, dir: &Arc<PinnedDir>) {
+        self.dirs.insert(
+            DirectoryKey {
+                path: rel.to_owned(),
+                identity: Some(dir.identity),
+            },
+            Some(Arc::clone(dir)),
+        );
+    }
     pub fn merge(&mut self, other: &Self) {
-        for dir in &other.dirs {
-            self.dirs.insert(dir.clone());
-        }
+        self.dirs.extend(other.dirs.clone());
     }
-
     pub fn len(&self) -> usize {
         self.dirs.len()
     }
-
     pub fn iter(&self) -> impl Iterator<Item = &str> {
-        self.dirs.iter().map(String::as_str)
+        self.dirs.keys().map(|key| key.path.as_str())
     }
-
     pub fn without(&self, already_synced: &Self) -> Self {
         Self {
             dirs: self
                 .dirs
-                .difference(&already_synced.dirs)
-                .cloned()
+                .iter()
+                .filter(|(key, _)| !already_synced.dirs.contains_key(*key))
+                .map(|(key, dir)| (key.clone(), dir.clone()))
                 .collect(),
         }
+    }
+    pub(super) fn barriers(&self) -> impl Iterator<Item = DirectoryBarrier> + '_ {
+        self.dirs.iter().map(|(key, pinned)| DirectoryBarrier {
+            key: key.clone(),
+            pinned: pinned.clone(),
+        })
     }
 }
 
@@ -263,12 +341,10 @@ fn is_fd_exhausted_io_err(err: &io::Error) -> bool {
 
 /// Capability-confined local content-addressed Zstd blob store (`LocalZstdV1`).
 pub struct LocalBlobStore {
-    root_dir: Dir,
-    staging_dir: Arc<Dir>,
+    root_dir: Arc<PinnedDir>,
     free_staging_slots: Arc<Mutex<Vec<u32>>>,
     guards: Box<[Mutex<DigestGuardTable>; GUARD_SHARDS]>,
-    known_dirs: StdRwLock<HashSet<String>>,
-    dir_cache: StdRwLock<HashMap<String, Arc<CachedRelDir>>>,
+    dir_cache: StdRwLock<HashMap<String, Arc<PinnedDir>>>,
     next_staging_seq: AtomicU64,
 }
 
@@ -285,31 +361,20 @@ impl LocalBlobStore {
         let root_dir = Dir::open_ambient_dir(data_root.root(), ambient_authority())
             .map_err(|err| internal_not_committed("local_cas_open_ambient_dir", err.to_string()))?;
 
-        let dummy_staging = Arc::new(
-            root_dir
-                .try_clone()
-                .expect("clone ambient root_dir during bootstrap"),
-        );
         let guards = Box::new(std::array::from_fn(|_| Mutex::new(HashMap::new())));
-        let mut store = Self {
-            root_dir,
-            staging_dir: dummy_staging,
+        let store = Self {
+            root_dir: Arc::new(
+                PinnedDir::new(root_dir)
+                    .map_err(|e| internal_not_committed("local_cas_root", e.to_string()))?,
+            ),
             free_staging_slots: Arc::new(Mutex::new(Vec::with_capacity(64))),
             guards,
-            known_dirs: StdRwLock::new(HashSet::new()),
             dir_cache: StdRwLock::new(HashMap::new()),
             next_staging_seq: AtomicU64::new(0),
         };
 
-        // Validate base `blobs`, `blobs/.staging`, and `blobs/.quarantine` directories with no-follow checks.
-        let mut init_syncs = PendingDirSyncs::default();
-        store.ensure_dir_chain(&["blobs", ".staging"])?;
-        let sdir = store.root_dir.open_dir("blobs/.staging").map_err(|err| {
-            internal_not_committed(
-                "local_cas_open_staging_dir",
-                format!("failed opening 'blobs/.staging': {err}"),
-            )
-        })?;
+        let staging = store.resolve_dir("blobs/.staging", true)?;
+        let sdir = &staging.dir;
         // Sweep any orphan temp files left in `blobs/.staging` by an unrecovered crash so dentry slots stay compact.
         for entry in sdir
             .entries()
@@ -326,11 +391,10 @@ impl LocalBlobStore {
                 })?;
             }
         }
-        init_syncs.insert("blobs/.staging");
-        store.staging_dir = Arc::new(sdir);
-
-        let quarantine =
-            store.get_or_create_cached_dir("blobs/.quarantine", &["blobs", ".quarantine"])?;
+        staging
+            .sync()
+            .map_err(|e| internal_not_committed("local_cas_sync_staging", e.to_string()))?;
+        let quarantine = store.resolve_dir("blobs/.quarantine", true)?;
         // Older staging diagnostics lacked a Space identifier. They have no live references.
         for entry in quarantine
             .dir
@@ -360,8 +424,9 @@ impl LocalBlobStore {
                 })?;
             }
         }
-        init_syncs.insert("blobs/.quarantine");
-        store.flush_dir_syncs(&init_syncs)?;
+        quarantine
+            .sync()
+            .map_err(|e| internal_not_committed("local_cas_sync_quarantine", e.to_string()))?;
 
         Ok(store)
     }
@@ -393,67 +458,96 @@ impl LocalBlobStore {
         }
     }
 
-    fn get_or_create_cached_dir(
-        &self,
-        full_rel: &str,
-        components: &[&str],
-    ) -> Result<Arc<CachedRelDir>, PortError> {
-        if let Some(existing) = self
-            .dir_cache
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(full_rel)
-        {
-            return Ok(Arc::clone(existing));
+    // Verify each namespace entry against its already-open parent. Cached handles
+    // are reusable only while that parent still names the same non-link inode.
+    fn walk_dir(&self, rel: &str, create: bool) -> io::Result<Arc<PinnedDir>> {
+        let mut parent = self.root_dir.clone();
+        let mut path = String::new();
+        if rel.is_empty() {
+            return Ok(parent);
         }
-
-        self.ensure_dir_chain(components)?;
-
-        let open_pair = || -> io::Result<(Dir, cap_std::fs::File)> {
-            let dir = self.root_dir.open_dir(full_rel)?;
-            let sync_file = self.root_dir.open(full_rel)?;
-            Ok((dir, sync_file))
-        };
-
-        let (dir, sync_file) = match open_pair() {
-            Ok(pair) => pair,
-            Err(first_err) => {
-                // Self-tune under low OS `RLIMIT_NOFILE` (e.g. macOS default 256) by evicting cached handles and retrying.
+        for component in rel.split('/') {
+            if !safe_component(component) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid CAS path component",
+                ));
+            }
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(component);
+            let cached = self
+                .dir_cache
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&path)
+                .cloned();
+            if let Some(cached) = cached {
+                #[cfg(not(windows))]
+                let metadata = parent.dir.symlink_metadata(component);
+                #[cfg(windows)]
+                let metadata = parent
+                    .dir
+                    .open_dir_nofollow(component)
+                    .and_then(|dir| dir.dir_metadata());
+                match metadata {
+                    Ok(md) if !md.is_dir() => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "not a CAS directory",
+                        ));
+                    }
+                    Ok(md) if (md.dev(), md.ino()) == cached.identity => {
+                        parent = cached;
+                        continue;
+                    }
+                    Ok(_) => (),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                    Err(e) => return Err(e),
+                }
+            }
+            let child = match parent.dir.open_dir_nofollow(component) {
+                Ok(child) => child,
+                Err(e) if create && e.kind() == io::ErrorKind::NotFound => {
+                    match parent.dir.create_dir(component) {
+                        Ok(()) => (),
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
+                        Err(e) => return Err(e),
+                    }
+                    parent.dir.open_dir_nofollow(component)?
+                }
+                Err(e) => return Err(e),
+            };
+            let child = Arc::new(PinnedDir::new(child)?);
+            if create {
+                // A competing creator may have installed this name but not synced it.
+                parent.sync()?;
+                let mut cache = self.dir_cache.write().unwrap_or_else(|p| p.into_inner());
+                if cache.len() >= MAX_CACHED_SPACE_DIRS {
+                    let victims: Vec<_> = cache.keys().take(64).cloned().collect();
+                    for key in victims {
+                        cache.remove(&key);
+                    }
+                }
+                cache.insert(path.clone(), child.clone());
+            }
+            parent = child;
+        }
+        Ok(parent)
+    }
+    fn open_dir(&self, rel: &str, create: bool) -> io::Result<Arc<PinnedDir>> {
+        match self.walk_dir(rel, create) {
+            Err(e) if is_fd_exhausted_io_err(&e) => {
                 self.evict_some_cached_dirs(128);
-                open_pair().map_err(|err| {
-                    internal_not_committed(
-                        "local_cas_open_cached_dir",
-                        format!("failed opening dir '{full_rel}' (initial: {first_err}): {err}"),
-                    )
-                })?
+                self.walk_dir(rel, create)
             }
-        };
-
-        let meta = sync_file.metadata().map_err(|err| {
-            internal_not_committed(
-                "local_cas_stat_sync_dir",
-                format!("failed stat dir '{full_rel}' for sync: {err}"),
-            )
-        })?;
-        if !meta.is_dir() {
-            return Err(internal_not_committed(
-                "local_cas_sync_non_dir",
-                format!("expected directory for sync at '{full_rel}'"),
-            ));
+            result => result,
         }
-
-        let arc = Arc::new(CachedRelDir { dir, sync_file });
-        let mut w = self.dir_cache.write().unwrap_or_else(|p| p.into_inner());
-        if w.len() >= MAX_CACHED_SPACE_DIRS && !w.contains_key(full_rel) {
-            let keys: Vec<String> = w.keys().take(64).cloned().collect();
-            for k in keys {
-                w.remove(&k);
-            }
-        }
-        Ok(Arc::clone(
-            w.entry(full_rel.to_owned())
-                .or_insert_with(|| Arc::clone(&arc)),
-        ))
+    }
+    fn resolve_dir(&self, rel: &str, create: bool) -> Result<Arc<PinnedDir>, PortError> {
+        self.open_dir(rel, create)
+            .map_err(|e| internal_not_committed("local_cas_open_dir", format!("{rel}: {e}")))
     }
 
     fn lock_arc(&self, space_id: &SpaceId, digest: ContentDigest) -> Arc<RwLock<()>> {
@@ -528,19 +622,24 @@ impl LocalBlobStore {
     ) -> Result<bool, PortError> {
         validate_safe_component(space_id.as_str())?;
         let hex = digest.to_hex();
-        let target_rel = format!("blobs/{}/{}/{hex}.zst", space_id.as_str(), &hex[..2]);
-        let quarantine = format!("blobs/.quarantine/{}.{hex}.corrupt", space_id.as_str());
-        for path in [target_rel, quarantine] {
-            match self.root_dir.symlink_metadata(&path) {
-                Ok(meta) if meta.is_file() => return Ok(true),
-                Ok(_) => {
-                    return Err(internal_not_committed(
-                        "local_cas_nonregular_entry",
-                        format!("non-regular entry at {path}"),
-                    ));
-                }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(internal_not_committed("local_cas_stat", err.to_string())),
+        for (parent, name) in [
+            (
+                format!("blobs/{}/{}", space_id.as_str(), &hex[..2]),
+                format!("{hex}.zst"),
+            ),
+            (
+                "blobs/.quarantine".to_owned(),
+                format!("{}.{hex}.corrupt", space_id.as_str()),
+            ),
+        ] {
+            let metadata = self
+                .open_dir(&parent, false)
+                .and_then(|parent| parent.dir.symlink_metadata(&name));
+            match metadata {
+                Ok(md) if md.is_file() => return Ok(true),
+                Ok(_) => return Err(internal_not_committed("local_cas_nonregular_entry", name)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => return Err(internal_not_committed("local_cas_stat", e.to_string())),
             }
         }
         Ok(false)
@@ -555,90 +654,22 @@ impl LocalBlobStore {
         expected_raw_size: u64,
         compressed_frame: &[u8],
     ) -> Result<PendingDirSyncs, PortError> {
-        validate_safe_component(space_id.as_str())?;
-        let hex = digest.to_hex();
-        let shard = &hex[..2];
-        let shard_rel = format!("blobs/{}/{shard}", space_id.as_str());
-        let target_rel = format!("{shard_rel}/{hex}.zst");
-
-        let mut pending = PendingDirSyncs::default();
-        self.ensure_dir_chain(&["blobs", space_id.as_str(), shard])?;
-
-        match self.root_dir.symlink_metadata(&target_rel) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() || !meta.is_file() {
-                    return Err(internal_not_committed(
-                        "local_cas_symlink_rejected",
-                        format!("refusing non-regular CAS entry at {target_rel}"),
-                    ));
-                }
-                let existing = self.read_compressed(space_id, digest)?;
-                match decode_zstd_verified(&existing, None, expected_raw_size, digest) {
-                    Ok(_) => {
-                        // Existing physical blob is verified intact; still sync shard dir before commit
-                        // in case an earlier process crashed between rename and directory fsync.
-                        pending.insert(shard_rel);
-                        return Ok(pending);
-                    }
-                    Err(_) => {
-                        // Corrupt physical file from an unreferenced torn write or fault: quarantine and replace.
-                        self.quarantine_corrupt_file(space_id, &target_rel, &hex, &mut pending)?;
-                    }
-                }
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(internal_not_committed(
-                    "local_cas_target_stat",
-                    err.to_string(),
-                ));
-            }
+        let (pending, temp) = self.stage_physical_file_deferred(
+            space_id,
+            digest,
+            expected_raw_size,
+            compressed_frame,
+        )?;
+        if let Some(temp) = temp {
+            temp.rename_into_place()?;
         }
-
-        let staging_dir = &self.staging_dir;
-        let slot = self.alloc_staging_slot();
-        let tmp_name = format!("t{slot:x}.tmp");
-
-        let write_res = (|| -> Result<(), PortError> {
-            let mut opts = cap_std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            let mut tmp_file = staging_dir
-                .open_with(&tmp_name, &opts)
-                .map_err(|err| internal_not_committed("local_cas_open_tmp", err.to_string()))?;
-            tmp_file
-                .write_all(compressed_frame)
-                .map_err(|err| internal_not_committed("local_cas_write_tmp", err.to_string()))?;
-            sync_blob_file(&tmp_file)?;
-            drop(tmp_file);
-
-            staging_dir
-                .rename(&tmp_name, &self.root_dir, &target_rel)
-                .map_err(|err| internal_not_committed("local_cas_rename", err.to_string()))?;
-            Ok(())
-        })();
-
-        if let Err(err) = write_res {
-            let _ = staging_dir.remove_file(&tmp_name);
-            self.free_staging_slots
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(slot);
-            return Err(err);
-        }
-        self.free_staging_slots
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(slot);
-
-        pending.insert(shard_rel);
-        pending.insert("blobs/.staging");
         Ok(pending)
     }
 
     /// Writes `compressed_frame` to a same-filesystem `.staging/` temp file so `WriteBatchActor`
     /// can coalesce `fdatasync` + atomic `rename` across the entire batch before directory `fsync` and SQL `COMMIT`.
     pub fn stage_physical_file_deferred(
-        self: &Arc<Self>,
+        &self,
         space_id: &SpaceId,
         digest: ContentDigest,
         expected_raw_size: u64,
@@ -651,8 +682,8 @@ impl LocalBlobStore {
         let file_name = format!("{hex}.zst");
 
         let mut pending = PendingDirSyncs::default();
-        let shard_dir =
-            self.get_or_create_cached_dir(&shard_rel, &["blobs", space_id.as_str(), shard])?;
+        let shard_dir = self.resolve_dir(&shard_rel, true)?;
+        pending.pin(&shard_rel, &shard_dir);
 
         match shard_dir.dir.symlink_metadata(&file_name) {
             Ok(meta) => {
@@ -662,15 +693,24 @@ impl LocalBlobStore {
                         format!("refusing non-regular CAS entry at {shard_rel}/{file_name}"),
                     ));
                 }
-                let existing = self.read_compressed(space_id, digest)?;
+                let existing = self.read_from_dir(&shard_dir, &file_name)?;
                 match decode_zstd_verified(&existing, None, expected_raw_size, digest) {
                     Ok(_) => {
-                        pending.insert(shard_rel);
                         return Ok((pending, None));
                     }
                     Err(_) => {
-                        let target_rel = format!("{shard_rel}/{file_name}");
-                        self.quarantine_corrupt_file(space_id, &target_rel, &hex, &mut pending)?;
+                        let quarantine = self.resolve_dir("blobs/.quarantine", true)?;
+                        shard_dir
+                            .dir
+                            .rename(
+                                &file_name,
+                                &quarantine.dir,
+                                format!("{}.{hex}.corrupt", space_id.as_str()),
+                            )
+                            .map_err(|e| {
+                                internal_not_committed("local_cas_quarantine_rename", e.to_string())
+                            })?;
+                        pending.pin("blobs/.quarantine", &quarantine);
                     }
                 }
             }
@@ -683,24 +723,25 @@ impl LocalBlobStore {
             }
         }
 
-        let staging_dir = Arc::clone(&self.staging_dir);
+        let staging_dir = self.resolve_dir("blobs/.staging", true)?;
         let mut slot = self.alloc_staging_slot();
         let mut tmp_name = format!("p{slot:x}.tmp");
 
         let mut opts = cap_std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        let mut tmp_file = match staging_dir.open_with(&tmp_name, &opts) {
+        opts.write(true).create_new(true).follow(FollowSymlinks::No);
+        let mut tmp_file = match staging_dir.dir.open_with(&tmp_name, &opts) {
             Ok(f) => f,
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 slot = self.next_staging_seq.fetch_add(1, Ordering::Relaxed) as u32;
                 tmp_name = format!("p{slot:x}.tmp");
                 staging_dir
+                    .dir
                     .open_with(&tmp_name, &opts)
                     .map_err(|e| internal_not_committed("local_cas_open_tmp", e.to_string()))?
             }
             Err(err) if is_fd_exhausted_io_err(&err) => {
                 self.evict_some_cached_dirs(64);
-                match staging_dir.open_with(&tmp_name, &opts) {
+                match staging_dir.dir.open_with(&tmp_name, &opts) {
                     Ok(f) => f,
                     Err(e2) => {
                         self.free_staging_slots
@@ -724,7 +765,7 @@ impl LocalBlobStore {
         };
         if let Err(err) = tmp_file.write_all(compressed_frame) {
             drop(tmp_file);
-            let _ = staging_dir.remove_file(&tmp_name);
+            let _ = staging_dir.dir.remove_file(&tmp_name);
             self.free_staging_slots
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -735,8 +776,7 @@ impl LocalBlobStore {
             ));
         }
 
-        pending.insert(shard_rel);
-        pending.insert("blobs/.staging");
+        pending.pin("blobs/.staging", &staging_dir);
         Ok((
             pending,
             Some(DeferredLocalTempFile {
@@ -773,103 +813,43 @@ impl LocalBlobStore {
         let shard_rel = format!("blobs/{}/{}", space_id.as_str(), &hex[..2]);
         let file_name = format!("{hex}.zst");
 
-        let cached_shard = self
-            .dir_cache
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&shard_rel)
-            .cloned();
+        let shard = self.resolve_dir(&shard_rel, false)?;
+        self.read_from_dir(&shard, &file_name)
+    }
 
-        let path_metadata = if let Some(shard) = &cached_shard {
-            shard.dir.symlink_metadata(&file_name)
-        } else {
-            self.root_dir
-                .symlink_metadata(format!("{shard_rel}/{file_name}"))
-        }
-        .map_err(|err| internal_not_committed("local_cas_read_stat", err.to_string()))?;
-        if !path_metadata.file_type().is_file() {
+    fn read_from_dir(&self, shard: &PinnedDir, name: &str) -> Result<Vec<u8>, PortError> {
+        let options = &mut OpenOptions::new();
+        options.read(true).follow(FollowSymlinks::No).nonblock(true);
+        // Reject non-regular files before open (in particular FIFOs), then verify
+        // the descriptor actually opened, independently of the directory entry.
+        if !shard
+            .dir
+            .symlink_metadata(name)
+            .map_err(|e| internal_not_committed("local_cas_read_stat", e.to_string()))?
+            .is_file()
+        {
             return Err(internal_not_committed(
                 "corrupt_local_blob_nonregular",
-                "expected a regular blob file",
+                name,
             ));
         }
-        let mut file = if let Some(ref shard) = cached_shard {
-            let open_res = match shard.dir.open(&file_name) {
-                Ok(f) => Ok(f),
-                Err(err) if is_fd_exhausted_io_err(&err) => {
-                    self.evict_some_cached_dirs(64);
-                    shard.dir.open(&file_name)
-                }
-                Err(err) => Err(err),
-            };
-            match open_res {
-                Ok(f) => f,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    return Err(internal_not_committed(
-                        "corrupt_local_blob_missing",
-                        format!("referenced local CAS blob missing at {shard_rel}/{file_name}"),
-                    ));
-                }
-                Err(err) => {
-                    if let Ok(meta) = shard.dir.symlink_metadata(&file_name)
-                        && (meta.file_type().is_symlink() || !meta.is_file())
-                    {
-                        return Err(internal_not_committed(
-                            "corrupt_local_blob_nonregular",
-                            format!("non-regular CAS entry at {shard_rel}/{file_name}"),
-                        ));
-                    }
-                    return Err(internal_not_committed(
-                        "local_cas_read_open",
-                        err.to_string(),
-                    ));
-                }
+        let mut file = match shard.dir.open_with(name, options) {
+            Err(e) if is_fd_exhausted_io_err(&e) => {
+                self.evict_some_cached_dirs(64);
+                shard.dir.open_with(name, options)
             }
-        } else {
-            let target_rel = format!("{shard_rel}/{file_name}");
-            let open_res = match self.root_dir.open(&target_rel) {
-                Ok(f) => Ok(f),
-                Err(err) if is_fd_exhausted_io_err(&err) => {
-                    self.evict_some_cached_dirs(64);
-                    self.root_dir.open(&target_rel)
-                }
-                Err(err) => Err(err),
-            };
-            match open_res {
-                Ok(f) => f,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    return Err(internal_not_committed(
-                        "corrupt_local_blob_missing",
-                        format!("referenced local CAS blob missing at {target_rel}"),
-                    ));
-                }
-                Err(err) => {
-                    if let Ok(meta) = self.root_dir.symlink_metadata(&target_rel)
-                        && (meta.file_type().is_symlink() || !meta.is_file())
-                    {
-                        return Err(internal_not_committed(
-                            "corrupt_local_blob_nonregular",
-                            format!("non-regular CAS entry at {target_rel}"),
-                        ));
-                    }
-                    return Err(internal_not_committed(
-                        "local_cas_read_open",
-                        err.to_string(),
-                    ));
-                }
-            }
-        };
-
+            result => result,
+        }
+        .map_err(|e| internal_not_committed("local_cas_read_open", e.to_string()))?;
         let meta = file
             .metadata()
-            .map_err(|err| internal_not_committed("local_cas_read_stat", err.to_string()))?;
-        if meta.file_type().is_symlink() || !meta.is_file() {
+            .map_err(|e| internal_not_committed("local_cas_read_stat", e.to_string()))?;
+        if !meta.is_file() {
             return Err(internal_not_committed(
                 "corrupt_local_blob_nonregular",
-                format!("non-regular CAS entry at {shard_rel}/{file_name}"),
+                name,
             ));
         }
-
         let len = usize::try_from(meta.len()).map_err(|_| {
             internal_not_committed("local_cas_read_too_large", "blob exceeds usize")
         })?;
@@ -898,211 +878,66 @@ impl LocalBlobStore {
     }
 
     fn unlink_and_sync(&self, parent: &str, name: &str) -> Result<(), PortError> {
-        let dir = match self.root_dir.open_dir(parent) {
+        let dir = match self.open_dir(parent, false) {
             Ok(dir) => dir,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
                 return Err(internal_not_committed(
                     "local_cas_delete_dir",
-                    err.to_string(),
+                    e.to_string(),
                 ));
             }
         };
-        match dir.remove_file(name) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(internal_not_committed(
-                    "local_cas_unlink_failed",
-                    err.to_string(),
-                ));
+        match dir.dir.symlink_metadata(name) {
+            Ok(md) if !md.is_file() => {
+                return Err(internal_not_committed("local_cas_nonregular_entry", name));
             }
-        }
-        // A retry may find a file absent after the previous unlink but before its fsync.
-        self.flush_single_dir(parent)
-    }
-
-    /// Flushes `fsync` on a single relative CAS directory. Any error blocks SQL `COMMIT`.
-    pub fn flush_single_dir(&self, rel: &str) -> Result<(), PortError> {
-        if !rel.is_empty()
-            && let Some(cached) = self
-                .dir_cache
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(rel)
-                .cloned()
-        {
-            cached.sync_file.sync_all().map_err(|err| {
-                internal_not_committed(
-                    "local_cas_sync_dir",
-                    format!("failed syncing dir '{rel}': {err}"),
-                )
-            })?;
-            return Ok(());
-        }
-
-        let target_path = if rel.is_empty() {
-            Path::new(".")
-        } else {
-            Path::new(rel)
-        };
-        // `Dir::open` opens an `O_RDONLY` capability-confined descriptor (unlike `Dir::open_dir`
-        // which uses `O_PATH` on Linux and cannot be passed to `fsync`).
-        let dir_file = self.root_dir.open(target_path).map_err(|err| {
-            internal_not_committed(
-                "local_cas_open_sync_dir",
-                format!("failed opening dir '{rel}' for sync: {err}"),
-            )
-        })?;
-        let meta = dir_file.metadata().map_err(|err| {
-            internal_not_committed(
-                "local_cas_stat_sync_dir",
-                format!("failed stat dir '{rel}' for sync: {err}"),
-            )
-        })?;
-        if !meta.is_dir() {
-            return Err(internal_not_committed(
-                "local_cas_sync_non_dir",
-                format!("expected directory for sync at '{rel}'"),
-            ));
-        }
-        dir_file.sync_all().map_err(|err| {
-            internal_not_committed(
-                "local_cas_sync_dir",
-                format!("failed syncing dir '{rel}': {err}"),
-            )
-        })?;
-        Ok(())
-    }
-
-    /// Flushes `fsync` on all deduplicated directories in `pending`. Any error blocks SQL `COMMIT`.
-    pub fn flush_dir_syncs(&self, pending: &PendingDirSyncs) -> Result<(), PortError> {
-        for rel in &pending.dirs {
-            self.flush_single_dir(rel)?;
-        }
-        Ok(())
-    }
-
-    fn quarantine_corrupt_file(
-        &self,
-        space_id: &SpaceId,
-        target_rel: &str,
-        hex: &str,
-        pending: &mut PendingDirSyncs,
-    ) -> Result<(), PortError> {
-        self.ensure_dir_chain(&["blobs", ".quarantine"])?;
-        let q_rel = format!("blobs/.quarantine/{}.{hex}.corrupt", space_id.as_str());
-        match self.root_dir.rename(target_rel, &self.root_dir, &q_rel) {
-            Ok(()) => {
-                pending.insert("blobs/.quarantine");
-                Ok(())
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(internal_not_committed(
-                "local_cas_quarantine_rename",
-                err.to_string(),
-            )),
-        }
-    }
-
-    fn ensure_dir_chain(&self, components: &[&str]) -> Result<(), PortError> {
-        for comp in components {
-            validate_safe_component(comp)?;
-        }
-        let full_rel = components.join("/");
-        if self
-            .known_dirs
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains(&full_rel)
-        {
-            return Ok(());
-        }
-
-        let mut current = String::new();
-        for comp in components {
-            let parent = current.clone();
-            if current.is_empty() {
-                current.push_str(comp);
-            } else {
-                current.push('/');
-                current.push_str(comp);
-            }
-
-            if self
-                .known_dirs
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains(&current)
-            {
-                continue;
-            }
-
-            match self.root_dir.symlink_metadata(&current) {
-                Ok(meta) => {
-                    if meta.file_type().is_symlink() || !meta.is_dir() {
-                        return Err(internal_not_committed(
-                            "local_cas_dir_not_regular",
-                            format!("expected regular directory at '{current}'"),
-                        ));
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    match self.root_dir.create_dir(&current) {
-                        Ok(()) => {}
-                        Err(race_err) if race_err.kind() == io::ErrorKind::AlreadyExists => {
-                            let meta = self.root_dir.symlink_metadata(&current).map_err(|e| {
-                                internal_not_committed("local_cas_dir_race_stat", e.to_string())
-                            })?;
-                            if meta.file_type().is_symlink() || !meta.is_dir() {
-                                return Err(internal_not_committed(
-                                    "local_cas_dir_race_nonregular",
-                                    format!("non-directory raced at '{current}'"),
-                                ));
-                            }
-                        }
-                        Err(other) => {
-                            return Err(internal_not_committed(
-                                "local_cas_mkdir",
-                                format!("failed creating '{current}': {other}"),
-                            ));
-                        }
-                    }
-                }
-                Err(err) => {
+            Ok(_) => match dir.dir.remove_file(name) {
+                Ok(()) => (),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+                Err(e) => {
                     return Err(internal_not_committed(
-                        "local_cas_dir_stat",
-                        format!("failed stat '{current}': {err}"),
+                        "local_cas_unlink_failed",
+                        e.to_string(),
                     ));
                 }
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => {
+                return Err(internal_not_committed(
+                    "local_cas_delete_stat",
+                    e.to_string(),
+                ));
             }
-
-            // Publish the directory in the process cache only after its parent entry is durable.
-            // A different item may reuse this shard even if the creating item never commits.
-            self.flush_single_dir(&parent)?;
-            self.known_dirs
-                .write()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(current.clone());
+        }
+        dir.sync()
+            .map_err(|e| internal_not_committed("local_cas_sync_dir", e.to_string()))
+    }
+    pub fn flush_single_dir(&self, rel: &str) -> Result<(), PortError> {
+        self.resolve_dir(rel, false)?
+            .sync()
+            .map_err(|e| internal_not_committed("local_cas_sync_dir", e.to_string()))
+    }
+    pub fn flush_dir_syncs(&self, pending: &PendingDirSyncs) -> Result<(), PortError> {
+        for barrier in pending.barriers() {
+            barrier.sync(self)?;
         }
         Ok(())
     }
 }
 
+fn safe_component(comp: &str) -> bool {
+    !comp.is_empty() && comp != "." && comp != ".." && !comp.contains(['/', '\\', '\0'])
+}
 fn validate_safe_component(comp: &str) -> Result<(), PortError> {
-    if comp.is_empty()
-        || comp == "."
-        || comp == ".."
-        || comp.contains('/')
-        || comp.contains('\\')
-        || comp.contains('\0')
-    {
-        return Err(internal_not_committed(
+    if safe_component(comp) {
+        Ok(())
+    } else {
+        Err(internal_not_committed(
             "local_cas_invalid_path_component",
-            format!("unsafe path component '{comp}'"),
-        ));
+            comp,
+        ))
     }
-    Ok(())
 }
 
 fn sync_blob_file(file: &cap_std::fs::File) -> Result<(), PortError> {

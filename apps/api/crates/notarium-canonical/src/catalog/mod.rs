@@ -1,9 +1,10 @@
 //! Canonical-owned metadata consumed by the account and control services.
-const LIST_PROJECTS: &str = "SELECT folder_id
+const LIST_PROJECTS: &str = "SELECT folder_id, created_seq
     FROM folder_heads
     WHERE space_id=$1 AND folder_id>$2 AND lifecycle_state='active' AND is_project=1
+    AND ($3='' OR folder_id=$3)
     ORDER BY folder_id
-    LIMIT $3";
+    LIMIT $4";
 
 use crate::{
     CanonicalStore, SpaceRecord,
@@ -135,6 +136,23 @@ fn encode_cursor<K: Serialize>(scope: String, after: K) -> Result<String, PortEr
     serde_json::to_string(&Cursor { scope, after })
         .map_err(|e| internal_not_committed("catalog_cursor", e.to_string()))
 }
+// A catalog candidate can still be filtered by the consumer. Its creation
+// event is a stable, indexed cursor position without exposing the entity ID.
+async fn cursor_entity(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    kind: &str,
+    seq: i64,
+) -> Result<String, PortError> {
+    db!(
+        tx,
+        sqlx::query_scalar("SELECT entity_id FROM change_log WHERE space_id=$1 AND space_seq=$2 AND entity_type=$3 AND op_kind='create'"),
+        fetch_optional,
+        space.as_str(),
+        seq,
+        kind
+    )?.ok_or_else(|| DomainError::validation(ValidationReason::CursorStale).into())
+}
 fn digest(value: impl Serialize) -> Result<String, PortError> {
     let bytes = crate::codec::encode_msgpack(&value)?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
@@ -191,7 +209,7 @@ impl ControlCatalogPort for CanonicalStore {
                         return Err(DomainError::ResourceNotFound.into());
                     }
                     let scope = digest((
-                        "projects",
+                        "visible-projects-v2",
                         &rec.scope,
                         rec.last_seq,
                         ctx.auth().grant(),
@@ -199,23 +217,31 @@ impl ControlCatalogPort for CanonicalStore {
                         &grant.project_root,
                         &grant.read_classes,
                     ))?;
-                    let after: Option<FolderId> = continuation(&page, &scope)?;
-                    let mut ids: Vec<String> = db!(
+                    let after = match continuation::<i64>(&page, &scope)? {
+                        Some(seq) => cursor_entity(tx, &rec.space.id, "folder", seq).await?,
+                        None => String::new(),
+                    };
+                    let pin = grant
+                        .project_root
+                        .as_ref()
+                        .filter(|id| *id != &rec.root_folder_id);
+                    let mut rows: Vec<(String, i64)> = db!(
                         tx,
-                        sqlx::query_scalar(LIST_PROJECTS),
+                        sqlx::query_as(LIST_PROJECTS),
                         fetch_all,
                         rec.space.id.as_str(),
-                        after.as_ref().map_or("", FolderId::as_str),
+                        &after,
+                        pin.map_or("", FolderId::as_str),
                         i64::from(page.limit()) + 1
                     )?;
-                    let next = if ids.len() > usize::from(page.limit()) {
-                        ids.pop();
-                        Some(encode_cursor(scope, ids.last().expect("nonempty page"))?)
+                    let next = if rows.len() > usize::from(page.limit()) {
+                        rows.pop();
+                        Some(encode_cursor(scope, rows.last().expect("nonempty page").1)?)
                     } else {
                         None
                     };
-                    let mut items = Vec::new();
-                    for id in ids {
+                    let mut items = Vec::with_capacity(rows.len());
+                    for (id, _) in rows {
                         let reference = FolderRef {
                             space_id: rec.space.id.clone(),
                             folder_id: FolderId::parse(&id)?,
@@ -226,7 +252,7 @@ impl ControlCatalogPort for CanonicalStore {
                                 name: row.display_name,
                             }),
                             Err(PortError::Domain(DomainError::ResourceNotFound)) => (),
-                            Err(e) => return Err(e),
+                            Err(error) => return Err(error),
                         }
                     }
                     Ok(ControlPage {

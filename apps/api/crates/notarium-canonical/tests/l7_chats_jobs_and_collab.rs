@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+#[path = "l7_chats_jobs_and_collab/authority.rs"]
+mod authority;
+#[path = "l7_chats_jobs_and_collab/pg_read_cancellation.rs"]
+mod pg_read_cancellation;
 mod support;
 
 use std::{
@@ -327,7 +331,7 @@ impl QueuePhysical<'_> {
 async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     store: &CanonicalStore,
     physical: QueuePhysical<'_>,
-) {
+) -> StaleCompactionCase {
     let is_sqlite = matches!(physical, QueuePhysical::Local(_));
     let scope = HistoryScope {
         space_id: sample_space_id(0x71),
@@ -1153,7 +1157,34 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     // 4. Redaction (`redact_chat_entry`):
     // Append a Compaction entry on branch A (descendant of `e2`) AND a Compaction entry on sibling
     // branch B (NOT a descendant of `e2`, and having HIGHER `entry_seq` than `e2`!).
-    let comp_a = store
+    let blob = store
+        .stage_chat_blob(
+            owner_ctx(&scope, owner.clone()),
+            &"branch A compaction summary".repeat(24),
+        )
+        .await
+        .unwrap();
+    let summary = next_mutation(
+        &scope,
+        &owner,
+        AppendChat {
+            thread: thread.clone(),
+            parent: cur_a,
+            kind: ChatEntryKind::Compaction,
+            body: ChatInputBody::Staged(blob.clone()),
+            referenced_notes: vec![NoteRef {
+                space_id: scope.space_id.clone(),
+                note_id: ref_note.clone(),
+            }],
+            tainted: false,
+        },
+    );
+    let appended = store
+        .append_chat(owner_ctx(&scope, owner.clone()), summary.clone())
+        .await
+        .unwrap();
+    let comp_a = appended.value;
+    let child = store
         .append_chat(
             owner_ctx(&scope, owner.clone()),
             next_mutation(
@@ -1161,17 +1192,18 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &owner,
                 AppendChat {
                     thread: thread.clone(),
-                    parent: cur_a,
-                    kind: ChatEntryKind::Compaction,
-                    body: ChatInputBody::Text("branch A compaction summary".to_owned()),
+                    parent: comp_a.seq,
+                    kind: ChatEntryKind::Model,
+                    body: ChatInputBody::Text("active child of summary".into()),
                     referenced_notes: Vec::new(),
                     tainted: false,
                 },
             ),
         )
         .await
-        .expect("append compaction A")
-        .value;
+        .unwrap()
+        .value
+        .seq;
     cur_a = comp_a.seq;
 
     let comp_b = store
@@ -1231,6 +1263,18 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     assert_eq!(redacted.parent, Some(e1.seq));
     // ONLY descendant `comp_a.seq` is invalidated — sibling `comp_b.seq` MUST NOT be invalidated!
     assert_eq!(redacted.invalidated_contexts, vec![comp_a.seq]);
+
+    let stale = StaleCompactionCase {
+        scope: scope.clone(),
+        owner: owner.clone(),
+        request: summary,
+        receipt: appended.receipt,
+        invalidated: comp_a.seq,
+        child,
+        valid: comp_b.seq,
+        digest: blob.digest(),
+    };
+    stale.check(store).await;
 
     // Idempotent replay with same `CommandIdentity` replays from `command_receipts`!
     let replayed_redacted = store
@@ -1578,6 +1622,67 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             Err(PortError::Domain(DomainError::CrossSpaceTainted))
         ));
     }
+    stale
+}
+
+struct StaleCompactionCase {
+    scope: HistoryScope,
+    owner: PrincipalId,
+    request: Mutation<AppendChat>,
+    receipt: notarium_core::receipt::MutationReceiptToken,
+    invalidated: ThreadEntrySeq,
+    child: ThreadEntrySeq,
+    valid: ThreadEntrySeq,
+    digest: ContentDigest,
+}
+
+impl StaleCompactionCase {
+    async fn check(&self, store: &CanonicalStore) {
+        let ctx = owner_ctx(&self.scope, self.owner.clone());
+        let branch = |leaf, before, limit| ChatRead {
+            thread: self.request.input.thread.clone(),
+            leaf,
+            before,
+            max_entries: PageLimit::new(limit).unwrap(),
+        };
+        for window in [
+            branch(self.invalidated, None, 1),
+            branch(self.child, Some(self.invalidated), 8),
+        ] {
+            let page = store.read_chat(ctx.clone(), window).await.unwrap();
+            let entry = page
+                .entries
+                .iter()
+                .find(|row| row.seq == self.invalidated)
+                .unwrap();
+            assert_eq!(entry.kind, ChatEntryKind::Redacted);
+            assert_eq!(entry.body, ChatBody::Redacted);
+            assert!(entry.referenced_notes.is_empty());
+        }
+        assert!(
+            store
+                .read_verified_blob(&self.scope, self.digest)
+                .await
+                .is_err()
+        );
+        let replay = store
+            .append_chat(ctx.clone(), self.request.clone())
+            .await
+            .unwrap();
+        assert_eq!(replay.receipt, self.receipt);
+        assert_eq!(replay.value.kind, ChatEntryKind::Redacted);
+        assert_eq!(replay.value.body, ChatBody::Redacted);
+        assert!(replay.value.referenced_notes.is_empty());
+        let sibling = store
+            .read_chat(ctx, branch(self.valid, None, 1))
+            .await
+            .unwrap();
+        assert_eq!(sibling.entries[0].kind, ChatEntryKind::Compaction);
+        assert_eq!(
+            sibling.entries[0].body,
+            ChatBody::Inline("branch B compaction summary".into())
+        );
+    }
 }
 
 async fn run_ten_thousand_entry_chat_dag_read_suite(store: &CanonicalStore) {
@@ -1911,10 +2016,7 @@ async fn check_reopened_room_concurrency(
     assert!(!closed.carrier_dirty);
 }
 
-async fn run_jobs_and_collab_lifecycle_suite(
-    store: &CanonicalStore,
-    local_root: Option<notarium_core::epoch::DataRoot>,
-) {
+async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: bool) {
     let scope = HistoryScope {
         space_id: sample_space_id(0x74),
         incarnation: sample_incarnation(0x74),
@@ -2448,17 +2550,75 @@ async fn run_jobs_and_collab_lifecycle_suite(
             carrier: "# Locked settlement\n".into(),
         }),
     };
-    if let Some(root) = local_root {
-        // The new CAS file witnesses completion of Phase 1 while the SQL writer is paused.
+    let before = store
+        .read_collab_session(None, &scope, &collab_note)
+        .await
+        .unwrap()
+        .unwrap();
+    let before_seq = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    for (field, reason) in [
+        ("id: spoofed", ValidationReason::ProtectedField),
+        ("class: user-doc", ValidationReason::ProtectedField),
+        ("space_id: spoofed", ValidationReason::ProtectedField),
+        ("folder_id: spoofed", ValidationReason::ProtectedField),
+        ("revision_id: spoofed", ValidationReason::ProtectedField),
+        ("ability_id: spoofed", ValidationReason::ProtectedField),
+        ("__proto__: spoofed", ValidationReason::ForbiddenKey),
+        (
+            "id: spoofed\nstatus: first\nstatus: again",
+            ValidationReason::FmNotWritable,
+        ),
+    ] {
+        let settlement = CollabCarrierSettlement {
+            auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+            carrier: format!("---\n{field}\n---\nChanged carrier\n"),
+        };
+        let denied = store
+            .checkpoint_collab_session(
+                &make_budget(),
+                CheckpointCollabSession {
+                    carrier_settlement: Some(settlement.clone()),
+                    ..locked_checkpoint.clone()
+                },
+            )
+            .await;
+        assert_validation_err(&denied, reason);
+        let denied = store
+            .close_collab_session(
+                &make_budget(),
+                CloseCollabSession {
+                    scope: scope.clone(),
+                    note: collab_note.clone(),
+                    owner_id: Some("room-worker-1".into()),
+                    expected_lease: opened.lease_epoch,
+                    expected_lineage: opened.lineage_epoch,
+                    final_yrs_snapshot: Some(vec![9]),
+                    compacted_through_update_seq: Some(1),
+                    carrier_settlement: Some(settlement),
+                },
+            )
+            .await;
+        assert_validation_err(&denied, reason);
+    }
+    let unchanged = store
+        .read_collab_session(None, &scope, &collab_note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.session, before.session);
+    assert_eq!(unchanged.updates, before.updates);
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        before_seq
+    );
+
+    if sqlite {
+        // Admission to the paused writer proves preflight completed, including deferred staging.
         let pause = store.acquire_writer_safe_point().await.unwrap();
         let mut late = locked_checkpoint.clone();
         let settlement = late.carrier_settlement.as_mut().unwrap();
         settlement.auth = owner_ctx(&scope, owner.clone()).auth().clone();
         settlement.carrier = "# Settlement revoked after staging\n".into();
-        let staged = root.blob(
-            &scope.space_id,
-            ContentDigest::from_bytes(*blake3::hash(settlement.carrier.as_bytes()).as_bytes()),
-        );
         let taint = settlement.auth.taint().clone();
         let task_store = store.clone();
         let pending = tokio::spawn(async move {
@@ -2467,7 +2627,7 @@ async fn run_jobs_and_collab_lifecycle_suite(
                 .await
         });
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !staged.exists() {
+            while !store.has_active_sqlite_writes_for_test().unwrap() {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         })
@@ -2733,6 +2893,7 @@ async fn run_jobs_and_collab_lifecycle_suite(
             .unwrap()
             .contains("Direct post-close edit.")
     );
+    authority::check(store).await;
 }
 
 #[tokio::test]
@@ -2742,18 +2903,19 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
 
     let staging_thread = sample_thread_id(0xd4);
     let staged_pair;
+    let stale;
     {
         let (store, runtime) = CanonicalRuntime::open(config.clone())
             .await
             .expect("open SQLite canonical runtime");
 
-        run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
+        stale = run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
             &store,
             QueuePhysical::Local(temp.data_root()),
         )
         .await;
         run_ten_thousand_entry_chat_dag_read_suite(&store).await;
-        run_jobs_and_collab_lifecycle_suite(&store, Some(temp.data_root())).await;
+        run_jobs_and_collab_lifecycle_suite(&store, true).await;
 
         // Leave an active collaborative session open and shut down WITHOUT closing the room
         // to simulate a single-writer SQLite process restart after an unclean termination!
@@ -2851,6 +3013,7 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
     let (store2, runtime2) = CanonicalRuntime::open(config)
         .await
         .expect("reopen SQLite canonical runtime");
+    stale.check(&store2).await;
     let crash_scope = HistoryScope {
         space_id: sample_space_id(0x79),
         incarnation: sample_incarnation(0x79),
@@ -3004,12 +3167,24 @@ async fn l7_postgres_s3_chats_jobs_and_collab_parity() {
             .await
             .expect("open PG16 + MinIO CE S3 canonical runtime");
 
-    run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(&store, QueuePhysical::S3(&audit))
-        .await;
+    let stale = run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
+        &store,
+        QueuePhysical::S3(&audit),
+    )
+    .await;
     run_ten_thousand_entry_chat_dag_read_suite(&store).await;
-    run_jobs_and_collab_lifecycle_suite(&store, None).await;
+    run_jobs_and_collab_lifecycle_suite(&store, false).await;
 
     let (successor, successor_runtime) = CanonicalRuntime::open(config).await.unwrap();
+    successor
+        .advance_space_lease(
+            &support::maintenance_ctx(notarium_core::ports::ServicePurpose::Revocation),
+            &stale.scope,
+            LeaseEpoch::new(2).unwrap(),
+        )
+        .await
+        .unwrap();
+    stale.check(&successor).await;
     let scope = HistoryScope {
         space_id: sample_space_id(0x74),
         incarnation: sample_incarnation(0x74),
@@ -3092,7 +3267,6 @@ async fn l7_postgres_s3_chats_jobs_and_collab_parity() {
 
 #[tokio::test]
 async fn l7_queue_takeover_fences_delayed_s3_uploads_and_preserves_new_owner() {
-    let fixtures = StorageTestFixtures::load_required();
     for (versioned, uploaded, enable_at_cut) in [
         (false, false, false),
         (false, true, false),
@@ -3100,155 +3274,255 @@ async fn l7_queue_takeover_fences_delayed_s3_uploads_and_preserves_new_owner() {
         (true, true, false),
         (false, true, true),
     ] {
-        let schema = fixtures.fresh_pg_schema();
-        let bucket = fixtures.fresh_s3_bucket("queue-takeover");
-        let s3 = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
-        admin_ensure_bucket(&s3, versioned.then_some("Enabled"))
-            .await
-            .unwrap();
-        let audit = Arc::new(QueueS3Audit::new(&s3));
-        let cfg = fixtures.pg_s3_config(sample_installation_id(0xad), &schema, s3.clone());
-        let (old, rt) = CanonicalRuntime::open_with_s3_transport(cfg.clone(), Some(audit.clone()))
-            .await
-            .unwrap();
-        let actor = sample_principal_id(0xad);
-        let epoch = LeaseEpoch::new(1).unwrap();
-        let scope = old
-            .create_space(CreateSpaceSpec {
-                space_id: sample_space_id(0xad),
-                incarnation: sample_incarnation(0xad),
-                root_folder_id: sample_folder_id(0xad),
-                slug: "queued".into(),
-                kind: SpaceKind::Personal,
-                owner: actor.clone(),
-                active_epoch: epoch,
-                initial_last_seq: SpaceSeq::ZERO,
-                created_at: None,
-            })
-            .await
-            .unwrap()
-            .scope;
-        let thread = sample_thread_id(0xad);
-        old.create_chat(
-            owner_ctx(&scope, actor.clone()),
-            next_mutation(
-                &scope,
-                &actor,
-                CreateChat {
-                    thread: thread.clone(),
-                    kind: ChatThreadKind::Personal,
-                    owner: actor.clone(),
-                    project_folder: None,
-                    title: "Queue".into(),
-                },
-            ),
-        )
+        exercise_interrupted_queue_upload(versioned, uploaded, enable_at_cut, false).await;
+    }
+}
+
+#[tokio::test]
+async fn l7_queue_cancelled_upload_retires_on_the_same_lease_while_backup_holds() {
+    for (versioned, uploaded) in [(false, false), (true, true)] {
+        exercise_interrupted_queue_upload(versioned, uploaded, false, true).await;
+    }
+}
+
+async fn exercise_interrupted_queue_upload(
+    versioned: bool,
+    uploaded: bool,
+    enable_at_cut: bool,
+    cancel: bool,
+) {
+    use notarium_core::{
+        ids::BackupId,
+        ports::{BackupParticipantPort, ServicePurpose},
+    };
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    let bucket = fixtures.fresh_s3_bucket("queue-takeover");
+    let s3 = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
+    admin_ensure_bucket(&s3, versioned.then_some("Enabled"))
         .await
         .unwrap();
-        let body = "payload spanning queue takeover".repeat(24);
-        let prepared = old.prepare_blob(body.as_bytes()).unwrap();
-        let (reached, until_put) = tokio::sync::oneshot::channel();
-        let (release, resume) = tokio::sync::oneshot::channel();
-        *audit.takeover.lock().unwrap() = Some(PausedQueuePut {
-            hash: blake3::hash(&prepared.s3_parts()[0].compressed),
-            uploaded,
-            reached,
-            resume,
-        });
-        let input = |id| {
-            next_mutation(
-                &scope,
-                &actor,
-                PendingChatInput {
-                    id: PendingInputId::from_bytes([id; 16]),
-                    thread: thread.clone(),
-                    sender: actor.clone(),
-                    body: body.clone(),
-                    queued_base_leaf: ThreadEntrySeq::ZERO,
-                    in_flight_run: sample_run_id(0xad),
-                    mentions_agent: false,
-                },
+    let audit = Arc::new(QueueS3Audit::new(&s3));
+    let cfg = fixtures.pg_s3_config(
+        sample_installation_id(if cancel { 0xaf } else { 0xad }),
+        &schema,
+        s3.clone(),
+    );
+    let (old, rt) = CanonicalRuntime::open_with_s3_transport(cfg.clone(), Some(audit.clone()))
+        .await
+        .unwrap();
+    let actor = sample_principal_id(0xad);
+    let epoch = LeaseEpoch::new(1).unwrap();
+    let scope = old
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(0xad),
+            incarnation: sample_incarnation(0xad),
+            root_folder_id: sample_folder_id(0xad),
+            slug: "queued".into(),
+            kind: SpaceKind::Personal,
+            owner: actor.clone(),
+            active_epoch: epoch,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let thread = sample_thread_id(0xad);
+    old.create_chat(
+        owner_ctx(&scope, actor.clone()),
+        next_mutation(
+            &scope,
+            &actor,
+            CreateChat {
+                thread: thread.clone(),
+                kind: ChatThreadKind::Personal,
+                owner: actor.clone(),
+                project_folder: None,
+                title: "Queue".into(),
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let body = "payload spanning queue takeover".repeat(24);
+    let prepared = old.prepare_blob(body.as_bytes()).unwrap();
+    let (reached, until_put) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    *audit.takeover.lock().unwrap() = Some(PausedQueuePut {
+        hash: blake3::hash(&prepared.s3_parts()[0].compressed),
+        uploaded,
+        reached,
+        resume,
+    });
+    let input = |id| {
+        next_mutation(
+            &scope,
+            &actor,
+            PendingChatInput {
+                id: PendingInputId::from_bytes([id; 16]),
+                thread: thread.clone(),
+                sender: actor.clone(),
+                body: body.clone(),
+                queued_base_leaf: ThreadEntrySeq::ZERO,
+                in_flight_run: sample_run_id(0xad),
+                mentions_agent: false,
+            },
+        )
+    };
+    let backup_hold = if cancel {
+        let mut backup = old
+            .prepare(
+                support::maintenance_ctx(ServicePurpose::Backup),
+                BackupId::from_bytes([0x62; 16]),
+                old.default_backup_budget(),
             )
-        };
-        let old_ctx = owner_ctx(&scope, actor.clone());
-        let old_req = input(0xe1);
-        let old_task = tokio::spawn(async move { old.queue_chat_input(old_ctx, old_req).await });
-        let (key, version_id) = tokio::time::timeout(Duration::from_secs(10), until_put)
             .await
-            .unwrap()
             .unwrap();
-        if enable_at_cut {
-            notarium_canonical::blobs::s3::admin_set_bucket_versioning(&s3, "Enabled")
-                .await
-                .unwrap();
-        }
-        let (current, current_rt) =
-            CanonicalRuntime::open_with_s3_transport(cfg, Some(audit.clone()))
-                .await
-                .unwrap();
+        let hold = backup.acquire_hold().await.unwrap();
+        Some((backup, hold))
+    } else {
+        None
+    };
+    let lease_owner = old.clone();
+    let old_ctx = owner_ctx(&scope, actor.clone());
+    let cancellation = old_ctx.budget.cancellation.clone();
+    let old_req = input(0xe1);
+    let old_task = tokio::spawn(async move { old.queue_chat_input(old_ctx, old_req).await });
+    let (key, version_id) = tokio::time::timeout(Duration::from_secs(10), until_put)
+        .await
+        .unwrap()
+        .unwrap();
+    if enable_at_cut {
+        notarium_canonical::blobs::s3::admin_set_bucket_versioning(&s3, "Enabled")
+            .await
+            .unwrap();
+    }
+    let (current, current_rt) = if cancel {
+        (lease_owner, None)
+    } else {
+        let (current, rt) = CanonicalRuntime::open_with_s3_transport(cfg, Some(audit.clone()))
+            .await
+            .unwrap();
         current
             .advance_space_lease(
-                &support::maintenance_ctx(notarium_core::ports::ServicePurpose::Revocation),
+                &support::maintenance_ctx(ServicePurpose::Revocation),
                 &scope,
                 epoch.checked_next().unwrap(),
             )
             .await
             .unwrap();
-        let accepted = current
-            .queue_chat_input(owner_ctx(&scope, actor.clone()), input(0xe2))
+        (current, Some(rt))
+    };
+    let accepted = current
+        .queue_chat_input(owner_ctx(&scope, actor.clone()), input(0xe2))
+        .await
+        .unwrap();
+    assert!(matches!(accepted, QueueInputOutcome::Queued(_)));
+    if cancel {
+        if uploaded {
+            old_task.abort();
+            assert!(old_task.await.unwrap_err().is_cancelled());
+        } else {
+            cancellation.cancel();
+            let result = tokio::time::timeout(Duration::from_secs(5), old_task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(result, Err(PortError::Cancelled(_))));
+        }
+        assert!(release.send(()).is_err());
+        // Observe completion on the original lease and with the original hold still active.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let pending = current
+                    .execute_diagnostic_read_sql_for_test(
+                        None,
+                        "SELECT COUNT(*) FROM blob_retirements WHERE status='pending'",
+                    )
+                    .await
+                    .unwrap();
+                if pending == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (backup, hold) = backup_hold.unwrap();
+        hold.release().await.unwrap();
+        drop(backup);
+        let mut next = current
+            .prepare(
+                support::maintenance_ctx(ServicePurpose::Backup),
+                BackupId::from_bytes([0x63; 16]),
+                current.default_backup_budget(),
+            )
             .await
             .unwrap();
-        assert!(matches!(accepted, QueueInputOutcome::Queued(_)));
+        next.acquire_hold().await.unwrap().release().await.unwrap();
+        assert_eq!(
+            current
+                .read_space(&scope.space_id)
+                .await
+                .unwrap()
+                .active_epoch,
+            epoch
+        );
+    } else {
         release.send(()).unwrap();
         assert!(old_task.await.unwrap().is_err());
-        let get = |version: Option<String>| S3RawRequest {
-            method: http::Method::GET,
-            key: Some(key.clone()),
-            query: version
-                .into_iter()
-                .map(|v| ("versionId".into(), v))
-                .collect(),
-            headers: vec![],
-            body: bytes::Bytes::new(),
-        };
-        let marker = audit.origin.send(get(None)).await.unwrap();
-        assert_eq!(marker.status, 200);
-        assert!(TerminalMarkerMeta::is_terminal_marker(&marker.body));
-        if uploaded && (versioned || enable_at_cut) {
-            let old_version = if enable_at_cut {
-                "null".to_owned()
-            } else {
-                version_id.unwrap()
-            };
-            assert_eq!(
-                audit
-                    .origin
-                    .send(get(Some(old_version)))
-                    .await
-                    .unwrap()
-                    .status,
-                404
-            );
-        }
-        assert_eq!(
-            current
-                .read_verified_blob(&scope, prepared.digest())
-                .await
-                .unwrap(),
-            body.as_bytes()
-        );
-        assert_eq!(
-            current
-                .execute_diagnostic_read_sql_for_test(
-                    None,
-                    "SELECT COUNT(*) FROM blob_references WHERE owner_kind='chat_pending_input'"
-                )
-                .await
-                .unwrap(),
-            1
-        );
-        current_rt.shutdown().await.unwrap();
-        rt.shutdown().await.unwrap();
-        fixtures.drop_pg_schema(&schema).await;
     }
+    let get = |version: Option<String>| S3RawRequest {
+        method: http::Method::GET,
+        key: Some(key.clone()),
+        query: version
+            .into_iter()
+            .map(|v| ("versionId".into(), v))
+            .collect(),
+        headers: vec![],
+        body: bytes::Bytes::new(),
+    };
+    let marker = audit.origin.send(get(None)).await.unwrap();
+    assert_eq!(marker.status, 200);
+    assert!(TerminalMarkerMeta::is_terminal_marker(&marker.body));
+    if uploaded && (versioned || enable_at_cut) {
+        let old_version = if enable_at_cut {
+            "null".to_owned()
+        } else {
+            version_id.unwrap()
+        };
+        assert_eq!(
+            audit
+                .origin
+                .send(get(Some(old_version)))
+                .await
+                .unwrap()
+                .status,
+            404
+        );
+    }
+    assert_eq!(
+        current
+            .read_verified_blob(&scope, prepared.digest())
+            .await
+            .unwrap(),
+        body.as_bytes()
+    );
+    assert_eq!(
+        current
+            .execute_diagnostic_read_sql_for_test(
+                None,
+                "SELECT COUNT(*) FROM blob_references WHERE owner_kind='chat_pending_input'"
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    if let Some(current_rt) = current_rt {
+        current_rt.shutdown().await.unwrap();
+    }
+    rt.shutdown().await.unwrap();
+    fixtures.drop_pg_schema(&schema).await;
 }

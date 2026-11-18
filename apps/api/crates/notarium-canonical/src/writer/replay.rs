@@ -13,7 +13,7 @@ use super::CommandIdentitySpec;
 use crate::{
     domain::{
         common::{build_resource_facts_tx, load_note_head_row_opt_tx},
-        folders::choose_folder_auth_class,
+        folders::folder_mutation_class,
     },
     runtime::{SpaceRecord, load_space_record},
     sql_exec::BackendConn,
@@ -207,7 +207,7 @@ async fn authorize_resource(
                 tx,
                 &srec.space,
                 folder,
-                choose_folder_auth_class(auth, &srec.space.id),
+                folder_mutation_class(auth, &srec.space.id)?,
                 None,
                 true,
             )

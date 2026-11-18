@@ -298,6 +298,156 @@ async fn exercise(pg: bool) {
             .iter()
             .all(|name| name.len() == MAX_ABILITY_AUX_PATH_BYTES)
     );
+    let project = notarium_core::model::FolderRef {
+        space_id: sid.clone(),
+        folder_id: FolderId::from_bytes([2; 16]),
+    };
+    let pinned = AccountContext::new(
+        account
+            .auth()
+            .for_pat(std::collections::BTreeMap::from([(
+                sid.clone(),
+                SpaceGrant {
+                    role: SpaceRole::Viewer,
+                    read_classes: DocClass::all(),
+                    write_classes: Default::default(),
+                    project_root: Some(project.folder_id.clone()),
+                },
+            )]))
+            .unwrap(),
+        budget(),
+    );
+    let project_page = control
+        .list_projects(pinned.clone(), ControlPageRequest::new(1, None).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(project_page.items.len(), 1);
+    assert_eq!(project_page.items[0].folder, project);
+    assert!(project_page.continuation.is_none());
+
+    // The tip still names the manifest published at the personal root.
+    let move_entry = |key, parent| {
+        canonical.move_note(
+            scoped.clone(),
+            mutation(
+                &scoped,
+                key,
+                MoveNote {
+                    note: entry.clone(),
+                    parent,
+                    slug: "my-skill".into(),
+                },
+            ),
+        )
+    };
+    move_entry(54, Some(project.folder_id.clone()))
+        .await
+        .unwrap();
+    let moved = AbilityRef {
+        placement: AbilityPlacement::OwnedProject(project.clone()),
+        ..value.reference.clone()
+    };
+    let selection = AbilitySelection::Exact {
+        reference: moved.clone(),
+        project: Some(project.clone()),
+    };
+    assert!(matches!(
+        control
+            .resolve_ability(pinned.clone(), selection)
+            .await
+            .unwrap(),
+        AbilityResolution::Missing
+    ));
+    assert!(matches!(
+        control
+            .get_ability(pinned.clone(), moved.clone(), Some(project.clone()))
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    assert_eq!(
+        control
+            .get_ability(account.clone(), moved, Some(project.clone()))
+            .await
+            .unwrap()
+            .auxiliary_files,
+        value.auxiliary_files
+    );
+
+    // Two visible manifests follow an earlier hidden one in package ID order.
+    for tag in [9, 10] {
+        let new_entry = NoteId::from_bytes([tag; 16]);
+        canonical
+            .create_note(
+                scoped.clone(),
+                mutation(
+                    &scoped,
+                    60 + tag,
+                    CreateNote {
+                        note: new_entry.clone(),
+                        parent: Some(project.folder_id.clone()),
+                        slug: format!("visible-{tag}"),
+                        class: DocClass::Skill,
+                        carrier: "---\nclass: skill\ntitle: Visible\n---\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        canonical
+            .publish_ability_package(
+                scoped.clone(),
+                mutation(
+                    &scoped,
+                    80 + tag,
+                    PublishAbilityPackage {
+                        ability: AbilityId::from_bytes([tag; 16]),
+                        kind: AbilityKind::Skill,
+                        entrypoint: new_entry,
+                        files: vec![],
+                        expected_package_revision: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    let query = |next| AbilityQuery {
+        page: ControlPageRequest::new(1, next).unwrap(),
+        project: Some(project.clone()),
+        kind: Some(AbilityKind::Skill),
+        name: None,
+        authoring: false,
+    };
+    let raw_first = canonical
+        .abilities(pinned.clone(), query(None))
+        .await
+        .unwrap();
+    assert!(raw_first.items.is_empty());
+    let token: serde_json::Value =
+        serde_json::from_str(raw_first.continuation.as_ref().unwrap()).unwrap();
+    assert!(token["after"][1].is_u64());
+    let mut cursor = None;
+    let mut discovered = Vec::new();
+    for _ in 0..3 {
+        let page = control
+            .discover_abilities(pinned.clone(), query(cursor.take()))
+            .await
+            .unwrap();
+        discovered.extend(page.items.into_iter().map(|item| item.reference.id));
+        cursor = page.continuation;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(cursor.is_none());
+    assert_eq!(
+        discovered,
+        vec![
+            AbilityId::from_bytes([9; 16]),
+            AbilityId::from_bytes([10; 16])
+        ]
+    );
+    move_entry(55, None).await.unwrap();
     let previous = value.reference;
     let updated = canonical
         .publish_ability_package(
@@ -328,6 +478,19 @@ async fn exercise(pg: bool) {
         .unwrap();
     assert_eq!(exact.reference, previous);
     assert_eq!(exact.auxiliary_files.len(), MAX_ABILITY_AUX_FILES);
+    assert!(matches!(
+        control
+            .resolve_ability(
+                account.clone(),
+                AbilitySelection::Exact {
+                    reference: previous.clone(),
+                    project: None,
+                }
+            )
+            .await
+            .unwrap(),
+        AbilityResolution::Stale
+    ));
     assert!(!account.auth().taint().is_tainted());
 
     let shared = SpaceId::from_bytes([5; 16]);

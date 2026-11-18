@@ -5,7 +5,7 @@
 //! Run with the checkout fixture launcher for a tree-attributed JSON report.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     sync::{
@@ -16,10 +16,11 @@ use std::{
 };
 
 use notarium_canonical::{
-    BlobBackendConfig, CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateFolderSpec,
-    CreateSpaceSpec, PgConnectConfig, PgTransport, S3AddressingStyle, S3BucketModePolicy, S3Config,
-    S3Credentials, SqlBackendConfig, WriterConfig, blobs::s3::admin_ensure_bucket,
-    build_pg_connect_options, default_backup_budget,
+    BlobBackendConfig, CanonicalConfig, CanonicalRuntime, CanonicalStore, CloseCollabSession,
+    CollabRoomState, CollabSessionRecord, CreateFolderSpec, CreateSpaceSpec, OpenCollabSession,
+    PgConnectConfig, PgTransport, S3AddressingStyle, S3BucketModePolicy, S3Config, S3Credentials,
+    SqlBackendConfig, WriterConfig, blobs::s3::admin_ensure_bucket, build_pg_connect_options,
+    default_backup_budget,
 };
 use notarium_control::{
     backup::{BackupConfig, ControlBackup},
@@ -30,10 +31,11 @@ use notarium_core::{
     auth::{ChatAudience, EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
     classes::DocClass,
     epoch::{DataRoot, EpochClassification, EpochReason, StorageEpochState},
+    error::PortError,
     ids::{
         AgentRunId, BackupId, ChatThreadId, CommandKey, ContentDigest, FolderId, GrantId,
-        HistoryIncarnation, InstallationId, LeaseEpoch, NoteId, PrincipalId, RequestId, RevisionId,
-        SpaceId, SpaceSeq, ThreadEntrySeq, ViewKey,
+        HistoryIncarnation, InstallationId, LeaseEpoch, LineageEpoch, NoteId, PrincipalId,
+        RequestId, RevisionId, SpaceId, SpaceSeq, ThreadEntrySeq, ViewKey,
     },
     model::HistoryScope,
     patch::{CarrierEditOrigin, CarrierPatchPlan, CarrierSplice},
@@ -42,8 +44,8 @@ use notarium_core::{
         BoardMutationFactsProvider, BoardPlannerAuthority, CallBudget, Cancellation, ChatEntryKind,
         ChatInputBody, ChatPort, ChatRead, ChatThreadKind, CreateChat, CreateNote,
         DeleteDisposition, DeleteNote, EditNote, EmptyRootAuthorization, EvaluatedBoardGroup,
-        EvaluatedBoardRow, ForkChat, GetNote, GroupKey, MaintenanceContext, MoveBoardCard,
-        MoveFolder, Mutation, NoteRevision, NoteWritePort, PageLimit, PortFuture, Preconditions,
+        EvaluatedBoardRow, GetNote, GroupKey, MaintenanceContext, MoveBoardCard, MoveFolder,
+        Mutation, NoteRevision, NoteWritePort, PageLimit, PortFuture, Preconditions,
         RankExpectation, RankNeighbor, RollbackAgentRun, RollbackBoardFacts,
         RollbackBoardFactsRequest, SemanticPlacement, ServiceAuthority, ServicePurpose,
         SpaceContext, ViewRef,
@@ -316,6 +318,7 @@ struct RollbackProfileMetrics {
     restored_per_call: usize,
     trashed_per_call: usize,
     skipped_manual_per_call: usize,
+    verified_closed_room_restores: usize,
     latency: PercentilesUs,
 }
 
@@ -327,30 +330,87 @@ struct ChatReadProfileMetrics {
     window_entries: usize,
     measured_reads: usize,
     measured_leaves: usize,
+    min_parent_gaps_with_128_foreign_turns: usize,
     sql_writes_during_reads: u64,
     latency: PercentilesUs,
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct MoveFailure {
+    stage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    move_number: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt_seq: Option<SpaceSeq>,
+    detail: String,
+}
+
+impl MoveFailure {
+    fn new(
+        stage: &'static str,
+        move_number: Option<usize>,
+        receipt_seq: Option<SpaceSeq>,
+        detail: String,
+    ) -> Self {
+        Self {
+            stage,
+            move_number,
+            receipt_seq,
+            detail,
+        }
+    }
+
+    fn port(
+        stage: &'static str,
+        move_number: Option<usize>,
+        receipt_seq: Option<SpaceSeq>,
+        err: PortError,
+    ) -> Self {
+        let code = err.code();
+        let detail = match err {
+            PortError::Domain(err) => format!("{code}: {err:?}"),
+            PortError::DeadlineExceeded(failure)
+            | PortError::Internal(failure)
+            | PortError::Unavailable(failure)
+            | PortError::Cancelled(failure) => {
+                format!(
+                    "{code}: {} ({:?}, {:?})",
+                    failure.diagnostic_ref().to_hex(),
+                    failure.effect(),
+                    failure.retry()
+                )
+            }
+        };
+        Self::new(stage, move_number, receipt_seq, detail)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 struct BoardFirstSlotMetrics {
     backend: &'static str,
+    moves_requested: usize,
     moves_executed: usize,
     max_rank_bytes_observed: usize,
     pma_rebalance_events: usize,
     max_overlays_changed_in_single_move: usize,
-    mean_overlays_changed_per_move: f64,
-    latency: PercentilesUs,
+    mean_overlays_changed_per_move: Option<f64>,
+    latency: Option<PercentilesUs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<MoveFailure>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct FolderMoveMetrics {
     backend: &'static str,
+    moves_requested: usize,
     seeded_descendant_folders: usize,
     seeded_descendant_notes: usize,
     total_seeded_descendants: usize,
     moves_executed: usize,
-    descendant_rows_modified: u64,
-    latency: PercentilesUs,
+    descendant_rows_modified: Option<u64>,
+    latency: Option<PercentilesUs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<MoveFailure>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -889,17 +949,24 @@ async fn run_writer_benchmark_case(
 // Suite 2: Rollback Microfixture (`p95 < 5 ms` on SQLite+Local & PG16+Local)
 // ============================================================================
 
+struct RollbackRoomExpectation {
+    closed: CollabSessionRecord,
+    original_revision: RevisionId,
+    original_digest: ContentDigest,
+}
+
 struct PreparedRollbackTemplate {
     scope: HistoryScope,
     owner: PrincipalId,
     run_id: AgentRunId,
     expected_run_rev: RevisionId,
     expected_entities: Vec<NoteRevision>,
-    warm_note: NoteId,
+    rooms: Vec<RollbackRoomExpectation>,
 }
 
 /// Seeds the exact D3 rollback microfixture:
 /// - 18 pre-existing 4 KiB notes edited by `run_id` (note 0 edited 3x, note 17 then manually edited by human)
+/// - 17 clean closed rooms on the edited notes eligible for restoration
 /// - 2 4 KiB notes created by `run_id`
 /// - 1 pre-existing 4 KiB note trashed by `run_id` with subsequent slug collision created by human
 async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackTemplate {
@@ -954,7 +1021,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
         let nid = NoteId::from_bytes(nb);
         let header = format!("---\ntitle: Pre Note {i}\n---\n");
         let (carrier_v0, _) = build_unique_4kib_carrier(&header, 100 + i, 0);
-        store
+        let created = store
             .create_note(
                 human_ctx.clone(),
                 next_mutation(
@@ -971,7 +1038,7 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
             )
             .await
             .unwrap();
-        edited_notes.push((nid, header, carrier_v0));
+        edited_notes.push((created.value, header, carrier_v0));
     }
 
     // 1 pre-existing note that `run_id` will Trash and then collide with via a run-created note on slug
@@ -996,8 +1063,11 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
         .await
         .unwrap();
 
-    // Agent run edits the 18 notes (note 0 edited 3x; notes 1..18 edited 1x)
-    for (i, (nid, header, cur_carrier)) in edited_notes.iter_mut().enumerate() {
+    // Agent run edits the 18 notes (note 0 edited 3x; notes 1..=17 edited 1x)
+    let mut room_inputs = Vec::with_capacity(17);
+    for (i, (original, header, cur_carrier)) in edited_notes.iter_mut().enumerate() {
+        let nid = &original.note;
+        let original_digest = notarium_syntax::content_digest(cur_carrier);
         let passes = if i == 0 { 3usize } else { 1usize };
         let mut latest_rev = None;
         for p in 1..=passes {
@@ -1055,10 +1125,12 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
                 revision: man_ed.value.revision,
             });
         } else {
-            expected_entities.push(NoteRevision {
+            let edited = NoteRevision {
                 note: nid.clone(),
                 revision: latest_rev.unwrap(),
-            });
+            };
+            expected_entities.push(edited.clone());
+            room_inputs.push((edited, original.revision.clone(), original_digest));
         }
     }
 
@@ -1125,13 +1197,67 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
         .unwrap()
         .expect("agent run revision");
 
+    let mut rooms = Vec::with_capacity(room_inputs.len());
+    let budget = make_budget();
+    for (edited, original_revision, original_digest) in room_inputs {
+        let opened = store
+            .open_collab_session(
+                &budget,
+                OpenCollabSession {
+                    scope: space.scope.clone(),
+                    note: edited.note.clone(),
+                    owner_id: "rollback-fixture".into(),
+                    expected_carrier_rev: edited.revision.clone(),
+                    expected_lease: Some(LeaseEpoch::ZERO),
+                    expected_lineage: Some(LineageEpoch::ZERO),
+                    initial_yrs_snapshot: None,
+                    allow_fenced_recovery: false,
+                },
+            )
+            .await
+            .expect("open room on the edited revision");
+        assert_eq!(opened.room_state, CollabRoomState::Active);
+        assert_eq!(opened.lineage_epoch, LineageEpoch::ZERO);
+        let closed = store
+            .close_collab_session(
+                &budget,
+                CloseCollabSession {
+                    scope: space.scope.clone(),
+                    note: edited.note.clone(),
+                    owner_id: opened.owner_id.clone(),
+                    expected_lease: opened.lease_epoch,
+                    expected_lineage: opened.lineage_epoch,
+                    final_yrs_snapshot: None,
+                    compacted_through_update_seq: None,
+                    carrier_settlement: None,
+                },
+            )
+            .await
+            .expect("close room cleanly without changing the edited carrier");
+        assert_eq!(closed.note, edited.note);
+        assert_eq!(closed.room_state, CollabRoomState::Closed);
+        assert_eq!(
+            closed.lease_epoch,
+            opened.lease_epoch.checked_next().unwrap()
+        );
+        assert_eq!(closed.lineage_epoch, opened.lineage_epoch);
+        assert_eq!(closed.carrier_rev_id, edited.revision);
+        assert!(!closed.carrier_dirty);
+        rooms.push(RollbackRoomExpectation {
+            closed,
+            original_revision,
+            original_digest,
+        });
+    }
+    assert_eq!(rooms.len(), 17);
+
     PreparedRollbackTemplate {
         scope: space.scope,
         owner,
         run_id,
         expected_run_rev,
         expected_entities,
-        warm_note: edited_notes[0].0.clone(),
+        rooms,
     }
 }
 
@@ -1142,6 +1268,7 @@ async fn measure_fresh_rollbacks(
     enforce_5ms_budget: bool,
 ) -> RollbackProfileMetrics {
     let mut samples = Vec::with_capacity(iterations);
+    let mut verified_closed_room_restores = 0;
     for sample in 0..=iterations {
         let fixture = seed_rollback_microfixture(store).await;
         let ctx = owner_ctx(&fixture.scope, fixture.owner.clone());
@@ -1149,7 +1276,7 @@ async fn measure_fresh_rollbacks(
             .get_note(
                 ctx.clone(),
                 GetNote {
-                    note: fixture.warm_note,
+                    note: fixture.rooms[0].closed.note.clone(),
                     revision: None,
                     causal: CausalBasis::Exact(ReceiptSet::default()),
                 },
@@ -1166,13 +1293,92 @@ async fn measure_fresh_rollbacks(
                 associated_board_expectations: Vec::new(),
             },
         );
+        let before = store
+            .read_space(&fixture.scope.space_id)
+            .await
+            .unwrap()
+            .last_seq;
+        let rollback_ctx = ctx.clone();
         let start = Instant::now();
-        let result = store.rollback_agent_run(ctx, request).await.unwrap();
+        let result = store
+            .rollback_agent_run(rollback_ctx, request)
+            .await
+            .unwrap();
         let elapsed = start.elapsed();
+        assert_eq!(result.receipt.scope(), &fixture.scope);
+        assert!(
+            result.receipt.seq() > before,
+            "rollback must produce a fresh receipt"
+        );
         assert_eq!(result.value.restored.len(), 18);
         assert_eq!(result.value.trashed.len(), 2);
         assert_eq!(result.value.skipped_manual_edits.len(), 1);
+        assert!(result.value.skipped_room_active.is_empty());
+        let mut verified = 0;
+        for room in &fixture.rooms {
+            let note = &room.closed.note;
+            let restored = result
+                .value
+                .restored
+                .iter()
+                .find(|r| &r.note == note)
+                .expect("rollback must restore each edited note with a closed room");
+            let durable = store
+                .read_collab_session(Some(&ctx.budget), &fixture.scope, note)
+                .await
+                .unwrap()
+                .expect("rollback must preserve the closed room");
+            let expected_room = CollabSessionRecord {
+                lineage_epoch: room.closed.lineage_epoch.checked_next().unwrap(),
+                carrier_rev_id: restored.revision.clone(),
+                updated_seq: result.receipt.seq(),
+                ..room.closed.clone()
+            };
+            assert_eq!(durable.session, expected_room);
+            assert!(durable.updates.is_empty());
+            assert_ne!(restored.revision, room.closed.carrier_rev_id);
+            assert_ne!(restored.revision, room.original_revision);
+
+            let revision = store
+                .read_entity_revision_at_cutoff(
+                    &fixture.scope,
+                    "note",
+                    note.as_str(),
+                    Some(result.receipt.seq()),
+                )
+                .await
+                .unwrap()
+                .expect("restored revision at the rollback receipt");
+            assert_eq!(revision.revision_id, restored.revision);
+            assert_eq!(
+                revision.restored_from_rev_id.as_ref(),
+                Some(&room.original_revision)
+            );
+            assert_eq!(revision.content_digest, Some(room.original_digest));
+            let historical = store
+                .get_note(
+                    ctx.clone(),
+                    GetNote {
+                        note: note.clone(),
+                        revision: Some(room.original_revision.clone()),
+                        causal: CausalBasis::Exact(
+                            ReceiptSet::new([result.receipt.clone()]).unwrap(),
+                        ),
+                    },
+                )
+                .await
+                .expect("read the original revision after rollback");
+            assert_eq!(historical.document.revision(), &room.original_revision);
+            let carrier = historical.document.explicit_read(ctx.auth()).unwrap();
+            assert_eq!(
+                notarium_syntax::content_digest(carrier),
+                room.original_digest
+            );
+            verified += 1;
+        }
+        assert_eq!(verified, 17);
         if sample > 0 {
+            verified_closed_room_restores += verified;
             samples.push(u64::try_from(elapsed.as_nanos()).unwrap());
         }
     }
@@ -1183,6 +1389,7 @@ async fn measure_fresh_rollbacks(
         restored_per_call: 18,
         trashed_per_call: 2,
         skipped_manual_per_call: 1,
+        verified_closed_room_restores,
         latency: compute_percentiles_from_ns(samples),
     }
 }
@@ -1257,15 +1464,18 @@ async fn run_pg_rollback_benchmark(
 
 // Triggers on the isolated benchmark schema observe actual writes, including no-op updates.
 // The counter and its triggers are installed after seeding, outside all timed operations.
-async fn install_row_write_counter(store: &CanonicalStore, sqlite: bool, tables: &[(&str, &str)]) {
+async fn install_row_write_counter(
+    store: &CanonicalStore,
+    sqlite: bool,
+    tables: &[(&str, &str)],
+) -> Result<(), PortError> {
     for statement in [
         "CREATE TABLE d3_row_writes (writes BIGINT NOT NULL)",
         "INSERT INTO d3_row_writes VALUES (0)",
     ] {
         store
             .execute_diagnostic_write_sql_for_test(statement)
-            .await
-            .unwrap();
+            .await?;
     }
     let increment = "UPDATE d3_row_writes SET writes = writes + 1";
     if !sqlite {
@@ -1274,8 +1484,7 @@ async fn install_row_write_counter(store: &CanonicalStore, sqlite: bool, tables:
                 "CREATE FUNCTION d3_count_write() RETURNS trigger LANGUAGE plpgsql AS $$
              BEGIN {increment}; RETURN NULL; END; $$"
             ))
-            .await
-            .unwrap();
+            .await?;
     }
     for (table, predicate) in tables {
         for (action, row) in [("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")] {
@@ -1290,20 +1499,75 @@ async fn install_row_write_counter(store: &CanonicalStore, sqlite: bool, tables:
             };
             store
                 .execute_diagnostic_write_sql_for_test(&statement)
-                .await
-                .unwrap();
+                .await?;
         }
     }
+    Ok(())
 }
 
-async fn observed_row_writes(store: &CanonicalStore) -> u64 {
-    u64::try_from(
+async fn observed_row_writes(store: &CanonicalStore) -> Result<u64, PortError> {
+    Ok(u64::try_from(
         store
             .execute_diagnostic_read_sql_for_test(None, "SELECT writes FROM d3_row_writes")
-            .await
-            .unwrap(),
+            .await?,
     )
-    .unwrap()
+    .expect("write counter is nonnegative"))
+}
+
+const CHAT_WINDOW: usize = 50;
+
+// Remember the expected parent path from append receipts before any reads.
+// Rotating runs of 16 on nine branches leave 128 foreign turns in each gap.
+async fn seed_chat_windows(
+    store: &CanonicalStore,
+    scope: &HistoryScope,
+    owner: &PrincipalId,
+    thread: &ChatThreadId,
+    turns: usize,
+    branches: usize,
+) -> Vec<VecDeque<ThreadEntrySeq>> {
+    let mut windows = vec![VecDeque::with_capacity(CHAT_WINDOW); branches];
+    for turn in 0..turns {
+        let branch = (turn.saturating_sub(CHAT_WINDOW) / 16) % branches;
+        let parent = windows[branch]
+            .back()
+            .copied()
+            .unwrap_or(ThreadEntrySeq::ZERO);
+        let result = store
+            .append_chat(
+                owner_ctx(scope, owner.clone()),
+                next_mutation(
+                    scope,
+                    owner,
+                    AppendChat {
+                        thread: thread.clone(),
+                        parent,
+                        kind: if turn % 2 == 0 {
+                            ChatEntryKind::Human
+                        } else {
+                            ChatEntryKind::Model
+                        },
+                        body: ChatInputBody::Text(format!("turn {turn}")),
+                        referenced_notes: Vec::new(),
+                        tainted: false,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let paths = if turn < CHAT_WINDOW {
+            0..branches
+        } else {
+            branch..branch + 1
+        };
+        for path in &mut windows[paths] {
+            if path.len() == CHAT_WINDOW {
+                path.pop_front();
+            }
+            path.push_back(result.value.seq);
+        }
+    }
+    windows
 }
 
 async fn run_chat_read_benchmarks_for_store(
@@ -1369,129 +1633,10 @@ async fn run_chat_read_benchmarks_for_store(
         .await
         .unwrap();
 
-    // Seed linear and branched 10,000-turn threads concurrently in 2 tasks so they share WriteBatchActor flushes!
-    let store_lin = store.clone();
-    let scope_lin = space.scope.clone();
-    let owner_lin = owner.clone();
-    let lin_tid_cl = linear_tid.clone();
-    let lin_seeder = tokio::spawn(async move {
-        let mut parent = ThreadEntrySeq::ZERO;
-        for i in 1..=turns_to_seed {
-            let committed = store_lin
-                .append_chat(
-                    owner_ctx(&scope_lin, owner_lin.clone()),
-                    next_mutation(
-                        &scope_lin,
-                        &owner_lin,
-                        AppendChat {
-                            thread: lin_tid_cl.clone(),
-                            parent,
-                            kind: if i % 2 == 1 {
-                                ChatEntryKind::Human
-                            } else {
-                                ChatEntryKind::Model
-                            },
-                            body: ChatInputBody::Text(format!("linear turn {i} payload")),
-                            referenced_notes: Vec::new(),
-                            tainted: false,
-                        },
-                    ),
-                )
-                .await
-                .unwrap();
-            parent = committed.value.seq;
-        }
-        parent
-    });
-
-    let store_br = store.clone();
-    let scope_br = space.scope.clone();
-    let owner_br = owner.clone();
-    let br_tid_cl = branched_tid.clone();
-    let br_seeder = tokio::spawn(async move {
-        let mut main_spine = ThreadEntrySeq::ZERO;
-        let mut side_tips = Vec::new();
-        let mut count = 0usize;
-        while count < turns_to_seed {
-            // Advance spine by 3 turns
-            for _ in 0..3 {
-                if count >= turns_to_seed {
-                    break;
-                }
-                count += 1;
-                let committed = store_br
-                    .append_chat(
-                        owner_ctx(&scope_br, owner_br.clone()),
-                        next_mutation(
-                            &scope_br,
-                            &owner_br,
-                            AppendChat {
-                                thread: br_tid_cl.clone(),
-                                parent: main_spine,
-                                kind: ChatEntryKind::Human,
-                                body: ChatInputBody::Text(format!("spine entry {count}")),
-                                referenced_notes: Vec::new(),
-                                tainted: false,
-                            },
-                        ),
-                    )
-                    .await
-                    .unwrap();
-                main_spine = committed.value.seq;
-            }
-            // Fork a 2-turn adversarial side branch off `main_spine` so `is_chain_node = 0` / branch_depth increases!
-            if count + 2 <= turns_to_seed && main_spine.get() > 0 {
-                store_br
-                    .fork_chat(
-                        owner_ctx(&scope_br, owner_br.clone()),
-                        next_mutation(
-                            &scope_br,
-                            &owner_br,
-                            ForkChat {
-                                thread: br_tid_cl.clone(),
-                                parent: main_spine,
-                            },
-                        ),
-                    )
-                    .await
-                    .unwrap();
-                let mut side_parent = main_spine;
-                for s in 0..2 {
-                    count += 1;
-                    let side = store_br
-                        .append_chat(
-                            owner_ctx(&scope_br, owner_br.clone()),
-                            next_mutation(
-                                &scope_br,
-                                &owner_br,
-                                AppendChat {
-                                    thread: br_tid_cl.clone(),
-                                    parent: side_parent,
-                                    kind: ChatEntryKind::Model,
-                                    body: ChatInputBody::Text(format!(
-                                        "side branch {s} at {count}"
-                                    )),
-                                    referenced_notes: Vec::new(),
-                                    tainted: false,
-                                },
-                            ),
-                        )
-                        .await
-                        .unwrap();
-                    side_parent = side.value.seq;
-                }
-                side_tips.push(side_parent);
-            }
-        }
-        // Measure switching between actual leaves, each with a full context window.
-        let mut leaves = vec![main_spine];
-        leaves.extend(side_tips.into_iter().rev().take(8));
-        leaves
-    });
-
-    let linear_leaf = lin_seeder.await.unwrap();
-    let branched_leaves = br_seeder.await.unwrap();
-    assert!(branched_leaves.len() > 1);
+    let (linear_windows, branched_windows) = tokio::join!(
+        seed_chat_windows(store, &space.scope, &owner, &linear_tid, turns_to_seed, 1),
+        seed_chat_windows(store, &space.scope, &owner, &branched_tid, turns_to_seed, 9),
+    );
 
     if let Some((fixtures, pg_schema)) = pg_settle {
         let mut conn = fixtures.open_raw_pg().await;
@@ -1504,38 +1649,62 @@ async fn run_chat_read_benchmarks_for_store(
         .iter()
         .map(|t| (t.name, "TRUE"))
         .collect();
-    install_row_write_counter(store, pg_settle.is_none(), &tables).await;
+    install_row_write_counter(store, pg_settle.is_none(), &tables)
+        .await
+        .unwrap();
 
-    let limit_50 = PageLimit::new(50).unwrap();
+    let limit_50 = PageLimit::new(CHAT_WINDOW as u16).unwrap();
     let mut results = Vec::with_capacity(2);
 
-    for (topology, tid, leaves) in [
-        ("linear_10k", linear_tid, vec![linear_leaf]),
-        ("branched_dag_10k", branched_tid, branched_leaves),
+    for (topology, tid, windows) in [
+        ("linear_10k", linear_tid, linear_windows),
+        ("branched_dag_10k", branched_tid, branched_windows),
     ] {
-        // Warm cache across all opened pool connections (`>= 6` executions/conn for generic plan)
+        let min_parent_gaps_with_128_foreign_turns = windows
+            .iter()
+            .map(|window| {
+                assert_eq!(window.len(), CHAT_WINDOW);
+                window
+                    .iter()
+                    .zip(window.iter().skip(1))
+                    .filter(|(parent, child)| child.get() - parent.get() > 128)
+                    .count()
+            })
+            .min()
+            .unwrap();
+        if windows.len() > 1 {
+            assert!(
+                min_parent_gaps_with_128_foreign_turns >= 2,
+                "each sparse window must cross the PostgreSQL lookback"
+            );
+        }
         for sample in 0..96 {
-            let leaf = leaves[sample % leaves.len()];
+            let window = &windows[sample % windows.len()];
             let warm = store
                 .read_chat(
                     owner_ctx(&space.scope, owner.clone()),
                     ChatRead {
                         thread: tid.clone(),
-                        leaf,
+                        leaf: *window.back().unwrap(),
                         before: None,
                         max_entries: limit_50,
                     },
                 )
                 .await
                 .unwrap();
-            assert_eq!(warm.entries.len(), 50.min(turns_to_seed));
+            assert!(
+                warm.entries
+                    .iter()
+                    .map(|entry| entry.seq)
+                    .eq(window.iter().copied())
+            );
         }
 
-        let before = observed_row_writes(store).await;
-
+        let before = observed_row_writes(store).await.unwrap();
         let mut lat_ns = Vec::with_capacity(read_samples);
         for sample in 0..read_samples {
-            let leaf = leaves[sample % leaves.len()];
+            let window = &windows[sample % windows.len()];
+            let leaf = *window.back().unwrap();
             let rctx = owner_ctx(&space.scope, owner.clone());
             let req = ChatRead {
                 thread: tid.clone(),
@@ -1546,12 +1715,18 @@ async fn run_chat_read_benchmarks_for_store(
             let t0 = Instant::now();
             let branch = store.read_chat(rctx, req).await.unwrap();
             let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            assert_eq!(branch.entries.len(), 50.min(turns_to_seed));
-            assert_eq!(branch.entries.last().unwrap().seq, leaf);
+            assert!(
+                branch
+                    .entries
+                    .iter()
+                    .map(|entry| entry.seq)
+                    .eq(window.iter().copied()),
+                "incorrect 50-entry ancestry at {topology} leaf {leaf:?}"
+            );
             lat_ns.push(elapsed_ns);
         }
 
-        let writes_delta = observed_row_writes(store).await - before;
+        let writes_delta = observed_row_writes(store).await.unwrap() - before;
         assert_eq!(
             writes_delta, 0,
             "chat reads must perform zero SQL row writes"
@@ -1562,9 +1737,10 @@ async fn run_chat_read_benchmarks_for_store(
             backend: backend_label,
             topology,
             seeded_turns: turns_to_seed,
-            window_entries: 50.min(turns_to_seed),
+            window_entries: CHAT_WINDOW,
             measured_reads: read_samples,
-            measured_leaves: leaves.len(),
+            measured_leaves: windows.len(),
+            min_parent_gaps_with_128_foreign_turns,
             sql_writes_during_reads: writes_delta,
             latency: pct,
         });
@@ -1704,6 +1880,27 @@ async fn run_board_first_slot_benchmark(
     backend_label: &'static str,
     total_moves: usize,
 ) -> BoardFirstSlotMetrics {
+    let mut metrics = BoardFirstSlotMetrics {
+        backend: backend_label,
+        moves_requested: total_moves,
+        ..Default::default()
+    };
+    let mut samples = Vec::with_capacity(total_moves);
+    metrics.failure = measure_board_moves(store, &mut metrics, &mut samples)
+        .await
+        .err();
+    metrics.moves_executed = samples.len();
+    if !samples.is_empty() {
+        metrics.latency = Some(compute_percentiles_from_ns(samples));
+    }
+    metrics
+}
+
+async fn measure_board_moves(
+    store: &CanonicalStore,
+    metrics: &mut BoardFirstSlotMetrics,
+    samples: &mut Vec<u64>,
+) -> Result<(), MoveFailure> {
     let owner = PrincipalId::from_bytes([0x61; 16]);
     let space = store
         .create_space(CreateSpaceSpec {
@@ -1718,7 +1915,7 @@ async fn run_board_first_slot_benchmark(
             created_at: None,
         })
         .await
-        .unwrap();
+        .map_err(|err| MoveFailure::port("create_space", None, None, err))?;
     let ctx = owner_ctx(&space.scope, owner.clone());
 
     let view_nid = NoteId::from_bytes([0x65; 16]);
@@ -1738,7 +1935,7 @@ async fn run_board_first_slot_benchmark(
             ),
         )
         .await
-        .unwrap();
+        .map_err(|err| MoveFailure::port("create_view", None, None, err))?;
     let view_rev = view_created.value.revision;
     let view_ref = ViewRef {
         note: view_nid,
@@ -1772,7 +1969,7 @@ async fn run_board_first_slot_benchmark(
                 ),
             )
             .await
-            .unwrap();
+            .map_err(|err| MoveFailure::port("create_card", None, None, err))?;
         card_revs.insert(nid.clone(), cr.value.revision.clone());
         cards.push(FastBenchBoardCard {
             note: nid,
@@ -1786,21 +1983,19 @@ async fn run_board_first_slot_benchmark(
         view_rev: view_rev.clone(),
         cards: StdMutex::new(cards),
     });
-    store.register_board_facts_provider(planner).unwrap();
+    store
+        .register_board_facts_provider(planner)
+        .map_err(|err| MoveFailure::port("register_planner", None, None, err))?;
 
     let todo_grp = GroupKey::Value(ScalarValue::String("todo".to_owned()));
-    let mut lat_ns = Vec::with_capacity(total_moves);
-    let mut max_rank_bytes = 0usize;
-    let mut rebalance_events = 0usize;
-    let mut max_changed_in_move = 0usize;
     let mut total_changed_overlays = 0usize;
 
     let mut prev_overlays = store
         .inspect_view_overlays_for_test(&space.scope.space_id, &view_ref)
         .await
-        .unwrap();
+        .map_err(|err| MoveFailure::port("read_initial_overlays", None, None, err))?;
 
-    for m in 0..total_moves {
+    for m in 1..=metrics.moves_requested {
         // Sort current cards in group order to pick the current tail card and move it before the current FIRST slot!
         let mut order: Vec<(Option<String>, String, NoteId)> = (0..CARD_COUNT)
             .map(|idx| {
@@ -1855,38 +2050,46 @@ async fn run_board_first_slot_benchmark(
 
         let mctx = owner_ctx(&space.scope, owner.clone());
         let t0 = Instant::now();
-        let committed = store.move_board_card(mctx, req).await.unwrap();
+        let committed = store
+            .move_board_card(mctx, req)
+            .await
+            .map_err(|err| MoveFailure::port("move_board_card", Some(m), None, err))?;
         let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        lat_ns.push(elapsed_ns);
-
-        let rank_len = committed.value.rank.len();
-        assert!(
-            rank_len <= 16,
-            "D3 board rank bound violated at move {m}: len={rank_len} > 16"
-        );
-        max_rank_bytes = max_rank_bytes.max(rank_len);
-
-        let after_overlays = match store
+        let receipt = Some(committed.receipt.seq());
+        let after_overlays = store
             .inspect_view_overlays_for_test(&space.scope.space_id, &view_ref)
             .await
+            .map_err(|err| MoveFailure::port("read_committed_overlays", Some(m), receipt, err))?;
+        let rank = &committed.value.rank;
+        if after_overlays
+            .get(&moving_nid)
+            .is_none_or(|row| &row.sort_rank_lexo != rank)
+            || after_overlays
+                .iter()
+                .any(|(nid, row)| nid != &moving_nid && &row.sort_rank_lexo <= rank)
         {
-            Ok(ov) => ov,
-            Err(notarium_core::error::PortError::DeadlineExceeded(_)) => {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                store
-                    .inspect_view_overlays_for_test(&space.scope.space_id, &view_ref)
-                    .await
-                    .unwrap()
-            }
-            Err(err) => panic!("inspect_view_overlays_for_test failed: {err:?}"),
-        };
+            return Err(MoveFailure::new(
+                "verify_first_slot",
+                Some(m),
+                receipt,
+                "the committed rank does not identify the first card".into(),
+            ));
+        }
+        let move_max_rank = after_overlays
+            .values()
+            .map(|row| row.sort_rank_lexo.len())
+            .max()
+            .unwrap();
+        if move_max_rank > 16 {
+            return Err(MoveFailure::new(
+                "verify_rank_bound",
+                Some(m),
+                receipt,
+                format!("rank length {move_max_rank} exceeds 16 bytes"),
+            ));
+        }
         let mut changed_count = 0usize;
         for (nid, ov_after) in &after_overlays {
-            assert!(
-                ov_after.sort_rank_lexo.len() <= 16,
-                "overlay rank exceeded 16B on {nid}"
-            );
-            max_rank_bytes = max_rank_bytes.max(ov_after.sort_rank_lexo.len());
             let changed = match prev_overlays.get(nid) {
                 Some(ov_before) => ov_before.rank_rev_id != ov_after.rank_rev_id,
                 None => true,
@@ -1896,23 +2099,18 @@ async fn run_board_first_slot_benchmark(
             }
         }
         if changed_count > 1 {
-            rebalance_events += 1;
+            metrics.pma_rebalance_events += 1;
         }
-        max_changed_in_move = max_changed_in_move.max(changed_count);
+        metrics.max_rank_bytes_observed = metrics.max_rank_bytes_observed.max(move_max_rank);
+        metrics.max_overlays_changed_in_single_move = metrics
+            .max_overlays_changed_in_single_move
+            .max(changed_count);
         total_changed_overlays += changed_count;
+        metrics.mean_overlays_changed_per_move = Some(total_changed_overlays as f64 / m as f64);
+        samples.push(elapsed_ns);
         prev_overlays = after_overlays;
     }
-
-    let pct = compute_percentiles_from_ns(lat_ns);
-    BoardFirstSlotMetrics {
-        backend: backend_label,
-        moves_executed: total_moves,
-        max_rank_bytes_observed: max_rank_bytes,
-        pma_rebalance_events: rebalance_events,
-        max_overlays_changed_in_single_move: max_changed_in_move,
-        mean_overlays_changed_per_move: (total_changed_overlays as f64) / (total_moves as f64),
-        latency: pct,
-    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1926,6 +2124,35 @@ async fn run_folder_100k_move_benchmark(
     descendant_notes: usize,
     move_iters: usize,
 ) -> FolderMoveMetrics {
+    let mut metrics = FolderMoveMetrics {
+        backend: backend_label,
+        moves_requested: move_iters,
+        ..Default::default()
+    };
+    let mut samples = Vec::with_capacity(move_iters);
+    metrics.failure = measure_folder_moves(
+        store,
+        descendant_folders,
+        descendant_notes,
+        &mut metrics,
+        &mut samples,
+    )
+    .await
+    .err();
+    metrics.moves_executed = samples.len();
+    if !samples.is_empty() {
+        metrics.latency = Some(compute_percentiles_from_ns(samples));
+    }
+    metrics
+}
+
+async fn measure_folder_moves(
+    store: &CanonicalStore,
+    descendant_folders: usize,
+    descendant_notes: usize,
+    metrics: &mut FolderMoveMetrics,
+    samples: &mut Vec<u64>,
+) -> Result<(), MoveFailure> {
     let owner = PrincipalId::from_bytes([0x71; 16]);
     let space = store
         .create_space(CreateSpaceSpec {
@@ -1940,7 +2167,7 @@ async fn run_folder_100k_move_benchmark(
             created_at: None,
         })
         .await
-        .unwrap();
+        .map_err(|err| MoveFailure::port("create_space", None, None, err))?;
 
     let parent_a = FolderId::from_bytes([0x75; 16]);
     let parent_b = FolderId::from_bytes([0x76; 16]);
@@ -1970,7 +2197,7 @@ async fn run_folder_100k_move_benchmark(
                 timestamp: None,
             })
             .await
-            .unwrap();
+            .map_err(|err| MoveFailure::port("create_folder", None, None, err))?;
     }
 
     let sid = space.scope.space_id.as_str();
@@ -1978,7 +2205,7 @@ async fn run_folder_100k_move_benchmark(
     let mut seq_cursor = store
         .read_space(&space.scope.space_id)
         .await
-        .unwrap()
+        .map_err(|err| MoveFailure::port("read_seed_space", None, None, err))?
         .last_seq
         .get();
 
@@ -2022,11 +2249,11 @@ async fn run_folder_100k_move_benchmark(
         store
             .execute_diagnostic_write_sql_for_test(&sql)
             .await
-            .unwrap();
+            .map_err(|err| MoveFailure::port("seed_descendant_folders", None, None, err))?;
     }
 
     // Bulk-seed `descendant_notes` active notes distributed across `moving_folder` and its child folders
-    let dummy_digest_lit = if backend_label.starts_with("sqlite") {
+    let dummy_digest_lit = if metrics.backend.starts_with("sqlite") {
         "X'1111111111111111111111111111111111111111111111111111111111111111'"
     } else {
         "'\\x1111111111111111111111111111111111111111111111111111111111111111'::bytea"
@@ -2067,7 +2294,7 @@ async fn run_folder_100k_move_benchmark(
         store
             .execute_diagnostic_write_sql_for_test(&sql)
             .await
-            .unwrap();
+            .map_err(|err| MoveFailure::port("seed_descendant_notes", None, None, err))?;
     }
 
     store
@@ -2075,7 +2302,7 @@ async fn run_folder_100k_move_benchmark(
             "UPDATE spaces SET last_seq = {seq_cursor} WHERE space_id = '{sid}'"
         ))
         .await
-        .unwrap();
+        .map_err(|err| MoveFailure::port("update_seed_sequence", None, None, err))?;
 
     let total_folders_db = store
         .execute_diagnostic_read_sql_for_test(
@@ -2088,17 +2315,28 @@ async fn run_folder_100k_move_benchmark(
                 moving_folder.as_str()
             ),
         )
-        .await
-        .unwrap();
+        .await.map_err(|err| MoveFailure::port("count_folders", None, None, err))?;
     let total_notes_db = store
         .execute_diagnostic_read_sql_for_test(
             None,
             &format!("SELECT COUNT(*) FROM note_heads WHERE space_id = '{sid}'"),
         )
         .await
-        .unwrap();
-    assert_eq!(total_folders_db as usize, descendant_folders);
-    assert_eq!(total_notes_db as usize, descendant_notes);
+        .map_err(|err| MoveFailure::port("count_notes", None, None, err))?;
+    metrics.seeded_descendant_folders = total_folders_db as usize;
+    metrics.seeded_descendant_notes = total_notes_db as usize;
+    metrics.total_seeded_descendants =
+        metrics.seeded_descendant_folders + metrics.seeded_descendant_notes;
+    if metrics.seeded_descendant_folders != descendant_folders
+        || metrics.seeded_descendant_notes != descendant_notes
+    {
+        return Err(MoveFailure::new(
+            "verify_seed_counts",
+            None,
+            None,
+            format!("expected {descendant_folders} folders and {descendant_notes} notes"),
+        ));
+    }
 
     let exclude_ancestors = format!(
         "ROW_ALIAS.folder_id NOT IN ('{}','{}','{}','{}')",
@@ -2109,13 +2347,13 @@ async fn run_folder_100k_move_benchmark(
     );
     install_row_write_counter(
         store,
-        backend_label.starts_with("sqlite"),
+        metrics.backend.starts_with("sqlite"),
         &[("folder_heads", &exclude_ancestors), ("note_heads", "TRUE")],
     )
-    .await;
+    .await
+    .map_err(|err| MoveFailure::port("install_write_counter", None, None, err))?;
 
-    let mut lat_ns = Vec::with_capacity(move_iters);
-    for iter in 0..move_iters {
+    for iter in 0..metrics.moves_requested {
         let dst = if iter % 2 == 0 {
             parent_b.clone()
         } else {
@@ -2131,16 +2369,26 @@ async fn run_folder_100k_move_benchmark(
             },
         );
         let t0 = Instant::now();
-        store.move_folder(mctx, req).await.unwrap();
+        store
+            .move_folder(mctx, req)
+            .await
+            .map_err(|err| MoveFailure::port("move_folder", Some(iter + 1), None, err))?;
         let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        lat_ns.push(elapsed_ns);
+        samples.push(elapsed_ns);
     }
 
-    let descendant_writes = observed_row_writes(store).await;
-    assert_eq!(
-        descendant_writes, 0,
-        "MoveFolder must touch 0 descendant rows"
-    );
+    let descendant_writes = observed_row_writes(store)
+        .await
+        .map_err(|err| MoveFailure::port("read_write_counter", None, None, err))?;
+    metrics.descendant_rows_modified = Some(descendant_writes);
+    if descendant_writes != 0 {
+        return Err(MoveFailure::new(
+            "verify_descendant_writes",
+            None,
+            None,
+            format!("observed {descendant_writes} descendant writes"),
+        ));
+    }
     // Even an UPDATE that leaves the stored values unchanged must increment the probe.
     store
         .execute_diagnostic_write_sql_for_test(&format!(
@@ -2148,18 +2396,19 @@ async fn run_folder_100k_move_benchmark(
          AND note_id = (SELECT MIN(note_id) FROM note_heads WHERE space_id = '{sid}')",
         ))
         .await
-        .unwrap();
-    assert_eq!(observed_row_writes(store).await, 1);
-
-    FolderMoveMetrics {
-        backend: backend_label,
-        seeded_descendant_folders: descendant_folders,
-        seeded_descendant_notes: descendant_notes,
-        total_seeded_descendants: descendant_folders + descendant_notes,
-        moves_executed: move_iters,
-        descendant_rows_modified: descendant_writes,
-        latency: compute_percentiles_from_ns(lat_ns),
+        .map_err(|err| MoveFailure::port("update_probe_row", None, None, err))?;
+    let probe = observed_row_writes(store)
+        .await
+        .map_err(|err| MoveFailure::port("read_probe_counter", None, None, err))?;
+    if probe != 1 {
+        return Err(MoveFailure::new(
+            "verify_probe_counter",
+            None,
+            None,
+            format!("observed {probe} writes after one descendant update"),
+        ));
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -2730,10 +2979,17 @@ async fn main() {
         let _ = fs::remove_dir_all(&b_dir);
     }
     for bp in &board_first_slot_profiles {
-        eprintln!(
-            "[D3]   -> {}: max_rank={}B, rebalances={}, p95={:.1} us",
-            bp.backend, bp.max_rank_bytes_observed, bp.pma_rebalance_events, bp.latency.p95_us
-        );
+        if let Some(failure) = &bp.failure {
+            eprintln!(
+                "[D3]   -> {} FAIL after {}/{} verified moves: {failure:?}",
+                bp.backend, bp.moves_executed, bp.moves_requested
+            );
+        } else if let Some(latency) = &bp.latency {
+            eprintln!(
+                "[D3]   -> {}: max_rank={}B, rebalances={}, p95={:.1} us",
+                bp.backend, bp.max_rank_bytes_observed, bp.pma_rebalance_events, latency.p95_us
+            );
+        }
     }
 
     eprintln!(
@@ -2799,10 +3055,17 @@ async fn main() {
         let _ = fs::remove_dir_all(&f_dir);
     }
     for fp in &folder_move_profiles {
-        eprintln!(
-            "[D3]   -> {}: descendant_writes={}, p95={:.1} us",
-            fp.backend, fp.descendant_rows_modified, fp.latency.p95_us
-        );
+        if let Some(failure) = &fp.failure {
+            eprintln!(
+                "[D3]   -> {} FAIL after {}/{} moves: {failure:?}",
+                fp.backend, fp.moves_executed, fp.moves_requested
+            );
+        } else if let (Some(latency), Some(writes)) = (&fp.latency, fp.descendant_rows_modified) {
+            eprintln!(
+                "[D3]   -> {}: descendant_writes={}, p95={:.1} us",
+                fp.backend, writes, latency.p95_us
+            );
+        }
     }
 
     let paired_backup_pause_profiles =
@@ -2819,6 +3082,12 @@ async fn main() {
         && chat_read_profiles
             .iter()
             .all(|c| c.latency.p95_us < 1_000.0)
+        && board_first_slot_profiles
+            .iter()
+            .all(|p| p.failure.is_none() && p.moves_executed == p.moves_requested)
+        && folder_move_profiles
+            .iter()
+            .all(|p| p.failure.is_none() && p.moves_executed == p.moves_requested)
         && paired_backup_pause_profiles
             .iter()
             .all(|p| p.confirmed_pause_latency.p95_us < 1_000.0);

@@ -436,16 +436,16 @@ impl CanonicalStore {
             byte_len,
         )?;
 
-        let space_rec = self.read_space(&ctx.scope().space_id).await?;
+        let space_rec = self
+            .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+            .await?;
         space_rec.scope.check(ctx.scope())?;
         authorize_chat_write_on_space(ctx.auth(), &space_rec.space)?;
 
         let prepared = PreparedBlobSource::prepare(raw.as_bytes(), self.blob_codec())?;
         let ticket = self
-            .stage_blob(&space_rec.scope, space_rec.active_epoch, &prepared)
+            .stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared)
             .await?;
-
-        self.flush_pending_local_dirs(&ticket.local_pending_dirs)?;
 
         let scope = space_rec.scope.clone();
         let staged_epoch = space_rec.active_epoch;
@@ -455,7 +455,9 @@ impl CanonicalStore {
         getrandom::fill(&mut lease)
             .map_err(|err| internal_not_committed("chat_staging_lease", err.to_string()))?;
         let resource_key = prepared.digest.to_hex();
-        let _retained_ticket = ticket.clone();
+        let retained_ticket = ticket.clone();
+        let publish_ticket = ticket.clone();
+        let publisher = self.clone();
 
         self.with_fenced_auxiliary_write_tx(|tx| {
             Box::pin(async move {
@@ -482,11 +484,16 @@ impl CanonicalStore {
                     },
                     live_space.last_seq,
                 )
-                .await
+                .await?;
+                let dirs = publisher
+                    .publish_deferred_local_tickets_async(std::slice::from_ref(&publish_ticket))
+                    .await?;
+                publisher.flush_pending_local_dirs_async(&dirs).await
             })
         })
         .await?;
 
+        drop(retained_ticket);
         Ok(attested.with_lease(lease))
     }
 }
@@ -1249,13 +1256,15 @@ async fn read_chat_impl(
                                  agent_run_id, inline_text, payload_blake3, referenced_notes_json,
                                  ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq, n
                              ) AS (
-                                 SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
+                                 SELECT entry_seq, parent_seq,
+                                        CASE WHEN checkpoint_stale <> 0 THEN 'redacted' ELSE kind END, tool_call_id, author_id,
                                         agent_run_id, inline_text, payload_blake3, referenced_notes_json,
                                         ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq, 1
                                  FROM chat_entries
                                  WHERE space_id = ? AND thread_id = ? AND entry_seq = ?
                                  UNION ALL
-                                 SELECT e.entry_seq, e.parent_seq, e.kind, e.tool_call_id, e.author_id,
+                                 SELECT e.entry_seq, e.parent_seq,
+                                        CASE WHEN e.checkpoint_stale <> 0 THEN 'redacted' ELSE e.kind END, e.tool_call_id, e.author_id,
                                         e.agent_run_id, e.inline_text, e.payload_blake3, e.referenced_notes_json,
                                         e.ext_space_tainted, e.is_chain_node, e.branch_depth, e.anc_16_seq, e.anc_256_seq, w.n + 1
                                  FROM win w
@@ -1307,20 +1316,22 @@ async fn read_chat_impl(
                                  agent_run_id, inline_text, payload_blake3, referenced_notes_json,
                                  ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq, n
                              ) AS (
-                                 SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
+                                 SELECT entry_seq, parent_seq,
+                                        CASE WHEN checkpoint_stale <> 0 THEN 'redacted' ELSE kind END, tool_call_id, author_id,
                                         agent_run_id, inline_text, payload_blake3, referenced_notes_json,
                                         ext_space_tainted::BIGINT, is_chain_node::BIGINT, branch_depth::BIGINT,
                                         anc_16_seq, anc_256_seq, 1::BIGINT
                                  FROM chat_entries
                                  WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3
                                  UNION ALL
-                                 SELECT e.entry_seq, e.parent_seq, e.kind, e.tool_call_id, e.author_id,
+                                 SELECT e.entry_seq, e.parent_seq,
+                                        CASE WHEN e.checkpoint_stale <> 0 THEN 'redacted' ELSE e.kind END, e.tool_call_id, e.author_id,
                                         e.agent_run_id, e.inline_text, e.payload_blake3, e.referenced_notes_json,
                                         e.ext_space_tainted::BIGINT, e.is_chain_node::BIGINT, e.branch_depth::BIGINT,
                                         e.anc_16_seq, e.anc_256_seq, w.n + 1
                                  FROM win w
                                  CROSS JOIN LATERAL (
-                                     SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
+                                     SELECT entry_seq, parent_seq, kind, checkpoint_stale, tool_call_id, author_id,
                                             agent_run_id, inline_text, payload_blake3, referenced_notes_json,
                                             ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq
                                      FROM chat_entries ce
@@ -1434,7 +1445,7 @@ async fn read_chat_impl(
                         })?),
                         None => None,
                     };
-                    let referenced_notes: Vec<NoteRef> = if refs_json == "[]" {
+                    let referenced_notes: Vec<NoteRef> = if kind == ChatEntryKind::Redacted || refs_json == "[]" {
                         Vec::new()
                     } else {
                         serde_json::from_str(&refs_json).map_err(|err| {
@@ -1525,7 +1536,9 @@ async fn read_chat_pg_single_query(
            ON ct.space_id = s.space_id AND ct.thread_id = $2
          LEFT JOIN LATERAL (
              SELECT
-                 ce.entry_seq, ce.parent_seq, ce.kind, ce.tool_call_id, ce.author_id,
+                 ce.entry_seq, ce.parent_seq,
+                 CASE WHEN ce.checkpoint_stale <> 0 THEN 'redacted' ELSE ce.kind END AS kind,
+                 ce.tool_call_id, ce.author_id,
                  ce.agent_run_id, ce.inline_text, ce.payload_blake3, ce.referenced_notes_json,
                  ce.ext_space_tainted, ce.is_chain_node, ce.branch_depth,
                  ce.anc_16_seq, ce.anc_256_seq,
@@ -1656,98 +1669,100 @@ async fn read_chat_pg_single_query(
         tainted: thread_tainted,
     };
 
-    let decode_entry_row =
-        |r: &sqlx::postgres::PgRow, base_col: usize| -> Result<ChatEntry, PortError> {
-            let e_seq_raw: i64 = r.get::<i64, usize>(base_col);
-            let p_seq_opt: Option<i64> = r.get::<Option<i64>, usize>(base_col + 1);
-            let k_str: &str = r.get::<&str, usize>(base_col + 2);
-            let tc_opt: Option<&str> = r.get::<Option<&str>, usize>(base_col + 3);
-            let author_str: &str = r.get::<&str, usize>(base_col + 4);
-            let run_opt: Option<&str> = r.get::<Option<&str>, usize>(base_col + 5);
-            let inline_opt: Option<&str> = r.get::<Option<&str>, usize>(base_col + 6);
-            let blob_opt: Option<&[u8]> = r.get::<Option<&[u8]>, usize>(base_col + 7);
-            let refs_json: &str = r.get::<&str, usize>(base_col + 8);
-            let taint_raw: i32 = r.get::<i32, usize>(base_col + 9);
-            let chain_raw: i32 = r.get::<i32, usize>(base_col + 10);
-            let depth_raw: i32 = r.get::<i32, usize>(base_col + 11);
-            let a16_opt: Option<i64> = r.get::<Option<i64>, usize>(base_col + 12);
-            let a256_opt: Option<i64> = r.get::<Option<i64>, usize>(base_col + 13);
+    let decode_entry_row = |r: &sqlx::postgres::PgRow,
+                            base_col: usize|
+     -> Result<ChatEntry, PortError> {
+        let e_seq_raw: i64 = r.get::<i64, usize>(base_col);
+        let p_seq_opt: Option<i64> = r.get::<Option<i64>, usize>(base_col + 1);
+        let k_str: &str = r.get::<&str, usize>(base_col + 2);
+        let tc_opt: Option<&str> = r.get::<Option<&str>, usize>(base_col + 3);
+        let author_str: &str = r.get::<&str, usize>(base_col + 4);
+        let run_opt: Option<&str> = r.get::<Option<&str>, usize>(base_col + 5);
+        let inline_opt: Option<&str> = r.get::<Option<&str>, usize>(base_col + 6);
+        let blob_opt: Option<&[u8]> = r.get::<Option<&[u8]>, usize>(base_col + 7);
+        let refs_json: &str = r.get::<&str, usize>(base_col + 8);
+        let taint_raw: i32 = r.get::<i32, usize>(base_col + 9);
+        let chain_raw: i32 = r.get::<i32, usize>(base_col + 10);
+        let depth_raw: i32 = r.get::<i32, usize>(base_col + 11);
+        let a16_opt: Option<i64> = r.get::<Option<i64>, usize>(base_col + 12);
+        let a256_opt: Option<i64> = r.get::<Option<i64>, usize>(base_col + 13);
 
-            let seq =
-                ThreadEntrySeq::new(u64::try_from(e_seq_raw).map_err(|_| {
-                    internal_not_committed("corrupt_entry_seq", "negative entry_seq")
-                })?)?;
-            let parent = match p_seq_opt {
-                Some(p) => Some(ThreadEntrySeq::new(u64::try_from(p).map_err(|_| {
-                    internal_not_committed("corrupt_parent_seq", "negative parent_seq")
-                })?)?),
-                None => None,
-            };
-            let anc_16 = match a16_opt {
-                Some(a) => Some(ThreadEntrySeq::new(u64::try_from(a).map_err(|_| {
-                    internal_not_committed("corrupt_a16", "negative anc_16_seq")
-                })?)?),
-                None => None,
-            };
-            let anc_256 = match a256_opt {
-                Some(a) => Some(ThreadEntrySeq::new(u64::try_from(a).map_err(|_| {
-                    internal_not_committed("corrupt_a256", "negative anc_256_seq")
-                })?)?),
-                None => None,
-            };
-            let kind = entry_kind_from_db(k_str, tc_opt.map(str::to_owned))?;
-            let body = if kind == ChatEntryKind::Redacted {
-                ChatBody::Redacted
-            } else if let Some(txt) = inline_opt {
-                ChatBody::Inline(txt.to_owned())
-            } else if let Some(b) = blob_opt {
-                let arr: [u8; 32] = b
-                    .try_into()
-                    .map_err(|_| internal_not_committed("corrupt_chat_blob", "digest != 32B"))?;
-                ChatBody::Blob(ContentDigest::from_bytes(arr))
-            } else {
-                return Err(internal_not_committed(
-                    "corrupt_chat_body",
-                    "entry lacks inline_text and payload_blake3",
-                ));
-            };
-            let author = PrincipalId::parse(author_str).map_err(|_| {
-                internal_not_committed("corrupt_chat_author", "invalid PrincipalId")
-            })?;
-            let run = match run_opt {
+        let seq = ThreadEntrySeq::new(
+            u64::try_from(e_seq_raw)
+                .map_err(|_| internal_not_committed("corrupt_entry_seq", "negative entry_seq"))?,
+        )?;
+        let parent = match p_seq_opt {
+            Some(p) => Some(ThreadEntrySeq::new(u64::try_from(p).map_err(|_| {
+                internal_not_committed("corrupt_parent_seq", "negative parent_seq")
+            })?)?),
+            None => None,
+        };
+        let anc_16 = match a16_opt {
+            Some(a) => Some(ThreadEntrySeq::new(u64::try_from(a).map_err(|_| {
+                internal_not_committed("corrupt_a16", "negative anc_16_seq")
+            })?)?),
+            None => None,
+        };
+        let anc_256 = match a256_opt {
+            Some(a) => Some(ThreadEntrySeq::new(u64::try_from(a).map_err(|_| {
+                internal_not_committed("corrupt_a256", "negative anc_256_seq")
+            })?)?),
+            None => None,
+        };
+        let kind = entry_kind_from_db(k_str, tc_opt.map(str::to_owned))?;
+        let body = if kind == ChatEntryKind::Redacted {
+            ChatBody::Redacted
+        } else if let Some(txt) = inline_opt {
+            ChatBody::Inline(txt.to_owned())
+        } else if let Some(b) = blob_opt {
+            let arr: [u8; 32] = b
+                .try_into()
+                .map_err(|_| internal_not_committed("corrupt_chat_blob", "digest != 32B"))?;
+            ChatBody::Blob(ContentDigest::from_bytes(arr))
+        } else {
+            return Err(internal_not_committed(
+                "corrupt_chat_body",
+                "entry lacks inline_text and payload_blake3",
+            ));
+        };
+        let author = PrincipalId::parse(author_str)
+            .map_err(|_| internal_not_committed("corrupt_chat_author", "invalid PrincipalId"))?;
+        let run =
+            match run_opt {
                 Some(s) => Some(AgentRunId::parse(s).map_err(|_| {
                     internal_not_committed("corrupt_chat_run", "invalid AgentRunId")
                 })?),
                 None => None,
             };
-            let referenced_notes: Vec<NoteRef> = if refs_json == "[]" {
-                Vec::new()
-            } else {
-                serde_json::from_str(refs_json)
-                    .map_err(|err| internal_not_committed("corrupt_chat_refs", err.to_string()))?
-            };
-            let depth = u32::try_from(depth_raw)
-                .map_err(|_| internal_not_committed("corrupt_chat_depth", "invalid depth"))?;
-            let entry_taint = taint_raw != 0;
-            if entry_taint {
-                auth.authorize_chat_read(&space, thread_out.project_folder.as_ref(), true)?;
-            }
-
-            Ok(ChatEntry {
-                thread: request.thread.clone(),
-                seq,
-                parent,
-                is_chain_node: chain_raw != 0,
-                depth,
-                ancestors: build_ancestors_vec(anc_16, anc_256),
-                author,
-                run,
-                kind,
-                body,
-                tainted: entry_taint,
-                referenced_notes,
-            })
+        let referenced_notes: Vec<NoteRef> = if kind == ChatEntryKind::Redacted || refs_json == "[]"
+        {
+            Vec::new()
+        } else {
+            serde_json::from_str(refs_json)
+                .map_err(|err| internal_not_committed("corrupt_chat_refs", err.to_string()))?
         };
+        let depth = u32::try_from(depth_raw)
+            .map_err(|_| internal_not_committed("corrupt_chat_depth", "invalid depth"))?;
+        let entry_taint = taint_raw != 0;
+        if entry_taint {
+            auth.authorize_chat_read(&space, thread_out.project_folder.as_ref(), true)?;
+        }
+
+        Ok(ChatEntry {
+            thread: request.thread.clone(),
+            seq,
+            parent,
+            is_chain_node: chain_raw != 0,
+            depth,
+            ancestors: build_ancestors_vec(anc_16, anc_256),
+            author,
+            run,
+            kind,
+            body,
+            tainted: entry_taint,
+            referenced_notes,
+        })
+    };
 
     let mut entries = Vec::with_capacity(max_n.min(rows.len()));
     let mut want_i64: Option<i64> = Some(tip_i64);
@@ -1990,13 +2005,15 @@ fn read_chat_rusqlite(
                  agent_run_id, inline_text, payload_blake3, referenced_notes_json,
                  ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq, n
              ) AS (
-                 SELECT entry_seq, parent_seq, kind, tool_call_id, author_id,
+                 SELECT entry_seq, parent_seq,
+                        CASE WHEN checkpoint_stale <> 0 THEN 'redacted' ELSE kind END, tool_call_id, author_id,
                         agent_run_id, inline_text, payload_blake3, referenced_notes_json,
                         ext_space_tainted, is_chain_node, branch_depth, anc_16_seq, anc_256_seq, 1
                  FROM chat_entries
                  WHERE space_id = ?1 AND thread_id = ?2 AND entry_seq = ?3
                  UNION ALL
-                 SELECT e.entry_seq, e.parent_seq, e.kind, e.tool_call_id, e.author_id,
+                 SELECT e.entry_seq, e.parent_seq,
+                        CASE WHEN e.checkpoint_stale <> 0 THEN 'redacted' ELSE e.kind END, e.tool_call_id, e.author_id,
                         e.agent_run_id, e.inline_text, e.payload_blake3, e.referenced_notes_json,
                         e.ext_space_tainted, e.is_chain_node, e.branch_depth, e.anc_16_seq, e.anc_256_seq, w.n + 1
                  FROM win w
@@ -2110,7 +2127,8 @@ fn read_chat_rusqlite(
                 })?),
                 None => None,
             };
-        let referenced_notes: Vec<NoteRef> = if refs_json == "[]" {
+        let referenced_notes: Vec<NoteRef> = if kind == ChatEntryKind::Redacted || refs_json == "[]"
+        {
             Vec::new()
         } else {
             serde_json::from_str(&refs_json)
@@ -2164,7 +2182,9 @@ async fn create_chat_impl(
         return Err(DomainError::validation(ValidationReason::InvalidRange).into());
     }
 
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let mut fp = blake3::Hasher::new();
@@ -2385,7 +2405,9 @@ async fn fork_chat_impl(
     request: Mutation<ForkChat>,
 ) -> Result<Committed<ChatThread>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let fp = format!(
@@ -2619,7 +2641,9 @@ async fn append_chat_impl(
         }
     }
 
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let mut fp = blake3::Hasher::new();
@@ -2672,6 +2696,26 @@ async fn append_chat_impl(
     )
     .await?
     {
+        // Older receipts can retain a compaction detail whose checkpoint was
+        // already invalidated. Resolve its current visibility before returning it.
+        if matches!(replayed.value.kind, StoredChatEntryKindV1::Compaction) {
+            let branch = store
+                .read_chat(
+                    ctx.clone(),
+                    ChatRead {
+                        thread: replayed.value.thread.clone(),
+                        leaf: replayed.value.seq,
+                        before: None,
+                        max_entries: notarium_core::ports::PageLimit::new(1)?,
+                    },
+                )
+                .await?;
+            if !branch.entries.first().is_some_and(|entry| {
+                entry.seq == replayed.value.seq && entry.kind == ChatEntryKind::Compaction
+            }) {
+                replayed = replayed.sanitized_for_redaction();
+            }
+        }
         replayed.value.tainted |= legacy_staged;
         return Ok(replayed.into_committed());
     }
@@ -3162,15 +3206,18 @@ async fn check_queue_admission_tx(
 
 async fn queue_chat_input_impl(
     store: &CanonicalStore,
-    ctx: SpaceContext,
+    mut ctx: SpaceContext,
     request: Mutation<PendingChatInput>,
 ) -> Result<QueueInputOutcome, PortError> {
+    let deadline = tokio::time::Instant::now() + ctx.budget.remaining;
     validate_mutation_identity(&ctx, &request.identity)?;
     if request.input.sender != *ctx.auth().principal() {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
 
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let mut fp = blake3::Hasher::new();
@@ -3235,18 +3282,18 @@ async fn queue_chat_input_impl(
     let staged_opt = if (request.input.body.len() as u64) > StagedChatBlob::INLINE_MAX_BYTES {
         let prepared =
             PreparedBlobSource::prepare(request.input.body.as_bytes(), store.blob_codec())?;
-        let ticket = store
-            .stage_queue_body(&space_rec.scope, space_rec.active_epoch, &prepared)
-            .await?;
+        let ticket = tokio::select! {
+            biased;
+            () = ctx.budget.cancellation.cancelled() => return Err(crate::codec::cancelled_not_committed("queue_upload_cancelled", "queue upload cancelled before writer admission")),
+            () = tokio::time::sleep_until(deadline) => return Err(crate::codec::deadline_not_committed("queue_upload_deadline", "queue upload deadline before writer admission")),
+            result = store.stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared) => result?,
+        };
         Some((prepared.digest, ticket))
     } else {
         None
     };
 
-    let discard_id = staged_opt
-        .as_ref()
-        .and_then(|(_, ticket)| ticket.queue_discard_id())
-        .map(str::to_owned);
+    let discard = staged_opt.as_ref().and_then(|(_, ticket)| ticket.discard());
     let queue_full_flag = Arc::new(AtomicBool::new(false));
     let flag_cl = Arc::clone(&queue_full_flag);
     let scope = space_rec.scope.clone();
@@ -3431,12 +3478,13 @@ async fn queue_chat_input_impl(
         }),
     };
 
+    ctx.budget.remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     let result = store
         .submit_write_command::<StoredCommittedQueuedInputV1>(&ctx.budget, intent)
         .await;
-    if let Some(publication) = discard_id {
-        // A pending writer may still commit after an ambiguous response. Its durable
-        // discard intent is recovered on takeover if it does not acquire this publication.
+    if let Some(discard) = discard {
+        // A pending writer may still commit after an ambiguous response. Its ticket
+        // retains cleanup ownership until the writer resolves its transaction.
         let definitive = match &result {
             Ok(_) | Err(PortError::Domain(_)) => true,
             Err(
@@ -3447,9 +3495,7 @@ async fn queue_chat_input_impl(
             ) => f.effect() == notarium_core::error::CommitEffect::NotCommitted,
         };
         if definitive {
-            let cleanup = store
-                .discard_queue_publication(&space_rec.scope, active_epoch, &publication)
-                .await;
+            let cleanup = discard.finish().await;
             // The accepted receipt is already durable. A failed cleanup of an unused
             // private upload stays recorded for recovery.
             if result.is_err() {
@@ -3477,7 +3523,9 @@ async fn consume_chat_input_impl(
     request: Mutation<ConsumePending>,
 ) -> Result<Committed<ConsumedPending>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let fp = format!(
@@ -3521,6 +3569,7 @@ async fn consume_chat_input_impl(
                 authorize_chat_write_on_space(&auth, &live_space.space)?;
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
+                authorize_thread_mutation(&auth, &live_space.space, &th, false)?;
                 if let Some(expected_rev) = &preconditions.revision
                     && *expected_rev != th.head_rev_id
                 {
@@ -3987,7 +4036,9 @@ async fn redact_chat_entry_impl(
     request: Mutation<RedactChatEntry>,
 ) -> Result<Committed<RedactedChat>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let fp = format!(
@@ -4145,7 +4196,7 @@ async fn redact_chat_entry_impl(
 
                 // Release CAS reference owned by this chat entry!
                 let entry_owner = format!("{}:{}", input.thread.as_str(), input.entry.get());
-                let zero_ref_digests = release_owner_blob_refs_tx(
+                let mut zero_ref_digests = release_owner_blob_refs_tx(
                     tx,
                     &scope.space_id,
                     BlobOwnerKind::ChatEntry,
@@ -4173,9 +4224,11 @@ async fn redact_chat_entry_impl(
                 // Mark ONLY true descendant `compaction` checkpoints stale along `parent_seq` (sibling forks untouched)!
                 let invalidated_contexts = mark_descendant_compactions_stale_tx(
                     tx,
-                    &scope.space_id,
+                    &scope,
                     &input.thread,
                     entry_i64,
+                    seq_i64,
+                    &mut zero_ref_digests,
                 )
                 .await?;
 
@@ -4408,11 +4461,11 @@ async fn find_nearest_non_redacted_ancestor_tx(
     let found_opt: Option<i64> = match tx {
         BackendConn::Sqlite(conn) => sqlx::query_scalar(
             "WITH RECURSIVE anc(entry_seq, parent_seq, kind, hops) AS (
-                 SELECT entry_seq, parent_seq, kind, 0
+                 SELECT entry_seq, parent_seq, CASE WHEN checkpoint_stale <> 0 THEN 'redacted' ELSE kind END, 0
                  FROM chat_entries
                  WHERE space_id = ? AND thread_id = ? AND entry_seq = ?
                  UNION ALL
-                 SELECT e.entry_seq, e.parent_seq, e.kind, a.hops + 1
+                 SELECT e.entry_seq, e.parent_seq, CASE WHEN e.checkpoint_stale <> 0 THEN 'redacted' ELSE e.kind END, a.hops + 1
                  FROM anc a
                  JOIN chat_entries e
                    ON e.space_id = ? AND e.thread_id = ? AND e.entry_seq = a.parent_seq
@@ -4430,11 +4483,11 @@ async fn find_nearest_non_redacted_ancestor_tx(
         .map_err(|err| internal_not_committed("sqlite_nearest_non_redacted", err.to_string()))?,
         BackendConn::Postgres(conn) => sqlx::query_scalar(
             "WITH RECURSIVE anc(entry_seq, parent_seq, kind, hops) AS (
-                 SELECT entry_seq, parent_seq, kind, 0::BIGINT
+                 SELECT entry_seq, parent_seq, CASE WHEN checkpoint_stale <> 0 THEN 'redacted' ELSE kind END, 0::BIGINT
                  FROM chat_entries
                  WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3
                  UNION ALL
-                 SELECT e.entry_seq, e.parent_seq, e.kind, a.hops + 1
+                 SELECT e.entry_seq, e.parent_seq, CASE WHEN e.checkpoint_stale <> 0 THEN 'redacted' ELSE e.kind END, a.hops + 1
                  FROM anc a
                  JOIN chat_entries e
                    ON e.space_id = $1 AND e.thread_id = $2 AND e.entry_seq = a.parent_seq
@@ -4460,10 +4513,13 @@ async fn find_nearest_non_redacted_ancestor_tx(
 
 async fn mark_descendant_compactions_stale_tx(
     tx: &mut BackendConn<'_>,
-    space_id: &SpaceId,
+    scope: &HistoryScope,
     thread_id: &ChatThreadId,
     target_entry_seq: i64,
+    redaction_seq: i64,
+    zero_refs: &mut Vec<ContentDigest>,
 ) -> Result<Vec<ThreadEntrySeq>, PortError> {
+    let space_id = &scope.space_id;
     let raw_seqs: Vec<i64> = match tx {
         BackendConn::Sqlite(conn) => sqlx::query_scalar(
             "WITH RECURSIVE desc_tree(entry_seq, kind) AS (
@@ -4509,36 +4565,45 @@ async fn mark_descendant_compactions_stale_tx(
 
     let mut out = Vec::with_capacity(raw_seqs.len());
     for raw in raw_seqs {
-        match tx {
+        let created_at: i64 = match tx {
             BackendConn::Sqlite(conn) => {
-                sqlx::query(
-                    "UPDATE chat_entries SET checkpoint_stale = 1
-                     WHERE space_id = ? AND thread_id = ? AND entry_seq = ?",
+                sqlx::query_scalar(
+                    "UPDATE chat_entries SET checkpoint_stale = 1, kind='redacted', inline_text=NULL,
+                            payload_blake3=NULL, referenced_notes_json='[]', redacted_at_seq=?4
+                     WHERE space_id = ?1 AND thread_id = ?2 AND entry_seq = ?3 RETURNING created_space_seq",
                 )
                 .bind(space_id.as_str())
                 .bind(thread_id.as_str())
                 .bind(raw)
-                .execute(&mut **conn)
+                .bind(redaction_seq)
+                .fetch_one(&mut **conn)
                 .await
                 .map_err(|err| {
                     internal_not_committed("sqlite_mark_compaction_stale", err.to_string())
-                })?;
+                })?
             }
             BackendConn::Postgres(conn) => {
-                sqlx::query(
-                    "UPDATE chat_entries SET checkpoint_stale = 1
-                     WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3",
+                sqlx::query_scalar(
+                    "UPDATE chat_entries SET checkpoint_stale = 1, kind='redacted', inline_text=NULL,
+                            payload_blake3=NULL, referenced_notes_json='[]', redacted_at_seq=$4
+                     WHERE space_id = $1 AND thread_id = $2 AND entry_seq = $3 RETURNING created_space_seq",
                 )
                 .bind(space_id.as_str())
                 .bind(thread_id.as_str())
                 .bind(raw)
-                .execute(&mut **conn)
+                .bind(redaction_seq)
+                .fetch_one(&mut **conn)
                 .await
                 .map_err(|err| {
                     internal_not_committed("pg_mark_compaction_stale", err.to_string())
-                })?;
+                })?
             }
-        }
+        };
+        let owner = format!("{}:{raw}", thread_id.as_str());
+        zero_refs.extend(
+            release_owner_blob_refs_tx(tx, space_id, BlobOwnerKind::ChatEntry, &owner).await?,
+        );
+        sanitize_chat_entry_receipt_tx(tx, scope, created_at).await?;
         out.push(ThreadEntrySeq::new(u64::try_from(raw).map_err(|_| {
             internal_not_committed("corrupt_compaction_seq", "negative entry_seq")
         })?)?);

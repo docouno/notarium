@@ -41,6 +41,59 @@ pub enum AbilityKind {
     Skill,
 }
 
+#[derive(Clone)]
+struct DocumentFacts {
+    recorded: ResourceFacts,
+    current: Option<Box<ResourceFacts>>,
+}
+impl DocumentFacts {
+    fn new(recorded: ResourceFacts) -> Self {
+        Self {
+            recorded,
+            current: None,
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &ResourceFacts> {
+        std::iter::once(&self.recorded).chain(self.current.as_deref())
+    }
+
+    fn in_project(&self, project: &crate::model::FolderRef) -> bool {
+        self.recorded.space.id == project.space_id
+            && self
+                .iter()
+                .all(|facts| facts.ancestor_folders.contains(&project.folder_id))
+    }
+
+    fn authorize(&self, auth: &EngineAuthContext) -> DomainResult<()> {
+        if let Some(current) = self.current.as_deref() {
+            auth.can_view_resource(current)?;
+        }
+        auth.authorize_read(&self.recorded)
+    }
+
+    fn allow_egress(&self, lifecycle: Lifecycle, auth: &EngineAuthContext) -> DomainResult<()> {
+        if self
+            .iter()
+            .any(|facts| facts.class == DocClass::EncryptedNote)
+        {
+            return Err(DomainError::validation(
+                ValidationReason::ClassEgressForbidden,
+            ));
+        }
+        if lifecycle != Lifecycle::Active {
+            return Err(DomainError::ResourceNotFound);
+        }
+        self.authorize(auth)
+    }
+
+    fn allow_provider(&self, policy: &ProviderPolicy) -> DomainResult<()> {
+        self.iter().try_for_each(|facts| {
+            ClassEgressFence::provider_policy(&facts.space, facts.class, policy)
+        })
+    }
+}
+
 /// Canonical metadata can be admitted without loading a document's carrier.
 /// The owning adapter attests provenance and current resource facts.
 /// ```compile_fail
@@ -51,7 +104,7 @@ pub enum AbilityKind {
 pub struct ClassifiedMetadata {
     reference: NoteRef,
     revision: RevisionId,
-    facts: ResourceFacts,
+    facts: DocumentFacts,
     lifecycle: Lifecycle,
     digest: ContentDigest,
 }
@@ -60,7 +113,7 @@ impl fmt::Debug for ClassifiedMetadata {
         f.debug_struct("ClassifiedMetadata")
             .field("reference", &self.reference)
             .field("revision", &self.revision)
-            .field("class", &self.facts.class)
+            .field("class", &self.facts.recorded.class)
             .finish_non_exhaustive()
     }
 }
@@ -78,7 +131,7 @@ impl ClassifiedMetadata {
         Ok(Self {
             reference,
             revision,
-            facts,
+            facts: DocumentFacts::new(facts),
             lifecycle,
             digest,
         })
@@ -90,7 +143,7 @@ impl ClassifiedMetadata {
         &self.revision
     }
     pub fn class(&self) -> DocClass {
-        self.facts.class
+        self.facts.recorded.class
     }
     pub fn lifecycle(&self) -> Lifecycle {
         self.lifecycle
@@ -99,7 +152,7 @@ impl ClassifiedMetadata {
         self.digest
     }
     pub fn listing(&self, auth: &EngineAuthContext) -> DomainResult<ListedDocument> {
-        auth.authorize_read(&self.facts)?;
+        self.facts.authorize(auth)?;
         if self.lifecycle == Lifecycle::Purged {
             return Err(DomainError::ResourceNotFound);
         }
@@ -130,7 +183,7 @@ impl SearchMetadata {
 pub struct ClassifiedDocument {
     reference: NoteRef,
     revision: RevisionId,
-    facts: ResourceFacts,
+    facts: DocumentFacts,
     lifecycle: Lifecycle,
     content: String,
     digest: ContentDigest,
@@ -140,7 +193,7 @@ impl fmt::Debug for ClassifiedDocument {
         f.debug_struct("ClassifiedDocument")
             .field("reference", &self.reference)
             .field("revision", &self.revision)
-            .field("class", &self.facts.class)
+            .field("class", &self.facts.recorded.class)
             .finish_non_exhaustive()
     }
 }
@@ -159,11 +212,22 @@ impl ClassifiedDocument {
         Ok(Self {
             reference,
             revision,
-            facts,
+            facts: DocumentFacts::new(facts),
             lifecycle,
             content,
             digest,
         })
+    }
+    /// Bind current canonical placement and class to a historical document.
+    /// This additional restriction follows the carrier and any derived metadata.
+    pub fn bind_current_facts(&mut self, current: ResourceFacts) -> DomainResult<()> {
+        if current.space.id != self.reference.space_id || self.facts.current.is_some() {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
+        if self.facts.recorded != current {
+            self.facts.current = Some(Box::new(current));
+        }
+        Ok(())
     }
     pub fn reference(&self) -> &NoteRef {
         &self.reference
@@ -172,7 +236,7 @@ impl ClassifiedDocument {
         &self.revision
     }
     pub fn class(&self) -> DocClass {
-        self.facts.class
+        self.facts.recorded.class
     }
     pub fn lifecycle(&self) -> Lifecycle {
         self.lifecycle
@@ -193,7 +257,7 @@ impl ClassifiedDocument {
         self.digest
     }
     pub fn explicit_read<'a>(&'a self, auth: &EngineAuthContext) -> DomainResult<&'a str> {
-        auth.authorize_read(&self.facts)?;
+        self.facts.authorize(auth)?;
         if self.lifecycle == Lifecycle::Purged {
             return Err(DomainError::ResourceNotFound);
         }
@@ -555,7 +619,7 @@ impl ProviderCurrentContent {
     }
     pub fn space(&self) -> &Space {
         match self {
-            Self::Note(value) => &value.facts.space,
+            Self::Note(value) => &value.facts.recorded.space,
             Self::Ability { facts, .. } => &facts.space,
             Self::Chat { space, .. } => space,
         }
@@ -566,7 +630,7 @@ impl ProviderCurrentContent {
             return false;
         }
         match self {
-            Self::Note(value) => value.facts.ancestor_folders.contains(&project.folder_id),
+            Self::Note(value) => value.facts.in_project(project),
             Self::Ability { facts, .. } => facts.ancestor_folders.contains(&project.folder_id),
             Self::Chat {
                 project: current, ..
@@ -575,6 +639,23 @@ impl ProviderCurrentContent {
     }
 }
 impl ProviderMessage {
+    /// Scope of the content as admitted, retained until dispatch even if a note moves.
+    pub fn in_project(&self, project: &crate::model::FolderRef) -> bool {
+        match self {
+            Self::Document(value) => value.provenance().facts.in_project(project),
+            Self::Part(value) => value.provenance().facts.in_project(project),
+            Self::Ability(value) => {
+                let facts = &value.resource.facts;
+                facts.space.id == project.space_id
+                    && facts.ancestor_folders.contains(&project.folder_id)
+            }
+            Self::Chat(value) => {
+                value.entry.space.id == project.space_id
+                    && value.entry.project.as_ref() == Some(&project.folder_id)
+            }
+        }
+    }
+
     pub fn origin(&self) -> ProviderOrigin {
         match self {
             Self::Document(value) => {
@@ -642,12 +723,11 @@ impl ClassEgressFence {
             return Err(DomainError::validation(ValidationReason::SourceMismatch));
         }
         match (message, current) {
-            (
-                ProviderMessage::Document(_) | ProviderMessage::Part(_),
-                ProviderCurrentContent::Note(value),
-            ) => {
-                Self::check_metadata(&value.facts, value.lifecycle, auth)?;
-                Self::provider_policy(&value.facts.space, value.facts.class, policy)
+            (ProviderMessage::Document(original), ProviderCurrentContent::Note(value)) => {
+                Self::revalidate_note(original.provenance(), value, auth, policy)
+            }
+            (ProviderMessage::Part(original), ProviderCurrentContent::Note(value)) => {
+                Self::revalidate_note(original.provenance(), value, auth, policy)
             }
             (
                 ProviderMessage::Ability(_),
@@ -691,6 +771,18 @@ impl ClassEgressFence {
             _ => Err(DomainError::validation(ValidationReason::SourceMismatch)),
         }
     }
+    fn revalidate_note(
+        original: &ClassifiedDocument,
+        current: &ClassifiedMetadata,
+        auth: &EngineAuthContext,
+        policy: &ProviderPolicy,
+    ) -> DomainResult<()> {
+        Self::check(original, auth)?;
+        original.facts.allow_provider(policy)?;
+        current.facts.allow_egress(current.lifecycle, auth)?;
+        current.facts.allow_provider(policy)
+    }
+
     pub fn search_part(part: ContentPart, auth: &EngineAuthContext) -> DomainResult<SearchPart> {
         Self::check(part.provenance(), auth)?;
         Ok(SearchPart(part))
@@ -701,7 +793,7 @@ impl ClassEgressFence {
         policy: &ProviderPolicy,
     ) -> DomainResult<ProviderPart> {
         Self::check(part.provenance(), auth)?;
-        Self::provider_policy(&part.document.facts.space, part.document.class(), policy)?;
+        part.document.facts.allow_provider(policy)?;
         Ok(ProviderPart {
             part,
             provider: policy.provider.clone(),
@@ -772,7 +864,7 @@ impl ClassEgressFence {
         Ok(())
     }
     fn check(document: &ClassifiedDocument, auth: &EngineAuthContext) -> DomainResult<()> {
-        Self::check_metadata(&document.facts, document.lifecycle, auth)
+        document.facts.allow_egress(document.lifecycle, auth)
     }
     fn check_metadata(
         facts: &ResourceFacts,
@@ -793,7 +885,7 @@ impl ClassEgressFence {
         document: ClassifiedMetadata,
         auth: &EngineAuthContext,
     ) -> DomainResult<SearchMetadata> {
-        Self::check_metadata(&document.facts, document.lifecycle, auth)?;
+        document.facts.allow_egress(document.lifecycle, auth)?;
         Ok(SearchMetadata(document))
     }
     pub fn projection(
@@ -816,7 +908,7 @@ impl ClassEgressFence {
         policy: &ProviderPolicy,
     ) -> DomainResult<ProviderContent> {
         Self::check(&document, auth)?;
-        Self::provider_policy(&document.facts.space, document.class(), policy)?;
+        document.facts.allow_provider(policy)?;
         Ok(ProviderContent {
             document,
             provider: policy.provider.clone(),

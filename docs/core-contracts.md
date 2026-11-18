@@ -46,6 +46,9 @@ cannot add exceptions outside their parent's project authority.
 
 Canonical owners create classified documents. `ClassEgressFence` creates private
 projection/search/provider wrappers only after read, lifecycle and class checks.
+When a note moves between the captured revision and the current read, the
+document retains both sets of resource facts. A second reader must be able to
+read both locations. Metadata and derived content inherit this restriction.
 Encrypted documents have no secondary egress. Provider wrappers also bind the
 selected provider and consent audience. Completion messages distinguish document
 content from committed chat entries; chat has its own provenance and taint check.
@@ -230,6 +233,9 @@ different commands.
 `Applied(receipt)` requires one canonical commit of the complete field/rank
 change. A rank conflict must not publish a partial field or CRDT update. The
 room owner performs the commit; the outer writer does not commit it again.
+The caller receives the result recorded for that receipt, even if another write
+has already advanced the head. A text settlement without a client command key
+must match the actor, note, parent revision and resulting content at that receipt.
 Closed-room writes consume a reservation under a commit fence, avoiding the
 race between checking whether a room is open and writing directly.
 

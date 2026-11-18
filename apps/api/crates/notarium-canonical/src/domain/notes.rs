@@ -106,13 +106,22 @@ pub(crate) async fn changed_revision_fields_tx(
     previous_rev: &RevisionId,
     current: &EvaluatedFields,
 ) -> Result<EvaluatedFields, PortError> {
-    let bytes: Vec<u8> = match tx {
+    let bytes = load_revision_metadata_tx(tx, scope, previous_rev).await?;
+    Ok(changed_note_fields(&revision_fields(&bytes)?, current))
+}
+
+async fn load_revision_metadata_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &notarium_core::model::HistoryScope,
+    revision: &RevisionId,
+) -> Result<Vec<u8>, PortError> {
+    match tx {
         BackendConn::Sqlite(conn) => {
             sqlx::query_scalar(
                 "SELECT metadata_msgpack FROM revisions WHERE space_id = ? AND rev_id = ?",
             )
             .bind(scope.space_id.as_str())
-            .bind(previous_rev.as_str())
+            .bind(revision.as_str())
             .fetch_one(&mut **conn)
             .await
         }
@@ -121,13 +130,12 @@ pub(crate) async fn changed_revision_fields_tx(
                 "SELECT metadata_msgpack FROM revisions WHERE space_id = $1 AND rev_id = $2",
             )
             .bind(scope.space_id.as_str())
-            .bind(previous_rev.as_str())
+            .bind(revision.as_str())
             .fetch_one(&mut **conn)
             .await
         }
     }
-    .map_err(|e| internal_not_committed("read_note_effect_base", e.to_string()))?;
-    Ok(changed_note_fields(&revision_fields(&bytes)?, current))
+    .map_err(|e| internal_not_committed("read_revision_metadata", e.to_string()))
 }
 
 pub(crate) fn analyze_and_prepare_carrier(
@@ -140,7 +148,7 @@ pub(crate) fn analyze_and_prepare_carrier(
     analyze_and_prepare_carrier_opt_preparsed(carrier, class, note_id, slug, codec, None)
 }
 
-fn analyze_and_prepare_carrier_opt_preparsed(
+pub(crate) fn analyze_and_prepare_carrier_opt_preparsed(
     carrier: &str,
     class: DocClass,
     _note_id: &NoteId,
@@ -334,6 +342,57 @@ fn hash_preconditions(hash: &mut blake3::Hasher, preconditions: &Preconditions) 
     }
 }
 
+async fn authorize_create_placement(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    parent: Option<notarium_core::ids::FolderId>,
+    class: DocClass,
+) -> Result<crate::SpaceRecord, PortError> {
+    let scope = ctx.scope().clone();
+    let auth = ctx.auth().clone();
+    if let crate::runtime::SqlDriverState::Sqlite { fast_read_pool, .. } = &store.inner.sql {
+        store.ensure_open()?;
+        let wal = store.inner.wal_coord.get().ok_or_else(|| {
+            internal_not_committed("sqlite_wal_coord_missing", "missing WAL coordinator")
+        })?;
+        return fast_read_pool
+            .with_read_conn(wal, Some(&ctx.budget), move |conn| {
+                let space = crate::sqlite_fast::load_space_record_rusqlite(conn, &scope.space_id)?;
+                space.scope.check(&scope)?;
+                let (facts, _) = crate::sqlite_fast::build_resource_facts_rusqlite(
+                    conn,
+                    &space.space,
+                    parent.as_ref().unwrap_or(&space.root_folder_id),
+                    class,
+                    None,
+                    true,
+                )?;
+                auth.authorize_direct_write(&facts, &facts)?;
+                Ok(space)
+            })
+            .await;
+    }
+    store
+        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+            Box::pin(async move {
+                let space = load_space_record(tx, &scope.space_id).await?;
+                space.scope.check(&scope)?;
+                let (facts, _) = build_resource_facts_tx(
+                    tx,
+                    &space.space,
+                    parent.as_ref().unwrap_or(&space.root_folder_id),
+                    class,
+                    None,
+                    true,
+                )
+                .await?;
+                auth.authorize_direct_write(&facts, &facts)?;
+                Ok(space)
+            })
+        })
+        .await
+}
+
 pub(crate) async fn create_note_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -354,10 +413,13 @@ pub(crate) async fn create_note_impl(
         store.blob_codec(),
     )?;
 
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
-        .await?;
-    space_rec.scope.check(ctx.scope())?;
+    let space_rec = authorize_create_placement(
+        store,
+        &ctx,
+        request.input.parent.clone(),
+        request.input.class,
+    )
+    .await?;
 
     let ticket = store
         .stage_blob_for_batch_prechecked(
@@ -932,17 +994,29 @@ pub(crate) async fn edit_note_impl(
             .await?
         {
             InterceptionResult::Applied(receipt) => {
-                let latest_rev =
-                    read_current_note_rev(store, &space_rec.scope.space_id, &request.input.note)
-                        .await?
-                        .unwrap_or(base_head.head_rev_id);
-                return Ok(Committed {
-                    value: NoteRevision {
-                        note: request.input.note,
-                        revision: latest_rev,
+                if let Some(result) = applied_outcome(
+                    store,
+                    &ctx,
+                    &idemp,
+                    receipt.clone(),
+                    |row: StoredCommittedNoteRevV1| {
+                        (row.value.note == request.input.note).then(|| row.into_committed())
                     },
+                )
+                .await?
+                {
+                    return Ok(result);
+                }
+                return applied_settlement(
+                    store,
+                    &ctx,
+                    &idemp,
                     receipt,
-                });
+                    &request.input.note,
+                    &base_head.head_rev_id,
+                    notarium_syntax::content_digest(&new_carrier),
+                )
+                .await;
             }
             InterceptionResult::Conflict(err) => return Err(err.into()),
             InterceptionResult::ClosedRoomReservation(res) => {
@@ -1388,7 +1462,9 @@ pub(crate) async fn delete_note_impl(
     }
 
     validate_mutation_identity(&ctx, &request.identity)?;
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let disp_tag = match request.input.disposition {
@@ -1554,24 +1630,19 @@ fn build_trash_or_restore_intent(
                     internal_not_committed("note_missing_digest", "non-purged note lacks digest")
                 })?;
 
-                let prev_rev = read_immutable_revision_tx(
-                    tx,
-                    &scope_cl,
-                    "note",
-                    note_id.as_str(),
-                    head.updated_seq,
-                )
-                .await?;
-                let (prev_raw_fields, prev_eval_fields, prev_diags, prev_schema_rev) =
-                    match prev_rev.map(|r| r.metadata.payload) {
-                        Some(RevisionMetadataPayload::Note(nm)) => (
-                            nm.raw_fields,
-                            nm.evaluated_fields,
-                            nm.diagnostics,
-                            nm.schema_revision,
-                        ),
-                        _ => (None, BTreeMap::new(), Vec::new(), None),
-                    };
+                if is_note_purge_fenced_tx(tx, &scope_cl.space_id, note_id.as_str()).await? {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let bytes = load_revision_metadata_tx(tx, &scope_cl, &head.head_rev_id).await?;
+                let prev = match RevisionMetadataEnvelope::decode(&bytes)?.payload {
+                    RevisionMetadataPayload::Note(meta) if meta.note_id == note_id => meta,
+                    _ => {
+                        return Err(internal_not_committed(
+                            "invalid_note_head",
+                            "current revision does not identify the note",
+                        ));
+                    }
+                };
 
                 let seq = item_ctx.alloc_next_seq()?;
                 let new_rev = new_revision_id()?;
@@ -1699,10 +1770,10 @@ fn build_trash_or_restore_intent(
                         visibility_mask: head.visibility_mask,
                         byte_size: head.byte_size,
                         content_digest: Some(digest),
-                        schema_revision: prev_schema_rev,
-                        raw_fields: prev_raw_fields,
-                        evaluated_fields: prev_eval_fields,
-                        diagnostics: prev_diags,
+                        schema_revision: prev.schema_revision,
+                        raw_fields: prev.raw_fields,
+                        evaluated_fields: prev.evaluated_fields,
+                        diagnostics: prev.diagnostics,
                     },
                 ))
                 .encode()?;
@@ -1813,7 +1884,9 @@ pub(crate) async fn move_note_impl(
         }
     }
 
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let fp = format!(
@@ -2254,7 +2327,7 @@ pub(crate) async fn rename_note_impl(
                 store.blob_codec(),
             )?;
             let ticket = store
-                .stage_blob(
+                .stage_blob_for_batch(
                     &space_rec.scope,
                     space_rec.active_epoch,
                     &info.prepared_blob,
@@ -2428,7 +2501,9 @@ pub(crate) async fn accept_batch_impl(
     ctx: SpaceContext,
     request: AcceptBatch,
 ) -> Result<BatchResult<NoteRevision>, PortError> {
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     if request.items.is_empty() {
@@ -2449,13 +2524,6 @@ pub(crate) async fn accept_batch_impl(
     let mut edited_notes = BTreeSet::new();
     for item in &request.items {
         match &item.input {
-            BatchItem::Create(create) => {
-                sources
-                    .classes
-                    .entry(create.note.clone())
-                    .or_default()
-                    .insert(create.class);
-            }
             BatchItem::Edit(edit) if !receipts.contains_key(item.identity.key.as_str()) => {
                 sources
                     .bytes
@@ -2470,13 +2538,39 @@ pub(crate) async fn accept_batch_impl(
     for nid in edited_notes {
         let scope = space_rec.scope.clone();
         let note = nid.clone();
+        let auth = ctx.auth().clone();
+        let space = space_rec.space.clone();
         let head = store
             .with_read_tx_budget(Some(&ctx.budget), |tx| {
                 Box::pin(async move {
                     if is_note_purge_fenced_tx(tx, &scope.space_id, note.as_str()).await? {
                         return Ok(None);
                     }
-                    load_note_head_row_opt_tx(tx, &scope.space_id, &note).await
+                    let Some(head) = load_note_head_row_opt_tx(tx, &scope.space_id, &note).await?
+                    else {
+                        return Ok(None);
+                    };
+                    if head.lifecycle == Lifecycle::Purged {
+                        return Ok(None);
+                    }
+                    let (facts, _) = match build_resource_facts_tx(
+                        tx,
+                        &space,
+                        &head.parent_folder_id,
+                        head.doc_class,
+                        head.ability_id.clone(),
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(facts) => facts,
+                        Err(PortError::Domain(_)) => return Ok(None),
+                        Err(error) => return Err(error),
+                    };
+                    if auth.authorize_direct_write(&facts, &facts).is_err() {
+                        return Ok(None);
+                    }
+                    Ok(Some(head))
                 })
             })
             .await?;
@@ -2501,6 +2595,7 @@ pub(crate) async fn accept_batch_impl(
     }
 
     let mut intents = Vec::with_capacity(request.items.len());
+    let mut placements = BTreeMap::new();
     for item_mut in request.items {
         if let Err(err) = validate_mutation_identity(&ctx, &item_mut.identity) {
             intents.push(build_failing_item_intent(
@@ -2573,6 +2668,16 @@ pub(crate) async fn accept_batch_impl(
                     if cr.class == DocClass::Skill {
                         ctx.auth().authorize_ability_mutation()?;
                     }
+                    let placement = (cr.parent.clone(), cr.class);
+                    let admitted = match placements.entry(placement) {
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
+                            authorize_create_placement(store, &ctx, cr.parent.clone(), cr.class)
+                                .await
+                                .map(|_| ()),
+                        ),
+                    };
+                    admitted.clone()?;
                     let info = analyze_and_prepare_carrier(
                         &cr.carrier,
                         cr.class,
@@ -2581,12 +2686,17 @@ pub(crate) async fn accept_batch_impl(
                         store.blob_codec(),
                     )?;
                     let ticket = store
-                        .stage_blob(
+                        .stage_blob_for_batch(
                             &space_rec.scope,
                             space_rec.active_epoch,
                             &info.prepared_blob,
                         )
                         .await?;
+                    sources
+                        .classes
+                        .entry(cr.note.clone())
+                        .or_default()
+                        .insert(cr.class);
                     sources.remember(&cr.note, info.prepared_blob.digest, &cr.carrier);
                     Ok(build_create_note_intent(
                         &space_rec.scope,
@@ -2638,7 +2748,7 @@ pub(crate) async fn accept_batch_impl(
                     }
                     let ticket = if variants.values().any(Result::is_ok) {
                         let ticket = store
-                            .stage_blob(&space_rec.scope, space_rec.active_epoch, &blob)
+                            .stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &blob)
                             .await?;
                         sources.remember(&ed.note, blob.digest, &next);
                         Some(ticket)
@@ -3271,6 +3381,29 @@ fn validate_and_format_link_line(link: &Link) -> Result<String, PortError> {
     Ok(format!("- {rel}: [[{target_token}]]\n"))
 }
 
+fn link_identity(
+    ctx: &SpaceContext,
+    item: &Mutation<Link>,
+    line: &str,
+) -> crate::writer::CommandIdentitySpec {
+    let kind = match item.input.target {
+        LinkTarget::Note(_) => "note",
+        LinkTarget::Folder(_) => "folder",
+        LinkTarget::AuthoredName(_) => "authored",
+    };
+    let mut hash = blake3::Hasher::new();
+    for part in [item.input.source.as_str(), kind, line] {
+        hash.update(part.as_bytes());
+        hash.update(&[0]);
+    }
+    hash_preconditions(&mut hash, &item.preconditions);
+    derive_command_identity_spec(&item.identity, "link", hash.finalize().as_bytes()).for_link(
+        ctx.auth(),
+        &item.input.source,
+        &item.input.target,
+    )
+}
+
 pub(crate) async fn link_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -3279,26 +3412,82 @@ pub(crate) async fn link_impl(
     validate_mutation_identity(&ctx, &request.identity)?;
     let link_line = validate_and_format_link_line(&request.input)?;
 
-    let fp = format!("src={}\0line={link_line}", request.input.source.as_str());
-    let idemp = derive_command_identity_spec(&request.identity, "link", fp.as_bytes()).for_link(
-        ctx.auth(),
-        &request.input.source,
-        &request.input.target,
-    );
-    if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedLinkV1>(
+    let idemp = link_identity(&ctx, &request, &link_line);
+    let replay = try_replay_completed_receipt::<StoredCommittedLinkV1>(
         store,
         ctx.scope(),
         &idemp,
         Some(&ctx.budget),
     )
-    .await?
-    {
+    .await;
+    let replay = match replay {
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => {
+            let original =
+                v1_receipts::link_identity(store, &ctx, &request, &link_line, idemp.clone())
+                    .await?;
+            let previous = try_replay_completed_receipt::<StoredCommittedLinkV1>(
+                store,
+                ctx.scope(),
+                &original,
+                Some(&ctx.budget),
+            )
+            .await?
+            .ok_or(DomainError::IdempotencyKeyReused)?;
+            return Ok(previous.into_committed());
+        }
+        other => other?,
+    };
+    if let Some(replayed) = replay {
         return Ok(replayed.into_committed());
     }
 
     let intent = prepare_link_intent(store, &ctx, request, &link_line, idemp, None).await?;
     let stored: StoredCommittedLinkV1 = store.submit_write_command(&ctx.budget, intent).await?;
     Ok(stored.into_committed())
+}
+
+async fn authorize_link_target_tx(
+    tx: &mut BackendConn<'_>,
+    space: &crate::SpaceRecord,
+    auth: &notarium_core::auth::EngineAuthContext,
+    source_class: DocClass,
+    target: &LinkTarget,
+) -> Result<(), PortError> {
+    match target {
+        LinkTarget::Note(target_nid) => {
+            if is_note_purge_fenced_tx(tx, &space.scope.space_id, target_nid.as_str()).await? {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let target_head = load_note_head_row_tx(tx, &space.scope.space_id, target_nid).await?;
+            if target_head.lifecycle != Lifecycle::Active {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let (tfacts, _) = build_resource_facts_tx(
+                tx,
+                &space.space,
+                &target_head.parent_folder_id,
+                target_head.doc_class,
+                target_head.ability_id,
+                true,
+            )
+            .await?;
+            auth.authorize_read(&tfacts)?;
+        }
+        LinkTarget::Folder(target_fid) => {
+            let fanc = load_folder_ancestry_tx(tx, &space.scope.space_id, target_fid, true).await?;
+            let tfacts = notarium_core::auth::ResourceFacts {
+                space: space.space.clone(),
+                class: source_class,
+                ancestor_folders: fanc.ancestors,
+                folder_write_locked: fanc.write_locked,
+                ability_package: None,
+            };
+            auth.authorize_read(&tfacts)?;
+        }
+        LinkTarget::AuthoredName(_) => {}
+    }
+
+    Ok(())
 }
 
 async fn prepare_link_intent(
@@ -3317,6 +3506,20 @@ async fn prepare_link_intent(
     }
     if base_head.doc_class == DocClass::EncryptedNote {
         return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
+    }
+
+    if !matches!(request.input.target, LinkTarget::AuthoredName(_)) {
+        let target = request.input.target.clone();
+        let space = space_rec.clone();
+        let auth = ctx.auth().clone();
+        let class = base_head.doc_class;
+        store
+            .with_read_tx_budget(Some(&ctx.budget), |tx| {
+                Box::pin(async move {
+                    authorize_link_target_tx(tx, &space, &auth, class, &target).await
+                })
+            })
+            .await?;
     }
 
     let base_digest = base_head.content_digest.ok_or_else(|| {
@@ -3338,7 +3541,7 @@ async fn prepare_link_intent(
         store.blob_codec(),
     )?;
     let ticket = store
-        .stage_blob(
+        .stage_blob_for_batch(
             &space_rec.scope,
             space_rec.active_epoch,
             &info.prepared_blob,
@@ -3426,7 +3629,9 @@ pub(crate) async fn link_many_impl(
     request: LinkBatch,
 ) -> Result<BatchResult<Link>, PortError> {
     let deadline = tokio::time::Instant::now() + ctx.budget.remaining;
-    let space = store.read_space(&ctx.scope().space_id).await?;
+    let space = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space.scope.check(ctx.scope())?;
     let keys = request
         .items
@@ -3494,24 +3699,12 @@ async fn prepare_link_batch_item(
 ) -> Result<PreparedWriteIntent, PortError> {
     validate_mutation_identity(ctx, &item.identity)?;
     let line = validate_and_format_link_line(&item.input)?;
-    let kind = match item.input.target {
-        LinkTarget::Note(_) => "note",
-        LinkTarget::Folder(_) => "folder",
-        LinkTarget::AuthoredName(_) => "authored",
-    };
-    let mut hash = blake3::Hasher::new();
-    for part in [item.input.source.as_str(), kind, &line] {
-        hash.update(part.as_bytes());
-        hash.update(&[0]);
-    }
-    hash_preconditions(&mut hash, &item.preconditions);
-    let spec = derive_command_identity_spec(&item.identity, "link", hash.finalize().as_bytes())
-        .for_link(ctx.auth(), &item.input.source, &item.input.target);
+    let spec = link_identity(ctx, &item, &line);
     if let Some(hash) = receipts.get(item.identity.key.as_str()) {
         let spec = if hash == spec.command_hash.as_bytes().as_slice() {
             spec
         } else {
-            v1_receipts::link_batch_identity(store, ctx, &item, &line, spec).await?
+            v1_receipts::link_identity(store, ctx, &item, &line, spec).await?
         };
         let mut replay = build_failing_item_intent(
             &space.scope,
@@ -3635,50 +3828,14 @@ fn build_link_item_intent(
                 .await?;
                 auth.authorize_direct_write(&facts, &facts)?;
 
-                // Verify typed target existence and caller visibility inside the same Space!
+                authorize_link_target_tx(tx, &live_space, &auth, head.doc_class, &link.target)
+                    .await?;
                 let mut owner_notes = vec![source_id.clone()];
-                match &link.target {
-                    LinkTarget::Note(target_nid) => {
-                        if is_note_purge_fenced_tx(tx, &scope_cl.space_id, target_nid.as_str())
-                            .await?
-                        {
-                            return Err(DomainError::ResourceNotFound.into());
-                        }
-                        let target_head =
-                            load_note_head_row_tx(tx, &scope_cl.space_id, target_nid).await?;
-                        if target_head.lifecycle != Lifecycle::Active {
-                            return Err(DomainError::ResourceNotFound.into());
-                        }
-                        let (tfacts, _) = build_resource_facts_tx(
-                            tx,
-                            &live_space.space,
-                            &target_head.parent_folder_id,
-                            target_head.doc_class,
-                            target_head.ability_id,
-                            true,
-                        )
-                        .await?;
-                        auth.authorize_read(&tfacts)?;
-                        if !owner_notes.contains(target_nid) {
-                            owner_notes.push(target_nid.clone());
-                        }
-                    }
-                    LinkTarget::Folder(target_fid) => {
-                        let fanc =
-                            load_folder_ancestry_tx(tx, &scope_cl.space_id, target_fid, true)
-                                .await?;
-                        let tfacts = notarium_core::auth::ResourceFacts {
-                            space: live_space.space.clone(),
-                            class: head.doc_class,
-                            ancestor_folders: fanc.ancestors,
-                            folder_write_locked: fanc.write_locked,
-                            ability_package: None,
-                        };
-                        auth.authorize_read(&tfacts)?;
-                    }
-                    LinkTarget::AuthoredName(_) => {}
+                if let LinkTarget::Note(target) = &link.target
+                    && *target != source_id
+                {
+                    owner_notes.push(target.clone());
                 }
-
                 let seq = item_ctx.alloc_next_seq()?;
                 let new_rev = new_revision_id()?;
                 let now_ts = now_utc_timestamp()?;
@@ -4036,17 +4193,35 @@ pub(crate) async fn accept_external_observation_impl(
             .await?
         {
             InterceptionResult::Applied(receipt) => {
-                let latest_rev =
-                    read_current_note_rev(store, &space_rec.scope.space_id, &request.input.note)
-                        .await?
-                        .unwrap_or(base_head.head_rev_id);
-                return Ok(ExternalObservationResult::Committed(Committed {
-                    value: NoteRevision {
-                        note: request.input.note,
-                        revision: latest_rev,
+                if let Some(result) = applied_outcome(
+                    store,
+                    &ctx,
+                    &idemp,
+                    receipt.clone(),
+                    |row: StoredExternalObsOutcomeV1| match row {
+                        StoredExternalObsOutcomeV1::Committed(result)
+                            if result.value.note == request.input.note =>
+                        {
+                            Some(result.into_committed())
+                        }
+                        _ => None,
                     },
+                )
+                .await?
+                {
+                    return Ok(ExternalObservationResult::Committed(result));
+                }
+                return applied_settlement(
+                    store,
+                    &ctx,
+                    &idemp,
                     receipt,
-                }));
+                    &request.input.note,
+                    &base_head.head_rev_id,
+                    computed_digest,
+                )
+                .await
+                .map(ExternalObservationResult::Committed);
             }
             InterceptionResult::Conflict(_) => {
                 let latest_rev =
@@ -4072,7 +4247,7 @@ pub(crate) async fn accept_external_observation_impl(
         preparsed_hdr,
     )?;
     let ticket = store
-        .stage_blob(
+        .stage_blob_for_batch(
             &space_rec.scope,
             space_rec.active_epoch,
             &info.prepared_blob,
@@ -4532,7 +4707,7 @@ pub(crate) async fn update_space_schema_impl(
         .await?;
 
     let ticket = store
-        .stage_blob(
+        .stage_blob_for_batch(
             &space_rec.scope,
             space_rec.active_epoch,
             &info.prepared_blob,
@@ -5199,26 +5374,22 @@ pub(crate) async fn get_note_impl(
         .map_err(|_| internal_not_committed("get_note_utf8", "note carrier is not valid UTF-8"))?;
 
     let current = recheck_note_read(store, &ctx, &request.note).await?;
-    let facts = if request.revision.is_some() {
-        live_facts
-    } else {
-        if current.class != live_facts.class {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        current
-    };
+    if request.revision.is_none() && current.class != live_facts.class {
+        return Err(DomainError::ResourceNotFound.into());
+    }
 
-    let document = ClassifiedDocument::from_canonical(
+    let mut document = ClassifiedDocument::from_canonical(
         NoteRef {
             space_id: ctx.scope().space_id.clone(),
             note_id: request.note,
         },
         rev_id,
-        facts,
+        live_facts,
         lifecycle,
         content,
         digest,
     )?;
+    document.bind_current_facts(current)?;
 
     Ok(NoteSnapshot {
         document,
@@ -5568,6 +5739,84 @@ async fn read_current_note_rev(
         .await
 }
 
+pub(crate) fn missing_applied_outcome() -> PortError {
+    crate::codec::unknown_commit_outcome(
+        "interceptor_receipt_mismatch",
+        "the applied receipt lacks a matching retained command outcome",
+    )
+}
+
+pub(crate) async fn applied_outcome<R: serde::de::DeserializeOwned, T>(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    idemp: &crate::writer::CommandIdentitySpec,
+    token: MutationReceiptToken,
+    committed: impl FnOnce(R) -> Option<Committed<T>>,
+) -> Result<Option<Committed<T>>, PortError> {
+    ctx.scope().check(token.scope())?;
+    let saved = try_replay_completed_receipt(store, ctx.scope(), idemp, Some(&ctx.budget))
+        .await
+        .map_err(applied_read_error)?;
+    saved
+        .map(|row| {
+            committed(row)
+                .filter(|result| result.receipt == token)
+                .ok_or_else(missing_applied_outcome)
+        })
+        .transpose()
+}
+
+fn applied_read_error(error: PortError) -> PortError {
+    match error {
+        PortError::Domain(_) => error,
+        other => batch_error(other, true),
+    }
+}
+
+// Room checkpoints do not have a client idempotency key. Prove their exact
+// effect against the immutable canonical command and its note revision.
+async fn applied_settlement(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    idemp: &crate::writer::CommandIdentitySpec,
+    token: MutationReceiptToken,
+    note: &NoteId,
+    parent: &RevisionId,
+    digest: ContentDigest,
+) -> Result<Committed<NoteRevision>, PortError> {
+    let scope = ctx.scope().clone();
+    let expected = note.clone();
+    let parent = parent.clone();
+    let seq = token.seq().get() as i64;
+    let idemp = idemp.clone();
+    let rev: Option<String> = store.with_read_tx_budget(Some(&ctx.budget), |tx| Box::pin(async move {
+        idemp.authorize_replay(tx, &scope).await?;
+        const EXACT: &str = "SELECT r.rev_id FROM revisions r
+            JOIN change_commands c ON c.space_id=r.space_id AND c.history_incarnation=r.history_incarnation
+              AND c.first_seq=r.space_seq AND c.last_seq=r.visibility_seq AND c.command_kind='collab_settlement'
+            WHERE r.space_id=$1 AND r.history_incarnation=$2 AND r.entity_type='note' AND r.entity_key=$3
+              AND r.visibility_seq=$4 AND r.parent_rev_id=$5 AND r.content_blake3=$6 AND r.actor_id=$7";
+        match tx {
+            BackendConn::Sqlite(conn) => sqlx::query_scalar(EXACT)
+                .bind(scope.space_id.as_str()).bind(scope.incarnation.as_bytes().as_slice()).bind(expected.as_str())
+                .bind(seq).bind(parent.as_str()).bind(digest.as_bytes().as_slice()).bind(idemp.actor.as_str())
+                .fetch_optional(&mut **conn).await,
+            BackendConn::Postgres(conn) => sqlx::query_scalar(EXACT)
+                .bind(scope.space_id.as_str()).bind(scope.incarnation.as_bytes().as_slice()).bind(expected.as_str())
+                .bind(seq).bind(parent.as_str()).bind(digest.as_bytes().as_slice()).bind(idemp.actor.as_str())
+                .fetch_optional(&mut **conn).await,
+        }.map_err(|err| internal_not_committed("read_collab_settlement_revision", err.to_string()))
+    })).await.map_err(applied_read_error)?;
+    let revision = RevisionId::parse(&rev.ok_or_else(missing_applied_outcome)?)?;
+    Ok(Committed {
+        value: NoteRevision {
+            note: note.clone(),
+            revision,
+        },
+        receipt: token,
+    })
+}
+
 pub(crate) async fn try_replay_completed_receipt<R: serde::de::DeserializeOwned>(
     store: &CanonicalStore,
     scope: &notarium_core::model::HistoryScope,
@@ -5617,7 +5866,7 @@ type PreparsedHeaderTuple = (
     usize,
 );
 
-fn enforce_protected_frontmatter_unchanged_with_header(
+pub(crate) fn enforce_protected_frontmatter_unchanged_with_header(
     before: &str,
     after: &str,
     class: DocClass,
@@ -5631,9 +5880,11 @@ fn enforce_protected_frontmatter_unchanged_with_header(
         return Ok(Some((old_hdr.fields, old_hdr.diagnostic, hdr_end)));
     }
     let new_hdr = notarium_syntax::frontmatter::analyze(after, class)?;
-    let empty = BTreeMap::new();
-    let old_map = old_hdr.fields.as_ref().unwrap_or(&empty);
-    let new_map = new_hdr.fields.as_ref().unwrap_or(&empty);
+    // Equal opaque headers took the byte-identical path above. A changed
+    // opaque header cannot establish whether protected keys were preserved.
+    let (Some(old_map), Some(new_map)) = (&old_hdr.fields, &new_hdr.fields) else {
+        return Err(DomainError::validation(ValidationReason::FmNotWritable).into());
+    };
     for key in old_map.keys().chain(new_map.keys()) {
         if old_map.get(key) != new_map.get(key) {
             authorize_field_key(key)?;

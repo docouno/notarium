@@ -5,7 +5,7 @@ const READ_REVISION: &str =
     "SELECT metadata_msgpack, visibility_seq
     FROM revisions
     WHERE space_id=$1 AND rev_id=$2 AND history_incarnation=$3 AND entity_type='ability' AND entity_key=$4";
-const LIST_PACKAGES: &str = "SELECT ability_id
+const LIST_PACKAGES: &str = "SELECT ability_id, created_seq
     FROM ability_packages
     WHERE space_id=$1 AND ability_id>$2 AND lifecycle_state='active'
     AND ($3='' OR kind=$3)
@@ -90,7 +90,9 @@ async fn resolve(
         return Err(DomainError::ResourceNotFound.into());
     }
     let mut facts = note.facts;
-    if exact.is_some() {
+    // The manifest, including the auxiliary filenames in a current descriptor,
+    // still belongs to its publication snapshot after its entrypoint moves.
+    {
         let cutoff = crate::codec::i64_to_space_seq(visibility)?;
         let entry = crate::runtime::read_immutable_revision_tx(
             tx,
@@ -261,28 +263,31 @@ pub(super) async fn page(
                     live.push(space);
                 }
                 let scope = digest((
-                    "abilities",
+                    "visible-abilities-v2",
                     ctx.auth().principal(),
                     ctx.auth().grant(),
+                    ctx.auth().readonly_abilities(),
                     versions,
                     &query.project,
                     query.kind,
                     &query.name,
                     query.authoring,
                 ))?;
-                let after: Option<(SpaceId, AbilityId)> = continuation(&query.page, &scope)?;
+                let after: Option<(SpaceId, i64)> = continuation(&query.page, &scope)?;
                 let cap = usize::from(query.page.limit());
                 let mut keys = Vec::new();
                 for (index, rec) in live.iter().enumerate() {
                     let after_id = match &after {
                         Some((sid, _)) if sid > &rec.space.id => continue,
-                        Some((sid, id)) if sid == &rec.space.id => id.as_str(),
-                        _ => "",
+                        Some((sid, seq)) if sid == &rec.space.id => {
+                            cursor_entity(tx, sid, "ability", *seq).await?
+                        }
+                        _ => String::new(),
                     };
                     let remaining = (cap + 1 - keys.len()) as i64;
-                    let ids: Vec<String> = db!(
+                    let ids: Vec<(String, i64)> = db!(
                         tx,
-                        sqlx::query_scalar(LIST_PACKAGES),
+                        sqlx::query_as(LIST_PACKAGES),
                         fetch_all,
                         rec.space.id.as_str(),
                         after_id,
@@ -290,8 +295,8 @@ pub(super) async fn page(
                         query.name.as_deref().unwrap_or(""),
                         remaining
                     )?;
-                    for id in ids {
-                        keys.push((index, AbilityId::parse(&id)?));
+                    for (id, seq) in ids {
+                        keys.push((index, AbilityId::parse(&id)?, seq));
                     }
                     if keys.len() > cap {
                         break;
@@ -299,13 +304,13 @@ pub(super) async fn page(
                 }
                 let next = if keys.len() > cap {
                     keys.pop();
-                    let (index, id) = keys.last().expect("nonempty page");
-                    Some(encode_cursor(scope, (&live[*index].space.id, id))?)
+                    let (index, _, seq) = keys.last().expect("nonempty page");
+                    Some(encode_cursor(scope, (&live[*index].space.id, seq))?)
                 } else {
                     None
                 };
                 let mut items = Vec::new();
-                for (index, id) in keys {
+                for (index, id, _) in keys {
                     match descriptor(tx, ctx.auth(), &live[index], &id, None).await {
                         Ok(value) => {
                             let visible = match &value.reference.placement {

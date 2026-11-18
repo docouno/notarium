@@ -38,7 +38,8 @@ use crate::{
             upsert_agent_run_head_tx, validate_mutation_identity,
         },
         notes::{
-            analyze_and_prepare_carrier, changed_revision_fields_tx, try_replay_completed_receipt,
+            analyze_and_prepare_carrier, applied_outcome, changed_revision_fields_tx,
+            try_replay_completed_receipt,
         },
     },
     runtime::{insert_revision_row, is_note_purge_fenced_tx, load_space_record},
@@ -789,12 +790,13 @@ pub(crate) async fn move_board_card_impl(
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
 
-    let idemp = build_move_board_card_identity_spec(&request)?.with_policy(
+    let mut idemp = build_move_board_card_identity_spec(&request)?.with_policy(
         ctx.auth(),
         crate::writer::replay::ReplayPolicy::Documents(vec![
             crate::writer::replay::ReplayResource::Write(request.input.note.clone()),
         ]),
     );
+    idemp.require_receipt_detail = true;
     if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedBoardMoveV1>(
         store,
         ctx.scope(),
@@ -888,14 +890,17 @@ pub(crate) async fn move_board_card_impl(
                 .await?
             {
                 InterceptionResult::Applied(receipt) => {
-                    return read_applied_board_move_result(
+                    return applied_outcome(
                         store,
-                        &space_rec.scope.space_id,
-                        &request.input,
-                        &base_head.head_rev_id,
+                        &ctx,
+                        &idemp,
                         receipt,
+                        |row: StoredCommittedBoardMoveV1| {
+                            (row.revision.note == request.input.note).then(|| row.into_committed())
+                        },
                     )
-                    .await;
+                    .await?
+                    .ok_or_else(super::notes::missing_applied_outcome);
                 }
                 InterceptionResult::Conflict(err) => return Err(err.into()),
                 InterceptionResult::ClosedRoomReservation(res) => {
@@ -959,7 +964,7 @@ pub(crate) async fn move_board_card_impl(
                 store.blob_codec(),
             )?;
             let ticket = store
-                .stage_blob(
+                .stage_blob_for_batch(
                     &space_rec.scope,
                     space_rec.active_epoch,
                     &info.prepared_blob,
@@ -1664,16 +1669,7 @@ pub(crate) async fn move_board_card_impl(
                         receipt: receipt_token,
                     };
                     let resp_bytes = encode_msgpack(&wire)?;
-                    let sanitized = encode_msgpack(&StoredCommittedBoardMoveV1 {
-                        revision: NoteRevision {
-                            note: input.note.clone(),
-                            revision: RevisionId::from_bytes([0u8; 16]),
-                        },
-                        rank_revision: RevisionId::from_bytes([0u8; 16]),
-                        group: GroupKey::Absent,
-                        rank: encode_rank_u128(RANK_SPACE / 2)?,
-                        receipt: MutationReceiptToken::new(scope_cl, visibility_seq)?,
-                    })?;
+                    let sanitized = encode_msgpack(&wire.receipt)?;
 
                     Ok(ItemCommitArtifacts {
                         command_id,
@@ -1754,54 +1750,6 @@ fn build_move_board_card_identity_spec(
         "move_board_card",
         fp.finalize().as_bytes(),
     ))
-}
-
-async fn read_applied_board_move_result(
-    store: &CanonicalStore,
-    space_id: &SpaceId,
-    input: &MoveBoardCard,
-    fallback_note_rev: &RevisionId,
-    receipt: MutationReceiptToken,
-) -> Result<Committed<BoardMoveResult>, PortError> {
-    let sid = space_id.clone();
-    let view = input.view.clone();
-    let target = input.note.clone();
-    let fallback_rev = fallback_note_rev.clone();
-    let fallback_group = input.group.clone();
-
-    let (note_rev, rank_rev, group, rank) = store
-        .with_read_tx(|tx| {
-            Box::pin(async move {
-                let cur_note_rev = load_note_head_row_tx(tx, &sid, &target)
-                    .await
-                    .map(|h| h.head_rev_id)
-                    .unwrap_or(fallback_rev);
-                if let Some(ov) = load_overlay_row_opt_tx(tx, &sid, &view, &target).await? {
-                    Ok((cur_note_rev, ov.rank_rev_id, ov.group, ov.sort_rank_lexo))
-                } else {
-                    Ok((
-                        cur_note_rev,
-                        new_revision_id()?,
-                        fallback_group,
-                        encode_rank_u128(RANK_SPACE / 2)?,
-                    ))
-                }
-            })
-        })
-        .await?;
-
-    Ok(Committed {
-        value: BoardMoveResult {
-            revision: NoteRevision {
-                note: input.note.clone(),
-                revision: note_rev,
-            },
-            rank_revision: rank_rev,
-            group,
-            rank,
-        },
-        receipt,
-    })
 }
 
 #[allow(clippy::too_many_arguments)]

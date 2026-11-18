@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -48,7 +48,7 @@ pub struct WalTelemetrySnapshot {
 }
 
 pub(crate) struct ActiveBackupPin {
-    pub baseline_wal_bytes: u64,
+    baseline_frames: Arc<OnceLock<u64>>,
     pub max_pinned_wal_bytes: u64,
     pub abort_flag: Arc<AtomicBool>,
     pub abort_notify: Arc<Notify>,
@@ -132,21 +132,59 @@ pub struct SqliteWalCoordinator {
 pub(crate) struct BackupWalPinGuard {
     coord: Arc<SqliteWalCoordinator>,
     pin_id: u64,
-    baseline_wal_bytes: u64,
+    baseline_frames: Arc<OnceLock<u64>>,
     pub abort_flag: Arc<AtomicBool>,
     pub abort_notify: Arc<Notify>,
 }
 
 #[allow(dead_code)]
 impl BackupWalPinGuard {
-    pub fn current_pinned_wal_bytes(&self) -> u64 {
-        self.coord
-            .observe_wal_file_bytes()
-            .saturating_sub(self.baseline_wal_bytes)
+    pub fn mark_cut(&self, observer: &rusqlite::Connection) -> Result<(), PortError> {
+        let (log, backfilled) = read_wal_frames(observer)?;
+        // A fully backfilled WAL can restart on the next write even with a
+        // database-only reader. In that case its new frames start at one.
+        let floor = if log > backfilled { log } else { 0 };
+        self.baseline_frames
+            .set(floor)
+            .map_err(|_| internal_not_committed("wal_backup_mark_cut", "cut already pinned"))
+    }
+
+    pub fn current_pinned_wal_bytes(
+        &self,
+        observer: &rusqlite::Connection,
+    ) -> Result<u64, PortError> {
+        let (log, backfilled) = read_wal_frames(observer)?;
+        let floor = self.baseline_frames.get().expect("backup cut is pinned");
+        Ok(log
+            .saturating_sub(backfilled.max(*floor))
+            .saturating_mul(self.coord.wal_frame_bytes))
     }
 
     pub fn is_aborted_by_coordinator(&self) -> bool {
         self.abort_flag.load(Ordering::SeqCst)
+    }
+}
+
+// NOOP reads the live WAL index without copying pages or changing its generation.
+fn read_wal_frames(observer: &rusqlite::Connection) -> Result<(u64, u64), PortError> {
+    let until = Instant::now() + Duration::from_millis(50);
+    loop {
+        let (busy, log, backfilled): (i64, i64, i64) = observer
+            .query_row("PRAGMA main.wal_checkpoint(NOOP)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|err| internal_not_committed("wal_backup_frames", err.to_string()))?;
+        if busy == 0 && log >= 0 && backfilled >= 0 {
+            return Ok((log as u64, backfilled as u64));
+        }
+        if Instant::now() >= until {
+            return Err(unavailable_retryable(
+                "wal_backup_observer_busy",
+                "WAL index unavailable",
+                Duration::from_millis(5),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -280,6 +318,14 @@ impl Drop for ActiveSqliteSnapshotGuard {
             self.coord.release_reader_slot(self.reader_id);
         }
     }
+}
+
+pub(crate) async fn read_cancelled(budget: Option<&CallBudget>) -> PortError {
+    match budget {
+        Some(budget) => budget.cancellation.cancelled().await,
+        None => std::future::pending().await,
+    }
+    cancelled_not_committed("sqlite_read_cancelled", "ordinary SQLite read cancelled")
 }
 
 pub fn sqlite_wal_path_for(db_path: &Path) -> PathBuf {
@@ -513,7 +559,7 @@ impl SqliteWalCoordinator {
         self: &Arc<Self>,
         max_pinned_wal_bytes: u64,
     ) -> BackupWalPinGuard {
-        let baseline = self.observe_wal_file_bytes();
+        let baseline_frames = Arc::new(OnceLock::new());
         let abort_flag = Arc::new(AtomicBool::new(false));
         let abort_notify = Arc::new(Notify::new());
 
@@ -524,7 +570,7 @@ impl SqliteWalCoordinator {
             st.active_backups.insert(
                 id,
                 ActiveBackupPin {
-                    baseline_wal_bytes: baseline,
+                    baseline_frames: Arc::clone(&baseline_frames),
                     max_pinned_wal_bytes,
                     abort_flag: Arc::clone(&abort_flag),
                     abort_notify: Arc::clone(&abort_notify),
@@ -536,7 +582,7 @@ impl SqliteWalCoordinator {
         BackupWalPinGuard {
             coord: Arc::clone(self),
             pin_id,
-            baseline_wal_bytes: baseline,
+            baseline_frames,
             abort_flag,
             abort_notify,
         }
@@ -669,6 +715,8 @@ impl SqliteWalCoordinator {
                 }
 
                 tokio::select! {
+                    biased;
+                    error = read_cancelled(budget) => return Err(error),
                     _ = notified => {}
                     _ = tokio::time::sleep_until(caller_deadline_tokio) => {
                         self.counters.timed_out_reads.fetch_add(1, Ordering::Relaxed);
@@ -773,6 +821,8 @@ impl SqliteWalCoordinator {
             }
 
             tokio::select! {
+                biased;
+                error = read_cancelled(budget) => return Err(error),
                 _ = notified => {}
                 _ = tokio::time::sleep_until(caller_deadline_tokio) => {
                     self.counters.timed_out_reads.fetch_add(1, Ordering::Relaxed);
@@ -801,6 +851,8 @@ impl SqliteWalCoordinator {
 
         // 2. Acquire read-only connection bounded by remaining caller budget.
         let pooled = tokio::select! {
+            biased;
+            error = read_cancelled(budget) => return Err(error),
             res = read_pool.acquire() => match res {
                 Ok(conn) => conn,
                 Err(err) => {
@@ -875,6 +927,8 @@ impl SqliteWalCoordinator {
                 Ok(out)
             };
             tokio::select! {
+                biased;
+                error = read_cancelled(budget) => Err(error),
                 res = fut => res,
                 _ = tokio::time::sleep_until(tx_deadline_tokio) => {
                     interrupt_flag.store(true, Ordering::SeqCst);
@@ -940,13 +994,31 @@ impl SqliteWalCoordinator {
 
         // 1. Check active backup WAL budgets first: if any backup exceeded `max_pinned_wal_bytes`,
         // signal abort and wait for it to close before resetting WAL!
+        let has_pins = !self
+            .gate
+            .lock()
+            .expect("wal gate mutex")
+            .active_backups
+            .is_empty();
+        let observed = if has_pins {
+            self.checkpoint_status("PRAGMA main.wal_checkpoint(NOOP)")
+                .await
+        } else {
+            None
+        };
         let mut aborted_any_backup = false;
+        if let Some((0, log, backfilled)) = observed
+            && log >= 0
+            && backfilled >= 0
         {
             let mut st = self.gate.lock().expect("wal gate mutex");
             for pin in st.active_backups.values() {
-                let pinned = disk_wal_bytes
-                    .max(pre_wal_bytes)
-                    .saturating_sub(pin.baseline_wal_bytes);
+                let Some(floor) = pin.baseline_frames.get() else {
+                    continue;
+                };
+                let pinned = (log as u64)
+                    .saturating_sub((*floor).max(backfilled as u64))
+                    .saturating_mul(self.wal_frame_bytes);
                 if pinned > pin.max_pinned_wal_bytes && !pin.abort_flag.swap(true, Ordering::SeqCst)
                 {
                     pin.abort_notify.notify_waiters();
@@ -955,7 +1027,7 @@ impl SqliteWalCoordinator {
             }
             if aborted_any_backup {
                 st.last_backup_abort_reason = Some(format!(
-                    "pinned WAL exceeded backup budget (current wal_bytes={disk_wal_bytes})"
+                    "pinned WAL exceeded backup budget (log_frames={log}, backfilled_frames={backfilled})"
                 ));
             }
         }
@@ -1387,6 +1459,81 @@ mod tests {
     use super::*;
     use crate::{CanonicalConfig, CanonicalRuntime, SqlBackendConfig};
     use notarium_core::{epoch::DataRoot, ids::InstallationId};
+
+    #[tokio::test]
+    async fn cancellation_releases_sqlite_readers_waiting_for_gate_or_pool() {
+        use notarium_core::{error::CommitEffect, ids::RequestId, ports::Cancellation};
+
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).unwrap();
+        let path = std::env::temp_dir().join(format!("notarium-read-cancel-{}", hex::encode(id)));
+        fs::create_dir_all(&path).unwrap();
+        let mut config =
+            CanonicalConfig::local_default(InstallationId::from_bytes(id), DataRoot::new(&path));
+        let SqlBackendConfig::Sqlite { read_pool_size, .. } = &mut config.sql else {
+            unreachable!()
+        };
+        *read_pool_size = 1;
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        {
+            let wal = store.inner.wal_coord.get().unwrap();
+            let SqlDriverState::Sqlite {
+                read_pool,
+                fast_read_pool,
+                ..
+            } = &store.inner.sql
+            else {
+                unreachable!()
+            };
+            let _maintenance = wal.maintenance_lock.lock().await;
+            let sqlx_slot = read_pool.acquire().await.unwrap();
+            let native_slots = fast_read_pool.hold_idle_slots();
+            for closed in [true, false] {
+                if closed {
+                    wal.close_reader_gate();
+                }
+                let budget = CallBudget {
+                    request: RequestId::from_bytes(id),
+                    cancellation: Cancellation::default(),
+                    remaining: Duration::from_secs(30),
+                };
+                let sqlx = wal.with_ordinary_read_tx(read_pool, Some(&budget), |_| {
+                    Box::pin(async { Ok(()) })
+                });
+                let native = fast_read_pool.with_read_conn(wal, Some(&budget), |_| Ok(()));
+                tokio::pin!(sqlx, native);
+                assert!(futures_util::poll!(sqlx.as_mut()).is_pending());
+                assert!(futures_util::poll!(native.as_mut()).is_pending());
+                assert_eq!(wal.telemetry().active_readers, if closed { 0 } else { 2 });
+                budget.cancellation.cancel();
+                let results = tokio::time::timeout(Duration::from_secs(1), async {
+                    tokio::join!(sqlx, native)
+                })
+                .await
+                .expect("cancellation must not wait for a reader slot or reopen");
+                for result in [results.0, results.1] {
+                    assert!(
+                        matches!(result, Err(PortError::Cancelled(err)) if err.effect() == CommitEffect::NotCommitted)
+                    );
+                }
+                assert_eq!(wal.telemetry().active_readers, 0);
+                if closed {
+                    wal.reopen_reader_gate();
+                }
+            }
+            drop((sqlx_slot, native_slots));
+            wal.with_ordinary_read_tx(read_pool, None, |_| Box::pin(async { Ok(()) }))
+                .await
+                .unwrap();
+            fast_read_pool
+                .with_read_conn(wal, None, |_| Ok(()))
+                .await
+                .unwrap();
+            assert_eq!(wal.telemetry().active_readers, 0);
+        }
+        runtime.shutdown().await.unwrap();
+        fs::remove_dir_all(path).unwrap();
+    }
 
     #[tokio::test]
     async fn checkpoint_io_overrun_counts_actual_reader_gate_dwell() {

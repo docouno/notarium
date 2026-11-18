@@ -383,6 +383,7 @@ pub struct InterceptedMutation {
 }
 #[derive(Debug)]
 pub enum InterceptionResult {
+    /// Identifies the exact canonical commit that applied the intercepted mutation.
     Applied(MutationReceiptToken),
     ClosedRoomReservation(ClosedRoomReservation),
     Conflict(DomainError),

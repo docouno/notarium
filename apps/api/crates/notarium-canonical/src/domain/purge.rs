@@ -100,56 +100,34 @@ impl CanonicalStore {
         self.inner.check_writer_epoch(&scope.space_id, epoch)?;
         const PURGES: &str = "SELECT purge_id, actor_id, idempotency_key, old_note_id, retirement_ids_json, sanitized_response_msgpack
             FROM pending_purges WHERE space_id = $1 AND history_incarnation = $2 AND phase <> 'completed' ORDER BY created_at_ms";
-        const RETIREMENTS: &str = "SELECT retirement_id FROM blob_retirements
-            WHERE space_id = $1 AND history_incarnation = $2 AND status = 'pending' ORDER BY created_at_ms, retirement_id";
         type PendingPurge = (String, String, String, String, String, Vec<u8>);
         let current = scope.clone();
-        let (purges, retirements): (Vec<PendingPurge>, Vec<String>) = self
+        let purges: Vec<PendingPurge> = self
             .with_read_tx(|tx| {
                 Box::pin(async move {
                     let sid = current.space_id.as_str();
                     let inc = current.incarnation.as_bytes().as_slice();
-                    let (purges, retirements) = match tx {
-                        BackendConn::Sqlite(conn) => (
+                    match tx {
+                        BackendConn::Sqlite(conn) => {
                             sqlx::query_as(PURGES)
                                 .bind(sid)
                                 .bind(inc)
                                 .fetch_all(&mut **conn)
-                                .await,
-                            sqlx::query_scalar(RETIREMENTS)
-                                .bind(sid)
-                                .bind(inc)
-                                .fetch_all(&mut **conn)
-                                .await,
-                        ),
-                        BackendConn::Postgres(conn) => (
+                                .await
+                        }
+                        BackendConn::Postgres(conn) => {
                             sqlx::query_as(PURGES)
                                 .bind(sid)
                                 .bind(inc)
                                 .fetch_all(&mut **conn)
-                                .await,
-                            sqlx::query_scalar(RETIREMENTS)
-                                .bind(sid)
-                                .bind(inc)
-                                .fetch_all(&mut **conn)
-                                .await,
-                        ),
-                    };
-                    Ok((
-                        purges.map_err(|err| {
-                            internal_not_committed("scan_pending_purges", err.to_string())
-                        })?,
-                        retirements.map_err(|err| {
-                            internal_not_committed("scan_pending_retirements", err.to_string())
-                        })?,
-                    ))
+                                .await
+                        }
+                    }
+                    .map_err(|err| internal_not_committed("scan_pending_purges", err.to_string()))
                 })
             })
             .await?;
-        for id in retirements {
-            self.drive_retirement_to_completion(scope, epoch, &id)
-                .await?;
-        }
+        self.resume_blob_retirements(scope, epoch, false).await?;
         for (purge_id, actor_id, idempotency_key, old_note, ret_json, sanitized_response_msgpack) in
             purges
         {
@@ -168,6 +146,81 @@ impl CanonicalStore {
             drive_pending_purge_steps_2_and_3(self, &exec).await?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn resume_blob_retirements(
+        &self,
+        scope: &HistoryScope,
+        epoch: LeaseEpoch,
+        restored_gc: bool,
+    ) -> Result<(), PortError> {
+        let mut after = String::new();
+        // A restore worker may run alongside new-epoch uploads. Their provisional
+        // discards belong to those uploads. Purge completion also owns a log entry.
+        let previous_epoch_only = restored_gc.then_some(epoch.get() as i64);
+        let limit = if restored_gc { 128 } else { i64::MAX };
+        const PAGE: &str = "SELECT retirement_id FROM blob_retirements
+            WHERE space_id=$1 AND history_incarnation=$2 AND status='pending' AND retirement_id>$3
+              AND (CAST($4 AS BIGINT) IS NULL OR (reason='gc' AND owner_epoch<$4))
+            ORDER BY CASE WHEN CAST($4 AS BIGINT) IS NULL THEN created_at_ms ELSE 0 END,
+                     retirement_id LIMIT $5";
+        loop {
+            self.inner.check_writer_epoch(&scope.space_id, epoch)?;
+            let current = scope.clone();
+            let page_after = after.clone();
+            let ids: Vec<String> = self
+                .with_read_tx(|tx| {
+                    Box::pin(async move {
+                        let sid = current.space_id.as_str();
+                        let inc = current.incarnation.as_bytes().as_slice();
+                        match tx {
+                            BackendConn::Sqlite(conn) => {
+                                sqlx::query_scalar(PAGE)
+                                    .bind(sid)
+                                    .bind(inc)
+                                    .bind(page_after)
+                                    .bind(previous_epoch_only)
+                                    .bind(limit)
+                                    .fetch_all(&mut **conn)
+                                    .await
+                            }
+                            BackendConn::Postgres(conn) => {
+                                sqlx::query_scalar(PAGE)
+                                    .bind(sid)
+                                    .bind(inc)
+                                    .bind(page_after)
+                                    .bind(previous_epoch_only)
+                                    .bind(limit)
+                                    .fetch_all(&mut **conn)
+                                    .await
+                            }
+                        }
+                        .map_err(|err| {
+                            internal_not_committed("scan_pending_retirements", err.to_string())
+                        })
+                    })
+                })
+                .await?;
+            if ids.is_empty() {
+                return Ok(());
+            }
+            for id in ids {
+                let mut backoff = Duration::from_millis(50);
+                loop {
+                    match self.drive_retirement_to_completion(scope, epoch, &id).await {
+                        Ok(()) => break,
+                        Err(error @ PortError::Domain(_)) => return Err(error),
+                        Err(error) if !restored_gc => return Err(error),
+                        Err(_) => tokio::time::sleep(backoff).await,
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+                after = id;
+            }
+            if !restored_gc {
+                return Ok(());
+            }
+        }
     }
 
     /// Executes Step 1 (SQL erasure + `pending_purges` + `blob_retirements`) of a `Purge`
@@ -201,7 +254,9 @@ async fn purge_note_inner(
     validate_mutation_identity(&ctx, &request.identity)?;
     store.ensure_blob_backend_ready().await?;
 
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let fp = format!("purge_note={}", request.input.note.as_str());
@@ -399,6 +454,35 @@ async fn purge_note_inner(
     }
 }
 
+async fn authorize_mint_placement_tx(
+    tx: &mut BackendConn<'_>,
+    space: &crate::SpaceRecord,
+    old_head: &crate::domain::common::NoteHeadRow,
+    auth: &notarium_core::auth::EngineAuthContext,
+) -> Result<crate::domain::common::FolderAncestryFacts, PortError> {
+    let (old_facts, _) = build_resource_facts_tx(
+        tx,
+        &space.space,
+        &old_head.parent_folder_id,
+        old_head.doc_class,
+        old_head.ability_id.clone(),
+        true,
+    )
+    .await?;
+    let (new_facts, new_anc) = build_resource_facts_tx(
+        tx,
+        &space.space,
+        &old_head.parent_folder_id,
+        DocClass::EncryptedNote,
+        None,
+        true,
+    )
+    .await?;
+    auth.authorize_direct_write(&old_facts, &new_facts)?;
+
+    Ok(new_anc)
+}
+
 pub(crate) async fn mint_and_purge_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -415,14 +499,12 @@ pub(crate) async fn mint_and_purge_impl(
     notarium_syntax::encrypted::validate(&request.input.encrypted_carrier)?;
 
     store.ensure_blob_backend_ready().await?;
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let prepared_blob = store.prepare_blob(request.input.encrypted_carrier.as_bytes())?;
-    let staged_ticket = store
-        .stage_blob(&space_rec.scope, space_rec.active_epoch, &prepared_blob)
-        .await?;
-    let staged_bytes = staged_ticket.compressed_size;
     let encrypted_byte_size = request.input.encrypted_carrier.len() as u64;
     let encrypted_digest = prepared_blob.digest;
 
@@ -451,6 +533,67 @@ pub(crate) async fn mint_and_purge_impl(
         ]),
     );
 
+    store
+        .inner
+        .check_writer_epoch(&space_rec.scope.space_id, space_rec.active_epoch)?;
+    let preflight = ctx.clone();
+    let old_note = request.input.old_note.clone();
+    let expected_rev = request.input.expected_revision.clone();
+    let check_id = idemp.clone();
+    let existing = store
+        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+            Box::pin(async move {
+                let space = load_space_record(tx, &preflight.scope().space_id).await?;
+                space.scope.check(preflight.scope())?;
+                if let Some(receipt) =
+                    crate::writer::lookup_command_receipt_tx(tx, &space.scope, &check_id).await?
+                {
+                    if receipt.command_hash != check_id.command_hash {
+                        return Err(DomainError::IdempotencyKeyReused.into());
+                    }
+                    return Ok(Some(receipt));
+                }
+                let head = load_note_head_row_tx(tx, &space.scope.space_id, &old_note).await?;
+                authorize_mint_placement_tx(tx, &space, &head, preflight.auth()).await?;
+                if head.lifecycle == Lifecycle::Purged
+                    || is_note_purge_fenced_tx(tx, &space.scope.space_id, old_note.as_str()).await?
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                if head.head_rev_id != expected_rev {
+                    return Err(DomainError::RevisionConflict {
+                        current: head.head_rev_id,
+                        lineage: None,
+                    }
+                    .into());
+                }
+                ensure_no_active_backup_holds_for_purge_tx(tx, &space.scope.space_id).await?;
+                Ok(None)
+            })
+        })
+        .await?;
+    if let Some(receipt) = existing {
+        if receipt.status != "completed" {
+            let pending = load_pending_purge_for_idempotency(store, &space_rec.scope, &idemp)
+                .await?
+                .ok_or_else(|| {
+                    internal_not_committed(
+                        "missing_pending_purge",
+                        "unfinished receipt missing purge state",
+                    )
+                })?;
+            drive_pending_purge_steps_2_and_3(store, &pending).await?;
+        }
+        let stored: StoredCommittedMintAndPurgeV1 = rmp_serde::from_slice(&receipt.response_blob)
+            .map_err(|err| {
+            internal_not_committed("decode_replayed_mint_purge", err.to_string())
+        })?;
+        return Ok(stored.into_committed());
+    }
+    let staged_ticket = store
+        .stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared_blob)
+        .await?;
+    let staged_bytes = staged_ticket.compressed_size;
     let step1_capture: Arc<StdMutex<Option<PendingPurgeExecution>>> = Arc::new(StdMutex::new(None));
     let step1_capture_cl = Arc::clone(&step1_capture);
 
@@ -527,25 +670,8 @@ pub(crate) async fn mint_and_purge_impl(
                 }
 
                 let live_space = load_space_record(tx, &scope.space_id).await?;
-                let (old_facts, _) = build_resource_facts_tx(
-                    tx,
-                    &live_space.space,
-                    &old_head.parent_folder_id,
-                    old_head.doc_class,
-                    old_head.ability_id.clone(),
-                    true,
-                )
-                .await?;
-                let (new_facts, new_anc) = build_resource_facts_tx(
-                    tx,
-                    &live_space.space,
-                    &old_head.parent_folder_id,
-                    DocClass::EncryptedNote,
-                    None,
-                    true,
-                )
-                .await?;
-                auth.authorize_direct_write(&old_facts, &new_facts)?;
+                let new_anc =
+                    authorize_mint_placement_tx(tx, &live_space, &old_head, &auth).await?;
 
                 let succ_slug = input
                     .new_slug

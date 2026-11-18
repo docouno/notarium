@@ -40,7 +40,10 @@ pub(crate) async fn move_folder_impl(
     request: Mutation<MoveFolder>,
 ) -> Result<Committed<FolderRef>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let fp = format!(
@@ -127,7 +130,6 @@ pub(crate) async fn move_folder_impl(
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
 
-                let target_write_class = choose_folder_auth_class(&auth, &scope.space_id);
                 let before_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
@@ -338,7 +340,10 @@ pub(crate) async fn rename_folder_impl(
 ) -> Result<Committed<FolderRef>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
     let new_slug_fold = normalize_slug_key(&request.input.name)?;
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let fp = format!(
@@ -389,7 +394,6 @@ pub(crate) async fn rename_folder_impl(
                 }
 
                 let anc = load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
-                let target_write_class = choose_folder_auth_class(&auth, &scope.space_id);
                 let facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
@@ -597,7 +601,10 @@ pub(crate) async fn rename_project_impl(
     if request.input.display_name.trim().is_empty() {
         return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
     }
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let fp = format!(
@@ -652,7 +659,6 @@ pub(crate) async fn rename_project_impl(
                 if folder_row.parent_folder_id.as_ref() != Some(&live_space.root_folder_id) {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
-                let target_write_class = choose_folder_auth_class(&auth, &scope.space_id);
                 let facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
@@ -1244,7 +1250,10 @@ pub(crate) async fn set_folder_write_lock_impl(
     folder: FolderId,
     locked: bool,
 ) -> Result<FolderRef, PortError> {
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let auth = ctx.auth().clone();
@@ -1266,7 +1275,6 @@ pub(crate) async fn set_folder_write_lock_impl(
                     return Err(DomainError::ResourceNotFound.into());
                 }
                 let anc = load_folder_ancestry_tx(tx, &scope.space_id, &folder_cl, true).await?;
-                let target_write_class = choose_folder_auth_class(&auth, &scope.space_id);
                 // Unlocking checks write permission without failing on the folder's own existing lock!
                 let check_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
@@ -1397,24 +1405,25 @@ pub(crate) async fn set_folder_write_lock_impl(
     store.submit_write_command(&ctx.budget, intent).await
 }
 
-pub(crate) fn choose_folder_auth_class(
+/// Memory and ability grants apply to those documents only. Neither grants authority
+/// to change the containing folder or its write lock.
+pub(crate) fn folder_mutation_class(
     auth: &notarium_core::auth::EngineAuthContext,
     space: &notarium_core::ids::SpaceId,
-) -> DocClass {
-    if let Some(grant) = auth.spaces().get(space) {
-        if grant.write_classes.contains(&DocClass::UserDoc) {
-            return DocClass::UserDoc;
-        }
-        if let Some(first_non_skill) = grant
-            .write_classes
-            .iter()
-            .copied()
-            .find(|c| *c != DocClass::Skill)
-        {
-            return first_non_skill;
-        }
+) -> Result<DocClass, DomainError> {
+    let grant = auth
+        .spaces()
+        .get(space)
+        .ok_or(DomainError::ResourceNotFound)?;
+    if grant.write_classes.contains(&DocClass::UserDoc) {
+        return Ok(DocClass::UserDoc);
     }
-    DocClass::UserDoc
+    grant
+        .write_classes
+        .iter()
+        .copied()
+        .find(|class| !matches!(class, DocClass::AgentMemory | DocClass::Skill))
+        .ok_or(DomainError::SpaceReadOnly)
 }
 
 async fn is_folder_readable_tx(

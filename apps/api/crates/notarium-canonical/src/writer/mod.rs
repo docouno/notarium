@@ -48,6 +48,7 @@ pub struct CommandIdentitySpec {
     pub actor: PrincipalId,
     pub command_key: CommandKey,
     pub command_hash: ContentDigest,
+    pub(crate) require_receipt_detail: bool,
     pub(crate) authority:
         Option<Arc<(notarium_core::auth::EngineAuthContext, replay::ReplayPolicy)>>,
 }
@@ -58,6 +59,7 @@ impl CommandIdentitySpec {
             command_key,
             command_hash,
             authority: None,
+            require_receipt_detail: false,
         }
     }
 }
@@ -996,6 +998,11 @@ impl crate::CanonicalStore {
             return Ok(0);
         };
         Ok(spaces.lock().expect("pg spaces").len())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn has_active_sqlite_writes_for_test(&self) -> Result<bool, PortError> {
+        Ok(self.inner.writer()?.has_active_sqlite_ops())
     }
 
     #[cfg(feature = "test-support")]
@@ -2076,6 +2083,7 @@ pub(crate) async fn lookup_command_receipt_tx(
         .try_into()
         .map_err(|_| internal_not_committed("corrupt_receipt_hash", "command_hash != 32B"))?;
 
+    let require_detail = idemp.require_receipt_detail && idemp.command_hash.as_bytes() == &arr;
     let effective_blob = if let Some(pid) = resp_payload_id {
         let detail_opt: Option<(i32, Option<Vec<u8>>)> = match tx {
             BackendConn::Sqlite(conn) => {
@@ -2110,8 +2118,11 @@ pub(crate) async fn lookup_command_receipt_tx(
         };
         match detail_opt {
             Some((0, Some(detail))) => detail,
+            _ if require_detail => return Err(DomainError::ResourceNotFound.into()),
             _ => sanitized_blob,
         }
+    } else if require_detail {
+        return Err(DomainError::ResourceNotFound.into());
     } else {
         sanitized_blob
     };

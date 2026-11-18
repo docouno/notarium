@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[path = "l6_board_pma_and_rollback/applied.rs"]
+mod applied;
 mod support;
 
 use std::{
@@ -856,10 +858,10 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
                 &scope,
                 &owner,
                 MoveBoardCard {
-                    view,
+                    view: view.clone(),
                     note: last.note,
                     expected_note: last.revision,
-                    expected_view: view_created.value.revision,
+                    expected_view: view_created.value.revision.clone(),
                     group: GroupKey::Value(ScalarValue::String("large".into())),
                     before: None,
                     after: None,
@@ -880,6 +882,8 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
             reason: AwaitReason::TooManyNotes
         }
     ));
+
+    applied::check(store, &ctx, &view, view_created.value.revision, &planner).await;
 
     BoardEffects {
         scope,
@@ -1342,6 +1346,17 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
         "closed collab_sessions.lineage_epoch must advance 3 -> 4 (board field patch) -> 5 (direct edit)"
     );
 
+    let mut trashed_metadata = note_metadata_at(
+        store,
+        &scope,
+        &created_board.value.revision,
+        &created_board.receipt,
+    )
+    .await;
+    trashed_metadata.lifecycle = Lifecycle::Trashed;
+    assert!(trashed_metadata.evaluated_fields.contains_key("status"));
+    let restored_metadata = note_metadata_at(store, &scope, &pre_v0.value, &pre_v0.receipt).await;
+
     let rollback_committed = store
         .rollback_agent_run(
             human_ctx.clone(),
@@ -1402,6 +1417,14 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
     assert_eq!(rb.trashed[0].note, n_created);
     assert_eq!(rb.restored.len(), 1);
     assert_eq!(rb.restored[0].note, n_pre);
+    assert_eq!(
+        note_metadata_at(store, &scope, &rb.trashed[0], &rollback_committed.receipt).await,
+        trashed_metadata
+    );
+    assert_eq!(
+        note_metadata_at(store, &scope, &rb.restored[0], &rollback_committed.receipt).await,
+        restored_metadata
+    );
     assert_eq!(rb.skipped_manual_edits, vec![n_manual]);
     assert_eq!(rb.skipped_room_active, vec![n_room.clone()]);
 
@@ -1777,10 +1800,145 @@ async fn check_rollback_destination_authority(
     assert_eq!(restored.value.restored[0].note, note);
 }
 
-async fn run_note_only_rollback_suite(store: &CanonicalStore) {
+async fn check_rollback_with_dirty_room(
+    store: &CanonicalStore,
+    scope: &HistoryScope,
+    owner: &PrincipalId,
+) {
+    use notarium_canonical::peers::{AppendCollabUpdate, CloseCollabSession, OpenCollabSession};
+    let human = owner_ctx(scope, owner.clone());
+    let note = sample_note_id(232);
+    let run = sample_run_id(46);
+    let created = store
+        .create_note(
+            agent_run_ctx(&human, run.clone()),
+            next_mutation(
+                scope,
+                owner,
+                CreateNote {
+                    note: note.clone(),
+                    parent: None,
+                    slug: "unsettled".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "Unsettled".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let opened = store
+        .open_collab_session(
+            &make_budget(),
+            OpenCollabSession {
+                scope: scope.clone(),
+                note: note.clone(),
+                owner_id: "room-owner".into(),
+                expected_carrier_rev: created.value.revision.clone(),
+                expected_lease: None,
+                expected_lineage: None,
+                initial_yrs_snapshot: None,
+                allow_fenced_recovery: false,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .append_collab_update(
+            &make_budget(),
+            AppendCollabUpdate {
+                scope: scope.clone(),
+                note: note.clone(),
+                owner_id: "room-owner".into(),
+                expected_lease: opened.lease_epoch,
+                expected_lineage: opened.lineage_epoch,
+                update_seq: 1,
+                update_bytes: vec![1, 2, 3],
+            },
+        )
+        .await
+        .unwrap();
+    let closed = store
+        .close_collab_session(
+            &make_budget(),
+            CloseCollabSession {
+                scope: scope.clone(),
+                note: note.clone(),
+                owner_id: Some("room-owner".into()),
+                expected_lease: opened.lease_epoch,
+                expected_lineage: opened.lineage_epoch,
+                final_yrs_snapshot: None,
+                compacted_through_update_seq: None,
+                carrier_settlement: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(closed.carrier_dirty);
+    let run_rev = store
+        .inspect_agent_run_revision_for_test(&scope.space_id, &run)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = store
+        .rollback_agent_run(
+            human,
+            next_mutation(
+                scope,
+                owner,
+                RollbackAgentRun {
+                    run,
+                    expected_run_revision: run_rev,
+                    expected_entities: vec![NoteRevision {
+                        note: note.clone(),
+                        revision: created.value.revision,
+                    }],
+                    associated_board_expectations: Vec::new(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.value.skipped_room_active.as_slice(),
+        std::slice::from_ref(&note)
+    );
+    assert!(result.value.trashed.is_empty());
+    let snap = store
+        .read_collab_session(None, scope, &note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snap.session, closed);
+    assert_eq!(snap.updates.len(), 1);
+    assert_eq!(snap.updates[0].update_bytes, [1, 2, 3]);
+}
+
+async fn note_metadata_at(
+    store: &CanonicalStore,
+    scope: &HistoryScope,
+    revision: &NoteRevision,
+    receipt: &notarium_core::receipt::MutationReceiptToken,
+) -> notarium_canonical::codec::NoteRevisionMetadata {
+    let record = store
+        .read_entity_revision_at_cutoff(scope, "note", revision.note.as_str(), Some(receipt.seq()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.revision_id, revision.revision);
+    let notarium_canonical::codec::RevisionMetadataPayload::Note(meta) = record.metadata.payload
+    else {
+        panic!("expected note metadata");
+    };
+    meta
+}
+
+async fn run_note_only_rollback_suite(
+    store: &CanonicalStore,
+    mut pg: Option<&mut sqlx::PgConnection>,
+) {
     let owner = sample_principal_id(45);
     let run_id = sample_run_id(45);
-    let (scope, _root) = seed_space(
+    let (scope, root_folder) = seed_space(
         store,
         sample_space_id(45),
         sample_incarnation(45),
@@ -1792,7 +1950,7 @@ async fn run_note_only_rollback_suite(store: &CanonicalStore) {
 
     let n_ed = sample_note_id(201);
     let cur_c = "---\ntitle: V0\n---\nHello v0\n";
-    let _pre = store
+    let pre = store
         .create_note(
             human_ctx.clone(),
             next_mutation(
@@ -1836,9 +1994,10 @@ async fn run_note_only_rollback_suite(store: &CanonicalStore) {
         .expect("run edit");
 
     let n_cr = sample_note_id(202);
+    let created_carrier = "---\ntitle: Created\npriority: 3\ntags: [red, green]\n---\nBody\n";
     let cr = store
         .create_note(
-            run_ctx,
+            run_ctx.clone(),
             next_mutation(
                 &scope,
                 &owner,
@@ -1847,46 +2006,306 @@ async fn run_note_only_rollback_suite(store: &CanonicalStore) {
                     parent: None,
                     slug: "note-only-created".to_owned(),
                     class: DocClass::UserDoc,
-                    carrier: "---\ntitle: Created\n---\nBody\n".to_owned(),
+                    carrier: created_carrier.into(),
                 },
             ),
         )
         .await
         .expect("run create");
 
+    // A duplicate ordinary key is opaque YAML with a preserved diagnostic.
+    let opaque_carrier = "---\nstatus: draft\nstatus: sent\n---\nOpaque body\n";
+    let opaque = store
+        .create_note(
+            run_ctx,
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    note: sample_note_id(203),
+                    parent: None,
+                    slug: "opaque-created".into(),
+                    class: DocClass::UserDoc,
+                    carrier: opaque_carrier.into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let pre_meta = note_metadata_at(store, &scope, &pre.value, &pre.receipt).await;
+    let created_meta = note_metadata_at(store, &scope, &cr.value, &cr.receipt).await;
+    let opaque_meta = note_metadata_at(store, &scope, &opaque.value, &opaque.receipt).await;
+    assert!(
+        created_meta
+            .raw_fields
+            .as_ref()
+            .unwrap()
+            .contains_key("tags")
+    );
+    assert!(created_meta.evaluated_fields.contains_key("priority"));
+    assert!(!opaque_meta.diagnostics.is_empty());
+    let unrelated = sample_note_id(231);
+    let unrelated_rev = store
+        .create_note(
+            human_ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    note: unrelated.clone(),
+                    parent: None,
+                    slug: "unrelated-live".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "Unrelated".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let open = |note, rev| notarium_canonical::peers::OpenCollabSession {
+        scope: scope.clone(),
+        note,
+        owner_id: "room-owner".into(),
+        expected_carrier_rev: rev,
+        expected_lease: None,
+        expected_lineage: None,
+        initial_yrs_snapshot: None,
+        allow_fenced_recovery: false,
+    };
+    let live = store
+        .open_collab_session(
+            &make_budget(),
+            open(unrelated, unrelated_rev.value.revision),
+        )
+        .await
+        .unwrap();
+    let opened = store
+        .open_collab_session(
+            &make_budget(),
+            open(n_ed.clone(), ed.value.revision.clone()),
+        )
+        .await
+        .unwrap();
+    let closed = store
+        .close_collab_session(
+            &make_budget(),
+            notarium_canonical::peers::CloseCollabSession {
+                scope: scope.clone(),
+                note: n_ed.clone(),
+                owner_id: Some("room-owner".into()),
+                expected_lease: opened.lease_epoch,
+                expected_lineage: opened.lineage_epoch,
+                final_yrs_snapshot: None,
+                compacted_through_update_seq: None,
+                carrier_settlement: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let seeded_snapshot = if let Some(db) = pg.as_deref_mut() {
+        // A settled snapshot may share a publication with the revision about to be restored.
+        let snapshot = cur_c.as_bytes();
+        sqlx::query("UPDATE collab_sessions SET yrs_snapshot_blob=$1, yrs_snapshot_blake3=$2 WHERE space_id=$3 AND note_id=$4")
+            .bind(snapshot).bind(blake3::hash(snapshot).as_bytes().as_slice())
+            .bind(scope.space_id.as_str()).bind(n_ed.as_str()).execute(&mut *db).await.unwrap();
+        sqlx::query("INSERT INTO collab_checkpoints(space_id, note_id, snapshot_lease_epoch, snapshot_update_seq, carrier_dirty)
+                     VALUES ($1, $2, $3, 1, 0)
+                     ON CONFLICT(space_id,note_id) DO UPDATE SET snapshot_lease_epoch=$3, snapshot_update_seq=1, carrier_dirty=0")
+            .bind(scope.space_id.as_str()).bind(n_ed.as_str()).bind(opened.lease_epoch.get() as i64)
+            .execute(&mut *db).await.unwrap();
+        let shared_digest: Vec<u8> = sqlx::query_scalar(
+            "INSERT INTO blob_references (space_id, owner_kind, owner_id, owner_rev_id, resource_key,
+                                          content_blake3, publication_id, created_seq)
+             SELECT space_id,'collab_snapshot',owner_id,owner_rev_id,'snapshot',content_blake3,publication_id,created_seq
+             FROM blob_references WHERE space_id=$1 AND owner_kind='note_revision' AND owner_id=$2 AND owner_rev_id=$3
+             RETURNING content_blake3",
+        ).bind(scope.space_id.as_str()).bind(n_ed.as_str()).bind(pre.value.revision.as_str())
+            .fetch_one(&mut *db).await.unwrap();
+        assert_eq!(shared_digest.as_slice(), blake3::hash(snapshot).as_bytes());
+        sqlx::query(
+            "UPDATE blob_catalog SET ref_count=ref_count+1 WHERE space_id=$1 AND content_blake3=$2",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(&shared_digest)
+        .execute(&mut *db)
+        .await
+        .unwrap();
+
+        // Record which public rollback route actually performed the room update.
+        sqlx::raw_sql("CREATE TABLE room_rollback_calls (used_root_function BOOLEAN NOT NULL);
+            CREATE FUNCTION observe_room_rollback() RETURNS trigger LANGUAGE plpgsql AS $fn$
+            BEGIN
+                INSERT INTO room_rollback_calls VALUES (position('notarium_pg_lean_commit_v3(' IN current_query()) > 0);
+                RETURN NEW;
+            END;
+            $fn$;
+            CREATE TRIGGER observe_room_rollback AFTER UPDATE OF lineage_epoch ON collab_sessions
+            FOR EACH ROW EXECUTE FUNCTION observe_room_rollback()")
+            .execute(&mut *db).await.unwrap();
+        Some(shared_digest)
+    } else {
+        None
+    };
     let run_rev = store
         .inspect_agent_run_revision_for_test(&scope.space_id, &run_id)
         .await
         .unwrap()
         .unwrap();
 
+    let rollback = next_mutation(
+        &scope,
+        &owner,
+        RollbackAgentRun {
+            run: run_id,
+            expected_run_revision: run_rev,
+            expected_entities: vec![ed.value.clone(), cr.value.clone(), opaque.value.clone()],
+            associated_board_expectations: Vec::new(),
+        },
+    );
+    let mut grants = human_ctx.auth().spaces().clone();
+    grants
+        .get_mut(&scope.space_id)
+        .unwrap()
+        .write_classes
+        .remove(&DocClass::UserDoc);
+    let restricted = SpaceContext::new(
+        EngineAuthContext::for_human(VerifiedHuman::attest(
+            owner.clone(),
+            GrantId::from_bytes([7; 16]),
+            grants,
+            true,
+        )),
+        scope.clone(),
+        make_budget(),
+    )
+    .unwrap();
+    let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    assert!(matches!(
+        store.rollback_agent_run(restricted, rollback.clone()).await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        before
+    );
+    assert_eq!(
+        store
+            .read_collab_session(None, &scope, &n_ed)
+            .await
+            .unwrap()
+            .unwrap()
+            .session
+            .lineage_epoch,
+        closed.lineage_epoch
+    );
+
     let rb = store
-        .rollback_agent_run(
-            human_ctx.clone(),
-            next_mutation(
-                &scope,
-                &owner,
-                RollbackAgentRun {
-                    run: run_id,
-                    expected_run_revision: run_rev,
-                    expected_entities: vec![
-                        NoteRevision {
-                            note: n_ed.clone(),
-                            revision: ed.value.revision,
-                        },
-                        NoteRevision {
-                            note: n_cr.clone(),
-                            revision: cr.value.revision,
-                        },
-                    ],
-                    associated_board_expectations: Vec::new(),
-                },
-            ),
-        )
+        .rollback_agent_run(human_ctx.clone(), rollback)
         .await
         .expect("note-only rollback");
     assert_eq!(rb.value.restored.len(), 1);
-    assert_eq!(rb.value.trashed.len(), 1);
+    assert_eq!(rb.value.trashed.len(), 2);
+    let restored = note_metadata_at(store, &scope, &rb.value.restored[0], &rb.receipt).await;
+    assert_eq!(restored, pre_meta);
+    assert_eq!(restored.parent_folder_id, root_folder);
+    assert!(restored.is_root_child);
+    for (original, carrier) in [
+        (created_meta, created_carrier),
+        (opaque_meta, opaque_carrier),
+    ] {
+        let trash = rb
+            .value
+            .trashed
+            .iter()
+            .find(|r| r.note == original.note_id)
+            .unwrap();
+        let trash_meta = note_metadata_at(store, &scope, trash, &rb.receipt).await;
+        let mut expected = original.clone();
+        expected.lifecycle = Lifecycle::Trashed;
+        assert_eq!(trash_meta, expected);
+        let undo = store
+            .delete_note(
+                human_ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::DeleteNote {
+                        note: original.note_id.clone(),
+                        disposition: notarium_core::ports::DeleteDisposition::Restore,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            note_metadata_at(store, &scope, &undo.value, &undo.receipt).await,
+            original
+        );
+        for (revision, expected_lifecycle) in [
+            (Some(trash.revision.clone()), Lifecycle::Trashed),
+            (None, Lifecycle::Active),
+        ] {
+            let snap = store
+                .get_note(
+                    human_ctx.clone(),
+                    GetNote {
+                        note: original.note_id.clone(),
+                        revision,
+                        causal: CausalBasis::Exact(
+                            ReceiptSet::new([undo.receipt.clone()]).unwrap(),
+                        ),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(snap.document.lifecycle(), expected_lifecycle);
+            assert_eq!(
+                snap.document.explicit_read(human_ctx.auth()).unwrap(),
+                carrier
+            );
+            assert_eq!(snap.parent, None);
+            assert_eq!(snap.fields, original.evaluated_fields);
+            assert_eq!(snap.diagnostics, original.diagnostics);
+        }
+    }
+    let now = store
+        .read_collab_session(None, &scope, &n_ed)
+        .await
+        .unwrap()
+        .unwrap()
+        .session;
+    assert_eq!(now.lease_epoch, closed.lease_epoch);
+    assert_eq!(now.lineage_epoch.get(), closed.lineage_epoch.get() + 1);
+    assert_eq!(now.carrier_rev_id, rb.value.restored[0].revision);
+    assert_eq!(now.updated_seq, rb.receipt.seq());
+    assert!(now.yrs_snapshot_blob.is_none() && now.yrs_snapshot_digest.is_none());
+    assert!(now.snapshot_coverage.is_none() && !now.carrier_dirty);
+    assert_eq!(
+        store
+            .read_collab_session(None, &scope, &live.note)
+            .await
+            .unwrap()
+            .unwrap()
+            .session,
+        live
+    );
+    if let (Some(db), Some(shared_digest)) = (pg, seeded_snapshot) {
+        let clean: (bool, i64, i64) = sqlx::query_as(
+            "SELECT NOT EXISTS(SELECT 1 FROM blob_references WHERE space_id=$1 AND owner_kind='collab_snapshot' AND owner_id=$2),
+                    (SELECT ref_count FROM blob_catalog WHERE space_id=$1 AND content_blake3=$3),
+                    (SELECT count(*) FROM blob_references WHERE space_id=$1 AND content_blake3=$3)"
+        ).bind(scope.space_id.as_str()).bind(n_ed.as_str()).bind(&shared_digest).fetch_one(&mut *db).await.unwrap();
+        assert!(clean.0 && clean.1 > 0);
+        assert_eq!(clean.1, clean.2);
+        let calls: Vec<bool> =
+            sqlx::query_scalar("SELECT used_root_function FROM room_rollback_calls")
+                .fetch_all(&mut *db)
+                .await
+                .unwrap();
+        assert_eq!(calls, [true]);
+    }
+    check_rollback_with_dirty_room(store, &scope, &owner).await;
     let got = store
         .get_note(
             human_ctx.clone(),
@@ -1911,7 +2330,7 @@ async fn l6_note_only_rollback_dual_dialect_parity() {
         let root = TempDataRoot::new("l6-nonly-sqlite");
         let cfg = CanonicalConfig::local_default(sample_installation_id(1), root.data_root());
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
-        run_note_only_rollback_suite(&store).await;
+        run_note_only_rollback_suite(&store, None).await;
         runtime.shutdown().await.expect("shutdown sqlite");
     }
     {
@@ -1924,7 +2343,12 @@ async fn l6_note_only_rollback_dual_dialect_parity() {
             .expect("ensure S3 bucket");
         let cfg = fixtures.pg_s3_config(sample_installation_id(2), &schema, s3_cfg);
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
-        run_note_only_rollback_suite(&store).await;
+        let mut conn = fixtures.open_raw_pg().await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        run_note_only_rollback_suite(&store, Some(&mut conn)).await;
         runtime.shutdown().await.expect("shutdown pg+s3");
         fixtures.drop_pg_schema(&schema).await;
     }

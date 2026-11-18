@@ -63,9 +63,85 @@ struct RunBoardMoveRow {
     before_placement: StoredSemanticPlacementV1,
 }
 
+pub(crate) fn decode_rollback_note(
+    bytes: &[u8],
+    note: &NoteId,
+) -> Result<NoteRevisionMetadata, PortError> {
+    match RevisionMetadataEnvelope::decode(bytes)?.payload {
+        RevisionMetadataPayload::Note(meta) if &meta.note_id == note => Ok(meta),
+        _ => Err(internal_not_committed(
+            "rollback_source_metadata",
+            "revision metadata does not identify the expected note",
+        )),
+    }
+}
+
+pub(crate) enum RollbackRevision<'a> {
+    Trash,
+    Restore(Option<&'a crate::domain::common::CurrentSpaceSchema>),
+}
+
+/// Lifecycle-only trash inherits the complete current carrier snapshot. A restoration
+/// interprets the pre-run carrier under the schema visible at the new command cut.
+pub(crate) fn encode_rollback_note(
+    source: &NoteRevisionMetadata,
+    original_bytes: Option<std::borrow::Cow<'_, [u8]>>,
+    is_root_child: bool,
+    operation: RollbackRevision<'_>,
+) -> Result<Vec<u8>, PortError> {
+    use std::borrow::Cow;
+
+    let mut result = Cow::Borrowed(source);
+    if source.is_root_child != is_root_child {
+        result.to_mut().is_root_child = is_root_child;
+    }
+    match operation {
+        RollbackRevision::Trash => {
+            if source.lifecycle != Lifecycle::Trashed {
+                result.to_mut().lifecycle = Lifecycle::Trashed;
+            }
+        }
+        RollbackRevision::Restore(schema) => {
+            let evaluated = if source.doc_class == DocClass::EncryptedNote {
+                BTreeMap::new()
+            } else {
+                evaluate_fields_with_schema(
+                    source.raw_fields.as_ref(),
+                    source.diagnostics.first(),
+                    schema.map(|s| &s.fields),
+                )
+            };
+            let revision = schema.map(|s| &s.schema_revision);
+            if source.schema_revision.as_ref() != revision || source.evaluated_fields != evaluated {
+                let meta = result.to_mut();
+                meta.schema_revision = revision.cloned();
+                meta.evaluated_fields = evaluated;
+            }
+        }
+    }
+    if matches!(result, Cow::Borrowed(_))
+        && let Some(bytes) = original_bytes
+    {
+        return Ok(bytes.into_owned());
+    }
+    RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(result.into_owned())).encode()
+}
+
+fn current_rollback_metadata(
+    history: &[(RevisionId, SpaceSeq, Vec<u8>, Option<AgentRunId>)],
+    head: &RevisionId,
+    note: &NoteId,
+) -> Result<Box<NoteRevisionMetadata>, PortError> {
+    let row = history.iter().find(|r| &r.0 == head).ok_or_else(|| {
+        internal_not_committed("rollback_missing_head", "current note revision is missing")
+    })?;
+    decode_rollback_note(&row.2, note).map(Box::new)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum CandidateAction {
     TrashCreated {
+        metadata: Box<NoteRevisionMetadata>,
         current_rev: RevisionId,
         current_lifecycle: Lifecycle,
         doc_class: DocClass,
@@ -156,9 +232,17 @@ pub(crate) async fn rollback_agent_run_impl(
                     .active_epoch
             }
         };
+        let mut try_pg_batch_plan = true;
         if !store.is_sqlite_local()
-            && let Some(direct_res) =
-                try_execute_pg_root_rollback(store, &ctx, &idemp, &request, writer_epoch).await
+            && let Some(direct_res) = try_execute_pg_root_rollback(
+                store,
+                &ctx,
+                &idemp,
+                &request,
+                writer_epoch,
+                &mut try_pg_batch_plan,
+            )
+            .await
         {
             return direct_res;
         }
@@ -176,15 +260,17 @@ pub(crate) async fn rollback_agent_run_impl(
                 .submit_write_command_tracked(&ctx.budget, intent, Some(fast_plan), active_op_guard)
                 .await
         } else {
-            let pg_fast = build_rollback_pg_single_item_fast(
-                ctx.scope().clone(),
-                idemp.clone(),
-                ctx.auth().clone(),
-                request.identity.clone(),
-                request.input.clone(),
-                store.inner.room_fences.clone(),
-                writer_epoch,
-            );
+            let pg_fast = try_pg_batch_plan.then(|| {
+                build_rollback_pg_single_item_fast(
+                    ctx.scope().clone(),
+                    idemp.clone(),
+                    ctx.auth().clone(),
+                    request.identity.clone(),
+                    request.input.clone(),
+                    store.inner.room_fences.clone(),
+                    writer_epoch,
+                )
+            });
             let intent = build_rollback_direct_single_tx_intent(
                 ctx.scope().clone(),
                 writer_epoch,
@@ -195,12 +281,7 @@ pub(crate) async fn rollback_agent_run_impl(
                 store.inner.room_fences.clone(),
             );
             store
-                .submit_write_command_tracked_pg(
-                    &ctx.budget,
-                    intent,
-                    Some(pg_fast),
-                    active_op_guard,
-                )
+                .submit_write_command_tracked_pg(&ctx.budget, intent, pg_fast, active_op_guard)
                 .await
         };
 
@@ -735,6 +816,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
 
                 let action = match pre_rev_opt {
                     None => CandidateAction::TrashCreated {
+                        metadata: current_rollback_metadata(&note_revs, &head.head_rev_id, &nid)?,
                         current_rev: head.head_rev_id,
                         current_lifecycle: head.lifecycle,
                         doc_class: head.doc_class,
@@ -748,13 +830,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                         content_digest: head.content_digest,
                     },
                     Some((pre_rev_id, _, meta_bytes, _)) => {
-                        let env = RevisionMetadataEnvelope::decode(meta_bytes)?;
-                        let RevisionMetadataPayload::Note(pre_meta) = env.payload else {
-                            return Err(internal_not_committed(
-                                "corrupt_note_rev_meta",
-                                "expected NoteRevisionMetadata",
-                            ));
-                        };
+                        let pre_meta = decode_rollback_note(meta_bytes, &nid)?;
                         let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
                             && head.parent_folder_id == pre_meta.parent_folder_id
                             && head.slug == pre_meta.slug
@@ -946,17 +1022,13 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
             // Trash created notes FIRST.
             for (nid, action) in &final_eligible {
                 let CandidateAction::TrashCreated {
+                    metadata,
                     current_rev,
                     current_lifecycle,
                     doc_class,
                     parent_folder_id,
-                    slug,
-                    slug_fold,
-                    title,
-                    ability_id,
-                    visibility_mask,
-                    byte_size,
                     content_digest,
+                    ..
                 } = action
                 else {
                     continue;
@@ -1004,27 +1076,12 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     });
                 }
 
-                let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
-                    NoteRevisionMetadata {
-                        note_id: nid.clone(),
-                        parent_folder_id: parent_folder_id.clone(),
-                        is_root_child: anc.is_root_child,
-                        slug: slug.clone(),
-                        slug_fold: slug_fold.clone(),
-                        title: title.clone(),
-                        doc_class: *doc_class,
-                        ability_id: ability_id.clone(),
-                        lifecycle: Lifecycle::Trashed,
-                        visibility_mask: *visibility_mask,
-                        byte_size: *byte_size,
-                        content_digest: *content_digest,
-                        schema_revision: current_schema.as_ref().map(|s| s.schema_revision.clone()),
-                        raw_fields: None,
-                        evaluated_fields: BTreeMap::new(),
-                        diagnostics: Vec::new(),
-                    },
-                ))
-                .encode()?;
+                let meta = encode_rollback_note(
+                    metadata,
+                    None,
+                    anc.is_root_child,
+                    RollbackRevision::Trash,
+                )?;
 
                 pending_rev_rows.push(PendingSingleRev {
                     rev_id: trev.clone(),
@@ -1136,36 +1193,12 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     delete_all_target_overlays_tx(tx, &scope_cl.space_id, nid).await?;
                 }
 
-                let eval_fields = if pre_meta.doc_class == DocClass::EncryptedNote {
-                    BTreeMap::new()
-                } else {
-                    evaluate_fields_with_schema(
-                        pre_meta.raw_fields.as_ref(),
-                        pre_meta.diagnostics.first(),
-                        current_schema.as_ref().map(|s| &s.fields),
-                    )
-                };
-                let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
-                    NoteRevisionMetadata {
-                        note_id: nid.clone(),
-                        parent_folder_id: pre_meta.parent_folder_id.clone(),
-                        is_root_child,
-                        slug: pre_meta.slug.clone(),
-                        slug_fold: pre_meta.slug_fold.clone(),
-                        title: pre_meta.title.clone(),
-                        doc_class: pre_meta.doc_class,
-                        ability_id: pre_meta.ability_id.clone(),
-                        lifecycle: pre_meta.lifecycle,
-                        visibility_mask: pre_meta.visibility_mask,
-                        byte_size: pre_meta.byte_size,
-                        content_digest: pre_meta.content_digest,
-                        schema_revision: current_schema.as_ref().map(|s| s.schema_revision.clone()),
-                        raw_fields: pre_meta.raw_fields.clone(),
-                        evaluated_fields: eval_fields,
-                        diagnostics: pre_meta.diagnostics.clone(),
-                    },
-                ))
-                .encode()?;
+                let meta = encode_rollback_note(
+                    pre_meta,
+                    None,
+                    is_root_child,
+                    RollbackRevision::Restore(current_schema.as_ref()),
+                )?;
 
                 pending_rev_rows.push(PendingSingleRev {
                     rev_id: rrev.clone(),
@@ -1816,17 +1849,13 @@ fn build_rollback_execute_fn(
             // 6a. Trash run-created eligible notes FIRST & remove their overlays across ALL views.
             for (nid, action) in &eligible_notes {
                 let CandidateAction::TrashCreated {
+                    metadata,
                     current_rev,
                     current_lifecycle,
                     doc_class,
                     parent_folder_id,
-                    slug,
-                    slug_fold,
-                    title,
-                    ability_id,
-                    visibility_mask,
-                    byte_size,
                     content_digest,
+                    ..
                 } = action
                 else {
                     continue;
@@ -1874,27 +1903,12 @@ fn build_rollback_execute_fn(
                     });
                 }
 
-                let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
-                    NoteRevisionMetadata {
-                        note_id: nid.clone(),
-                        parent_folder_id: parent_folder_id.clone(),
-                        is_root_child: anc.is_root_child,
-                        slug: slug.clone(),
-                        slug_fold: slug_fold.clone(),
-                        title: title.clone(),
-                        doc_class: *doc_class,
-                        ability_id: ability_id.clone(),
-                        lifecycle: Lifecycle::Trashed,
-                        visibility_mask: *visibility_mask,
-                        byte_size: *byte_size,
-                        content_digest: *content_digest,
-                        schema_revision: current_schema.as_ref().map(|s| s.schema_revision.clone()),
-                        raw_fields: None,
-                        evaluated_fields: BTreeMap::new(),
-                        diagnostics: Vec::new(),
-                    },
-                ))
-                .encode()?;
+                let meta = encode_rollback_note(
+                    metadata,
+                    None,
+                    anc.is_root_child,
+                    RollbackRevision::Trash,
+                )?;
 
                 pending_rev_rows.push(PendingRevRow {
                     rev_id: trev.clone(),
@@ -2005,36 +2019,12 @@ fn build_rollback_execute_fn(
                     delete_all_target_overlays_tx(tx, &scope_cl.space_id, nid).await?;
                 }
 
-                let eval_fields = if pre_meta.doc_class == DocClass::EncryptedNote {
-                    BTreeMap::new()
-                } else {
-                    evaluate_fields_with_schema(
-                        pre_meta.raw_fields.as_ref(),
-                        pre_meta.diagnostics.first(),
-                        current_schema.as_ref().map(|s| &s.fields),
-                    )
-                };
-                let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
-                    NoteRevisionMetadata {
-                        note_id: nid.clone(),
-                        parent_folder_id: pre_meta.parent_folder_id.clone(),
-                        is_root_child,
-                        slug: pre_meta.slug.clone(),
-                        slug_fold: pre_meta.slug_fold.clone(),
-                        title: pre_meta.title.clone(),
-                        doc_class: pre_meta.doc_class,
-                        ability_id: pre_meta.ability_id.clone(),
-                        lifecycle: pre_meta.lifecycle,
-                        visibility_mask: pre_meta.visibility_mask,
-                        byte_size: pre_meta.byte_size,
-                        content_digest: pre_meta.content_digest,
-                        schema_revision: current_schema.as_ref().map(|s| s.schema_revision.clone()),
-                        raw_fields: pre_meta.raw_fields.clone(),
-                        evaluated_fields: eval_fields,
-                        diagnostics: pre_meta.diagnostics.clone(),
-                    },
-                ))
-                .encode()?;
+                let meta = encode_rollback_note(
+                    pre_meta,
+                    None,
+                    is_root_child,
+                    RollbackRevision::Restore(current_schema.as_ref()),
+                )?;
 
                 pending_rev_rows.push(PendingRevRow {
                     rev_id: rrev.clone(),
@@ -2421,8 +2411,9 @@ async fn discover_rollback_state_tx(
         match pre_rev_opt {
             None => {
                 candidates.insert(
-                    nid,
+                    nid.clone(),
                     CandidateAction::TrashCreated {
+                        metadata: current_rollback_metadata(&note_revs, &head.head_rev_id, &nid)?,
                         current_rev: head.head_rev_id,
                         current_lifecycle: head.lifecycle,
                         doc_class: head.doc_class,
@@ -2438,13 +2429,7 @@ async fn discover_rollback_state_tx(
                 );
             }
             Some((pre_rev_id, _, meta_bytes, _)) => {
-                let env = RevisionMetadataEnvelope::decode(meta_bytes)?;
-                let RevisionMetadataPayload::Note(pre_meta) = env.payload else {
-                    return Err(internal_not_committed(
-                        "corrupt_note_rev_meta",
-                        "expected NoteRevisionMetadata",
-                    ));
-                };
+                let pre_meta = decode_rollback_note(meta_bytes, &nid)?;
                 authorize_rollback_destination_tx(
                     tx,
                     &mut folder_cache,
@@ -3099,8 +3084,9 @@ async fn load_space_collab_states_tx(
     let rows: Vec<(String, bool)> = match tx {
         BackendConn::Sqlite(conn) => {
             let fetched =
-                sqlx::query("SELECT note_id, (room_state <> 'closed' OR COALESCE(carrier_dirty, 0) <> 0) AS blocked
-                     FROM collab_sessions LEFT JOIN collab_checkpoints USING (space_id, note_id) WHERE space_id = ?")
+                sqlx::query("SELECT s.note_id, (s.room_state <> 'closed' OR COALESCE(c.carrier_dirty, 0) <> 0
+                        OR EXISTS (SELECT 1 FROM collab_update_log u WHERE u.space_id = s.space_id AND u.note_id = s.note_id)) AS blocked
+                     FROM collab_sessions s LEFT JOIN collab_checkpoints c USING (space_id, note_id) WHERE s.space_id = ?")
                     .bind(space_id.as_str())
                     .fetch_all(&mut **conn)
                     .await
@@ -3114,8 +3100,9 @@ async fn load_space_collab_states_tx(
         }
         BackendConn::Postgres(conn) => {
             let fetched =
-                sqlx::query("SELECT note_id, (room_state <> 'closed' OR COALESCE(carrier_dirty, 0) <> 0) AS blocked
-                     FROM collab_sessions LEFT JOIN collab_checkpoints USING (space_id, note_id) WHERE space_id = $1")
+                sqlx::query("SELECT s.note_id, (s.room_state <> 'closed' OR COALESCE(c.carrier_dirty, 0) <> 0
+                        OR EXISTS (SELECT 1 FROM collab_update_log u WHERE u.space_id = s.space_id AND u.note_id = s.note_id)) AS blocked
+                     FROM collab_sessions s LEFT JOIN collab_checkpoints c USING (space_id, note_id) WHERE s.space_id = $1")
                     .bind(space_id.as_str())
                     .fetch_all(&mut **conn)
                     .await
@@ -4127,6 +4114,7 @@ async fn try_execute_pg_root_rollback(
     idemp: &crate::writer::CommandIdentitySpec,
     request: &Mutation<RollbackAgentRun>,
     writer_epoch: notarium_core::ids::LeaseEpoch,
+    try_pg_batch_plan: &mut bool,
 ) -> Option<Result<Committed<RollbackResult>, PortError>> {
     use crate::{
         codec::{
@@ -4256,11 +4244,8 @@ async fn try_execute_pg_root_rollback(
     struct RollbackHead {
         slug: String,
         folded_slug: String,
-        title: String,
         head_rev: String,
         lifecycle: Lifecycle,
-        byte_size: u64,
-        visibility_mask: i32,
         digest: Option<ContentDigest>,
     }
     struct RestoredMetadata {
@@ -4284,6 +4269,13 @@ async fn try_execute_pg_root_rollback(
         .fetch_all(&mut *pooled)
         .await;
     let Ok(rows) = rows else { return None };
+    // The batch optimization also requires an empty room table. A known unsupported
+    // room should enter the ordinary planner directly, without a second history read.
+    if rows.iter().any(|row| !row.get::<bool, _>("room_writable")) {
+        *try_pg_batch_plan = false;
+        park_pooled(pooled);
+        return None;
+    }
     let hydrated = (|| {
         if rows.len() != n {
             return None;
@@ -4313,11 +4305,8 @@ async fn try_execute_pg_root_rollback(
             let head = RollbackHead {
                 slug: row.get("slug"),
                 folded_slug: row.get("slug_fold"),
-                title: row.get("title"),
                 head_rev: row.get("head_rev_id"),
                 lifecycle: lifecycle_from_db(row.get("lifecycle_state")).ok()?,
-                byte_size: u64::try_from(row.get::<i64, _>("byte_size")).ok()?,
-                visibility_mask: row.get("visibility_mask"),
                 digest: dig("content_blake3")?,
             };
             if let Some(pub_id) = row.get::<Option<&str>, _>("current_publication_id") {
@@ -4325,12 +4314,8 @@ async fn try_execute_pg_root_rollback(
             }
             let metadata = match row.get::<Option<&[u8]>, _>("prior_metadata") {
                 Some(bytes) => {
-                    let env = RevisionMetadataEnvelope::decode(bytes).ok()?;
-                    let RevisionMetadataPayload::Note(mut pm) = env.payload else {
-                        return None;
-                    };
-                    if pm.note_id != *sorted_note_refs[idx]
-                        || pm.doc_class != DocClass::UserDoc
+                    let pm = decode_rollback_note(bytes, sorted_note_refs[idx]).ok()?;
+                    if pm.doc_class != DocClass::UserDoc
                         || pm.ability_id.is_some()
                         || pm.visibility_mask < 0
                         || pm.parent_folder_id != folder
@@ -4338,24 +4323,13 @@ async fn try_execute_pg_root_rollback(
                         return None;
                     }
                     let normalized_title_fold = normalize_title_key(&pm.title);
-                    let fields = evaluate_fields_with_schema(
-                        pm.raw_fields.as_ref(),
-                        pm.diagnostics.first(),
-                        None,
-                    );
-                    let encoded = if !pm.is_root_child
-                        && pm.schema_revision.is_none()
-                        && pm.evaluated_fields == fields
-                    {
-                        bytes.to_vec()
-                    } else {
-                        pm.is_root_child = false;
-                        pm.schema_revision = None;
-                        pm.evaluated_fields = fields;
-                        RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(pm.clone()))
-                            .encode()
-                            .ok()?
-                    };
+                    let encoded = encode_rollback_note(
+                        &pm,
+                        Some(bytes.into()),
+                        true,
+                        RollbackRevision::Restore(None),
+                    )
+                    .ok()?;
                     Some(RestoredMetadata {
                         pre_meta: pm,
                         normalized_title_fold,
@@ -4648,27 +4622,12 @@ async fn try_execute_pg_root_rollback(
                         rel_seq: trel,
                     });
                 }
-                let Ok(meta) = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
-                    NoteRevisionMetadata {
-                        note_id: nid_ref.clone(),
-                        parent_folder_id: root_folder_id.clone(),
-                        is_root_child: false,
-                        slug: head.slug.clone(),
-                        slug_fold: head.folded_slug.clone(),
-                        title: head.title.clone(),
-                        doc_class: DocClass::UserDoc,
-                        ability_id: None,
-                        lifecycle: Lifecycle::Trashed,
-                        visibility_mask: head.visibility_mask,
-                        byte_size: head.byte_size,
-                        content_digest: head.digest,
-                        schema_revision: None,
-                        raw_fields: None,
-                        evaluated_fields: BTreeMap::new(),
-                        diagnostics: Vec::new(),
-                    },
-                ))
-                .encode() else {
+                let metadata = rows[i]
+                    .get::<Option<&[u8]>, _>("created_metadata")
+                    .and_then(|bytes| decode_rollback_note(bytes, nid_ref).ok());
+                let Some(meta) = metadata.and_then(|source| {
+                    encode_rollback_note(&source, None, true, RollbackRevision::Trash).ok()
+                }) else {
                     park_pooled(pooled);
                     return None;
                 };
@@ -4947,6 +4906,15 @@ async fn try_execute_pg_root_rollback(
         park_pooled(pooled);
         return Some(Err(err.into()));
     }
+    let (room_leases, room_lineages): (Vec<Option<i64>>, Vec<Option<i64>>) = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<Option<i64>, _>("room_lease"),
+                row.get::<Option<i64>, _>("room_lineage"),
+            )
+        })
+        .unzip();
     let commit_res = sqlx::query(crate::schema::PG_LEAN_ROLLBACK_COMMIT_CALL_SQL)
         .bind(scope.space_id.as_str())
         .bind(scope.incarnation.as_bytes().as_slice())
@@ -5018,6 +4986,8 @@ async fn try_execute_pg_root_rollback(
         .bind(&all_exp_lcs)
         .bind(root_folder_str)
         .bind(writer_epoch.get() as i64)
+        .bind(&room_leases)
+        .bind(&room_lineages)
         .fetch_one(&mut *pooled)
         .await;
 
@@ -5033,6 +5003,7 @@ async fn try_execute_pg_root_rollback(
 
             let vis_seq_i64: i64 = row.get::<i64, usize>(0);
             if vis_seq_i64 <= 0 {
+                *try_pg_batch_plan = false;
                 drop(fences_guard);
                 return None;
             }
@@ -5089,6 +5060,7 @@ async fn try_execute_pg_root_rollback(
         Err(sqlx::Error::Database(db_err))
             if db_err.message().contains("NOTARIUM_RB_FALLBACK_0") =>
         {
+            *try_pg_batch_plan = false;
             fences_guard.armed_for_drop_consume = false;
             park_pooled(pooled);
             drop(fences_guard);
@@ -5365,6 +5337,7 @@ async fn execute_pg_fast_rollback_inner(
     }
 
     struct MiniNoteSummary {
+        created_source: Option<(String, Vec<u8>)>,
         has_foreign: bool,
         pre_rev: Option<(RevisionId, Vec<u8>)>,
     }
@@ -5425,6 +5398,9 @@ async fn execute_pg_fast_rollback_inner(
             rev_summaries.insert(
                 nid,
                 MiniNoteSummary {
+                    created_source: row
+                        .get::<Option<String>, usize>(3)
+                        .zip(row.get::<Option<Vec<u8>>, usize>(24)),
                     has_foreign,
                     pre_rev,
                 },
@@ -5594,6 +5570,20 @@ async fn execute_pg_fast_rollback_inner(
         }
         let action = match summary.pre_rev {
             None => CandidateAction::TrashCreated {
+                metadata: match summary.created_source {
+                    Some((rev, bytes)) if rev == head.head_rev_id.as_str() => {
+                        match decode_rollback_note(&bytes, &nid) {
+                            Ok(meta) => Box::new(meta),
+                            Err(err) => {
+                                return PgFastInnerResult::Failed {
+                                    err,
+                                    effective_cut: Some(current_effective_cut),
+                                };
+                            }
+                        }
+                    }
+                    _ => return PgFastInnerResult::FallbackToStandard,
+                },
                 current_rev: head.head_rev_id,
                 current_lifecycle: head.lifecycle,
                 doc_class: head.doc_class,
@@ -5607,23 +5597,14 @@ async fn execute_pg_fast_rollback_inner(
                 content_digest: head.content_digest,
             },
             Some((pre_rev_id, meta_bytes)) => {
-                let env = match RevisionMetadataEnvelope::decode(&meta_bytes) {
-                    Ok(e) => e,
+                let pre_meta = match decode_rollback_note(&meta_bytes, &nid) {
+                    Ok(meta) => meta,
                     Err(err) => {
                         return PgFastInnerResult::Failed {
                             err,
                             effective_cut: Some(current_effective_cut),
                         };
                     }
-                };
-                let RevisionMetadataPayload::Note(pre_meta) = env.payload else {
-                    return PgFastInnerResult::Failed {
-                        err: internal_not_committed(
-                            "corrupt_note_rev_meta",
-                            "expected NoteRevisionMetadata",
-                        ),
-                        effective_cut: Some(current_effective_cut),
-                    };
                 };
                 let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
                     && head.parent_folder_id == pre_meta.parent_folder_id
@@ -5885,6 +5866,7 @@ async fn execute_pg_fast_rollback_inner(
 
         for (nid, action) in &final_eligible {
             let CandidateAction::TrashCreated {
+                metadata,
                 current_rev,
                 current_lifecycle,
                 doc_class,
@@ -5922,27 +5904,7 @@ async fn execute_pg_fast_rollback_inner(
             } else {
                 None
             };
-            let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
-                NoteRevisionMetadata {
-                    note_id: nid.clone(),
-                    parent_folder_id: parent_folder_id.clone(),
-                    is_root_child,
-                    slug: slug.clone(),
-                    slug_fold: slug_fold.clone(),
-                    title: title.clone(),
-                    doc_class: *doc_class,
-                    ability_id: ability_id.clone(),
-                    lifecycle: Lifecycle::Trashed,
-                    visibility_mask: *visibility_mask,
-                    byte_size: *byte_size,
-                    content_digest: *content_digest,
-                    schema_revision: None,
-                    raw_fields: None,
-                    evaluated_fields: BTreeMap::new(),
-                    diagnostics: Vec::new(),
-                },
-            ))
-            .encode()?;
+            let meta = encode_rollback_note(metadata, None, is_root_child, RollbackRevision::Trash)?;
             mut_rows.push(UnifiedMutRow {
                 is_full: false,
                 note_id: nid.as_str(),
@@ -6006,36 +5968,7 @@ async fn execute_pg_fast_rollback_inner(
             if is_full {
                 has_full = true;
             }
-            let eval_fields = if pre_meta.doc_class == DocClass::EncryptedNote {
-                BTreeMap::new()
-            } else {
-                evaluate_fields_with_schema(
-                    pre_meta.raw_fields.as_ref(),
-                    pre_meta.diagnostics.first(),
-                    None,
-                )
-            };
-            let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
-                NoteRevisionMetadata {
-                    note_id: nid.clone(),
-                    parent_folder_id: pre_meta.parent_folder_id.clone(),
-                    is_root_child,
-                    slug: pre_meta.slug.clone(),
-                    slug_fold: pre_meta.slug_fold.clone(),
-                    title: pre_meta.title.clone(),
-                    doc_class: pre_meta.doc_class,
-                    ability_id: pre_meta.ability_id.clone(),
-                    lifecycle: pre_meta.lifecycle,
-                    visibility_mask: pre_meta.visibility_mask,
-                    byte_size: pre_meta.byte_size,
-                    content_digest: pre_meta.content_digest,
-                    schema_revision: None,
-                    raw_fields: pre_meta.raw_fields.clone(),
-                    evaluated_fields: eval_fields,
-                    diagnostics: pre_meta.diagnostics.clone(),
-                },
-            ))
-            .encode()?;
+            let meta = encode_rollback_note(pre_meta, None, is_root_child, RollbackRevision::Restore(None))?;
             mut_rows.push(UnifiedMutRow {
                 is_full,
                 note_id: nid.as_str(),

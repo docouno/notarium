@@ -330,6 +330,14 @@ struct BackendCase {
 
 impl BackendCase {
     async fn open_sqlite() -> Self {
+        Self::open_sqlite_with_wal(Duration::from_millis(20), 64 * 1024, 128 * 1024).await
+    }
+
+    async fn open_sqlite_with_wal(
+        passive_checkpoint_interval: Duration,
+        wal_soft_watermark_bytes: u64,
+        wal_high_watermark_bytes: u64,
+    ) -> Self {
         let temp_root = TempDataRoot::new("l4-backup-sqlite");
         let data_root = temp_root.data_root();
         let spool_dir = data_root.staging().join("backups");
@@ -339,9 +347,9 @@ impl BackendCase {
                 data_root: data_root.clone(),
                 read_pool_size: 6,
                 read_deadline: Duration::from_millis(250),
-                passive_checkpoint_interval: Duration::from_millis(20),
-                wal_soft_watermark_bytes: 64 * 1024,
-                wal_high_watermark_bytes: 128 * 1024,
+                passive_checkpoint_interval,
+                wal_soft_watermark_bytes,
+                wal_high_watermark_bytes,
                 wal_reset_cycle_deadline: Duration::from_millis(250),
             },
             blobs: BlobBackendConfig::Local { data_root },
@@ -478,6 +486,12 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version < 4 {
+                sqlx::raw_sql(include_str!("fixtures/schema-v3-reference-index.sql"))
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
             if decoded.schema_version < 3 {
                 sqlx::raw_sql(
                     "DROP TABLE collab_checkpoints;
@@ -582,6 +596,319 @@ fn backup_test_space(byte: u8) -> CreateSpaceSpec {
         initial_last_seq: SpaceSeq::ZERO,
         created_at: None,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_hold_interruption_releases_partial_row_locks_and_ownership() {
+    let case = BackendCase::open_pg_s3_with_pool(1).await;
+    let store = &case.store;
+    for byte in [0x31, 0x32] {
+        store.create_space(backup_test_space(byte)).await.unwrap();
+    }
+    let (fixtures, schema) = case.pg_cleanup.as_ref().unwrap();
+    let mut blocker = fixtures.open_raw_pg().await;
+    let mut probe = fixtures.open_raw_pg().await;
+    let locker: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut blocker)
+        .await
+        .unwrap();
+    let id = BackupId::from_bytes([0x33; 16]);
+    for mode in ["cancel", "drop", "deadline"] {
+        let mut lock = blocker.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT space_id FROM {schema}.spaces ORDER BY space_id DESC LIMIT 1 FOR UPDATE"
+        )))
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+        let ctx = maintenance_ctx(ServicePurpose::Backup);
+        let cancel = ctx.budget.cancellation.clone();
+        let mut budget = store.default_backup_budget();
+        if mode == "deadline" {
+            budget.deadline = Duration::from_secs(2);
+        }
+        let mut prepared = store.prepare(ctx, id.clone(), budget).await.unwrap();
+        let mut acquisition = prepared.acquire_hold();
+        let blocked = async {
+            loop {
+                let pid = sqlx::query_scalar::<_, i32>(
+                    "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                )
+                .bind(locker)
+                .fetch_optional(&mut probe)
+                .await
+                .unwrap();
+                if let Some(pid) = pid {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        let pid = tokio::select! {
+            res = &mut acquisition => panic!("hold returned before reaching the row lock: {}", res.is_ok()),
+            pid = tokio::time::timeout(Duration::from_secs(2), blocked) => pid.unwrap(),
+        };
+        match mode {
+            "drop" => drop(acquisition),
+            "cancel" => {
+                cancel.cancel();
+                assert!(matches!(acquisition.await, Err(PortError::Cancelled(_))));
+            }
+            _ => {
+                let result = acquisition.await;
+                assert!(matches!(
+                    result,
+                    Err(PortError::Domain(notarium_core::DomainError::ValidationFailed { diagnostic }))
+                        if diagnostic.reason == ValidationReason::BudgetExceeded
+                ));
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let active: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$1)",
+                )
+                .bind(pid)
+                .fetch_one(&mut probe)
+                .await
+                .unwrap();
+                if !active {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the interrupted owner must leave while the second Space remains locked");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT space_id FROM {schema}.spaces ORDER BY space_id LIMIT 1 FOR UPDATE NOWAIT"
+        )))
+        .execute(&mut probe)
+        .await
+        .unwrap();
+        let owns: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_xact_lock(hashtextextended($1 || ':' || $2, 7311230))",
+        )
+        .bind(schema)
+        .bind(id.as_str())
+        .fetch_one(&mut probe)
+        .await
+        .unwrap();
+        assert!(owns);
+        assert_eq!(
+            store
+                .execute_diagnostic_read_sql_for_test(None, "SELECT COUNT(*) FROM backup_holds")
+                .await
+                .unwrap(),
+            0
+        );
+        lock.rollback().await.unwrap();
+    }
+    let mut next = store
+        .prepare(
+            maintenance_ctx(ServicePurpose::Backup),
+            id,
+            store.default_backup_budget(),
+        )
+        .await
+        .unwrap();
+    next.acquire_hold().await.unwrap().release().await.unwrap();
+    drop(next);
+    case.shutdown().await;
+}
+
+#[tokio::test]
+async fn sqlite_cancelled_hold_does_not_outlive_the_writer_pause() {
+    let case = BackendCase::open_sqlite().await;
+    let store = &case.store;
+    store.create_space(backup_test_space(0x38)).await.unwrap();
+    let budget = store.default_backup_budget();
+    let mut first = store
+        .prepare(
+            maintenance_ctx(ServicePurpose::Backup),
+            BackupId::from_bytes([0x38; 16]),
+            budget,
+        )
+        .await
+        .unwrap();
+    let hold = first.acquire_hold().await.unwrap();
+    let pause = first.pause_writes().await.unwrap();
+    let ctx = maintenance_ctx(ServicePurpose::Backup);
+    let cancel = ctx.budget.cancellation.clone();
+    let id = BackupId::from_bytes([0x39; 16]);
+    let mut other = store.prepare(ctx, id.clone(), budget).await.unwrap();
+    let mut acquire = other.acquire_hold();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut acquire)
+            .await
+            .is_err()
+    );
+    cancel.cancel();
+    let interrupted = tokio::time::timeout(Duration::from_secs(1), acquire)
+        .await
+        .expect("the writer pause is still held");
+    assert!(matches!(interrupted, Err(PortError::Cancelled(_))));
+    pause.resume().await.unwrap();
+    hold.release().await.unwrap();
+    let mut next = store
+        .prepare(maintenance_ctx(ServicePurpose::Backup), id, budget)
+        .await
+        .unwrap();
+    next.acquire_hold().await.unwrap().release().await.unwrap();
+    assert_eq!(
+        store
+            .execute_diagnostic_read_sql_for_test(None, "SELECT COUNT(*) FROM backup_holds")
+            .await
+            .unwrap(),
+        0
+    );
+    drop((first, other, next));
+    case.shutdown().await;
+}
+
+#[tokio::test]
+async fn snapshot_checks_retirements_and_holds_store_one_space_each() {
+    for case in [
+        BackendCase::open_sqlite().await,
+        BackendCase::open_pg_s3_with_pool(1).await,
+    ] {
+        let store = &case.store;
+        for byte in 1..=8 {
+            store.create_space(backup_test_space(byte)).await.unwrap();
+        }
+        let budget = store.default_backup_budget();
+        let id = BackupId::from_bytes([0x34; 16]);
+        let mut prepared = store
+            .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
+            .await
+            .unwrap();
+        let hold = prepared.acquire_hold().await.unwrap();
+        // A private upload can register its discard after hold admission.
+        store.execute_diagnostic_write_sql_for_test(
+            "INSERT INTO blob_retirements (space_id, retirement_id, history_incarnation, owner_epoch, reason, status, created_at_ms)
+             SELECT space_id, 'staging', history_incarnation, active_epoch, 'gc', 'pending', 0 FROM spaces ORDER BY space_id LIMIT 1"
+        ).await.unwrap();
+        let mut pause = prepared.pause_writes().await.unwrap();
+        assert!(matches!(
+            pause.open_cut().await,
+            Err(PortError::Unavailable(_))
+        ));
+        pause.resume().await.unwrap();
+        hold.release().await.unwrap();
+        drop(prepared);
+        store
+            .execute_diagnostic_write_sql_for_test("UPDATE blob_retirements SET status='completed'")
+            .await
+            .unwrap();
+        let mut prepared = store
+            .prepare(maintenance_ctx(ServicePurpose::Backup), id, budget)
+            .await
+            .unwrap();
+        let hold = prepared.acquire_hold().await.unwrap();
+        let count_local = if case.is_sqlite {
+            "SELECT COUNT(*) FROM backup_holds WHERE json_array_length(witness_json, '$.histories')=1 AND json_extract(witness_json, '$.histories[0].scope.space_id')=space_id"
+        } else {
+            "SELECT COUNT(*) FROM backup_holds WHERE json_array_length(witness_json::json->'histories')=1 AND (witness_json::json #>> '{histories,0,scope,space_id}')=space_id"
+        };
+        assert_eq!(
+            store
+                .execute_diagnostic_read_sql_for_test(None, count_local)
+                .await
+                .unwrap(),
+            8
+        );
+        let mut pause = prepared.pause_writes().await.unwrap();
+        let mut snapshot = pause.open_cut().await.unwrap();
+        pause.resume().await.unwrap();
+        let receipt = snapshot
+            .spool(budget, Cancellation::default())
+            .await
+            .unwrap();
+        snapshot.close().await.unwrap();
+        assert_eq!(
+            store
+                .execute_diagnostic_read_sql_for_test(None, count_local)
+                .await
+                .unwrap(),
+            8
+        );
+        let record = store.get_backup_artifact(&receipt.artifact).await.unwrap();
+        assert_eq!(record.witness.histories, hold.witness().histories);
+        assert_eq!(record.witness.histories.len(), 8);
+        hold.release().await.unwrap();
+        drop(prepared);
+        case.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn reused_sqlite_wal_frames_exhaust_the_pinned_budget() {
+    let case =
+        BackendCase::open_sqlite_with_wal(Duration::from_secs(3600), 16 << 20, 32 << 20).await;
+    let store = &case.store;
+    store.create_space(backup_test_space(0x35)).await.unwrap();
+    let db = case.temp_root.data_root().canonical();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "PRAGMA wal_autocheckpoint = 0;
+        CREATE TABLE retained_wal_probe (value BLOB);
+        INSERT INTO retained_wal_probe VALUES (zeroblob(1000000))",
+    )
+    .unwrap();
+    for idle in [false, true] {
+        let busy: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(RESTART)", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy, 0);
+        let retained = store.wal_telemetry().unwrap().wal_bytes;
+        assert!(retained > 500_000);
+        let tight = notarium_core::ports::BackupRetentionBudget::SqliteWal {
+            max_pinned_bytes: 2048,
+        };
+        let mut budget = store.default_backup_budget();
+        if idle {
+            budget.retention = tight;
+        }
+        let mut prepared = store
+            .prepare(
+                maintenance_ctx(ServicePurpose::Backup),
+                BackupId::from_bytes([0x35; 16]),
+                budget,
+            )
+            .await
+            .unwrap();
+        let hold = prepared.acquire_hold().await.unwrap();
+        let mut pause = prepared.pause_writes().await.unwrap();
+        let mut snapshot = pause.open_cut().await.unwrap();
+        pause.resume().await.unwrap();
+        store
+            .create_space(backup_test_space(if idle { 0x37 } else { 0x36 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.wal_telemetry().unwrap().wal_bytes,
+            retained,
+            "logical frames reused the allocation"
+        );
+        if idle {
+            store.run_wal_maintenance_now(false).await;
+            assert!(store.wal_telemetry().unwrap().backup_aborts > 0);
+        }
+        let result = snapshot
+            .spool(
+                BackupBudget {
+                    retention: tight,
+                    ..budget
+                },
+                Cancellation::default(),
+            )
+            .await;
+        assert_validation_err(&result, ValidationReason::BudgetExceeded);
+        snapshot.close().await.unwrap();
+        hold.release().await.unwrap();
+    }
+    drop(conn);
+    case.shutdown().await;
 }
 
 #[tokio::test]
@@ -730,12 +1057,13 @@ async fn failed_temp_unlink_retains_its_recovery_marker() {
 
 #[tokio::test]
 async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
-    // Both files came from their version's PostgreSQL participant with a single synthetic Space.
+    // Each file came from its version's PostgreSQL participant with a single synthetic Space.
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let case = BackendCase::open_pg_s3().await;
     for (version, install, space_id, slug, table_count, queue_columns) in [
         (1, 1, 11, "review-space", 34, 13),
         (2, 0x62, 0xB2, "backup-178", 35, 14),
+        (3, 0x62, 0xB2, "backup-178", 36, 14),
     ] {
         let fixture = directory.join(format!("schema-v{version}.pgspool"));
         let decoded = decode_postgres_spool_v1(&fixture).unwrap();
@@ -753,10 +1081,150 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
         assert_eq!(queue.columns.len(), queue_columns);
         let cut = decoded.witness.histories.first().unwrap();
         assert_eq!(cut.scope.space_id, sample_space_id(space_id));
-        let config = case
+        let blob_root = TempDataRoot::new("historical-chat-cas");
+        let mut config = case
             .restored_config(&fixture, &case.temp_root.data_root())
             .await;
+        // Recreate the old writer's stale rows in the materialized v3 database.
+        // Runtime bootstrap is the same entry point used for in-place upgrades.
+        let mut migrated_db = if version == 3 {
+            let SqlBackendConfig::Postgres { schema, .. } = &config.sql else {
+                unreachable!()
+            };
+            config.blobs = BlobBackendConfig::Local {
+                data_root: blob_root.data_root(),
+            };
+            let mut conn = case.pg_cleanup.as_ref().unwrap().0.open_raw_pg().await;
+            sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let raw = vec![0x64; 600];
+            let digest = ContentDigest::from_bytes(*blake3::hash(&raw).as_bytes());
+            let frame = notarium_canonical::blobs::encode_zstd_level3(&raw).unwrap();
+            sqlx::query(
+                "CREATE TEMP TABLE fixture_blob (body_digest BYTEA, compressed_size BIGINT)",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO fixture_blob VALUES ($1,$2)")
+                .bind(digest.as_bytes().as_slice())
+                .bind(frame.len() as i64)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            sqlx::raw_sql(include_str!("fixtures/legacy-stale-compactions.sql"))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let mut scopes = Vec::new();
+            for slug in ["stale-alone", "stale-shared"] {
+                let (id, inc): (String, Vec<u8>) =
+                    sqlx::query_as("SELECT space_id,history_incarnation FROM spaces WHERE slug=$1")
+                        .bind(slug)
+                        .fetch_one(&mut conn)
+                        .await
+                        .unwrap();
+                let scope = HistoryScope {
+                    space_id: notarium_core::ids::SpaceId::parse(&id).unwrap(),
+                    incarnation: notarium_core::ids::HistoryIncarnation::from_bytes(
+                        inc.try_into().unwrap(),
+                    ),
+                };
+                let path = blob_root.data_root().blob(&scope.space_id, digest);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, &frame).unwrap();
+                scopes.push(scope);
+            }
+            Some((conn, scopes, digest, raw))
+        } else {
+            None
+        };
         let (restored, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
+        if let Some((db, scopes, digest, raw)) = migrated_db.as_mut() {
+            let result: i32 =
+                sqlx::query_scalar(include_str!("fixtures/check-stale-compactions.sql"))
+                    .fetch_one(&mut *db)
+                    .await
+                    .unwrap();
+            assert_eq!(result, 1);
+            assert!(matches!(
+                restored.read_verified_blob(&scopes[0], *digest).await,
+                Err(PortError::Domain(
+                    notarium_core::DomainError::ResourceNotFound
+                ))
+            ));
+            let stale_path = blob_root.data_root().blob(&scopes[0].space_id, *digest);
+            assert!(stale_path.exists());
+            // Force the second unlink to fail until the first is observable.
+            let blocker = blob_root
+                .data_root()
+                .root()
+                .join("blobs/.quarantine")
+                .join(format!(
+                    "{}.{}.corrupt",
+                    scopes[0].space_id.as_str(),
+                    digest.to_hex()
+                ));
+            fs::create_dir_all(&blocker).unwrap();
+            let rotated = HistoryScope {
+                space_id: scopes[0].space_id.clone(),
+                incarnation: sample_incarnation(0xD1),
+            };
+            restored
+                .restore_cursors(
+                    maintenance_ctx(ServicePurpose::Restore),
+                    vec![ChangeCursor {
+                        scope: rotated.clone(),
+                        after: SpaceSeq::new(6).unwrap(),
+                    }],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                restored.get_space(&rotated.space_id).await.unwrap().scope,
+                rotated
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while stale_path.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let status_sql = "SELECT status FROM blob_retirements WHERE space_id=$1";
+            let status: String = sqlx::query_scalar(status_sql)
+                .bind(rotated.space_id.as_str())
+                .fetch_one(&mut *db)
+                .await
+                .unwrap();
+            assert_eq!(status, "pending");
+            fs::remove_dir(&blocker).unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let status: String = sqlx::query_scalar(status_sql)
+                        .bind(rotated.space_id.as_str())
+                        .fetch_one(&mut *db)
+                        .await
+                        .unwrap();
+                    if status == "completed" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                restored
+                    .read_verified_blob(&scopes[1], *digest)
+                    .await
+                    .unwrap(),
+                *raw
+            );
+        }
+        drop(migrated_db);
         let space = restored.get_space(&cut.scope.space_id).await.unwrap();
         assert_eq!(space.scope, cut.scope);
         assert_eq!(space.last_seq, cut.after);

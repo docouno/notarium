@@ -289,6 +289,22 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     notarium_canonical::schema::bootstrap_postgres_schema(&mut raw, &schema, &install)
         .await
         .unwrap();
+    let reference_indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema()
+         AND tablename='blob_references' ORDER BY indexname",
+    )
+    .fetch_all(&mut raw)
+    .await
+    .unwrap();
+    for key in [
+        "(space_id, owner_kind, owner_id)",
+        "(space_id, content_blake3)",
+    ] {
+        assert!(
+            reference_indexes.iter().any(|def| def.ends_with(key)),
+            "missing full index on {key}"
+        );
+    }
     let upgraded_constraints: Vec<(String, String, String)> = sqlx::query_as(CONSTRAINTS)
         .fetch_all(&mut raw)
         .await

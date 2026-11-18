@@ -11,7 +11,7 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::{ArtifactId, BackupId, ContentDigest},
 };
-use sqlx::PgConnection;
+use sqlx::{PgConnection, Row};
 
 use super::{
     BackendConn, BackupArtifactEncoding, CanonicalInner, CanonicalStore, SqlDriverState,
@@ -20,11 +20,14 @@ use super::{
     unavailable_retryable,
 };
 
-const HOLD_LOCK_SQL: &str = "SELECT pg_try_advisory_lock(hashtextextended(current_schema() || ':' || $1, 7311230)), set_config('application_name', $2, false)";
+const HOLD_LOCK_SQL: &str = "SELECT pg_try_advisory_lock(hashtextextended(current_schema() || ':' || $1, 7311230)), set_config('application_name', $2, false), pg_backend_pid(), set_config('statement_timeout', $3, false)";
 
 pub(super) enum HoldOwnership {
     Local(Weak<CanonicalInner>, BackupId),
-    Postgres { connection: Box<PgConnection> },
+    Postgres {
+        connection: Box<PgConnection>,
+        pid: i32,
+    },
 }
 
 impl HoldOwnership {
@@ -32,6 +35,7 @@ impl HoldOwnership {
         store: &CanonicalStore,
         id: &BackupId,
         generation: &ArtifactId,
+        deadline: tokio::time::Instant,
     ) -> Result<Self, PortError> {
         match &store.inner.sql {
             SqlDriverState::Sqlite { .. } => {
@@ -47,15 +51,22 @@ impl HoldOwnership {
             }
             SqlDriverState::Postgres { .. } => {
                 let mut conn = open_backup_connection(store).await?;
-                let acquired: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(HOLD_LOCK_SQL))
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let timeout = remaining
+                    .saturating_add(Duration::from_secs(1))
+                    .as_millis()
+                    .min(i32::MAX as u128);
+                let row = sqlx::query(sqlx::AssertSqlSafe(HOLD_LOCK_SQL))
                     .bind(id.as_str())
                     .bind(generation.as_str())
+                    .bind(format!("{timeout}ms"))
                     .fetch_one(&mut conn)
                     .await
                     .map_err(|err| internal_not_committed("pg_backup_owner", err.to_string()))?;
-                if acquired {
+                if row.get::<bool, _>(0) {
                     return Ok(Self::Postgres {
                         connection: Box::new(conn),
+                        pid: row.get(2),
                     });
                 }
             }
@@ -65,6 +76,30 @@ impl HoldOwnership {
             "another hold owns this BackupId",
             Duration::from_millis(50),
         ))
+    }
+
+    // Dropping the client future alone does not wake a backend waiting on a row
+    // lock. The generation tag prevents a recycled PID from matching this owner.
+    pub(super) async fn interrupt_acquisition(
+        &mut self,
+        store: &CanonicalStore,
+        generation: &ArtifactId,
+    ) -> Result<(), PortError> {
+        let Self::Postgres { pid, .. } = self else {
+            return Ok(());
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut control = open_backup_connection(store).await?;
+            let terminated: Option<bool> = sqlx::query_scalar(
+                "SELECT pg_terminate_backend(pid, 1000) FROM pg_stat_activity
+                 WHERE pid = $1 AND application_name = $2 AND usename = current_user AND datname = current_database()",
+            ).bind(*pid).bind(generation.as_str()).fetch_optional(&mut control).await
+             .map_err(|err| internal_not_committed("pg_backup_interrupt_hold", err.to_string()))?;
+            if terminated == Some(false) {
+                return Err(internal_not_committed("pg_backup_interrupt_hold", "PostgreSQL could not stop the hold transaction"));
+            }
+            Ok(())
+        }).await.map_err(|_| unavailable_retryable("pg_backup_interrupt_hold", "PostgreSQL cancellation timed out", Duration::from_millis(50)))?
     }
 
     // PostgreSQL never reconnects this socket. Transactions on it belong only to the
@@ -77,7 +112,7 @@ impl HoldOwnership {
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
-        let Self::Postgres { connection } = self else {
+        let Self::Postgres { connection, .. } = self else {
             return store.with_write_tx(op).await;
         };
         let _gate = store.inner.writer()?.acquire_commit_read_guard().await;
@@ -89,7 +124,7 @@ impl HoldOwnership {
     }
 
     pub(super) async fn verify(&mut self) -> Result<(), PortError> {
-        if let Self::Postgres { connection } = self {
+        if let Self::Postgres { connection, .. } = self {
             sqlx::raw_sql("SELECT 1")
                 .execute(&mut **connection)
                 .await

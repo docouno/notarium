@@ -1,5 +1,7 @@
-//! Additive upgrades run inside the bootstrap transaction. The incoming witness
+//! Schema upgrades run inside the bootstrap transaction. The incoming witness
 //! must identify the exact schema this migration understands.
+mod compactions;
+
 use super::{POSTGRES_BASELINE_DDL, SQLITE_BASELINE_DDL, split_sql_statements};
 use crate::codec::internal_not_committed;
 use crate::schema::manifest::CANONICAL_SCHEMA_VERSION;
@@ -14,10 +16,13 @@ pub(crate) const V1_HASH: &str = "3992ad6e8c888cc7ed98c9dd45e9463bf3334c5617b9c7
 
 pub(crate) const V2_HASH: &str = "4375964fa9cf7de29749e52c6387a9f72d1a4538fb9f97240a9fe356061bdbdf";
 
+pub(crate) const V3_HASH: &str = "ca79d3e2db2eed95fb8b0e503340139b3fd166b51340e6676d37ca0411fed4dc";
+
 pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
     match version {
         1 => hex::encode(hash) == V1_HASH,
         2 => hex::encode(hash) == V2_HASH,
+        3 => hex::encode(hash) == V3_HASH,
         _ => false,
     }
 }
@@ -67,19 +72,43 @@ const NORMALIZE_PG_V2: &str = "DO $migration$
         END IF;
     END $migration$";
 
-fn create_new_table(ddl: &str, table: &str) -> Result<String, PortError> {
-    let prefix = format!("CREATE TABLE IF NOT EXISTS {table} (");
+fn baseline_statement(ddl: &str, prefix: &str) -> Result<String, PortError> {
     split_sql_statements(ddl)
         .into_iter()
-        .find(|s| s.starts_with(&prefix))
-        .map(|s| s.replacen("CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1))
-        .ok_or_else(|| {
-            internal_not_committed("migration_add_table", format!("missing table {table}"))
-        })
+        .find(|s| s.starts_with(prefix))
+        .ok_or_else(|| internal_not_committed("migration_missing_ddl", prefix))
+}
+
+fn create_new_table(ddl: &str, table: &str) -> Result<String, PortError> {
+    let prefix = format!("CREATE TABLE IF NOT EXISTS {table} (");
+    Ok(baseline_statement(ddl, &prefix)?.replacen("CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1))
+}
+
+async fn upgrade_sqlite_catalog(conn: &mut SqliteConnection) -> Result<(), PortError> {
+    let create = create_new_table(SQLITE_BASELINE_DDL, "blob_catalog")?;
+    let zero_ref = baseline_statement(
+        SQLITE_BASELINE_DDL,
+        "CREATE INDEX IF NOT EXISTS idx_blob_catalog_zero_ref",
+    )?;
+    // No foreign key targets blob_catalog. Keep its logical key and every
+    // publication, count and lifecycle field while rebuilding the primary tree.
+    for sql in [
+        "ALTER TABLE blob_catalog RENAME TO blob_catalog_v3", &create,
+        "INSERT INTO blob_catalog(space_id, content_blake3, raw_size, compressed_size, ref_count,
+            current_publication_id, admission_state, blob_state, touched_at_ms)
+         SELECT space_id, content_blake3, raw_size, compressed_size, ref_count,
+            current_publication_id, admission_state, blob_state, touched_at_ms FROM blob_catalog_v3",
+        "DROP TABLE blob_catalog_v3", &zero_ref,
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *conn).await
+            .map_err(|e| internal_not_committed("migration_v4_blob_catalog", e.to_string()))?;
+    }
+    Ok(())
 }
 
 macro_rules! upgrade {
-    ($name:ident, $connection:ty, $ddl:ident, $pg_v2:expr) => {
+    ($name:ident, $connection:ty, $variant:ident, $ddl:ident, $pg_v2:expr $(, $catalog:ident)?) => {
         pub(super) async fn $name(
             conn: &mut $connection,
             installation: &InstallationId,
@@ -110,23 +139,38 @@ macro_rules! upgrade {
                         internal_not_committed("migration_pending_input_provenance", e.to_string())
                     })?;
                 }
-            } else if let Some(sql) = $pg_v2 {
+            } else if version == 2 && let Some(sql) = $pg_v2 {
                 sqlx::query(sql).execute(&mut *conn).await.map_err(|e| {
                     internal_not_committed("migration_v2_receipt_constraint", e.to_string())
                 })?;
             }
-            sqlx::query(sqlx::AssertSqlSafe(create_new_table(
-                $ddl,
-                "collab_checkpoints",
-            )?))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| internal_not_committed("migration_add_table", e.to_string()))?;
-            for sql in [ADD_HOLD_GENERATION, BACKFILL_CHECKPOINTS] {
-                sqlx::query(sql).execute(&mut *conn).await.map_err(|e| {
-                    internal_not_committed("migration_v3_runtime_state", e.to_string())
-                })?;
+            if version < 3 {
+                sqlx::query(sqlx::AssertSqlSafe(create_new_table(
+                    $ddl,
+                    "collab_checkpoints",
+                )?))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| internal_not_committed("migration_add_table", e.to_string()))?;
+                for sql in [ADD_HOLD_GENERATION, BACKFILL_CHECKPOINTS] {
+                    sqlx::query(sql).execute(&mut *conn).await.map_err(|e| {
+                        internal_not_committed("migration_v3_runtime_state", e.to_string())
+                    })?;
+                }
             }
+            $($catalog(&mut *conn).await?;)?
+            sqlx::query("DROP INDEX IF EXISTS idx_blob_references_non_note_owner")
+                .execute(&mut *conn).await
+                .map_err(|e| internal_not_committed("migration_v4_drop_index", e.to_string()))?;
+            for prefix in [
+                "CREATE INDEX IF NOT EXISTS idx_blob_references_owner",
+                "CREATE INDEX IF NOT EXISTS idx_blob_references_digest",
+            ] {
+                let sql = baseline_statement($ddl, prefix)?;
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("migration_v4_reference_index", e.to_string()))?;
+            }
+            compactions::scrub(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
             sqlx::query(WRITE_WITNESS)
@@ -144,12 +188,15 @@ macro_rules! upgrade {
 upgrade!(
     sqlite,
     SqliteConnection,
+    Sqlite,
     SQLITE_BASELINE_DDL,
-    None::<&'static str>
+    None::<&'static str>,
+    upgrade_sqlite_catalog
 );
 upgrade!(
     postgres,
     PgConnection,
+    Postgres,
     POSTGRES_BASELINE_DDL,
     Some(NORMALIZE_PG_V2)
 );
@@ -158,7 +205,110 @@ upgrade!(
 mod tests {
     use super::*;
     use crate::schema::bootstrap_sqlite_schema;
-    use sqlx::Connection;
+    use sqlx::{Connection, Row};
+
+    #[tokio::test]
+    async fn v3_catalog_rebuild_preserves_rows_and_uses_selective_reference_indexes() {
+        let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+        let installation = InstallationId::from_bytes([3; 16]);
+        for sql in split_sql_statements(SQLITE_BASELINE_DDL) {
+            let sql = if sql.starts_with("CREATE TABLE IF NOT EXISTS blob_catalog (") {
+                sql.replace(" WITHOUT ROWID", "")
+            } else {
+                sql
+            };
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut db)
+                .await
+                .unwrap();
+        }
+        sqlx::raw_sql(include_str!(
+            "../../tests/fixtures/schema-v3-reference-index.sql"
+        ))
+        .execute(&mut db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO schema_meta VALUES(1,3,1,$1,'ready',$2,0,0,0,0)")
+            .bind(installation.as_str())
+            .bind(hex::decode(V3_HASH).unwrap())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        sqlx::raw_sql("INSERT INTO blob_catalog VALUES
+            ('s',zeroblob(32),1024,63,2,'pub','open','active',391),
+            ('t',zeroblob(32),1024,63,0,NULL,'retiring','quarantined',492);
+            INSERT INTO blob_references VALUES
+            ('s','note_revision','note','r1','',zeroblob(32),'pub',11),
+            ('s','note_revision','note','r2','',zeroblob(32),'pub',12);
+            CREATE TEMP TABLE old_catalog AS SELECT * FROM blob_catalog;
+            CREATE TEMP TABLE old_refs AS SELECT * FROM blob_references;
+            CREATE TRIGGER abort_witness BEFORE UPDATE ON schema_meta BEGIN SELECT RAISE(ABORT,'fault'); END;")
+            .execute(&mut db).await.unwrap();
+        assert!(
+            bootstrap_sqlite_schema(&mut db, &installation)
+                .await
+                .is_err()
+        );
+        let layout = "SELECT wr FROM pragma_table_list WHERE schema='main' AND name='blob_catalog'";
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(layout)
+                .fetch_one(&mut db)
+                .await
+                .unwrap(),
+            0
+        );
+        sqlx::query("DROP TRIGGER abort_witness")
+            .execute(&mut db)
+            .await
+            .unwrap();
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(layout)
+                .fetch_one(&mut db)
+                .await
+                .unwrap(),
+            1
+        );
+        for (actual, before) in [
+            ("blob_catalog", "old_catalog"),
+            ("blob_references", "old_refs"),
+        ] {
+            for (lhs, rhs) in [(actual, before), (before, actual)] {
+                let sql = format!(
+                    "SELECT count(*) FROM (SELECT * FROM {lhs} EXCEPT SELECT * FROM {rhs})"
+                );
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                        .fetch_one(&mut db)
+                        .await
+                        .unwrap(),
+                    0
+                );
+            }
+        }
+        for (statement, lookup) in [
+            (
+                "EXPLAIN QUERY PLAN DELETE FROM blob_references WHERE space_id='s' AND owner_kind='note_revision' AND owner_id='note' RETURNING content_blake3",
+                "idx_blob_references_owner (space_id=? AND owner_kind=? AND owner_id=?)",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM blob_references WHERE space_id='s' AND content_blake3=zeroblob(32)",
+                "idx_blob_references_digest (space_id=? AND content_blake3=?)",
+            ),
+        ] {
+            let rows = sqlx::query(statement).fetch_all(&mut db).await.unwrap();
+            assert!(
+                rows.iter()
+                    .any(|r| r.get::<String, _>("detail").contains(lookup)),
+                "missing indexed lookup {lookup}"
+            );
+        }
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn previous_schema_upgrades_atomically_and_preserves_queue_provenance() {

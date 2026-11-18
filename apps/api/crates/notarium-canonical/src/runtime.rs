@@ -42,6 +42,14 @@ use crate::{
     writer::WriteCoordinator,
 };
 
+async fn pg_read_cancelled(budget: Option<&CallBudget>) -> PortError {
+    match budget {
+        Some(budget) => budget.cancellation.cancelled().await,
+        None => std::future::pending().await,
+    }
+    cancelled_not_committed("pg_read_cancelled", "PostgreSQL read cancelled")
+}
+
 #[cfg(feature = "test-support")]
 use crate::{
     blobs::{
@@ -849,9 +857,13 @@ impl CanonicalStore {
         } else {
             None
         };
+        let cancelled = pg_read_cancelled(budget);
+        tokio::pin!(cancelled);
         let mut pooled = match cached_opt {
             Some(c) => c,
             None => tokio::select! {
+                biased;
+                error = &mut cancelled => return Err(error),
                 res = pool.acquire() => res.map_err(|err| {
                     unavailable_retryable(
                         "pg_acquire_read",
@@ -868,47 +880,26 @@ impl CanonicalStore {
             },
         };
 
-        let run_res: Result<T, PortError> = {
-            let conn: &mut sqlx::PgConnection = &mut pooled;
-            match tokio::time::timeout_at(deadline_tokio, op(conn)).await {
-                Ok(res) => res,
-                Err(_) => Err(deadline_not_committed(
+        let mut lease = PgTransactionLease::new(&mut pooled);
+        let val = tokio::select! {
+            biased;
+            error = &mut cancelled => return Err(error),
+            _ = tokio::time::sleep_until(deadline_tokio) => {
+                return Err(deadline_not_committed(
                     "pg_read_tx_deadline",
                     "PostgreSQL read statement exceeded deadline",
-                )),
+                ));
             }
+            result = op(lease.conn()) => result?,
         };
-
-        match run_res {
-            Ok(val) => {
-                if *can_cache_fast_conn {
-                    let mut slot = fast_read_conn.lock().expect("pg fast_read_conn mutex");
-                    if slot.is_none() {
-                        *slot = Some(pooled);
-                    }
-                }
-                if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
-                    return Err(cancelled_not_committed(
-                        "pg_read_cancelled",
-                        "PostgreSQL read cancelled",
-                    ));
-                }
-                Ok(val)
-            }
-            Err(err) => {
-                let raw_conn = pooled.detach();
-                tokio::spawn(async move {
-                    let _ = raw_conn.close().await;
-                });
-                if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
-                    return Err(cancelled_not_committed(
-                        "pg_read_cancelled",
-                        "PostgreSQL read cancelled",
-                    ));
-                }
-                Err(err)
+        lease.complete();
+        if *can_cache_fast_conn {
+            let mut slot = fast_read_conn.lock().expect("pg fast_read_conn mutex");
+            if slot.is_none() {
+                *slot = Some(pooled);
             }
         }
+        Ok(val)
     }
 
     pub(crate) async fn with_read_tx<F, T>(&self, op: F) -> Result<T, PortError>
@@ -970,12 +961,7 @@ impl CanonicalStore {
                 }
                 let eff_timeout = caller_rem.min(*statement_timeout);
                 let deadline_tokio = tokio::time::Instant::now() + eff_timeout;
-                let cancelled = async {
-                    match budget {
-                        Some(b) => b.cancellation.cancelled().await,
-                        None => std::future::pending::<()>().await,
-                    }
-                };
+                let cancelled = pg_read_cancelled(budget);
                 tokio::pin!(cancelled);
 
                 let mut pooled = tokio::select! {
@@ -986,9 +972,7 @@ impl CanonicalStore {
                             Duration::from_millis(50),
                         )
                     })?,
-                    _ = &mut cancelled => {
-                        return Err(cancelled_not_committed("pg_read_cancelled", "PostgreSQL read cancelled"));
-                    }
+                    error = &mut cancelled => return Err(error),
                     _ = tokio::time::sleep_until(deadline_tokio) => {
                         return Err(deadline_not_committed(
                             "pg_acquire_read_deadline",
@@ -1027,9 +1011,7 @@ impl CanonicalStore {
                     };
                     tokio::select! {
                         res = fut => res,
-                        _ = &mut cancelled => {
-                            Err(cancelled_not_committed("pg_read_cancelled", "PostgreSQL read cancelled"))
-                        }
+                        error = &mut cancelled => Err(error),
                         _ = tokio::time::sleep_until(deadline_tokio) => {
                             Err(deadline_not_committed(
                                 "pg_read_tx_deadline",

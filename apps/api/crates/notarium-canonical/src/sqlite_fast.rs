@@ -62,12 +62,12 @@ use crate::{
             build_create_note_intent, changed_note_fields, revision_fields,
         },
         rollback::{
-            CandidateAction, build_rollback_direct_single_tx_exec,
-            rollback_fallback_board_present_err,
+            CandidateAction, RollbackRevision, build_rollback_direct_single_tx_exec,
+            decode_rollback_note, encode_rollback_note, rollback_fallback_board_present_err,
         },
     },
     runtime::{FolderHeadRow, SqlDriverState},
-    wal::SqliteWalCoordinator,
+    wal::{SqliteWalCoordinator, read_cancelled},
     writer::{
         BatchEventDraft, BatchExecOutcome, ChangePayloadDraft, CommandIdentitySpec,
         ItemCommitArtifacts, ItemExecCtx, ItemExecuteFn, ItemOutcomeSlot, PreparedWriteIntent,
@@ -112,6 +112,15 @@ impl SqliteFastReadPool {
             writer_active_read_sem: Arc::new(Semaphore::new(1)),
             conns: Arc::new(StdMutex::new(initial)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_idle_slots(&self) -> tokio::sync::OwnedSemaphorePermit {
+        let permits = u32::try_from(self.sem.available_permits()).unwrap();
+        assert!(permits > 0);
+        Arc::clone(&self.sem)
+            .try_acquire_many_owned(permits)
+            .unwrap()
     }
 
     pub async fn close_all(&self) {
@@ -171,6 +180,8 @@ impl SqliteFastReadPool {
             }
             Err(tokio::sync::TryAcquireError::NoPermits) => {
                 tokio::select! {
+                    biased;
+                    error = read_cancelled(budget) => return Err(error),
                     res = Arc::clone(&self.sem).acquire_owned() => match res {
                         Ok(p) => p,
                         Err(_) => {
@@ -399,6 +410,8 @@ impl SqliteFastReadPool {
         });
 
         tokio::select! {
+            biased;
+            error = read_cancelled(budget) => Err(error),
             join_res = &mut handle => {
                 outer_guard.completed = true;
                 join_res.map_err(|err| internal_not_committed("sqlite_fast_read_join", err.to_string()))?
@@ -653,6 +666,8 @@ pub(crate) async fn get_note_sqlite_local_fast(
             Err(tokio::sync::TryAcquireError::NoPermits) => {
                 let eff_deadline = tokio::time::Instant::now() + ctx.budget.remaining;
                 tokio::select! {
+                    biased;
+                    error = read_cancelled(Some(&ctx.budget)) => return Err(error),
                     res = Arc::clone(&fast_read_pool.writer_active_read_sem).acquire_owned() => res.ok(),
                     _ = tokio::time::sleep_until(eff_deadline) => {
                         return Err(deadline_not_committed(
@@ -925,17 +940,18 @@ pub(crate) async fn get_note_sqlite_local_fast(
         return Err(DomainError::ResourceNotFound.into());
     }
 
-    let document = ClassifiedDocument::from_canonical(
+    let mut document = ClassifiedDocument::from_canonical(
         NoteRef {
             space_id: ctx.scope().space_id.clone(),
             note_id: request.note,
         },
         rev_id,
-        live_facts,
+        initial_facts,
         lifecycle,
         content,
         digest,
     )?;
+    document.bind_current_facts(live_facts)?;
 
     if writer_active {
         for _ in 0..4 {
@@ -3922,7 +3938,7 @@ fn authorize_replay_rusqlite(
                     conn,
                     &srec.space,
                     folder,
-                    crate::domain::folders::choose_folder_auth_class(auth, &srec.space.id),
+                    crate::domain::folders::folder_mutation_class(auth, &srec.space.id)?,
                     None,
                     true,
                 )?;
@@ -4378,7 +4394,7 @@ fn load_folder_ancestry_rusqlite(
     ))
 }
 
-fn build_resource_facts_rusqlite(
+pub(crate) fn build_resource_facts_rusqlite(
     conn: &rusqlite::Connection,
     space: &Space,
     parent_folder_id: &FolderId,
@@ -5695,15 +5711,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
         )
         .map_err(FastItemExecError::PreWrite)?;
 
-        let has_collab = space_has_any_collab_session_cached(conn, cache, &scope_cl.space_id)
-            .map_err(FastItemExecError::PreWrite)?;
-        let collab_states = if has_collab {
-            load_space_collab_states_rusqlite(conn, &scope_cl.space_id)
-                .map_err(FastItemExecError::PreWrite)?
-        } else {
-            HashMap::new()
-        };
-
+        let mut closed_room_has_stored_state = HashMap::new();
         let mut skipped_manual_edits = Vec::new();
         let mut skipped_room_active = Vec::new();
         let mut candidates = BTreeMap::new();
@@ -5721,8 +5729,29 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                         WHERE r.space_id = ?1 AND r.entity_type = 'note' AND r.entity_key = t.entity_key
                           AND r.visibility_seq > t.first_run_seq AND r.space_seq > t.first_run_seq
                           AND r.agent_run_id IS NOT ?2
-                    ), pre.rev_id, pre.metadata_msgpack
-             FROM touched t LEFT JOIN revisions pre ON pre.rowid = (
+                    ), pre.rev_id, pre.metadata_msgpack,
+                    CASE WHEN s.note_id IS NOT NULL THEN
+                        s.room_state <> 'closed' OR COALESCE(c.carrier_dirty, 0) <> 0 OR EXISTS (
+                            SELECT 1 FROM collab_update_log u
+                            WHERE u.space_id = s.space_id AND u.note_id = s.note_id)
+                    END,
+                    CASE WHEN s.note_id IS NOT NULL THEN
+                        c.note_id IS NOT NULL OR s.yrs_snapshot_blob IS NOT NULL
+                        OR s.yrs_snapshot_blake3 IS NOT NULL OR EXISTS (
+                            SELECT 1 FROM blob_references b WHERE b.space_id = s.space_id
+                              AND b.owner_kind <> 'note_revision' AND b.owner_kind = 'collab_snapshot'
+                              AND b.owner_id = s.note_id)
+                    END,
+                    CASE WHEN pre.rev_id IS NULL THEN (
+                        SELECT r.metadata_msgpack
+                        FROM note_heads h JOIN revisions r ON r.space_id = h.space_id AND r.rev_id = h.head_rev_id
+                        WHERE h.space_id = ?1 AND h.note_id = t.entity_key
+                          AND r.entity_type = 'note' AND r.entity_key = t.entity_key
+                    ) END
+             FROM touched t
+             LEFT JOIN collab_sessions s ON s.space_id = ?1 AND s.note_id = t.entity_key
+             LEFT JOIN collab_checkpoints c USING (space_id, note_id)
+             LEFT JOIN revisions pre ON pre.rowid = (
                  SELECT r.rowid FROM revisions r
                  WHERE r.space_id = ?1 AND r.entity_type = 'note' AND r.entity_key = t.entity_key
                    AND r.space_seq < t.first_run_seq
@@ -5757,15 +5786,23 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                 skipped_manual_edits.push(nid);
                 continue;
             }
-            if collab_states.get(&nid) == Some(&true) {
-                skipped_room_active.push(nid);
-                continue;
+            if let Some(blocked) = row.get::<_, Option<bool>>(4).map_err(map_history_error)? {
+                if blocked {
+                    skipped_room_active.push(nid);
+                    continue;
+                }
+                let has_stored_state: bool = row.get(5).map_err(map_history_error)?;
+                closed_room_has_stored_state.insert(nid.clone(), has_stored_state);
             }
             let pre_raw: Option<String> = row.get(2).map_err(map_history_error)?;
             let Some(pre_raw) = pre_raw else {
+                let bytes: Vec<u8> = row.get(6).map_err(map_history_error)?;
+                let metadata =
+                    decode_rollback_note(&bytes, &nid).map_err(FastItemExecError::PreWrite)?;
                 candidates.insert(
                     nid,
                     CandidateAction::TrashCreated {
+                        metadata: Box::new(metadata),
                         current_rev: head.head_rev_id,
                         current_lifecycle: head.lifecycle,
                         doc_class: head.doc_class,
@@ -5784,14 +5821,8 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             let pre_rev_id =
                 RevisionId::parse(&pre_raw).map_err(|e| FastItemExecError::PreWrite(e.into()))?;
             let bytes: Vec<u8> = row.get(3).map_err(map_history_error)?;
-            let envelope =
-                RevisionMetadataEnvelope::decode(&bytes).map_err(FastItemExecError::PreWrite)?;
-            let RevisionMetadataPayload::Note(pre_meta) = envelope.payload else {
-                return Err(FastItemExecError::PreWrite(internal_not_committed(
-                    "corrupt_note_rev_meta",
-                    "expected note revision metadata",
-                )));
-            };
+            let pre_meta =
+                decode_rollback_note(&bytes, &nid).map_err(FastItemExecError::PreWrite)?;
             let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
                 && head.parent_folder_id == pre_meta.parent_folder_id
                 && head.slug == pre_meta.slug
@@ -6083,6 +6114,23 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             content_blake3: Option<ContentDigest>,
             metadata_msgpack: Vec<u8>,
         }
+        let mut empty_rooms = Vec::new();
+        let mut sync_room = |note: &NoteId, revision: &RevisionId| -> Result<(), PortError> {
+            match closed_room_has_stored_state.get(note) {
+                Some(true) => sync_closed_collab_session_on_direct_write_rusqlite(
+                    conn,
+                    &scope_cl.space_id,
+                    note,
+                    revision,
+                    visibility_seq,
+                ),
+                Some(false) => {
+                    empty_rooms.push(note.as_str().to_owned());
+                    Ok(())
+                }
+                None => Ok(()),
+            }
+        };
         let mut pending_rev_rows: Vec<PendingFastRev> = Vec::with_capacity(eligible_notes.len());
 
         // 2a. Trash run-created eligible notes FIRST so colliding sibling slots are freed before restore.
@@ -6103,17 +6151,12 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
 
             for (nid, action) in &eligible_notes {
                 let CandidateAction::TrashCreated {
+                    metadata,
                     current_rev,
                     current_lifecycle,
                     doc_class,
-                    parent_folder_id,
-                    slug,
-                    slug_fold,
-                    title,
-                    ability_id,
-                    visibility_mask,
-                    byte_size,
                     content_digest,
+                    ..
                 } = action
                 else {
                     continue;
@@ -6160,43 +6203,15 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     .in_batch_modified_notes
                     .insert((scope_cl.space_id.clone(), nid.clone()));
 
-                if collab_states.contains_key(nid) {
-                    sync_closed_collab_session_on_direct_write_rusqlite(
-                        conn,
-                        &scope_cl.space_id,
-                        nid,
-                        &trev,
-                        visibility_seq,
-                    )
-                    .map_err(FastItemExecError::PostWrite)?;
-                }
+                sync_room(nid, &trev).map_err(FastItemExecError::PostWrite)?;
 
                 if let Some(digest) = *content_digest {
                     pending_blob_rebinds.push((nid.clone(), trev.clone(), digest, tseq));
                 }
 
-                let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
-                    NoteRevisionMetadata {
-                        note_id: nid.clone(),
-                        parent_folder_id: parent_folder_id.clone(),
-                        is_root_child,
-                        slug: slug.clone(),
-                        slug_fold: slug_fold.clone(),
-                        title: title.clone(),
-                        doc_class: *doc_class,
-                        ability_id: ability_id.clone(),
-                        lifecycle: Lifecycle::Trashed,
-                        visibility_mask: *visibility_mask,
-                        byte_size: *byte_size,
-                        content_digest: *content_digest,
-                        schema_revision: current_schema.as_ref().map(|s| s.schema_revision.clone()),
-                        raw_fields: None,
-                        evaluated_fields: BTreeMap::new(),
-                        diagnostics: Vec::new(),
-                    },
-                ))
-                .encode()
-                .map_err(FastItemExecError::PostWrite)?;
+                let meta =
+                    encode_rollback_note(metadata, None, is_root_child, RollbackRevision::Trash)
+                        .map_err(FastItemExecError::PostWrite)?;
 
                 pending_rev_rows.push(PendingFastRev {
                     rev_id: trev.clone(),
@@ -6352,50 +6367,20 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     .in_batch_modified_notes
                     .insert((scope_cl.space_id.clone(), nid.clone()));
 
-                if collab_states.contains_key(nid) {
-                    sync_closed_collab_session_on_direct_write_rusqlite(
-                        conn,
-                        &scope_cl.space_id,
-                        nid,
-                        &rrev,
-                        visibility_seq,
-                    )
-                    .map_err(FastItemExecError::PostWrite)?;
-                }
+                sync_room(nid, &rrev).map_err(FastItemExecError::PostWrite)?;
 
                 if space_has_overlays && pre_meta.lifecycle != Lifecycle::Active {
                     delete_all_target_overlays_rusqlite(conn, &scope_cl.space_id, nid)
                         .map_err(FastItemExecError::PostWrite)?;
                 }
 
-                let schema_revision = current_schema.as_ref().map(|s| &s.schema_revision);
-                let evaluated_fields = if pre_meta.doc_class == DocClass::EncryptedNote {
-                    BTreeMap::new()
-                } else {
-                    evaluate_fields_with_schema(
-                        pre_meta.raw_fields.as_ref(),
-                        pre_meta.diagnostics.first(),
-                        current_schema.as_ref().map(|s| &s.fields),
-                    )
-                };
-                let meta = if pre_meta.is_root_child == is_root_child
-                    && pre_meta.schema_revision.as_ref() == schema_revision
-                    && pre_meta.note_id == *nid
-                    && pre_meta.evaluated_fields == evaluated_fields
-                {
-                    original_metadata
-                        .remove(nid)
-                        .expect("loaded pre-run revision")
-                } else {
-                    let mut restored = pre_meta.as_ref().clone();
-                    restored.note_id = nid.clone();
-                    restored.is_root_child = is_root_child;
-                    restored.schema_revision = schema_revision.cloned();
-                    restored.evaluated_fields = evaluated_fields;
-                    RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(restored))
-                        .encode()
-                        .map_err(FastItemExecError::PostWrite)?
-                };
+                let meta = encode_rollback_note(
+                    pre_meta,
+                    original_metadata.remove(nid).map(Into::into),
+                    is_root_child,
+                    RollbackRevision::Restore(current_schema.as_deref()),
+                )
+                .map_err(FastItemExecError::PostWrite)?;
 
                 pending_rev_rows.push(PendingFastRev {
                     rev_id: rrev.clone(),
@@ -6420,6 +6405,42 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     note: nid.clone(),
                     revision: rrev,
                 });
+            }
+        }
+
+        if !empty_rooms.is_empty() {
+            // The writer transaction owns the changed heads and their room rows. Only
+            // rooms proven to have no checkpoint, updates, snapshot or references reach here.
+            let room_error = |err: rusqlite::Error| {
+                FastItemExecError::PostWrite(internal_not_committed(
+                    "sqlite_rollback_rooms",
+                    err.to_string(),
+                ))
+            };
+            let ids = serde_json::to_string(&empty_rooms).map_err(|err| {
+                FastItemExecError::PostWrite(internal_not_committed(
+                    "sqlite_rollback_rooms",
+                    err.to_string(),
+                ))
+            })?;
+            let mut update = conn
+                .prepare_cached(
+                    "UPDATE collab_sessions AS s
+                 SET lineage_epoch = lineage_epoch + 1, updated_seq = ?1,
+                     carrier_rev_id = (SELECT h.head_rev_id FROM note_heads h
+                                       WHERE h.space_id = s.space_id AND h.note_id = s.note_id)
+                 WHERE s.space_id = ?2 AND s.room_state = 'closed'
+                   AND s.note_id IN (SELECT value FROM json_each(?3))",
+                )
+                .map_err(room_error)?;
+            let affected = update
+                .execute(params![vis_i64, scope_cl.space_id.as_str(), ids])
+                .map_err(room_error)?;
+            if affected != empty_rooms.len() {
+                return Err(FastItemExecError::PostWrite(internal_not_committed(
+                    "sqlite_rollback_rooms",
+                    "closed rollback room was not updated",
+                )));
             }
         }
 
@@ -6854,30 +6875,6 @@ fn load_revision_meta_bytes_rusqlite(
         r.get::<_, Vec<u8>>(0)
     })
     .map_err(|err| map_interrupt_or_internal(err, "sqlite_load_rev_meta_fast"))
-}
-
-fn load_space_collab_states_rusqlite(
-    conn: &rusqlite::Connection,
-    space_id: &SpaceId,
-) -> Result<HashMap<NoteId, bool>, PortError> {
-    let mut stmt = conn
-        .prepare_cached("SELECT note_id, (room_state <> 'closed' OR COALESCE(carrier_dirty, 0) <> 0) AS blocked
-                     FROM collab_sessions LEFT JOIN collab_checkpoints USING (space_id, note_id) WHERE space_id = ?1")
-        .map_err(|err| internal_not_committed("sqlite_collab_states", err.to_string()))?;
-    let rows = stmt
-        .query_map(params![space_id.as_str()], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
-        })
-        .map_err(|err| map_interrupt_or_internal(err, "sqlite_collab_states"))?;
-    let mut out = HashMap::new();
-    for item in rows {
-        let (nid_raw, st) =
-            item.map_err(|err| map_interrupt_or_internal(err, "sqlite_collab_states"))?;
-        if let Ok(nid) = NoteId::parse(&nid_raw) {
-            out.insert(nid, st);
-        }
-    }
-    Ok(out)
 }
 
 fn has_any_board_moves_in_space_rusqlite(

@@ -43,7 +43,10 @@ use crate::{
             FolderAncestryCache, derive_command_identity_spec, load_current_space_schema_tx,
             load_note_head_row_tx, note_rank_version_digest, validate_mutation_identity,
         },
-        notes::{analyze_and_prepare_carrier, changed_revision_fields_tx},
+        notes::{
+            analyze_and_prepare_carrier_opt_preparsed, changed_revision_fields_tx,
+            enforce_protected_frontmatter_unchanged_with_header,
+        },
     },
     runtime::{
         CanonicalInner, SpaceRecord, insert_revision_row, is_note_purge_fenced_tx,
@@ -979,6 +982,18 @@ async fn authorize_export_notes_tx(
     Ok(())
 }
 
+async fn authorize_job_payload_tx(
+    tx: &mut BackendConn<'_>,
+    space: &Space,
+    auth: &EngineAuthContext,
+    job: &ContentJob,
+) -> Result<(), PortError> {
+    if let ContentJobKind::Export { notes, .. } = &job.kind {
+        authorize_export_notes_tx(tx, space, auth, notes).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn authorize_job_replay_tx(
     tx: &mut BackendConn<'_>,
     space: &Space,
@@ -991,9 +1006,7 @@ pub(crate) async fn authorize_job_replay_tx(
         let (current, ..) = load_job_row_opt_tx(tx, &space.id, id)
             .await?
             .ok_or(DomainError::ResourceNotFound)?;
-        if let ContentJobKind::Export { notes, .. } = current.kind {
-            authorize_export_notes_tx(tx, space, auth, &notes).await?;
-        }
+        authorize_job_payload_tx(tx, space, auth, &current).await?;
     }
     authorize_export_notes_tx(tx, space, auth, notes).await
 }
@@ -1004,7 +1017,9 @@ async fn create_job_impl(
     request: Mutation<ContentJobKind>,
 ) -> Result<Committed<ContentJob>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let payload_wire = StoredJobPayloadV1::from(&request.input);
@@ -1225,6 +1240,7 @@ async fn get_job_impl(
                 else {
                     return Err(DomainError::ResourceNotFound.into());
                 };
+                authorize_job_payload_tx(tx, &srec.space, &auth, &found).await?;
                 Ok(found)
             })
         })
@@ -1387,24 +1403,39 @@ async fn list_jobs_impl(
 
                 let fetch_limit = i64::from(limit.get()) + 1;
                 let base_cut_i64 = base_cut.get() as i64;
-                let fetched = query_jobs_page_tx(
-                    tx,
-                    &srec.scope.space_id,
-                    base_cut_i64,
-                    &states,
-                    after_key_opt.as_ref(),
-                    fetch_limit,
-                )
-                .await?;
-
                 let page_cap = usize::from(limit.get());
-                let has_more = fetched.len() > page_cap;
-                let mut items = Vec::with_capacity(fetched.len().min(page_cap));
-                let mut last_seq_for_cursor = 0i64;
-                for (cseq, job) in fetched.into_iter().take(page_cap) {
-                    last_seq_for_cursor = cseq;
-                    items.push(job);
-                }
+                let mut items = Vec::with_capacity(page_cap);
+                let mut scan_after = after_key_opt.clone();
+                let mut last_seq_for_cursor = 0;
+                // Read ahead to the next visible job; hidden exports must not become cursor keys.
+                let has_more = 'pages: loop {
+                    let rows = query_jobs_page_tx(
+                        tx,
+                        &srec.scope.space_id,
+                        base_cut_i64,
+                        &states,
+                        scan_after.as_ref(),
+                        fetch_limit,
+                    )
+                    .await?;
+                    let exhausted = rows.len() < fetch_limit as usize;
+                    for (seq, job) in rows {
+                        scan_after = Some((seq, job.id.as_str().to_owned()));
+                        match authorize_job_payload_tx(tx, &srec.space, &auth, &job).await {
+                            Ok(()) => {}
+                            Err(PortError::Domain(DomainError::ResourceNotFound)) => continue,
+                            Err(err) => return Err(err),
+                        }
+                        if items.len() == page_cap {
+                            break 'pages true;
+                        }
+                        last_seq_for_cursor = seq;
+                        items.push(job);
+                    }
+                    if exhausted {
+                        break false;
+                    }
+                };
 
                 let next = if has_more {
                     let last_job = items.last().expect("non-empty page when has_more");
@@ -1686,7 +1717,9 @@ async fn cancel_job_impl(
     request: Mutation<CancelJob>,
 ) -> Result<Committed<ContentJob>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
 
     let fp = format!(
@@ -3393,6 +3426,31 @@ async fn close_collab_session_impl(
     Ok(res)
 }
 
+fn validate_settlement_room(
+    room: &CollabSessionRecord,
+    carrier: &RevisionId,
+    owner: Option<&str>,
+    lease: LeaseEpoch,
+    lineage: LineageEpoch,
+    closing: bool,
+) -> Result<(), PortError> {
+    match room.room_state {
+        CollabRoomState::Active if room.owner_id.as_deref() != owner => {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+        }
+        CollabRoomState::Active => {}
+        CollabRoomState::Fenced if closing => {}
+        _ => return Err(DomainError::validation(ValidationReason::InvalidState).into()),
+    }
+    if room.lease_epoch != lease {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
+    if room.lineage_epoch != lineage || &room.carrier_rev_id != carrier {
+        return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn settle_and_update_collab_session(
     store: &CanonicalStore,
@@ -3412,12 +3470,18 @@ async fn settle_and_update_collab_session(
         let sc = scope.clone();
         let nid = note.clone();
         let auth = settlement.auth.clone();
+        let owner = expected_owner.clone();
         store
             .with_read_tx_budget(Some(budget), |tx| {
                 Box::pin(async move {
                     let srec = load_space_record(tx, &sc.space_id).await?;
                     srec.scope.check(&sc)?;
                     let head = load_note_head_row_tx(tx, &srec.scope.space_id, &nid).await?;
+                    if head.lifecycle != Lifecycle::Active
+                        || is_note_purge_fenced_tx(tx, &sc.space_id, nid.as_str()).await?
+                    {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
                     let (facts, _) = crate::domain::common::build_resource_facts_tx(
                         tx,
                         &srec.space,
@@ -3428,6 +3492,17 @@ async fn settle_and_update_collab_session(
                     )
                     .await?;
                     auth.authorize_direct_write(&facts, &facts)?;
+                    let room = load_collab_session_opt_tx(tx, &sc.space_id, &nid)
+                        .await?
+                        .ok_or(DomainError::ResourceNotFound)?;
+                    validate_settlement_room(
+                        &room,
+                        &head.head_rev_id,
+                        owner.as_deref(),
+                        expected_lease,
+                        expected_lineage,
+                        close_room,
+                    )?;
                     Ok((srec, head))
                 })
             })
@@ -3437,15 +3512,34 @@ async fn settle_and_update_collab_session(
     if base_head.doc_class == DocClass::EncryptedNote {
         return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
     }
-    let info = analyze_and_prepare_carrier(
+    let digest = base_head.content_digest.ok_or_else(|| {
+        internal_not_committed(
+            "settlement_missing_digest",
+            "active note lacks content_blake3",
+        )
+    })?;
+    let bytes = store.read_verified_blob(&space_rec.scope, digest).await?;
+    let previous = std::str::from_utf8(&bytes).map_err(|_| {
+        internal_not_committed(
+            "corrupt_note_utf8",
+            "canonical note carrier is not valid UTF-8",
+        )
+    })?;
+    let header = enforce_protected_frontmatter_unchanged_with_header(
+        previous,
+        &settlement.carrier,
+        base_head.doc_class,
+    )?;
+    let info = analyze_and_prepare_carrier_opt_preparsed(
         &settlement.carrier,
         base_head.doc_class,
         &note,
         &base_head.slug,
         store.blob_codec(),
+        header,
     )?;
     let ticket = store
-        .stage_blob(
+        .stage_blob_for_batch(
             &space_rec.scope,
             space_rec.active_epoch,
             &info.prepared_blob,
@@ -3498,31 +3592,14 @@ async fn settle_and_update_collab_session(
                 else {
                     return Err(DomainError::ResourceNotFound.into());
                 };
-                if close_room {
-                    if cur.room_state == CollabRoomState::Closed {
-                        return Err(DomainError::validation(ValidationReason::InvalidState).into());
-                    }
-                    if cur.room_state == CollabRoomState::Active && cur.owner_id != expected_owner {
-                        return Err(
-                            DomainError::validation(ValidationReason::InvalidAuthority).into()
-                        );
-                    }
-                } else {
-                    if cur.room_state != CollabRoomState::Active {
-                        return Err(DomainError::validation(ValidationReason::InvalidState).into());
-                    }
-                    if cur.owner_id != expected_owner {
-                        return Err(
-                            DomainError::validation(ValidationReason::InvalidAuthority).into()
-                        );
-                    }
-                }
-                if cur.lease_epoch != expected_lease {
-                    return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
-                }
-                if cur.lineage_epoch != expected_lineage || cur.carrier_rev_id != head.head_rev_id {
-                    return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-                }
+                validate_settlement_room(
+                    &cur,
+                    &head.head_rev_id,
+                    expected_owner.as_deref(),
+                    expected_lease,
+                    expected_lineage,
+                    close_room,
+                )?;
 
                 advance_collab_snapshot_tx(
                     tx,

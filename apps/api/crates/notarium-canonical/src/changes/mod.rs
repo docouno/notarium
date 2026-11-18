@@ -1480,7 +1480,7 @@ impl CanonicalStore {
                     return Err(DomainError::validation(ValidationReason::CursorStale).into());
                 }
                 let mut current = crate::domain::common::FolderAncestryCache::default();
-                for note in &hydrated_notes {
+                for note in &mut hydrated_notes {
                     let facts = current
                         .live_note_facts(
                             tx,
@@ -1493,6 +1493,7 @@ impl CanonicalStore {
                     if let Some(auth) = &space_auth {
                         auth.authorize_read(&facts)?;
                     }
+                    note.document.bind_current_facts(facts)?;
                 }
                 if let Some(auth) = &space_auth {
                     for thread in &thread_items {

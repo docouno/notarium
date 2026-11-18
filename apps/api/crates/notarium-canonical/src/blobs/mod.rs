@@ -343,6 +343,55 @@ pub fn decode_zstd_verified(
     Ok(decoded)
 }
 
+/// Owns a provisionally registered S3 publication until the last uploader or writer
+/// releases it. SQL removes the discard intent atomically when that publication wins.
+#[derive(Debug)]
+pub(crate) struct PublicationDiscard {
+    store: crate::CanonicalStore,
+    scope: HistoryScope,
+    epoch: LeaseEpoch,
+    publication: String,
+    runtime: tokio::runtime::Handle,
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl PublicationDiscard {
+    pub(crate) async fn finish(&self) -> Result<(), PortError> {
+        self.store
+            .discard_publication(&self.scope, self.epoch, &self.publication)
+            .await?;
+        self.finished
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Drop for PublicationDiscard {
+    fn drop(&mut self) {
+        if self.finished.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let store = self.store.clone();
+        let scope = self.scope.clone();
+        let epoch = self.epoch;
+        let publication = self.publication.clone();
+        self.runtime.spawn(async move {
+            let mut backoff = Duration::from_millis(50);
+            while !store
+                .inner
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                match store.discard_publication(&scope, epoch, &publication).await {
+                    Ok(()) | Err(PortError::Domain(_)) => break,
+                    Err(_) => tokio::time::sleep(backoff).await,
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
+        });
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StagedBlobTicket {
     pub(crate) space_id: SpaceId,
@@ -353,7 +402,7 @@ pub struct StagedBlobTicket {
     pub(crate) compressed_size: u64,
     pub(crate) publication_id: String,
     pub(crate) codec: BlobCodecTag,
-    queue_discard: bool,
+    discard: Option<Arc<PublicationDiscard>>,
     pub(crate) local_pending_dirs: PendingDirSyncs,
     /// Retains the shared per-`(SpaceId, ContentDigest)` guard until outer Phase-2 commit/rollback drops it.
     pub(crate) _local_guard: Option<Arc<LocalSharedGuard>>,
@@ -364,8 +413,8 @@ pub struct StagedBlobTicket {
 }
 
 impl StagedBlobTicket {
-    pub(crate) fn queue_discard_id(&self) -> Option<&str> {
-        self.queue_discard.then_some(self.publication_id.as_str())
+    pub(crate) fn discard(&self) -> Option<Arc<PublicationDiscard>> {
+        self.discard.clone()
     }
 
     pub fn digest(&self) -> ContentDigest {
@@ -537,20 +586,17 @@ impl crate::CanonicalStore {
             BlobBackendDriver::Local(local) => {
                 if pending.len() == 1 {
                     let local_cl = Arc::clone(local);
-                    let dir_rel = pending.iter().next().unwrap().to_owned();
-                    return tokio::task::spawn_blocking(move || {
-                        local_cl.flush_single_dir(&dir_rel)
-                    })
-                    .await
-                    .map_err(|err| {
-                        internal_not_committed("local_cas_sync_dir_join", err.to_string())
-                    })?;
+                    let barrier = pending.barriers().next().unwrap();
+                    return tokio::task::spawn_blocking(move || barrier.sync(&local_cl))
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("local_cas_sync_dir_join", err.to_string())
+                        })?;
                 }
                 let mut set = tokio::task::JoinSet::new();
-                for dir_rel in pending.iter() {
+                for barrier in pending.barriers() {
                     let local_cl = Arc::clone(local);
-                    let dir_owned = dir_rel.to_owned();
-                    set.spawn_blocking(move || local_cl.flush_single_dir(&dir_owned));
+                    set.spawn_blocking(move || barrier.sync(&local_cl));
                 }
                 let mut first_err: Option<PortError> = None;
                 while let Some(res) = set.join_next().await {
@@ -1049,7 +1095,7 @@ impl crate::CanonicalStore {
                     compressed_size: comp_size,
                     publication_id: pub_id,
                     codec: BlobCodecTag::LocalZstdV1,
-                    queue_discard: false,
+                    discard: None,
                     local_pending_dirs: PendingDirSyncs::default(),
                     _local_guard: Some(guard),
                     deferred_local_key: Some((scope.space_id.as_str().to_owned(), digest)),
@@ -1057,7 +1103,8 @@ impl crate::CanonicalStore {
                 })
             }
             BlobBackendDriver::S3(s3) => {
-                self.stage_s3_blob(s3, scope, active_epoch, prepared).await
+                self.stage_owned_s3_blob(s3, scope, active_epoch, prepared)
+                    .await
             }
         }
     }
@@ -1142,7 +1189,7 @@ impl crate::CanonicalStore {
                     compressed_size: comp_size,
                     publication_id: pub_id,
                     codec: BlobCodecTag::LocalZstdV1,
-                    queue_discard: false,
+                    discard: None,
                     local_pending_dirs: PendingDirSyncs::default(),
                     _local_guard: Some(guard),
                     deferred_local_key: Some((scope.space_id.as_str().to_owned(), digest)),
@@ -1150,7 +1197,8 @@ impl crate::CanonicalStore {
                 })
             }
             BlobBackendDriver::S3(s3) => {
-                self.stage_s3_blob(s3, scope, active_epoch, prepared).await
+                self.stage_owned_s3_blob(s3, scope, active_epoch, prepared)
+                    .await
             }
         }
     }
@@ -1209,7 +1257,7 @@ impl crate::CanonicalStore {
             compressed_size: comp_size,
             publication_id: pub_id,
             codec: BlobCodecTag::LocalZstdV1,
-            queue_discard: false,
+            discard: None,
             local_pending_dirs: pending_dirs,
             _local_guard: Some(guard),
             deferred_local_key: None,
@@ -1228,34 +1276,44 @@ impl crate::CanonicalStore {
             .await
     }
 
-    pub(crate) async fn stage_queue_body(
+    async fn stage_owned_s3_blob(
         &self,
+        s3: &S3BlobStore,
         scope: &HistoryScope,
-        active_epoch: LeaseEpoch,
+        epoch: LeaseEpoch,
         prepared: &PreparedBlobSource,
     ) -> Result<StagedBlobTicket, PortError> {
-        self.inner
-            .check_writer_epoch(&scope.space_id, active_epoch)?;
-        match &self.inner.blobs {
-            BlobBackendDriver::Local(_) => {
-                self.stage_blob_for_batch(scope, active_epoch, prepared)
-                    .await
-            }
-            BlobBackendDriver::S3(s3) => {
-                let publication = new_prefixed_hex_id("pub_")?;
-                let staged = self
-                    .stage_s3_publication(s3, scope, active_epoch, prepared, Some(&publication))
-                    .await;
-                if staged.is_err() {
-                    self.discard_queue_publication(scope, active_epoch, &publication)
-                        .await?;
+        let discard = Arc::new(PublicationDiscard {
+            store: self.clone(),
+            scope: scope.clone(),
+            epoch,
+            publication: new_prefixed_hex_id("pub_")?,
+            runtime: tokio::runtime::Handle::current(),
+            finished: Default::default(),
+        });
+        let staged = self
+            .stage_s3_publication(s3, scope, epoch, prepared, Some(&discard.publication))
+            .await;
+        match staged {
+            Ok(mut ticket) => {
+                if ticket.publication_id == discard.publication {
+                    ticket.discard = Some(discard);
+                } else {
+                    // Reusing a committed publication created no private keys or discard intent.
+                    discard
+                        .finished
+                        .store(true, std::sync::atomic::Ordering::Release);
                 }
-                staged
+                Ok(ticket)
+            }
+            Err(error) => {
+                discard.finish().await?;
+                Err(error)
             }
         }
     }
 
-    pub(crate) async fn discard_queue_publication(
+    async fn discard_publication(
         &self,
         scope: &HistoryScope,
         epoch: LeaseEpoch,
@@ -1281,7 +1339,7 @@ impl crate::CanonicalStore {
     ) -> Result<StagedBlobTicket, PortError> {
         s3.verify_runtime_bucket_mode().await?;
 
-        let queue_discard = provisional_publication.is_some();
+        let provisional = provisional_publication.is_some();
         let pub_id = match provisional_publication {
             Some(id) => id.to_owned(),
             None => new_prefixed_hex_id("pub_")?,
@@ -1306,12 +1364,10 @@ impl crate::CanonicalStore {
                         &app_prefix,
                     )
                     .await?;
-                    if queue_discard
-                        && matches!(registration, S3StageRegistration::NewStaging { .. })
+                    if provisional && matches!(registration, S3StageRegistration::NewStaging { .. })
                     {
-                        // Keep a pinned backup from capturing an unresolved, private upload.
-                        ensure_no_backup_holds_tx(tx, &scope_cl.space_id).await?;
-                        record_queue_discard_tx(tx, &scope_cl, active_epoch, &pub_id_cl).await?;
+                        record_publication_discard_tx(tx, &scope_cl, active_epoch, &pub_id_cl)
+                            .await?;
                     }
                     Ok(registration)
                 })
@@ -1329,7 +1385,7 @@ impl crate::CanonicalStore {
                     compressed_size: prepared.total_compressed_size,
                     publication_id,
                     codec: BlobCodecTag::S3ChunkedV1,
-                    queue_discard: false,
+                    discard: None,
                     local_pending_dirs: PendingDirSyncs::default(),
                     _local_guard: None,
                     deferred_local_key: None,
@@ -1376,7 +1432,7 @@ impl crate::CanonicalStore {
             compressed_size: prepared.total_compressed_size,
             publication_id: pub_id,
             codec: BlobCodecTag::S3ChunkedV1,
-            queue_discard,
+            discard: None,
             local_pending_dirs: PendingDirSyncs::default(),
             _local_guard: None,
             deferred_local_key: None,
@@ -1533,9 +1589,6 @@ impl crate::CanonicalStore {
                     let result =
                         load_pending_retirement_targets_tx(tx, &scope_in, active_epoch, &ret_in)
                             .await?;
-                    if !result.1.is_empty() {
-                        ensure_no_backup_holds_tx(tx, &scope_in.space_id).await?;
-                    }
                     if result
                         .1
                         .first()
@@ -1558,11 +1611,10 @@ impl crate::CanonicalStore {
                                 .map(|_| ()),
                         }
                         .map_err(|err| {
-                            internal_not_committed(
-                                "seal_discarded_queue_publication",
-                                err.to_string(),
-                            )
+                            internal_not_committed("seal_discarded_publication", err.to_string())
                         })?;
+                    } else if !result.1.is_empty() {
+                        ensure_no_backup_holds_tx(tx, &scope_in.space_id).await?;
                     }
                     Ok(result)
                 })
@@ -2376,8 +2428,8 @@ pub(crate) async fn activate_and_bind_blob_ref_tx(
         }
     };
 
-    if claim.ticket.queue_discard && effective_pub_id == claim.ticket.publication_id {
-        disarm_queue_discard_tx(tx, space_id, &effective_pub_id).await?;
+    if claim.ticket.discard.is_some() && effective_pub_id == claim.ticket.publication_id {
+        disarm_publication_discard_tx(tx, space_id, &effective_pub_id).await?;
     }
 
     // Insert explicit blob_references row (ignoring exact duplicate owner tuple within the same command).
@@ -2935,29 +2987,17 @@ pub(crate) async fn release_owner_blob_refs_tx(
 ) -> Result<Vec<ContentDigest>, PortError> {
     let now_ms = now_unix_ms()?;
     let raw_digests: Vec<Vec<u8>> = match tx {
-        BackendConn::Sqlite(conn) => {
-            let digests: Vec<Vec<u8>> = sqlx::query_scalar(
-                "SELECT DISTINCT content_blake3 FROM blob_references
-                 WHERE space_id = ? AND owner_kind = ? AND owner_id = ?",
-            )
-            .bind(space_id.as_str())
-            .bind(owner_kind.as_db_str())
-            .bind(owner_id)
-            .fetch_all(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_list_owner_refs", err.to_string()))?;
-
-            sqlx::query(
-                "DELETE FROM blob_references WHERE space_id = ? AND owner_kind = ? AND owner_id = ?",
-            )
-            .bind(space_id.as_str())
-            .bind(owner_kind.as_db_str())
-            .bind(owner_id)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_del_owner_refs", err.to_string()))?;
-            digests
-        }
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "DELETE FROM blob_references
+                 WHERE space_id = ? AND owner_kind = ? AND owner_id = ?
+                 RETURNING content_blake3",
+        )
+        .bind(space_id.as_str())
+        .bind(owner_kind.as_db_str())
+        .bind(owner_id)
+        .fetch_all(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_del_owner_refs", err.to_string()))?,
         BackendConn::Postgres(conn) => {
             let digests: Vec<Vec<u8>> = sqlx::query_scalar(
                 "DELETE FROM blob_references
@@ -3230,7 +3270,7 @@ async fn load_active_blob_meta_tx(
         BackendConn::Sqlite(conn) => {
             let r = sqlx::query(
                 "SELECT raw_size, blob_state, current_publication_id
-                 FROM blob_catalog WHERE space_id = ? AND content_blake3 = ?",
+                 FROM blob_catalog WHERE space_id = ? AND content_blake3 = ? AND admission_state = 'open'",
             )
             .bind(space_id.as_str())
             .bind(digest.as_bytes().as_slice())
@@ -3248,7 +3288,7 @@ async fn load_active_blob_meta_tx(
         BackendConn::Postgres(conn) => {
             let r = sqlx::query(
                 "SELECT raw_size, blob_state, current_publication_id
-                 FROM blob_catalog WHERE space_id = $1 AND content_blake3 = $2",
+                 FROM blob_catalog WHERE space_id = $1 AND content_blake3 = $2 AND admission_state = 'open'",
             )
             .bind(space_id.as_str())
             .bind(digest.as_bytes().as_slice())
@@ -3421,7 +3461,7 @@ async fn load_s3_manifest_parts_tx(
 
 // A provisional discard uses its unique publication ID as retirement ID. It owns
 // exactly those immutable part keys; digest-wide GC may run independently.
-async fn record_queue_discard_tx(
+async fn record_publication_discard_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     epoch: LeaseEpoch,
@@ -3449,7 +3489,9 @@ async fn record_queue_discard_tx(
                 .bind(now)
                 .execute(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("plan_queue_discard", err.to_string()))?;
+                .map_err(|err| {
+                    internal_not_committed("plan_publication_discard", err.to_string())
+                })?;
             sqlx::query(PARTS)
                 .bind(sid)
                 .bind(publication)
@@ -3466,7 +3508,9 @@ async fn record_queue_discard_tx(
                 .bind(now)
                 .execute(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("plan_queue_discard", err.to_string()))?;
+                .map_err(|err| {
+                    internal_not_committed("plan_publication_discard", err.to_string())
+                })?;
             sqlx::query(PARTS)
                 .bind(sid)
                 .bind(publication)
@@ -3475,10 +3519,10 @@ async fn record_queue_discard_tx(
                 .map(|_| ())
         }
     }
-    .map_err(|err| internal_not_committed("plan_queue_discard_parts", err.to_string()))
+    .map_err(|err| internal_not_committed("plan_publication_discard_parts", err.to_string()))
 }
 
-async fn disarm_queue_discard_tx(
+async fn disarm_publication_discard_tx(
     tx: &mut BackendConn<'_>,
     space: &SpaceId,
     publication: &str,
@@ -3501,7 +3545,7 @@ async fn disarm_queue_discard_tx(
                 .await
                 .map(|_| ()),
         }
-        .map_err(|err| internal_not_committed("disarm_queue_discard", err.to_string()))?;
+        .map_err(|err| internal_not_committed("disarm_publication_discard", err.to_string()))?;
     }
     Ok(())
 }
@@ -4217,6 +4261,12 @@ async fn finalize_retirement_tx(
         .map_err(|err| internal_not_committed("pg_ret_digests", err.to_string()))?,
     };
 
+    // Keep the immutable publication audit, but a discarded upload cannot leave
+    // a digest indefinitely advertised as staging. A sibling in flight still owns it.
+    const RETIRE_UNUSED_DIGEST: &str = "UPDATE blob_catalog SET blob_state='retired', touched_at_ms=$1
+        WHERE space_id=$2 AND content_blake3=$3 AND admission_state='open' AND blob_state='staging'
+        AND ref_count=0 AND current_publication_id IS NULL AND NOT EXISTS (
+            SELECT 1 FROM blob_publications WHERE space_id=$2 AND content_blake3=$3 AND state <> 'retired')";
     for (d_bytes, publication_only) in target_digests {
         match tx {
             BackendConn::Sqlite(conn) => {
@@ -4235,6 +4285,15 @@ async fn finalize_retirement_tx(
                 .await
                 .map_err(|err| internal_not_committed("sqlite_retire_pubs", err.to_string()))?;
                 if publication_only != 0 {
+                    sqlx::query(RETIRE_UNUSED_DIGEST)
+                        .bind(now_ms)
+                        .bind(space_id.as_str())
+                        .bind(&d_bytes)
+                        .execute(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("retire_unused_digest", err.to_string())
+                        })?;
                     continue;
                 }
 
@@ -4266,6 +4325,15 @@ async fn finalize_retirement_tx(
                 .await
                 .map_err(|err| internal_not_committed("pg_retire_pubs", err.to_string()))?;
                 if publication_only != 0 {
+                    sqlx::query(RETIRE_UNUSED_DIGEST)
+                        .bind(now_ms)
+                        .bind(space_id.as_str())
+                        .bind(&d_bytes)
+                        .execute(&mut **conn)
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("retire_unused_digest", err.to_string())
+                        })?;
                     continue;
                 }
 

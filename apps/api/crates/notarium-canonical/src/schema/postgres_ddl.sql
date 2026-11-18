@@ -348,9 +348,11 @@ CREATE TABLE IF NOT EXISTS blob_references (
     PRIMARY KEY (space_id, owner_kind, owner_rev_id, owner_id, resource_key)
 );
 
-CREATE INDEX IF NOT EXISTS idx_blob_references_non_note_owner
-    ON blob_references (space_id, owner_kind, owner_id)
-    WHERE owner_kind <> 'note_revision';
+CREATE INDEX IF NOT EXISTS idx_blob_references_owner
+    ON blob_references (space_id, owner_kind, owner_id);
+
+CREATE INDEX IF NOT EXISTS idx_blob_references_digest
+    ON blob_references (space_id, content_blake3);
 
 CREATE TABLE IF NOT EXISTS blob_retirements (
     space_id TEXT NOT NULL,

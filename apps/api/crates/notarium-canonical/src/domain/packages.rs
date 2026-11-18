@@ -62,6 +62,110 @@ fn validate_ability_aux_path(rel_path: &str) -> Result<(), PortError> {
     Ok(())
 }
 
+async fn check_package_publication_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &notarium_core::model::HistoryScope,
+    auth: &notarium_core::auth::EngineAuthContext,
+    entrypoint: &notarium_core::ids::NoteId,
+    ability: &AbilityId,
+    expected_pkg_rev: Option<&RevisionId>,
+    aux_raw_bytes: u64,
+) -> Result<
+    (
+        crate::domain::common::NoteHeadRow,
+        ContentDigest,
+        Option<RevisionId>,
+    ),
+    PortError,
+> {
+    auth.authorize_ability_mutation()?;
+    let live_space = load_space_record(tx, &scope.space_id).await?;
+    live_space.scope.check(scope)?;
+    let entry_head = load_note_head_row_tx(tx, &scope.space_id, entrypoint).await?;
+    let (before_facts, _) = build_resource_facts_tx(
+        tx,
+        &live_space.space,
+        &entry_head.parent_folder_id,
+        entry_head.doc_class,
+        entry_head.ability_id.clone(),
+        true,
+    )
+    .await?;
+    let mut after_facts = before_facts.clone();
+    after_facts.ability_package = Some(ability.clone());
+    auth.authorize_direct_write(&before_facts, &after_facts)?;
+
+    if entry_head.lifecycle != Lifecycle::Active {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if entry_head.doc_class != DocClass::Skill {
+        return Err(DomainError::validation(ValidationReason::ClassMismatch).into());
+    }
+    if let Some(existing_ab) = &entry_head.ability_id
+        && existing_ab != ability
+    {
+        return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+    }
+
+    let entry_digest = entry_head.content_digest.ok_or_else(|| {
+        internal_not_committed(
+            "skill_entrypoint_missing_digest",
+            "active Skill note missing content_blake3",
+        )
+    })?;
+    let total_raw_bytes = entry_head.byte_size.saturating_add(aux_raw_bytes);
+    if total_raw_bytes > MAX_ABILITY_PACKAGE_RAW_BYTES {
+        return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+    }
+
+    // Check existing `ability_packages` state and expected_package_revision CAS.
+    let existing_pkg = load_ability_package_row_opt_tx(tx, &scope.space_id, ability).await?;
+    let prev_rev_opt = match &existing_pkg {
+        Some((lc, cur_rev, cur_entry)) => {
+            if *lc == Lifecycle::Purged {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            if cur_entry != entrypoint {
+                return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+            }
+            if expected_pkg_rev != Some(cur_rev) {
+                return Err(DomainError::RevisionConflict {
+                    current: cur_rev.clone(),
+                    lineage: None,
+                }
+                .into());
+            }
+            Some(cur_rev.clone())
+        }
+        None => {
+            if let Some(unexpected) = expected_pkg_rev {
+                return Err(DomainError::RevisionConflict {
+                    current: unexpected.clone(),
+                    lineage: None,
+                }
+                .into());
+            }
+            None
+        }
+    };
+
+    // Enforce active package slug uniqueness across the Space.
+    if active_ability_slug_conflict_tx(tx, &scope.space_id, &entry_head.slug_fold, ability).await? {
+        let report_parent = (entry_head.parent_folder_id != live_space.root_folder_id)
+            .then_some(entry_head.parent_folder_id.clone());
+        return Err(DomainError::PathConflict {
+            target: PathTarget {
+                space_id: scope.space_id.clone(),
+                parent: report_parent,
+                component: entry_head.slug.clone(),
+            },
+        }
+        .into());
+    }
+
+    Ok((entry_head, entry_digest, prev_rev_opt))
+}
+
 pub(crate) async fn publish_ability_package_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -97,19 +201,10 @@ pub(crate) async fn publish_ability_package_impl(
         prepared_aux.push((file.path.clone(), actual_digest, prep));
     }
 
-    let space_rec = store.read_space(&ctx.scope().space_id).await?;
+    let space_rec = store
+        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        .await?;
     space_rec.scope.check(ctx.scope())?;
-
-    // Stage all auxiliary CAS blobs in Phase 1 outside the writer lock.
-    let mut staged_aux = Vec::with_capacity(prepared_aux.len());
-    let mut total_staged_bytes: u64 = 0;
-    for (path, digest, prep) in &prepared_aux {
-        let ticket = store
-            .stage_blob(&space_rec.scope, space_rec.active_epoch, prep)
-            .await?;
-        total_staged_bytes = total_staged_bytes.saturating_add(ticket.compressed_size);
-        staged_aux.push((path.clone(), *digest, ticket));
-    }
 
     let mut fp_hasher = blake3::Hasher::new();
     fp_hasher.update(request.input.ability.as_str().as_bytes());
@@ -121,7 +216,7 @@ pub(crate) async fn publish_ability_package_impl(
     if let Some(exp) = &request.input.expected_package_revision {
         fp_hasher.update(exp.as_str().as_bytes());
     }
-    for (path, digest, _) in &staged_aux {
+    for (path, digest, _) in &prepared_aux {
         fp_hasher.update(&[0]);
         fp_hasher.update(path.as_bytes());
         fp_hasher.update(digest.as_bytes());
@@ -140,6 +235,58 @@ pub(crate) async fn publish_ability_package_impl(
     let expected_pkg_rev = request.input.expected_package_revision.clone();
     let scope = space_rec.scope.clone();
 
+    let preflight_scope = scope.clone();
+    let preflight_auth = auth.clone();
+    let entrypoint = input_entrypoint.clone();
+    let ability = input_ability.clone();
+    let expected = expected_pkg_rev.clone();
+    let replay_key = idemp.clone();
+    let replayed = store
+        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+            Box::pin(async move {
+                if let Some(receipt) =
+                    crate::writer::lookup_command_receipt_tx(tx, &preflight_scope, &replay_key)
+                        .await?
+                {
+                    if receipt.command_hash != replay_key.command_hash {
+                        return Err(DomainError::IdempotencyKeyReused.into());
+                    }
+                    return Ok(Some(receipt.response_blob));
+                }
+                check_package_publication_tx(
+                    tx,
+                    &preflight_scope,
+                    &preflight_auth,
+                    &entrypoint,
+                    &ability,
+                    expected.as_ref(),
+                    aux_raw_bytes,
+                )
+                .await?;
+                Ok(None)
+            })
+        })
+        .await?;
+    if let Some(bytes) = replayed {
+        store
+            .inner
+            .check_writer_epoch(&scope.space_id, space_rec.active_epoch)?;
+        let committed: StoredCommittedAbilityRevV1 = rmp_serde::from_slice(&bytes)
+            .map_err(|err| internal_not_committed("decode_replayed_package", err.to_string()))?;
+        return Ok(committed.into_committed());
+    }
+
+    // Stage all auxiliary CAS blobs in Phase 1 outside the writer lock.
+    let mut staged_aux = Vec::with_capacity(prepared_aux.len());
+    let mut total_staged_bytes: u64 = 0;
+    for (path, digest, prep) in &prepared_aux {
+        let ticket = store
+            .stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, prep)
+            .await?;
+        total_staged_bytes = total_staged_bytes.saturating_add(ticket.compressed_size);
+        staged_aux.push((path.clone(), *digest, ticket));
+    }
+
     let intent = PreparedWriteIntent {
         scope: scope.clone(),
         active_epoch: space_rec.active_epoch,
@@ -149,101 +296,16 @@ pub(crate) async fn publish_ability_package_impl(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                auth.authorize_ability_mutation()?;
-                let live_space = load_space_record(tx, &scope.space_id).await?;
-                let entry_head =
-                    load_note_head_row_tx(tx, &scope.space_id, &input_entrypoint).await?;
-                if entry_head.lifecycle != Lifecycle::Active {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                if entry_head.doc_class != DocClass::Skill {
-                    return Err(DomainError::validation(ValidationReason::ClassMismatch).into());
-                }
-                if let Some(existing_ab) = &entry_head.ability_id
-                    && existing_ab != &input_ability
-                {
-                    return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
-                }
-
-                let entry_digest = entry_head.content_digest.ok_or_else(|| {
-                    internal_not_committed(
-                        "skill_entrypoint_missing_digest",
-                        "active Skill note missing content_blake3",
-                    )
-                })?;
-                let total_raw_bytes = entry_head.byte_size.saturating_add(aux_raw_bytes);
-                if total_raw_bytes > MAX_ABILITY_PACKAGE_RAW_BYTES {
-                    return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
-                }
-
-                let (before_facts, _) = build_resource_facts_tx(
+                let (entry_head, entry_digest, prev_rev_opt) = check_package_publication_tx(
                     tx,
-                    &live_space.space,
-                    &entry_head.parent_folder_id,
-                    DocClass::Skill,
-                    entry_head.ability_id.clone(),
-                    true,
+                    &scope,
+                    &auth,
+                    &input_entrypoint,
+                    &input_ability,
+                    expected_pkg_rev.as_ref(),
+                    aux_raw_bytes,
                 )
                 .await?;
-                let mut after_facts = before_facts.clone();
-                after_facts.ability_package = Some(input_ability.clone());
-                auth.authorize_direct_write(&before_facts, &after_facts)?;
-
-                // Check existing `ability_packages` state and expected_package_revision CAS.
-                let existing_pkg =
-                    load_ability_package_row_opt_tx(tx, &scope.space_id, &input_ability).await?;
-                let prev_rev_opt = match &existing_pkg {
-                    Some((lc, cur_rev, cur_entry)) => {
-                        if *lc == Lifecycle::Purged {
-                            return Err(DomainError::ResourceNotFound.into());
-                        }
-                        if cur_entry != &input_entrypoint {
-                            return Err(
-                                DomainError::validation(ValidationReason::ScopeMismatch).into()
-                            );
-                        }
-                        if expected_pkg_rev.as_ref() != Some(cur_rev) {
-                            return Err(DomainError::RevisionConflict {
-                                current: cur_rev.clone(),
-                                lineage: None,
-                            }
-                            .into());
-                        }
-                        Some(cur_rev.clone())
-                    }
-                    None => {
-                        if let Some(unexpected) = &expected_pkg_rev {
-                            return Err(DomainError::RevisionConflict {
-                                current: unexpected.clone(),
-                                lineage: None,
-                            }
-                            .into());
-                        }
-                        None
-                    }
-                };
-
-                // Enforce active package slug uniqueness across the Space.
-                if active_ability_slug_conflict_tx(
-                    tx,
-                    &scope.space_id,
-                    &entry_head.slug_fold,
-                    &input_ability,
-                )
-                .await?
-                {
-                    let report_parent = (entry_head.parent_folder_id != item_ctx.root_folder_id)
-                        .then_some(entry_head.parent_folder_id.clone());
-                    return Err(DomainError::PathConflict {
-                        target: PathTarget {
-                            space_id: scope.space_id.clone(),
-                            parent: report_parent,
-                            component: entry_head.slug.clone(),
-                        },
-                    }
-                    .into());
-                }
-
                 let seq = item_ctx.alloc_next_seq()?;
                 let pkg_rev = new_revision_id()?;
                 let now_ts = now_utc_timestamp()?;
@@ -326,7 +388,7 @@ pub(crate) async fn publish_ability_package_impl(
                 }
 
                 let kind_str = ability_kind_to_db(input_kind);
-                if existing_pkg.is_some() {
+                if prev_rev_opt.is_some() {
                     match tx {
                         BackendConn::Sqlite(conn) => {
                             sqlx::query(
@@ -428,7 +490,7 @@ pub(crate) async fn publish_ability_package_impl(
                         entrypoint_revision: entry_head.head_rev_id.clone(),
                         lifecycle: Lifecycle::Active,
                         resources: manifest.clone(),
-                        total_bytes: total_raw_bytes,
+                        total_bytes: entry_head.byte_size.saturating_add(aux_raw_bytes),
                     },
                 ))
                 .encode()?;
@@ -490,7 +552,7 @@ pub(crate) async fn publish_ability_package_impl(
                     receipt,
                 };
                 let sanitized_bytes = CanonicalStore::encode_command_outcome(&sanitized_resp)?;
-                let op_kind = if existing_pkg.is_some() {
+                let op_kind = if prev_rev_opt.is_some() {
                     "edit"
                 } else {
                     "create"

@@ -54,7 +54,7 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `3` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `4` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
@@ -67,7 +67,14 @@ The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
 
-Schema version 3 adds a backup hold generation and a collaboration checkpoint
+Schema version 4 rebuilds the SQLite `blob_catalog` as a `WITHOUT ROWID` table
+keyed by Space and digest. Both backends index blob references by Space and
+digest for recounts, and by Space, owner kind and owner ID for purge. Upgrading
+from versions 1 through 3 preserves active ownership and scrubs previously
+invalidated chat summaries. A digest becomes eligible for retirement when the
+last reference is removed.
+
+Schema version 3 added a backup hold generation and a collaboration checkpoint
 row keyed by Space and note. Upgrading from schema 1 or 2 keeps every stored
 collaboration delta. A legacy snapshot has unknown coverage through its last
 lease, so recovery establishes a new lease before advancing the checkpoint.
@@ -285,11 +292,12 @@ same example against an isolated prefix.
   messages inline and `> 512`-byte payloads in verified CAS. Each
   `stage_chat_blob` call records a per-author lease with its provenance, including
   when several calls stage the same digest. Append consumes the specific lease.
-  Legacy leases with unknown provenance count as externally tainted. The DAG
-  maintains deterministic skip pointers at `depth - 16` and `depth - 256` so
-  50-entry branch context reads execute in `O(window + log depth)` with `0`
-  writes. `chat_pending_inputs` enforces a 16-item per-thread queue (`Full`
-  without a mutation receipt on the 17th item). Queue admission checks the
+  Legacy leases with unknown provenance count as externally tainted. A leaf window follows at most one parent per returned entry and issues
+  zero writes. For a distant `before` cursor, ancestry validation first walks
+  fixed jumps of 256 levels, then 16 levels, then individual parents. For a
+  depth difference `d`, this takes up to `d / 256` full jumps plus at most 30
+  shorter hops before reading the requested window. `chat_pending_inputs`
+  enforces a 16-item per-thread queue (`Full` without a mutation receipt on the 17th item). Queue admission checks the
   thread, write authority and available space before staging a large body and
   again at commit. Local publication follows admission. For S3, each new upload
   records its own cleanup intent before the first conditional PUT. The winning
@@ -297,7 +305,9 @@ same example against an isolated prefix.
   fences its registered keys while preserving other publications of the same digest.
   `redact_chat_entry` applies the same thread and taint checks on first execution
   and replay. It erases target entry content, preserves DAG ancestry and
-  invalidates only descendant `Compaction` entries. Taint is monotonic.
+  clears the stored bodies and CAS references of dependent `Compaction` entries.
+  Direct reads, history windows and command replay suppress stale summaries.
+  An independent entry that owns the same digest keeps its content. Taint is monotonic.
 - **Paired backup (`BackupParticipantPort`).** Prepare both participants and acquire
   their holds before pausing control, then canonical. PostgreSQL uses a dedicated
   connection to fence writers across runtimes sharing the canonical schema. Pin
@@ -307,23 +317,25 @@ same example against an isolated prefix.
   paired backup. Losing the PostgreSQL hold session invalidates the attempt,
   including an external CAS copy already in progress. Each acquisition uses
   a new generation, so a disconnected owner cannot release its successor.
-  Source-local holds expire with their owner and are omitted
-  from restored data. SQLite copies 16 pages per step and releases an idle cut
-  when its deadline or WAL retention budget expires. PostgreSQL streams cursor
+  Each canonical Space holds its own history cursor. The artifact records the
+  combined witness once. Source-local holds expire with their owner and are
+  omitted from restored data. SQLite copies 16 pages per step and releases an
+  idle cut when its deadline or logical WAL retention budget expires. Reusing
+  already allocated WAL space still consumes that budget. PostgreSQL streams cursor
   rows in slices of up to 64 KiB. Both participants release their source after
   durable spool or abort. A canonical artifact ID resolves on its original spool
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact schema 1, 2 and 3 manifests.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 4.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
   target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 and 2, drop
   `collab_checkpoints` and `backup_holds.owner_generation`. For version 1,
   also drop `account_catalog_receipts` and `chat_pending_inputs.ext_space_tainted`.
   Import the verified rows in the same transaction. Opening the target with
-  the original installation ID applies the version 3 migration. The canonical
-  L4 backup suite exercises this procedure with archives from both exporters.
+  the original installation ID applies the version 4 migration. The canonical
+  L4 backup suite exercises this procedure with archives from all three predecessor versions.
 
 ## Offline fixture lifecycle and attributed benchmarks
 
@@ -358,14 +370,19 @@ The JSON records launcher and
 benchmark-container cgroup limits separately, alongside observed PostgreSQL
 socket round-trip latency, filesystem, database settings, cardinalities and
 p50/p95/p99. An unavailable controller is recorded as `unknown`. A completed measurement that misses a target writes a report
-with `FAIL` and returns a nonzero status.
+with `FAIL` and returns a nonzero status. A board or folder storage error
+ends that profile and later profiles still run. Its `failure` records the
+stage, the one-based move number when applicable, and the storage diagnostic.
+A board verification failure after commit also records the receipt sequence.
+Latency includes successful calls only. A board move must also pass its
+post-commit overlay checks to count. Empty latency samples serialize as null.
 
 | Workload | Release profile and target |
 | --- | --- |
 | SQLite writer | 50 writers with either 0 or 200 readers, unique 4 KiB edits, 10 s warmup + 30 s measurement, 3 runs each. Every run must exceed 2,000 mutations/s and return zero busy errors. The report samples the active batch writer's synchronous setting and journal size limit and records reader gate dwell. |
-| Rollback | Fresh run, history and revisions for every sample. The Space also has an unrelated folder. Seed 18 edited notes, 2 creations, 1 deletion with a slug collision and 1 subsequent manual edit through the public ports before starting the timer. SQLite and PostgreSQL with local CAS each require p95 below 5 ms across 1,000 samples. A separate 200-sample PostgreSQL/S3 profile reports local UDS latency. |
-| Chat window | 10,000 reads of 50 entries on each 10,000-turn thread, p95 below 1 ms. The branched profile rotates across nine tips and checks that each result ends at the selected tip. Row triggers count writes across the canonical tables. |
-| Board and folder | 10,000 first-slot board moves with ranks at most 16 bytes. Moving a folder over 100,000 seeded descendant heads must perform zero row writes to descendants. Triggers observe inserts, updates and deletes. A no-op update to one descendant verifies the counter. |
+| Rollback | Fresh run, history and revisions for every sample. The Space also has an unrelated folder. Seed 18 edited notes, 2 creations, 1 deletion with a slug collision and 1 subsequent manual edit through the public ports before starting the timer. Open and cleanly close a room on each of the 17 edited notes eligible for restoration. After timing, verify that every room retains its lease, advances exactly one lineage and points at its returned restore revision. Require a new rollback receipt above the pre-call Space sequence. At that receipt, verify that each revision references its original revision and content digest, then read and hash the original carrier through the note API. The `verified_closed_room_restores` counter includes successful checks for measured samples and excludes the warmup. SQLite and PostgreSQL with local CAS each require p95 below 5 ms across 1,000 samples. A separate 200-sample PostgreSQL/S3 profile reports local UDS latency. |
+| Chat window | 10,000 reads of 50 entries on each 10,000-turn thread, p95 below 1 ms. After 50 shared turns, the branched thread appends 16 turns at a time to each of nine branches in rotation. All nine measured windows cross at least two parent gaps containing 128 or more off-branch turns, beyond the PostgreSQL 100-entry lookback. Every read compares its full ordered sequence of 50 entries against append receipts. The smoke run uses the same topology with 512 turns and 200 reads per profile. Row triggers count writes across the canonical tables. |
+| Board and folder | 10,000 first-slot board moves with ranks at most 16 bytes. After each move, compare its receipt result to the first ranked overlay and check every rank length. Moving a folder over 100,000 seeded descendant heads must perform zero row writes to descendants. Triggers observe inserts, updates and deletes. A no-op update to one descendant verifies the counter. |
 | Paired backup | The control and canonical participants share an installation. Test 1 and 64 canonical Spaces separately on SQLite and PostgreSQL. For each profile, prepare both participants, acquire both holds, pause control then canonical, pin both snapshots, and resume both writers. Report prepare/holds, safe-point acquisition, confirmed pause after control acknowledges its safe point, and the inclusive interval from the first pause call through the last resume. The confirmed pause from the first safe point through both resume acknowledgements must reach p95 below 1 ms across 1,000 captures per profile. |
 
 ### Proof boundaries

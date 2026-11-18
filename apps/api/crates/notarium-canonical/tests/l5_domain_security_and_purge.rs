@@ -4,6 +4,10 @@
 mod batch;
 #[path = "l5_domain_security_and_purge/collab_schema.rs"]
 mod collab_schema;
+#[path = "l5_domain_security_and_purge/folder_authority.rs"]
+mod folder_authority;
+#[path = "l5_domain_security_and_purge/staging.rs"]
+mod staging;
 mod support;
 
 use notarium_canonical::blobs::s3::{ReqwestS3Transport, S3RawRequest, S3RawResponse, S3Transport};
@@ -11,7 +15,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -165,6 +169,8 @@ async fn seed_default_space(
 struct PausedObjectRead {
     transport: ReqwestS3Transport,
     armed: AtomicBool,
+    data_puts: AtomicUsize,
+    fail_put: AtomicUsize,
     received: tokio::sync::Notify,
     resume: tokio::sync::Notify,
 }
@@ -177,6 +183,22 @@ impl S3Transport for PausedObjectRead {
         Box<dyn std::future::Future<Output = Result<S3RawResponse, PortError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            if request.method == http::Method::PUT
+                && request
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| key.contains("/cas-v1/"))
+                && !notarium_canonical::blobs::TerminalMarkerMeta::is_terminal_marker(&request.body)
+            {
+                let count = self.data_puts.fetch_add(1, Ordering::SeqCst) + 1;
+                if self.fail_put.load(Ordering::SeqCst) == count {
+                    return Ok(S3RawResponse {
+                        status: 503,
+                        headers: BTreeMap::new(),
+                        body: bytes::Bytes::new(),
+                    });
+                }
+            }
             let object_get = request.method == http::Method::GET && request.key.is_some();
             let response = self.transport.send(request).await?;
             if object_get && self.armed.swap(false, Ordering::SeqCst) {
@@ -188,7 +210,11 @@ impl S3Transport for PausedObjectRead {
     }
 }
 
-async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&PausedObjectRead>) {
+async fn run_domain_and_security_suite(
+    store: &CanonicalStore,
+    gate: Option<&PausedObjectRead>,
+    local: Option<&TempDataRoot>,
+) {
     let owner = sample_principal_id(10);
     let viewer = sample_principal_id(11);
     let (scope, _root_folder) = seed_default_space(
@@ -554,6 +580,60 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
         historical[0].as_ref().unwrap().path,
         "alpha-prime/docs/specs/arch-overview.md"
     );
+    let portable = store
+        .get_note(
+            ctx.clone(),
+            GetNote {
+                note: note_1.clone(),
+                revision: Some(rev_1.clone()),
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap()
+        .document;
+    let ChangeReadResult::Seed(seed) = store
+        .read_changes(
+            ctx.clone(),
+            ChangeRead::Seed {
+                scope: scope.clone(),
+                cutoff: Some(cut.canonical_seq),
+                limit: PageLimit::new(20).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected seed")
+    };
+    let seeded = seed
+        .notes
+        .into_iter()
+        .find(|n| n.document.reference().note_id == note_1)
+        .unwrap()
+        .document;
+    let current = store
+        .get_note(
+            ctx.clone(),
+            GetNote {
+                note: note_1.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap()
+        .document
+        .metadata();
+    use notarium_core::classes::{
+        ClassEgressFence, ProviderAudience, ProviderCurrentContent, ProviderMessage, ProviderPolicy,
+    };
+    let policy = ProviderPolicy {
+        provider: notarium_core::ids::ProviderResourceId::from_bytes([1; 16]),
+        audience: ProviderAudience::Personal { consented: true },
+        allowed_classes: DocClass::all(),
+    };
+    let live_origin = ProviderCurrentContent::Note(current);
     for root in [&proj_a, &archive_root] {
         let pinned = make_human_ctx(
             &scope,
@@ -567,6 +647,47 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
             false,
             false,
         );
+        for doc in [&portable, &seeded] {
+            assert_eq!(doc.explicit_read(ctx.auth()).unwrap(), c1_carrier);
+            assert!(matches!(
+                doc.explicit_read(pinned.auth()),
+                Err(DomainError::ResourceNotFound)
+            ));
+            assert!(matches!(
+                doc.listing(pinned.auth()),
+                Err(DomainError::ResourceNotFound)
+            ));
+            assert!(matches!(
+                ClassEgressFence::search_metadata(doc.metadata(), pinned.auth()),
+                Err(DomainError::ResourceNotFound)
+            ));
+            assert!(matches!(
+                ClassEgressFence::projection(doc.clone(), pinned.auth()),
+                Err(DomainError::ResourceNotFound)
+            ));
+            assert!(matches!(
+                ClassEgressFence::search(doc.clone(), pinned.auth()),
+                Err(DomainError::ResourceNotFound)
+            ));
+            assert!(matches!(
+                ClassEgressFence::provider(doc.clone(), pinned.auth(), &policy),
+                Err(DomainError::ResourceNotFound)
+            ));
+            let message = ProviderMessage::Document(
+                ClassEgressFence::provider(doc.clone(), ctx.auth(), &policy).unwrap(),
+            );
+            let project = FolderRef {
+                space_id: scope.space_id.clone(),
+                folder_id: root.clone(),
+            };
+            assert!(!message.in_project(&project));
+            assert_eq!(live_origin.in_project(&project), root == &archive_root);
+            ClassEgressFence::revalidate(&message, ctx.auth(), &policy, &live_origin).unwrap();
+            assert!(matches!(
+                ClassEgressFence::revalidate(&message, pinned.auth(), &policy, &live_origin),
+                Err(DomainError::ResourceNotFound)
+            ));
+        }
         let cards = store
             .hydrate_cards(pinned.clone(), cut.clone(), vec![note_1.clone()])
             .await
@@ -1295,6 +1416,17 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
         )
         .await
         .expect("create DocClass::Skill entrypoint note");
+
+    staging::verify_write_admission(
+        store,
+        &scope,
+        &owner,
+        &skill_entry_note,
+        &ability_id,
+        gate,
+        local,
+    )
+    .await;
 
     // Both independent attestations are required to publish an ability.
     for (ability_write, human_management) in [(false, true), (true, false)] {
@@ -2085,6 +2217,7 @@ async fn run_domain_and_security_suite(store: &CanonicalStore, gate: Option<&Pau
         let (result, ()) = tokio::join!(seed, purge);
         assert_validation_err(&result, ValidationReason::CursorStale);
     }
+    folder_authority::check(store, &scope, &owner).await;
 }
 
 #[tokio::test]
@@ -2094,7 +2227,7 @@ async fn l5_domain_crud_batches_packages_and_security_parity() {
         let root = TempDataRoot::new("l5-domain-sqlite");
         let cfg = CanonicalConfig::local_default(sample_installation_id(1), root.data_root());
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
-        run_domain_and_security_suite(&store, None).await;
+        run_domain_and_security_suite(&store, None, Some(&root)).await;
         runtime.shutdown().await.expect("shutdown sqlite");
     }
 
@@ -2110,6 +2243,8 @@ async fn l5_domain_crud_batches_packages_and_security_parity() {
         let gate = Arc::new(PausedObjectRead {
             transport: ReqwestS3Transport::new(&s3_cfg).unwrap(),
             armed: AtomicBool::new(false),
+            data_puts: AtomicUsize::new(0),
+            fail_put: AtomicUsize::new(0),
             received: tokio::sync::Notify::new(),
             resume: tokio::sync::Notify::new(),
         });
@@ -2117,7 +2252,7 @@ async fn l5_domain_crud_batches_packages_and_security_parity() {
         let (store, runtime) = CanonicalRuntime::open_with_s3_transport(cfg, Some(gate.clone()))
             .await
             .expect("open pg+s3");
-        run_domain_and_security_suite(&store, Some(&gate)).await;
+        run_domain_and_security_suite(&store, Some(&gate), None).await;
         runtime.shutdown().await.expect("shutdown pg+s3");
         fixtures.drop_pg_schema(&schema).await;
     }

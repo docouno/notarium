@@ -263,7 +263,10 @@ pub(super) async fn check(
         .await
         .unwrap();
     assert!(linked.items.iter().all(Result::is_ok));
-    let repeated = store.link_many(ctx.clone(), link_batch).await.unwrap();
+    let repeated = store
+        .link_many(ctx.clone(), link_batch.clone())
+        .await
+        .unwrap();
     assert_eq!(
         linked.committed_high_watermark,
         repeated.committed_high_watermark
@@ -281,6 +284,87 @@ pub(super) async fn check(
         after.metadata().revision(),
         other_linked.metadata().revision()
     );
+
+    // Batch-era receipts replay through the single endpoint after the head advances.
+    let legacy_single = store
+        .link(ctx.clone(), link_batch.items[0].clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy_single.receipt,
+        linked.items[0].as_ref().unwrap().receipt
+    );
+
+    let req = link(&other, LinkTarget::Note(note.clone()));
+    let single = store.link(ctx.clone(), req.clone()).await.unwrap();
+    let once = |item| LinkBatch { items: vec![item] };
+    let batch_replay = store
+        .link_many(ctx.clone(), once(req.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        batch_replay.items[0].as_ref().unwrap().receipt,
+        single.receipt
+    );
+    let boundary = batch_replay.committed_high_watermark;
+
+    let untouched = link_batch.items[1].clone();
+    let from_batch = store.link(ctx.clone(), untouched).await.unwrap();
+    assert_eq!(
+        from_batch.receipt,
+        linked.items[1].as_ref().unwrap().receipt
+    );
+
+    let mut collision = req.clone();
+    collision.input.target = LinkTarget::AuthoredName(note.as_str().into());
+    for old_single in [false, true] {
+        if old_single {
+            // Same textual target but an untyped single-link fingerprint from the old writer.
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"notarium-cmd-v1:link\0");
+            hash.update(req.identity.hash.as_bytes());
+            hash.update(&[0]);
+            hash.update(
+                format!(
+                    "src={}\0line=- related: [[{}]]\n",
+                    other.as_str(),
+                    note.as_str()
+                )
+                .as_bytes(),
+            );
+            let hex = hash.finalize().to_hex();
+            let literal = if postgres {
+                format!("decode('{hex}', 'hex')")
+            } else {
+                format!("X'{hex}'")
+            };
+            assert_eq!(store.execute_diagnostic_write_sql_for_test(&format!(
+                "UPDATE command_receipts SET command_hash={literal} WHERE space_id='{}' AND idempotency_key='{}'",
+                scope.space_id.as_str(),req.identity.key.as_str())).await.unwrap(),1);
+        }
+        assert!(matches!(
+            store.link(ctx.clone(), collision.clone()).await,
+            Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+        ));
+        let refused = store
+            .link_many(ctx.clone(), once(collision.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            refused.items[0],
+            Err(DomainError::IdempotencyKeyReused)
+        ));
+        let accepted = store
+            .link_many(ctx.clone(), once(req.clone()))
+            .await
+            .unwrap();
+        assert_eq!(accepted.items[0].as_ref().unwrap().receipt, single.receipt);
+        assert_eq!(
+            store.link(ctx.clone(), req.clone()).await.unwrap().receipt,
+            single.receipt
+        );
+        assert_eq!(accepted.committed_high_watermark, boundary);
+    }
 
     let chained = LinkBatch {
         items: vec![
