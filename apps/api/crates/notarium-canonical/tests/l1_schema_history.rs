@@ -25,6 +25,49 @@ use crate::support::{
     sample_space_id,
 };
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn sqlite_access_time_policy_applies_to_new_database_files() {
+    use rustix::fs::{IFlags, ioctl_getflags, ioctl_setflags};
+    use std::fs::{self, File};
+
+    let root = TempDataRoot::new("sqlite-inode-policy");
+    let data = root.data_root();
+    let probe = data.root().join("probe");
+    fs::create_dir_all(&probe).unwrap();
+    let dir = File::open(&probe).unwrap();
+    let Ok(flags) = ioctl_getflags(&dir) else {
+        return;
+    };
+    if ioctl_setflags(&dir, flags | IFlags::NOATIME).is_err() {
+        return;
+    }
+    let expected = ioctl_getflags(File::create(probe.join("child")).unwrap()).unwrap();
+    let db = data.canonical();
+    let parent = db.parent().unwrap();
+    fs::create_dir_all(parent).unwrap();
+    let prior = parent.join("existing-file");
+    let original = ioctl_getflags(File::create(&prior).unwrap()).unwrap();
+    let config = CanonicalConfig::local_default(sample_installation_id(51), data.clone());
+    let (_, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    runtime.shutdown().await.unwrap();
+
+    assert!(
+        ioctl_getflags(File::open(parent).unwrap())
+            .unwrap()
+            .contains(IFlags::NOATIME)
+    );
+    assert_eq!(
+        ioctl_getflags(File::open(prior).unwrap()).unwrap(),
+        original
+    );
+    let actual = ioctl_getflags(File::open(db).unwrap()).unwrap();
+    assert_eq!(
+        actual.contains(IFlags::NOATIME),
+        expected.contains(IFlags::NOATIME)
+    );
+}
+
 #[tokio::test]
 async fn postgres_tcp_requires_a_verified_server_and_redacts_credentials() {
     use sqlx::postgres::PgSslMode;

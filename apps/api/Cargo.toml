@@ -97,6 +97,7 @@ unicode-normalization = "0.1"
 
 saphyr-parser = "0.3"
 
+rustix = { version = "1", features = ["fs"] }
 rusqlite = { version = "=0.39.0", default-features = false, features = ["backup", "bundled", "cache", "hooks"] }
 base64 = "0.22"
 getrandom = "0.4"

@@ -182,9 +182,15 @@ revision lookup under the 50-writer, 200-reader workload. Thread samples
 caught its file read waiting for space in the ext4 journal. In a separate
 comparison on that volume, six mixed runs with default access timestamps
 reported three read failures. All six runs with access timestamps suppressed
-on fresh fixture files completed without read failures. Record filesystem
-and timestamp settings when comparing tails. Run acceptance with the
-settings used by the deployment.
+on fresh fixture files completed without read failures. A separate set of
+24 mixed runs compared the database and blob directories on the same volume.
+Six runs in each configuration produced five read errors with ordinary
+timestamps, five with timestamps suppressed only for blobs, and zero when
+suppressed for database files, with or without the blob setting. With the
+database directory alone changed, the six runs completed 181,835 reads and
+350,877 mutations versus 163,700 reads and 357,302 mutations in the control.
+Record filesystem and timestamp settings when comparing tails. Run
+acceptance with the settings used by the deployment.
 
 ## Measures for the next integration
 

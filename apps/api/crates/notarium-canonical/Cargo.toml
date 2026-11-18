@@ -43,6 +43,9 @@ cap-std = { workspace = true }
 time = { workspace = true }
 cap-fs-ext.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 notarium-canonical = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }

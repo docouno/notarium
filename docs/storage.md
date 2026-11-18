@@ -316,10 +316,19 @@ same example against an isolated prefix.
   repeats. An admitted item or group stays with the actor when cancellation or
   a deadline ends the caller's wait for its acknowledgement. An unavailable
   reply has an unknown commit outcome. A group can be retried by key when
-  every item has an idempotent identity. If a batch encounters an operational
+  every item has an idempotent identity. Link, memory append, schema publication and
+  room carrier settlement share a caller deadline across lookup, payload
+  preparation and writer acknowledgement. A purge interrupted after its
+  logical deletion retains its recovery record for retry. If a batch encounters an operational
   error after any successful item, or an item's commit outcome is unknown,
   retry with the same command keys.
   The returned commit effect is `Unknown` in both cases.
+- On Linux, canonical SQLite requests the no-access-time inode flag on the
+  managed `v1/` database directory before opening the database. On ext4,
+  newly created files inherit it, including WAL and shared-memory sidecars.
+  Existing files keep their individual timestamp policy. Filesystems that
+  decline the request use their normal timestamps. To inspect the deployed
+  policy on ext4, run `lsattr -d` on the directory and its database files.
 - **`SqliteWalCoordinator`:** Ordinary reads enter through a bounded reader gate
   with a monotonic `< 250 ms` progress-handler deadline (`248 ms` default) and
   guaranteed worker-snapshot rollback/close if a caller drops its future.

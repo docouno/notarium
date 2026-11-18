@@ -20,6 +20,22 @@ use crate::{
 
 pub const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
+#[cfg(target_os = "linux")]
+fn suppress_database_access_times(directory: &std::path::Path) {
+    use rustix::fs::{IFlags, Mode, OFlags, ioctl_getflags, ioctl_setflags, open};
+
+    // On ext4 an atime update can block a SQLite read on journal space. Newly
+    // created database files inherit this directory flag, including WAL sidecars.
+    let options = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    if let Ok(dir) = open(directory, options, Mode::empty())
+        && let Ok(flags) = ioctl_getflags(&dir)
+        && !flags.contains(IFlags::NOATIME)
+    {
+        // Timestamp policy is optional on filesystems or mounts that deny the ioctl.
+        let _ = ioctl_setflags(&dir, flags | IFlags::NOATIME);
+    }
+}
+
 pub async fn open_and_bootstrap_sqlite(
     data_root: &DataRoot,
     installation_id: &InstallationId,
@@ -38,6 +54,8 @@ pub async fn open_and_bootstrap_sqlite(
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| internal_not_committed("sqlite_parent_mkdir", err.to_string()))?;
+        #[cfg(target_os = "linux")]
+        suppress_database_access_times(parent);
     }
 
     let mut writer_conn = open_sqlite_writer_connection(&db_path).await?;
