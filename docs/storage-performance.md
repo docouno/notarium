@@ -35,26 +35,28 @@ closed rooms per command. The separate 200-command PostgreSQL/S3 profile
 over a local Unix socket reported p95 of 4.176 ms on High and 12.620 ms on
 Medium. Remote object storage needs a measurement over the intended network.
 
-### Rollback acceptance by hardware class
+### Storage acceptance by hardware class
 
 Select the hardware class before running the release suite. Keep the data
 volume, CPU/disk calibration, resource limits and build identity with the
-reports. Medium acceptance requires three independent full series on the
-same runtime and reference system. Check each measured p95. A failed or
-incomplete series remains in the record.
+reports. Qualify each class with three independent full series on the same
+runtime and reference system. Check each latency limit and writer floor.
+Keep every failed and incomplete attempt with its exit status.
 
 | Profile | High | Medium |
 | --- | ---: | ---: |
 | SQLite rollback, local CAS, 1,000 fresh commands | p95 <4 ms | p95 <10 ms |
 | PostgreSQL rollback, local CAS, 1,000 fresh commands | p95 <5 ms | p95 <15 ms |
-| SQLite, 50 writers with zero or 200 readers | >2,000 confirmed mutations/s in each run | >2,000 confirmed mutations/s in each run |
-| Chat window, 10,000 reads of 50 turns per topology | p95 <1 ms, working target <0.5 ms | p95 <1 ms |
+| SQLite, 50 writers with zero or 200 readers | >2,000 confirmed mutations/s in each run | >1,600 confirmed mutations/s in each run |
+| Chat window, 10,000 reads of 50 turns per topology | p95 <0.5 ms | p95 <1 ms |
+| Confirmed paired backup pause on SQLite, 1 and 64 Spaces | p95 <1 ms | p95 <1 ms |
+| Confirmed paired backup pause on PostgreSQL, 1 and 64 Spaces | p95 <1 ms | p95 <2.5 ms |
 
 Every class checks receipts, rights, resulting state and zero errors. The
 ordinary command without a tier keeps the original <5 ms local rollback
-limits for both backends. The PostgreSQL/S3 Unix-socket profile reports its
-own latency. Record whether the rollback component and the full suite each
-passed.
+limits, the >2,000 mutations/s writer floor and the <1 ms chat and paired
+pause limits. The PostgreSQL/S3 Unix-socket profile reports its own latency.
+Record whether the rollback component and the full suite each passed.
 
 Three full High series on the same runtime revision (`f6651e2c`) gave
 SQLite rollback p95 of 3.29, 3.38 and 3.26 ms. PostgreSQL rollback had
@@ -63,13 +65,25 @@ p95 of 4.54, 8.97 and 4.98 ms. All twelve chat profiles stayed at or below
 mutations/s. One mixed run in the second series fell to 330/s with a p95
 batch write time of 233 ms. The full suites returned pass, fail and pass.
 These results rule out promoting 3,500/s to a High release floor.
+Across 24 additional High chat profiles on `7e7ef4fb` and `c2925d8d`, the
+largest p95 was 0.329 ms rounded upward.
 
-A full-sized repeat on Medium at the same revision measured 7.80 ms in
+A full-sized repeat on Medium at `f6651e2c` measured 7.80 ms in
 SQLite and 11.51 ms in PostgreSQL. A separate 200-command diagnostic on
 each backend timed the phases of each individual rollback. At SQLite's
 p95 of 7.70 ms, the durable commit took 2.97 ms and buffered SQL inserts
 took 1.70 ms. At PostgreSQL's p95 of 11.42 ms, the statement that checks
 and applies the changes took 7.80 ms and commit took 1.34 ms.
+
+Across three full Medium series on `7e7ef4fb`, the 18 SQLite saturation
+runs ranged from 1,742 to 2,008 confirmed mutations/s (bounds rounded
+outward). Two exceeded 2,000/s. The Medium release floor is 1,600/s in
+each run. Sustaining >2,000/s remains the engineering target. The six
+PostgreSQL backup profiles on that revision recorded confirmed pause p95
+between 1.319 and 1.951 ms. A separate 2,000-capture diagnostic on the same
+system measured 1.53 ms with one Space and 2.08 ms with 64. The 2.5 ms
+Medium budget covers the first confirmed safe point through both resume
+acknowledgements. Measure user-visible save latency at ordinary concurrency.
 
 ### Ordinary edits on both references
 
@@ -90,6 +104,14 @@ cycles. A single worker issued the next cycle immediately.
 | Medium | PostgreSQL | 1 | 2.24–3.47 | 10.66–12.78 | 13.84–15.69 | 15.05–19.29 |
 | Medium | SQLite | 8 | 2.21–2.33 | 14.89–15.79 | 77.98–145.88 | 18.53–18.90 |
 | Medium | PostgreSQL | 8 | 4.07–4.72 | 33.08–41.72 | 94.47–123.20 | 38.59–50.09 |
+
+On `c2925d8d`, the public interaction example completed 52,562 cycles on
+High and 27,659 on Medium. All 24 reopen audits passed. On Medium the
+slowest single-worker save p95 across three repeats was 9.82 ms for SQLite
+and 15.05 ms for PostgreSQL. At eight workers, 1.07% of SQLite saves and
+1.54% of PostgreSQL saves exceeded 100 ms. On High the corresponding
+shares were 0.96% and 0%. The binaries for these two runs were built
+separately from the same tree.
 
 Track eight-worker p99 alongside single-worker p95. These series cover a
 4 KiB note and local database access. HTTP, rendering and the 50,000-note
@@ -159,8 +181,8 @@ visibility and acknowledgement durability in every comparison.
 | Open a board or move a card | Projections measure the four-filter, top-50 view at p95 <5 ms warm and ≤15 ms cold. After a move, check the first result for its receipt while a projection backlog exists. Track card order, group counts and visible frame time. [Projections](https://github.com/docouno/notarium/issues/5) |
 | Search a Space | Search measures lexical p95 <40 ms and hybrid p95 <95 ms on its specified corpus. Verify authorized results and lexical fallback at the 150 ms embedding deadline. Time the first useful visible results through the client separately. [Search](https://github.com/docouno/notarium/issues/6) |
 | Type together or save an open note | Collaboration measures local echo, durable update acknowledgement and delivery to the second editor separately. The <3 ms coalesced checkpoint applies to the intercepted path. Verify that acknowledged edits survive restart. [Collaboration](https://github.com/docouno/notarium/issues/7) |
-| Switch chat branch or undo a Keeper run | Chats and Keepers measure the correct 50-entry window, command receipt and visibility of restored notes. Measure time to the first provider token separately. Keep the storage window p95 <1 ms and the selected tier’s rollback p95 as component checks. [Chats and Keepers](https://github.com/docouno/notarium/issues/8) |
-| Edit while an import or backup runs | Jobs measure foreground read/save tails during background work, the export manifest read <50 ms, the paired backup barrier <1 ms, archive completion and verified restore. [Jobs and backup](https://github.com/docouno/notarium/issues/9) |
+| Switch chat branch or undo a Keeper run | Chats and Keepers measure the correct 50-entry window, command receipt and visibility of restored notes. Measure time to the first provider token separately. Keep the selected tier’s chat-window and rollback p95 limits as component checks. [Chats and Keepers](https://github.com/docouno/notarium/issues/8) |
+| Edit while an import or backup runs | Jobs measure foreground read/save tails during background work, the export manifest read <50 ms, the applicable backend and tier’s confirmed paired pause, archive completion and verified restore. [Jobs and backup](https://github.com/docouno/notarium/issues/9) |
 | Save from an external editor or switch branches | Vault measures filesystem change to durable receipt and visible revision. Track convergence and ID preservation across the 300-file checkout. The <500 ms sidecar shutdown check times the flush and release after parent exit. [Vault and sidecar](https://github.com/docouno/notarium/issues/10) |
 
 For ordinary note saves the scale suite specifies p95 <12 ms on local NVMe

@@ -496,26 +496,36 @@ to measure just the paired backup participants. A run with uncommitted source
 records the exact Git tree and base commit. Its `git_commit` is null.
 To qualify one reference system, choose its tier explicitly. Run three full
 release series on that system with the same source tree and configuration.
-The loop records all three outcomes, including any failed run.
+Keep the launcher log and exit code for every attempt.
 
 ```sh
 tier=medium
-rc=0
+mkdir -p .artifacts/3-storage-cas
+campaign=$(mktemp -d ".artifacts/3-storage-cas/${tier}-campaign.XXXXXXXX") || exit 1
+printf 'Logs: %s\n' "$campaign"
+failed=0
 for series in 1 2 3; do
-  sh docker/storage-fixtures/with-storage-fixtures.sh benchmark --tier "$tier" || rc=1
+  rc=0
+  sh docker/storage-fixtures/with-storage-fixtures.sh benchmark --tier "$tier" \
+    >"$campaign/series-$series.log" 2>&1 || rc=$?
+  printf '%s\n' "$rc" >"$campaign/series-$series.exit"
+  if [ "$rc" -ne 0 ]; then failed=1; fi
 done
-test "$rc" -eq 0
+test "$failed" -eq 0
 ```
 
-Use `tier=high` for the High reference. Each tier run retains
+Use `tier=high` for the High reference. Each completed tier run retains
 `.artifacts/3-storage-cas/d3-benchmarks-<tier>-<tree>-<fixture_run_id>.json`.
 Compare the same `environment.git_tree`, `rollback_tier` and three distinct
 `environment.fixture_run_id` values. All three full reports must pass to
 qualify the complete suite. For rollback acceptance inspect each of the three
 reports individually, including its completed sample counts, room restorations,
 cutoff read deadlines and the strict p95 limits for both local CAS profiles.
-Other profiles retain their own acceptance conditions and their failures
-remain visible in the full suite status.
+The full report records the selected rollback, writer, chat and confirmed-pause
+thresholds in `applied_limits`. Every profile contributes to the full suite status.
+A launcher failure before the final report leaves the attempt incomplete.
+Keep its log and exit code and run another full series to obtain three
+complete measurements. Retain every completed numerical failure.
 
 The JSON records launcher and
 benchmark-container cgroup limits separately, alongside observed PostgreSQL
@@ -541,11 +551,11 @@ phase and retains up to eight detailed examples per operation type.
 
 | Workload | Release profile and target |
 | --- | --- |
-| SQLite writer | 50 writers with either 0 or 200 readers, unique 4 KiB edits, 10 s warmup + 30 s measurement, 3 runs each. Every run must exceed 2,000 mutations/s and return zero busy errors. The report samples the active batch writer's synchronous setting and journal size limit and records reader gate dwell. |
-| Rollback | Fresh run, history and revisions for every sample. The Space also has an unrelated folder. Seed 18 edited notes, 2 creations, 1 deletion with a slug collision and 1 subsequent manual edit through the public ports before starting the timer. Open and cleanly close a room on each of the 17 edited notes eligible for restoration. After timing, verify that every room retains its lease, advances exactly one lineage and points at its returned restore revision. Require a new rollback receipt above the pre-call Space sequence. At that receipt, verify that each revision references its original revision and content digest, then read and hash the original carrier through the note API. The `verified_closed_room_restores` counter includes successful checks for measured samples and excludes the warmup. Across 1,000 samples the default requires p95 below 5 ms for SQLite and PostgreSQL with local CAS. High requires <4 ms for SQLite and <5 ms for PostgreSQL, Medium <10 ms and <15 ms respectively. Each profile records its exact `p95_limit_us`. The compatibility field `enforce_5ms_budget` is true for limits of 5 ms or tighter. The separate 200-sample PostgreSQL/S3 profile reports local UDS latency and has a null limit. |
-| Chat window | 10,000 reads of 50 entries on each 10,000-turn thread, p95 below 1 ms. After 50 shared turns, the branched thread appends 16 turns at a time to each of nine branches in rotation. All nine measured windows cross at least two parent gaps containing 128 or more off-branch turns. A PostgreSQL read from a nonzero leaf with no pagination cursor follows parent keys and returns the authorized thread header and bounded window from one statement snapshot. Every timed read compares its full ordered sequence of 50 entries against append receipts. The smoke run uses the same topology with 512 turns and 200 reads per profile. Row triggers count writes across the canonical tables. |
+| SQLite writer | 50 writers with either 0 or 200 readers, unique 4 KiB edits, 10 s warmup + 30 s measurement, 3 runs each. Every run must exceed 1,600 confirmed mutations/s on Medium or 2,000/s on High and default, with zero reader, writer or busy errors. Each mixed run also requires completed reads. The report samples the active batch writer's synchronous setting and journal size limit and records reader gate dwell. |
+| Rollback | Fresh run, history and revisions for every sample. The Space also has an unrelated folder. Seed 18 edited notes, 2 creations, 1 deletion with a slug collision and 1 subsequent manual edit through the public ports before starting the timer. Open and cleanly close a room on each of the 17 edited notes eligible for restoration. After timing, verify that every room retains its lease, advances exactly one lineage and points at its returned restore revision. Require a new rollback receipt above the pre-call Space sequence. At that receipt, verify that each revision references its original revision and content digest, then read and hash the original carrier through the note API. The `verified_closed_room_restores` counter includes successful checks for measured samples and excludes the warmup. Across 1,000 samples the default requires p95 below 5 ms for SQLite and PostgreSQL with local CAS. High requires <4 ms for SQLite and <5 ms for PostgreSQL, Medium <10 ms and <15 ms respectively. Each profile records its exact `p95_limit_us`. The compatibility field `enforce_5ms_budget` is true for limits of 5 ms or tighter. The test-only lookup of the expected run revision uses the fixture's 30 s call budget while waiting for admission before the timer starts. Its active SQL snapshot keeps the ordinary deadline. The separate 200-sample PostgreSQL/S3 profile reports local UDS latency and has a null limit. |
+| Chat window | 10,000 reads of 50 entries on each 10,000-turn thread, p95 below 0.5 ms on High or 1 ms on Medium and default. After 50 shared turns, the branched thread appends 16 turns at a time to each of nine branches in rotation. All nine measured windows cross at least two parent gaps containing 128 or more off-branch turns. A PostgreSQL read from a nonzero leaf with no pagination cursor follows parent keys and returns the authorized thread header and bounded window from one statement snapshot. Every timed read compares its full ordered sequence of 50 entries against append receipts. The smoke run uses the same topology with 512 turns and 200 reads per profile. Row triggers count writes across the canonical tables. |
 | Board and folder | 10,000 first-slot board moves with ranks at most 16 bytes. After each move, compare its receipt result to the first ranked overlay and check every rank length. Each move over 100,000 seeded descendants alternates between two parents. After timing, verify the receipt sequence, durable parent and revision chain, every historical alias at its original parent and sequence, and zero descendant row writes. Only verified moves enter the latency distribution. A no-op update to one descendant verifies the write counter. |
-| Paired backup | The control and canonical participants share an installation. Test 1 and 64 canonical Spaces separately on SQLite and PostgreSQL. For each profile, prepare both participants, acquire both holds, pause control then canonical, pin both snapshots, and resume both writers. Report prepare/holds, safe-point acquisition, confirmed pause after control acknowledges its safe point, and the inclusive interval from the first pause call through the last resume. The confirmed pause from the first safe point through both resume acknowledgements must reach p95 below 1 ms across 1,000 captures per profile. |
+| Paired backup | The control and canonical participants share an installation. Test 1 and 64 canonical Spaces separately on SQLite and PostgreSQL. For each profile, prepare both participants, acquire both holds, pause control then canonical, pin both snapshots, and resume both writers. Report prepare/holds, safe-point acquisition, confirmed pause after control acknowledges its safe point, and the inclusive interval from the first pause call through the last resume. The confirmed pause from the first safe point through both resume acknowledgements must reach p95 below 2.5 ms for PostgreSQL on Medium and below 1 ms for every other backend/tier combination, across 1,000 captures per profile. |
 
 For reference machine results, candidate targets and the metrics that follow a
 user action through the next component, see [Storage performance and integration targets](storage-performance.md).

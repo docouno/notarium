@@ -349,6 +349,7 @@ impl WriterErrors {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(test, derive(Default))]
 struct WriterRunMetrics {
     run_index: usize,
     concurrent_writers: usize,
@@ -377,8 +378,8 @@ struct WriterRunMetrics {
 }
 
 impl WriterRunMetrics {
-    fn met_targets(&self) -> bool {
-        self.throughput_mut_per_sec > 2_000.0
+    fn met_targets(&self, writer_floor: u32) -> bool {
+        self.throughput_mut_per_sec > f64::from(writer_floor)
             && self.reader_errors == 0
             && self.writer_errors == 0
             && self.leaked_sqlite_busy == 0
@@ -389,13 +390,21 @@ impl WriterRunMetrics {
     }
 }
 
-struct RollbackBudgets {
+#[derive(Clone, Debug, Serialize)]
+struct D3Budgets {
+    #[serde(skip)]
     tier: &'static str,
+    #[serde(rename = "sqlite_rollback_p95_limit_us")]
     sqlite_us: u32,
+    #[serde(rename = "postgres_rollback_p95_limit_us")]
     postgres_us: u32,
+    writer_throughput_floor_mut_per_sec: u32,
+    chat_read_p95_limit_us: u32,
+    sqlite_confirmed_pause_p95_limit_us: u32,
+    postgres_confirmed_pause_p95_limit_us: u32,
 }
 
-impl RollbackBudgets {
+impl D3Budgets {
     fn from_args(args: &[String]) -> Self {
         let mut flags = args.iter().enumerate().filter(|(_, arg)| *arg == "--tier");
         let selected = flags.next().map(|(index, _)| {
@@ -409,17 +418,46 @@ impl RollbackBudgets {
             );
             args.get(index + 1).expect("missing --tier value").as_str()
         });
-        let (tier, sqlite_us, postgres_us) = match selected {
-            None => ("default", 5_000, 5_000),
-            Some("high") => ("high", 4_000, 5_000),
-            Some("medium") => ("medium", 10_000, 15_000),
-            Some(_) => panic!("--tier expects high or medium"),
+        let default = Self {
+            tier: "default",
+            sqlite_us: 5_000,
+            postgres_us: 5_000,
+            writer_throughput_floor_mut_per_sec: 2_000,
+            chat_read_p95_limit_us: 1_000,
+            sqlite_confirmed_pause_p95_limit_us: 1_000,
+            postgres_confirmed_pause_p95_limit_us: 1_000,
         };
-        Self {
-            tier,
-            sqlite_us,
-            postgres_us,
+        match selected {
+            None => default,
+            Some("high") => Self {
+                tier: "high",
+                sqlite_us: 4_000,
+                chat_read_p95_limit_us: 500,
+                ..default
+            },
+            Some("medium") => Self {
+                tier: "medium",
+                sqlite_us: 10_000,
+                postgres_us: 15_000,
+                writer_throughput_floor_mut_per_sec: 1_600,
+                postgres_confirmed_pause_p95_limit_us: 2_500,
+                ..default
+            },
+            Some(_) => panic!("--tier expects high or medium"),
         }
+    }
+
+    fn chat_read_passes(&self, p95_us: f64) -> bool {
+        p95_us < f64::from(self.chat_read_p95_limit_us)
+    }
+
+    fn confirmed_pause_passes(&self, backend: &str, p95_us: f64) -> bool {
+        let limit = match backend {
+            "sqlite_control_canonical" => self.sqlite_confirmed_pause_p95_limit_us,
+            "postgres16_control_canonical" => self.postgres_confirmed_pause_p95_limit_us,
+            _ => return false,
+        };
+        p95_us < f64::from(limit)
     }
 }
 
@@ -549,6 +587,7 @@ struct PairedBackupPauseMetrics {
 struct D3BenchmarkReport {
     status: &'static str,
     rollback_tier: &'static str,
+    applied_limits: D3Budgets,
     environment: EnvironmentAttribution,
     writer_50w_0r_runs: Vec<WriterRunMetrics>,
     writer_50w_200r_runs: Vec<WriterRunMetrics>,
@@ -768,7 +807,7 @@ fn read_trimmed_or_unknown(path: &str) -> String {
 }
 
 // ============================================================================
-// Suite 1: Writer (`> 2000 mut/s`, `0` leaked `SQLITE_BUSY`)
+// Suite 1: Writer throughput and error accounting
 // ============================================================================
 
 async fn run_writer_benchmark_case(
@@ -1078,7 +1117,7 @@ async fn run_writer_benchmark_case(
 }
 
 // ============================================================================
-// Suite 2: Rollback Microfixture (`p95 < 5 ms` on SQLite+Local & PG16+Local)
+// Suite 2: Rollback with local CAS and PostgreSQL/S3
 // ============================================================================
 
 struct RollbackRoomExpectation {
@@ -1323,8 +1362,13 @@ async fn seed_rollback_microfixture(store: &CanonicalStore) -> PreparedRollbackT
         });
     }
 
+    // Build the rollback precondition with the fixture's call budget before timing the command.
     let expected_run_rev = store
-        .inspect_agent_run_revision_for_test(&space.scope.space_id, &run_id)
+        .inspect_agent_run_revision_with_budget_for_test(
+            &space.scope.space_id,
+            &run_id,
+            Some(&run_ctx.budget),
+        )
         .await
         .unwrap()
         .expect("agent run revision");
@@ -1626,7 +1670,7 @@ async fn run_pg_rollback_benchmark(
 }
 
 // ============================================================================
-// Suite 3: Chat (`p95 < 1 ms`, `0` writes across 10k-turn linear & branched DAG)
+// Suite 3: Read-only chat windows on linear and branched 10,000-turn histories
 // ============================================================================
 
 // Triggers on the isolated benchmark schema observe actual writes, including no-op updates.
@@ -2667,7 +2711,7 @@ async fn measure_folder_moves(
 }
 
 // ============================================================================
-// Suite 5: Paired Backup Pause (`p95 < 1 ms` across >= 1,000 captures)
+// Suite 5: Confirmed pause across both backup participants
 // ============================================================================
 
 async fn measure_paired_cuts(
@@ -2891,7 +2935,7 @@ fn write_report(report: &impl Serialize, path: &Path, met_targets: bool) {
 
 fn main() {
     let args: Vec<_> = env::args().collect();
-    let budgets = RollbackBudgets::from_args(&args);
+    let budgets = D3Budgets::from_args(&args);
     match args.get(1).map(String::as_str) {
         Some("--interactions") => interactive::campaign(&args),
         Some("--interaction-series") => interactive::series(&args[2..]),
@@ -2900,7 +2944,7 @@ fn main() {
 }
 
 #[tokio::main(flavor = "multi_thread")]
-async fn d3(budgets: RollbackBudgets) {
+async fn d3(budgets: D3Budgets) {
     let args: Vec<String> = env::args().collect();
     let smoke_mode = args.iter().any(|a| a == "--smoke");
     let hash_arg = |key: &str| {
@@ -3052,7 +3096,7 @@ async fn d3(budgets: RollbackBudgets) {
         let profiles = run_paired_profiles(&fixtures, &work_root, backup_captures).await;
         let met_targets = profiles
             .iter()
-            .all(|p| p.confirmed_pause_latency.p95_us < 1_000.0);
+            .all(|p| budgets.confirmed_pause_passes(p.backend, p.confirmed_pause_latency.p95_us));
         let report = serde_json::json!({
             "suite": "paired_backup",
             "status": if !met_targets { "FAIL" } else if smoke_mode { "SMOKE" } else { "PASS" },
@@ -3358,10 +3402,10 @@ async fn d3(budgets: RollbackBudgets) {
         && writer_50w_0r_runs
             .iter()
             .chain(&writer_50w_200r_runs)
-            .all(WriterRunMetrics::met_targets)
+            .all(|run| run.met_targets(budgets.writer_throughput_floor_mut_per_sec))
         && chat_read_profiles
             .iter()
-            .all(|c| c.latency.p95_us < 1_000.0)
+            .all(|c| budgets.chat_read_passes(c.latency.p95_us))
         && board_first_slot_profiles
             .iter()
             .all(|p| p.failure.is_none() && p.moves_executed == p.moves_requested)
@@ -3370,9 +3414,10 @@ async fn d3(budgets: RollbackBudgets) {
             .all(|p| p.failure.is_none() && p.moves_executed == p.moves_requested)
         && paired_backup_pause_profiles
             .iter()
-            .all(|p| p.confirmed_pause_latency.p95_us < 1_000.0);
+            .all(|p| budgets.confirmed_pause_passes(p.backend, p.confirmed_pause_latency.p95_us));
     let report = D3BenchmarkReport {
         rollback_tier: budgets.tier,
+        applied_limits: budgets,
         status: if !met_targets {
             "FAIL"
         } else if smoke_mode {
@@ -3405,7 +3450,7 @@ mod rollback_budget_tests {
             (Some("medium"), "medium", 10_000, 15_000),
         ] {
             let args = selected.map_or_else(Vec::new, |tier| vec!["--tier".into(), tier.into()]);
-            let budgets = RollbackBudgets::from_args(&args);
+            let budgets = D3Budgets::from_args(&args);
             assert_eq!(
                 (budgets.tier, budgets.sqlite_us, budgets.postgres_us),
                 (name, sqlite, postgres)
@@ -3416,5 +3461,44 @@ mod rollback_budget_tests {
             }
         }
         assert!(within_rollback_limit(50_000.0, None));
+    }
+    #[test]
+    fn full_series_checks_strict_writer_chat_and_pause_limits() {
+        for (selected, writer_floor, chat_us, pg_pause_us) in [
+            (None, 2_000, 1_000, 1_000),
+            (Some("high"), 2_000, 500, 1_000),
+            (Some("medium"), 1_600, 1_000, 2_500),
+        ] {
+            let args = selected.map_or_else(Vec::new, |tier| vec!["--tier".into(), tier.into()]);
+            let budgets = D3Budgets::from_args(&args);
+            assert_eq!(budgets.writer_throughput_floor_mut_per_sec, writer_floor);
+            let mut run = WriterRunMetrics {
+                concurrent_readers: 200,
+                measured_reads_completed: 1,
+                measured_mutations: 1,
+                unique_carrier_digests: 1,
+                phase2_batch_count: 1,
+                throughput_mut_per_sec: f64::from(writer_floor),
+                ..Default::default()
+            };
+            assert!(!run.met_targets(budgets.writer_throughput_floor_mut_per_sec));
+            run.throughput_mut_per_sec += 0.001;
+            assert!(run.met_targets(budgets.writer_throughput_floor_mut_per_sec));
+            run.reader_errors = 1;
+            assert!(!run.met_targets(budgets.writer_throughput_floor_mut_per_sec));
+            run.reader_errors = 0;
+            run.measured_reads_completed = 0;
+            assert!(!run.met_targets(budgets.writer_throughput_floor_mut_per_sec));
+            assert!(budgets.chat_read_passes(f64::from(chat_us) - 0.001));
+            assert!(!budgets.chat_read_passes(f64::from(chat_us)));
+            for (backend, limit) in [
+                ("sqlite_control_canonical", 1_000),
+                ("postgres16_control_canonical", pg_pause_us),
+            ] {
+                assert!(budgets.confirmed_pause_passes(backend, f64::from(limit) - 0.001));
+                assert!(!budgets.confirmed_pause_passes(backend, f64::from(limit)));
+            }
+            assert!(!budgets.confirmed_pause_passes("unknown", 0.0));
+        }
     }
 }

@@ -307,10 +307,10 @@ Resume releases the writer pause, not snapshots or the CAS hold. Source snapshot
 close after the stable database spool; the reference-counted CAS hold lasts
 through blob copying. Uploading a spool does not retain source snapshots.
 Cancellation or failure of either participant releases all pauses, snapshots
-and holds; incomplete artifacts are never successful backups. Numeric budgets,
-adapter compatibility, crash recovery and the target pause below 1 ms are
-verified in the storage/backup deliveries (see [canonical storage](storage.md)),
-not core test doubles.
+and holds. Incomplete artifacts fail verification. Storage integration tests
+verify numeric budgets, adapter compatibility, crash recovery and the
+confirmed pause limit for each backend and hardware class.
+[Canonical storage](storage.md)
 
 `BackupWitness` carries installation and schema version, canonical history cursors
 when owned by that participant, and key ID/generation/active/readable/canary-digest

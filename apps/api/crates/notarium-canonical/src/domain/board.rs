@@ -331,9 +331,20 @@ impl CanonicalStore {
         space_id: &SpaceId,
         run: &AgentRunId,
     ) -> Result<Option<RevisionId>, PortError> {
+        self.inspect_agent_run_revision_with_budget_for_test(space_id, run, None)
+            .await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn inspect_agent_run_revision_with_budget_for_test(
+        &self,
+        space_id: &SpaceId,
+        run: &AgentRunId,
+        budget: Option<&notarium_core::ports::CallBudget>,
+    ) -> Result<Option<RevisionId>, PortError> {
         let sid = space_id.clone();
         let rid = run.clone();
-        self.with_read_tx(|tx| {
+        self.with_read_tx_budget(budget, |tx| {
             Box::pin(async move {
                 let raw: Option<String> = match tx {
                     BackendConn::Sqlite(conn) => sqlx::query_scalar(
