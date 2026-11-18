@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 5;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {

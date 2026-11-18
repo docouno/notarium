@@ -488,6 +488,15 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version <= 5 {
+                sqlx::raw_sql(
+                    "DROP INDEX idx_blob_retirements_status;
+                     CREATE INDEX idx_blob_retirements_status ON blob_retirements(space_id, status)",
+                )
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
             if decoded.schema_version < 5 {
                 sqlx::raw_sql(
                     "DROP INDEX idx_receipt_exception_pointer; DROP INDEX idx_payload_owners_job;
@@ -1054,6 +1063,7 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
         (2, 0x62, 0xB2, "backup-178", 35, 14),
         (3, 0x62, 0xB2, "backup-178", 36, 14),
         (4, 0x62, 0xB2, "backup-178", 36, 14),
+        (5, 0x62, 0xB2, "backup-178", 36, 14),
     ] {
         let fixture = directory.join(format!("schema-v{version}.pgspool"));
         let decoded = decode_postgres_spool_v1(&fixture).unwrap();
@@ -1137,6 +1147,18 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
                 .unwrap_or_else(|error| {
                     panic!("open materialized PostgreSQL v{version} archive: {error:?}")
                 });
+        if let SqlBackendConfig::Postgres { schema, .. } = &config.sql {
+            let mut db = case.pg_cleanup.as_ref().unwrap().0.open_raw_pg().await;
+            let key: (String, String) = sqlx::query_as(
+                "SELECT pg_get_indexdef(to_regclass($1), 1, true),
+                        pg_get_indexdef(to_regclass($1), 2, true)",
+            )
+            .bind(format!("{schema}.idx_blob_retirements_status"))
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+            assert_eq!(key, ("status".to_owned(), "space_id".to_owned()));
+        }
         if let Some((db, scopes, digest, raw)) = migrated_db.as_mut() {
             let result: i32 =
                 sqlx::query_scalar(include_str!("fixtures/check-stale-compactions.sql"))

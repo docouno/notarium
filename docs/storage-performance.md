@@ -110,6 +110,28 @@ system measured 1.53 ms with one Space and 2.08 ms with 64. The 2.5 ms
 Medium budget covers the first confirmed safe point through both resume
 acknowledgements. Measure user-visible save latency at ordinary concurrency.
 
+### Pending CAS retirements
+
+Backup checks the entire installation for pending retirements before accepting
+a cut. SQLite also uses this lookup when selecting its write path. Completed
+retirement records can accumulate. The `(status, space_id)` index serves the
+global check and the per-Space equality check. Its size and write cost depend
+on the number of retained records.
+
+A local query test populated the shipped tables with 64 Spaces and one
+million completed retirements. In SQLite 3.51.3 without planner statistics,
+looking for a pending record with the former Space-first index took 3,000,013
+VM instructions and 106 ms p95 across 25 executions. A status-first index
+returned the same result in 13 instructions and 1.13 µs p95. In PostgreSQL 16
+after `ANALYZE`, median execution time across five observations fell from
+2.05 ms to 0.072 ms.
+
+A file-backed SQLite run then exercised both backup participants on the same
+million completed retirements across 64 Spaces. Alternating the old and new
+index orders twice, with 40 measured cuts per run, gave confirmed pause p95 of
+89.25 and 92.19 ms with the old index and 0.604 and 0.614 ms with the new
+index. The hardware-class suite uses 1,000 captures per profile.
+
 ### Ordinary edits on both references
 
 The same release executable on `f6651e2c` completed 53,303 measured

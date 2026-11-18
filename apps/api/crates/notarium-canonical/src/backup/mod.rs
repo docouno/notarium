@@ -2031,7 +2031,7 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         })
 }
 
-/// Materializes a verified schema 1 through 5 spool for offline inspection within the default budget.
+/// Materializes a verified schema 1 through 6 spool for offline inspection within the default budget.
 pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, PortError> {
     decode_postgres_spool_v1_bounded(
         path,
@@ -2103,7 +2103,7 @@ pub fn decode_postgres_spool_v1_bounded(
     let expected_tables = spool_tables(schema_version);
     let expected_checksum = match schema_version {
         CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1..=4 => {
+        1..=5 => {
             let digest = checksum_tables(schema_version, expected_tables.clone());
             if !crate::schema::migrate::recognized_predecessor(
                 i64::from(schema_version),

@@ -20,12 +20,15 @@ pub(crate) const V3_HASH: &str = "ca79d3e2db2eed95fb8b0e503340139b3fd166b51340e6
 
 pub(crate) const V4_HASH: &str = "23fda6322e7820fdb9b60bd67192098e3d472c074f655a9d0edceaa7e3fb66e0";
 
+pub(crate) const V5_HASH: &str = "e32b31f85aeb41b99c19c355bad2f9103eac552a0fe4b9c1ebb149892a7d9774";
+
 pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
     match version {
         1 => hex::encode(hash) == V1_HASH,
         2 => hex::encode(hash) == V2_HASH,
         3 => hex::encode(hash) == V3_HASH,
         4 => hex::encode(hash) == V4_HASH,
+        5 => hex::encode(hash) == V5_HASH,
         _ => false,
     }
 }
@@ -234,7 +237,16 @@ macro_rules! upgrade {
                 }
                 compactions::scrub(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
             }
-            upgrade_owners_v5(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
+            if version < 5 {
+                upgrade_owners_v5(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
+            }
+            // Both global and per-Space pending checks can seek by status.
+            let index = baseline_statement($ddl, "CREATE INDEX IF NOT EXISTS idx_blob_retirements_status")?;
+            sqlx::query("DROP INDEX idx_blob_retirements_status")
+                .execute(&mut *conn).await
+                .map_err(|e| internal_not_committed("migration_v6_drop_retirement_index", e.to_string()))?;
+            sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
+                .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
             sqlx::query(WRITE_WITNESS)
@@ -270,6 +282,59 @@ mod tests {
     use super::*;
     use crate::schema::bootstrap_sqlite_schema;
     use sqlx::{Connection, Row};
+
+    #[tokio::test]
+    async fn v5_retirement_upgrade_preserves_rows_and_indexes_global_pending_work() {
+        let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+        let installation = InstallationId::from_bytes([5; 16]);
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "DROP INDEX idx_blob_retirements_status;
+             CREATE INDEX idx_blob_retirements_status ON blob_retirements(space_id, status);
+             UPDATE schema_meta SET schema_version=5,
+                 manifest_checksum=X'E32B31F85AEB41B99C19C355BAD2F9103EAC552A0FE4B9C1EBB149892A7D9774';
+             INSERT INTO spaces VALUES('space',zeroblob(16),'root','s','s','personal',
+                 'owner','active',0,0,'{}',0,0);",
+        )
+        .execute(&mut db).await.unwrap();
+        sqlx::raw_sql(
+            "WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<256)
+             INSERT INTO blob_retirements SELECT 'space',printf('retirement-%d',n),zeroblob(16),0,
+                 'gc',NULL,'completed',0,1 FROM ids;
+             INSERT INTO blob_retirements VALUES('space','last',zeroblob(16),0,'gc',NULL,'pending',0,NULL);",
+        ).execute(&mut db).await.unwrap();
+
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE status='pending') FROM blob_retirements",
+        )
+        .fetch_one(&mut db)
+        .await
+        .unwrap();
+        assert_eq!(counts, (257, 1));
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_index_info('idx_blob_retirements_status') ORDER BY seqno",
+        )
+        .fetch_all(&mut db)
+        .await
+        .unwrap();
+        assert_eq!(columns, ["status", "space_id"]);
+        let plan = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM blob_retirements WHERE status='pending' LIMIT 1",
+        )
+        .fetch_one(&mut db)
+        .await
+        .unwrap();
+        let detail: String = plan.get("detail");
+        assert!(
+            detail.contains("SEARCH") && detail.contains("idx_blob_retirements_status (status=?)"),
+            "{detail}"
+        );
+    }
 
     #[tokio::test]
     async fn v4_owner_lookup_upgrade_preserves_explicit_rows_and_receipts() {

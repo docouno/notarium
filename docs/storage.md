@@ -94,7 +94,7 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `5` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `6` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
@@ -106,6 +106,11 @@ and resulting Space identity, history and cutoff, including after restart.
 The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
+
+Schema version 6 orders the existing retirement index by status and then Space.
+Both the installation-wide and per-Space pending checks can seek directly to
+pending work as completed retirements accumulate. Startup rebuilds this index
+in the same transaction that updates the schema witness.
 
 Schema version 5 preserves the explicit payload-owner relation and places the Note after
 the Space in its primary key. SQLite stores this table without a separate rowid tree. A
@@ -476,7 +481,7 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 5.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 6.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
   target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 and 2, drop
@@ -492,8 +497,9 @@ same example against an isolated prefix.
   tables one row at a time. For folder heads and chat entries it first fills a
   temporary table, then inserts the full set in one statement so foreign keys
   can resolve parents that appear later in the archive.
-  Opening the target with the original installation ID applies the version 5 migration. The canonical
-  L4 backup suite exercises this procedure with archives from all four predecessor versions.
+  Opening the target with the original installation ID applies the remaining
+  migrations through version 6. The canonical L4 backup suite exercises this
+  procedure with archives from all five predecessor versions.
   Before serving the restored database, call `restore_cursors` with each
   original cutoff and a fresh history incarnation. The same transaction
   rotates the writer epoch and fences active rooms, retaining their snapshots,

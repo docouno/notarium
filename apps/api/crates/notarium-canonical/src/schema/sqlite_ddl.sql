@@ -369,7 +369,7 @@ CREATE TABLE IF NOT EXISTS blob_retirements (
 );
 
 CREATE INDEX IF NOT EXISTS idx_blob_retirements_status
-    ON blob_retirements (space_id, status);
+    ON blob_retirements (status, space_id);
 
 CREATE TABLE IF NOT EXISTS blob_retirement_targets (
     space_id TEXT NOT NULL,
