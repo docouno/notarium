@@ -10,7 +10,7 @@ use std::{
 };
 
 use notarium_core::{error::PortError, ports::CallBudget};
-use sqlx::{Connection, Row, Sqlite, SqliteConnection, pool::PoolConnection};
+use sqlx::{Row, Sqlite, SqliteConnection, pool::PoolConnection};
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -125,6 +125,7 @@ pub struct SqliteWalCoordinator {
     bg_stop: AtomicBool,
     bg_wake: Notify,
     bg_task: Mutex<Option<JoinHandle<()>>>,
+    cleanup_executor: tokio::runtime::Handle,
     detached_cleanups: StdMutex<Vec<JoinHandle<()>>>,
 }
 
@@ -216,14 +217,14 @@ impl Drop for GateReopenGuard<'_> {
     }
 }
 
-pub(crate) struct FastReaderGateGuard {
+pub(crate) struct ReaderGateGuard {
     coord: Arc<SqliteWalCoordinator>,
     reader_id: u64,
     completed_cleanly: bool,
     counted_timeout: bool,
 }
 
-impl FastReaderGateGuard {
+impl ReaderGateGuard {
     pub fn mark_timeout(&mut self) {
         if !self.counted_timeout {
             self.counted_timeout = true;
@@ -240,7 +241,7 @@ impl FastReaderGateGuard {
     }
 }
 
-impl Drop for FastReaderGateGuard {
+impl Drop for ReaderGateGuard {
     fn drop(&mut self) {
         if !self.completed_cleanly {
             if !self.counted_timeout {
@@ -255,12 +256,9 @@ impl Drop for FastReaderGateGuard {
 }
 
 struct ActiveSqliteSnapshotGuard {
-    coord: Arc<SqliteWalCoordinator>,
-    reader_id: u64,
+    slot: Option<ReaderGateGuard>,
     interrupt_flag: Arc<AtomicBool>,
     pooled: Option<PoolConnection<Sqlite>>,
-    completed_cleanly: bool,
-    counted_timeout: bool,
 }
 
 impl ActiveSqliteSnapshotGuard {
@@ -270,52 +268,46 @@ impl ActiveSqliteSnapshotGuard {
             .expect("pooled connection present while active")
     }
 
+    fn mark_timeout(&mut self) {
+        self.slot
+            .as_mut()
+            .expect("active reader slot")
+            .mark_timeout();
+    }
+
     async fn finish_cleanly(mut self) {
         if let Some(pooled) = self.pooled.as_mut()
             && let Ok(mut locked) = pooled.lock_handle().await
         {
             locked.remove_progress_handler();
         }
-        self.completed_cleanly = true;
-        drop(self.pooled.take());
-        self.coord.release_reader_slot(self.reader_id);
+        let slot = self.slot.take().expect("active reader slot");
+        {
+            // SQLx schedules pool return on the current runtime.
+            let _owner = slot.coord.cleanup_executor.enter();
+            drop(self.pooled.take());
+        }
+        slot.finish_cleanly();
     }
 }
 
 impl Drop for ActiveSqliteSnapshotGuard {
     fn drop(&mut self) {
-        if self.completed_cleanly {
-            return;
-        }
-        // Immediately interrupt any running SQLite VM step on the worker thread!
+        let Some(slot) = self.slot.take() else { return };
         self.interrupt_flag.store(true, Ordering::SeqCst);
-        if !self.counted_timeout {
-            self.coord
-                .counters
-                .cancelled_or_dropped_reads
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
-        if let Some(pooled) = self.pooled.take() {
-            // Detach from pool so an interrupted or uncommitted connection is NEVER reused!
-            let mut raw_conn = pooled.detach();
-            let coord = Arc::clone(&self.coord);
-            let reader_id = self.reader_id;
-
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                let coord_bg = Arc::clone(&coord);
-                let handle = rt.spawn(async move {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut raw_conn).await;
-                    let _ = raw_conn.close().await;
-                    coord_bg.release_reader_slot(reader_id);
-                });
-                coord.register_detached_cleanup(handle);
-            } else {
-                drop(raw_conn);
-                coord.release_reader_slot(reader_id);
-            }
-        } else {
-            self.coord.release_reader_slot(self.reader_id);
+        if let Some(mut pooled) = self.pooled.take() {
+            // The storage executor outlives request runtimes. Keep admission until
+            // the worker closes the interrupted snapshot and discard the connection.
+            let coord = Arc::clone(&slot.coord);
+            let _owner = coord.cleanup_executor.enter();
+            // Keep the pool permit until close, including during store shutdown.
+            pooled.close_on_drop();
+            let cleanup = coord.cleanup_executor.spawn(async move {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *pooled).await;
+                let _ = pooled.close().await;
+                drop(slot);
+            });
+            coord.register_detached_cleanup(cleanup);
         }
     }
 }
@@ -415,6 +407,7 @@ impl SqliteWalCoordinator {
             bg_stop: AtomicBool::new(false),
             bg_wake: Notify::new(),
             bg_task: Mutex::new(None),
+            cleanup_executor: inner.backup_executor.clone(),
             detached_cleanups: StdMutex::new(Vec::new()),
         });
 
@@ -667,12 +660,11 @@ impl SqliteWalCoordinator {
         }
     }
 
-    /// Admits a short-lived synchronous `rusqlite` read transaction through the exact same
-    /// WAL reader gate and monotonic deadline contract as `with_ordinary_read_tx`.
+    /// Admits either SQLite reader through the WAL gate under the caller deadline.
     pub(crate) async fn acquire_reader_gate_slot(
         self: &Arc<Self>,
         budget: Option<&CallBudget>,
-    ) -> Result<(FastReaderGateGuard, tokio::time::Instant), PortError> {
+    ) -> Result<(ReaderGateGuard, tokio::time::Instant), PortError> {
         if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
             return Err(cancelled_not_committed(
                 "sqlite_read_cancelled_pre_admission",
@@ -764,7 +756,7 @@ impl SqliteWalCoordinator {
             .fetch_add(waited_ns, Ordering::Relaxed);
 
         Ok((
-            FastReaderGateGuard {
+            ReaderGateGuard {
                 coord: Arc::clone(self),
                 reader_id,
                 completed_cleanly: false,
@@ -775,7 +767,7 @@ impl SqliteWalCoordinator {
     }
 
     /// Executes an ordinary short-lived read transaction with reader-gate admission,
-    /// `<250 ms` monotonic SQLite progress-handler deadline, and guaranteed connection detach/close on cancel or drop.
+    /// `<250 ms` monotonic SQLite progress-handler deadline, and connection discard on cancel or drop.
     pub(crate) async fn with_ordinary_read_tx<F, T>(
         self: &Arc<Self>,
         read_pool: &sqlx::SqlitePool,
@@ -785,82 +777,12 @@ impl SqliteWalCoordinator {
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> BoxFuture<'c, Result<T, PortError>>,
     {
-        if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
-            return Err(cancelled_not_committed(
-                "sqlite_read_cancelled_pre_admission",
-                "read cancelled before admission",
-            ));
-        }
-        let start_wait = Instant::now();
-        let caller_deadline_tokio = self.gate_deadline(tokio::time::Instant::now(), budget)?;
-
-        // 1. Wait for ordinary reader admission gate without losing Caller's deadline!
-        let reader_id = loop {
-            let notified = self.gate_open_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            {
-                let mut st = self.gate.lock().expect("wal gate mutex");
-                if st.shutting_down {
-                    return Err(unavailable_retryable(
-                        "sqlite_wal_shutting_down",
-                        "SQLite WAL coordinator is shutting down",
-                        Duration::from_millis(50),
-                    ));
-                }
-                if st.open {
-                    let id = st.next_reader_id;
-                    st.next_reader_id += 1;
-                    st.active_readers.insert(id, Instant::now());
-                    break id;
-                }
-            }
-
-            if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
-                return Err(cancelled_not_committed(
-                    "sqlite_read_cancelled_waiting_gate",
-                    "read cancelled while waiting for WAL reset gate",
-                ));
-            }
-            if tokio::time::Instant::now() >= caller_deadline_tokio {
-                self.counters
-                    .timed_out_reads
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(deadline_not_committed(
-                    "sqlite_read_gate_deadline",
-                    "read deadline exceeded while waiting for WAL reset gate",
-                ));
-            }
-
-            tokio::select! {
-                biased;
-                error = read_cancelled(budget) => return Err(error),
-                _ = notified => {}
-                _ = tokio::time::sleep_until(caller_deadline_tokio) => {
-                    self.counters.timed_out_reads.fetch_add(1, Ordering::Relaxed);
-                    return Err(deadline_not_committed(
-                        "sqlite_read_gate_deadline",
-                        "read deadline exceeded while waiting for WAL reset gate",
-                    ));
-                }
-            }
-        };
-
-        let caller_deadline_tokio = self.checkout_deadline(budget, caller_deadline_tokio);
-        let waited_ns = u64::try_from(start_wait.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        self.counters
-            .total_admission_wait_ns
-            .fetch_add(waited_ns, Ordering::Relaxed);
-
+        let (slot, caller_deadline_tokio) = self.acquire_reader_gate_slot(budget).await?;
         let interrupt_flag = Arc::new(AtomicBool::new(false));
         let mut snap_guard = ActiveSqliteSnapshotGuard {
-            coord: Arc::clone(self),
-            reader_id,
+            slot: Some(slot),
             interrupt_flag: Arc::clone(&interrupt_flag),
             pooled: None,
-            completed_cleanly: false,
-            counted_timeout: false,
         };
 
         // 2. Acquire read-only connection bounded by remaining caller budget.
@@ -879,8 +801,7 @@ impl SqliteWalCoordinator {
                 }
             },
             _ = tokio::time::sleep_until(caller_deadline_tokio) => {
-                snap_guard.counted_timeout = true;
-                self.counters.timed_out_reads.fetch_add(1, Ordering::Relaxed);
+                snap_guard.mark_timeout();
                 return Err(deadline_not_committed(
                     "sqlite_acquire_read_deadline",
                     "deadline exceeded acquiring SQLite read connection",
@@ -893,10 +814,7 @@ impl SqliteWalCoordinator {
         let remaining_after_acquire = caller_deadline_tokio.saturating_duration_since(now_tokio);
         if remaining_after_acquire.is_zero() {
             snap_guard.pooled = Some(pooled);
-            snap_guard.counted_timeout = true;
-            self.counters
-                .timed_out_reads
-                .fetch_add(1, Ordering::Relaxed);
+            snap_guard.mark_timeout();
             return Err(deadline_not_committed(
                 "sqlite_read_budget_exhausted",
                 "read budget exhausted after pool acquire",
@@ -949,8 +867,7 @@ impl SqliteWalCoordinator {
                 res = fut => res,
                 _ = tokio::time::sleep_until(tx_deadline_tokio) => {
                     interrupt_flag.store(true, Ordering::SeqCst);
-                    snap_guard.counted_timeout = true;
-                    self.counters.timed_out_reads.fetch_add(1, Ordering::Relaxed);
+                    snap_guard.mark_timeout();
                     Err(deadline_not_committed(
                         "sqlite_read_tx_deadline",
                         "ordinary SQLite read transaction exceeded monotonic deadline",
@@ -972,19 +889,14 @@ impl SqliteWalCoordinator {
                     ));
                 }
                 if Instant::now() >= tx_deadline_std {
-                    if !snap_guard.counted_timeout {
-                        snap_guard.counted_timeout = true;
-                        self.counters
-                            .timed_out_reads
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
+                    snap_guard.mark_timeout();
                     return Err(deadline_not_committed(
                         "sqlite_read_interrupted_deadline",
                         "ordinary SQLite read interrupted at deadline",
                     ));
                 }
                 self.record_busy_if_any(&format!("{err:?}"));
-                // `snap_guard` Drop detaches and closes the connection in background!
+                // The storage executor closes the interrupted connection.
                 Err(err)
             }
         }
@@ -1712,6 +1624,89 @@ mod tests {
             assert_eq!(wal.telemetry().active_readers, 0);
         }
         runtime.shutdown().await.unwrap();
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn interrupted_sqlite_read_drains_when_the_callers_executor_stops() {
+        use tokio::runtime::Builder;
+
+        let owner = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).unwrap();
+        let path = std::env::temp_dir().join(format!("notarium-reader-owner-{}", hex::encode(id)));
+        let config =
+            CanonicalConfig::local_default(InstallationId::from_bytes(id), DataRoot::new(&path));
+        let (store, runtime) = owner.block_on(CanonicalRuntime::open(config)).unwrap();
+        let wal = store.inner.wal_coord.get().unwrap();
+        for outside in [false, true] {
+            let client = Builder::new_current_thread().enable_all().build().unwrap();
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let mut read = Box::pin(store.with_read_tx(|tx| {
+                Box::pin(async move {
+                    let BackendConn::Sqlite(conn) = tx else {
+                        unreachable!()
+                    };
+                    sqlx::query("SELECT schema_version FROM schema_meta")
+                        .execute(&mut **conn)
+                        .await
+                        .unwrap();
+                    entered.send(()).unwrap();
+                    std::future::pending::<Result<(), PortError>>().await
+                })
+            }));
+            client.block_on(async {
+                tokio::select! {
+                    result = &mut read => panic!("read returned early: {result:?}"),
+                    _ = ready => {}
+                }
+            });
+            assert_eq!(wal.telemetry().active_readers, 1);
+            if outside {
+                drop(client);
+                drop(read);
+            } else {
+                let _entered = client.enter();
+                drop(read);
+                drop(_entered);
+                drop(client);
+            }
+            owner.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while wal.telemetry().active_readers != 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("storage executor must finish an abandoned snapshot");
+                let previous = wal.telemetry().reset_successes;
+                wal.run_maintenance_tick(&store.inner, true).await;
+                assert!(wal.telemetry().reset_successes > previous);
+                let current = store
+                    .with_read_tx(|tx| {
+                        Box::pin(async move {
+                            let BackendConn::Sqlite(conn) = tx else {
+                                unreachable!()
+                            };
+                            Ok(
+                                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM schema_meta")
+                                    .fetch_one(&mut **conn)
+                                    .await
+                                    .unwrap(),
+                            )
+                        })
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(current, 1);
+            });
+        }
+        assert_eq!(wal.telemetry().cancelled_or_dropped_reads, 2);
+        owner.block_on(runtime.shutdown()).unwrap();
         fs::remove_dir_all(path).unwrap();
     }
 
