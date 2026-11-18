@@ -822,6 +822,17 @@ impl CanonicalStore {
         caller: ChangeCaller<'_>,
         request: ChangeRead,
     ) -> Result<ChangeReadResult, PortError> {
+        let budget = caller.budget();
+        crate::domain::common::CommandDeadline::start(budget, "read_changes")
+            .prepare(budget, || self.read_change_page(caller, request))
+            .await
+    }
+
+    async fn read_change_page(
+        &self,
+        caller: ChangeCaller<'_>,
+        request: ChangeRead,
+    ) -> Result<ChangeReadResult, PortError> {
         match request {
             ChangeRead::Log {
                 after,

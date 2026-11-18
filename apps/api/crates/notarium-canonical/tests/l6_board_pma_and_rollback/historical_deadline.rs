@@ -2,7 +2,12 @@ use super::*;
 
 #[test]
 fn sqlite_note_reads_and_edits_preserve_the_budget_across_cas_and_writer_ack() {
-    use notarium_core::error::{CommitEffect, RetryAdvice};
+    use notarium_core::{
+        error::{CommitEffect, RetryAdvice},
+        ids::ProjectionGeneration,
+        model::SnapshotCut,
+        ports::{ChangeRead, Link, LinkTarget, PageLimit},
+    };
     use std::time::Duration;
 
     tokio::runtime::Builder::new_multi_thread()
@@ -80,9 +85,16 @@ fn sqlite_note_reads_and_edits_preserve_the_budget_across_cas_and_writer_ack() {
                 before.document.explicit_read(ctx.auth()).unwrap(), DocClass::UserDoc, &note,
                 &[FieldEdit::Set { key: "status".into(), value: YamlValue::String("done".into()) }],
             ).unwrap();
-            let edit = next_mutation(&scope, &owner, EditNote { note, plan });
+            let edit = next_mutation(&scope, &owner, EditNote { note: note.clone(), plan });
+            let link = next_mutation(&scope, &owner, Link {
+                source: note.clone(), target: LinkTarget::Note(note.clone()), relation: "related".into()
+            });
+            let cut = SnapshotCut {
+                scope: scope.clone(), generation: ProjectionGeneration::new(1).unwrap(),
+                canonical_seq: changed.receipt.seq(), projected_seq: changed.receipt.seq(),
+            };
 
-            // Both the historical read and this large edit need the only blocking worker.
+            // Each public operation needs the only blocking worker to verify the carrier.
             let (occupied, ready) = tokio::sync::oneshot::channel();
             let (release, hold) = std::sync::mpsc::channel();
             let blocker = tokio::task::spawn_blocking(move || {
@@ -95,14 +107,19 @@ fn sqlite_note_reads_and_edits_preserve_the_budget_across_cas_and_writer_ack() {
             let requests = async {
                 tokio::join!(
                     store.get_note(limited.clone(), historical.clone()),
-                    store.edit_note(limited, edit.clone()),
+                    store.edit_note(limited.clone(), edit.clone()),
+                    store.link(limited.clone(), link),
+                    store.hydrate_cards(limited.clone(), cut, vec![note]),
+                    store.read_changes(limited, ChangeRead::Seed {
+                        scope: scope.clone(), cutoff: None, limit: PageLimit::new(10).unwrap(),
+                    }),
                 )
             };
             let result = tokio::time::timeout(Duration::from_millis(500), requests).await;
             let _ = release.send(());
-            let (read_result, edit_result) = result.expect("CAS waits exceeded the caller's deadline");
+            let (read_result, edit_result, link_result, cards, seed) = result.expect("CAS waits exceeded the caller's deadline");
             blocker.await.unwrap();
-            for error in [read_result.unwrap_err(), edit_result.unwrap_err()] {
+            for error in [read_result.unwrap_err(), edit_result.unwrap_err(), link_result.unwrap_err(), cards.unwrap_err(), seed.unwrap_err()] {
                 assert!(matches!(error, PortError::DeadlineExceeded(ref f) if f.effect()==CommitEffect::NotCommitted), "{error:?}");
             }
             assert!(store.get_note(ctx.clone(), historical).await.is_ok());

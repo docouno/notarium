@@ -180,6 +180,8 @@ pub(crate) async fn publish_ability_package_impl(
     ctx: SpaceContext,
     request: Mutation<PublishAbilityPackage>,
 ) -> Result<Committed<AbilityPackageRevision>, PortError> {
+    let deadline =
+        crate::domain::common::CommandDeadline::start(&ctx.budget, "publish_ability_package");
     validate_mutation_identity(&ctx, &request.identity)?;
     // Cap::AbilityWrite + DirectHuman is strictly mandatory!
     ctx.auth().authorize_ability_mutation()?;
@@ -211,8 +213,10 @@ pub(crate) async fn publish_ability_package_impl(
         prepared_aux.push((file.path.clone(), actual_digest, prep));
     }
 
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -251,8 +255,8 @@ pub(crate) async fn publish_ability_package_impl(
     let ability = input_ability.clone();
     let expected = expected_pkg_rev.clone();
     let replay_key = idemp.clone();
-    let replayed = store
-        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+    let preflight = || {
+        store.with_read_tx_budget(Some(&ctx.budget), |tx| {
             Box::pin(async move {
                 if let Some(receipt) =
                     crate::writer::lookup_command_receipt_tx(tx, &preflight_scope, &replay_key)
@@ -276,7 +280,8 @@ pub(crate) async fn publish_ability_package_impl(
                 Ok(None)
             })
         })
-        .await?;
+    };
+    let replayed = deadline.prepare(&ctx.budget, preflight).await?;
     if let Some(bytes) = replayed {
         store
             .inner
@@ -290,8 +295,10 @@ pub(crate) async fn publish_ability_package_impl(
     let mut staged_aux = Vec::with_capacity(prepared_aux.len());
     let mut total_staged_bytes: u64 = 0;
     for (path, digest, prep) in &prepared_aux {
-        let ticket = store
-            .stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, prep)
+        let ticket = deadline
+            .prepare(&ctx.budget, || {
+                store.stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, prep)
+            })
             .await?;
         total_staged_bytes = total_staged_bytes.saturating_add(ticket.compressed_size);
         staged_aux.push((path.clone(), *digest, ticket));
@@ -590,8 +597,7 @@ pub(crate) async fn publish_ability_package_impl(
         }),
     };
 
-    let stored: StoredCommittedAbilityRevV1 =
-        store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedAbilityRevV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 

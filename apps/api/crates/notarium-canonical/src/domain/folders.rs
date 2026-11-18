@@ -39,11 +39,14 @@ pub(crate) async fn move_folder_impl(
     ctx: SpaceContext,
     request: Mutation<MoveFolder>,
 ) -> Result<Committed<FolderRef>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "move_folder");
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_revision_only(&request.preconditions)?;
     let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -344,8 +347,7 @@ pub(crate) async fn move_folder_impl(
         }),
     };
 
-    let stored: StoredCommittedFolderRefV1 =
-        store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedFolderRefV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -354,12 +356,15 @@ pub(crate) async fn rename_folder_impl(
     ctx: SpaceContext,
     request: Mutation<RenameFolder>,
 ) -> Result<Committed<FolderRef>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "rename_folder");
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_revision_only(&request.preconditions)?;
     let new_slug_fold = normalize_slug_key(&request.input.name)?;
     let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -608,8 +613,7 @@ pub(crate) async fn rename_folder_impl(
         }),
     };
 
-    let stored: StoredCommittedFolderRefV1 =
-        store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedFolderRefV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -618,6 +622,7 @@ pub(crate) async fn rename_project_impl(
     ctx: SpaceContext,
     request: Mutation<RenameProject>,
 ) -> Result<Committed<FolderRef>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "rename_project");
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_revision_only(&request.preconditions)?;
     let new_slug_fold = normalize_slug_key(&request.input.name)?;
@@ -625,8 +630,10 @@ pub(crate) async fn rename_project_impl(
         return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
     }
     let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -899,8 +906,7 @@ pub(crate) async fn rename_project_impl(
         }),
     };
 
-    let stored: StoredCommittedFolderRefV1 =
-        store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedFolderRefV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -1273,9 +1279,13 @@ pub(crate) async fn set_folder_write_lock_impl(
     folder: FolderId,
     locked: bool,
 ) -> Result<FolderRef, PortError> {
+    let deadline =
+        crate::domain::common::CommandDeadline::start(&ctx.budget, "set_folder_write_lock");
     let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -1425,7 +1435,7 @@ pub(crate) async fn set_folder_write_lock_impl(
     };
 
     let _ = active_note_sibling_exists_tx;
-    store.submit_write_command(&ctx.budget, intent).await
+    deadline.submit(store, &ctx.budget, intent).await
 }
 
 /// Memory and ability grants apply to those documents only. Neither grants authority

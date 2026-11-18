@@ -2628,19 +2628,33 @@ async fn run_purge_and_mint_suite(
         .await
         .expect("release backup_hold");
 
+    let purge = next_mutation_rev(
+        &scope,
+        &owner,
+        purge_head_rev,
+        DeleteNote {
+            note: note_purge.clone(),
+            disposition: DeleteDisposition::Purge,
+        },
+    );
+    let mut short = ctx.clone();
+    short.budget.remaining = std::time::Duration::from_millis(300);
+    let hold = store.acquire_writer_safe_point().await.unwrap();
+    let stalled = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        store.delete_note(short, purge.clone()),
+    )
+    .await;
+    drop(hold);
+    let error = stalled
+        .expect("admitted purge exceeded the caller budget")
+        .unwrap_err();
+    assert!(
+        matches!(error, PortError::Unavailable(ref f) if f.effect() == CommitEffect::Unknown && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand),
+        "{error:?}"
+    );
     let purged_res = store
-        .delete_note(
-            ctx.clone(),
-            next_mutation_rev(
-                &scope,
-                &owner,
-                purge_head_rev,
-                DeleteNote {
-                    note: note_purge.clone(),
-                    disposition: DeleteDisposition::Purge,
-                },
-            ),
-        )
+        .delete_note(ctx.clone(), purge)
         .await
         .expect("Purge note_purge after hold release");
 

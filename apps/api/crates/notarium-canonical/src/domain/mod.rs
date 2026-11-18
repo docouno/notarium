@@ -239,7 +239,12 @@ impl CanonicalStore {
         ctx: SpaceContext,
         request: ReadAbilityResource,
     ) -> Result<ClassifiedAbilityResource, PortError> {
-        packages::read_ability_resource_impl(self, ctx, request).await
+        let budget = ctx.budget.clone();
+        common::CommandDeadline::start(&budget, "read_ability_resource")
+            .prepare(&budget, || {
+                packages::read_ability_resource_impl(self, ctx, request)
+            })
+            .await
     }
 
     pub async fn read_changes(
@@ -273,7 +278,10 @@ impl CanonicalStore {
         cut: SnapshotCut,
         notes: Vec<NoteId>,
     ) -> Result<Vec<Option<NoteCard>>, PortError> {
-        notes::hydrate_cards_impl(self, ctx, cut, notes).await
+        let budget = ctx.budget.clone();
+        common::CommandDeadline::start(&budget, "hydrate_cards")
+            .prepare(&budget, || notes::hydrate_cards_impl(self, ctx, cut, notes))
+            .await
     }
 
     pub async fn resolve_note_alias(

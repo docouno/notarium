@@ -3482,7 +3482,11 @@ async fn settle_and_update_collab_session(
     settlement: CollabCarrierSettlement,
     close_room: bool,
 ) -> Result<CollabSessionRecord, PortError> {
-    store.ensure_blob_backend_ready().await?;
+    let deadline =
+        crate::domain::common::CommandDeadline::start(budget, "collab_carrier_settlement");
+    deadline
+        .prepare(budget, || store.ensure_blob_backend_ready())
+        .await?;
     let transition = RoomCarrierTransition {
         expected_owner,
         expected_lease,
@@ -3492,8 +3496,10 @@ async fn settle_and_update_collab_session(
         close_room,
         client_command: false,
     };
-    let (space_rec, base_head) = transition
-        .check_before_staging(store, budget, &scope, &note, &settlement.auth, None)
+    let (space_rec, base_head) = deadline
+        .prepare(budget, || {
+            transition.check_before_staging(store, budget, &scope, &note, &settlement.auth, None)
+        })
         .await?;
 
     if base_head.doc_class == DocClass::EncryptedNote {
@@ -3505,7 +3511,11 @@ async fn settle_and_update_collab_session(
             "active note lacks content_blake3",
         )
     })?;
-    let bytes = store.read_verified_blob(&space_rec.scope, digest).await?;
+    let bytes = deadline
+        .prepare(budget, || {
+            store.read_verified_blob(&space_rec.scope, digest)
+        })
+        .await?;
     let previous = std::str::from_utf8(&bytes).map_err(|_| {
         internal_not_committed(
             "corrupt_note_utf8",
@@ -3525,12 +3535,14 @@ async fn settle_and_update_collab_session(
         store.blob_codec(),
         header,
     )?;
-    let ticket = store
-        .stage_blob_for_batch(
-            &space_rec.scope,
-            space_rec.active_epoch,
-            &info.prepared_blob,
-        )
+    let ticket = deadline
+        .prepare(budget, || {
+            store.stage_blob_for_batch(
+                &space_rec.scope,
+                space_rec.active_epoch,
+                &info.prepared_blob,
+            )
+        })
         .await?;
     let staged_bytes = ticket.compressed_size;
     let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
@@ -3753,7 +3765,7 @@ async fn settle_and_update_collab_session(
         }),
     };
 
-    let stored: StoredCollabSessionV1 = store.submit_write_command(budget, intent).await?;
+    let stored: StoredCollabSessionV1 = deadline.submit(store, budget, intent).await?;
     stored.try_into()
 }
 

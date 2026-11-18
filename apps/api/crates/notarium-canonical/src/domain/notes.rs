@@ -1641,13 +1641,16 @@ pub(crate) async fn delete_note_impl(
     ctx: SpaceContext,
     request: Mutation<DeleteNote>,
 ) -> Result<Committed<NoteRevision>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "delete_note");
     if request.input.disposition == DeleteDisposition::Purge {
         return crate::domain::purge::purge_note_impl(store, ctx, request).await;
     }
 
     validate_mutation_identity(&ctx, &request.identity)?;
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -1671,7 +1674,7 @@ pub(crate) async fn delete_note_impl(
         request.input,
     );
 
-    let stored: StoredCommittedNoteRevV1 = store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedNoteRevV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -2101,24 +2104,30 @@ pub(crate) async fn move_note_impl(
     );
 
     let space_rec = if let Some(interceptor) = store.inner.collab_interceptor.get() {
-        if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
-            store,
-            ctx.scope(),
-            &idemp,
-            Some(&ctx.budget),
-        )
-        .await?
+        if let Some(replayed) = deadline
+            .prepare(&ctx.budget, || {
+                try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
+                    store,
+                    ctx.scope(),
+                    &idemp,
+                    Some(&ctx.budget),
+                )
+            })
+            .await?
         {
             return Ok(replayed.into_committed());
         }
-        let (space, _) = read_active_note_for_mutation(
-            store,
-            &ctx,
-            &request.input.note,
-            &request.preconditions,
-            NoteMutationAccess::Move(request.input.parent.clone()),
-        )
-        .await?;
+        let (space, _) = deadline
+            .prepare(&ctx.budget, || {
+                read_active_note_for_mutation(
+                    store,
+                    &ctx,
+                    &request.input.note,
+                    &request.preconditions,
+                    NoteMutationAccess::Move(request.input.parent.clone()),
+                )
+            })
+            .await?;
         ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
         deadline
             .wait(&ctx.budget, || {
@@ -2127,8 +2136,10 @@ pub(crate) async fn move_note_impl(
             .await??;
         space
     } else {
-        let space = store
-            .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        let space = deadline
+            .prepare(&ctx.budget, || {
+                store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+            })
             .await?;
         space.scope.check(ctx.scope())?;
         space
@@ -2146,7 +2157,7 @@ pub(crate) async fn move_note_impl(
     );
 
     ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
-    let stored: StoredCommittedNoteRevV1 = store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedNoteRevV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -3507,6 +3518,7 @@ pub(crate) async fn append_memory_impl(
     ctx: SpaceContext,
     request: Mutation<AppendMemory>,
 ) -> Result<Committed<NoteRevision>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "append_memory");
     validate_mutation_identity(&ctx, &request.identity)?;
     if request.input.target.note.space_id != ctx.scope().space_id {
         return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
@@ -3536,8 +3548,8 @@ pub(crate) async fn append_memory_impl(
     let note_id = request.input.target.note.note_id.clone();
     let target_spec = request.input.target.target.clone();
 
-    let (space_rec, base_head) = store
-        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+    let read_base = || {
+        store.with_read_tx_budget(Some(&ctx.budget), |tx| {
             let scope_in = ctx.scope().clone();
             let auth_in = ctx.auth().clone();
             let nid_in = note_id.clone();
@@ -3603,15 +3615,19 @@ pub(crate) async fn append_memory_impl(
                 Ok((srec, head))
             })
         })
-        .await?;
+    };
+    let (space_rec, base_head) = deadline.prepare(&ctx.budget, read_base).await?;
 
-    if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
-        store,
-        ctx.scope(),
-        &idemp,
-        Some(&ctx.budget),
-    )
-    .await?
+    if let Some(replayed) = deadline
+        .prepare(&ctx.budget, || {
+            try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
+                store,
+                ctx.scope(),
+                &idemp,
+                Some(&ctx.budget),
+            )
+        })
+        .await?
     {
         return Ok(replayed.into_committed());
     }
@@ -3629,8 +3645,10 @@ pub(crate) async fn append_memory_impl(
     let base_digest = base_head.content_digest.ok_or_else(|| {
         internal_not_committed("memory_missing_digest", "AgentMemory note lacks digest")
     })?;
-    let raw_bytes = store
-        .read_verified_blob(&space_rec.scope, base_digest)
+    let raw_bytes = deadline
+        .prepare(&ctx.budget, || {
+            store.read_verified_blob(&space_rec.scope, base_digest)
+        })
         .await?;
     let base_carrier = String::from_utf8(raw_bytes).map_err(|_| {
         internal_not_committed("memory_corrupt_utf8", "AgentMemory carrier not valid UTF-8")
@@ -3661,12 +3679,14 @@ pub(crate) async fn append_memory_impl(
         &base_head.slug,
         store.blob_codec(),
     )?;
-    let ticket = store
-        .stage_blob_for_batch(
-            &space_rec.scope,
-            space_rec.active_epoch,
-            &info.prepared_blob,
-        )
+    let ticket = deadline
+        .prepare(&ctx.budget, || {
+            store.stage_blob_for_batch(
+                &space_rec.scope,
+                space_rec.active_epoch,
+                &info.prepared_blob,
+            )
+        })
         .await?;
 
     let intent = build_carrier_replacement_intent(
@@ -3686,7 +3706,7 @@ pub(crate) async fn append_memory_impl(
         None,
     );
 
-    let stored: StoredCommittedNoteRevV1 = store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedNoteRevV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -3750,30 +3770,39 @@ pub(crate) async fn link_impl(
     ctx: SpaceContext,
     request: Mutation<Link>,
 ) -> Result<Committed<Link>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "link");
     validate_mutation_identity(&ctx, &request.identity)?;
     let link_line = validate_and_format_link_line(&request.input)?;
 
     let idemp = link_identity(&ctx, &request, &link_line);
-    let replay = try_replay_completed_receipt::<StoredCommittedLinkV1>(
-        store,
-        ctx.scope(),
-        &idemp,
-        Some(&ctx.budget),
-    )
-    .await;
-    let replay = match replay {
-        Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => {
-            let original =
-                v1_receipts::link_identity(store, &ctx, &request, &link_line, idemp.clone())
-                    .await?;
-            let previous = try_replay_completed_receipt::<StoredCommittedLinkV1>(
+    let replay = deadline
+        .prepare(&ctx.budget, || {
+            try_replay_completed_receipt::<StoredCommittedLinkV1>(
                 store,
                 ctx.scope(),
-                &original,
+                &idemp,
                 Some(&ctx.budget),
             )
-            .await?
-            .ok_or(DomainError::IdempotencyKeyReused)?;
+        })
+        .await;
+    let replay = match replay {
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => {
+            let original = deadline
+                .prepare(&ctx.budget, || {
+                    v1_receipts::link_identity(store, &ctx, &request, &link_line, idemp.clone())
+                })
+                .await?;
+            let previous = deadline
+                .prepare(&ctx.budget, || {
+                    try_replay_completed_receipt::<StoredCommittedLinkV1>(
+                        store,
+                        ctx.scope(),
+                        &original,
+                        Some(&ctx.budget),
+                    )
+                })
+                .await?
+                .ok_or(DomainError::IdempotencyKeyReused)?;
             return Ok(previous.into_committed());
         }
         other => other?,
@@ -3782,8 +3811,12 @@ pub(crate) async fn link_impl(
         return Ok(replayed.into_committed());
     }
 
-    let intent = prepare_link_intent(store, &ctx, request, &link_line, idemp, None).await?;
-    let stored: StoredCommittedLinkV1 = store.submit_write_command(&ctx.budget, intent).await?;
+    let intent = deadline
+        .prepare(&ctx.budget, || {
+            prepare_link_intent(store, &ctx, request, &link_line, idemp, None)
+        })
+        .await?;
+    let stored: StoredCommittedLinkV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -5187,6 +5220,8 @@ pub(crate) async fn update_space_schema_impl(
     ctx: SpaceContext,
     request: Mutation<UpdateSpaceSchema>,
 ) -> Result<Committed<SpaceSchemaRevision>, PortError> {
+    let deadline =
+        crate::domain::common::CommandDeadline::start(&ctx.budget, "update_space_schema");
     validate_mutation_identity(&ctx, &request.identity)?;
     let slug_fold = normalize_slug_key(&request.input.slug)?;
     for field_key in request.input.schema.keys() {
@@ -5206,8 +5241,8 @@ pub(crate) async fn update_space_schema_impl(
     let admission = ctx.clone();
     let schema_note = request.input.schema_note.clone();
     let destination = request.input.parent.clone();
-    let space_rec = store
-        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+    let read_placement = || {
+        store.with_read_tx_budget(Some(&ctx.budget), |tx| {
             Box::pin(async move {
                 let srec = load_space_record(tx, &admission.scope().space_id).await?;
                 srec.scope.check(admission.scope())?;
@@ -5222,14 +5257,17 @@ pub(crate) async fn update_space_schema_impl(
                 Ok(srec)
             })
         })
-        .await?;
+    };
+    let space_rec = deadline.prepare(&ctx.budget, read_placement).await?;
 
-    let ticket = store
-        .stage_blob_for_batch(
-            &space_rec.scope,
-            space_rec.active_epoch,
-            &info.prepared_blob,
-        )
+    let ticket = deadline
+        .prepare(&ctx.budget, || {
+            store.stage_blob_for_batch(
+                &space_rec.scope,
+                space_rec.active_epoch,
+                &info.prepared_blob,
+            )
+        })
         .await?;
     let staged_bytes = ticket.compressed_size;
 
@@ -5723,8 +5761,7 @@ pub(crate) async fn update_space_schema_impl(
         }),
     };
 
-    let stored: StoredCommittedSchemaRevV1 =
-        store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedSchemaRevV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 

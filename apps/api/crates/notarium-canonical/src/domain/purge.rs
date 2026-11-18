@@ -277,12 +277,17 @@ async fn purge_note_inner(
     request: Mutation<DeleteNote>,
     run_steps_2_and_3: bool,
 ) -> Result<Committed<NoteRevision>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "purge_note");
     debug_assert_eq!(request.input.disposition, DeleteDisposition::Purge);
     validate_mutation_identity(&ctx, &request.identity)?;
-    store.ensure_blob_backend_ready().await?;
+    deadline
+        .prepare(&ctx.budget, || store.ensure_blob_backend_ready())
+        .await?;
 
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -450,25 +455,30 @@ async fn purge_note_inner(
         }),
     };
 
-    match store
-        .submit_write_command::<StoredCommittedNoteRevV1>(&ctx.budget, intent)
+    match deadline
+        .submit::<StoredCommittedNoteRevV1>(store, &ctx.budget, intent)
         .await
     {
         Ok(stored) => {
             let captured = step1_capture.lock().expect("step1 capture mutex").take();
             if run_steps_2_and_3 && let Some(exec) = captured {
-                drive_pending_purge_steps_2_and_3(store, &exec).await?;
+                finish_committed_purge(store, &exec, &ctx.budget, &deadline).await?;
             }
             Ok(stored.into_committed())
         }
-        Err(PortError::Unavailable(_)) => {
-            if let Some(pending) =
-                load_pending_purge_for_idempotency(store, &space_rec.scope, &idemp).await?
+        Err(PortError::Unavailable(failure))
+            if failure.effect() == notarium_core::error::CommitEffect::NotCommitted =>
+        {
+            if let Some(pending) = deadline
+                .prepare(&ctx.budget, || {
+                    load_pending_purge_for_idempotency(store, &space_rec.scope, &idemp)
+                })
+                .await?
             {
-                drive_pending_purge_steps_2_and_3(store, &pending).await?;
+                finish_committed_purge(store, &pending, &ctx.budget, &deadline).await?;
                 let stored: StoredCommittedNoteRevV1 =
                     rmp_serde::from_slice(&pending.sanitized_response_msgpack).map_err(|err| {
-                        internal_not_committed("decode_resumed_purge_resp", err.to_string())
+                        unknown_commit_outcome("decode_resumed_purge_resp", err.to_string())
                     })?;
                 return Ok(stored.into_committed());
             }
@@ -516,6 +526,7 @@ pub(crate) async fn mint_and_purge_impl(
     ctx: SpaceContext,
     request: Mutation<MintAndPurge>,
 ) -> Result<Committed<MintAndPurgeResult>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "mint_and_purge");
     validate_mutation_identity(&ctx, &request.identity)?;
     if request.input.old_note == request.input.new_note {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
@@ -526,9 +537,13 @@ pub(crate) async fn mint_and_purge_impl(
     // Validate age-armored carrier BEFORE staging or mutating anything!
     notarium_syntax::encrypted::validate(&request.input.encrypted_carrier)?;
 
-    store.ensure_blob_backend_ready().await?;
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    deadline
+        .prepare(&ctx.budget, || store.ensure_blob_backend_ready())
+        .await?;
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -575,8 +590,8 @@ pub(crate) async fn mint_and_purge_impl(
     let new_note = request.input.new_note.clone();
     let expected_rev = request.input.expected_revision.clone();
     let check_id = idemp.clone();
-    let existing = store
-        .with_read_tx_budget(Some(&ctx.budget), |tx| {
+    let read_existing = || {
+        store.with_read_tx_budget(Some(&ctx.budget), |tx| {
             Box::pin(async move {
                 let space = load_space_record(tx, &preflight.scope().space_id).await?;
                 space.scope.check(preflight.scope())?;
@@ -620,27 +635,36 @@ pub(crate) async fn mint_and_purge_impl(
                 Ok(None)
             })
         })
-        .await?;
+    };
+    let existing = deadline.prepare(&ctx.budget, read_existing).await?;
     if let Some(receipt) = existing {
         if receipt.status != "completed" {
-            let pending = load_pending_purge_for_idempotency(store, &space_rec.scope, &idemp)
-                .await?
+            let pending = deadline
+                .prepare(&ctx.budget, || {
+                    load_pending_purge_for_idempotency(store, &space_rec.scope, &idemp)
+                })
+                .await
+                .map_err(|err| {
+                    unknown_commit_outcome("lookup_pending_mint_purge", err.to_string())
+                })?
                 .ok_or_else(|| {
-                    internal_not_committed(
+                    unknown_commit_outcome(
                         "missing_pending_purge",
                         "unfinished receipt missing purge state",
                     )
                 })?;
-            drive_pending_purge_steps_2_and_3(store, &pending).await?;
+            finish_committed_purge(store, &pending, &ctx.budget, &deadline).await?;
         }
         let stored: StoredCommittedMintAndPurgeV1 = rmp_serde::from_slice(&receipt.response_blob)
             .map_err(|err| {
-            internal_not_committed("decode_replayed_mint_purge", err.to_string())
+            unknown_commit_outcome("decode_replayed_mint_purge", err.to_string())
         })?;
         return Ok(stored.into_committed());
     }
-    let staged_ticket = store
-        .stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared_blob)
+    let staged_ticket = deadline
+        .prepare(&ctx.budget, || {
+            store.stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared_blob)
+        })
         .await?;
     let staged_bytes = staged_ticket.compressed_size;
     let step1_capture: Arc<StdMutex<Option<PendingPurgeExecution>>> = Arc::new(StdMutex::new(None));
@@ -1019,25 +1043,30 @@ pub(crate) async fn mint_and_purge_impl(
         }),
     };
 
-    match store
-        .submit_write_command::<StoredCommittedMintAndPurgeV1>(&ctx.budget, intent)
+    match deadline
+        .submit::<StoredCommittedMintAndPurgeV1>(store, &ctx.budget, intent)
         .await
     {
         Ok(stored) => {
             let captured = step1_capture.lock().expect("step1 capture mutex").take();
             if let Some(exec) = captured {
-                drive_pending_purge_steps_2_and_3(store, &exec).await?;
+                finish_committed_purge(store, &exec, &ctx.budget, &deadline).await?;
             }
             Ok(stored.into_committed())
         }
-        Err(PortError::Unavailable(_)) => {
-            if let Some(pending) =
-                load_pending_purge_for_idempotency(store, &space_rec.scope, &idemp).await?
+        Err(PortError::Unavailable(failure))
+            if failure.effect() == notarium_core::error::CommitEffect::NotCommitted =>
+        {
+            if let Some(pending) = deadline
+                .prepare(&ctx.budget, || {
+                    load_pending_purge_for_idempotency(store, &space_rec.scope, &idemp)
+                })
+                .await?
             {
-                drive_pending_purge_steps_2_and_3(store, &pending).await?;
+                finish_committed_purge(store, &pending, &ctx.budget, &deadline).await?;
                 let stored: StoredCommittedMintAndPurgeV1 =
                     rmp_serde::from_slice(&pending.sanitized_response_msgpack).map_err(|err| {
-                        internal_not_committed("decode_resumed_mint_purge_resp", err.to_string())
+                        unknown_commit_outcome("decode_resumed_mint_purge_resp", err.to_string())
                     })?;
                 return Ok(stored.into_committed());
             }
@@ -1049,6 +1078,20 @@ pub(crate) async fn mint_and_purge_impl(
         }
         Err(other) => Err(other),
     }
+}
+
+// Step 1 and its durable recovery record are already committed. A retry or startup
+// recovery resumes the same retirement if the caller leaves during steps 2 and 3.
+async fn finish_committed_purge(
+    store: &CanonicalStore,
+    pending: &PendingPurgeExecution,
+    budget: &notarium_core::ports::CallBudget,
+    deadline: &super::common::CommandDeadline,
+) -> Result<(), PortError> {
+    deadline
+        .wait(budget, || drive_pending_purge_steps_2_and_3(store, pending))
+        .await
+        .map_err(|err| unknown_commit_outcome("purge_completion_interrupted", err.to_string()))?
 }
 
 async fn drive_pending_purge_steps_2_and_3(

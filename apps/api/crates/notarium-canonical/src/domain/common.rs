@@ -38,13 +38,13 @@ use crate::{
     writer::CommandIdentitySpec,
 };
 
-pub(super) struct CommandDeadline {
+pub(crate) struct CommandDeadline {
     pub(super) at: tokio::time::Instant,
     operation: &'static str,
 }
 
 impl CommandDeadline {
-    pub(super) fn start(
+    pub(crate) fn start(
         budget: &notarium_core::ports::CallBudget,
         operation: &'static str,
     ) -> Self {
@@ -84,6 +84,28 @@ impl CommandDeadline {
             return Err(self.expired());
         }
         Ok(remaining)
+    }
+
+    /// Bounds read-only work or preparation whose mutation has not been admitted.
+    pub(crate) async fn prepare<T, F: Future<Output = Result<T, PortError>>>(
+        &self,
+        budget: &notarium_core::ports::CallBudget,
+        operation: impl FnOnce() -> F,
+    ) -> Result<T, PortError> {
+        let result = self.wait(budget, operation).await?;
+        self.remaining(budget)?;
+        result
+    }
+
+    pub(crate) async fn submit<T: Serialize + serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        store: &crate::CanonicalStore,
+        budget: &notarium_core::ports::CallBudget,
+        intent: crate::writer::PreparedWriteIntent,
+    ) -> Result<T, PortError> {
+        store
+            .submit_write_command_until(budget, self.at, intent, None, None, None)
+            .await
     }
 
     pub(super) async fn wait<F: Future>(
