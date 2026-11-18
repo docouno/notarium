@@ -1255,7 +1255,7 @@ impl CarrierRoomCommit {
         self,
         tx: &mut BackendConn<'_>,
         item_ctx: &mut crate::writer::ItemExecCtx,
-        fences: &crate::RoomFenceTable,
+        store: &CanonicalStore,
         note: &NoteId,
         base: &RevisionId,
         revision: &RevisionId,
@@ -1264,7 +1264,7 @@ impl CarrierRoomCommit {
         match self {
             Self::Accepted(transition) => {
                 transition
-                    .commit_revision(tx, item_ctx, fences, note, base, revision, seq)
+                    .commit_revision(tx, item_ctx, store, note, base, revision, seq)
                     .await?;
             }
             Self::Direct {
@@ -1306,7 +1306,7 @@ pub(crate) fn build_carrier_replacement_intent(
 ) -> PreparedWriteIntent {
     let scope_cl = scope.clone();
     let staged_bytes = ticket.compressed_size;
-    let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
+    let room_store = store.clone();
 
     PreparedWriteIntent {
         scope: scope.clone(),
@@ -1335,7 +1335,7 @@ pub(crate) fn build_carrier_replacement_intent(
                 let room = prepare_carrier_room_tx(
                     tx,
                     item_ctx,
-                    &room_fences,
+                    &room_store.inner.room_fences,
                     reservation_opt,
                     &identity,
                     &note_id,
@@ -1430,7 +1430,7 @@ pub(crate) fn build_carrier_replacement_intent(
                 room.commit(
                     tx,
                     item_ctx,
-                    &room_fences,
+                    &room_store,
                     &note_id,
                     &head.head_rev_id,
                     &new_rev,
@@ -4792,7 +4792,7 @@ pub(crate) async fn accept_external_observation_impl(
     let identity = request.identity.clone();
     let preconditions = request.preconditions.clone();
     let obs_input = request.input.clone();
-    let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
+    let room_store = store.clone();
 
     let intent = PreparedWriteIntent {
         scope: scope_cl.clone(),
@@ -4822,7 +4822,7 @@ pub(crate) async fn accept_external_observation_impl(
                 let room = prepare_carrier_room_tx(
                     tx,
                     item_ctx,
-                    &room_fences,
+                    &room_store.inner.room_fences,
                     reservation_opt,
                     &identity,
                     &obs_input.note,
@@ -4871,7 +4871,7 @@ pub(crate) async fn accept_external_observation_impl(
                 room.commit(
                     tx,
                     item_ctx,
-                    &room_fences,
+                    &room_store,
                     &obs_input.note,
                     &head.head_rev_id,
                     &new_rev,

@@ -528,10 +528,79 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
     assert_validation_err(&wrong_owner_res, ValidationReason::InvalidAuthority);
 
     // Legitimate `stage_chat_blob` (>512B) + `append_chat` succeeds and stores `ChatBody::Blob(digest)`!
+    let stage_ctx = owner_ctx(&scope, owner.clone());
+    let source_request = stage_ctx.budget.request.clone();
     let staged_513 = store
-        .stage_chat_blob(owner_ctx(&scope, owner.clone()), &body_513)
+        .stage_chat_blob(stage_ctx.clone(), &body_513)
         .await
         .expect("stage 513B chat blob");
+    let duplicate = store
+        .stage_chat_blob(stage_ctx.clone(), &body_513)
+        .await
+        .unwrap();
+    let other_request = owner_ctx(&scope, owner.clone()).budget.request;
+    let digest = staged_513.digest();
+    let first = store
+        .next_staged_chat_blob(stage_ctx.clone(), source_request.clone(), digest, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = store
+        .next_staged_chat_blob(
+            stage_ctx.clone(),
+            source_request.clone(),
+            digest,
+            first.lease(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(first, second);
+    assert!([first.clone(), second.clone()].contains(&staged_513));
+    assert!([first, second.clone()].contains(&duplicate));
+    assert!(
+        store
+            .next_staged_chat_blob(
+                stage_ctx.clone(),
+                source_request.clone(),
+                digest,
+                second.lease()
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .next_staged_chat_blob(stage_ctx.clone(), other_request, digest, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let tainted_ctx = owner_ctx(&scope, owner.clone());
+    tainted_ctx.auth().taint().mark_external_read();
+    assert!(
+        store
+            .next_staged_chat_blob(tainted_ctx, source_request.clone(), digest, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store
+        .discard_staged_chat_blob(stage_ctx.clone(), duplicate.clone())
+        .await
+        .unwrap();
+    store
+        .discard_staged_chat_blob(stage_ctx.clone(), duplicate)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .next_staged_chat_blob(stage_ctx, source_request, digest, None)
+            .await
+            .unwrap(),
+        Some(staged_513.clone())
+    );
     let e2 = store
         .append_chat(
             owner_ctx(&scope, owner.clone()),

@@ -1,3 +1,5 @@
+mod staging;
+
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -479,48 +481,57 @@ impl CanonicalStore {
         let mut lease = [0u8; 16];
         getrandom::fill(&mut lease)
             .map_err(|err| internal_not_committed("chat_staging_lease", err.to_string()))?;
-        let resource_key = prepared.digest.to_hex();
-        let retained_ticket = ticket.clone();
+        let resource_key = staging::request_key(ctx.auth(), &ctx.budget.request);
         let publish_ticket = ticket.clone();
         let publisher = self.clone();
-
-        let finish = move |()| {
-            drop(retained_ticket);
-            Ok(attested.with_lease(lease))
-        };
-        self.with_auxiliary_command(&ctx.budget, deadline, finish, move |tx| {
-            Box::pin(async move {
-                let live_space = load_space_record(tx, &scope.space_id).await?;
-                live_space.scope.check(&scope)?;
-                authorize_chat_write_on_space(&auth_cl, &live_space.space)?;
-                if live_space.active_epoch != staged_epoch {
-                    return Err(crate::codec::unavailable_retryable(
-                        "stage_chat_blob_epoch_changed",
-                        "Space active_epoch changed while staging chat blob",
-                        std::time::Duration::from_millis(25),
-                    ));
-                }
-                activate_and_bind_blob_ref_tx(
-                    tx,
-                    &live_space.scope,
-                    live_space.active_epoch,
-                    &BlobReferenceClaim {
-                        ticket,
-                        owner_kind: BlobOwnerKind::StagedChat,
-                        owner_id,
-                        owner_rev_id: staged_chat_lease_key(lease, auth_cl.taint().is_tainted()),
-                        resource_key,
-                    },
-                    live_space.last_seq,
-                )
-                .await?;
-                let dirs = publisher
-                    .publish_deferred_local_tickets_async(std::slice::from_ref(&publish_ticket))
+        let value = self
+            .with_auxiliary_command(&ctx.budget, deadline, Ok, move |tx| {
+                Box::pin(async move {
+                    let live_space =
+                        crate::runtime::load_space_record_for_update_opt(tx, &scope.space_id)
+                            .await?
+                            .ok_or(DomainError::ResourceNotFound)?;
+                    live_space.scope.check(&scope)?;
+                    authorize_chat_write_on_space(&auth_cl, &live_space.space)?;
+                    if live_space.active_epoch != staged_epoch {
+                        return Err(crate::codec::unavailable_retryable(
+                            "stage_chat_blob_epoch_changed",
+                            "Space active_epoch changed while staging chat blob",
+                            std::time::Duration::from_millis(25),
+                        ));
+                    }
+                    let owner_lease = staged_chat_lease_key(lease, auth_cl.taint().is_tainted());
+                    activate_and_bind_blob_ref_tx(
+                        tx,
+                        &live_space.scope,
+                        live_space.active_epoch,
+                        &BlobReferenceClaim {
+                            ticket,
+                            owner_kind: BlobOwnerKind::StagedChat,
+                            owner_id,
+                            owner_rev_id: owner_lease.clone(),
+                            resource_key,
+                        },
+                        live_space.last_seq,
+                    )
                     .await?;
-                publisher.flush_pending_local_dirs_async(&dirs).await
+                    let dirs = publisher
+                        .publish_deferred_local_tickets_async(std::slice::from_ref(&publish_ticket))
+                        .await?;
+                    publisher.flush_pending_local_dirs_async(&dirs).await?;
+                    Ok((
+                        staging::UndeliveredLease::new(
+                            publisher,
+                            scope,
+                            attested.with_lease(lease),
+                            owner_lease,
+                        ),
+                        publish_ticket,
+                    ))
+                })
             })
-        })
-        .await
+            .await?;
+        Ok(value.0.deliver())
     }
 }
 
@@ -964,7 +975,6 @@ async fn lookup_staged_chat_lease_tx(
         .map(|lease| staged_chat_lease_key(lease, true))
         .unwrap_or_default();
     let digest = staged.digest();
-    let res_key = digest.to_hex();
     let lease_opt: Option<(String, i64)> = match tx {
         BackendConn::Sqlite(conn) => {
             let r = sqlx::query(
@@ -973,16 +983,15 @@ async fn lookup_staged_chat_lease_tx(
                  JOIN blob_catalog c
                    ON c.space_id = r.space_id AND c.content_blake3 = r.content_blake3
                  WHERE r.space_id = ? AND r.owner_kind = 'staged_chat'
-                   AND r.owner_id = ?2 AND r.resource_key = ?3 AND r.content_blake3 = ?4
-                   AND ((?5 = 1 AND substr(r.owner_rev_id,1,4) = 'stg_')
-                   OR (?5 = 0 AND r.owner_rev_id IN (?6,?7)))
+                   AND r.owner_id = ?2 AND r.content_blake3 = ?3
+                   AND ((?4 = 1 AND substr(r.owner_rev_id,1,4) = 'stg_')
+                   OR (?4 = 0 AND r.owner_rev_id IN (?5,?6)))
                    AND c.blob_state = 'active' AND c.admission_state = 'open'
                  ORDER BY r.created_seq, r.owner_rev_id
                  LIMIT 1",
             )
             .bind(space_id.as_str())
             .bind(staged.owner().as_str())
-            .bind(&res_key)
             .bind(digest.as_bytes().as_slice())
             .bind(legacy)
             .bind(&clean_key)
@@ -999,16 +1008,15 @@ async fn lookup_staged_chat_lease_tx(
                  JOIN blob_catalog c
                    ON c.space_id = r.space_id AND c.content_blake3 = r.content_blake3
                  WHERE r.space_id = $1 AND r.owner_kind = 'staged_chat'
-                   AND r.owner_id = $2 AND r.resource_key = $3 AND r.content_blake3 = $4
-                   AND (($5::int = 1 AND substr(r.owner_rev_id,1,4) = 'stg_')
-                   OR ($5::int = 0 AND r.owner_rev_id IN ($6,$7)))
+                   AND r.owner_id = $2 AND r.content_blake3 = $3
+                   AND (($4::int = 1 AND substr(r.owner_rev_id,1,4) = 'stg_')
+                   OR ($4::int = 0 AND r.owner_rev_id IN ($5,$6)))
                    AND c.blob_state = 'active' AND c.admission_state = 'open'
                  ORDER BY r.created_seq, r.owner_rev_id
                  LIMIT 1",
             )
             .bind(space_id.as_str())
             .bind(staged.owner().as_str())
-            .bind(&res_key)
             .bind(digest.as_bytes().as_slice())
             .bind(legacy)
             .bind(&clean_key)
@@ -1042,7 +1050,6 @@ async fn consume_one_staged_chat_ref_and_bind_entry_tx(
     seq: SpaceSeq,
 ) -> Result<(), PortError> {
     let digest = staged.digest();
-    let res_key = digest.to_hex();
     let entry_owner_id = format!("{}:{}", thread_id.as_str(), entry_seq.get());
     bind_existing_active_blob_ref_tx(
         tx,
@@ -1056,37 +1063,49 @@ async fn consume_one_staged_chat_ref_and_bind_entry_tx(
     )
     .await?;
 
+    remove_staging_lease_tx(tx, space_id, staged, staging_lease).await?;
+    Ok(())
+}
+
+async fn remove_staging_lease_tx(
+    tx: &mut BackendConn<'_>,
+    space_id: &SpaceId,
+    staged: &StagedChatBlob,
+    staging_lease: &str,
+) -> Result<Option<i64>, PortError> {
+    let digest = staged.digest();
     // Release the single consumed staging lease and recompute exact `ref_count`.
     let now_ms = now_unix_ms()?;
-    match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query(
-                "DELETE FROM blob_references
+    let affected = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query(
+            "DELETE FROM blob_references
                  WHERE space_id = ? AND owner_kind = 'staged_chat'
-                   AND owner_id = ? AND owner_rev_id = ? AND resource_key = ?",
-            )
-            .bind(space_id.as_str())
-            .bind(staged.owner().as_str())
-            .bind(staging_lease)
-            .bind(&res_key)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_del_staged_chat", err.to_string()))?;
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "DELETE FROM blob_references
+                   AND owner_id = ? AND owner_rev_id = ? AND content_blake3 = ?",
+        )
+        .bind(space_id.as_str())
+        .bind(staged.owner().as_str())
+        .bind(staging_lease)
+        .bind(digest.as_bytes().as_slice())
+        .execute(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_del_staged_chat", err.to_string()))?
+        .rows_affected(),
+        BackendConn::Postgres(conn) => sqlx::query(
+            "DELETE FROM blob_references
                  WHERE space_id = $1 AND owner_kind = 'staged_chat'
-                   AND owner_id = $2 AND owner_rev_id = $3 AND resource_key = $4",
-            )
-            .bind(space_id.as_str())
-            .bind(staged.owner().as_str())
-            .bind(staging_lease)
-            .bind(&res_key)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_del_staged_chat", err.to_string()))?;
-        }
+                   AND owner_id = $2 AND owner_rev_id = $3 AND content_blake3 = $4",
+        )
+        .bind(space_id.as_str())
+        .bind(staged.owner().as_str())
+        .bind(staging_lease)
+        .bind(digest.as_bytes().as_slice())
+        .execute(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("pg_del_staged_chat", err.to_string()))?
+        .rows_affected(),
+    };
+    if affected == 0 {
+        return Ok(None);
     }
 
     let exact_count = count_reachable_refs_tx(tx, space_id, digest).await?;
@@ -1119,7 +1138,7 @@ async fn consume_one_staged_chat_ref_and_bind_entry_tx(
         }
     }
 
-    Ok(())
+    Ok(Some(exact_count))
 }
 
 async fn read_chat_impl(
@@ -4344,7 +4363,7 @@ async fn redact_chat_entry_impl(
                         &scope,
                         active_epoch,
                         retirements,
-                        attempted,
+                        Some(attempted),
                     ));
                 }
 

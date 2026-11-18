@@ -1336,14 +1336,14 @@ impl crate::CanonicalStore {
         scope: &HistoryScope,
         epoch: LeaseEpoch,
         ids: Vec<String>,
-        first_attempt: retirement_worker::HandoffSender,
+        first_attempt: Option<retirement_worker::HandoffSender>,
     ) -> RetirementHandoff {
         RetirementHandoff {
             store: self.clone(),
             scope: scope.clone(),
             epoch,
             ids,
-            first_attempt: Some(first_attempt),
+            first_attempt,
         }
     }
 
@@ -1600,7 +1600,12 @@ impl crate::CanonicalStore {
                         }
                     }
                     let handoff = (reason == RetirementReason::Gc && !ids.is_empty()).then(|| {
-                        worker.retirement_handoff(&scope_in, active_epoch, ids.clone(), notify)
+                        worker.retirement_handoff(
+                            &scope_in,
+                            active_epoch,
+                            ids.clone(),
+                            Some(notify),
+                        )
                     });
                     Ok((ids, handoff))
                 })

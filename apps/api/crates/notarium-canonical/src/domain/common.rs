@@ -126,6 +126,21 @@ impl CommandDeadline {
 
 pub const MAX_FOLDER_DEPTH: usize = 256;
 
+pub(crate) fn persisted_room_fence(
+    note: NoteId,
+    scope: HistoryScope,
+    epoch: LeaseEpoch,
+    active: bool,
+) -> Result<RoomFenceState, PortError> {
+    if !active {
+        return Ok(RoomFenceState::new(note, scope, epoch));
+    }
+    let base = LeaseEpoch::new(epoch.get().saturating_sub(1))?;
+    let mut state = RoomFenceState::new(note, scope, base);
+    state.open()?;
+    Ok(state)
+}
+
 type RoomFenceMap = HashMap<(SpaceId, NoteId), Arc<Mutex<RoomFenceState>>>;
 
 /// Runtime-owned table of per-`(SpaceId, NoteId)` room fences (`tokio::sync::Mutex<RoomFenceState>`).
@@ -392,39 +407,18 @@ impl RoomFenceTable {
         epoch: LeaseEpoch,
         active: bool,
     ) -> Result<(), PortError> {
-        let mut state = if active {
-            let base = LeaseEpoch::new(epoch.get().saturating_sub(1))?;
-            let mut s = RoomFenceState::new(note.clone(), scope.clone(), base);
-            s.open()?;
-            s
-        } else {
-            RoomFenceState::new(note.clone(), scope.clone(), epoch)
-        };
-        let _ = &mut state;
-        let lock = {
+        let state = persisted_room_fence(note.clone(), scope.clone(), epoch, active)?;
+        let existing = {
             let mut map = self.fences.lock().expect("room fence table mutex");
-            if let Some(existing) = map.get(&(scope.space_id.clone(), note.clone())) {
-                Some(Arc::clone(existing))
-            } else {
-                map.insert(
-                    (scope.space_id.clone(), note.clone()),
-                    Arc::new(Mutex::new(state)),
-                );
-                return Ok(());
+            match map.entry((scope.space_id.clone(), note.clone())) {
+                std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Arc::new(Mutex::new(state)));
+                    return Ok(());
+                }
             }
         };
-        if let Some(existing_lock) = lock {
-            let mut guard = existing_lock.lock().await;
-            let rebuilt = if active {
-                let base = LeaseEpoch::new(epoch.get().saturating_sub(1))?;
-                let mut s = RoomFenceState::new(note.clone(), scope.clone(), base);
-                s.open()?;
-                s
-            } else {
-                RoomFenceState::new(note.clone(), scope.clone(), epoch)
-            };
-            *guard = rebuilt;
-        }
+        *existing.lock().await = state;
         Ok(())
     }
 }

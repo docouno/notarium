@@ -521,7 +521,7 @@ impl WriteCoordinator {
                 let gate_cl = Arc::clone(&commit_gate);
                 let faults_cl = Arc::clone(&faults);
                 let telem_cl = Arc::clone(&batch_telemetry);
-                let worker = tokio::spawn(async move {
+                let worker = inner.backup_executor.spawn(async move {
                     run_batch_worker_loop(
                         inner_weak, rx, cfg, gate_cl, faults_cl, telem_cl, tracker_cl, None,
                     )
@@ -855,7 +855,7 @@ impl WriteCoordinator {
                 let faults_cl = Arc::clone(&self.faults);
                 let telem_cl = Arc::clone(&self.batch_telemetry);
                 let cfg = self.cfg;
-                let worker = tokio::spawn(async move {
+                let worker = inner.backup_executor.spawn(async move {
                     run_batch_worker_loop(
                         inner_weak,
                         rx,

@@ -56,7 +56,7 @@ impl CanonicalStore {
         let permission = Arc::new(AtomicBool::new(true));
         let commit = Arc::clone(&permission);
         let worker_budget = budget.clone();
-        let task = tokio::spawn(async move {
+        let task = self.inner.backup_executor.spawn(async move {
             deadline.remaining(&worker_budget)?;
             let result = store
                 .with_write_tx(move |tx| {

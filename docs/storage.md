@@ -389,6 +389,9 @@ same example against an isolated prefix.
   Direct carrier changes, including schema-note changes, wait until an authorized
   settlement pairs the snapshot with the canonical carrier and covers the last
   pending update. A clean close permits direct changes to start a new lineage.
+  The storage executor owns admitted work. If the database loses a COMMIT reply,
+  it retains the affected room lock until a fresh transaction verifies the durable
+  lease under the Space lock. Unrelated rooms keep their own fences.
 - **Job pagination.** `list_jobs` binds each cursor to the original Space cut.
   Continuation returns `CursorStale` if the cut advances or a heartbeat changes
   progress visible to the query. Consumers can open a new read at the current cut.
@@ -396,6 +399,12 @@ same example against an isolated prefix.
   messages inline and `> 512`-byte payloads in verified CAS. Each
   `stage_chat_blob` call records a per-author lease with its provenance, including
   when several calls stage the same digest. Append consumes the specific lease.
+  When a caller leaves during COMMIT, storage releases its undelivered lease and
+  retires the content if the last owner has gone. A process crash can interrupt
+  this handoff. The original grant can call `next_staged_chat_blob` with its
+  request ID, content digest and matching provenance to recover each outstanding
+  lease, then append it or release it with `discard_staged_chat_blob`. A repeated
+  release is safe. Existing leases remain consumable with their original tokens.
   Legacy leases with unknown provenance count as externally tainted. A leaf window follows at most one parent per returned entry and issues
   zero writes. For a distant `before` cursor, ancestry validation first walks
   fixed jumps of 256 levels, then 16 levels, then individual parents. For a

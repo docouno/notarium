@@ -1,3 +1,6 @@
+mod fence;
+
+use fence::RoomTransition;
 use std::{
     collections::{BTreeSet, VecDeque},
     sync::Mutex as StdMutex,
@@ -2668,29 +2671,14 @@ async fn open_collab_session_impl(
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
 
-    let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
-
     let inner = std::sync::Arc::clone(&store.inner);
-    let note = spec.note.clone();
-    let scope = spec.scope.clone();
-    let sync_fence = move |(res, mut fence_guard): (
-        CollabSessionRecord,
-        tokio::sync::OwnedMutexGuard<notarium_core::ports::RoomFenceState>,
-    )| {
-        // Synchronize the already-locked `RoomFenceState` to `(res.lease_epoch, active = true)` before releasing!
-        let base = LeaseEpoch::new(res.lease_epoch.get().saturating_sub(1))?;
-        let mut synced = notarium_core::ports::RoomFenceState::new(note, scope, base);
-        synced.open()?;
-        *fence_guard = synced;
-
-        Ok(res)
-    };
+    let room_store = store.clone();
     store
-        .with_auxiliary_command(budget, deadline, sync_fence, move |tx| {
+        .with_auxiliary_command(budget, deadline, RoomTransition::confirmed, move |tx| {
             let spec_cl = spec;
             Box::pin(async move {
                 let srec = lock_peer_space(tx, &inner, &spec_cl.scope).await?;
-                let fence_guard = room_fences.lock_for_write(&spec_cl.scope, &spec_cl.note)?;
+                let fence_guard = inner.room_fences.lock_for_write(&spec_cl.scope, &spec_cl.note)?;
                 if is_note_purge_fenced_tx(tx, &srec.scope.space_id, spec_cl.note.as_str()).await? {
                     return Err(DomainError::ResourceNotFound.into());
                 }
@@ -2858,7 +2846,7 @@ async fn open_collab_session_impl(
                 if installs_snapshot {
                     write_collab_checkpoint_state_tx(tx, &spec_cl.scope.space_id, &spec_cl.note, coverage, true).await?;
                 }
-                Ok((CollabSessionRecord {
+                let record = CollabSessionRecord {
                     note: spec_cl.note,
                     lease_epoch: new_lease,
                     lineage_epoch: lineage,
@@ -2870,7 +2858,8 @@ async fn open_collab_session_impl(
                     room_state: CollabRoomState::Active,
                     owner_id: Some(spec_cl.owner_id),
                     updated_seq,
-                }, fence_guard))
+                };
+                RoomTransition::prepare(room_store, &spec_cl.scope, fence_guard, record)
             })
         })
         .await
@@ -3313,28 +3302,19 @@ async fn close_collab_session_impl(
         .await;
     }
 
-    let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
-
     let inner = std::sync::Arc::clone(&store.inner);
-    let note = spec.note.clone();
-    let scope = spec.scope.clone();
-    let sync_fence = move |(res, mut fence_guard): (
-        CollabSessionRecord,
-        tokio::sync::OwnedMutexGuard<notarium_core::ports::RoomFenceState>,
-    )| {
-        *fence_guard = notarium_core::ports::RoomFenceState::new(note, scope, res.lease_epoch);
-
-        Ok(res)
-    };
+    let room_store = store.clone();
     store
-        .with_auxiliary_command(budget, deadline, sync_fence, move |tx| {
+        .with_auxiliary_command(budget, deadline, RoomTransition::confirmed, move |tx| {
             let spec_cl = spec;
             Box::pin(async move {
                 let srec = lock_peer_space(tx, &inner, &spec_cl.scope).await?;
                 if is_note_purge_fenced_tx(tx, &srec.scope.space_id, spec_cl.note.as_str()).await? {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                let fence_guard = room_fences.lock_for_write(&spec_cl.scope, &spec_cl.note)?;
+                let fence_guard = inner
+                    .room_fences
+                    .lock_for_write(&spec_cl.scope, &spec_cl.note)?;
 
                 let Some(mut cur) =
                     load_collab_session_opt_tx(tx, &srec.scope.space_id, &spec_cl.note).await?
@@ -3423,7 +3403,7 @@ async fn close_collab_session_impl(
                 cur.lease_epoch = new_lease;
                 cur.yrs_snapshot_blob = yrs_blob;
                 cur.yrs_snapshot_digest = yrs_digest;
-                Ok((cur, fence_guard))
+                RoomTransition::prepare(room_store, &spec_cl.scope, fence_guard, cur)
             })
         })
         .await
@@ -3530,7 +3510,7 @@ async fn settle_and_update_collab_session(
         })
         .await?;
     let staged_bytes = ticket.compressed_size;
-    let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
+    let room_store = store.clone();
     let scope_cl = space_rec.scope.clone();
 
     let intent = PreparedWriteIntent {
@@ -3697,7 +3677,7 @@ async fn settle_and_update_collab_session(
                     .commit_revision(
                         tx,
                         item_ctx,
-                        &room_fences,
+                        &room_store,
                         &note,
                         &base_head.head_rev_id,
                         &new_rev,
@@ -3861,7 +3841,7 @@ impl RoomCarrierTransition {
         self,
         tx: &mut BackendConn<'_>,
         item_ctx: &mut crate::writer::ItemExecCtx,
-        room_fences: &crate::RoomFenceTable,
+        store: &CanonicalStore,
         note: &NoteId,
         base_revision: &RevisionId,
         new_rev: &RevisionId,
@@ -3882,7 +3862,7 @@ impl RoomCarrierTransition {
         let scope_cl = item_ctx.scope.clone();
         let seq_i64 = seq.get() as i64;
         let fence_guard = if close_room {
-            Some(room_fences.lock_for_write(&scope_cl, note)?)
+            Some(store.inner.room_fences.lock_for_write(&scope_cl, note)?)
         } else {
             None
         };
@@ -3989,15 +3969,6 @@ impl RoomCarrierTransition {
             }
         }
 
-        if let Some(mut guard) = fence_guard {
-            let closed = notarium_core::ports::RoomFenceState::new(
-                note.clone(),
-                scope_cl.clone(),
-                new_lease,
-            );
-            item_ctx.on_commit(move || *guard = closed);
-        }
-
         let out_rec = CollabSessionRecord {
             note: note.clone(),
             lease_epoch: new_lease,
@@ -4011,6 +3982,10 @@ impl RoomCarrierTransition {
             owner_id: new_owner,
             updated_seq: seq,
         };
+        if let Some(guard) = fence_guard {
+            let transition = RoomTransition::new(store.clone(), &scope_cl, guard, &out_rec)?;
+            item_ctx.on_commit(move || transition.publish());
+        }
         Ok(out_rec)
     }
 }
