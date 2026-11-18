@@ -2,6 +2,8 @@
 
 #[path = "l6_board_pma_and_rollback/applied.rs"]
 mod applied;
+#[path = "l6_board_pma_and_rollback/board_deadline.rs"]
+mod board_deadline;
 #[path = "l6_board_pma_and_rollback/pg_deadline.rs"]
 mod pg_deadline;
 #[path = "l6_board_pma_and_rollback/rollback_deadline.rs"]
@@ -31,7 +33,7 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::{
         AgentRunId, CommandKey, ContentDigest, FolderId, GrantId, HistoryIncarnation, LeaseEpoch,
-        NoteId, PrincipalId, RequestId, SpaceId, SpaceSeq, ViewKey,
+        NoteId, PrincipalId, RequestId, RevisionId, SpaceId, SpaceSeq, ViewKey,
     },
     model::{HistoryScope, Lifecycle},
     ports::{
@@ -143,6 +145,7 @@ struct CanonicalTestBoardPlanner {
     forge_authority_once: AtomicBool,
     inject_stale_cutoff_once: AtomicBool,
     evaluate_move_calls: AtomicUsize,
+    move_waits: Mutex<Option<Vec<std::time::Duration>>>,
 }
 
 impl CanonicalTestBoardPlanner {
@@ -153,6 +156,7 @@ impl CanonicalTestBoardPlanner {
             forge_authority_once: AtomicBool::new(false),
             inject_stale_cutoff_once: AtomicBool::new(false),
             evaluate_move_calls: AtomicUsize::new(0),
+            move_waits: Mutex::new(None),
         })
     }
 
@@ -183,6 +187,16 @@ impl BoardMutationFactsProvider for CanonicalTestBoardPlanner {
     ) -> PortFuture<'a, BoardMoveFacts> {
         Box::pin(async move {
             self.evaluate_move_calls.fetch_add(1, Ordering::SeqCst);
+            let wait_number = self.move_waits.lock().unwrap().as_mut().map(|waits| {
+                waits.push(ctx.budget.remaining);
+                waits.len()
+            });
+            match wait_number {
+                Some(1) => tokio::time::sleep(std::time::Duration::from_millis(180)).await,
+                Some(_) => std::future::pending().await,
+                None => {}
+            }
+
             let scope = ctx.scope().clone();
             let space_rec = self.store.read_space(&scope.space_id).await?;
             let view_snap = self
@@ -1922,10 +1936,33 @@ async fn check_rollback_destination_authority(
         owner,
         RollbackAgentRun {
             run,
-            expected_run_revision: revision,
+            expected_run_revision: revision.clone(),
             expected_entities: vec![moved.value],
             associated_board_expectations: vec![],
         },
+    );
+    let mut stale = rollback.clone();
+    stale.input.expected_run_revision = RevisionId::from_bytes([93; 16]);
+    store
+        .set_folder_write_lock(human.clone(), current.clone(), true)
+        .await
+        .unwrap();
+    let cut = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    assert!(matches!(
+        store.rollback_agent_run(human.clone(), stale.clone()).await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        cut
+    );
+    store
+        .set_folder_write_lock(human.clone(), current.clone(), false)
+        .await
+        .unwrap();
+    assert!(
+        matches!(store.rollback_agent_run(human.clone(), stale).await,
+        Err(PortError::Domain(DomainError::RevisionConflict { current, .. })) if current == revision)
     );
     store
         .set_folder_write_lock(human.clone(), destination.clone(), true)

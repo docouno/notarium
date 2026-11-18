@@ -37,8 +37,8 @@ use crate::{
         StoredCommittedMintAndPurgeV1, StoredCommittedNoteRevV1, active_note_sibling_exists_tx,
         build_resource_facts_tx, check_collab_preconditions_tx, derive_command_identity_spec,
         extract_agent_run_from_auth, is_note_room_active_tx, load_current_space_schema_tx,
-        load_note_head_row_opt_tx, load_note_head_row_tx, note_rank_version_digest,
-        upsert_agent_run_head_tx, validate_mutation_identity,
+        load_note_head_row_tx, note_rank_version_digest, upsert_agent_run_head_tx,
+        validate_mutation_identity,
     },
     runtime::{insert_revision_row, is_note_purge_fenced_tx, load_space_record},
     sql_exec::BackendConn,
@@ -147,7 +147,7 @@ impl CanonicalStore {
                                 .await
                         }
                     }
-                    .map_err(|err| internal_not_committed("scan_pending_purges", err.to_string()))
+                    .map_err(|err| crate::runtime::pg_read_error("scan_pending_purges", err))
                 })
             })
             .await?;
@@ -222,7 +222,7 @@ impl CanonicalStore {
                             }
                         }
                         .map_err(|err| {
-                            internal_not_committed("scan_pending_retirements", err.to_string())
+                            crate::runtime::pg_read_error("scan_pending_retirements", err)
                         })
                     })
                 })
@@ -313,8 +313,6 @@ async fn purge_note_inner(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                ensure_no_active_backup_holds_for_purge_tx(tx, &scope.space_id).await?;
-
                 if is_note_purge_fenced_tx(tx, &scope.space_id, old_note.as_str()).await? {
                     return Err(DomainError::ResourceNotFound.into());
                 }
@@ -322,6 +320,20 @@ async fn purge_note_inner(
                 if old_head.lifecycle == Lifecycle::Purged {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                let live_space = load_space_record(tx, &scope.space_id).await?;
+                let (old_facts, _) = build_resource_facts_tx(
+                    tx,
+                    &live_space.space,
+                    &old_head.parent_folder_id,
+                    old_head.doc_class,
+                    old_head.ability_id.clone(),
+                    false,
+                )
+                .await?;
+                auth.authorize_direct_write(&old_facts, &old_facts)?;
+
+                ensure_no_active_backup_holds_for_purge_tx(tx, &scope.space_id).await?;
+
                 if let Some(expected_rev) = &preconditions.revision
                     && *expected_rev != old_head.head_rev_id
                 {
@@ -341,18 +353,6 @@ async fn purge_note_inner(
                         Duration::from_millis(50),
                     ));
                 }
-
-                let live_space = load_space_record(tx, &scope.space_id).await?;
-                let (old_facts, _) = build_resource_facts_tx(
-                    tx,
-                    &live_space.space,
-                    &old_head.parent_folder_id,
-                    old_head.doc_class,
-                    old_head.ability_id.clone(),
-                    false,
-                )
-                .await?;
-                auth.authorize_direct_write(&old_facts, &old_facts)?;
 
                 let purge_seq = item_ctx.alloc_next_seq()?;
                 let tombstone_rev = new_revision_id()?;
@@ -566,6 +566,7 @@ pub(crate) async fn mint_and_purge_impl(
         .check_writer_epoch(&space_rec.scope.space_id, space_rec.active_epoch)?;
     let preflight = ctx.clone();
     let old_note = request.input.old_note.clone();
+    let new_note = request.input.new_note.clone();
     let expected_rev = request.input.expected_revision.clone();
     let check_id = idemp.clone();
     let existing = store
@@ -588,9 +589,23 @@ pub(crate) async fn mint_and_purge_impl(
                 {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                let collision = super::common::authorized_collision_revision_tx(
+                    tx,
+                    &space.space,
+                    preflight.auth(),
+                    &new_note,
+                )
+                .await?;
                 if head.head_rev_id != expected_rev {
                     return Err(DomainError::RevisionConflict {
                         current: head.head_rev_id,
+                        lineage: None,
+                    }
+                    .into());
+                }
+                if let Some(current) = collision {
+                    return Err(DomainError::RevisionConflict {
+                        current,
                         lineage: None,
                     }
                     .into());
@@ -643,8 +658,6 @@ pub(crate) async fn mint_and_purge_impl(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                ensure_no_active_backup_holds_for_purge_tx(tx, &scope.space_id).await?;
-
                 if is_note_purge_fenced_tx(tx, &scope.space_id, input.old_note.as_str()).await? {
                     return Err(DomainError::ResourceNotFound.into());
                 }
@@ -656,6 +669,19 @@ pub(crate) async fn mint_and_purge_impl(
                 if old_head.lifecycle == Lifecycle::Purged {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                let live_space = load_space_record(tx, &scope.space_id).await?;
+                let new_anc =
+                    authorize_mint_placement_tx(tx, &live_space, &old_head, &auth).await?;
+
+                let collision = super::common::authorized_collision_revision_tx(
+                    tx,
+                    &live_space.space,
+                    &auth,
+                    &input.new_note,
+                )
+                .await?;
+                ensure_no_active_backup_holds_for_purge_tx(tx, &scope.space_id).await?;
+
                 if old_head.head_rev_id != input.expected_revision {
                     return Err(DomainError::RevisionConflict {
                         current: old_head.head_rev_id,
@@ -684,22 +710,13 @@ pub(crate) async fn mint_and_purge_impl(
                     ));
                 }
 
-                if let Some(existing_new) =
-                    load_note_head_row_opt_tx(tx, &scope.space_id, &input.new_note).await?
-                {
-                    if existing_new.lifecycle == Lifecycle::Purged {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
+                if let Some(current) = collision {
                     return Err(DomainError::RevisionConflict {
-                        current: existing_new.head_rev_id,
+                        current,
                         lineage: None,
                     }
                     .into());
                 }
-
-                let live_space = load_space_record(tx, &scope.space_id).await?;
-                let new_anc =
-                    authorize_mint_placement_tx(tx, &live_space, &old_head, &auth).await?;
 
                 let succ_slug = input
                     .new_slug
@@ -1667,7 +1684,7 @@ async fn ensure_no_active_backup_holds_for_purge_tx(
                 .bind(space_id.as_str())
                 .fetch_optional(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("pg_purge_check_holds", err.to_string()))?
+                .map_err(|err| crate::runtime::pg_read_error("pg_purge_check_holds", err))?
         }
     };
     if hold_exists.is_some() {
@@ -1814,7 +1831,7 @@ async fn load_pending_purge_for_idempotency(
                         .fetch_optional(&mut **conn)
                         .await
                         .map_err(|err| {
-                            internal_not_committed("pg_lookup_pending_purge", err.to_string())
+                            crate::runtime::pg_read_error("pg_lookup_pending_purge", err)
                         })?;
                         row.map(|r| {
                             (

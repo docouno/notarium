@@ -171,6 +171,21 @@ done
   fail "PostgreSQL 16 UDS fixture failed readiness within 30s"
 }
 
+# Give the startup refusal test a separate cluster and socket in the pinned PG
+# container. Its temporary data directory disappears with the fixture.
+pg_fsync_off_port=null
+if [ "$1" != "benchmark" ]; then
+  pg_fsync_off_port=5433
+  docker compose -f "$COMPOSE_FILE" -p "$COMPOSE_PROJECT" exec -T postgres \
+    sh -eu -s -- "$pg_fsync_off_port" <<'PG_FIXTURE'
+data=$(mktemp -d /tmp/notarium-fsync-off.XXXXXX)
+printf '%s\n' "$POSTGRES_PASSWORD" | initdb -D "$data" --no-sync --username="$POSTGRES_USER" \
+  --auth=scram-sha-256 --pwfile=/dev/stdin >/dev/null
+pg_ctl -D "$data" -l "$data/server.log" -t 30 -w \
+  -o "-c listen_addresses= -p $1 -k /var/run/postgresql -c synchronous_commit=on -c fsync=off -c shared_buffers=1MB -c max_connections=8 -c max_wal_senders=0 -c autovacuum=off" start
+PG_FIXTURE
+fi
+
 # Wait for MinIO Community Edition + UDS bridge readiness (bounded 30s).
 s3_ready=0
 attempt=0
@@ -197,6 +212,7 @@ cat >"$TMP_MANIFEST" <<EOF
   "pg_socket_dir_container": "/workspace/.artifacts/storage-tests/${RUN_ID}/pgsock",
   "pg_socket_dir_host": "${RUN_DIR}/pgsock",
   "pg_port": 5432,
+  "pg_fsync_off_port": ${pg_fsync_off_port},
   "pg_user": "${PG_USER}",
   "pg_password": "${PG_PASSWORD}",
   "pg_database": "${PG_DB}",

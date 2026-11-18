@@ -631,6 +631,40 @@ impl SqliteWalCoordinator {
         self.gate_open_notify.notify_waiters();
     }
 
+    fn gate_deadline(
+        &self,
+        now: tokio::time::Instant,
+        budget: Option<&CallBudget>,
+    ) -> Result<tokio::time::Instant, PortError> {
+        let remaining = budget.map_or_else(
+            || {
+                self.wal_reset_cycle_deadline
+                    .saturating_add(self.read_deadline)
+            },
+            |caller| caller.remaining,
+        );
+        if remaining.is_zero() {
+            return Err(deadline_not_committed(
+                "sqlite_read_zero_budget",
+                "read call budget expired before admission",
+            ));
+        }
+        Ok(crate::runtime::deadline_after(now, remaining))
+    }
+
+    fn checkout_deadline(
+        &self,
+        budget: Option<&CallBudget>,
+        gate_deadline: tokio::time::Instant,
+    ) -> tokio::time::Instant {
+        match budget {
+            Some(_) => gate_deadline,
+            None => tokio::time::Instant::now()
+                .checked_add(self.read_deadline)
+                .map_or(gate_deadline, |read| gate_deadline.min(read)),
+        }
+    }
+
     /// Admits a short-lived synchronous `rusqlite` read transaction through the exact same
     /// WAL reader gate and monotonic deadline contract as `with_ordinary_read_tx`.
     pub(crate) async fn acquire_reader_gate_slot(
@@ -643,16 +677,8 @@ impl SqliteWalCoordinator {
                 "read cancelled before admission",
             ));
         }
-        let caller_remaining = budget.map(|b| b.remaining).unwrap_or(self.read_deadline);
-        if caller_remaining.is_zero() {
-            return Err(deadline_not_committed(
-                "sqlite_read_zero_budget",
-                "read call budget expired before admission",
-            ));
-        }
-
         let start_wait = Instant::now();
-        let caller_deadline_tokio = tokio::time::Instant::now() + caller_remaining;
+        let caller_deadline_tokio = self.gate_deadline(tokio::time::Instant::now(), budget)?;
 
         // Fast path: 99.99% of the time `st.open == true`; avoid allocating/enabling `Notify` waiter!
         let fast_id = {
@@ -729,6 +755,7 @@ impl SqliteWalCoordinator {
             },
         };
 
+        let caller_deadline_tokio = self.checkout_deadline(budget, caller_deadline_tokio);
         let waited_ns = u64::try_from(start_wait.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.counters
             .total_admission_wait_ns
@@ -762,16 +789,8 @@ impl SqliteWalCoordinator {
                 "read cancelled before admission",
             ));
         }
-        let caller_remaining = budget.map(|b| b.remaining).unwrap_or(self.read_deadline);
-        if caller_remaining.is_zero() {
-            return Err(deadline_not_committed(
-                "sqlite_read_zero_budget",
-                "read call budget expired before admission",
-            ));
-        }
-
         let start_wait = Instant::now();
-        let caller_deadline_tokio = tokio::time::Instant::now() + caller_remaining;
+        let caller_deadline_tokio = self.gate_deadline(tokio::time::Instant::now(), budget)?;
 
         // 1. Wait for ordinary reader admission gate without losing Caller's deadline!
         let reader_id = loop {
@@ -826,6 +845,7 @@ impl SqliteWalCoordinator {
             }
         };
 
+        let caller_deadline_tokio = self.checkout_deadline(budget, caller_deadline_tokio);
         let waited_ns = u64::try_from(start_wait.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.counters
             .total_admission_wait_ns
@@ -881,9 +901,12 @@ impl SqliteWalCoordinator {
             ));
         }
 
-        let effective_tx_budget = remaining_after_acquire.min(self.read_deadline);
-        let tx_deadline_std = Instant::now() + effective_tx_budget;
-        let tx_deadline_tokio = now_tokio + effective_tx_budget;
+        let tx_deadline_tokio = now_tokio
+            .checked_add(self.read_deadline)
+            .map_or(caller_deadline_tokio, |read| {
+                read.min(caller_deadline_tokio)
+            });
+        let tx_deadline_std = tx_deadline_tokio.into_std();
 
         snap_guard.pooled = Some(pooled);
         {
@@ -1026,7 +1049,10 @@ impl SqliteWalCoordinator {
         if aborted_any_backup {
             self.counters.backup_aborts.fetch_add(1, Ordering::Relaxed);
             // Wait boundedly for aborted backup snapshot(s) to close.
-            let wait_backup_deadline = tokio::time::Instant::now() + self.wal_reset_cycle_deadline;
+            let wait_backup_deadline = crate::runtime::deadline_after(
+                tokio::time::Instant::now(),
+                self.wal_reset_cycle_deadline,
+            );
             loop {
                 let notified = self.drained_notify.notified();
                 tokio::pin!(notified);
@@ -1230,7 +1256,10 @@ impl SqliteWalCoordinator {
         }
 
         self.counters.reset_attempts.fetch_add(1, Ordering::Relaxed);
-        let cycle_deadline = tokio::time::Instant::now() + self.wal_reset_cycle_deadline;
+        let cycle_deadline = crate::runtime::deadline_after(
+            tokio::time::Instant::now(),
+            self.wal_reset_cycle_deadline,
+        );
 
         // Close ordinary reader admission and ensure an RAII guard ALWAYS reopens it!
         self.close_reader_gate();
@@ -1451,6 +1480,106 @@ mod tests {
     use super::*;
     use crate::{CanonicalConfig, CanonicalRuntime, SqlBackendConfig};
     use notarium_core::{epoch::DataRoot, ids::InstallationId};
+
+    #[tokio::test]
+    async fn sqlite_default_read_budget_allows_one_reset_before_the_snapshot() {
+        use notarium_core::{ids::RequestId, ports::Cancellation};
+
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).unwrap();
+        let path = std::env::temp_dir().join(format!("notarium-read-admit-{}", hex::encode(id)));
+        let mut config =
+            CanonicalConfig::local_default(InstallationId::from_bytes(id), DataRoot::new(&path));
+        let SqlBackendConfig::Sqlite {
+            read_pool_size,
+            read_deadline,
+            wal_reset_cycle_deadline,
+            ..
+        } = &mut config.sql
+        else {
+            unreachable!()
+        };
+        *read_pool_size = 1;
+        *read_deadline = Duration::from_millis(60);
+        *wal_reset_cycle_deadline = Duration::from_secs(1);
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        {
+            let wal = store.inner.wal_coord.get().unwrap();
+            let SqlDriverState::Sqlite {
+                read_pool,
+                fast_read_pool,
+                ..
+            } = &store.inner.sql
+            else {
+                unreachable!()
+            };
+            let _maintenance = wal.maintenance_lock.lock().await;
+            let now = tokio::time::Instant::now();
+            assert_eq!(
+                wal.gate_deadline(now, None).unwrap() - now,
+                Duration::from_millis(1060)
+            );
+            let short = CallBudget {
+                request: RequestId::from_bytes(id),
+                remaining: Duration::from_millis(10),
+                cancellation: Cancellation::default(),
+            };
+            assert_eq!(
+                wal.gate_deadline(now, Some(&short)).unwrap() - now,
+                short.remaining
+            );
+            let mut long = short.clone();
+            long.remaining = Duration::MAX;
+            assert!(wal.gate_deadline(now, Some(&long)).unwrap() > now + Duration::from_secs(1));
+            wal.close_reader_gate();
+            let sqlx = wal.with_ordinary_read_tx(read_pool, None, |_| Box::pin(async { Ok(()) }));
+            let native = fast_read_pool.with_read_conn(wal, None, |_| Ok(()));
+            let open = async {
+                let (one, two) = tokio::join!(
+                    wal.with_ordinary_read_tx(read_pool, Some(&short), |_| Box::pin(async {
+                        Ok(())
+                    })),
+                    fast_read_pool.with_read_conn(wal, Some(&short), |_| Ok(())),
+                );
+                assert!(matches!(one, Err(PortError::DeadlineExceeded(_))));
+                assert!(matches!(two, Err(PortError::DeadlineExceeded(_))));
+                tokio::time::sleep(Duration::from_millis(90)).await;
+                assert_eq!(wal.telemetry().active_readers, 0);
+                wal.reopen_reader_gate();
+            };
+            let (one, two, ()) = tokio::join!(sqlx, native, open);
+            one.unwrap();
+            two.unwrap();
+
+            // A pool wait with the gate already open gets no reset allowance.
+            let sqlx_slot = read_pool.acquire().await.unwrap();
+            let native_slots = fast_read_pool.hold_idle_slots();
+            let (one, two) = tokio::time::timeout(Duration::from_millis(600), async {
+                tokio::join!(
+                    wal.with_ordinary_read_tx(read_pool, None, |_| Box::pin(async { Ok(()) })),
+                    fast_read_pool.with_read_conn(wal, None, |_| Ok(())),
+                )
+            })
+            .await
+            .unwrap();
+            assert!(matches!(one, Err(PortError::DeadlineExceeded(_))));
+            assert!(matches!(two, Err(PortError::DeadlineExceeded(_))));
+            drop((sqlx_slot, native_slots));
+
+            wal.close_reader_gate();
+            let (one, two) = tokio::join!(
+                wal.with_ordinary_read_tx(read_pool, None, |_| Box::pin(async { Ok(()) })),
+                fast_read_pool.with_read_conn(wal, None, |_| Ok(())),
+            );
+            wal.reopen_reader_gate();
+            assert!(matches!(one, Err(PortError::DeadlineExceeded(_))));
+            assert!(matches!(two, Err(PortError::DeadlineExceeded(_))));
+            assert_eq!(wal.telemetry().active_readers, 0);
+        }
+        drop(store);
+        runtime.shutdown().await.unwrap();
+        fs::remove_dir_all(path).unwrap();
+    }
 
     #[tokio::test]
     async fn cancellation_releases_sqlite_readers_waiting_for_gate_or_pool() {

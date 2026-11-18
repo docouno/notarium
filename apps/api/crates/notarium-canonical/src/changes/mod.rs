@@ -395,7 +395,7 @@ impl CanonicalChangeSubscription {
                              AND history_incarnation=$2 AND space_seq>$3 AND space_seq<=$4 AND op_kind='purge')",
                         ).bind(rec.scope.space_id.as_str()).bind(rec.scope.incarnation.as_bytes().as_slice())
                          .bind(start.get() as i64).bind(rec.last_seq.get() as i64)
-                         .fetch_one(&mut **conn).await.map_err(|e| internal_not_committed("pg_poll_purge_notice", e.to_string()))?,
+                         .fetch_one(&mut **conn).await.map_err(|e| crate::runtime::pg_read_error("pg_poll_purge_notice", e))?,
                         BackendConn::Sqlite(_) => has_erased_change_payload_in_range_tx(tx, &rec.scope, start, rec.last_seq).await?,
                     }
                 } else {
@@ -767,7 +767,7 @@ impl CanonicalStore {
                             .fetch_optional(&mut **conn)
                             .await
                             .map_err(|err| {
-                                internal_not_committed("pg_resolve_rcpt_cmd", err.to_string())
+                                crate::runtime::pg_read_error("pg_resolve_rcpt_cmd", err)
                             })?;
                             r.map(|row| (row.get("command_kind"), row.get("payload_id")))
                         }
@@ -971,7 +971,7 @@ impl CanonicalStore {
                         .fetch_all(&mut **conn)
                         .await
                         .map_err(|err| {
-                            internal_not_committed("pg_read_change_log", err.to_string())
+                            crate::runtime::pg_read_error("pg_read_change_log", err)
                         })?;
 
                         rows.into_iter()
@@ -1658,7 +1658,7 @@ async fn load_decoded_effect_tx(
             .bind(payload_id)
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_change_pay", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_change_pay", err))?;
             r.map(|row| {
                 (
                     row.get("codec"),
@@ -1743,7 +1743,7 @@ async fn verify_overlay_versions_retained_tx(
                 .await
             }
         }
-        .map_err(|err| internal_not_committed("read_retained_board_ranks", err.to_string()))?;
+        .map_err(|err| crate::runtime::pg_read_error("read_retained_board_ranks", err))?;
         if count != versions.len() as i64 {
             return Ok(MutationEffect::AwaitProjection {
                 reason: AwaitReason::UnavailableVersion,
@@ -1784,7 +1784,7 @@ async fn verify_overlay_versions_retained_tx(
             .bind(ver.revision.as_str())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_check_overlay_rev", err.to_string()))?,
+            .map_err(|err| crate::runtime::pg_read_error("pg_check_overlay_rev", err))?,
         };
         if exists.is_none() {
             return Ok(MutationEffect::AwaitProjection {
@@ -1828,7 +1828,7 @@ async fn last_complete_command_end_at_or_below_tx(
         .bind(bound_i64)
         .fetch_one(&mut **conn)
         .await
-        .map_err(|err| internal_not_committed("pg_max_complete_cmd", err.to_string()))?,
+        .map_err(|err| crate::runtime::pg_read_error("pg_max_complete_cmd", err))?,
     };
     Ok(i64_to_space_seq(raw_max)?)
 }
@@ -1873,7 +1873,7 @@ async fn has_erased_change_payload_in_range_tx(
         .bind(through_i64)
         .fetch_optional(&mut **conn)
         .await
-        .map_err(|err| internal_not_committed("pg_check_erased_range", err.to_string()))?,
+        .map_err(|err| crate::runtime::pg_read_error("pg_check_erased_range", err))?,
     };
     Ok(found.is_some())
 }
@@ -1911,7 +1911,7 @@ async fn has_post_cutoff_purge_of_prior_note_tx(
             .bind(cut)
             .fetch_one(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_check_post_cutoff_purge", err.to_string())),
+            .map_err(|err| crate::runtime::pg_read_error("pg_check_post_cutoff_purge", err)),
     }
 }
 
@@ -1945,7 +1945,7 @@ async fn list_note_keys_at_or_below_cutoff_tx(
             .bind(limit)
             .fetch_all(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_seed_note_keys", err.to_string())),
+            .map_err(|err| crate::runtime::pg_read_error("pg_seed_note_keys", err)),
     }
 }
 
@@ -1979,6 +1979,6 @@ async fn list_thread_keys_at_or_below_cutoff_tx(
             .bind(limit)
             .fetch_all(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_seed_thread_keys", err.to_string())),
+            .map_err(|err| crate::runtime::pg_read_error("pg_seed_thread_keys", err)),
     }
 }

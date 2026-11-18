@@ -330,7 +330,7 @@ pub(crate) async fn lookup_thread_visibility_tx(
         .bind(thread_id)
         .fetch_optional(&mut **conn)
         .await
-        .map_err(|err| internal_not_committed("pg_lookup_thread_taint", err.to_string()))?,
+        .map_err(|err| crate::runtime::pg_read_error("pg_lookup_thread_taint", err))?,
     };
     row.map(|(project, mask)| {
         let project = project

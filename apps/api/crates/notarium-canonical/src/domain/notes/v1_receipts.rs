@@ -189,7 +189,7 @@ async fn recorded_note_tx(
                 .await
         }
     }
-    .map_err(|e| internal_not_committed("read_v1_receipt_revision", e.to_string()))?;
+    .map_err(|e| crate::runtime::pg_read_error("read_v1_receipt_revision", e))?;
     let (bytes, parent_revision, base_digest) = row.ok_or_else(mismatch)?;
     let RevisionMetadataPayload::Note(meta) = RevisionMetadataEnvelope::decode(&bytes)?.payload
     else {
@@ -302,7 +302,7 @@ pub(super) async fn link_identity(
                 .bind(result.receipt.seq().get() as i64).bind(scope.incarnation.as_bytes().as_slice()).fetch_optional(&mut **conn).await,
             BackendConn::Postgres(conn) => sqlx::query_as(BASE).bind(scope.space_id.as_str()).bind(link.source.as_str())
                 .bind(result.receipt.seq().get() as i64).bind(scope.incarnation.as_bytes().as_slice()).fetch_optional(&mut **conn).await,
-        }.map_err(|e| internal_not_committed("read_link_receipt_base", e.to_string()))?.ok_or_else(mismatch)?;
+        }.map_err(|e| crate::runtime::pg_read_error("read_link_receipt_base", e))?.ok_or_else(mismatch)?;
         if expected_parent.as_ref().is_some_and(|r| r.as_str() != parent_revision) {
             return Err(mismatch());
         }

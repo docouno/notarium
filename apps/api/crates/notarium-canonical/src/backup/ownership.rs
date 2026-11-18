@@ -354,7 +354,7 @@ async fn reconcile(
             BackendConn::Sqlite(conn) => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM backup_artifacts WHERE artifact_id = ? AND state = 'ready')")
                 .bind(lookup.as_str()).fetch_one(&mut **conn).await.map_err(|e|internal_not_committed("recover_sqlite_artifact", e.to_string())),
             BackendConn::Postgres(conn) => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM backup_artifacts WHERE artifact_id = $1 AND state = 'ready')")
-                .bind(lookup.as_str()).fetch_one(&mut **conn).await.map_err(|e|internal_not_committed("recover_pg_artifact", e.to_string())),
+                .bind(lookup.as_str()).fetch_one(&mut **conn).await.map_err(|e|crate::runtime::pg_read_error("recover_pg_artifact", e)),
         }
     })).await?;
     remove_tmp_artifacts(&dir.join(format!("{}.tmp", id.as_str())))?;

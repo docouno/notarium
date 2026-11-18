@@ -126,6 +126,15 @@ async fn check_package_publication_tx(
                 return Err(DomainError::ResourceNotFound.into());
             }
             if cur_entry != entrypoint {
+                super::common::authorized_collision_revision_tx(
+                    tx,
+                    &live_space.space,
+                    auth,
+                    cur_entry,
+                )
+                .await?
+                .ok_or(DomainError::ResourceNotFound)?;
+
                 return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
             }
             if expected_pkg_rev != Some(cur_rev) {
@@ -669,7 +678,7 @@ async fn load_ability_package_row_opt_tx(
             .bind(ability_id.as_str())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_ability_pkg", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_ability_pkg", err))?;
             row.map(|r| {
                 (
                     r.get("lifecycle_state"),
@@ -718,7 +727,7 @@ async fn active_ability_slug_conflict_tx(
         .bind(exclude_ability.as_str())
         .fetch_optional(&mut **conn)
         .await
-        .map_err(|err| internal_not_committed("pg_ability_slug_check", err.to_string()))?,
+        .map_err(|err| crate::runtime::pg_read_error("pg_ability_slug_check", err))?,
     };
     Ok(found.is_some())
 }

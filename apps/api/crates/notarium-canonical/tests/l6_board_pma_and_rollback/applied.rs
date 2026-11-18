@@ -21,6 +21,7 @@ struct PausedRoom {
     fences: Arc<RoomFenceTable>,
     pause: Mutex<Option<Pause>>,
     accepted: Mutex<Option<AcceptedRoomCarrier>>,
+    pinned: Mutex<Option<(NoteId, LeaseEpoch)>>,
 }
 
 impl PausedRoom {
@@ -98,8 +99,18 @@ impl LiveCollabInterceptor for PausedRoom {
         })
     }
 
-    fn filename_pin(&self, _: SpaceContext, _: NoteId) -> PortFuture<'_, FilenamePin> {
-        Box::pin(async { Ok(FilenamePin::Unpinned) })
+    fn filename_pin(&self, _: SpaceContext, note: NoteId) -> PortFuture<'_, FilenamePin> {
+        Box::pin(async move {
+            let pin = self.pinned.lock().unwrap();
+            match pin.as_ref() {
+                Some((pinned, lease)) if *pinned == note => Ok(FilenamePin::Pinned {
+                    note,
+                    filename: "room-move".into(),
+                    lease: *lease,
+                }),
+                _ => Ok(FilenamePin::Unpinned),
+            }
+        })
     }
 }
 
@@ -114,8 +125,10 @@ pub(super) async fn check(
         fences: Arc::clone(store.room_fences()),
         pause: Mutex::new(None),
         accepted: Mutex::new(None),
+        pinned: Mutex::new(None),
     });
     store.register_collab_interceptor(room.clone()).unwrap();
+    check_move_pin(store, ctx, &room).await;
     let scope = ctx.scope();
     let actor = ctx.auth().principal();
     let note = sample_note_id(0xe7);
@@ -306,6 +319,113 @@ pub(super) async fn check(
         store.move_board_card(ctx.clone(), saved_card).await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
+}
+
+async fn check_move_pin(store: &CanonicalStore, ctx: &SpaceContext, room: &PausedRoom) {
+    use notarium_core::ports::{AcceptBatch, BatchItem, MoveNote};
+
+    let note = NoteId::from_bytes(*b"batch-move-pin!!");
+    let scope = ctx.scope();
+    let actor = ctx.auth().principal();
+    let create = next_mutation(
+        scope,
+        actor,
+        BatchItem::Create(CreateNote {
+            note: note.clone(),
+            parent: None,
+            slug: "before-room-move".into(),
+            class: DocClass::UserDoc,
+            carrier: "Remember the filename.\n".into(),
+        }),
+    );
+    let mov = |slug: &str| MoveNote {
+        note: note.clone(),
+        parent: None,
+        slug: slug.into(),
+    };
+    let before_room = store
+        .accept_batch(
+            ctx.clone(),
+            AcceptBatch {
+                items: vec![
+                    create,
+                    next_mutation(scope, actor, BatchItem::Move(mov("room-move"))),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+    let before = before_room.items[1].as_ref().unwrap();
+    let active = store
+        .open_collab_session(
+            &ctx.budget,
+            OpenCollabSession {
+                scope: scope.clone(),
+                note: note.clone(),
+                owner_id: "filename-owner".into(),
+                expected_carrier_rev: before.value.revision.clone(),
+                expected_lease: None,
+                expected_lineage: None,
+                initial_yrs_snapshot: None,
+                allow_fenced_recovery: false,
+            },
+        )
+        .await
+        .unwrap();
+    *room.pinned.lock().unwrap() = Some((note.clone(), active.lease_epoch));
+    let request = next_mutation(scope, actor, mov("after-room-move"));
+    let batch = AcceptBatch {
+        items: vec![Mutation {
+            identity: request.identity.clone(),
+            preconditions: request.preconditions.clone(),
+            input: BatchItem::Move(request.input.clone()),
+        }],
+    };
+    let cut = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    for error in [
+        store
+            .move_note(ctx.clone(), request.clone())
+            .await
+            .unwrap_err(),
+        store
+            .accept_batch(ctx.clone(), batch.clone())
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(matches!(error, PortError::Unavailable(failure)
+            if failure.effect() == notarium_core::error::CommitEffect::NotCommitted));
+    }
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        cut
+    );
+    *room.pinned.lock().unwrap() = None;
+    let result = store
+        .accept_batch(ctx.clone(), batch.clone())
+        .await
+        .unwrap();
+    let moved = result.items[0].as_ref().unwrap();
+    let durable = store
+        .read_collab_session(Some(&ctx.budget), scope, &note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.session.room_state, CollabRoomState::Active);
+    assert_eq!(durable.session.carrier_rev_id, moved.value.revision);
+    assert_eq!(durable.session.lineage_epoch, active.lineage_epoch);
+    *room.pinned.lock().unwrap() = Some((note, active.lease_epoch));
+    assert_eq!(
+        store.move_note(ctx.clone(), request).await.unwrap().receipt,
+        moved.receipt
+    );
+    assert_eq!(
+        store.accept_batch(ctx.clone(), batch).await.unwrap().items[0]
+            .as_ref()
+            .unwrap()
+            .receipt,
+        moved.receipt
+    );
+    *room.pinned.lock().unwrap() = None;
 }
 
 async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, room: &PausedRoom) {
@@ -584,6 +704,7 @@ async fn committed_room_observation_survives_process_exit() {
             fences: Arc::clone(store.room_fences()),
             pause: Mutex::new(None),
             accepted: Mutex::new(None),
+            pinned: Mutex::new(None),
         });
         room.accept(
             &active,

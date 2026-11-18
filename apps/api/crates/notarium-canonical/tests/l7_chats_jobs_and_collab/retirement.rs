@@ -535,3 +535,353 @@ async fn retrying_owner_keeps_its_upload_and_cleans_a_dropped_caller_executor() 
     rt.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }
+
+#[tokio::test]
+async fn lease_turnover_respects_budget_and_recovers_beyond_a_local_pin() {
+    use notarium_canonical::blobs::BlobOwnerKind;
+    use notarium_core::error::CommitEffect;
+    let fixtures = StorageTestFixtures::load_required();
+    let old = LeaseEpoch::new(1).unwrap();
+    let next = LeaseEpoch::new(2).unwrap();
+    for pg in [false, true] {
+        let root = TempDataRoot::new("lease-interruption");
+        let schema = fixtures.fresh_pg_schema();
+        let cfg = if pg {
+            fixtures.pg_local_config(sample_installation_id(0xe2), &schema, root.data_root())
+        } else {
+            CanonicalConfig::local_default(sample_installation_id(0xe2), root.data_root())
+        };
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+        for cancel in [false, true] {
+            let (scope, actor, _) = create_thread(&store, if cancel { 0xe3 } else { 0xe4 }).await;
+            let mut ctx = support::maintenance_ctx(ServicePurpose::Revocation);
+            if cancel {
+                ctx.budget.cancellation.cancel();
+            } else {
+                ctx.budget.remaining = Duration::ZERO;
+            }
+            let rejected = store.advance_space_lease(&ctx, &scope, next).await;
+            assert!(
+                matches!(rejected, Err(PortError::Cancelled(e) | PortError::DeadlineExceeded(e)) if e.effect()==CommitEffect::NotCommitted)
+            );
+            assert_eq!(
+                store
+                    .read_space(&scope.space_id)
+                    .await
+                    .unwrap()
+                    .active_epoch,
+                old
+            );
+
+            // A safe point keeps a live request waiting before it can update the epoch.
+            let mut backup = store
+                .prepare(
+                    support::maintenance_ctx(ServicePurpose::Backup),
+                    BackupId::from_bytes(random_bytes_16()),
+                    store.default_backup_budget(),
+                )
+                .await
+                .unwrap();
+            let hold = backup.acquire_hold().await.unwrap();
+            let pause = backup.pause_writes().await.unwrap();
+            let mut waiting = support::maintenance_ctx(ServicePurpose::Revocation);
+            waiting.budget.remaining = Duration::from_millis(50);
+            assert!(
+                matches!(store.advance_space_lease(&waiting, &scope, next).await,
+                Err(PortError::DeadlineExceeded(e)) if e.effect()==CommitEffect::NotCommitted)
+            );
+            pause.resume().await.unwrap();
+            hold.release().await.unwrap();
+            assert_eq!(
+                store
+                    .read_space(&scope.space_id)
+                    .await
+                    .unwrap()
+                    .active_epoch,
+                old
+            );
+
+            let text = "an unowned local publication held by a live staging ticket ".repeat(20);
+            let prepared = store.prepare_blob(text.as_bytes()).unwrap();
+            store
+                .stage_chat_blob(owner_ctx(&scope, actor.clone()), &text)
+                .await
+                .unwrap();
+            let pin = store.stage_blob(&scope, old, &prepared).await.unwrap();
+            let released = store
+                .release_blob_owner_references(
+                    &scope,
+                    old,
+                    BlobOwnerKind::StagedChat,
+                    actor.as_str(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(released, vec![prepared.digest()]);
+            let mut ctx = support::maintenance_ctx(ServicePurpose::Revocation);
+            ctx.budget.remaining = if cancel {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_millis(500)
+            };
+            let token = ctx.budget.cancellation.clone();
+            let active = store.clone();
+            let target = scope.clone();
+            let task =
+                tokio::spawn(async move { active.advance_space_lease(&ctx, &target, next).await });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while pending(&store).await == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if cancel {
+                token.cancel();
+            }
+            let granted = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(granted, next);
+            assert_eq!(
+                store
+                    .read_space(&scope.space_id)
+                    .await
+                    .unwrap()
+                    .active_epoch,
+                next
+            );
+            assert!(
+                root.data_root()
+                    .blob(&scope.space_id, prepared.digest())
+                    .is_file()
+            );
+            drop(pin);
+            wait_for_cleanup(&store).await;
+            assert!(
+                !root
+                    .data_root()
+                    .blob(&scope.space_id, prepared.digest())
+                    .exists()
+            );
+            assert_validation_err(
+                &store.stage_blob(&scope, old, &prepared).await,
+                ValidationReason::InvalidAuthority,
+            );
+            assert_eq!(
+                store
+                    .advance_space_lease(
+                        &support::maintenance_ctx(ServicePurpose::Revocation),
+                        &scope,
+                        next
+                    )
+                    .await
+                    .unwrap(),
+                next
+            );
+        }
+        runtime.shutdown().await.unwrap();
+        if pg {
+            fixtures.drop_pg_schema(&schema).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn postgres_inflight_lease_commit_keeps_its_grant_with_the_initiator() {
+    use notarium_core::error::{CommitEffect, RetryAdvice};
+    use sqlx::Connection;
+    let fixtures = StorageTestFixtures::load_required();
+    let first = TempDataRoot::new("lease-ack-old");
+    let second = TempDataRoot::new("lease-ack-new");
+    let schema = fixtures.fresh_pg_schema();
+    let install = sample_installation_id(0xe5);
+    let (old, old_runtime) = CanonicalRuntime::open(fixtures.pg_local_config(
+        install.clone(),
+        &schema,
+        first.data_root(),
+    ))
+    .await
+    .unwrap();
+    let (scope, _, _) = create_thread(&old, 0xe5).await;
+    let (owner, runtime) =
+        CanonicalRuntime::open(fixtures.pg_local_config(install, &schema, second.data_root()))
+            .await
+            .unwrap();
+    let mut admin = fixtures.open_raw_pg().await;
+    let mut probe = fixtures.open_raw_pg().await;
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE FUNCTION {schema}.hold_lease_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(hashtextextended('{schema}',8509)); RETURN NEW; END; $$; CREATE CONSTRAINT TRIGGER lease_commit AFTER UPDATE ON {schema}.spaces DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {schema}.hold_lease_commit()")))
+        .execute(&mut probe).await.unwrap();
+    let next = LeaseEpoch::new(2).unwrap();
+    for in_commit in [false, true] {
+        let mut barrier = admin.begin().await.unwrap();
+        if in_commit {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,8509))")
+                .bind(&schema)
+                .execute(&mut *barrier)
+                .await
+                .unwrap();
+        } else {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT space_id FROM {schema}.spaces FOR UPDATE"
+            )))
+            .execute(&mut *barrier)
+            .await
+            .unwrap();
+        }
+        let ctx = support::maintenance_ctx(ServicePurpose::Revocation);
+        let cancel = ctx.budget.cancellation.clone();
+        let running = owner.advance_space_lease(&ctx, &scope, next);
+        tokio::pin!(running);
+        let blocked = async {
+            loop {
+                let waiting: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))").bind(pid).fetch_one(&mut probe).await.unwrap();
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        };
+        tokio::select! {r = &mut running => panic!("expected blocked lease: {r:?}"), ()=blocked=>{} }
+        cancel.cancel();
+        let expected = if in_commit {
+            CommitEffect::Unknown
+        } else {
+            CommitEffect::NotCommitted
+        };
+        assert!(
+            matches!(tokio::time::timeout(Duration::from_secs(1), &mut running).await.unwrap(), Err(PortError::Cancelled(e)) if e.effect()==expected && e.retry()==RetryAdvice::RetrySameCommand)
+        );
+        if !in_commit {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let blocked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))").bind(pid).fetch_one(&mut probe).await.unwrap();
+                    if !blocked { break; }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }).await.expect("cancelled lease must release its database session while the row stays locked");
+        }
+        barrier.rollback().await.unwrap();
+        if !in_commit {
+            assert_eq!(
+                old.read_space(&scope.space_id).await.unwrap().active_epoch,
+                LeaseEpoch::new(1).unwrap()
+            );
+        }
+    }
+    // A new takeover request could mask a rolled-back first attempt. Observe
+    // its SQL effect, then use the original initiator's grant for a normal write.
+    let prepared = owner.prepare_blob(b"owner after a delayed commit").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while old.read_space(&scope.space_id).await.unwrap().active_epoch != next {
+            tokio::task::yield_now().await;
+        }
+        loop {
+            match owner.stage_blob(&scope, next, &prepared).await {
+                Ok(_) => break,
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if diagnostic.reason == ValidationReason::InvalidAuthority =>
+                {
+                    tokio::task::yield_now().await
+                }
+                Err(e) => panic!("unexpected staging failure: {e:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the initiating runtime publishes the actual COMMIT acknowledgement");
+    let ctx = support::maintenance_ctx(ServicePurpose::Revocation);
+    assert_eq!(
+        owner.advance_space_lease(&ctx, &scope, next).await.unwrap(),
+        next
+    );
+    assert_validation_err(
+        &old.advance_space_lease(&ctx, &scope, next).await,
+        ValidationReason::InvalidState,
+    );
+    runtime.shutdown().await.unwrap();
+    old_runtime.shutdown().await.unwrap();
+    fixtures.drop_pg_schema(&schema).await;
+}
+
+#[tokio::test]
+async fn lease_reports_permanent_recovery_failure_after_grant() {
+    use notarium_core::error::{CommitEffect, RetryAdvice};
+    let fixtures = StorageTestFixtures::load_required();
+    for pg in [false, true] {
+        let root = TempDataRoot::new("lease-recovery-outcome");
+        let schema = fixtures.fresh_pg_schema();
+        let install = sample_installation_id(0xe7);
+        let cfg = if pg {
+            fixtures.pg_local_config(install, &schema, root.data_root())
+        } else {
+            CanonicalConfig::local_default(install, root.data_root())
+        };
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+        let (scope, _, _) = create_thread(&store, 0xe7).await;
+        let next = LeaseEpoch::new(2).unwrap();
+        let mut ctx = support::maintenance_ctx(ServicePurpose::Revocation);
+        ctx.budget.remaining = Duration::from_secs(10);
+        // A missing required table is reported as Internal/Never by the
+        // recovery scanner. The Space epoch update can still commit normally.
+        if pg {
+            let mut admin = fixtures.open_raw_pg().await;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {schema}.pending_purges RENAME TO hidden_purges"
+            )))
+            .execute(&mut admin)
+            .await
+            .unwrap();
+        } else {
+            sqlx::query("ALTER TABLE pending_purges RENAME TO hidden_purges")
+                .execute(&mut root.open_raw_sqlite().await)
+                .await
+                .unwrap();
+        }
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            store.advance_space_lease(&ctx, &scope, next),
+        )
+        .await
+        .expect("permanent recovery failure must return before the caller budget expires");
+        assert!(
+            matches!(outcome, Err(PortError::Internal(e)) if e.effect() == CommitEffect::Unknown && e.retry() == RetryAdvice::Never)
+        );
+        assert_eq!(
+            store
+                .read_space(&scope.space_id)
+                .await
+                .unwrap()
+                .active_epoch,
+            next
+        );
+        if pg {
+            let mut admin = fixtures.open_raw_pg().await;
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {schema}.hidden_purges RENAME TO pending_purges"
+            )))
+            .execute(&mut admin)
+            .await
+            .unwrap();
+        } else {
+            sqlx::query("ALTER TABLE hidden_purges RENAME TO pending_purges")
+                .execute(&mut root.open_raw_sqlite().await)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.advance_space_lease(&ctx, &scope, next).await.unwrap(),
+            next
+        );
+        runtime.shutdown().await.unwrap();
+        if pg {
+            fixtures.drop_pg_schema(&schema).await;
+        }
+    }
+}

@@ -413,7 +413,7 @@ impl CanonicalStore {
                         .fetch_optional(&mut **conn)
                         .await
                         .map_err(|err| {
-                            internal_not_committed("pg_get_backup_artifact", err.to_string())
+                            crate::runtime::pg_read_error("pg_get_backup_artifact", err)
                         })?;
                         r.map(|row| {
                             (
@@ -2629,7 +2629,7 @@ struct ActiveSpool {
     cancel: Cancellation,
     task: tokio::task::JoinHandle<Result<BackupSpool, PortError>>,
 }
-struct CancelOnDrop(Cancellation);
+pub(crate) struct CancelOnDrop(pub(crate) Cancellation);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.cancel();

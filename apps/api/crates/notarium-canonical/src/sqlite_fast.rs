@@ -270,7 +270,9 @@ impl SqliteFastReadPool {
                         .as_ref()
                         .is_some_and(|s| s.dropped.load(Ordering::Acquire))
             };
-            let tx_deadline = (Instant::now() + wal.read_deadline()).min(caller_deadline);
+            let tx_deadline = Instant::now()
+                .checked_add(wal.read_deadline())
+                .map_or(caller_deadline, |read| caller_deadline.min(read));
             let sql = (|| {
                 if let Some((state, started)) = worker {
                     *state.interrupt.lock().expect("worker read interrupt mutex") =
@@ -574,7 +576,8 @@ pub(crate) async fn get_note_sqlite_local_fast(
     mut ctx: SpaceContext,
     request: GetNote,
 ) -> Result<NoteSnapshot, PortError> {
-    let caller_deadline = tokio::time::Instant::now() + ctx.budget.remaining;
+    let caller_deadline =
+        crate::runtime::deadline_after(tokio::time::Instant::now(), ctx.budget.remaining);
     store.ensure_open()?;
     let SqlDriverState::Sqlite { fast_read_pool, .. } = &store.inner.sql else {
         return Err(internal_not_committed(
@@ -2885,6 +2888,18 @@ impl SqliteSyncItemPlan for CreateNoteFastPlan {
                     DomainError::ResourceNotFound.into(),
                 ));
             }
+            let (current, _) = build_resource_facts_cached(
+                conn,
+                cache,
+                &item_ctx.space,
+                &existing.parent_folder_id,
+                existing.doc_class,
+                existing.ability_id,
+                false,
+            )
+            .map_err(FastItemExecError::PreWrite)?;
+            auth.authorize_direct_write(&current, &current)
+                .map_err(|e| FastItemExecError::PreWrite(e.into()))?;
             return Err(FastItemExecError::PreWrite(
                 DomainError::RevisionConflict {
                     current: existing.head_rev_id,
@@ -6742,6 +6757,7 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
     auth: &EngineAuthContext,
     input: &RollbackAgentRun,
 ) -> Result<BTreeMap<NoteId, NoteHeadRow>, PortError> {
+    auth.authorize_space_write(space)?;
     let run_row: Option<(Vec<u8>, String)> = {
         let mut stmt = conn
             .prepare_cached(
@@ -6770,13 +6786,6 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
 
     let actual_run_rev = RevisionId::parse(&run_rev_raw)
         .map_err(|_| internal_not_committed("corrupt_run_rev", "invalid run_revision"))?;
-    if actual_run_rev != input.expected_run_revision {
-        return Err(DomainError::RevisionConflict {
-            current: actual_run_rev,
-            lineage: None,
-        }
-        .into());
-    }
 
     let mut caller_notes: BTreeMap<NoteId, RevisionId> = BTreeMap::new();
     for exp in &input.expected_entities {
@@ -6818,15 +6827,8 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
     }
 
     let mut heads_map = BTreeMap::new();
-    for (nid, exp_rev) in &caller_notes {
+    for nid in caller_notes.keys() {
         let head = load_note_head_row_rusqlite(conn, &scope.space_id, nid)?;
-        if head.head_rev_id != *exp_rev {
-            return Err(DomainError::RevisionConflict {
-                current: head.head_rev_id,
-                lineage: None,
-            }
-            .into());
-        }
         let (rfacts, _) = build_resource_facts_cached(
             conn,
             cache,
@@ -6840,6 +6842,9 @@ fn verify_run_and_entity_preconditions_note_only_rusqlite(
         heads_map.insert(nid.clone(), head);
     }
 
+    crate::domain::rollback::verify_authorized_rollback_revisions(actual_run_rev, input, |nid| {
+        heads_map.get(nid).map(|head| &head.head_rev_id)
+    })?;
     Ok(heads_map)
 }
 

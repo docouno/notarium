@@ -433,7 +433,7 @@ pub(crate) async fn load_overlay_row_opt_tx(
                 .bind(target_note.as_str())
                 .fetch_optional(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("pg_load_overlay_row", err.to_string()))?;
+                .map_err(|err| crate::runtime::pg_read_error("pg_load_overlay_row", err))?;
             row.map(|r| {
                 (
                     r.get("group_key_msgpack"),
@@ -514,7 +514,7 @@ pub(crate) async fn load_view_overlays_tx(
             .bind(view.key.as_str())
             .fetch_all(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_view_overlays", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_view_overlays", err))?;
             fetched
                 .into_iter()
                 .map(|r| {
@@ -782,9 +782,10 @@ fn destination_group_rows<'a>(
 
 pub(crate) async fn move_board_card_impl(
     store: &CanonicalStore,
-    ctx: SpaceContext,
+    mut ctx: SpaceContext,
     request: Mutation<MoveBoardCard>,
 ) -> Result<Committed<BoardMoveResult>, PortError> {
+    let deadline = super::common::CommandDeadline::start(&ctx.budget, "board_move");
     validate_mutation_identity(&ctx, &request.identity)?;
     for (field_key, opt_val) in &request.input.fields {
         authorize_field_key(field_key)?;
@@ -816,13 +817,17 @@ pub(crate) async fn move_board_card_impl(
         ]),
     );
     idemp.require_receipt_detail = true;
-    if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedBoardMoveV1>(
-        store,
-        ctx.scope(),
-        &idemp,
-        Some(&ctx.budget),
-    )
-    .await?
+    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+    if let Some(replayed) = deadline
+        .wait(&ctx.budget, || {
+            try_replay_completed_receipt::<StoredCommittedBoardMoveV1>(
+                store,
+                ctx.scope(),
+                &idemp,
+                Some(&ctx.budget),
+            )
+        })
+        .await??
     {
         return Ok(replayed.into_committed());
     }
@@ -835,6 +840,7 @@ pub(crate) async fn move_board_card_impl(
         .clone();
 
     for attempt in 0..MAX_PLANNER_RETRIES {
+        ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
         // Pre-read target note head & authorize direct write before live-room interception or CAS staging.
         let ctx_read = ctx.clone();
         let target_id = request.input.note.clone();
@@ -875,9 +881,12 @@ pub(crate) async fn move_board_card_impl(
             return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
         }
 
-        let facts = provider
-            .evaluate_move(&board_authority, ctx.clone(), None, request.input.clone())
-            .await?;
+        ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+        let facts = deadline
+            .wait(&ctx.budget, || {
+                provider.evaluate_move(&board_authority, ctx.clone(), None, request.input.clone())
+            })
+            .await??;
         facts.verify_authority(&board_authority)?;
         ctx.scope().check(facts.scope())?;
         if facts.view() != &request.input.view {
@@ -899,30 +908,49 @@ pub(crate) async fn move_board_card_impl(
         let mut reservation_opt = None;
         if let Some(interceptor) = store.inner.collab_interceptor.get() {
             destination_group_rows(&facts, &request.input)?;
-            match interceptor
-                .intercept(InterceptedMutation {
-                    context: ctx.clone(),
-                    identity: request.identity.clone(),
-                    preconditions: request.preconditions.clone(),
-                    payload: InterceptedPayload::MoveBoardCard {
-                        card: request.input.clone(),
-                        facts: Box::new(facts.clone()),
-                    },
+            ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+            let mut dispatched = false;
+            let response = deadline
+                .wait(&ctx.budget, || async {
+                    dispatched = true;
+                    interceptor
+                        .intercept(InterceptedMutation {
+                            context: ctx.clone(),
+                            identity: request.identity.clone(),
+                            preconditions: request.preconditions.clone(),
+                            payload: InterceptedPayload::MoveBoardCard {
+                                card: request.input.clone(),
+                                facts: Box::new(facts.clone()),
+                            },
+                        })
+                        .await
                 })
-                .await?
-            {
+                .await;
+            let unknown = |_| {
+                crate::codec::unknown_commit_outcome(
+                    "board_room_outcome_unknown",
+                    "the room may have applied the Board command",
+                )
+            };
+            match response.map_err(|err| if dispatched { unknown(err) } else { err })?? {
                 InterceptionResult::Applied(receipt) => {
-                    return applied_outcome(
-                        store,
-                        &ctx,
-                        &idemp,
-                        receipt,
-                        |row: StoredCommittedBoardMoveV1| {
-                            (row.revision.note == request.input.note).then(|| row.into_committed())
-                        },
-                    )
-                    .await?
-                    .ok_or_else(super::notes::missing_applied_outcome);
+                    ctx.budget.remaining = deadline.remaining(&ctx.budget).map_err(unknown)?;
+                    return deadline
+                        .wait(&ctx.budget, || {
+                            applied_outcome(
+                                store,
+                                &ctx,
+                                &idemp,
+                                receipt,
+                                |row: StoredCommittedBoardMoveV1| {
+                                    (row.revision.note == request.input.note)
+                                        .then(|| row.into_committed())
+                                },
+                            )
+                        })
+                        .await
+                        .map_err(unknown)??
+                        .ok_or_else(super::notes::missing_applied_outcome);
                 }
                 InterceptionResult::SettleCarrier(_) => {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
@@ -948,9 +976,11 @@ pub(crate) async fn move_board_card_impl(
                 "active note lacks content_blake3",
             )
         })?;
-        let raw_bytes = store
-            .read_verified_blob(&space_rec.scope, base_digest)
-            .await?;
+        let raw_bytes = deadline
+            .wait(&ctx.budget, || {
+                store.read_verified_blob(&space_rec.scope, base_digest)
+            })
+            .await??;
         let base_carrier = String::from_utf8(raw_bytes).map_err(|_| {
             internal_not_committed(
                 "corrupt_note_utf8",
@@ -988,13 +1018,15 @@ pub(crate) async fn move_board_card_impl(
                 &base_head.slug,
                 store.blob_codec(),
             )?;
-            let ticket = store
-                .stage_blob_for_batch(
-                    &space_rec.scope,
-                    space_rec.active_epoch,
-                    &info.prepared_blob,
-                )
-                .await?;
+            let ticket = deadline
+                .wait(&ctx.budget, || {
+                    store.stage_blob_for_batch(
+                        &space_rec.scope,
+                        space_rec.active_epoch,
+                        &info.prepared_blob,
+                    )
+                })
+                .await??;
             Some((info, ticket))
         } else {
             None
@@ -1105,33 +1137,31 @@ pub(crate) async fn move_board_card_impl(
                         overlays.get(&input.note),
                         &head.head_rev_id,
                     )?;
-                    for neighbor in input.before.iter().chain(&input.after) {
-                        verify_rank_expectation(
-                            &neighbor.expected_rank,
-                            overlays.get(&neighbor.note),
-                            &view_head.head_rev_id,
-                        )?;
-                    }
-
                     // Verify every row in `eval_group_rows` still matches its `expected_note` & `expected_rank`.
                     let mut verified_neighbors = HashMap::with_capacity(eval_group_rows.len());
+                    let mut folder_cache = super::common::FolderAncestryCache::default();
                     for row in eval_group_rows {
-                        let rhead =
-                            load_note_head_row_tx(tx, &scope_cl.space_id, &row.note).await?;
-                        if rhead.lifecycle != Lifecycle::Active
-                            || rhead.head_rev_id != row.expected_note
-                        {
-                            return Err(DomainError::RevisionConflict {
-                                current: rhead.head_rev_id,
-                                lineage: None,
-                            }
-                            .into());
-                        }
+                        let rhead = verified_board_row_tx(
+                            tx,
+                            &item_ctx.space,
+                            &auth,
+                            &mut folder_cache,
+                            row,
+                        )
+                        .await?;
                         verified_neighbors.insert(&row.note, (&row.expected_note, rhead.doc_class));
                         verify_rank_expectation(
                             &row.expected_rank,
                             overlays.get(&row.note),
                             &rhead.head_rev_id,
+                        )?;
+                    }
+
+                    for neighbor in input.before.iter().chain(&input.after) {
+                        verify_rank_expectation(
+                            &neighbor.expected_rank,
+                            overlays.get(&neighbor.note),
+                            &view_head.head_rev_id,
                         )?;
                     }
 
@@ -1691,8 +1721,16 @@ pub(crate) async fn move_board_card_impl(
             }),
         };
 
+        ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
         match store
-            .submit_write_command::<StoredCommittedBoardMoveV1>(&ctx.budget, intent)
+            .submit_write_command_until::<StoredCommittedBoardMoveV1>(
+                &ctx.budget,
+                deadline.at,
+                intent,
+                None,
+                None,
+                None,
+            )
             .await
         {
             Ok(decoded) => {
@@ -1716,6 +1754,38 @@ pub(crate) async fn move_board_card_impl(
         "board facts cutoff contended across bounded retries",
         std::time::Duration::from_millis(10),
     ))
+}
+
+pub(crate) async fn verified_board_row_tx(
+    tx: &mut BackendConn<'_>,
+    space: &notarium_core::auth::Space,
+    auth: &notarium_core::auth::EngineAuthContext,
+    folders: &mut super::common::FolderAncestryCache,
+    row: &EvaluatedBoardRow,
+) -> Result<super::common::NoteHeadRow, PortError> {
+    let head = load_note_head_row_tx(tx, &space.id, &row.note).await?;
+    if head.lifecycle != Lifecycle::Active {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let (facts, _) = folders
+        .build_resource_facts_tx(
+            tx,
+            space,
+            &head.parent_folder_id,
+            head.doc_class,
+            head.ability_id.clone(),
+            true,
+        )
+        .await?;
+    auth.authorize_read(&facts)?;
+    if head.head_rev_id != row.expected_note {
+        return Err(DomainError::RevisionConflict {
+            current: head.head_rev_id,
+            lineage: None,
+        }
+        .into());
+    }
+    Ok(head)
 }
 
 pub(crate) async fn authorized_view_head(

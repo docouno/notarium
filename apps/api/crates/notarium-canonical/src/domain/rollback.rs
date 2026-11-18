@@ -205,9 +205,7 @@ pub(crate) async fn rollback_agent_run_impl(
     mut ctx: SpaceContext,
     request: Mutation<RollbackAgentRun>,
 ) -> Result<Committed<RollbackResult>, PortError> {
-    let deadline = Instant::now()
-        .checked_add(ctx.budget.remaining)
-        .unwrap_or_else(|| tokio::time::sleep(ctx.budget.remaining).deadline());
+    let deadline = super::common::CommandDeadline::start(&ctx.budget, "rollback").at;
     validate_mutation_identity(&ctx, &request.identity)?;
     let idemp = build_rollback_identity_spec(&request)?.with_policy(
         ctx.auth(),
@@ -255,20 +253,18 @@ pub(crate) async fn rollback_agent_run_impl(
         if matches!(
             store.inner.sql,
             crate::runtime::SqlDriverState::Postgres { .. }
-        ) {
-            if let Some(outcome) = try_execute_pg_root_rollback(
-                store,
-                &ctx,
-                &idemp,
-                &request,
-                writer_epoch,
-                &mut try_pg_batch_plan,
-                deadline,
-            )
-            .await
-            {
-                return outcome;
-            }
+        ) && let Some(outcome) = try_execute_pg_root_rollback(
+            store,
+            &ctx,
+            &idemp,
+            &request,
+            writer_epoch,
+            &mut try_pg_batch_plan,
+            deadline,
+        )
+        .await
+        {
+            return outcome;
         }
         ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
         let single_res: Result<StoredCommittedRollbackV1, PortError> = if store.is_sqlite_local() {
@@ -607,6 +603,7 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
 ) -> crate::writer::ItemExecuteFn {
     Box::new(move |tx, item_ctx| {
         Box::pin(async move {
+            auth.authorize_space_write(&item_ctx.space)?;
             let mut folder_cache = FolderAncestryCache::default();
             // 1. Consolidated Space + Run + RootFolder state probe (1 single query on PostgreSQL!).
             type RollbackStateProbeTuple =
@@ -774,13 +771,6 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
 
             let actual_run_rev = RevisionId::parse(&run_rev_raw)
                 .map_err(|_| internal_not_committed("corrupt_run_rev", "invalid run_revision"))?;
-            if actual_run_rev != input.expected_run_revision {
-                return Err(DomainError::RevisionConflict {
-                    current: actual_run_rev,
-                    lineage: None,
-                }
-                .into());
-            }
 
             let purged_notes = if has_pf {
                 load_space_purged_notes_tx(tx, &scope_cl.space_id).await?
@@ -820,15 +810,8 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
             let mut heads_map =
                 load_note_heads_batch_tx(tx, &scope_cl.space_id, &caller_note_vec).await?;
 
-            for (nid, exp_rev) in &caller_notes {
+            for nid in caller_notes.keys() {
                 let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
-                if head.head_rev_id != *exp_rev {
-                    return Err(DomainError::RevisionConflict {
-                        current: head.head_rev_id.clone(),
-                        lineage: None,
-                    }
-                    .into());
-                }
                 let (rfacts, _) = folder_cache
                     .build_resource_facts_tx(
                         tx,
@@ -841,6 +824,10 @@ pub(crate) fn build_rollback_direct_single_tx_exec(
                     .await?;
                 auth.authorize_direct_write(&rfacts, &rfacts)?;
             }
+
+            verify_authorized_rollback_revisions(actual_run_rev, &input, |nid| {
+                heads_map.get(nid).map(|head| &head.head_rev_id)
+            })?;
 
             let collab_states = if has_cs {
                 load_space_collab_states_tx(tx, &scope_cl.space_id).await?
@@ -1461,7 +1448,19 @@ fn build_rollback_execute_fn(
 ) -> crate::writer::ItemExecuteFn {
     Box::new(move |tx, item_ctx| {
         Box::pin(async move {
-            // 1. Consume all closed-room reservations in ascending NoteId order.
+            // 1. Re-verify `expected_run_revision`, `expected_entities`, and `associated_board_expectations`.
+            let mut folder_cache = FolderAncestryCache::default();
+            let _ = verify_run_and_entity_preconditions_tx(
+                tx,
+                &scope_cl,
+                &item_ctx.space,
+                &auth,
+                &input,
+                &mut folder_cache,
+            )
+            .await?;
+
+            // 2. Consume all closed-room reservations in ascending NoteId order.
             let collab_states = load_space_collab_states_tx(tx, &scope_cl.space_id).await?;
             for (nid, res) in eligible_reservations {
                 let guard = room_fences
@@ -1473,18 +1472,6 @@ fn build_rollback_execute_fn(
                 }
                 item_ctx.retain_until_batch_commit(guard);
             }
-
-            // 2. Re-verify `expected_run_revision`, `expected_entities`, and `associated_board_expectations`.
-            let mut folder_cache = FolderAncestryCache::default();
-            let _ = verify_run_and_entity_preconditions_tx(
-                tx,
-                &scope_cl,
-                &item_ctx.space,
-                &auth,
-                &input,
-                &mut folder_cache,
-            )
-            .await?;
 
             // 3. Validate folder existence and post-trash slug uniqueness for all eligible restored notes.
             let eligible_all_ids: BTreeSet<NoteId> = eligible_notes.keys().cloned().collect();
@@ -1592,17 +1579,14 @@ fn build_rollback_execute_fn(
                     // Verify planner rows match current note & overlay state.
                     for eg in &view_facts.groups {
                         for row in &eg.rows {
-                            let rhead =
-                                load_note_head_row_tx(tx, &scope_cl.space_id, &row.note).await?;
-                            if rhead.lifecycle != Lifecycle::Active
-                                || rhead.head_rev_id != row.expected_note
-                            {
-                                return Err(DomainError::RevisionConflict {
-                                    current: rhead.head_rev_id,
-                                    lineage: None,
-                                }
-                                .into());
-                            }
+                            let rhead = super::board::verified_board_row_tx(
+                                tx,
+                                &item_ctx.space,
+                                &auth,
+                                &mut folder_cache,
+                                row,
+                            )
+                            .await?;
                             verify_rank_expectation(
                                 &row.expected_rank,
                                 overlays.get(&row.note),
@@ -2537,6 +2521,31 @@ async fn discover_rollback_state_tx(
     ))
 }
 
+pub(crate) fn verify_authorized_rollback_revisions<'a>(
+    actual_run: RevisionId,
+    input: &RollbackAgentRun,
+    current_head: impl Fn(&NoteId) -> Option<&'a RevisionId>,
+) -> Result<(), PortError> {
+    if actual_run != input.expected_run_revision {
+        return Err(DomainError::RevisionConflict {
+            current: actual_run,
+            lineage: None,
+        }
+        .into());
+    }
+    for expected in &input.expected_entities {
+        let current = current_head(&expected.note).ok_or(DomainError::ResourceNotFound)?;
+        if current != &expected.revision {
+            return Err(DomainError::RevisionConflict {
+                current: current.clone(),
+                lineage: None,
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
 async fn verify_run_and_entity_preconditions_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
@@ -2545,6 +2554,7 @@ async fn verify_run_and_entity_preconditions_tx(
     input: &RollbackAgentRun,
     folder_cache: &mut FolderAncestryCache,
 ) -> Result<(BTreeMap<NoteId, NoteHeadRow>, Vec<RunBoardMoveRow>), PortError> {
+    auth.authorize_space_write(space)?;
     for view in input
         .associated_board_expectations
         .iter()
@@ -2575,7 +2585,7 @@ async fn verify_run_and_entity_preconditions_tx(
             .bind(input.run.as_str())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_run_head", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_run_head", err))?;
             row.map(|r| (r.get("history_incarnation"), r.get("run_revision")))
         }
     };
@@ -2594,13 +2604,6 @@ async fn verify_run_and_entity_preconditions_tx(
 
     let actual_run_rev = RevisionId::parse(&run_rev_raw)
         .map_err(|_| internal_not_committed("corrupt_run_rev", "invalid run_revision"))?;
-    if actual_run_rev != input.expected_run_revision {
-        return Err(DomainError::RevisionConflict {
-            current: actual_run_rev,
-            lineage: None,
-        }
-        .into());
-    }
 
     // Discover full touched set of notes in `revisions` UNION `board_move_history`.
     let mut touched_set: BTreeSet<NoteId> = BTreeSet::new();
@@ -2630,7 +2633,7 @@ async fn verify_run_and_entity_preconditions_tx(
     let caller_note_vec: Vec<NoteId> = caller_notes.keys().cloned().collect();
     let heads_map = load_note_heads_batch_tx(tx, &scope.space_id, &caller_note_vec).await?;
 
-    for (nid, exp_rev) in &caller_notes {
+    for nid in caller_notes.keys() {
         let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
         let (rfacts, _) = folder_cache
             .build_resource_facts_tx(
@@ -2643,13 +2646,6 @@ async fn verify_run_and_entity_preconditions_tx(
             )
             .await?;
         auth.authorize_direct_write(&rfacts, &rfacts)?;
-        if head.head_rev_id != *exp_rev {
-            return Err(DomainError::RevisionConflict {
-                current: head.head_rev_id.clone(),
-                lineage: None,
-            }
-            .into());
-        }
     }
 
     // Verify `associated_board_expectations` covers all `(view, target_note)` pairs in `board_move_history` for this run.
@@ -2673,6 +2669,10 @@ async fn verify_run_and_entity_preconditions_tx(
     if caller_pair_keys != required_pairs {
         return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
     }
+
+    verify_authorized_rollback_revisions(actual_run_rev, input, |nid| {
+        heads_map.get(nid).map(|head| &head.head_rev_id)
+    })?;
 
     for ((view, nid), assoc) in caller_pairs {
         let fallback_rev = caller_notes
@@ -2730,7 +2730,7 @@ async fn load_run_touched_notes_tx(
             .bind(run_id.as_str())
             .fetch_all(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_run_touched_notes", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_run_touched_notes", err))?;
             rows.into_iter().map(|r| r.get("nid")).collect()
         }
     };
@@ -2792,7 +2792,7 @@ async fn load_run_board_moves_tx(
             .bind(run_id.as_str())
             .fetch_all(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_run_bmh", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_run_bmh", err))?;
             fetched
                 .into_iter()
                 .map(|r| {
@@ -2875,7 +2875,7 @@ async fn load_target_board_move_runs_tx(
             .bind(note_id.as_str())
             .fetch_all(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_target_bmh", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_target_bmh", err))?;
             fetched
                 .into_iter()
                 .map(|r| (r.get("command_end_seq"), r.get("agent_run_id")))
@@ -2953,9 +2953,10 @@ async fn load_notes_revision_histories_batch_tx(
                     sep.push_bind(nid.as_str());
                 }
                 sep.push_unseparated(") ORDER BY entity_key ASC, space_seq ASC");
-                let fetched = qb.build().fetch_all(&mut **conn).await.map_err(|err| {
-                    internal_not_committed("pg_load_note_revs_batch", err.to_string())
-                })?;
+                let fetched =
+                    qb.build().fetch_all(&mut **conn).await.map_err(|err| {
+                        crate::runtime::pg_read_error("pg_load_note_revs_batch", err)
+                    })?;
                 fetched
                     .into_iter()
                     .map(|r| {
@@ -3148,7 +3149,7 @@ async fn load_space_purged_notes_tx(
                 .bind(space_id.as_str())
                 .fetch_all(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("pg_load_purged_notes", err.to_string()))?
+                .map_err(|err| crate::runtime::pg_read_error("pg_load_purged_notes", err))?
         }
     };
     Ok(rows.into_iter().map(|s| (s, ())).collect())
@@ -3183,7 +3184,7 @@ async fn load_space_collab_states_tx(
                     .bind(space_id.as_str())
                     .fetch_all(&mut **conn)
                     .await
-                    .map_err(|err| internal_not_committed("pg_collab_states", err.to_string()))?;
+                    .map_err(|err| crate::runtime::pg_read_error("pg_collab_states", err))?;
             fetched
                 .into_iter()
                 .map(|r| (r.get("note_id"), r.get("blocked")))
@@ -3219,7 +3220,7 @@ async fn has_any_board_moves_in_space_tx(
                     .bind(space_id.as_str())
                     .fetch_optional(&mut **conn)
                     .await
-                    .map_err(|err| internal_not_committed("pg_has_bmh", err.to_string()))?;
+                    .map_err(|err| crate::runtime::pg_read_error("pg_has_bmh", err))?;
             Ok(found.is_some())
         }
     }
@@ -4189,20 +4190,7 @@ fn rollback_time_left(
     budget: &notarium_core::ports::CallBudget,
     deadline: Instant,
 ) -> Result<std::time::Duration, PortError> {
-    if budget.cancellation.is_cancelled() {
-        return Err(crate::codec::cancelled_not_committed(
-            "rollback_cancelled",
-            "rollback cancelled before commit",
-        ));
-    }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(crate::codec::deadline_not_committed(
-            "rollback_deadline",
-            "rollback deadline expired before commit",
-        ));
-    }
-    Ok(remaining)
+    super::common::CommandDeadline::at(deadline, "rollback").remaining(budget)
 }
 
 async fn rollback_wait<T>(
@@ -4210,15 +4198,9 @@ async fn rollback_wait<T>(
     deadline: Instant,
     operation: impl Future<Output = T>,
 ) -> Result<T, PortError> {
-    rollback_time_left(budget, deadline)?;
-    tokio::select! {
-        biased;
-        _ = budget.cancellation.cancelled() =>
-            Err(crate::codec::cancelled_not_committed("rollback_cancelled", "rollback cancelled before commit")),
-        _ = tokio::time::sleep_until(deadline) =>
-            Err(crate::codec::deadline_not_committed("rollback_deadline", "rollback deadline expired before commit")),
-        result = operation => Ok(result),
-    }
+    super::common::CommandDeadline::at(deadline, "rollback")
+        .wait(budget, || operation)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4335,7 +4317,10 @@ async fn try_execute_pg_root_rollback(
             .expect("pg fast_write_conn mutex")
             .take()
     };
-    let read_deadline = deadline.min(Instant::now() + *statement_timeout);
+    let read_deadline = deadline.min(crate::runtime::deadline_after(
+        Instant::now(),
+        *statement_timeout,
+    ));
     let mut pooled = match cached_conn {
         Some(c) => c,
         None => match rollback_wait(&ctx.budget, read_deadline, pool.acquire()).await {
@@ -5448,6 +5433,12 @@ async fn execute_pg_fast_rollback_inner(
         kind: space_kind,
     };
 
+    if let Err(err) = auth.authorize_space_write(&space_obj) {
+        return PgFastInnerResult::Failed {
+            err: err.into(),
+            effective_cut: Some(current_effective_cut),
+        };
+    }
     let run_inc_opt: Option<Vec<u8>> = r1.get::<Option<Vec<u8>>, usize>(24);
     let run_rev_opt: Option<String> = r1.get::<Option<String>, usize>(6);
     let Some((run_inc_bytes, run_rev_raw)) = run_inc_opt.zip(run_rev_opt) else {
@@ -5477,16 +5468,6 @@ async fn execute_pg_fast_rollback_inner(
             effective_cut: Some(current_effective_cut),
         };
     };
-    if actual_run_rev != input.expected_run_revision {
-        return PgFastInnerResult::Failed {
-            err: DomainError::RevisionConflict {
-                current: actual_run_rev,
-                lineage: None,
-            }
-            .into(),
-            effective_cut: Some(current_effective_cut),
-        };
-    }
 
     if (flags & 512) != 0 {
         return PgFastInnerResult::Failed {
@@ -5694,23 +5675,13 @@ async fn execute_pg_fast_rollback_inner(
 
     {
         let mut bconn = BackendConn::Postgres(conn);
-        for (nid, exp_rev) in &caller_notes {
+        for nid in caller_notes.keys() {
             let Some(head) = heads_map.get(nid) else {
                 return PgFastInnerResult::Failed {
                     err: DomainError::ResourceNotFound.into(),
                     effective_cut: Some(current_effective_cut),
                 };
             };
-            if head.head_rev_id != *exp_rev {
-                return PgFastInnerResult::Failed {
-                    err: DomainError::RevisionConflict {
-                        current: head.head_rev_id.clone(),
-                        lineage: None,
-                    }
-                    .into(),
-                    effective_cut: Some(current_effective_cut),
-                };
-            }
             let rfacts = match folder_cache
                 .build_resource_facts_tx(
                     &mut bconn,
@@ -5737,6 +5708,15 @@ async fn execute_pg_fast_rollback_inner(
                 };
             }
         }
+    }
+
+    if let Err(err) = verify_authorized_rollback_revisions(actual_run_rev, input, |nid| {
+        heads_map.get(nid).map(|head| &head.head_rev_id)
+    }) {
+        return PgFastInnerResult::Failed {
+            err,
+            effective_cut: Some(current_effective_cut),
+        };
     }
 
     let mut skipped_manual_edits = Vec::new();

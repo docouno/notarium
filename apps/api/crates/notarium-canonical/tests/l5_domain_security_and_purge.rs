@@ -4,6 +4,8 @@
 mod batch;
 #[path = "l5_domain_security_and_purge/collab_schema.rs"]
 mod collab_schema;
+#[path = "l5_domain_security_and_purge/conflict_authority.rs"]
+mod conflict_authority;
 #[path = "l5_domain_security_and_purge/folder_authority.rs"]
 mod folder_authority;
 #[path = "l5_domain_security_and_purge/folder_depth.rs"]
@@ -1860,11 +1862,31 @@ async fn run_domain_and_security_suite(
             if current == renamed.value.revision
     ));
 
+    conflict_authority::check(
+        store,
+        &ctx,
+        &replay_note,
+        &original.value.revision,
+        &renamed.value.revision,
+        &proj_a,
+        false,
+    )
+    .await;
     // Folder write lock blocks descendant writes until unlocked!
     store
         .set_folder_write_lock(ctx.clone(), proj_a.clone(), true)
         .await
         .expect("lock proj_a");
+    conflict_authority::check(
+        store,
+        &ctx,
+        &replay_note,
+        &original.value.revision,
+        &renamed.value.revision,
+        &proj_a,
+        true,
+    )
+    .await;
     let locked_cut = store.read_space(&scope.space_id).await.unwrap().last_seq;
     assert!(matches!(
         store.edit_note(ctx.clone(), stale_edit.clone()).await,

@@ -477,6 +477,11 @@ pub struct WriteCoordinator {
     mode: CoordinatorMode,
 }
 
+struct WriterWait<'a> {
+    budget: &'a CallBudget,
+    caller_deadline: Option<tokio::time::Instant>,
+}
+
 impl WriteCoordinator {
     pub(crate) fn start(inner: &Arc<CanonicalInner>) -> Arc<Self> {
         let cfg = inner.config.writer;
@@ -629,27 +634,41 @@ impl WriteCoordinator {
         budget: &CallBudget,
         intent: PreparedWriteIntent,
     ) -> Result<Vec<u8>, PortError> {
-        self.submit_raw_opt_fast(inner, budget, None, intent, None, None, None)
-            .await
+        self.submit_raw_opt_fast(
+            inner,
+            WriterWait {
+                budget,
+                caller_deadline: None,
+            },
+            intent,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
-    pub(crate) async fn submit_raw_opt_fast(
+    async fn submit_raw_opt_fast(
         &self,
         inner: &Arc<CanonicalInner>,
-        budget: &CallBudget,
-        caller_deadline: Option<tokio::time::Instant>,
+        wait: WriterWait<'_>,
         intent: PreparedWriteIntent,
         sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         pg_fast_plan: Option<PgSingleItemFastFn>,
         pretracked_guard: Option<ActiveWriteOpGuard>,
     ) -> Result<Vec<u8>, PortError> {
+        let WriterWait {
+            budget,
+            caller_deadline,
+        } = wait;
         inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)?;
         let _active_guard = match pretracked_guard {
             Some(g) => g,
             None => self.enter_write_op(&intent.scope.space_id, 1),
         };
-        let deadline =
-            caller_deadline.unwrap_or_else(|| tokio::time::Instant::now() + budget.remaining);
+        let deadline = caller_deadline.unwrap_or_else(|| {
+            crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining)
+        });
         let (permit, reserved_bytes) = self
             .reserve_entry(
                 inner,
@@ -721,7 +740,7 @@ impl WriteCoordinator {
                 inner,
                 space_id,
                 budget,
-                tokio::time::Instant::now() + budget.remaining,
+                crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining),
                 total_staged,
             )
             .await?;
@@ -941,8 +960,10 @@ impl crate::CanonicalStore {
         let raw_bytes = writer
             .submit_raw_opt_fast(
                 &self.inner,
-                budget,
-                None,
+                WriterWait {
+                    budget,
+                    caller_deadline: None,
+                },
                 intent,
                 sqlite_fast_plan,
                 None,
@@ -970,8 +991,10 @@ impl crate::CanonicalStore {
         let raw_bytes = writer
             .submit_raw_opt_fast(
                 &self.inner,
-                budget,
-                Some(deadline),
+                WriterWait {
+                    budget,
+                    caller_deadline: Some(deadline),
+                },
                 intent,
                 sqlite_fast_plan,
                 pg_fast_plan,
@@ -1150,7 +1173,8 @@ async fn run_batch_worker_loop(
         }
 
         if item_count < initial_target && !flush_window.is_zero() {
-            let deadline = tokio::time::Instant::now() + flush_window;
+            let deadline =
+                crate::runtime::deadline_after(tokio::time::Instant::now(), flush_window);
             while item_count < max_items {
                 let notified = tracker.notify.notified();
                 tokio::pin!(notified);
@@ -2099,7 +2123,7 @@ pub(crate) async fn lookup_command_receipt_tx(
             .bind(idemp.command_key.as_str())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_lookup_receipt", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_lookup_receipt", err))?;
             row.map(|r| {
                 (
                     r.get("command_hash"),
@@ -2148,7 +2172,7 @@ pub(crate) async fn lookup_command_receipt_tx(
                 .bind(&pid)
                 .fetch_optional(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("pg_lookup_rcpt_pay", err.to_string()))?;
+                .map_err(|err| crate::runtime::pg_read_error("pg_lookup_rcpt_pay", err))?;
                 r.map(|row| (row.get("erased_by_purge"), row.get("effect_msgpack")))
             }
         };

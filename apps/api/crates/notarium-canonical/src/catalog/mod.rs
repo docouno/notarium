@@ -26,12 +26,17 @@ use notarium_core::{
 use serde::{Deserialize, Serialize};
 
 macro_rules! db {
+    (read $($args:tt)*) => {
+        db!($($args)*).map_err(|err| crate::runtime::pg_read_error("canonical_catalog_query", err))
+    };
+    (write $($args:tt)*) => {
+        db!($($args)*).map_err(|err| internal_not_committed("canonical_catalog_query", err.to_string()))
+    };
     ($tx:expr, $expr:expr, $method:ident $(,$arg:expr)* $(,)?) => {{
         match $tx {
             BackendConn::Sqlite(conn) => $expr$(.bind($arg))*.$method(&mut **conn).await,
             BackendConn::Postgres(conn) => $expr$(.bind($arg))*.$method(&mut **conn).await,
         }
-        .map_err(|error| internal_not_committed("canonical_catalog_query", error.to_string()))
     }}
 }
 mod abilities;
@@ -147,7 +152,7 @@ async fn cursor_entity(
     seq: i64,
 ) -> Result<String, PortError> {
     db!(
-        tx,
+        read tx,
         sqlx::query_scalar("SELECT entity_id FROM change_log WHERE space_id=$1 AND space_seq=$2 AND entity_type=$3 AND op_kind='create'"),
         fetch_optional,
         space.as_str(),
@@ -228,7 +233,7 @@ impl ControlCatalogPort for CanonicalStore {
                         .as_ref()
                         .filter(|id| *id != &rec.root_folder_id);
                     let mut rows: Vec<(String, i64)> = db!(
-                        tx,
+                        read tx,
                         sqlx::query_as(LIST_PROJECTS),
                         fetch_all,
                         rec.space.id.as_str(),

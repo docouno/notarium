@@ -34,7 +34,7 @@ pub(super) async fn personal_space(
         return Err(DomainError::ResourceNotFound.into());
     }
     let matches: Vec<String> = db!(
-        tx,
+        read tx,
         sqlx::query_scalar(
             "SELECT space_id FROM spaces WHERE owner_id=$1 AND space_kind='personal' AND lifecycle_state='active' LIMIT 2"
         ),

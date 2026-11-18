@@ -1867,7 +1867,7 @@ pub(crate) async fn ensure_no_backup_holds_tx(
                 .bind(space_id.as_str())
                 .fetch_optional(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("pg_check_backup_holds", err.to_string()))?
+                .map_err(|err| crate::runtime::pg_read_error("pg_check_backup_holds", err))?
         }
     };
     if held.is_some() {
@@ -1909,7 +1909,7 @@ async fn check_local_catalog_open_read_tx(
             .bind(digest.as_bytes().as_slice())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_read_blob_catalog", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_read_blob_catalog", err))?;
             row.map(|r| {
                 (
                     r.get("admission_state"),
@@ -1971,7 +1971,7 @@ async fn ensure_local_catalog_open_tx(
             .bind(digest.as_bytes().as_slice())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_read_blob_catalog", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_read_blob_catalog", err))?;
             row.map(|r| {
                 (
                     r.get("admission_state"),
@@ -3117,7 +3117,7 @@ pub(crate) async fn count_reachable_refs_tx(
         .bind(digest.as_bytes().as_slice())
         .fetch_one(&mut **conn)
         .await
-        .map_err(|err| internal_not_committed("pg_count_refs", err.to_string())),
+        .map_err(|err| crate::runtime::pg_read_error("pg_count_refs", err)),
     }
 }
 
@@ -3614,7 +3614,7 @@ async fn pending_retirement_for_digest_tx(
                 .await
         }
     }
-    .map_err(|err| internal_not_committed("find_pending_digest_retirement", err.to_string()))
+    .map_err(|err| crate::runtime::pg_read_error("find_pending_digest_retirement", err))
 }
 
 macro_rules! zero_ref_page {

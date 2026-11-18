@@ -641,7 +641,7 @@ pub(crate) async fn reconcile_collab_fences_on_startup(
                         .fetch_all(&mut **conn)
                         .await
                         .map_err(|err| {
-                            internal_not_committed("pg_scan_collab_startup", err.to_string())
+                            crate::runtime::pg_read_error("pg_scan_collab_startup", err)
                         })?;
                         Ok(rows
                             .into_iter()
@@ -894,7 +894,7 @@ async fn load_job_row_opt_tx(
             .bind(job_id.as_str())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_job", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_job", err))?;
             r.map(|row| {
                 (
                     row.get("job_kind"),
@@ -1528,7 +1528,7 @@ async fn job_progress_digest(
     while let Some((id, done, total)) = rows
         .try_next()
         .await
-        .map_err(|err| internal_not_committed("job_progress_digest", err.to_string()))?
+        .map_err(|err| crate::runtime::pg_read_error("job_progress_digest", err))?
     {
         hash.update(id.as_bytes());
         hash.update(&done.to_be_bytes());
@@ -1657,7 +1657,7 @@ async fn query_jobs_page_tx(
             .bind(fetch_limit)
             .fetch_all(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_list_jobs", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_list_jobs", err))?;
 
             rows.into_iter()
                 .map(|r| {
@@ -1949,7 +1949,7 @@ async fn claim_next_job_impl(
                     .bind(now_check)
                     .fetch_optional(&mut **conn)
                     .await
-                    .map_err(|err| internal_not_committed("pg_probe_claim_job", err.to_string()))?,
+                    .map_err(|err| crate::runtime::pg_read_error("pg_probe_claim_job", err))?,
                 };
                 match raw_opt {
                     Some(s) => Ok(Some(JobId::parse(&s).map_err(|_| {
@@ -2471,7 +2471,7 @@ async fn load_collab_session_opt_tx(
             .bind(note_id.as_str())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_collab_sess", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_collab_sess", err))?;
             r.map(|row| {
                 (
                     row.get("lease_epoch"),
@@ -2610,7 +2610,7 @@ async fn read_collab_session_impl(
                         .fetch_all(&mut **conn)
                         .await
                         .map_err(|err| {
-                            internal_not_committed("pg_load_collab_updates", err.to_string())
+                            crate::runtime::pg_read_error("pg_load_collab_updates", err)
                         })?;
                         rows.into_iter()
                             .map(|r| {
@@ -3548,13 +3548,6 @@ async fn settle_and_update_collab_session(
                     return Err(DomainError::ResourceNotFound.into());
                 }
 
-                if head.head_rev_id != base_head.head_rev_id {
-                    return Err(DomainError::RevisionConflict {
-                        current: head.head_rev_id,
-                        lineage: None,
-                    }
-                    .into());
-                }
                 let (facts, anc) = crate::domain::common::build_resource_facts_tx(
                     tx,
                     &item_ctx.space,
@@ -3565,6 +3558,13 @@ async fn settle_and_update_collab_session(
                 )
                 .await?;
                 settlement.auth.authorize_direct_write(&facts, &facts)?;
+                if head.head_rev_id != base_head.head_rev_id {
+                    return Err(DomainError::RevisionConflict {
+                        current: head.head_rev_id,
+                        lineage: None,
+                    }
+                    .into());
+                }
 
                 let seq = item_ctx.alloc_next_seq()?;
                 let new_rev = new_revision_id()?;

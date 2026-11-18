@@ -38,6 +38,69 @@ use crate::{
     writer::CommandIdentitySpec,
 };
 
+pub(super) struct CommandDeadline {
+    pub(super) at: tokio::time::Instant,
+    operation: &'static str,
+}
+
+impl CommandDeadline {
+    pub(super) fn start(
+        budget: &notarium_core::ports::CallBudget,
+        operation: &'static str,
+    ) -> Self {
+        let at = crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining);
+        Self { at, operation }
+    }
+
+    pub(super) fn at(at: tokio::time::Instant, operation: &'static str) -> Self {
+        Self { at, operation }
+    }
+
+    fn cancelled(&self) -> PortError {
+        crate::codec::cancelled_not_committed(
+            &format!("{}_cancelled", self.operation),
+            format!("{} cancelled before commit", self.operation),
+        )
+    }
+
+    fn expired(&self) -> PortError {
+        crate::codec::deadline_not_committed(
+            &format!("{}_deadline", self.operation),
+            format!("{} deadline expired before commit", self.operation),
+        )
+    }
+
+    pub(super) fn remaining(
+        &self,
+        budget: &notarium_core::ports::CallBudget,
+    ) -> Result<std::time::Duration, PortError> {
+        if budget.cancellation.is_cancelled() {
+            return Err(self.cancelled());
+        }
+        let remaining = self
+            .at
+            .saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(self.expired());
+        }
+        Ok(remaining)
+    }
+
+    pub(super) async fn wait<F: Future>(
+        &self,
+        budget: &notarium_core::ports::CallBudget,
+        operation: impl FnOnce() -> F,
+    ) -> Result<F::Output, PortError> {
+        self.remaining(budget)?;
+        tokio::select! {
+            biased;
+            _ = budget.cancellation.cancelled() => Err(self.cancelled()),
+            _ = tokio::time::sleep_until(self.at) => Err(self.expired()),
+            result = operation() => Ok(result),
+        }
+    }
+}
+
 pub const MAX_FOLDER_DEPTH: usize = 256;
 
 type RoomFenceMap = HashMap<(SpaceId, NoteId), Arc<Mutex<RoomFenceState>>>;
@@ -453,6 +516,16 @@ pub(crate) struct NoteHeadRow {
     pub last_actor_id: PrincipalId,
 }
 
+// Optional projections omit inaccessible or unavailable values. A cancelled or
+// expired request must still interrupt the enclosing page, even in a last slot.
+pub(super) fn optional_read<T>(result: Result<T, PortError>) -> Result<Option<T>, PortError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err @ (PortError::DeadlineExceeded(_) | PortError::Cancelled(_))) => Err(err),
+        Err(_) => Ok(None),
+    }
+}
+
 #[allow(clippy::type_complexity)]
 pub(crate) async fn load_note_head_row_opt_tx(
     tx: &mut BackendConn<'_>,
@@ -751,7 +824,7 @@ pub(crate) async fn load_note_heads_batch_tx(
                 .fetch_all(&mut **conn)
                 .await
                 .map_err(|err| {
-                    internal_not_committed("pg_load_note_heads_batch", err.to_string())
+                    crate::runtime::pg_read_error("pg_load_note_heads_batch", err)
                 })?;
                 fetched
                     .into_iter()
@@ -1199,6 +1272,31 @@ pub(crate) async fn build_resource_facts_tx(
     Ok((facts, anc))
 }
 
+pub(crate) async fn authorized_collision_revision_tx(
+    tx: &mut BackendConn<'_>,
+    space: &Space,
+    auth: &notarium_core::auth::EngineAuthContext,
+    note: &NoteId,
+) -> Result<Option<RevisionId>, PortError> {
+    let Some(head) = load_note_head_row_opt_tx(tx, &space.id, note).await? else {
+        return Ok(None);
+    };
+    if head.lifecycle == Lifecycle::Purged {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let (facts, _) = build_resource_facts_tx(
+        tx,
+        space,
+        &head.parent_folder_id,
+        head.doc_class,
+        head.ability_id,
+        false,
+    )
+    .await?;
+    auth.authorize_direct_write(&facts, &facts)?;
+    Ok(Some(head.head_rev_id))
+}
+
 pub(crate) async fn active_note_sibling_exists_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
@@ -1282,7 +1380,7 @@ pub(crate) async fn load_current_space_schema_tx(
             .bind(space_id.as_str())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_space_schema", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_space_schema", err))?;
             row.map(|r| {
                 (
                     r.get("schema_rev_id"),
@@ -1496,7 +1594,7 @@ pub(crate) async fn check_collab_preconditions_tx(
             .bind(note_id.as_str())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_check_collab_prec", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_check_collab_prec", err))?;
             row.map(|r| (r.get("lease_epoch"), r.get("lineage_epoch")))
         }
     };

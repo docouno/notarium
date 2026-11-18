@@ -147,7 +147,7 @@ pub(super) async fn load_revision_metadata_opt_tx(
             .await
         }
     }
-    .map_err(|e| internal_not_committed("read_revision_metadata", e.to_string()))
+    .map_err(|e| crate::runtime::pg_read_error("read_revision_metadata", e))
 }
 
 pub(crate) fn analyze_and_prepare_carrier(
@@ -547,14 +547,16 @@ pub(crate) fn build_create_note_intent(
                 .await?;
                 auth.authorize_direct_write(&facts, &facts)?;
 
-                if let Some(existing) =
-                    load_note_head_row_opt_tx(tx, &scope_cl.space_id, &input.note).await?
+                if let Some(current) = super::common::authorized_collision_revision_tx(
+                    tx,
+                    &live_space.space,
+                    &auth,
+                    &input.note,
+                )
+                .await?
                 {
-                    if existing.lifecycle == Lifecycle::Purged {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
                     return Err(DomainError::RevisionConflict {
-                        current: existing.head_rev_id,
+                        current,
                         lineage: None,
                     }
                     .into());
@@ -1663,18 +1665,6 @@ fn build_trash_or_restore_intent(
                 if head.lifecycle == Lifecycle::Purged {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                if let Some(prec_rev) = &preconditions.revision
-                    && *prec_rev != head.head_rev_id
-                {
-                    return Err(DomainError::RevisionConflict {
-                        current: head.head_rev_id,
-                        lineage: None,
-                    }
-                    .into());
-                }
-                check_collab_preconditions_tx(tx, &scope_cl.space_id, &note_id, &preconditions)
-                    .await?;
-
                 let require_active_folders = input.disposition == DeleteDisposition::Restore;
                 let (facts, anc) = build_resource_facts_tx(
                     tx,
@@ -1686,6 +1676,18 @@ fn build_trash_or_restore_intent(
                 )
                 .await?;
                 auth.authorize_direct_write(&facts, &facts)?;
+
+                if let Some(prec_rev) = &preconditions.revision
+                    && *prec_rev != head.head_rev_id
+                {
+                    return Err(DomainError::RevisionConflict {
+                        current: head.head_rev_id,
+                        lineage: None,
+                    }
+                    .into());
+                }
+                check_collab_preconditions_tx(tx, &scope_cl.space_id, &note_id, &preconditions)
+                    .await?;
 
                 let (target_lc, op_kind, cmd_kind) = match input.disposition {
                     DeleteDisposition::Trash => {
@@ -1971,49 +1973,87 @@ fn build_trash_or_restore_intent(
     }
 }
 
-pub(crate) async fn move_note_impl(
-    store: &CanonicalStore,
-    ctx: SpaceContext,
-    request: Mutation<MoveNote>,
-) -> Result<Committed<NoteRevision>, PortError> {
-    validate_mutation_identity(&ctx, &request.identity)?;
-    let new_slug_fold = normalize_slug_key(&request.input.slug)?;
-
-    if let Some(interceptor) = store.inner.collab_interceptor.get() {
-        let pin = interceptor
-            .filename_pin(ctx.clone(), request.input.note.clone())
-            .await?;
-        if let FilenamePin::Pinned { .. } = pin {
-            return Err(unavailable_retryable(
-                "move_note_blocked_by_filename_pin",
-                "cannot move note while live room holds a filename pin",
-                std::time::Duration::from_millis(50),
-            ));
-        }
-    }
-
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
-        .await?;
-    space_rec.scope.check(ctx.scope())?;
-
+fn move_note_identity(
+    ctx: &SpaceContext,
+    identity: &CommandIdentity,
+    input: &MoveNote,
+) -> crate::writer::CommandIdentitySpec {
     let fp = format!(
         "note={}\0parent={}\0slug={}",
-        request.input.note.as_str(),
-        request
-            .input
+        input.note.as_str(),
+        input
             .parent
             .as_ref()
             .map(|p| p.as_str())
             .unwrap_or("<root>"),
-        request.input.slug
+        input.slug
     );
-    let idemp = derive_command_identity_spec(&request.identity, "move_note", fp.as_bytes())
-        .for_move(
-            ctx.auth(),
+    derive_command_identity_spec(identity, "move_note", fp.as_bytes()).for_move(
+        ctx.auth(),
+        &input.note,
+        input.parent.as_ref(),
+    )
+}
+
+async fn check_move_pin(
+    interceptor: &dyn notarium_core::ports::LiveCollabInterceptor,
+    ctx: &SpaceContext,
+    note: &NoteId,
+) -> Result<(), PortError> {
+    if let FilenamePin::Pinned { .. } = interceptor.filename_pin(ctx.clone(), note.clone()).await? {
+        return Err(unavailable_retryable(
+            "move_note_blocked_by_filename_pin",
+            "cannot move note while live room holds a filename pin",
+            std::time::Duration::from_millis(50),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn move_note_impl(
+    store: &CanonicalStore,
+    mut ctx: SpaceContext,
+    request: Mutation<MoveNote>,
+) -> Result<Committed<NoteRevision>, PortError> {
+    let deadline = super::common::CommandDeadline::start(&ctx.budget, "move_note");
+    validate_mutation_identity(&ctx, &request.identity)?;
+    let new_slug_fold = normalize_slug_key(&request.input.slug)?;
+
+    let idemp = move_note_identity(&ctx, &request.identity, &request.input);
+
+    let space_rec = if let Some(interceptor) = store.inner.collab_interceptor.get() {
+        if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
+            store,
+            ctx.scope(),
+            &idemp,
+            Some(&ctx.budget),
+        )
+        .await?
+        {
+            return Ok(replayed.into_committed());
+        }
+        let (space, _) = read_active_note_for_mutation(
+            store,
+            &ctx,
             &request.input.note,
-            request.input.parent.as_ref(),
-        );
+            &request.preconditions,
+            NoteMutationAccess::Move(request.input.parent.clone()),
+        )
+        .await?;
+        ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+        deadline
+            .wait(&ctx.budget, || {
+                check_move_pin(interceptor.as_ref(), &ctx, &request.input.note)
+            })
+            .await??;
+        space
+    } else {
+        let space = store
+            .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+            .await?;
+        space.scope.check(ctx.scope())?;
+        space
+    };
 
     let intent = build_move_note_intent(
         &space_rec.scope,
@@ -2023,12 +2063,49 @@ pub(crate) async fn move_note_impl(
         request.preconditions,
         request.input,
         new_slug_fold,
+        Ok(MovePin::Checked),
     );
 
+    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
     let stored: StoredCommittedNoteRevV1 = store.submit_write_command(&ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
+// A move can follow the creation or restoration of the same note in this batch.
+enum MovePin {
+    Checked,
+    NoActiveSource(Arc<super::RoomFenceTable>),
+}
+
+async fn prepare_batch_move_pin(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    input: &MoveNote,
+) -> Result<MovePin, PortError> {
+    let Some(interceptor) = store.inner.collab_interceptor.get() else {
+        return Ok(MovePin::Checked);
+    };
+    match read_active_note_for_mutation(
+        store,
+        ctx,
+        &input.note,
+        &Preconditions::default(),
+        NoteMutationAccess::Move(input.parent.clone()),
+    )
+    .await
+    {
+        Ok(_) => {
+            check_move_pin(interceptor.as_ref(), ctx, &input.note).await?;
+            Ok(MovePin::Checked)
+        }
+        Err(PortError::Domain(DomainError::ResourceNotFound)) => {
+            Ok(MovePin::NoActiveSource(store.inner.room_fences.clone()))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_move_note_intent(
     scope: &notarium_core::model::HistoryScope,
     active_epoch: notarium_core::ids::LeaseEpoch,
@@ -2037,6 +2114,7 @@ fn build_move_note_intent(
     preconditions: Preconditions,
     input: MoveNote,
     new_slug_fold: String,
+    pin: Result<MovePin, PortError>,
 ) -> PreparedWriteIntent {
     let scope_cl = scope.clone();
     let note_id = input.note.clone();
@@ -2055,6 +2133,15 @@ fn build_move_note_intent(
                 if head.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                let dest_parent = input
+                    .parent
+                    .clone()
+                    .unwrap_or_else(|| item_ctx.root_folder_id.clone());
+
+                let after_anc =
+                    authorize_note_placement_tx(tx, &live_space, &auth, &head, &dest_parent)
+                        .await?;
+
                 if let Some(prec_rev) = &preconditions.revision
                     && *prec_rev != head.head_rev_id
                 {
@@ -2067,30 +2154,15 @@ fn build_move_note_intent(
                 check_collab_preconditions_tx(tx, &scope_cl.space_id, &note_id, &preconditions)
                     .await?;
 
-                let dest_parent = input
-                    .parent
-                    .clone()
-                    .unwrap_or_else(|| item_ctx.root_folder_id.clone());
-
-                let (before_facts, _) = build_resource_facts_tx(
-                    tx,
-                    &live_space.space,
-                    &head.parent_folder_id,
-                    head.doc_class,
-                    head.ability_id.clone(),
-                    true,
-                )
-                .await?;
-                let (after_facts, after_anc) = build_resource_facts_tx(
-                    tx,
-                    &live_space.space,
-                    &dest_parent,
-                    head.doc_class,
-                    head.ability_id.clone(),
-                    true,
-                )
-                .await?;
-                auth.authorize_direct_write(&before_facts, &after_facts)?;
+                if let MovePin::NoActiveSource(fences) = pin?
+                    && is_note_room_active_tx(tx, &fences, &scope_cl, &note_id).await?
+                {
+                    return Err(unavailable_retryable(
+                        "move_note_pin_changed",
+                        "retry the move after checking the newly active room",
+                        std::time::Duration::from_millis(50),
+                    ));
+                }
 
                 if (dest_parent != head.parent_folder_id || new_slug_fold != head.slug_fold)
                     && active_note_sibling_exists_tx(
@@ -2363,21 +2435,6 @@ pub(crate) async fn rename_note_impl(
     validate_mutation_identity(&ctx, &request.identity)?;
     let new_slug_fold = normalize_slug_key(&request.input.slug)?;
 
-    if let Some(interceptor) = store.inner.collab_interceptor.get() {
-        let pin = interceptor
-            .filename_pin(ctx.clone(), request.input.note.clone())
-            .await?;
-        if let FilenamePin::Pinned { filename, .. } = pin
-            && filename != request.input.slug
-        {
-            return Err(unavailable_retryable(
-                "rename_note_blocked_by_filename_pin",
-                "cannot rename note slug while live room holds filename pin",
-                std::time::Duration::from_millis(50),
-            ));
-        }
-    }
-
     let fp = format!(
         "note={}\0slug={}\0title={}",
         request.input.note.as_str(),
@@ -2398,9 +2455,29 @@ pub(crate) async fn rename_note_impl(
         return Ok(replayed.into_committed());
     }
 
-    let (space_rec, base_head) =
-        read_active_note_for_mutation(store, &ctx, &request.input.note, &request.preconditions)
+    let (space_rec, base_head) = read_active_note_for_mutation(
+        store,
+        &ctx,
+        &request.input.note,
+        &request.preconditions,
+        NoteMutationAccess::Current,
+    )
+    .await?;
+
+    if let Some(interceptor) = store.inner.collab_interceptor.get() {
+        let pin = interceptor
+            .filename_pin(ctx.clone(), request.input.note.clone())
             .await?;
+        if let FilenamePin::Pinned { filename, .. } = pin
+            && filename != request.input.slug
+        {
+            return Err(unavailable_retryable(
+                "rename_note_blocked_by_filename_pin",
+                "cannot rename note slug while live room holds filename pin",
+                std::time::Duration::from_millis(50),
+            ));
+        }
+    }
 
     if let Some(explicit_title) = &request.input.title {
         let trimmed = explicit_title.trim();
@@ -2477,6 +2554,7 @@ pub(crate) async fn rename_note_impl(
             slug: request.input.slug,
         },
         new_slug_fold,
+        Ok(MovePin::Checked),
     );
     let stored: StoredCommittedNoteRevV1 = store.submit_write_command(&ctx.budget, intent).await?;
     Ok(stored.into_committed())
@@ -2599,16 +2677,17 @@ async fn batch_receipt_hashes(
                  AND idempotency_key=ANY($4)",
             ).bind(scope.space_id.as_str()).bind(scope.incarnation.as_bytes().as_slice()).bind(actor.as_str())
              .bind(&keys).fetch_all(&mut **conn).await,
-        }.map_err(|err| internal_not_committed("lookup_batch_receipt_keys", err.to_string()))?;
+        }.map_err(|err| crate::runtime::pg_read_error("lookup_batch_receipt_keys", err))?;
         Ok(rows.into_iter().collect())
     })).await
 }
 
 pub(crate) async fn accept_batch_impl(
     store: &CanonicalStore,
-    ctx: SpaceContext,
+    mut ctx: SpaceContext,
     request: AcceptBatch,
 ) -> Result<BatchResult<NoteRevision>, PortError> {
+    let deadline = super::common::CommandDeadline::start(&ctx.budget, "accept_batch");
     let space_rec = store
         .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
         .await?;
@@ -2624,7 +2703,11 @@ pub(crate) async fn accept_batch_impl(
     let keys = request
         .items
         .iter()
-        .filter(|item| matches!(item.input, BatchItem::Create(_) | BatchItem::Edit(_)))
+        .filter(|item| {
+            matches!(item.input, BatchItem::Create(_) | BatchItem::Edit(_))
+                || (store.inner.collab_interceptor.get().is_some()
+                    && matches!(item.input, BatchItem::Move(_)))
+        })
         .map(|item| item.identity.key.as_str().to_owned())
         .collect();
     let receipts = batch_receipt_hashes(store, &ctx, keys).await?;
@@ -2705,6 +2788,7 @@ pub(crate) async fn accept_batch_impl(
     let mut intents = Vec::with_capacity(request.items.len());
     let mut placements = BTreeMap::new();
     for item_mut in request.items {
+        ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
         if let Err(err) = validate_mutation_identity(&ctx, &item_mut.identity) {
             intents.push(build_failing_item_intent(
                 &space_rec.scope,
@@ -2727,12 +2811,17 @@ pub(crate) async fn accept_batch_impl(
                 ed,
                 &item_mut.preconditions,
             )),
+            BatchItem::Move(mv) => Some(move_note_identity(&ctx, &item_mut.identity, mv)),
             _ => None,
         };
         if let (Some(spec), Some(stored_hash)) =
             (&idemp, receipts.get(item_mut.identity.key.as_str()))
         {
-            let checked = if spec.command_hash.as_bytes().as_slice() == stored_hash {
+            // The writer checks the current move fingerprint. Only carrier
+            // commands need historical evidence to recognize old hashes.
+            let checked = if matches!(item_mut.input, BatchItem::Move(_))
+                || spec.command_hash.as_bytes().as_slice() == stored_hash
+            {
                 Ok(spec.clone())
             } else {
                 let command = match &item_mut.input {
@@ -2908,26 +2997,18 @@ pub(crate) async fn accept_batch_impl(
             }
             BatchItem::Move(mv) => match normalize_slug_key(&mv.slug) {
                 Ok(sf) => {
-                    let fp = format!(
-                        "note={}\0parent={}\0slug={}",
-                        mv.note.as_str(),
-                        mv.parent.as_ref().map(|p| p.as_str()).unwrap_or("<root>"),
-                        mv.slug
-                    );
-                    let idemp = derive_command_identity_spec(
-                        &item_mut.identity,
-                        "move_note",
-                        fp.as_bytes(),
-                    )
-                    .for_move(ctx.auth(), &mv.note, mv.parent.as_ref());
+                    let pin = deadline
+                        .wait(&ctx.budget, || prepare_batch_move_pin(store, &ctx, &mv))
+                        .await?;
                     intents.push(build_move_note_intent(
                         &space_rec.scope,
                         space_rec.active_epoch,
-                        Some(idemp),
+                        idemp,
                         ctx.auth().clone(),
                         item_mut.preconditions,
                         mv,
                         sf,
+                        pin,
                     ));
                 }
                 Err(err) => intents.push(build_failing_item_intent(
@@ -2939,6 +3020,7 @@ pub(crate) async fn accept_batch_impl(
         }
     }
 
+    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
     let (raw_outcomes, committed_high_watermark) = store
         .submit_write_batch::<StoredCommittedNoteRevV1>(
             &ctx.budget,
@@ -3319,20 +3401,20 @@ pub(crate) async fn append_memory_impl(
                 if head.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                if head.doc_class != DocClass::AgentMemory {
-                    return Err(DomainError::validation(ValidationReason::ClassMismatch).into());
-                }
                 let (facts, _) = build_resource_facts_tx(
                     tx,
                     &srec.space,
                     &head.parent_folder_id,
-                    DocClass::AgentMemory,
+                    head.doc_class,
                     head.ability_id.clone(),
                     true,
                 )
                 .await?;
                 auth_in.authorize_direct_write(&facts, &facts)?;
 
+                if head.doc_class != DocClass::AgentMemory {
+                    return Err(DomainError::validation(ValidationReason::ClassMismatch).into());
+                }
                 // Re-verify ResolvedMemoryTarget provenance!
                 match &target_in {
                     MemoryTarget::User { owner } => {
@@ -3606,28 +3688,19 @@ async fn prepare_link_intent(
     idemp: crate::writer::CommandIdentitySpec,
     expected_epoch: Option<notarium_core::ids::LeaseEpoch>,
 ) -> Result<PreparedWriteIntent, PortError> {
-    let (space_rec, base_head) =
-        read_active_note_for_mutation(store, ctx, &request.input.source, &request.preconditions)
-            .await?;
+    let (space_rec, base_head) = read_active_note_for_mutation(
+        store,
+        ctx,
+        &request.input.source,
+        &request.preconditions,
+        NoteMutationAccess::Link(request.input.target.clone()),
+    )
+    .await?;
     if expected_epoch.is_some_and(|epoch| epoch != space_rec.active_epoch) {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
     if base_head.doc_class == DocClass::EncryptedNote {
         return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
-    }
-
-    if !matches!(request.input.target, LinkTarget::AuthoredName(_)) {
-        let target = request.input.target.clone();
-        let space = space_rec.clone();
-        let auth = ctx.auth().clone();
-        let class = base_head.doc_class;
-        store
-            .with_read_tx_budget(Some(&ctx.budget), |tx| {
-                Box::pin(async move {
-                    authorize_link_target_tx(tx, &space, &auth, class, &target).await
-                })
-            })
-            .await?;
     }
 
     let base_digest = base_head.content_digest.ok_or_else(|| {
@@ -3736,7 +3809,8 @@ pub(crate) async fn link_many_impl(
     mut ctx: SpaceContext,
     request: LinkBatch,
 ) -> Result<BatchResult<Link>, PortError> {
-    let deadline = tokio::time::Instant::now() + ctx.budget.remaining;
+    let deadline =
+        crate::runtime::deadline_after(tokio::time::Instant::now(), ctx.budget.remaining);
     let space = store
         .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
         .await?;
@@ -3896,6 +3970,19 @@ fn build_link_item_intent(
                 if head.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                let (facts, anc) = build_resource_facts_tx(
+                    tx,
+                    &live_space.space,
+                    &head.parent_folder_id,
+                    head.doc_class,
+                    head.ability_id.clone(),
+                    true,
+                )
+                .await?;
+                auth.authorize_direct_write(&facts, &facts)?;
+
+                authorize_link_target_tx(tx, &live_space, &auth, head.doc_class, &link.target)
+                    .await?;
                 if head.doc_class == DocClass::EncryptedNote {
                     return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
                 }
@@ -3925,19 +4012,6 @@ fn build_link_item_intent(
                     ));
                 }
 
-                let (facts, anc) = build_resource_facts_tx(
-                    tx,
-                    &live_space.space,
-                    &head.parent_folder_id,
-                    head.doc_class,
-                    head.ability_id.clone(),
-                    true,
-                )
-                .await?;
-                auth.authorize_direct_write(&facts, &facts)?;
-
-                authorize_link_target_tx(tx, &live_space, &auth, head.doc_class, &link.target)
-                    .await?;
                 let mut owner_notes = vec![source_id.clone()];
                 if let LinkTarget::Note(target) = &link.target
                     && *target != source_id
@@ -4189,35 +4263,14 @@ pub(crate) async fn accept_external_observation_impl(
         });
     }
 
-    let (space_rec, base_head) = store
-        .with_read_tx_budget(Some(&ctx.budget), |tx| {
-            let scope_in = ctx.scope().clone();
-            let auth_in = ctx.auth().clone();
-            let nid_in = request.input.note.clone();
-            Box::pin(async move {
-                let srec = load_space_record(tx, &scope_in.space_id).await?;
-                srec.scope.check(&scope_in)?;
-                if is_note_purge_fenced_tx(tx, &scope_in.space_id, nid_in.as_str()).await? {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                let head = load_note_head_row_tx(tx, &scope_in.space_id, &nid_in).await?;
-                if head.lifecycle != Lifecycle::Active {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                let (facts, _) = build_resource_facts_tx(
-                    tx,
-                    &srec.space,
-                    &head.parent_folder_id,
-                    head.doc_class,
-                    head.ability_id.clone(),
-                    true,
-                )
-                .await?;
-                auth_in.authorize_direct_write(&facts, &facts)?;
-                Ok((srec, head))
-            })
-        })
-        .await?;
+    let (space_rec, base_head) = read_active_note_for_mutation(
+        store,
+        &ctx,
+        &request.input.note,
+        &Preconditions::default(),
+        NoteMutationAccess::Current,
+    )
+    .await?;
 
     if base_head.head_rev_id != request.input.base_revision {
         return Ok(ExternalObservationResult::Conflict {
@@ -4343,12 +4396,16 @@ pub(crate) async fn accept_external_observation_impl(
                 reservation_opt = Some(CarrierRoomWrite::Accepted(transition));
             }
             InterceptionResult::Conflict(_) => {
-                let latest_rev =
-                    read_current_note_rev(store, &space_rec.scope.space_id, &request.input.note)
-                        .await?
-                        .unwrap_or(base_head.head_rev_id);
+                let (_, current) = read_active_note_for_mutation(
+                    store,
+                    &ctx,
+                    &request.input.note,
+                    &Preconditions::default(),
+                    NoteMutationAccess::Current,
+                )
+                .await?;
                 return Ok(ExternalObservationResult::Conflict {
-                    current: latest_rev,
+                    current: current.head_rev_id,
                 });
             }
             InterceptionResult::ClosedRoomReservation(res) => {
@@ -4390,6 +4447,22 @@ pub(crate) async fn accept_external_observation_impl(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
+                let live_space = load_space_record(tx, &scope_cl.space_id).await?;
+                let head = load_note_head_row_tx(tx, &scope_cl.space_id, &obs_input.note).await?;
+                if head.lifecycle != Lifecycle::Active {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let (facts, anc) = build_resource_facts_tx(
+                    tx,
+                    &live_space.space,
+                    &head.parent_folder_id,
+                    head.doc_class,
+                    head.ability_id.clone(),
+                    true,
+                )
+                .await?;
+                auth.authorize_direct_write(&facts, &facts)?;
+
                 let room = prepare_carrier_room_tx(
                     tx,
                     item_ctx,
@@ -4399,11 +4472,6 @@ pub(crate) async fn accept_external_observation_impl(
                     &obs_input.note,
                 )
                 .await?;
-                let live_space = load_space_record(tx, &scope_cl.space_id).await?;
-                let head = load_note_head_row_tx(tx, &scope_cl.space_id, &obs_input.note).await?;
-                if head.lifecycle != Lifecycle::Active {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
                 if head.head_rev_id != obs_input.base_revision {
                     return Err(DomainError::RevisionConflict {
                         current: head.head_rev_id,
@@ -4418,17 +4486,6 @@ pub(crate) async fn accept_external_observation_impl(
                     &preconditions,
                 )
                 .await?;
-
-                let (facts, anc) = build_resource_facts_tx(
-                    tx,
-                    &live_space.space,
-                    &head.parent_folder_id,
-                    head.doc_class,
-                    head.ability_id.clone(),
-                    true,
-                )
-                .await?;
-                auth.authorize_direct_write(&facts, &facts)?;
 
                 let seq = item_ctx.alloc_next_seq()?;
                 let new_rev = new_revision_id()?;
@@ -5646,25 +5703,28 @@ pub(crate) async fn hydrate_cards_impl(
                         out.push(None);
                         continue;
                     }
-                    let Ok((live_facts, _)) = folder_cache
-                        .build_resource_facts_tx(
-                            tx,
-                            &space_rec.space,
-                            &live_head.parent_folder_id,
-                            live_head.doc_class,
-                            live_head.ability_id.clone(),
-                            true,
-                        )
-                        .await
+                    let Some((live_facts, _)) = super::common::optional_read(
+                        folder_cache
+                            .build_resource_facts_tx(
+                                tx,
+                                &space_rec.space,
+                                &live_head.parent_folder_id,
+                                live_head.doc_class,
+                                live_head.ability_id.clone(),
+                                true,
+                            )
+                            .await,
+                    )?
                     else {
                         out.push(None);
                         continue;
                     };
 
-                    let Ok(Some(hist_rev)) =
+                    let Some(hist_rev) = super::common::optional_read(
                         read_immutable_revision_tx(tx, &scope, "note", nid.as_str(), valid_cut)
-                            .await
-                    else {
+                            .await,
+                    )?
+                    .flatten() else {
                         out.push(None);
                         continue;
                     };
@@ -5686,16 +5746,18 @@ pub(crate) async fn hydrate_cards_impl(
                         out.push(None);
                         continue;
                     }
-                    let Ok((snap_facts, ancestors)) = historical
-                        .build_resource_facts_tx(
-                            tx,
-                            &space_rec.space,
-                            &nm.parent_folder_id,
-                            nm.doc_class,
-                            nm.ability_id,
-                            true,
-                        )
-                        .await
+                    let Some((snap_facts, ancestors)) = super::common::optional_read(
+                        historical
+                            .build_resource_facts_tx(
+                                tx,
+                                &space_rec.space,
+                                &nm.parent_folder_id,
+                                nm.doc_class,
+                                nm.ability_id,
+                                true,
+                            )
+                            .await,
+                    )?
                     else {
                         out.push(None);
                         continue;
@@ -5744,7 +5806,9 @@ pub(crate) async fn hydrate_cards_impl(
             hydrated.push(None);
             continue;
         };
-        let Ok(raw_bytes) = store.read_verified_blob(ctx.scope(), plan.digest).await else {
+        let Some(raw_bytes) =
+            super::common::optional_read(store.read_verified_blob(ctx.scope(), plan.digest).await)?
+        else {
             hydrated.push(None);
             continue;
         };
@@ -5789,11 +5853,51 @@ struct SearchMetadataPlan {
     doc_class: DocClass,
 }
 
+enum NoteMutationAccess {
+    Current,
+    Move(Option<notarium_core::ids::FolderId>),
+    Link(LinkTarget),
+}
+
+async fn authorize_note_placement_tx(
+    tx: &mut BackendConn<'_>,
+    space: &crate::SpaceRecord,
+    auth: &notarium_core::auth::EngineAuthContext,
+    head: &crate::domain::common::NoteHeadRow,
+    destination: &notarium_core::ids::FolderId,
+) -> Result<crate::domain::common::FolderAncestryFacts, PortError> {
+    let (current, ancestry) = build_resource_facts_tx(
+        tx,
+        &space.space,
+        &head.parent_folder_id,
+        head.doc_class,
+        head.ability_id.clone(),
+        true,
+    )
+    .await?;
+    if destination == &head.parent_folder_id {
+        auth.authorize_direct_write(&current, &current)?;
+        return Ok(ancestry);
+    }
+    let (after, ancestry) = build_resource_facts_tx(
+        tx,
+        &space.space,
+        destination,
+        head.doc_class,
+        head.ability_id.clone(),
+        true,
+    )
+    .await?;
+    auth.authorize_direct_write(&current, &after)?;
+    Ok(ancestry)
+}
+
 async fn read_active_note_for_mutation(
     store: &CanonicalStore,
     ctx: &SpaceContext,
     note_id: &NoteId,
     preconditions: &Preconditions,
+    access: NoteMutationAccess,
 ) -> Result<(crate::SpaceRecord, crate::domain::common::NoteHeadRow), PortError> {
     let scope = ctx.scope().clone();
     let auth = ctx.auth().clone();
@@ -5812,6 +5916,16 @@ async fn read_active_note_for_mutation(
                 if head.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                let destination = match &access {
+                    NoteMutationAccess::Move(parent) => {
+                        parent.as_ref().unwrap_or(&srec.root_folder_id)
+                    }
+                    _ => &head.parent_folder_id,
+                };
+                authorize_note_placement_tx(tx, &srec, &auth, &head, destination).await?;
+                if let NoteMutationAccess::Link(target) = &access {
+                    authorize_link_target_tx(tx, &srec, &auth, head.doc_class, target).await?;
+                }
                 if let Some(expected_rev) = &prec.revision
                     && *expected_rev != head.head_rev_id
                 {
@@ -5822,58 +5936,7 @@ async fn read_active_note_for_mutation(
                     .into());
                 }
                 check_collab_preconditions_tx(tx, &scope.space_id, &nid, &prec).await?;
-                let (facts, _) = build_resource_facts_tx(
-                    tx,
-                    &srec.space,
-                    &head.parent_folder_id,
-                    head.doc_class,
-                    head.ability_id.clone(),
-                    true,
-                )
-                .await?;
-                auth.authorize_direct_write(&facts, &facts)?;
                 Ok((srec, head))
-            })
-        })
-        .await
-}
-
-async fn read_current_note_rev(
-    store: &CanonicalStore,
-    space_id: &notarium_core::ids::SpaceId,
-    note_id: &NoteId,
-) -> Result<Option<RevisionId>, PortError> {
-    let sid = space_id.clone();
-    let nid = note_id.clone();
-    store
-        .with_read_tx(|tx| {
-            Box::pin(async move {
-                let raw: Option<String> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                        "SELECT head_rev_id FROM note_heads WHERE space_id = ? AND note_id = ?",
-                    )
-                    .bind(sid.as_str())
-                    .bind(nid.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| {
-                        internal_not_committed("sqlite_read_cur_rev", err.to_string())
-                    })?,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(
-                        "SELECT head_rev_id FROM note_heads WHERE space_id = $1 AND note_id = $2",
-                    )
-                    .bind(sid.as_str())
-                    .bind(nid.as_str())
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| internal_not_committed("pg_read_cur_rev", err.to_string()))?,
-                };
-                match raw {
-                    Some(s) => Ok(Some(RevisionId::parse(&s).map_err(|_| {
-                        internal_not_committed("corrupt_cur_rev", "invalid head_rev_id")
-                    })?)),
-                    None => Ok(None),
-                }
             })
         })
         .await

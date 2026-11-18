@@ -206,7 +206,7 @@ async fn postgres_rollback_deadline_covers_safe_point_pool_and_commit_ack() {
 async fn postgres_read_admission_statements_and_snapshot_have_distinct_deadlines() {
     use notarium_core::{
         ids::{ChatThreadId, ThreadEntrySeq},
-        ports::{ChatPort, ChatRead, PageLimit},
+        ports::{ChangeBroadcast, ChangeRead, ChatPort, ChatRead, PageLimit, ServicePurpose},
     };
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
@@ -236,7 +236,8 @@ async fn postgres_read_admission_statements_and_snapshot_have_distinct_deadlines
         owner.clone(),
     )
     .await;
-    let ctx = owner_ctx(&scope, owner.clone());
+    let mut ctx = owner_ctx(&scope, owner.clone());
+    ctx.budget.remaining = Duration::MAX;
     let note = sample_note_id(77);
     let created = store
         .create_note(
@@ -316,6 +317,61 @@ async fn postgres_read_admission_statements_and_snapshot_have_distinct_deadlines
         wait_for_pool
     );
     assert!(read.is_ok(), "{read:?}");
+
+    // A server-side 57014 must survive the SQL call that consumed it. The
+    // diagnostic distinguishes that statement from the outer snapshot timer.
+    for (table, stage) in [
+        ("space_field_schemas", "pg_load_space_schema"),
+        ("note_heads", "pg_seed_note_keys"),
+        ("chat_threads", "pg_seed_thread_keys"),
+        ("folder_heads", "pg_load_folder"),
+    ] {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "BEGIN; LOCK TABLE \"{schema}\".{table} IN ACCESS EXCLUSIVE MODE"
+        )))
+        .execute(&mut spaces)
+        .await
+        .unwrap();
+        let error = if table == "space_field_schemas" {
+            let current = GetNote {
+                revision: None,
+                ..historical.clone()
+            };
+            store.get_note(ctx.clone(), current).await.unwrap_err()
+        } else if table == "folder_heads" {
+            store
+                .is_live_visible(&ctx, &historical.note)
+                .await
+                .unwrap_err()
+        } else {
+            store
+                .catch_up(
+                    crate::support::maintenance_ctx(ServicePurpose::Projection),
+                    ChangeRead::Seed {
+                        scope: scope.clone(),
+                        cutoff: None,
+                        limit: PageLimit::new(8).unwrap(),
+                    },
+                )
+                .await
+                .unwrap_err()
+        };
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut spaces)
+            .await
+            .unwrap();
+        let PortError::DeadlineExceeded(failure) = error else {
+            panic!("{stage}: {error:?}");
+        };
+        assert_eq!(failure.effect(), CommitEffect::NotCommitted);
+        assert_eq!(
+            failure.diagnostic_ref(),
+            notarium_canonical::codec::diagnostic_digest(
+                stage,
+                "PostgreSQL read statement was canceled"
+            ),
+        );
+    }
 
     let expired = store
         .execute_diagnostic_read_sql_for_test(

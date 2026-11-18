@@ -108,7 +108,7 @@ async fn execute(
                     }
 
                     let inserted: Option<String> = db!(
-                        tx,
+                        write tx,
                         sqlx::query_scalar(CLAIM_COMMAND),
                         fetch_optional,
                         id.owner.as_str(),
@@ -118,7 +118,7 @@ async fn execute(
                     )?;
                     if inserted.is_none() {
                         let (old, bytes): (Vec<u8>, Vec<u8>) = db!(
-                            tx,
+                            write tx,
                             sqlx::query_as(READ_RECEIPT),
                             fetch_one,
                             id.owner.as_str(),
@@ -157,7 +157,7 @@ async fn execute(
                             let rec = create_space_tx(tx, spec).await?;
                             let settings = serde_json::json!({"name":space.name}).to_string();
                             let _: String = db!(
-                                tx,
+                                write tx,
                                 sqlx::query_scalar(SET_SPACE_SETTINGS),
                                 fetch_one,
                                 settings,
@@ -188,7 +188,7 @@ async fn execute(
                                 }
                             };
                             let _: String = db!(
-                                tx,
+                                write tx,
                                 sqlx::query_scalar(SET_LIFECYCLE),
                                 fetch_one,
                                 state,
@@ -200,7 +200,7 @@ async fn execute(
                     };
                     let bytes = encode_msgpack(&(&record.space, &record.scope, record.last_seq))?;
                     let _: String = db!(
-                        tx,
+                        write tx,
                         sqlx::query_scalar(CONFIRM_RECEIPT),
                         fetch_one,
                         &bytes,

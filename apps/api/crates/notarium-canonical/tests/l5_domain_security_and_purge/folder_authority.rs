@@ -97,21 +97,49 @@ pub(super) async fn check(store: &CanonicalStore, scope: &HistoryScope, owner: &
         .await
         .unwrap();
     store
-        .rename_folder(human.clone(), rename_child)
+        .rename_folder(human.clone(), rename_child.clone())
         .await
         .unwrap();
     store
-        .rename_project(human.clone(), rename_project)
+        .rename_project(human.clone(), rename_project.clone())
         .await
         .unwrap();
     assert!(matches!(
-        store.move_folder(keeper.clone(), move_child).await,
+        store.move_folder(keeper.clone(), move_child.clone()).await,
         Err(PortError::Domain(DomainError::SpaceReadOnly))
     ));
     store
         .set_folder_write_lock(human.clone(), project.clone(), true)
         .await
         .unwrap();
+    let stale = RevisionId::from_bytes([91; 16]);
+    let move_stale = next_mutation_rev(scope, owner, stale.clone(), move_child.input);
+    let folder_stale = next_mutation_rev(scope, owner, stale.clone(), rename_child.input);
+    let project_stale = next_mutation_rev(scope, owner, stale, rename_project.input);
+    let cut = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    for result in [
+        store
+            .move_folder(human.clone(), move_stale.clone())
+            .await
+            .map(|_| ()),
+        store
+            .rename_folder(human.clone(), folder_stale.clone())
+            .await
+            .map(|_| ()),
+        store
+            .rename_project(human.clone(), project_stale.clone())
+            .await
+            .map(|_| ()),
+    ] {
+        assert_eq!(
+            result.unwrap_err(),
+            PortError::Domain(DomainError::SpaceReadOnly)
+        );
+    }
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        cut
+    );
     assert!(matches!(
         store
             .set_folder_write_lock(keeper, project.clone(), false)
@@ -119,7 +147,23 @@ pub(super) async fn check(store: &CanonicalStore, scope: &HistoryScope, owner: &
         Err(PortError::Domain(DomainError::SpaceReadOnly))
     ));
     store
-        .set_folder_write_lock(human, project, false)
+        .set_folder_write_lock(human.clone(), project, false)
         .await
         .unwrap();
+    for result in [
+        store
+            .move_folder(human.clone(), move_stale)
+            .await
+            .map(|_| ()),
+        store
+            .rename_folder(human.clone(), folder_stale)
+            .await
+            .map(|_| ()),
+        store.rename_project(human, project_stale).await.map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(PortError::Domain(DomainError::RevisionConflict { .. }))
+        ));
+    }
 }

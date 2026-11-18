@@ -88,57 +88,18 @@ pub(crate) async fn move_folder_impl(
                 if folder_row.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                if folder_row.is_root {
-                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
-                }
-                if let Some(expected_rev) = &preconditions.revision
-                    && *expected_rev != folder_row.head_rev_id
-                {
-                    return Err(DomainError::RevisionConflict {
-                        current: folder_row.head_rev_id,
-                        lineage: None,
-                    }
-                    .into());
-                }
-
                 let dest_parent = input
                     .new_parent
                     .clone()
                     .unwrap_or_else(|| item_ctx.root_folder_id.clone());
-                if dest_parent == input.folder {
-                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
-                }
-                if folder_row.is_project && dest_parent != item_ctx.root_folder_id {
-                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
-                }
-
                 let before_anc =
                     load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
                 let dest_anc =
                     load_folder_ancestry_tx(tx, &scope.space_id, &dest_parent, true).await?;
 
-                // O(depth) cycle prevention under Space write lock: moving a folder into any of its own descendants is forbidden.
-                if dest_anc.ancestors.contains(&input.folder) {
-                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
-                }
-
-                // Descendants retain their relative depth. Only a deeper destination
-                // can push a previously valid path beyond the absolute limit.
+                let would_cycle = dest_anc.ancestors.contains(&input.folder);
                 let old_depth = before_anc.ancestors.len() - 1;
                 let new_depth = dest_anc.ancestors.len();
-                if new_depth > MAX_FOLDER_DEPTH
-                    || (new_depth > old_depth
-                        && subtree_reaches_depth_tx(
-                            tx,
-                            &scope.space_id,
-                            &input.folder,
-                            MAX_FOLDER_DEPTH - new_depth + 1,
-                        )
-                        .await?)
-                {
-                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
-                }
-
                 let before_facts = notarium_core::auth::ResourceFacts {
                     space: live_space.space.clone(),
                     class: target_write_class,
@@ -157,6 +118,46 @@ pub(crate) async fn move_folder_impl(
                     ability_package: None,
                 };
                 auth.authorize_direct_write(&before_facts, &after_facts)?;
+
+                if folder_row.is_root {
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                }
+                if let Some(expected_rev) = &preconditions.revision
+                    && *expected_rev != folder_row.head_rev_id
+                {
+                    return Err(DomainError::RevisionConflict {
+                        current: folder_row.head_rev_id,
+                        lineage: None,
+                    }
+                    .into());
+                }
+
+                if dest_parent == input.folder {
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                }
+                if folder_row.is_project && dest_parent != item_ctx.root_folder_id {
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                }
+
+                // O(depth) cycle prevention under Space write lock: moving a folder into any of its own descendants is forbidden.
+                if would_cycle {
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                }
+
+                // Descendants retain their relative depth. Only a deeper destination
+                // can push a previously valid path beyond the absolute limit.
+                if new_depth > MAX_FOLDER_DEPTH
+                    || (new_depth > old_depth
+                        && subtree_reaches_depth_tx(
+                            tx,
+                            &scope.space_id,
+                            &input.folder,
+                            MAX_FOLDER_DEPTH - new_depth + 1,
+                        )
+                        .await?)
+                {
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                }
 
                 let old_parent = folder_row.parent_folder_id.clone().ok_or_else(|| {
                     internal_not_committed("folder_missing_parent", "non-root folder lacks parent")
@@ -389,6 +390,16 @@ pub(crate) async fn rename_folder_impl(
                 if folder_row.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                let anc = load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
+                let facts = notarium_core::auth::ResourceFacts {
+                    space: live_space.space.clone(),
+                    class: target_write_class,
+                    ancestor_folders: anc.ancestors,
+                    folder_write_locked: anc.write_locked,
+                    ability_package: None,
+                };
+                auth.authorize_direct_write(&facts, &facts)?;
+
                 if folder_row.is_root {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
@@ -401,16 +412,6 @@ pub(crate) async fn rename_folder_impl(
                     }
                     .into());
                 }
-
-                let anc = load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
-                let facts = notarium_core::auth::ResourceFacts {
-                    space: live_space.space.clone(),
-                    class: target_write_class,
-                    ancestor_folders: anc.ancestors,
-                    folder_write_locked: anc.write_locked,
-                    ability_package: None,
-                };
-                auth.authorize_direct_write(&facts, &facts)?;
 
                 let parent_id = folder_row.parent_folder_id.clone().ok_or_else(|| {
                     internal_not_committed("folder_missing_parent", "non-root folder lacks parent")
@@ -651,6 +652,16 @@ pub(crate) async fn rename_project_impl(
                 if folder_row.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                let anc = load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
+                let facts = notarium_core::auth::ResourceFacts {
+                    space: live_space.space.clone(),
+                    class: target_write_class,
+                    ancestor_folders: anc.ancestors,
+                    folder_write_locked: anc.write_locked,
+                    ability_package: None,
+                };
+                auth.authorize_direct_write(&facts, &facts)?;
+
                 if folder_row.is_root || !folder_row.is_project {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
@@ -664,18 +675,9 @@ pub(crate) async fn rename_project_impl(
                     .into());
                 }
 
-                let anc = load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
                 if folder_row.parent_folder_id.as_ref() != Some(&live_space.root_folder_id) {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
-                let facts = notarium_core::auth::ResourceFacts {
-                    space: live_space.space.clone(),
-                    class: target_write_class,
-                    ancestor_folders: anc.ancestors,
-                    folder_write_locked: anc.write_locked,
-                    ability_package: None,
-                };
-                auth.authorize_direct_write(&facts, &facts)?;
 
                 let parent_id = folder_row.parent_folder_id.clone().ok_or_else(|| {
                     internal_not_committed("project_missing_parent", "project folder lacks parent")
@@ -933,7 +935,7 @@ pub(crate) async fn resolve_folder_alias_impl(
                     .fetch_optional(&mut **conn)
                     .await
                     .map_err(|err| {
-                        internal_not_committed("pg_resolve_folder_exact", err.to_string())
+                        crate::runtime::pg_read_error("pg_resolve_folder_exact", err)
                     })?,
                 };
 
@@ -986,7 +988,7 @@ pub(crate) async fn resolve_folder_alias_impl(
                         .fetch_all(&mut **conn)
                         .await
                         .map_err(|err| {
-                            internal_not_committed("pg_resolve_folder_alias", err.to_string())
+                            crate::runtime::pg_read_error("pg_resolve_folder_alias", err)
                         })?;
                         rows.into_iter()
                             .map(|r| r.get("target_folder_id"))
@@ -1069,7 +1071,7 @@ pub(crate) async fn resolve_note_alias_impl(
                         .fetch_optional(&mut **conn)
                         .await
                         .map_err(|err| {
-                            internal_not_committed("pg_resolve_note_slug", err.to_string())
+                            crate::runtime::pg_read_error("pg_resolve_note_slug", err)
                         })?,
                     };
                     if let Some(nid_raw) = exact_slug {
@@ -1121,7 +1123,7 @@ pub(crate) async fn resolve_note_alias_impl(
                             .fetch_all(&mut **conn)
                             .await
                             .map_err(|err| {
-                                internal_not_committed("pg_resolve_note_title", err.to_string())
+                                crate::runtime::pg_read_error("pg_resolve_note_title", err)
                             })?;
                             rows.into_iter().map(|r| r.get("note_id")).collect()
                         }
@@ -1176,10 +1178,7 @@ pub(crate) async fn resolve_note_alias_impl(
                             .fetch_all(&mut **conn)
                             .await
                             .map_err(|err| {
-                                internal_not_committed(
-                                    "pg_resolve_note_slug_alias",
-                                    err.to_string(),
-                                )
+                                crate::runtime::pg_read_error("pg_resolve_note_slug_alias", err)
                             })?;
                             rows.into_iter().map(|r| r.get("target_note_id")).collect()
                         }
@@ -1221,10 +1220,7 @@ pub(crate) async fn resolve_note_alias_impl(
                             .fetch_all(&mut **conn)
                             .await
                             .map_err(|err| {
-                                internal_not_committed(
-                                    "pg_resolve_note_title_alias",
-                                    err.to_string(),
-                                )
+                                crate::runtime::pg_read_error("pg_resolve_note_title_alias", err)
                             })?;
                             rows.into_iter().map(|r| r.get("target_note_id")).collect()
                         }
@@ -1441,7 +1437,10 @@ async fn is_folder_readable_tx(
     auth: &notarium_core::auth::EngineAuthContext,
     folder_id: &FolderId,
 ) -> Result<bool, PortError> {
-    let Ok(anc) = load_folder_ancestry_tx(tx, &space.id, folder_id, true).await else {
+    let Some(anc) = super::common::optional_read(
+        load_folder_ancestry_tx(tx, &space.id, folder_id, true).await,
+    )?
+    else {
         return Ok(false);
     };
     let Some(grant) = auth.spaces().get(&space.id) else {
@@ -1475,15 +1474,17 @@ pub(crate) async fn is_note_live_readable_tx(
     if head.lifecycle != Lifecycle::Active {
         return Ok(false);
     }
-    let Ok((facts, _)) = build_resource_facts_tx(
-        tx,
-        space,
-        &head.parent_folder_id,
-        head.doc_class,
-        head.ability_id,
-        true,
-    )
-    .await
+    let Some((facts, _)) = super::common::optional_read(
+        build_resource_facts_tx(
+            tx,
+            space,
+            &head.parent_folder_id,
+            head.doc_class,
+            head.ability_id,
+            true,
+        )
+        .await,
+    )?
     else {
         return Ok(false);
     };

@@ -197,6 +197,33 @@ pub struct CanonicalConfig {
 }
 
 impl CanonicalConfig {
+    pub(crate) fn validate_timer_intervals(&self) -> DomainResult<()> {
+        let now = std::time::Instant::now();
+        let fits = |delay: Duration| now.checked_add(delay).is_some();
+        let valid = match &self.sql {
+            SqlBackendConfig::Sqlite {
+                read_deadline,
+                passive_checkpoint_interval,
+                wal_reset_cycle_deadline,
+                ..
+            } => {
+                *read_deadline < Duration::from_millis(250)
+                    && fits(*passive_checkpoint_interval)
+                    && fits(
+                        wal_reset_cycle_deadline
+                            .saturating_add((*read_deadline).max(Duration::from_millis(1))),
+                    )
+            }
+            SqlBackendConfig::Postgres {
+                statement_timeout, ..
+            } => fits(*statement_timeout),
+        };
+        if !valid || !fits(self.writer.batch_flush_window) {
+            return Err(DomainError::validation(ValidationReason::InvalidRange));
+        }
+        Ok(())
+    }
+
     pub fn local_default(installation_id: InstallationId, data_root: DataRoot) -> Self {
         Self {
             installation_id,

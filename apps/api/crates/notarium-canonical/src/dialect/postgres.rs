@@ -146,14 +146,24 @@ pub(crate) async fn open_and_bootstrap_postgres(
         .await
         .map_err(|err| internal_not_committed("pg_set_sync_commit", err.to_string()))?;
 
-    let sync_commit: String = sqlx::query_scalar("SHOW synchronous_commit")
-        .fetch_one(&mut bootstrap_conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_show_sync_commit", err.to_string()))?;
+    let (sync_commit, fsync): (String, String) =
+        sqlx::query_as("SELECT current_setting('synchronous_commit'), current_setting('fsync')")
+            .fetch_one(&mut bootstrap_conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("pg_read_durability_settings", err.to_string())
+            })?;
     if !sync_commit.eq_ignore_ascii_case("on") {
         return Err(internal_not_committed(
             "pg_sync_commit_disabled",
             format!("SHOW synchronous_commit={sync_commit}, expected on"),
+        ));
+    }
+
+    if !fsync.eq_ignore_ascii_case("on") {
+        return Err(internal_not_committed(
+            "pg_fsync_disabled",
+            format!("PostgreSQL fsync={fsync}, expected on"),
         ));
     }
 

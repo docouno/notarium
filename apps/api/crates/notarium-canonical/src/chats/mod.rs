@@ -611,7 +611,7 @@ async fn load_thread_head_opt_tx(
             .bind(thread_id.as_str())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_thread", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_thread", err))?;
             r.map(|row| {
                 (
                     row.get("kind"),
@@ -799,7 +799,7 @@ async fn jump_to_ancestor_at_depth_tx(
         .bind(target_i64)
         .fetch_optional(&mut **conn)
         .await
-        .map_err(|err| internal_not_committed("pg_jump_ancestor", err.to_string()))?,
+        .map_err(|err| crate::runtime::pg_read_error("pg_jump_ancestor", err))?,
     };
 
     match landed_opt {
@@ -842,7 +842,7 @@ async fn load_entry_depth_and_taint_tx(
             .bind(seq_i64)
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_entry_depth", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_entry_depth", err))?;
             r.map(|row| (row.get("d"), row.get("t")))
         }
     };
@@ -1361,7 +1361,7 @@ async fn read_chat_impl(
                         .bind(max_n)
                         .fetch_all(&mut **conn)
                         .await
-                        .map_err(|err| internal_not_committed("pg_read_chat_win", err.to_string()))?;
+                        .map_err(|err| crate::runtime::pg_read_error("pg_read_chat_win", err))?;
 
                         rows.into_iter()
                             .map(|r| {
@@ -2237,10 +2237,15 @@ async fn create_chat_impl(
                     return Err(DomainError::CrossSpaceTainted.into());
                 }
 
-                if load_thread_head_opt_tx(tx, &scope.space_id, &input.thread)
-                    .await?
-                    .is_some()
+                auth.authorize_chat_read(
+                    &live_space.space,
+                    input.project_folder.as_ref(),
+                    tainted,
+                )?;
+                if let Some(existing) =
+                    load_thread_head_opt_tx(tx, &scope.space_id, &input.thread).await?
                 {
+                    authorize_thread_mutation(&auth, &live_space.space, &existing, false)?;
                     return Err(DomainError::validation(ValidationReason::DuplicateKey).into());
                 }
 
@@ -2446,16 +2451,7 @@ async fn fork_chat_impl(
                 authorize_chat_write_on_space(&auth, &live_space.space)?;
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
-                if let Some(expected_rev) = &preconditions.revision
-                    && *expected_rev != th.head_rev_id
-                {
-                    return Err(DomainError::RevisionConflict {
-                        current: th.head_rev_id,
-                        lineage: None,
-                    }
-                    .into());
-                }
-
+                authorize_thread_mutation(&auth, &live_space.space, &th, false)?;
                 let parent_tainted = if input.parent == ThreadEntrySeq::ZERO {
                     false
                 } else {
@@ -2479,6 +2475,16 @@ async fn fork_chat_impl(
                         || live_space.space.kind == SpaceKind::Shared)
                 {
                     return Err(DomainError::CrossSpaceTainted.into());
+                }
+
+                if let Some(expected_rev) = &preconditions.revision
+                    && *expected_rev != th.head_rev_id
+                {
+                    return Err(DomainError::RevisionConflict {
+                        current: th.head_rev_id,
+                        lineage: None,
+                    }
+                    .into());
                 }
 
                 let seq = item_ctx.alloc_next_seq()?;
@@ -2748,16 +2754,7 @@ async fn append_chat_impl(
                 authorize_chat_write_on_space(&auth, &live_space.space)?;
 
                 let th = load_thread_head_tx(tx, &scope.space_id, &input.thread).await?;
-                if let Some(expected_rev) = &preconditions.revision
-                    && *expected_rev != th.head_rev_id
-                {
-                    return Err(DomainError::RevisionConflict {
-                        current: th.head_rev_id,
-                        lineage: None,
-                    }
-                    .into());
-                }
-
+                authorize_thread_mutation(&auth, &live_space.space, &th, false)?;
                 let (parent_opt, depth, anc_16, anc_256, parent_tainted) =
                     compute_skip_pointers_for_parent_tx(
                         tx,
@@ -2824,6 +2821,16 @@ async fn append_chat_impl(
                         || live_space.space.kind == SpaceKind::Shared)
                 {
                     return Err(DomainError::CrossSpaceTainted.into());
+                }
+
+                if let Some(expected_rev) = &preconditions.revision
+                    && *expected_rev != th.head_rev_id
+                {
+                    return Err(DomainError::RevisionConflict {
+                        current: th.head_rev_id,
+                        lineage: None,
+                    }
+                    .into());
                 }
 
                 if staging_lease.is_some() && effective_tainted {
@@ -3206,7 +3213,7 @@ async fn check_queue_admission_tx(
                 .await
         }
     }
-    .map_err(|err| internal_not_committed("queue_admission_counts", err.to_string()))?;
+    .map_err(|err| crate::runtime::pg_read_error("queue_admission_counts", err))?;
     if duplicates != 0 {
         return Err(DomainError::validation(ValidationReason::DuplicateKey).into());
     }
@@ -3218,7 +3225,8 @@ async fn queue_chat_input_impl(
     mut ctx: SpaceContext,
     request: Mutation<PendingChatInput>,
 ) -> Result<QueueInputOutcome, PortError> {
-    let deadline = tokio::time::Instant::now() + ctx.budget.remaining;
+    let deadline =
+        crate::runtime::deadline_after(tokio::time::Instant::now(), ctx.budget.remaining);
     validate_mutation_identity(&ctx, &request.identity)?;
     if request.input.sender != *ctx.auth().principal() {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());

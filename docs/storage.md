@@ -20,6 +20,9 @@ same behavioral parity suites:
   `spaces` and `fillfactor = 80` on `note_heads` to preserve PostgreSQL HOT
   updates without indexing `last_seq` or `updated_seq`) paired with
   `S3ChunkedV1` over `rustls` (`ring`) and pure-Rust `AWS4-HMAC-SHA256`.
+  Startup requires server-wide `fsync=on` before creating or migrating the canonical
+  schema. Keep it enabled while the store is running. Every pooled session sets
+  `synchronous_commit=on`. The D3 report records both observed settings.
   PostgreSQL TCP connections verify the server certificate against WebPKI trust
   roots and match its identity to the configured host, including loopback.
   Set the TCP transport's `root_cert` field to a PEM CA file to trust a private
@@ -49,7 +52,16 @@ provisioning runtime. Opening an existing database permits reads. To take over
 writes after a restart or failover, the trusted lease owner calls
 `advance_space_lease` with `ServicePurpose::Revocation` and an epoch greater
 than the persisted one. The successful transition grants that epoch to the
-calling runtime and resumes pending storage erasure for the Space. A restore
+calling runtime and resumes pending storage erasure for the Space. Cancellation
+or deadline expiry before commit leaves the epoch unchanged. During commit the
+outcome can be unknown. The initiating runtime publishes the grant only after
+acknowledgement. Retrying the same epoch is safe on that runtime. A runtime
+without a confirmed grant must request a higher epoch if the database already
+contains the requested value. After acknowledgement, expiry or cancellation
+returns the granted epoch while the store continues recovery. Concurrent retries
+on the owning runtime share one recovery. A permanent recovery failure ends the
+worker and is logged; callers still waiting receive a non-retryable failure for
+the combined operation. The confirmed epoch stays in force. A restore
 grants the epoch of the new history to its restoring runtime. A process that
 lost its grant must obtain a new one before writing again. Local SQLite
 recovers writes under its exclusive DataRoot owner lock.
@@ -115,6 +127,9 @@ A supplied revision must match the recorded parent revision. Old edits have
 no witness for lease or lineage preconditions, so a retry that supplies either
 is rejected. Replaying a retained receipt requires current authorization and
 the historical evidence above. The note head keeps its current revision.
+Mutation conflicts carry a current revision or room details only after the
+store checks the caller's access to that resource. Batch items use the same
+rule under their writer savepoints.
 
 - **Scoped history:** Every Space owns `(SpaceId, HistoryIncarnation)` and a
   stable root `FolderId` (`parent = None` normalizes to `root_folder_id`).
@@ -218,7 +233,7 @@ Irreversible erasure executes as a crash-recoverable 3-phase protocol:
    enforced ahead of historical reads, cold seeds and card hydration). SQLite
    startup resumes pending purges and standalone blob retirements. For an
    existing PostgreSQL Space, the incoming writer must acquire a higher epoch
-   with `advance_space_lease`; that call resumes pending work before returning.
+   with `advance_space_lease`. The caller waits for recovery within its budget.
 
 Shared blobs that remain referenced by independent live notes or chat entries
 retain their active references, and historical external backups created prior to
@@ -263,6 +278,9 @@ same example against an isolated prefix.
   item without creating `SpaceSeq` gaps. Preceding items in the same batch
   advance a virtual per-Space `effective_cut` immediately, preventing intra-batch
   semantic phantoms.
+  A filename pin reported by the registered room owner defers the same fresh
+  note move through either entry point. A retained move receipt can still be
+  replayed. Metadata-only moves preserve an unpinned room's carrier lineage.
   A batch note edit uses its requested base digest and the head visible at its
   savepoint. Link appends derive their base from the current source. `link_many`
   submits distinct sources together and starts a new transaction when a source
@@ -277,6 +295,10 @@ same example against an isolated prefix.
   checkout's interrupt handle. A background loop runs `PASSIVE` checkpoints during idle ticks (`15 ms` cadence)
   and uses a 250 ms budget to drain readers and acquire the writer for a
   `RESTART`/`TRUNCATE` checkpoint (512 MiB soft / 896 MiB high watermarks).
+  An explicit caller deadline includes admission, checkout, and the read itself.
+  Without one, the default allows one configured reset interval plus one read
+  interval (498 ms by default). Once admitted, the no-budget path allows at most
+  one read interval for checkout and SQL. The active snapshot retains its own cap.
   Once the filesystem flush starts, SQLite holds the gate until I/O completes.
   `WalTelemetrySnapshot.max_reset_reader_gate_ns` records the longest actual
   closure and `reset_gate_overruns` counts closures over budget.
@@ -379,9 +401,10 @@ same example against an isolated prefix.
   For versions 1 through 3, restore the predecessor index layout on
   `blob_references` using `tests/fixtures/schema-v3-reference-index.sql`
   in the canonical crate. Call `decoded.import_rows(&mut transaction)` and
-  commit the transaction. The importer stages self-referencing tables and
-  inserts each complete table in one statement with foreign keys enforced.
-  This accommodates child folders whose IDs sort before their parents.
+  commit the transaction. The importer writes decoded rows into their target
+  tables one row at a time. For folder heads and chat entries it first fills a
+  temporary table, then inserts the full set in one statement so foreign keys
+  can resolve parents that appear later in the archive.
   Opening the target with the original installation ID applies the version 5 migration. The canonical
   L4 backup suite exercises this procedure with archives from all four predecessor versions.
   Before serving the restored database, call `restore_cursors` with each
@@ -438,7 +461,7 @@ post-commit overlay checks to count. Empty latency samples serialize as null.
 | SQLite writer | 50 writers with either 0 or 200 readers, unique 4 KiB edits, 10 s warmup + 30 s measurement, 3 runs each. Every run must exceed 2,000 mutations/s and return zero busy errors. The report samples the active batch writer's synchronous setting and journal size limit and records reader gate dwell. |
 | Rollback | Fresh run, history and revisions for every sample. The Space also has an unrelated folder. Seed 18 edited notes, 2 creations, 1 deletion with a slug collision and 1 subsequent manual edit through the public ports before starting the timer. Open and cleanly close a room on each of the 17 edited notes eligible for restoration. After timing, verify that every room retains its lease, advances exactly one lineage and points at its returned restore revision. Require a new rollback receipt above the pre-call Space sequence. At that receipt, verify that each revision references its original revision and content digest, then read and hash the original carrier through the note API. The `verified_closed_room_restores` counter includes successful checks for measured samples and excludes the warmup. SQLite and PostgreSQL with local CAS each require p95 below 5 ms across 1,000 samples. A separate 200-sample PostgreSQL/S3 profile reports local UDS latency. |
 | Chat window | 10,000 reads of 50 entries on each 10,000-turn thread, p95 below 1 ms. After 50 shared turns, the branched thread appends 16 turns at a time to each of nine branches in rotation. All nine measured windows cross at least two parent gaps containing 128 or more off-branch turns, beyond the PostgreSQL 100-entry lookback. Every read compares its full ordered sequence of 50 entries against append receipts. The smoke run uses the same topology with 512 turns and 200 reads per profile. Row triggers count writes across the canonical tables. |
-| Board and folder | 10,000 first-slot board moves with ranks at most 16 bytes. After each move, compare its receipt result to the first ranked overlay and check every rank length. Moving a folder over 100,000 seeded descendant heads must perform zero row writes to descendants. Triggers observe inserts, updates and deletes. A no-op update to one descendant verifies the counter. |
+| Board and folder | 10,000 first-slot board moves with ranks at most 16 bytes. After each move, compare its receipt result to the first ranked overlay and check every rank length. Each move over 100,000 seeded descendants alternates between two parents. After timing, verify the receipt sequence, durable parent and revision chain, every historical alias at its original parent and sequence, and zero descendant row writes. Only verified moves enter the latency distribution. A no-op update to one descendant verifies the write counter. |
 | Paired backup | The control and canonical participants share an installation. Test 1 and 64 canonical Spaces separately on SQLite and PostgreSQL. For each profile, prepare both participants, acquire both holds, pause control then canonical, pin both snapshots, and resume both writers. Report prepare/holds, safe-point acquisition, confirmed pause after control acknowledges its safe point, and the inclusive interval from the first pause call through the last resume. The confirmed pause from the first safe point through both resume acknowledgements must reach p95 below 1 ms across 1,000 captures per profile. |
 
 ### Proof boundaries

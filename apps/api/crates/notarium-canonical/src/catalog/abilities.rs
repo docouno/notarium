@@ -32,7 +32,7 @@ async fn resolve(
     exact: Option<&RevisionId>,
 ) -> Result<ResolvedAbility, PortError> {
     let (entry, tip, state, current_name): (String, String, String, String) = db!(
-        tx,
+        read tx,
         sqlx::query_as(READ_PACKAGE),
         fetch_optional,
         space.space.id.as_str(),
@@ -74,7 +74,7 @@ async fn resolve(
         None => RevisionId::parse(&tip)?,
     };
     let (bytes, visibility): (Vec<u8>, i64) = db!(
-        tx,
+        read tx,
         sqlx::query_as(READ_REVISION),
         fetch_optional,
         space.space.id.as_str(),
@@ -305,7 +305,7 @@ pub(super) async fn page(
                     };
                     let remaining = (cap + 1 - keys.len()) as i64;
                     let ids: Vec<(String, i64)> = db!(
-                        tx,
+                        read tx,
                         sqlx::query_as(LIST_PACKAGES),
                         fetch_all,
                         rec.space.id.as_str(),

@@ -67,6 +67,45 @@ async fn postgres_tcp_requires_a_verified_server_and_redacts_credentials() {
 }
 
 #[tokio::test]
+async fn postgres_open_rejects_fsync_off_before_creating_the_schema() {
+    let mut fixtures = StorageTestFixtures::load_required();
+    fixtures.pg_port = fixtures
+        .pg_fsync_off_port
+        .expect("isolated fsync-off test server");
+    fixtures.pg_database = "postgres".into();
+    let mut observer = fixtures.open_raw_pg().await;
+    let (sync, fsync): (String, String) =
+        sqlx::query_as("SELECT current_setting('synchronous_commit'), current_setting('fsync')")
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+    assert_eq!((sync.as_str(), fsync.as_str()), ("on", "off"));
+
+    let temp = TempDataRoot::new("pg-durability");
+    let schema = fixtures.fresh_pg_schema();
+    let cfg = fixtures.pg_local_config(sample_installation_id(53), &schema, temp.data_root());
+    let Err(failure) = CanonicalRuntime::open(cfg).await else {
+        panic!("fsync-off startup must fail");
+    };
+    assert_eq!(
+        failure,
+        notarium_canonical::codec::internal_not_committed(
+            "pg_fsync_disabled",
+            "PostgreSQL fsync=off, expected on",
+        )
+    );
+    let created: bool = sqlx::query_scalar("SELECT to_regnamespace($1) IS NOT NULL")
+        .bind(&schema)
+        .fetch_one(&mut observer)
+        .await
+        .unwrap();
+    assert!(
+        !created,
+        "durability verification precedes schema migration"
+    );
+}
+
+#[tokio::test]
 async fn l1_sqlite_bootstrap_witness_owner_lock_and_fail_closed_guards() {
     let temp = TempDataRoot::new("l1-sqlite-boot");
     let install = sample_installation_id(1);
@@ -78,6 +117,22 @@ async fn l1_sqlite_bootstrap_witness_owner_lock_and_fail_closed_guards() {
     );
 
     let cfg = CanonicalConfig::local_default(install.clone(), temp.data_root());
+    let mut invalid_timer = cfg.clone();
+    if let SqlBackendConfig::Sqlite {
+        wal_reset_cycle_deadline,
+        ..
+    } = &mut invalid_timer.sql
+    {
+        *wal_reset_cycle_deadline = std::time::Duration::MAX;
+    }
+    assert_validation_err(
+        &CanonicalRuntime::open(invalid_timer).await.map(|_| ()),
+        ValidationReason::InvalidRange,
+    );
+    assert_eq!(
+        observe_sqlite_canonical_witness(&temp.data_root()).await,
+        MarkerObservation::Missing
+    );
     let (store, runtime) = CanonicalRuntime::open(cfg.clone())
         .await
         .expect("initial SQLite canonical open");

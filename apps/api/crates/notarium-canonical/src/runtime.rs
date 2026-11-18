@@ -1,3 +1,5 @@
+mod lease;
+
 use std::{
     sync::{
         Arc, OnceLock,
@@ -18,7 +20,7 @@ use notarium_core::{
         NoteId, PrincipalId, RevisionId, SpaceId, SpaceSeq,
     },
     model::{FolderRef, HistoryScope, Lifecycle, PathTarget},
-    ports::{CallBudget, MaintenanceContext, ServicePurpose},
+    ports::CallBudget,
     value::Timestamp,
 };
 use sqlx::{Connection, Row, SqlitePool};
@@ -46,6 +48,17 @@ use crate::{
 // Ordinary source snapshots are bounded below 250 ms in both storage profiles.
 const PG_READ_SNAPSHOT_LIMIT: Duration = Duration::from_millis(240);
 
+// An arbitrarily long caller budget still permits admission. Keep representable
+// instants and leave room for Tokio's millisecond timer rounding.
+pub(crate) fn deadline_after(
+    now: tokio::time::Instant,
+    duration: Duration,
+) -> tokio::time::Instant {
+    now.checked_add(duration)
+        .filter(|at| at.checked_add(Duration::from_millis(1)).is_some())
+        .unwrap_or_else(|| tokio::time::sleep(duration).deadline())
+}
+
 fn pg_read_caller_deadline(
     pool: &StorePgPool,
     budget: Option<&CallBudget>,
@@ -65,13 +78,14 @@ fn pg_read_caller_deadline(
             "PostgreSQL read call budget expired",
         ));
     }
-    Ok(tokio::time::Instant::now() + remaining)
+    Ok(deadline_after(tokio::time::Instant::now(), remaining))
 }
 
 pub(crate) fn pg_read_error(stage: &'static str, error: sqlx::Error) -> PortError {
     if error
         .as_database_error()
-        .is_some_and(|db| db.code().as_deref() == Some("57014"))
+        .and_then(|db| db.try_downcast_ref::<sqlx::postgres::PgDatabaseError>())
+        .is_some_and(|db| db.code() == "57014")
     {
         return deadline_not_committed(stage, "PostgreSQL read statement was canceled");
     }
@@ -139,6 +153,9 @@ pub(crate) struct CanonicalInner {
         std::sync::Mutex<std::collections::HashSet<notarium_core::ids::BackupId>>,
     pub backup_spool_roots: std::sync::Mutex<Vec<std::path::PathBuf>>,
     pub backup_spool_override: std::sync::Mutex<Option<std::path::PathBuf>>,
+    lease_recoveries: std::sync::Mutex<
+        std::collections::HashMap<(HistoryScope, LeaseEpoch), lease::RecoveryWaiters>,
+    >,
     pub retirement_workers: crate::blobs::retirement_worker::RetirementWorkers,
     pub backup_cleanups: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pub last_backup_memory_stats:
@@ -294,6 +311,7 @@ impl CanonicalRuntime {
         config: CanonicalConfig,
         custom_s3_transport: Option<Arc<dyn S3Transport>>,
     ) -> Result<(CanonicalStore, Self), PortError> {
+        config.validate_timer_intervals()?;
         let mut locks = Vec::new();
         match (&config.sql, &config.blobs) {
             (
@@ -415,6 +433,7 @@ impl CanonicalRuntime {
             backup_local_holds: Default::default(),
             backup_spool_roots: Default::default(),
             backup_spool_override: std::sync::Mutex::new(None),
+            lease_recoveries: Default::default(),
             retirement_workers: Default::default(),
             backup_cleanups: std::sync::Mutex::new(Vec::new()),
             last_backup_memory_stats: std::sync::Mutex::new(None),
@@ -852,7 +871,7 @@ impl CanonicalStore {
         budget: CallBudget,
         operation: impl Future<Output = Result<T, PortError>>,
     ) -> Result<T, PortError> {
-        let deadline = tokio::time::Instant::now() + budget.remaining;
+        let deadline = deadline_after(tokio::time::Instant::now(), budget.remaining);
         tokio::select! {
             biased;
             error = pg_read_cancelled(Some(&budget)) => Err(error),
@@ -1070,12 +1089,12 @@ impl CanonicalStore {
                         let mut transaction = conn
                             .begin_with(sqlx::AssertSqlSafe(settings))
                             .await
-                            .map_err(|e| internal_not_committed("pg_begin_read", e.to_string()))?;
+                            .map_err(|e| pg_read_error("pg_begin_read", e))?;
                         let val = op(&mut BackendConn::Postgres(&mut transaction)).await?;
                         transaction
                             .commit()
                             .await
-                            .map_err(|e| internal_not_committed("pg_commit_read", e.to_string()))?;
+                            .map_err(|e| pg_read_error("pg_commit_read", e))?;
                         Ok(val)
                     };
                     tokio::select! {
@@ -1122,82 +1141,6 @@ impl CanonicalStore {
             Box::pin(async move { load_space_record(tx, &id_cl).await })
         })
         .await
-    }
-
-    /// Trusted lease turnover primitive updating `spaces.active_epoch`.
-    pub async fn advance_space_lease(
-        &self,
-        ctx: &MaintenanceContext,
-        scope: &HistoryScope,
-        new_epoch: LeaseEpoch,
-    ) -> Result<LeaseEpoch, PortError> {
-        ctx.authority.require(ServicePurpose::Revocation)?;
-        let scope_cl = scope.clone();
-        let retry_own_epoch = self
-            .inner
-            .check_writer_epoch(&scope.space_id, new_epoch)
-            .is_ok();
-        self.with_write_tx(|tx| {
-            let scope_inner = scope_cl.clone();
-            Box::pin(async move {
-                let current = load_space_record_for_update_opt(tx, &scope_inner.space_id).await?
-                    .ok_or(DomainError::ResourceNotFound)?;
-                current.scope.check(&scope_inner)?;
-                if new_epoch == current.active_epoch && retry_own_epoch {
-                    return Ok(new_epoch);
-                }
-                if new_epoch <= current.active_epoch {
-                    return Err(
-                        DomainError::validation(ValidationReason::InvalidState).into()
-                    );
-                }
-                let epoch_i64 = new_epoch.get() as i64;
-                let affected = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query(
-                        "UPDATE spaces SET active_epoch = ? WHERE space_id = ? AND history_incarnation = ?",
-                    )
-                    .bind(epoch_i64)
-                    .bind(scope_inner.space_id.as_str())
-                    .bind(scope_inner.incarnation.as_bytes().as_slice())
-                    .execute(&mut **conn)
-                    .await
-                    .map_err(|err| internal_not_committed("sqlite_advance_epoch", err.to_string()))?
-                    .rows_affected(),
-                    BackendConn::Postgres(conn) => sqlx::query(
-                        "UPDATE spaces SET active_epoch = $1 WHERE space_id = $2 AND history_incarnation = $3",
-                    )
-                    .bind(epoch_i64)
-                    .bind(scope_inner.space_id.as_str())
-                    .bind(scope_inner.incarnation.as_bytes().as_slice())
-                    .execute(&mut **conn)
-                    .await
-                    .map_err(|err| internal_not_committed("pg_advance_epoch", err.to_string()))?
-                    .rows_affected(),
-                };
-                if affected != 1 {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                if tx.is_postgres() {
-                    crate::peers::fence_rooms_on_takeover_tx(tx, &scope_inner).await?;
-                }
-                Ok(new_epoch)
-            })
-        })
-        .await?;
-        self.inner.grant_writer_epoch(&scope.space_id, new_epoch);
-        self.resume_pending_storage_for_space(
-            scope,
-            new_epoch,
-            crate::domain::purge::RetirementRecovery::Lease,
-        )
-        .await
-        .map_err(|err| {
-            crate::codec::unknown_commit_outcome(
-                "lease_recovery_incomplete",
-                format!("storage recovery after lease turnover: {err:?}"),
-            )
-        })?;
-        Ok(new_epoch)
     }
 
     /// Creates a canonical folder inside `spec.scope` (normalizing `parent = None` to `root_folder_id`).
@@ -3021,9 +2964,7 @@ pub(crate) async fn are_any_notes_purge_fenced_tx(
                     .build_query_scalar()
                     .fetch_optional(&mut **conn)
                     .await
-                    .map_err(|err| {
-                        internal_not_committed("pg_check_purge_fence_batch", err.to_string())
-                    })?;
+                    .map_err(|err| pg_read_error("pg_check_purge_fence_batch", err))?;
                 row.is_some()
             }
         };

@@ -274,6 +274,7 @@ struct EnvironmentAttribution {
     sqlite_wal_high_watermark_bytes: u64,
     postgres_transport: &'static str,
     postgres_synchronous_commit: String,
+    postgres_fsync: String,
     postgres_select_one_rtt: PercentilesUs,
     s3_transport: &'static str,
     writer_max_batch_items: usize,
@@ -319,6 +320,7 @@ struct RollbackProfileMetrics {
     trashed_per_call: usize,
     skipped_manual_per_call: usize,
     verified_closed_room_restores: usize,
+    ordinary_cutoff_read_deadlines: usize,
     latency: PercentilesUs,
 }
 
@@ -408,6 +410,8 @@ struct FolderMoveMetrics {
     total_seeded_descendants: usize,
     moves_executed: usize,
     descendant_rows_modified: Option<u64>,
+    verified_alias_rows: usize,
+    last_verified_move_seq: Option<SpaceSeq>,
     latency: Option<PercentilesUs>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<MoveFailure>,
@@ -1269,6 +1273,7 @@ async fn measure_fresh_rollbacks(
 ) -> RollbackProfileMetrics {
     let mut samples = Vec::with_capacity(iterations);
     let mut verified_closed_room_restores = 0;
+    let mut ordinary_cutoff_read_deadlines = 0;
     for sample in 0..=iterations {
         let fixture = seed_rollback_microfixture(store).await;
         let ctx = owner_ctx(&fixture.scope, fixture.owner.clone());
@@ -1339,16 +1344,35 @@ async fn measure_fresh_rollbacks(
             assert_ne!(restored.revision, room.closed.carrier_rev_id);
             assert_ne!(restored.revision, room.original_revision);
 
-            let revision = store
-                .read_entity_revision_at_cutoff(
-                    &fixture.scope,
-                    "note",
-                    note.as_str(),
-                    Some(result.receipt.seq()),
-                )
-                .await
-                .unwrap()
-                .expect("restored revision at the rollback receipt");
+            let cutoff = Some(result.receipt.seq());
+            let read_started = Instant::now();
+            let first = store
+                .read_entity_revision_at_cutoff(&fixture.scope, "note", note.as_str(), cutoff)
+                .await;
+            let revision = match first {
+                Err(error @ PortError::DeadlineExceeded(_)) => {
+                    ordinary_cutoff_read_deadlines += 1;
+                    eprintln!(
+                        "[D3] cutoff read failed: backend={backend} sample={sample} room={verified}\
+                         space={} note={} revision={} cutoff={} attempt=1 read_us={} rollback_ns={}\
+                         error={error:?} wal={:?}",
+                        fixture.scope.space_id, note, restored.revision, result.receipt.seq().get(),
+                        read_started.elapsed().as_micros(), elapsed.as_nanos(), store.wal_telemetry(),
+                    );
+                    let observed = store
+                        .read_entity_revision_at_cutoff(&fixture.scope, "note", note.as_str(), cutoff)
+                        .await;
+                    eprintln!(
+                        "[D3] cutoff read observation: backend={backend} sample={sample} room={verified}\
+                         attempt=2 observed={} error={:?} wal={:?}",
+                        matches!(&observed, Ok(Some(_))), observed.as_ref().err(), store.wal_telemetry(),
+                    );
+                    observed
+                }
+                result => result,
+            }
+            .expect("read the immutable revision at the original rollback receipt")
+            .expect("restored revision at the rollback receipt");
             assert_eq!(revision.revision_id, restored.revision);
             assert_eq!(
                 revision.restored_from_rev_id.as_ref(),
@@ -1390,6 +1414,7 @@ async fn measure_fresh_rollbacks(
         trashed_per_call: 2,
         skipped_manual_per_call: 1,
         verified_closed_room_restores,
+        ordinary_cutoff_read_deadlines,
         latency: compute_percentiles_from_ns(samples),
     }
 }
@@ -2209,6 +2234,8 @@ async fn measure_folder_moves(
         .last_seq
         .get();
 
+    let moving_created_seq = seq_cursor;
+
     // Bulk-seed `descendant_folders` nested child folders under `moving_folder` (multi-level tree)
     let mut sub_folder_ids = Vec::with_capacity(descendant_folders);
     for idx in 0..descendant_folders {
@@ -2353,7 +2380,47 @@ async fn measure_folder_moves(
     .await
     .map_err(|err| MoveFailure::port("install_write_counter", None, None, err))?;
 
+    // This one read snapshot must reflect the receipt, the new head and its predecessor.
+    // Every valid alias slot has a unique primary key. Requiring all rows to be valid
+    // and one row per move proves the complete alternating history, including old rows.
+    let audit_sql = format!(
+        "WITH step AS (
+             SELECT history_incarnation, last_seq, last_seq - {seq_cursor} AS n
+             FROM spaces WHERE space_id = '{sid}'
+         ), aliases AS (
+             SELECT COUNT(*) AS total, COUNT(CASE WHEN
+                 a.target_folder_id = '{moving}' AND a.old_slug_fold = 'moving-subtree'
+                 AND a.created_seq > {seq_cursor} AND a.created_seq <= step.last_seq
+                 AND a.old_parent_folder_id = CASE WHEN (a.created_seq - {seq_cursor}) % 2 = 1
+                     THEN '{a}' ELSE '{b}' END THEN 1 END) AS valid
+             FROM folder_aliases a CROSS JOIN step WHERE a.space_id = '{sid}'
+         )
+         SELECT CASE
+             WHEN NOT EXISTS (
+                 SELECT 1 FROM folder_heads f
+                 JOIN revisions r ON r.space_id = f.space_id AND r.rev_id = f.head_rev_id
+                 JOIN revisions prev ON prev.space_id = r.space_id AND prev.rev_id = r.parent_rev_id
+                 WHERE f.space_id = '{sid}' AND f.folder_id = '{moving}'
+                 AND f.parent_folder_id = CASE WHEN step.n % 2 = 1 THEN '{b}' ELSE '{a}' END
+                 AND f.slug_fold = 'moving-subtree' AND f.lifecycle_state = 'active'
+                 AND f.created_seq = {moving_created_seq} AND f.rev_seq = {moving_created_seq} + step.n
+                 AND f.updated_seq = step.last_seq AND r.space_seq = step.last_seq
+                 AND r.visibility_seq = step.last_seq AND r.entity_type = 'folder' AND r.entity_key = f.folder_id
+                 AND r.history_incarnation = step.history_incarnation
+                 AND prev.entity_type = 'folder' AND prev.entity_key = f.folder_id
+                 AND prev.history_incarnation = step.history_incarnation
+                 AND prev.space_seq = CASE WHEN step.n = 1 THEN {moving_created_seq} ELSE step.last_seq - 1 END
+             ) THEN -1
+             WHEN aliases.total <> step.n OR aliases.valid <> step.n THEN -2
+             ELSE step.last_seq END
+         FROM step CROSS JOIN aliases",
+        moving = moving_folder.as_str(),
+        a = parent_a.as_str(),
+        b = parent_b.as_str(),
+    );
+
     for iter in 0..metrics.moves_requested {
+        metrics.descendant_rows_modified = None;
         let dst = if iter % 2 == 0 {
             parent_b.clone()
         } else {
@@ -2369,25 +2436,71 @@ async fn measure_folder_moves(
             },
         );
         let t0 = Instant::now();
-        store
+        let committed = store
             .move_folder(mctx, req)
             .await
             .map_err(|err| MoveFailure::port("move_folder", Some(iter + 1), None, err))?;
         let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        samples.push(elapsed_ns);
-    }
 
-    let descendant_writes = observed_row_writes(store)
-        .await
-        .map_err(|err| MoveFailure::port("read_write_counter", None, None, err))?;
-    metrics.descendant_rows_modified = Some(descendant_writes);
-    if descendant_writes != 0 {
-        return Err(MoveFailure::new(
-            "verify_descendant_writes",
-            None,
-            None,
-            format!("observed {descendant_writes} descendant writes"),
-        ));
+        let number = iter + 1;
+        let receipt = committed.receipt.seq();
+        let expected_seq = seq_cursor + number as u64;
+        let at_move = |stage, err| MoveFailure::port(stage, Some(number), Some(receipt), err);
+        let failed = |stage, detail| MoveFailure::new(stage, Some(number), Some(receipt), detail);
+        if committed.receipt.scope() != &space.scope
+            || receipt.get() != expected_seq
+            || committed.value.space_id != space.scope.space_id
+            || committed.value.folder_id != moving_folder
+        {
+            return Err(failed(
+                "verify_move_receipt",
+                format!(
+                    "expected folder {moving_folder:?} in {:?} at sequence {expected_seq}, got {committed:?}",
+                    space.scope
+                ),
+            ));
+        }
+
+        let audited = store
+            .execute_diagnostic_read_sql_for_test(None, &audit_sql)
+            .await
+            .map_err(|err| at_move("read_folder_move_state", err))?;
+        match audited {
+            -1 => {
+                return Err(failed(
+                    "verify_folder_head",
+                    "parent, head revision or predecessor differs at the cut".into(),
+                ));
+            }
+            -2 => {
+                return Err(failed(
+                    "verify_folder_aliases",
+                    format!(
+                        "expected {number} aliases covering every alternating source parent and sequence"
+                    ),
+                ));
+            }
+            seq if u64::try_from(seq).ok() != Some(expected_seq) => {
+                return Err(failed(
+                    "verify_folder_sequence",
+                    format!("expected durable sequence {expected_seq}, observed {seq}"),
+                ));
+            }
+            _ => {}
+        }
+        let writes = observed_row_writes(store)
+            .await
+            .map_err(|err| at_move("read_write_counter", err))?;
+        metrics.descendant_rows_modified = Some(writes);
+        if writes != 0 {
+            return Err(failed(
+                "verify_descendant_writes",
+                format!("observed {writes} descendant writes"),
+            ));
+        }
+        metrics.verified_alias_rows = number;
+        metrics.last_verified_move_seq = Some(receipt);
+        samples.push(elapsed_ns);
     }
     // Even an UPDATE that leaves the stored values unchanged must increment the probe.
     store
@@ -2691,13 +2804,19 @@ async fn main() {
 
     let fixtures = BenchFixtures::load_required(repo_root);
 
-    // Verify PostgreSQL `synchronous_commit = on`
-    let (pg_sync_commit, postgres_select_one_rtt) = {
+    let (pg_sync_commit, pg_fsync, postgres_select_one_rtt) = {
         let mut conn = fixtures.open_raw_pg().await;
-        let val: String = sqlx::query_scalar("SHOW synchronous_commit")
-            .fetch_one(&mut conn)
-            .await
-            .unwrap();
+        let (sync_commit, fsync): (String, String) = sqlx::query_as(
+            "SELECT current_setting('synchronous_commit'), current_setting('fsync')",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            sync_commit, "on",
+            "PostgreSQL fixture must enforce synchronous_commit=on"
+        );
+        assert_eq!(fsync, "on", "PostgreSQL fixture must enforce fsync=on");
         let mut rtt = Vec::with_capacity(100);
         for _ in 0..100 {
             let start = Instant::now();
@@ -2709,11 +2828,7 @@ async fn main() {
             assert_eq!(one, 1);
         }
         let _ = conn.close().await;
-        assert_eq!(
-            val, "on",
-            "PostgreSQL fixture must enforce synchronous_commit=on"
-        );
-        (val, compute_percentiles_from_ns(rtt))
+        (sync_commit, fsync, compute_percentiles_from_ns(rtt))
     };
 
     let writer_runs = if smoke_mode { 1usize } else { 3usize };
@@ -2769,6 +2884,7 @@ async fn main() {
         sqlite_wal_high_watermark_bytes: 896 * 1024 * 1024,
         postgres_transport: "local_unix_domain_socket",
         postgres_synchronous_commit: pg_sync_commit,
+        postgres_fsync: pg_fsync,
         postgres_select_one_rtt,
         s3_transport: "local_unix_domain_socket_bridge_to_loopback_minio_ce",
         writer_max_batch_items: WriterConfig::default().max_batch_items,
@@ -3075,6 +3191,9 @@ async fn main() {
     let met_targets = rollback_profiles
         .iter()
         .all(|r| !r.enforce_5ms_budget || r.latency.p95_us < 5_000.0)
+        && rollback_profiles
+            .iter()
+            .all(|p| p.ordinary_cutoff_read_deadlines == 0)
         && writer_50w_0r_runs
             .iter()
             .chain(&writer_50w_200r_runs)
