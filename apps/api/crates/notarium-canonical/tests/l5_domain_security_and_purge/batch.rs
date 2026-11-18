@@ -236,11 +236,12 @@ pub(super) async fn check(
         )
         .await;
         drop(hold);
-        assert_effect(
-            result
-                .expect("link staging exceeded caller budget")
-                .unwrap_err(),
-            CommitEffect::NotCommitted,
+        let error = result
+            .expect("link staging exceeded caller budget")
+            .unwrap_err();
+        assert!(
+            matches!(error, PortError::DeadlineExceeded(ref f) if f.effect() == CommitEffect::NotCommitted),
+            "{error:?}"
         );
     }
     assert_effect(
