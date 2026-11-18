@@ -222,6 +222,26 @@ provide any idempotency guarantee before retry is allowed. Service authority is
 not deserializable from external requests and grants no human content capability.
 Public subscriptions and revocations first pass verified scope/admission checks.
 
+## Mutation preconditions
+
+The `Mutation<T>` envelope can qualify the current entity revision and the
+lease and lineage of a note's collaborative room. Each producer accepts the
+following fields, in addition to its command-specific input.
+
+| Operation | Accepted envelope fields |
+| --- | --- |
+| Edit, trash, restore, purge, mint-and-purge, move or rename an existing note, append memory, link, accept an external observation, move a board card, update the Space schema note | `revision`, `lease`, `lineage` on the target or source note |
+| Move or rename a folder, rename a project, fork or append to a chat, consume pending input, redact a chat entry | `revision` on the folder or thread |
+| Create a note or chat, queue chat input, publish an ability package, roll back an agent run, create or cancel a content job | Empty envelope |
+
+Batch note and link items follow the corresponding single-operation rule.
+An unsupported field produces `InvalidState` after checking command identity
+and before using a receipt. It needs no knowledge of resource existence.
+Supported conditions are checked under current resource authority. A schema
+update that supplies a note revision requires an existing note. The expected
+package revision, queue base leaf, rollback run/entity/rank expectations and
+job cancellation lease belong to their typed inputs.
+
 ## Complete mutation intent across live rooms
 
 The live interceptor receives a typed mutation with the original authorization,

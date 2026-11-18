@@ -1078,3 +1078,131 @@ async fn restored_retirements_release_terminal_workers_and_serve_other_spaces() 
         }
     }
 }
+
+async fn seed_startup_retirement(config: &CanonicalConfig) -> (HistoryScope, ContentDigest) {
+    let (store, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
+    let (scope, actor, _) = create_thread(&store, 0xe9).await;
+    let body = "last owner released before restart ".repeat(24);
+    let staged = store
+        .stage_chat_blob(owner_ctx(&scope, actor.clone()), &body)
+        .await
+        .unwrap();
+    let digest = staged.digest();
+    let released = store
+        .release_blob_owner_references(
+            &scope,
+            LeaseEpoch::new(1).unwrap(),
+            notarium_canonical::blobs::BlobOwnerKind::StagedChat,
+            actor.as_str(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(released, vec![digest]);
+    runtime.shutdown().await.unwrap();
+    (scope, digest)
+}
+
+#[tokio::test]
+async fn sqlite_startup_releases_ownership_after_recovery_failure() {
+    let tmp = TempDataRoot::new("startup-recovery-failure");
+    let root = tmp.data_root();
+    let cfg = CanonicalConfig::local_default(sample_installation_id(0xe9), root.clone());
+    let (scope, digest) = seed_startup_retirement(&cfg).await;
+    let object = root.blob(&scope.space_id, digest);
+    assert!(object.is_file());
+    let blocker = root.root().join("blobs/.quarantine").join(format!(
+        "{}.{}.corrupt",
+        scope.space_id.as_str(),
+        digest.to_hex()
+    ));
+    std::fs::create_dir_all(&blocker).unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(5), CanonicalRuntime::open(cfg.clone()))
+        .await
+        .expect("startup reports the first attempt")
+        .unwrap_err();
+    assert!(
+        matches!(error, PortError::Unavailable(failure) if failure.retry() == notarium_core::error::RetryAdvice::After(Duration::from_millis(250)))
+    );
+    let owner = notarium_canonical::DataRootOwnerLock::acquire(&root)
+        .expect("failed opener released ownership");
+    assert!(!object.exists());
+    assert!(blocker.is_dir());
+    drop(owner);
+
+    std::fs::remove_dir(blocker).unwrap();
+    let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+    assert_eq!(pending(&store).await, 0);
+    runtime.shutdown().await.unwrap();
+}
+
+#[derive(Debug)]
+struct StalledStartupMarker {
+    origin: ReqwestS3Transport,
+    started: tokio::sync::Notify,
+    active: tokio::sync::Semaphore,
+}
+
+impl S3Transport for StalledStartupMarker {
+    fn send<'a>(&'a self, request: S3RawRequest) -> PortFuture<'a, S3RawResponse> {
+        if request.method == http::Method::PUT
+            && TerminalMarkerMeta::is_terminal_marker(&request.body)
+        {
+            return Box::pin(async move {
+                let _active = self.active.acquire().await.unwrap();
+                self.started.notify_one();
+                std::future::pending().await
+            });
+        }
+        self.origin.send(request)
+    }
+}
+
+#[tokio::test]
+async fn sqlite_startup_cancels_unpublished_work_when_open_is_dropped() {
+    let fixtures = StorageTestFixtures::load_required();
+    let tmp = TempDataRoot::new("drop-startup");
+    let root = tmp.data_root();
+    let mut cfg = CanonicalConfig::local_default(sample_installation_id(0xe9), root.clone());
+    let bucket = fixtures.fresh_s3_bucket("drop-startup");
+    let s3 = fixtures.s3_config(&bucket, S3BucketModePolicy::DetectFromBucket);
+    admin_ensure_bucket(&s3, None).await.unwrap();
+    let transport = Arc::new(StalledStartupMarker {
+        origin: ReqwestS3Transport::new(&s3).unwrap(),
+        started: tokio::sync::Notify::new(),
+        active: tokio::sync::Semaphore::new(1),
+    });
+    cfg.blobs = notarium_canonical::BlobBackendConfig::S3(Box::new(s3));
+    seed_startup_retirement(&cfg).await;
+    let mut opening = Box::pin(CanonicalRuntime::open_with_s3_transport(
+        cfg.clone(),
+        Some(transport.clone()),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut opening => panic!("open returned before interrupted marker: {result:?}"),
+            () = transport.started.notified() => {}
+        }
+    })
+    .await
+    .expect("startup reaches durable retirement");
+    assert!(notarium_canonical::DataRootOwnerLock::acquire(&root).is_err());
+    assert_eq!(transport.active.available_permits(), 0);
+    drop(opening);
+
+    let owner = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(lock) = notarium_canonical::DataRootOwnerLock::acquire(&root) {
+                break lock;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled opening releases ownership while the marker is stalled");
+    assert_eq!(transport.active.available_permits(), 1);
+    drop(owner);
+    let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+    assert_eq!(pending(&store).await, 0);
+    runtime.shutdown().await.unwrap();
+}

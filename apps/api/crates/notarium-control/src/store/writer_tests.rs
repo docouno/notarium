@@ -139,6 +139,10 @@ async fn postgres_cancelled_admission_keeps_writer_fence_until_driver_ack() {
         .execute(&mut admin)
         .await
         .unwrap();
+    sqlx::query("ALTER DATABASE writer_ownership_test SET synchronous_commit TO off")
+        .execute(&mut admin)
+        .await
+        .unwrap();
     let store = ControlStore::postgres(PostgresConfig::unix_socket(
         socket,
         "writer_ownership_test",
@@ -149,6 +153,25 @@ async fn postgres_cancelled_admission_keeps_writer_fence_until_driver_ack() {
     let mut blocker = sqlx::PgConnection::connect_with(&options.database("writer_ownership_test"))
         .await
         .unwrap();
+    let inherited: String = sqlx::query_scalar("SHOW synchronous_commit")
+        .fetch_one(&mut blocker)
+        .await
+        .unwrap();
+    assert_eq!(inherited, "off");
+    {
+        let Backend::Postgres { pool, .. } = &store.backend else {
+            unreachable!()
+        };
+        // Hold the first lease so checkout must return a different physical writer.
+        let mut first = pool.acquire().await.unwrap();
+        let mut second = pool.acquire().await.unwrap();
+        for conn in [&mut first, &mut second] {
+            let durability: (String, String) = sqlx::query_as(
+                "SELECT pg_catalog.current_setting('fsync'), pg_catalog.current_setting('synchronous_commit')",
+            ).fetch_one(&mut **conn).await.unwrap();
+            assert_eq!(durability, ("on".to_owned(), "on".to_owned()));
+        }
+    }
     sqlx::query("BEGIN").execute(&mut blocker).await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(BACKUP_LOCK)
@@ -340,4 +363,53 @@ async fn postgres_bootstrap_waits_for_the_backup_fence() {
         .execute(&mut admin)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn postgres_refuses_control_ddl_with_server_fsync_off() {
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        pg_socket_dir_container: PathBuf,
+        pg_socket_dir_host: PathBuf,
+        pg_fsync_off_port: u16,
+        pg_user: String,
+        pg_password: String,
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../..");
+    let manifest = std::fs::read(root.join(".artifacts/storage-tests/current.json"))
+        .expect("run make test with the PostgreSQL storage fixture");
+    let fixture: Fixture = serde_json::from_slice(&manifest).unwrap();
+    let socket = if fixture.pg_socket_dir_container.is_dir() {
+        fixture.pg_socket_dir_container
+    } else {
+        root.join(fixture.pg_socket_dir_host)
+    };
+    let options = PgConnectOptions::new()
+        .socket(socket)
+        .port(fixture.pg_fsync_off_port)
+        .username(&fixture.pg_user)
+        .password(&fixture.pg_password)
+        .database("postgres");
+    let mut observer = sqlx::PgConnection::connect_with(&options).await.unwrap();
+    let fsync: String = sqlx::query_scalar("SHOW fsync")
+        .fetch_one(&mut observer)
+        .await
+        .unwrap();
+    assert_eq!(fsync, "off");
+    let Err(error) = ControlStore::postgres(PostgresConfig { options }).await else {
+        panic!("control startup must reject fsync=off");
+    };
+    assert_eq!(
+        error,
+        unavailable("control PostgreSQL durability", CommitEffect::NotCommitted)
+    );
+    let created: bool =
+        sqlx::query_scalar("SELECT pg_catalog.to_regnamespace('v1_control') IS NOT NULL")
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+    assert!(
+        !created,
+        "durability must be verified before creating the control schema"
+    );
 }

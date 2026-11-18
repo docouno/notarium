@@ -4,6 +4,9 @@
 //!
 //! Run with the checkout fixture launcher for a tree-attributed JSON report.
 
+#[path = "d3_benchmarks/interactive.rs"]
+mod interactive;
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs,
@@ -229,6 +232,13 @@ struct PercentilesUs {
     mean_us: f64,
 }
 
+fn format_p95(value: Option<&PercentilesUs>) -> String {
+    value.map_or_else(
+        || "unavailable".to_owned(),
+        |pct| format!("{:.1}", pct.p95_us),
+    )
+}
+
 fn compute_percentiles_from_ns(mut samples_ns: Vec<u64>) -> PercentilesUs {
     assert!(
         !samples_ns.is_empty(),
@@ -286,6 +296,54 @@ struct EnvironmentAttribution {
     smoke_mode: bool,
 }
 
+// Each operation and error code has one counter per start/finish phase. The workload
+// only transitions from warmup (0) to measurement (1) to drain (2).
+#[derive(Clone, Debug, Default, Serialize)]
+struct WriterErrors {
+    total: u64,
+    counts_by_code_and_phase: BTreeMap<&'static str, [[u64; 3]; 3]>,
+    examples: Vec<WriterErrorExample>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WriterErrorExample {
+    worker: usize,
+    start_phase: usize,
+    finish_phase: usize,
+    elapsed_ns: u64,
+    code: &'static str,
+    detail: String,
+}
+
+impl WriterErrors {
+    const EXAMPLE_LIMIT: usize = 8;
+
+    fn record(
+        &mut self,
+        worker: usize,
+        start: u64,
+        finish: u64,
+        elapsed_ns: u64,
+        error: PortError,
+    ) {
+        let start_phase = start as usize;
+        let finish_phase = finish as usize;
+        let code = error.code();
+        self.total += 1;
+        self.counts_by_code_and_phase.entry(code).or_default()[start_phase][finish_phase] += 1;
+        if self.examples.len() < Self::EXAMPLE_LIMIT {
+            self.examples.push(WriterErrorExample {
+                worker,
+                start_phase,
+                finish_phase,
+                elapsed_ns,
+                code,
+                detail: MoveFailure::port("writer_profile", None, None, error).detail,
+            });
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct WriterRunMetrics {
     run_index: usize,
@@ -305,10 +363,26 @@ struct WriterRunMetrics {
     leaked_sqlite_busy: u64,
     writer_errors: u64,
     reader_errors: u64,
-    admission_to_receipt: PercentilesUs,
-    phase2_batch_commit: PercentilesUs,
+    failed_reads: WriterErrors,
+    failed_edits: WriterErrors,
+    admission_to_receipt: Option<PercentilesUs>,
+    all_measured_edit_attempts: Option<PercentilesUs>,
+    phase2_batch_commit: Option<PercentilesUs>,
     phase2_batch_count: usize,
     mean_batch_items: f64,
+}
+
+impl WriterRunMetrics {
+    fn met_targets(&self) -> bool {
+        self.throughput_mut_per_sec > 2_000.0
+            && self.reader_errors == 0
+            && self.writer_errors == 0
+            && self.leaked_sqlite_busy == 0
+            && self.measured_mutations > 0
+            && self.unique_carrier_digests as u64 == self.measured_mutations
+            && self.phase2_batch_count > 0
+            && (self.concurrent_readers == 0 || self.measured_reads_completed > 0)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -739,9 +813,8 @@ async fn run_writer_benchmark_case(
     let shared_auth = build_owner_auth(&space.scope, actor.clone());
 
     let phase = Arc::new(AtomicU64::new(0)); // 0 = warmup, 1 = measure, 2 = stop
-    let writer_errors = Arc::new(AtomicU64::new(0));
-    let first_writer_err: Arc<std::sync::OnceLock<String>> = Arc::new(std::sync::OnceLock::new());
-    let reader_errors = Arc::new(AtomicU64::new(0));
+    let writer_errors = Arc::new(StdMutex::new(WriterErrors::default()));
+    let reader_errors = Arc::new(StdMutex::new(WriterErrors::default()));
     let measured_reads = Arc::new(AtomicU64::new(0));
 
     let mut reader_handles = Vec::with_capacity(concurrent_readers);
@@ -759,6 +832,8 @@ async fn run_writer_benchmark_case(
                 let nid = notes_cl[idx].clone();
                 idx = (idx + 1) % notes_cl.len();
                 let ctx = fast_space_ctx(&auth_cl, &scope_cl);
+                let before = phase_cl.load(Ordering::Acquire);
+                let start = Instant::now();
                 match store_cl
                     .get_note(
                         ctx,
@@ -776,8 +851,14 @@ async fn run_writer_benchmark_case(
                             m_reads.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    Err(_) => {
-                        r_errs.fetch_add(1, Ordering::Relaxed);
+                    Err(err) => {
+                        let after = phase_cl.load(Ordering::Acquire);
+                        let elapsed_ns =
+                            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        r_errs
+                            .lock()
+                            .unwrap()
+                            .record(r, before, after, elapsed_ns, err);
                     }
                 }
                 tokio::task::yield_now().await;
@@ -793,12 +874,12 @@ async fn run_writer_benchmark_case(
         let auth_cl = shared_auth.clone();
         let phase_cl = Arc::clone(&phase);
         let w_errs = Arc::clone(&writer_errors);
-        let first_w_err = Arc::clone(&first_writer_err);
         writer_handles.push(tokio::spawn(async move {
             let mut cur_carrier = initial_carrier;
             let mut cur_digest =
                 ContentDigest::from_bytes(*blake3::hash(cur_carrier.as_bytes()).as_bytes());
             let mut seq_num = 1u64;
+            let mut measured_failed_latencies = Vec::new();
             let mut local_latencies_ns = Vec::with_capacity(4096);
             let mut local_digests = Vec::with_capacity(4096);
 
@@ -832,7 +913,8 @@ async fn run_writer_benchmark_case(
                     },
                 );
 
-                let in_measure_before = phase_cl.load(Ordering::Acquire) == 1;
+                let before = phase_cl.load(Ordering::Acquire);
+                let in_measure_before = before == 1;
                 let t0 = Instant::now();
                 match store_cl.edit_note(ctx, mutation).await {
                     Ok(_committed) => {
@@ -846,12 +928,19 @@ async fn run_writer_benchmark_case(
                         cur_digest = ContentDigest::from_bytes(next_digest_bytes);
                     }
                     Err(err) => {
-                        let _ = first_w_err.set(format!("{err:?}"));
-                        w_errs.fetch_add(1, Ordering::Relaxed);
+                        let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        let after = phase_cl.load(Ordering::Acquire);
+                        if in_measure_before && after == 1 {
+                            measured_failed_latencies.push(elapsed_ns);
+                        }
+                        w_errs
+                            .lock()
+                            .unwrap()
+                            .record(w, before, after, elapsed_ns, err);
                     }
                 }
             }
-            (local_latencies_ns, local_digests)
+            (local_latencies_ns, local_digests, measured_failed_latencies)
         }));
     }
 
@@ -871,9 +960,11 @@ async fn run_writer_benchmark_case(
     let batch_samples = store.take_writer_batch_samples().unwrap();
 
     let mut all_latencies_ns = Vec::new();
+    let mut failed_in_window = Vec::new();
     let mut unique_digests = BTreeSet::new();
     for jh in writer_handles {
-        let (lats, digests) = jh.await.unwrap();
+        let (lats, digests, failed) = jh.await.unwrap();
+        failed_in_window.extend(failed);
         all_latencies_ns.extend(lats);
         for d in digests {
             unique_digests.insert(d);
@@ -886,10 +977,9 @@ async fn run_writer_benchmark_case(
     let (_, journal_limit_after) = store.sqlite_writer_pragmas_for_bench().await.unwrap();
     let wal_telem = store.wal_telemetry().expect("SQLite WAL telemetry");
     let leaked_busy = wal_telem.leaked_sqlite_busy_errors;
-    let w_err_count = writer_errors.load(Ordering::SeqCst);
-    let r_err_count = reader_errors.load(Ordering::SeqCst);
+    let failed_edits = std::mem::take(&mut *writer_errors.lock().unwrap());
+    let failed_reads = std::mem::take(&mut *reader_errors.lock().unwrap());
     let measured_reads_completed = measured_reads.load(Ordering::SeqCst);
-    assert!(concurrent_readers == 0 || measured_reads_completed > 0);
     let measured_mutations = all_latencies_ns.len() as u64;
     let throughput = (measured_mutations as f64) / measured_secs;
 
@@ -901,30 +991,18 @@ async fn run_writer_benchmark_case(
         (total_batch_items as f64) / (batch_samples.len() as f64)
     };
 
-    assert_eq!(
-        w_err_count,
-        0,
-        "D3 gate failed: writer errors > 0 (first={:?})",
-        first_writer_err.get()
-    );
-    assert_eq!(r_err_count, 0, "D3 gate failed: reader errors > 0");
+    let all_attempts_pct = if failed_in_window.is_empty() {
+        None
+    } else {
+        failed_in_window.extend_from_slice(&all_latencies_ns);
+        Some(compute_percentiles_from_ns(failed_in_window))
+    };
+    let admission_pct =
+        (!all_latencies_ns.is_empty()).then(|| compute_percentiles_from_ns(all_latencies_ns));
+    let all_attempts_pct = all_attempts_pct.or_else(|| admission_pct.clone());
+    let phase2_pct = (!batch_lat_ns.is_empty()).then(|| compute_percentiles_from_ns(batch_lat_ns));
 
-    let admission_pct = compute_percentiles_from_ns(all_latencies_ns);
-    let phase2_pct = compute_percentiles_from_ns(batch_lat_ns);
-
-    drop(store);
-    runtime.shutdown().await.unwrap();
-    fs::remove_dir_all(run_dir).expect("remove completed writer fixture");
-
-    assert_eq!(leaked_busy, 0, "D3 gate failed: leaked SQLITE_BUSY > 0");
-    assert_eq!(w_err_count, 0, "D3 gate failed: writer errors > 0");
-    assert_eq!(r_err_count, 0, "D3 gate failed: reader errors > 0");
-    assert_eq!(
-        unique_digests.len(),
-        measured_mutations as usize,
-        "every measured mutation must carry a unique 4 KiB digest (zero receipt replays)"
-    );
-    WriterRunMetrics {
+    let metrics = WriterRunMetrics {
         run_index,
         concurrent_writers,
         concurrent_readers,
@@ -940,13 +1018,25 @@ async fn run_writer_benchmark_case(
         reset_gate_overruns: wal_telem.reset_gate_overruns,
         throughput_mut_per_sec: throughput,
         leaked_sqlite_busy: leaked_busy,
-        writer_errors: w_err_count,
-        reader_errors: r_err_count,
+        writer_errors: failed_edits.total,
+        reader_errors: failed_reads.total,
+        failed_reads,
+        failed_edits,
+        all_measured_edit_attempts: all_attempts_pct,
         admission_to_receipt: admission_pct,
         phase2_batch_commit: phase2_pct,
         phase2_batch_count: batch_samples.len(),
         mean_batch_items,
-    }
+    };
+    eprintln!(
+        "[D3] writer sample {}",
+        serde_json::to_string(&metrics).unwrap()
+    );
+    drop(store);
+    runtime.shutdown().await.unwrap();
+    fs::remove_dir_all(run_dir).expect("remove completed writer fixture");
+
+    metrics
 }
 
 // ============================================================================
@@ -2747,8 +2837,17 @@ fn write_report(report: &impl Serialize, path: &Path, met_targets: bool) {
 // Entrypoint
 // ============================================================================
 
+fn main() {
+    let args: Vec<_> = env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("--interactions") => interactive::campaign(&args),
+        Some("--interaction-series") => interactive::series(&args[2..]),
+        _ => d3(),
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
-async fn main() {
+async fn d3() {
     let args: Vec<String> = env::args().collect();
     let smoke_mode = args.iter().any(|a| a == "--smoke");
     let hash_arg = |key: &str| {
@@ -2953,10 +3052,10 @@ async fn main() {
         eprintln!("[D3] writer 50w/0r run {r}/{writer_runs}...");
         let m = run_writer_benchmark_case(&work_root, r, 50, 0, warmup_dur, measure_dur).await;
         eprintln!(
-            "[D3]   -> {:.1} mut/s, p95={:.1} us, phase2_p95={:.1} us (mean batch {:.1})",
+            "[D3]   -> {:.1} mut/s, p95={} us, phase2_p95={} us (mean batch {:.1})",
             m.throughput_mut_per_sec,
-            m.admission_to_receipt.p95_us,
-            m.phase2_batch_commit.p95_us,
+            format_p95(m.admission_to_receipt.as_ref()),
+            format_p95(m.phase2_batch_commit.as_ref()),
             m.mean_batch_items
         );
         writer_50w_0r_runs.push(m);
@@ -2966,11 +3065,11 @@ async fn main() {
         eprintln!("[D3] writer 50w/200r run {r}/{writer_runs}...");
         let m = run_writer_benchmark_case(&work_root, r, 50, 200, warmup_dur, measure_dur).await;
         eprintln!(
-            "[D3]   -> {:.1} mut/s ({} reads), p95={:.1} us, phase2_p95={:.1} us",
+            "[D3]   -> {:.1} mut/s ({} reads), p95={} us, phase2_p95={} us",
             m.throughput_mut_per_sec,
             m.measured_reads_completed,
-            m.admission_to_receipt.p95_us,
-            m.phase2_batch_commit.p95_us
+            format_p95(m.admission_to_receipt.as_ref()),
+            format_p95(m.phase2_batch_commit.as_ref())
         );
         writer_50w_200r_runs.push(m);
     }
@@ -3197,7 +3296,7 @@ async fn main() {
         && writer_50w_0r_runs
             .iter()
             .chain(&writer_50w_200r_runs)
-            .all(|w| w.throughput_mut_per_sec > 2_000.0)
+            .all(WriterRunMetrics::met_targets)
         && chat_read_profiles
             .iter()
             .all(|c| c.latency.p95_us < 1_000.0)

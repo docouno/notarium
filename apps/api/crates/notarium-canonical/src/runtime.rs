@@ -242,6 +242,26 @@ pub struct CanonicalRuntime {
     inner: Arc<CanonicalInner>,
 }
 
+// Until recovery succeeds, the opener owns shutdown on both error and cancellation.
+struct OpeningRuntime(Option<CanonicalRuntime>);
+
+impl OpeningRuntime {
+    fn stop(&mut self) -> Option<tokio::task::JoinHandle<Result<(), PortError>>> {
+        let runtime = self.0.take()?;
+        runtime.inner.backup_shutdown.cancel();
+        let executor = runtime.inner.backup_executor.clone();
+        Some(executor.spawn(Box::pin(runtime.shutdown())))
+    }
+}
+
+impl Drop for OpeningRuntime {
+    fn drop(&mut self) {
+        // A dropped open cannot await cleanup. Keep DataRoot ownership until the
+        // store executor drains the cancelled work and closes the connections.
+        drop(self.stop());
+    }
+}
+
 impl std::fmt::Debug for CanonicalRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CanonicalRuntime")
@@ -446,6 +466,9 @@ impl CanonicalRuntime {
             owner_locks: Mutex::new(locks),
         });
 
+        let mut opening = OpeningRuntime(Some(Self {
+            inner: inner.clone(),
+        }));
         let coord = WriteCoordinator::start(&inner);
         let _ = inner.writer_coord.set(coord);
 
@@ -474,11 +497,23 @@ impl CanonicalRuntime {
         let store = CanonicalStore {
             inner: Arc::clone(&inner),
         };
-        crate::backup::recover_backup_state(&store).await?;
-        crate::peers::reconcile_collab_fences_on_startup(&store).await?;
-        crate::domain::purge::resume_pending_purges_on_startup(&store).await?;
-
-        Ok((store, Self { inner }))
+        let recovered = async {
+            crate::backup::recover_backup_state(&store).await?;
+            crate::peers::reconcile_collab_fences_on_startup(&store).await?;
+            crate::domain::purge::resume_pending_purges_on_startup(&store).await
+        }
+        .await;
+        if let Err(error) = recovered {
+            let cleanup = opening.stop().expect("opening runtime owns shutdown");
+            if let result @ (Err(_) | Ok(Err(_))) = cleanup.await {
+                tracing::error!(
+                    ?result,
+                    "failed to shut down an unpublished canonical runtime"
+                );
+            }
+            return Err(error);
+        }
+        Ok((store, opening.0.take().expect("recovered runtime")))
     }
 
     pub fn witness(&self) -> &DatabaseWitness {

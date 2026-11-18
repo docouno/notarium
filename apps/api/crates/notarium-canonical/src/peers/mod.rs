@@ -1024,6 +1024,7 @@ async fn create_job_impl(
     request: Mutation<ContentJobKind>,
 ) -> Result<Committed<ContentJob>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
+    crate::domain::common::require_empty_preconditions(&request.preconditions)?;
     let space_rec = store
         .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
         .await?;
@@ -1732,6 +1733,7 @@ async fn cancel_job_impl(
     request: Mutation<CancelJob>,
 ) -> Result<Committed<ContentJob>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
+    crate::domain::common::require_empty_preconditions(&request.preconditions)?;
     let space_rec = store
         .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
         .await?;

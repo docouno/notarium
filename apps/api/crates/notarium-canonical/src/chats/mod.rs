@@ -2162,6 +2162,7 @@ async fn create_chat_impl(
     request: Mutation<CreateChat>,
 ) -> Result<Committed<ChatThread>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
+    crate::domain::common::require_empty_preconditions(&request.preconditions)?;
     if request.input.owner != *ctx.auth().principal() {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
@@ -2397,6 +2398,7 @@ async fn fork_chat_impl(
     request: Mutation<ForkChat>,
 ) -> Result<Committed<ChatThread>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
+    crate::domain::common::require_revision_only(&request.preconditions)?;
     let space_rec = store
         .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
         .await?;
@@ -2616,6 +2618,7 @@ async fn append_chat_impl(
     request: Mutation<AppendChat>,
 ) -> Result<Committed<ChatEntry>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
+    crate::domain::common::require_revision_only(&request.preconditions)?;
     if request.input.kind == ChatEntryKind::Redacted {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
@@ -3220,6 +3223,7 @@ async fn queue_chat_input_impl(
     if request.input.sender != *ctx.auth().principal() {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
+    crate::domain::common::require_empty_preconditions(&request.preconditions)?;
 
     let space_rec = store
         .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
@@ -3529,6 +3533,7 @@ async fn consume_chat_input_impl(
     request: Mutation<ConsumePending>,
 ) -> Result<Committed<ConsumedPending>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
+    crate::domain::common::require_revision_only(&request.preconditions)?;
     let space_rec = store
         .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
         .await?;
@@ -4066,6 +4071,7 @@ async fn redact_chat_entry_impl(
 ) -> Result<Committed<RedactedChat>, PortError> {
     let started = tokio::time::Instant::now();
     validate_mutation_identity(&ctx, &request.identity)?;
+    crate::domain::common::require_revision_only(&request.preconditions)?;
     let space_rec = store
         .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
         .await?;

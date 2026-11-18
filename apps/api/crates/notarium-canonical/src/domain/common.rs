@@ -437,6 +437,22 @@ pub(crate) fn validate_mutation_identity(
     Ok(())
 }
 
+/// These commands create an identity or carry their own typed predicates.
+pub(crate) fn require_empty_preconditions(pre: &Preconditions) -> Result<(), PortError> {
+    if pre != &Preconditions::default() {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+    Ok(())
+}
+
+/// Folders and chat threads have revisions, but do not own a collaborative note room.
+pub(crate) fn require_revision_only(pre: &Preconditions) -> Result<(), PortError> {
+    if pre.lease.is_some() || pre.lineage.is_some() {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+    Ok(())
+}
+
 /// Derives a forged-hash-safe internal command hash binding `command_kind`, caller `identity.hash`,
 /// and the canonicalized mutation input fingerprint. Even if two requests share a forged `identity.hash`
 /// with the same `CommandKey`, distinct inputs produce distinct `CommandIdentitySpec.command_hash` values

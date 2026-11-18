@@ -420,6 +420,7 @@ pub(crate) async fn create_note_impl(
 ) -> Result<Committed<NoteRevision>, PortError> {
     let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
     validate_mutation_identity(&ctx, &request.identity)?;
+    crate::domain::common::require_empty_preconditions(&request.preconditions)?;
     let slug_fold = normalize_slug_key(&request.input.slug)?;
     if request.input.class == DocClass::Skill {
         ctx.auth().authorize_ability_mutation()?;
@@ -2720,6 +2721,14 @@ async fn batch_receipt_hashes(
     })).await
 }
 
+fn validate_batch_item(ctx: &SpaceContext, item: &Mutation<BatchItem>) -> Result<(), PortError> {
+    validate_mutation_identity(ctx, &item.identity)?;
+    if matches!(item.input, BatchItem::Create(_)) {
+        super::common::require_empty_preconditions(&item.preconditions)?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn accept_batch_impl(
     store: &CanonicalStore,
     mut ctx: SpaceContext,
@@ -2746,6 +2755,7 @@ pub(crate) async fn accept_batch_impl(
                 || (store.inner.collab_interceptor.get().is_some()
                     && matches!(item.input, BatchItem::Move(_)))
         })
+        .filter(|item| validate_batch_item(&ctx, item).is_ok())
         .map(|item| item.identity.key.as_str().to_owned())
         .collect();
     let receipts = batch_receipt_hashes(store, &ctx, keys).await?;
@@ -2827,7 +2837,7 @@ pub(crate) async fn accept_batch_impl(
     let mut placements = BTreeMap::new();
     for item_mut in request.items {
         ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
-        if let Err(err) = validate_mutation_identity(&ctx, &item_mut.identity) {
+        if let Err(err) = validate_batch_item(&ctx, &item_mut) {
             intents.push(build_failing_item_intent(
                 &space_rec.scope,
                 space_rec.active_epoch,
@@ -4314,14 +4324,20 @@ pub(crate) async fn accept_external_observation_impl(
         });
     }
 
-    let (space_rec, base_head) = read_active_note_for_mutation(
+    let current = read_active_note_for_mutation(
         store,
         &ctx,
         &request.input.note,
-        &Preconditions::default(),
+        &request.preconditions,
         NoteMutationAccess::Current,
     )
-    .await?;
+    .await;
+    let (space_rec, base_head) = match current {
+        Err(PortError::Domain(DomainError::RevisionConflict { current, .. })) => {
+            return Ok(ExternalObservationResult::Conflict { current });
+        }
+        other => other?,
+    };
 
     if base_head.head_rev_id != request.input.base_revision {
         return Ok(ExternalObservationResult::Conflict {
@@ -4451,7 +4467,7 @@ pub(crate) async fn accept_external_observation_impl(
                     store,
                     &ctx,
                     &request.input.note,
-                    &Preconditions::default(),
+                    &request.preconditions,
                     NoteMutationAccess::Current,
                 )
                 .await?;
@@ -4997,6 +5013,9 @@ pub(crate) async fn update_space_schema_impl(
                 )
                 .await?;
 
+                if existing_note.is_none() && preconditions.revision.is_some() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
                 let (mut guard, reservation) = room_fences
                     .try_lock_closed_for_rollback(&scope_cl, &input.schema_note, &schema_identity)
                     .await?

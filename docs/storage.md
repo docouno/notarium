@@ -36,6 +36,10 @@ same behavioral parity suites:
 local storage is used, verifies or bootstraps the schema transactionally,
 reconciles interrupted collaboration room fences and resumes any interrupted
 purge closure before returning `(CanonicalStore, CanonicalRuntime)`.
+If recovery fails, opening cancels its workers and releases local ownership
+before returning the error. Dropping an opening future schedules the same
+shutdown on its Tokio runtime. The DataRoot stays locked until the workers and
+connections close. The next opener resumes any durable recovery still pending.
 The Tokio runtime that opens a PostgreSQL store owns its pooled connections.
 Keep it running through shutdown. Callers on other runtimes can release their
 handles or stop their runtimes while the store continues serving requests.
@@ -214,6 +218,9 @@ retirements and re-uploads never collide:
 - Two bucket modes are supported (`NeverVersioned` and `Enabled`); `Suspended`
   bucket versioning is rejected fail-closed, and startup runs a conditional
   write conformance probe (`If-None-Match: *` duplicate `PUT` must reject).
+  Startup sends each conditional write once. A transport interruption during
+  the origin read of that probe key allows one repeat within the original GET
+  timeout. An unexpected HTTP status or payload fails the probe immediately.
 - During retirement, the publication transitions to `Retiring`, blocking new
   part registrations or reference binds, writes a permanent nonsecret normal
   object (`NOTARIUM_RETIRED_BLOB_V1`) over every registered part key (including
@@ -294,12 +301,15 @@ same example against an isolated prefix.
   A filename pin reported by the registered room owner defers the same fresh
   note move through either entry point. A retained move receipt can still be
   replayed. Metadata-only moves preserve an unpinned room's carrier lineage.
-  The writer binds request preconditions and typed input to the caller's command
-  hash. Single and batch forms share that fingerprint. Reusing a command key with
-  different predicates returns `IdempotencyKeyReused`. When an older writer
-  omitted a predicate, replay can verify a revision from the original command's
-  history. A caller-supplied lease or lineage needs a matching stored fingerprint.
-  Old ambiguous title encodings also require the recorded rename operation.
+  For accepted mutation shapes the writer binds applicable predicates and
+  canonical input to the caller's command hash. Single and batch forms share
+  that fingerprint. Reusing the key with different supported predicates returns
+  `IdempotencyKeyReused`. An older receipt may supply an omitted revision from
+  immutable command history. A supplied room lease or lineage needs a matching
+  stored fingerprint. Old ambiguous rename titles require the recorded operation.
+  An old rollback receipt also requires a unique typed interpretation of the
+  entity and board IDs in each record. See the mutation preconditions in
+  [Core contracts](core-contracts.md#mutation-preconditions).
   A batch note edit uses its requested base digest and the head visible at its
   savepoint. Link appends derive their base from the current source. `link_many`
   submits distinct sources together and starts a new transaction when a source
@@ -457,6 +467,26 @@ Run the full release suite with
 sh docker/storage-fixtures/with-storage-fixtures.sh benchmark
 ```
 
+For full-note storage interaction timings, run
+
+```sh
+sh docker/storage-fixtures/with-storage-fixtures.sh benchmark --interactions
+```
+
+Each series uses SQLite or local PostgreSQL 16 with a local blob store. One
+unpaced worker or eight workers with independent 4 KiB Markdown notes and a
+100 ms think time open the latest note, edit with its revision precondition,
+and verify the complete carrier with the new receipt. The save includes patch
+preparation, CAS staging and durable acknowledgment. Three fresh series per
+combination have a 3 s warmup and 30 s measured window. Cycles admitted before
+the window closes may finish afterwards. A failed worker stops, surviving
+workers continue, and every later series starts independently. Each series also
+closes and reopens storage to verify every confirmed head outside the timers.
+The report in `.artifacts/storage-interactions/` links raw per-cycle timings
+and faults, and reports nearest-rank p95/p99 for all attempted and successful
+stages. Compare the same executable hash across stands. These measurements
+cover the canonical storage ports on the local machine.
+
 The command builds `fitness-gates` with the `storage-bench` feature and the
 same `mimalloc` allocator as both runtime binaries. It checks the source tree
 before and after measurement and writes
@@ -482,6 +512,9 @@ post-commit overlay checks to count. Empty latency samples serialize as null.
 | Chat window | 10,000 reads of 50 entries on each 10,000-turn thread, p95 below 1 ms. After 50 shared turns, the branched thread appends 16 turns at a time to each of nine branches in rotation. All nine measured windows cross at least two parent gaps containing 128 or more off-branch turns. A PostgreSQL read from a nonzero leaf with no pagination cursor follows parent keys and returns the authorized thread header and bounded window from one statement snapshot. Every timed read compares its full ordered sequence of 50 entries against append receipts. The smoke run uses the same topology with 512 turns and 200 reads per profile. Row triggers count writes across the canonical tables. |
 | Board and folder | 10,000 first-slot board moves with ranks at most 16 bytes. After each move, compare its receipt result to the first ranked overlay and check every rank length. Each move over 100,000 seeded descendants alternates between two parents. After timing, verify the receipt sequence, durable parent and revision chain, every historical alias at its original parent and sequence, and zero descendant row writes. Only verified moves enter the latency distribution. A no-op update to one descendant verifies the write counter. |
 | Paired backup | The control and canonical participants share an installation. Test 1 and 64 canonical Spaces separately on SQLite and PostgreSQL. For each profile, prepare both participants, acquire both holds, pause control then canonical, pin both snapshots, and resume both writers. Report prepare/holds, safe-point acquisition, confirmed pause after control acknowledges its safe point, and the inclusive interval from the first pause call through the last resume. The confirmed pause from the first safe point through both resume acknowledgements must reach p95 below 1 ms across 1,000 captures per profile. |
+
+For reference machine results, candidate targets and the metrics that follow a
+user action through the next component, see [Storage performance and integration targets](storage-performance.md).
 
 ### Proof boundaries
 

@@ -5,7 +5,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use http::Method;
 use notarium_core::{
     DomainError,
-    error::{PortError, ValidationReason},
+    error::{PortError, RetryAdvice, ValidationReason},
     ids::{ContentDigest, LeaseEpoch},
     model::HistoryScope,
 };
@@ -25,6 +25,8 @@ use crate::{
     codec::{internal_not_committed, new_prefixed_hex_id, unavailable_retryable},
     config::{S3AddressingStyle, S3BucketMode, S3BucketModePolicy, S3Config, S3Credentials},
 };
+
+const PROBE_DIRECTORY: &str = ".notarium-conformance-probe";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -239,13 +241,28 @@ impl S3Transport for ReqwestS3Transport {
                 }
             }
 
-            let body = resp.bytes().await.map_err(|err| {
-                unavailable_retryable(
-                    "s3_http_read_body",
-                    err.to_string(),
-                    Duration::from_millis(50),
-                )
-            })?;
+            // The status already disproves conformance. Its optional error body
+            // cannot turn a rejected GET into a retryable, incomplete response.
+            let rejected_probe = status != 200
+                && req.method == Method::GET
+                && req
+                    .key
+                    .as_deref()
+                    .and_then(|key| key.rsplit_once('/'))
+                    .is_some_and(|(directory, _)| {
+                        directory.rsplit('/').next() == Some(PROBE_DIRECTORY)
+                    });
+            let body = if rejected_probe {
+                Bytes::new()
+            } else {
+                resp.bytes().await.map_err(|err| {
+                    unavailable_retryable(
+                        "s3_http_read_body",
+                        err.to_string(),
+                        Duration::from_millis(50),
+                    )
+                })?
+            };
 
             Ok(S3RawResponse {
                 status,
@@ -346,14 +363,50 @@ impl S3BlobStore {
         Ok(())
     }
 
+    async fn read_conformance_probe(&self, key: &str) -> Result<S3RawResponse, PortError> {
+        let read = || {
+            self.transport.send(S3RawRequest {
+                method: Method::GET,
+                key: Some(key.to_owned()),
+                query: Vec::new(),
+                headers: Vec::new(),
+                body: Bytes::new(),
+            })
+        };
+        let started = tokio::time::Instant::now();
+        let budget = self.config.request_timeout;
+        let result = tokio::time::timeout(budget, read()).await.map_err(|_| {
+            unavailable_retryable(
+                "s3_conformance_read_timeout",
+                "origin GET timed out",
+                Duration::from_millis(50),
+            )
+        })?;
+        let Err(error @ PortError::Unavailable(failure)) = result else {
+            return result;
+        };
+        let delay = match failure.retry() {
+            RetryAdvice::Never => return Err(error),
+            RetryAdvice::RetrySameCommand => Duration::ZERO,
+            RetryAdvice::After(delay) => delay,
+        };
+        let remaining = budget.saturating_sub(started.elapsed());
+        if delay >= remaining {
+            return Err(error);
+        }
+        tokio::time::timeout(remaining, async {
+            tokio::time::sleep(delay).await;
+            read().await
+        })
+        .await
+        .unwrap_or(Err(error))
+    }
+
     /// Verifies atomic `PutObject` `If-None-Match: *` and strong origin read-after-write on startup.
     /// Rejects endpoints or negative-control doubles that silently ignore conditional headers.
     pub async fn run_conformance_probe(&self) -> Result<(), PortError> {
         let probe_id = new_prefixed_hex_id("prb_")?;
-        let probe_key = format!(
-            "{}.notarium-conformance-probe/{probe_id}",
-            self.normalized_prefix
-        );
+        let probe_key = format!("{}{PROBE_DIRECTORY}/{probe_id}", self.normalized_prefix);
         let payload_a = Bytes::from_static(b"notarium-s3-conformance-probe-v1-a");
         let payload_b = Bytes::from_static(b"notarium-s3-conformance-probe-v1-b");
 
@@ -387,16 +440,7 @@ impl S3BlobStore {
             })
             .await?;
 
-        let get_back = self
-            .transport
-            .send(S3RawRequest {
-                method: Method::GET,
-                key: Some(probe_key.clone()),
-                query: Vec::new(),
-                headers: Vec::new(),
-                body: Bytes::new(),
-            })
-            .await?;
+        let get_back = self.read_conformance_probe(&probe_key).await;
 
         // Best-effort cleanup of the dedicated conformance probe object (outside `spaces/*/cas-v1/`).
         let cleanup_query = match (self.bucket_mode, first_vid.as_deref()) {
@@ -423,6 +467,7 @@ impl S3BlobStore {
                 ),
             ));
         }
+        let get_back = get_back?;
         if get_back.status != 200 || get_back.body != payload_a {
             return Err(internal_not_committed(
                 "s3_conformance_read_after_write_failed",
@@ -1490,6 +1535,123 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32], PortError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn conformance_probe_retries_only_incomplete_reads_within_budget() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        const PAYLOAD: &str = "notarium-s3-conformance-probe-v1-a";
+        const PARTIAL_OK: &str = "200 OK\r\nContent-Length: 99\r\n\r\npartial";
+        const NOT_FOUND: &str = "404 Not Found\r\nContent-Length: 3\r\n\r\n404";
+        const TRUNCATED_ERROR: &str = "503 Unavailable\r\nContent-Length: 99\r\n\r\npartial";
+        const WRONG: &str = "200 OK\r\nContent-Length: 5\r\n\r\nwrong";
+        let good = format!(
+            "200 OK\r\nContent-Length: {}\r\n\r\n{PAYLOAD}",
+            PAYLOAD.len()
+        );
+        for (reads, budget_ms, expected_error) in [
+            (vec!["", &good], 2_000, None),
+            (vec![PARTIAL_OK, &good], 2_000, None),
+            (vec![NOT_FOUND], 2_000, Some("internal")),
+            (vec![TRUNCATED_ERROR], 2_000, Some("internal")),
+            (vec![WRONG], 2_000, Some("internal")),
+            (vec!["", ""], 2_000, Some("unavailable")),
+            (vec![""], 35, Some("unavailable")),
+        ] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let config = S3Config {
+                endpoint: format!("http://{}", listener.local_addr().unwrap()),
+                region: "test-region".into(),
+                bucket: "probe-test".into(),
+                application_prefix: "app".into(),
+                addressing: S3AddressingStyle::PathStyle,
+                credentials: S3Credentials {
+                    access_key_id: "test-key".into(),
+                    secret_access_key: "test-secret".into(),
+                    session_token: None,
+                },
+                custom_ca_pem: None,
+                unix_socket: None,
+                bucket_mode_policy: S3BucketModePolicy::DetectFromBucket,
+                request_timeout: Duration::from_millis(budget_ms),
+            };
+            let transport = Arc::new(ReqwestS3Transport::new(&config).unwrap());
+            let store = S3BlobStore {
+                config,
+                normalized_prefix: "app/".into(),
+                bucket_mode: S3BucketMode::NeverVersioned,
+                transport,
+            };
+            let serve = async {
+                let mut operations = vec![
+                    ("PUT", "200 OK\r\nContent-Length: 0\r\n\r\n"),
+                    (
+                        "PUT",
+                        "412 Precondition Failed\r\nContent-Length: 0\r\n\r\n",
+                    ),
+                ];
+                operations.extend(reads.iter().map(|response| ("GET", *response)));
+                operations.push(("DELETE", "204 No Content\r\nContent-Length: 0\r\n\r\n"));
+                let mut key = None;
+                for (index, (method, response)) in operations.into_iter().enumerate() {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = BufReader::new(socket);
+                    let mut line = String::new();
+                    socket.read_line(&mut line).await.unwrap();
+                    let mut request = line.split_ascii_whitespace();
+                    assert_eq!(request.next(), Some(method));
+                    let path = request.next().unwrap();
+                    assert!(path.contains("/app/.notarium-conformance-probe/prb_"));
+                    assert_eq!(key.get_or_insert_with(|| path.to_owned()).as_str(), path);
+                    let mut length = 0;
+                    let mut conditional = false;
+                    loop {
+                        line.clear();
+                        socket.read_line(&mut line).await.unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        let (name, value) = line.split_once(':').unwrap();
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                        if name.eq_ignore_ascii_case("if-none-match") {
+                            conditional = value.trim() == "*";
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    socket.read_exact(&mut body).await.unwrap();
+                    if method == "PUT" {
+                        assert!(conditional);
+                        assert_eq!(
+                            body,
+                            if index == 0 {
+                                PAYLOAD.as_bytes()
+                            } else {
+                                b"notarium-s3-conformance-probe-v1-b"
+                            }
+                        );
+                    }
+                    // Empty wire response closes the socket after the server actually read the GET.
+                    if !response.is_empty() {
+                        socket
+                            .get_mut()
+                            .write_all(format!("HTTP/1.1 {response}").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                    socket.get_mut().shutdown().await.unwrap();
+                }
+            };
+            let ((), result) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(serve, store.run_conformance_probe())
+            })
+            .await
+            .expect("unexpected number of probe requests");
+            assert_eq!(result.err().as_ref().map(PortError::code), expected_error);
+        }
+    }
 
     #[test]
     fn sigv4_signing_and_canonical_encoding_deterministic() {

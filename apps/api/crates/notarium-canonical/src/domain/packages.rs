@@ -183,6 +183,7 @@ pub(crate) async fn publish_ability_package_impl(
     validate_mutation_identity(&ctx, &request.identity)?;
     // Cap::AbilityWrite + DirectHuman is strictly mandatory!
     ctx.auth().authorize_ability_mutation()?;
+    crate::domain::common::require_empty_preconditions(&request.preconditions)?;
 
     if request.input.files.len() > MAX_ABILITY_AUX_FILES {
         return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());

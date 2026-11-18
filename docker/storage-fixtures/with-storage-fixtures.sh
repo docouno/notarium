@@ -90,10 +90,11 @@ flock -x 9
 if [ "$1" = "benchmark" ]; then
   case "$*" in
     benchmark) report=d3-benchmarks ;;
+    'benchmark --interactions') report=storage-interactions ;;
     'benchmark --smoke') report=d3-benchmarks-smoke ;;
     'benchmark --paired-only') report=d3-paired ;;
     'benchmark --paired-only --smoke') report=d3-paired-smoke ;;
-    *) fail "usage: benchmark [--paired-only] [--smoke]" ;;
+    *) fail "usage: benchmark [--paired-only] [--smoke] | benchmark --interactions" ;;
   esac
   commit=$(git -C "$ROOT" rev-parse HEAD)
   head_tree=$(git -C "$ROOT" rev-parse 'HEAD^{tree}')
@@ -235,11 +236,24 @@ if [ "$1" = "benchmark" ]; then
   status=0
   caller_cpu=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || printf unknown)
   caller_memory=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || printf unknown)
+  output="/workspace/.artifacts/storage-tests/$RUN_ID/report.json"
+  if [ "$report" = storage-interactions ]; then
+    results=".artifacts/storage-interactions/$tree-$RUN_ID"
+    mkdir -p "$ROOT/$results"
+    output="/workspace/$results/report.json"
+    elf_sha=$(sha256sum "$ROOT/apps/api/target/release/examples/d3_benchmarks" | cut -d' ' -f1)
+    set -- "$@" --elf-sha256 "$elf_sha" --work-root "/workspace/.artifacts/storage-tests/$RUN_ID"
+  fi
   sh "$ROOT/.devkit/runtime/devkit.sh" cli exec --component apps/api --write --network none -- \
     ./target/release/examples/d3_benchmarks "$@" --git-base "$commit" --head-tree "$head_tree" --git-tree "$tree" \
     --caller-cgroup-cpu "$caller_cpu" --caller-cgroup-memory "$caller_memory" \
-    --output "/workspace/.artifacts/storage-tests/$RUN_ID/report.json" || status=$?
+    --output "$output" || status=$?
   [ "$tree" = "$(source_tree)" ] || fail "benchmark source changed during measurement"
+  if [ "$report" = storage-interactions ]; then
+    [ -f "$ROOT/$results/report.json" ] || fail "interaction campaign produced no report"
+    printf '%s\n' "$ROOT/$results/report.json"
+    exit "$status"
+  fi
   [ -f "$RUN_DIR/report.json" ] || fail "benchmark did not finish its measurements"
   mv "$RUN_DIR/report.json" "$ROOT/.artifacts/3-storage-cas/$report-$tree.json"
   printf '%s\n' "$ROOT/.artifacts/3-storage-cas/$report-$tree.json"

@@ -40,6 +40,7 @@ pub(crate) async fn move_folder_impl(
     request: Mutation<MoveFolder>,
 ) -> Result<Committed<FolderRef>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
+    crate::domain::common::require_revision_only(&request.preconditions)?;
     let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
     let space_rec = store
         .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
@@ -354,6 +355,7 @@ pub(crate) async fn rename_folder_impl(
     request: Mutation<RenameFolder>,
 ) -> Result<Committed<FolderRef>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
+    crate::domain::common::require_revision_only(&request.preconditions)?;
     let new_slug_fold = normalize_slug_key(&request.input.name)?;
     let target_write_class = folder_mutation_class(ctx.auth(), &ctx.scope().space_id)?;
     let space_rec = store
@@ -617,6 +619,7 @@ pub(crate) async fn rename_project_impl(
     request: Mutation<RenameProject>,
 ) -> Result<Committed<FolderRef>, PortError> {
     validate_mutation_identity(&ctx, &request.identity)?;
+    crate::domain::common::require_revision_only(&request.preconditions)?;
     let new_slug_fold = normalize_slug_key(&request.input.name)?;
     if request.input.display_name.trim().is_empty() {
         return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());

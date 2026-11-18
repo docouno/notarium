@@ -870,6 +870,17 @@ pub(crate) async fn move_board_card_impl(
                     .await?;
                     ctx_read.auth().authorize_direct_write(&rfacts, &rfacts)?;
                     authorized_view_head(tx, &srec.space, ctx_read.auth(), &view_id).await?;
+                    if prec_read
+                        .revision
+                        .as_ref()
+                        .is_some_and(|r| *r != head.head_rev_id)
+                    {
+                        return Err(DomainError::RevisionConflict {
+                            current: head.head_rev_id,
+                            lineage: None,
+                        }
+                        .into());
+                    }
                     check_collab_preconditions_tx(tx, &srec.scope.space_id, &target_id, &prec_read)
                         .await?;
                     Ok((srec, head))
@@ -1101,7 +1112,12 @@ pub(crate) async fn move_board_card_impl(
                         }
                     }
 
-                    if head.head_rev_id != input.expected_note {
+                    if head.head_rev_id != input.expected_note
+                        || req_prec
+                            .revision
+                            .as_ref()
+                            .is_some_and(|r| *r != head.head_rev_id)
+                    {
                         return Err(DomainError::RevisionConflict {
                             current: head.head_rev_id,
                             lineage: None,

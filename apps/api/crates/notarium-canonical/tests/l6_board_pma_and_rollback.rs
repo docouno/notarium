@@ -2145,6 +2145,60 @@ async fn note_metadata_at(
     meta
 }
 
+async fn check_legacy_rollback(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    command: &Mutation<RollbackAgentRun>,
+    committed: &notarium_core::ports::Committed<notarium_core::ports::RollbackResult>,
+    postgres: bool,
+) {
+    assert!(command.input.associated_board_expectations.is_empty());
+    let mut payload = blake3::Hasher::new();
+    payload.update(command.input.run.as_str().as_bytes());
+    payload.update(&[0]);
+    payload.update(command.input.expected_run_revision.as_str().as_bytes());
+    for expected in &command.input.expected_entities {
+        payload.update(&[0]);
+        payload.update(expected.note.as_str().as_bytes());
+        payload.update(expected.revision.as_str().as_bytes());
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"notarium-cmd-v1:rollback_agent_run\0");
+    hash.update(command.identity.hash.as_bytes());
+    hash.update(&[0]);
+    hash.update(payload.finalize().as_bytes());
+    let hex = hash.finalize().to_hex();
+    let literal = if postgres {
+        format!("decode('{hex}','hex')")
+    } else {
+        format!("X'{hex}'")
+    };
+    assert_eq!(store.execute_diagnostic_write_sql_for_test(&format!(
+        "UPDATE command_receipts SET command_hash={literal} WHERE space_id='{}' AND actor_id='{}' AND idempotency_key='{}'",
+        ctx.scope().space_id.as_str(), command.identity.actor.as_str(), command.identity.key.as_str()
+    )).await.unwrap(),1);
+    let replayed = store
+        .rollback_agent_run(ctx.clone(), command.clone())
+        .await
+        .unwrap();
+    assert_eq!(replayed.receipt, committed.receipt);
+    assert_eq!(replayed.value, committed.value);
+    let mut changed = command.clone();
+    changed.input.expected_entities.reverse();
+    assert!(matches!(
+        store.rollback_agent_run(ctx.clone(), changed).await,
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+    ));
+    assert_eq!(
+        store
+            .read_space(&ctx.scope().space_id)
+            .await
+            .unwrap()
+            .last_seq,
+        committed.receipt.seq()
+    );
+}
+
 async fn run_note_only_rollback_suite(
     store: &CanonicalStore,
     mut pg: Option<&mut sqlx::PgConnection>,
@@ -2414,9 +2468,10 @@ async fn run_note_only_rollback_suite(
     );
 
     let rb = store
-        .rollback_agent_run(human_ctx.clone(), rollback)
+        .rollback_agent_run(human_ctx.clone(), rollback.clone())
         .await
         .expect("note-only rollback");
+    check_legacy_rollback(store, &human_ctx, &rollback, &rb, pg.is_some()).await;
     assert_eq!(rb.value.restored.len(), 1);
     assert_eq!(rb.value.trashed.len(), 2);
     let restored = note_metadata_at(store, &scope, &rb.value.restored[0], &rb.receipt).await;

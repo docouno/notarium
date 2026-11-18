@@ -39,8 +39,8 @@ use crate::{
         },
         common::{
             FolderAncestryCache, NoteHeadRow, StoredCommittedRollbackV1,
-            derive_command_identity_spec, load_current_space_schema_tx, load_note_head_row_tx,
-            load_note_heads_batch_tx, upsert_agent_run_head_tx, validate_mutation_identity,
+            load_current_space_schema_tx, load_note_head_row_tx, load_note_heads_batch_tx,
+            upsert_agent_run_head_tx, validate_mutation_identity,
         },
         notes::try_replay_completed_receipt,
     },
@@ -50,6 +50,8 @@ use crate::{
     sql_exec::BackendConn,
     writer::{BatchEventDraft, ItemCommitArtifacts, PreparedWriteIntent, SemanticCutMismatchKind},
 };
+
+mod fingerprint;
 
 const MAX_PLANNER_RETRIES: usize = 4;
 
@@ -207,7 +209,8 @@ pub(crate) async fn rollback_agent_run_impl(
 ) -> Result<Committed<RollbackResult>, PortError> {
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "rollback").at;
     validate_mutation_identity(&ctx, &request.identity)?;
-    let idemp = build_rollback_identity_spec(&request)?.with_policy(
+    crate::domain::common::require_empty_preconditions(&request.preconditions)?;
+    let idemp = fingerprint::current(&request)?.with_policy(
         ctx.auth(),
         crate::writer::replay::ReplayPolicy::Documents(
             request
@@ -230,6 +233,42 @@ pub(crate) async fn rollback_agent_run_impl(
         ),
     );
 
+    let result = execute_rollback(store, &mut ctx, &request, &idemp, deadline).await;
+    if !matches!(
+        result,
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+    ) {
+        return result;
+    }
+    let Some(old_hash) = fingerprint::legacy(&request)? else {
+        return result;
+    };
+    let mut previous = idemp;
+    previous.command_hash = old_hash;
+    ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
+    let saved = rollback_wait(
+        &ctx.budget,
+        deadline,
+        try_replay_completed_receipt::<StoredCommittedRollbackV1>(
+            store,
+            ctx.scope(),
+            &previous,
+            Some(&ctx.budget),
+        ),
+    )
+    .await??;
+    saved
+        .map(StoredCommittedRollbackV1::into_committed)
+        .ok_or_else(|| DomainError::IdempotencyKeyReused.into())
+}
+
+async fn execute_rollback(
+    store: &CanonicalStore,
+    ctx: &mut SpaceContext,
+    request: &Mutation<RollbackAgentRun>,
+    idemp: &crate::writer::CommandIdentitySpec,
+    deadline: Instant,
+) -> Result<Committed<RollbackResult>, PortError> {
     ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
     if request.input.associated_board_expectations.is_empty()
         && store.inner.collab_interceptor.get().is_none()
@@ -255,9 +294,9 @@ pub(crate) async fn rollback_agent_run_impl(
             crate::runtime::SqlDriverState::Postgres { .. }
         ) && let Some(outcome) = try_execute_pg_root_rollback(
             store,
-            &ctx,
-            &idemp,
-            &request,
+            ctx,
+            idemp,
+            request,
             writer_epoch,
             &mut try_pg_batch_plan,
             deadline,
@@ -336,7 +375,7 @@ pub(crate) async fn rollback_agent_run_impl(
         try_replay_completed_receipt::<StoredCommittedRollbackV1>(
             store,
             ctx.scope(),
-            &idemp,
+            idemp,
             Some(&ctx.budget),
         ),
     )
@@ -2307,35 +2346,6 @@ fn build_rollback_execute_fn(
             })
         })
     })
-}
-
-fn build_rollback_identity_spec(
-    request: &Mutation<RollbackAgentRun>,
-) -> Result<crate::writer::replay::UnboundCommand, PortError> {
-    let mut fp = blake3::Hasher::new();
-    fp.update(request.input.run.as_str().as_bytes());
-    fp.update(&[0]);
-    fp.update(request.input.expected_run_revision.as_str().as_bytes());
-    for ent in &request.input.expected_entities {
-        fp.update(&[0]);
-        fp.update(ent.note.as_str().as_bytes());
-        fp.update(ent.revision.as_str().as_bytes());
-    }
-    for assoc in &request.input.associated_board_expectations {
-        fp.update(&[0]);
-        fp.update(assoc.view.note.as_str().as_bytes());
-        fp.update(assoc.view.key.as_str().as_bytes());
-        fp.update(assoc.note.as_str().as_bytes());
-        let er = serde_json::to_vec(&assoc.expected_rank)
-            .map_err(|err| internal_not_committed("rb_fp_json", err.to_string()))?;
-        fp.update(&er);
-        fp.update(assoc.expected_placement_revision.as_str().as_bytes());
-    }
-    Ok(derive_command_identity_spec(
-        &request.identity,
-        "rollback_agent_run",
-        fp.finalize().as_bytes(),
-    ))
 }
 
 #[allow(clippy::type_complexity)]

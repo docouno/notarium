@@ -20,7 +20,10 @@ foreign keys, strict tables, a 4 MiB `journal_size_limit`, a 256-page
 The composition owner must classify the data root before opening it and create the
 approved parent directory. PostgreSQL uses the `v1_control` schema, qualified
 queries and `COLLATE "C"` on text keys so keyset pagination and export order match
-SQLite byte order. SQLite separates a 1-connection write pool from a 20-connection
+SQLite byte order. Before creating or migrating the control schema, the server
+must report `fsync=on`. Every pooled control writer sets `synchronous_commit=on`,
+including the migration connection.
+SQLite separates a 1-connection write pool from a 20-connection
 read-only pool; PostgreSQL separates a 6-connection write/export pool from a
 20-connection read pool, with 16 active reader slots, a bounded 512-waiter read
 queue, and per-operation `SET LOCAL statement_timeout` and
