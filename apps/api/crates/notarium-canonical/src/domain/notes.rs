@@ -800,9 +800,11 @@ pub(crate) fn build_create_note_intent(
 
 pub(crate) async fn edit_note_impl(
     store: &CanonicalStore,
-    ctx: SpaceContext,
+    mut ctx: SpaceContext,
     request: Mutation<EditNote>,
 ) -> Result<Committed<NoteRevision>, PortError> {
+    let budget = ctx.budget.clone();
+    let deadline = super::common::CommandDeadline::start(&budget, "edit_note");
     let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
     validate_mutation_identity(&ctx, &request.identity)?;
     let idemp = edit_note_identity(
@@ -812,6 +814,7 @@ pub(crate) async fn edit_note_impl(
         &request.preconditions,
     );
 
+    ctx.budget.remaining = deadline.remaining(&budget)?;
     let phase1 = if store.is_sqlite_local() {
         crate::sqlite_fast::edit_note_phase1_sqlite_local(
             store,
@@ -918,11 +921,18 @@ pub(crate) async fn edit_note_impl(
             .await
     };
 
+    ctx.budget.remaining = deadline.remaining(&budget)?;
     let phase1 = match phase1 {
         Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => {
-            return v1_receipts::LegacyNoteCommand::Edit(&request.input, &request.preconditions)
-                .replay(store, &ctx, &request.identity, &idemp)
-                .await;
+            let legacy =
+                v1_receipts::LegacyNoteCommand::Edit(&request.input, &request.preconditions);
+            let result = deadline
+                .wait(&budget, || {
+                    legacy.replay(store, &ctx, &request.identity, &idemp)
+                })
+                .await?;
+            deadline.remaining(&budget)?;
+            return result;
         }
         other => other?,
     };
@@ -962,19 +972,21 @@ pub(crate) async fn edit_note_impl(
         Some(carrier) => carrier,
         None => {
             let raw_bytes = match fast_local_read {
+                Some(plan) if base_head.byte_size <= 64 * 1024 => plan.read_verified()?,
                 Some(plan) => {
-                    if base_head.byte_size <= 64 * 1024 {
-                        plan.read_verified()?
-                    } else {
-                        plan.read_verified_async().await?
-                    }
+                    deadline
+                        .wait(&budget, || plan.read_verified_async())
+                        .await??
                 }
                 None => {
-                    store
-                        .read_verified_blob(&space_rec.scope, base_digest)
-                        .await?
+                    deadline
+                        .wait(&budget, || {
+                            store.read_verified_blob(&space_rec.scope, base_digest)
+                        })
+                        .await??
                 }
             };
+            deadline.remaining(&budget)?;
             String::from_utf8(raw_bytes).map_err(|_| {
                 internal_not_committed(
                     "corrupt_note_utf8",
@@ -1007,44 +1019,66 @@ pub(crate) async fn edit_note_impl(
             base_head.doc_class,
             &base_head.head_rev_id,
         )?;
-        match interceptor
-            .intercept(InterceptedMutation {
-                context: ctx.clone(),
-                identity: request.identity.clone(),
-                preconditions: request.preconditions.clone(),
-                payload: InterceptedPayload::EditNote {
-                    note: request.input.note.clone(),
-                    body: body_plan,
-                    header: header_mut,
-                },
+        ctx.budget.remaining = deadline.remaining(&budget)?;
+        let mut dispatched = false;
+        let response = deadline
+            .wait(&budget, || async {
+                dispatched = true;
+                interceptor
+                    .intercept(InterceptedMutation {
+                        context: ctx.clone(),
+                        identity: request.identity.clone(),
+                        preconditions: request.preconditions.clone(),
+                        payload: InterceptedPayload::EditNote {
+                            note: request.input.note.clone(),
+                            body: body_plan,
+                            header: header_mut,
+                        },
+                    })
+                    .await
             })
-            .await?
-        {
+            .await;
+        let unknown = || {
+            crate::codec::unknown_commit_outcome(
+                "edit_room_outcome_unknown",
+                "the room may have applied the note edit",
+            )
+        };
+        match response.map_err(|err| if dispatched { unknown() } else { err })?? {
             InterceptionResult::Applied(receipt) => {
-                return applied_outcome(
-                    store,
-                    &ctx,
-                    &idemp,
-                    receipt,
-                    |row: StoredCommittedNoteRevV1| {
-                        (row.value.note == request.input.note).then(|| row.into_committed())
-                    },
-                )
-                .await?
-                .ok_or_else(missing_applied_outcome);
+                ctx.budget.remaining = deadline.remaining(&budget).map_err(|_| unknown())?;
+                let outcome = deadline
+                    .wait(&budget, || {
+                        applied_outcome(
+                            store,
+                            &ctx,
+                            &idemp,
+                            receipt,
+                            |row: StoredCommittedNoteRevV1| {
+                                (row.value.note == request.input.note).then(|| row.into_committed())
+                            },
+                        )
+                    })
+                    .await
+                    .map_err(|_| unknown())?;
+                deadline.remaining(&budget).map_err(|_| unknown())?;
+                return outcome?.ok_or_else(missing_applied_outcome);
             }
             InterceptionResult::SettleCarrier(accepted) => {
                 let transition = crate::peers::RoomCarrierTransition::from(accepted);
-                transition
-                    .check_before_staging(
-                        store,
-                        &ctx.budget,
-                        ctx.scope(),
-                        &request.input.note,
-                        ctx.auth(),
-                        Some(&base_head.head_rev_id),
-                    )
-                    .await?;
+                ctx.budget.remaining = deadline.remaining(&budget)?;
+                deadline
+                    .wait(&budget, || {
+                        transition.check_before_staging(
+                            store,
+                            &ctx.budget,
+                            ctx.scope(),
+                            &request.input.note,
+                            ctx.auth(),
+                            Some(&base_head.head_rev_id),
+                        )
+                    })
+                    .await??;
                 reservation_opt = Some(CarrierRoomWrite::Accepted(transition));
             }
             InterceptionResult::Conflict(err) => return Err(err.into()),
@@ -1062,13 +1096,15 @@ pub(crate) async fn edit_note_impl(
         store.blob_codec(),
         preparsed_hdr,
     )?;
-    let ticket = store
-        .stage_blob_for_batch_prechecked(
-            &space_rec.scope,
-            space_rec.active_epoch,
-            &info.prepared_blob,
-        )
-        .await?;
+    let ticket = deadline
+        .wait(&budget, || {
+            store.stage_blob_for_batch_prechecked(
+                &space_rec.scope,
+                space_rec.active_epoch,
+                &info.prepared_blob,
+            )
+        })
+        .await??;
 
     if store.is_sqlite_local() && reservation_opt.is_none() {
         let phase1_cached = base_anc.map(|anc| (base_head.clone(), anc));
@@ -1089,6 +1125,7 @@ pub(crate) async fn edit_note_impl(
             phase1_receipt_checked_gen,
             phase1_cached,
         )?;
+        ctx.budget.remaining = deadline.remaining(&budget)?;
         let stored: StoredCommittedNoteRevV1 = store
             .submit_write_command_tracked(&ctx.budget, intent, Some(fast_plan), active_op_guard)
             .await?;
@@ -1112,6 +1149,7 @@ pub(crate) async fn edit_note_impl(
         reservation_opt,
     );
 
+    ctx.budget.remaining = deadline.remaining(&budget)?;
     let stored: StoredCommittedNoteRevV1 = store
         .submit_write_command_tracked(&ctx.budget, intent, None, active_op_guard)
         .await?;
@@ -5637,14 +5675,12 @@ pub(crate) async fn update_space_schema_impl(
     Ok(stored.into_committed())
 }
 
-pub(crate) async fn get_note_impl(
+pub(super) async fn get_note_impl(
     store: &CanonicalStore,
-    ctx: SpaceContext,
+    mut ctx: SpaceContext,
     request: GetNote,
+    deadline: &super::common::CommandDeadline,
 ) -> Result<NoteSnapshot, PortError> {
-    if store.is_sqlite_local() && request.revision.is_none() {
-        return crate::sqlite_fast::get_note_sqlite_local_fast(store, ctx, request).await;
-    }
     let scope = ctx.scope().clone();
     let auth = ctx.auth().clone();
     let req_note = request.note.clone();
@@ -5664,6 +5700,7 @@ pub(crate) async fn get_note_impl(
         }
         error
     };
+    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
     let store_in = store.clone();
     let (
         rev_id,
@@ -5839,6 +5876,7 @@ pub(crate) async fn get_note_impl(
     let content = String::from_utf8(raw_bytes)
         .map_err(|_| internal_not_committed("get_note_utf8", "note carrier is not valid UTF-8"))?;
 
+    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
     let (current, live_lifecycle) = recheck_note_read(store, &ctx, &request.note, false)
         .await
         .map_err(|err| record_failure("current_authorization", err))?;
@@ -5859,6 +5897,7 @@ pub(crate) async fn get_note_impl(
     )?;
     document.bind_current(current, live_lifecycle)?;
 
+    deadline.remaining(&ctx.budget)?;
     Ok(NoteSnapshot {
         document,
         parent: parent_opt,

@@ -4,6 +4,8 @@
 mod applied;
 #[path = "l6_board_pma_and_rollback/board_deadline.rs"]
 mod board_deadline;
+#[path = "l6_board_pma_and_rollback/historical_deadline.rs"]
+mod historical_deadline;
 #[path = "l6_board_pma_and_rollback/pg_deadline.rs"]
 mod pg_deadline;
 #[path = "l6_board_pma_and_rollback/rollback_deadline.rs"]

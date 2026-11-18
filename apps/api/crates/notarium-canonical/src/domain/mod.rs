@@ -213,14 +213,23 @@ impl CanonicalStore {
         ctx: SpaceContext,
         request: GetNote,
     ) -> Result<NoteSnapshot, PortError> {
+        if self.is_sqlite_local() && request.revision.is_none() {
+            return crate::sqlite_fast::get_note_sqlite_local_fast(self, ctx, request).await;
+        }
+        let budget = ctx.budget.clone();
+        let deadline = common::CommandDeadline::start(&budget, "get_note");
         if self.is_postgres() {
             return Self::run_pg_read_request(
-                ctx.budget.clone(),
-                notes::get_note_impl(self, ctx, request),
+                budget,
+                notes::get_note_impl(self, ctx, request, &deadline),
             )
             .await;
         }
-        notes::get_note_impl(self, ctx, request).await
+        let result = deadline
+            .wait(&budget, || notes::get_note_impl(self, ctx, request, &deadline))
+            .await?;
+        deadline.remaining(&budget)?;
+        result
     }
 
     pub async fn read_ability_resource(

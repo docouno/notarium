@@ -199,3 +199,102 @@ async fn board_move_deadline_covers_planner_retry_room_and_writer_ack_on_both_ba
         }
     }
 }
+
+#[tokio::test]
+async fn edit_note_bounds_room_dispatch_on_both_backends() {
+    let fixtures = StorageTestFixtures::load_required();
+    for postgres in [false, true] {
+        let root = TempDataRoot::new("edit-room-deadline");
+        let schema = fixtures.fresh_pg_schema();
+        let config = if postgres {
+            fixtures.pg_local_config(sample_installation_id(76), &schema, root.data_root())
+        } else {
+            CanonicalConfig::local_default(sample_installation_id(76), root.data_root())
+        };
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        let owner = sample_principal_id(76);
+        let (scope, _) = seed_space(
+            &store,
+            sample_space_id(76),
+            sample_incarnation(76),
+            owner.clone(),
+        )
+        .await;
+        let ctx = owner_ctx(&scope, owner.clone());
+        let note = sample_note_id(76);
+        let carrier = "---\nstatus: todo\n---\n# Report\n";
+        let created = store
+            .create_note(
+                ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        note: note.clone(),
+                        parent: None,
+                        slug: "report".into(),
+                        class: DocClass::UserDoc,
+                        carrier: carrier.into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let plan = extract::finalize_document(
+            carrier,
+            DocClass::UserDoc,
+            &note,
+            &[FieldEdit::Set {
+                key: "status".into(),
+                value: YamlValue::String("done".into()),
+            }],
+        )
+        .unwrap();
+        let edit = next_mutation(&scope, &owner, EditNote { note, plan });
+        let room = Arc::new(PendingRoom {
+            received: tokio::sync::Notify::new(),
+        });
+        store.register_collab_interceptor(room.clone()).unwrap();
+
+        let mut expired = ctx.clone();
+        expired.budget.remaining = Duration::ZERO;
+        let result = store.edit_note(expired, edit.clone()).await;
+        assert!(
+            matches!(result, Err(PortError::DeadlineExceeded(ref f)) if f.effect() == CommitEffect::NotCommitted),
+            "{result:?}"
+        );
+
+        for cancel in [false, true] {
+            let mut call = ctx.clone();
+            call.budget.remaining = if cancel {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_millis(300)
+            };
+            call.budget.cancellation = Cancellation::default();
+            let token = call.budget.cancellation.clone();
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(4), async {
+                tokio::join!(store.edit_note(call, edit.clone()), async {
+                    room.received.notified().await;
+                    if cancel {
+                        token.cancel();
+                    }
+                })
+            })
+            .await
+            .expect("the dispatched edit must respect the caller");
+            assert!(
+                matches!(result, Err(PortError::Unavailable(ref f)) if f.effect() == CommitEffect::Unknown && f.retry()==RetryAdvice::RetrySameCommand),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            store.read_space(&scope.space_id).await.unwrap().last_seq,
+            created.receipt.seq()
+        );
+        runtime.shutdown().await.unwrap();
+        if postgres {
+            fixtures.drop_pg_schema(&schema).await;
+        }
+    }
+}
