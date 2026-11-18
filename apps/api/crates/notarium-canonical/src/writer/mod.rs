@@ -482,7 +482,26 @@ pub struct WriteCoordinator {
 
 struct WriterWait<'a> {
     budget: &'a CallBudget,
-    caller_deadline: Option<tokio::time::Instant>,
+    deadline: tokio::time::Instant,
+}
+
+impl<'a> WriterWait<'a> {
+    fn from_budget(budget: &'a CallBudget) -> Self {
+        Self {
+            budget,
+            deadline: crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining),
+        }
+    }
+
+    async fn acknowledgement<T>(&self, reply: oneshot::Receiver<T>) -> Option<T> {
+        // The actor owns the admitted work, even after the caller stops waiting.
+        tokio::select! {
+            biased;
+            result = reply => result.ok(),
+            _ = self.budget.cancellation.cancelled() => None,
+            _ = tokio::time::sleep_until(self.deadline) => None,
+        }
+    }
 }
 
 impl WriteCoordinator {
@@ -631,6 +650,7 @@ impl WriteCoordinator {
     }
 
     /// Enqueues a prepared write intent into `WriteBatchActor` with bounded backpressure and cancellation semantics.
+    #[cfg(test)]
     pub(crate) async fn submit_raw(
         &self,
         inner: &Arc<CanonicalInner>,
@@ -639,10 +659,7 @@ impl WriteCoordinator {
     ) -> Result<Vec<u8>, PortError> {
         self.submit_raw_opt_fast(
             inner,
-            WriterWait {
-                budget,
-                caller_deadline: None,
-            },
+            WriterWait::from_budget(budget),
             intent,
             None,
             None,
@@ -660,24 +677,17 @@ impl WriteCoordinator {
         pg_fast_plan: Option<PgSingleItemFastFn>,
         pretracked_guard: Option<ActiveWriteOpGuard>,
     ) -> Result<Vec<u8>, PortError> {
-        let WriterWait {
-            budget,
-            caller_deadline,
-        } = wait;
         inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)?;
         let _active_guard = match pretracked_guard {
             Some(g) => g,
             None => self.enter_write_op(&intent.scope.space_id, 1),
         };
-        let deadline = caller_deadline.unwrap_or_else(|| {
-            crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining)
-        });
         let (permit, reserved_bytes) = self
             .reserve_entry(
                 inner,
                 &intent.scope.space_id,
-                budget,
-                deadline,
+                wait.budget,
+                wait.deadline,
                 intent.staged_bytes,
             )
             .await?;
@@ -693,18 +703,7 @@ impl WriteCoordinator {
             reply_tx,
         });
 
-        let reply = if let Some(deadline) = caller_deadline {
-            // The worker owns an admitted command even when the caller stops waiting for its ACK.
-            tokio::select! {
-                biased;
-                result = reply_rx => result.ok(),
-                _ = budget.cancellation.cancelled() => None,
-                _ = tokio::time::sleep_until(deadline) => None,
-            }
-        } else {
-            reply_rx.await.ok()
-        };
-        match reply {
+        match wait.acknowledgement(reply_rx).await {
             Some(outcome) => outcome,
             None => {
                 if is_idempotent {
@@ -731,6 +730,7 @@ impl WriteCoordinator {
         space_id: &SpaceId,
         intents: Vec<PreparedWriteIntent>,
     ) -> Result<(Vec<Result<Vec<u8>, PortError>>, SpaceSeq), PortError> {
+        let wait = WriterWait::from_budget(budget);
         for intent in &intents {
             inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)?;
         }
@@ -739,13 +739,7 @@ impl WriteCoordinator {
             .iter()
             .fold(0u64, |sum, item| sum.saturating_add(item.staged_bytes));
         let (permit, reserved_bytes) = self
-            .reserve_entry(
-                inner,
-                space_id,
-                budget,
-                crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining),
-                total_staged,
-            )
+            .reserve_entry(inner, space_id, budget, wait.deadline, total_staged)
             .await?;
         let all_idempotent = intents.iter().all(|i| i.idempotency.is_some());
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -756,18 +750,18 @@ impl WriteCoordinator {
             reply_tx,
         });
 
-        match reply_rx.await {
-            Ok(outcome) => outcome,
-            Err(_) => {
+        match wait.acknowledgement(reply_rx).await {
+            Some(outcome) => outcome,
+            None => {
                 if all_idempotent {
                     Err(unknown_commit_outcome(
                         "writer_worker_dropped_batch_reply",
-                        "batch worker dropped group reply channel after admission",
+                        "batch writer group reply unavailable after admission",
                     ))
                 } else {
                     Err(unknown_commit_non_idempotent(
                         "writer_worker_dropped_batch_reply",
-                        "batch worker dropped group reply channel after admission",
+                        "batch writer group reply unavailable after admission",
                     ))
                 }
             }
@@ -931,10 +925,10 @@ impl crate::CanonicalStore {
     where
         R: Serialize + DeserializeOwned + Send + 'static,
     {
-        let writer = self.inner.writer()?;
-        let raw_bytes = writer.submit_raw(&self.inner, budget, intent).await?;
-        rmp_serde::from_slice(&raw_bytes)
-            .map_err(|err| internal_not_committed("decode_writer_command_outcome", err.to_string()))
+        let deadline =
+            crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining);
+        self.submit_write_command_until(budget, deadline, intent, None, None, None)
+            .await
     }
 
     #[cfg(feature = "test-support")]
@@ -947,34 +941,6 @@ impl crate::CanonicalStore {
         R: Serialize + DeserializeOwned + Send + 'static,
     {
         self.submit_write_command(budget, intent).await
-    }
-
-    pub(crate) async fn submit_write_command_tracked<R>(
-        &self,
-        budget: &CallBudget,
-        intent: PreparedWriteIntent,
-        sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
-        pretracked_guard: ActiveWriteOpGuard,
-    ) -> Result<R, PortError>
-    where
-        R: Serialize + DeserializeOwned + Send + 'static,
-    {
-        let writer = self.inner.writer()?;
-        let raw_bytes = writer
-            .submit_raw_opt_fast(
-                &self.inner,
-                WriterWait {
-                    budget,
-                    caller_deadline: None,
-                },
-                intent,
-                sqlite_fast_plan,
-                None,
-                Some(pretracked_guard),
-            )
-            .await?;
-        rmp_serde::from_slice(&raw_bytes)
-            .map_err(|err| internal_not_committed("decode_writer_command_outcome", err.to_string()))
     }
 
     pub(crate) async fn submit_write_command_until<R>(
@@ -994,10 +960,7 @@ impl crate::CanonicalStore {
         let raw_bytes = writer
             .submit_raw_opt_fast(
                 &self.inner,
-                WriterWait {
-                    budget,
-                    caller_deadline: Some(deadline),
-                },
+                WriterWait { budget, deadline },
                 intent,
                 sqlite_fast_plan,
                 pg_fast_plan,

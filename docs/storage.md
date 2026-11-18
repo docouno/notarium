@@ -313,8 +313,12 @@ same example against an isolated prefix.
   A batch note edit uses its requested base digest and the head visible at its
   savepoint. Link appends derive their base from the current source. `link_many`
   submits distinct sources together and starts a new transaction when a source
-  repeats. If a batch encounters an operational error after any successful
-  item, or an item's commit outcome is unknown, retry with the same command keys.
+  repeats. An admitted item or group stays with the actor when cancellation or
+  a deadline ends the caller's wait for its acknowledgement. An unavailable
+  reply has an unknown commit outcome. A group can be retried by key when
+  every item has an idempotent identity. If a batch encounters an operational
+  error after any successful item, or an item's commit outcome is unknown,
+  retry with the same command keys.
   The returned commit effect is `Unknown` in both cases.
 - **`SqliteWalCoordinator`:** Ordinary reads enter through a bounded reader gate
   with a monotonic `< 250 ms` progress-handler deadline (`248 ms` default) and

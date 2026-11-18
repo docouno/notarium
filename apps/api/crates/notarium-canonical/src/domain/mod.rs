@@ -226,7 +226,9 @@ impl CanonicalStore {
             .await;
         }
         let result = deadline
-            .wait(&budget, || notes::get_note_impl(self, ctx, request, &deadline))
+            .wait(&budget, || {
+                notes::get_note_impl(self, ctx, request, &deadline)
+            })
             .await?;
         deadline.remaining(&budget)?;
         result

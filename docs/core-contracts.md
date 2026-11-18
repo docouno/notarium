@@ -261,7 +261,7 @@ outstanding room updates. A room with neither a snapshot nor pending updates
 can accept a carrier while closing without a final snapshot.
 
 A note edit uses one caller deadline for the base read, room dispatch, CAS
-staging and writer admission. If the room receives the edit and its answer
+staging and writer acknowledgement. If the room receives the edit and its answer
 is lost, the caller receives an unknown commit outcome and can retry with
 the same command key. Historical note reads share one deadline across the
 revision lookup, object read and final authorization check.

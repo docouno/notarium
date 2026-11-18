@@ -48,15 +48,53 @@ pub(super) async fn check(
     let first = create(&note, "batch-source-a", base);
     let mut reused = create(&note, "batch-source-b", "Rejected bytes.");
     reused.identity = first.identity.clone();
-    let initial = store
-        .accept_batch(
-            ctx.clone(),
-            AcceptBatch {
-                items: vec![first, reused, edit(&note, base, "accepted")],
-            },
-        )
-        .await
-        .unwrap();
+    let mixed = AcceptBatch {
+        items: vec![first, reused, edit(&note, base, "accepted")],
+    };
+    let stalled = |request| {
+        let mut short = ctx.clone();
+        short.budget.remaining = std::time::Duration::from_millis(300);
+        async move {
+            let hold = store.acquire_writer_safe_point().await.unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                store.accept_batch(short, request),
+            )
+            .await;
+            drop(hold);
+            result
+                .expect("stalled batch exceeded caller budget")
+                .unwrap_err()
+        }
+    };
+    let error = stalled(mixed.clone()).await;
+    if postgres {
+        // Fresh S3 publications need a write transaction before mailbox admission.
+        assert!(
+            matches!(error, PortError::DeadlineExceeded(ref f) if f.effect()==CommitEffect::NotCommitted),
+            "{error:?}"
+        );
+    } else {
+        assert!(
+            matches!(error, PortError::Unavailable(ref f) if f.effect()==CommitEffect::Unknown && f.retry()==RetryAdvice::RetrySameCommand),
+            "{error:?}"
+        );
+    }
+    let replay = AcceptBatch {
+        items: vec![mixed.items[0].clone()],
+    };
+    let initial = store.accept_batch(ctx.clone(), mixed).await.unwrap();
+    // Replaying a persisted receipt needs no blob staging on either backend.
+    let error = stalled(replay.clone()).await;
+    assert!(
+        matches!(error, PortError::Unavailable(ref f) if f.effect()==CommitEffect::Unknown && f.retry()==RetryAdvice::RetrySameCommand),
+        "{error:?}"
+    );
+    let acknowledged = store.accept_batch(ctx.clone(), replay).await.unwrap();
+    assert_eq!(
+        acknowledged.items[0].as_ref().unwrap().receipt.seq(),
+        initial.items[0].as_ref().unwrap().receipt.seq()
+    );
     assert!(initial.items[0].is_ok());
     assert!(matches!(
         initial.items[1],
@@ -188,6 +226,23 @@ pub(super) async fn check(
             link(&note, LinkTarget::Note(other.clone())),
         ],
     };
+    if postgres {
+        let mut short = ctx.clone();
+        short.budget.remaining = std::time::Duration::from_millis(300);
+        let hold = store.acquire_writer_safe_point().await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            store.link_many(short, link_batch.clone()),
+        )
+        .await;
+        drop(hold);
+        assert_effect(
+            result
+                .expect("link staging exceeded caller budget")
+                .unwrap_err(),
+            CommitEffect::NotCommitted,
+        );
+    }
     assert_effect(
         store
             .link_many(ctx.clone(), link_batch.clone())

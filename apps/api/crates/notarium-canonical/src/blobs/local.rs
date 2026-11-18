@@ -1002,4 +1002,55 @@ mod guard_tests {
         drop(store);
         std::fs::remove_dir_all(path).unwrap();
     }
+
+    #[test]
+    fn dropping_a_queued_blob_read_releases_its_digest_guard() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let path = std::env::temp_dir()
+                    .join(crate::codec::new_prefixed_hex_id("queued-blob-test-").unwrap());
+                let store = Arc::new(LocalBlobStore::open(&DataRoot::new(&path)).unwrap());
+                let space = SpaceId::from_bytes([1; 16]);
+                let digest = ContentDigest::from_bytes([4; 32]);
+                let guard = store.acquire_shared_guard(&space, digest).await;
+                let observed = Arc::downgrade(&guard);
+                let plan = crate::blobs::FastLocalBlobReadPlan::new(
+                    store.clone(),
+                    space,
+                    digest,
+                    10,
+                    guard,
+                );
+
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let (release, hold) = std::sync::mpsc::channel::<()>();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    let _ = hold.recv_timeout(std::time::Duration::from_secs(3));
+                });
+                ready.await.unwrap();
+                {
+                    let read = plan.read_verified_async();
+                    tokio::pin!(read);
+                    tokio::select! {
+                        biased;
+                        _ = &mut read => panic!("read ran while the only worker was busy"),
+                        _ = std::future::ready(()) => {}
+                    }
+                }
+                let released = observed.upgrade().is_none();
+                drop(release);
+                blocker.await.unwrap();
+                assert!(
+                    released,
+                    "a queued read retained the digest after caller drop"
+                );
+                drop(store);
+                std::fs::remove_dir_all(path).unwrap();
+            });
+    }
 }

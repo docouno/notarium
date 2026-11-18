@@ -419,9 +419,11 @@ async fn authorize_create_placement(
 
 pub(crate) async fn create_note_impl(
     store: &CanonicalStore,
-    ctx: SpaceContext,
+    mut ctx: SpaceContext,
     request: Mutation<CreateNote>,
 ) -> Result<Committed<NoteRevision>, PortError> {
+    let budget = ctx.budget.clone();
+    let deadline = super::common::CommandDeadline::start(&budget, "create_note");
     let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
@@ -438,21 +440,27 @@ pub(crate) async fn create_note_impl(
         store.blob_codec(),
     )?;
 
-    let space_rec = authorize_create_placement(
-        store,
-        &ctx,
-        request.input.parent.clone(),
-        request.input.class,
-    )
-    .await?;
+    ctx.budget.remaining = deadline.remaining(&budget)?;
+    let space_rec = deadline
+        .wait(&budget, || {
+            authorize_create_placement(
+                store,
+                &ctx,
+                request.input.parent.clone(),
+                request.input.class,
+            )
+        })
+        .await??;
 
-    let ticket = store
-        .stage_blob_for_batch_prechecked(
-            &space_rec.scope,
-            space_rec.active_epoch,
-            &info.prepared_blob,
-        )
-        .await?;
+    let ticket = deadline
+        .wait(&budget, || {
+            store.stage_blob_for_batch_prechecked(
+                &space_rec.scope,
+                space_rec.active_epoch,
+                &info.prepared_blob,
+            )
+        })
+        .await??;
 
     let created = v1_receipts::CreatedNote::from_input(
         &request.input,
@@ -493,19 +501,28 @@ pub(crate) async fn create_note_impl(
             None,
         )
     };
+    ctx.budget.remaining = deadline.remaining(&budget)?;
     match store
-        .submit_write_command_tracked::<StoredCommittedNoteRevV1>(
+        .submit_write_command_until::<StoredCommittedNoteRevV1>(
             &ctx.budget,
+            deadline.at,
             intent,
             fast_plan,
-            active_op_guard,
+            None,
+            Some(active_op_guard),
         )
         .await
     {
         Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => {
-            v1_receipts::LegacyNoteCommand::Create(created)
-                .replay(store, &ctx, &request.identity, &idemp)
-                .await
+            ctx.budget.remaining = deadline.remaining(&budget)?;
+            let legacy = v1_receipts::LegacyNoteCommand::Create(created);
+            let result = deadline
+                .wait(&budget, || {
+                    legacy.replay(store, &ctx, &request.identity, &idemp)
+                })
+                .await?;
+            deadline.remaining(&budget)?;
+            result
         }
         other => other.map(StoredCommittedNoteRevV1::into_committed),
     }
@@ -1127,7 +1144,14 @@ pub(crate) async fn edit_note_impl(
         )?;
         ctx.budget.remaining = deadline.remaining(&budget)?;
         let stored: StoredCommittedNoteRevV1 = store
-            .submit_write_command_tracked(&ctx.budget, intent, Some(fast_plan), active_op_guard)
+            .submit_write_command_until(
+                &ctx.budget,
+                deadline.at,
+                intent,
+                Some(fast_plan),
+                None,
+                Some(active_op_guard),
+            )
             .await?;
         return Ok(stored.into_committed());
     }
@@ -1151,7 +1175,14 @@ pub(crate) async fn edit_note_impl(
 
     ctx.budget.remaining = deadline.remaining(&budget)?;
     let stored: StoredCommittedNoteRevV1 = store
-        .submit_write_command_tracked(&ctx.budget, intent, None, active_op_guard)
+        .submit_write_command_until(
+            &ctx.budget,
+            deadline.at,
+            intent,
+            None,
+            None,
+            Some(active_op_guard),
+        )
         .await?;
     Ok(stored.into_committed())
 }
@@ -2777,9 +2808,13 @@ pub(crate) async fn accept_batch_impl(
     request: AcceptBatch,
 ) -> Result<BatchResult<NoteRevision>, PortError> {
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "accept_batch");
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
-        .await?;
+    let budget = ctx.budget.clone();
+    let space_rec = deadline
+        .wait(&budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&budget))
+        })
+        .await??;
+    deadline.remaining(&budget)?;
     space_rec.scope.check(ctx.scope())?;
 
     if request.items.is_empty() {
@@ -2789,6 +2824,35 @@ pub(crate) async fn accept_batch_impl(
         });
     }
 
+    let intents = deadline
+        .wait(&budget, || {
+            prepare_batch_intents(store, &mut ctx, &space_rec, request, &deadline)
+        })
+        .await??;
+    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+    let (raw_outcomes, committed_high_watermark) = store
+        .submit_write_batch::<StoredCommittedNoteRevV1>(
+            &ctx.budget,
+            &space_rec.scope.space_id,
+            intents,
+        )
+        .await
+        .map_err(|error| batch_error(error, false))?;
+
+    batch_results(
+        raw_outcomes,
+        committed_high_watermark,
+        StoredCommittedNoteRevV1::into_committed,
+    )
+}
+
+async fn prepare_batch_intents(
+    store: &CanonicalStore,
+    ctx: &mut SpaceContext,
+    space_rec: &crate::SpaceRecord,
+    request: AcceptBatch,
+    deadline: &super::common::CommandDeadline,
+) -> Result<Vec<PreparedWriteIntent>, PortError> {
     let keys = request
         .items
         .iter()
@@ -2797,10 +2861,10 @@ pub(crate) async fn accept_batch_impl(
                 || (store.inner.collab_interceptor.get().is_some()
                     && matches!(item.input, BatchItem::Move(_)))
         })
-        .filter(|item| validate_batch_item(&ctx, item).is_ok())
+        .filter(|item| validate_batch_item(ctx, item).is_ok())
         .map(|item| item.identity.key.as_str().to_owned())
         .collect();
-    let receipts = batch_receipt_hashes(store, &ctx, keys).await?;
+    let receipts = batch_receipt_hashes(store, ctx, keys).await?;
     let mut sources = BatchEditSources::default();
     let mut edited_notes = BTreeSet::new();
     for item in &request.items {
@@ -2879,7 +2943,7 @@ pub(crate) async fn accept_batch_impl(
     let mut placements = BTreeMap::new();
     for item_mut in request.items {
         ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
-        if let Err(err) = validate_batch_item(&ctx, &item_mut) {
+        if let Err(err) = validate_batch_item(ctx, &item_mut) {
             intents.push(build_failing_item_intent(
                 &space_rec.scope,
                 space_rec.active_epoch,
@@ -2889,20 +2953,20 @@ pub(crate) async fn accept_batch_impl(
         }
         let idemp = match &item_mut.input {
             BatchItem::Create(cr) => Some(create_note_identity(
-                &ctx,
+                ctx,
                 &item_mut.identity,
                 cr,
                 &space_rec.root_folder_id,
                 notarium_syntax::content_digest(&cr.carrier),
             )),
             BatchItem::Edit(ed) => Some(edit_note_identity(
-                &ctx,
+                ctx,
                 &item_mut.identity,
                 ed,
                 &item_mut.preconditions,
             )),
             BatchItem::Move(mv) => Some(move_note_identity(
-                &ctx,
+                ctx,
                 &item_mut.identity,
                 mv,
                 &item_mut.preconditions,
@@ -2933,7 +2997,7 @@ pub(crate) async fn accept_batch_impl(
                     _ => unreachable!("only carrier items have a receipt candidate"),
                 };
                 command
-                    .verified_identity(store, &ctx, &item_mut.identity, spec)
+                    .verified_identity(store, ctx, &item_mut.identity, spec)
                     .await
             };
             let replay = match checked {
@@ -2964,7 +3028,7 @@ pub(crate) async fn accept_batch_impl(
                     let admitted = match placements.entry(placement) {
                         std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                         std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
-                            authorize_create_placement(store, &ctx, cr.parent.clone(), cr.class)
+                            authorize_create_placement(store, ctx, cr.parent.clone(), cr.class)
                                 .await
                                 .map(|_| ()),
                         ),
@@ -3094,7 +3158,7 @@ pub(crate) async fn accept_batch_impl(
             BatchItem::Move(mv) => match normalize_slug_key(&mv.slug) {
                 Ok(sf) => {
                     let pin = deadline
-                        .wait(&ctx.budget, || prepare_batch_move_pin(store, &ctx, &mv))
+                        .wait(&ctx.budget, || prepare_batch_move_pin(store, ctx, &mv))
                         .await?;
                     intents.push(build_move_note_intent(
                         &space_rec.scope,
@@ -3116,21 +3180,7 @@ pub(crate) async fn accept_batch_impl(
         }
     }
 
-    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
-    let (raw_outcomes, committed_high_watermark) = store
-        .submit_write_batch::<StoredCommittedNoteRevV1>(
-            &ctx.budget,
-            &space_rec.scope.space_id,
-            intents,
-        )
-        .await
-        .map_err(|error| batch_error(error, false))?;
-
-    batch_results(
-        raw_outcomes,
-        committed_high_watermark,
-        StoredCommittedNoteRevV1::into_committed,
-    )
+    Ok(intents)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3910,18 +3960,23 @@ pub(crate) async fn link_many_impl(
     mut ctx: SpaceContext,
     request: LinkBatch,
 ) -> Result<BatchResult<Link>, PortError> {
-    let deadline =
-        crate::runtime::deadline_after(tokio::time::Instant::now(), ctx.budget.remaining);
-    let space = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
-        .await?;
+    let budget = ctx.budget.clone();
+    let deadline = super::common::CommandDeadline::start(&budget, "link_many");
+    let space = deadline
+        .wait(&budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&budget))
+        })
+        .await??;
     space.scope.check(ctx.scope())?;
     let keys = request
         .items
         .iter()
         .map(|item| item.identity.key.as_str().to_owned())
         .collect();
-    let receipts = batch_receipt_hashes(store, &ctx, keys).await?;
+    let receipts = deadline
+        .wait(&budget, || batch_receipt_hashes(store, &ctx, keys))
+        .await??;
+    deadline.remaining(&budget)?;
     let mut pending = request.items.into_iter().peekable();
     let mut outcomes = Vec::with_capacity(pending.len());
     let mut high_watermark = space.last_seq;
@@ -3935,22 +3990,20 @@ pub(crate) async fn link_many_impl(
                 break;
             }
             let item = pending.next().expect("peeked");
-            let result = prepare_link_batch_item(store, &ctx, &space, item, &receipts).await;
+            let result = deadline
+                .wait(&budget, || {
+                    prepare_link_batch_item(store, &ctx, &space, item, &receipts)
+                })
+                .await
+                .map_err(|error| batch_error(error, outcomes.iter().any(has_commit_outcome)))?;
             intents.push(match result {
                 Ok(intent) => intent,
                 Err(error) => build_failing_item_intent(&space.scope, space.active_epoch, error),
             });
         }
-        ctx.budget.remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if ctx.budget.remaining.is_zero() {
-            return Err(batch_error(
-                crate::codec::deadline_not_committed(
-                    "link_many_deadline",
-                    "deadline before group admission",
-                ),
-                outcomes.iter().any(has_commit_outcome),
-            ));
-        }
+        ctx.budget.remaining = deadline
+            .remaining(&budget)
+            .map_err(|error| batch_error(error, outcomes.iter().any(has_commit_outcome)))?;
         let group = store
             .submit_write_batch::<StoredCommittedLinkV1>(
                 &ctx.budget,

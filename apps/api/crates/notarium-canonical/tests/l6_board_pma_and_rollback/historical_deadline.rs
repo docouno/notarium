@@ -1,10 +1,12 @@
 use super::*;
 
 #[test]
-fn sqlite_historical_get_note_respects_the_caller_during_blob_read() {
+fn sqlite_note_reads_and_edits_preserve_the_budget_across_cas_and_writer_ack() {
+    use notarium_core::error::{CommitEffect, RetryAdvice};
     use std::time::Duration;
 
-    tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .max_blocking_threads(1)
         .build()
@@ -35,7 +37,7 @@ fn sqlite_historical_get_note_respects_the_caller_during_blob_read() {
                             parent: None,
                             slug: "before".into(),
                             class: DocClass::UserDoc,
-                            carrier: "# Before\n".into(),
+                            carrier: format!("# Before\n{}", "x".repeat(72 * 1024)),
                         },
                     ),
                 )
@@ -57,9 +59,9 @@ fn sqlite_historical_get_note_respects_the_caller_during_blob_read() {
                 .await
                 .unwrap();
             let historical = GetNote {
-                note,
+                note: note.clone(),
                 revision: Some(created.value.revision),
-                causal: CausalBasis::Exact(ReceiptSet::new([changed.receipt]).unwrap()),
+                causal: CausalBasis::Exact(ReceiptSet::new([changed.receipt.clone()]).unwrap()),
             };
             assert!(
                 store
@@ -68,7 +70,19 @@ fn sqlite_historical_get_note_respects_the_caller_during_blob_read() {
                     .is_ok()
             );
 
-            // Historical LocalZstdV1 reads dispatch the verified CAS read to the blocking pool.
+            let head = GetNote {
+                note: note.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            };
+            let before = store.get_note(ctx.clone(), head.clone()).await.unwrap();
+            let plan = extract::finalize_document(
+                before.document.explicit_read(ctx.auth()).unwrap(), DocClass::UserDoc, &note,
+                &[FieldEdit::Set { key: "status".into(), value: YamlValue::String("done".into()) }],
+            ).unwrap();
+            let edit = next_mutation(&scope, &owner, EditNote { note, plan });
+
+            // Both the historical read and this large edit need the only blocking worker.
             let (occupied, ready) = tokio::sync::oneshot::channel();
             let (release, hold) = std::sync::mpsc::channel();
             let blocker = tokio::task::spawn_blocking(move || {
@@ -78,22 +92,34 @@ fn sqlite_historical_get_note_respects_the_caller_during_blob_read() {
             ready.await.unwrap();
             let mut limited = ctx.clone();
             limited.budget.remaining = Duration::from_millis(100);
-            let request = store.get_note(limited, historical.clone());
-            tokio::pin!(request);
-            let result = tokio::time::timeout(Duration::from_millis(400), &mut request).await;
-            let _ = release.send(());
-            let before_release = result.is_ok();
-            let outcome = match result {
-                Ok(outcome) => outcome,
-                Err(_) => request.await,
+            let requests = async {
+                tokio::join!(
+                    store.get_note(limited.clone(), historical.clone()),
+                    store.edit_note(limited, edit.clone()),
+                )
             };
+            let result = tokio::time::timeout(Duration::from_millis(500), requests).await;
+            let _ = release.send(());
+            let (read_result, edit_result) = result.expect("CAS waits exceeded the caller's deadline");
             blocker.await.unwrap();
-            let code = outcome.as_ref().err().map(PortError::code).unwrap_or("ok");
-            assert!(store.get_note(ctx, historical).await.is_ok());
+            for error in [read_result.unwrap_err(), edit_result.unwrap_err()] {
+                assert!(matches!(error, PortError::DeadlineExceeded(ref f) if f.effect()==CommitEffect::NotCommitted), "{error:?}");
+            }
+            assert!(store.get_note(ctx.clone(), historical).await.is_ok());
+            assert_eq!(store.read_space(&scope.space_id).await.unwrap().last_seq, changed.receipt.seq());
+
+            // The actor owns the admitted edit even if its caller stops waiting for the receipt.
+            let hold = store.acquire_writer_safe_point().await.unwrap();
+            let mut short = ctx.clone();
+            short.budget.remaining = Duration::from_millis(300);
+            let result = tokio::time::timeout(Duration::from_secs(2), store.edit_note(short, edit.clone())).await;
+            drop(hold);
+            let error = result.expect("caller remained blocked behind the writer gate").unwrap_err();
+            assert!(matches!(error, PortError::Unavailable(ref f) if f.effect()==CommitEffect::Unknown && f.retry()==RetryAdvice::RetrySameCommand), "{error:?}");
+            let recovered = store.edit_note(ctx.clone(), edit.clone()).await.unwrap();
+            let replayed = store.edit_note(ctx, edit).await.unwrap();
+            assert_eq!(recovered.receipt, replayed.receipt);
+            assert_eq!(replayed.receipt.seq().get(), changed.receipt.seq().get()+1);
             runtime.shutdown().await.unwrap();
-            assert!(
-                before_release && matches!(outcome, Err(PortError::DeadlineExceeded(_))),
-                "historical read exceeded its original deadline: {code}"
-            );
         });
 }

@@ -177,6 +177,15 @@ to locate the point where throughput flattens while queues and tail latency
 grow. Record the reason for each failed read. Keep class permissions, causal
 visibility and acknowledgement durability in every comparison.
 
+On a Medium ext4 volume, a diagnostic SQLite snapshot spent 955 ms in a
+revision lookup under the 50-writer, 200-reader workload. Thread samples
+caught its file read waiting for space in the ext4 journal. In a separate
+comparison on that volume, six mixed runs with default access timestamps
+reported three read failures. All six runs with access timestamps suppressed
+on fresh fixture files completed without read failures. Record filesystem
+and timestamp settings when comparing tails. Run acceptance with the
+settings used by the deployment.
+
 ## Measures for the next integration
 
 | User action | Owning component and next observable result |

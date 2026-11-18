@@ -530,15 +530,29 @@ impl FastLocalBlobReadPlan {
         }
     }
 
-    pub fn read_verified(self) -> Result<Vec<u8>, PortError> {
+    pub fn read_verified(&self) -> Result<Vec<u8>, PortError> {
         self.local
             .read_verified(&self.space_id, self.digest, self.raw_size)
     }
 
     pub async fn read_verified_async(self) -> Result<Vec<u8>, PortError> {
-        tokio::task::spawn_blocking(move || self.read_verified())
-            .await
-            .map_err(|err| internal_not_committed("local_cas_fast_read_join", err.to_string()))?
+        // A queued job must not keep a digest alive after its caller leaves.
+        // A worker that has started the read keeps its own guard until verification ends.
+        let plan = Arc::new(self);
+        let pending = Arc::downgrade(&plan);
+        let read = tokio::task::spawn_blocking(move || {
+            let plan = pending.upgrade().ok_or_else(|| {
+                crate::codec::cancelled_not_committed(
+                    "local_cas_read_cancelled",
+                    "caller left before the local blob read started",
+                )
+            })?;
+            plan.read_verified()
+        })
+        .await
+        .map_err(|err| internal_not_committed("local_cas_fast_read_join", err.to_string()))?;
+        drop(plan);
+        read
     }
 }
 
@@ -1479,9 +1493,15 @@ impl crate::CanonicalStore {
                         })
                     })
                     .await?;
-                let bytes = local.read_verified(&scope.space_id, digest, meta.raw_size)?;
-                drop(guard);
-                Ok(bytes)
+                FastLocalBlobReadPlan::new(
+                    Arc::clone(local),
+                    scope.space_id.clone(),
+                    digest,
+                    meta.raw_size,
+                    guard,
+                )
+                .read_verified_async()
+                .await
             }
             BlobBackendDriver::S3(s3) => {
                 let scope_cl = scope.clone();
