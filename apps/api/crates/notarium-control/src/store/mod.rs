@@ -124,7 +124,7 @@ impl ControlStore {
                 .busy_timeout(Duration::from_millis(250))
                 .and_then(|()| {
                     connection.execute_batch(
-                        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=4194304; PRAGMA secure_delete=ON;",
+                        "PRAGMA fullfsync=ON; PRAGMA synchronous=FULL; PRAGMA journal_mode=WAL; PRAGMA journal_size_limit=4194304; PRAGMA secure_delete=ON;",
                     )
                 })
                 .map_err(|_| unavailable("control SQLite bootstrap", CommitEffect::Unknown))?;
@@ -138,6 +138,7 @@ impl ControlStore {
         // Request pools only join the already initialized WAL database.
         let write_options = SqliteConnectOptions::new()
             .filename(&path)
+            .pragma("fullfsync", "ON")
             .synchronous(SqliteSynchronous::Full)
             .foreign_keys(true)
             .busy_timeout(Duration::from_millis(2500))

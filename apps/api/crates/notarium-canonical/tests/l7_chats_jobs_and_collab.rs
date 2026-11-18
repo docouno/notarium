@@ -3528,3 +3528,143 @@ async fn exercise_interrupted_queue_upload(
     rt.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }
+
+#[tokio::test]
+async fn chat_receipts_preserve_body_and_reference_boundaries() {
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    for postgres in [false, true] {
+        let root = TempDataRoot::new("chat-reference-identity");
+        let installation = sample_installation_id(0x64);
+        let cfg = if postgres {
+            fixtures.pg_local_config(installation, &schema, root.data_root())
+        } else {
+            CanonicalConfig::local_default(installation, root.data_root())
+        };
+        let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+        let scope = HistoryScope {
+            space_id: sample_space_id(0x64),
+            incarnation: sample_incarnation(0x64),
+        };
+        let owner = sample_principal_id(0x64);
+        store
+            .create_space(CreateSpaceSpec {
+                space_id: scope.space_id.clone(),
+                incarnation: scope.incarnation,
+                root_folder_id: sample_folder_id(0x64),
+                slug: "receipts".into(),
+                kind: SpaceKind::Personal,
+                owner: owner.clone(),
+                active_epoch: LeaseEpoch::new(1).unwrap(),
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+        let ctx = owner_ctx(&scope, owner.clone());
+        let note = sample_note_id(0x64);
+        store
+            .create_note(
+                ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateNote {
+                        note: note.clone(),
+                        parent: None,
+                        slug: "report".into(),
+                        class: DocClass::UserDoc,
+                        carrier: "Report.\n".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let thread = sample_thread_id(0x64);
+        store
+            .create_chat(
+                ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    CreateChat {
+                        thread: thread.clone(),
+                        kind: ChatThreadKind::Personal,
+                        owner: owner.clone(),
+                        project_folder: None,
+                        title: "Notes".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let request = next_mutation(
+            &scope,
+            &owner,
+            AppendChat {
+                thread: thread.clone(),
+                parent: ThreadEntrySeq::ZERO,
+                kind: ChatEntryKind::Human,
+                body: ChatInputBody::Text("Report: ".into()),
+                referenced_notes: vec![NoteRef {
+                    space_id: scope.space_id.clone(),
+                    note_id: note.clone(),
+                }],
+                tainted: false,
+            },
+        );
+        let appended = store
+            .append_chat(ctx.clone(), request.clone())
+            .await
+            .unwrap();
+        let mut inline = request.clone();
+        inline.input.referenced_notes.clear();
+        inline.input.body = ChatInputBody::Text(format!(
+            "Report: {}{}",
+            scope.space_id.as_str(),
+            note.as_str()
+        ));
+        for previous in [false, true] {
+            if previous {
+                let mut payload = blake3::Hasher::new();
+                payload.update(thread.as_str().as_bytes());
+                payload.update(&[0]);
+                payload.update(&0u64.to_be_bytes());
+                payload.update(b"\0human\0\x01Report: ");
+                payload.update(scope.space_id.as_str().as_bytes());
+                payload.update(note.as_str().as_bytes());
+                payload.update(&[0]);
+                let mut command = blake3::Hasher::new();
+                command.update(b"notarium-cmd-v1:append_chat\0");
+                command.update(request.identity.hash.as_bytes());
+                command.update(&[0]);
+                command.update(payload.finalize().as_bytes());
+                let hex = command.finalize().to_hex();
+                let literal = if postgres {
+                    format!("decode('{hex}', 'hex')")
+                } else {
+                    format!("X'{hex}'")
+                };
+                assert_eq!(store.execute_diagnostic_write_sql_for_test(&format!(
+                    "UPDATE command_receipts SET command_hash={literal} WHERE space_id='{}' AND idempotency_key='{}'",
+                    scope.space_id.as_str(), request.identity.key.as_str())).await.unwrap(),1);
+            }
+            assert!(matches!(
+                store.append_chat(ctx.clone(), inline.clone()).await,
+                Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+            ));
+            let exact = store
+                .append_chat(ctx.clone(), request.clone())
+                .await
+                .unwrap();
+            assert_eq!(exact.receipt, appended.receipt);
+            assert_eq!(exact.value.referenced_notes, request.input.referenced_notes);
+            assert_eq!(
+                store.read_space(&scope.space_id).await.unwrap().last_seq,
+                appended.receipt.seq()
+            );
+        }
+        runtime.shutdown().await.unwrap();
+    }
+    fixtures.drop_pg_schema(&schema).await;
+}

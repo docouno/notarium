@@ -14,7 +14,7 @@ belong to the transport composition.
 
 ## Persistence
 
-SQLite uses `<DataRoot>/v1/control.sqlite`, WAL mode, full synchronous writes,
+SQLite uses `<DataRoot>/v1/control.sqlite`, WAL mode, `synchronous=FULL`, `fullfsync=ON`,
 foreign keys, strict tables, a 4 MiB `journal_size_limit`, a 256-page
 `wal_autocheckpoint`, a 2500 ms write busy timeout and a 250 ms read busy timeout.
 The composition owner must classify the data root before opening it and create the

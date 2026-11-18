@@ -487,8 +487,10 @@ impl SqliteWalCoordinator {
             .fetch_add(1, Ordering::Release);
     }
 
+    // Admission can wait for a configured reset cycle. Once a snapshot starts,
+    // both SQLx and native readers use the ordinary transaction ceiling.
     pub(crate) fn read_deadline(&self) -> Duration {
-        self.read_deadline
+        self.read_deadline.min(Duration::from_millis(249))
     }
 
     pub fn record_busy_if_any(&self, err_msg: &str) {
@@ -902,7 +904,7 @@ impl SqliteWalCoordinator {
         }
 
         let tx_deadline_tokio = now_tokio
-            .checked_add(self.read_deadline)
+            .checked_add(self.read_deadline())
             .map_or(caller_deadline_tokio, |read| {
                 read.min(caller_deadline_tokio)
             });
@@ -1480,6 +1482,38 @@ mod tests {
     use super::*;
     use crate::{CanonicalConfig, CanonicalRuntime, SqlBackendConfig};
     use notarium_core::{epoch::DataRoot, ids::InstallationId};
+
+    #[tokio::test]
+    async fn sqlite_long_configured_read_interval_bounds_only_ordinary_snapshots() {
+        let id = crate::codec::csprng_16().unwrap();
+        let path = std::env::temp_dir().join(format!("notarium-read-range-{}", hex::encode(id)));
+        let mut config =
+            CanonicalConfig::local_default(InstallationId::from_bytes(id), DataRoot::new(&path));
+        let SqlBackendConfig::Sqlite { read_deadline, .. } = &mut config.sql else {
+            unreachable!();
+        };
+        *read_deadline = Duration::MAX;
+        assert!(matches!(
+            CanonicalRuntime::open(config.clone()).await,
+            Err(PortError::Domain(notarium_core::DomainError::ValidationFailed { diagnostic }))
+                if diagnostic.reason == notarium_core::error::ValidationReason::InvalidRange
+        ));
+        let SqlBackendConfig::Sqlite { read_deadline, .. } = &mut config.sql else {
+            unreachable!();
+        };
+        *read_deadline = Duration::from_secs(1);
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        let wal = store.inner.wal_coord.get().unwrap();
+        assert_eq!(wal.read_deadline(), Duration::from_millis(249));
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            wal.gate_deadline(start, None).unwrap() - start,
+            Duration::from_millis(1250)
+        );
+        runtime.shutdown().await.unwrap();
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[tokio::test]
     async fn sqlite_default_read_budget_allows_one_reset_before_the_snapshot() {

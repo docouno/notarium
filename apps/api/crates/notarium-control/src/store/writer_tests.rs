@@ -96,6 +96,15 @@ async fn sqlite_cancelled_begin_keeps_writer_fence_until_driver_ack() {
         .join(format!("control-tests/writer-{unique}"));
     std::fs::create_dir_all(root.join("v1")).unwrap();
     let store = ControlStore::sqlite(&DataRoot::new(&root)).await.unwrap();
+    let Backend::Sqlite { pool, .. } = &store.backend else {
+        unreachable!()
+    };
+    let flags: (i64, i64) =
+        sqlx::query_as("SELECT synchronous, fullfsync FROM pragma_synchronous, pragma_fullfsync")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(flags, (2, 1));
     let mut blocker = sqlx::SqliteConnection::connect(&format!(
         "sqlite:{}",
         root.join("v1/control.sqlite").display()

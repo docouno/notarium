@@ -207,8 +207,7 @@ impl CanonicalConfig {
                 wal_reset_cycle_deadline,
                 ..
             } => {
-                *read_deadline < Duration::from_millis(250)
-                    && fits(*passive_checkpoint_interval)
+                fits(*passive_checkpoint_interval)
                     && fits(
                         wal_reset_cycle_deadline
                             .saturating_add((*read_deadline).max(Duration::from_millis(1))),

@@ -1,4 +1,5 @@
 use super::*;
+use notarium_core::error::RetryAdvice;
 use tokio::sync::{oneshot, watch};
 
 type Key = (HistoryScope, LeaseEpoch, String);
@@ -32,6 +33,22 @@ fn stopped() -> PortError {
         "storage closed during GC",
         Duration::from_millis(50),
     )
+}
+
+/// Earliest automatic retry allowed by the operation that failed.
+pub(crate) fn retry_after(error: &PortError) -> Option<Duration> {
+    let failure = match error {
+        PortError::Domain(_) => return None,
+        PortError::Cancelled(failure)
+        | PortError::DeadlineExceeded(failure)
+        | PortError::Unavailable(failure)
+        | PortError::Internal(failure) => failure,
+    };
+    match failure.retry() {
+        RetryAdvice::Never => None,
+        RetryAdvice::RetrySameCommand => Some(Duration::ZERO),
+        RetryAdvice::After(delay) => Some(delay),
+    }
 }
 
 pub(crate) async fn outcome(attempt: &mut Attempt) -> Result<(), PortError> {
@@ -97,6 +114,16 @@ impl crate::CanonicalStore {
     }
 
     #[cfg(feature = "test-support")]
+    pub fn storage_cleanup_idle_for_test(&self) -> bool {
+        self.inner
+            .backup_cleanups
+            .lock()
+            .expect("storage cleanup tasks")
+            .iter()
+            .all(tokio::task::JoinHandle::is_finished)
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn active_retirement_workers_for_test(&self) -> usize {
         self.inner
             .retirement_workers
@@ -111,6 +138,7 @@ async fn run(mut pending: Vec<Work>) {
     let mut backoff = Duration::from_millis(25);
     while !pending.is_empty() {
         let mut retry = Vec::new();
+        let mut delay = backoff;
         for work in pending {
             let (scope, epoch, id) = &work.key;
             let result = match work
@@ -121,18 +149,24 @@ async fn run(mut pending: Vec<Work>) {
                 Err(PortError::Domain(DomainError::ResourceNotFound)) => Ok(()),
                 result => result,
             };
-            let retryable = result
-                .as_ref()
-                .is_err_and(|e| !matches!(e, PortError::Domain(_)));
-            work.outcome.send_replace(Some(result));
-            if retryable {
+            if let Some(minimum) = result.as_ref().err().and_then(retry_after) {
+                delay = delay.max(minimum);
+                work.outcome.send_replace(Some(result));
                 retry.push(work);
+            } else {
+                if let Err(error) = &result {
+                    tracing::warn!(?error, space = %scope.space_id.as_str(), retirement = id, "durable retirement stopped");
+                }
+                // Release the durable ID before a subscriber can explicitly retry.
+                let outcome = work.outcome.clone();
+                drop(work);
+                outcome.send_replace(Some(result));
             }
         }
         pending = retry;
         if !pending.is_empty() {
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(1));
+            tokio::time::sleep(delay).await;
+            backoff = (backoff * 2).min(Duration::from_secs(5));
         }
     }
 }

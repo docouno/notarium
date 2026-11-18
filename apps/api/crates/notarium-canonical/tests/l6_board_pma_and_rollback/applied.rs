@@ -22,6 +22,7 @@ struct PausedRoom {
     pause: Mutex<Option<Pause>>,
     accepted: Mutex<Option<AcceptedRoomCarrier>>,
     pinned: Mutex<Option<(NoteId, LeaseEpoch)>>,
+    pin_gate: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 impl PausedRoom {
@@ -101,6 +102,11 @@ impl LiveCollabInterceptor for PausedRoom {
 
     fn filename_pin(&self, _: SpaceContext, note: NoteId) -> PortFuture<'_, FilenamePin> {
         Box::pin(async move {
+            let gate = self.pin_gate.lock().unwrap().take();
+            if let Some((entered, resume)) = gate {
+                entered.send(()).unwrap();
+                resume.await.unwrap();
+            }
             let pin = self.pinned.lock().unwrap();
             match pin.as_ref() {
                 Some((pinned, lease)) if *pinned == note => Ok(FilenamePin::Pinned {
@@ -126,6 +132,7 @@ pub(super) async fn check(
         pause: Mutex::new(None),
         accepted: Mutex::new(None),
         pinned: Mutex::new(None),
+        pin_gate: Mutex::new(None),
     });
     store.register_collab_interceptor(room.clone()).unwrap();
     check_move_pin(store, ctx, &room).await;
@@ -310,6 +317,12 @@ pub(super) async fn check(
     assert_eq!(answer.value.group, first.value.group);
     assert_ne!(answer.value.rank_revision, later.value.rank_revision);
     assert_ne!(answer.value.group, later.value.group);
+    let mut changed = saved_card.clone();
+    changed.preconditions.lease = Some(LeaseEpoch::MAX);
+    assert!(matches!(
+        store.move_board_card(ctx.clone(), changed).await,
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+    ));
     let count = store.execute_diagnostic_write_sql_for_test(&format!(
         "UPDATE command_receipts SET response_payload_id=NULL WHERE space_id='{}' AND idempotency_key='{}'",
         scope.space_id.as_str(), saved_card.identity.key.as_str(),
@@ -413,7 +426,7 @@ async fn check_move_pin(store: &CanonicalStore, ctx: &SpaceContext, room: &Pause
     assert_eq!(durable.session.room_state, CollabRoomState::Active);
     assert_eq!(durable.session.carrier_rev_id, moved.value.revision);
     assert_eq!(durable.session.lineage_epoch, active.lineage_epoch);
-    *room.pinned.lock().unwrap() = Some((note, active.lease_epoch));
+    *room.pinned.lock().unwrap() = Some((note.clone(), active.lease_epoch));
     assert_eq!(
         store.move_note(ctx.clone(), request).await.unwrap().receipt,
         moved.receipt
@@ -426,6 +439,104 @@ async fn check_move_pin(store: &CanonicalStore, ctx: &SpaceContext, room: &Pause
         moved.receipt
     );
     *room.pinned.lock().unwrap() = None;
+    check_rename_placement_and_deadline(store, ctx, room, &note).await;
+}
+
+async fn check_rename_placement_and_deadline(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    room: &PausedRoom,
+    note: &NoteId,
+) {
+    use notarium_core::ports::MoveNote;
+    let scope = ctx.scope();
+    let owner = ctx.auth().principal();
+    let folder = FolderId::from_bytes([173; 16]);
+    store
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: folder.clone(),
+            parent: None,
+            slug: "concurrent-move".into(),
+            display_name: "Concurrent move".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let rename = |slug: &str| {
+        next_mutation(
+            scope,
+            owner,
+            RenameNote {
+                note: note.clone(),
+                slug: slug.into(),
+                title: None,
+            },
+        )
+    };
+    let pause = || {
+        let (entered, waiting) = oneshot::channel();
+        let (release, resume) = oneshot::channel();
+        *room.pin_gate.lock().unwrap() = Some((entered, resume));
+        (waiting, release)
+    };
+    let (waiting, release) = pause();
+    let move_during_pin = async {
+        waiting.await.unwrap();
+        store
+            .move_note(
+                ctx.clone(),
+                next_mutation(
+                    scope,
+                    owner,
+                    MoveNote {
+                        note: note.clone(),
+                        parent: Some(folder.clone()),
+                        slug: "concurrent-placement".into(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+    };
+    let (renamed, ()) = tokio::join!(
+        store.rename_note(ctx.clone(), rename("renamed-in-place")),
+        move_during_pin
+    );
+    let renamed = renamed.unwrap();
+    let read = store
+        .get_note(
+            ctx.clone(),
+            GetNote {
+                note: note.clone(),
+                revision: Some(renamed.value.revision.clone()),
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.parent, Some(folder));
+    let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    let (waiting, _hold) = pause();
+    let mut short = ctx.clone();
+    short.budget.remaining = std::time::Duration::from_millis(180);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::join!(store.rename_note(short, rename("expired-rename")), waiting).0
+    })
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, Err(PortError::DeadlineExceeded(failure)) if failure.effect() == notarium_core::error::CommitEffect::NotCommitted)
+    );
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        before
+    );
 }
 
 async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, room: &PausedRoom) {
@@ -705,6 +816,7 @@ async fn committed_room_observation_survives_process_exit() {
             pause: Mutex::new(None),
             accepted: Mutex::new(None),
             pinned: Mutex::new(None),
+            pin_gate: Mutex::new(None),
         });
         room.accept(
             &active,

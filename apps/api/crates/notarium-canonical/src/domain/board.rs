@@ -1850,7 +1850,9 @@ fn build_move_board_card_identity_spec(
         &request.identity,
         "move_board_card",
         fp.finalize().as_bytes(),
-    ))
+    )
+    .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
+    .with_known_base(&request.input.expected_note))
 }
 
 #[allow(clippy::too_many_arguments)]

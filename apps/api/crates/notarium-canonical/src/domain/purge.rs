@@ -57,7 +57,7 @@ struct PendingPurgeExecution {
     sanitized_response_msgpack: Vec<u8>,
 }
 
-type RawLookupPendingPurgeRow = (String, Vec<u8>, String, String, Vec<u8>);
+type RawLookupPendingPurgeRow = (String, Vec<u8>, String, String, Vec<u8>, i64);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetirementRecovery {
@@ -179,6 +179,7 @@ impl CanonicalStore {
         recovery: RetirementRecovery,
     ) -> Result<(), PortError> {
         let mut after = String::new();
+        let mut permanent_failure = None;
         let restored_gc = recovery == RetirementRecovery::RestoredGc;
         let online_epoch = (recovery != RetirementRecovery::Startup).then_some(epoch.get() as i64);
         // The retirement owner can change when a recovery adopts it. The publication's
@@ -228,22 +229,20 @@ impl CanonicalStore {
                 })
                 .await?;
             if ids.is_empty() {
-                return Ok(());
+                return permanent_failure.map_or(Ok(()), Err);
             }
             for id in ids {
                 let mut attempts = self.schedule_retirements(scope, epoch, vec![id.clone()]);
-                let attempt = &mut attempts[0];
-                loop {
-                    match crate::blobs::retirement_worker::outcome(attempt).await {
-                        Ok(()) => break,
-                        Err(error @ PortError::Domain(_)) => return Err(error),
-                        Err(error) if error == crate::blobs::held_retirement() => break,
-                        Err(error) if !restored_gc => return Err(error),
-                        Err(error) => {
-                            if attempt.changed().await.is_err() {
-                                return Err(error);
-                            }
-                        }
+                if let Err(error) = crate::blobs::retirement_worker::outcome(&mut attempts[0]).await
+                    && error != crate::blobs::held_retirement()
+                {
+                    if !restored_gc {
+                        return Err(error);
+                    }
+                    // A retryable ID keeps its existing worker. It can wait for the
+                    // filesystem or object store without occupying a restore scan slot.
+                    if crate::blobs::retirement_worker::retry_after(&error).is_none() {
+                        permanent_failure.get_or_insert(error);
                     }
                 }
                 after = id;
@@ -289,6 +288,7 @@ async fn purge_note_inner(
 
     let fp = format!("purge_note={}", request.input.note.as_str());
     let idemp = derive_command_identity_spec(&request.identity, "purge_note", fp.as_bytes())
+        .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
         .for_note(ctx.auth(), &request.input.note);
 
     let step1_capture: Arc<StdMutex<Option<PendingPurgeExecution>>> = Arc::new(StdMutex::new(None));
@@ -553,6 +553,12 @@ pub(crate) async fn mint_and_purge_impl(
         "mint_and_purge",
         fp_hasher.finalize().as_bytes(),
     )
+    .with_preconditions(
+        &request.preconditions,
+        "note",
+        request.input.old_note.as_str(),
+    )
+    .with_known_base(&request.input.expected_revision)
     .with_policy(
         ctx.auth(),
         crate::writer::replay::ReplayPolicy::Documents(vec![
@@ -1791,7 +1797,7 @@ async fn load_pending_purge_for_idempotency(
                 let raw: Option<RawLookupPendingPurgeRow> = match tx {
                     BackendConn::Sqlite(conn) => {
                         let row = sqlx::query(
-                            "SELECT purge_id, command_hash, old_note_id, retirement_ids_json, sanitized_response_msgpack
+                            "SELECT purge_id, command_hash, old_note_id, retirement_ids_json, sanitized_response_msgpack, canonical_seq
                              FROM pending_purges
                              WHERE space_id = ? AND history_incarnation = ? AND actor_id = ? AND idempotency_key = ?
                              ORDER BY created_at_ms DESC
@@ -1813,12 +1819,13 @@ async fn load_pending_purge_for_idempotency(
                                 r.get("old_note_id"),
                                 r.get("retirement_ids_json"),
                                 r.get("sanitized_response_msgpack"),
+                                r.get("canonical_seq"),
                             )
                         })
                     }
                     BackendConn::Postgres(conn) => {
                         let row = sqlx::query(
-                            "SELECT purge_id, command_hash, old_note_id, retirement_ids_json, sanitized_response_msgpack
+                            "SELECT purge_id, command_hash, old_note_id, retirement_ids_json, sanitized_response_msgpack, canonical_seq
                              FROM pending_purges
                              WHERE space_id = $1 AND history_incarnation = $2 AND actor_id = $3 AND idempotency_key = $4
                              ORDER BY created_at_ms DESC
@@ -1840,15 +1847,17 @@ async fn load_pending_purge_for_idempotency(
                                 r.get("old_note_id"),
                                 r.get("retirement_ids_json"),
                                 r.get("sanitized_response_msgpack"),
+                                r.get("canonical_seq"),
                             )
                         })
                     }
                 };
 
-                let Some((purge_id, hash_bytes, old_note_raw, ret_json, resp_msgpack)) = raw else {
+                let Some((purge_id, hash_bytes, old_note_raw, ret_json, resp_msgpack, seq)) = raw else {
                     return Ok(None);
                 };
-                if hash_bytes.as_slice() != idemp_cl.command_hash.as_bytes() {
+                idemp_cl.authorize_replay(tx, &scope_cl).await?;
+                if !idemp_cl.matches_receipt_hash(tx, &scope_cl, seq, &hash_bytes).await? {
                     return Err(DomainError::IdempotencyKeyReused.into());
                 }
                 let old_note_id = NoteId::parse(&old_note_raw).map_err(|_| {

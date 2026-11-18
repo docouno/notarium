@@ -41,6 +41,7 @@ use crate::{
     sql_exec::{BackendConn, PgTransactionLease, WriteTransaction},
 };
 
+pub(crate) mod fingerprint;
 pub(crate) mod replay;
 
 #[derive(Clone, Debug)]
@@ -48,6 +49,7 @@ pub struct CommandIdentitySpec {
     pub actor: PrincipalId,
     pub command_key: CommandKey,
     pub command_hash: ContentDigest,
+    legacy: Option<Arc<fingerprint::LegacyFingerprint>>,
     pub(crate) require_receipt_detail: bool,
     pub(crate) authority:
         Option<Arc<(notarium_core::auth::EngineAuthContext, replay::ReplayPolicy)>>,
@@ -59,6 +61,7 @@ impl CommandIdentitySpec {
             command_key,
             command_hash,
             authority: None,
+            legacy: None,
             require_receipt_detail: false,
         }
     }
@@ -2081,7 +2084,7 @@ pub(crate) struct StoredReceiptRow {
     pub response_blob: Vec<u8>,
 }
 
-type RawReceiptRow = (Vec<u8>, String, Option<String>, Vec<u8>);
+type RawReceiptRow = (Vec<u8>, String, Option<String>, Vec<u8>, i64);
 
 pub(crate) async fn lookup_command_receipt_tx(
     tx: &mut BackendConn<'_>,
@@ -2091,7 +2094,7 @@ pub(crate) async fn lookup_command_receipt_tx(
     let raw: Option<RawReceiptRow> = match tx {
         BackendConn::Sqlite(conn) => {
             let row = sqlx::query(
-                "SELECT command_hash, status, response_payload_id, sanitized_envelope_msgpack
+                "SELECT command_hash, status, response_payload_id, sanitized_envelope_msgpack, canonical_seq
                  FROM command_receipts
                  WHERE space_id = ? AND history_incarnation = ? AND actor_id = ? AND idempotency_key = ?",
             )
@@ -2108,12 +2111,13 @@ pub(crate) async fn lookup_command_receipt_tx(
                     r.get("status"),
                     r.get("response_payload_id"),
                     r.get("sanitized_envelope_msgpack"),
+                    r.get("canonical_seq"),
                 )
             })
         }
         BackendConn::Postgres(conn) => {
             let row = sqlx::query(
-                "SELECT command_hash, status, response_payload_id, sanitized_envelope_msgpack
+                "SELECT command_hash, status, response_payload_id, sanitized_envelope_msgpack, canonical_seq
                  FROM command_receipts
                  WHERE space_id = $1 AND history_incarnation = $2 AND actor_id = $3 AND idempotency_key = $4",
             )
@@ -2130,12 +2134,13 @@ pub(crate) async fn lookup_command_receipt_tx(
                     r.get("status"),
                     r.get("response_payload_id"),
                     r.get("sanitized_envelope_msgpack"),
+                    r.get("canonical_seq"),
                 )
             })
         }
     };
 
-    let Some((hash_bytes, status, resp_payload_id, sanitized_blob)) = raw else {
+    let Some((hash_bytes, status, resp_payload_id, sanitized_blob, canonical_seq)) = raw else {
         return Ok(None);
     };
     idemp.authorize_replay(tx, scope).await?;
@@ -2143,7 +2148,15 @@ pub(crate) async fn lookup_command_receipt_tx(
         .try_into()
         .map_err(|_| internal_not_committed("corrupt_receipt_hash", "command_hash != 32B"))?;
 
-    let require_detail = idemp.require_receipt_detail && idemp.command_hash.as_bytes() == &arr;
+    let hash = if idemp
+        .matches_receipt_hash(tx, scope, canonical_seq, &arr)
+        .await?
+    {
+        idemp.command_hash
+    } else {
+        ContentDigest::from_bytes(arr)
+    };
+    let require_detail = idemp.require_receipt_detail && idemp.command_hash == hash;
     let effective_blob = if let Some(pid) = resp_payload_id {
         let detail_opt: Option<(i32, Option<Vec<u8>>)> = match tx {
             BackendConn::Sqlite(conn) => {
@@ -2188,7 +2201,11 @@ pub(crate) async fn lookup_command_receipt_tx(
     };
 
     Ok(Some(StoredReceiptRow {
-        command_hash: ContentDigest::from_bytes(arr),
+        command_hash: if idemp.matches_legacy_detail(&arr, &effective_blob) {
+            hash
+        } else {
+            ContentDigest::from_bytes(arr)
+        },
         status,
         response_blob: effective_blob,
     }))

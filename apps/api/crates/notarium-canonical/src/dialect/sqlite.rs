@@ -7,7 +7,7 @@ use notarium_core::{
 };
 use sqlx::{
     Connection, Row, SqliteConnection, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
 };
 
 use crate::{
@@ -81,9 +81,10 @@ pub fn open_rusqlite_writer_connection(db_path: &Path) -> Result<rusqlite::Conne
     conn.set_prepared_statement_cache_capacity(256);
 
     conn.execute_batch(
-        "PRAGMA secure_delete = ON;
-         PRAGMA journal_mode = WAL;
+        "PRAGMA fullfsync = ON;
          PRAGMA synchronous = FULL;
+         PRAGMA secure_delete = ON;
+         PRAGMA journal_mode = WAL;
          PRAGMA wal_autocheckpoint = 0;
          PRAGMA journal_size_limit = 67108864;
          PRAGMA foreign_keys = ON;
@@ -113,13 +114,17 @@ pub fn open_rusqlite_writer_connection(db_path: &Path) -> Result<rusqlite::Conne
         ));
     }
 
-    let synchronous: i64 = conn
-        .query_row("PRAGMA synchronous", [], |r| r.get(0))
+    let (synchronous, fullfsync): (i64, i64) = conn
+        .query_row(
+            "SELECT synchronous, fullfsync FROM pragma_synchronous, pragma_fullfsync",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .map_err(|err| internal_not_committed("rusqlite_verify_synchronous", err.to_string()))?;
-    if synchronous != 2 {
+    if (synchronous, fullfsync) != (2, 1) {
         return Err(internal_not_committed(
             "sqlite_synchronous_invalid",
-            format!("PRAGMA synchronous={synchronous}, expected 2 (FULL)"),
+            format!("expected synchronous=2 and fullfsync=1, got {synchronous} and {fullfsync}"),
         ));
     }
 
@@ -197,9 +202,10 @@ pub fn open_rusqlite_checkpoint_connection(
     conn.busy_timeout(Duration::ZERO)
         .map_err(|err| internal_not_committed("rusqlite_ckpt_busy_timeout", err.to_string()))?;
     conn.execute_batch(
-        "PRAGMA secure_delete = ON;
-         PRAGMA journal_mode = WAL;
+        "PRAGMA fullfsync = ON;
          PRAGMA synchronous = FULL;
+         PRAGMA secure_delete = ON;
+         PRAGMA journal_mode = WAL;
          PRAGMA wal_autocheckpoint = 0;
          PRAGMA foreign_keys = ON;
          PRAGMA cache_size = -8192;
@@ -213,7 +219,9 @@ pub async fn open_sqlite_writer_connection(db_path: &Path) -> Result<SqliteConne
     let options = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
+        // SQLx orders its journal_mode option before custom pragmas. Enter WAL
+        // in apply_writer_pragmas, after fullfsync is active on this connection.
+        .pragma("fullfsync", "ON")
         .synchronous(SqliteSynchronous::Full)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
@@ -229,9 +237,9 @@ pub async fn open_sqlite_writer_connection(db_path: &Path) -> Result<SqliteConne
 
 async fn apply_writer_pragmas(conn: &mut SqliteConnection) -> Result<(), PortError> {
     for stmt in [
+        "PRAGMA synchronous = FULL",
         "PRAGMA secure_delete = ON",
         "PRAGMA journal_mode = WAL",
-        "PRAGMA synchronous = FULL",
         "PRAGMA wal_autocheckpoint = 0",
         "PRAGMA journal_size_limit = 67108864",
         "PRAGMA foreign_keys = ON",
@@ -269,15 +277,16 @@ pub async fn verify_writer_pragmas(conn: &mut SqliteConnection) -> Result<(), Po
         ));
     }
 
-    let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_verify_synchronous", err.to_string()))?;
+    let (synchronous, fullfsync): (i64, i64) =
+        sqlx::query_as("SELECT synchronous, fullfsync FROM pragma_synchronous, pragma_fullfsync")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_verify_synchronous", err.to_string()))?;
     // FULL is 2 in SQLite.
-    if synchronous != 2 {
+    if (synchronous, fullfsync) != (2, 1) {
         return Err(internal_not_committed(
             "sqlite_synchronous_invalid",
-            format!("PRAGMA synchronous={synchronous}, expected 2 (FULL)"),
+            format!("expected synchronous=2 and fullfsync=1, got {synchronous} and {fullfsync}"),
         ));
     }
 

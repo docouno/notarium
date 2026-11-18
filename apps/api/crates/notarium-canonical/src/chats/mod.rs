@@ -233,6 +233,16 @@ struct StoredCommittedChatEntryV1 {
     receipt: MutationReceiptToken,
 }
 
+pub(crate) fn recorded_reference_digest(detail: &[u8]) -> Option<ContentDigest> {
+    let recorded: StoredCommittedChatEntryV1 = rmp_serde::from_slice(detail).ok()?;
+    if matches!(recorded.value.body, StoredChatBodyV1::Redacted) {
+        return None;
+    }
+    Some(crate::writer::fingerprint::chat_reference_digest(
+        &recorded.value.referenced_notes,
+    ))
+}
+
 impl StoredCommittedChatEntryV1 {
     fn into_committed(self) -> Committed<ChatEntry> {
         Committed {
@@ -1131,21 +1141,13 @@ async fn read_chat_impl(
     let auth = ctx.auth().clone();
 
     if store.is_postgres() && request.before.is_none() && request.leaf != ThreadEntrySeq::ZERO {
-        let probe_scope = scope.clone();
-        let probe_auth = auth.clone();
-        let probe_request = request.clone();
-        if let Some(branch) = store
+        return store
             .with_pg_autocommit_read_budget(Some(&ctx.budget), |conn| {
-                Box::pin(async move {
-                    read_chat_pg_single_query(conn, &probe_scope, &probe_auth, &probe_request).await
-                })
+                Box::pin(
+                    async move { read_chat_pg_single_query(conn, &scope, &auth, &request).await },
+                )
             })
-            .await?
-        {
-            return Ok(branch);
-        }
-        // A sparse branch did not fit in one statement. Re-read the entire
-        // branch in the repeatable-read transaction below.
+            .await;
     }
 
     // Every table lookup in `read_chat` (`spaces`, `chat_threads`, `chat_entries`) is an exact
@@ -1502,30 +1504,22 @@ async fn read_chat_pg_single_query(
     scope: &HistoryScope,
     auth: &EngineAuthContext,
     request: &ChatRead,
-) -> Result<Option<ChatBranch>, PortError> {
+) -> Result<ChatBranch, PortError> {
     let tip_i64 = request.leaf.get() as i64;
-    let max_n = usize::from(request.max_entries.get());
-    let scan_limit = i64::from(request.max_entries.get())
-        .saturating_mul(2)
-        .min(128)
-        .max(max_n as i64);
-
-    // Fast 1-RT path: single `Index Scan Backward` on `chat_entries_pkey` (`ORDER BY ce.entry_seq DESC LIMIT $4`)
-    // plus `spaces` + `chat_threads` PK lookups. Because `parent_seq < entry_seq` holds monotonically,
-    // both linear threads and localized branched DAG windows resolve in 1 B-tree leaf scan without recursion;
-    // only branches jumping across an older fork gap > `scan_limit` invoke the recursive PK continuation.
+    // Read the header and exactly the requested parent chain at one MVCC cut.
+    // A lateral point lookup bounds every hop by the composite entry primary key.
     let rows = sqlx::query(
         "SELECT
-            CASE WHEN COALESCE(w.rn, 1) = 1 THEN s.history_incarnation ELSE NULL END,
-            CASE WHEN COALESCE(w.rn, 1) = 1 THEN s.space_kind ELSE NULL END,
-            CASE WHEN COALESCE(w.rn, 1) = 1 THEN s.lifecycle_state ELSE NULL END,
-            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.thread_id ELSE NULL END,
-            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.kind ELSE NULL END,
-            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.owner_id ELSE NULL END,
-            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.project_folder_id ELSE NULL END,
-            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.head_leaf_seq ELSE NULL END,
-            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.head_rev_id ELSE NULL END,
-            CASE WHEN COALESCE(w.rn, 1) = 1 THEN ct.ext_space_tainted_mask ELSE NULL END,
+            CASE WHEN COALESCE(w.n, 1) = 1 THEN s.history_incarnation ELSE NULL END,
+            CASE WHEN COALESCE(w.n, 1) = 1 THEN s.space_kind ELSE NULL END,
+            CASE WHEN COALESCE(w.n, 1) = 1 THEN s.lifecycle_state ELSE NULL END,
+            CASE WHEN COALESCE(w.n, 1) = 1 THEN ct.thread_id ELSE NULL END,
+            CASE WHEN COALESCE(w.n, 1) = 1 THEN ct.kind ELSE NULL END,
+            CASE WHEN COALESCE(w.n, 1) = 1 THEN ct.owner_id ELSE NULL END,
+            CASE WHEN COALESCE(w.n, 1) = 1 THEN ct.project_folder_id ELSE NULL END,
+            CASE WHEN COALESCE(w.n, 1) = 1 THEN ct.head_leaf_seq ELSE NULL END,
+            CASE WHEN COALESCE(w.n, 1) = 1 THEN ct.head_rev_id ELSE NULL END,
+            CASE WHEN COALESCE(w.n, 1) = 1 THEN ct.ext_space_tainted_mask ELSE NULL END,
             w.entry_seq,
             w.parent_seq,
             w.kind,
@@ -1544,38 +1538,44 @@ async fn read_chat_pg_single_query(
          LEFT JOIN chat_threads ct
            ON ct.space_id = s.space_id AND ct.thread_id = $2
          LEFT JOIN LATERAL (
-             SELECT
-                 ce.entry_seq, ce.parent_seq,
-                 CASE WHEN ce.checkpoint_stale <> 0 THEN 'redacted' ELSE ce.kind END AS kind,
-                 ce.tool_call_id, ce.author_id,
-                 ce.agent_run_id, ce.inline_text, ce.payload_blake3, ce.referenced_notes_json,
-                 ce.ext_space_tainted, ce.is_chain_node, ce.branch_depth,
-                 ce.anc_16_seq, ce.anc_256_seq,
-                 (CASE WHEN ce.entry_seq = $3 THEN 1 ELSE 2 END)::INT4 AS rn
-             FROM chat_entries ce
-             WHERE ce.space_id = $1 AND ce.thread_id = $2 AND ce.entry_seq <= $3
-             ORDER BY ce.entry_seq DESC
-             LIMIT $4
+             WITH RECURSIVE win AS (
+                 SELECT e.entry_seq, e.parent_seq,
+                        CASE WHEN e.checkpoint_stale <> 0 THEN 'redacted' ELSE e.kind END AS kind,
+                        e.tool_call_id, e.author_id, e.agent_run_id, e.inline_text,
+                        e.payload_blake3, e.referenced_notes_json, e.ext_space_tainted,
+                        e.is_chain_node, e.branch_depth, e.anc_16_seq, e.anc_256_seq, 1::BIGINT AS n
+                 FROM chat_entries e
+                 WHERE e.space_id = ct.space_id AND e.thread_id = ct.thread_id AND e.entry_seq = $3
+                 UNION ALL
+                 SELECT parent.*, w.n + 1
+                 FROM win w
+                 CROSS JOIN LATERAL (
+                     SELECT e.entry_seq, e.parent_seq,
+                            CASE WHEN e.checkpoint_stale <> 0 THEN 'redacted' ELSE e.kind END AS kind,
+                            e.tool_call_id, e.author_id, e.agent_run_id, e.inline_text,
+                            e.payload_blake3, e.referenced_notes_json, e.ext_space_tainted,
+                            e.is_chain_node, e.branch_depth, e.anc_16_seq, e.anc_256_seq
+                     FROM chat_entries e
+                     WHERE e.space_id = ct.space_id AND e.thread_id = ct.thread_id AND e.entry_seq = w.parent_seq
+                     LIMIT 1
+                 ) parent
+                 WHERE w.n < $4 AND w.parent_seq IS NOT NULL
+             )
+             SELECT * FROM win
          ) w ON ct.thread_id IS NOT NULL
-         WHERE s.space_id = $1",
+         WHERE s.space_id = $1
+         ORDER BY w.n DESC",
     )
     .bind(scope.space_id.as_str())
     .bind(request.thread.as_str())
     .bind(tip_i64)
-    .bind(scan_limit)
+    .bind(i64::from(request.max_entries.get()))
     .fetch_all(&mut *conn)
     .await
     .map_err(|err| crate::runtime::pg_read_error("pg_read_chat_single", err))?;
 
-    if rows.is_empty() {
-        return Err(DomainError::ResourceNotFound.into());
-    }
-    let Some(hdr) = rows
-        .iter()
-        .find(|r| r.get::<Option<&[u8]>, usize>(0).is_some())
-    else {
-        return Ok(None);
-    };
+    // Descending hop count returns the oldest entry first and the tip/header last.
+    let hdr = rows.last().ok_or(DomainError::ResourceNotFound)?;
 
     let inc_bytes: &[u8] = hdr
         .get::<Option<&[u8]>, usize>(0)
@@ -1773,38 +1773,16 @@ async fn read_chat_pg_single_query(
         })
     };
 
-    let mut entries = Vec::with_capacity(max_n.min(rows.len()));
-    let mut want_i64: Option<i64> = Some(tip_i64);
-    for r in &rows {
-        let Some(target_seq) = want_i64 else {
-            break;
-        };
-        if entries.len() >= max_n {
-            want_i64 = None;
-            break;
-        }
-        let e_seq_raw: i64 = r.get::<i64, usize>(10);
-        if e_seq_raw != target_seq {
-            continue;
-        }
-        let entry = decode_entry_row(r, 10)?;
-        want_i64 = entry.parent.map(|p| p.get() as i64);
-        entries.push(entry);
-    }
-
-    if entries.len() < max_n && want_i64.is_some() {
-        return Ok(None);
-    }
-
-    entries.reverse();
-    entries.sort_unstable_by_key(|e| e.depth);
-
+    let entries = rows
+        .iter()
+        .map(|row| decode_entry_row(row, 10))
+        .collect::<Result<Vec<_>, _>>()?;
     let next_ancestor = entries.first().and_then(|oldest| oldest.parent);
-    Ok(Some(ChatBranch {
+    Ok(ChatBranch {
         thread: thread_out,
         entries,
         next_ancestor,
-    }))
+    })
 }
 
 fn read_chat_rusqlite(
@@ -2430,6 +2408,11 @@ async fn fork_chat_impl(
         request.input.parent.get()
     );
     let idemp = derive_command_identity_spec(&request.identity, "fork_chat", fp.as_bytes())
+        .with_preconditions(
+            &request.preconditions,
+            "thread",
+            request.input.thread.as_str(),
+        )
         .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
     let scope = space_rec.scope.clone();
@@ -2694,6 +2677,12 @@ async fn append_chat_impl(
         matches!(&request.input.body,ChatInputBody::Staged(st) if st.lease().is_none());
     let idemp =
         derive_command_identity_spec(&request.identity, "append_chat", fp.finalize().as_bytes())
+            .with_preconditions(
+                &request.preconditions,
+                "thread",
+                request.input.thread.as_str(),
+            )
+            .with_chat_body(&request.input.body, &request.input.referenced_notes)
             .with_policy(
                 ctx.auth(),
                 crate::writer::replay::ReplayPolicy::Chat(
@@ -3554,6 +3543,11 @@ async fn consume_chat_input_impl(
     );
     let idemp =
         derive_command_identity_spec(&request.identity, "consume_chat_input", fp.as_bytes())
+            .with_preconditions(
+                &request.preconditions,
+                "thread",
+                request.input.thread.as_str(),
+            )
             .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
     if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedConsumedPendingV1>(
@@ -4084,6 +4078,12 @@ async fn redact_chat_entry_impl(
         request.input.expected_thread_revision.as_str()
     );
     let idemp = derive_command_identity_spec(&request.identity, "redact_chat_entry", fp.as_bytes())
+        .with_preconditions(
+            &request.preconditions,
+            "thread",
+            request.input.thread.as_str(),
+        )
+        .with_known_base(&request.input.expected_thread_revision)
         .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
     if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedRedactedChatV1>(

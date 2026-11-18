@@ -388,4 +388,187 @@ pub(super) async fn check(
             .unwrap()
             .contains("[[last-target]]")
     );
+
+    check_metadata_retries(store, ctx, scope, owner, &other, postgres).await;
+}
+
+async fn check_metadata_retries(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    scope: &HistoryScope,
+    owner: &PrincipalId,
+    note: &NoteId,
+    postgres: bool,
+) {
+    let metadata = |slug: &str| MoveNote {
+        note: note.clone(),
+        parent: None,
+        slug: slug.into(),
+    };
+    let base = store
+        .move_note(
+            ctx.clone(),
+            next_mutation(scope, owner, metadata("before-qualified-move")),
+        )
+        .await
+        .unwrap();
+    let request = next_mutation_rev(
+        scope,
+        owner,
+        base.value.revision.clone(),
+        metadata("qualified-move"),
+    );
+    let moved = store.move_note(ctx.clone(), request.clone()).await.unwrap();
+    let batch = |item: &Mutation<MoveNote>| AcceptBatch {
+        items: vec![Mutation {
+            identity: item.identity.clone(),
+            preconditions: item.preconditions.clone(),
+            input: BatchItem::Move(item.input.clone()),
+        }],
+    };
+
+    let mut no_title = next_mutation(
+        scope,
+        owner,
+        RenameNote {
+            note: note.clone(),
+            slug: "literal-title".into(),
+            title: None,
+        },
+    );
+    no_title.preconditions.revision = Some(moved.value.revision.clone());
+    let mut literal = no_title.clone();
+    literal.input.title = Some("<none>".into());
+    let first_rename = store
+        .rename_note(ctx.clone(), no_title.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.rename_note(ctx.clone(), literal.clone()).await,
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+    ));
+    let old_rename = format!("note={}\0slug=literal-title\0title=<none>", note.as_str());
+    install_legacy_hash(
+        store,
+        scope,
+        "rename_note",
+        &no_title.identity,
+        &old_rename,
+        postgres,
+    )
+    .await;
+    assert_eq!(
+        store
+            .rename_note(ctx.clone(), no_title.clone())
+            .await
+            .unwrap()
+            .receipt,
+        first_rename.receipt
+    );
+    assert!(matches!(
+        store.rename_note(ctx.clone(), literal.clone()).await,
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+    ));
+
+    literal.identity = next_mutation(scope, owner, ()).identity;
+    literal.preconditions.revision = Some(first_rename.value.revision);
+    let titled = store
+        .rename_note(ctx.clone(), literal.clone())
+        .await
+        .unwrap();
+    let mut opposite = literal.clone();
+    opposite.input.title = None;
+    for old in [false, true] {
+        if old {
+            install_legacy_hash(
+                store,
+                scope,
+                "rename_note",
+                &literal.identity,
+                &old_rename,
+                postgres,
+            )
+            .await;
+        }
+        assert_eq!(
+            store
+                .rename_note(ctx.clone(), literal.clone())
+                .await
+                .unwrap()
+                .receipt,
+            titled.receipt
+        );
+        assert!(matches!(
+            store.rename_note(ctx.clone(), opposite.clone()).await,
+            Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+        ));
+    }
+
+    let mut different = request.clone();
+    different.preconditions.revision = Some(titled.value.revision);
+    for old in [false, true] {
+        if old {
+            let fp = format!("note={}\0parent=<root>\0slug=qualified-move", note.as_str());
+            install_legacy_hash(store, scope, "move_note", &request.identity, &fp, postgres).await;
+        }
+        assert!(matches!(
+            store.move_note(ctx.clone(), different.clone()).await,
+            Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+        ));
+        let rejected = store
+            .accept_batch(ctx.clone(), batch(&different))
+            .await
+            .unwrap();
+        assert!(matches!(
+            rejected.items[0],
+            Err(DomainError::IdempotencyKeyReused)
+        ));
+        let mut epoch = request.clone();
+        epoch.preconditions.lineage = Some(notarium_core::ids::LineageEpoch::MAX);
+        assert!(matches!(
+            store.move_note(ctx.clone(), epoch).await,
+            Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+        ));
+        let confirmed = store
+            .accept_batch(ctx.clone(), batch(&request))
+            .await
+            .unwrap();
+        assert_eq!(confirmed.items[0].as_ref().unwrap().receipt, moved.receipt);
+        assert_eq!(
+            store
+                .move_note(ctx.clone(), request.clone())
+                .await
+                .unwrap()
+                .receipt,
+            moved.receipt
+        );
+        assert_eq!(confirmed.committed_high_watermark, titled.receipt.seq());
+    }
+}
+
+async fn install_legacy_hash(
+    store: &CanonicalStore,
+    scope: &HistoryScope,
+    kind: &str,
+    identity: &CommandIdentity,
+    payload: &str,
+    postgres: bool,
+) {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"notarium-cmd-v1:");
+    hash.update(kind.as_bytes());
+    hash.update(&[0]);
+    hash.update(identity.hash.as_bytes());
+    hash.update(&[0]);
+    hash.update(payload.as_bytes());
+    let hex = hash.finalize().to_hex();
+    let literal = if postgres {
+        format!("decode('{hex}','hex')")
+    } else {
+        format!("X'{hex}'")
+    };
+    assert_eq!(store.execute_diagnostic_write_sql_for_test(&format!(
+        "UPDATE command_receipts SET command_hash={literal} WHERE space_id='{}' AND actor_id='{}' AND idempotency_key='{}'",
+        scope.space_id.as_str(), identity.actor.as_str(), identity.key.as_str()
+    )).await.unwrap(),1);
 }

@@ -885,3 +885,196 @@ async fn lease_reports_permanent_recovery_failure_after_grant() {
         }
     }
 }
+
+async fn set_target_versions(
+    fixtures: &StorageTestFixtures,
+    root: &TempDataRoot,
+    schema: Option<&str>,
+    spaces: &[(ChangeCursor, std::path::PathBuf)],
+    value: Option<&str>,
+) {
+    const UPDATE: &str =
+        "UPDATE blob_retirement_targets SET data_version_ids_json = $1 WHERE space_id = $2";
+    if let Some(schema) = schema {
+        let mut conn = fixtures.open_raw_pg().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        for (cut, _) in spaces {
+            let changed = sqlx::query(UPDATE)
+                .bind(value)
+                .bind(cut.scope.space_id.as_str())
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(changed.rows_affected(), 1);
+        }
+    } else {
+        let mut conn = root.open_raw_sqlite().await;
+        for (cut, _) in spaces {
+            let changed = sqlx::query(UPDATE)
+                .bind(value)
+                .bind(cut.scope.space_id.as_str())
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            assert_eq!(changed.rows_affected(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn restored_retirements_release_terminal_workers_and_serve_other_spaces() {
+    use notarium_canonical::blobs::BlobOwnerKind;
+    use notarium_core::error::{CommitEffect, RetryAdvice};
+
+    let fixtures = StorageTestFixtures::load_required();
+    let old = LeaseEpoch::new(1).unwrap();
+    let granted = LeaseEpoch::new(2).unwrap();
+    for pg in [false, true] {
+        let root = TempDataRoot::new("restored-terminal-retirements");
+        let schema = fixtures.fresh_pg_schema();
+        let installation = sample_installation_id(0xc7);
+        let config = if pg {
+            fixtures.pg_local_config(installation, &schema, root.data_root())
+        } else {
+            CanonicalConfig::local_default(installation, root.data_root())
+        };
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        let mut spaces = Vec::new();
+        for seed in 0xc0..=0xc8 {
+            let (scope, actor, _) = create_thread(&store, seed).await;
+            let text = format!("physical retirement for Space {seed} ").repeat(40);
+            let digest = store.prepare_blob(text.as_bytes()).unwrap().digest();
+            store
+                .stage_chat_blob(owner_ctx(&scope, actor.clone()), &text)
+                .await
+                .unwrap();
+            let released = store
+                .release_blob_owner_references(
+                    &scope,
+                    old,
+                    BlobOwnerKind::StagedChat,
+                    actor.as_str(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(released, vec![digest]);
+            let path = root.data_root().blob(&scope.space_id, digest);
+            assert!(path.is_file());
+            let head = store.read_space(&scope.space_id).await.unwrap().last_seq;
+            let target = ChangeCursor {
+                scope: HistoryScope {
+                    space_id: scope.space_id,
+                    incarnation: sample_incarnation(seed - 32),
+                },
+                after: head,
+            };
+            spaces.push((target, path));
+        }
+        // Restore schedules the sorted Spaces with four concurrent scanners.
+        spaces.sort_by(|a, b| a.0.scope.space_id.cmp(&b.0.scope.space_id));
+        let mut obstructions = Vec::new();
+        for (cut, path) in &spaces[..8] {
+            let digest = path.file_stem().unwrap().to_str().unwrap();
+            let blocker = root
+                .data_root()
+                .root()
+                .join("blobs/.quarantine")
+                .join(format!("{}.{digest}.corrupt", cut.scope.space_id.as_str()));
+            std::fs::create_dir_all(&blocker).unwrap();
+            obstructions.push(blocker);
+        }
+        store
+            .restore_cursors(
+                support::maintenance_ctx(ServicePurpose::Restore),
+                spaces.iter().map(|(cut, _)| cut.clone()).collect(),
+            )
+            .await
+            .unwrap();
+
+        // Eight blocked physical objects must release the restore scan slots.
+        // The ninth Space completes with every obstruction still in place.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while spaces.iter().any(|(_, path)| path.exists())
+                || store.active_retirement_workers_for_test() != 8
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("healthy Space must progress past all eight blocked Spaces");
+        assert_eq!(pending(&store).await, 8);
+
+        // Corrupt durable metadata for four IDs. Their physical workers must
+        // stop. The other four remain eligible for automatic recovery.
+        set_target_versions(
+            &fixtures,
+            &root,
+            pg.then_some(schema.as_str()),
+            &spaces[4..8],
+            Some("invalid"),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while store.active_retirement_workers_for_test() != 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("terminal metadata failure must release each worker");
+        for blocker in obstructions {
+            std::fs::remove_dir(blocker).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !store.storage_cleanup_idle_for_test() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("all automatic work must finish after repairing the filesystem");
+        assert!(spaces[..4].iter().all(|(_, path)| !path.exists()));
+        assert!(spaces[4..8].iter().all(|(_, path)| !path.exists()));
+        assert_eq!(store.active_retirement_workers_for_test(), 0);
+        assert_eq!(pending(&store).await, 4);
+        for (cut, _) in &spaces {
+            let observed = store.read_space(&cut.scope.space_id).await.unwrap();
+            assert_eq!(observed.scope, cut.scope);
+            assert_eq!(observed.active_epoch, granted);
+        }
+
+        let ctx = support::maintenance_ctx(ServicePurpose::Revocation);
+        let outcome = store
+            .advance_space_lease(&ctx, &spaces[4].0.scope, granted)
+            .await;
+        assert!(
+            matches!(outcome, Err(PortError::Internal(e)) if e.effect()==CommitEffect::Unknown && e.retry()==RetryAdvice::Never)
+        );
+        assert_eq!(store.active_retirement_workers_for_test(), 0);
+        assert_eq!(pending(&store).await, 4);
+        set_target_versions(
+            &fixtures,
+            &root,
+            pg.then_some(schema.as_str()),
+            &spaces[4..8],
+            None,
+        )
+        .await;
+        for (cut, path) in &spaces[4..8] {
+            assert_eq!(
+                store
+                    .advance_space_lease(&ctx, &cut.scope, granted)
+                    .await
+                    .unwrap(),
+                granted
+            );
+            assert!(!path.exists());
+        }
+        assert_eq!(pending(&store).await, 0);
+        runtime.shutdown().await.unwrap();
+        if pg {
+            fixtures.drop_pg_schema(&schema).await;
+        }
+    }
+}

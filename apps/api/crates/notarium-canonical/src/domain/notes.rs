@@ -1584,6 +1584,7 @@ pub(crate) async fn delete_note_impl(
     };
     let fp = format!("{disp_tag}={}", request.input.note.as_str());
     let idemp = derive_command_identity_spec(&request.identity, disp_tag, fp.as_bytes())
+        .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
         .for_note(ctx.auth(), &request.input.note);
 
     let intent = build_trash_or_restore_intent(
@@ -1977,6 +1978,7 @@ fn move_note_identity(
     ctx: &SpaceContext,
     identity: &CommandIdentity,
     input: &MoveNote,
+    preconditions: &Preconditions,
 ) -> crate::writer::CommandIdentitySpec {
     let fp = format!(
         "note={}\0parent={}\0slug={}",
@@ -1988,11 +1990,9 @@ fn move_note_identity(
             .unwrap_or("<root>"),
         input.slug
     );
-    derive_command_identity_spec(identity, "move_note", fp.as_bytes()).for_move(
-        ctx.auth(),
-        &input.note,
-        input.parent.as_ref(),
-    )
+    derive_command_identity_spec(identity, "move_note", fp.as_bytes())
+        .with_preconditions(preconditions, "note", input.note.as_str())
+        .for_move(ctx.auth(), &input.note, input.parent.as_ref())
 }
 
 async fn check_move_pin(
@@ -2019,7 +2019,12 @@ pub(crate) async fn move_note_impl(
     validate_mutation_identity(&ctx, &request.identity)?;
     let new_slug_fold = normalize_slug_key(&request.input.slug)?;
 
-    let idemp = move_note_identity(&ctx, &request.identity, &request.input);
+    let idemp = move_note_identity(
+        &ctx,
+        &request.identity,
+        &request.input,
+        &request.preconditions,
+    );
 
     let space_rec = if let Some(interceptor) = store.inner.collab_interceptor.get() {
         if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
@@ -2061,7 +2066,7 @@ pub(crate) async fn move_note_impl(
         Some(idemp),
         ctx.auth().clone(),
         request.preconditions,
-        request.input,
+        MetadataChange::Move(request.input),
         new_slug_fold,
         Ok(MovePin::Checked),
     );
@@ -2105,6 +2110,11 @@ async fn prepare_batch_move_pin(
     }
 }
 
+enum MetadataChange {
+    Move(MoveNote),
+    Rename(RenameNote),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_move_note_intent(
     scope: &notarium_core::model::HistoryScope,
@@ -2112,12 +2122,16 @@ fn build_move_note_intent(
     idemp: Option<crate::writer::CommandIdentitySpec>,
     auth: notarium_core::auth::EngineAuthContext,
     preconditions: Preconditions,
-    input: MoveNote,
+    change: MetadataChange,
     new_slug_fold: String,
     pin: Result<MovePin, PortError>,
 ) -> PreparedWriteIntent {
     let scope_cl = scope.clone();
-    let note_id = input.note.clone();
+    let note_id = match &change {
+        MetadataChange::Move(mv) => &mv.note,
+        MetadataChange::Rename(rename) => &rename.note,
+    }
+    .clone();
 
     PreparedWriteIntent {
         scope: scope.clone(),
@@ -2133,6 +2147,15 @@ fn build_move_note_intent(
                 if head.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                let input = match change {
+                    MetadataChange::Move(mv) => mv,
+                    MetadataChange::Rename(rename) => MoveNote {
+                        note: rename.note,
+                        parent: (head.parent_folder_id != item_ctx.root_folder_id)
+                            .then(|| head.parent_folder_id.clone()),
+                        slug: rename.slug,
+                    },
+                };
                 let dest_parent = input
                     .parent
                     .clone()
@@ -2429,9 +2452,10 @@ fn build_move_note_intent(
 
 pub(crate) async fn rename_note_impl(
     store: &CanonicalStore,
-    ctx: SpaceContext,
+    mut ctx: SpaceContext,
     request: Mutation<RenameNote>,
 ) -> Result<Committed<NoteRevision>, PortError> {
+    let deadline = super::common::CommandDeadline::start(&ctx.budget, "rename_note");
     validate_mutation_identity(&ctx, &request.identity)?;
     let new_slug_fold = normalize_slug_key(&request.input.slug)?;
 
@@ -2442,32 +2466,44 @@ pub(crate) async fn rename_note_impl(
         request.input.title.as_deref().unwrap_or("<none>")
     );
     let idemp = derive_command_identity_spec(&request.identity, "rename_note", fp.as_bytes())
+        .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
+        .with_rename_title(request.input.title.as_deref())
         .for_note(ctx.auth(), &request.input.note);
 
-    if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
-        store,
-        ctx.scope(),
-        &idemp,
-        Some(&ctx.budget),
-    )
-    .await?
+    if let Some(replayed) = deadline
+        .wait(&ctx.budget, || {
+            try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
+                store,
+                ctx.scope(),
+                &idemp,
+                Some(&ctx.budget),
+            )
+        })
+        .await??
     {
         return Ok(replayed.into_committed());
     }
 
-    let (space_rec, base_head) = read_active_note_for_mutation(
-        store,
-        &ctx,
-        &request.input.note,
-        &request.preconditions,
-        NoteMutationAccess::Current,
-    )
-    .await?;
+    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+    let (space_rec, base_head) = deadline
+        .wait(&ctx.budget, || {
+            read_active_note_for_mutation(
+                store,
+                &ctx,
+                &request.input.note,
+                &request.preconditions,
+                NoteMutationAccess::Current,
+            )
+        })
+        .await??;
 
     if let Some(interceptor) = store.inner.collab_interceptor.get() {
-        let pin = interceptor
-            .filename_pin(ctx.clone(), request.input.note.clone())
-            .await?;
+        ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+        let pin = deadline
+            .wait(&ctx.budget, || {
+                interceptor.filename_pin(ctx.clone(), request.input.note.clone())
+            })
+            .await??;
         if let FilenamePin::Pinned { filename, .. } = pin
             && filename != request.input.slug
         {
@@ -2491,9 +2527,11 @@ pub(crate) async fn rename_note_impl(
             let base_digest = base_head.content_digest.ok_or_else(|| {
                 internal_not_committed("active_note_missing_digest", "active note lacks digest")
             })?;
-            let raw_bytes = store
-                .read_verified_blob(&space_rec.scope, base_digest)
-                .await?;
+            let raw_bytes = deadline
+                .wait(&ctx.budget, || {
+                    store.read_verified_blob(&space_rec.scope, base_digest)
+                })
+                .await??;
             let base_carrier = String::from_utf8(raw_bytes).map_err(|_| {
                 internal_not_committed("corrupt_note_utf8", "carrier not valid UTF-8")
             })?;
@@ -2511,13 +2549,15 @@ pub(crate) async fn rename_note_impl(
                 &request.input.slug,
                 store.blob_codec(),
             )?;
-            let ticket = store
-                .stage_blob_for_batch(
-                    &space_rec.scope,
-                    space_rec.active_epoch,
-                    &info.prepared_blob,
-                )
-                .await?;
+            let ticket = deadline
+                .wait(&ctx.budget, || {
+                    store.stage_blob_for_batch(
+                        &space_rec.scope,
+                        space_rec.active_epoch,
+                        &info.prepared_blob,
+                    )
+                })
+                .await??;
             let intent = build_carrier_replacement_intent(
                 store,
                 &space_rec.scope,
@@ -2534,8 +2574,9 @@ pub(crate) async fn rename_note_impl(
                 ticket,
                 None,
             );
-            let stored: StoredCommittedNoteRevV1 =
-                store.submit_write_command(&ctx.budget, intent).await?;
+            let stored: StoredCommittedNoteRevV1 = store
+                .submit_write_command_until(&ctx.budget, deadline.at, intent, None, None, None)
+                .await?;
             return Ok(stored.into_committed());
         }
     }
@@ -2547,16 +2588,13 @@ pub(crate) async fn rename_note_impl(
         Some(idemp),
         ctx.auth().clone(),
         request.preconditions,
-        MoveNote {
-            note: request.input.note,
-            parent: (base_head.parent_folder_id != space_rec.root_folder_id)
-                .then_some(base_head.parent_folder_id),
-            slug: request.input.slug,
-        },
+        MetadataChange::Rename(request.input),
         new_slug_fold,
         Ok(MovePin::Checked),
     );
-    let stored: StoredCommittedNoteRevV1 = store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedNoteRevV1 = store
+        .submit_write_command_until(&ctx.budget, deadline.at, intent, None, None, None)
+        .await?;
     Ok(stored.into_committed())
 }
 
@@ -2811,7 +2849,12 @@ pub(crate) async fn accept_batch_impl(
                 ed,
                 &item_mut.preconditions,
             )),
-            BatchItem::Move(mv) => Some(move_note_identity(&ctx, &item_mut.identity, mv)),
+            BatchItem::Move(mv) => Some(move_note_identity(
+                &ctx,
+                &item_mut.identity,
+                mv,
+                &item_mut.preconditions,
+            )),
             _ => None,
         };
         if let (Some(spec), Some(stored_hash)) =
@@ -2984,6 +3027,7 @@ pub(crate) async fn accept_batch_impl(
                 let fp = format!("{disp_tag}={}", del.note.as_str());
                 let idemp =
                     derive_command_identity_spec(&item_mut.identity, disp_tag, fp.as_bytes())
+                        .with_preconditions(&item_mut.preconditions, "note", del.note.as_str())
                         .for_note(ctx.auth(), &del.note);
                 intents.push(build_trash_or_restore_intent(
                     store,
@@ -3006,7 +3050,7 @@ pub(crate) async fn accept_batch_impl(
                         idemp,
                         ctx.auth().clone(),
                         item_mut.preconditions,
-                        mv,
+                        MetadataChange::Move(mv),
                         sf,
                         pin,
                     ));
@@ -3381,6 +3425,11 @@ pub(crate) async fn append_memory_impl(
         request.input.target.note.note_id.as_str()
     );
     let idemp = derive_command_identity_spec(&request.identity, "append_memory", fp.as_bytes())
+        .with_preconditions(
+            &request.preconditions,
+            "note",
+            request.input.target.note.note_id.as_str(),
+        )
         .for_note(ctx.auth(), &request.input.target.note.note_id);
     let note_id = request.input.target.note.note_id.clone();
     let target_spec = request.input.target.target.clone();
@@ -4240,6 +4289,8 @@ pub(crate) async fn accept_external_observation_impl(
         "accept_external_observation",
         fp.finalize().as_bytes(),
     )
+    .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
+    .with_known_base(&request.input.base_revision)
     .for_note(ctx.auth(), &request.input.note);
 
     if let Some(replayed) = try_replay_completed_receipt::<StoredExternalObsOutcomeV1>(
@@ -4890,6 +4941,20 @@ pub(crate) async fn update_space_schema_impl(
         &request.identity,
         "update_space_schema",
         fp_hasher.finalize().as_bytes(),
+    )
+    .with_preconditions(
+        &request.preconditions,
+        "note",
+        request.input.schema_note.as_str(),
+    )
+    .with_schema_placement(
+        request
+            .input
+            .parent
+            .as_ref()
+            .unwrap_or(&space_rec.root_folder_id),
+        &request.input.slug,
+        request.input.expected_schema_revision.as_ref(),
     )
     .with_policy(
         ctx.auth(),

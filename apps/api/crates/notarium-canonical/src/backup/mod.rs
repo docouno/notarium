@@ -647,6 +647,21 @@ impl SqliteBackupWorkerHandle {
     }
 }
 
+fn open_sqlite_backup_destination(path: &Path) -> Result<rusqlite::Connection, PortError> {
+    let dst = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| internal_not_committed("rusqlite_open_backup_dst", err.to_string()))?;
+    dst.busy_timeout(Duration::from_millis(250))
+        .map_err(|err| internal_not_committed("rusqlite_dst_busy_timeout", err.to_string()))?;
+    dst.execute_batch(&format!(
+            "PRAGMA fullfsync = ON; PRAGMA synchronous = FULL; PRAGMA journal_mode = DELETE; PRAGMA secure_delete = ON; PRAGMA cache_size = -{SQLITE_CACHE_KIB}; PRAGMA temp_store = MEMORY;"
+        ))
+        .map_err(|err| internal_not_committed("rusqlite_dst_pragmas", err.to_string()))?;
+    Ok(dst)
+}
+
 fn sqlite_backup_worker_loop(
     src_path: PathBuf,
     tmp_path: PathBuf,
@@ -666,17 +681,7 @@ fn sqlite_backup_worker_loop(
         ))
         .map_err(|err| internal_not_committed("rusqlite_src_pragmas", err.to_string()))?;
 
-        let dst = rusqlite::Connection::open_with_flags(
-            &tmp_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|err| internal_not_committed("rusqlite_open_backup_dst", err.to_string()))?;
-        dst.busy_timeout(Duration::from_millis(250))
-            .map_err(|err| internal_not_committed("rusqlite_dst_busy_timeout", err.to_string()))?;
-        dst.execute_batch(&format!(
-            "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA secure_delete = ON; PRAGMA cache_size = -{SQLITE_CACHE_KIB}; PRAGMA temp_store = MEMORY;"
-        ))
-        .map_err(|err| internal_not_committed("rusqlite_dst_pragmas", err.to_string()))?;
+        let dst = open_sqlite_backup_destination(&tmp_path)?;
 
         // SQLite requires the WAL-status query to run outside the pinned transaction.
         let observer =
@@ -3354,8 +3359,14 @@ async fn recover_restored_gc(store: CanonicalStore, spaces: Vec<(HistoryScope, L
                         )
                         .await
                     {
-                        Ok(()) | Err(PortError::Domain(_)) => return,
-                        Err(_) => tokio::time::sleep(backoff).await,
+                        Ok(()) => return,
+                        Err(error) => {
+                            let Some(minimum) = crate::blobs::retirement_worker::retry_after(&error) else {
+                                tracing::warn!(?error, space = %scope.space_id.as_str(), "restored Space GC stopped");
+                                return;
+                            };
+                            tokio::time::sleep(backoff.max(minimum)).await;
+                        }
                     }
                     backoff = (backoff * 2).min(Duration::from_secs(5));
                 }
@@ -4006,4 +4017,42 @@ async fn load_restored_room_fences(
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod sqlite_sync_tests {
+    use super::*;
+    use crate::dialect::sqlite::{
+        open_rusqlite_checkpoint_connection, open_rusqlite_writer_connection,
+        open_sqlite_writer_connection,
+    };
+
+    #[tokio::test]
+    async fn disk_writers_and_checkpoint_request_full_hardware_sync() {
+        let root = std::env::temp_dir().join(format!(
+            "notarium-sync-{}",
+            hex::encode(crate::codec::csprng_16().unwrap())
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("main.sqlite");
+        let mut sql = open_sqlite_writer_connection(&path).await.unwrap();
+        const FLAGS: &str =
+            "SELECT synchronous, fullfsync FROM pragma_synchronous, pragma_fullfsync";
+        let flags: (i64, i64) = sqlx::query_as(FLAGS).fetch_one(&mut sql).await.unwrap();
+        assert_eq!(flags, (2, 1));
+        let target = root.join("backup.sqlite");
+        std::fs::File::create(&target).unwrap();
+        for conn in [
+            open_rusqlite_writer_connection(&path).unwrap(),
+            open_rusqlite_checkpoint_connection(&path).unwrap(),
+            open_sqlite_backup_destination(&target).unwrap(),
+        ] {
+            let flags: (i64, i64) = conn
+                .query_row(FLAGS, [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap();
+            assert_eq!(flags, (2, 1));
+        }
+        sqlx::Connection::close(sql).await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

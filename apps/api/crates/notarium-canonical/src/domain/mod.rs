@@ -305,7 +305,7 @@ impl CanonicalStore {
         ctx: SpaceContext,
         request: Mutation<MoveBoardCard>,
     ) -> Result<Committed<BoardMoveResult>, PortError> {
-        board::move_board_card_impl(self, ctx, request).await
+        Box::pin(board::move_board_card_impl(self, ctx, request)).await
     }
 }
 

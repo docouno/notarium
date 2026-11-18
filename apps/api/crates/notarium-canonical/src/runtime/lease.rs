@@ -196,29 +196,18 @@ impl CanonicalStore {
             else {
                 return Ok(());
             };
-            let retry = match &error {
-                PortError::Domain(_) => RetryAdvice::Never,
-                PortError::Cancelled(e)
-                | PortError::DeadlineExceeded(e)
-                | PortError::Unavailable(e)
-                | PortError::Internal(e) => e.retry(),
+            let Some(minimum) = crate::blobs::retirement_worker::retry_after(&error) else {
+                tracing::error!(
+                    ?error,
+                    "storage recovery stopped after confirmed lease turnover"
+                );
+                // The epoch committed while the combined transfer/recovery operation failed.
+                return Err(crate::codec::unknown_commit_non_idempotent(
+                    "lease_recovery_incomplete",
+                    format!("{error:?}"),
+                ));
             };
-            let delay = match retry {
-                RetryAdvice::Never => {
-                    tracing::error!(
-                        ?error,
-                        "storage recovery stopped after confirmed lease turnover"
-                    );
-                    // The epoch committed, while the combined transfer/recovery
-                    // operation failed. Retrying cannot repair permanent data errors.
-                    return Err(crate::codec::unknown_commit_non_idempotent(
-                        "lease_recovery_incomplete",
-                        format!("{error:?}"),
-                    ));
-                }
-                RetryAdvice::After(minimum) => backoff.max(minimum),
-                RetryAdvice::RetrySameCommand => backoff,
-            };
+            let delay = backoff.max(minimum);
             tracing::warn!(
                 ?error,
                 ?delay,

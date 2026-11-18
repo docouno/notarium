@@ -878,40 +878,36 @@ impl LocalBlobStore {
     }
 
     fn unlink_and_sync(&self, parent: &str, name: &str) -> Result<(), PortError> {
+        // The durable target is valid. The filesystem can become available again
+        // after a mount, permission, non-regular entry, or sync problem is repaired.
+        let blocked = |tag, detail: String| {
+            crate::codec::unavailable_retryable(tag, detail, std::time::Duration::from_millis(250))
+        };
         let dir = match self.open_dir(parent, false) {
             Ok(dir) => dir,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => {
-                return Err(internal_not_committed(
-                    "local_cas_delete_dir",
-                    e.to_string(),
-                ));
+                return Err(blocked("local_cas_delete_dir", e.to_string()));
             }
         };
         match dir.dir.symlink_metadata(name) {
             Ok(md) if !md.is_file() => {
-                return Err(internal_not_committed("local_cas_nonregular_entry", name));
+                return Err(blocked("local_cas_nonregular_entry", name.to_owned()));
             }
             Ok(_) => match dir.dir.remove_file(name) {
                 Ok(()) => (),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => (),
                 Err(e) => {
-                    return Err(internal_not_committed(
-                        "local_cas_unlink_failed",
-                        e.to_string(),
-                    ));
+                    return Err(blocked("local_cas_unlink_failed", e.to_string()));
                 }
             },
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
             Err(e) => {
-                return Err(internal_not_committed(
-                    "local_cas_delete_stat",
-                    e.to_string(),
-                ));
+                return Err(blocked("local_cas_delete_stat", e.to_string()));
             }
         }
         dir.sync()
-            .map_err(|e| internal_not_committed("local_cas_sync_dir", e.to_string()))
+            .map_err(|e| blocked("local_cas_sync_dir", e.to_string()))
     }
     pub fn flush_single_dir(&self, rel: &str) -> Result<(), PortError> {
         self.resolve_dir(rel, false)?

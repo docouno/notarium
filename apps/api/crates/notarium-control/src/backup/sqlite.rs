@@ -20,6 +20,20 @@ pub(crate) struct SqliteCut {
     pinned: bool,
 }
 impl SqliteCut {
+    #[cfg(test)]
+    pub(super) fn assert_sync_settings(&self) {
+        for conn in [&self.barrier, self.destination.as_ref().unwrap()] {
+            let flags: (i64, i64) = conn
+                .query_row(
+                    "SELECT synchronous, fullfsync FROM pragma_synchronous, pragma_fullfsync",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(flags, (2, 1));
+        }
+    }
+
     pub(crate) fn prepare(
         source: &Path,
         destination: &Path,
@@ -35,7 +49,7 @@ impl SqliteCut {
             .busy_timeout(Duration::from_millis(5))
             .map_err(|_| failure())?;
         barrier
-            .execute_batch("PRAGMA journal_size_limit=4194304; PRAGMA trusted_schema=OFF;")
+            .execute_batch("PRAGMA fullfsync=ON; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=4194304; PRAGMA trusted_schema=OFF;")
             .map_err(|_| failure())?;
         let _ = barrier.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         let source = Connection::open_with_flags(
@@ -70,7 +84,7 @@ impl SqliteCut {
             .map_err(|_| failure())?;
         destination
             .execute_batch(
-                "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF;",
+                "PRAGMA fullfsync=ON; PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE; PRAGMA trusted_schema=OFF;",
             )
             .map_err(|_| failure())?;
         session.interrupts.lock().map_err(|_| failure())?.extend([

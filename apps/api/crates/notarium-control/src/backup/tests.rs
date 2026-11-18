@@ -849,6 +849,7 @@ async fn sqlite_pinned_cut_close_survives_concurrent_interrupts() {
         fs::write(&dest, b"").unwrap();
         let session = session::Session::new(budget(), limits, Some(wal.clone()));
         let mut cut = sqlite::SqliteCut::prepare(&data.control(), &dest, &session).unwrap();
+        cut.assert_sync_settings();
         cut.pin(&witness, &keys, &session).unwrap();
         let mut tiny = limits;
         tiny.max_spool_bytes = 1;
