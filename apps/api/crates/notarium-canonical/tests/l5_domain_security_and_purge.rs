@@ -181,6 +181,21 @@ struct PausedObjectRead {
     fail_put: AtomicUsize,
     received: tokio::sync::Notify,
     resume: tokio::sync::Notify,
+    paused: tokio::sync::Semaphore,
+}
+
+impl PausedObjectRead {
+    fn new(config: &notarium_canonical::S3Config) -> Self {
+        Self {
+            transport: ReqwestS3Transport::new(config).unwrap(),
+            armed: AtomicBool::new(false),
+            data_puts: AtomicUsize::new(0),
+            fail_put: AtomicUsize::new(0),
+            received: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+            paused: tokio::sync::Semaphore::new(1),
+        }
+    }
 }
 
 impl S3Transport for PausedObjectRead {
@@ -210,6 +225,7 @@ impl S3Transport for PausedObjectRead {
             let object_get = request.method == http::Method::GET && request.key.is_some();
             let response = self.transport.send(request).await?;
             if object_get && self.armed.swap(false, Ordering::SeqCst) {
+                let _paused = self.paused.acquire().await.unwrap();
                 self.received.notify_one();
                 self.resume.notified().await;
             }
@@ -2375,14 +2391,7 @@ async fn l5_domain_crud_batches_packages_and_security_parity() {
         admin_ensure_bucket(&s3_cfg, Some("Enabled"))
             .await
             .expect("ensure versioned S3 bucket");
-        let gate = Arc::new(PausedObjectRead {
-            transport: ReqwestS3Transport::new(&s3_cfg).unwrap(),
-            armed: AtomicBool::new(false),
-            data_puts: AtomicUsize::new(0),
-            fail_put: AtomicUsize::new(0),
-            received: tokio::sync::Notify::new(),
-            resume: tokio::sync::Notify::new(),
-        });
+        let gate = Arc::new(PausedObjectRead::new(&s3_cfg));
         let cfg = fixtures.pg_s3_config(sample_installation_id(2), &schema, s3_cfg);
         let (store, runtime) = CanonicalRuntime::open_with_s3_transport(cfg, Some(gate.clone()))
             .await

@@ -4299,7 +4299,8 @@ fn observation_plan_fingerprint(plan: &CarrierPatchPlan) -> ContentDigest {
 
 async fn verify_observation_replay(
     store: &CanonicalStore,
-    ctx: &SpaceContext,
+    mut ctx: SpaceContext,
+    deadline: &super::common::CommandDeadline,
     observation: &ExternalObservation,
     replayed: &StoredExternalObsOutcomeV1,
     idemp: &crate::writer::CommandIdentitySpec,
@@ -4323,6 +4324,7 @@ async fn verify_observation_replay(
             let note = observation.note.clone();
             let revision = observation.base_revision.clone();
             let authority = idemp.clone();
+            ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
             let digest = store
                 .with_read_tx_budget(Some(&ctx.budget), |tx| {
                     Box::pin(async move {
@@ -4352,6 +4354,7 @@ async fn verify_observation_replay(
             }
             let bytes = store.read_verified_blob(ctx.scope(), digest).await?;
             // Re-check current authority, erasure, history and identity after CAS I/O.
+            ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
             if try_replay_completed_receipt::<StoredExternalObsOutcomeV1>(
                 store,
                 ctx.scope(),
@@ -4372,11 +4375,36 @@ async fn verify_observation_replay(
     }
 }
 
+async fn current_observation_head(
+    store: &CanonicalStore,
+    ctx: &mut SpaceContext,
+    request: &Mutation<ExternalObservation>,
+    deadline: &super::common::CommandDeadline,
+) -> Result<(crate::SpaceRecord, super::common::NoteHeadRow), PortError> {
+    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+    let result = deadline
+        .wait(&ctx.budget, || {
+            read_active_note_for_mutation(
+                store,
+                ctx,
+                &request.input.note,
+                &request.preconditions,
+                NoteMutationAccess::Current,
+            )
+        })
+        .await?;
+    deadline.remaining(&ctx.budget)?;
+    result
+}
+
 pub(crate) async fn accept_external_observation_impl(
     store: &CanonicalStore,
-    ctx: SpaceContext,
+    mut ctx: SpaceContext,
     request: Mutation<ExternalObservation>,
 ) -> Result<ExternalObservationResult, PortError> {
+    let deadline =
+        super::common::CommandDeadline::start(&ctx.budget, "accept_external_observation");
+    let budget = ctx.budget.clone();
     validate_mutation_identity(&ctx, &request.identity)?;
     let mut fp = blake3::Hasher::new();
     fp.update(request.input.note.as_str().as_bytes());
@@ -4395,22 +4423,31 @@ pub(crate) async fn accept_external_observation_impl(
     .with_known_base(&request.input.base_revision)
     .for_note(ctx.auth(), &request.input.note);
 
-    if let Some(replayed) = try_replay_completed_receipt::<StoredExternalObsOutcomeV1>(
-        store,
-        ctx.scope(),
-        &idemp,
-        Some(&ctx.budget),
-    )
-    .await?
+    ctx.budget.remaining = deadline.remaining(&budget)?;
+    if let Some(replayed) = deadline
+        .wait(&budget, || {
+            try_replay_completed_receipt::<StoredExternalObsOutcomeV1>(
+                store,
+                ctx.scope(),
+                &idemp,
+                Some(&ctx.budget),
+            )
+        })
+        .await??
     {
-        Box::pin(verify_observation_replay(
-            store,
-            &ctx,
-            &request.input,
-            &replayed,
-            &idemp,
-        ))
-        .await?;
+        deadline
+            .wait(&budget, || {
+                Box::pin(verify_observation_replay(
+                    store,
+                    ctx.clone(),
+                    &deadline,
+                    &request.input,
+                    &replayed,
+                    &idemp,
+                ))
+            })
+            .await??;
+        deadline.remaining(&budget)?;
         return Ok(match replayed {
             StoredExternalObsOutcomeV1::Committed { result: c, .. } => {
                 ExternalObservationResult::Committed(c.into_committed())
@@ -4424,14 +4461,7 @@ pub(crate) async fn accept_external_observation_impl(
         });
     }
 
-    let current = read_active_note_for_mutation(
-        store,
-        &ctx,
-        &request.input.note,
-        &request.preconditions,
-        NoteMutationAccess::Current,
-    )
-    .await;
+    let current = current_observation_head(store, &mut ctx, &request, &deadline).await;
     let (space_rec, base_head) = match current {
         Ok(head) => head,
         Err(error) => return observation_error(error),
@@ -4446,6 +4476,7 @@ pub(crate) async fn accept_external_observation_impl(
     if let ObservedContent::Carrier(carrier) = &request.input.content {
         check_observed_digest(carrier, request.input.observed_digest)?;
         if same_digest {
+            deadline.remaining(&budget)?;
             return Ok(ExternalObservationResult::NoChange {
                 revision: base_head.head_rev_id,
             });
@@ -4455,9 +4486,11 @@ pub(crate) async fn accept_external_observation_impl(
     let base_digest = base_head.content_digest.ok_or_else(|| {
         internal_not_committed("obs_missing_digest", "active note lacks content_blake3")
     })?;
-    let raw_bytes = store
-        .read_verified_blob(&space_rec.scope, base_digest)
-        .await?;
+    let raw_bytes = deadline
+        .wait(&budget, || {
+            store.read_verified_blob(&space_rec.scope, base_digest)
+        })
+        .await??;
     let base_carrier = String::from_utf8(raw_bytes)
         .map_err(|_| internal_not_committed("obs_corrupt_utf8", "carrier not valid UTF-8"))?;
 
@@ -4467,15 +4500,7 @@ pub(crate) async fn accept_external_observation_impl(
             let carrier = notarium_syntax::patch::apply(&base_carrier, plan)?;
             check_observed_digest(&carrier, request.input.observed_digest)?;
             if same_digest {
-                return match read_active_note_for_mutation(
-                    store,
-                    &ctx,
-                    &request.input.note,
-                    &request.preconditions,
-                    NoteMutationAccess::Current,
-                )
-                .await
-                {
+                return match current_observation_head(store, &mut ctx, &request, &deadline).await {
                     Ok((_, head)) if head.head_rev_id == base_head.head_rev_id => {
                         Ok(ExternalObservationResult::NoChange {
                             revision: head.head_rev_id,
@@ -4538,68 +4563,79 @@ pub(crate) async fn accept_external_observation_impl(
                 )
             }
         };
-        match interceptor
-            .intercept(InterceptedMutation {
+        ctx.budget.remaining = deadline.remaining(&budget)?;
+        let unknown = || {
+            crate::codec::unknown_commit_outcome(
+                "observation_room_outcome_unknown",
+                "the room may have applied the external observation",
+            )
+        };
+        // A ready reply can distinguish a confirmed non-write from a lost room response.
+        let reply = tokio::select! {
+            biased;
+            result = interceptor.intercept(InterceptedMutation {
                 context: ctx.clone(),
                 identity: request.identity.clone(),
                 preconditions: request.preconditions.clone(),
                 payload: InterceptedPayload::ExternalObservation {
-                    observation: request.input.clone(),
-                    body: body_plan,
-                    header: header_mut,
+                    observation: request.input.clone(), body: body_plan, header: header_mut,
                 },
-            })
-            .await?
-        {
+            }) => result?,
+            () = budget.cancellation.cancelled() => return Err(unknown()),
+            () = tokio::time::sleep_until(deadline.at) => return Err(unknown()),
+        };
+        match reply {
             InterceptionResult::Applied(receipt) => {
-                return applied_outcome(
-                    store,
-                    &ctx,
-                    &idemp,
-                    receipt,
-                    |row: StoredExternalObsOutcomeV1| match row {
-                        StoredExternalObsOutcomeV1::Committed { result, .. }
-                            if result.value.note == request.input.note =>
-                        {
-                            Some(result.into_committed())
-                        }
-                        _ => None,
-                    },
-                )
-                .await?
-                .ok_or_else(missing_applied_outcome)
-                .map(ExternalObservationResult::Committed);
+                ctx.budget.remaining = deadline.remaining(&budget).map_err(|_| unknown())?;
+                let committed = deadline
+                    .wait(&budget, || {
+                        applied_outcome(
+                            store,
+                            &ctx,
+                            &idemp,
+                            receipt,
+                            |row: StoredExternalObsOutcomeV1| match row {
+                                StoredExternalObsOutcomeV1::Committed { result, .. }
+                                    if result.value.note == request.input.note =>
+                                {
+                                    Some(result.into_committed())
+                                }
+                                _ => None,
+                            },
+                        )
+                    })
+                    .await
+                    .map_err(|_| unknown())??
+                    .ok_or_else(missing_applied_outcome)?;
+                deadline.remaining(&budget).map_err(|_| unknown())?;
+                return Ok(ExternalObservationResult::Committed(committed));
             }
             InterceptionResult::SettleCarrier(accepted) => {
                 let transition = crate::peers::RoomCarrierTransition::from(accepted);
-                if let Err(error) = transition
-                    .check_before_staging(
-                        store,
-                        &ctx.budget,
-                        ctx.scope(),
-                        &request.input.note,
-                        ctx.auth(),
-                        Some(&base_head.head_rev_id),
-                    )
-                    .await
+                ctx.budget.remaining = deadline.remaining(&budget)?;
+                if let Err(error) = deadline
+                    .wait(&budget, || {
+                        transition.check_before_staging(
+                            store,
+                            &ctx.budget,
+                            ctx.scope(),
+                            &request.input.note,
+                            ctx.auth(),
+                            Some(&base_head.head_rev_id),
+                        )
+                    })
+                    .await?
                 {
                     return observation_error(error);
                 }
                 reservation_opt = Some(CarrierRoomWrite::Accepted(transition));
             }
             InterceptionResult::Conflict(_) => {
-                let current = match read_active_note_for_mutation(
-                    store,
-                    &ctx,
-                    &request.input.note,
-                    &request.preconditions,
-                    NoteMutationAccess::Current,
-                )
-                .await
-                {
-                    Ok((_, head)) => head.head_rev_id,
-                    Err(error) => return observation_error(error),
-                };
+                let current =
+                    match current_observation_head(store, &mut ctx, &request, &deadline).await {
+                        Ok((_, head)) => head.head_rev_id,
+                        Err(error) => return observation_error(error),
+                    };
                 return Ok(ExternalObservationResult::Conflict { current });
             }
             InterceptionResult::ClosedRoomReservation(res) => {
@@ -4616,13 +4652,15 @@ pub(crate) async fn accept_external_observation_impl(
         store.blob_codec(),
         preparsed_hdr,
     )?;
-    let ticket = store
-        .stage_blob_for_batch(
-            &space_rec.scope,
-            space_rec.active_epoch,
-            &info.prepared_blob,
-        )
-        .await?;
+    let ticket = deadline
+        .wait(&budget, || {
+            store.stage_blob_for_batch(
+                &space_rec.scope,
+                space_rec.active_epoch,
+                &info.prepared_blob,
+            )
+        })
+        .await??;
 
     let scope_cl = space_rec.scope.clone();
     let staged_bytes = ticket.compressed_size;
@@ -4983,8 +5021,16 @@ pub(crate) async fn accept_external_observation_impl(
         }),
     };
 
+    ctx.budget.remaining = deadline.remaining(&budget)?;
     match store
-        .submit_write_command::<StoredExternalObsOutcomeV1>(&ctx.budget, intent)
+        .submit_write_command_until::<StoredExternalObsOutcomeV1>(
+            &ctx.budget,
+            deadline.at,
+            intent,
+            None,
+            None,
+            None,
+        )
         .await
     {
         Ok(StoredExternalObsOutcomeV1::Committed { result: c, .. }) => {

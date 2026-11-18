@@ -37,19 +37,27 @@ Medium. Remote object storage needs a measurement over the intended network.
 
 | Profile | Current acceptance on both systems | Candidate operating target |
 | --- | --- | --- |
-| SQLite rollback with local CAS | p95 <5 ms | High <4 ms. On Medium, reduce the measured 7.614 ms to the shared target. |
+| SQLite rollback with local CAS | p95 <5 ms | High working target <4 ms. On Medium, track the shortfall against the shared target. |
 | PostgreSQL rollback with local CAS | p95 <5 ms | High <5 ms. On Medium, reduce the measured 11.858 ms to the shared target. |
 | SQLite 50 writers, zero or 200 readers | >2,000 confirmed mutations/s in **each** run, zero errors | High >3,500/s in each run. On Medium, eliminate the reader error and repeat both profiles against the shared target. |
 
-Two subsequent High series on the same runtime revision (`f6651e2c`)
-illustrate how to evaluate these candidates. SQLite rollback had p95 of
-3.29 and 3.38 ms. PostgreSQL rollback had p95 of 4.54 and 8.97 ms. The
+Three subsequent High series on the same runtime revision (`f6651e2c`)
+gave SQLite rollback p95 of 3.29, 3.38 and 3.26 ms. Each series verified
+1,000 fresh commands. The worst p95 leaves 0.62 ms to the 4 ms working target.
+PostgreSQL rollback had p95 of 4.54, 8.97 and 4.98 ms. The
 first series sustained 3,909–4,183 mutations/s across its six writer runs.
 In the second series a 50-writer/200-reader run completed 330 mutations/s.
 Keep the PostgreSQL miss and the throughput drop in the release evidence.
 The observed variation rules out promoting 3,500/s to a High release floor
 from these measurements. For a slowdown, compare the affected durable
 operation, queue, batch commit and storage pressure on the same host.
+
+The first repeat on the Medium reference at the same runtime revision
+measured 7.80 ms and 11.51 ms p95 for the SQLite and PostgreSQL rollback.
+For capacity planning on this reference, use **10 ms (SQLite)** and
+**15 ms (PostgreSQL)** as initial investigation thresholds. These values
+round up from the measured latencies with headroom for variation. Keep the
+published 5 ms release test and its outcome visible separately.
 
 ### Ordinary edits on Medium
 

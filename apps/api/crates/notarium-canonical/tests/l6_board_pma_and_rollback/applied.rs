@@ -680,6 +680,36 @@ async fn check_observation_conflict(
         }
         base = changed;
     }
+
+    let mut caller = ctx.clone();
+    caller.budget = make_budget();
+    let cancelled = caller.budget.cancellation.clone();
+    let waiting = next_mutation(
+        ctx.scope(),
+        ctx.auth().principal(),
+        ExternalObservation {
+            note: base.note,
+            base_revision: base.revision,
+            observed_digest: notarium_syntax::content_digest("Pending observation."),
+            disk_identity: notarium_syntax::content_digest("pending-observation"),
+            content: ObservedContent::Carrier("Pending observation.".to_owned()),
+        },
+    );
+    let (started, entered) = oneshot::channel();
+    let (hold, reply) = oneshot::channel();
+    *room.pause.lock().unwrap() = Some((started, reply));
+    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(store.accept_external_observation(caller, waiting), async {
+            entered.await.unwrap();
+            cancelled.cancel();
+        },)
+    })
+    .await
+    .expect("cancelled dispatched room call releases its wait");
+    drop(hold);
+    assert!(matches!(result, Err(PortError::Unavailable(f))
+        if f.effect() == notarium_core::error::CommitEffect::Unknown
+        && f.retry() == notarium_core::error::RetryAdvice::RetrySameCommand));
 }
 
 async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, room: &PausedRoom) {

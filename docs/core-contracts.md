@@ -267,7 +267,11 @@ keeps its validated plan fingerprint in note-owned receipt detail until purge.
 For older receipts and equivalent alternative plans, verification applies the
 plan to the original revision of the same note and rechecks the receipt after
 reading storage. A missing original or a mismatched plan fails verification.
-A valid replay returns the original receipt without exposing historical bytes.
+A valid replay returns the original receipt without exposing historical bytes. The
+original caller deadline and cancellation cover the historical object read and
+the receipt check afterward. A cancelled replay submits no new mutation. A
+timeout after a live room receives a new observation can have an unknown commit
+outcome. Retry the same command key to resolve it.
 
 `Applied(receipt)` identifies the retained typed outcome of the original command.
 A Board move includes the complete field and rank change. Standalone room
