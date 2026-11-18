@@ -835,18 +835,19 @@ pub(crate) async fn edit_note_impl(
 
     ctx.budget.remaining = deadline.remaining(&budget)?;
     let phase1 = if store.is_sqlite_local() {
-        crate::sqlite_fast::prepare_note_edit_read(deadline, &budget, || {
-            crate::sqlite_fast::edit_note_phase1_sqlite_local(
-                store,
-                &ctx,
-                deadline,
-                &request.input.note,
-                &request.preconditions,
-                request.input.plan.base_content_hash,
-                &idemp,
-            )
-        })
-        .await
+        deadline
+            .prepare_read(&budget, || {
+                crate::sqlite_fast::edit_note_phase1_sqlite_local(
+                    store,
+                    &ctx,
+                    deadline,
+                    &request.input.note,
+                    &request.preconditions,
+                    request.input.plan.base_content_hash,
+                    &idemp,
+                )
+            })
+            .await
     } else {
         let scope_p1 = ctx.scope().clone();
         let auth_p1 = ctx.auth().clone();
@@ -6386,10 +6387,21 @@ pub(crate) async fn try_replay_completed_receipt<R: serde::de::DeserializeOwned>
     idemp: &crate::writer::CommandIdentitySpec,
     budget: Option<&notarium_core::ports::CallBudget>,
 ) -> Result<Option<R>, PortError> {
+    read_space_and_receipt(store, scope, idemp, budget)
+        .await
+        .map(|(_, receipt)| receipt)
+}
+
+pub(crate) async fn read_space_and_receipt<R: serde::de::DeserializeOwned>(
+    store: &CanonicalStore,
+    scope: &notarium_core::model::HistoryScope,
+    idemp: &crate::writer::CommandIdentitySpec,
+    budget: Option<&notarium_core::ports::CallBudget>,
+) -> Result<(crate::SpaceRecord, Option<R>), PortError> {
     let scope_cl = scope.clone();
     let idemp_cl = idemp.clone();
     let inner = std::sync::Arc::clone(&store.inner);
-    let blob_opt = store
+    let (space, blob_opt) = store
         .with_read_tx_budget(budget, |tx| {
             Box::pin(async move {
                 let srec = load_space_record(tx, &scope_cl.space_id).await?;
@@ -6398,15 +6410,15 @@ pub(crate) async fn try_replay_completed_receipt<R: serde::de::DeserializeOwned>
                 let Some(existing) =
                     crate::writer::lookup_command_receipt_tx(tx, &scope_cl, &idemp_cl).await?
                 else {
-                    return Ok(None);
+                    return Ok((srec, None));
                 };
                 if existing.command_hash != idemp_cl.command_hash {
                     return Err(DomainError::IdempotencyKeyReused.into());
                 }
                 if existing.status == "completed" {
-                    Ok(Some(existing.response_blob))
+                    Ok((srec, Some(existing.response_blob)))
                 } else {
-                    Ok(None)
+                    Ok((srec, None))
                 }
             })
         })
@@ -6417,9 +6429,9 @@ pub(crate) async fn try_replay_completed_receipt<R: serde::de::DeserializeOwned>
             let decoded = rmp_serde::from_slice(&bytes).map_err(|err| {
                 internal_not_committed("decode_replayed_receipt", err.to_string())
             })?;
-            Ok(Some(decoded))
+            Ok((space, Some(decoded)))
         }
-        None => Ok(None),
+        None => Ok((space, None)),
     }
 }
 

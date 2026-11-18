@@ -98,6 +98,20 @@ impl CommandDeadline {
         result
     }
 
+    /// Restart a read-only command phase once if its short snapshot expires.
+    /// Both attempts must fit the command's original deadline.
+    pub(crate) async fn prepare_read<T, F: Future<Output = Result<T, PortError>>>(
+        &self,
+        budget: &notarium_core::ports::CallBudget,
+        mut read: impl FnMut() -> F,
+    ) -> Result<T, PortError> {
+        let first = self.prepare(budget, &mut read).await;
+        if matches!(first, Err(PortError::DeadlineExceeded(_))) {
+            return self.prepare(budget, read).await;
+        }
+        first
+    }
+
     pub(crate) async fn submit<T: Serialize + serde::de::DeserializeOwned + Send + 'static>(
         &self,
         store: &crate::CanonicalStore,

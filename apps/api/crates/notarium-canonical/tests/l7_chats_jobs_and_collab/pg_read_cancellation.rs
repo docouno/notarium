@@ -3,12 +3,17 @@ use notarium_canonical::SqlBackendConfig;
 use notarium_core::error::CommitEffect;
 use sqlx::Connection;
 
-async fn waiting_reader_pid(observer: &mut sqlx::PgConnection, blocker: i32) -> i32 {
+async fn waiting_reader_pid(
+    observer: &mut sqlx::PgConnection,
+    blocker: i32,
+    previous: Option<i32>,
+) -> i32 {
     loop {
         if let Some(pid) = sqlx::query_scalar::<_, i32>(
-            "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+            "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) AND pid IS DISTINCT FROM $2::int",
         )
         .bind(blocker)
+        .bind(previous)
         .fetch_optional(&mut *observer)
         .await
         .unwrap()
@@ -19,23 +24,16 @@ async fn waiting_reader_pid(observer: &mut sqlx::PgConnection, blocker: i32) -> 
     }
 }
 
-#[tokio::test]
-async fn fast_pg_chat_read_releases_slots_on_cancel_drop_and_shutdown() {
-    let fixtures = StorageTestFixtures::load_required();
-    let schema = fixtures.fresh_pg_schema();
-    let data = TempDataRoot::new("fast-pg-read-cancel");
-    let mut cfg = fixtures.pg_local_config(sample_installation_id(97), &schema, data.data_root());
-    let SqlBackendConfig::Postgres { pool_size, .. } = &mut cfg.sql else {
-        unreachable!()
-    };
-    *pool_size = 1;
-    let (store, runtime) = CanonicalRuntime::open(cfg.clone()).await.unwrap();
-    let owner = sample_principal_id(97);
+async fn seed_personal_chat(
+    store: &CanonicalStore,
+    seed: u8,
+) -> (HistoryScope, PrincipalId, ChatThreadId) {
+    let owner = sample_principal_id(seed);
     let scope = store
         .create_space(CreateSpaceSpec {
-            space_id: sample_space_id(97),
-            incarnation: sample_incarnation(97),
-            root_folder_id: sample_folder_id(97),
+            space_id: sample_space_id(seed),
+            incarnation: sample_incarnation(seed),
+            root_folder_id: sample_folder_id(seed),
             slug: "read-cancellation".into(),
             kind: SpaceKind::Personal,
             owner: owner.clone(),
@@ -46,11 +44,10 @@ async fn fast_pg_chat_read_releases_slots_on_cancel_drop_and_shutdown() {
         .await
         .unwrap()
         .scope;
-    let thread = sample_thread_id(97);
-    let ctx = || owner_ctx(&scope, owner.clone());
+    let thread = sample_thread_id(seed);
     store
         .create_chat(
-            ctx(),
+            owner_ctx(&scope, owner.clone()),
             next_mutation(
                 &scope,
                 &owner,
@@ -65,6 +62,22 @@ async fn fast_pg_chat_read_releases_slots_on_cancel_drop_and_shutdown() {
         )
         .await
         .unwrap();
+    (scope, owner, thread)
+}
+
+#[tokio::test]
+async fn fast_pg_chat_read_releases_slots_on_cancel_drop_and_shutdown() {
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    let data = TempDataRoot::new("fast-pg-read-cancel");
+    let mut cfg = fixtures.pg_local_config(sample_installation_id(97), &schema, data.data_root());
+    let SqlBackendConfig::Postgres { pool_size, .. } = &mut cfg.sql else {
+        unreachable!()
+    };
+    *pool_size = 1;
+    let (store, runtime) = CanonicalRuntime::open(cfg.clone()).await.unwrap();
+    let (scope, owner, thread) = seed_personal_chat(&store, 97).await;
+    let ctx = || owner_ctx(&scope, owner.clone());
     let leaf = store
         .append_chat(
             ctx(),
@@ -108,7 +121,7 @@ async fn fast_pg_chat_read_releases_slots_on_cancel_drop_and_shutdown() {
         let active = ctx();
         let cancel = active.budget.cancellation.clone();
         let mut read = store.read_chat(active, request.clone());
-        let blocked = waiting_reader_pid(&mut observer, blocker_pid);
+        let blocked = waiting_reader_pid(&mut observer, blocker_pid, None);
         let pid = tokio::select! {
             result = &mut read => panic!("expected the chat query to block: {result:?}"),
             pid = blocked => pid,
@@ -168,7 +181,7 @@ async fn fast_pg_chat_read_releases_slots_on_cancel_drop_and_shutdown() {
     let mut read = store.read_chat(ctx(), request);
     tokio::select! {
         result = &mut read => panic!("expected an in-flight read: {result:?}"),
-        _ = waiting_reader_pid(&mut observer, blocker_pid) => {}
+        _ = waiting_reader_pid(&mut observer, blocker_pid, None) => {}
     }
     let stopping = tokio::spawn(runtime.shutdown());
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -312,5 +325,62 @@ async fn pg_pool_returns_foreign_checkout_to_the_store_runtime() {
     })
     .await
     .expect("shutdown closes the surviving pooled connection");
+    fixtures.drop_pg_schema(&schema).await;
+}
+
+#[tokio::test]
+async fn pg_append_chat_rechecks_an_expired_read_before_writer_admission() {
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    let data = TempDataRoot::new("pg-chat-read-deadline");
+    let config = fixtures.pg_local_config(sample_installation_id(89), &schema, data.data_root());
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let (scope, owner, thread) = seed_personal_chat(&store, 89).await;
+    let ctx = || owner_ctx(&scope, owner.clone());
+    let mut blocker = fixtures.open_raw_pg().await;
+    let mut observer = fixtures.open_raw_pg().await;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut blocker)
+        .await
+        .unwrap();
+    for (index, table) in ["command_receipts", "spaces"].into_iter().enumerate() {
+        let mut lock = blocker.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "LOCK TABLE {schema}.{table} IN ACCESS EXCLUSIVE MODE"
+        )))
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+        let command = next_mutation(
+            &scope,
+            &owner,
+            AppendChat {
+                thread: thread.clone(),
+                parent: ThreadEntrySeq::ZERO,
+                kind: ChatEntryKind::Human,
+                body: ChatInputBody::Text(format!("branch {index}")),
+                referenced_notes: vec![],
+                tainted: false,
+            },
+        );
+        let mut append = store.append_chat(ctx(), command.clone());
+        let first = tokio::select! {
+            result = &mut append => panic!("append must wait at {table}: {result:?}"),
+            first = tokio::time::timeout(Duration::from_secs(5), waiting_reader_pid(&mut observer, blocker_pid, None)) => first.unwrap(),
+        };
+        tokio::select! {
+            result = &mut append => panic!("an expired read must leave time for a fresh snapshot at {table}: {result:?}"),
+            second = tokio::time::timeout(Duration::from_secs(5), waiting_reader_pid(&mut observer, blocker_pid, Some(first))) => {
+                second.expect("the fresh read must reach the locked table");
+            }
+        }
+        lock.rollback().await.unwrap();
+        let result = append.await.unwrap();
+        assert_eq!(result.value.seq.get(), u64::try_from(index).unwrap() + 1);
+        let replay = store.append_chat(ctx(), command).await.unwrap();
+        assert_eq!(replay.receipt, result.receipt);
+        assert_eq!(replay.value.seq, result.value.seq);
+    }
+    runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }

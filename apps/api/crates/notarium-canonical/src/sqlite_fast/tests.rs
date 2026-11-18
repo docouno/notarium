@@ -43,7 +43,7 @@ async fn edit_preparation_restarts_one_expired_snapshot_within_the_original_budg
     let attempts = std::cell::Cell::new(0);
     let (store, runtime, pool, path) = fixture().await;
     let wal = store.inner.wal_coord.get().unwrap();
-    let result = prepare_note_edit_read(deadline, &budget, || async {
+    let result = deadline.prepare_read(&budget, || async {
         attempts.set(attempts.get() + 1);
         let mut current = budget.clone();
         current.remaining = deadline.remaining(&budget)?;
@@ -77,20 +77,21 @@ async fn edit_preparation_preserves_terminal_errors_and_limits_attempts() {
         }
         let deadline = CommandDeadline::start(&budget, "edit_note");
         let attempts = std::cell::Cell::new(0);
-        let result: Result<(), _> = prepare_note_edit_read(deadline, &budget, || async {
-            attempts.set(attempts.get() + 1);
-            if mode == "domain_error" {
-                return Err(DomainError::ResourceNotFound.into());
-            }
-            if mode == "cancelled" {
-                budget.cancellation.cancel();
-            }
-            Err(deadline_not_committed(
-                "test_read_timeout",
-                "snapshot expired",
-            ))
-        })
-        .await;
+        let result: Result<(), _> = deadline
+            .prepare_read(&budget, || async {
+                attempts.set(attempts.get() + 1);
+                if mode == "domain_error" {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                if mode == "cancelled" {
+                    budget.cancellation.cancel();
+                }
+                Err(deadline_not_committed(
+                    "test_read_timeout",
+                    "snapshot expired",
+                ))
+            })
+            .await;
         match mode {
             "repeated_timeout" => {
                 assert!(matches!(result, Err(PortError::DeadlineExceeded(_))));

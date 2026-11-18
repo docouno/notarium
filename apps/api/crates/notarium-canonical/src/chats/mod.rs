@@ -45,7 +45,7 @@ use crate::{
             FolderAncestryCache, derive_command_identity_spec, extract_agent_run_from_auth,
             load_note_head_row_tx, upsert_agent_run_head_tx, validate_mutation_identity,
         },
-        notes::try_replay_completed_receipt,
+        notes::{read_space_and_receipt, try_replay_completed_receipt},
     },
     runtime::{
         insert_revision_row, is_note_purge_fenced_tx, load_folder_head_row, load_space_record,
@@ -2673,13 +2673,6 @@ async fn append_chat_impl(
         }
     }
 
-    let space_rec = deadline
-        .prepare(&ctx.budget, || {
-            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
-        })
-        .await?;
-    space_rec.scope.check(ctx.scope())?;
-
     let mut fp = blake3::Hasher::new();
     fp.update(request.input.thread.as_str().as_bytes());
     fp.update(&[0]);
@@ -2728,17 +2721,17 @@ async fn append_chat_impl(
                 ),
             );
 
-    if let Some(mut replayed) = deadline
-        .prepare(&ctx.budget, || {
-            try_replay_completed_receipt::<StoredCommittedChatEntryV1>(
+    let (space_rec, replayed) = deadline
+        .prepare_read(&ctx.budget, || {
+            read_space_and_receipt::<StoredCommittedChatEntryV1>(
                 store,
-                &space_rec.scope,
+                ctx.scope(),
                 &idemp,
                 Some(&ctx.budget),
             )
         })
-        .await?
-    {
+        .await?;
+    if let Some(mut replayed) = replayed {
         // Older receipts can retain a compaction detail whose checkpoint was
         // already invalidated. Resolve its current visibility before returning it.
         if matches!(replayed.value.kind, StoredChatEntryKindV1::Compaction) {

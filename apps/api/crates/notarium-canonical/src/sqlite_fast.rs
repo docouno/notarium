@@ -456,20 +456,6 @@ pub(crate) enum EditPhase1Read {
     },
 }
 
-/// A single short SQLite snapshot can expire while the edit still has time.
-/// Re-read all preconditions once, before staging a blob or admitting a write.
-pub(crate) async fn prepare_note_edit_read<T, F: Future<Output = Result<T, PortError>>>(
-    deadline: CommandDeadline,
-    budget: &CallBudget,
-    mut read: impl FnMut() -> F,
-) -> Result<T, PortError> {
-    let first = deadline.prepare(budget, &mut read).await;
-    if matches!(first, Err(PortError::DeadlineExceeded(_))) {
-        return deadline.prepare(budget, read).await;
-    }
-    first
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn edit_note_phase1_sqlite_local(
     store: &CanonicalStore,

@@ -69,7 +69,10 @@ The writer report includes internal SQLite read timeouts and all returned
 reader and writer errors, including warmup. A note edit may restart its
 read-only preparation once if a short SQLite snapshot expires. Both attempts
 share the original command deadline. The latency includes both attempts and
-the durable write. Each snapshot retains its own time limit.
+the durable write. Chat append checks the Space and its existing receipt in one
+read transaction. If that snapshot expires, the service can repeat those checks
+once within the original command deadline, before admitting a write. Each
+snapshot retains its own time limit.
 
 Three full High series on the same runtime revision (`f6651e2c`) gave
 SQLite rollback p95 of 3.29, 3.38 and 3.26 ms. PostgreSQL rollback had
