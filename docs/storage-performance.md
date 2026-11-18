@@ -118,6 +118,15 @@ retirement records can accumulate. The `(status, space_id)` index serves the
 global check and the per-Space equality check. Its size and write cost depend
 on the number of retained records.
 
+The canonical SQLite participant compiles its schema, history and retirement
+queries on the source connection during preparation. Preparation uses zero
+lock wait for this optional work. The participant executes the queries in the
+pinned transaction and checks the current Space set against the active hold.
+On the Medium reference, two isolated 1,000-cut runs at 64 Spaces measured
+confirmed pause p95 of 0.802 and 0.830 ms with prepared queries. Two
+interleaved runs with the previous behavior measured 0.907 and 0.891 ms.
+The release suite measures the entire paired pause again for each hardware class.
+
 A local query test populated the shipped tables with 64 Spaces and one
 million completed retirements. In SQLite 3.51.3 without planner statistics,
 looking for a pending record with the former Space-first index took 3,000,013

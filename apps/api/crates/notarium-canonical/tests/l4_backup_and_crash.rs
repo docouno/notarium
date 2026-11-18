@@ -769,7 +769,7 @@ async fn snapshot_checks_retirements_and_holds_store_one_space_each() {
         BackendCase::open_pg_s3_with_pool(1).await,
     ] {
         let store = &case.store;
-        for byte in 1..=8 {
+        for byte in 1..=7 {
             store.create_space(backup_test_space(byte)).await.unwrap();
         }
         let budget = store.default_backup_budget();
@@ -800,6 +800,7 @@ async fn snapshot_checks_retirements_and_holds_store_one_space_each() {
             .prepare(maintenance_ctx(ServicePurpose::Backup), id, budget)
             .await
             .unwrap();
+        store.create_space(backup_test_space(8)).await.unwrap();
         let hold = prepared.acquire_hold().await.unwrap();
         let count_local = if case.is_sqlite {
             "SELECT COUNT(*) FROM backup_holds WHERE json_array_length(witness_json, '$.histories')=1 AND json_extract(witness_json, '$.histories[0].scope.space_id')=space_id"
@@ -831,6 +832,25 @@ async fn snapshot_checks_retirements_and_holds_store_one_space_each() {
         let record = store.get_backup_artifact(&receipt.artifact).await.unwrap();
         assert_eq!(record.witness.histories, hold.witness().histories);
         assert_eq!(record.witness.histories.len(), 8);
+        hold.release().await.unwrap();
+        drop(prepared);
+
+        let mut prepared = store
+            .prepare(
+                maintenance_ctx(ServicePurpose::Backup),
+                BackupId::from_bytes([0x3f; 16]),
+                budget,
+            )
+            .await
+            .unwrap();
+        let hold = prepared.acquire_hold().await.unwrap();
+        store.create_space(backup_test_space(9)).await.unwrap();
+        let mut pause = prepared.pause_writes().await.unwrap();
+        assert!(matches!(
+            pause.open_cut().await,
+            Err(PortError::Unavailable(_))
+        ));
+        pause.resume().await.unwrap();
         hold.release().await.unwrap();
         drop(prepared);
         case.shutdown().await;

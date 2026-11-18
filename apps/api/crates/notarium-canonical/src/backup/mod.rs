@@ -665,11 +665,26 @@ fn open_sqlite_backup_destination(path: &Path) -> Result<rusqlite::Connection, P
     Ok(dst)
 }
 
-fn warm_sqlite_backup_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+const SQLITE_CUT_SCHEMA: &str = "SELECT schema_version, installation_id, manifest_checksum
+    FROM schema_meta WHERE singleton_id = 1 AND epoch_version = 1 AND migration_state = 'ready'";
+const SQLITE_CUT_HISTORIES: &str =
+    "SELECT space_id, history_incarnation, last_seq FROM spaces ORDER BY space_id ASC";
+const SQLITE_CUT_RETIREMENTS: &str =
+    "SELECT EXISTS (SELECT 1 FROM blob_retirements WHERE status = 'pending')";
+
+fn warm_sqlite_backup_schema(
+    conn: &rusqlite::Connection,
+    queries: &[&str],
+) -> rusqlite::Result<()> {
     let timeout_ms: u32 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
     conn.busy_timeout(Duration::ZERO)?;
     // Schema warming is optional. The cut performs the authoritative reads.
     let _ = conn.query_row("SELECT 1 FROM main.sqlite_schema LIMIT 1", [], |_| Ok(()));
+    // Compile the queries before pausing writers. The cut executes them in
+    // its own transaction, including after a schema change.
+    for query in queries {
+        let _ = conn.prepare_cached(query);
+    }
     conn.busy_timeout(Duration::from_millis(u64::from(timeout_ms)))
 }
 
@@ -699,8 +714,13 @@ fn sqlite_backup_worker_loop(
             rusqlite::Connection::open_with_flags(&src_path, read_only).map_err(|err| {
                 internal_not_committed("rusqlite_open_backup_wal_observer", err.to_string())
             })?;
-        for conn in [&src, &observer] {
-            warm_sqlite_backup_schema(conn).map_err(|err| {
+        let queries = [
+            SQLITE_CUT_SCHEMA,
+            SQLITE_CUT_HISTORIES,
+            SQLITE_CUT_RETIREMENTS,
+        ];
+        for (conn, queries) in [(&src, queries.as_slice()), (&observer, &[])] {
+            warm_sqlite_backup_schema(conn, queries).map_err(|err| {
                 internal_not_committed("sqlite_backup_warm_schema", err.to_string())
             })?;
         }
@@ -865,11 +885,8 @@ fn pin_and_read_sqlite_witness(
 
     let witness = read_and_verify_sqlite_conn_witness(src, expected_installation)?;
     let pending: bool = src
-        .query_row(
-            "SELECT EXISTS (SELECT 1 FROM blob_retirements WHERE status = 'pending')",
-            [],
-            |row| row.get(0),
-        )
+        .prepare_cached(SQLITE_CUT_RETIREMENTS)
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
         .map_err(|err| internal_not_committed("sqlite_backup_pin_retirements", err.to_string()))?;
     if pending {
         return Err(pending_retirement_at_cut());
@@ -890,13 +907,8 @@ fn read_and_verify_sqlite_conn_witness(
     expected_installation: &InstallationId,
 ) -> Result<BackupWitness, PortError> {
     let (schema_version, installation_raw, checksum_bytes): (i64, String, Vec<u8>) = conn
-        .query_row(
-            "SELECT schema_version, installation_id, manifest_checksum
-             FROM schema_meta
-             WHERE singleton_id = 1 AND epoch_version = 1 AND migration_state = 'ready'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
+        .prepare_cached(SQLITE_CUT_SCHEMA)
+        .and_then(|mut stmt| stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))))
         .map_err(|err| internal_not_committed("sqlite_backup_read_schema_meta", err.to_string()))?;
 
     if schema_version != i64::from(CANONICAL_SCHEMA_VERSION) {
@@ -910,11 +922,7 @@ fn read_and_verify_sqlite_conn_witness(
     }
 
     let mut stmt = conn
-        .prepare(
-            "SELECT space_id, history_incarnation, last_seq
-             FROM spaces
-             ORDER BY space_id ASC",
-        )
+        .prepare_cached(SQLITE_CUT_HISTORIES)
         .map_err(|err| internal_not_committed("sqlite_backup_prepare_spaces", err.to_string()))?;
 
     let mut rows = stmt
@@ -4106,7 +4114,14 @@ mod sqlite_sync_tests {
         let (finished, finish) = mpsc::channel();
         let worker = std::thread::spawn(move || {
             started.send(()).unwrap();
-            let result = warm_sqlite_backup_schema(&reader);
+            let result = warm_sqlite_backup_schema(
+                &reader,
+                &[
+                    SQLITE_CUT_SCHEMA,
+                    SQLITE_CUT_HISTORIES,
+                    SQLITE_CUT_RETIREMENTS,
+                ],
+            );
             let restored: u32 = reader
                 .pragma_query_value(None, "busy_timeout", |row| row.get(0))
                 .unwrap();
