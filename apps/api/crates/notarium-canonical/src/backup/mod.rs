@@ -662,6 +662,14 @@ fn open_sqlite_backup_destination(path: &Path) -> Result<rusqlite::Connection, P
     Ok(dst)
 }
 
+fn warm_sqlite_backup_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let timeout_ms: u32 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+    conn.busy_timeout(Duration::ZERO)?;
+    // Schema warming is optional. The cut performs the authoritative reads.
+    let _ = conn.query_row("SELECT 1 FROM main.sqlite_schema LIMIT 1", [], |_| Ok(()));
+    conn.busy_timeout(Duration::from_millis(u64::from(timeout_ms)))
+}
+
 fn sqlite_backup_worker_loop(
     src_path: PathBuf,
     tmp_path: PathBuf,
@@ -688,6 +696,11 @@ fn sqlite_backup_worker_loop(
             rusqlite::Connection::open_with_flags(&src_path, read_only).map_err(|err| {
                 internal_not_committed("rusqlite_open_backup_wal_observer", err.to_string())
             })?;
+        for conn in [&src, &observer] {
+            warm_sqlite_backup_schema(conn).map_err(|err| {
+                internal_not_committed("sqlite_backup_warm_schema", err.to_string())
+            })?;
+        }
         Ok((src, dst, observer))
     })();
 
@@ -4026,6 +4039,63 @@ mod sqlite_sync_tests {
         open_rusqlite_checkpoint_connection, open_rusqlite_writer_connection,
         open_sqlite_writer_connection,
     };
+
+    #[test]
+    fn schema_warm_returns_while_an_exclusive_writer_owns_the_file() {
+        let root =
+            std::env::temp_dir().join(crate::codec::new_prefixed_hex_id("schema-warm-").unwrap());
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("main.sqlite");
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE data(v INTEGER);
+             PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; INSERT INTO data VALUES(1);",
+            )
+            .unwrap();
+
+        let reader = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        reader.busy_timeout(Duration::ZERO).unwrap();
+        let blocked = reader
+            .query_row("SELECT 1 FROM main.sqlite_schema LIMIT 1", [], |_| Ok(()))
+            .unwrap_err();
+        assert_eq!(
+            blocked.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        let initial_timeout_ms = 30_000_u32;
+        reader
+            .busy_timeout(Duration::from_millis(initial_timeout_ms.into()))
+            .unwrap();
+
+        let (started, start) = mpsc::sync_channel(0);
+        let (finished, finish) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let result = warm_sqlite_backup_schema(&reader);
+            let restored: u32 = reader
+                .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+                .unwrap();
+            finished
+                .send((result, restored, reader.is_autocommit()))
+                .unwrap();
+        });
+        start.recv().unwrap();
+        let observed = finish.recv_timeout(Duration::from_secs(3));
+        // An unguarded schema read may still be waiting. Release its writer before joining.
+        drop(writer);
+        let joined = worker.join();
+        std::fs::remove_dir_all(root).unwrap();
+        joined.unwrap();
+        let (result, timeout_ms, autocommit) = observed.expect("schema warm waited for the writer");
+        result.unwrap();
+        assert_eq!(timeout_ms, initial_timeout_ms);
+        assert!(autocommit);
+    }
 
     #[tokio::test]
     async fn disk_writers_and_checkpoint_request_full_hardware_sync() {
