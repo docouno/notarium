@@ -1880,6 +1880,29 @@ async fn check_reopened_room_concurrency(
         allow_fenced_recovery: false,
     };
     let budget = make_budget();
+    // With the writer paused, neither deadline expiry nor dropping a pending
+    // caller may reopen the persisted room or its corresponding runtime fence.
+    let hold = store.acquire_writer_safe_point().await.unwrap();
+    let mut short = budget.clone();
+    short.remaining = Duration::from_millis(120);
+    let stalled = tokio::time::timeout(
+        Duration::from_secs(2),
+        store.open_collab_session(&short, open("expired")),
+    )
+    .await
+    .expect("room admission exceeded the caller budget")
+    .unwrap_err();
+    assert!(
+        matches!(stalled, PortError::DeadlineExceeded(ref f) if f.effect() == notarium_core::error::CommitEffect::NotCommitted),
+        "{stalled:?}"
+    );
+    let mut abandoned = Box::pin(store.open_collab_session(&budget, open("abandoned")));
+    tokio::select! {
+        result = &mut abandoned => panic!("unexpected room transition while paused: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(25)) => {}
+    }
+    drop(abandoned);
+    drop(hold);
     let (a, b) = tokio::join!(
         store.open_collab_session(&budget, open("writer-a")),
         store.open_collab_session(&budget, open("writer-b")),

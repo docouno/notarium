@@ -319,7 +319,12 @@ same example against an isolated prefix.
   every item has an idempotent identity. Link, memory append, schema publication and
   room carrier settlement share a caller deadline across lookup, payload
   preparation and writer acknowledgement. A purge interrupted after its
-  logical deletion retains its recovery record for retry. If a batch encounters an operational
+  logical deletion retains its recovery record for retry.
+  Auxiliary room transitions accept commit permission once, after their
+  transactional checks and immediately before SQL commit. Expiry, cancellation
+  or caller drop before that point rolls back the transition. After that point
+  the runtime owns commit and fence synchronization. A caller that loses the
+  reply reconciles the session or lease before issuing another command. If a batch encounters an operational
   error after any successful item, or an item's commit outcome is unknown,
   retry with the same command keys.
   The returned commit effect is `Unknown` in both cases.

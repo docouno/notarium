@@ -447,6 +447,8 @@ impl CanonicalStore {
         ctx: SpaceContext,
         raw: &str,
     ) -> Result<StagedChatBlob, PortError> {
+        let deadline =
+            crate::domain::common::CommandDeadline::start(&ctx.budget, "stage_chat_blob");
         let byte_len = raw.len() as u64;
         let attested = StagedChatBlob::attest_canonical(
             ctx.scope().space_id.clone(),
@@ -455,15 +457,19 @@ impl CanonicalStore {
             byte_len,
         )?;
 
-        let space_rec = self
-            .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        let space_rec = deadline
+            .prepare(&ctx.budget, || {
+                self.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+            })
             .await?;
         space_rec.scope.check(ctx.scope())?;
         authorize_chat_write_on_space(ctx.auth(), &space_rec.space)?;
 
         let prepared = PreparedBlobSource::prepare(raw.as_bytes(), self.blob_codec())?;
-        let ticket = self
-            .stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared)
+        let ticket = deadline
+            .prepare(&ctx.budget, || {
+                self.stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared)
+            })
             .await?;
 
         let scope = space_rec.scope.clone();
@@ -478,7 +484,11 @@ impl CanonicalStore {
         let publish_ticket = ticket.clone();
         let publisher = self.clone();
 
-        self.with_fenced_auxiliary_write_tx(|tx| {
+        let finish = move |()| {
+            drop(retained_ticket);
+            Ok(attested.with_lease(lease))
+        };
+        self.with_auxiliary_command(&ctx.budget, deadline, finish, move |tx| {
             Box::pin(async move {
                 let live_space = load_space_record(tx, &scope.space_id).await?;
                 live_space.scope.check(&scope)?;
@@ -510,10 +520,7 @@ impl CanonicalStore {
                 publisher.flush_pending_local_dirs_async(&dirs).await
             })
         })
-        .await?;
-
-        drop(retained_ticket);
-        Ok(attested.with_lease(lease))
+        .await
     }
 }
 
@@ -2161,6 +2168,7 @@ async fn create_chat_impl(
     ctx: SpaceContext,
     request: Mutation<CreateChat>,
 ) -> Result<Committed<ChatThread>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "create_chat");
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
     if request.input.owner != *ctx.auth().principal() {
@@ -2170,8 +2178,10 @@ async fn create_chat_impl(
         return Err(DomainError::validation(ValidationReason::InvalidRange).into());
     }
 
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -2387,8 +2397,7 @@ async fn create_chat_impl(
         }),
     };
 
-    let stored: StoredCommittedChatThreadV1 =
-        store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedChatThreadV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -2397,10 +2406,13 @@ async fn fork_chat_impl(
     ctx: SpaceContext,
     request: Mutation<ForkChat>,
 ) -> Result<Committed<ChatThread>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "fork_chat");
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_revision_only(&request.preconditions)?;
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -2607,8 +2619,7 @@ async fn fork_chat_impl(
         }),
     };
 
-    let stored: StoredCommittedChatThreadV1 =
-        store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedChatThreadV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -2617,6 +2628,7 @@ async fn append_chat_impl(
     ctx: SpaceContext,
     request: Mutation<AppendChat>,
 ) -> Result<Committed<ChatEntry>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "append_chat");
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_revision_only(&request.preconditions)?;
     if request.input.kind == ChatEntryKind::Redacted {
@@ -2642,8 +2654,10 @@ async fn append_chat_impl(
         }
     }
 
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -2695,27 +2709,33 @@ async fn append_chat_impl(
                 ),
             );
 
-    if let Some(mut replayed) = try_replay_completed_receipt::<StoredCommittedChatEntryV1>(
-        store,
-        &space_rec.scope,
-        &idemp,
-        Some(&ctx.budget),
-    )
-    .await?
+    if let Some(mut replayed) = deadline
+        .prepare(&ctx.budget, || {
+            try_replay_completed_receipt::<StoredCommittedChatEntryV1>(
+                store,
+                &space_rec.scope,
+                &idemp,
+                Some(&ctx.budget),
+            )
+        })
+        .await?
     {
         // Older receipts can retain a compaction detail whose checkpoint was
         // already invalidated. Resolve its current visibility before returning it.
         if matches!(replayed.value.kind, StoredChatEntryKindV1::Compaction) {
-            let branch = store
-                .read_chat(
-                    ctx.clone(),
-                    ChatRead {
-                        thread: replayed.value.thread.clone(),
-                        leaf: replayed.value.seq,
-                        before: None,
-                        max_entries: notarium_core::ports::PageLimit::new(1)?,
-                    },
-                )
+            let limit = notarium_core::ports::PageLimit::new(1)?;
+            let branch = deadline
+                .prepare(&ctx.budget, || {
+                    store.read_chat(
+                        ctx.clone(),
+                        ChatRead {
+                            thread: replayed.value.thread.clone(),
+                            leaf: replayed.value.seq,
+                            before: None,
+                            max_entries: limit,
+                        },
+                    )
+                })
                 .await?;
             if !branch.entries.first().is_some_and(|entry| {
                 entry.seq == replayed.value.seq && entry.kind == ChatEntryKind::Compaction
@@ -3005,7 +3025,7 @@ async fn append_chat_impl(
     };
 
     let mut stored: StoredCommittedChatEntryV1 =
-        store.submit_write_command(&ctx.budget, intent).await?;
+        deadline.submit(store, &ctx.budget, intent).await?;
     stored.value.tainted |= legacy_staged;
     Ok(stored.into_committed())
 }
@@ -3217,16 +3237,17 @@ async fn queue_chat_input_impl(
     mut ctx: SpaceContext,
     request: Mutation<PendingChatInput>,
 ) -> Result<QueueInputOutcome, PortError> {
-    let deadline =
-        crate::runtime::deadline_after(tokio::time::Instant::now(), ctx.budget.remaining);
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "queue_chat_input");
     validate_mutation_identity(&ctx, &request.identity)?;
     if request.input.sender != *ctx.auth().principal() {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
 
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -3257,28 +3278,33 @@ async fn queue_chat_input_impl(
     let check_thread = request.input.thread.clone();
     let check_id = request.input.id.clone();
     let base = request.input.queued_base_leaf;
-    let admission = store
-        .with_read_tx_budget(Some(&ctx.budget), |tx| {
-            Box::pin(async move {
-                check_queue_admission_tx(
-                    tx,
-                    &check_scope,
-                    &check_auth,
-                    &check_thread,
-                    &check_id,
-                    base,
-                )
-                .await
+    let admission = deadline
+        .prepare(&ctx.budget, || {
+            store.with_read_tx_budget(Some(&ctx.budget), |tx| {
+                Box::pin(async move {
+                    check_queue_admission_tx(
+                        tx,
+                        &check_scope,
+                        &check_auth,
+                        &check_thread,
+                        &check_id,
+                        base,
+                    )
+                    .await
+                })
             })
         })
         .await;
-    if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedQueuedInputV1>(
-        store,
-        &space_rec.scope,
-        &idemp,
-        Some(&ctx.budget),
-    )
-    .await?
+    if let Some(replayed) = deadline
+        .prepare(&ctx.budget, || {
+            try_replay_completed_receipt::<StoredCommittedQueuedInputV1>(
+                store,
+                &space_rec.scope,
+                &idemp,
+                Some(&ctx.budget),
+            )
+        })
+        .await?
     {
         return Ok(QueueInputOutcome::Queued(replayed.into_committed()));
     }
@@ -3295,7 +3321,7 @@ async fn queue_chat_input_impl(
         let ticket = tokio::select! {
             biased;
             () = ctx.budget.cancellation.cancelled() => return Err(crate::codec::cancelled_not_committed("queue_upload_cancelled", "queue upload cancelled before writer admission")),
-            () = tokio::time::sleep_until(deadline) => return Err(crate::codec::deadline_not_committed("queue_upload_deadline", "queue upload deadline before writer admission")),
+            () = tokio::time::sleep_until(deadline.at) => return Err(crate::codec::deadline_not_committed("queue_upload_deadline", "queue upload deadline before writer admission")),
             result = store.stage_blob_for_batch(&space_rec.scope, space_rec.active_epoch, &prepared) => result?,
         };
         Some((prepared.digest, ticket))
@@ -3488,9 +3514,9 @@ async fn queue_chat_input_impl(
         }),
     };
 
-    ctx.budget.remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    let result = store
-        .submit_write_command::<StoredCommittedQueuedInputV1>(&ctx.budget, intent)
+    ctx.budget.remaining = deadline.remaining(&ctx.budget)?;
+    let result = deadline
+        .submit::<StoredCommittedQueuedInputV1>(store, &ctx.budget, intent)
         .await;
     if let Some(discard) = discard {
         // A pending writer may still commit after an ambiguous response. Its ticket
@@ -3505,10 +3531,12 @@ async fn queue_chat_input_impl(
             ) => f.effect() == notarium_core::error::CommitEffect::NotCommitted,
         };
         if definitive {
-            let cleanup = discard.finish().await;
+            let cleanup = deadline.wait(&ctx.budget, || discard.finish()).await;
             // The accepted receipt is already durable. A failed cleanup of an unused
             // private upload stays recorded for recovery.
-            if result.is_err() {
+            if result.is_err()
+                && let Ok(cleanup) = cleanup
+            {
                 cleanup?;
             }
         }
@@ -3532,10 +3560,13 @@ async fn consume_chat_input_impl(
     ctx: SpaceContext,
     request: Mutation<ConsumePending>,
 ) -> Result<Committed<ConsumedPending>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "consume_chat_input");
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_revision_only(&request.preconditions)?;
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -3555,13 +3586,16 @@ async fn consume_chat_input_impl(
             )
             .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
-    if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedConsumedPendingV1>(
-        store,
-        &space_rec.scope,
-        &idemp,
-        Some(&ctx.budget),
-    )
-    .await?
+    if let Some(replayed) = deadline
+        .prepare(&ctx.budget, || {
+            try_replay_completed_receipt::<StoredCommittedConsumedPendingV1>(
+                store,
+                &space_rec.scope,
+                &idemp,
+                Some(&ctx.budget),
+            )
+        })
+        .await?
     {
         return Ok(replayed.into_committed());
     }
@@ -4042,7 +4076,7 @@ async fn consume_chat_input_impl(
     };
 
     let stored: StoredCommittedConsumedPendingV1 =
-        store.submit_write_command(&ctx.budget, intent).await?;
+        deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -4069,11 +4103,14 @@ async fn redact_chat_entry_impl(
     ctx: SpaceContext,
     request: Mutation<RedactChatEntry>,
 ) -> Result<Committed<RedactedChat>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "redact_chat_entry");
     let started = tokio::time::Instant::now();
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_revision_only(&request.preconditions)?;
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -4092,13 +4129,16 @@ async fn redact_chat_entry_impl(
         .with_known_base(&request.input.expected_thread_revision)
         .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
-    if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedRedactedChatV1>(
-        store,
-        &space_rec.scope,
-        &idemp,
-        Some(&ctx.budget),
-    )
-    .await?
+    if let Some(replayed) = deadline
+        .prepare(&ctx.budget, || {
+            try_replay_completed_receipt::<StoredCommittedRedactedChatV1>(
+                store,
+                &space_rec.scope,
+                &idemp,
+                Some(&ctx.budget),
+            )
+        })
+        .await?
     {
         let (committed, zero_refs) = replayed.into_committed();
         if !zero_refs.is_empty() {
@@ -4424,8 +4464,7 @@ async fn redact_chat_entry_impl(
         }),
     };
 
-    let stored: StoredCommittedRedactedChatV1 =
-        store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedRedactedChatV1 = deadline.submit(store, &ctx.budget, intent).await?;
     let (committed, _) = stored.into_committed();
     wait_for_redaction_gc(
         &ctx.budget,

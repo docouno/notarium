@@ -1,3 +1,4 @@
+mod auxiliary;
 mod lease;
 
 use std::{
@@ -744,7 +745,7 @@ impl CanonicalStore {
             .check_writer_epoch(&scope.space_id, active_epoch)?;
         let scope = scope.clone();
         let owner_id = owner_id.to_owned();
-        self.with_fenced_auxiliary_write_tx(|tx| {
+        self.with_write_tx(|tx| {
             Box::pin(async move {
                 crate::blobs::lock_and_check_space_tx(tx, &scope, active_epoch).await?;
                 release_owner_blob_refs_tx(tx, &scope.space_id, owner_kind, &owner_id).await
@@ -762,13 +763,6 @@ impl CanonicalStore {
             ));
         }
         Ok(())
-    }
-
-    pub(crate) async fn with_fenced_auxiliary_write_tx<F, T>(&self, op: F) -> Result<T, PortError>
-    where
-        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
-    {
-        self.with_write_tx(op).await
     }
 
     pub(crate) async fn with_write_tx<F, T>(&self, op: F) -> Result<T, PortError>

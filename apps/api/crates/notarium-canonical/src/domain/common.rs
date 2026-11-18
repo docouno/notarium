@@ -38,8 +38,9 @@ use crate::{
     writer::CommandIdentitySpec,
 };
 
+#[derive(Clone, Copy)]
 pub(crate) struct CommandDeadline {
-    pub(super) at: tokio::time::Instant,
+    pub(crate) at: tokio::time::Instant,
     operation: &'static str,
 }
 
@@ -70,7 +71,7 @@ impl CommandDeadline {
         )
     }
 
-    pub(super) fn remaining(
+    pub(crate) fn remaining(
         &self,
         budget: &notarium_core::ports::CallBudget,
     ) -> Result<std::time::Duration, PortError> {
@@ -108,7 +109,7 @@ impl CommandDeadline {
             .await
     }
 
-    pub(super) async fn wait<F: Future>(
+    pub(crate) async fn wait<F: Future>(
         &self,
         budget: &notarium_core::ports::CallBudget,
         operation: impl FnOnce() -> F,

@@ -498,15 +498,7 @@ impl CanonicalStore {
         budget: &CallBudget,
         spec: OpenCollabSession,
     ) -> Result<CollabSessionRecord, PortError> {
-        let store = self.clone();
-        let budget = budget.clone();
-        // The runtime fence must be synchronized even if the requester drops its
-        // future while the database is committing the room transition.
-        tokio::spawn(async move { open_collab_session_impl(&store, &budget, spec).await })
-            .await
-            .map_err(|err| {
-                crate::codec::unknown_commit_outcome("open_room_task", err.to_string())
-            })?
+        open_collab_session_impl(self, budget, spec).await
     }
 
     /// Appends an incremental Yrs update to `collab_update_log` under exact `(lease_epoch, lineage_epoch)`.
@@ -535,15 +527,7 @@ impl CanonicalStore {
         budget: &CallBudget,
         spec: CloseCollabSession,
     ) -> Result<CollabSessionRecord, PortError> {
-        let store = self.clone();
-        let budget = budget.clone();
-        // The runtime fence must be synchronized even if the requester drops its
-        // future while the database is committing the room transition.
-        tokio::spawn(async move { close_collab_session_impl(&store, &budget, spec).await })
-            .await
-            .map_err(|err| {
-                crate::codec::unknown_commit_outcome("close_room_task", err.to_string())
-            })?
+        close_collab_session_impl(self, budget, spec).await
     }
 }
 
@@ -1023,10 +1007,13 @@ async fn create_job_impl(
     ctx: SpaceContext,
     request: Mutation<ContentJobKind>,
 ) -> Result<Committed<ContentJob>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "create_job");
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -1225,7 +1212,7 @@ async fn create_job_impl(
         }),
     };
 
-    let stored: StoredCommittedJobV1 = store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedJobV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -1732,10 +1719,13 @@ async fn cancel_job_impl(
     ctx: SpaceContext,
     request: Mutation<CancelJob>,
 ) -> Result<Committed<ContentJob>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "cancel_job");
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
-    let space_rec = store
-        .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+    let space_rec = deadline
+        .prepare(&ctx.budget, || {
+            store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
+        })
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
@@ -1895,7 +1885,7 @@ async fn cancel_job_impl(
         }),
     };
 
-    let stored: StoredCommittedJobV1 = store.submit_write_command(&ctx.budget, intent).await?;
+    let stored: StoredCommittedJobV1 = deadline.submit(store, &ctx.budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -1915,6 +1905,7 @@ async fn claim_next_job_impl(
     worker_id: &str,
     lease_duration: Duration,
 ) -> Result<Option<ClaimedContentJob>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(budget, "claim_next_job");
     if worker_id.trim().is_empty() || lease_duration.is_zero() {
         return Err(DomainError::validation(ValidationReason::InvalidRange).into());
     }
@@ -1922,7 +1913,7 @@ async fn claim_next_job_impl(
     let scope_read = scope.clone();
 
     // Quick read precheck so empty queues do not allocate sequence numbers or write transactions.
-    let candidate_opt: Option<JobId> = store
+    let candidate_opt: Option<JobId> = deadline.prepare(budget, || store
         .with_read_tx_budget(Some(budget), |tx| {
             Box::pin(async move {
                 let srec = load_space_record(tx, &scope_read.space_id).await?;
@@ -1960,14 +1951,18 @@ async fn claim_next_job_impl(
                     None => Ok(None),
                 }
             })
-        })
+        }))
         .await?;
 
     if candidate_opt.is_none() {
         return Ok(None);
     }
 
-    let space_rec = store.read_space(&scope.space_id).await?;
+    let space_rec = deadline
+        .prepare(budget, || {
+            store.read_space_fast_or_pool(&scope.space_id, Some(budget))
+        })
+        .await?;
     space_rec.scope.check(scope)?;
     let scope_cl = space_rec.scope.clone();
     let worker_owned = worker_id.to_owned();
@@ -2111,8 +2106,8 @@ async fn claim_next_job_impl(
         }),
     };
 
-    match store
-        .submit_write_command::<StoredClaimedJobV1>(budget, intent)
+    match deadline
+        .submit::<StoredClaimedJobV1>(store, budget, intent)
         .await
     {
         Ok(claimed) => Ok(Some(ClaimedContentJob {
@@ -2143,12 +2138,7 @@ async fn heartbeat_job_lease_impl(
     completed_units: u64,
     total_units: Option<u64>,
 ) -> Result<ContentJob, PortError> {
-    if budget.cancellation.is_cancelled() {
-        return Err(crate::codec::cancelled_not_committed(
-            "job_heartbeat_cancelled",
-            "job heartbeat cancelled",
-        ));
-    }
+    let deadline = crate::domain::common::CommandDeadline::start(budget, "heartbeat_job_lease");
     let scope_cl = scope.clone();
     let jid = job_id.clone();
     let worker_owned = worker_id.to_owned();
@@ -2156,7 +2146,7 @@ async fn heartbeat_job_lease_impl(
 
     let inner = std::sync::Arc::clone(&store.inner);
     store
-        .with_fenced_auxiliary_write_tx(|tx| {
+        .with_auxiliary_command(budget, deadline, Ok, move |tx| {
             Box::pin(async move {
                 lock_peer_space(tx, &inner, &scope_cl).await?;
 
@@ -2233,7 +2223,12 @@ async fn complete_job_impl(
     expected_lease: LeaseEpoch,
     outcome: JobCompletionOutcome,
 ) -> Result<Committed<ContentJob>, PortError> {
-    let space_rec = store.read_space(&scope.space_id).await?;
+    let deadline = crate::domain::common::CommandDeadline::start(budget, "complete_job");
+    let space_rec = deadline
+        .prepare(budget, || {
+            store.read_space_fast_or_pool(&scope.space_id, Some(budget))
+        })
+        .await?;
     space_rec.scope.check(scope)?;
 
     let scope_cl = space_rec.scope.clone();
@@ -2405,7 +2400,7 @@ async fn complete_job_impl(
         }),
     };
 
-    let stored: StoredCommittedJobV1 = store.submit_write_command(budget, intent).await?;
+    let stored: StoredCommittedJobV1 = deadline.submit(store, budget, intent).await?;
     Ok(stored.into_committed())
 }
 
@@ -2668,12 +2663,7 @@ async fn open_collab_session_impl(
     budget: &CallBudget,
     spec: OpenCollabSession,
 ) -> Result<CollabSessionRecord, PortError> {
-    if budget.cancellation.is_cancelled() {
-        return Err(crate::codec::cancelled_not_committed(
-            "open_collab_cancelled",
-            "open_collab_session cancelled",
-        ));
-    }
+    let deadline = crate::domain::common::CommandDeadline::start(budget, "open_collab_session");
     if spec.owner_id.trim().is_empty() {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
@@ -2681,9 +2671,23 @@ async fn open_collab_session_impl(
     let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
 
     let inner = std::sync::Arc::clone(&store.inner);
-    let (res, mut fence_guard) = store
-        .with_fenced_auxiliary_write_tx(|tx| {
-            let spec_cl = spec.clone();
+    let note = spec.note.clone();
+    let scope = spec.scope.clone();
+    let sync_fence = move |(res, mut fence_guard): (
+        CollabSessionRecord,
+        tokio::sync::OwnedMutexGuard<notarium_core::ports::RoomFenceState>,
+    )| {
+        // Synchronize the already-locked `RoomFenceState` to `(res.lease_epoch, active = true)` before releasing!
+        let base = LeaseEpoch::new(res.lease_epoch.get().saturating_sub(1))?;
+        let mut synced = notarium_core::ports::RoomFenceState::new(note, scope, base);
+        synced.open()?;
+        *fence_guard = synced;
+
+        Ok(res)
+    };
+    store
+        .with_auxiliary_command(budget, deadline, sync_fence, move |tx| {
+            let spec_cl = spec;
             Box::pin(async move {
                 let srec = lock_peer_space(tx, &inner, &spec_cl.scope).await?;
                 let fence_guard = room_fences.lock_for_write(&spec_cl.scope, &spec_cl.note)?;
@@ -2869,16 +2873,7 @@ async fn open_collab_session_impl(
                 }, fence_guard))
             })
         })
-        .await?;
-
-    // Synchronize the already-locked `RoomFenceState` to `(res.lease_epoch, active = true)` before releasing!
-    let base = LeaseEpoch::new(res.lease_epoch.get().saturating_sub(1))?;
-    let mut synced = notarium_core::ports::RoomFenceState::new(spec.note, spec.scope, base);
-    synced.open()?;
-    *fence_guard = synced;
-    drop(fence_guard);
-
-    Ok(res)
+        .await
 }
 
 async fn append_collab_update_impl(
@@ -2886,19 +2881,14 @@ async fn append_collab_update_impl(
     budget: &CallBudget,
     spec: AppendCollabUpdate,
 ) -> Result<u64, PortError> {
-    if budget.cancellation.is_cancelled() {
-        return Err(crate::codec::cancelled_not_committed(
-            "append_collab_cancelled",
-            "append_collab_update cancelled",
-        ));
-    }
+    let deadline = crate::domain::common::CommandDeadline::start(budget, "append_collab_update");
     if spec.update_seq == 0 || spec.update_seq > i64::MAX as u64 {
         return Err(DomainError::validation(ValidationReason::InvalidRange).into());
     }
 
     let inner = std::sync::Arc::clone(&store.inner);
     store
-        .with_fenced_auxiliary_write_tx(|tx| {
+        .with_auxiliary_command(budget, deadline, Ok, move |tx| {
             Box::pin(async move {
                 let srec = lock_peer_space(tx, &inner, &spec.scope).await?;
                 if is_note_purge_fenced_tx(tx, &srec.scope.space_id, spec.note.as_str()).await? {
@@ -3195,10 +3185,13 @@ async fn checkpoint_collab_session_impl(
     budget: &CallBudget,
     spec: CheckpointCollabSession,
 ) -> Result<CollabSessionRecord, PortError> {
+    let deadline =
+        crate::domain::common::CommandDeadline::start(budget, "checkpoint_collab_session");
     if let Some(settlement) = spec.carrier_settlement {
         return settle_and_update_collab_session(
             store,
             budget,
+            deadline,
             spec.scope,
             spec.note,
             Some(spec.owner_id),
@@ -3212,16 +3205,9 @@ async fn checkpoint_collab_session_impl(
         .await;
     }
 
-    if budget.cancellation.is_cancelled() {
-        return Err(crate::codec::cancelled_not_committed(
-            "checkpoint_collab_cancelled",
-            "checkpoint_collab_session cancelled",
-        ));
-    }
-
     let inner = std::sync::Arc::clone(&store.inner);
     store
-        .with_fenced_auxiliary_write_tx(|tx| {
+        .with_auxiliary_command(budget, deadline, Ok, move |tx| {
             Box::pin(async move {
                 let srec = lock_peer_space(tx, &inner, &spec.scope).await?;
                 if is_note_purge_fenced_tx(tx, &srec.scope.space_id, spec.note.as_str()).await? {
@@ -3305,6 +3291,7 @@ async fn close_collab_session_impl(
     budget: &CallBudget,
     spec: CloseCollabSession,
 ) -> Result<CollabSessionRecord, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(budget, "close_collab_session");
     if spec.final_yrs_snapshot.is_none() && spec.compacted_through_update_seq.is_some() {
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     }
@@ -3312,6 +3299,7 @@ async fn close_collab_session_impl(
         return settle_and_update_collab_session(
             store,
             budget,
+            deadline,
             spec.scope,
             spec.note,
             spec.owner_id,
@@ -3325,19 +3313,22 @@ async fn close_collab_session_impl(
         .await;
     }
 
-    if budget.cancellation.is_cancelled() {
-        return Err(crate::codec::cancelled_not_committed(
-            "close_collab_cancelled",
-            "close_collab_session cancelled",
-        ));
-    }
-
     let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
 
     let inner = std::sync::Arc::clone(&store.inner);
-    let (res, mut fence_guard) = store
-        .with_fenced_auxiliary_write_tx(|tx| {
-            let spec_cl = spec.clone();
+    let note = spec.note.clone();
+    let scope = spec.scope.clone();
+    let sync_fence = move |(res, mut fence_guard): (
+        CollabSessionRecord,
+        tokio::sync::OwnedMutexGuard<notarium_core::ports::RoomFenceState>,
+    )| {
+        *fence_guard = notarium_core::ports::RoomFenceState::new(note, scope, res.lease_epoch);
+
+        Ok(res)
+    };
+    store
+        .with_auxiliary_command(budget, deadline, sync_fence, move |tx| {
+            let spec_cl = spec;
             Box::pin(async move {
                 let srec = lock_peer_space(tx, &inner, &spec_cl.scope).await?;
                 if is_note_purge_fenced_tx(tx, &srec.scope.space_id, spec_cl.note.as_str()).await? {
@@ -3435,12 +3426,7 @@ async fn close_collab_session_impl(
                 Ok((cur, fence_guard))
             })
         })
-        .await?;
-
-    *fence_guard =
-        notarium_core::ports::RoomFenceState::new(spec.note, spec.scope, res.lease_epoch);
-    drop(fence_guard);
-    Ok(res)
+        .await
 }
 
 fn validate_settlement_room(
@@ -3472,6 +3458,7 @@ fn validate_settlement_room(
 async fn settle_and_update_collab_session(
     store: &CanonicalStore,
     budget: &CallBudget,
+    deadline: crate::domain::common::CommandDeadline,
     scope: HistoryScope,
     note: NoteId,
     expected_owner: Option<String>,
@@ -3482,8 +3469,6 @@ async fn settle_and_update_collab_session(
     settlement: CollabCarrierSettlement,
     close_room: bool,
 ) -> Result<CollabSessionRecord, PortError> {
-    let deadline =
-        crate::domain::common::CommandDeadline::start(budget, "collab_carrier_settlement");
     deadline
         .prepare(budget, || store.ensure_blob_backend_ready())
         .await?;
