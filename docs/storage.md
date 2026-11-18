@@ -39,7 +39,8 @@ purge closure before returning `(CanonicalStore, CanonicalRuntime)`.
 If recovery fails, opening cancels its workers and releases local ownership
 before returning the error. Dropping an opening future schedules the same
 shutdown on its Tokio runtime. The DataRoot stays locked until the workers and
-connections close. The next opener resumes any durable recovery still pending.
+connections close. Once shutdown starts, the store completes this cleanup even
+if the caller stops waiting. The next opener resumes pending durable recovery.
 The Tokio runtime that opens the store owns PostgreSQL pool returns, native
 SQLite blocking reads and interrupted SQLite snapshot cleanup. Shutdown closes
 native reader admission and waits for outstanding connections before releasing
@@ -367,7 +368,9 @@ same example against an isolated prefix.
   one read interval for checkout and SQL. The active snapshot retains its own cap.
   Reader admission reopens when the checkpoint finishes or the reset budget
   expires. A slow checkpoint retains its writer connection and safe point until
-  SQLite returns. SQLite coordinates new readers with the active checkpoint.
+  SQLite returns. The store finishes an admitted manual checkpoint even if the
+  requesting task is cancelled. SQLite coordinates new readers with the
+  active checkpoint.
   `WalTelemetrySnapshot.max_reset_reader_gate_ns` records the actual admission
   pause and `reset_gate_overruns` counts closures over budget.
 - **Hierarchy, boards and semantic rollback:** `MoveFolder` updates only the

@@ -124,7 +124,7 @@ pub struct SqliteWalCoordinator {
     gate_open_notify: Notify,
     drained_notify: Notify,
     counters: WalAtomicCounters,
-    maintenance_lock: Mutex<()>,
+    maintenance_lock: Arc<Mutex<()>>,
     passive_conn: Mutex<Option<rusqlite::Connection>>,
     #[cfg(test)]
     checkpoint_pause: StdMutex<Option<CheckpointPause>>,
@@ -406,7 +406,7 @@ impl SqliteWalCoordinator {
                 wal_bytes: AtomicU64::new(initial_wal_bytes),
                 ..WalAtomicCounters::default()
             },
-            maintenance_lock: Mutex::new(()),
+            maintenance_lock: Arc::new(Mutex::new(())),
             passive_conn: Mutex::new(None),
             #[cfg(test)]
             checkpoint_pause: StdMutex::new(None),
@@ -915,6 +915,29 @@ impl SqliteWalCoordinator {
         force_reset: bool,
     ) {
         let _maint_guard = self.maintenance_lock.lock().await;
+        self.maintain_locked(inner, force_reset).await;
+    }
+
+    pub(crate) async fn run_requested_tick(
+        self: &Arc<Self>,
+        inner: &Arc<CanonicalInner>,
+        force_reset: bool,
+    ) {
+        // Waiting callers own no work. After admission the store owns both the
+        // checkpoint and its mutex, including when the caller stops waiting.
+        let guard = Arc::clone(&self.maintenance_lock).lock_owned().await;
+        let coord = Arc::clone(self);
+        let inner = Arc::clone(inner);
+        let job = self.storage_executor.spawn(async move {
+            let _guard = guard;
+            coord.maintain_locked(&inner, force_reset).await;
+        });
+        if let Err(error) = job.await {
+            tracing::error!(?error, "SQLite maintenance task did not finish");
+        }
+    }
+
+    async fn maintain_locked(&self, inner: &Arc<CanonicalInner>, force_reset: bool) {
         if self.bg_stop.load(Ordering::SeqCst) || inner.shutting_down.load(Ordering::SeqCst) {
             return;
         }
@@ -1820,6 +1843,82 @@ mod tests {
         assert!(wal.telemetry().reset_successes > before);
         assert_eq!(wal.telemetry().leaked_sqlite_busy_errors, 0);
         runtime.shutdown().await.unwrap();
+        fs::remove_dir_all(path).unwrap();
+    }
+    async fn lifecycle_fixture() -> (crate::CanonicalStore, CanonicalRuntime, PathBuf) {
+        let id = crate::codec::csprng_16().unwrap();
+        let path = std::env::temp_dir().join(format!("notarium-wal-owner-{}", hex::encode(id)));
+        let config =
+            CanonicalConfig::local_default(InstallationId::from_bytes(id), DataRoot::new(&path));
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        (store, runtime, path)
+    }
+
+    #[tokio::test]
+    async fn cancelled_lifecycle_request_keeps_the_checkpoint_writer() {
+        let (store, runtime, path) = lifecycle_fixture().await;
+        let wal = store.inner.wal_coord.get().unwrap();
+        let (started, checkpoint_started) = tokio::sync::oneshot::channel();
+        let (release, checkpoint_release) = std::sync::mpsc::channel();
+        *wal.checkpoint_pause.lock().unwrap() = Some(CheckpointPause {
+            started,
+            release: checkpoint_release,
+        });
+        let client = store.clone();
+        let request = tokio::spawn(async move { client.run_wal_maintenance_now(true).await });
+        tokio::time::timeout(Duration::from_secs(2), checkpoint_started)
+            .await
+            .unwrap()
+            .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let SqlDriverState::Sqlite { writer, .. } = &store.inner.sql else {
+            unreachable!()
+        };
+        let still_owned = writer.try_lock().is_err();
+        release.send(()).unwrap();
+        assert!(
+            still_owned,
+            "leaving a maintenance request must retain the writer through I/O"
+        );
+        let guard = tokio::time::timeout(Duration::from_secs(2), writer.lock())
+            .await
+            .unwrap();
+        assert!(guard.as_ref().unwrap().rusqlite_conn.is_some());
+        drop(guard);
+        assert!(wal.telemetry().reset_successes > 0);
+        runtime.shutdown().await.unwrap();
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_lifecycle_shutdown_waiter_still_releases_the_root() {
+        let (store, runtime, path) = lifecycle_fixture().await;
+        let wal = store.inner.wal_coord.get().unwrap();
+        let maintenance = wal.maintenance_lock.lock().await;
+        let stopping = tokio::spawn(runtime.shutdown());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !wal.gate.lock().unwrap().shutting_down {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must reach the active maintenance");
+        stopping.abort();
+        assert!(stopping.await.unwrap_err().is_cancelled());
+        assert!(!store.inner.owner_locks.lock().await.is_empty());
+        drop(maintenance);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !store.inner.owner_locks.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the store must complete an already-started shutdown without its waiter");
+        let (_store, next) = CanonicalRuntime::open(store.inner.config.clone())
+            .await
+            .unwrap();
+        next.shutdown().await.unwrap();
         fs::remove_dir_all(path).unwrap();
     }
 }

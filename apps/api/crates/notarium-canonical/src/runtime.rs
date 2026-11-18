@@ -248,10 +248,7 @@ struct OpeningRuntime(Option<CanonicalRuntime>);
 
 impl OpeningRuntime {
     fn stop(&mut self) -> Option<tokio::task::JoinHandle<Result<(), PortError>>> {
-        let runtime = self.0.take()?;
-        runtime.inner.backup_shutdown.cancel();
-        let executor = runtime.inner.backup_executor.clone();
-        Some(executor.spawn(Box::pin(runtime.shutdown())))
+        self.0.take().map(CanonicalRuntime::start_shutdown)
     }
 }
 
@@ -525,8 +522,19 @@ impl CanonicalRuntime {
         &self.inner.config.installation_id
     }
 
-    pub async fn shutdown(self) -> Result<(), PortError> {
+    fn start_shutdown(self) -> tokio::task::JoinHandle<Result<(), PortError>> {
         self.inner.backup_shutdown.cancel();
+        let executor = self.inner.backup_executor.clone();
+        executor.spawn(Box::pin(self.drain_shutdown()))
+    }
+
+    pub async fn shutdown(self) -> Result<(), PortError> {
+        self.start_shutdown()
+            .await
+            .map_err(|error| internal_not_committed("canonical_shutdown_join", error.to_string()))?
+    }
+
+    async fn drain_shutdown(self) -> Result<(), PortError> {
         let pending_backup_cleanups: Vec<tokio::task::JoinHandle<()>> = {
             let mut guard = self
                 .inner
@@ -839,7 +847,7 @@ impl CanonicalStore {
 
     pub async fn run_wal_maintenance_now(&self, force_reset: bool) {
         if let Some(wal) = self.inner.wal_coord.get() {
-            wal.run_maintenance_tick(&self.inner, force_reset).await;
+            wal.run_requested_tick(&self.inner, force_reset).await;
         }
     }
 
