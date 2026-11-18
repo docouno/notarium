@@ -37,6 +37,86 @@ fn budget() -> CallBudget {
 }
 
 #[tokio::test]
+async fn edit_preparation_restarts_one_expired_snapshot_within_the_original_budget() {
+    let budget = budget();
+    let deadline = CommandDeadline::start(&budget, "edit_note");
+    let attempts = std::cell::Cell::new(0);
+    let (store, runtime, pool, path) = fixture().await;
+    let wal = store.inner.wal_coord.get().unwrap();
+    let result = prepare_note_edit_read(deadline, &budget, || async {
+        attempts.set(attempts.get() + 1);
+        let mut current = budget.clone();
+        current.remaining = deadline.remaining(&budget)?;
+        let expire = attempts.get() == 1;
+        pool.with_read_conn(wal, Some(&current), move |conn| {
+            if expire {
+                // This read runs until the ordinary SQLite VM progress deadline.
+                conn.query_row("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n) SELECT sum(i) FROM n", [], |row| row.get::<_, i64>(0))
+            } else {
+                conn.query_row("SELECT 17", [], |row| row.get::<_, i64>(0))
+            }
+            .map_err(|err| map_interrupt_or_internal(err, "edit_preparation_read"))
+        })
+        .await
+    })
+    .await;
+    assert_eq!(result.unwrap(), 17);
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(wal.telemetry().timed_out_reads, 1);
+    assert_eq!(wal.telemetry().active_readers, 0);
+    runtime.shutdown().await.unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn edit_preparation_preserves_terminal_errors_and_limits_attempts() {
+    for mode in ["repeated_timeout", "domain_error", "cancelled", "expired"] {
+        let mut budget = budget();
+        if mode == "expired" {
+            budget.remaining = Duration::ZERO;
+        }
+        let deadline = CommandDeadline::start(&budget, "edit_note");
+        let attempts = std::cell::Cell::new(0);
+        let result: Result<(), _> = prepare_note_edit_read(deadline, &budget, || async {
+            attempts.set(attempts.get() + 1);
+            if mode == "domain_error" {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            if mode == "cancelled" {
+                budget.cancellation.cancel();
+            }
+            Err(deadline_not_committed(
+                "test_read_timeout",
+                "snapshot expired",
+            ))
+        })
+        .await;
+        match mode {
+            "repeated_timeout" => {
+                assert!(matches!(result, Err(PortError::DeadlineExceeded(_))));
+                assert_eq!(attempts.get(), 2);
+            }
+            "domain_error" => {
+                assert!(matches!(
+                    result,
+                    Err(PortError::Domain(DomainError::ResourceNotFound))
+                ));
+                assert_eq!(attempts.get(), 1);
+            }
+            "cancelled" => {
+                assert!(matches!(result, Err(PortError::Cancelled(_))));
+                assert_eq!(attempts.get(), 1);
+            }
+            "expired" => {
+                assert!(matches!(result, Err(PortError::DeadlineExceeded(_))));
+                assert_eq!(attempts.get(), 0);
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
 async fn cancelled_post_cannot_interrupt_the_next_checkout() {
     let (store, runtime, pool, path) = fixture().await;
     let wal = store.inner.wal_coord.get().unwrap();

@@ -14,6 +14,7 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::{ContentDigest, LeaseEpoch, SpaceId, SpaceSeq},
     model::HistoryScope,
+    ports::CallBudget,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -1480,12 +1481,27 @@ impl crate::CanonicalStore {
         scope: &HistoryScope,
         digest: ContentDigest,
     ) -> Result<Vec<u8>, PortError> {
+        self.read_verified_blob_with_budget(scope, digest, None)
+            .await
+    }
+
+    pub(crate) async fn read_verified_blob_with_budget(
+        &self,
+        scope: &HistoryScope,
+        digest: ContentDigest,
+        budget: Option<&CallBudget>,
+    ) -> Result<Vec<u8>, PortError> {
         match &self.inner.blobs {
             BlobBackendDriver::Local(local) => {
+                let started = tokio::time::Instant::now();
                 let guard = local.acquire_shared_guard(&scope.space_id, digest).await;
+                let budget = budget.cloned().map(|mut budget| {
+                    budget.remaining = budget.remaining.saturating_sub(started.elapsed());
+                    budget
+                });
                 let scope_cl = scope.clone();
                 let meta = self
-                    .with_read_tx(|tx| {
+                    .with_read_tx_budget(budget.as_ref(), |tx| {
                         Box::pin(async move {
                             let space_rec = load_space_record(tx, &scope_cl.space_id).await?;
                             space_rec.scope.check(&scope_cl)?;
@@ -1506,7 +1522,7 @@ impl crate::CanonicalStore {
             BlobBackendDriver::S3(s3) => {
                 let scope_cl = scope.clone();
                 let (meta, parts) = self
-                    .with_read_tx(|tx| {
+                    .with_read_tx_budget(budget, |tx| {
                         Box::pin(async move {
                             let space_rec = load_space_record(tx, &scope_cl.space_id).await?;
                             space_rec.scope.check(&scope_cl)?;

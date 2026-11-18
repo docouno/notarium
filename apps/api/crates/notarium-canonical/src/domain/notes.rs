@@ -820,6 +820,8 @@ pub(crate) async fn edit_note_impl(
     mut ctx: SpaceContext,
     request: Mutation<EditNote>,
 ) -> Result<Committed<NoteRevision>, PortError> {
+    use crate::sqlite_fast::EditBaseRead;
+
     let budget = ctx.budget.clone();
     let deadline = super::common::CommandDeadline::start(&budget, "edit_note");
     let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
@@ -833,14 +835,17 @@ pub(crate) async fn edit_note_impl(
 
     ctx.budget.remaining = deadline.remaining(&budget)?;
     let phase1 = if store.is_sqlite_local() {
-        crate::sqlite_fast::edit_note_phase1_sqlite_local(
-            store,
-            &ctx,
-            &request.input.note,
-            &request.preconditions,
-            request.input.plan.base_content_hash,
-            &idemp,
-        )
+        crate::sqlite_fast::prepare_note_edit_read(deadline, &budget, || {
+            crate::sqlite_fast::edit_note_phase1_sqlite_local(
+                store,
+                &ctx,
+                deadline,
+                &request.input.note,
+                &request.preconditions,
+                request.input.plan.base_content_hash,
+                &idemp,
+            )
+        })
         .await
     } else {
         let scope_p1 = ctx.scope().clone();
@@ -929,8 +934,8 @@ pub(crate) async fn edit_note_impl(
                         base_head: head,
                         base_anc: None,
                         base_digest,
-                        preloaded_base_carrier: None,
-                        fast_local_read,
+                        base_read: fast_local_read
+                            .map_or(EditBaseRead::Lookup, EditBaseRead::Guarded),
                         phase1_receipt_checked_gen: None,
                     })
                 })
@@ -954,64 +959,55 @@ pub(crate) async fn edit_note_impl(
         other => other?,
     };
 
-    let (
-        space_rec,
-        base_head,
-        base_anc,
-        base_digest,
-        preloaded_base_carrier,
-        fast_local_read,
-        phase1_receipt_checked_gen,
-    ) = match phase1 {
-        crate::sqlite_fast::EditPhase1Read::Replayed(replayed) => {
-            return Ok(replayed.into_committed());
-        }
-        crate::sqlite_fast::EditPhase1Read::Proceed {
-            space_rec,
-            base_head,
-            base_anc,
-            base_digest,
-            preloaded_base_carrier,
-            fast_local_read,
-            phase1_receipt_checked_gen,
-        } => (
-            space_rec,
-            base_head,
-            base_anc,
-            base_digest,
-            preloaded_base_carrier,
-            fast_local_read,
-            phase1_receipt_checked_gen,
-        ),
-    };
+    let (space_rec, base_head, base_anc, base_digest, base_read, phase1_receipt_checked_gen) =
+        match phase1 {
+            crate::sqlite_fast::EditPhase1Read::Replayed(replayed) => {
+                return Ok(replayed.into_committed());
+            }
+            crate::sqlite_fast::EditPhase1Read::Proceed {
+                space_rec,
+                base_head,
+                base_anc,
+                base_digest,
+                base_read,
+                phase1_receipt_checked_gen,
+            } => (
+                space_rec,
+                base_head,
+                base_anc,
+                base_digest,
+                base_read,
+                phase1_receipt_checked_gen,
+            ),
+        };
 
-    let base_carrier = match preloaded_base_carrier {
-        Some(carrier) => carrier,
-        None => {
-            let raw_bytes = match fast_local_read {
-                Some(plan) if base_head.byte_size <= 64 * 1024 => plan.read_verified()?,
-                Some(plan) => {
-                    deadline
-                        .wait(&budget, || plan.read_verified_async())
-                        .await??
-                }
-                None => {
-                    deadline
-                        .wait(&budget, || {
-                            store.read_verified_blob(&space_rec.scope, base_digest)
-                        })
-                        .await??
-                }
-            };
-            deadline.remaining(&budget)?;
-            String::from_utf8(raw_bytes).map_err(|_| {
-                internal_not_committed(
-                    "corrupt_note_utf8",
-                    "canonical note carrier is not valid UTF-8",
-                )
-            })?
+    let raw_bytes = match base_read {
+        EditBaseRead::Verified(bytes) => bytes,
+        EditBaseRead::Guarded(plan) if base_head.byte_size <= 64 * 1024 => plan.read_verified()?,
+        EditBaseRead::Guarded(plan) => {
+            deadline
+                .prepare(&budget, || plan.read_verified_async())
+                .await?
+        }
+        EditBaseRead::Lookup => {
+            deadline
+                .prepare(&budget, || {
+                    store.read_verified_blob_with_budget(
+                        &space_rec.scope,
+                        base_digest,
+                        Some(&ctx.budget),
+                    )
+                })
+                .await?
         }
     };
+    deadline.remaining(&budget)?;
+    let base_carrier = String::from_utf8(raw_bytes).map_err(|_| {
+        internal_not_committed(
+            "corrupt_note_utf8",
+            "canonical note carrier is not valid UTF-8",
+        )
+    })?;
 
     let new_carrier = notarium_syntax::patch::apply(&base_carrier, &request.input.plan)?;
     let preparsed_hdr = if base_head.doc_class != DocClass::EncryptedNote {

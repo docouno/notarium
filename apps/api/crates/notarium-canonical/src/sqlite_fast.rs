@@ -53,9 +53,9 @@ use crate::{
     domain::{
         RoomFenceTable,
         common::{
-            CurrentSpaceSchema, FolderAncestryFacts, MAX_FOLDER_DEPTH, NoteHeadRow,
-            NoteRoomDirectWriteState, StoredCommittedNoteRevV1, StoredCommittedRollbackV1,
-            extract_agent_run_from_auth, note_rank_version_digest,
+            CommandDeadline, CurrentSpaceSchema, FolderAncestryFacts, MAX_FOLDER_DEPTH,
+            NoteHeadRow, NoteRoomDirectWriteState, StoredCommittedNoteRevV1,
+            StoredCommittedRollbackV1, extract_agent_run_from_auth, note_rank_version_digest,
         },
         notes::{
             EvaluatedFields, PreparedCarrierInfo, build_carrier_replacement_intent,
@@ -424,6 +424,12 @@ fn record_rusqlite_busy(wal: &SqliteWalCoordinator, err: &rusqlite::Error) {
     wal.record_busy_if_any(&err.to_string());
 }
 
+pub(crate) enum EditBaseRead {
+    Lookup,
+    Guarded(FastLocalBlobReadPlan),
+    Verified(Vec<u8>),
+}
+
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum EditPhase1Read {
     Replayed(StoredCommittedNoteRevV1),
@@ -432,16 +438,30 @@ pub(crate) enum EditPhase1Read {
         base_head: NoteHeadRow,
         base_anc: Option<FolderAncestryFacts>,
         base_digest: ContentDigest,
-        preloaded_base_carrier: Option<String>,
-        fast_local_read: Option<FastLocalBlobReadPlan>,
+        base_read: EditBaseRead,
         phase1_receipt_checked_gen: Option<u64>,
     },
+}
+
+/// A single short SQLite snapshot can expire while the edit still has time.
+/// Re-read all preconditions once, before staging a blob or admitting a write.
+pub(crate) async fn prepare_note_edit_read<T, F: Future<Output = Result<T, PortError>>>(
+    deadline: CommandDeadline,
+    budget: &CallBudget,
+    mut read: impl FnMut() -> F,
+) -> Result<T, PortError> {
+    let first = deadline.prepare(budget, &mut read).await;
+    if matches!(first, Err(PortError::DeadlineExceeded(_))) {
+        return deadline.prepare(budget, read).await;
+    }
+    first
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn edit_note_phase1_sqlite_local(
     store: &CanonicalStore,
     ctx: &SpaceContext,
+    deadline: CommandDeadline,
     note_id: &NoteId,
     preconditions: &Preconditions,
     expected_base_hash: ContentDigest,
@@ -480,8 +500,10 @@ pub(crate) async fn edit_note_phase1_sqlite_local(
         .sqlite_has_any_collab_sessions
         .load(Ordering::Acquire);
 
-    fast_read_pool
-        .with_read_conn(wal, Some(&ctx.budget), move |conn| {
+    let mut budget = ctx.budget.clone();
+    budget.remaining = deadline.remaining(&budget)?;
+    let mut phase = fast_read_pool
+        .with_read_conn(wal, Some(&budget), move |conn| {
             let srec = load_space_record_rusqlite_Read(conn, &scope.space_id, &wal_for_err)?;
             srec.scope.check(&scope)?;
 
@@ -544,10 +566,10 @@ pub(crate) async fn edit_note_phase1_sqlite_local(
                 return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
             }
 
-            let fast_local_read = if let Some(guard) =
+            let base_read = if let Some(guard) =
                 local_store.try_acquire_shared_guard(&srec.scope.space_id, base_digest)
             {
-                Some(FastLocalBlobReadPlan::new(
+                EditBaseRead::Guarded(FastLocalBlobReadPlan::new(
                     Arc::clone(&local_store),
                     srec.scope.space_id.clone(),
                     base_digest,
@@ -555,7 +577,7 @@ pub(crate) async fn edit_note_phase1_sqlite_local(
                     guard,
                 ))
             } else {
-                None
+                EditBaseRead::Lookup
             };
 
             Ok(EditPhase1Read::Proceed {
@@ -563,12 +585,27 @@ pub(crate) async fn edit_note_phase1_sqlite_local(
                 base_head: head,
                 base_anc: Some(anc),
                 base_digest,
-                preloaded_base_carrier: None,
-                fast_local_read,
+                base_read,
                 phase1_receipt_checked_gen: Some(writer_gen_before),
             })
         })
-        .await
+        .await?;
+    if let EditPhase1Read::Proceed {
+        space_rec,
+        base_digest,
+        base_read,
+        ..
+    } = &mut phase
+        && matches!(base_read, EditBaseRead::Lookup)
+    {
+        budget.remaining = deadline.remaining(&budget)?;
+        *base_read = EditBaseRead::Verified(
+            store
+                .read_verified_blob_with_budget(&space_rec.scope, *base_digest, Some(&budget))
+                .await?,
+        );
+    }
+    Ok(phase)
 }
 
 pub(crate) async fn get_note_sqlite_local_fast(

@@ -1598,7 +1598,32 @@ mod tests {
             .unwrap();
             assert!(matches!(one, Err(PortError::DeadlineExceeded(_))));
             assert!(matches!(two, Err(PortError::DeadlineExceeded(_))));
-            drop((sqlx_slot, native_slots));
+            // A budgeted blob lookup can wait for checkout beyond one snapshot limit.
+            // Once admitted, it reaches the database and observes the real missing Space.
+            let caller = CallBudget {
+                remaining: Duration::from_secs(2),
+                ..short.clone()
+            };
+            let scope = notarium_core::model::HistoryScope {
+                space_id: notarium_core::ids::SpaceId::from_bytes(id),
+                incarnation: notarium_core::ids::HistoryIncarnation::from_bytes(id),
+            };
+            let lookup = store.read_verified_blob_with_budget(
+                &scope,
+                notarium_core::ids::ContentDigest::from_bytes([33; 32]),
+                Some(&caller),
+            );
+            let release = async {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                drop((sqlx_slot, native_slots));
+            };
+            let (result, ()) = tokio::join!(lookup, release);
+            assert!(matches!(
+                result,
+                Err(PortError::Domain(
+                    notarium_core::DomainError::ResourceNotFound
+                ))
+            ));
 
             wal.close_reader_gate();
             let (one, two) = tokio::join!(
