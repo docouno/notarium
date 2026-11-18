@@ -40,9 +40,11 @@ If recovery fails, opening cancels its workers and releases local ownership
 before returning the error. Dropping an opening future schedules the same
 shutdown on its Tokio runtime. The DataRoot stays locked until the workers and
 connections close. The next opener resumes any durable recovery still pending.
-The Tokio runtime that opens the store owns PostgreSQL pool returns and
-interrupted SQLite snapshot cleanup. A cancelled SQLite reader holds its WAL
-registration and pool permit through connection close. Keep the runtime
+The Tokio runtime that opens the store owns PostgreSQL pool returns, native
+SQLite blocking reads and interrupted SQLite snapshot cleanup. Shutdown closes
+native reader admission and waits for outstanding connections before releasing
+the DataRoot lock. A cancelled SQLite reader holds its WAL registration and
+pool permit through connection close. Keep the runtime
 running through shutdown. Callers on other runtimes can release their
 handles or stop their runtimes while the store continues serving requests.
 `CanonicalStore` is a cloneable handle that never exposes raw SQL pools or

@@ -277,3 +277,117 @@ fn worker_queue_and_post_use_the_caller_deadline() {
         std::fs::remove_dir_all(path).unwrap();
     });
 }
+
+#[test]
+fn native_sqlite_checkout_finishes_before_owner_handoff() {
+    use tokio::runtime::Builder;
+
+    let owner = Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (store, runtime, _, path) = owner.block_on(fixture());
+    let SqlDriverState::Sqlite { fast_read_pool, .. } = &store.inner.sql else {
+        unreachable!()
+    };
+    let wal = store.inner.wal_coord.get().unwrap();
+    let (occupied, ready) = mpsc::channel();
+    let (resume_client, blocked_client) = mpsc::channel();
+    let client_worker = client.spawn_blocking(move || {
+        occupied.send(()).unwrap();
+        let _ = blocked_client.recv_timeout(Duration::from_secs(10));
+    });
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let (started, reading) = mpsc::channel();
+    let (finish, finish_read) = mpsc::channel();
+    let mut read = Box::pin(fast_read_pool.with_read_conn(wal, None, move |conn| {
+        let count = conn
+            .query_row("SELECT count(*) FROM schema_meta", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        started.send(count).unwrap();
+        let _ = finish_read.recv_timeout(Duration::from_secs(5));
+        Ok(count)
+    }));
+    client.block_on(async {
+        tokio::select! {
+            biased;
+            result = &mut read => panic!("read returned before release: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+    });
+    assert_eq!(
+        reading
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a native checkout must progress on the storage executor"),
+        1
+    );
+    let stopping = owner.spawn(runtime.shutdown());
+    owner.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fast_read_pool.sem.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown must close native admission");
+    });
+    assert!(!stopping.is_finished());
+    assert!(
+        owner
+            .block_on(CanonicalRuntime::open(store.inner.config.clone()))
+            .is_err()
+    );
+    finish.send(()).unwrap();
+    owner.block_on(stopping).unwrap().unwrap();
+    assert_eq!(wal.telemetry().active_readers, 0);
+    assert!(matches!(
+        client.block_on(read),
+        Ok(1) | Err(PortError::DeadlineExceeded(_))
+    ));
+    resume_client.send(()).unwrap();
+    client.block_on(client_worker).unwrap();
+
+    let (_next, runtime) = owner
+        .block_on(CanonicalRuntime::open(store.inner.config.clone()))
+        .unwrap();
+    assert!(matches!(
+        owner.block_on(fast_read_pool.with_read_conn(wal, None, |_| Ok(()))),
+        Err(PortError::Unavailable(_))
+    ));
+    owner.block_on(runtime.shutdown()).unwrap();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
+async fn native_sqlite_shutdown_releases_waiters_without_a_checkout() {
+    let (store, runtime, _, path) = fixture().await;
+    let SqlDriverState::Sqlite { fast_read_pool, .. } = &store.inner.sql else {
+        unreachable!()
+    };
+    let wal = store.inner.wal_coord.get().unwrap();
+    let reserved = fast_read_pool.hold_idle_slots();
+    let mut read = Box::pin(fast_read_pool.with_read_conn(wal, None, |_| Ok(())));
+    tokio::select! {
+        biased;
+        result = &mut read => panic!("read returned before checkout: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    assert_eq!(wal.telemetry().active_readers, 1);
+    tokio::time::timeout(Duration::from_secs(2), runtime.shutdown())
+        .await
+        .expect("a parked client does not own a SQLite connection")
+        .unwrap();
+    drop(reserved);
+    assert!(matches!(read.await, Err(PortError::Unavailable(_))));
+    assert_eq!(wal.telemetry().active_readers, 0);
+    std::fs::remove_dir_all(path).unwrap();
+}

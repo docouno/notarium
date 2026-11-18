@@ -87,6 +87,7 @@ pub(crate) struct SqliteWriterPair {
 pub(crate) struct SqliteFastReadPool {
     db_path: PathBuf,
     sem: Arc<Semaphore>,
+    checkouts: Arc<tokio::sync::RwLock<()>>,
     writer_active_read_sem: Arc<Semaphore>,
     conns: Arc<StdMutex<Vec<rusqlite::Connection>>>,
 }
@@ -117,6 +118,14 @@ impl Drop for OuterReadCancelGuard {
     }
 }
 
+fn native_pool_closed() -> PortError {
+    unavailable_retryable(
+        "sqlite_fast_pool_closed",
+        "SQLite fast read pool closed",
+        Duration::from_millis(50),
+    )
+}
+
 fn native_read_cancelled() -> PortError {
     cancelled_not_committed("sqlite_read_cancelled", "ordinary SQLite read cancelled")
 }
@@ -141,6 +150,7 @@ impl SqliteFastReadPool {
         Self {
             db_path,
             sem: Arc::new(Semaphore::new(cap)),
+            checkouts: Arc::new(tokio::sync::RwLock::new(())),
             writer_active_read_sem: Arc::new(Semaphore::new(1)),
             conns: Arc::new(StdMutex::new(initial)),
         }
@@ -156,6 +166,8 @@ impl SqliteFastReadPool {
     }
 
     pub async fn close_all(&self) {
+        self.sem.close();
+        let _drained = self.checkouts.write().await;
         let drained: Vec<rusqlite::Connection> = {
             let mut guard = self.conns.lock().expect("fast read pool mutex");
             std::mem::take(&mut *guard)
@@ -203,11 +215,7 @@ impl SqliteFastReadPool {
         let permit = match Arc::clone(&self.sem).try_acquire_owned() {
             Ok(p) => p,
             Err(tokio::sync::TryAcquireError::Closed) => {
-                return Err(unavailable_retryable(
-                    "sqlite_fast_pool_closed",
-                    "SQLite fast read pool closed",
-                    Duration::from_millis(50),
-                ));
+                return Err(native_pool_closed());
             }
             Err(tokio::sync::TryAcquireError::NoPermits) => {
                 tokio::select! {
@@ -216,11 +224,7 @@ impl SqliteFastReadPool {
                     res = Arc::clone(&self.sem).acquire_owned() => match res {
                         Ok(p) => p,
                         Err(_) => {
-                            return Err(unavailable_retryable(
-                                "sqlite_fast_pool_closed",
-                                "SQLite fast read pool closed",
-                                Duration::from_millis(50),
-                            ));
+                            return Err(native_pool_closed());
                         }
                     },
                     _ = tokio::time::sleep_until(caller_deadline_tokio) => {
@@ -241,6 +245,14 @@ impl SqliteFastReadPool {
             ));
         }
 
+        // Shutdown drains actual checkouts. A client parked while waiting for a slot
+        // owns no database connection and can resume after the DataRoot has reopened.
+        let checkout = Arc::clone(&self.checkouts)
+            .try_read_owned()
+            .map_err(|_| native_pool_closed())?;
+        if self.sem.is_closed() {
+            return Err(native_pool_closed());
+        }
         let conn_opt = {
             let mut guard = self.conns.lock().expect("fast read pool mutex");
             guard.pop()
@@ -361,6 +373,7 @@ impl SqliteFastReadPool {
                     return Err(err);
                 }
             };
+            drop(checkout);
             if cancelled() {
                 return Err(native_read_cancelled());
             }
@@ -387,9 +400,9 @@ impl SqliteFastReadPool {
         let pool = Arc::clone(&self.conns);
         let db_path = self.db_path.clone();
         let wal = Arc::clone(wal);
-        let task = tokio::task::spawn_blocking(move || {
-            run(&wal, &pool, &db_path, Some((worker_state, started)))
-        });
+        let executor = wal.storage_executor.clone();
+        let task = executor
+            .spawn_blocking(move || run(&wal, &pool, &db_path, Some((worker_state, started))));
 
         let snapshot_timeout = async {
             if let Ok(deadline) = start.await {

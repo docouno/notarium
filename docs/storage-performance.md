@@ -20,15 +20,20 @@ device whose physical medium was unknown. SQLite used WAL with
 
 | Measurement | High | Medium |
 | --- | ---: | ---: |
-| 4 KiB append + fdatasync, p95 | 0.867 ms | 1.621 ms |
-| 256 KiB append + fdatasync, p95 | 1.276 ms | 2.048 ms |
-| Single-thread BLAKE3 + Zstd level 3, median per 4 KiB document | 7.47 µs | 12.97 µs |
+| 4 KiB append + fdatasync, p95 across three runs | 0.827–0.891 ms | 1.616–2.005 ms |
+| 256 KiB append + fdatasync, p95 across three runs | 1.268–1.290 ms | 1.952–2.443 ms |
+| Single-thread BLAKE3 + Zstd level 3, median per 4 KiB document across three runs | 7.09–7.29 µs | 13.45–13.87 µs |
 | SQLite rollback, p95 / p99 | 3.197 / 3.969 ms | 7.614 / 8.787 ms |
 | PostgreSQL rollback, p95 / p99 | 4.250 / 6.125 ms | 11.858 / 18.054 ms |
 | SQLite, 50 writers, zero readers, three runs (mutations/s) | 4,152.4 / 4,187.6 / 4,126.5 | 1,910.3 / 1,937.2 / 1,908.3 |
 | SQLite, 50 writers, 200 readers, three runs (mutations/s) | 3,992.5 / 4,078.4 / 3,937.5 | First run stopped after one reader error |
 
-These release measurements used commit
+The first three rows used the same release codec executable, driver and input
+corpus on both machines. Comparing the medians of three runs, Medium took
+1.95 times as long for the codec, 2.08 times as long for the 4 KiB durable
+append and 1.75 times as long for the 256 KiB durable append.
+
+The database measurements in the table used commit
 `4665459572174d74fc58c8ebaf010d1a59985593`, tree
 `16e1dfb7d53c9b84debaa5c92cbdc511a5e02267`. High completed the full
 suite. The Medium launcher exited with an error during its first mixed writer

@@ -125,7 +125,7 @@ pub struct SqliteWalCoordinator {
     bg_stop: AtomicBool,
     bg_wake: Notify,
     bg_task: Mutex<Option<JoinHandle<()>>>,
-    cleanup_executor: tokio::runtime::Handle,
+    pub(crate) storage_executor: tokio::runtime::Handle,
     detached_cleanups: StdMutex<Vec<JoinHandle<()>>>,
 }
 
@@ -284,7 +284,7 @@ impl ActiveSqliteSnapshotGuard {
         let slot = self.slot.take().expect("active reader slot");
         {
             // SQLx schedules pool return on the current runtime.
-            let _owner = slot.coord.cleanup_executor.enter();
+            let _owner = slot.coord.storage_executor.enter();
             drop(self.pooled.take());
         }
         slot.finish_cleanly();
@@ -299,10 +299,10 @@ impl Drop for ActiveSqliteSnapshotGuard {
             // The storage executor outlives request runtimes. Keep admission until
             // the worker closes the interrupted snapshot and discard the connection.
             let coord = Arc::clone(&slot.coord);
-            let _owner = coord.cleanup_executor.enter();
+            let _owner = coord.storage_executor.enter();
             // Keep the pool permit until close, including during store shutdown.
             pooled.close_on_drop();
-            let cleanup = coord.cleanup_executor.spawn(async move {
+            let cleanup = coord.storage_executor.spawn(async move {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *pooled).await;
                 let _ = pooled.close().await;
                 drop(slot);
@@ -407,7 +407,7 @@ impl SqliteWalCoordinator {
             bg_stop: AtomicBool::new(false),
             bg_wake: Notify::new(),
             bg_task: Mutex::new(None),
-            cleanup_executor: inner.backup_executor.clone(),
+            storage_executor: inner.backup_executor.clone(),
             detached_cleanups: StdMutex::new(Vec::new()),
         });
 
