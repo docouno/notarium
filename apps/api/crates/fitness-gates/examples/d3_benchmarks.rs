@@ -389,11 +389,50 @@ impl WriterRunMetrics {
     }
 }
 
+struct RollbackBudgets {
+    tier: &'static str,
+    sqlite_us: u32,
+    postgres_us: u32,
+}
+
+impl RollbackBudgets {
+    fn from_args(args: &[String]) -> Self {
+        let mut flags = args.iter().enumerate().filter(|(_, arg)| *arg == "--tier");
+        let selected = flags.next().map(|(index, _)| {
+            assert!(
+                flags.next().is_none()
+                    && !args.iter().any(|arg| matches!(
+                        arg.as_str(),
+                        "--smoke" | "--paired-only" | "--interactions" | "--interaction-series"
+                    )),
+                "--tier selects a full D3 series"
+            );
+            args.get(index + 1).expect("missing --tier value").as_str()
+        });
+        let (tier, sqlite_us, postgres_us) = match selected {
+            None => ("default", 5_000, 5_000),
+            Some("high") => ("high", 4_000, 5_000),
+            Some("medium") => ("medium", 10_000, 15_000),
+            Some(_) => panic!("--tier expects high or medium"),
+        };
+        Self {
+            tier,
+            sqlite_us,
+            postgres_us,
+        }
+    }
+}
+
+fn within_rollback_limit(p95_us: f64, limit_us: Option<u32>) -> bool {
+    limit_us.is_none_or(|limit| p95_us < f64::from(limit))
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct RollbackProfileMetrics {
     backend: &'static str,
     iterations: usize,
     enforce_5ms_budget: bool,
+    p95_limit_us: Option<u32>,
     restored_per_call: usize,
     trashed_per_call: usize,
     skipped_manual_per_call: usize,
@@ -509,6 +548,7 @@ struct PairedBackupPauseMetrics {
 #[derive(Clone, Debug, Serialize)]
 struct D3BenchmarkReport {
     status: &'static str,
+    rollback_tier: &'static str,
     environment: EnvironmentAttribution,
     writer_50w_0r_runs: Vec<WriterRunMetrics>,
     writer_50w_200r_runs: Vec<WriterRunMetrics>,
@@ -1357,7 +1397,7 @@ async fn measure_fresh_rollbacks(
     store: &CanonicalStore,
     backend: &'static str,
     iterations: usize,
-    enforce_5ms_budget: bool,
+    p95_limit_us: Option<u32>,
 ) -> RollbackProfileMetrics {
     let mut samples = Vec::with_capacity(iterations);
     let mut verified_closed_room_restores = 0;
@@ -1497,7 +1537,8 @@ async fn measure_fresh_rollbacks(
     RollbackProfileMetrics {
         backend,
         iterations,
-        enforce_5ms_budget,
+        enforce_5ms_budget: p95_limit_us.is_some_and(|limit| limit <= 5_000),
+        p95_limit_us,
         restored_per_call: 18,
         trashed_per_call: 2,
         skipped_manual_per_call: 1,
@@ -1510,6 +1551,7 @@ async fn measure_fresh_rollbacks(
 async fn run_sqlite_rollback_benchmark(
     work_root: &Path,
     iterations: usize,
+    p95_limit_us: u32,
 ) -> RollbackProfileMetrics {
     let directory = work_root.join("rollback-sqlite");
     let config = CanonicalConfig::local_default(
@@ -1517,8 +1559,13 @@ async fn run_sqlite_rollback_benchmark(
         DataRoot::new(&directory),
     );
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
-    let result =
-        measure_fresh_rollbacks(&store, "sqlite_wal_full+local_zstd_v1", iterations, true).await;
+    let result = measure_fresh_rollbacks(
+        &store,
+        "sqlite_wal_full+local_zstd_v1",
+        iterations,
+        Some(p95_limit_us),
+    )
+    .await;
     runtime.shutdown().await.unwrap();
     fs::remove_dir_all(directory).unwrap();
     result
@@ -1529,6 +1576,7 @@ async fn run_pg_rollback_benchmark(
     work_root: &Path,
     use_s3: bool,
     iterations: usize,
+    local_p95_limit_us: u32,
 ) -> RollbackProfileMetrics {
     let tag = if use_s3 { "rbs3" } else { "rbloc" };
     let live_schema = fixtures.fresh_pg_schema(tag);
@@ -1564,7 +1612,13 @@ async fn run_pg_rollback_benchmark(
     } else {
         "postgres16_sync+local_zstd_v1"
     };
-    let metrics = measure_fresh_rollbacks(&store, backend, iterations, !use_s3).await;
+    let metrics = measure_fresh_rollbacks(
+        &store,
+        backend,
+        iterations,
+        (!use_s3).then_some(local_p95_limit_us),
+    )
+    .await;
     rt.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&live_schema).await;
     fs::remove_dir_all(local_dir).unwrap();
@@ -2837,15 +2891,16 @@ fn write_report(report: &impl Serialize, path: &Path, met_targets: bool) {
 
 fn main() {
     let args: Vec<_> = env::args().collect();
+    let budgets = RollbackBudgets::from_args(&args);
     match args.get(1).map(String::as_str) {
         Some("--interactions") => interactive::campaign(&args),
         Some("--interaction-series") => interactive::series(&args[2..]),
-        _ => d3(),
+        _ => d3(budgets),
     }
 }
 
 #[tokio::main(flavor = "multi_thread")]
-async fn d3() {
+async fn d3(budgets: RollbackBudgets) {
     let args: Vec<String> = env::args().collect();
     let smoke_mode = args.iter().any(|a| a == "--smoke");
     let hash_arg = |key: &str| {
@@ -3011,7 +3066,7 @@ async fn d3() {
 
     // 1. Rollback microfixture (run first on clean filesystem before 500k+ CAS file churn)
     eprintln!("[D3] rollback microfixture ({rb_iters} independent resets)...");
-    let rb_sqlite = run_sqlite_rollback_benchmark(&work_root, rb_iters).await;
+    let rb_sqlite = run_sqlite_rollback_benchmark(&work_root, rb_iters, budgets.sqlite_us).await;
     eprintln!(
         "[D3]   -> SQLite+Local min={:.1} us, p50={:.1} us, p95={:.1} us, p99={:.1} us, max={:.1} us",
         rb_sqlite.latency.min_us,
@@ -3021,7 +3076,9 @@ async fn d3() {
         rb_sqlite.latency.max_us,
     );
     tokio::time::sleep(Duration::from_millis(3000)).await;
-    let rb_pg_local = run_pg_rollback_benchmark(&fixtures, &work_root, false, rb_iters).await;
+    let rb_pg_local =
+        run_pg_rollback_benchmark(&fixtures, &work_root, false, rb_iters, budgets.postgres_us)
+            .await;
     eprintln!(
         "[D3]   -> PG16+Local   min={:.1} us, p50={:.1} us, p95={:.1} us, p99={:.1} us, max={:.1} us",
         rb_pg_local.latency.min_us,
@@ -3030,7 +3087,14 @@ async fn d3() {
         rb_pg_local.latency.p99_us,
         rb_pg_local.latency.max_us,
     );
-    let rb_pg_s3 = run_pg_rollback_benchmark(&fixtures, &work_root, true, rb_s3_iters).await;
+    let rb_pg_s3 = run_pg_rollback_benchmark(
+        &fixtures,
+        &work_root,
+        true,
+        rb_s3_iters,
+        budgets.postgres_us,
+    )
+    .await;
     eprintln!(
         "[D3]   -> PG16+S3(UDS) min={:.1} us, p50={:.1} us, p95={:.1} us, p99={:.1} us, max={:.1} us",
         rb_pg_s3.latency.min_us,
@@ -3287,7 +3351,7 @@ async fn d3() {
 
     let met_targets = rollback_profiles
         .iter()
-        .all(|r| !r.enforce_5ms_budget || r.latency.p95_us < 5_000.0)
+        .all(|r| within_rollback_limit(r.latency.p95_us, r.p95_limit_us))
         && rollback_profiles
             .iter()
             .all(|p| p.ordinary_cutoff_read_deadlines == 0)
@@ -3308,6 +3372,7 @@ async fn d3() {
             .iter()
             .all(|p| p.confirmed_pause_latency.p95_us < 1_000.0);
     let report = D3BenchmarkReport {
+        rollback_tier: budgets.tier,
         status: if !met_targets {
             "FAIL"
         } else if smoke_mode {
@@ -3326,4 +3391,30 @@ async fn d3() {
     };
 
     write_report(&report, &out_file, met_targets);
+}
+
+#[cfg(test)]
+mod rollback_budget_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_limits_are_strict_and_selected_explicitly() {
+        for (selected, name, sqlite, postgres) in [
+            (None, "default", 5_000, 5_000),
+            (Some("high"), "high", 4_000, 5_000),
+            (Some("medium"), "medium", 10_000, 15_000),
+        ] {
+            let args = selected.map_or_else(Vec::new, |tier| vec!["--tier".into(), tier.into()]);
+            let budgets = RollbackBudgets::from_args(&args);
+            assert_eq!(
+                (budgets.tier, budgets.sqlite_us, budgets.postgres_us),
+                (name, sqlite, postgres)
+            );
+            for limit in [budgets.sqlite_us, budgets.postgres_us] {
+                assert!(within_rollback_limit(f64::from(limit) - 0.001, Some(limit)));
+                assert!(!within_rollback_limit(f64::from(limit), Some(limit)));
+            }
+        }
+        assert!(within_rollback_limit(50_000.0, None));
+    }
 }

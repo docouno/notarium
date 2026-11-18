@@ -88,13 +88,19 @@ mkdir -p -- "$FIXTURES_BASE"
 exec 9>"$FIXTURES_BASE/lifecycle.lock"
 flock -x 9
 if [ "$1" = "benchmark" ]; then
+  tier=
   case "$*" in
     benchmark) report=d3-benchmarks ;;
+    'benchmark --tier high'|'benchmark --tier medium')
+      [ "$#" -eq 3 ] && [ "$2" = "--tier" ] || fail "expected --tier high or --tier medium"
+      tier=$3
+      report="d3-benchmarks-$tier"
+      ;;
     'benchmark --interactions') report=storage-interactions ;;
     'benchmark --smoke') report=d3-benchmarks-smoke ;;
     'benchmark --paired-only') report=d3-paired ;;
     'benchmark --paired-only --smoke') report=d3-paired-smoke ;;
-    *) fail "usage: benchmark [--paired-only] [--smoke] | benchmark --interactions" ;;
+    *) fail "usage: benchmark [--paired-only] [--smoke] | benchmark --interactions | benchmark --tier high|medium" ;;
   esac
   commit=$(git -C "$ROOT" rev-parse HEAD)
   head_tree=$(git -C "$ROOT" rev-parse 'HEAD^{tree}')
@@ -255,8 +261,15 @@ if [ "$1" = "benchmark" ]; then
     exit "$status"
   fi
   [ -f "$RUN_DIR/report.json" ] || fail "benchmark did not finish its measurements"
-  mv "$RUN_DIR/report.json" "$ROOT/.artifacts/3-storage-cas/$report-$tree.json"
-  printf '%s\n' "$ROOT/.artifacts/3-storage-cas/$report-$tree.json"
+  destination="$ROOT/.artifacts/3-storage-cas/$report-$tree.json"
+  if [ -n "$tier" ]; then
+    destination="${destination%.json}-$RUN_ID.json"
+    mv -n "$RUN_DIR/report.json" "$destination"
+    [ ! -f "$RUN_DIR/report.json" ] || fail "tier report already exists: $destination"
+  else
+    mv "$RUN_DIR/report.json" "$destination"
+  fi
+  printf '%s\n' "$destination"
   exit "$status"
 elif [ "${1:-}" = "exec-custom" ]; then
   shift

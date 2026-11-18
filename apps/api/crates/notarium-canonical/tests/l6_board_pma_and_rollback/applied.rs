@@ -20,6 +20,7 @@ type Pause = (oneshot::Sender<()>, oneshot::Receiver<InterceptionResult>);
 struct PausedRoom {
     fences: Arc<RoomFenceTable>,
     pause: Mutex<Option<Pause>>,
+    cancel_on_reply: AtomicBool,
     accepted: Mutex<Option<AcceptedRoomCarrier>>,
     pinned: Mutex<Option<(NoteId, LeaseEpoch)>>,
     pin_gate: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
@@ -67,7 +68,12 @@ impl LiveCollabInterceptor for PausedRoom {
             let pause = self.pause.lock().unwrap().take();
             if let Some((entered, result)) = pause {
                 entered.send(()).unwrap();
-                return Ok(result.await.unwrap());
+                let reply = result.await.unwrap();
+                if self.cancel_on_reply.swap(false, Ordering::SeqCst) {
+                    // The room has a definite answer and returns it in this same poll.
+                    request.context.budget.cancellation.cancel();
+                }
+                return Ok(reply);
             }
             let note = match request.payload {
                 InterceptedPayload::EditNote { note, .. } => note,
@@ -130,6 +136,7 @@ pub(super) async fn check(
     let room = Arc::new(PausedRoom {
         fences: Arc::clone(store.room_fences()),
         pause: Mutex::new(None),
+        cancel_on_reply: AtomicBool::new(false),
         accepted: Mutex::new(None),
         pinned: Mutex::new(None),
         pin_gate: Mutex::new(None),
@@ -585,7 +592,8 @@ async fn check_observation_conflict(
     {
         let mut caller = ctx.clone();
         caller.budget = make_budget();
-        let cancel = caller.budget.cancellation.clone();
+        room.cancel_on_reply
+            .store(matches!(state, AfterChange::Cancelled), Ordering::SeqCst);
         let mut observation = next_mutation(
             ctx.scope(),
             ctx.auth().principal(),
@@ -617,15 +625,11 @@ async fn check_observation_conflict(
                         )
                         .await
                         .unwrap();
-                    match state {
-                        AfterChange::Writable => (),
-                        AfterChange::Cancelled => cancel.cancel(),
-                        AfterChange::Locked => {
-                            store
-                                .set_folder_write_lock(ctx.clone(), folder.clone(), true)
-                                .await
-                                .unwrap();
-                        }
+                    if matches!(state, AfterChange::Locked) {
+                        store
+                            .set_folder_write_lock(ctx.clone(), folder.clone(), true)
+                            .await
+                            .unwrap();
                     }
                     let cut = store
                         .read_space(&ctx.scope().space_id)
@@ -658,7 +662,8 @@ async fn check_observation_conflict(
             AfterChange::Writable => assert!(
                 matches!(answer, Ok(ExternalObservationResult::Conflict { current }) if current == changed.revision)
             ),
-            AfterChange::Cancelled => assert!(matches!(answer, Err(PortError::Cancelled(_)))),
+            AfterChange::Cancelled => assert!(matches!(answer, Err(PortError::Cancelled(f))
+                if f.effect() == notarium_core::error::CommitEffect::NotCommitted)),
             AfterChange::Locked => assert!(matches!(
                 answer,
                 Err(PortError::Domain(DomainError::SpaceReadOnly))
@@ -987,6 +992,7 @@ async fn committed_room_observation_survives_process_exit() {
         let room = Arc::new(PausedRoom {
             fences: Arc::clone(store.room_fences()),
             pause: Mutex::new(None),
+            cancel_on_reply: AtomicBool::new(false),
             accepted: Mutex::new(None),
             pinned: Mutex::new(None),
             pin_gate: Mutex::new(None),
