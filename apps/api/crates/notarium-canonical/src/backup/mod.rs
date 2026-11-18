@@ -1,5 +1,6 @@
 mod materialize;
 mod ownership;
+mod phase;
 mod restore;
 use ownership::{ArtifactLease, HoldOwnership};
 
@@ -292,6 +293,7 @@ fn tighten_budget(a: BackupBudget, b: BackupBudget) -> Result<BackupBudget, Port
 async fn wait_for_phase<T>(
     remaining: Duration,
     cancellation: &Cancellation,
+    shutdown: &Cancellation,
     operation: impl std::future::Future<Output = Result<T, PortError>>,
 ) -> Result<T, PortError> {
     if cancellation.is_cancelled() {
@@ -304,6 +306,7 @@ async fn wait_for_phase<T>(
         return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
     }
     tokio::select! {
+        () = shutdown.cancelled() => Err(cancelled_not_committed("backup_shutdown", "backup shutting down")),
         () = cancellation.cancelled() => Err(cancelled_not_committed("backup_cancelled", "backup cancelled")),
         result = tokio::time::timeout(remaining, operation) => result.map_err(|_| DomainError::validation(ValidationReason::BudgetExceeded))?,
     }
@@ -524,7 +527,7 @@ enum SqliteWorkerCmd {
     },
     Spool {
         budget: BackupBudget,
-        expected_witness: BackupWitness,
+        expected_witness: Arc<BackupWitness>,
         final_path: PathBuf,
         step_delay_us: u64,
         reply: tokio::sync::oneshot::Sender<Result<SqliteSpoolSuccess, PortError>>,
@@ -558,7 +561,11 @@ impl Drop for SqliteBackupWorkerHandle {
 }
 
 impl SqliteBackupWorkerHandle {
-    fn spawn(src_path: PathBuf, tmp_path: PathBuf) -> Result<Self, PortError> {
+    fn spawn(
+        src_path: PathBuf,
+        tmp_path: PathBuf,
+        finished: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<Self, PortError> {
         // Pre-create private `0600` destination file before opening SQLite on it.
         let pre_file = create_private_tmp_file(&tmp_path)?;
         drop(pre_file);
@@ -573,6 +580,7 @@ impl SqliteBackupWorkerHandle {
         let join_handle = std::thread::Builder::new()
             .name("notarium-sqlite-backup".to_owned())
             .spawn(move || {
+                let _finished = finished;
                 sqlite_backup_worker_loop(src_path, tmp_cl, cancel_cl, init_tx, cmd_rx);
             })
             .map_err(|err| {
@@ -633,16 +641,11 @@ impl SqliteBackupWorkerHandle {
         }
         let tmp = self.tmp_path.clone();
         if let Some(jh) = self.join_handle.take() {
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                let handle = rt.spawn_blocking(move || {
-                    let _ = jh.join();
-                    remove_tmp_artifacts_best_effort(&tmp);
-                });
-                register_cleanup_task(inner, handle);
-            } else {
+            let handle = inner.backup_executor.spawn_blocking(move || {
                 let _ = jh.join();
                 remove_tmp_artifacts_best_effort(&tmp);
-            }
+            });
+            register_cleanup_task(inner, handle);
         }
     }
 }
@@ -1364,11 +1367,14 @@ impl PgPreparedSource {
     }
 
     fn detach_abort_cleanup(&mut self, inner: &CanonicalInner) {
-        if let Some(conn) = self.source.take() {
+        let connections = [self.source.take(), self.barrier.take()];
+        if connections.iter().any(Option::is_some) {
             register_cleanup_task(
                 inner,
                 inner.backup_executor.spawn(async move {
-                    let _ = conn.close().await;
+                    for conn in connections.into_iter().flatten() {
+                        let _ = conn.close().await;
+                    }
                 }),
             );
         }
@@ -2450,14 +2456,14 @@ impl PausedBackup for CanonicalPausedBackup {
             if remaining.is_zero() {
                 return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
             }
-            let mut drv = self
+            let drv = self
                 .unpinned_driver
                 .take()
                 .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
 
             let expected_inst = self.store.inner.config.installation_id.clone();
-            match &mut drv {
-                PreparedBackendDriver::Sqlite(worker) => {
+            let (witness, state) = match drv {
+                PreparedBackendDriver::Sqlite(mut worker) => {
                     let wal = self.store.inner.wal_coord.get().ok_or_else(|| {
                         internal_not_committed(
                             "sqlite_wal_coord_missing",
@@ -2491,11 +2497,19 @@ impl PausedBackup for CanonicalPausedBackup {
                         internal_not_committed("sqlite_backup_send_open_cut", err.to_string())
                     })?;
 
-                    let result = wait_for_phase(remaining, &self.caller_cancel, async {
-                        reply_rx.await.map_err(|err| {
-                            internal_not_committed("sqlite_backup_open_cut_eof", err.to_string())
-                        })?
-                    })
+                    let result = wait_for_phase(
+                        remaining,
+                        &self.caller_cancel,
+                        &self.store.inner.backup_shutdown,
+                        async {
+                            reply_rx.await.map_err(|err| {
+                                internal_not_committed(
+                                    "sqlite_backup_open_cut_eof",
+                                    err.to_string(),
+                                )
+                            })?
+                        },
+                    )
                     .await;
                     let witness = match result {
                         Ok(witness) => witness,
@@ -2504,35 +2518,16 @@ impl PausedBackup for CanonicalPausedBackup {
                             return Err(error);
                         }
                     };
-                    self.validate_cut(&witness)?;
-                    Ok(Box::new(CanonicalBackupSnapshot {
-                        store: self.store.clone(),
-                        backup_id: self.backup_id.clone(),
-                        artifact_id: self.artifact_id.clone(),
-                        prepare_budget: self.prepare_budget,
-                        caller_cancel: self.caller_cancel.clone(),
-                        prepared_at: self.prepared_at,
-                        spool_dir: self.spool_dir.clone(),
-                        artifact_lease: self.artifact_lease.take(),
+                    (
                         witness,
-                        active: None,
-                        hold: self
-                            .held_histories
-                            .as_ref()
-                            .expect("pause owns hold")
-                            .0
-                            .clone(),
-                        state: Some(PinnedSnapshotDriver::Sqlite {
-                            worker: match drv {
-                                PreparedBackendDriver::Sqlite(w) => w,
-                                PreparedBackendDriver::Postgres(_) => unreachable!(),
-                            },
+                        PinnedSnapshotDriver::Sqlite {
+                            worker,
                             abort_flag,
                             abort_notify,
-                        }),
-                    }) as Box<dyn BackupSnapshot>)
+                        },
+                    )
                 }
-                PreparedBackendDriver::Postgres(pg) => {
+                PreparedBackendDriver::Postgres(mut pg) => {
                     let conn = pg.source.as_mut().ok_or_else(|| {
                         internal_not_committed(
                             "pg_backup_conn_missing",
@@ -2546,14 +2541,19 @@ impl PausedBackup for CanonicalPausedBackup {
                     };
                     let remaining = remaining.min(max_age);
                     pg.pinned_at = Some(Instant::now());
-                    let pin_res = wait_for_phase(remaining, &self.caller_cancel, async {
-                        let hold = &self.held_histories.as_ref().expect("pause owns hold").0;
-                        let (witness, ()) = tokio::try_join!(
-                            pin_and_read_pg_witness(&mut *conn, &expected_inst, remaining),
-                            hold.verify()
-                        )?;
-                        Ok(witness)
-                    })
+                    let pin_res = wait_for_phase(
+                        remaining,
+                        &self.caller_cancel,
+                        &self.store.inner.backup_shutdown,
+                        async {
+                            let hold = &self.held_histories.as_ref().expect("pause owns hold").0;
+                            let (witness, ()) = tokio::try_join!(
+                                pin_and_read_pg_witness(&mut *conn, &expected_inst, remaining),
+                                hold.verify()
+                            )?;
+                            Ok(witness)
+                        },
+                    )
                     .await;
                     let witness = match pin_res {
                         Ok(w) => w,
@@ -2563,31 +2563,30 @@ impl PausedBackup for CanonicalPausedBackup {
                         }
                     };
 
-                    self.validate_cut(&witness)?;
-                    Ok(Box::new(CanonicalBackupSnapshot {
-                        store: self.store.clone(),
-                        backup_id: self.backup_id.clone(),
-                        artifact_id: self.artifact_id.clone(),
-                        prepare_budget: self.prepare_budget,
-                        caller_cancel: self.caller_cancel.clone(),
-                        prepared_at: self.prepared_at,
-                        spool_dir: self.spool_dir.clone(),
-                        artifact_lease: self.artifact_lease.take(),
-                        witness,
-                        active: None,
-                        hold: self
-                            .held_histories
-                            .as_ref()
-                            .expect("pause owns hold")
-                            .0
-                            .clone(),
-                        state: Some(PinnedSnapshotDriver::Postgres(match drv {
-                            PreparedBackendDriver::Postgres(p) => p,
-                            PreparedBackendDriver::Sqlite(_) => unreachable!(),
-                        })),
-                    }) as Box<dyn BackupSnapshot>)
+                    (witness, PinnedSnapshotDriver::Postgres(pg))
                 }
-            }
+            };
+            self.validate_cut(&witness)?;
+            let snapshot = CanonicalBackupSnapshot {
+                store: self.store.clone(),
+                backup_id: self.backup_id.clone(),
+                artifact_id: self.artifact_id.clone(),
+                prepare_budget: self.prepare_budget,
+                caller_cancel: self.caller_cancel.clone(),
+                prepared_at: self.prepared_at,
+                spool_dir: self.spool_dir.clone(),
+                artifact_lease: self.artifact_lease.take(),
+                witness: Arc::new(witness),
+                active: None,
+                hold: self
+                    .held_histories
+                    .as_ref()
+                    .expect("pause owns hold")
+                    .0
+                    .clone(),
+                state: Some(state),
+            };
+            Ok(Box::new(phase::Snapshot::new(snapshot)?) as Box<dyn BackupSnapshot>)
         })
     }
 
@@ -2637,7 +2636,7 @@ struct CanonicalBackupSnapshot {
     prepared_at: Instant,
     spool_dir: PathBuf,
     artifact_lease: Option<ArtifactLease>,
-    witness: BackupWitness,
+    witness: Arc<BackupWitness>,
     hold: HoldProof,
     state: Option<PinnedSnapshotDriver>,
     active: Option<ActiveSpool>,
@@ -2903,7 +2902,7 @@ impl CanonicalBackupSnapshot {
                 artifact: self.artifact_id.clone(),
                 bytes,
                 digest,
-                witness: self.witness.clone(),
+                witness: self.witness.as_ref().clone(),
             })
         })
     }
@@ -3113,23 +3112,28 @@ impl PreparedBackup for CanonicalPreparedBackup {
                 .prepare_budget
                 .deadline
                 .saturating_sub(self.prepared_at.elapsed());
-            let (safe_point, pg_barrier) = wait_for_phase(remaining, &self.caller_cancel, async {
-                let guard = self.store.inner.writer()?.acquire_safe_point().await;
-                let mut barrier = match &mut drv {
-                    PreparedBackendDriver::Postgres(pg) => pg.barrier.take(),
-                    PreparedBackendDriver::Sqlite(_) => None,
-                };
-                if let Some(conn) = barrier.as_mut() {
-                    sqlx::query(PG_BACKUP_BARRIER_SQL)
-                        .bind(true)
-                        .execute(conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("pg_backup_barrier", err.to_string())
-                        })?;
-                }
-                Ok::<_, PortError>((guard, barrier))
-            })
+            let (safe_point, pg_barrier) = wait_for_phase(
+                remaining,
+                &self.caller_cancel,
+                &self.store.inner.backup_shutdown,
+                async {
+                    let guard = self.store.inner.writer()?.acquire_safe_point().await;
+                    let mut barrier = match &mut drv {
+                        PreparedBackendDriver::Postgres(pg) => pg.barrier.take(),
+                        PreparedBackendDriver::Sqlite(_) => None,
+                    };
+                    if let Some(conn) = barrier.as_mut() {
+                        sqlx::query(PG_BACKUP_BARRIER_SQL)
+                            .bind(true)
+                            .execute(conn)
+                            .await
+                            .map_err(|err| {
+                                internal_not_committed("pg_backup_barrier", err.to_string())
+                            })?;
+                    }
+                    Ok::<_, PortError>((guard, barrier))
+                },
+            )
             .await?;
 
             let locks = Arc::new(std::sync::Mutex::new(Some(PauseLocks {
@@ -3159,7 +3163,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
                     }
                 })
                 .abort_handle();
-            Ok(Box::new(CanonicalPausedBackup {
+            let paused = CanonicalPausedBackup {
                 store: self.store.clone(),
                 backup_id: self.backup_id.clone(),
                 artifact_id: self.artifact_id.clone(),
@@ -3172,7 +3176,155 @@ impl PreparedBackup for CanonicalPreparedBackup {
                 watchdog,
                 held_histories: self.held_histories.take(),
                 unpinned_driver: Some(drv),
-            }) as Box<dyn PausedBackup>)
+            };
+            Ok(Box::new(phase::Phase::new(&self.store.inner, paused)?) as Box<dyn PausedBackup>)
+        })
+    }
+}
+
+impl CanonicalStore {
+    async fn prepare_source(
+        &self,
+        ctx: MaintenanceContext,
+        backup: BackupId,
+        budget: BackupBudget,
+    ) -> Result<CanonicalPreparedBackup, PortError> {
+        let store = self.clone();
+        ctx.authority.require(ServicePurpose::Backup)?;
+        if ctx.budget.cancellation.is_cancelled() {
+            return Err(cancelled_not_committed(
+                "backup_prepare_cancelled",
+                "backup prepare cancelled",
+            ));
+        }
+        if ctx.budget.remaining.is_zero() {
+            return Err(deadline_not_committed(
+                "backup_prepare_zero_budget",
+                "backup prepare call budget expired",
+            ));
+        }
+        let prepared_at = Instant::now();
+        let mut budget = tighten_budget(store.default_backup_budget(), budget)?;
+        budget.deadline = budget.deadline.min(ctx.budget.remaining);
+        match (&store.inner.sql, budget.retention) {
+            (SqlDriverState::Sqlite { .. }, BackupRetentionBudget::SqliteWal { .. })
+            | (SqlDriverState::Postgres { .. }, BackupRetentionBudget::PostgresSnapshot { .. }) => {
+            }
+            _ => return Err(DomainError::validation(ValidationReason::ScopeMismatch).into()),
+        }
+        store.ensure_open()?;
+
+        let spool_dir = resolve_spool_dir(&store.inner)?;
+        wait_for_phase(
+            budget.deadline,
+            &ctx.budget.cancellation,
+            &store.inner.backup_shutdown,
+            ownership::recover_directory(&store, &spool_dir),
+        )
+        .await?;
+        let artifact_id = mint_artifact_id()?;
+        let artifact_lease = ArtifactLease::create(&store, &spool_dir, &artifact_id)?;
+        {
+            let mut roots = store
+                .inner
+                .backup_spool_roots
+                .lock()
+                .expect("backup spool roots");
+            if !roots.contains(&spool_dir) {
+                roots.push(spool_dir.clone());
+            }
+        }
+        let tmp_path = spool_dir.join(format!("{}.tmp", artifact_id.as_str()));
+
+        let (driver, artifact_lease) = match (&store.inner.config.sql, &store.inner.sql) {
+            (SqlBackendConfig::Sqlite { data_root, .. }, SqlDriverState::Sqlite { .. }) => {
+                let src_path = data_root.canonical();
+                let remaining = budget.deadline.saturating_sub(prepared_at.elapsed());
+                // A cancelled preparation can leave native initialization in flight.
+                // Track the thread through its last database and staging-file access.
+                let (finished, completion) = tokio::sync::oneshot::channel();
+                register_cleanup_task(
+                    &store.inner,
+                    store.inner.backup_executor.spawn(async move {
+                        let _ = completion.await;
+                    }),
+                );
+                wait_for_phase(
+                    remaining,
+                    &ctx.budget.cancellation,
+                    &store.inner.backup_shutdown,
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let worker =
+                                SqliteBackupWorkerHandle::spawn(src_path, tmp_path, finished)?;
+                            Ok((PreparedBackendDriver::Sqlite(worker), artifact_lease))
+                        })
+                        .await
+                        .map_err(|err| {
+                            internal_not_committed("sqlite_prepare_worker", err.to_string())
+                        })?
+                    },
+                )
+                .await?
+            }
+            (_, SqlDriverState::Postgres { .. }) => {
+                let remaining = budget.deadline.saturating_sub(prepared_at.elapsed());
+                let (source, barrier, backend_pid) = wait_for_phase(
+                    remaining,
+                    &ctx.budget.cancellation,
+                    &store.inner.backup_shutdown,
+                    async {
+                        let (mut source, mut barrier) = tokio::try_join!(
+                            open_backup_connection(&store),
+                            open_backup_connection(&store)
+                        )?;
+                        let BackupRetentionBudget::PostgresSnapshot { max_age } = budget.retention
+                        else {
+                            return Err(
+                                DomainError::validation(ValidationReason::ScopeMismatch).into()
+                            );
+                        };
+                        let (backend_pid, ()) = tokio::try_join!(
+                            warm_pg_backup_connection(&mut source, remaining, max_age),
+                            warm_pg_backup_barrier(&mut barrier, remaining)
+                        )?;
+                        Ok((source, barrier, backend_pid))
+                    },
+                )
+                .await?;
+                create_private_tmp_file(&tmp_path)?;
+                (
+                    PreparedBackendDriver::Postgres(PgPreparedSource {
+                        source: Some(source),
+                        store: store.clone(),
+                        backend_pid,
+                        barrier: Some(barrier),
+                        pinned_at: None,
+                        tmp_path,
+                    }),
+                    artifact_lease,
+                )
+            }
+            _ => {
+                remove_tmp_artifacts_best_effort(&tmp_path);
+                return Err(internal_not_committed(
+                    "backup_driver_mismatch",
+                    "SQL config and runtime state mismatch",
+                ));
+            }
+        };
+
+        Ok(CanonicalPreparedBackup {
+            store,
+            backup_id: backup,
+            artifact_id,
+            prepared_at,
+            prepare_budget: budget,
+            caller_cancel: ctx.budget.cancellation.clone(),
+            spool_dir,
+            artifact_lease: Some(artifact_lease),
+            driver: Some(driver),
+            held_histories: None,
         })
     }
 }
@@ -3184,129 +3336,7 @@ impl BackupParticipantPort for CanonicalStore {
         backup: BackupId,
         budget: BackupBudget,
     ) -> PortFuture<'_, Box<dyn PreparedBackup>> {
-        let store = self.clone();
-        Box::pin(async move {
-            ctx.authority.require(ServicePurpose::Backup)?;
-            if ctx.budget.cancellation.is_cancelled() {
-                return Err(cancelled_not_committed(
-                    "backup_prepare_cancelled",
-                    "backup prepare cancelled",
-                ));
-            }
-            if ctx.budget.remaining.is_zero() {
-                return Err(deadline_not_committed(
-                    "backup_prepare_zero_budget",
-                    "backup prepare call budget expired",
-                ));
-            }
-            let prepared_at = Instant::now();
-            let mut budget = tighten_budget(store.default_backup_budget(), budget)?;
-            budget.deadline = budget.deadline.min(ctx.budget.remaining);
-            match (&store.inner.sql, budget.retention) {
-                (SqlDriverState::Sqlite { .. }, BackupRetentionBudget::SqliteWal { .. })
-                | (
-                    SqlDriverState::Postgres { .. },
-                    BackupRetentionBudget::PostgresSnapshot { .. },
-                ) => {}
-                _ => return Err(DomainError::validation(ValidationReason::ScopeMismatch).into()),
-            }
-            store.ensure_open()?;
-
-            let spool_dir = resolve_spool_dir(&store.inner)?;
-            wait_for_phase(
-                budget.deadline,
-                &ctx.budget.cancellation,
-                ownership::recover_directory(&store, &spool_dir),
-            )
-            .await?;
-            let artifact_id = mint_artifact_id()?;
-            let artifact_lease = ArtifactLease::create(&store, &spool_dir, &artifact_id)?;
-            {
-                let mut roots = store
-                    .inner
-                    .backup_spool_roots
-                    .lock()
-                    .expect("backup spool roots");
-                if !roots.contains(&spool_dir) {
-                    roots.push(spool_dir.clone());
-                }
-            }
-            let tmp_path = spool_dir.join(format!("{}.tmp", artifact_id.as_str()));
-
-            let (driver, artifact_lease) = match (&store.inner.config.sql, &store.inner.sql) {
-                (SqlBackendConfig::Sqlite { data_root, .. }, SqlDriverState::Sqlite { .. }) => {
-                    let src_path = data_root.canonical();
-                    let remaining = budget.deadline.saturating_sub(prepared_at.elapsed());
-                    wait_for_phase(remaining, &ctx.budget.cancellation, async move {
-                        tokio::task::spawn_blocking(move || {
-                            let worker = SqliteBackupWorkerHandle::spawn(src_path, tmp_path)?;
-                            Ok((PreparedBackendDriver::Sqlite(worker), artifact_lease))
-                        })
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_prepare_worker", err.to_string())
-                        })?
-                    })
-                    .await?
-                }
-                (_, SqlDriverState::Postgres { .. }) => {
-                    let remaining = budget.deadline.saturating_sub(prepared_at.elapsed());
-                    let (source, barrier, backend_pid) =
-                        wait_for_phase(remaining, &ctx.budget.cancellation, async {
-                            let (mut source, mut barrier) = tokio::try_join!(
-                                open_backup_connection(&store),
-                                open_backup_connection(&store)
-                            )?;
-                            let BackupRetentionBudget::PostgresSnapshot { max_age } =
-                                budget.retention
-                            else {
-                                return Err(DomainError::validation(
-                                    ValidationReason::ScopeMismatch,
-                                )
-                                .into());
-                            };
-                            let (backend_pid, ()) = tokio::try_join!(
-                                warm_pg_backup_connection(&mut source, remaining, max_age),
-                                warm_pg_backup_barrier(&mut barrier, remaining)
-                            )?;
-                            Ok((source, barrier, backend_pid))
-                        })
-                        .await?;
-                    create_private_tmp_file(&tmp_path)?;
-                    (
-                        PreparedBackendDriver::Postgres(PgPreparedSource {
-                            source: Some(source),
-                            store: store.clone(),
-                            backend_pid,
-                            barrier: Some(barrier),
-                            pinned_at: None,
-                            tmp_path,
-                        }),
-                        artifact_lease,
-                    )
-                }
-                _ => {
-                    remove_tmp_artifacts_best_effort(&tmp_path);
-                    return Err(internal_not_committed(
-                        "backup_driver_mismatch",
-                        "SQL config and runtime state mismatch",
-                    ));
-                }
-            };
-
-            Ok(Box::new(CanonicalPreparedBackup {
-                store,
-                backup_id: backup,
-                artifact_id,
-                prepared_at,
-                prepare_budget: budget,
-                caller_cancel: ctx.budget.cancellation.clone(),
-                spool_dir,
-                artifact_lease: Some(artifact_lease),
-                driver: Some(driver),
-                held_histories: None,
-            }) as Box<dyn PreparedBackup>)
-        })
+        phase::prepare(self.clone(), ctx, backup, budget)
     }
 
     fn restore_cursors(

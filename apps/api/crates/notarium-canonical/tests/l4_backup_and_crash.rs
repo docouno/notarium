@@ -3449,3 +3449,87 @@ async fn run_sigkill_victim_child() {
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
+
+async fn shutdown_closes_retained_backup_phases(mut case: BackendCase) {
+    let space = backup_test_space(0xEA);
+    let id = space.space_id.clone();
+    case.store.create_space(space).await.unwrap();
+    for phase in 0..4 {
+        let budget = case.store.default_backup_budget();
+        let mut prepared = case
+            .store
+            .prepare(
+                maintenance_ctx(ServicePurpose::Backup),
+                BackupId::from_bytes([0xE0 + phase; 16]),
+                budget,
+            )
+            .await
+            .unwrap();
+        let hold = if phase >= 1 {
+            Some(prepared.acquire_hold().await.unwrap())
+        } else {
+            None
+        };
+        let mut pause = if phase >= 2 {
+            Some(prepared.pause_writes().await.unwrap())
+        } else {
+            None
+        };
+        let snapshot = if phase == 3 {
+            let mut pinned = pause.take().unwrap();
+            let cut = pinned.open_cut().await.unwrap();
+            pinned.resume().await.unwrap();
+            Some(cut)
+        } else {
+            None
+        };
+        let resources = || {
+            fs::read_dir(&case.spool_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|p| {
+                    matches!(
+                        p.extension().and_then(|x| x.to_str()),
+                        Some("pending" | "tmp")
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !resources().is_empty(),
+            "the backup must own its staging files"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            case.runtime.take().unwrap().shutdown(),
+        )
+        .await
+        .expect("shutdown must finish with retained backup handles")
+        .unwrap();
+        assert!(
+            resources().is_empty(),
+            "shutdown must retire every backup source and staging lease"
+        );
+        let (store, runtime) = CanonicalRuntime::open(case.config.clone()).await.unwrap();
+        store.set_backup_spool_dir(case.spool_dir.clone());
+        assert_eq!(store.read_space(&id).await.unwrap().space.id, id);
+        assert!(prepared.acquire_hold().await.is_err());
+        if let Some(cut) = snapshot {
+            cut.close().await.unwrap();
+        }
+        drop((pause, hold, prepared));
+        case.store = store;
+        case.runtime = Some(runtime);
+    }
+    case.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_closes_retained_sqlite_backup_phases() {
+    shutdown_closes_retained_backup_phases(BackendCase::open_sqlite().await).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_closes_retained_postgres_backup_phases() {
+    shutdown_closes_retained_backup_phases(BackendCase::open_pg_s3_with_pool(1).await).await;
+}

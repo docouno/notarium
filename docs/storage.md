@@ -41,6 +41,10 @@ before returning the error. Dropping an opening future schedules the same
 shutdown on its Tokio runtime. The DataRoot stays locked until the workers and
 connections close. Once shutdown starts, the store completes this cleanup even
 if the caller stops waiting. The next opener resumes pending durable recovery.
+A retained canonical backup handle can outlive shutdown. The store closes its
+SQLite files or dedicated PostgreSQL sessions and releases its temporary spool
+files and publication lock before handing over the DataRoot. The backup's
+witness remains available through the snapshot handle.
 The Tokio runtime that opens the store owns PostgreSQL pool returns, native
 SQLite blocking reads and interrupted SQLite snapshot cleanup. Shutdown closes
 native reader admission and waits for outstanding connections before releasing

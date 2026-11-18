@@ -535,16 +535,23 @@ impl CanonicalRuntime {
     }
 
     async fn drain_shutdown(self) -> Result<(), PortError> {
-        let pending_backup_cleanups: Vec<tokio::task::JoinHandle<()>> = {
-            let mut guard = self
-                .inner
-                .backup_cleanups
-                .lock()
-                .expect("backup cleanups mutex");
-            std::mem::take(&mut *guard)
-        };
-        for handle in pending_backup_cleanups {
-            let _ = handle.await;
+        // Closing a backup phase can schedule a final join or artifact cleanup.
+        // Admission already closed when shutdown was requested.
+        loop {
+            let pending = {
+                let mut tasks = self
+                    .inner
+                    .backup_cleanups
+                    .lock()
+                    .expect("backup cleanups mutex");
+                std::mem::take(&mut *tasks)
+            };
+            if pending.is_empty() {
+                break;
+            }
+            for task in pending {
+                let _ = task.await;
+            }
         }
         if let Some(coord) = self.inner.writer_coord.get() {
             coord.drain_and_shutdown().await;
