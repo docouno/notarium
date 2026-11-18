@@ -104,6 +104,12 @@ struct WalAtomicCounters {
     backup_aborts: AtomicU64,
 }
 
+#[cfg(test)]
+struct CheckpointPause {
+    started: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 pub struct SqliteWalCoordinator {
     started_at: Instant,
     db_path: PathBuf,
@@ -121,7 +127,7 @@ pub struct SqliteWalCoordinator {
     maintenance_lock: Mutex<()>,
     passive_conn: Mutex<Option<rusqlite::Connection>>,
     #[cfg(test)]
-    checkpoint_io_delay_ms: AtomicU64,
+    checkpoint_pause: StdMutex<Option<CheckpointPause>>,
     bg_stop: AtomicBool,
     bg_wake: Notify,
     bg_task: Mutex<Option<JoinHandle<()>>>,
@@ -403,7 +409,7 @@ impl SqliteWalCoordinator {
             maintenance_lock: Mutex::new(()),
             passive_conn: Mutex::new(None),
             #[cfg(test)]
-            checkpoint_io_delay_ms: AtomicU64::new(0),
+            checkpoint_pause: StdMutex::new(None),
             bg_stop: AtomicBool::new(false),
             bg_wake: Notify::new(),
             bg_task: Mutex::new(None),
@@ -1140,6 +1146,71 @@ impl SqliteWalCoordinator {
         ckpt_res.ok()
     }
 
+    async fn checkpoint_writer(
+        &self,
+        pair: &mut crate::sqlite_fast::SqliteWriterPair,
+        ckpt_sql: &'static str,
+        rem_ms: u64,
+        target_journal_limit: i64,
+    ) -> Option<(i64, i64, i64)> {
+        if let Some(rconn) = pair.rusqlite_conn.take() {
+            #[cfg(test)]
+            let pause = self
+                .checkpoint_pause
+                .lock()
+                .expect("checkpoint test pause")
+                .take();
+            let join_res = tokio::task::spawn_blocking(move || {
+                let _ = rconn.busy_timeout(Duration::from_millis(rem_ms));
+                let _ = rconn.execute_batch(&format!(
+                    "PRAGMA journal_size_limit = {target_journal_limit};"
+                ));
+                // SQLite's busy timeout limits lock waits. The OS can take longer
+                // to flush dirty pages, and the connection remains owned until it returns.
+                #[cfg(test)]
+                if let Some(pause) = pause {
+                    let _ = pause.started.send(());
+                    let _ = pause.release.recv_timeout(Duration::from_secs(5));
+                }
+                let res = rconn.query_row(ckpt_sql, [], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                });
+                let _ = rconn.busy_timeout(Duration::from_secs(5));
+                (rconn, res.ok())
+            })
+            .await;
+            match join_res {
+                Ok((rc, out)) => {
+                    pair.rusqlite_conn = Some(rc);
+                    out
+                }
+                Err(_) => None,
+            }
+        } else {
+            let conn = &mut pair.sqlx_conn;
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "PRAGMA busy_timeout = {rem_ms}"
+            )))
+            .execute(&mut *conn)
+            .await;
+            let trunc_res = sqlx::query(ckpt_sql).fetch_one(&mut *conn).await;
+            let _ = sqlx::query("PRAGMA busy_timeout = 5000")
+                .execute(&mut *conn)
+                .await;
+            trunc_res.ok().map(|row| {
+                (
+                    row.get::<i64, _>(0),
+                    row.get::<i64, _>(1),
+                    row.get::<i64, _>(2),
+                )
+            })
+        }
+    }
+
     async fn run_bounded_wal_reset(&self, inner: &Arc<CanonicalInner>, force_truncate: bool) {
         let Some(writer_coord) = inner.writer_coord.get() else {
             return;
@@ -1239,59 +1310,20 @@ impl SqliteWalCoordinator {
             }
             let rem_ms = u64::try_from(remaining.as_millis().clamp(1, 250)).unwrap_or(250);
 
-            let trunc_tuple = if let Some(rconn) = pair.rusqlite_conn.take() {
-                #[cfg(test)]
-                let io_delay_ms = self.checkpoint_io_delay_ms.load(Ordering::Relaxed);
-                let join_res = tokio::task::spawn_blocking(move || {
-                    let _ = rconn.busy_timeout(Duration::from_millis(rem_ms));
-                    let target_journal_limit = if burst_active {
-                        high_limit_i64.saturating_add(high_limit_i64 / 2)
-                    } else {
-                        crate::dialect::sqlite::SQLITE_JOURNAL_SIZE_LIMIT_BYTES
-                    };
-                    let _ = rconn.execute_batch(&format!(
-                        "PRAGMA journal_size_limit = {target_journal_limit};"
-                    ));
-                    // SQLite's busy timeout limits lock waits. The OS can take longer
-                    // to flush dirty pages, and the connection remains owned until it returns.
-                    #[cfg(test)]
-                    std::thread::sleep(Duration::from_millis(io_delay_ms));
-                    let res = rconn.query_row(ckpt_sql, [], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    });
-                    let _ = rconn.busy_timeout(Duration::from_secs(5));
-                    (rconn, res.ok())
-                })
-                .await;
-                match join_res {
-                    Ok((rc, out)) => {
-                        pair.rusqlite_conn = Some(rc);
-                        out
-                    }
-                    Err(_) => None,
-                }
+            let target_journal_limit = if burst_active {
+                high_limit_i64.saturating_add(high_limit_i64 / 2)
             } else {
-                let conn = &mut pair.sqlx_conn;
-                let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "PRAGMA busy_timeout = {rem_ms}"
-                )))
-                .execute(&mut *conn)
-                .await;
-                let trunc_res = sqlx::query(ckpt_sql).fetch_one(&mut *conn).await;
-                let _ = sqlx::query("PRAGMA busy_timeout = 5000")
-                    .execute(&mut *conn)
-                    .await;
-                trunc_res.ok().map(|row| {
-                    (
-                        row.get::<i64, _>(0),
-                        row.get::<i64, _>(1),
-                        row.get::<i64, _>(2),
-                    )
-                })
+                crate::dialect::sqlite::SQLITE_JOURNAL_SIZE_LIMIT_BYTES
+            };
+            let checkpoint = self.checkpoint_writer(pair, ckpt_sql, rem_ms, target_journal_limit);
+            tokio::pin!(checkpoint);
+            // SQLite serializes a late reader with the checkpoint itself. Keep the
+            // writer and its safe point until I/O finishes, but bound reader admission.
+            let completed = tokio::time::timeout_at(cycle_deadline, &mut checkpoint).await;
+            drop(reopen_guard);
+            let trunc_tuple = match completed {
+                Ok(outcome) => outcome,
+                Err(_) => checkpoint.await,
             };
 
             if let Some((busy, log_frames, ckpt_frames)) = trunc_tuple {
@@ -1332,8 +1364,6 @@ impl SqliteWalCoordinator {
         drop(writer_guard);
         drop(safe_point);
 
-        // Immediately reopen reader admission before filesystem stat!
-        drop(reopen_guard);
         let _ = self.observe_wal_file_bytes();
     }
 
@@ -1711,7 +1741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_io_overrun_counts_actual_reader_gate_dwell() {
+    async fn slow_checkpoint_releases_readers_while_the_writer_stays_owned() {
         let mut id = [0; 16];
         getrandom::fill(&mut id).unwrap();
         let path = std::env::temp_dir().join(format!("notarium-wal-dwell-{}", hex::encode(id)));
@@ -1728,12 +1758,67 @@ mod tests {
         *wal_reset_cycle_deadline = Duration::from_millis(20);
         let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
         let wal = store.inner.wal_coord.get().unwrap();
-        wal.checkpoint_io_delay_ms.store(75, Ordering::Relaxed);
-        wal.run_maintenance_tick(&store.inner, true).await;
-        let snapshot = wal.telemetry();
-        assert!(snapshot.max_reset_reader_gate_ns >= 75_000_000);
-        assert!(snapshot.reset_gate_overruns >= 1);
-        assert!(wal.gate.lock().unwrap().open);
+        let (started, checkpoint_started) = tokio::sync::oneshot::channel();
+        let (release, checkpoint_release) = std::sync::mpsc::channel();
+        *wal.checkpoint_pause.lock().unwrap() = Some(CheckpointPause {
+            started,
+            release: checkpoint_release,
+        });
+        let before = wal.telemetry().reset_successes;
+        let owner = store.clone();
+        let reset = tokio::spawn(async move {
+            let wal = owner.inner.wal_coord.get().unwrap();
+            wal.run_maintenance_tick(&owner.inner, true).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), checkpoint_started)
+            .await
+            .unwrap()
+            .unwrap();
+        let count = store
+            .with_read_tx(|tx| {
+                Box::pin(async move {
+                    let BackendConn::Sqlite(conn) = tx else {
+                        unreachable!()
+                    };
+                    Ok(
+                        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM schema_meta")
+                            .fetch_one(&mut **conn)
+                            .await
+                            .unwrap(),
+                    )
+                })
+            })
+            .await
+            .expect("reader admission must resume during slow checkpoint I/O");
+        assert_eq!(count, 1);
+        let SqlDriverState::Sqlite {
+            writer,
+            fast_read_pool,
+            ..
+        } = &store.inner.sql
+        else {
+            unreachable!()
+        };
+        let count = fast_read_pool
+            .with_read_conn(wal, None, |conn| {
+                Ok(conn
+                    .query_row("SELECT count(*) FROM schema_meta", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap())
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            writer.try_lock().is_err(),
+            "the checkpoint still owns the writer"
+        );
+        assert!(!reset.is_finished());
+        release.send(()).unwrap();
+        reset.await.unwrap();
+        assert!(wal.telemetry().reset_successes > before);
+        assert_eq!(wal.telemetry().leaked_sqlite_busy_errors, 0);
         runtime.shutdown().await.unwrap();
         fs::remove_dir_all(path).unwrap();
     }

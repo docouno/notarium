@@ -192,6 +192,14 @@ catalog count and its references in one transaction. Purge can release the
 erased owner's references by key, and recovery can check the count against
 the surviving references. The reference index grows with retained ownership.
 
+In a physical sizing fixture with 50,000 notes in 64 Spaces, 20 retained
+revisions per note produced one million owner rows. The table and its three
+indexes occupied 537.7 MiB on SQLite 3.51.3 and 585.5 MiB on PostgreSQL
+16.16. The indexes accounted for 331.6 and 348.5 MiB, respectively.
+Both engines used the owner index to release one note's 20 references and
+the digest index to count the surviving references. Blob data, other
+relations, WAL and backups require additional disk space.
+
 ### `LocalZstdV1`
 
 Local blobs live under `blobs/<space_id>/<aa>/<blake3_hex>.zst` via
@@ -357,9 +365,11 @@ same example against an isolated prefix.
   Without one, the default allows one configured reset interval plus one read
   interval (498 ms by default). Once admitted, the no-budget path allows at most
   one read interval for checkout and SQL. The active snapshot retains its own cap.
-  Once the filesystem flush starts, SQLite holds the gate until I/O completes.
-  `WalTelemetrySnapshot.max_reset_reader_gate_ns` records the longest actual
-  closure and `reset_gate_overruns` counts closures over budget.
+  Reader admission reopens when the checkpoint finishes or the reset budget
+  expires. A slow checkpoint retains its writer connection and safe point until
+  SQLite returns. SQLite coordinates new readers with the active checkpoint.
+  `WalTelemetrySnapshot.max_reset_reader_gate_ns` records the actual admission
+  pause and `reset_gate_overruns` counts closures over budget.
 - **Hierarchy, boards and semantic rollback:** `MoveFolder` updates only the
   moved folder row (`0` descendant row writes) under cycle checks and per-Space
   serialization. Same-depth and upward moves check the two ancestor paths.
