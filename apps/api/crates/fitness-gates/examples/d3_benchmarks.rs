@@ -6,6 +6,10 @@
 
 #[path = "d3_benchmarks/interactive.rs"]
 mod interactive;
+#[path = "d3_benchmarks/writer_samples.rs"]
+mod writer_samples;
+
+use writer_samples::WriterEditSamples;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -879,9 +883,7 @@ async fn run_writer_benchmark_case(
             let mut cur_digest =
                 ContentDigest::from_bytes(*blake3::hash(cur_carrier.as_bytes()).as_bytes());
             let mut seq_num = 1u64;
-            let mut measured_failed_latencies = Vec::new();
-            let mut local_latencies_ns = Vec::with_capacity(4096);
-            let mut local_digests = Vec::with_capacity(4096);
+            let mut samples = WriterEditSamples::new(4096);
 
             while phase_cl.load(Ordering::Relaxed) != 2 {
                 let (next_carrier, next_body) = build_unique_4kib_carrier(&header, w, seq_num);
@@ -914,25 +916,22 @@ async fn run_writer_benchmark_case(
                 );
 
                 let before = phase_cl.load(Ordering::Acquire);
-                let in_measure_before = before == 1;
                 let t0 = Instant::now();
-                match store_cl.edit_note(ctx, mutation).await {
+                let result = store_cl.edit_note(ctx, mutation).await;
+                let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let after = phase_cl.load(Ordering::Acquire);
+                samples.record(
+                    before,
+                    after,
+                    elapsed_ns,
+                    result.is_ok().then_some(next_digest_bytes),
+                );
+                match result {
                     Ok(_committed) => {
-                        let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                        let in_measure_after = phase_cl.load(Ordering::Acquire) == 1;
-                        if in_measure_before && in_measure_after {
-                            local_latencies_ns.push(elapsed_ns);
-                            local_digests.push(next_digest_bytes);
-                        }
                         cur_carrier = next_carrier;
                         cur_digest = ContentDigest::from_bytes(next_digest_bytes);
                     }
                     Err(err) => {
-                        let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                        let after = phase_cl.load(Ordering::Acquire);
-                        if in_measure_before && after == 1 {
-                            measured_failed_latencies.push(elapsed_ns);
-                        }
                         w_errs
                             .lock()
                             .unwrap()
@@ -940,7 +939,7 @@ async fn run_writer_benchmark_case(
                     }
                 }
             }
-            (local_latencies_ns, local_digests, measured_failed_latencies)
+            samples
         }));
     }
 
@@ -959,16 +958,16 @@ async fn run_writer_benchmark_case(
     store.set_writer_batch_telemetry(false).unwrap();
     let batch_samples = store.take_writer_batch_samples().unwrap();
 
-    let mut all_latencies_ns = Vec::new();
-    let mut failed_in_window = Vec::new();
+    let mut successful_ns = Vec::new();
+    let mut failed_ns = Vec::new();
+    let mut measured_mutations = 0u64;
     let mut unique_digests = BTreeSet::new();
-    for jh in writer_handles {
-        let (lats, digests, failed) = jh.await.unwrap();
-        failed_in_window.extend(failed);
-        all_latencies_ns.extend(lats);
-        for d in digests {
-            unique_digests.insert(d);
-        }
+    for handle in writer_handles {
+        let samples = handle.await.unwrap();
+        measured_mutations += samples.completed_digests.len() as u64;
+        unique_digests.extend(samples.completed_digests);
+        successful_ns.extend(samples.successful_ns);
+        failed_ns.extend(samples.failed_ns);
     }
     for jh in reader_handles {
         jh.await.expect("join the mixed-profile reader");
@@ -980,7 +979,6 @@ async fn run_writer_benchmark_case(
     let failed_edits = std::mem::take(&mut *writer_errors.lock().unwrap());
     let failed_reads = std::mem::take(&mut *reader_errors.lock().unwrap());
     let measured_reads_completed = measured_reads.load(Ordering::SeqCst);
-    let measured_mutations = all_latencies_ns.len() as u64;
     let throughput = (measured_mutations as f64) / measured_secs;
 
     let batch_lat_ns: Vec<u64> = batch_samples.iter().map(|&(ns, _)| ns).collect();
@@ -991,14 +989,14 @@ async fn run_writer_benchmark_case(
         (total_batch_items as f64) / (batch_samples.len() as f64)
     };
 
-    let all_attempts_pct = if failed_in_window.is_empty() {
+    let all_attempts_pct = if failed_ns.is_empty() {
         None
     } else {
-        failed_in_window.extend_from_slice(&all_latencies_ns);
-        Some(compute_percentiles_from_ns(failed_in_window))
+        failed_ns.extend_from_slice(&successful_ns);
+        Some(compute_percentiles_from_ns(failed_ns))
     };
     let admission_pct =
-        (!all_latencies_ns.is_empty()).then(|| compute_percentiles_from_ns(all_latencies_ns));
+        (!successful_ns.is_empty()).then(|| compute_percentiles_from_ns(successful_ns));
     let all_attempts_pct = all_attempts_pct.or_else(|| admission_pct.clone());
     let phase2_pct = (!batch_lat_ns.is_empty()).then(|| compute_percentiles_from_ns(batch_lat_ns));
 

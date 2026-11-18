@@ -10,6 +10,8 @@ mod conflict_authority;
 mod folder_authority;
 #[path = "l5_domain_security_and_purge/folder_depth.rs"]
 mod folder_depth;
+#[path = "l5_domain_security_and_purge/observations.rs"]
+mod observations;
 #[path = "l5_domain_security_and_purge/preconditions.rs"]
 mod preconditions;
 #[path = "l5_domain_security_and_purge/staging.rs"]

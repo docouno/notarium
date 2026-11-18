@@ -41,15 +41,73 @@ Medium. Remote object storage needs a measurement over the intended network.
 | PostgreSQL rollback with local CAS | p95 <5 ms | High <5 ms. On Medium, reduce the measured 11.858 ms to the shared target. |
 | SQLite 50 writers, zero or 200 readers | >2,000 confirmed mutations/s in **each** run, zero errors | High >3,500/s in each run. On Medium, eliminate the reader error and repeat both profiles against the shared target. |
 
+Two subsequent High series on the same runtime revision (`f6651e2c`)
+illustrate how to evaluate these candidates. SQLite rollback had p95 of
+3.29 and 3.38 ms. PostgreSQL rollback had p95 of 4.54 and 8.97 ms. The
+first series sustained 3,909–4,183 mutations/s across its six writer runs.
+In the second series a 50-writer/200-reader run completed 330 mutations/s.
+Keep the PostgreSQL miss and the throughput drop in the release evidence.
+The observed variation rules out promoting 3,500/s to a High release floor
+from these measurements. For a slowdown, compare the affected durable
+operation, queue, batch commit and storage pressure on the same host.
+
+### Ordinary edits on Medium
+
+The canonical port benchmark on `f6651e2c` completed 29,564 measured
+open/edit/readback cycles across 12 series, with zero errors. Reopening the
+store verified the last confirmed head for every note. The table shows the
+range across three independent series. Eight workers edited distinct notes in
+one Space as the same owner, with a 100 ms pause between cycles. A single
+worker issued the next cycle immediately.
+
+| Backend | Workers | Open p95 (ms) | Durable edit p95 (ms) | Durable edit p99 (ms) | Whole cycle p95 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SQLite | 1 | 0.96–1.08 | 7.95–8.82 | 10.98–11.20 | 10.06–11.01 |
+| PostgreSQL | 1 | 2.24–3.47 | 10.66–12.78 | 13.84–15.69 | 15.05–19.29 |
+| SQLite | 8 | 2.21–2.33 | 14.89–15.79 | 77.98–145.88 | 18.53–18.90 |
+| PostgreSQL | 8 | 4.07–4.72 | 33.08–41.72 | 94.47–123.20 | 38.59–50.09 |
+
+Track the eight-worker p99 per backend alongside single-worker p95. These
+series cover a 4 KiB note and local database access. HTTP, rendering and the
+50,000-note import enter the system budgets in their respective integration
+tests. Reproduce the interaction with the release fixture.
+
+```sh
+sh docker/storage-fixtures/with-storage-fixtures.sh benchmark --interactions
+```
+
 ## Repeatable comparison
 
-Record commit and tree, release build, client and server resource limits,
-mount, database settings, cache state and competing workload. Characterize
-a new host independently of the application results. For the disk figures
-above, alternate 4 KiB and 256 KiB appends to one file on the data mount,
-call fdatasync after each append and collect 320 samples per size after
-32 warmup rounds. For the codec, time the same release binary and corpus on
-one thread for 32 batches of 512 documents after four warmup batches.
+Characterize the host independently of application latency. After `make setup`,
+build the release codec example once on Linux. From the repository root run
+
+```sh
+sh .devkit/runtime/devkit.sh cli exec --component apps/api --network none -- \
+  cargo build --offline --locked --release -p fitness-gates --example storage_codec_probe
+```
+
+Copy that executable and `scripts/storage-calibration.py` to both compatible
+Linux hosts. Use Python 3.9+ and supply an existing writable directory on the
+same filesystem as the database. For example, from the original checkout run
+
+```sh
+python3 scripts/storage-calibration.py apps/api/target/release/examples/storage_codec_probe \
+  /path/on/database-volume > storage-calibration.json
+```
+
+Record the release commit/tree, database settings, filesystem mount, effective
+CPU and memory limits, cache state and competing work. The JSON records the
+binary and driver SHA-256, target directory and device number. Check that
+`codec.corpus_blake3` is
+`dfd19ddf972050fc6f758933718a5b3e0a36c5d31a2f113f35720e8487d3c43c`.
+This covers the concatenated 512 documents in order, each 4,096 bytes.
+The probe measures the production LocalZstdV1 codec in 32 single-thread
+batches after four warmup batches. Disk samples use one growing temporary
+file (about 90 MiB), one append followed by fdatasync, alternating the order
+of 4 KiB and 256 KiB appends over 32 warmup and 320 measured rounds. The
+report includes the SHA-256 of each input block and the individual timings.
+The reference values above are historical measurements. Compare new runs
+using identical executable, driver and input hashes.
 
 Run three independent release series per configuration. Match input sizes,
 corpus topology, concurrency, warmup and operation mix. When a workload

@@ -260,6 +260,15 @@ with the original key after subsequent edits. The owner's snapshot covers the
 outstanding room updates. A room with neither a snapshot nor pending updates
 can accept a carrier while closing without a final snapshot.
 
+An external observation checks that its full carrier or applied patch produces
+the declared content digest before returning `NoChange` or a committed receipt.
+A replay first checks current write authority. A committed patch observation
+keeps its validated plan fingerprint in note-owned receipt detail until purge.
+For older receipts and equivalent alternative plans, verification applies the
+plan to the original revision of the same note and rechecks the receipt after
+reading storage. A missing original or a mismatched plan fails verification.
+A valid replay returns the original receipt without exposing historical bytes.
+
 `Applied(receipt)` identifies the retained typed outcome of the original command.
 A Board move includes the complete field and rank change. Standalone room
 checkpoints and closes record their own room operations.

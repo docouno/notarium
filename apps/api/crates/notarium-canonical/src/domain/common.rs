@@ -2105,7 +2105,17 @@ impl StoredCommittedSchemaRevV1 {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "outcome", content = "data", rename_all = "snake_case")]
 pub(crate) enum StoredExternalObsOutcomeV1 {
-    Committed(StoredCommittedNoteRevV1),
-    NoChange { revision: RevisionId },
-    Conflict { current: RevisionId },
+    Committed {
+        #[serde(flatten)]
+        result: StoredCommittedNoteRevV1,
+        // Older receipts retain value and receipt without a validated plan.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verified_plan: Option<ContentDigest>,
+    },
+    NoChange {
+        revision: RevisionId,
+    },
+    Conflict {
+        current: RevisionId,
+    },
 }

@@ -502,8 +502,19 @@ with `FAIL` and returns a nonzero status. A board or folder storage error
 ends that profile and later profiles still run. Its `failure` records the
 stage, the one-based move number when applicable, and the storage diagnostic.
 A board verification failure after commit also records the receipt sequence.
-Latency includes successful calls only. A board move must also pass its
-post-commit overlay checks to count. Empty latency samples serialize as null.
+Board and folder latency includes verified successful moves. Empty writer,
+board and folder latency distributions serialize as null.
+
+For the SQLite writer, `measured_mutations` counts successful edits that both
+start and return during the measurement window. Throughput divides that count
+by `measured_secs`. The latency distributions follow every edit started
+during the window until it returns, including edits that finish during drain.
+`admission_to_receipt` includes successful edits. `all_measured_edit_attempts`
+also includes failed edits. Warmup admissions belong to neither distribution,
+even when they finish during measurement. The counts for a latency distribution
+and for throughput can therefore differ. Any reader or writer error in any
+phase fails the profile. The report counts every error by code and start/end
+phase and retains up to eight detailed examples per operation type.
 
 | Workload | Release profile and target |
 | --- | --- |

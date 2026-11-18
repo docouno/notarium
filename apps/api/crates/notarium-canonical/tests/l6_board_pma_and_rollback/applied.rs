@@ -15,7 +15,7 @@ use notarium_core::{
 };
 use tokio::sync::oneshot;
 
-type Pause = (oneshot::Sender<()>, oneshot::Receiver<MutationReceiptToken>);
+type Pause = (oneshot::Sender<()>, oneshot::Receiver<InterceptionResult>);
 
 struct PausedRoom {
     fences: Arc<RoomFenceTable>,
@@ -36,25 +36,25 @@ impl PausedRoom {
         });
     }
 
-    async fn applied<T, U>(
+    async fn during_interception<T, U>(
         &self,
         original: impl Future<Output = Result<T, PortError>>,
-        other_writes: impl Future<Output = (MutationReceiptToken, U)>,
+        other_writes: impl Future<Output = (InterceptionResult, U)>,
     ) -> (Result<T, PortError>, U) {
         let (entered_tx, entered) = oneshot::channel();
-        let (release, receipt_rx) = oneshot::channel();
-        *self.pause.lock().unwrap() = Some((entered_tx, receipt_rx));
+        let (release, outcome_rx) = oneshot::channel();
+        *self.pause.lock().unwrap() = Some((entered_tx, outcome_rx));
         let writes = async {
             entered.await.unwrap();
-            let (receipt, result) = other_writes.await;
-            release.send(receipt).unwrap();
+            let (outcome, result) = other_writes.await;
+            release.send(outcome).unwrap();
             result
         };
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             tokio::join!(original, writes)
         })
         .await
-        .expect("room must deliver Applied after the competing writes")
+        .expect("room must respond after the competing writes")
     }
 }
 
@@ -67,7 +67,7 @@ impl LiveCollabInterceptor for PausedRoom {
             let pause = self.pause.lock().unwrap().take();
             if let Some((entered, result)) = pause {
                 entered.send(()).unwrap();
-                return Ok(InterceptionResult::Applied(result.await.unwrap()));
+                return Ok(result.await.unwrap());
             }
             let note = match request.payload {
                 InterceptedPayload::EditNote { note, .. } => note,
@@ -174,13 +174,16 @@ pub(super) async fn check(
     };
     let a = edit("zero", "one");
     let (answer, (committed_a, committed_b)) = room
-        .applied(store.edit_note(ctx.clone(), a.clone()), async {
+        .during_interception(store.edit_note(ctx.clone(), a.clone()), async {
             let committed_a = store.edit_note(ctx.clone(), a).await.unwrap();
             let committed_b = store
                 .edit_note(ctx.clone(), edit("one", "two"))
                 .await
                 .unwrap();
-            (committed_a.receipt.clone(), (committed_a, committed_b))
+            (
+                InterceptionResult::Applied(committed_a.receipt.clone()),
+                (committed_a, committed_b),
+            )
         })
         .await;
     let answer = answer.unwrap();
@@ -216,7 +219,7 @@ pub(super) async fn check(
         .await
         .unwrap();
     let (answer, (_, later)) = room
-        .applied(
+        .during_interception(
             store.accept_external_observation(ctx.clone(), observation),
             async {
                 let first = store
@@ -243,7 +246,9 @@ pub(super) async fn check(
                     .await
                     .unwrap();
                 (
-                    MutationReceiptToken::new(scope.clone(), first.updated_seq).unwrap(),
+                    InterceptionResult::Applied(
+                        MutationReceiptToken::new(scope.clone(), first.updated_seq).unwrap(),
+                    ),
                     (first, later),
                 )
             },
@@ -270,8 +275,8 @@ pub(super) async fn check(
         },
     );
     let (foreign, ()) = room
-        .applied(store.move_board_card(ctx.clone(), card.clone()), async {
-            (created.receipt, ())
+        .during_interception(store.move_board_card(ctx.clone(), card.clone()), async {
+            (InterceptionResult::Applied(created.receipt), ())
         })
         .await;
     assert!(matches!(foreign, Err(PortError::Unavailable(failure))
@@ -286,7 +291,7 @@ pub(super) async fn check(
 
     let saved_card = card.clone();
     let (answer, (first, later)) = room
-        .applied(store.move_board_card(ctx.clone(), card.clone()), async {
+        .during_interception(store.move_board_card(ctx.clone(), card.clone()), async {
             let first = store
                 .move_board_card(ctx.clone(), card.clone())
                 .await
@@ -306,7 +311,10 @@ pub(super) async fn check(
                 },
             );
             let later = store.move_board_card(ctx.clone(), next).await.unwrap();
-            (first.receipt.clone(), (first, later))
+            (
+                InterceptionResult::Applied(first.receipt.clone()),
+                (first, later),
+            )
         })
         .await;
     let answer = answer.unwrap();
@@ -520,7 +528,7 @@ async fn check_rename_placement_and_deadline(
         )
         .await
         .unwrap();
-    assert_eq!(read.parent, Some(folder));
+    assert_eq!(read.parent, Some(folder.clone()));
     let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
     let (waiting, _hold) = pause();
     let mut short = ctx.clone();
@@ -537,6 +545,141 @@ async fn check_rename_placement_and_deadline(
         store.read_space(&scope.space_id).await.unwrap().last_seq,
         before
     );
+    Box::pin(check_observation_conflict(
+        store,
+        ctx,
+        room,
+        &folder,
+        renamed.value,
+    ))
+    .await;
+}
+
+async fn check_observation_conflict(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    room: &PausedRoom,
+    folder: &FolderId,
+    mut base: NoteRevision,
+) {
+    enum AfterChange {
+        Writable,
+        Cancelled,
+        Locked,
+    }
+    let active = store
+        .read_collab_session(Some(&ctx.budget), ctx.scope(), &base.note)
+        .await
+        .unwrap()
+        .unwrap()
+        .session;
+    for (i, (settle, state)) in [
+        (false, AfterChange::Writable),
+        (true, AfterChange::Writable),
+        (false, AfterChange::Cancelled),
+        (false, AfterChange::Locked),
+        (true, AfterChange::Locked),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut caller = ctx.clone();
+        caller.budget = make_budget();
+        let cancel = caller.budget.cancellation.clone();
+        let mut observation = next_mutation(
+            ctx.scope(),
+            ctx.auth().principal(),
+            ExternalObservation {
+                note: base.note.clone(),
+                base_revision: base.revision.clone(),
+                observed_digest: notarium_syntax::content_digest("Observed bytes.\n"),
+                disk_identity: notarium_syntax::content_digest("observation-conflict"),
+                content: ObservedContent::Carrier("Observed bytes.\n".into()),
+            },
+        );
+        observation.preconditions.revision = Some(base.revision.clone());
+        let (answer, (changed, cut)) = room
+            .during_interception(
+                store.accept_external_observation(caller, observation),
+                async {
+                    let changed = store
+                        .rename_note(
+                            ctx.clone(),
+                            next_mutation(
+                                ctx.scope(),
+                                ctx.auth().principal(),
+                                RenameNote {
+                                    note: base.note.clone(),
+                                    slug: format!("observed-change-{i}"),
+                                    title: None,
+                                },
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                    match state {
+                        AfterChange::Writable => (),
+                        AfterChange::Cancelled => cancel.cancel(),
+                        AfterChange::Locked => {
+                            store
+                                .set_folder_write_lock(ctx.clone(), folder.clone(), true)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    let cut = store
+                        .read_space(&ctx.scope().space_id)
+                        .await
+                        .unwrap()
+                        .last_seq;
+                    let reply = if settle {
+                        InterceptionResult::SettleCarrier(AcceptedRoomCarrier {
+                            owner_id: active.owner_id.clone().unwrap(),
+                            expected_lease: active.lease_epoch,
+                            expected_lineage: active.lineage_epoch,
+                            compacted_through_update_seq: None,
+                            action: RoomCarrierAction::Close {
+                                final_yrs_snapshot: None,
+                            },
+                        })
+                    } else {
+                        // This deliberately stale revision cannot establish the current head.
+                        InterceptionResult::Conflict(DomainError::RevisionConflict {
+                            current: base.revision.clone(),
+                            lineage: None,
+                        })
+                    };
+                    (reply, (changed.value, cut))
+                },
+            )
+            .await;
+        assert_ne!(base.revision, changed.revision);
+        match state {
+            AfterChange::Writable => assert!(
+                matches!(answer, Ok(ExternalObservationResult::Conflict { current }) if current == changed.revision)
+            ),
+            AfterChange::Cancelled => assert!(matches!(answer, Err(PortError::Cancelled(_)))),
+            AfterChange::Locked => assert!(matches!(
+                answer,
+                Err(PortError::Domain(DomainError::SpaceReadOnly))
+            )),
+        }
+        assert_eq!(
+            store
+                .read_space(&ctx.scope().space_id)
+                .await
+                .unwrap()
+                .last_seq,
+            cut
+        );
+        if matches!(state, AfterChange::Locked) {
+            store
+                .set_folder_write_lock(ctx.clone(), folder.clone(), false)
+                .await
+                .unwrap();
+        }
+        base = changed;
+    }
 }
 
 async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, room: &PausedRoom) {

@@ -320,11 +320,18 @@ fn edit_note_identity(
 ) -> crate::writer::CommandIdentitySpec {
     let mut hash = blake3::Hasher::new();
     hash.update(input.note.as_str().as_bytes());
-    hash.update(input.plan.base_content_hash.as_bytes());
-    hash.update(&(input.plan.body_range.start() as u64).to_be_bytes());
-    hash.update(&(input.plan.body_range.end() as u64).to_be_bytes());
-    hash.update(&(input.plan.edits.len() as u64).to_be_bytes());
-    for edit in &input.plan.edits {
+    hash_carrier_plan(&mut hash, &input.plan);
+    hash_preconditions(&mut hash, preconditions);
+    derive_command_identity_spec(identity, "edit_note", hash.finalize().as_bytes())
+        .for_note(ctx.auth(), &input.note)
+}
+
+fn hash_carrier_plan(hash: &mut blake3::Hasher, plan: &CarrierPatchPlan) {
+    hash.update(plan.base_content_hash.as_bytes());
+    hash.update(&(plan.body_range.start() as u64).to_be_bytes());
+    hash.update(&(plan.body_range.end() as u64).to_be_bytes());
+    hash.update(&(plan.edits.len() as u64).to_be_bytes());
+    for edit in &plan.edits {
         hash.update(&[match edit.origin {
             CarrierEditOrigin::Header => 0,
             CarrierEditOrigin::Body => 1,
@@ -341,9 +348,6 @@ fn edit_note_identity(
         }
         hash.update(edit.replacement.as_bytes());
     }
-    hash_preconditions(&mut hash, preconditions);
-    derive_command_identity_spec(identity, "edit_note", hash.finalize().as_bytes())
-        .for_note(ctx.auth(), &input.note)
 }
 
 fn hash_preconditions(hash: &mut blake3::Hasher, preconditions: &Preconditions) {
@@ -4280,6 +4284,94 @@ fn build_link_item_intent(
     }
 }
 
+fn check_observed_digest(carrier: &str, declared: ContentDigest) -> Result<(), PortError> {
+    if notarium_syntax::content_digest(carrier) != declared {
+        return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
+    }
+    Ok(())
+}
+
+fn observation_plan_fingerprint(plan: &CarrierPatchPlan) -> ContentDigest {
+    let mut hash = blake3::Hasher::new_derive_key("notarium external observation plan v1");
+    hash_carrier_plan(&mut hash, plan);
+    ContentDigest::from_bytes(*hash.finalize().as_bytes())
+}
+
+async fn verify_observation_replay(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    observation: &ExternalObservation,
+    replayed: &StoredExternalObsOutcomeV1,
+    idemp: &crate::writer::CommandIdentitySpec,
+) -> Result<(), PortError> {
+    match &observation.content {
+        ObservedContent::Carrier(carrier) => {
+            check_observed_digest(carrier, observation.observed_digest)
+        }
+        ObservedContent::Planned(plan) => {
+            if let StoredExternalObsOutcomeV1::Committed {
+                verified_plan: Some(verified),
+                ..
+            } = replayed
+                && *verified == observation_plan_fingerprint(plan)
+            {
+                return Ok(());
+            }
+            // The receipt binds this note and base. Verification is internal to the
+            // write and never grants the caller access to the historical carrier.
+            let scope = ctx.scope().clone();
+            let note = observation.note.clone();
+            let revision = observation.base_revision.clone();
+            let authority = idemp.clone();
+            let digest = store
+                .with_read_tx_budget(Some(&ctx.budget), |tx| {
+                    Box::pin(async move {
+                        authority.authorize_replay(tx, &scope).await?;
+                        if is_note_purge_fenced_tx(tx, &scope.space_id, note.as_str()).await? {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        let bytes = load_revision_metadata_opt_tx(tx, &scope, &revision)
+                            .await?
+                            .ok_or(DomainError::ResourceNotFound)?;
+                        match RevisionMetadataEnvelope::decode(&bytes)?.payload {
+                            RevisionMetadataPayload::Note(previous)
+                                if previous.note_id == note
+                                    && previous.lifecycle != Lifecycle::Purged =>
+                            {
+                                previous
+                                    .content_digest
+                                    .ok_or(DomainError::ResourceNotFound.into())
+                            }
+                            _ => Err(DomainError::ResourceNotFound.into()),
+                        }
+                    })
+                })
+                .await?;
+            if digest != plan.base_content_hash {
+                return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+            }
+            let bytes = store.read_verified_blob(ctx.scope(), digest).await?;
+            // Re-check current authority, erasure, history and identity after CAS I/O.
+            if try_replay_completed_receipt::<StoredExternalObsOutcomeV1>(
+                store,
+                ctx.scope(),
+                idemp,
+                Some(&ctx.budget),
+            )
+            .await?
+            .is_none()
+            {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            let base = std::str::from_utf8(&bytes).map_err(|_| {
+                internal_not_committed("obs_corrupt_utf8", "carrier not valid UTF-8")
+            })?;
+            let carrier = notarium_syntax::patch::apply(base, plan)?;
+            check_observed_digest(&carrier, observation.observed_digest)
+        }
+    }
+}
+
 pub(crate) async fn accept_external_observation_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -4311,8 +4403,16 @@ pub(crate) async fn accept_external_observation_impl(
     )
     .await?
     {
+        Box::pin(verify_observation_replay(
+            store,
+            &ctx,
+            &request.input,
+            &replayed,
+            &idemp,
+        ))
+        .await?;
         return Ok(match replayed {
-            StoredExternalObsOutcomeV1::Committed(c) => {
+            StoredExternalObsOutcomeV1::Committed { result: c, .. } => {
                 ExternalObservationResult::Committed(c.into_committed())
             }
             StoredExternalObsOutcomeV1::NoChange { revision } => {
@@ -4333,10 +4433,8 @@ pub(crate) async fn accept_external_observation_impl(
     )
     .await;
     let (space_rec, base_head) = match current {
-        Err(PortError::Domain(DomainError::RevisionConflict { current, .. })) => {
-            return Ok(ExternalObservationResult::Conflict { current });
-        }
-        other => other?,
+        Ok(head) => head,
+        Err(error) => return observation_error(error),
     };
 
     if base_head.head_rev_id != request.input.base_revision {
@@ -4344,10 +4442,14 @@ pub(crate) async fn accept_external_observation_impl(
             current: base_head.head_rev_id,
         });
     }
-    if base_head.content_digest == Some(request.input.observed_digest) {
-        return Ok(ExternalObservationResult::NoChange {
-            revision: base_head.head_rev_id,
-        });
+    let same_digest = base_head.content_digest == Some(request.input.observed_digest);
+    if let ObservedContent::Carrier(carrier) = &request.input.content {
+        check_observed_digest(carrier, request.input.observed_digest)?;
+        if same_digest {
+            return Ok(ExternalObservationResult::NoChange {
+                revision: base_head.head_rev_id,
+            });
+        }
     }
 
     let base_digest = base_head.content_digest.ok_or_else(|| {
@@ -4359,15 +4461,35 @@ pub(crate) async fn accept_external_observation_impl(
     let base_carrier = String::from_utf8(raw_bytes)
         .map_err(|_| internal_not_committed("obs_corrupt_utf8", "carrier not valid UTF-8"))?;
 
-    let new_carrier = match &request.input.content {
-        ObservedContent::Carrier(carrier) => carrier.clone(),
-        ObservedContent::Planned(plan) => notarium_syntax::patch::apply(&base_carrier, plan)?,
+    let (new_carrier, verified_plan) = match &request.input.content {
+        ObservedContent::Carrier(carrier) => (carrier.clone(), None),
+        ObservedContent::Planned(plan) => {
+            let carrier = notarium_syntax::patch::apply(&base_carrier, plan)?;
+            check_observed_digest(&carrier, request.input.observed_digest)?;
+            if same_digest {
+                return match read_active_note_for_mutation(
+                    store,
+                    &ctx,
+                    &request.input.note,
+                    &request.preconditions,
+                    NoteMutationAccess::Current,
+                )
+                .await
+                {
+                    Ok((_, head)) if head.head_rev_id == base_head.head_rev_id => {
+                        Ok(ExternalObservationResult::NoChange {
+                            revision: head.head_rev_id,
+                        })
+                    }
+                    Ok((_, head)) => Ok(ExternalObservationResult::Conflict {
+                        current: head.head_rev_id,
+                    }),
+                    Err(error) => observation_error(error),
+                };
+            }
+            (carrier, Some(observation_plan_fingerprint(plan)))
+        }
     };
-
-    let computed_digest = notarium_syntax::content_digest(&new_carrier);
-    if computed_digest != request.input.observed_digest {
-        return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
-    }
     let preparsed_hdr = if base_head.doc_class != DocClass::EncryptedNote {
         enforce_protected_frontmatter_unchanged_with_header(
             &base_carrier,
@@ -4436,7 +4558,7 @@ pub(crate) async fn accept_external_observation_impl(
                     &idemp,
                     receipt,
                     |row: StoredExternalObsOutcomeV1| match row {
-                        StoredExternalObsOutcomeV1::Committed(result)
+                        StoredExternalObsOutcomeV1::Committed { result, .. }
                             if result.value.note == request.input.note =>
                         {
                             Some(result.into_committed())
@@ -4450,7 +4572,7 @@ pub(crate) async fn accept_external_observation_impl(
             }
             InterceptionResult::SettleCarrier(accepted) => {
                 let transition = crate::peers::RoomCarrierTransition::from(accepted);
-                transition
+                if let Err(error) = transition
                     .check_before_staging(
                         store,
                         &ctx.budget,
@@ -4459,21 +4581,26 @@ pub(crate) async fn accept_external_observation_impl(
                         ctx.auth(),
                         Some(&base_head.head_rev_id),
                     )
-                    .await?;
+                    .await
+                {
+                    return observation_error(error);
+                }
                 reservation_opt = Some(CarrierRoomWrite::Accepted(transition));
             }
             InterceptionResult::Conflict(_) => {
-                let (_, current) = read_active_note_for_mutation(
+                let current = match read_active_note_for_mutation(
                     store,
                     &ctx,
                     &request.input.note,
                     &request.preconditions,
                     NoteMutationAccess::Current,
                 )
-                .await?;
-                return Ok(ExternalObservationResult::Conflict {
-                    current: current.head_rev_id,
-                });
+                .await
+                {
+                    Ok((_, head)) => head.head_rev_id,
+                    Err(error) => return observation_error(error),
+                };
+                return Ok(ExternalObservationResult::Conflict { current });
             }
             InterceptionResult::ClosedRoomReservation(res) => {
                 reservation_opt = Some(CarrierRoomWrite::Reserved(res));
@@ -4810,14 +4937,29 @@ pub(crate) async fn accept_external_observation_impl(
                 )?;
 
                 let receipt = MutationReceiptToken::new(scope_cl.clone(), seq)?;
-                let stored_resp = StoredExternalObsOutcomeV1::Committed(StoredCommittedNoteRevV1 {
-                    value: NoteRevision {
-                        note: obs_input.note.clone(),
-                        revision: new_rev.clone(),
+                let mut stored_resp = StoredExternalObsOutcomeV1::Committed {
+                    result: StoredCommittedNoteRevV1 {
+                        value: NoteRevision {
+                            note: obs_input.note.clone(),
+                            revision: new_rev.clone(),
+                        },
+                        receipt,
                     },
-                    receipt,
-                });
+                    verified_plan,
+                };
                 let resp_bytes = CanonicalStore::encode_command_outcome(&stored_resp)?;
+                let detail = room_receipt_detail(room_grant.as_ref(), &stored_resp)?
+                    .or_else(|| verified_plan.map(|_| resp_bytes.clone()));
+                let sanitized = if let StoredExternalObsOutcomeV1::Committed {
+                    verified_plan: plan @ Some(_),
+                    ..
+                } = &mut stored_resp
+                {
+                    *plan = None;
+                    CanonicalStore::encode_command_outcome(&stored_resp)?
+                } else {
+                    resp_bytes.clone()
+                };
 
                 Ok(ItemCommitArtifacts {
                     command_id: cmd_id,
@@ -4832,8 +4974,8 @@ pub(crate) async fn accept_external_observation_impl(
                         doc_class: Some(head.doc_class),
                     }],
                     change_payload: Some(cp),
-                    receipt_detail_blob: room_receipt_detail(room_grant.as_ref(), &stored_resp)?,
-                    receipt_sanitized_blob: resp_bytes.clone(),
+                    receipt_detail_blob: detail,
+                    receipt_sanitized_blob: sanitized,
                     receipt_owner_note_ids: vec![obs_input.note],
                     response_bytes: resp_bytes,
                 })
@@ -4845,7 +4987,7 @@ pub(crate) async fn accept_external_observation_impl(
         .submit_write_command::<StoredExternalObsOutcomeV1>(&ctx.budget, intent)
         .await
     {
-        Ok(StoredExternalObsOutcomeV1::Committed(c)) => {
+        Ok(StoredExternalObsOutcomeV1::Committed { result: c, .. }) => {
             Ok(ExternalObservationResult::Committed(c.into_committed()))
         }
         Ok(StoredExternalObsOutcomeV1::NoChange { revision }) => {
@@ -4854,10 +4996,17 @@ pub(crate) async fn accept_external_observation_impl(
         Ok(StoredExternalObsOutcomeV1::Conflict { current }) => {
             Ok(ExternalObservationResult::Conflict { current })
         }
-        Err(PortError::Domain(DomainError::RevisionConflict { current, .. })) => {
+        Err(error) => observation_error(error),
+    }
+}
+
+/// Convert a revision conflict from an authorized canonical read or write.
+fn observation_error(error: PortError) -> Result<ExternalObservationResult, PortError> {
+    match error {
+        PortError::Domain(DomainError::RevisionConflict { current, .. }) => {
             Ok(ExternalObservationResult::Conflict { current })
         }
-        Err(other) => Err(other),
+        other => Err(other),
     }
 }
 
