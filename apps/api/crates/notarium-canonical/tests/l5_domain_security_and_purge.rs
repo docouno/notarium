@@ -6,6 +6,8 @@ mod batch;
 mod collab_schema;
 #[path = "l5_domain_security_and_purge/folder_authority.rs"]
 mod folder_authority;
+#[path = "l5_domain_security_and_purge/folder_depth.rs"]
+mod folder_depth;
 #[path = "l5_domain_security_and_purge/staging.rs"]
 mod staging;
 mod support;
@@ -647,6 +649,16 @@ async fn run_domain_and_security_suite(
             false,
             false,
         );
+        let portable_card = historical[0].as_ref().unwrap().document.provenance();
+        assert!(portable_card.listing(ctx.auth()).is_ok());
+        assert!(matches!(
+            portable_card.listing(pinned.auth()),
+            Err(DomainError::ResourceNotFound)
+        ));
+        assert!(matches!(
+            ClassEgressFence::search_metadata(portable_card.clone(), pinned.auth()),
+            Err(DomainError::ResourceNotFound)
+        ));
         for doc in [&portable, &seeded] {
             assert_eq!(doc.explicit_read(ctx.auth()).unwrap(), c1_carrier);
             assert!(matches!(
@@ -886,6 +898,58 @@ async fn run_domain_and_security_suite(
         )
         .await
         .expect("trash note_1");
+    let active_revision = store
+        .get_note(
+            ctx.clone(),
+            GetNote {
+                note: note_1.clone(),
+                revision: Some(rev_1.clone()),
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap()
+        .document;
+    let ChangeReadResult::Seed(seed) = store
+        .read_changes(
+            ctx.clone(),
+            ChangeRead::Seed {
+                scope: scope.clone(),
+                cutoff: Some(cut.canonical_seq),
+                limit: PageLimit::new(20).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected seed")
+    };
+    let old_seed = seed
+        .notes
+        .into_iter()
+        .find(|n| n.document.reference().note_id == note_1)
+        .unwrap()
+        .document;
+    for historical in [active_revision, old_seed] {
+        assert_eq!(historical.explicit_read(ctx.auth()).unwrap(), c1_carrier);
+        assert!(matches!(
+            ClassEgressFence::projection(historical.clone(), ctx.auth()),
+            Err(DomainError::ResourceNotFound)
+        ));
+        assert!(matches!(
+            ClassEgressFence::search(historical.clone(), ctx.auth()),
+            Err(DomainError::ResourceNotFound)
+        ));
+        assert!(matches!(
+            ClassEgressFence::search_metadata(historical.metadata(), ctx.auth()),
+            Err(DomainError::ResourceNotFound)
+        ));
+        assert!(matches!(
+            ClassEgressFence::provider(historical, ctx.auth(), &policy),
+            Err(DomainError::ResourceNotFound)
+        ));
+    }
+
     assert!(
         !store
             .is_live_visible(&ctx, &note_1)
@@ -2318,6 +2382,85 @@ async fn run_purge_and_mint_suite(
         .await
         .expect("create note_purge");
 
+    // A historical import may retain this same canonical key in other incarnations,
+    // a duplicate pointer owned by another key, and a newer binding to a different detail.
+    let neighbor_space = sample_space_id(97);
+    let detail = "rcpt_pay:import-owner:import-key";
+    let source = format!(
+        "SELECT r.* FROM command_receipts r JOIN spaces s ON s.space_id=r.space_id
+           AND s.history_incarnation=r.history_incarnation WHERE r.space_id='{space}' AND r.expires_at_ms>=0
+         ORDER BY r.canonical_seq,r.idempotency_key LIMIT 1", space=scope.space_id,
+    );
+    let payload=format!("INSERT INTO change_payloads(space_id,payload_id,codec,erased_by_purge,effect_msgpack,created_seq)
+        SELECT space_id,'{detail}','receipt_detail_v1',0,sanitized_envelope_msgpack,canonical_seq FROM ({source}) src");
+    assert_eq!(
+        store
+            .execute_diagnostic_write_sql_for_test(&payload)
+            .await
+            .unwrap(),
+        1
+    );
+    let attach = format!(
+        "INSERT INTO payload_owners(space_id,payload_kind,payload_id,note_id)
+        VALUES ('{}','command_receipt','import-owner:import-key','{note_purge}')",
+        scope.space_id
+    );
+    assert_eq!(
+        store
+            .execute_diagnostic_write_sql_for_test(&attach)
+            .await
+            .unwrap(),
+        1
+    );
+    for (sid, inc, actor, pointer, marker) in [
+        (
+            &scope.space_id,
+            "history_incarnation",
+            "import-owner",
+            detail,
+            -970,
+        ),
+        (
+            &scope.space_id,
+            "substr(command_hash,1,16)",
+            "import-owner",
+            detail,
+            -971,
+        ),
+        (
+            &scope.space_id,
+            "history_incarnation",
+            "imported-alias",
+            detail,
+            -972,
+        ),
+        (
+            &scope.space_id,
+            "substr(command_hash,17,16)",
+            "import-owner",
+            "other-detail",
+            -973,
+        ),
+        (
+            &neighbor_space,
+            "history_incarnation",
+            "import-owner",
+            detail,
+            -974,
+        ),
+    ] {
+        let sql=format!("INSERT INTO command_receipts
+             SELECT '{sid}',{inc},'{actor}','import-key',command_hash,status,envelope_version,'{pointer}',
+                    sanitized_envelope_msgpack,canonical_seq,{marker} FROM ({source}) src");
+        assert_eq!(
+            store
+                .execute_diagnostic_write_sql_for_test(&sql)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
     // Rank membership uses both ends of view:key:target. Legacy IDs are case-sensitive
     // and an underscore is part of the identifier.
     let neighbor_keys = ["LegacyXA0001:view:other", "other:view:legacy_A0001"];
@@ -2420,6 +2563,19 @@ async fn run_purge_and_mint_suite(
         )
         .await
         .expect("Purge note_purge after hold release");
+
+    for (marker, expected) in [(-970, 0), (-971, 0), (-972, 0), (-973, 1), (-974, 1)] {
+        let sql = format!(
+            "SELECT count(*) FROM command_receipts WHERE expires_at_ms={marker} AND response_payload_id IS NOT NULL"
+        );
+        assert_eq!(
+            store
+                .execute_diagnostic_read_sql_for_test(None, &sql)
+                .await
+                .unwrap(),
+            expected
+        );
+    }
 
     for (keys, count) in [(&neighbor_keys, 1), (&owned_keys, 0)] {
         for key in keys {

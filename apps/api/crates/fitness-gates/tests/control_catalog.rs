@@ -448,6 +448,42 @@ async fn exercise(pg: bool) {
         ]
     );
     move_entry(55, None).await.unwrap();
+    canonical
+        .rename_note(
+            scoped.clone(),
+            mutation(
+                &scoped,
+                56,
+                RenameNote {
+                    note: entry.clone(),
+                    slug: "renamed-skill".into(),
+                    title: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let renamed = control
+        .get_ability(account.clone(), value.reference.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "renamed-skill");
+    assert_eq!(renamed.auxiliary_files, value.auxiliary_files);
+    let by_name = |name: &str| AbilitySelection::Name {
+        name: name.into(),
+        kind: AbilityKind::Skill,
+        project: None,
+    };
+    assert!(
+        matches!(control.resolve_ability(account.clone(), by_name("renamed-skill")).await.unwrap(), AbilityResolution::Resolved(item) if item.reference == value.reference)
+    );
+    assert!(matches!(
+        control
+            .resolve_ability(account.clone(), by_name("my-skill"))
+            .await
+            .unwrap(),
+        AbilityResolution::Missing
+    ));
     let previous = value.reference;
     let updated = canonical
         .publish_ability_package(
@@ -477,6 +513,7 @@ async fn exercise(pg: bool) {
         .await
         .unwrap();
     assert_eq!(exact.reference, previous);
+    assert_eq!(exact.name, "my-skill");
     assert_eq!(exact.auxiliary_files.len(), MAX_ABILITY_AUX_FILES);
     assert!(matches!(
         control

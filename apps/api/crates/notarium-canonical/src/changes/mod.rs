@@ -869,14 +869,17 @@ impl CanonicalStore {
         limit: PageLimit,
     ) -> Result<ChangePage, PortError> {
         let budget = caller.budget();
-        let is_space_caller = matches!(caller, ChangeCaller::Space(_));
+        let space_auth = match caller {
+            ChangeCaller::Space(ctx) => Some(ctx.auth().clone()),
+            ChangeCaller::Maintenance(_) => None,
+        };
 
         self.with_read_tx_budget(Some(budget), |tx| {
             Box::pin(async move {
                 let space_rec = load_space_record(tx, &after.scope.space_id).await?;
                 // History check BEFORE comparing any SpaceSeq!
                 space_rec.scope.check(&after.scope)?;
-                if is_space_caller
+                if space_auth.is_some()
                     && space_rec.space.lifecycle != notarium_core::auth::SpaceLifecycle::Active
                 {
                     return Err(DomainError::ResourceNotFound.into());
@@ -995,6 +998,8 @@ impl CanonicalStore {
                     &raw_rows[..]
                 };
 
+                let mut access = space_auth.as_ref().map(|auth|
+                    crate::domain::change_visibility::ChangeVisibility::new(&space_rec, auth));
                 let mut payload_cache: HashMap<String, MutationEffect> = HashMap::new();
                 let mut changes = Vec::with_capacity(page_rows.len());
                 let mut latest_complete_in_page: Option<SpaceSeq> = None;
@@ -1034,7 +1039,7 @@ impl CanonicalStore {
                         }
                     };
 
-                    changes.push(Change {
+                    let mut change = Change {
                         cursor: ChangeCursor {
                             scope: after.scope.clone(),
                             after: seq,
@@ -1046,17 +1051,18 @@ impl CanonicalStore {
                         lifecycle,
                         class,
                         effect,
-                    });
+                    };
+                    if let Some(access) = &mut access && !access.filter(tx, &mut change).await? {
+                        continue;
+                    }
+                    changes.push(change);
                 }
 
                 let complete = !has_more;
                 let next_seq = if complete {
                     validated_through
                 } else {
-                    changes
-                        .last()
-                        .map(|c| c.cursor.after)
-                        .unwrap_or(after.after)
+                    i64_to_space_seq(page_rows.last().expect("nonempty limited page").space_seq)?
                 };
 
                 let safe_ack_end = match latest_complete_in_page {
@@ -1220,7 +1226,7 @@ impl CanonicalStore {
 
                                 // Current live fence check: if currently purged -> CursorStale;
                                 // if SpaceContext caller, enforce BOTH current live fence AND snapshot facts!
-                                let Some(live_facts) = folder_cache
+                                let Some((live_facts, _)) = folder_cache
                                     .live_note_facts(
                                         tx,
                                         &space_rec.space,
@@ -1481,7 +1487,7 @@ impl CanonicalStore {
                 }
                 let mut current = crate::domain::common::FolderAncestryCache::default();
                 for note in &mut hydrated_notes {
-                    let facts = current
+                    let (facts, lifecycle) = current
                         .live_note_facts(
                             tx,
                             &space.space,
@@ -1493,7 +1499,7 @@ impl CanonicalStore {
                     if let Some(auth) = &space_auth {
                         auth.authorize_read(&facts)?;
                     }
-                    note.document.bind_current_facts(facts)?;
+                    note.document.bind_current(facts, lifecycle)?;
                 }
                 if let Some(auth) = &space_auth {
                     for thread in &thread_items {

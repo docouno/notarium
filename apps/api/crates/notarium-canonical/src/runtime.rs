@@ -1112,14 +1112,18 @@ impl CanonicalStore {
         })
         .await?;
         self.inner.grant_writer_epoch(&scope.space_id, new_epoch);
-        self.resume_pending_storage_for_space(scope, new_epoch)
-            .await
-            .map_err(|err| {
-                crate::codec::unknown_commit_outcome(
-                    "lease_recovery_incomplete",
-                    format!("storage recovery after lease turnover: {err:?}"),
-                )
-            })?;
+        self.resume_pending_storage_for_space(
+            scope,
+            new_epoch,
+            crate::domain::purge::RetirementRecovery::Lease,
+        )
+        .await
+        .map_err(|err| {
+            crate::codec::unknown_commit_outcome(
+                "lease_recovery_incomplete",
+                format!("storage recovery after lease turnover: {err:?}"),
+            )
+        })?;
         Ok(new_epoch)
     }
 

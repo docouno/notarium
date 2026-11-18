@@ -44,7 +44,7 @@ pub enum AbilityKind {
 #[derive(Clone)]
 struct DocumentFacts {
     recorded: ResourceFacts,
-    current: Option<Box<ResourceFacts>>,
+    current: Option<Box<(ResourceFacts, Lifecycle)>>,
 }
 impl DocumentFacts {
     fn new(recorded: ResourceFacts) -> Self {
@@ -55,7 +55,22 @@ impl DocumentFacts {
     }
 
     fn iter(&self) -> impl Iterator<Item = &ResourceFacts> {
-        std::iter::once(&self.recorded).chain(self.current.as_deref())
+        std::iter::once(&self.recorded).chain(self.current.as_deref().map(|(facts, _)| facts))
+    }
+
+    fn bind_current(
+        &mut self,
+        recorded_lifecycle: Lifecycle,
+        facts: ResourceFacts,
+        lifecycle: Lifecycle,
+    ) -> DomainResult<()> {
+        if self.recorded.space.id != facts.space.id || self.current.is_some() {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
+        if self.recorded != facts || recorded_lifecycle != lifecycle {
+            self.current = Some(Box::new((facts, lifecycle)));
+        }
+        Ok(())
     }
 
     fn in_project(&self, project: &crate::model::FolderRef) -> bool {
@@ -66,7 +81,7 @@ impl DocumentFacts {
     }
 
     fn authorize(&self, auth: &EngineAuthContext) -> DomainResult<()> {
-        if let Some(current) = self.current.as_deref() {
+        if let Some((current, _)) = self.current.as_deref() {
             auth.can_view_resource(current)?;
         }
         auth.authorize_read(&self.recorded)
@@ -81,7 +96,12 @@ impl DocumentFacts {
                 ValidationReason::ClassEgressForbidden,
             ));
         }
-        if lifecycle != Lifecycle::Active {
+        if lifecycle != Lifecycle::Active
+            || self
+                .current
+                .as_deref()
+                .is_some_and(|(_, now)| *now != Lifecycle::Active)
+        {
             return Err(DomainError::ResourceNotFound);
         }
         self.authorize(auth)
@@ -135,6 +155,9 @@ impl ClassifiedMetadata {
             lifecycle,
             digest,
         })
+    }
+    pub fn bind_current(&mut self, facts: ResourceFacts, lifecycle: Lifecycle) -> DomainResult<()> {
+        self.facts.bind_current(self.lifecycle, facts, lifecycle)
     }
     pub fn reference(&self) -> &NoteRef {
         &self.reference
@@ -221,13 +244,10 @@ impl ClassifiedDocument {
     /// Bind current canonical placement and class to a historical document.
     /// This additional restriction follows the carrier and any derived metadata.
     pub fn bind_current_facts(&mut self, current: ResourceFacts) -> DomainResult<()> {
-        if current.space.id != self.reference.space_id || self.facts.current.is_some() {
-            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
-        }
-        if self.facts.recorded != current {
-            self.facts.current = Some(Box::new(current));
-        }
-        Ok(())
+        self.bind_current(current, self.lifecycle)
+    }
+    pub fn bind_current(&mut self, facts: ResourceFacts, lifecycle: Lifecycle) -> DomainResult<()> {
+        self.facts.bind_current(self.lifecycle, facts, lifecycle)
     }
     pub fn reference(&self) -> &NoteRef {
         &self.reference

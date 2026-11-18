@@ -613,13 +613,13 @@ impl WriteCoordinator {
 
     pub(crate) fn try_acquire_commit_read_guard(
         &self,
-    ) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
-        self.commit_gate.try_read().ok()
+    ) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        self.commit_gate.clone().try_read_owned().ok()
     }
 
     /// Acquires a shared commit-gate read guard for auxiliary SQL writes that must pause during safe points.
-    pub(crate) async fn acquire_commit_read_guard(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
-        self.commit_gate.read().await
+    pub(crate) async fn acquire_commit_read_guard(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.commit_gate.clone().read_owned().await
     }
 
     /// Enqueues a prepared write intent into `WriteBatchActor` with bounded backpressure and cancellation semantics.

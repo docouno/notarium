@@ -1072,7 +1072,7 @@ impl FolderAncestryCache {
         space: &Space,
         note: &NoteId,
         active_only: bool,
-    ) -> Result<Option<ResourceFacts>, PortError> {
+    ) -> Result<Option<(ResourceFacts, Lifecycle)>, PortError> {
         if crate::runtime::is_note_purge_fenced_tx(tx, &space.id, note.as_str()).await? {
             return Ok(None);
         }
@@ -1094,7 +1094,7 @@ impl FolderAncestryCache {
                 active_only,
             )
             .await?;
-        Ok(Some(facts))
+        Ok(Some((facts, head.lifecycle)))
     }
 
     pub(crate) async fn build_resource_facts_tx(

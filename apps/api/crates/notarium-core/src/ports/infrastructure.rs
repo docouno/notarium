@@ -381,10 +381,26 @@ pub struct InterceptedMutation {
     pub preconditions: Preconditions,
     pub payload: InterceptedPayload,
 }
+/// Room state to install atomically with the intercepted edit or observation.
+/// Canonical retains the original mutation, carrier, grant and command identity.
+#[derive(Debug)]
+pub struct AcceptedRoomCarrier {
+    pub owner_id: String,
+    pub expected_lease: LeaseEpoch,
+    pub expected_lineage: LineageEpoch,
+    pub compacted_through_update_seq: Option<u64>,
+    pub action: RoomCarrierAction,
+}
+#[derive(Debug)]
+pub enum RoomCarrierAction {
+    Checkpoint { yrs_snapshot: Vec<u8> },
+    Close { final_yrs_snapshot: Option<Vec<u8>> },
+}
 #[derive(Debug)]
 pub enum InterceptionResult {
     /// Identifies the exact canonical commit that applied the intercepted mutation.
     Applied(MutationReceiptToken),
+    SettleCarrier(AcceptedRoomCarrier),
     ClosedRoomReservation(ClosedRoomReservation),
     Conflict(DomainError),
 }

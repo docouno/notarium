@@ -35,7 +35,9 @@ macro_rules! db {
     }}
 }
 mod abilities;
-pub(crate) use abilities::resource_digest_tx;
+pub(crate) use abilities::{
+    authorize_change_tx as authorize_ability_change_tx, resource_digest_tx,
+};
 mod commands;
 pub(crate) mod memory;
 

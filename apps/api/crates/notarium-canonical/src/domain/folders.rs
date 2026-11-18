@@ -122,11 +122,20 @@ pub(crate) async fn move_folder_impl(
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
 
-                // Enforce <= MAX_FOLDER_DEPTH (256) across the entire moved folder subtree.
-                let dest_depth = dest_anc.ancestors.len().saturating_sub(1);
-                let subtree_rel_depth =
-                    max_folder_subtree_rel_depth_tx(tx, &scope.space_id, &input.folder).await?;
-                if dest_depth + 1 + subtree_rel_depth > MAX_FOLDER_DEPTH {
+                // Descendants retain their relative depth. Only a deeper destination
+                // can push a previously valid path beyond the absolute limit.
+                let old_depth = before_anc.ancestors.len() - 1;
+                let new_depth = dest_anc.ancestors.len();
+                if new_depth > MAX_FOLDER_DEPTH
+                    || (new_depth > old_depth
+                        && subtree_reaches_depth_tx(
+                            tx,
+                            &scope.space_id,
+                            &input.folder,
+                            MAX_FOLDER_DEPTH - new_depth + 1,
+                        )
+                        .await?)
+                {
                     return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
 
@@ -1481,47 +1490,29 @@ pub(crate) async fn is_note_live_readable_tx(
     Ok(auth.authorize_read(&facts).is_ok())
 }
 
-async fn max_folder_subtree_rel_depth_tx(
+async fn subtree_reaches_depth_tx(
     tx: &mut BackendConn<'_>,
     space_id: &notarium_core::ids::SpaceId,
     root_of_move: &FolderId,
-) -> Result<usize, PortError> {
-    let limit = i64::try_from(MAX_FOLDER_DEPTH).unwrap_or(256);
-    let max_rel: i64 = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "WITH RECURSIVE sub(folder_id, rel_depth) AS (
-                 SELECT ?, 0
-                 UNION ALL
-                 SELECT fh.folder_id, s.rel_depth + 1
-                 FROM folder_heads fh
-                 JOIN sub s ON fh.space_id = ? AND fh.parent_folder_id = s.folder_id
-                 WHERE fh.lifecycle_state = 'active' AND s.rel_depth <= ?
-             )
-             SELECT COALESCE(MAX(rel_depth), 0) FROM sub",
-        )
-        .bind(root_of_move.as_str())
-        .bind(space_id.as_str())
-        .bind(limit)
-        .fetch_one(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_subtree_depth", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "WITH RECURSIVE sub(folder_id, rel_depth) AS (
-                 SELECT $2::text, 0::bigint
-                 UNION ALL
-                 SELECT fh.folder_id, s.rel_depth + 1
-                 FROM folder_heads fh
-                 JOIN sub s ON fh.space_id = $1 AND fh.parent_folder_id = s.folder_id
-                 WHERE fh.lifecycle_state = 'active' AND s.rel_depth <= $3
-             )
-             SELECT COALESCE(MAX(rel_depth), 0::bigint) FROM sub",
-        )
-        .bind(space_id.as_str())
-        .bind(root_of_move.as_str())
-        .bind(limit)
-        .fetch_one(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_subtree_depth", err.to_string()))?,
-    };
-    Ok(usize::try_from(max_rel).unwrap_or(MAX_FOLDER_DEPTH + 1))
+    forbidden_depth: usize,
+) -> Result<bool, PortError> {
+    let depth = forbidden_depth as i64;
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(include_str!("folder_subtree.sqlite.sql"))
+            .bind(space_id.as_str())
+            .bind(root_of_move.as_str())
+            .bind(depth)
+            .fetch_one(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_subtree_depth", err.to_string())),
+        BackendConn::Postgres(conn) => {
+            sqlx::query_scalar(include_str!("folder_subtree.postgres.sql"))
+                .bind(space_id.as_str())
+                .bind(root_of_move.as_str())
+                .bind(depth)
+                .fetch_one(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_subtree_depth", err.to_string()))
+        }
+    }
 }

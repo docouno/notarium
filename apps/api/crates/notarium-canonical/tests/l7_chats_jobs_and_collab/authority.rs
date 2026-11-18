@@ -130,6 +130,37 @@ pub(super) async fn check(store: &CanonicalStore) {
         make_budget(),
     )
     .unwrap();
+    let all_changes = ChangeRead::Log {
+        after: ChangeCursor {
+            scope: scope.clone(),
+            after: SpaceSeq::ZERO,
+        },
+        through: store.read_space(&scope.space_id).await.unwrap().last_seq,
+        limit: PageLimit::new(200).unwrap(),
+    };
+    for reader in [&admitted, &restricted] {
+        let ChangeReadResult::Log(page) = store
+            .recent_activity(reader.clone(), all_changes.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("expected log")
+        };
+        assert_eq!(
+            page.changes
+                .iter()
+                .any(|ch| ch.entity == EntityId::Job(hidden.id.clone())),
+            reader.auth().spaces()[&scope.space_id]
+                .read_classes
+                .contains(&DocClass::UserDoc)
+        );
+        assert!(
+            page.changes
+                .iter()
+                .any(|ch| ch.entity == EntityId::Job(visible_new.clone()))
+        );
+        assert!(page.complete);
+    }
     assert!(matches!(
         store.get_job(restricted.clone(), hidden.id).await,
         Err(PortError::Domain(DomainError::ResourceNotFound))

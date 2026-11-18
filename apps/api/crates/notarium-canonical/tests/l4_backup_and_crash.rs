@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[path = "l4_backup_and_crash/restore.rs"]
+mod restore;
 mod support;
 
 use std::{
@@ -486,6 +488,16 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version < 5 {
+                sqlx::raw_sql(
+                    "DROP INDEX idx_receipt_exception_pointer; DROP INDEX idx_payload_owners_job;
+                     ALTER TABLE payload_owners DROP CONSTRAINT payload_owners_pkey,
+                         ADD PRIMARY KEY (space_id, payload_kind, payload_id, note_id)",
+                )
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
             if decoded.schema_version < 4 {
                 sqlx::raw_sql(include_str!("fixtures/schema-v3-reference-index.sql"))
                     .execute(&mut *tx)
@@ -510,35 +522,10 @@ impl BackendCase {
                 .await
                 .unwrap();
             }
-            for table in decoded.tables {
-                // The independent decoder validates identifiers and column order against the manifest.
-                let insert = format!("INSERT INTO {} ({}) ", table.name, table.columns.join(", "));
-                for row in table.rows {
-                    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(insert.clone());
-                    query.push_values([row], |mut args, row| {
-                        for value in row {
-                            match value {
-                                PostgresSpoolValue::Null => {
-                                    args.push("NULL");
-                                }
-                                PostgresSpoolValue::Int(v) => {
-                                    args.push_bind(v);
-                                }
-                                PostgresSpoolValue::Text(v) => {
-                                    args.push_bind(v);
-                                }
-                                PostgresSpoolValue::Bytes(v) => {
-                                    args.push_bind(v);
-                                }
-                            }
-                        }
-                    });
-                    query.build().execute(&mut *tx).await.unwrap();
-                }
-            }
+            let witness = decoded.import_rows(&mut tx).await.unwrap();
             tx.commit().await.unwrap();
             let mut config = self.config.clone();
-            config.installation_id = decoded.witness.installation;
+            config.installation_id = witness.installation;
             config.sql = SqlBackendConfig::postgres_default(fixtures.pg_connect_config(), &schema);
             return config;
         }
@@ -958,7 +945,9 @@ async fn disconnected_pg_hold_cannot_confirm_or_release_its_successor() {
         ).bind(&generation).fetch_all(&mut sql).await.unwrap();
         assert_eq!(terminated, [true]);
 
-        let (peer, runtime) = CanonicalRuntime::open(case.config.clone()).await.unwrap();
+        let (peer, runtime) = CanonicalRuntime::open(case.config.clone())
+            .await
+            .unwrap_or_else(|error| panic!("reopen after loss of the {phase} hold: {error:?}"));
         let mut next = peer
             .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
             .await
@@ -1064,6 +1053,7 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
         (1, 1, 11, "review-space", 34, 13),
         (2, 0x62, 0xB2, "backup-178", 35, 14),
         (3, 0x62, 0xB2, "backup-178", 36, 14),
+        (4, 0x62, 0xB2, "backup-178", 36, 14),
     ] {
         let fixture = directory.join(format!("schema-v{version}.pgspool"));
         let decoded = decode_postgres_spool_v1(&fixture).unwrap();
@@ -1141,7 +1131,12 @@ async fn restores_historical_postgres_spools_and_rejects_invalid_headers() {
         } else {
             None
         };
-        let (restored, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
+        let (restored, runtime) =
+            CanonicalRuntime::open(config.clone())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("open materialized PostgreSQL v{version} archive: {error:?}")
+                });
         if let Some((db, scopes, digest, raw)) = migrated_db.as_mut() {
             let result: i32 =
                 sqlx::query_scalar(include_str!("fixtures/check-stale-compactions.sql"))

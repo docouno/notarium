@@ -230,12 +230,19 @@ identity, target group, neighbour rank references, field changes and expected
 note/view/rank revisions. Equal field changes with different neighbours remain
 different commands.
 
-`Applied(receipt)` requires one canonical commit of the complete field/rank
-change. A rank conflict must not publish a partial field or CRDT update. The
-room owner performs the commit; the outer writer does not commit it again.
-The caller receives the result recorded for that receipt, even if another write
-has already advanced the head. A text settlement without a client command key
-must match the actor, note, parent revision and resulting content at that receipt.
+`SettleCarrier` lets an active room owner accept an edit or external observation
+and supply its lease, lineage and checkpoint or close details. The canonical
+writer checks the original grant and records its ID in the note-owned receipt
+detail. The same transaction records the agent provenance, typed result,
+canonical history and room revision. An external observation records
+its disk identity and path in that transaction. A lost response can be retried
+with the original key after subsequent edits. The owner's snapshot covers the
+outstanding room updates. A room with neither a snapshot nor pending updates
+can accept a carrier while closing without a final snapshot.
+
+`Applied(receipt)` identifies the retained typed outcome of the original command.
+A Board move includes the complete field and rank change. Standalone room
+checkpoints and closes record their own room operations.
 Closed-room writes consume a reservation under a commit fence, avoiding the
 race between checking whether a room is open and writing directly.
 

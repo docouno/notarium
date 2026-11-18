@@ -1,4 +1,6 @@
+mod materialize;
 mod ownership;
+mod restore;
 use ownership::{ArtifactLease, HoldOwnership};
 
 use std::{
@@ -34,7 +36,6 @@ use sqlx::{Connection, PgConnection, Row};
 
 use crate::{
     CanonicalStore, RoomFenceTable,
-    changes::BroadcastSignal,
     codec::{
         MAX_MSGPACK_DECODE_BYTES, cancelled_not_committed, deadline_not_committed,
         decode_msgpack_bounded, encode_msgpack, i64_to_space_seq, internal_not_committed,
@@ -163,7 +164,7 @@ fn decode_witness_json(raw: &str) -> Result<BackupWitness, PortError> {
         .map_err(|err| internal_not_committed("decode_backup_witness_json", err.to_string()))
 }
 
-fn register_cleanup_task(inner: &CanonicalInner, handle: tokio::task::JoinHandle<()>) {
+pub(crate) fn register_cleanup_task(inner: &CanonicalInner, handle: tokio::task::JoinHandle<()>) {
     let mut guard = inner.backup_cleanups.lock().expect("backup cleanups mutex");
     guard.retain(|h| !h.is_finished());
     guard.push(handle);
@@ -1972,6 +1973,13 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         .iter()
         .copied()
         .filter_map(move |mut table| {
+            if schema_version < 5 && table.name == "command_receipts" {
+                table.indexes = &["idx_command_receipts_expires"];
+            }
+            if schema_version < 5 && table.name == "payload_owners" {
+                table.primary_key = &["space_id", "payload_kind", "payload_id", "note_id"];
+                table.indexes = &[];
+            }
             if schema_version < 4 && table.name == "blob_references" {
                 table.indexes = &["idx_blob_references_non_note_owner"];
             }
@@ -1996,7 +2004,7 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         })
 }
 
-/// Materializes a verified schema 1 through 4 spool for offline inspection within the default budget.
+/// Materializes a verified schema 1 through 5 spool for offline inspection within the default budget.
 pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, PortError> {
     decode_postgres_spool_v1_bounded(
         path,
@@ -2068,7 +2076,7 @@ pub fn decode_postgres_spool_v1_bounded(
     let expected_tables = spool_tables(schema_version);
     let expected_checksum = match schema_version {
         CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1..=3 => {
+        1..=4 => {
             let digest = checksum_tables(schema_version, expected_tables.clone());
             if !crate::schema::migrate::recognized_predecessor(
                 i64::from(schema_version),
@@ -3287,6 +3295,7 @@ impl BackupParticipantPort for CanonicalStore {
     ) -> PortFuture<'_, ()> {
         let store = self.clone();
         Box::pin(async move {
+            let started = Instant::now();
             ctx.authority.require(ServicePurpose::Restore)?;
             if ctx.budget.cancellation.is_cancelled() {
                 return Err(cancelled_not_committed(
@@ -3315,67 +3324,9 @@ impl BackupParticipantPort for CanonicalStore {
                 return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
             }
 
-            // Acquire exclusive writer safe point so zero concurrent batch or auxiliary writes race restore_cursors.
-            let _safe_point = store.inner.writer()?.acquire_safe_point().await;
-
-            let restored_cl = restored.clone();
-            let (fences, epochs, retirements) = store
-                .with_write_tx_unfenced(|tx| {
-                    Box::pin(async move {
-                        let mut epochs = Vec::with_capacity(restored_cl.len());
-                        for cur in &restored_cl {
-                            epochs.push(validate_restore_cursor_tx(tx, cur).await?);
-                        }
-                        let fences = RoomFenceTable::default();
-                        let mut retirements = Vec::new();
-                        for (cur, epoch) in restored_cl.iter().zip(epochs.iter().copied()) {
-                            if apply_restore_cursor_tx(tx, cur, epoch).await? {
-                                retirements.push((cur.scope.clone(), epoch));
-                            }
-                            load_restored_room_fences(tx, &cur.scope, &fences).await?;
-                        }
-                        Ok((fences, epochs, retirements))
-                    })
-                })
-                .await?;
-
-            // Clear per-Space in-memory caches, clamp watermarks, re-seed collab fences, and notify subscribers.
-            let spaces = restored.iter().map(|cur| &cur.scope.space_id).collect();
-            store
-                .inner
-                .room_fences
-                .replace_restored_spaces(&spaces, fences);
-            for (cur, epoch) in restored.iter().zip(epochs) {
-                store.inner.grant_writer_epoch(&cur.scope.space_id, epoch);
-                store.inner.job_reads.remove_space(&cur.scope.space_id);
-                store
-                    .inner
-                    .broadcast_hub
-                    .rebind_and_clamp_watermarks(&cur.scope, cur.after);
-                store
-                    .inner
-                    .broadcast_hub
-                    .publish(BroadcastSignal::IncarnationChanged {
-                        new_scope: cur.scope.clone(),
-                        ceiling: cur.after,
-                    });
-            }
-            // The cutover has committed. A failed CAS unlink must not report a
-            // failed rotation, and cancelling the caller must not abandon GC.
-            if !retirements.is_empty() {
-                let shutdown = store.inner.backup_shutdown.clone();
-                let worker = store.clone();
-                register_cleanup_task(
-                    &store.inner,
-                    store.inner.backup_executor.spawn(async move {
-                        tokio::select! {
-                            () = shutdown.cancelled() => {}
-                            () = recover_restored_gc(worker, retirements) => {}
-                        }
-                    }),
-                );
-            }
-            Ok(())
+            let mut budget = ctx.budget;
+            budget.remaining = budget.remaining.saturating_sub(started.elapsed());
+            restore::run(&store, budget, restored).await
         })
     }
 }
@@ -3392,7 +3343,14 @@ async fn recover_restored_gc(store: CanonicalStore, spaces: Vec<(HistoryScope, L
             async move {
                 let mut backoff = Duration::from_millis(50);
                 loop {
-                    match store.resume_blob_retirements(&scope, epoch, true).await {
+                    match store
+                        .resume_blob_retirements(
+                            &scope,
+                            epoch,
+                            crate::domain::purge::RetirementRecovery::RestoredGc,
+                        )
+                        .await
+                    {
                         Ok(()) | Err(PortError::Domain(_)) => return,
                         Err(_) => tokio::time::sleep(backoff).await,
                     }
@@ -4005,6 +3963,8 @@ async fn apply_restore_cursor_tx(
         }
     }
 
+    rebound_retirements |=
+        crate::blobs::plan_unowned_active_blobs_tx(tx, &target.scope, next_epoch).await?;
     Ok(rebound_retirements)
 }
 

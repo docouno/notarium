@@ -1,4 +1,4 @@
-const READ_PACKAGE: &str = "SELECT entrypoint_note_id,manifest_rev_id,lifecycle_state
+const READ_PACKAGE: &str = "SELECT entrypoint_note_id,manifest_rev_id,lifecycle_state,slug_fold
     FROM ability_packages
     WHERE space_id=$1 AND ability_id=$2";
 const READ_REVISION: &str =
@@ -20,6 +20,7 @@ struct ResolvedAbility {
     reference: AbilityRef,
     entrypoint: NoteRef,
     metadata: AbilityRevisionMetadata,
+    name: String,
     facts: ResourceFacts,
 }
 
@@ -30,7 +31,7 @@ async fn resolve(
     id: &AbilityId,
     exact: Option<&RevisionId>,
 ) -> Result<ResolvedAbility, PortError> {
-    let (entry, tip, state): (String, String, String) = db!(
+    let (entry, tip, state, current_name): (String, String, String, String) = db!(
         tx,
         sqlx::query_as(READ_PACKAGE),
         fetch_optional,
@@ -130,7 +131,13 @@ async fn resolve(
             .ancestor_folders
             .retain(|folder| historical.ancestor_folders.contains(folder));
     }
+    let name = if revision.as_str() == tip {
+        current_name
+    } else {
+        meta.slug_fold.clone()
+    };
     Ok(ResolvedAbility {
+        name,
         reference: AbilityRef {
             id: id.clone(),
             placement,
@@ -153,12 +160,13 @@ async fn descriptor(
         reference,
         entrypoint,
         metadata: meta,
+        name,
         ..
     } = resolve(tx, auth, space, id, exact).await?;
     Ok(AbilityDescriptor {
         reference,
         kind: meta.kind,
-        name: meta.slug_fold,
+        name,
         enabled: true,
         healthy: true,
         lifecycle: meta.lifecycle,
@@ -169,6 +177,17 @@ async fn descriptor(
             .filter(|p| p != crate::domain::packages::ABILITY_ENTRYPOINT_KEY)
             .collect(),
     })
+}
+
+pub(crate) async fn authorize_change_tx(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    space: &SpaceRecord,
+    id: &AbilityId,
+    revision: &RevisionId,
+) -> Result<(), PortError> {
+    let package = resolve(tx, auth, space, id, Some(revision)).await?;
+    Ok(auth.authorize_read(&package.facts)?)
 }
 
 pub(crate) async fn resource_digest_tx(

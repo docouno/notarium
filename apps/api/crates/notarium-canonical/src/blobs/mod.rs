@@ -343,6 +343,27 @@ pub fn decode_zstd_verified(
     Ok(decoded)
 }
 
+/// Kept by the writer until the outer transaction resolves. On a lost commit ACK
+/// the worker determines the result from the durable retirement IDs.
+pub(crate) struct RetirementHandoff {
+    store: crate::CanonicalStore,
+    scope: HistoryScope,
+    epoch: LeaseEpoch,
+    ids: Vec<String>,
+    first_attempt: Option<tokio::sync::oneshot::Sender<Result<(), PortError>>>,
+}
+
+impl Drop for RetirementHandoff {
+    fn drop(&mut self) {
+        self.store.schedule_retirements(
+            self.scope.clone(),
+            self.epoch,
+            std::mem::take(&mut self.ids),
+            self.first_attempt.take(),
+        );
+    }
+}
+
 /// Owns a provisionally registered S3 publication until the last uploader or writer
 /// releases it. SQL removes the discard intent atomically when that publication wins.
 #[derive(Debug)]
@@ -351,7 +372,6 @@ pub(crate) struct PublicationDiscard {
     scope: HistoryScope,
     epoch: LeaseEpoch,
     publication: String,
-    runtime: tokio::runtime::Handle,
     finished: std::sync::atomic::AtomicBool,
 }
 
@@ -371,24 +391,12 @@ impl Drop for PublicationDiscard {
         if self.finished.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let store = self.store.clone();
-        let scope = self.scope.clone();
-        let epoch = self.epoch;
-        let publication = self.publication.clone();
-        self.runtime.spawn(async move {
-            let mut backoff = Duration::from_millis(50);
-            while !store
-                .inner
-                .shutting_down
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                match store.discard_publication(&scope, epoch, &publication).await {
-                    Ok(()) | Err(PortError::Domain(_)) => break,
-                    Err(_) => tokio::time::sleep(backoff).await,
-                }
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-            }
-        });
+        self.store.schedule_retirements(
+            self.scope.clone(),
+            self.epoch,
+            vec![self.publication.clone()],
+            None,
+        );
     }
 }
 
@@ -1288,7 +1296,6 @@ impl crate::CanonicalStore {
             scope: scope.clone(),
             epoch,
             publication: new_prefixed_hex_id("pub_")?,
-            runtime: tokio::runtime::Handle::current(),
             finished: Default::default(),
         });
         let staged = self
@@ -1311,6 +1318,69 @@ impl crate::CanonicalStore {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn retirement_handoff(
+        &self,
+        scope: &HistoryScope,
+        epoch: LeaseEpoch,
+        ids: Vec<String>,
+        first_attempt: tokio::sync::oneshot::Sender<Result<(), PortError>>,
+    ) -> RetirementHandoff {
+        RetirementHandoff {
+            store: self.clone(),
+            scope: scope.clone(),
+            epoch,
+            ids,
+            first_attempt: Some(first_attempt),
+        }
+    }
+
+    /// Waiters observe the first attempt; store-owned retries outlive the request and its executor.
+    pub(crate) fn schedule_retirements(
+        &self,
+        scope: HistoryScope,
+        epoch: LeaseEpoch,
+        mut pending: Vec<String>,
+        mut attempted: Option<tokio::sync::oneshot::Sender<Result<(), PortError>>>,
+    ) {
+        let store = self.clone();
+        let shutdown = self.inner.backup_shutdown.clone();
+        let work = async move {
+            let mut backoff = Duration::from_millis(25);
+            while !pending.is_empty() {
+                let mut retry = Vec::new();
+                let mut result = Ok(());
+                for id in pending {
+                    match store
+                        .drive_retirement_to_completion(&scope, epoch, &id)
+                        .await
+                    {
+                        Ok(()) | Err(PortError::Domain(DomainError::ResourceNotFound)) => {}
+                        Err(error) => {
+                            if !matches!(error, PortError::Domain(_)) {
+                                retry.push(id);
+                            }
+                            if result.is_ok() {
+                                result = Err(error);
+                            }
+                        }
+                    }
+                }
+                if let Some(sender) = attempted.take() {
+                    let _ = sender.send(result);
+                }
+                pending = retry;
+                if !pending.is_empty() {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                }
+            }
+        };
+        let handle = self.inner.backup_executor.spawn(async move {
+            tokio::select! { biased; () = shutdown.cancelled() => {}, () = work => {} }
+        });
+        crate::backup::register_cleanup_task(&self.inner, handle);
     }
 
     async fn discard_publication(
@@ -1527,9 +1597,11 @@ impl crate::CanonicalStore {
             BlobBackendDriver::S3(_) => None,
         };
 
-        // Step 1: Under Space lock + epoch + zero backup_holds, seal zero-ref publications into `retiring`
+        // Step 1: Under the Space lock and epoch, seal zero-ref publications into `retiring`
         // and create durable `blob_retirements` + `blob_retirement_targets`.
-        let planned_retirements = self
+        let worker = self.clone();
+        let (notify, attempted) = tokio::sync::oneshot::channel();
+        let (planned_retirements, handoff) = self
             .with_write_tx(|tx| {
                 let scope_in = scope_cl.clone();
                 let digests_in = digests_vec.clone();
@@ -1537,7 +1609,9 @@ impl crate::CanonicalStore {
                 let local_in = local_opt.clone();
                 Box::pin(async move {
                     lock_and_check_space_tx(tx, &scope_in, active_epoch).await?;
-                    ensure_no_backup_holds_tx(tx, &scope_in.space_id).await?;
+                    if reason == RetirementReason::Purge {
+                        ensure_no_backup_holds_tx(tx, &scope_in.space_id).await?;
+                    }
 
                     let mut ids = Vec::new();
                     for digest in digests_in {
@@ -1555,14 +1629,28 @@ impl crate::CanonicalStore {
                             ids.push(ret_id);
                         }
                     }
-                    Ok(ids)
+                    let handoff = (reason == RetirementReason::Gc && !ids.is_empty()).then(|| {
+                        worker.retirement_handoff(&scope_in, active_epoch, ids.clone(), notify)
+                    });
+                    Ok((ids, handoff))
                 })
             })
             .await?;
 
-        for ret_id in &planned_retirements {
-            self.drive_retirement_to_completion(scope, active_epoch, ret_id)
-                .await?;
+        if let Some(handoff) = handoff {
+            drop(handoff);
+            attempted.await.map_err(|_| {
+                unavailable_retryable(
+                    "gc_worker_stopped",
+                    "storage closed during GC",
+                    Duration::from_millis(50),
+                )
+            })??;
+        } else {
+            for ret_id in &planned_retirements {
+                self.drive_retirement_to_completion(scope, active_epoch, ret_id)
+                    .await?;
+            }
         }
 
         Ok(planned_retirements)
@@ -1808,6 +1896,14 @@ pub(crate) async fn lock_and_check_space_tx(
     Ok(rec)
 }
 
+pub(crate) fn held_retirement() -> PortError {
+    unavailable_retryable(
+        "backup_hold_active",
+        "cannot retire or purge blobs while a backup hold is active",
+        Duration::from_millis(100),
+    )
+}
+
 pub(crate) async fn ensure_no_backup_holds_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
@@ -1831,11 +1927,7 @@ pub(crate) async fn ensure_no_backup_holds_tx(
         }
     };
     if held.is_some() {
-        return Err(unavailable_retryable(
-            "backup_hold_active",
-            "cannot retire or purge blobs while a backup hold is active",
-            Duration::from_millis(100),
-        ));
+        return Err(held_retirement());
     }
     Ok(())
 }
@@ -3270,7 +3362,7 @@ async fn load_active_blob_meta_tx(
         BackendConn::Sqlite(conn) => {
             let r = sqlx::query(
                 "SELECT raw_size, blob_state, current_publication_id
-                 FROM blob_catalog WHERE space_id = ? AND content_blake3 = ? AND admission_state = 'open'",
+                 FROM blob_catalog WHERE space_id = ? AND content_blake3 = ? AND admission_state = 'open' AND ref_count > 0",
             )
             .bind(space_id.as_str())
             .bind(digest.as_bytes().as_slice())
@@ -3288,7 +3380,7 @@ async fn load_active_blob_meta_tx(
         BackendConn::Postgres(conn) => {
             let r = sqlx::query(
                 "SELECT raw_size, blob_state, current_publication_id
-                 FROM blob_catalog WHERE space_id = $1 AND content_blake3 = $2 AND admission_state = 'open'",
+                 FROM blob_catalog WHERE space_id = $1 AND content_blake3 = $2 AND admission_state = 'open' AND ref_count > 0",
             )
             .bind(space_id.as_str())
             .bind(digest.as_bytes().as_slice())
@@ -3579,6 +3671,60 @@ async fn pending_retirement_for_digest_tx(
         }
     }
     .map_err(|err| internal_not_committed("find_pending_digest_retirement", err.to_string()))
+}
+
+/// Older redaction receipts could release their last reference while a backup
+/// prevented GC planning. Reconcile those catalog rows when opening saved state.
+pub(crate) async fn plan_unowned_active_blobs_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    epoch: LeaseEpoch,
+) -> Result<bool, PortError> {
+    const PAGE: &str = "SELECT content_blake3 FROM blob_catalog c WHERE space_id=$1
+        AND content_blake3 > $2 AND admission_state='open' AND blob_state='active' AND ref_count=0
+        AND NOT EXISTS (SELECT 1 FROM blob_references r WHERE r.space_id=c.space_id
+            AND r.content_blake3=c.content_blake3) ORDER BY content_blake3 LIMIT 128";
+    let mut after = Vec::new();
+    let mut planned = false;
+    loop {
+        let rows: Vec<Vec<u8>> = match tx {
+            BackendConn::Sqlite(conn) => {
+                sqlx::query_scalar(PAGE)
+                    .bind(scope.space_id.as_str())
+                    .bind(&after)
+                    .fetch_all(&mut **conn)
+                    .await
+            }
+            BackendConn::Postgres(conn) => {
+                sqlx::query_scalar(PAGE)
+                    .bind(scope.space_id.as_str())
+                    .bind(&after)
+                    .fetch_all(&mut **conn)
+                    .await
+            }
+        }
+        .map_err(|err| internal_not_committed("scan_unowned_blobs", err.to_string()))?;
+        let Some(last) = rows.last() else {
+            return Ok(planned);
+        };
+        after = last.clone();
+        for raw in rows {
+            let digest = ContentDigest::from_bytes(raw.try_into().map_err(|_| {
+                internal_not_committed("corrupt_blob_digest", "invalid digest length")
+            })?);
+            planned |= initiate_digest_retirement_tx(
+                tx,
+                scope,
+                epoch,
+                digest,
+                RetirementReason::Gc,
+                None,
+                None,
+            )
+            .await?
+            .is_some();
+        }
+    }
 }
 
 pub(crate) async fn initiate_digest_retirement_tx(

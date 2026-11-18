@@ -4079,6 +4079,8 @@ async fn redact_chat_entry_impl(
     let preconditions = request.preconditions;
     let input = request.input;
 
+    let cleanup_store = store.clone();
+    let (attempted, first_attempt) = tokio::sync::oneshot::channel();
     let intent = PreparedWriteIntent {
         scope: scope.clone(),
         active_epoch,
@@ -4232,6 +4234,33 @@ async fn redact_chat_entry_impl(
                 )
                 .await?;
 
+                // End peer admission and record the physical work with the reference removal.
+                // A backup holds the bytes, but cannot extend ownership of a chat payload.
+                let mut retirements = Vec::new();
+                for digest in &zero_ref_digests {
+                    if let Some(id) = crate::blobs::initiate_digest_retirement_tx(
+                        tx,
+                        &scope,
+                        active_epoch,
+                        *digest,
+                        RetirementReason::Gc,
+                        None,
+                        None,
+                    )
+                    .await?
+                    {
+                        retirements.push(id);
+                    }
+                }
+                if !retirements.is_empty() {
+                    item_ctx.retain_until_batch_commit(cleanup_store.retirement_handoff(
+                        &scope,
+                        active_epoch,
+                        retirements,
+                        attempted,
+                    ));
+                }
+
                 match tx {
                     BackendConn::Sqlite(conn) => {
                         sqlx::query(
@@ -4349,19 +4378,10 @@ async fn redact_chat_entry_impl(
 
     let stored: StoredCommittedRedactedChatV1 =
         store.submit_write_command(&ctx.budget, intent).await?;
-    let (committed, zero_refs) = stored.into_committed();
-    if !zero_refs.is_empty() {
-        // Best-effort physical GC when no backup holds block retirement; ref_count is already 0.
-        let _ = store
-            .retire_zero_ref_digests(
-                &space_rec.scope,
-                space_rec.active_epoch,
-                &zero_refs,
-                RetirementReason::Gc,
-                None,
-            )
-            .await;
-    }
+    let (committed, _) = stored.into_committed();
+    // Preserve synchronous cleanup when possible. A held backup or unavailable backend
+    // leaves the durable task with the store and does not delay the committed receipt.
+    let _ = first_attempt.await;
     Ok(committed)
 }
 

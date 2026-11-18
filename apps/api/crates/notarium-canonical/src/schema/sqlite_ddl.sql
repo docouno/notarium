@@ -439,6 +439,10 @@ CREATE TABLE IF NOT EXISTS command_receipts (
 CREATE INDEX IF NOT EXISTS idx_command_receipts_expires
     ON command_receipts (space_id, expires_at_ms);
 
+CREATE INDEX IF NOT EXISTS idx_receipt_exception_pointer ON command_receipts (space_id, response_payload_id) WHERE response_payload_id IS NOT NULL AND
+            (response_payload_id <> 'rcpt_pay:' || actor_id || ':' || idempotency_key
+             OR actor_id LIKE '%:%');
+
 CREATE TABLE IF NOT EXISTS change_commands (
     space_id TEXT NOT NULL,
     history_incarnation BLOB NOT NULL CHECK (typeof(history_incarnation) = 'blob' AND length(history_incarnation) = 16),
@@ -491,8 +495,11 @@ CREATE TABLE IF NOT EXISTS payload_owners (
     payload_kind TEXT NOT NULL CHECK (payload_kind IN ('change_payload', 'command_receipt', 'content_job', 'materialized_observation', 'board_move_history')),
     payload_id TEXT NOT NULL,
     note_id TEXT NOT NULL,
-    PRIMARY KEY (space_id, payload_kind, payload_id, note_id)
-);
+    PRIMARY KEY (space_id, note_id, payload_kind, payload_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_payload_owners_job
+    ON payload_owners (space_id, payload_id, note_id) WHERE payload_kind = 'content_job';
 
 CREATE TABLE IF NOT EXISTS agent_run_heads (
     space_id TEXT NOT NULL,

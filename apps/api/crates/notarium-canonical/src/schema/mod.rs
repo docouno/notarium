@@ -1497,15 +1497,15 @@ pub async fn verify_sqlite_catalog(conn: &mut SqliteConnection) -> Result<(), Po
     }
 
     let without_rowid: i64 = sqlx::query_scalar(
-        "SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = 'blob_catalog'",
+        "SELECT count(*) FROM pragma_table_list WHERE schema = 'main' AND name IN ('blob_catalog','payload_owners') AND wr=1",
     )
     .fetch_one(&mut *conn)
     .await
     .map_err(|err| internal_not_committed("sqlite_catalog_layout", err.to_string()))?;
-    if without_rowid != 1 {
+    if without_rowid != 2 {
         return Err(internal_not_committed(
             "sqlite_catalog_layout",
-            "blob_catalog requires WITHOUT ROWID",
+            "blob_catalog and payload_owners require WITHOUT ROWID",
         ));
     }
 

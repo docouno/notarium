@@ -75,6 +75,9 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) struct SqliteWriterPair {
     pub sqlx_conn: sqlx::SqliteConnection,
     pub rusqlite_conn: Option<rusqlite::Connection>,
@@ -88,19 +91,48 @@ pub(crate) struct SqliteFastReadPool {
     conns: Arc<StdMutex<Vec<rusqlite::Connection>>>,
 }
 
-struct OuterReadCancelGuard {
-    cancel_flag: Arc<AtomicBool>,
-    interrupt: rusqlite::InterruptHandle,
-    completed: bool,
+#[derive(Default)]
+struct WorkerReadState {
+    dropped: AtomicBool,
+    interrupt: StdMutex<Option<rusqlite::InterruptHandle>>,
 }
+
+impl WorkerReadState {
+    fn interrupt_active(&self) -> bool {
+        let active = self.interrupt.lock().expect("worker read interrupt mutex");
+        if let Some(handle) = active.as_ref() {
+            handle.interrupt();
+            return true;
+        }
+        false
+    }
+}
+
+struct OuterReadCancelGuard(Arc<WorkerReadState>);
 
 impl Drop for OuterReadCancelGuard {
     fn drop(&mut self) {
-        if !self.completed {
-            self.cancel_flag.store(true, Ordering::SeqCst);
-            self.interrupt.interrupt();
-        }
+        self.0.dropped.store(true, Ordering::Release);
+        self.0.interrupt_active();
     }
+}
+
+fn native_read_cancelled() -> PortError {
+    cancelled_not_committed("sqlite_read_cancelled", "ordinary SQLite read cancelled")
+}
+
+fn native_snapshot_deadline() -> PortError {
+    deadline_not_committed(
+        "sqlite_read_interrupted_deadline",
+        "ordinary SQLite read interrupted at deadline",
+    )
+}
+
+fn native_caller_deadline() -> PortError {
+    deadline_not_committed(
+        "sqlite_read_caller_deadline",
+        "SQLite read exceeded caller deadline",
+    )
 }
 
 impl SqliteFastReadPool {
@@ -166,8 +198,7 @@ impl SqliteFastReadPool {
         T: Send + 'static,
         U: Send + 'static,
     {
-        let (mut gate_guard, caller_deadline_tokio, _gate_tx_deadline_std) =
-            wal.acquire_reader_gate_slot(budget).await?;
+        let (mut gate_guard, caller_deadline_tokio) = wal.acquire_reader_gate_slot(budget).await?;
 
         let permit = match Arc::clone(&self.sem).try_acquire_owned() {
             Ok(p) => p,
@@ -219,210 +250,161 @@ impl SqliteFastReadPool {
             None => open_rusqlite_readonly_connection(&self.db_path)?,
         };
 
-        // Start the `< 250 ms` snapshot hold timer right before `BEGIN DEFERRED`,
-        // bounded by the caller's remaining request budget.
-        let now_tokio = tokio::time::Instant::now();
-        let remaining_after_acquire = caller_deadline_tokio.saturating_duration_since(now_tokio);
-        if remaining_after_acquire.is_zero() {
-            if conn.is_autocommit() {
-                self.conns.lock().expect("fast read pool mutex").push(conn);
-            }
-            drop(permit);
-            gate_guard.mark_timeout();
-            return Err(deadline_not_committed(
-                "sqlite_read_budget_exhausted",
-                "read budget exhausted after fast pool acquire",
-            ));
-        }
-        let effective_tx_budget = remaining_after_acquire.min(wal.read_deadline());
-        let tx_deadline_std = Instant::now() + effective_tx_budget;
-        let tx_deadline_tokio = now_tokio + effective_tx_budget;
-
         let is_multi_thread = tokio::runtime::Handle::try_current()
             .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+        let inline = is_multi_thread && !force_blocking;
+        let caller_deadline = caller_deadline_tokio.into_std();
+        let caller_cancel = budget.map(|b| b.cancellation.clone());
 
-        if is_multi_thread && !force_blocking {
-            let caller_cancel = budget.map(|b| b.cancellation.clone());
-            let caller_cancel_check = caller_cancel.clone();
-            let cancel_flag = AtomicBool::new(false);
+        let run = move |wal: &SqliteWalCoordinator,
+                        pool: &StdMutex<Vec<rusqlite::Connection>>,
+                        db_path: &std::path::Path,
+                        worker: Option<(
+            Arc<WorkerReadState>,
+            tokio::sync::oneshot::Sender<Instant>,
+        )>| {
+            let state = worker.as_ref().map(|(state, _)| Arc::clone(state));
+            let cancelled = || {
+                caller_cancel.as_ref().is_some_and(|c| c.is_cancelled())
+                    || state
+                        .as_ref()
+                        .is_some_and(|s| s.dropped.load(Ordering::Acquire))
+            };
+            let tx_deadline = (Instant::now() + wal.read_deadline()).min(caller_deadline);
+            let sql = (|| {
+                if let Some((state, started)) = worker {
+                    *state.interrupt.lock().expect("worker read interrupt mutex") =
+                        Some(conn.get_interrupt_handle());
+                    let _ = started.send(tx_deadline);
+                }
+                if cancelled() {
+                    return Err(native_read_cancelled());
+                }
+                if Instant::now() >= caller_deadline {
+                    return Err(native_caller_deadline());
+                }
 
-            let res: Result<T, PortError> = (|| {
+                let cancel_token = caller_cancel.clone();
+                let drop_state = state.clone();
                 conn.progress_handler(
-                    1024,
+                    if inline { 1024 } else { 256 },
                     Some(move || {
-                        caller_cancel.as_ref().is_some_and(|c| c.is_cancelled())
-                            || Instant::now() >= tx_deadline_std
+                        cancel_token.as_ref().is_some_and(|c| c.is_cancelled())
+                            || drop_state
+                                .as_ref()
+                                .is_some_and(|s| s.dropped.load(Ordering::Acquire))
+                            || Instant::now() >= tx_deadline
                     }),
                 )
                 .map_err(|err| {
                     internal_not_committed("sqlite_progress_handler", err.to_string())
                 })?;
 
-                conn.prepare_cached("BEGIN DEFERRED")
-                    .and_then(|mut s| s.execute([]))
-                    .map_err(|err| {
-                        record_rusqlite_busy(wal, &err);
-                        map_rusqlite_read_err(
-                            err,
-                            "sqlite_fast_begin_read",
-                            &cancel_flag,
-                            caller_cancel_check.as_ref(),
-                            tx_deadline_std,
-                        )
-                    })?;
-                let val = op(&conn)?;
-                conn.prepare_cached("COMMIT")
-                    .and_then(|mut s| s.execute([]))
-                    .map_err(|err| {
-                        record_rusqlite_busy(wal, &err);
-                        map_rusqlite_read_err(
-                            err,
-                            "sqlite_fast_commit_read",
-                            &cancel_flag,
-                            caller_cancel_check.as_ref(),
-                            tx_deadline_std,
-                        )
-                    })?;
-                Ok(val)
+                let transaction_stmt = |stmt, stage| {
+                    conn.prepare_cached(stmt)
+                        .and_then(|mut s| s.execute([]))
+                        .map_err(|err| {
+                            record_rusqlite_busy(wal, &err);
+                            map_interrupt_or_internal(err, stage)
+                        })
+                };
+                transaction_stmt("BEGIN DEFERRED", "sqlite_fast_begin_read")?;
+                let value = op(&conn)?;
+                if cancelled() {
+                    return Err(native_read_cancelled());
+                }
+                if Instant::now() >= tx_deadline {
+                    return Err(native_snapshot_deadline());
+                }
+                transaction_stmt("COMMIT", "sqlite_fast_commit_read")?;
+                if Instant::now() >= tx_deadline {
+                    return Err(native_snapshot_deadline());
+                }
+                Ok(value)
             })();
 
             let _ = conn.progress_handler(0, None::<fn() -> bool>);
-
             if !conn.is_autocommit() {
                 let _ = conn.execute_batch("ROLLBACK");
             }
+            // Revoke this checkout's interrupt capability before another reader can use it.
+            if let Some(state) = &state {
+                state
+                    .interrupt
+                    .lock()
+                    .expect("worker read interrupt mutex")
+                    .take();
+            }
             if conn.is_autocommit() {
-                self.conns.lock().expect("fast read pool mutex").push(conn);
+                pool.lock().expect("fast read pool mutex").push(conn);
             } else {
                 let _ = conn.close();
-                if let Ok(fresh) = open_rusqlite_readonly_connection(&self.db_path) {
-                    self.conns.lock().expect("fast read pool mutex").push(fresh);
+                if let Ok(fresh) = open_rusqlite_readonly_connection(db_path) {
+                    pool.lock().expect("fast read pool mutex").push(fresh);
                 }
             }
             drop(permit);
-
-            return match res {
-                Ok(val) => {
+            let value = match sql {
+                Ok(value) => {
                     gate_guard.finish_cleanly();
-                    post_after_release(val)
+                    value
+                }
+                Err(_) if caller_cancel.as_ref().is_some_and(|c| c.is_cancelled()) => {
+                    return Err(native_read_cancelled());
                 }
                 Err(err) => {
-                    if Instant::now() >= tx_deadline_std
-                        && !caller_cancel_check
-                            .as_ref()
-                            .is_some_and(|c| c.is_cancelled())
-                    {
+                    if matches!(err, PortError::DeadlineExceeded(_)) {
                         gate_guard.mark_timeout();
                     }
-                    drop(gate_guard);
-                    Err(err)
+                    return Err(err);
                 }
             };
-        }
-
-        let interrupt = conn.get_interrupt_handle();
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        let mut outer_guard = OuterReadCancelGuard {
-            cancel_flag: Arc::clone(&cancel_flag),
-            interrupt,
-            completed: false,
+            if cancelled() {
+                return Err(native_read_cancelled());
+            }
+            if Instant::now() >= caller_deadline {
+                return Err(native_caller_deadline());
+            }
+            let result = post_after_release(value);
+            if cancelled() {
+                return Err(native_read_cancelled());
+            }
+            if Instant::now() >= caller_deadline {
+                return Err(native_caller_deadline());
+            }
+            result
         };
 
-        let caller_cancel = budget.map(|b| b.cancellation.clone());
-        let cancel_for_handler = Arc::clone(&cancel_flag);
-        let cancel_for_check = Arc::clone(&cancel_flag);
-        let caller_cancel_check = caller_cancel.clone();
-        let conns_arc = Arc::clone(&self.conns);
+        if inline {
+            return run(wal, &self.conns, &self.db_path, None);
+        }
+        let state = Arc::new(WorkerReadState::default());
+        let _cancel_on_drop = OuterReadCancelGuard(Arc::clone(&state));
+        let (started, start) = tokio::sync::oneshot::channel();
+        let worker_state = Arc::clone(&state);
+        let pool = Arc::clone(&self.conns);
         let db_path = self.db_path.clone();
-        let wal_cl = Arc::clone(wal);
-
-        let mut handle = tokio::task::spawn_blocking(move || {
-            let res: Result<T, PortError> = (|| {
-                conn.progress_handler(
-                    256,
-                    Some(move || {
-                        cancel_for_handler.load(Ordering::Relaxed)
-                            || caller_cancel.as_ref().is_some_and(|c| c.is_cancelled())
-                            || Instant::now() >= tx_deadline_std
-                    }),
-                )
-                .map_err(|err| {
-                    internal_not_committed("sqlite_progress_handler", err.to_string())
-                })?;
-
-                conn.execute_batch("BEGIN DEFERRED").map_err(|err| {
-                    record_rusqlite_busy(&wal_cl, &err);
-                    map_rusqlite_read_err(
-                        err,
-                        "sqlite_fast_begin_read",
-                        &cancel_for_check,
-                        caller_cancel_check.as_ref(),
-                        tx_deadline_std,
-                    )
-                })?;
-                let val = op(&conn)?;
-                conn.execute_batch("COMMIT").map_err(|err| {
-                    record_rusqlite_busy(&wal_cl, &err);
-                    map_rusqlite_read_err(
-                        err,
-                        "sqlite_fast_commit_read",
-                        &cancel_for_check,
-                        caller_cancel_check.as_ref(),
-                        tx_deadline_std,
-                    )
-                })?;
-                Ok(val)
-            })();
-
-            let _ = conn.progress_handler(0, None::<fn() -> bool>);
-
-            if !conn.is_autocommit() {
-                let _ = conn.execute_batch("ROLLBACK");
-            }
-            if conn.is_autocommit() {
-                conns_arc.lock().expect("fast read pool mutex").push(conn);
-            } else {
-                let _ = conn.close();
-                if let Ok(fresh) = open_rusqlite_readonly_connection(&db_path) {
-                    conns_arc.lock().expect("fast read pool mutex").push(fresh);
-                }
-            }
-            drop(permit);
-
-            match res {
-                Ok(val) => {
-                    gate_guard.finish_cleanly();
-                    post_after_release(val)
-                }
-                Err(err) => {
-                    if Instant::now() >= tx_deadline_std
-                        && !cancel_for_check.load(Ordering::Relaxed)
-                        && !caller_cancel_check
-                            .as_ref()
-                            .is_some_and(|c| c.is_cancelled())
-                    {
-                        gate_guard.mark_timeout();
-                    }
-                    drop(gate_guard);
-                    Err(err)
-                }
-            }
+        let wal = Arc::clone(wal);
+        let task = tokio::task::spawn_blocking(move || {
+            run(&wal, &pool, &db_path, Some((worker_state, started)))
         });
 
+        let snapshot_timeout = async {
+            if let Ok(deadline) = start.await {
+                tokio::time::sleep_until(deadline.into()).await;
+                if state.interrupt_active() {
+                    return;
+                }
+            }
+            // SQL has already released this checkout. Only the caller can cancel post-processing.
+            std::future::pending::<()>().await;
+        };
         tokio::select! {
             biased;
             error = read_cancelled(budget) => Err(error),
-            join_res = &mut handle => {
-                outer_guard.completed = true;
-                join_res.map_err(|err| internal_not_committed("sqlite_fast_read_join", err.to_string()))?
-            }
-            _ = tokio::time::sleep_until(tx_deadline_tokio) => {
-                // `outer_guard` Drop interrupts `conn`; `handle` rolls back and drops `gate_guard` cleanly.
-                Err(deadline_not_committed(
-                    "sqlite_read_interrupted_deadline",
-                    "ordinary SQLite read interrupted at deadline",
-                ))
-            }
+            result = task => result.map_err(|err| internal_not_committed("sqlite_fast_read_join", err.to_string()))?,
+            _ = tokio::time::sleep_until(caller_deadline_tokio) => Err(native_caller_deadline()),
+            _ = snapshot_timeout => Err(native_snapshot_deadline()),
         }
     }
 }
@@ -438,36 +420,6 @@ fn record_rusqlite_busy(wal: &SqliteWalCoordinator, err: &rusqlite::Error) {
         return;
     }
     wal.record_busy_if_any(&err.to_string());
-}
-
-fn map_rusqlite_read_err(
-    err: rusqlite::Error,
-    stage: &'static str,
-    cancel_flag: &AtomicBool,
-    caller_cancel: Option<&notarium_core::ports::Cancellation>,
-    tx_deadline_std: Instant,
-) -> PortError {
-    if let rusqlite::Error::SqliteFailure(ffi_err, _) = &err
-        && ffi_err.code == rusqlite::ErrorCode::OperationInterrupted
-    {
-        if cancel_flag.load(Ordering::Relaxed) || caller_cancel.is_some_and(|c| c.is_cancelled()) {
-            return cancelled_not_committed(
-                "sqlite_read_cancelled",
-                "ordinary SQLite read cancelled",
-            );
-        }
-        return deadline_not_committed(
-            "sqlite_read_interrupted_deadline",
-            "ordinary SQLite read interrupted at deadline",
-        );
-    }
-    if Instant::now() >= tx_deadline_std {
-        return deadline_not_committed(
-            "sqlite_read_interrupted_deadline",
-            "ordinary SQLite read interrupted at deadline",
-        );
-    }
-    internal_not_committed(stage, err.to_string())
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -619,9 +571,10 @@ pub(crate) async fn edit_note_phase1_sqlite_local(
 
 pub(crate) async fn get_note_sqlite_local_fast(
     store: &CanonicalStore,
-    ctx: SpaceContext,
+    mut ctx: SpaceContext,
     request: GetNote,
 ) -> Result<NoteSnapshot, PortError> {
+    let caller_deadline = tokio::time::Instant::now() + ctx.budget.remaining;
     store.ensure_open()?;
     let SqlDriverState::Sqlite { fast_read_pool, .. } = &store.inner.sql else {
         return Err(internal_not_committed(
@@ -664,12 +617,11 @@ pub(crate) async fn get_note_sqlite_local_fast(
             Ok(p) => Some(p),
             Err(tokio::sync::TryAcquireError::Closed) => None,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
-                let eff_deadline = tokio::time::Instant::now() + ctx.budget.remaining;
                 tokio::select! {
                     biased;
                     error = read_cancelled(Some(&ctx.budget)) => return Err(error),
                     res = Arc::clone(&fast_read_pool.writer_active_read_sem).acquire_owned() => res.ok(),
-                    _ = tokio::time::sleep_until(eff_deadline) => {
+                    _ = tokio::time::sleep_until(caller_deadline) => {
                         return Err(deadline_not_committed(
                             "sqlite_read_lane_deadline",
                             "ordinary SQLite read exceeded deadline waiting for active read lane",
@@ -686,6 +638,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
         None
     };
 
+    ctx.budget.remaining = caller_deadline.saturating_duration_since(tokio::time::Instant::now());
     let scope = ctx.scope().clone();
     let auth = ctx.auth().clone();
     let req_note = request.note.clone();
@@ -929,13 +882,27 @@ pub(crate) async fn get_note_sqlite_local_fast(
 
     let raw_bytes = match (eager_raw_bytes, deferred_plan) {
         (Some(bytes), _) => bytes,
-        (None, Some(plan)) => plan.read_verified_async().await?,
-        (None, None) => store.read_verified_blob(ctx.scope(), digest).await?,
+        (None, plan) => {
+            let read = async {
+                match plan {
+                    Some(plan) => plan.read_verified_async().await,
+                    None => store.read_verified_blob(ctx.scope(), digest).await,
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = ctx.budget.cancellation.cancelled() => return Err(native_read_cancelled()),
+                _ = tokio::time::sleep_until(caller_deadline) => return Err(native_caller_deadline()),
+                bytes = read => bytes?,
+            }
+        }
     };
     let content = String::from_utf8(raw_bytes)
         .map_err(|_| internal_not_committed("get_note_utf8", "note carrier is not valid UTF-8"))?;
 
-    let live_facts = crate::domain::notes::recheck_note_read(store, &ctx, &request.note).await?;
+    ctx.budget.remaining = caller_deadline.saturating_duration_since(tokio::time::Instant::now());
+    let (live_facts, live_lifecycle) =
+        crate::domain::notes::recheck_note_read(store, &ctx, &request.note, false).await?;
     if live_facts.class != initial_facts.class {
         return Err(DomainError::ResourceNotFound.into());
     }
@@ -951,7 +918,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
         content,
         digest,
     )?;
-    document.bind_current_facts(live_facts)?;
+    document.bind_current(live_facts, live_lifecycle)?;
 
     if writer_active {
         for _ in 0..4 {
@@ -959,6 +926,12 @@ pub(crate) async fn get_note_sqlite_local_fast(
         }
     }
     drop(_active_read_permit);
+    if ctx.budget.cancellation.is_cancelled() {
+        return Err(native_read_cancelled());
+    }
+    if tokio::time::Instant::now() >= caller_deadline {
+        return Err(native_caller_deadline());
+    }
 
     Ok(NoteSnapshot {
         document,
@@ -3960,9 +3933,15 @@ fn authorize_replay_rusqlite(
             }
             ReplayResource::Write(note)
             | ReplayResource::Read(note)
+            | ReplayResource::View(note)
             | ReplayResource::Create(note, ..)
             | ReplayResource::Move(note, ..) => note,
         };
+        if matches!(target, ReplayResource::View(_))
+            && is_note_purge_fenced_rusqlite(conn, &srec.space.id, note.as_str())?
+        {
+            return Err(DomainError::ResourceNotFound.into());
+        }
         let head = load_note_head_row_opt_rusqlite(conn, &scope.space_id, note)?;
         if let Some((parent, class)) = destination(target, head.as_ref().map(|h| h.doc_class)) {
             let (facts, _) = build_resource_facts_rusqlite(
@@ -3984,7 +3963,7 @@ fn authorize_replay_rusqlite(
                 head.ability_id,
                 true,
             )?;
-            authorize_head(auth, target, &facts)?;
+            authorize_head(auth, target, &facts, head.lifecycle)?;
         } else if !matches!(target, ReplayResource::Create(..)) {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -4670,7 +4649,7 @@ fn load_active_blob_raw_size_rusqlite(
         let mut stmt = conn
             .prepare_cached(
                 "SELECT raw_size, blob_state, current_publication_id
-                 FROM blob_catalog WHERE space_id = ?1 AND content_blake3 = ?2",
+                 FROM blob_catalog WHERE space_id = ?1 AND content_blake3 = ?2 AND admission_state='open' AND ref_count > 0",
             )
             .map_err(|err| internal_not_committed("sqlite_load_blob_meta", err.to_string()))?;
         stmt.query_row(

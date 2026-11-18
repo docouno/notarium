@@ -2,6 +2,8 @@
 
 #[path = "l6_board_pma_and_rollback/applied.rs"]
 mod applied;
+#[path = "l6_board_pma_and_rollback/pg_deadline.rs"]
+mod pg_deadline;
 mod support;
 
 use std::{
@@ -599,6 +601,30 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
     .await;
     let ctx = owner_ctx(&scope, owner.clone());
 
+    let project = sample_folder_id(123);
+    store
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: project.clone(),
+            parent: None,
+            slug: "board-project".into(),
+            display_name: "Board Project".into(),
+            is_project: true,
+            project_slug: Some("board-project".into()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let mut grants = ctx.auth().spaces().clone();
+    grants.get_mut(&scope.space_id).unwrap().project_root = Some(project.clone());
+    let pinned = SpaceContext::new(
+        ctx.auth().for_pat(grants).unwrap(),
+        scope.clone(),
+        make_budget(),
+    )
+    .unwrap();
     let view_note = sample_note_id(100);
     let view_created = store
         .create_note(
@@ -608,7 +634,7 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
                 &owner,
                 CreateNote {
                     note: view_note.clone(),
-                    parent: None,
+                    parent: Some(project.clone()),
                     slug: "sprint-board".to_owned(),
                     class: DocClass::UserDoc,
                     carrier: "---\ntitle: Sprint Board\n---\n# Sprint Board\n".to_owned(),
@@ -639,7 +665,7 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
                     &owner,
                     CreateNote {
                         note: nid.clone(),
-                        parent: None,
+                        parent: (nid == &card_3).then(|| project.clone()),
                         slug: slug.to_owned(),
                         class: DocClass::UserDoc,
                         carrier: format!("---\ntitle: {slug}\nstatus: todo\n---\n# {slug}\n"),
@@ -728,28 +754,26 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
         .inject_stale_cutoff_once
         .store(true, Ordering::SeqCst);
 
+    let first_request = next_mutation(
+        &scope,
+        &owner,
+        MoveBoardCard {
+            view: view.clone(),
+            note: card_3.clone(),
+            group: todo_grp.clone(),
+            before: Some(RankNeighbor {
+                note: card_1.clone(),
+                expected_rank: RankExpectation::Absent,
+            }),
+            after: None,
+            fields: BTreeMap::new(),
+            expected_note: revs[&card_3].clone(),
+            expected_view: view_created.value.revision.clone(),
+            expected_rank: RankExpectation::Absent,
+        },
+    );
     let moved_first = store
-        .move_board_card(
-            ctx.clone(),
-            next_mutation(
-                &scope,
-                &owner,
-                MoveBoardCard {
-                    view: view.clone(),
-                    note: card_3.clone(),
-                    group: todo_grp.clone(),
-                    before: Some(RankNeighbor {
-                        note: card_1.clone(),
-                        expected_rank: RankExpectation::Absent,
-                    }),
-                    after: None,
-                    fields: BTreeMap::new(),
-                    expected_note: revs[&card_3].clone(),
-                    expected_view: view_created.value.revision.clone(),
-                    expected_rank: RankExpectation::Absent,
-                },
-            ),
-        )
+        .move_board_card(ctx.clone(), first_request.clone())
         .await
         .expect("move_board_card succeeds after automatic stale cutoff retry");
     assert_eq!(
@@ -801,7 +825,9 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
                     )]),
                     expected_note: moved_first.value.revision.revision.clone(),
                     expected_view: view_created.value.revision.clone(),
-                    expected_rank: RankExpectation::Existing(moved_first.value.rank_revision),
+                    expected_rank: RankExpectation::Existing(
+                        moved_first.value.rank_revision.clone(),
+                    ),
                 },
             ),
         )
@@ -812,7 +838,7 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
         .get_note(
             ctx.clone(),
             GetNote {
-                note: card_3,
+                note: card_3.clone(),
                 revision: None,
                 causal: CausalBasis::Exact(ReceiptSet::default()),
             },
@@ -885,6 +911,90 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
 
     applied::check(store, &ctx, &view, view_created.value.revision, &planner).await;
 
+    assert_eq!(
+        store
+            .move_board_card(pinned.clone(), first_request.clone())
+            .await
+            .unwrap()
+            .receipt,
+        moved_first.receipt
+    );
+    // The former neighbor now belongs to this reader, but the earlier Board command did not.
+    store
+        .move_note(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                notarium_core::ports::MoveNote {
+                    note: card_1.clone(),
+                    parent: Some(project),
+                    slug: "card-1".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let log = notarium_core::ports::ChangeRead::Log {
+        after: notarium_core::receipt::ChangeCursor {
+            scope: scope.clone(),
+            after: SpaceSeq::ZERO,
+        },
+        through: moved_first.receipt.seq(),
+        limit: notarium_core::ports::PageLimit::new(100).unwrap(),
+    };
+    let notarium_core::ports::ChangeReadResult::Log(filtered) = store
+        .recent_activity(pinned.clone(), log.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("expected log")
+    };
+    let board_rows: Vec<_> = filtered
+        .changes
+        .iter()
+        .filter(|ch| ch.command_range.last_seq == moved_first.receipt.seq())
+        .collect();
+    assert!(!board_rows.is_empty());
+    assert!(board_rows.iter().all(|ch| ch.entity
+        == notarium_core::ports::EntityId::Note(card_3.clone())
+        && matches!(
+            ch.effect,
+            MutationEffect::AwaitProjection {
+                reason: AwaitReason::UnavailableVersion
+            }
+        )));
+    assert_eq!(filtered.safe_ack_end, moved_first.receipt.seq());
+    store
+        .move_note(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                notarium_core::ports::MoveNote {
+                    note: view.note.clone(),
+                    parent: None,
+                    slug: "sprint-board".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.move_board_card(pinned.clone(), first_request).await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    let notarium_core::ports::ChangeReadResult::Log(filtered) =
+        store.read_changes(pinned, log).await.unwrap()
+    else {
+        panic!("expected log")
+    };
+    assert!(
+        filtered
+            .changes
+            .iter()
+            .all(|ch| ch.revision != moved_first.value.rank_revision)
+    );
     BoardEffects {
         scope,
         materialized,
@@ -1357,61 +1467,79 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
     assert!(trashed_metadata.evaluated_fields.contains_key("status"));
     let restored_metadata = note_metadata_at(store, &scope, &pre_v0.value, &pre_v0.receipt).await;
 
-    let rollback_committed = store
-        .rollback_agent_run(
-            human_ctx.clone(),
-            next_mutation(
-                &scope,
-                &owner,
-                RollbackAgentRun {
-                    run: run_id.clone(),
-                    expected_run_revision: expected_run_rev,
-                    expected_entities: vec![
-                        NoteRevision {
-                            note: n_pre.clone(),
-                            revision: pre_archived.value.revision,
-                        },
-                        NoteRevision {
-                            note: n_created.clone(),
-                            revision: created_board.value.revision.revision,
-                        },
-                        NoteRevision {
-                            note: n_manual.clone(),
-                            revision: manual_foreign_ed.value.revision,
-                        },
-                        NoteRevision {
-                            note: n_room.clone(),
-                            revision: room_run_ed.value.revision,
-                        },
-                    ],
-                    associated_board_expectations: vec![
-                        AssociatedBoardExpectation {
-                            view: view.clone(),
-                            note: n_pre.clone(),
-                            expected_rank: RankExpectation::Existing(
-                                cur_overlays[&n_pre].rank_rev_id.clone(),
-                            ),
-                            expected_placement_revision: cur_overlays[&n_pre]
-                                .placement_revision
-                                .clone(),
-                        },
-                        AssociatedBoardExpectation {
-                            view: view.clone(),
-                            note: n_created.clone(),
-                            expected_rank: RankExpectation::Existing(
-                                cur_overlays[&n_created].rank_rev_id.clone(),
-                            ),
-                            expected_placement_revision: cur_overlays[&n_created]
-                                .placement_revision
-                                .clone(),
-                        },
-                    ],
+    let board_rollback = next_mutation(
+        &scope,
+        &owner,
+        RollbackAgentRun {
+            run: run_id.clone(),
+            expected_run_revision: expected_run_rev,
+            expected_entities: vec![
+                NoteRevision {
+                    note: n_pre.clone(),
+                    revision: pre_archived.value.revision,
                 },
-            ),
-        )
+                NoteRevision {
+                    note: n_created.clone(),
+                    revision: created_board.value.revision.revision,
+                },
+                NoteRevision {
+                    note: n_manual.clone(),
+                    revision: manual_foreign_ed.value.revision,
+                },
+                NoteRevision {
+                    note: n_room.clone(),
+                    revision: room_run_ed.value.revision,
+                },
+            ],
+            associated_board_expectations: vec![
+                AssociatedBoardExpectation {
+                    view: view.clone(),
+                    note: n_pre.clone(),
+                    expected_rank: RankExpectation::Existing(
+                        cur_overlays[&n_pre].rank_rev_id.clone(),
+                    ),
+                    expected_placement_revision: cur_overlays[&n_pre].placement_revision.clone(),
+                },
+                AssociatedBoardExpectation {
+                    view: view.clone(),
+                    note: n_created.clone(),
+                    expected_rank: RankExpectation::Existing(
+                        cur_overlays[&n_created].rank_rev_id.clone(),
+                    ),
+                    expected_placement_revision: cur_overlays[&n_created]
+                        .placement_revision
+                        .clone(),
+                },
+            ],
+        },
+    );
+    let mut grants = human_ctx.auth().spaces().clone();
+    grants
+        .get_mut(&scope.space_id)
+        .unwrap()
+        .read_classes
+        .clear();
+    let write_only = SpaceContext::new(
+        human_ctx.auth().for_pat(grants).unwrap(),
+        scope.clone(),
+        make_budget(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .rollback_agent_run(write_only.clone(), board_rollback.clone())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
+    let rollback_committed = store
+        .rollback_agent_run(human_ctx.clone(), board_rollback.clone())
         .await
         .expect("rollback_agent_run");
 
+    assert!(matches!(
+        store.rollback_agent_run(write_only, board_rollback).await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
     let rb = rollback_committed.value;
     assert_eq!(rb.trashed.len(), 1);
     assert_eq!(rb.trashed[0].note, n_created);

@@ -547,24 +547,28 @@ impl CanonicalStore {
     }
 }
 
-/// A PostgreSQL writer takeover revokes leases from the previous runtime in the
-/// same transaction as the Space epoch change. Uncompacted updates remain durable.
+/// Fence active rooms when a Space writer changes. Snapshots and uncompacted
+/// updates remain available to the new owner for explicit recovery.
 pub(crate) async fn fence_rooms_on_takeover_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
 ) -> Result<(), PortError> {
-    if let BackendConn::Postgres(conn) = tx {
-        sqlx::query(
-            "UPDATE collab_sessions SET room_state = 'fenced',
-             lease_epoch = lease_epoch + 1, owner_id = NULL
-             WHERE space_id = $1 AND room_state = 'active'",
-        )
-        .bind(scope.space_id.as_str())
-        .execute(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_fence_takeover_rooms", err.to_string()))?;
+    let sql = "UPDATE collab_sessions SET room_state = 'fenced',
+               lease_epoch = lease_epoch + 1, owner_id = NULL
+               WHERE space_id = $1 AND room_state = 'active'";
+    match tx {
+        BackendConn::Postgres(conn) => sqlx::query(sql)
+            .bind(scope.space_id.as_str())
+            .execute(&mut **conn)
+            .await
+            .map(|_| ()),
+        BackendConn::Sqlite(conn) => sqlx::query(sql)
+            .bind(scope.space_id.as_str())
+            .execute(&mut **conn)
+            .await
+            .map(|_| ()),
     }
-    Ok(())
+    .map_err(|err| internal_not_committed("fence_takeover_rooms", err.to_string()))
 }
 
 /// Startup fenced recovery: on single-writer SQLite, transitions any leftover `'active'`
@@ -958,12 +962,15 @@ async fn authorize_export_notes_tx(
     auth: &EngineAuthContext,
     notes: &[NoteId],
 ) -> Result<(), PortError> {
+    if crate::runtime::are_any_notes_purge_fenced_tx(tx, &space.id, notes).await? {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let heads = crate::domain::common::load_note_heads_batch_tx(tx, &space.id, notes).await?;
+    if notes.iter().any(|note| !heads.contains_key(note)) {
+        return Err(DomainError::ResourceNotFound.into());
+    }
     let mut folders = FolderAncestryCache::default();
-    for note in notes {
-        if is_note_purge_fenced_tx(tx, &space.id, note.as_str()).await? {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        let head = load_note_head_row_tx(tx, &space.id, note).await?;
+    for head in heads.into_values() {
         if head.lifecycle != Lifecycle::Active {
             return Err(DomainError::ResourceNotFound.into());
         }
@@ -1221,6 +1228,21 @@ async fn create_job_impl(
     Ok(stored.into_committed())
 }
 
+pub(crate) async fn read_visible_job_tx(
+    tx: &mut BackendConn<'_>,
+    space: &Space,
+    auth: &EngineAuthContext,
+    job: &JobId,
+) -> Result<ContentJob, PortError> {
+    authorize_job_read_on_space(auth, space)?;
+
+    let Some((found, ..)) = load_job_row_opt_tx(tx, &space.id, job).await? else {
+        return Err(DomainError::ResourceNotFound.into());
+    };
+    authorize_job_payload_tx(tx, space, auth, &found).await?;
+    Ok(found)
+}
+
 async fn get_job_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -1234,14 +1256,7 @@ async fn get_job_impl(
             Box::pin(async move {
                 let srec = load_space_record(tx, &scope.space_id).await?;
                 srec.scope.check(&scope)?;
-                authorize_job_read_on_space(&auth, &srec.space)?;
-
-                let Some((found, ..)) = load_job_row_opt_tx(tx, &scope.space_id, &job).await?
-                else {
-                    return Err(DomainError::ResourceNotFound.into());
-                };
-                authorize_job_payload_tx(tx, &srec.space, &auth, &found).await?;
-                Ok(found)
+                read_visible_job_tx(tx, &srec.space, &auth, &job).await
             })
         })
         .await
@@ -3466,48 +3481,18 @@ async fn settle_and_update_collab_session(
     close_room: bool,
 ) -> Result<CollabSessionRecord, PortError> {
     store.ensure_blob_backend_ready().await?;
-    let (space_rec, base_head) = {
-        let sc = scope.clone();
-        let nid = note.clone();
-        let auth = settlement.auth.clone();
-        let owner = expected_owner.clone();
-        store
-            .with_read_tx_budget(Some(budget), |tx| {
-                Box::pin(async move {
-                    let srec = load_space_record(tx, &sc.space_id).await?;
-                    srec.scope.check(&sc)?;
-                    let head = load_note_head_row_tx(tx, &srec.scope.space_id, &nid).await?;
-                    if head.lifecycle != Lifecycle::Active
-                        || is_note_purge_fenced_tx(tx, &sc.space_id, nid.as_str()).await?
-                    {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
-                    let (facts, _) = crate::domain::common::build_resource_facts_tx(
-                        tx,
-                        &srec.space,
-                        &head.parent_folder_id,
-                        head.doc_class,
-                        head.ability_id.clone(),
-                        true,
-                    )
-                    .await?;
-                    auth.authorize_direct_write(&facts, &facts)?;
-                    let room = load_collab_session_opt_tx(tx, &sc.space_id, &nid)
-                        .await?
-                        .ok_or(DomainError::ResourceNotFound)?;
-                    validate_settlement_room(
-                        &room,
-                        &head.head_rev_id,
-                        owner.as_deref(),
-                        expected_lease,
-                        expected_lineage,
-                        close_room,
-                    )?;
-                    Ok((srec, head))
-                })
-            })
-            .await?
+    let transition = RoomCarrierTransition {
+        expected_owner,
+        expected_lease,
+        expected_lineage,
+        yrs_snapshot,
+        compacted_through,
+        close_room,
+        client_command: false,
     };
+    let (space_rec, base_head) = transition
+        .check_before_staging(store, budget, &scope, &note, &settlement.auth, None)
+        .await?;
 
     if base_head.doc_class == DocClass::EncryptedNote {
         return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
@@ -3558,12 +3543,6 @@ async fn settle_and_update_collab_session(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                let fence_guard = if close_room {
-                    Some(room_fences.lock_for_write(&scope_cl, &note)?)
-                } else {
-                    None
-                };
-
                 let head = load_note_head_row_tx(tx, &scope_cl.space_id, &note).await?;
                 if head.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
@@ -3587,29 +3566,6 @@ async fn settle_and_update_collab_session(
                 .await?;
                 settlement.auth.authorize_direct_write(&facts, &facts)?;
 
-                let Some(mut cur) =
-                    load_collab_session_opt_tx(tx, &scope_cl.space_id, &note).await?
-                else {
-                    return Err(DomainError::ResourceNotFound.into());
-                };
-                validate_settlement_room(
-                    &cur,
-                    &head.head_rev_id,
-                    expected_owner.as_deref(),
-                    expected_lease,
-                    expected_lineage,
-                    close_room,
-                )?;
-
-                advance_collab_snapshot_tx(
-                    tx,
-                    &scope_cl,
-                    &mut cur,
-                    yrs_snapshot.as_deref(),
-                    compacted_through,
-                    true,
-                )
-                .await?;
                 let seq = item_ctx.alloc_next_seq()?;
                 let new_rev = new_revision_id()?;
                 let now_ts = now_utc_timestamp()?;
@@ -3738,105 +3694,17 @@ async fn settle_and_update_collab_session(
                 )
                 .await?;
 
-                let new_lease = if let Some(guard) = &fence_guard {
-                    cur.lease_epoch.max(guard.epoch()).checked_next()?
-                } else {
-                    cur.lease_epoch
-                };
-                let new_state = if close_room {
-                    CollabRoomState::Closed
-                } else {
-                    CollabRoomState::Active
-                };
-                let new_owner = if close_room { None } else { cur.owner_id };
-                let (final_yrs, final_yrs_digest) = match yrs_snapshot {
-                    Some(b) => {
-                        let d = ContentDigest::from_bytes(*blake3::hash(&b).as_bytes());
-                        (Some(b), Some(d))
-                    }
-                    None => (cur.yrs_snapshot_blob, cur.yrs_snapshot_digest),
-                };
-                let digest_slice = final_yrs_digest.as_ref().map(|d| d.as_bytes().as_slice());
-
-                match tx {
-                    BackendConn::Sqlite(conn) => {
-                        sqlx::query(
-                            "UPDATE collab_sessions
-                             SET lease_epoch = ?,
-                                 carrier_rev_id = ?,
-                                 yrs_snapshot_blob = ?,
-                                 yrs_snapshot_blake3 = ?,
-                                 room_state = ?,
-                                 owner_id = ?,
-                                 updated_seq = ?
-                             WHERE space_id = ? AND note_id = ?",
-                        )
-                        .bind(new_lease.get() as i64)
-                        .bind(new_rev.as_str())
-                        .bind(final_yrs.as_deref())
-                        .bind(digest_slice)
-                        .bind(new_state.as_db())
-                        .bind(new_owner.as_deref())
-                        .bind(seq_i64)
-                        .bind(scope_cl.space_id.as_str())
-                        .bind(note.as_str())
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_settle_collab_sess", err.to_string())
-                        })?;
-                    }
-                    BackendConn::Postgres(conn) => {
-                        sqlx::query(
-                            "UPDATE collab_sessions
-                             SET lease_epoch = $1,
-                                 carrier_rev_id = $2,
-                                 yrs_snapshot_blob = $3,
-                                 yrs_snapshot_blake3 = $4,
-                                 room_state = $5,
-                                 owner_id = $6,
-                                 updated_seq = $7
-                             WHERE space_id = $8 AND note_id = $9",
-                        )
-                        .bind(new_lease.get() as i64)
-                        .bind(new_rev.as_str())
-                        .bind(final_yrs.as_deref())
-                        .bind(digest_slice)
-                        .bind(new_state.as_db())
-                        .bind(new_owner.as_deref())
-                        .bind(seq_i64)
-                        .bind(scope_cl.space_id.as_str())
-                        .bind(note.as_str())
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("pg_settle_collab_sess", err.to_string())
-                        })?;
-                    }
-                }
-
-                if let Some(mut guard) = fence_guard {
-                    let closed = notarium_core::ports::RoomFenceState::new(
-                        note.clone(),
-                        scope_cl.clone(),
-                        new_lease,
-                    );
-                    item_ctx.on_commit(move || *guard = closed);
-                }
-
-                let out_rec = CollabSessionRecord {
-                    note: note.clone(),
-                    lease_epoch: new_lease,
-                    lineage_epoch: cur.lineage_epoch,
-                    carrier_rev_id: new_rev.clone(),
-                    yrs_snapshot_blob: final_yrs,
-                    yrs_snapshot_digest: final_yrs_digest,
-                    snapshot_coverage: cur.snapshot_coverage,
-                    carrier_dirty: cur.carrier_dirty,
-                    room_state: new_state,
-                    owner_id: new_owner,
-                    updated_seq: seq,
-                };
+                let out_rec = transition
+                    .commit_revision(
+                        tx,
+                        item_ctx,
+                        &room_fences,
+                        &note,
+                        &base_head.head_rev_id,
+                        &new_rev,
+                        seq,
+                    )
+                    .await?;
                 let stored_wire = StoredCollabSessionV1::from(&out_rec);
                 let resp_bytes = CanonicalStore::encode_command_outcome(&stored_wire)?;
 
@@ -3885,4 +3753,265 @@ async fn settle_and_update_collab_session(
 
     let stored: StoredCollabSessionV1 = store.submit_write_command(budget, intent).await?;
     stored.try_into()
+}
+
+/// Updates the collaborative state in the transaction that owns the carrier revision.
+pub(crate) struct RoomCarrierTransition {
+    expected_owner: Option<String>,
+    expected_lease: LeaseEpoch,
+    expected_lineage: LineageEpoch,
+    yrs_snapshot: Option<Vec<u8>>,
+    compacted_through: Option<u64>,
+    close_room: bool,
+    client_command: bool,
+}
+
+impl From<notarium_core::ports::AcceptedRoomCarrier> for RoomCarrierTransition {
+    fn from(reply: notarium_core::ports::AcceptedRoomCarrier) -> Self {
+        use notarium_core::ports::RoomCarrierAction;
+        let (yrs_snapshot, close_room) = match reply.action {
+            RoomCarrierAction::Checkpoint { yrs_snapshot } => (Some(yrs_snapshot), false),
+            RoomCarrierAction::Close { final_yrs_snapshot } => (final_yrs_snapshot, true),
+        };
+        Self {
+            expected_owner: Some(reply.owner_id),
+            expected_lease: reply.expected_lease,
+            expected_lineage: reply.expected_lineage,
+            yrs_snapshot,
+            compacted_through: reply.compacted_through_update_seq,
+            close_room,
+            client_command: true,
+        }
+    }
+}
+
+impl RoomCarrierTransition {
+    pub(crate) async fn check_before_staging(
+        &self,
+        store: &CanonicalStore,
+        budget: &CallBudget,
+        scope: &HistoryScope,
+        note: &NoteId,
+        auth: &EngineAuthContext,
+        base: Option<&RevisionId>,
+    ) -> Result<(SpaceRecord, crate::domain::common::NoteHeadRow), PortError> {
+        if self.yrs_snapshot.is_none() && self.compacted_through.is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+        let scope = scope.clone();
+        let note = note.clone();
+        let base = base.cloned();
+        let auth = auth.clone();
+        let owner = self.expected_owner.clone();
+        let lease = self.expected_lease;
+        let lineage = self.expected_lineage;
+        let allow_fenced = self.close_room && !self.client_command;
+        let needs_empty_snapshot = self.client_command && self.yrs_snapshot.is_none();
+        store
+            .with_read_tx_budget(Some(budget), |tx| {
+                Box::pin(async move {
+                    let srec = load_space_record(tx, &scope.space_id).await?;
+                    srec.scope.check(&scope)?;
+                    let head = load_note_head_row_tx(tx, &scope.space_id, &note).await?;
+                    if head.lifecycle != Lifecycle::Active
+                        || is_note_purge_fenced_tx(tx, &scope.space_id, note.as_str()).await?
+                    {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let (facts, _) = crate::domain::common::build_resource_facts_tx(
+                        tx,
+                        &srec.space,
+                        &head.parent_folder_id,
+                        head.doc_class,
+                        head.ability_id.clone(),
+                        true,
+                    )
+                    .await?;
+                    auth.authorize_direct_write(&facts, &facts)?;
+                    if base.is_some_and(|expected| head.head_rev_id != expected) {
+                        return Err(DomainError::RevisionConflict {
+                            current: head.head_rev_id,
+                            lineage: None,
+                        }
+                        .into());
+                    }
+                    let room = load_collab_session_opt_tx(tx, &scope.space_id, &note)
+                        .await?
+                        .ok_or(DomainError::ResourceNotFound)?;
+                    validate_settlement_room(
+                        &room,
+                        &head.head_rev_id,
+                        owner.as_deref(),
+                        lease,
+                        lineage,
+                        allow_fenced,
+                    )?;
+                    if needs_empty_snapshot
+                        && (room.yrs_snapshot_blob.is_some() || room.carrier_dirty)
+                    {
+                        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                    }
+                    Ok((srec, head))
+                })
+            })
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn commit_revision(
+        self,
+        tx: &mut BackendConn<'_>,
+        item_ctx: &mut crate::writer::ItemExecCtx,
+        room_fences: &crate::RoomFenceTable,
+        note: &NoteId,
+        base_revision: &RevisionId,
+        new_rev: &RevisionId,
+        seq: SpaceSeq,
+    ) -> Result<CollabSessionRecord, PortError> {
+        let Self {
+            expected_owner,
+            expected_lease,
+            expected_lineage,
+            yrs_snapshot,
+            compacted_through,
+            close_room,
+            client_command,
+        } = self;
+        if yrs_snapshot.is_none() && compacted_through.is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+        let scope_cl = item_ctx.scope.clone();
+        let seq_i64 = seq.get() as i64;
+        let fence_guard = if close_room {
+            Some(room_fences.lock_for_write(&scope_cl, note)?)
+        } else {
+            None
+        };
+
+        let Some(mut cur) = load_collab_session_opt_tx(tx, &scope_cl.space_id, note).await? else {
+            return Err(DomainError::ResourceNotFound.into());
+        };
+        validate_settlement_room(
+            &cur,
+            base_revision,
+            expected_owner.as_deref(),
+            expected_lease,
+            expected_lineage,
+            close_room && !client_command,
+        )?;
+
+        if client_command && yrs_snapshot.is_none() && cur.yrs_snapshot_blob.is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+        advance_collab_snapshot_tx(
+            tx,
+            &scope_cl,
+            &mut cur,
+            yrs_snapshot.as_deref(),
+            compacted_through,
+            true,
+        )
+        .await?;
+        if client_command && cur.carrier_dirty {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+        let new_lease = if let Some(guard) = &fence_guard {
+            cur.lease_epoch.max(guard.epoch()).checked_next()?
+        } else {
+            cur.lease_epoch
+        };
+        let new_state = if close_room {
+            CollabRoomState::Closed
+        } else {
+            CollabRoomState::Active
+        };
+        let new_owner = if close_room { None } else { cur.owner_id };
+        let (final_yrs, final_yrs_digest) = match yrs_snapshot {
+            Some(b) => {
+                let d = ContentDigest::from_bytes(*blake3::hash(&b).as_bytes());
+                (Some(b), Some(d))
+            }
+            None => (cur.yrs_snapshot_blob, cur.yrs_snapshot_digest),
+        };
+        let digest_slice = final_yrs_digest.as_ref().map(|d| d.as_bytes().as_slice());
+
+        match tx {
+            BackendConn::Sqlite(conn) => {
+                sqlx::query(
+                    "UPDATE collab_sessions
+                     SET lease_epoch = ?,
+                         carrier_rev_id = ?,
+                         yrs_snapshot_blob = ?,
+                         yrs_snapshot_blake3 = ?,
+                         room_state = ?,
+                         owner_id = ?,
+                         updated_seq = ?
+                     WHERE space_id = ? AND note_id = ?",
+                )
+                .bind(new_lease.get() as i64)
+                .bind(new_rev.as_str())
+                .bind(final_yrs.as_deref())
+                .bind(digest_slice)
+                .bind(new_state.as_db())
+                .bind(new_owner.as_deref())
+                .bind(seq_i64)
+                .bind(scope_cl.space_id.as_str())
+                .bind(note.as_str())
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| {
+                    internal_not_committed("sqlite_settle_collab_sess", err.to_string())
+                })?;
+            }
+            BackendConn::Postgres(conn) => {
+                sqlx::query(
+                    "UPDATE collab_sessions
+                     SET lease_epoch = $1,
+                         carrier_rev_id = $2,
+                         yrs_snapshot_blob = $3,
+                         yrs_snapshot_blake3 = $4,
+                         room_state = $5,
+                         owner_id = $6,
+                         updated_seq = $7
+                     WHERE space_id = $8 AND note_id = $9",
+                )
+                .bind(new_lease.get() as i64)
+                .bind(new_rev.as_str())
+                .bind(final_yrs.as_deref())
+                .bind(digest_slice)
+                .bind(new_state.as_db())
+                .bind(new_owner.as_deref())
+                .bind(seq_i64)
+                .bind(scope_cl.space_id.as_str())
+                .bind(note.as_str())
+                .execute(&mut **conn)
+                .await
+                .map_err(|err| internal_not_committed("pg_settle_collab_sess", err.to_string()))?;
+            }
+        }
+
+        if let Some(mut guard) = fence_guard {
+            let closed = notarium_core::ports::RoomFenceState::new(
+                note.clone(),
+                scope_cl.clone(),
+                new_lease,
+            );
+            item_ctx.on_commit(move || *guard = closed);
+        }
+
+        let out_rec = CollabSessionRecord {
+            note: note.clone(),
+            lease_epoch: new_lease,
+            lineage_epoch: cur.lineage_epoch,
+            carrier_rev_id: new_rev.clone(),
+            yrs_snapshot_blob: final_yrs,
+            yrs_snapshot_digest: final_yrs_digest,
+            snapshot_coverage: cur.snapshot_coverage,
+            carrier_dirty: cur.carrier_dirty,
+            room_state: new_state,
+            owner_id: new_owner,
+            updated_seq: seq,
+        };
+        Ok(out_rec)
+    }
 }

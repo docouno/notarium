@@ -54,7 +54,7 @@ recovers writes under its exclusive DataRoot owner lock.
 ## Dual-dialect schema and history model
 
 Both SQL dialects materialize the same ordinary B-tree tables in schema
-version `4` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
+version `5` and verify live database catalogs (`sqlite_master` / `pg_catalog`)
 against a shared typed manifest checksum (`schema_meta`) on every startup.
 Unknown newer schema versions, mismatched manifest checksums or unfinished
 migration states fail closed.
@@ -66,6 +66,15 @@ and resulting Space identity, history and cutoff, including after restart.
 The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
+
+Schema version 5 preserves the explicit payload-owner relation and places the Note after
+the Space in its primary key. SQLite stores this table without a separate rowid tree. A
+partial job index serves lookups from a job to its Notes. Purge clears ordinary receipt
+pointers by the full receipt key. For imported Spaces retaining multiple incarnations,
+it enumerates each distinct incarnation once by seeking through the receipt primary
+index. A partial index holds exceptional historical pointers whose ID does not encode
+their stored key. Expired receipts leave owners addressable without scanning unrelated
+history.
 
 Schema version 4 rebuilds the SQLite `blob_catalog` as a `WITHOUT ROWID` table
 keyed by Space and digest. Both backends index blob references by Space and
@@ -118,7 +127,15 @@ the historical evidence above. The note head keeps its current revision.
 - **Gapless change log and erasable payloads:** `change_log` records gapless
   ID-only envelopes across `[1, last_seq]`. Bounded semantic overlays
   (`EffectEnvelopeV1`, at most 8 notes and `<= 64 KiB`) live in erasable
-  `change_payloads` indexed by `payload_owners (space_id, payload_kind, payload_id, note_id)`.
+  `change_payloads` indexed by `payload_owners (space_id, note_id, payload_kind, payload_id)`.
+- A scoped change feed checks current authority and the command-end location
+  and class of each resource. A Board rank also requires access to its View.
+  Scoped subscribers receive `AwaitProjection` for a multi-note overlay. Their
+  cursors and safe acknowledgments still advance across all scanned events.
+- Historical carriers and hydrated cards retain both the recorded and current
+  access facts. Search, projection and provider egress require an active
+  document at both boundaries. An authorized explicit read can still open a
+  retained revision after the note moves to Trash.
 - PostgreSQL subscribers check their Space's durable head once per second while
   waiting for a notice. Local commits still wake subscribers immediately. A
   changed incarnation or erased payload directs the subscriber to resynchronize.
@@ -251,8 +268,10 @@ same example against an isolated prefix.
   The returned commit effect is `Unknown` in both cases.
 - **`SqliteWalCoordinator`:** Ordinary reads enter through a bounded reader gate
   with a monotonic `< 250 ms` progress-handler deadline (`248 ms` default) and
-  guaranteed worker-snapshot rollback/close if a caller drops its future. A
-  background loop runs `PASSIVE` checkpoints during idle ticks (`15 ms` cadence)
+  guaranteed worker-snapshot rollback/close if a caller drops its future.
+  Native reads use the caller budget while waiting for a worker and while verifying
+  CAS bytes after commit. Returning the connection to the pool revokes that
+  checkout's interrupt handle. A background loop runs `PASSIVE` checkpoints during idle ticks (`15 ms` cadence)
   and uses a 250 ms budget to drain readers and acquire the writer for a
   `RESTART`/`TRUNCATE` checkpoint (512 MiB soft / 896 MiB high watermarks).
   Once the filesystem flush starts, SQLite holds the gate until I/O completes.
@@ -260,9 +279,17 @@ same example against an isolated prefix.
   closure and `reset_gate_overruns` counts closures over budget.
 - **Hierarchy, boards and semantic rollback:** `MoveFolder` updates only the
   moved folder row (`0` descendant row writes) under cycle checks and per-Space
-  serialization. `move_board_card` maintains `<= 16`-byte `sort_rank_lexo` keys
+  serialization. Same-depth and upward moves check the two ancestor paths.
+  Moving deeper also probes indexed children until the first path that would
+  exceed 256 levels. `move_board_card` maintains `<= 16`-byte `sort_rank_lexo` keys
   via windowed Packed Memory Array (PMA) rebalancing that updates physical
   `rank_rev_id` without overwriting semantic `placement_revision` provenance.
+  A PostgreSQL root-note rollback uses one caller deadline across the writer
+  safe point, connection checkout, planning, room fences and SQL. Planning reads
+  also respect the configured read timeout. Cancellation before COMMIT leaves
+  the transaction uncommitted. An ambiguous COMMIT acknowledgement returns
+  `Unknown` with a same-command retry. The writer gate and room fences cover the
+  outstanding acknowledgement.
   `rollback_agent_run` freezes eligible targets and closed-room reservations
   before planning, simulates inverse board moves in reverse command order over
   recorded semantic before-anchors, and applies `Trash`-first slug deconfliction
@@ -301,13 +328,19 @@ same example against an isolated prefix.
   thread, write authority and available space before staging a large body and
   again at commit. Local publication follows admission. For S3, each new upload
   records its own cleanup intent before the first conditional PUT. The winning
-  bind removes that intent atomically. A losing request or a replacement writer
-  fences its registered keys while preserving other publications of the same digest.
+  bind removes that intent atomically. The store's executor cleans up abandoned
+  uploads even when a caller closes its executor. A lease takeover adopts
+  older private uploads. Retrying the same lease leaves that generation's
+  active uploads with their owners.
   `redact_chat_entry` applies the same thread and taint checks on first execution
   and replay. It erases target entry content, preserves DAG ancestry and
   clears the stored bodies and CAS references of dependent `Compaction` entries.
   Direct reads, history windows and command replay suppress stale summaries.
-  An independent entry that owns the same digest keeps its content. Taint is monotonic.
+  An independent entry that owns the same digest keeps its content. Removing the
+  last owner closes peer reads and records retirement in the redaction transaction.
+  An active backup hold keeps the physical bytes until release. The store retries
+  deletion after release and recovers outstanding work after restart or takeover.
+  Taint is monotonic.
 - **Paired backup (`BackupParticipantPort`).** Prepare both participants and acquire
   their holds before pausing control, then canonical. PostgreSQL uses a dedicated
   connection to fence writers across runtimes sharing the canonical schema. Pin
@@ -327,15 +360,31 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 4.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 5.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
   target with `schema::POSTGRES_BASELINE_DDL`. For versions 1 and 2, drop
   `collab_checkpoints` and `backup_holds.owner_generation`. For version 1,
   also drop `account_catalog_receipts` and `chat_pending_inputs.ext_space_tainted`.
-  Import the verified rows in the same transaction. Opening the target with
-  the original installation ID applies the version 4 migration. The canonical
-  L4 backup suite exercises this procedure with archives from all three predecessor versions.
+  For versions 1 through 4, drop `idx_receipt_exception_pointer` and
+  `idx_payload_owners_job`, and restore the `payload_owners` primary key to
+  `(space_id, payload_kind, payload_id, note_id)`.
+  For versions 1 through 3, restore the predecessor index layout on
+  `blob_references` using `tests/fixtures/schema-v3-reference-index.sql`
+  in the canonical crate. Call `decoded.import_rows(&mut transaction)` and
+  commit the transaction. The importer stages self-referencing tables and
+  inserts each complete table in one statement with foreign keys enforced.
+  This accommodates child folders whose IDs sort before their parents.
+  Opening the target with the original installation ID applies the version 5 migration. The canonical
+  L4 backup suite exercises this procedure with archives from all four predecessor versions.
+  Before serving the restored database, call `restore_cursors` with each
+  original cutoff and a fresh history incarnation. The same transaction
+  rotates the writer epoch and fences active rooms, retaining their snapshots,
+  lineages and unapplied updates for explicit recovery. An interruption before
+  COMMIT has effect `NotCommitted`. During COMMIT it has effect `Unknown`;
+  inspect the persisted incarnation before deciding whether to retry. The
+  runtime publishes its new writer grants and room fences after the database
+  acknowledges the commit, including when the requesting future was dropped.
 
 ## Offline fixture lifecycle and attributed benchmarks
 

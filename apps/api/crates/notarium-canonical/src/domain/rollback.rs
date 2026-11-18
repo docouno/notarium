@@ -17,6 +17,7 @@ use notarium_core::{
     receipt::MutationReceiptToken,
 };
 use sqlx::Row;
+use tokio::time::Instant;
 
 use crate::{
     CanonicalStore,
@@ -201,9 +202,10 @@ fn is_fallback_board_present(err: &PortError) -> bool {
 
 pub(crate) async fn rollback_agent_run_impl(
     store: &CanonicalStore,
-    ctx: SpaceContext,
+    mut ctx: SpaceContext,
     request: Mutation<RollbackAgentRun>,
 ) -> Result<Committed<RollbackResult>, PortError> {
+    let entered = Instant::now();
     validate_mutation_identity(&ctx, &request.identity)?;
     let idemp = build_rollback_identity_spec(&request)?.with_policy(
         ctx.auth(),
@@ -213,6 +215,17 @@ pub(crate) async fn rollback_agent_run_impl(
                 .expected_entities
                 .iter()
                 .map(|entry| crate::writer::replay::ReplayResource::Write(entry.note.clone()))
+                .chain(
+                    request
+                        .input
+                        .associated_board_expectations
+                        .iter()
+                        .map(|entry| &entry.view.note)
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .cloned()
+                        .map(crate::writer::replay::ReplayResource::View),
+                )
                 .collect(),
         ),
     );
@@ -233,18 +246,27 @@ pub(crate) async fn rollback_agent_run_impl(
             }
         };
         let mut try_pg_batch_plan = true;
-        if !store.is_sqlite_local()
-            && let Some(direct_res) = try_execute_pg_root_rollback(
+        if matches!(
+            store.inner.sql,
+            crate::runtime::SqlDriverState::Postgres { .. }
+        ) {
+            let deadline = entered
+                .checked_add(ctx.budget.remaining)
+                .unwrap_or_else(|| tokio::time::sleep(ctx.budget.remaining).deadline());
+            if let Some(outcome) = try_execute_pg_root_rollback(
                 store,
                 &ctx,
                 &idemp,
                 &request,
                 writer_epoch,
                 &mut try_pg_batch_plan,
+                deadline,
             )
             .await
-        {
-            return direct_res;
+            {
+                return outcome;
+            }
+            ctx.budget.remaining = pg_rollback_time_left(&ctx.budget, deadline)?;
         }
         let single_res: Result<StoredCommittedRollbackV1, PortError> = if store.is_sqlite_local() {
             let (intent, fast_plan) = crate::sqlite_fast::build_rollback_direct_sqlite_fast_intent(
@@ -2476,6 +2498,14 @@ async fn verify_run_and_entity_preconditions_tx(
     input: &RollbackAgentRun,
     folder_cache: &mut FolderAncestryCache,
 ) -> Result<(BTreeMap<NoteId, NoteHeadRow>, Vec<RunBoardMoveRow>), PortError> {
+    for view in input
+        .associated_board_expectations
+        .iter()
+        .map(|entry| &entry.view.note)
+        .collect::<BTreeSet<_>>()
+    {
+        super::board::authorized_view_head(tx, space, auth, view).await?;
+    }
     let run_row: Option<(Vec<u8>, String)> = match tx {
         BackendConn::Sqlite(conn) => {
             let row = sqlx::query(
@@ -2555,13 +2585,6 @@ async fn verify_run_and_entity_preconditions_tx(
 
     for (nid, exp_rev) in &caller_notes {
         let head = heads_map.get(nid).ok_or(DomainError::ResourceNotFound)?;
-        if head.head_rev_id != *exp_rev {
-            return Err(DomainError::RevisionConflict {
-                current: head.head_rev_id.clone(),
-                lineage: None,
-            }
-            .into());
-        }
         let (rfacts, _) = folder_cache
             .build_resource_facts_tx(
                 tx,
@@ -2573,6 +2596,13 @@ async fn verify_run_and_entity_preconditions_tx(
             )
             .await?;
         auth.authorize_direct_write(&rfacts, &rfacts)?;
+        if head.head_rev_id != *exp_rev {
+            return Err(DomainError::RevisionConflict {
+                current: head.head_rev_id.clone(),
+                lineage: None,
+            }
+            .into());
+        }
     }
 
     // Verify `associated_board_expectations` covers all `(view, target_note)` pairs in `board_move_history` for this run.
@@ -4085,29 +4115,66 @@ async fn execute_pg_fast_rollback_on_conn(
     }
 }
 
-struct PendingRollbackFencesGuard<'a> {
+struct PendingRollbackFencesGuard {
     slots: Vec<
         Option<(
             tokio::sync::OwnedMutexGuard<notarium_core::ports::RoomFenceState>,
             ClosedRoomReservation,
         )>,
     >,
-    req_id: &'a notarium_core::receipt::CommandIdentity,
+    req_id: notarium_core::receipt::CommandIdentity,
     armed_for_drop_consume: bool,
 }
 
-impl Drop for PendingRollbackFencesGuard<'_> {
+impl Drop for PendingRollbackFencesGuard {
     fn drop(&mut self) {
         if self.armed_for_drop_consume {
             for slot_opt in &mut self.slots {
                 if let Some((mut guard, res)) = slot_opt.take() {
-                    let _ = guard.consume(res, self.req_id);
+                    let _ = guard.consume(res, &self.req_id);
                 }
             }
         }
     }
 }
 
+fn pg_rollback_time_left(
+    budget: &notarium_core::ports::CallBudget,
+    deadline: Instant,
+) -> Result<std::time::Duration, PortError> {
+    if budget.cancellation.is_cancelled() {
+        return Err(crate::codec::cancelled_not_committed(
+            "pg_rollback_cancelled",
+            "rollback cancelled before commit",
+        ));
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(crate::codec::deadline_not_committed(
+            "pg_rollback_deadline",
+            "rollback deadline expired before commit",
+        ));
+    }
+    Ok(remaining)
+}
+
+async fn pg_rollback_wait<T>(
+    budget: &notarium_core::ports::CallBudget,
+    deadline: Instant,
+    operation: impl Future<Output = T>,
+) -> Result<T, PortError> {
+    pg_rollback_time_left(budget, deadline)?;
+    tokio::select! {
+        biased;
+        _ = budget.cancellation.cancelled() =>
+            Err(crate::codec::cancelled_not_committed("pg_rollback_cancelled", "rollback cancelled before commit")),
+        _ = tokio::time::sleep_until(deadline) =>
+            Err(crate::codec::deadline_not_committed("pg_rollback_deadline", "rollback deadline expired before commit")),
+        result = operation => Ok(result),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn try_execute_pg_root_rollback(
     store: &CanonicalStore,
     ctx: &SpaceContext,
@@ -4115,6 +4182,7 @@ async fn try_execute_pg_root_rollback(
     request: &Mutation<RollbackAgentRun>,
     writer_epoch: notarium_core::ids::LeaseEpoch,
     try_pg_batch_plan: &mut bool,
+    deadline: Instant,
 ) -> Option<Result<Committed<RollbackResult>, PortError>> {
     use crate::{
         codec::{
@@ -4155,6 +4223,7 @@ async fn try_execute_pg_root_rollback(
         pool,
         fast_write_conn,
         can_cache_fast_conn,
+        statement_timeout,
         ..
     } = &store.inner.sql
     else {
@@ -4192,7 +4261,11 @@ async fn try_execute_pg_root_rollback(
                     .expect("pg fast_write_conn mutex")
                     .take();
             }
-            writer.acquire_commit_read_guard().await
+            match pg_rollback_wait(&ctx.budget, deadline, writer.acquire_commit_read_guard()).await
+            {
+                Ok(guard) => guard,
+                Err(err) => return Some(Err(err)),
+            }
         }
     };
 
@@ -4216,11 +4289,13 @@ async fn try_execute_pg_root_rollback(
             .expect("pg fast_write_conn mutex")
             .take()
     };
+    let read_deadline = deadline.min(Instant::now() + *statement_timeout);
     let mut pooled = match cached_conn {
         Some(c) => c,
-        None => match pool.acquire().await {
-            Ok(c) => c,
-            Err(err) => {
+        None => match pg_rollback_wait(&ctx.budget, read_deadline, pool.acquire()).await {
+            Ok(Ok(c)) => c,
+            Err(err) => return Some(Err(err)),
+            Ok(Err(err)) => {
                 return Some(Err(unavailable_retryable(
                     "pg_pool_acquire_failed",
                     err.to_string(),
@@ -4259,16 +4334,26 @@ async fn try_execute_pg_root_rollback(
         pre_rev_id: Option<String>,
         metadata: Option<RestoredMetadata>,
     }
-    let rows = sqlx::query(crate::schema::PG_LEAN_ROLLBACK_READ_SQL)
+    let mut read_lease = crate::sql_exec::PgTransactionLease::new(&mut pooled);
+    let query = sqlx::query(crate::schema::PG_LEAN_ROLLBACK_READ_SQL)
         .bind(scope.space_id.as_str())
         .bind(request.input.run.as_str())
         .bind(&sorted_note_strs)
         .bind(scope.incarnation.as_bytes().as_slice())
         .bind(writer_epoch.get() as i64)
         .bind(request.input.expected_run_revision.as_str())
-        .fetch_all(&mut *pooled)
-        .await;
-    let Ok(rows) = rows else { return None };
+        .fetch_all(read_lease.conn());
+    let rows = match pg_rollback_wait(&ctx.budget, read_deadline, query).await {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => {
+            return Some(Err(internal_not_committed(
+                "pg_rollback_read",
+                err.to_string(),
+            )));
+        }
+        Err(err) => return Some(Err(err)),
+    };
+    read_lease.complete();
     // The batch optimization also requires an empty room table. A known unsupported
     // room should enter the ordinary planner directly, without a second history read.
     if rows.iter().any(|row| !row.get::<bool, _>("room_writable")) {
@@ -4377,6 +4462,9 @@ async fn try_execute_pg_root_rollback(
 
     // Step 2: Acquire room fences only for non-manual-skip notes (matching `execute_pg_fast_rollback_inner`),
     // classify actions in memory, and encode metadata + receipt MsgPack payloads in compiled Rust.
+    if let Err(err) = pg_rollback_time_left(&ctx.budget, deadline) {
+        return Some(Err(err));
+    }
     let fence_slots = match store.inner.room_fences.try_lock_batch_for_rollback_sync(
         scope,
         &sorted_note_refs,
@@ -4386,6 +4474,9 @@ async fn try_execute_pg_root_rollback(
         Ok(None) => {
             let mut slots = Vec::with_capacity(n);
             for &nid in &sorted_note_refs {
+                if let Err(err) = pg_rollback_time_left(&ctx.budget, deadline) {
+                    return Some(Err(err));
+                }
                 match store
                     .inner
                     .room_fences
@@ -4409,7 +4500,7 @@ async fn try_execute_pg_root_rollback(
 
     let mut fences_guard = PendingRollbackFencesGuard {
         slots: fence_slots,
-        req_id: &request.identity,
+        req_id: request.identity.clone(),
         armed_for_drop_consume: false,
     };
 
@@ -4901,7 +4992,6 @@ async fn try_execute_pg_root_rollback(
         .is_batch_telemetry_enabled()
         .then(std::time::Instant::now);
 
-    fences_guard.armed_for_drop_consume = true;
     if let Err(err) = ctx.auth().authorize_direct_write(&root_facts, &root_facts) {
         park_pooled(pooled);
         return Some(Err(err.into()));
@@ -4915,7 +5005,7 @@ async fn try_execute_pg_root_rollback(
             )
         })
         .unzip();
-    let commit_res = sqlx::query(crate::schema::PG_LEAN_ROLLBACK_COMMIT_CALL_SQL)
+    let apply = sqlx::query(crate::schema::PG_LEAN_ROLLBACK_COMMIT_CALL_SQL)
         .bind(scope.space_id.as_str())
         .bind(scope.incarnation.as_bytes().as_slice())
         .bind(total_seqs)
@@ -4987,103 +5077,160 @@ async fn try_execute_pg_root_rollback(
         .bind(root_folder_str)
         .bind(writer_epoch.get() as i64)
         .bind(&room_leases)
-        .bind(&room_lineages)
-        .fetch_one(&mut *pooled)
-        .await;
-
-    if let Some(t0) = phase2_start {
-        let dur_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        writer.record_batch_telemetry(dur_ns, 1);
-    }
-
-    match commit_res {
-        Ok(row) => {
-            fences_guard.armed_for_drop_consume = false;
-            park_pooled(pooled);
-
-            let vis_seq_i64: i64 = row.get::<i64, usize>(0);
-            if vis_seq_i64 <= 0 {
-                *try_pg_batch_plan = false;
-                drop(fences_guard);
-                return None;
-            }
-            let (Ok(visibility_seq), Some(receipt)) = (
-                i64_to_space_seq(vis_seq_i64),
-                i64_to_space_seq(vis_seq_i64)
-                    .ok()
-                    .and_then(|vs| MutationReceiptToken::new(scope.clone(), vs).ok()),
-            ) else {
-                drop(fences_guard);
-                return Some(Err(unknown_commit_outcome(
-                    "corrupt_lean_rb_vis_seq",
-                    format!("invalid committed visibility_seq {vis_seq_i64}"),
-                )));
-            };
-
-            for (i, slot_opt) in fences_guard.slots.iter_mut().enumerate() {
-                if acts[i] >= 2
-                    && let Some((mut guard, res)) = slot_opt.take()
-                    && let Err(err) = guard.consume(res, &request.identity)
-                {
-                    return Some(Err(unknown_commit_outcome(
-                        "fence_consume_lean_rb",
-                        format!("fence consume failed after lean rollback commit: {err:?}"),
-                    )));
-                }
-            }
-            drop(fences_guard);
-
-            store
-                .inner
-                .broadcast_hub
-                .publish(crate::changes::BroadcastSignal::Committed {
-                    scope: scope.clone(),
-                    new_last_seq: visibility_seq,
-                });
-
-            if writer
-                .faults()
-                .drop_commit_response_once
-                .swap(false, Ordering::SeqCst)
-            {
-                return Some(Err(unknown_commit_outcome(
-                    "fault_injected_commit_response_loss",
-                    "fault-injected commit response loss after lean rollback commit",
-                )));
-            }
-
-            Some(Ok(Committed {
-                value: result_value,
-                receipt,
-            }))
+        .bind(&room_lineages);
+    let remaining = match pg_rollback_time_left(&ctx.budget, deadline) {
+        Ok(remaining) => remaining,
+        Err(err) => return Some(Err(err)),
+    };
+    // The owned transaction rolls back on any return before COMMIT. The SQL
+    // timeout also bounds server work if the client disconnects.
+    let sql = format!(
+        "BEGIN; SET LOCAL statement_timeout = '{}ms'",
+        remaining.as_millis().clamp(1, i32::MAX as u128)
+    );
+    let mut transaction = crate::sql_exec::PgTransactionLease::new(pooled);
+    let begin = sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).execute(transaction.conn());
+    match pg_rollback_wait(&ctx.budget, deadline, begin).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            return Some(Err(internal_not_committed(
+                "pg_rollback_begin",
+                err.to_string(),
+            )));
         }
-        Err(sqlx::Error::Database(db_err))
-            if db_err.message().contains("NOTARIUM_RB_FALLBACK_0") =>
-        {
+        Err(err) => return Some(Err(err)),
+    };
+    let row = match pg_rollback_wait(&ctx.budget, deadline, apply.fetch_one(transaction.conn()))
+        .await
+    {
+        Ok(Ok(row)) => row,
+        Ok(Err(sqlx::Error::Database(err))) if err.message().contains("NOTARIUM_RB_FALLBACK_0") => {
             *try_pg_batch_plan = false;
-            fences_guard.armed_for_drop_consume = false;
-            park_pooled(pooled);
-            drop(fences_guard);
-            None
+            return None;
         }
-        Err(sqlx::Error::Database(db_err)) => {
-            fences_guard.armed_for_drop_consume = false;
-            park_pooled(pooled);
-            drop(fences_guard);
-            Some(Err(internal_not_committed(
-                "pg_lean_rb_db_err",
-                db_err.to_string(),
-            )))
+        Ok(Err(sqlx::Error::Database(err))) if err.code().as_deref() == Some("57014") => {
+            return Some(Err(deadline_not_committed(
+                "pg_rollback_statement_timeout",
+                "rollback statement exceeded its SQL time budget",
+            )));
         }
-        Err(_transport_err) => {
-            drop(pooled);
-            drop(fences_guard);
-            Some(Err(unknown_commit_outcome(
-                "pg_lean_rb_ambiguous_io",
-                "transport error during autocommit lean rollback",
-            )))
+        Ok(Err(err)) => {
+            return Some(Err(internal_not_committed(
+                "pg_lean_rb_apply",
+                err.to_string(),
+            )));
         }
+        Err(err) => return Some(Err(err)),
+    };
+    if row.get::<i64, usize>(0) <= 0 {
+        *try_pg_batch_plan = false;
+        return None;
     }
+
+    let executor = store.inner.backup_executor.clone();
+    let store = store.clone();
+    let scope = scope.clone();
+    let writer = writer.clone();
+    let commit = async move {
+        // Retain the backup safe point and room fences until the database
+        // answers, including when the caller stops waiting for the ACK.
+        let _gate = _commit_gate;
+        fences_guard.armed_for_drop_consume = true;
+        match sqlx::raw_sql("COMMIT").execute(transaction.conn()).await {
+            Ok(_) => {
+                transaction.complete();
+                fences_guard.armed_for_drop_consume = false;
+            }
+            Err(sqlx::Error::Database(err)) => {
+                fences_guard.armed_for_drop_consume = false;
+                drop(fences_guard);
+                return Err(internal_not_committed("pg_lean_rb_commit", err.to_string()));
+            }
+            Err(_) => {
+                return Err(unknown_commit_outcome(
+                    "pg_lean_rb_lost_ack",
+                    "rollback COMMIT reply was lost",
+                ));
+            }
+        }
+
+        if let Some(t0) = phase2_start {
+            let dur_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            writer.record_batch_telemetry(dur_ns, 1);
+        }
+
+        let vis_seq_i64 = row.get::<i64, usize>(0);
+        let (Ok(visibility_seq), Some(receipt)) = (
+            i64_to_space_seq(vis_seq_i64),
+            i64_to_space_seq(vis_seq_i64)
+                .ok()
+                .and_then(|vs| MutationReceiptToken::new(scope.clone(), vs).ok()),
+        ) else {
+            drop(fences_guard);
+            return Err(unknown_commit_outcome(
+                "corrupt_lean_rb_vis_seq",
+                format!("invalid committed visibility_seq {vis_seq_i64}"),
+            ));
+        };
+
+        for (i, slot_opt) in fences_guard.slots.iter_mut().enumerate() {
+            if acts[i] >= 2
+                && let Some((mut guard, res)) = slot_opt.take()
+                && let Err(err) = guard.consume(res, &fences_guard.req_id)
+            {
+                return Err(unknown_commit_outcome(
+                    "fence_consume_lean_rb",
+                    format!("fence consume failed after lean rollback commit: {err:?}"),
+                ));
+            }
+        }
+        drop(fences_guard);
+
+        store
+            .inner
+            .broadcast_hub
+            .publish(crate::changes::BroadcastSignal::Committed {
+                scope: scope.clone(),
+                new_last_seq: visibility_seq,
+            });
+
+        if writer
+            .faults()
+            .drop_commit_response_once
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(unknown_commit_outcome(
+                "fault_injected_commit_response_loss",
+                "fault-injected commit response loss after lean rollback commit",
+            ));
+        }
+
+        Ok(Committed {
+            value: result_value,
+            receipt,
+        })
+    };
+    let mut completion = Box::pin(commit);
+    // First poll is the COMMIT handoff. Prior cancellation can still discard
+    // the transaction. After that poll the same future must drain the ACK.
+    if let Err(err) = pg_rollback_time_left(&ctx.budget, deadline) {
+        return Some(Err(err));
+    }
+    let first =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(completion.as_mut().poll(cx))).await;
+    if let std::task::Poll::Ready(result) = first {
+        return Some(result);
+    }
+    let acknowledgement = executor.spawn(completion);
+    Some(
+        match pg_rollback_wait(&ctx.budget, deadline, acknowledgement).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(unknown_commit_outcome(
+                "pg_lean_rb_ambiguous_commit",
+                "rollback COMMIT was sent without a definitive reply",
+            )),
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

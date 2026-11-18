@@ -1,3 +1,5 @@
+mod receipt_pointers;
+
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex as StdMutex},
@@ -57,6 +59,14 @@ struct PendingPurgeExecution {
 
 type RawLookupPendingPurgeRow = (String, Vec<u8>, String, String, Vec<u8>);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetirementRecovery {
+    /// The exclusive DataRoot lock was obtained before accepting any requests.
+    Startup,
+    Lease,
+    RestoredGc,
+}
+
 pub(crate) async fn resume_pending_purges_on_startup(
     store: &CanonicalStore,
 ) -> Result<(), PortError> {
@@ -68,7 +78,8 @@ pub(crate) async fn resume_pending_purges_on_startup(
         return Ok(());
     }
     const SQL: &str = "SELECT space_id FROM pending_purges WHERE phase <> 'completed'
-        UNION SELECT space_id FROM blob_retirements WHERE status = 'pending'";
+        UNION SELECT space_id FROM blob_retirements WHERE status = 'pending'
+        UNION SELECT space_id FROM blob_catalog WHERE ref_count=0 AND blob_state='active' AND admission_state='open'";
     let spaces: Vec<String> = store
         .with_read_tx(|tx| {
             Box::pin(async move {
@@ -85,7 +96,11 @@ pub(crate) async fn resume_pending_purges_on_startup(
     for space in spaces {
         let space = store.read_space(&SpaceId::parse(&space)?).await?;
         store
-            .resume_pending_storage_for_space(&space.scope, space.active_epoch)
+            .resume_pending_storage_for_space(
+                &space.scope,
+                space.active_epoch,
+                RetirementRecovery::Startup,
+            )
             .await?;
     }
     Ok(())
@@ -96,8 +111,17 @@ impl CanonicalStore {
         &self,
         scope: &HistoryScope,
         epoch: LeaseEpoch,
+        recovery: RetirementRecovery,
     ) -> Result<(), PortError> {
         self.inner.check_writer_epoch(&scope.space_id, epoch)?;
+        let current = scope.clone();
+        self.with_write_tx(|tx| {
+            Box::pin(async move {
+                crate::blobs::lock_and_check_space_tx(tx, &current, epoch).await?;
+                crate::blobs::plan_unowned_active_blobs_tx(tx, &current, epoch).await
+            })
+        })
+        .await?;
         const PURGES: &str = "SELECT purge_id, actor_id, idempotency_key, old_note_id, retirement_ids_json, sanitized_response_msgpack
             FROM pending_purges WHERE space_id = $1 AND history_incarnation = $2 AND phase <> 'completed' ORDER BY created_at_ms";
         type PendingPurge = (String, String, String, String, String, Vec<u8>);
@@ -127,7 +151,7 @@ impl CanonicalStore {
                 })
             })
             .await?;
-        self.resume_blob_retirements(scope, epoch, false).await?;
+        self.resume_blob_retirements(scope, epoch, recovery).await?;
         for (purge_id, actor_id, idempotency_key, old_note, ret_json, sanitized_response_msgpack) in
             purges
         {
@@ -152,18 +176,20 @@ impl CanonicalStore {
         &self,
         scope: &HistoryScope,
         epoch: LeaseEpoch,
-        restored_gc: bool,
+        recovery: RetirementRecovery,
     ) -> Result<(), PortError> {
         let mut after = String::new();
-        // A restore worker may run alongside new-epoch uploads. Their provisional
-        // discards belong to those uploads. Purge completion also owns a log entry.
-        let previous_epoch_only = restored_gc.then_some(epoch.get() as i64);
-        let limit = if restored_gc { 128 } else { i64::MAX };
-        const PAGE: &str = "SELECT retirement_id FROM blob_retirements
-            WHERE space_id=$1 AND history_incarnation=$2 AND status='pending' AND retirement_id>$3
-              AND (CAST($4 AS BIGINT) IS NULL OR (reason='gc' AND owner_epoch<$4))
-            ORDER BY CASE WHEN CAST($4 AS BIGINT) IS NULL THEN created_at_ms ELSE 0 END,
-                     retirement_id LIMIT $5";
+        let restored_gc = recovery == RetirementRecovery::RestoredGc;
+        let online_epoch = (recovery != RetirementRecovery::Startup).then_some(epoch.get() as i64);
+        // The retirement owner can change when a recovery adopts it. The publication's
+        // creation epoch stays immutable, including across unsuccessful recovery attempts.
+        const PAGE: &str = "SELECT r.retirement_id FROM blob_retirements r
+            WHERE r.space_id=$1 AND r.history_incarnation=$2 AND r.status='pending' AND r.retirement_id>$3
+              AND (NOT $5 OR r.reason='gc')
+              AND (CAST($4 AS BIGINT) IS NULL OR NOT EXISTS (
+                SELECT 1 FROM blob_publications p WHERE p.space_id=r.space_id AND p.publication_id=r.retirement_id
+                  AND p.owner_epoch >= $4))
+            ORDER BY r.retirement_id LIMIT 128";
         loop {
             self.inner.check_writer_epoch(&scope.space_id, epoch)?;
             let current = scope.clone();
@@ -179,8 +205,8 @@ impl CanonicalStore {
                                     .bind(sid)
                                     .bind(inc)
                                     .bind(page_after)
-                                    .bind(previous_epoch_only)
-                                    .bind(limit)
+                                    .bind(online_epoch)
+                                    .bind(restored_gc)
                                     .fetch_all(&mut **conn)
                                     .await
                             }
@@ -189,8 +215,8 @@ impl CanonicalStore {
                                     .bind(sid)
                                     .bind(inc)
                                     .bind(page_after)
-                                    .bind(previous_epoch_only)
-                                    .bind(limit)
+                                    .bind(online_epoch)
+                                    .bind(restored_gc)
                                     .fetch_all(&mut **conn)
                                     .await
                             }
@@ -210,15 +236,16 @@ impl CanonicalStore {
                     match self.drive_retirement_to_completion(scope, epoch, &id).await {
                         Ok(()) => break,
                         Err(error @ PortError::Domain(_)) => return Err(error),
+                        Err(error) if error == crate::blobs::held_retirement() => {
+                            self.schedule_retirements(scope.clone(), epoch, vec![id.clone()], None);
+                            break;
+                        }
                         Err(error) if !restored_gc => return Err(error),
                         Err(_) => tokio::time::sleep(backoff).await,
                     }
                     backoff = (backoff * 2).min(Duration::from_secs(5));
                 }
                 after = id;
-            }
-            if !restored_gc {
-                return Ok(());
             }
         }
     }
@@ -1399,6 +1426,7 @@ async fn execute_sql_erasure_for_old_note_tx(
         }
     };
 
+    let mut erased_detail_ids = Vec::new();
     for (pkind, pid) in owned_payloads {
         match pkind.as_str() {
             "change_payload" => match tx {
@@ -1443,18 +1471,6 @@ async fn execute_sql_erasure_for_old_note_tx(
                         .map_err(|err| {
                             internal_not_committed("sqlite_erase_rcpt_pay", err.to_string())
                         })?;
-                        sqlx::query(
-                            "UPDATE command_receipts
-                             SET response_payload_id = NULL
-                             WHERE space_id = ? AND response_payload_id = ?",
-                        )
-                        .bind(scope.space_id.as_str())
-                        .bind(&rcpt_pay_id)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_clear_rcpt_pay_ref", err.to_string())
-                        })?;
                     }
                     BackendConn::Postgres(conn) => {
                         sqlx::query(
@@ -1469,20 +1485,9 @@ async fn execute_sql_erasure_for_old_note_tx(
                         .map_err(|err| {
                             internal_not_committed("pg_erase_rcpt_pay", err.to_string())
                         })?;
-                        sqlx::query(
-                            "UPDATE command_receipts
-                             SET response_payload_id = NULL
-                             WHERE space_id = $1 AND response_payload_id = $2",
-                        )
-                        .bind(scope.space_id.as_str())
-                        .bind(&rcpt_pay_id)
-                        .execute(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("pg_clear_rcpt_pay_ref", err.to_string())
-                        })?;
                     }
                 }
+                erased_detail_ids.push(rcpt_pay_id);
             }
             "content_job" => match tx {
                 BackendConn::Sqlite(conn) => {
@@ -1513,6 +1518,8 @@ async fn execute_sql_erasure_for_old_note_tx(
             _ => {}
         }
     }
+
+    receipt_pointers::clear(tx, scope, &erased_detail_ids).await?;
 
     // Erase all board_move_history rows and payload_owners referencing `old_note`!
     match tx {

@@ -636,7 +636,7 @@ impl SqliteWalCoordinator {
     pub(crate) async fn acquire_reader_gate_slot(
         self: &Arc<Self>,
         budget: Option<&CallBudget>,
-    ) -> Result<(FastReaderGateGuard, tokio::time::Instant, Instant), PortError> {
+    ) -> Result<(FastReaderGateGuard, tokio::time::Instant), PortError> {
         if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
             return Err(cancelled_not_committed(
                 "sqlite_read_cancelled_pre_admission",
@@ -734,13 +734,6 @@ impl SqliteWalCoordinator {
             .total_admission_wait_ns
             .fetch_add(waited_ns, Ordering::Relaxed);
 
-        let now_tokio = tokio::time::Instant::now();
-        let remaining_after_gate = caller_deadline_tokio.saturating_duration_since(now_tokio);
-        let eff_budget = remaining_after_gate
-            .min(self.read_deadline)
-            .max(Duration::from_millis(1));
-        let tx_deadline_std = Instant::now() + eff_budget;
-
         Ok((
             FastReaderGateGuard {
                 coord: Arc::clone(self),
@@ -749,7 +742,6 @@ impl SqliteWalCoordinator {
                 counted_timeout: false,
             },
             caller_deadline_tokio,
-            tx_deadline_std,
         ))
     }
 

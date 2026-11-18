@@ -794,6 +794,7 @@ pub(crate) async fn move_board_card_impl(
         ctx.auth(),
         crate::writer::replay::ReplayPolicy::Documents(vec![
             crate::writer::replay::ReplayResource::Write(request.input.note.clone()),
+            crate::writer::replay::ReplayResource::View(request.input.view.note.clone()),
         ]),
     );
     idemp.require_receipt_detail = true;
@@ -816,28 +817,10 @@ pub(crate) async fn move_board_card_impl(
         .clone();
 
     for attempt in 0..MAX_PLANNER_RETRIES {
-        let facts = provider
-            .evaluate_move(&board_authority, ctx.clone(), None, request.input.clone())
-            .await?;
-        facts.verify_authority(&board_authority)?;
-        ctx.scope().check(facts.scope())?;
-        if facts.view() != &request.input.view {
-            return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
-        }
-        if *facts.view_revision() != request.input.expected_view {
-            return Err(DomainError::RevisionConflict {
-                current: facts.view_revision().clone(),
-                lineage: None,
-            }
-            .into());
-        }
-        if !facts.after_eligible_in_group() {
-            return Err(DomainError::validation(ValidationReason::InvalidState).into());
-        }
-
         // Pre-read target note head & authorize direct write before live-room interception or CAS staging.
         let ctx_read = ctx.clone();
         let target_id = request.input.note.clone();
+        let view_id = request.input.view.note.clone();
         let prec_read = request.preconditions.clone();
         let (space_rec, base_head) = store
             .with_read_tx_budget(Some(&ctx.budget), |tx| {
@@ -862,6 +845,7 @@ pub(crate) async fn move_board_card_impl(
                     )
                     .await?;
                     ctx_read.auth().authorize_direct_write(&rfacts, &rfacts)?;
+                    authorized_view_head(tx, &srec.space, ctx_read.auth(), &view_id).await?;
                     check_collab_preconditions_tx(tx, &srec.scope.space_id, &target_id, &prec_read)
                         .await?;
                     Ok((srec, head))
@@ -871,6 +855,25 @@ pub(crate) async fn move_board_card_impl(
 
         if base_head.doc_class == DocClass::EncryptedNote {
             return Err(DomainError::UnsafePlaintextOutsideAgeFence.into());
+        }
+
+        let facts = provider
+            .evaluate_move(&board_authority, ctx.clone(), None, request.input.clone())
+            .await?;
+        facts.verify_authority(&board_authority)?;
+        ctx.scope().check(facts.scope())?;
+        if facts.view() != &request.input.view {
+            return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
+        }
+        if *facts.view_revision() != request.input.expected_view {
+            return Err(DomainError::RevisionConflict {
+                current: facts.view_revision().clone(),
+                lineage: None,
+            }
+            .into());
+        }
+        if !facts.after_eligible_in_group() {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
 
         // Live-room interception (if registered) BEFORE checking closed-room `head_rev_id == expected_note`
@@ -901,6 +904,9 @@ pub(crate) async fn move_board_card_impl(
                     )
                     .await?
                     .ok_or_else(super::notes::missing_applied_outcome);
+                }
+                InterceptionResult::SettleCarrier(_) => {
+                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
                 }
                 InterceptionResult::Conflict(err) => return Err(err.into()),
                 InterceptionResult::ClosedRoomReservation(res) => {
@@ -1030,13 +1036,6 @@ pub(crate) async fn move_board_card_impl(
                     if head.lifecycle != Lifecycle::Active {
                         return Err(DomainError::ResourceNotFound.into());
                     }
-                    if head.head_rev_id != input.expected_note {
-                        return Err(DomainError::RevisionConflict {
-                            current: head.head_rev_id,
-                            lineage: None,
-                        }
-                        .into());
-                    }
                     let (rfacts, anc) = build_resource_facts_tx(
                         tx,
                         &space_obj,
@@ -1051,9 +1050,13 @@ pub(crate) async fn move_board_card_impl(
                         .await?;
 
                     let view_head =
-                        load_note_head_row_tx(tx, &scope_cl.space_id, &input.view.note).await?;
-                    if view_head.lifecycle != Lifecycle::Active {
-                        return Err(DomainError::ResourceNotFound.into());
+                        authorized_view_head(tx, &space_obj, &auth, &input.view.note).await?;
+                    if head.head_rev_id != input.expected_note {
+                        return Err(DomainError::RevisionConflict {
+                            current: head.head_rev_id,
+                            lineage: None,
+                        }
+                        .into());
                     }
                     if view_head.head_rev_id != input.expected_view {
                         return Err(DomainError::RevisionConflict {
@@ -1710,6 +1713,31 @@ pub(crate) async fn move_board_card_impl(
         "board facts cutoff contended across bounded retries",
         std::time::Duration::from_millis(10),
     ))
+}
+
+pub(crate) async fn authorized_view_head(
+    tx: &mut BackendConn<'_>,
+    space: &notarium_core::auth::Space,
+    auth: &notarium_core::auth::EngineAuthContext,
+    view: &NoteId,
+) -> Result<super::common::NoteHeadRow, PortError> {
+    let head = load_note_head_row_tx(tx, &space.id, view).await?;
+    if head.lifecycle != Lifecycle::Active
+        || is_note_purge_fenced_tx(tx, &space.id, view.as_str()).await?
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let (facts, _) = build_resource_facts_tx(
+        tx,
+        space,
+        &head.parent_folder_id,
+        head.doc_class,
+        head.ability_id.clone(),
+        true,
+    )
+    .await?;
+    auth.authorize_read(&facts)?;
+    Ok(head)
 }
 
 fn build_move_board_card_identity_spec(

@@ -23,6 +23,7 @@ use crate::{
 pub(crate) enum ReplayResource {
     Write(NoteId),
     Read(NoteId),
+    View(NoteId),
     Create(NoteId, Option<FolderId>, DocClass),
     Move(NoteId, Option<FolderId>),
     WriteFolder(Option<FolderId>),
@@ -222,6 +223,11 @@ async fn authorize_resource(
                     .await?;
             return Ok(auth.authorize_read(&facts)?);
         }
+        ReplayResource::View(note) => {
+            return crate::domain::board::authorized_view_head(tx, &srec.space, auth, note)
+                .await
+                .map(|_| ());
+        }
         ReplayResource::Read(note)
         | ReplayResource::Write(note)
         | ReplayResource::Create(note, ..)
@@ -250,7 +256,7 @@ async fn authorize_resource(
             true,
         )
         .await?;
-        authorize_head(auth, target, &facts)?;
+        authorize_head(auth, target, &facts, head.lifecycle)?;
     } else if !matches!(target, ReplayResource::Create(..)) {
         return Err(DomainError::ResourceNotFound.into());
     }
@@ -272,8 +278,14 @@ pub(crate) fn authorize_head(
     auth: &EngineAuthContext,
     target: &ReplayResource,
     facts: &ResourceFacts,
+    lifecycle: notarium_core::model::Lifecycle,
 ) -> Result<(), PortError> {
-    if matches!(target, ReplayResource::Read(_)) {
+    if matches!(target, ReplayResource::View(_))
+        && lifecycle != notarium_core::model::Lifecycle::Active
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if matches!(target, ReplayResource::Read(_) | ReplayResource::View(_)) {
         auth.authorize_read(facts)?;
     } else {
         auth.authorize_direct_write(facts, facts)?;

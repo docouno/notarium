@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use notarium_core::{
     DomainError,
@@ -9,7 +9,7 @@ use notarium_core::{
     ports::{
         AbilityPackageRevision, AcceptBatch, AppendMemory, BatchResult, BoardMoveResult,
         BoardMutationFactsProvider, BoardPlannerAuthority, ChangeRead, ChangeReadResult, Committed,
-        CreateNote, DeleteDisposition, DeleteNote, EditNote, EntityId, ExternalObservation,
+        CreateNote, DeleteDisposition, DeleteNote, EditNote, ExternalObservation,
         ExternalObservationResult, GetNote, Link, LinkBatch, LiveCollabInterceptor, MintAndPurge,
         MintAndPurgeResult, MoveBoardCard, MoveFolder, MoveNote, Mutation, NoteCard, NoteRevision,
         NoteSnapshot, NoteWritePort, PortFuture, PublishAbilityPackage, ReadAbilityResource,
@@ -18,15 +18,11 @@ use notarium_core::{
 };
 
 use crate::{
-    CanonicalStore,
-    changes::ChangeCaller,
-    codec::internal_not_committed,
-    domain::common::{FolderAncestryCache, NoteHeadRow, load_note_head_row_opt_tx},
-    runtime::load_space_record,
-    sql_exec::BackendConn,
+    CanonicalStore, changes::ChangeCaller, codec::internal_not_committed, sql_exec::BackendConn,
 };
 
 pub mod board;
+pub(crate) mod change_visibility;
 pub mod common;
 pub mod folders;
 pub mod notes;
@@ -233,10 +229,8 @@ impl CanonicalStore {
         ctx: SpaceContext,
         request: ChangeRead,
     ) -> Result<ChangeReadResult, PortError> {
-        let raw = self
-            .execute_change_read(ChangeCaller::Space(&ctx), request)
-            .await?;
-        filter_change_result_for_space_caller(self, &ctx, raw).await
+        self.execute_change_read(ChangeCaller::Space(&ctx), request)
+            .await
     }
 
     pub async fn recent_activity(
@@ -308,156 +302,6 @@ impl CanonicalStore {
     }
 }
 
-async fn filter_change_result_for_space_caller(
-    store: &CanonicalStore,
-    ctx: &SpaceContext,
-    result: ChangeReadResult,
-) -> Result<ChangeReadResult, PortError> {
-    let ChangeReadResult::Log(mut page) = result else {
-        // `Seed` pages are already authorized against `ChangeCaller::Space` inside `read_seed_page`.
-        return Ok(result);
-    };
-    if page.changes.is_empty() {
-        return Ok(ChangeReadResult::Log(page));
-    }
-
-    let scope = ctx.scope().clone();
-    let auth = ctx.auth().clone();
-    let changes_in = page.changes;
-
-    let visible_changes = store
-        .with_read_tx_budget(Some(&ctx.budget), |tx| {
-            Box::pin(async move {
-                let srec = load_space_record(tx, &scope.space_id).await?;
-                srec.scope.check(&scope)?;
-                let mut folder_cache = FolderAncestryCache::default();
-                let mut note_cache: HashMap<NoteId, Option<NoteHeadRow>> = HashMap::new();
-                let mut thread_visibility = HashMap::new();
-                let mut kept = Vec::with_capacity(changes_in.len());
-
-                for ch in changes_in {
-                    let allowed = match &ch.entity {
-                        EntityId::Note(nid) => {
-                            let head_opt = if let Some(cached) = note_cache.get(nid) {
-                                cached.clone()
-                            } else {
-                                let loaded =
-                                    load_note_head_row_opt_tx(tx, &scope.space_id, nid).await?;
-                                note_cache.insert(nid.clone(), loaded.clone());
-                                loaded
-                            };
-                            if let Some(head) = head_opt {
-                                match folder_cache
-                                    .build_resource_facts_tx(
-                                        tx,
-                                        &srec.space,
-                                        &head.parent_folder_id,
-                                        head.doc_class,
-                                        head.ability_id,
-                                        false,
-                                    )
-                                    .await
-                                {
-                                    Ok((facts, _)) => auth.authorize_read(&facts).is_ok(),
-                                    Err(_) => false,
-                                }
-                            } else if let Some(cls) = ch.class {
-                                auth.authorize_read(&notarium_core::auth::ResourceFacts {
-                                    space: srec.space.clone(),
-                                    class: cls,
-                                    ancestor_folders: Vec::new(),
-                                    folder_write_locked: false,
-                                    ability_package: None,
-                                })
-                                .is_ok()
-                            } else {
-                                false
-                            }
-                        }
-                        EntityId::Folder(fid) => {
-                            match folder_cache
-                                .load_ancestry_tx(tx, &scope.space_id, fid, false)
-                                .await
-                            {
-                                Ok(anc) => auth
-                                    .authorize_folder_read(&srec.space, fid, &anc.ancestors)
-                                    .is_ok(),
-                                Err(_) => false,
-                            }
-                        }
-                        EntityId::Ability(ab_id) => {
-                            let ep_opt =
-                                lookup_ability_entrypoint_tx(tx, &scope.space_id, ab_id.as_str())
-                                    .await?;
-                            if let Some(ep_raw) = ep_opt
-                                && let Ok(ep_id) = NoteId::parse(&ep_raw)
-                            {
-                                let head_opt = if let Some(cached) = note_cache.get(&ep_id) {
-                                    cached.clone()
-                                } else {
-                                    let loaded =
-                                        load_note_head_row_opt_tx(tx, &scope.space_id, &ep_id)
-                                            .await?;
-                                    note_cache.insert(ep_id.clone(), loaded.clone());
-                                    loaded
-                                };
-                                if let Some(head) = head_opt {
-                                    match folder_cache
-                                        .build_resource_facts_tx(
-                                            tx,
-                                            &srec.space,
-                                            &head.parent_folder_id,
-                                            head.doc_class,
-                                            head.ability_id,
-                                            false,
-                                        )
-                                        .await
-                                    {
-                                        Ok((facts, _)) => auth.authorize_read(&facts).is_ok(),
-                                        Err(_) => false,
-                                    }
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        }
-                        EntityId::Thread(tid) => {
-                            if let Some(allowed) = thread_visibility.get(tid) {
-                                *allowed
-                            } else {
-                                let facts =
-                                    lookup_thread_visibility_tx(tx, &scope.space_id, tid.as_str())
-                                        .await?;
-                                let allowed = facts.is_some_and(|(project, tainted)| {
-                                    auth.authorize_chat_read(&srec.space, project.as_ref(), tainted)
-                                        .is_ok()
-                                });
-                                thread_visibility.insert(tid.clone(), allowed);
-                                allowed
-                            }
-                        }
-                        EntityId::Job(_) => {
-                            auth.spaces()
-                                .get(&scope.space_id)
-                                .is_some_and(|g| g.project_root.is_none())
-                                && auth.authorize_chat_read(&srec.space, None, false).is_ok()
-                        }
-                    };
-                    if allowed {
-                        kept.push(ch);
-                    }
-                }
-                Ok(kept)
-            })
-        })
-        .await?;
-
-    page.changes = visible_changes;
-    Ok(ChangeReadResult::Log(page))
-}
-
 pub(crate) async fn lookup_thread_visibility_tx(
     tx: &mut BackendConn<'_>,
     space_id: &notarium_core::ids::SpaceId,
@@ -490,29 +334,4 @@ pub(crate) async fn lookup_thread_visibility_tx(
         Ok((project, mask != 0))
     })
     .transpose()
-}
-
-async fn lookup_ability_entrypoint_tx(
-    tx: &mut BackendConn<'_>,
-    space_id: &notarium_core::ids::SpaceId,
-    ability_id: &str,
-) -> Result<Option<String>, PortError> {
-    match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT entrypoint_note_id FROM ability_packages WHERE space_id = ? AND ability_id = ?",
-        )
-        .bind(space_id.as_str())
-        .bind(ability_id)
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_lookup_ab_ep", err.to_string())),
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT entrypoint_note_id FROM ability_packages WHERE space_id = $1 AND ability_id = $2",
-        )
-        .bind(space_id.as_str())
-        .bind(ability_id)
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_lookup_ab_ep", err.to_string())),
-    }
 }

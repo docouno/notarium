@@ -88,18 +88,7 @@ impl HoldOwnership {
         let Self::Postgres { pid, .. } = self else {
             return Ok(());
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
-            let mut control = open_backup_connection(store).await?;
-            let terminated: Option<bool> = sqlx::query_scalar(
-                "SELECT pg_terminate_backend(pid, 1000) FROM pg_stat_activity
-                 WHERE pid = $1 AND application_name = $2 AND usename = current_user AND datname = current_database()",
-            ).bind(*pid).bind(generation.as_str()).fetch_optional(&mut control).await
-             .map_err(|err| internal_not_committed("pg_backup_interrupt_hold", err.to_string()))?;
-            if terminated == Some(false) {
-                return Err(internal_not_committed("pg_backup_interrupt_hold", "PostgreSQL could not stop the hold transaction"));
-            }
-            Ok(())
-        }).await.map_err(|_| unavailable_retryable("pg_backup_interrupt_hold", "PostgreSQL cancellation timed out", Duration::from_millis(50)))?
+        interrupt_pg_session(store, *pid, generation).await
     }
 
     // PostgreSQL never reconnects this socket. Transactions on it belong only to the
@@ -138,6 +127,25 @@ impl HoldOwnership {
         }
         Ok(())
     }
+}
+
+pub(super) async fn interrupt_pg_session(
+    store: &CanonicalStore,
+    pid: i32,
+    generation: &ArtifactId,
+) -> Result<(), PortError> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+            let mut control = open_backup_connection(store).await?;
+            let terminated: Option<bool> = sqlx::query_scalar(
+                "SELECT pg_terminate_backend(pid, 1000) FROM pg_stat_activity
+                 WHERE pid = $1 AND application_name = $2 AND usename = current_user AND datname = current_database()",
+            ).bind(pid).bind(generation.as_str()).fetch_optional(&mut control).await
+             .map_err(|err| internal_not_committed("pg_interrupt_backup_session", err.to_string()))?;
+            if terminated == Some(false) {
+                return Err(internal_not_committed("pg_interrupt_backup_session", "PostgreSQL could not stop the storage transaction"));
+            }
+            Ok(())
+        }).await.map_err(|_| unavailable_retryable("pg_interrupt_backup_session", "PostgreSQL cancellation timed out", Duration::from_millis(50)))?
 }
 
 impl Drop for HoldOwnership {

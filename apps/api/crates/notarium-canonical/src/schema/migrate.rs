@@ -18,11 +18,14 @@ pub(crate) const V2_HASH: &str = "4375964fa9cf7de29749e52c6387a9f72d1a4538fb9f97
 
 pub(crate) const V3_HASH: &str = "ca79d3e2db2eed95fb8b0e503340139b3fd166b51340e6676d37ca0411fed4dc";
 
+pub(crate) const V4_HASH: &str = "23fda6322e7820fdb9b60bd67192098e3d472c074f655a9d0edceaa7e3fb66e0";
+
 pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
     match version {
         1 => hex::encode(hash) == V1_HASH,
         2 => hex::encode(hash) == V2_HASH,
         3 => hex::encode(hash) == V3_HASH,
+        4 => hex::encode(hash) == V4_HASH,
         _ => false,
     }
 }
@@ -107,6 +110,64 @@ async fn upgrade_sqlite_catalog(conn: &mut SqliteConnection) -> Result<(), PortE
     Ok(())
 }
 
+async fn upgrade_owners_v5(conn: &mut crate::sql_exec::BackendConn<'_>) -> Result<(), PortError> {
+    use crate::sql_exec::BackendConn;
+    let fail = |e: sqlx::Error| internal_not_committed("migration_v5_ownership", e.to_string());
+    match conn {
+        BackendConn::Sqlite(c) => {
+            let create = create_new_table(SQLITE_BASELINE_DDL, "payload_owners")?;
+            let job = baseline_statement(
+                SQLITE_BASELINE_DDL,
+                "CREATE INDEX IF NOT EXISTS idx_payload_owners_job",
+            )?;
+            let odd = baseline_statement(
+                SQLITE_BASELINE_DDL,
+                "CREATE INDEX IF NOT EXISTS idx_receipt_exception_pointer",
+            )?;
+            for statement in [
+                "ALTER TABLE payload_owners RENAME TO payload_owners_v4",
+                &create,
+                "INSERT INTO payload_owners(space_id,payload_kind,payload_id,note_id)
+                 SELECT space_id,payload_kind,payload_id,note_id FROM payload_owners_v4",
+                "DROP TABLE payload_owners_v4",
+                &job,
+                &odd,
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(&mut **c)
+                    .await
+                    .map_err(fail)?;
+            }
+        }
+        BackendConn::Postgres(c) => {
+            sqlx::query(
+                "ALTER TABLE payload_owners DROP CONSTRAINT payload_owners_pkey,
+                         ADD PRIMARY KEY (space_id, note_id, payload_kind, payload_id)",
+            )
+            .execute(&mut **c)
+            .await
+            .map_err(fail)?;
+            let odd = baseline_statement(
+                POSTGRES_BASELINE_DDL,
+                "CREATE INDEX IF NOT EXISTS idx_receipt_exception_pointer",
+            )?;
+            sqlx::query(sqlx::AssertSqlSafe(odd))
+                .execute(&mut **c)
+                .await
+                .map_err(fail)?;
+            let job = baseline_statement(
+                POSTGRES_BASELINE_DDL,
+                "CREATE INDEX IF NOT EXISTS idx_payload_owners_job",
+            )?;
+            sqlx::query(sqlx::AssertSqlSafe(job))
+                .execute(&mut **c)
+                .await
+                .map_err(fail)?;
+        }
+    }
+    Ok(())
+}
+
 macro_rules! upgrade {
     ($name:ident, $connection:ty, $variant:ident, $ddl:ident, $pg_v2:expr $(, $catalog:ident)?) => {
         pub(super) async fn $name(
@@ -158,19 +219,22 @@ macro_rules! upgrade {
                     })?;
                 }
             }
-            $($catalog(&mut *conn).await?;)?
-            sqlx::query("DROP INDEX IF EXISTS idx_blob_references_non_note_owner")
-                .execute(&mut *conn).await
-                .map_err(|e| internal_not_committed("migration_v4_drop_index", e.to_string()))?;
-            for prefix in [
-                "CREATE INDEX IF NOT EXISTS idx_blob_references_owner",
-                "CREATE INDEX IF NOT EXISTS idx_blob_references_digest",
-            ] {
-                let sql = baseline_statement($ddl, prefix)?;
-                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
-                    .map_err(|e| internal_not_committed("migration_v4_reference_index", e.to_string()))?;
+            if version < 4 {
+                $($catalog(&mut *conn).await?;)?
+                sqlx::query("DROP INDEX IF EXISTS idx_blob_references_non_note_owner")
+                    .execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("migration_v4_drop_index", e.to_string()))?;
+                for prefix in [
+                    "CREATE INDEX IF NOT EXISTS idx_blob_references_owner",
+                    "CREATE INDEX IF NOT EXISTS idx_blob_references_digest",
+                ] {
+                    let sql = baseline_statement($ddl, prefix)?;
+                    sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
+                        .map_err(|e| internal_not_committed("migration_v4_reference_index", e.to_string()))?;
+                }
+                compactions::scrub(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
             }
-            compactions::scrub(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
+            upgrade_owners_v5(&mut crate::sql_exec::BackendConn::$variant(conn)).await?;
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
             sqlx::query(WRITE_WITNESS)
@@ -206,6 +270,72 @@ mod tests {
     use super::*;
     use crate::schema::bootstrap_sqlite_schema;
     use sqlx::{Connection, Row};
+
+    #[tokio::test]
+    async fn v4_owner_lookup_upgrade_preserves_explicit_rows_and_receipts() {
+        let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+        let installation = InstallationId::from_bytes([4; 16]);
+        for sql in split_sql_statements(SQLITE_BASELINE_DDL) {
+            if sql.starts_with("CREATE INDEX IF NOT EXISTS idx_payload_owners_job")
+                || sql.starts_with("CREATE INDEX IF NOT EXISTS idx_receipt_exception_pointer")
+            {
+                continue;
+            }
+            let sql = if sql.starts_with("CREATE TABLE IF NOT EXISTS payload_owners (") {
+                sql.replace(
+                    "space_id, note_id, payload_kind, payload_id",
+                    "space_id, payload_kind, payload_id, note_id",
+                )
+                .replace(" WITHOUT ROWID", "")
+            } else {
+                sql
+            };
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO schema_meta VALUES(1,4,1,$1,'ready',$2,0,0,0,0)")
+            .bind(installation.as_str())
+            .bind(hex::decode(V4_HASH).unwrap())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        sqlx::raw_sql("INSERT INTO payload_owners VALUES
+            ('s','change_payload','e','n'), ('s','command_receipt','p:k','n'), ('s','content_job','j','other');
+            INSERT INTO command_receipts VALUES ('s',zeroblob(16),'p','k',zeroblob(32),'completed',1,'historic-pointer',X'05',1,1);
+            CREATE TEMP TABLE before_owners AS SELECT * FROM payload_owners;
+            CREATE TEMP TABLE before_receipts AS SELECT * FROM command_receipts;")
+            .execute(&mut db).await.unwrap();
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        for (live, snapshot) in [
+            ("payload_owners", "before_owners"),
+            ("command_receipts", "before_receipts"),
+        ] {
+            for (a, b) in [(live, snapshot), (snapshot, live)] {
+                let sql =
+                    format!("SELECT COUNT(*) FROM (SELECT * FROM {a} EXCEPT SELECT * FROM {b})");
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                        .fetch_one(&mut db)
+                        .await
+                        .unwrap(),
+                    0
+                );
+            }
+        }
+        let plan=sqlx::query("EXPLAIN QUERY PLAN SELECT payload_id FROM payload_owners WHERE space_id='s' AND note_id='n'")
+            .fetch_one(&mut db).await.unwrap();
+        assert!(
+            plan.get::<String, _>(3)
+                .contains("PRIMARY KEY (space_id=? AND note_id=?)")
+        );
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn v3_catalog_rebuild_preserves_rows_and_uses_selective_reference_indexes() {
