@@ -2149,7 +2149,7 @@ async fn heartbeat_job_lease_impl(
 
     let inner = std::sync::Arc::clone(&store.inner);
     store
-        .with_auxiliary_command(budget, deadline, Ok, move |tx| {
+        .with_auxiliary_command(Some((budget, deadline)), Ok, move |tx| {
             Box::pin(async move {
                 lock_peer_space(tx, &inner, &scope_cl).await?;
 
@@ -2673,8 +2673,9 @@ async fn open_collab_session_impl(
 
     let inner = std::sync::Arc::clone(&store.inner);
     let room_store = store.clone();
+    let timing = Some((budget, deadline));
     store
-        .with_auxiliary_command(budget, deadline, RoomTransition::confirmed, move |tx| {
+        .with_auxiliary_command(timing, RoomTransition::confirmed, move |tx| {
             let spec_cl = spec;
             Box::pin(async move {
                 let srec = lock_peer_space(tx, &inner, &spec_cl.scope).await?;
@@ -2877,7 +2878,7 @@ async fn append_collab_update_impl(
 
     let inner = std::sync::Arc::clone(&store.inner);
     store
-        .with_auxiliary_command(budget, deadline, Ok, move |tx| {
+        .with_auxiliary_command(Some((budget, deadline)), Ok, move |tx| {
             Box::pin(async move {
                 let srec = lock_peer_space(tx, &inner, &spec.scope).await?;
                 if is_note_purge_fenced_tx(tx, &srec.scope.space_id, spec.note.as_str()).await? {
@@ -3196,7 +3197,7 @@ async fn checkpoint_collab_session_impl(
 
     let inner = std::sync::Arc::clone(&store.inner);
     store
-        .with_auxiliary_command(budget, deadline, Ok, move |tx| {
+        .with_auxiliary_command(Some((budget, deadline)), Ok, move |tx| {
             Box::pin(async move {
                 let srec = lock_peer_space(tx, &inner, &spec.scope).await?;
                 if is_note_purge_fenced_tx(tx, &srec.scope.space_id, spec.note.as_str()).await? {
@@ -3304,8 +3305,9 @@ async fn close_collab_session_impl(
 
     let inner = std::sync::Arc::clone(&store.inner);
     let room_store = store.clone();
+    let timing = Some((budget, deadline));
     store
-        .with_auxiliary_command(budget, deadline, RoomTransition::confirmed, move |tx| {
+        .with_auxiliary_command(timing, RoomTransition::confirmed, move |tx| {
             let spec_cl = spec;
             Box::pin(async move {
                 let srec = lock_peer_space(tx, &inner, &spec_cl.scope).await?;

@@ -14,7 +14,7 @@ use crate::{
 };
 
 // Caller cancellation and COMMIT contend for one permission. Once COMMIT owns
-// it, the task also owns the post-commit update to the in-memory room fence.
+// it, the storage executor owns both the SQL result and its local publication.
 struct PendingWrite<T> {
     permission: Arc<AtomicBool>,
     task: JoinHandle<Result<T, PortError>>,
@@ -39,8 +39,7 @@ impl<T> Drop for PendingWrite<T> {
 impl CanonicalStore {
     pub(crate) async fn with_auxiliary_command<T, R, F>(
         &self,
-        budget: &CallBudget,
-        deadline: CommandDeadline,
+        timing: Option<(&CallBudget, CommandDeadline)>,
         after_commit: impl FnOnce(T) -> Result<R, PortError> + Send + 'static,
         op: F,
     ) -> Result<R, PortError>
@@ -51,19 +50,25 @@ impl CanonicalStore {
         T: Send + 'static,
         R: Send + 'static,
     {
-        deadline.remaining(budget)?;
+        let worker_timing = timing.map(|(budget, deadline)| (budget.clone(), deadline));
+        let check = move || -> Result<(), PortError> {
+            if let Some((budget, deadline)) = &worker_timing {
+                deadline.remaining(budget)?;
+            }
+            Ok(())
+        };
+        check()?;
         let store = self.clone();
         let permission = Arc::new(AtomicBool::new(true));
         let commit = Arc::clone(&permission);
-        let worker_budget = budget.clone();
         let task = self.inner.backup_executor.spawn(async move {
-            deadline.remaining(&worker_budget)?;
+            check()?;
             let result = store
                 .with_write_tx(move |tx| {
                     let body = op(tx);
                     Box::pin(async move {
                         let result = body.await?;
-                        deadline.remaining(&worker_budget)?;
+                        check()?;
                         if !commit.swap(false, Ordering::AcqRel) {
                             return Err(cancelled_not_committed(
                                 "auxiliary_write_revoked",
@@ -77,7 +82,11 @@ impl CanonicalStore {
             after_commit(result)
         });
         let mut pending = PendingWrite { permission, task };
-        let error = match deadline.wait(budget, || &mut pending.task).await {
+        let joined = match timing {
+            Some((budget, deadline)) => deadline.wait(budget, || &mut pending.task).await,
+            None => Ok((&mut pending.task).await),
+        };
+        let error = match joined {
             Ok(Ok(result)) => {
                 return result.map_err(|error| {
                     if !pending.permission.load(Ordering::Acquire) {

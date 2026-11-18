@@ -54,7 +54,7 @@ impl<'c> WriteTransaction<'c> {
                 .map(Self::Sqlite)
                 .map_err(|e| internal_not_committed("sqlite_begin_write", e.to_string())),
             BackendConn::Postgres(conn) => conn.begin_with(
-                "BEGIN; SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema(), 7311229))"
+                "BEGIN; SET LOCAL client_connection_check_interval='20ms'; SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema(), 7311229))"
             ).await.map(Self::Postgres).map_err(|e| internal_not_committed("pg_begin_write", e.to_string())),
         }
     }

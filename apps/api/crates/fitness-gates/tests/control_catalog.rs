@@ -541,6 +541,39 @@ async fn exercise(pg: bool) {
             name: "Another / display name".into(),
         },
     };
+    // A cancelled provisioning request queued behind a backup must leave
+    // neither a Space nor a receipt. The same command remains usable.
+    let mut backup = canonical
+        .prepare(
+            MaintenanceContext {
+                authority: ServiceAuthority::admit(ServicePurpose::Backup),
+                budget: budget(),
+            },
+            BackupId::from_bytes([0x71; 16]),
+            canonical.default_backup_budget(),
+        )
+        .await
+        .unwrap();
+    let hold = backup.acquire_hold().await.unwrap();
+    let pause = backup.pause_writes().await.unwrap();
+    let queued_budget = budget();
+    let cancel = queued_budget.cancellation.clone();
+    let mut queued = Box::pin(canonical.ensure_space(queued_budget, create.clone()));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut queued)
+            .await
+            .is_err()
+    );
+    cancel.cancel();
+    assert!(matches!(queued.await, Err(PortError::Cancelled(e))
+        if e.effect() == notarium_core::error::CommitEffect::NotCommitted));
+    pause.resume().await.unwrap();
+    hold.release().await.unwrap();
+    drop(backup);
+    assert!(matches!(
+        canonical.read_space(&shared).await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
     let r = canonical
         .ensure_space(budget(), create.clone())
         .await

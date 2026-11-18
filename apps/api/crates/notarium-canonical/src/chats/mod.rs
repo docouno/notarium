@@ -485,7 +485,7 @@ impl CanonicalStore {
         let publish_ticket = ticket.clone();
         let publisher = self.clone();
         let value = self
-            .with_auxiliary_command(&ctx.budget, deadline, Ok, move |tx| {
+            .with_auxiliary_command(Some((&ctx.budget, deadline)), Ok, move |tx| {
                 Box::pin(async move {
                     let live_space =
                         crate::runtime::load_space_record_for_update_opt(tx, &scope.space_id)

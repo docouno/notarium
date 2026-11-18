@@ -1,7 +1,7 @@
 use notarium_core::{
     DomainError,
     auth::EngineAuthContext,
-    error::{CommitEffect, PortError},
+    error::PortError,
     ids::{ContentDigest, RequestId},
     model::HistoryScope,
     ports::{SpaceContext, StagedChatBlob},
@@ -58,8 +58,7 @@ impl CanonicalStore {
         let store = self.clone();
         let result = self
             .with_auxiliary_command(
-                &budget,
-                deadline,
+                Some((&budget, deadline)),
                 |handoff| {
                     drop(handoff);
                     Ok(())
@@ -92,12 +91,7 @@ impl CanonicalStore {
                 },
             )
             .await;
-        result.map_err(|e| match &e {
-            PortError::Internal(f) if f.effect() == CommitEffect::Unknown => {
-                crate::codec::unknown_commit_outcome("discard_chat_stage", e.to_string())
-            }
-            _ => e,
-        })
+        result.map_err(|err| crate::codec::retry_unknown_commit("discard_chat_stage", err))
     }
 }
 
@@ -118,15 +112,20 @@ async fn next_lease_tx(
         .unwrap_or_else(|| prefix.into());
     let end = format!("{prefix}~");
     let key = request_key(ctx.auth(), &original);
-    const SQL: &str = "SELECT r.owner_rev_id,c.raw_size FROM blob_references r
-                JOIN blob_catalog c ON c.space_id=r.space_id AND c.content_blake3=r.content_blake3
-                WHERE r.space_id=$1 AND r.owner_kind='staged_chat' AND r.owner_id=$2
-                  AND r.resource_key=$3 AND r.content_blake3=$4 AND r.owner_rev_id>$5 AND r.owner_rev_id<$6
-                  AND c.blob_state='active' AND c.admission_state='open'
-                ORDER BY r.owner_rev_id LIMIT 1";
+    // The cursor is an opaque hexadecimal ID. Its bounds and ordering must
+    // use the same byte ordering in every database locale.
     macro_rules! outstanding {
-        ($conn:expr) => {
-            sqlx::query_as::<_, (String, i64)>(SQL)
+        ($conn:expr, $collation:literal) => {
+            sqlx::query_as::<_, (String, i64)>(concat!(
+                "SELECT lease_key, raw_size FROM (
+                   SELECT r.owner_rev_id COLLATE ", $collation, " AS lease_key, c.raw_size
+                   FROM blob_references r JOIN blob_catalog c
+                     ON c.space_id=r.space_id AND c.content_blake3=r.content_blake3
+                   WHERE r.space_id=$1 AND r.owner_kind='staged_chat' AND r.owner_id=$2
+                     AND r.resource_key=$3 AND r.content_blake3=$4
+                     AND c.blob_state='active' AND c.admission_state='open'
+                 ) AS grants WHERE lease_key>$5 AND lease_key<$6 ORDER BY lease_key LIMIT 1"
+            ))
                 .bind(space.scope.space_id.as_str())
                 .bind(ctx.auth().principal().as_str())
                 .bind(&key)
@@ -138,8 +137,8 @@ async fn next_lease_tx(
         };
     }
     let row = match tx {
-        BackendConn::Sqlite(c) => outstanding!(c),
-        BackendConn::Postgres(c) => outstanding!(c),
+        BackendConn::Sqlite(c) => outstanding!(c, "BINARY"),
+        BackendConn::Postgres(c) => outstanding!(c, r#""C""#),
     }
     .map_err(|err| internal_not_committed("recover_chat_stage", err.to_string()))?;
     let Some((key, bytes)) = row else {
@@ -152,9 +151,6 @@ async fn next_lease_tx(
         .ok_or_else(|| internal_not_committed("corrupt_chat_stage", "invalid lease key"))?;
     let bytes = u64::try_from(bytes)
         .map_err(|e| internal_not_committed("corrupt_chat_stage", e.to_string()))?;
-    if tainted != ctx.auth().taint().is_tainted() {
-        return Err(DomainError::CrossSpaceTainted.into());
-    }
     Ok(Some(
         StagedChatBlob::attest_canonical(
             space.scope.space_id,
@@ -234,31 +230,34 @@ impl Drop for UndeliveredLease {
         let task = self.store.inner.backup_executor.spawn(async move {
             let mut delay = std::time::Duration::from_millis(25);
             loop {
-                let result = store
-                    .with_write_tx(|tx| {
-                        let scope = scope.clone();
-                        let staged = staged.clone();
-                        let lease = lease.clone();
-                        let owner = store.clone();
-                        Box::pin(async move {
-                            let Some(space) =
-                                load_space_record_for_update_opt(tx, &scope.space_id).await?
-                            else {
-                                return Ok(None);
-                            };
-                            if space.scope != scope
-                                || owner
-                                    .inner
-                                    .check_writer_epoch(&scope.space_id, space.active_epoch)
-                                    .is_err()
-                            {
-                                // A new owner can resolve the same durable request/lease.
-                                return Ok(None);
-                            }
-                            release_tx(&owner, tx, &space, &staged, &lease).await
-                        })
+                let cleanup = store.with_write_tx(|tx| {
+                    let scope = scope.clone();
+                    let staged = staged.clone();
+                    let lease = lease.clone();
+                    let owner = store.clone();
+                    Box::pin(async move {
+                        let Some(space) =
+                            load_space_record_for_update_opt(tx, &scope.space_id).await?
+                        else {
+                            return Ok(None);
+                        };
+                        if space.scope != scope
+                            || owner
+                                .inner
+                                .check_writer_epoch(&scope.space_id, space.active_epoch)
+                                .is_err()
+                        {
+                            // A new owner can resolve the same durable request/lease.
+                            return Ok(None);
+                        }
+                        release_tx(&owner, tx, &space, &staged, &lease).await
                     })
-                    .await;
+                });
+                let result = tokio::select! {
+                    biased;
+                    result = cleanup => result,
+                    () = store.inner.backup_shutdown.cancelled() => return,
+                };
                 match result {
                     Ok(handoff) => {
                         drop(handoff);

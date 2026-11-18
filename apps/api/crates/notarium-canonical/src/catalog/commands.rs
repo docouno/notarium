@@ -20,12 +20,12 @@ const CONFIRM_RECEIPT: &str = "UPDATE account_catalog_receipts
     RETURNING command_key";
 
 use super::*;
+use crate::domain::common::CommandDeadline;
 use crate::{
     CreateSpaceSpec,
-    codec::{csprng_16, decode_msgpack_bounded, encode_msgpack, unknown_commit_outcome},
+    codec::{csprng_16, decode_msgpack_bounded, encode_msgpack, retry_unknown_commit},
     runtime::{create_space_tx, load_space_record_for_update_opt},
 };
-use std::time::Instant;
 
 // Each command claims its account-scoped key inside the same transaction as
 // the effect. Concurrent PostgreSQL requests wait on the unique index.
@@ -60,43 +60,31 @@ impl Command {
     }
 }
 
-fn check_budget(budget: &CallBudget, started: Instant) -> Result<(), PortError> {
-    if budget.cancellation.is_cancelled() {
-        return Err(crate::codec::cancelled_not_committed(
-            "catalog_write_cancelled",
-            "catalog request cancelled",
-        ));
-    }
-    if started.elapsed() >= budget.remaining {
-        return Err(crate::codec::deadline_not_committed(
-            "catalog_write_deadline",
-            "catalog request expired",
-        ));
-    }
-    Ok(())
-}
-
 async fn execute(
     store: &CanonicalStore,
     budget: CallBudget,
     id: AccountCommandIdentity,
     command: Command,
 ) -> Result<CatalogSpace, PortError> {
-    let started = Instant::now();
-    check_budget(&budget, started)?;
+    let deadline = CommandDeadline::start(&budget, "catalog_write");
+    deadline.remaining(&budget)?;
     let hash = command.fingerprint(&id)?;
     let inner = store.inner.clone();
-    let owned = store.clone();
+    let grants = store.inner.clone();
     let work_budget = budget.clone();
-    // A lost response can race COMMIT. Keep ownership through the initial writer
-    // grant; replaying a receipt must never reissue a lease after takeover.
-    let work = tokio::spawn(async move {
-        let (result, grant) = owned
-            .with_write_tx(move |tx| {
+    store
+        .with_auxiliary_command(
+            Some((&budget, deadline)),
+            move |(result, grant)| {
+                if let Some((space, epoch)) = grant {
+                    grants.grant_writer_epoch(&space, epoch);
+                }
+                Ok(result)
+            },
+            move |tx| {
                 Box::pin(async move {
-                    check_budget(&work_budget, started)?;
                     if let BackendConn::Postgres(conn) = tx {
-                        let remaining = work_budget.remaining.saturating_sub(started.elapsed());
+                        let remaining = deadline.remaining(&work_budget)?;
                         let millis = remaining.as_millis().clamp(1, i32::MAX as u128);
                         sqlx::query("SELECT set_config('statement_timeout', $1, true)")
                             .bind(format!("{millis}ms"))
@@ -210,23 +198,10 @@ async fn execute(
                     )?;
                     Ok((catalog_space(record), grant))
                 })
-            })
-            .await?;
-        if let Some((space, epoch)) = grant {
-            owned.inner.grant_writer_epoch(&space, epoch);
-        }
-        Ok(result)
-    });
-    let remaining = budget.remaining.saturating_sub(started.elapsed());
-    tokio::select! {
-        result = work => result.map_err(|err| unknown_commit_outcome("catalog_worker", err.to_string()))?,
-        _ = budget.cancellation.cancelled() => {
-            Err(unknown_commit_outcome("catalog_cancelled", "catalog worker accepted the operation"))
-        }
-        _ = tokio::time::sleep(remaining) => {
-            Err(unknown_commit_outcome("catalog_deadline", "catalog worker accepted the operation"))
-        }
-    }
+            },
+        )
+        .await
+        .map_err(|err| retry_unknown_commit("catalog_commit", err))
 }
 
 pub(super) async fn ensure(

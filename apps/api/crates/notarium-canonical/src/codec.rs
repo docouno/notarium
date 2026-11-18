@@ -89,6 +89,15 @@ pub fn unknown_commit_outcome(tag: &str, detail: impl AsRef<str>) -> PortError {
     PortError::Unavailable(failure)
 }
 
+pub(crate) fn retry_unknown_commit(tag: &str, error: PortError) -> PortError {
+    match error {
+        PortError::Internal(failure) if failure.effect() == CommitEffect::Unknown => {
+            unknown_commit_outcome(tag, error.to_string())
+        }
+        other => other,
+    }
+}
+
 pub fn unknown_commit_non_idempotent(tag: &str, detail: impl AsRef<str>) -> PortError {
     let failure = OperationalFailure::new(
         diagnostic_digest(tag, detail.as_ref()),

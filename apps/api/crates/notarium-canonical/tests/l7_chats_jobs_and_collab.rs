@@ -3261,6 +3261,14 @@ async fn l7_postgres_s3_chats_jobs_and_collab_parity() {
             .await
             .expect("open PG16 + MinIO CE S3 canonical runtime");
 
+    // Opaque staging cursors must paginate identically under a linguistic
+    // database collation and the bytewise collation of the default fixture.
+    store
+        .execute_diagnostic_write_sql_for_test(
+            r#"ALTER TABLE blob_references ALTER COLUMN owner_rev_id TYPE TEXT COLLATE "en-US-x-icu""#,
+        )
+        .await
+        .unwrap();
     let stale = run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         &store,
         QueuePhysical::S3(&audit),

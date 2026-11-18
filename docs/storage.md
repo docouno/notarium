@@ -56,7 +56,11 @@ planning (`NoteReadPort::list_notes`), `ViewGraphPort` and `SearchPort` remain
 owned by downstream projection and search crates.
 
 In PostgreSQL, creating a Space grants its initial writer epoch to the
-provisioning runtime. Opening an existing database permits reads. To take over
+provisioning runtime when storage receives the commit acknowledgement, even if
+the caller has already left. If the database acknowledgement itself is lost,
+direct creation reports an unknown outcome with no automatic retry. The
+catalog command can replay its durable receipt. Replaying the receipt does
+not issue a writer grant. Opening an existing database permits reads. To take over
 writes after a restart or failover, the trusted lease owner calls
 `advance_space_lease` with `ServicePurpose::Revocation` and an epoch greater
 than the persisted one. The successful transition grants that epoch to the
@@ -400,7 +404,7 @@ same example against an isolated prefix.
   `stage_chat_blob` call records a per-author lease with its provenance, including
   when several calls stage the same digest. Append consumes the specific lease.
   When a caller leaves during COMMIT, storage releases its undelivered lease and
-  retires the content if the last owner has gone. A process crash can interrupt
+  retires the content if the last owner has gone. Shutdown or a process crash can interrupt
   this handoff. The original grant can call `next_staged_chat_blob` with its
   request ID, content digest and matching provenance to recover each outstanding
   lease, then append it or release it with `discard_staged_chat_blob`. A repeated

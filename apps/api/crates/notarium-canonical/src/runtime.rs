@@ -1155,12 +1155,16 @@ impl CanonicalStore {
 
     /// Initializes a canonical Space row and its permanent root folder atomically.
     pub async fn create_space(&self, spec: CreateSpaceSpec) -> Result<SpaceRecord, PortError> {
-        let record = self
-            .with_write_tx(|tx| Box::pin(create_space_tx(tx, spec)))
-            .await?;
-        self.inner
-            .grant_writer_epoch(&record.space.id, record.active_epoch);
-        Ok(record)
+        let inner = Arc::clone(&self.inner);
+        self.with_auxiliary_command(
+            None,
+            move |record: SpaceRecord| {
+                inner.grant_writer_epoch(&record.space.id, record.active_epoch);
+                Ok(record)
+            },
+            move |tx| Box::pin(create_space_tx(tx, spec)),
+        )
+        .await
     }
 
     pub async fn get_space(&self, space_id: &SpaceId) -> Result<SpaceRecord, PortError> {
