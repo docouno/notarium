@@ -201,3 +201,185 @@ async fn postgres_rollback_deadline_covers_safe_point_pool_and_commit_ack() {
     runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }
+
+#[tokio::test]
+async fn postgres_read_admission_statements_and_snapshot_have_distinct_deadlines() {
+    use notarium_core::{
+        ids::{ChatThreadId, ThreadEntrySeq},
+        ports::{ChatPort, ChatRead, PageLimit},
+    };
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    let root = TempDataRoot::new("l6-pg-read-budgets");
+    let mut config = CanonicalConfig::local_default(sample_installation_id(77), root.data_root());
+    config.sql = notarium_canonical::SqlBackendConfig::postgres_default(
+        fixtures.pg_connect_config(),
+        &schema,
+    );
+    let statement = Duration::from_millis(120);
+    if let notarium_canonical::SqlBackendConfig::Postgres {
+        pool_size,
+        statement_timeout,
+        ..
+    } = &mut config.sql
+    {
+        *pool_size = 1;
+        *statement_timeout = statement;
+    }
+    config.default_backup_budget = notarium_canonical::config::default_postgres_backup_budget();
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let owner = sample_principal_id(77);
+    let (scope, _) = seed_space(
+        &store,
+        sample_space_id(77),
+        sample_incarnation(77),
+        owner.clone(),
+    )
+    .await;
+    let ctx = owner_ctx(&scope, owner.clone());
+    let note = sample_note_id(77);
+    let created = store
+        .create_note(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                CreateNote {
+                    note: note.clone(),
+                    parent: None,
+                    slug: "timing".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Timing\n".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let renamed = store
+        .rename_note(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &owner,
+                RenameNote {
+                    note: note.clone(),
+                    slug: "new-timing".into(),
+                    title: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let historical = GetNote {
+        note,
+        revision: Some(created.value.revision),
+        causal: CausalBasis::Exact(ReceiptSet::new([renamed.receipt]).unwrap()),
+    };
+
+    // Two distinct point lookups wait 70 ms each. Neither exceeds the 120 ms statement limit.
+    let mut spaces = fixtures.open_raw_pg().await;
+    let mut fences = fixtures.open_raw_pg().await;
+    for (db, table) in [
+        (&mut spaces, "spaces"),
+        (&mut fences, "revision_purge_fences"),
+    ] {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "BEGIN; LOCK TABLE \"{schema}\".{table} IN ACCESS EXCLUSIVE MODE"
+        )))
+        .execute(db)
+        .await
+        .unwrap();
+    }
+    let (locked, wait_for_first) = tokio::sync::oneshot::channel();
+    let release = async {
+        wait_for_blocked_session(&mut spaces).await;
+        locked.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        sqlx::raw_sql("COMMIT").execute(&mut spaces).await.unwrap();
+        wait_for_blocked_session(&mut fences).await;
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        sqlx::raw_sql("COMMIT").execute(&mut fences).await.unwrap();
+    };
+    let wait_for_pool = async {
+        wait_for_first.await.unwrap();
+        let started = std::time::Instant::now();
+        let one = store
+            .execute_diagnostic_read_sql_for_test(Some(&ctx.budget), "SELECT 1::bigint")
+            .await
+            .unwrap();
+        assert_eq!(one, 1);
+        assert!(started.elapsed() >= statement);
+    };
+    let (read, (), ()) = tokio::join!(
+        store.get_note(ctx.clone(), historical.clone()),
+        release,
+        wait_for_pool
+    );
+    assert!(read.is_ok(), "{read:?}");
+
+    let expired = store
+        .execute_diagnostic_read_sql_for_test(
+            Some(&ctx.budget),
+            "SELECT 1::bigint FROM pg_sleep(2)",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(expired, PortError::DeadlineExceeded(ref failure) if failure.effect()==CommitEffect::NotCommitted),
+        "{expired:?}"
+    );
+
+    let mut short = ctx.clone();
+    short.budget.remaining = Duration::from_millis(30);
+    let timeout = store
+        .execute_diagnostic_read_sql_for_test(
+            Some(&short.budget),
+            "SELECT 1::bigint FROM pg_sleep(2)",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(timeout, PortError::DeadlineExceeded(_)));
+    assert_eq!(
+        store
+            .execute_diagnostic_read_sql_for_test(Some(&ctx.budget), "SELECT 2::bigint")
+            .await
+            .unwrap(),
+        2
+    );
+
+    // Cancel a real autocommit ChatRead with the server VM blocked on this lock.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "BEGIN; LOCK TABLE \"{schema}\".chat_threads IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(&mut spaces)
+    .await
+    .unwrap();
+    let mut other = ctx.clone();
+    other.budget.cancellation = Cancellation::default();
+    let cancel = other.budget.cancellation.clone();
+    let release = async {
+        wait_for_blocked_session(&mut spaces).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let still_blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT FROM pg_stat_activity WHERE pg_backend_pid()=ANY(pg_blocking_pids(pid)))")
+                    .fetch_one(&mut spaces).await.unwrap();
+                if !still_blocked { break; }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }).await.expect("the canceled PostgreSQL reader must release its backend");
+        sqlx::raw_sql("COMMIT").execute(&mut spaces).await.unwrap();
+    };
+    let request = ChatRead {
+        thread: ChatThreadId::from_bytes([77; 16]),
+        leaf: ThreadEntrySeq::new(1).unwrap(),
+        before: None,
+        max_entries: PageLimit::new(4).unwrap(),
+    };
+    let (result, ()) = tokio::join!(store.read_chat(other, request), release);
+    assert!(matches!(result, Err(PortError::Cancelled(_))));
+    assert!(store.get_note(ctx, historical).await.is_ok());
+    runtime.shutdown().await.unwrap();
+    fixtures.drop_pg_schema(&schema).await;
+}

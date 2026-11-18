@@ -205,7 +205,9 @@ pub(crate) async fn rollback_agent_run_impl(
     mut ctx: SpaceContext,
     request: Mutation<RollbackAgentRun>,
 ) -> Result<Committed<RollbackResult>, PortError> {
-    let entered = Instant::now();
+    let deadline = Instant::now()
+        .checked_add(ctx.budget.remaining)
+        .unwrap_or_else(|| tokio::time::sleep(ctx.budget.remaining).deadline());
     validate_mutation_identity(&ctx, &request.identity)?;
     let idemp = build_rollback_identity_spec(&request)?.with_policy(
         ctx.auth(),
@@ -230,6 +232,7 @@ pub(crate) async fn rollback_agent_run_impl(
         ),
     );
 
+    ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
     if request.input.associated_board_expectations.is_empty()
         && store.inner.collab_interceptor.get().is_none()
     {
@@ -239,10 +242,13 @@ pub(crate) async fn rollback_agent_run_impl(
                 store.inner.writer_epoch(&ctx.scope().space_id)?
             }
             crate::runtime::SqlDriverState::Sqlite { .. } => {
-                store
-                    .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
-                    .await?
-                    .active_epoch
+                rollback_wait(
+                    &ctx.budget,
+                    deadline,
+                    store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget)),
+                )
+                .await??
+                .active_epoch
             }
         };
         let mut try_pg_batch_plan = true;
@@ -250,9 +256,6 @@ pub(crate) async fn rollback_agent_run_impl(
             store.inner.sql,
             crate::runtime::SqlDriverState::Postgres { .. }
         ) {
-            let deadline = entered
-                .checked_add(ctx.budget.remaining)
-                .unwrap_or_else(|| tokio::time::sleep(ctx.budget.remaining).deadline());
             if let Some(outcome) = try_execute_pg_root_rollback(
                 store,
                 &ctx,
@@ -266,8 +269,8 @@ pub(crate) async fn rollback_agent_run_impl(
             {
                 return outcome;
             }
-            ctx.budget.remaining = pg_rollback_time_left(&ctx.budget, deadline)?;
         }
+        ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
         let single_res: Result<StoredCommittedRollbackV1, PortError> = if store.is_sqlite_local() {
             let (intent, fast_plan) = crate::sqlite_fast::build_rollback_direct_sqlite_fast_intent(
                 ctx.scope(),
@@ -279,7 +282,14 @@ pub(crate) async fn rollback_agent_run_impl(
                 store.inner.room_fences.clone(),
             );
             store
-                .submit_write_command_tracked(&ctx.budget, intent, Some(fast_plan), active_op_guard)
+                .submit_write_command_until(
+                    &ctx.budget,
+                    deadline,
+                    intent,
+                    Some(fast_plan),
+                    None,
+                    Some(active_op_guard),
+                )
                 .await
         } else {
             let pg_fast = try_pg_batch_plan.then(|| {
@@ -303,7 +313,14 @@ pub(crate) async fn rollback_agent_run_impl(
                 store.inner.room_fences.clone(),
             );
             store
-                .submit_write_command_tracked_pg(&ctx.budget, intent, pg_fast, active_op_guard)
+                .submit_write_command_until(
+                    &ctx.budget,
+                    deadline,
+                    intent,
+                    None,
+                    pg_fast,
+                    Some(active_op_guard),
+                )
                 .await
         };
 
@@ -316,29 +333,38 @@ pub(crate) async fn rollback_agent_run_impl(
         }
     }
 
-    if let Some(replayed) = try_replay_completed_receipt::<StoredCommittedRollbackV1>(
-        store,
-        ctx.scope(),
-        &idemp,
-        Some(&ctx.budget),
+    ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
+    if let Some(replayed) = rollback_wait(
+        &ctx.budget,
+        deadline,
+        try_replay_completed_receipt::<StoredCommittedRollbackV1>(
+            store,
+            ctx.scope(),
+            &idemp,
+            Some(&ctx.budget),
+        ),
     )
-    .await?
+    .await??
     {
         return Ok(replayed.into_committed());
     }
 
     for attempt in 0..MAX_PLANNER_RETRIES {
         // Step 1 & 2: Read run head, touched set, caller expectations, and classify `skipped_manual_edits`.
+        ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
         let ctx_read = ctx.clone();
         let input_read = request.input.clone();
         let (space_rec, skipped_manual_edits, candidates, durable_active_rooms, run_board_moves) =
-            store
-                .with_read_tx_budget(Some(&ctx.budget), |tx| {
+            rollback_wait(
+                &ctx.budget,
+                deadline,
+                store.with_read_tx_budget(Some(&ctx.budget), |tx| {
                     Box::pin(
                         async move { discover_rollback_state_tx(tx, &ctx_read, &input_read).await },
                     )
-                })
-                .await?;
+                }),
+            )
+            .await??;
 
         // Load pre-run carriers from CAS ONLY when board views were moved by this run and require
         // `planned_carrier` in `RollbackBoardFactsRequest`.
@@ -354,7 +380,12 @@ pub(crate) async fn rollback_agent_run_impl(
                 && pre_meta.doc_class != DocClass::EncryptedNote
                 && let Some(digest) = pre_meta.content_digest
             {
-                let raw = store.read_verified_blob(&space_rec.scope, digest).await?;
+                let raw = rollback_wait(
+                    &ctx.budget,
+                    deadline,
+                    store.read_verified_blob(&space_rec.scope, digest),
+                )
+                .await??;
                 let carrier_str = String::from_utf8(raw).map_err(|_| {
                     internal_not_committed(
                         "rollback_corrupt_utf8",
@@ -376,17 +407,21 @@ pub(crate) async fn rollback_agent_run_impl(
                 skipped_room_active.push(nid);
                 continue;
             }
-            let reservation = if let Some(interceptor) = store.inner.collab_interceptor.get() {
-                interceptor
-                    .reserve_rollback(ctx.clone(), nid.clone(), request.identity.clone())
-                    .await?
-            } else {
-                store
-                    .inner
-                    .room_fences
-                    .reserve_rollback(ctx.scope(), &nid, request.identity.clone())
-                    .await?
-            };
+            ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
+            let reservation = rollback_wait(&ctx.budget, deadline, async {
+                if let Some(interceptor) = store.inner.collab_interceptor.get() {
+                    interceptor
+                        .reserve_rollback(ctx.clone(), nid.clone(), request.identity.clone())
+                        .await
+                } else {
+                    store
+                        .inner
+                        .room_fences
+                        .reserve_rollback(ctx.scope(), &nid, request.identity.clone())
+                        .await
+                }
+            })
+            .await??;
             match reservation {
                 RollbackReservation::SkippedRoomActive => {
                     skipped_room_active.push(nid);
@@ -457,9 +492,13 @@ pub(crate) async fn rollback_agent_run_impl(
                 views: affected_views_set.iter().cloned().collect(),
                 eligible_notes: planned_list,
             };
-            let facts = provider
-                .evaluate_rollback(&board_authority, ctx.clone(), req)
-                .await?;
+            ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
+            let facts = rollback_wait(
+                &ctx.budget,
+                deadline,
+                provider.evaluate_rollback(&board_authority, ctx.clone(), req),
+            )
+            .await??;
             facts.verify_authority(&board_authority)?;
             ctx.scope().check(facts.scope())?;
             Some(facts)
@@ -503,8 +542,16 @@ pub(crate) async fn rollback_agent_run_impl(
             ),
         };
 
+        ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
         match store
-            .submit_write_command::<StoredCommittedRollbackV1>(&ctx.budget, intent)
+            .submit_write_command_until::<StoredCommittedRollbackV1>(
+                &ctx.budget,
+                deadline,
+                intent,
+                None,
+                None,
+                None,
+            )
             .await
         {
             Ok(decoded) => {
@@ -4138,38 +4185,38 @@ impl Drop for PendingRollbackFencesGuard {
     }
 }
 
-fn pg_rollback_time_left(
+fn rollback_time_left(
     budget: &notarium_core::ports::CallBudget,
     deadline: Instant,
 ) -> Result<std::time::Duration, PortError> {
     if budget.cancellation.is_cancelled() {
         return Err(crate::codec::cancelled_not_committed(
-            "pg_rollback_cancelled",
+            "rollback_cancelled",
             "rollback cancelled before commit",
         ));
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(crate::codec::deadline_not_committed(
-            "pg_rollback_deadline",
+            "rollback_deadline",
             "rollback deadline expired before commit",
         ));
     }
     Ok(remaining)
 }
 
-async fn pg_rollback_wait<T>(
+async fn rollback_wait<T>(
     budget: &notarium_core::ports::CallBudget,
     deadline: Instant,
     operation: impl Future<Output = T>,
 ) -> Result<T, PortError> {
-    pg_rollback_time_left(budget, deadline)?;
+    rollback_time_left(budget, deadline)?;
     tokio::select! {
         biased;
         _ = budget.cancellation.cancelled() =>
-            Err(crate::codec::cancelled_not_committed("pg_rollback_cancelled", "rollback cancelled before commit")),
+            Err(crate::codec::cancelled_not_committed("rollback_cancelled", "rollback cancelled before commit")),
         _ = tokio::time::sleep_until(deadline) =>
-            Err(crate::codec::deadline_not_committed("pg_rollback_deadline", "rollback deadline expired before commit")),
+            Err(crate::codec::deadline_not_committed("rollback_deadline", "rollback deadline expired before commit")),
         result = operation => Ok(result),
     }
 }
@@ -4261,8 +4308,7 @@ async fn try_execute_pg_root_rollback(
                     .expect("pg fast_write_conn mutex")
                     .take();
             }
-            match pg_rollback_wait(&ctx.budget, deadline, writer.acquire_commit_read_guard()).await
-            {
+            match rollback_wait(&ctx.budget, deadline, writer.acquire_commit_read_guard()).await {
                 Ok(guard) => guard,
                 Err(err) => return Some(Err(err)),
             }
@@ -4292,7 +4338,7 @@ async fn try_execute_pg_root_rollback(
     let read_deadline = deadline.min(Instant::now() + *statement_timeout);
     let mut pooled = match cached_conn {
         Some(c) => c,
-        None => match pg_rollback_wait(&ctx.budget, read_deadline, pool.acquire()).await {
+        None => match rollback_wait(&ctx.budget, read_deadline, pool.acquire()).await {
             Ok(Ok(c)) => c,
             Err(err) => return Some(Err(err)),
             Ok(Err(err)) => {
@@ -4305,7 +4351,7 @@ async fn try_execute_pg_root_rollback(
         },
     };
 
-    let park_pooled = |conn: sqlx::pool::PoolConnection<sqlx::Postgres>| {
+    let park_pooled = |conn: crate::dialect::postgres::StorePgConnection| {
         if *can_cache_fast_conn {
             let mut slot = fast_write_conn.lock().expect("pg fast_write_conn mutex");
             if slot.is_none() {
@@ -4343,7 +4389,7 @@ async fn try_execute_pg_root_rollback(
         .bind(writer_epoch.get() as i64)
         .bind(request.input.expected_run_revision.as_str())
         .fetch_all(read_lease.conn());
-    let rows = match pg_rollback_wait(&ctx.budget, read_deadline, query).await {
+    let rows = match rollback_wait(&ctx.budget, read_deadline, query).await {
         Ok(Ok(rows)) => rows,
         Ok(Err(err)) => {
             return Some(Err(internal_not_committed(
@@ -4462,7 +4508,7 @@ async fn try_execute_pg_root_rollback(
 
     // Step 2: Acquire room fences only for non-manual-skip notes (matching `execute_pg_fast_rollback_inner`),
     // classify actions in memory, and encode metadata + receipt MsgPack payloads in compiled Rust.
-    if let Err(err) = pg_rollback_time_left(&ctx.budget, deadline) {
+    if let Err(err) = rollback_time_left(&ctx.budget, deadline) {
         return Some(Err(err));
     }
     let fence_slots = match store.inner.room_fences.try_lock_batch_for_rollback_sync(
@@ -4474,7 +4520,7 @@ async fn try_execute_pg_root_rollback(
         Ok(None) => {
             let mut slots = Vec::with_capacity(n);
             for &nid in &sorted_note_refs {
-                if let Err(err) = pg_rollback_time_left(&ctx.budget, deadline) {
+                if let Err(err) = rollback_time_left(&ctx.budget, deadline) {
                     return Some(Err(err));
                 }
                 match store
@@ -5078,7 +5124,7 @@ async fn try_execute_pg_root_rollback(
         .bind(writer_epoch.get() as i64)
         .bind(&room_leases)
         .bind(&room_lineages);
-    let remaining = match pg_rollback_time_left(&ctx.budget, deadline) {
+    let remaining = match rollback_time_left(&ctx.budget, deadline) {
         Ok(remaining) => remaining,
         Err(err) => return Some(Err(err)),
     };
@@ -5090,7 +5136,7 @@ async fn try_execute_pg_root_rollback(
     );
     let mut transaction = crate::sql_exec::PgTransactionLease::new(pooled);
     let begin = sqlx::raw_sql(sqlx::AssertSqlSafe(sql)).execute(transaction.conn());
-    match pg_rollback_wait(&ctx.budget, deadline, begin).await {
+    match rollback_wait(&ctx.budget, deadline, begin).await {
         Ok(Ok(_)) => {}
         Ok(Err(err)) => {
             return Some(Err(internal_not_committed(
@@ -5100,8 +5146,7 @@ async fn try_execute_pg_root_rollback(
         }
         Err(err) => return Some(Err(err)),
     };
-    let row = match pg_rollback_wait(&ctx.budget, deadline, apply.fetch_one(transaction.conn()))
-        .await
+    let row = match rollback_wait(&ctx.budget, deadline, apply.fetch_one(transaction.conn())).await
     {
         Ok(Ok(row)) => row,
         Ok(Err(sqlx::Error::Database(err))) if err.message().contains("NOTARIUM_RB_FALLBACK_0") => {
@@ -5213,7 +5258,7 @@ async fn try_execute_pg_root_rollback(
     let mut completion = Box::pin(commit);
     // First poll is the COMMIT handoff. Prior cancellation can still discard
     // the transaction. After that poll the same future must drain the ACK.
-    if let Err(err) = pg_rollback_time_left(&ctx.budget, deadline) {
+    if let Err(err) = rollback_time_left(&ctx.budget, deadline) {
         return Some(Err(err));
     }
     let first =
@@ -5223,7 +5268,7 @@ async fn try_execute_pg_root_rollback(
     }
     let acknowledgement = executor.spawn(completion);
     Some(
-        match pg_rollback_wait(&ctx.budget, deadline, acknowledgement).await {
+        match rollback_wait(&ctx.budget, deadline, acknowledgement).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => Err(unknown_commit_outcome(
                 "pg_lean_rb_ambiguous_commit",

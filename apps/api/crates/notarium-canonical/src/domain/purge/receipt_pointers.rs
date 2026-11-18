@@ -1,19 +1,43 @@
 use crate::{codec::internal_not_committed, sql_exec::BackendConn};
 use notarium_core::{error::PortError, model::HistoryScope};
 
-// A normal restore clears old receipts. Imported data can retain several incarnations.
-// Each scalar query seeks past one distinct key prefix in the existing receipt primary index.
-const ADDITIONAL_HISTORIES: &str = "WITH RECURSIVE histories(h) AS (
-    SELECT (SELECT history_incarnation FROM command_receipts WHERE space_id=$1 ORDER BY history_incarnation LIMIT 1)
-    UNION ALL
-    SELECT (SELECT r.history_incarnation FROM command_receipts r
-            WHERE r.space_id=$1 AND r.history_incarnation>histories.h ORDER BY r.history_incarnation LIMIT 1)
-    FROM histories WHERE h IS NOT NULL
-)
-SELECT h FROM histories WHERE h IS NOT NULL AND h<>$2";
+// Seek each distinct primary-key prefix, including imported histories. Apply the
+// requested (actor, key) set in one statement and keep the enclosing receipt shells.
+// A short history costs at most its own rows. A large history costs a bounded
+// prefix count followed by one primary-key probe per requested key.
+macro_rules! clear_regular {
+    ($keys:literal, $row:literal) => {
+        concat!(
+            "WITH RECURSIVE histories(h) AS (
+                SELECT (SELECT history_incarnation FROM command_receipts WHERE space_id=$1 ORDER BY history_incarnation LIMIT 1)
+                UNION ALL SELECT (SELECT r.history_incarnation FROM command_receipts r WHERE r.space_id=$1
+                    AND r.history_incarnation>histories.h ORDER BY r.history_incarnation LIMIT 1)
+                    FROM histories WHERE h IS NOT NULL
+            ), keys(actor, command) AS MATERIALIZED (", $keys, "),
+            sizes AS MATERIALIZED (
+                SELECT h, EXISTS (SELECT 1 FROM command_receipts r
+                    WHERE r.space_id=$1 AND r.history_incarnation=h
+                    LIMIT 1 OFFSET (SELECT count(*) FROM keys)) AS dense
+                FROM histories WHERE h IS NOT NULL
+            )
+            UPDATE command_receipts SET response_payload_id=NULL WHERE ", $row, " IN (
+                SELECT r.", $row, " FROM sizes CROSS JOIN command_receipts r
+                WHERE NOT dense AND r.space_id=$1 AND r.history_incarnation=h
+                  AND r.response_payload_id IN (SELECT 'rcpt_pay:' || actor || ':' || command FROM keys)
+                UNION ALL
+                SELECT r.", $row, " FROM sizes CROSS JOIN keys CROSS JOIN command_receipts r
+                WHERE dense AND r.space_id=$1 AND r.history_incarnation=h AND r.actor_id=actor AND r.idempotency_key=command
+                  AND r.response_payload_id = 'rcpt_pay:' || r.actor_id || ':' || r.idempotency_key)"
+        )
+    };
+}
 
-const CLEAR_BY_KEY: &str = "UPDATE command_receipts SET response_payload_id=NULL
-    WHERE space_id=$1 AND history_incarnation=$2 AND actor_id=$3 AND idempotency_key=$4 AND response_payload_id=$5";
+const CLEAR_SQLITE_KEYS: &str =
+    clear_regular!("SELECT value->>0, value->>1 FROM json_each($2)", "rowid");
+const CLEAR_PG_KEYS: &str = clear_regular!(
+    "SELECT value->>0, value->>1 FROM jsonb_array_elements($2::jsonb)",
+    "ctid"
+);
 
 const CLEAR_SQLITE_EXCEPTIONS: &str = "UPDATE command_receipts INDEXED BY idx_receipt_exception_pointer
     SET response_payload_id=NULL WHERE space_id=$1 AND response_payload_id IN (SELECT value FROM json_each($2))
@@ -34,57 +58,28 @@ pub(super) async fn clear(
         return Ok(());
     }
     let space = scope.space_id.as_str();
-    let current = scope.incarnation.as_bytes().as_slice();
     let keys: Vec<_> = details
         .iter()
-        .filter_map(|detail| {
-            let (actor, key) = detail.strip_prefix("rcpt_pay:")?.split_once(':')?;
-            Some((actor, key, detail.as_str()))
-        })
+        .filter_map(|detail| detail.strip_prefix("rcpt_pay:")?.split_once(':'))
         .collect();
     if !keys.is_empty() {
-        let other: Vec<Vec<u8>> = match tx {
-            BackendConn::Sqlite(db) => {
-                sqlx::query_scalar(ADDITIONAL_HISTORIES)
-                    .bind(space)
-                    .bind(current)
-                    .fetch_all(&mut **db)
-                    .await
-            }
-            BackendConn::Postgres(db) => {
-                sqlx::query_scalar(ADDITIONAL_HISTORIES)
-                    .bind(space)
-                    .bind(current)
-                    .fetch_all(&mut **db)
-                    .await
-            }
+        let keys = serde_json::to_string(&keys)
+            .map_err(|e| internal_not_committed("encode_erased_receipt_keys", e.to_string()))?;
+        match tx {
+            BackendConn::Sqlite(db) => sqlx::query(CLEAR_SQLITE_KEYS)
+                .bind(space)
+                .bind(&keys)
+                .execute(&mut **db)
+                .await
+                .map(|_| ()),
+            BackendConn::Postgres(db) => sqlx::query(CLEAR_PG_KEYS)
+                .bind(space)
+                .bind(&keys)
+                .execute(&mut **db)
+                .await
+                .map(|_| ()),
         }
-        .map_err(|e| internal_not_committed("purge_receipt_incarnations", e.to_string()))?;
-        for incarnation in std::iter::once(current).chain(other.iter().map(Vec::as_slice)) {
-            for &(actor, key, detail) in &keys {
-                match tx {
-                    BackendConn::Sqlite(db) => sqlx::query(CLEAR_BY_KEY)
-                        .bind(space)
-                        .bind(incarnation)
-                        .bind(actor)
-                        .bind(key)
-                        .bind(detail)
-                        .execute(&mut **db)
-                        .await
-                        .map(|_| ()),
-                    BackendConn::Postgres(db) => sqlx::query(CLEAR_BY_KEY)
-                        .bind(space)
-                        .bind(incarnation)
-                        .bind(actor)
-                        .bind(key)
-                        .bind(detail)
-                        .execute(&mut **db)
-                        .await
-                        .map(|_| ()),
-                }
-                .map_err(|e| internal_not_committed("purge_receipt_pointer", e.to_string()))?;
-            }
-        }
+        .map_err(|e| internal_not_committed("purge_receipt_pointers", e.to_string()))?;
     }
     // Exceptional source pointers might also name a detail with a valid primary receipt.
     match tx {
@@ -110,8 +105,31 @@ pub(super) async fn clear(
 
 #[cfg(test)]
 mod tests {
-    use super::{ADDITIONAL_HISTORIES, CLEAR_BY_KEY, CLEAR_SQLITE_EXCEPTIONS};
+    use super::{CLEAR_SQLITE_EXCEPTIONS, CLEAR_SQLITE_KEYS};
     use rusqlite::{Connection, StatementStatus, params};
+
+    #[test]
+    fn batched_receipt_erasure_visits_short_imported_histories_once() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(crate::schema::SQLITE_BASELINE_DDL)
+            .unwrap();
+        let mut insert = db.prepare("INSERT INTO command_receipts VALUES ('s',?1,'owner',?2,zeroblob(32),'completed',1,'rcpt_pay:owner:' || ?2,X'01',1,9000)").unwrap();
+        for n in 0..100u128 {
+            insert
+                .execute(params![n.to_be_bytes().as_slice(), "other"])
+                .unwrap();
+        }
+        let keys: Vec<_> = (0..40).map(|i| ("owner", format!("k{i}"))).collect();
+        for (_, key) in &keys {
+            insert.execute(params![[0u8; 16].as_slice(), key]).unwrap();
+        }
+        let mut regular = db.prepare(CLEAR_SQLITE_KEYS).unwrap();
+        regular
+            .execute(params!["s", serde_json::to_string(&keys).unwrap()])
+            .unwrap();
+        assert_eq!(db.changes(), 40);
+        assert!(regular.get_status(StatementStatus::VmStep) < 20_000);
+    }
 
     #[test]
     fn expired_and_irregular_receipt_pointers_use_bounded_lookups() {
@@ -137,35 +155,21 @@ mod tests {
             db.execute("INSERT INTO command_receipts SELECT space_id,?1,actor_id,idempotency_key,command_hash,status,
                 envelope_version,response_payload_id,sanitized_envelope_msgpack,canonical_seq,expires_at_ms
                 FROM command_receipts WHERE space_id='s' AND idempotency_key='1'",[[2u8;16].as_slice()]).unwrap();
-            let mut histories = db.prepare(ADDITIONAL_HISTORIES).unwrap();
-            let other: Vec<Vec<u8>> = histories
-                .query_map(params!["s", [0u8; 16].as_slice()], |row| row.get(0))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect();
-            assert_eq!(other, [vec![2u8; 16]]);
-            assert!(histories.get_status(StatementStatus::VmStep) < 200);
-            db.execute(
-                CLEAR_BY_KEY,
-                params!["s", &other[0], "principal", "1", regular],
-            )
-            .unwrap();
             let exception_count: i64 = db.query_row(
                 "SELECT count(*) FROM command_receipts INDEXED BY idx_receipt_exception_pointer
                  WHERE response_payload_id IS NOT NULL AND (response_payload_id <> 'rcpt_pay:' || actor_id || ':' || idempotency_key OR actor_id LIKE '%:%')",
                 [], |r| r.get(0),
             ).unwrap();
             assert_eq!(exception_count, 3);
-            for (key, detail, expected) in [("expired", expired, 0), ("1", regular, 1)] {
-                let mut direct = db.prepare(CLEAR_BY_KEY).unwrap();
-                assert_eq!(
-                    direct
-                        .execute(params!["s", [0u8; 16].as_slice(), "principal", key, detail])
-                        .unwrap(),
-                    expected
-                );
-                assert!(direct.get_status(StatementStatus::VmStep) < 200);
-            }
+            let mut direct = db.prepare(CLEAR_SQLITE_KEYS).unwrap();
+            direct
+                .execute(params![
+                    "s",
+                    r#"[["principal","expired"],["principal","1"]]"#
+                ])
+                .unwrap();
+            assert_eq!(db.changes(), 2);
+            assert!(direct.get_status(StatementStatus::VmStep) < 700);
             for (ids, expected) in [
                 (vec![expired], 0),
                 (vec![regular, opaque], 2),

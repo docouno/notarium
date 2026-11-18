@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use crate::dialect::postgres::{StorePgConnection, StorePgPool};
 use notarium_core::{
     DomainError,
     auth::{Space, SpaceKind, SpaceLifecycle},
@@ -20,7 +21,7 @@ use notarium_core::{
     ports::{CallBudget, MaintenanceContext, ServicePurpose},
     value::Timestamp,
 };
-use sqlx::{Connection, PgPool, Row, SqlitePool};
+use sqlx::{Connection, Row, SqlitePool};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -41,6 +42,41 @@ use crate::{
     wal::{SqliteWalCoordinator, WalTelemetrySnapshot},
     writer::WriteCoordinator,
 };
+
+// Ordinary source snapshots are bounded below 250 ms in both storage profiles.
+const PG_READ_SNAPSHOT_LIMIT: Duration = Duration::from_millis(240);
+
+fn pg_read_caller_deadline(
+    pool: &StorePgPool,
+    budget: Option<&CallBudget>,
+) -> Result<tokio::time::Instant, PortError> {
+    if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
+        return Err(cancelled_not_committed(
+            "pg_read_cancelled_pre_acquire",
+            "PostgreSQL read cancelled before pool acquire",
+        ));
+    }
+    let remaining = budget
+        .map(|b| b.remaining)
+        .unwrap_or_else(|| pool.acquire_timeout());
+    if remaining.is_zero() {
+        return Err(deadline_not_committed(
+            "pg_read_zero_budget",
+            "PostgreSQL read call budget expired",
+        ));
+    }
+    Ok(tokio::time::Instant::now() + remaining)
+}
+
+pub(crate) fn pg_read_error(stage: &'static str, error: sqlx::Error) -> PortError {
+    if error
+        .as_database_error()
+        .is_some_and(|db| db.code().as_deref() == Some("57014"))
+    {
+        return deadline_not_committed(stage, "PostgreSQL read statement was canceled");
+    }
+    internal_not_committed(stage, error.to_string())
+}
 
 async fn pg_read_cancelled(budget: Option<&CallBudget>) -> PortError {
     match budget {
@@ -71,9 +107,9 @@ pub(crate) enum SqlDriverState {
         read_deadline: Duration,
     },
     Postgres {
-        pool: PgPool,
-        fast_write_conn: std::sync::Mutex<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>,
-        fast_read_conn: std::sync::Mutex<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>,
+        pool: StorePgPool,
+        fast_write_conn: std::sync::Mutex<Option<StorePgConnection>>,
+        fast_read_conn: std::sync::Mutex<Option<StorePgConnection>>,
         can_cache_fast_conn: bool,
         #[allow(dead_code)]
         schema: String,
@@ -103,6 +139,7 @@ pub(crate) struct CanonicalInner {
         std::sync::Mutex<std::collections::HashSet<notarium_core::ids::BackupId>>,
     pub backup_spool_roots: std::sync::Mutex<Vec<std::path::PathBuf>>,
     pub backup_spool_override: std::sync::Mutex<Option<std::path::PathBuf>>,
+    pub retirement_workers: crate::blobs::retirement_worker::RetirementWorkers,
     pub backup_cleanups: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pub last_backup_memory_stats:
         std::sync::Mutex<Option<crate::backup::BackupExporterMemoryStats>>,
@@ -378,6 +415,7 @@ impl CanonicalRuntime {
             backup_local_holds: Default::default(),
             backup_spool_roots: Default::default(),
             backup_spool_override: std::sync::Mutex::new(None),
+            retirement_workers: Default::default(),
             backup_cleanups: std::sync::Mutex::new(Vec::new()),
             last_backup_memory_stats: std::sync::Mutex::new(None),
             backup_step_delay_us: std::sync::atomic::AtomicU64::new(0),
@@ -774,7 +812,7 @@ impl CanonicalStore {
                     BackendConn::Postgres(conn) => sqlx::query_scalar(sqlx::AssertSqlSafe(owned))
                         .fetch_one(&mut **conn)
                         .await
-                        .map_err(|err| internal_not_committed("diag_pg_read", err.to_string())),
+                        .map_err(|err| pg_read_error("diag_pg_read", err)),
                 }
             })
         })
@@ -810,6 +848,20 @@ impl CanonicalStore {
         matches!(&self.inner.sql, SqlDriverState::Postgres { .. })
     }
 
+    pub(crate) async fn run_pg_read_request<T>(
+        budget: CallBudget,
+        operation: impl Future<Output = Result<T, PortError>>,
+    ) -> Result<T, PortError> {
+        let deadline = tokio::time::Instant::now() + budget.remaining;
+        tokio::select! {
+            biased;
+            error = pg_read_cancelled(Some(&budget)) => Err(error),
+            _ = tokio::time::sleep_until(deadline) => Err(deadline_not_committed(
+                "pg_read_request_deadline", "PostgreSQL read exceeded caller deadline")),
+            result = operation => result,
+        }
+    }
+
     pub(crate) async fn with_pg_autocommit_read_budget<F, T>(
         &self,
         budget: Option<&CallBudget>,
@@ -833,22 +885,14 @@ impl CanonicalStore {
             ));
         };
 
-        if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
-            return Err(cancelled_not_committed(
-                "pg_read_cancelled_pre_acquire",
-                "PostgreSQL read cancelled before pool acquire",
-            ));
-        }
-        let caller_rem = budget.map(|b| b.remaining).unwrap_or(*statement_timeout);
-        if caller_rem.is_zero() {
+        let caller_deadline = pg_read_caller_deadline(pool, budget)?;
+        if statement_timeout.is_zero() {
             return Err(deadline_not_committed(
-                "pg_read_zero_budget",
-                "PostgreSQL read call budget expired",
+                "pg_read_statement_deadline",
+                "PostgreSQL read statement exceeded deadline",
             ));
         }
-        let eff_timeout = caller_rem.min(*statement_timeout);
-        let deadline_tokio = tokio::time::Instant::now() + eff_timeout;
-
+        let statement_limit = (*statement_timeout).min(PG_READ_SNAPSHOT_LIMIT);
         let cached_opt = if *can_cache_fast_conn {
             fast_read_conn
                 .lock()
@@ -859,6 +903,7 @@ impl CanonicalStore {
         };
         let cancelled = pg_read_cancelled(budget);
         tokio::pin!(cancelled);
+        let initialize = cached_opt.is_none();
         let mut pooled = match cached_opt {
             Some(c) => c,
             None => tokio::select! {
@@ -871,7 +916,7 @@ impl CanonicalStore {
                         Duration::from_millis(50),
                     )
                 })?,
-                _ = tokio::time::sleep_until(deadline_tokio) => {
+                _ = tokio::time::sleep_until(caller_deadline) => {
                     return Err(deadline_not_committed(
                         "pg_acquire_read_deadline",
                         "deadline exceeded acquiring PostgreSQL read connection",
@@ -881,23 +926,53 @@ impl CanonicalStore {
         };
 
         let mut lease = PgTransactionLease::new(&mut pooled);
+        if initialize {
+            // A cached reader owns its session settings. An uncached reader resets them before
+            // it returns to the shared pool. Any interrupted checkout is closed.
+            let settings = format!(
+                "SET statement_timeout = '{}ms'; SET client_connection_check_interval = '20ms'",
+                statement_limit.as_millis().max(1)
+            );
+            tokio::select! {
+                biased;
+                error = &mut cancelled => return Err(error),
+                _ = tokio::time::sleep_until(caller_deadline) => return Err(deadline_not_committed(
+                    "pg_read_setup_deadline", "PostgreSQL read setup exceeded caller deadline")),
+                result = sqlx::raw_sql(sqlx::AssertSqlSafe(settings)).execute(lease.conn()) =>
+                    result.map_err(|e| internal_not_committed("pg_read_setup",e.to_string()))?,
+            };
+        }
+        let statement_deadline = caller_deadline.min(tokio::time::Instant::now() + statement_limit);
         let val = tokio::select! {
             biased;
             error = &mut cancelled => return Err(error),
-            _ = tokio::time::sleep_until(deadline_tokio) => {
+            _ = tokio::time::sleep_until(statement_deadline) => {
                 return Err(deadline_not_committed(
-                    "pg_read_tx_deadline",
+                    "pg_read_statement_deadline",
                     "PostgreSQL read statement exceeded deadline",
                 ));
             }
             result = op(lease.conn()) => result?,
         };
-        lease.complete();
         if *can_cache_fast_conn {
+            lease.complete();
+            // This connection has read-specific session settings. Discard it if its private
+            // slot is occupied or the runtime is shutting down.
+            pooled.close_on_drop();
             let mut slot = fast_read_conn.lock().expect("pg fast_read_conn mutex");
             if slot.is_none() {
                 *slot = Some(pooled);
             }
+        } else {
+            tokio::select! {
+                biased;
+                error = &mut cancelled => return Err(error),
+                _ = tokio::time::sleep_until(caller_deadline) => return Err(deadline_not_committed(
+                    "pg_read_cleanup_deadline", "PostgreSQL read cleanup exceeded caller deadline")),
+                result = sqlx::raw_sql("RESET statement_timeout; RESET client_connection_check_interval").execute(lease.conn()) =>
+                    result.map_err(|e| internal_not_committed("pg_read_reset", e.to_string()))?,
+            };
+            lease.complete();
         }
         Ok(val)
     }
@@ -946,25 +1021,26 @@ impl CanonicalStore {
                 statement_timeout,
                 ..
             } => {
-                if budget.is_some_and(|b| b.cancellation.is_cancelled()) {
-                    return Err(cancelled_not_committed(
-                        "pg_read_cancelled_pre_acquire",
-                        "PostgreSQL read cancelled before pool acquire",
-                    ));
-                }
-                let caller_rem = budget.map(|b| b.remaining).unwrap_or(*statement_timeout);
-                if caller_rem.is_zero() {
+                let caller_deadline = pg_read_caller_deadline(pool, budget)?;
+                if statement_timeout.is_zero() {
                     return Err(deadline_not_committed(
-                        "pg_read_zero_budget",
-                        "PostgreSQL read call budget expired",
+                        "pg_read_statement_deadline",
+                        "PostgreSQL read statement exceeded deadline",
                     ));
                 }
-                let eff_timeout = caller_rem.min(*statement_timeout);
-                let deadline_tokio = tokio::time::Instant::now() + eff_timeout;
                 let cancelled = pg_read_cancelled(budget);
                 tokio::pin!(cancelled);
 
+                let admission_started = tokio::time::Instant::now();
                 let mut pooled = tokio::select! {
+                    biased;
+                    error = &mut cancelled => return Err(error),
+                    _ = tokio::time::sleep_until(caller_deadline) => {
+                        return Err(deadline_not_committed(
+                            "pg_acquire_read_deadline",
+                            "deadline exceeded acquiring PostgreSQL read connection",
+                        ));
+                    }
                     res = pool.acquire() => res.map_err(|err| {
                         unavailable_retryable(
                             "pg_acquire_read",
@@ -972,27 +1048,20 @@ impl CanonicalStore {
                             Duration::from_millis(50),
                         )
                     })?,
-                    error = &mut cancelled => return Err(error),
-                    _ = tokio::time::sleep_until(deadline_tokio) => {
-                        return Err(deadline_not_committed(
-                            "pg_acquire_read_deadline",
-                            "deadline exceeded acquiring PostgreSQL read connection",
-                        ));
-                    }
                 };
 
-                let rem_ms = deadline_tokio
-                    .saturating_duration_since(tokio::time::Instant::now())
+                let now = tokio::time::Instant::now();
+                let snapshot_deadline = caller_deadline.min(now + PG_READ_SNAPSHOT_LIMIT);
+                let timeout_ms = (*statement_timeout)
+                    .min(snapshot_deadline.saturating_duration_since(now))
                     .as_millis()
                     .max(1);
-                let timeout_ms = u64::try_from(rem_ms).unwrap_or(200);
-
                 let mut lease = PgTransactionLease::new(&mut pooled);
                 let run_res: Result<T, PortError> = {
                     let conn = lease.conn();
                     let fut = async {
                         let mut settings = format!(
-                            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout = '{timeout_ms}ms'"
+                            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout = '{timeout_ms}ms'; SET LOCAL client_connection_check_interval = '20ms'"
                         );
                         if let Some(sql) = extra_pg_sql {
                             settings.push_str("; ");
@@ -1010,14 +1079,18 @@ impl CanonicalStore {
                         Ok(val)
                     };
                     tokio::select! {
-                        res = fut => res,
+                        biased;
                         error = &mut cancelled => Err(error),
-                        _ = tokio::time::sleep_until(deadline_tokio) => {
+                        _ = tokio::time::sleep_until(snapshot_deadline) => {
+                            tracing::warn!(admission_us = now.duration_since(admission_started).as_micros() as u64,
+                                transaction_us = now.elapsed().as_micros() as u64,
+                                "PostgreSQL ordinary read reached its transaction deadline");
                             Err(deadline_not_committed(
                                 "pg_read_tx_deadline",
                                 "PostgreSQL read transaction exceeded deadline",
                             ))
                         }
+                        res = fut => res,
                     }
                 };
 
@@ -1994,7 +2067,7 @@ pub(crate) async fn load_space_record(
             .bind(space_id.as_str())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_space", err.to_string()))?
+            .map_err(|err| pg_read_error("pg_load_space", err))?
             .ok_or(DomainError::ResourceNotFound)?;
             (
                 row.get("history_incarnation"),
@@ -2419,7 +2492,7 @@ pub(crate) async fn load_folder_head_row(
             .bind(folder_id.as_str())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_folder", err.to_string()))?
+            .map_err(|err| pg_read_error("pg_load_folder", err))?
             .ok_or(DomainError::ResourceNotFound)?;
             (
                 row.get("parent_folder_id"),
@@ -2868,7 +2941,7 @@ pub(crate) async fn require_command_end_tx(
         .bind(req_i64)
         .fetch_optional(&mut **conn)
         .await
-        .map_err(|err| internal_not_committed("pg_check_cutoff", err.to_string()))?,
+        .map_err(|err| pg_read_error("pg_check_cutoff", err))?,
     };
     if found_end.is_none() {
         return Err(DomainError::validation(ValidationReason::InvalidCutoff).into());
@@ -2897,7 +2970,7 @@ pub(crate) async fn is_note_purge_fenced_tx(
         .bind(note_id)
         .fetch_optional(&mut **conn)
         .await
-        .map_err(|err| internal_not_committed("pg_check_purge_fence", err.to_string()))?,
+        .map_err(|err| pg_read_error("pg_check_purge_fence", err))?,
     };
     Ok(exists.is_some())
 }
@@ -3033,7 +3106,7 @@ pub(crate) async fn read_immutable_revision_tx(
             .bind(cut_i64)
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_read_immutable_rev", err.to_string()))?;
+            .map_err(|err| pg_read_error("pg_read_immutable_rev", err))?;
 
             row.map(|r| {
                 (

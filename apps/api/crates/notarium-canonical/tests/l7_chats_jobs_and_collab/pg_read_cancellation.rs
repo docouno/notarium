@@ -151,3 +151,126 @@ async fn fast_pg_chat_read_releases_single_pool_slot_on_cancel_and_drop() {
     runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }
+
+#[tokio::test]
+async fn pg_pool_returns_foreign_checkout_to_the_store_runtime() {
+    let fixtures = StorageTestFixtures::load_required();
+    let schema = fixtures.fresh_pg_schema();
+    let data = TempDataRoot::new("foreign-pg-checkout");
+    let mut cfg = fixtures.pg_local_config(sample_installation_id(98), &schema, data.data_root());
+    let SqlBackendConfig::Postgres { pool_size, .. } = &mut cfg.sql else {
+        unreachable!()
+    };
+    *pool_size = 1;
+    let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+
+    const PID: &str = "SELECT pg_backend_pid()::bigint";
+    let initial = store
+        .execute_diagnostic_read_sql_for_test(None, PID)
+        .await
+        .unwrap();
+    // A failed transaction discards the one checkout. The foreign caller must
+    // now establish a new physical connection, even with an otherwise idle pool.
+    assert!(matches!(
+        store
+            .execute_diagnostic_read_sql_for_test(None, "SELECT 1::bigint / 0")
+            .await,
+        Err(PortError::Internal(_))
+    ));
+    let caller = store.clone();
+    let foreign_pid = tokio::task::spawn_blocking(move || {
+        let foreign = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        foreign
+            .block_on(caller.execute_diagnostic_read_sql_for_test(None, PID))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_ne!(initial, foreign_pid);
+    assert_eq!(
+        store
+            .execute_diagnostic_read_sql_for_test(None, PID)
+            .await
+            .unwrap(),
+        foreign_pid
+    );
+    let mut observer = fixtures.open_raw_pg().await;
+    let pid = i32::try_from(foreign_pid).unwrap();
+    sqlx::query("SELECT pg_advisory_lock(14823,$1)")
+        .bind(pid)
+        .execute(&mut observer)
+        .await
+        .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let caller = store.clone();
+    let foreign = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            tokio::spawn(async move {
+                caller
+                    .execute_diagnostic_write_sql_for_test(&format!(
+                        "SELECT pg_advisory_xact_lock(14823,{pid})"
+                    ))
+                    .await
+            });
+            stopped.await.unwrap();
+        });
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT cardinality(pg_blocking_pids($1)) > 0")
+                .bind(pid)
+                .fetch_one(&mut observer)
+                .await
+                .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the foreign transaction holds the surviving checkout");
+    stop.send(()).unwrap();
+    foreign.await.unwrap();
+    sqlx::query("SELECT pg_advisory_unlock(14823,$1)")
+        .bind(pid)
+        .execute(&mut observer)
+        .await
+        .unwrap();
+    let replacement = store
+        .execute_diagnostic_read_sql_for_test(None, PID)
+        .await
+        .unwrap();
+    assert_ne!(
+        replacement, foreign_pid,
+        "a checkout interrupted during SQL must close"
+    );
+    runtime.shutdown().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let live: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid IN ($1,$2))",
+            )
+            .bind(pid)
+            .bind(i32::try_from(replacement).unwrap())
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+            if !live {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown closes the surviving pooled connection");
+    fixtures.drop_pg_schema(&schema).await;
+}

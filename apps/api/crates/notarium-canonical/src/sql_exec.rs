@@ -2,6 +2,7 @@ use notarium_core::error::PortError;
 use sqlx::{Connection, PgConnection, Postgres, Sqlite, SqliteConnection, Transaction};
 
 use crate::codec::{internal_not_committed, unknown_commit_outcome};
+use crate::dialect::postgres::StorePgConnection;
 
 pub enum BackendConn<'a> {
     Sqlite(&'a mut SqliteConnection),
@@ -9,14 +10,12 @@ pub enum BackendConn<'a> {
 }
 
 /// PostgreSQL may already have opened the transaction when its BEGIN future is dropped.
-pub(crate) struct PgTransactionLease<
-    C: std::borrow::BorrowMut<sqlx::pool::PoolConnection<Postgres>>,
-> {
+pub(crate) struct PgTransactionLease<C: std::borrow::BorrowMut<StorePgConnection>> {
     pooled: C,
     completed: bool,
 }
 
-impl<C: std::borrow::BorrowMut<sqlx::pool::PoolConnection<Postgres>>> PgTransactionLease<C> {
+impl<C: std::borrow::BorrowMut<StorePgConnection>> PgTransactionLease<C> {
     pub(crate) fn new(pooled: C) -> Self {
         Self {
             pooled,
@@ -33,9 +32,7 @@ impl<C: std::borrow::BorrowMut<sqlx::pool::PoolConnection<Postgres>>> PgTransact
     }
 }
 
-impl<C: std::borrow::BorrowMut<sqlx::pool::PoolConnection<Postgres>>> Drop
-    for PgTransactionLease<C>
-{
+impl<C: std::borrow::BorrowMut<StorePgConnection>> Drop for PgTransactionLease<C> {
     fn drop(&mut self) {
         if !self.completed {
             self.pooled.borrow_mut().close_on_drop();

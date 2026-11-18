@@ -859,6 +859,16 @@ pub(crate) async fn edit_note_impl(
                     if head.lifecycle != Lifecycle::Active {
                         return Err(DomainError::ResourceNotFound.into());
                     }
+                    let (facts, _) = build_resource_facts_tx(
+                        tx,
+                        &srec.space,
+                        &head.parent_folder_id,
+                        head.doc_class,
+                        head.ability_id.clone(),
+                        true,
+                    )
+                    .await?;
+                    auth_p1.authorize_direct_write(&facts, &facts)?;
                     if let Some(expected_rev) = &prec_p1.revision
                         && *expected_rev != head.head_rev_id
                     {
@@ -870,16 +880,6 @@ pub(crate) async fn edit_note_impl(
                     }
                     check_collab_preconditions_tx(tx, &scope_p1.space_id, &nid_p1, &prec_p1)
                         .await?;
-                    let (facts, _) = build_resource_facts_tx(
-                        tx,
-                        &srec.space,
-                        &head.parent_folder_id,
-                        head.doc_class,
-                        head.ability_id.clone(),
-                        true,
-                    )
-                    .await?;
-                    auth_p1.authorize_direct_write(&facts, &facts)?;
 
                     let base_digest = head.content_digest.ok_or_else(|| {
                         internal_not_committed(
@@ -1241,6 +1241,21 @@ pub(crate) fn build_carrier_replacement_intent(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
+                let head = load_note_head_row_tx(tx, &scope_cl.space_id, &note_id).await?;
+                if head.lifecycle != Lifecycle::Active {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                let (facts, anc) = build_resource_facts_tx(
+                    tx,
+                    &item_ctx.space,
+                    &head.parent_folder_id,
+                    head.doc_class,
+                    head.ability_id.clone(),
+                    true,
+                )
+                .await?;
+                auth.authorize_direct_write(&facts, &facts)?;
+
                 let room = prepare_carrier_room_tx(
                     tx,
                     item_ctx,
@@ -1250,10 +1265,6 @@ pub(crate) fn build_carrier_replacement_intent(
                     &note_id,
                 )
                 .await?;
-                let head = load_note_head_row_tx(tx, &scope_cl.space_id, &note_id).await?;
-                if head.lifecycle != Lifecycle::Active {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
                 if head.head_rev_id != expected_base_rev {
                     return Err(DomainError::RevisionConflict {
                         current: head.head_rev_id,
@@ -1272,17 +1283,6 @@ pub(crate) fn build_carrier_replacement_intent(
                 }
                 check_collab_preconditions_tx(tx, &scope_cl.space_id, &note_id, &preconditions)
                     .await?;
-
-                let (facts, anc) = build_resource_facts_tx(
-                    tx,
-                    &item_ctx.space,
-                    &head.parent_folder_id,
-                    head.doc_class,
-                    head.ability_id.clone(),
-                    true,
-                )
-                .await?;
-                auth.authorize_direct_write(&facts, &facts)?;
 
                 let (final_slug, final_slug_fold) = match &explicit_slug_override {
                     Some((s, sf)) => {
@@ -2989,6 +2989,17 @@ fn build_batch_edit_intent(
                 if head.lifecycle != Lifecycle::Active {
                     return Err(DomainError::ResourceNotFound.into());
                 }
+                let (facts, anc) = build_resource_facts_tx(
+                    tx,
+                    &live_space.space,
+                    &head.parent_folder_id,
+                    head.doc_class,
+                    head.ability_id.clone(),
+                    true,
+                )
+                .await?;
+                auth.authorize_direct_write(&facts, &facts)?;
+
                 if let Some(prec_rev) = &preconditions.revision
                     && *prec_rev != head.head_rev_id
                 {
@@ -3007,17 +3018,6 @@ fn build_batch_edit_intent(
                         std::time::Duration::from_millis(50),
                     ));
                 }
-
-                let (facts, anc) = build_resource_facts_tx(
-                    tx,
-                    &live_space.space,
-                    &head.parent_folder_id,
-                    head.doc_class,
-                    head.ability_id.clone(),
-                    true,
-                )
-                .await?;
-                auth.authorize_direct_write(&facts, &facts)?;
 
                 if head.content_digest != Some(expected_base_digest) {
                     return Err(DomainError::validation(ValidationReason::SourceMismatch).into());
@@ -5315,6 +5315,19 @@ pub(crate) async fn get_note_impl(
     let req_rev_opt = request.revision.clone();
     let causal = request.causal.clone();
 
+    let started = store.is_postgres().then(std::time::Instant::now);
+    let record_failure = |phase: &'static str, error: PortError| {
+        if let Some(started) = started
+            && matches!(error, PortError::DeadlineExceeded(_))
+        {
+            tracing::warn!(
+                phase,
+                elapsed_us = started.elapsed().as_micros() as u64,
+                "PostgreSQL note read reached its deadline"
+            );
+        }
+        error
+    };
     let store_in = store.clone();
     let (
         rev_id,
@@ -5340,7 +5353,15 @@ pub(crate) async fn get_note_impl(
                     CausalBasis::Exact(receipts) => {
                         let mut max_s = SpaceSeq::ZERO;
                         for r in receipts.for_scope(&scope)? {
-                            let _ = validate_snapshot_cutoff_tx(tx, &scope, Some(r.seq())).await?;
+                            match tx {
+                                BackendConn::Postgres(_) => {
+                                    // The Space scope and last_seq are already in this snapshot.
+                                    crate::runtime::require_command_end_tx(tx, &scope, r.seq()).await?;
+                                }
+                                BackendConn::Sqlite(_) => {
+                                    validate_snapshot_cutoff_tx(tx, &scope, Some(r.seq())).await?;
+                                }
+                            }
                             max_s = max_s.max(r.seq());
                         }
                         max_s
@@ -5404,7 +5425,7 @@ pub(crate) async fn get_note_impl(
                     .bind(req_note.as_str())
                     .fetch_optional(&mut **conn)
                     .await
-                    .map_err(|err| internal_not_committed("pg_get_note_rev", err.to_string()))?,
+                    .map_err(|err| crate::runtime::pg_read_error("pg_get_note_rev", err))?,
                 };
 
                 let Some((raw_meta, visibility_seq)) = revision else {
@@ -5472,16 +5493,19 @@ pub(crate) async fn get_note_impl(
                 ))
             })
         })
-        .await?;
+        .await.map_err(|err| record_failure("revision_and_authorization", err))?;
 
     let raw_bytes = match fast_local_read {
-        Some(plan) => plan.read_verified_async().await?,
-        None => store.read_verified_blob(ctx.scope(), digest).await?,
-    };
+        Some(plan) => plan.read_verified_async().await,
+        None => store.read_verified_blob(ctx.scope(), digest).await,
+    }
+    .map_err(|err| record_failure("blob", err))?;
     let content = String::from_utf8(raw_bytes)
         .map_err(|_| internal_not_committed("get_note_utf8", "note carrier is not valid UTF-8"))?;
 
-    let (current, live_lifecycle) = recheck_note_read(store, &ctx, &request.note, false).await?;
+    let (current, live_lifecycle) = recheck_note_read(store, &ctx, &request.note, false)
+        .await
+        .map_err(|err| record_failure("current_authorization", err))?;
     if request.revision.is_none() && current.class != live_facts.class {
         return Err(DomainError::ResourceNotFound.into());
     }

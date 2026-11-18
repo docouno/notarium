@@ -129,21 +129,38 @@ async fn held_redactions(
             .await
             .unwrap()
             .thread;
-        store
-            .redact_chat_entry(
-                ctx.clone(),
-                next_mutation(
-                    &scope,
-                    &actor,
-                    RedactChatEntry {
-                        thread: thread.clone(),
-                        entry,
-                        expected_thread_revision: head.revision,
-                    },
-                ),
-            )
+        let request = next_mutation(
+            &scope,
+            &actor,
+            RedactChatEntry {
+                thread: thread.clone(),
+                entry,
+                expected_thread_revision: head.revision,
+            },
+        );
+        let committed = store
+            .redact_chat_entry(ctx.clone(), request.clone())
             .await
             .unwrap();
+        if entry == leaves[2] {
+            // Retry the command and the same granted epoch while physical work is held.
+            for _ in 0..4 {
+                let replay = store
+                    .redact_chat_entry(ctx.clone(), request.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(replay.receipt, committed.receipt);
+                store
+                    .advance_space_lease(
+                        &support::maintenance_ctx(ServicePurpose::Revocation),
+                        &scope,
+                        LeaseEpoch::new(1).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(store.active_retirement_workers_for_test(), 1);
+            }
+        }
         if entry == leaves[1] {
             assert_eq!(
                 store.read_verified_blob(&scope, digest).await.unwrap(),
@@ -300,6 +317,93 @@ async fn redaction_with_backup_hold_preserves_shared_owners_and_reclaims_after_r
             fixtures.drop_pg_schema(&schema).await;
         }
     }
+}
+
+#[tokio::test]
+async fn committed_redaction_and_replay_return_while_local_stager_holds_bytes() {
+    let root = TempDataRoot::new("redaction-live-stager");
+    let cfg = CanonicalConfig::local_default(sample_installation_id(0xe1), root.data_root());
+    let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+    let (scope, actor, thread) = create_thread(&store, 0xe1).await;
+    let ctx = owner_ctx(&scope, actor.clone());
+    let text = "local stage keeps this digest pinned ".repeat(24);
+    let prepared = store.prepare_blob(text.as_bytes()).unwrap();
+    let staged = store.stage_chat_blob(ctx.clone(), &text).await.unwrap();
+    let appended = store
+        .append_chat(
+            ctx.clone(),
+            next_mutation(
+                &scope,
+                &actor,
+                AppendChat {
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Staged(staged),
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let read = ChatRead {
+        thread: thread.clone(),
+        leaf: appended.value.seq,
+        before: None,
+        max_entries: PageLimit::new(1).unwrap(),
+    };
+    let before = store.read_chat(ctx.clone(), read.clone()).await.unwrap();
+    let pin = store
+        .stage_blob(&scope, LeaseEpoch::new(1).unwrap(), &prepared)
+        .await
+        .unwrap();
+    let request = next_mutation(
+        &scope,
+        &actor,
+        RedactChatEntry {
+            thread,
+            entry: appended.value.seq,
+            expected_thread_revision: before.thread.revision,
+        },
+    );
+    let mut caller = ctx.clone();
+    caller.budget.remaining = Duration::from_millis(500);
+    let committed = tokio::time::timeout(
+        caller.budget.remaining,
+        store.redact_chat_entry(caller.clone(), request.clone()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let replay = tokio::time::timeout(
+        caller.budget.remaining,
+        store.redact_chat_entry(caller, request),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(committed.receipt, replay.receipt);
+    assert_eq!(pending(&store).await, 1);
+    assert_eq!(store.active_retirement_workers_for_test(), 1);
+    assert!(
+        root.data_root()
+            .blob(&scope.space_id, prepared.digest())
+            .is_file()
+    );
+    assert_eq!(
+        store.read_chat(ctx, read).await.unwrap().entries[0].body,
+        ChatBody::Redacted
+    );
+    drop(pin);
+    wait_for_cleanup(&store).await;
+    assert!(
+        !root
+            .data_root()
+            .blob(&scope.space_id, prepared.digest())
+            .exists()
+    );
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]

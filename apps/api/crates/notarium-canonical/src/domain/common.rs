@@ -531,7 +531,7 @@ pub(crate) async fn load_note_head_row_opt_tx(
             .bind(note_id.as_str())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_note_head", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_note_head", err))?;
             row.map(|r| {
                 (
                     r.get("parent_folder_id"),

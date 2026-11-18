@@ -4,6 +4,8 @@
 mod applied;
 #[path = "l6_board_pma_and_rollback/pg_deadline.rs"]
 mod pg_deadline;
+#[path = "l6_board_pma_and_rollback/rollback_deadline.rs"]
+mod rollback_deadline;
 mod support;
 
 use std::{
@@ -834,6 +836,52 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
         .await
         .expect("cross-column move_board_card");
     assert_eq!(cross_col.value.group, doing_grp);
+
+    let placement = |before, after| {
+        next_mutation(
+            &scope,
+            &owner,
+            MoveBoardCard {
+                view: view.clone(),
+                note: card_1.clone(),
+                group: todo_grp.clone(),
+                before,
+                after,
+                fields: BTreeMap::new(),
+                expected_note: revs[&card_1].clone(),
+                expected_view: view_created.value.revision.clone(),
+                expected_rank: RankExpectation::Existing(overlays[&card_1].rank_rev_id.clone()),
+            },
+        )
+    };
+    let member = RankNeighbor {
+        note: card_2.clone(),
+        expected_rank: RankExpectation::Absent,
+    };
+    let former_member = RankNeighbor {
+        note: card_3.clone(),
+        expected_rank: RankExpectation::Absent,
+    };
+    assert!(matches!(
+        store
+            .move_board_card(ctx.clone(), placement(Some(member.clone()), None))
+            .await,
+        Err(PortError::Domain(DomainError::RevisionConflict { current, .. }))
+            if current == overlays[&card_2].rank_rev_id
+    ));
+    for (before, after) in [
+        (Some(former_member.clone()), None),
+        (Some(member), Some(former_member)),
+    ] {
+        let result = store
+            .move_board_card(ctx.clone(), placement(before, after))
+            .await;
+        assert_validation_err(&result, ValidationReason::InvalidState);
+    }
+    assert_eq!(
+        store.read_space(&scope.space_id).await.unwrap().last_seq,
+        cross_col.receipt.seq()
+    );
     let snap_card_3 = store
         .get_note(
             ctx.clone(),

@@ -1130,7 +1130,14 @@ impl CanonicalStore {
 
                     // If any note that existed at or before `valid_cutoff` was purged AFTER `valid_cutoff`,
                     // this seed cursor/cut is stale regardless of retention!
-                    if has_post_cutoff_purge_of_prior_note_tx(tx, &scope_in, valid_cutoff).await? {
+                    if has_post_cutoff_purge_of_prior_note_tx(
+                        tx,
+                        &scope_in,
+                        valid_cutoff,
+                        space_rec.last_seq,
+                    )
+                    .await?
+                    {
                         return Err(DomainError::validation(ValidationReason::CursorStale).into());
                     }
 
@@ -1482,7 +1489,14 @@ impl CanonicalStore {
                 {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                if has_post_cutoff_purge_of_prior_note_tx(tx, &cutoff.scope, cutoff.after).await? {
+                if has_post_cutoff_purge_of_prior_note_tx(
+                    tx,
+                    &cutoff.scope,
+                    cutoff.after,
+                    space.last_seq,
+                )
+                .await?
+                {
                     return Err(DomainError::validation(ValidationReason::CursorStale).into());
                 }
                 let mut current = crate::domain::common::FolderAncestryCache::default();
@@ -1868,50 +1882,37 @@ async fn has_post_cutoff_purge_of_prior_note_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     valid_cutoff: SpaceSeq,
+    snapshot_head: SpaceSeq,
 ) -> Result<bool, PortError> {
-    let cut_i64 = valid_cutoff.get() as i64;
-    let found: Option<i64> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT 1 FROM revision_purge_fences f
-             WHERE f.space_id = ? AND f.history_incarnation = ? AND f.purge_seq > ?
-               AND EXISTS (
-                   SELECT 1 FROM change_log cl
-                   WHERE cl.space_id = f.space_id
-                     AND cl.history_incarnation = f.history_incarnation
-                     AND cl.entity_type = 'note'
-                     AND cl.entity_id = f.note_id
-                     AND cl.space_seq <= ?
-               )
-             LIMIT 1",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(cut_i64)
-        .bind(cut_i64)
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_check_post_cutoff_purge", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT 1::BIGINT FROM revision_purge_fences f
-             WHERE f.space_id = $1 AND f.history_incarnation = $2 AND f.purge_seq > $3
-               AND EXISTS (
-                   SELECT 1 FROM change_log cl
-                   WHERE cl.space_id = f.space_id
-                     AND cl.history_incarnation = f.history_incarnation
-                     AND cl.entity_type = 'note'
-                     AND cl.entity_id = f.note_id
-                     AND cl.space_seq <= $3
-               )
-             LIMIT 1",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(cut_i64)
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_check_post_cutoff_purge", err.to_string()))?,
-    };
-    Ok(found.is_some())
+    if valid_cutoff == snapshot_head {
+        return Ok(false);
+    }
+    // Even a purged identity retains its head and original creation sequence.
+    const STALE: &str = "SELECT EXISTS (
+        SELECT 1 FROM revision_purge_fences f
+        WHERE f.space_id = $1 AND f.history_incarnation = $2 AND f.purge_seq > $3
+          AND (SELECT n.created_seq FROM note_heads n
+               WHERE n.space_id = f.space_id AND n.note_id = f.note_id) <= $3
+    )";
+    let cut = valid_cutoff.get() as i64;
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(STALE)
+            .bind(scope.space_id.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(cut)
+            .fetch_one(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_check_post_cutoff_purge", err.to_string())
+            }),
+        BackendConn::Postgres(conn) => sqlx::query_scalar(STALE)
+            .bind(scope.space_id.as_str())
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(cut)
+            .fetch_one(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_check_post_cutoff_purge", err.to_string())),
+    }
 }
 
 async fn list_note_keys_at_or_below_cutoff_tx(
@@ -1921,7 +1922,31 @@ async fn list_note_keys_at_or_below_cutoff_tx(
     after_key: Option<&str>,
     limit: i64,
 ) -> Result<Vec<String>, PortError> {
-    list_entity_keys_at_or_below_cutoff_tx(tx, scope, "note", cutoff, after_key, limit).await
+    // The enclosing snapshot has checked the space incarnation. Head identity and
+    // creation sequence survive edits, trash and purge; revisions supply the state at the cut.
+    const PAGE: &str = "SELECT note_id FROM note_heads
+        WHERE space_id = $1 AND note_id > $2 AND created_seq <= $3
+        ORDER BY note_id LIMIT $4";
+    let after = after_key.unwrap_or(""); // All NoteIds are nonempty.
+    let cut = cutoff.get() as i64;
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(PAGE)
+            .bind(scope.space_id.as_str())
+            .bind(after)
+            .bind(cut)
+            .bind(limit)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_seed_note_keys", err.to_string())),
+        BackendConn::Postgres(conn) => sqlx::query_scalar(PAGE)
+            .bind(scope.space_id.as_str())
+            .bind(after)
+            .bind(cut)
+            .bind(limit)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_seed_note_keys", err.to_string())),
+    }
 }
 
 async fn list_thread_keys_at_or_below_cutoff_tx(
@@ -1931,80 +1956,29 @@ async fn list_thread_keys_at_or_below_cutoff_tx(
     after_key: Option<&str>,
     limit: i64,
 ) -> Result<Vec<String>, PortError> {
-    list_entity_keys_at_or_below_cutoff_tx(tx, scope, "thread", cutoff, after_key, limit).await
-}
-
-async fn list_entity_keys_at_or_below_cutoff_tx(
-    tx: &mut BackendConn<'_>,
-    scope: &HistoryScope,
-    entity_type: &str,
-    cutoff: SpaceSeq,
-    after_key: Option<&str>,
-    limit: i64,
-) -> Result<Vec<String>, PortError> {
-    let cut_i64 = cutoff.get() as i64;
-    match (tx, after_key) {
-        (BackendConn::Sqlite(conn), None) => sqlx::query_scalar(
-            "SELECT DISTINCT entity_id FROM change_log
-             WHERE space_id = ? AND history_incarnation = ?
-               AND entity_type = ? AND space_seq <= ?
-             ORDER BY entity_id ASC
-             LIMIT ?",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(entity_type)
-        .bind(cut_i64)
-        .bind(limit)
-        .fetch_all(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_seed_entity_keys", err.to_string())),
-        (BackendConn::Sqlite(conn), Some(after)) => sqlx::query_scalar(
-            "SELECT DISTINCT entity_id FROM change_log
-             WHERE space_id = ? AND history_incarnation = ?
-               AND entity_type = ? AND space_seq <= ? AND entity_id > ?
-             ORDER BY entity_id ASC
-             LIMIT ?",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(entity_type)
-        .bind(cut_i64)
-        .bind(after)
-        .bind(limit)
-        .fetch_all(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_seed_entity_keys_after", err.to_string())),
-        (BackendConn::Postgres(conn), None) => sqlx::query_scalar(
-            "SELECT DISTINCT entity_id FROM change_log
-             WHERE space_id = $1 AND history_incarnation = $2
-               AND entity_type = $3 AND space_seq <= $4
-             ORDER BY entity_id ASC
-             LIMIT $5",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(entity_type)
-        .bind(cut_i64)
-        .bind(limit)
-        .fetch_all(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_seed_entity_keys", err.to_string())),
-        (BackendConn::Postgres(conn), Some(after)) => sqlx::query_scalar(
-            "SELECT DISTINCT entity_id FROM change_log
-             WHERE space_id = $1 AND history_incarnation = $2
-               AND entity_type = $3 AND space_seq <= $4 AND entity_id > $5
-             ORDER BY entity_id ASC
-             LIMIT $6",
-        )
-        .bind(scope.space_id.as_str())
-        .bind(scope.incarnation.as_bytes().as_slice())
-        .bind(entity_type)
-        .bind(cut_i64)
-        .bind(after)
-        .bind(limit)
-        .fetch_all(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_seed_entity_keys_after", err.to_string())),
+    const PAGE: &str = "SELECT thread_id FROM chat_threads
+        WHERE space_id = $1 AND thread_id > $2 AND created_seq <= $3 AND history_incarnation = $4
+        ORDER BY thread_id LIMIT $5";
+    let after = after_key.unwrap_or(""); // All ChatThreadIds are nonempty.
+    let cut = cutoff.get() as i64;
+    match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(PAGE)
+            .bind(scope.space_id.as_str())
+            .bind(after)
+            .bind(cut)
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(limit)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_seed_thread_keys", err.to_string())),
+        BackendConn::Postgres(conn) => sqlx::query_scalar(PAGE)
+            .bind(scope.space_id.as_str())
+            .bind(after)
+            .bind(cut)
+            .bind(scope.incarnation.as_bytes().as_slice())
+            .bind(limit)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("pg_seed_thread_keys", err.to_string())),
     }
 }

@@ -629,7 +629,7 @@ impl WriteCoordinator {
         budget: &CallBudget,
         intent: PreparedWriteIntent,
     ) -> Result<Vec<u8>, PortError> {
-        self.submit_raw_opt_fast(inner, budget, intent, None, None, None)
+        self.submit_raw_opt_fast(inner, budget, None, intent, None, None, None)
             .await
     }
 
@@ -637,6 +637,7 @@ impl WriteCoordinator {
         &self,
         inner: &Arc<CanonicalInner>,
         budget: &CallBudget,
+        caller_deadline: Option<tokio::time::Instant>,
         intent: PreparedWriteIntent,
         sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         pg_fast_plan: Option<PgSingleItemFastFn>,
@@ -647,8 +648,16 @@ impl WriteCoordinator {
             Some(g) => g,
             None => self.enter_write_op(&intent.scope.space_id, 1),
         };
+        let deadline =
+            caller_deadline.unwrap_or_else(|| tokio::time::Instant::now() + budget.remaining);
         let (permit, reserved_bytes) = self
-            .reserve_entry(inner, &intent.scope.space_id, budget, intent.staged_bytes)
+            .reserve_entry(
+                inner,
+                &intent.scope.space_id,
+                budget,
+                deadline,
+                intent.staged_bytes,
+            )
             .await?;
         let is_idempotent = intent.idempotency.is_some();
 
@@ -662,18 +671,29 @@ impl WriteCoordinator {
             reply_tx,
         });
 
-        match reply_rx.await {
-            Ok(outcome) => outcome,
-            Err(_) => {
+        let reply = if let Some(deadline) = caller_deadline {
+            // The worker owns an admitted command even when the caller stops waiting for its ACK.
+            tokio::select! {
+                biased;
+                result = reply_rx => result.ok(),
+                _ = budget.cancellation.cancelled() => None,
+                _ = tokio::time::sleep_until(deadline) => None,
+            }
+        } else {
+            reply_rx.await.ok()
+        };
+        match reply {
+            Some(outcome) => outcome,
+            None => {
                 if is_idempotent {
                     Err(unknown_commit_outcome(
                         "writer_worker_dropped_reply",
-                        "batch worker dropped reply channel after admission",
+                        "batch writer reply unavailable after admission",
                     ))
                 } else {
                     Err(unknown_commit_non_idempotent(
                         "writer_worker_dropped_reply",
-                        "batch worker dropped reply channel after admission",
+                        "batch writer reply unavailable after admission",
                     ))
                 }
             }
@@ -697,7 +717,13 @@ impl WriteCoordinator {
             .iter()
             .fold(0u64, |sum, item| sum.saturating_add(item.staged_bytes));
         let (permit, reserved_bytes) = self
-            .reserve_entry(inner, space_id, budget, total_staged)
+            .reserve_entry(
+                inner,
+                space_id,
+                budget,
+                tokio::time::Instant::now() + budget.remaining,
+                total_staged,
+            )
             .await?;
         let all_idempotent = intents.iter().all(|i| i.idempotency.is_some());
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -731,6 +757,7 @@ impl WriteCoordinator {
         inner: &Arc<CanonicalInner>,
         space: &SpaceId,
         budget: &CallBudget,
+        deadline: tokio::time::Instant,
         bytes: u64,
     ) -> Result<(mpsc::OwnedPermit<QueuedWriteEntry>, StagedByteReservation), PortError> {
         if !self.accepting.load(Ordering::Acquire) || inner.shutting_down.load(Ordering::Acquire) {
@@ -740,7 +767,6 @@ impl WriteCoordinator {
                 Duration::from_millis(100),
             ));
         }
-        let deadline = tokio::time::Instant::now() + budget.remaining;
         let bytes = self.byte_limiter.acquire(bytes, budget, deadline).await?;
         let sender = self.sender_for_space(inner, space)?;
         let closed = || {
@@ -916,6 +942,7 @@ impl crate::CanonicalStore {
             .submit_raw_opt_fast(
                 &self.inner,
                 budget,
+                None,
                 intent,
                 sqlite_fast_plan,
                 None,
@@ -926,29 +953,38 @@ impl crate::CanonicalStore {
             .map_err(|err| internal_not_committed("decode_writer_command_outcome", err.to_string()))
     }
 
-    pub(crate) async fn submit_write_command_tracked_pg<R>(
+    pub(crate) async fn submit_write_command_until<R>(
         &self,
         budget: &CallBudget,
+        deadline: tokio::time::Instant,
         intent: PreparedWriteIntent,
+        sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         pg_fast_plan: Option<PgSingleItemFastFn>,
-        pretracked_guard: ActiveWriteOpGuard,
+        pretracked_guard: Option<ActiveWriteOpGuard>,
     ) -> Result<R, PortError>
     where
         R: Serialize + DeserializeOwned + Send + 'static,
     {
+        let is_idempotent = intent.idempotency.is_some();
         let writer = self.inner.writer()?;
         let raw_bytes = writer
             .submit_raw_opt_fast(
                 &self.inner,
                 budget,
+                Some(deadline),
                 intent,
-                None,
+                sqlite_fast_plan,
                 pg_fast_plan,
-                Some(pretracked_guard),
+                pretracked_guard,
             )
             .await?;
-        rmp_serde::from_slice(&raw_bytes)
-            .map_err(|err| internal_not_committed("decode_writer_command_outcome", err.to_string()))
+        rmp_serde::from_slice(&raw_bytes).map_err(|err| {
+            if is_idempotent {
+                unknown_commit_outcome("decode_writer_command_outcome", err.to_string())
+            } else {
+                unknown_commit_non_idempotent("decode_writer_command_outcome", err.to_string())
+            }
+        })
     }
 
     /// Submits an ordered group of item intents for a single Space (`AcceptBatch` / `LinkMany`)
@@ -1057,7 +1093,7 @@ async fn run_batch_worker_loop(
 ) {
     let max_items = cfg.max_batch_items.max(1);
     let flush_window = cfg.batch_flush_window;
-    let mut cached_pg_conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>> = None;
+    let mut cached_pg_conn: Option<crate::dialect::postgres::StorePgConnection> = None;
 
     loop {
         let next = if let Some((id, registry)) = &pg_space {
@@ -1230,7 +1266,7 @@ async fn flush_single_batch(
     batch: Vec<QueuedWriteEntry>,
     cfg: WriterConfig,
     faults: &WriterFaultState,
-    cached_pg_conn: &mut Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    cached_pg_conn: &mut Option<crate::dialect::postgres::StorePgConnection>,
 ) {
     let store = crate::CanonicalStore {
         inner: Arc::clone(inner),

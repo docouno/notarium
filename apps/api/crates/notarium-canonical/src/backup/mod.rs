@@ -1290,7 +1290,10 @@ async fn open_backup_connection(store: &CanonicalStore) -> Result<PgConnection, 
         return Err(DomainError::validation(ValidationReason::InvalidState).into());
     };
     let options = crate::dialect::postgres::build_pg_connect_options(connect);
-    let mut conn = PgConnection::connect_with(&options)
+    let mut conn =
+        crate::dialect::postgres::on_store_executor(&store.inner.backup_executor, async move {
+            PgConnection::connect_with(&options).await
+        })
         .await
         .map_err(|err| internal_not_committed("pg_backup_connect", err.to_string()))?;
     sqlx::query("SELECT set_config('search_path', quote_ident($1), false)")

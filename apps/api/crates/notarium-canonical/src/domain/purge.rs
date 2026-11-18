@@ -231,19 +231,20 @@ impl CanonicalStore {
                 return Ok(());
             }
             for id in ids {
-                let mut backoff = Duration::from_millis(50);
+                let mut attempts = self.schedule_retirements(scope, epoch, vec![id.clone()]);
+                let attempt = &mut attempts[0];
                 loop {
-                    match self.drive_retirement_to_completion(scope, epoch, &id).await {
+                    match crate::blobs::retirement_worker::outcome(attempt).await {
                         Ok(()) => break,
                         Err(error @ PortError::Domain(_)) => return Err(error),
-                        Err(error) if error == crate::blobs::held_retirement() => {
-                            self.schedule_retirements(scope.clone(), epoch, vec![id.clone()], None);
-                            break;
-                        }
+                        Err(error) if error == crate::blobs::held_retirement() => break,
                         Err(error) if !restored_gc => return Err(error),
-                        Err(_) => tokio::time::sleep(backoff).await,
+                        Err(error) => {
+                            if attempt.changed().await.is_err() {
+                                return Err(error);
+                            }
+                        }
                     }
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
                 }
                 after = id;
             }

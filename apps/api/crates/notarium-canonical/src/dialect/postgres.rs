@@ -38,12 +38,102 @@ pub fn build_pg_connect_options(cfg: &PgConnectConfig) -> PgConnectOptions {
         .database(&cfg.database)
 }
 
-pub async fn open_and_bootstrap_postgres(
+/// SQLx binds a new socket to the runtime polling pool checkout. A store may be
+/// called from short-lived runtimes and keep the connection for later requests.
+pub(crate) struct StorePgPool {
+    pool: PgPool,
+    executor: tokio::runtime::Handle,
+}
+
+impl StorePgPool {
+    pub(crate) fn acquire_timeout(&self) -> std::time::Duration {
+        self.pool.options().get_acquire_timeout()
+    }
+
+    pub(crate) async fn acquire(&self) -> Result<StorePgConnection, sqlx::Error> {
+        if tokio::runtime::Handle::current().id() == self.executor.id() {
+            return Ok(StorePgConnection {
+                connection: Some(self.pool.acquire().await?),
+                executor: self.executor.clone(),
+            });
+        }
+        // Keep the cross-runtime task out of the ordinary checkout future. The
+        // latter is embedded in shared SQLite/PostgreSQL operations.
+        let pool = self.pool.clone();
+        let executor = self.executor.clone();
+        Box::pin(on_store_executor(&self.executor, async move {
+            Ok(StorePgConnection {
+                connection: Some(pool.acquire().await?),
+                executor,
+            })
+        }))
+        .await
+    }
+
+    pub(crate) async fn close(&self) {
+        self.pool.close().await;
+    }
+}
+
+pub(crate) async fn on_store_executor<T: Send + 'static>(
+    executor: &tokio::runtime::Handle,
+    operation: impl Future<Output = Result<T, sqlx::Error>> + Send + 'static,
+) -> Result<T, sqlx::Error> {
+    if tokio::runtime::Handle::current().id() == executor.id() {
+        return operation.await;
+    }
+
+    // Dropping the caller aborts any checkout still queued on the store.
+    let mut task = tokio::task::JoinSet::new();
+    task.spawn_on(operation, executor);
+    task.join_next()
+        .await
+        .expect("one PostgreSQL checkout task")
+        .map_err(|e| sqlx::Error::Io(std::io::Error::other(e)))?
+}
+
+pub(crate) struct StorePgConnection {
+    connection: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    executor: tokio::runtime::Handle,
+}
+
+impl StorePgConnection {
+    pub(crate) fn close_on_drop(&mut self) {
+        self.connection
+            .as_mut()
+            .expect("checked out connection")
+            .close_on_drop();
+    }
+}
+
+impl std::ops::Deref for StorePgConnection {
+    type Target = PgConnection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection.as_ref().expect("checked out connection")
+    }
+}
+
+impl std::ops::DerefMut for StorePgConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.connection.as_mut().expect("checked out connection")
+    }
+}
+
+impl Drop for StorePgConnection {
+    fn drop(&mut self) {
+        // PoolConnection::drop schedules return or close on the current executor.
+        let _owner = self.executor.enter();
+        drop(self.connection.take());
+    }
+}
+
+pub(crate) async fn open_and_bootstrap_postgres(
     connect: &PgConnectConfig,
     schema: &str,
     installation_id: &InstallationId,
     pool_size: u32,
-) -> Result<(PgPool, DatabaseWitness, String), PortError> {
+) -> Result<(StorePgPool, DatabaseWitness, String), PortError> {
     let validated_schema = validate_pg_schema_name(schema)?.to_owned();
     let options = build_pg_connect_options(connect);
 
@@ -96,5 +186,9 @@ pub async fn open_and_bootstrap_postgres(
         .await
         .map_err(|err| internal_not_committed("pg_pool_connect", err.to_string()))?;
 
+    let pool = StorePgPool {
+        pool,
+        executor: tokio::runtime::Handle::current(),
+    };
     Ok((pool, witness, validated_schema))
 }

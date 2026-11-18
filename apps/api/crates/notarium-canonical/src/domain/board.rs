@@ -7,9 +7,9 @@ use notarium_core::{
     ids::{AgentRunId, ContentDigest, NoteId, PrincipalId, RevisionId, SpaceId, SpaceSeq},
     model::{HistoryScope, Lifecycle},
     ports::{
-        BoardMoveResult, Committed, GroupKey, InterceptedMutation, InterceptedPayload,
-        InterceptionResult, MoveBoardCard, Mutation, NoteRevision, RankExpectation,
-        SemanticPlacement, SpaceContext, ViewRef,
+        BoardMoveFacts, BoardMoveResult, Committed, EvaluatedBoardRow, GroupKey,
+        InterceptedMutation, InterceptedPayload, InterceptionResult, MoveBoardCard, Mutation,
+        NoteRevision, RankExpectation, SemanticPlacement, SpaceContext, ViewRef,
     },
     receipt::MutationReceiptToken,
     value::Timestamp,
@@ -762,6 +762,24 @@ pub(crate) fn verify_rank_expectation(
     }
 }
 
+fn destination_group_rows<'a>(
+    facts: &'a BoardMoveFacts,
+    input: &MoveBoardCard,
+) -> Result<&'a [EvaluatedBoardRow], DomainError> {
+    let rows = facts
+        .groups()
+        .iter()
+        .find(|g| g.group == input.group)
+        .map(|g| g.rows.as_slice())
+        .unwrap_or_default();
+    for neighbor in input.before.iter().chain(&input.after) {
+        if !rows.iter().any(|row| row.note == neighbor.note) {
+            return Err(DomainError::validation(ValidationReason::InvalidState));
+        }
+    }
+    Ok(rows)
+}
+
 pub(crate) async fn move_board_card_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
@@ -880,6 +898,7 @@ pub(crate) async fn move_board_card_impl(
         // or staging closed-room CAS blobs.
         let mut reservation_opt = None;
         if let Some(interceptor) = store.inner.collab_interceptor.get() {
+            destination_group_rows(&facts, &request.input)?;
             match interceptor
                 .intercept(InterceptedMutation {
                     context: ctx.clone(),
@@ -987,7 +1006,6 @@ pub(crate) async fn move_board_card_impl(
             .unwrap_or(0);
 
         let scope_cl = space_rec.scope.clone();
-        let space_obj = space_rec.space.clone();
         let auth = ctx.auth().clone();
         let req_id = request.identity.clone();
         let req_prec = request.preconditions.clone();
@@ -1005,6 +1023,26 @@ pub(crate) async fn move_board_card_impl(
             required_semantic_cut: Some((facts.cutoff(), SemanticCutMismatchKind::CursorStale)),
             execute: Box::new(move |tx, item_ctx| {
                 Box::pin(async move {
+                    // Re-verify target note, view note, auth, and Space schema under writer lock.
+                    let head = load_note_head_row_tx(tx, &scope_cl.space_id, &input.note).await?;
+                    if head.lifecycle != Lifecycle::Active {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let (rfacts, anc) = build_resource_facts_tx(
+                        tx,
+                        &item_ctx.space,
+                        &head.parent_folder_id,
+                        head.doc_class,
+                        head.ability_id.clone(),
+                        true,
+                    )
+                    .await?;
+                    auth.authorize_direct_write(&rfacts, &rfacts)?;
+                    let view_head =
+                        authorized_view_head(tx, &item_ctx.space, &auth, &input.view.note).await?;
+                    let eval_group_rows = destination_group_rows(&facts_cl, &input)?;
+                    check_collab_preconditions_tx(tx, &scope_cl.space_id, &input.note, &req_prec)
+                        .await?;
                     match reservation_opt {
                         Some(res) => {
                             let g = room_fences
@@ -1031,26 +1069,6 @@ pub(crate) async fn move_board_card_impl(
                         }
                     }
 
-                    // Re-verify target note, view note, auth, and Space schema under writer lock.
-                    let head = load_note_head_row_tx(tx, &scope_cl.space_id, &input.note).await?;
-                    if head.lifecycle != Lifecycle::Active {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
-                    let (rfacts, anc) = build_resource_facts_tx(
-                        tx,
-                        &space_obj,
-                        &head.parent_folder_id,
-                        head.doc_class,
-                        head.ability_id.clone(),
-                        true,
-                    )
-                    .await?;
-                    auth.authorize_direct_write(&rfacts, &rfacts)?;
-                    check_collab_preconditions_tx(tx, &scope_cl.space_id, &input.note, &req_prec)
-                        .await?;
-
-                    let view_head =
-                        authorized_view_head(tx, &space_obj, &auth, &input.view.note).await?;
                     if head.head_rev_id != input.expected_note {
                         return Err(DomainError::RevisionConflict {
                             current: head.head_rev_id,
@@ -1087,28 +1105,13 @@ pub(crate) async fn move_board_card_impl(
                         overlays.get(&input.note),
                         &head.head_rev_id,
                     )?;
-                    if let Some(ref b) = input.before {
+                    for neighbor in input.before.iter().chain(&input.after) {
                         verify_rank_expectation(
-                            &b.expected_rank,
-                            overlays.get(&b.note),
+                            &neighbor.expected_rank,
+                            overlays.get(&neighbor.note),
                             &view_head.head_rev_id,
                         )?;
                     }
-                    if let Some(ref a) = input.after {
-                        verify_rank_expectation(
-                            &a.expected_rank,
-                            overlays.get(&a.note),
-                            &view_head.head_rev_id,
-                        )?;
-                    }
-
-                    // Locate target group in planner's pre-move `facts.groups()` (may be newly created if empty!).
-                    let eval_group_rows = facts_cl
-                        .groups()
-                        .iter()
-                        .find(|g| g.group == input.group)
-                        .map(|g| g.rows.as_slice())
-                        .unwrap_or(&[]);
 
                     // Verify every row in `eval_group_rows` still matches its `expected_note` & `expected_rank`.
                     let mut verified_neighbors = HashMap::with_capacity(eval_group_rows.len());

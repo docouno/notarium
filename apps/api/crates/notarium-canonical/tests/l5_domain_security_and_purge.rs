@@ -1839,11 +1839,56 @@ async fn run_domain_and_security_suite(
         Err(PortError::Domain(DomainError::SpaceReadOnly))
     ));
 
+    let stale_edit = next_mutation_rev(
+        &scope,
+        &owner,
+        original.value.revision.clone(),
+        EditNote {
+            note: replay_note.clone(),
+            plan: extract::finalize_document(
+                &create_again.input.carrier,
+                DocClass::UserDoc,
+                &replay_note,
+                &[],
+            )
+            .unwrap(),
+        },
+    );
+    assert!(matches!(
+        store.edit_note(ctx.clone(), stale_edit.clone()).await,
+        Err(PortError::Domain(DomainError::RevisionConflict { current, .. }))
+            if current == renamed.value.revision
+    ));
+
     // Folder write lock blocks descendant writes until unlocked!
     store
         .set_folder_write_lock(ctx.clone(), proj_a.clone(), true)
         .await
         .expect("lock proj_a");
+    let locked_cut = store.read_space(&scope.space_id).await.unwrap().last_seq;
+    assert!(matches!(
+        store.edit_note(ctx.clone(), stale_edit.clone()).await,
+        Err(PortError::Domain(DomainError::SpaceReadOnly))
+    ));
+    let batch = store
+        .accept_batch(
+            ctx.clone(),
+            AcceptBatch {
+                items: vec![next_mutation_rev(
+                    &scope,
+                    &owner,
+                    original.value.revision.clone(),
+                    BatchItem::Edit(stale_edit.input),
+                )],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        batch.items.as_slice(),
+        [Err(DomainError::SpaceReadOnly)]
+    ));
+    assert_eq!(batch.committed_high_watermark, locked_cut);
     assert!(matches!(
         store.create_note(ctx.clone(), create_again).await,
         Err(PortError::Domain(DomainError::SpaceReadOnly))

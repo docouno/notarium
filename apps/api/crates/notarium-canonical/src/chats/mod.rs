@@ -361,7 +361,16 @@ impl StoredCommittedRedactedChatV1 {
 impl ChatPort for CanonicalStore {
     fn read_chat(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatBranch> {
         let store = self.clone();
-        Box::pin(async move { read_chat_impl(&store, ctx, request).await })
+        Box::pin(async move {
+            if store.is_postgres() {
+                return Self::run_pg_read_request(
+                    ctx.budget.clone(),
+                    read_chat_impl(&store, ctx, request),
+                )
+                .await;
+            }
+            read_chat_impl(&store, ctx, request).await
+        })
     }
 
     fn create_chat(
@@ -1556,7 +1565,7 @@ async fn read_chat_pg_single_query(
     .bind(scan_limit)
     .fetch_all(&mut *conn)
     .await
-    .map_err(|err| internal_not_committed("pg_read_chat_single", err.to_string()))?;
+    .map_err(|err| crate::runtime::pg_read_error("pg_read_chat_single", err))?;
 
     if rows.is_empty() {
         return Err(DomainError::ResourceNotFound.into());
@@ -4030,11 +4039,30 @@ async fn consume_chat_input_impl(
     Ok(stored.into_committed())
 }
 
+/// Give a healthy store a short opportunity to reclaim bytes inline. Once the
+/// receipt is committed, a slow backend or a competing local guard is GC's concern.
+async fn wait_for_redaction_gc(
+    budget: &notarium_core::ports::CallBudget,
+    started: tokio::time::Instant,
+    gc: impl std::future::Future,
+) {
+    let remaining = budget.remaining.saturating_sub(started.elapsed());
+    let grace = remaining.min(std::time::Duration::from_millis(50));
+    if !grace.is_zero() {
+        tokio::select! {
+            biased;
+            () = budget.cancellation.cancelled() => {},
+            _ = tokio::time::timeout(grace, gc) => {},
+        }
+    }
+}
+
 async fn redact_chat_entry_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
     request: Mutation<RedactChatEntry>,
 ) -> Result<Committed<RedactedChat>, PortError> {
+    let started = tokio::time::Instant::now();
     validate_mutation_identity(&ctx, &request.identity)?;
     let space_rec = store
         .read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
@@ -4060,15 +4088,20 @@ async fn redact_chat_entry_impl(
     {
         let (committed, zero_refs) = replayed.into_committed();
         if !zero_refs.is_empty() {
-            let _ = store
-                .retire_zero_ref_digests(
+            // A receipt from an older writer can refer to bytes released before
+            // it gained transactional GC. Reconciliation on open/lease also covers these.
+            wait_for_redaction_gc(
+                &ctx.budget,
+                started,
+                store.retire_zero_ref_digests(
                     &space_rec.scope,
                     space_rec.active_epoch,
                     &zero_refs,
                     RetirementReason::Gc,
                     None,
-                )
-                .await;
+                ),
+            )
+            .await;
         }
         return Ok(committed);
     }
@@ -4335,7 +4368,8 @@ async fn redact_chat_entry_impl(
                         entry: input.entry,
                         parent: nearest_non_redacted,
                         invalidated_contexts,
-                        zero_ref_digests,
+                        // The durable retirement records now carry the physical work.
+                        zero_ref_digests: Vec::new(),
                     },
                     receipt,
                 };
@@ -4379,9 +4413,12 @@ async fn redact_chat_entry_impl(
     let stored: StoredCommittedRedactedChatV1 =
         store.submit_write_command(&ctx.budget, intent).await?;
     let (committed, _) = stored.into_committed();
-    // Preserve synchronous cleanup when possible. A held backup or unavailable backend
-    // leaves the durable task with the store and does not delay the committed receipt.
-    let _ = first_attempt.await;
+    wait_for_redaction_gc(
+        &ctx.budget,
+        started,
+        crate::blobs::retirement_worker::handoff_outcome(first_attempt),
+    )
+    .await;
     Ok(committed)
 }
 

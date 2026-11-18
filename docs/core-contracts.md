@@ -258,7 +258,10 @@ pins both control and canonical database snapshots before resuming writers.
 In SQLite, `BEGIN DEFERRED; SELECT 1` does not pin a database snapshot; an actual
 database read is required. Both snapshots must retain the same original cut.
 
-The ordinary read-transaction budget remains below 250 ms. Backup source
+The ordinary read-transaction budget remains below 250 ms. PostgreSQL starts its
+240 ms snapshot budget after pool checkout and applies the configured statement
+timeout to each SQL statement. The caller deadline includes pool admission, SQL,
+external blob reads and the final access check for a note. Backup source
 snapshots have a bounded exception until a stable local database spool exists
 or the backup aborts. Incremental backup steps do not shorten this lifetime or
 eliminate its WAL checkpoint impact. Budgets specify a deadline, spool bytes and

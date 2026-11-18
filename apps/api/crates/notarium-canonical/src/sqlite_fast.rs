@@ -510,6 +510,15 @@ pub(crate) async fn edit_note_phase1_sqlite_local(
             if head.lifecycle != Lifecycle::Active {
                 return Err(DomainError::ResourceNotFound.into());
             }
+            let (facts, anc) = build_resource_facts_rusqlite(
+                conn,
+                &srec.space,
+                &head.parent_folder_id,
+                head.doc_class,
+                head.ability_id.clone(),
+                true,
+            )?;
+            auth.authorize_direct_write(&facts, &facts)?;
             if let Some(expected_rev) = &prec.revision
                 && *expected_rev != head.head_rev_id
             {
@@ -522,15 +531,6 @@ pub(crate) async fn edit_note_phase1_sqlite_local(
             if has_any_collab_sessions || prec.lease.is_some() || prec.lineage.is_some() {
                 check_collab_preconditions_rusqlite(conn, &scope.space_id, &nid, &prec)?;
             }
-            let (facts, anc) = build_resource_facts_rusqlite(
-                conn,
-                &srec.space,
-                &head.parent_folder_id,
-                head.doc_class,
-                head.ability_id.clone(),
-                true,
-            )?;
-            auth.authorize_direct_write(&facts, &facts)?;
 
             let base_digest = head.content_digest.ok_or_else(|| {
                 internal_not_committed(
@@ -1270,11 +1270,11 @@ impl DeferredAppendRows {
             ))
         });
         self.payload_owners.sort_unstable_by(|a, b| {
-            (&a.space_id, a.payload_kind, &a.payload_id, &a.note_id).cmp(&(
+            (&a.space_id, &a.note_id, a.payload_kind, &a.payload_id).cmp(&(
                 &b.space_id,
+                &b.note_id,
                 b.payload_kind,
                 &b.payload_id,
-                &b.note_id,
             ))
         });
         self.command_receipts.sort_unstable_by(|a, b| {
@@ -3322,17 +3322,15 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
         let info = &self.info;
 
         // --- 1. Read-only preconditions & pure serialization (zero SQL mutations) ---
-        let has_closed_collab_session =
-            check_note_room_direct_write_cached(conn, cache, room_fences, scope_cl, note_id)
-                .and_then(NoteRoomDirectWriteState::require_writable)
-                .map_err(FastItemExecError::PreWrite)?;
-
         let note_cache_key = (scope_cl.space_id.clone(), note_id.clone());
         let (used_phase1_cache, head, anc) = if self.phase1_receipt_checked_gen
             == Some(cache.current_writer_gen)
             && !cache.in_batch_modified_notes.contains(&note_cache_key)
             && let Some((cached_head, cached_anc)) = &self.phase1_cached
         {
+            // The generation covers durable facts. Branch taint can change independently.
+            auth.authorize_space_write(&item_ctx.space)
+                .map_err(|e| FastItemExecError::PreWrite(e.into()))?;
             (true, cached_head.clone(), cached_anc.clone())
         } else {
             let head = load_note_head_row_rusqlite(conn, &scope_cl.space_id, note_id)
@@ -3342,6 +3340,18 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
                     DomainError::ResourceNotFound.into(),
                 ));
             }
+            let (facts, anc) = build_resource_facts_cached(
+                conn,
+                cache,
+                &item_ctx.space,
+                &head.parent_folder_id,
+                head.doc_class,
+                head.ability_id.clone(),
+                true,
+            )
+            .map_err(FastItemExecError::PreWrite)?;
+            auth.authorize_direct_write(&facts, &facts)
+                .map_err(|e| FastItemExecError::PreWrite(e.into()))?;
             if &head.head_rev_id != expected_base_rev {
                 return Err(FastItemExecError::PreWrite(
                     DomainError::RevisionConflict {
@@ -3371,20 +3381,13 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
             )
             .map_err(FastItemExecError::PreWrite)?;
 
-            let (facts, anc) = build_resource_facts_cached(
-                conn,
-                cache,
-                &item_ctx.space,
-                &head.parent_folder_id,
-                head.doc_class,
-                head.ability_id.clone(),
-                true,
-            )
-            .map_err(FastItemExecError::PreWrite)?;
-            auth.authorize_direct_write(&facts, &facts)
-                .map_err(|e| FastItemExecError::PreWrite(e.into()))?;
             (false, head, anc)
         };
+
+        let has_closed_collab_session =
+            check_note_room_direct_write_cached(conn, cache, room_fences, scope_cl, note_id)
+                .and_then(NoteRoomDirectWriteState::require_writable)
+                .map_err(FastItemExecError::PreWrite)?;
 
         let (final_slug, final_slug_fold) = match explicit_slug_override {
             Some((s, sf)) => {

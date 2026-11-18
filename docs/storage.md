@@ -29,6 +29,9 @@ same behavioral parity suites:
 local storage is used, verifies or bootstraps the schema transactionally,
 reconciles interrupted collaboration room fences and resumes any interrupted
 purge closure before returning `(CanonicalStore, CanonicalRuntime)`.
+The Tokio runtime that opens a PostgreSQL store owns its pooled connections.
+Keep it running through shutdown. Callers on other runtimes can release their
+handles or stop their runtimes while the store continues serving requests.
 `CanonicalStore` is a cloneable handle that never exposes raw SQL pools or
 connections. Integration tests use a development dependency on their own package
 to enable the `test-support` Cargo feature for raw diagnostics and fault injection.
@@ -284,12 +287,14 @@ same example against an isolated prefix.
   exceed 256 levels. `move_board_card` maintains `<= 16`-byte `sort_rank_lexo` keys
   via windowed Packed Memory Array (PMA) rebalancing that updates physical
   `rank_rev_id` without overwriting semantic `placement_revision` provenance.
-  A PostgreSQL root-note rollback uses one caller deadline across the writer
-  safe point, connection checkout, planning, room fences and SQL. Planning reads
-  also respect the configured read timeout. Cancellation before COMMIT leaves
-  the transaction uncommitted. An ambiguous COMMIT acknowledgement returns
-  `Unknown` with a same-command retry. The writer gate and room fences cover the
-  outstanding acknowledgement.
+  Rollback spends one caller budget across room reservations, Board planning,
+  retries and writer admission. The direct PostgreSQL path includes the writer
+  safe point, connection checkout and SQL in that budget. Planning reads also
+  respect the configured read timeout. Cancellation before writer admission
+  leaves the command uncommitted. A queued command can finish after its caller
+  stops waiting. An ambiguous acknowledgement returns `Unknown`. Retrying with
+  the same command identity recovers the durable outcome. On the direct
+  PostgreSQL path the writer gate and room fences cover the outstanding COMMIT.
   `rollback_agent_run` freezes eligible targets and closed-room reservations
   before planning, simulates inverse board moves in reverse command order over
   recorded semantic before-anchors, and applies `Trash`-first slug deconfliction
@@ -338,8 +343,10 @@ same example against an isolated prefix.
   Direct reads, history windows and command replay suppress stale summaries.
   An independent entry that owns the same digest keeps its content. Removing the
   last owner closes peer reads and records retirement in the redaction transaction.
-  An active backup hold keeps the physical bytes until release. The store retries
-  deletion after release and recovers outstanding work after restart or takeover.
+  An active backup hold or local staging ticket can retain the physical bytes.
+  The committed receipt remains available within the caller's remaining budget.
+  Retries share the same retirement worker for a given history, lease epoch and
+  retirement ID. The store recovers outstanding work after restart or takeover.
   Taint is monotonic.
 - **Paired backup (`BackupParticipantPort`).** Prepare both participants and acquire
   their holds before pausing control, then canonical. PostgreSQL uses a dedicated

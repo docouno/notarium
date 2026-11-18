@@ -15,10 +15,10 @@ use notarium_core::{
     classes::DocClass,
     error::{Diagnostic, ValidationReason},
     ids::{ChatThreadId, HistoryIncarnation, LeaseEpoch, NoteId, SpaceSeq},
-    model::Lifecycle,
+    model::{HistoryScope, Lifecycle},
     ports::{
-        ChangeBroadcast, ChangeKind, ChangeNotice, ChangeRead, ChangeReadResult, PageLimit,
-        SeedPosition, ServicePurpose,
+        BackupParticipantPort, ChangeBroadcast, ChangeKind, ChangeNotice, ChangeRead,
+        ChangeReadResult, PageLimit, SeedPosition, ServicePurpose,
     },
     query::{FieldObservation, FieldValue},
     receipt::{
@@ -736,6 +736,12 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
             .expect("concurrent thread write during seed");
     }
 
+    // Both birth and purge occurred after the pinned cut. This fence cannot invalidate it.
+    store
+        .commit_synthetic_note_purge_for_test(&scope3, epoch, &note_id_seq(seed.wrapping_add(2), 6))
+        .await
+        .expect("purge the note created after the seed cut");
+
     // Page 2 (`ContinueSeed`) MUST still return pinned cut 9 (2 remaining notes at v1 + 1 thread at head=1)!
     let ChangeReadResult::Seed(sp2) = store
         .catch_up(
@@ -912,11 +918,68 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
 
     // HistoryIncarnation mismatch -> `ChangeNotice::Resync` on `subscribe` BEFORE comparing seq,
     // and `HistoryIncarnationMismatch` on `catch_up`!
-    let new_inc = HistoryIncarnation::from_bytes([0xEE; 16]);
-    let rotated_scope = store
-        .rotate_incarnation_for_test(&scope3, new_inc)
+    let rotated_scope = HistoryScope {
+        space_id: scope3.space_id.clone(),
+        incarnation: HistoryIncarnation::from_bytes([0xEE; 16]),
+    };
+    let ceiling = store.get_space(&scope3.space_id).await.unwrap().last_seq;
+    store
+        .restore_cursors(
+            maintenance_ctx(ServicePurpose::Restore),
+            vec![ChangeCursor {
+                scope: rotated_scope.clone(),
+                after: ceiling,
+            }],
+        )
         .await
-        .expect("rotate incarnation");
+        .expect("restore the history under a new incarnation");
+
+    let ChangeReadResult::Seed(restored) = store
+        .catch_up(
+            maintenance_ctx(ServicePurpose::Projection),
+            ChangeRead::Seed {
+                scope: rotated_scope.clone(),
+                cutoff: Some(ceiling),
+                limit: PageLimit::new(10).unwrap(),
+            },
+        )
+        .await
+        .expect("seed the restored history")
+    else {
+        panic!("expected Seed");
+    };
+    let expected_seed = seed.wrapping_add(2);
+    assert_eq!(
+        restored
+            .notes
+            .iter()
+            .map(|n| n.document.reference().note_id.clone())
+            .collect::<Vec<_>>(),
+        (2..=5)
+            .map(|idx| note_id_seq(expected_seed, idx))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        restored
+            .threads
+            .iter()
+            .map(|t| t.id.clone())
+            .collect::<Vec<_>>(),
+        (1..=5)
+            .map(|idx| thread_id_seq(expected_seed, idx))
+            .collect::<Vec<_>>(),
+    );
+    assert!(restored.next.is_none());
+
+    let stale_seed = store
+        .catch_up(
+            maintenance_ctx(ServicePurpose::Projection),
+            ChangeRead::ContinueSeed {
+                cursor: cursor_after_p1,
+            },
+        )
+        .await;
+    assert_validation_err(&stale_seed, ValidationReason::HistoryIncarnationMismatch);
 
     let mut sub_stale_inc = store
         .subscribe(

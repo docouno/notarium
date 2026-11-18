@@ -1,4 +1,5 @@
 pub mod local;
+pub(crate) mod retirement_worker;
 pub mod s3;
 
 use std::{
@@ -350,17 +351,17 @@ pub(crate) struct RetirementHandoff {
     scope: HistoryScope,
     epoch: LeaseEpoch,
     ids: Vec<String>,
-    first_attempt: Option<tokio::sync::oneshot::Sender<Result<(), PortError>>>,
+    first_attempt: Option<retirement_worker::HandoffSender>,
 }
 
 impl Drop for RetirementHandoff {
     fn drop(&mut self) {
-        self.store.schedule_retirements(
-            self.scope.clone(),
-            self.epoch,
-            std::mem::take(&mut self.ids),
-            self.first_attempt.take(),
-        );
+        let attempts =
+            self.store
+                .schedule_retirements(&self.scope, self.epoch, std::mem::take(&mut self.ids));
+        if let Some(sender) = self.first_attempt.take() {
+            let _ = sender.send(attempts);
+        }
     }
 }
 
@@ -391,12 +392,8 @@ impl Drop for PublicationDiscard {
         if self.finished.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        self.store.schedule_retirements(
-            self.scope.clone(),
-            self.epoch,
-            vec![self.publication.clone()],
-            None,
-        );
+        self.store
+            .schedule_retirements(&self.scope, self.epoch, vec![self.publication.clone()]);
     }
 }
 
@@ -1325,7 +1322,7 @@ impl crate::CanonicalStore {
         scope: &HistoryScope,
         epoch: LeaseEpoch,
         ids: Vec<String>,
-        first_attempt: tokio::sync::oneshot::Sender<Result<(), PortError>>,
+        first_attempt: retirement_worker::HandoffSender,
     ) -> RetirementHandoff {
         RetirementHandoff {
             store: self.clone(),
@@ -1334,53 +1331,6 @@ impl crate::CanonicalStore {
             ids,
             first_attempt: Some(first_attempt),
         }
-    }
-
-    /// Waiters observe the first attempt; store-owned retries outlive the request and its executor.
-    pub(crate) fn schedule_retirements(
-        &self,
-        scope: HistoryScope,
-        epoch: LeaseEpoch,
-        mut pending: Vec<String>,
-        mut attempted: Option<tokio::sync::oneshot::Sender<Result<(), PortError>>>,
-    ) {
-        let store = self.clone();
-        let shutdown = self.inner.backup_shutdown.clone();
-        let work = async move {
-            let mut backoff = Duration::from_millis(25);
-            while !pending.is_empty() {
-                let mut retry = Vec::new();
-                let mut result = Ok(());
-                for id in pending {
-                    match store
-                        .drive_retirement_to_completion(&scope, epoch, &id)
-                        .await
-                    {
-                        Ok(()) | Err(PortError::Domain(DomainError::ResourceNotFound)) => {}
-                        Err(error) => {
-                            if !matches!(error, PortError::Domain(_)) {
-                                retry.push(id);
-                            }
-                            if result.is_ok() {
-                                result = Err(error);
-                            }
-                        }
-                    }
-                }
-                if let Some(sender) = attempted.take() {
-                    let _ = sender.send(result);
-                }
-                pending = retry;
-                if !pending.is_empty() {
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(1));
-                }
-            }
-        };
-        let handle = self.inner.backup_executor.spawn(async move {
-            tokio::select! { biased; () = shutdown.cancelled() => {}, () = work => {} }
-        });
-        crate::backup::register_cleanup_task(&self.inner, handle);
     }
 
     async fn discard_publication(
@@ -1639,13 +1589,7 @@ impl crate::CanonicalStore {
 
         if let Some(handoff) = handoff {
             drop(handoff);
-            attempted.await.map_err(|_| {
-                unavailable_retryable(
-                    "gc_worker_stopped",
-                    "storage closed during GC",
-                    Duration::from_millis(50),
-                )
-            })??;
+            retirement_worker::handoff_outcome(attempted).await?;
         } else {
             for ret_id in &planned_retirements {
                 self.drive_retirement_to_completion(scope, active_epoch, ret_id)
@@ -3386,7 +3330,7 @@ async fn load_active_blob_meta_tx(
             .bind(digest.as_bytes().as_slice())
             .fetch_optional(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_blob_meta", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_blob_meta", err))?;
             r.map(|row| {
                 (
                     row.get("raw_size"),
@@ -3426,7 +3370,7 @@ async fn load_active_blob_meta_tx(
                 .bind(pub_id)
                 .fetch_optional(&mut **conn)
                 .await
-                .map_err(|err| internal_not_committed("pg_load_pub_meta", err.to_string()))?;
+                .map_err(|err| crate::runtime::pg_read_error("pg_load_pub_meta", err))?;
                 r.map(|row| (row.get("state"), row.get("part_count")))
             }
         };
@@ -3494,7 +3438,7 @@ async fn load_s3_manifest_parts_tx(
             .bind(publication_id)
             .fetch_all(&mut **conn)
             .await
-            .map_err(|err| internal_not_committed("pg_load_s3_parts", err.to_string()))?;
+            .map_err(|err| crate::runtime::pg_read_error("pg_load_s3_parts", err))?;
             rows.into_iter()
                 .map(|r| {
                     (
@@ -3673,6 +3617,21 @@ async fn pending_retirement_for_digest_tx(
     .map_err(|err| internal_not_committed("find_pending_digest_retirement", err.to_string()))
 }
 
+macro_rules! zero_ref_page {
+    ($index:literal) => {
+        concat!(
+            "SELECT c.touched_at_ms, c.content_blake3 FROM blob_catalog c ", $index, "
+            WHERE c.space_id=$1 AND c.ref_count=0 AND (c.touched_at_ms, c.content_blake3)>($2,$3)
+            AND c.admission_state='open' AND c.blob_state='active'
+            AND NOT EXISTS (SELECT 1 FROM blob_references r WHERE r.space_id=c.space_id
+                AND r.content_blake3=c.content_blake3)
+            ORDER BY c.touched_at_ms, c.content_blake3 LIMIT 128"
+        )
+    };
+}
+const SQLITE_ZERO_REF_PAGE: &str = zero_ref_page!("INDEXED BY idx_blob_catalog_zero_ref");
+const PG_ZERO_REF_PAGE: &str = zero_ref_page!("");
+
 /// Older redaction receipts could release their last reference while a backup
 /// prevented GC planning. Reconcile those catalog rows when opening saved state.
 pub(crate) async fn plan_unowned_active_blobs_tx(
@@ -3680,25 +3639,23 @@ pub(crate) async fn plan_unowned_active_blobs_tx(
     scope: &HistoryScope,
     epoch: LeaseEpoch,
 ) -> Result<bool, PortError> {
-    const PAGE: &str = "SELECT content_blake3 FROM blob_catalog c WHERE space_id=$1
-        AND content_blake3 > $2 AND admission_state='open' AND blob_state='active' AND ref_count=0
-        AND NOT EXISTS (SELECT 1 FROM blob_references r WHERE r.space_id=c.space_id
-            AND r.content_blake3=c.content_blake3) ORDER BY content_blake3 LIMIT 128";
-    let mut after = Vec::new();
+    let mut after = (i64::MIN, Vec::new());
     let mut planned = false;
     loop {
-        let rows: Vec<Vec<u8>> = match tx {
+        let rows: Vec<(i64, Vec<u8>)> = match tx {
             BackendConn::Sqlite(conn) => {
-                sqlx::query_scalar(PAGE)
+                sqlx::query_as(SQLITE_ZERO_REF_PAGE)
                     .bind(scope.space_id.as_str())
-                    .bind(&after)
+                    .bind(after.0)
+                    .bind(&after.1)
                     .fetch_all(&mut **conn)
                     .await
             }
             BackendConn::Postgres(conn) => {
-                sqlx::query_scalar(PAGE)
+                sqlx::query_as(PG_ZERO_REF_PAGE)
                     .bind(scope.space_id.as_str())
-                    .bind(&after)
+                    .bind(after.0)
+                    .bind(&after.1)
                     .fetch_all(&mut **conn)
                     .await
             }
@@ -3708,7 +3665,7 @@ pub(crate) async fn plan_unowned_active_blobs_tx(
             return Ok(planned);
         };
         after = last.clone();
-        for raw in rows {
+        for (_, raw) in rows {
             let digest = ContentDigest::from_bytes(raw.try_into().map_err(|_| {
                 internal_not_committed("corrupt_blob_digest", "invalid digest length")
             })?);
@@ -4526,4 +4483,57 @@ async fn finalize_retirement_tx(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod zero_ref_tests {
+    use super::SQLITE_ZERO_REF_PAGE;
+    use rusqlite::{Connection, StatementStatus, params};
+
+    #[test]
+    fn zero_ref_pages_skip_live_catalog_and_page_tied_timestamps() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(crate::schema::SQLITE_BASELINE_DDL)
+            .unwrap();
+        let mut insert = db
+            .prepare("INSERT INTO blob_catalog VALUES ('s',?1,1,1,?2,NULL,'open','active',?3)")
+            .unwrap();
+        for n in 0..10_000u32 {
+            let digest = *blake3::hash(&n.to_be_bytes()).as_bytes();
+            insert.execute(params![digest.as_slice(), 1, 0]).unwrap();
+        }
+        let mut page = db.prepare(SQLITE_ZERO_REF_PAGE).unwrap();
+        assert!(
+            page.query(params!["s", i64::MIN, &[] as &[u8]])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
+        assert!(page.get_status(StatementStatus::VmStep) < 100);
+        let mut expected = Vec::new();
+        for n in 10_000..10_257u32 {
+            let digest = *blake3::hash(&n.to_be_bytes()).as_bytes();
+            insert
+                .execute(params![digest.as_slice(), 0, i64::MIN])
+                .unwrap();
+            expected.push(digest.to_vec());
+        }
+        expected.sort();
+        let mut seen = Vec::new();
+        let mut after = (i64::MIN, Vec::new());
+        loop {
+            let rows: Vec<(i64, Vec<u8>)> = page
+                .query_map(params!["s", after.0, &after.1], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let Some(last) = rows.last() else { break };
+            after = last.clone();
+            seen.extend(rows.into_iter().map(|(_, digest)| digest));
+        }
+        assert_eq!(seen, expected);
+    }
 }

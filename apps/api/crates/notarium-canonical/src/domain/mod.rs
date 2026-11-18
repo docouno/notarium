@@ -213,6 +213,13 @@ impl CanonicalStore {
         ctx: SpaceContext,
         request: GetNote,
     ) -> Result<NoteSnapshot, PortError> {
+        if self.is_postgres() {
+            return Self::run_pg_read_request(
+                ctx.budget.clone(),
+                notes::get_note_impl(self, ctx, request),
+            )
+            .await;
+        }
         notes::get_note_impl(self, ctx, request).await
     }
 
