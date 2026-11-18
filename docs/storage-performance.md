@@ -9,7 +9,10 @@ shows the correct order and counts for that receipt.
 ## Reference configurations and results
 
 High and Medium identify two measured reference systems. Both had an 8-vCPU,
-16-GiB allocation and an ext4 data volume. High used a Core i5-12500 host
+16-GiB parent cgroup allocation and an ext4 data volume. The benchmark
+process could see eight logical CPUs on High and sixteen on Medium. Record
+both the launcher quota and the CPU count visible to the process when
+comparing concurrent workloads. High used a Core i5-12500 host
 with NVMe storage. Medium used an EPYC Rome guest with a virtual block
 device whose physical medium was unknown. SQLite used WAL with
 `synchronous=FULL`. PostgreSQL 16 used `fsync=on` and

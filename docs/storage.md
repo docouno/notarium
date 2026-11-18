@@ -320,8 +320,11 @@ same example against an isolated prefix.
   with a monotonic `< 250 ms` progress-handler deadline (`248 ms` default) and
   guaranteed worker-snapshot rollback/close if a caller drops its future.
   Native reads use the caller budget while waiting for a worker and while verifying
-  CAS bytes after commit. Returning the connection to the pool revokes that
-  checkout's interrupt handle. A background loop runs `PASSIVE` checkpoints during idle ticks (`15 ms` cadence)
+  CAS bytes after commit. While a SQL snapshot is open, an eager local blob
+  read tries both the registry shard and the digest guard. Contention defers
+  the verified blob read until after the snapshot closes. The ordinary path
+  waits asynchronously for the registry and digest. Returning the connection
+  to the pool revokes that checkout's interrupt handle. A background loop runs `PASSIVE` checkpoints during idle ticks (`15 ms` cadence)
   and uses a 250 ms budget to drain readers and acquire the writer for a
   `RESTART`/`TRUNCATE` checkpoint (512 MiB soft / 896 MiB high watermarks).
   An explicit caller deadline includes admission, checkout, and the read itself.

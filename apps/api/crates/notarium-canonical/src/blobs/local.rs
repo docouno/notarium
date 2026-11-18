@@ -21,7 +21,7 @@ use notarium_core::{
     error::PortError,
     ids::{ContentDigest, SpaceId},
 };
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use crate::{blobs::decode_zstd_verified, codec::internal_not_committed};
 
@@ -343,7 +343,7 @@ fn is_fd_exhausted_io_err(err: &io::Error) -> bool {
 pub struct LocalBlobStore {
     root_dir: Arc<PinnedDir>,
     free_staging_slots: Arc<Mutex<Vec<u32>>>,
-    guards: Box<[Mutex<DigestGuardTable>; GUARD_SHARDS]>,
+    guards: Box<[AsyncMutex<DigestGuardTable>; GUARD_SHARDS]>,
     dir_cache: StdRwLock<HashMap<String, Arc<PinnedDir>>>,
     next_staging_seq: AtomicU64,
 }
@@ -361,7 +361,7 @@ impl LocalBlobStore {
         let root_dir = Dir::open_ambient_dir(data_root.root(), ambient_authority())
             .map_err(|err| internal_not_committed("local_cas_open_ambient_dir", err.to_string()))?;
 
-        let guards = Box::new(std::array::from_fn(|_| Mutex::new(HashMap::new())));
+        let guards = Box::new(std::array::from_fn(|_| AsyncMutex::new(HashMap::new())));
         let store = Self {
             root_dir: Arc::new(
                 PinnedDir::new(root_dir)
@@ -550,11 +550,15 @@ impl LocalBlobStore {
             .map_err(|e| internal_not_committed("local_cas_open_dir", format!("{rel}: {e}")))
     }
 
-    fn lock_arc(&self, space_id: &SpaceId, digest: ContentDigest) -> Arc<RwLock<()>> {
-        let shard_idx = usize::from(digest.as_bytes()[0]) & (GUARD_SHARDS - 1);
-        let mut map = self.guards[shard_idx]
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn guard_shard(&self, digest: ContentDigest) -> &AsyncMutex<DigestGuardTable> {
+        &self.guards[usize::from(digest.as_bytes()[0]) & (GUARD_SHARDS - 1)]
+    }
+
+    fn digest_lock(
+        map: &mut DigestGuardTable,
+        space_id: &SpaceId,
+        digest: ContentDigest,
+    ) -> Arc<RwLock<()>> {
         let key = (space_id.clone(), digest);
         if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
             return existing;
@@ -568,12 +572,21 @@ impl LocalBlobStore {
         arc
     }
 
+    async fn wait_for_digest_lock(
+        &self,
+        space_id: &SpaceId,
+        digest: ContentDigest,
+    ) -> Arc<RwLock<()>> {
+        let mut map = self.guard_shard(digest).lock().await;
+        Self::digest_lock(&mut map, space_id, digest)
+    }
+
     pub async fn acquire_shared_guard(
         &self,
         space_id: &SpaceId,
         digest: ContentDigest,
     ) -> Arc<LocalSharedGuard> {
-        let lock = self.lock_arc(space_id, digest);
+        let lock = self.wait_for_digest_lock(space_id, digest).await;
         let guard = lock.read_owned().await;
         Arc::new(LocalSharedGuard { _guard: guard })
     }
@@ -583,7 +596,11 @@ impl LocalBlobStore {
         space_id: &SpaceId,
         digest: ContentDigest,
     ) -> Option<Arc<LocalSharedGuard>> {
-        let lock = self.lock_arc(space_id, digest);
+        // A contended registry must also defer the read until the SQL snapshot closes.
+        let lock = {
+            let mut map = self.guard_shard(digest).try_lock().ok()?;
+            Self::digest_lock(&mut map, space_id, digest)
+        };
         let guard = lock.try_read_owned().ok()?;
         Some(Arc::new(LocalSharedGuard { _guard: guard }))
     }
@@ -610,7 +627,7 @@ impl LocalBlobStore {
         space_id: &SpaceId,
         digest: ContentDigest,
     ) -> LocalExclusiveGuard {
-        let lock = self.lock_arc(space_id, digest);
+        let lock = self.wait_for_digest_lock(space_id, digest).await;
         let guard = lock.write_owned().await;
         LocalExclusiveGuard { _guard: guard }
     }
@@ -947,5 +964,42 @@ fn sync_blob_file(file: &cap_std::fs::File) -> Result<(), PortError> {
     {
         file.sync_data()
             .map_err(|err| internal_not_committed("local_cas_fdatasync", err.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn eager_read_defers_on_registry_or_digest_contention() {
+        let path = std::env::temp_dir()
+            .join(crate::codec::new_prefixed_hex_id("local-guard-test-").unwrap());
+        let store = LocalBlobStore::open(&DataRoot::new(&path)).unwrap();
+        let space = SpaceId::parse("GuardSpace01").unwrap();
+        let digest = ContentDigest::from_bytes([0; 32]);
+
+        let shard = store.guard_shard(digest).lock().await;
+        std::thread::scope(|threads| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let store_ref = &store;
+            let space_ref = &space;
+            threads.spawn(move || {
+                let deferred = store_ref
+                    .try_acquire_shared_guard(space_ref, digest)
+                    .is_none();
+                let _ = send.send(deferred);
+            });
+            let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+            drop(shard);
+            assert!(result.expect("eager read waited for the held registry shard"));
+        });
+
+        let exclusive = store.acquire_exclusive_guard(&space, digest).await;
+        assert!(store.try_acquire_shared_guard(&space, digest).is_none());
+        drop(exclusive);
+        assert!(store.try_acquire_shared_guard(&space, digest).is_some());
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }
