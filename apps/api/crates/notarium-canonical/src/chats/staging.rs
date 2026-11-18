@@ -32,13 +32,20 @@ impl CanonicalStore {
     ) -> Result<Option<StagedChatBlob>, PortError> {
         let deadline = CommandDeadline::start(&ctx.budget, "recover_chat_stage");
         let budget = ctx.budget.clone();
-        deadline
+        let provenance = ctx.auth().taint().clone();
+        let tainted = provenance.is_tainted();
+        let found = deadline
             .prepare(&budget, || {
                 self.with_read_tx_budget(Some(&budget), |tx| {
-                    Box::pin(next_lease_tx(tx, ctx, original, digest, after))
+                    Box::pin(next_lease_tx(tx, ctx, original, digest, after, tainted))
                 })
             })
-            .await
+            .await?;
+        // Sibling contexts can acquire external provenance while SQL is pending.
+        if provenance.is_tainted() != tainted {
+            return Err(DomainError::CrossSpaceTainted.into());
+        }
+        Ok(found)
     }
 
     /// Relinquishes one exact outstanding lease. Repeating a release is safe.
@@ -101,11 +108,11 @@ async fn next_lease_tx(
     original: RequestId,
     digest: ContentDigest,
     after: Option<[u8; 16]>,
+    tainted: bool,
 ) -> Result<Option<StagedChatBlob>, PortError> {
     let space = load_space_record(tx, &ctx.scope().space_id).await?;
     space.scope.check(ctx.scope())?;
     super::authorize_chat_write_on_space(ctx.auth(), &space.space)?;
-    let tainted = ctx.auth().taint().is_tainted();
     let prefix = if tainted { "st2t_" } else { "st2c_" };
     let start = after
         .map(|v| super::staged_chat_lease_key(v, tainted))
