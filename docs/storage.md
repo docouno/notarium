@@ -40,8 +40,10 @@ If recovery fails, opening cancels its workers and releases local ownership
 before returning the error. Dropping an opening future schedules the same
 shutdown on its Tokio runtime. The DataRoot stays locked until the workers and
 connections close. The next opener resumes any durable recovery still pending.
-The Tokio runtime that opens a PostgreSQL store owns its pooled connections.
-Keep it running through shutdown. Callers on other runtimes can release their
+The Tokio runtime that opens the store owns PostgreSQL pool returns and
+interrupted SQLite snapshot cleanup. A cancelled SQLite reader holds its WAL
+registration and pool permit through connection close. Keep the runtime
+running through shutdown. Callers on other runtimes can release their
 handles or stop their runtimes while the store continues serving requests.
 `CanonicalStore` is a cloneable handle that never exposes raw SQL pools or
 connections. Integration tests use a development dependency on their own package
@@ -371,6 +373,9 @@ same example against an isolated prefix.
   stops waiting. An ambiguous acknowledgement returns `Unknown`. Retrying with
   the same command identity recovers the durable outcome. On the direct
   PostgreSQL path the writer gate and room fences cover the outstanding COMMIT.
+  Pools with at least three connections can retain one idle rollback session
+  across Spaces to reuse database plans. A successful rollback returns that
+  session to the cache after COMMIT acknowledgement. Shutdown drains the cache.
   `rollback_agent_run` freezes eligible targets and closed-room reservations
   before planning, simulates inverse board moves in reverse command order over
   recorded semantic before-anchors, and applies `Trash`-first slug deconfliction

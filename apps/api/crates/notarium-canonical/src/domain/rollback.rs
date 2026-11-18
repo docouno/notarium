@@ -4213,6 +4213,29 @@ async fn rollback_wait<T>(
         .await
 }
 
+// Reuse one session's prepared history and commit plans across clean rollbacks.
+fn park_pg_rollback_connection(
+    store: &CanonicalStore,
+    connection: crate::dialect::postgres::StorePgConnection,
+) {
+    if let crate::runtime::SqlDriverState::Postgres {
+        fast_write_conn,
+        can_cache_fast_conn: true,
+        ..
+    } = &store.inner.sql
+    {
+        let mut slot = fast_write_conn.lock().expect("pg fast_write_conn mutex");
+        if slot.is_none()
+            && !store
+                .inner
+                .shutting_down
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            *slot = Some(connection);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_execute_pg_root_rollback(
     store: &CanonicalStore,
@@ -4261,7 +4284,6 @@ async fn try_execute_pg_root_rollback(
     let SqlDriverState::Postgres {
         pool,
         fast_write_conn,
-        can_cache_fast_conn,
         statement_timeout,
         ..
     } = &store.inner.sql
@@ -4346,15 +4368,6 @@ async fn try_execute_pg_root_rollback(
         },
     };
 
-    let park_pooled = |conn: crate::dialect::postgres::StorePgConnection| {
-        if *can_cache_fast_conn {
-            let mut slot = fast_write_conn.lock().expect("pg fast_write_conn mutex");
-            if slot.is_none() {
-                *slot = Some(conn);
-            }
-        }
-    };
-
     // Read each run entity and the publication of the content it could restore together.
     // The commit rechecks the grant, heads and live publication before applying any writes.
     struct RollbackHead {
@@ -4399,7 +4412,7 @@ async fn try_execute_pg_root_rollback(
     // room should enter the ordinary planner directly, without a second history read.
     if rows.iter().any(|row| !row.get::<bool, _>("room_writable")) {
         *try_pg_batch_plan = false;
-        park_pooled(pooled);
+        park_pg_rollback_connection(store, pooled);
         return None;
     }
     let hydrated = (|| {
@@ -4475,7 +4488,7 @@ async fn try_execute_pg_root_rollback(
         Some((folder, kind, heads, history, pubs))
     })();
     let Some((root_folder_id, space_kind, heads, mut revs, active_pubs)) = hydrated else {
-        park_pooled(pooled);
+        park_pg_rollback_connection(store, pooled);
         return None;
     };
 
@@ -4495,7 +4508,7 @@ async fn try_execute_pg_root_rollback(
         .authorize_direct_write(&root_facts, &root_facts)
         .is_err()
     {
-        park_pooled(pooled);
+        park_pg_rollback_connection(store, pooled);
         return None;
     }
 
@@ -4526,7 +4539,7 @@ async fn try_execute_pg_root_rollback(
                 {
                     Ok(opt) => slots.push(opt),
                     Err(err) => {
-                        park_pooled(pooled);
+                        park_pg_rollback_connection(store, pooled);
                         return Some(Err(err));
                     }
                 }
@@ -4534,7 +4547,7 @@ async fn try_execute_pg_root_rollback(
             slots
         }
         Err(err) => {
-            park_pooled(pooled);
+            park_pg_rollback_connection(store, pooled);
             return Some(Err(err));
         }
     };
@@ -4581,11 +4594,11 @@ async fn try_execute_pg_root_rollback(
                 }
             } else {
                 let Some(pre_rev_id) = r_acc.pre_rev_id.take() else {
-                    park_pooled(pooled);
+                    park_pg_rollback_connection(store, pooled);
                     return None;
                 };
                 let Some(cached) = r_acc.metadata.take() else {
-                    park_pooled(pooled);
+                    park_pg_rollback_connection(store, pooled);
                     return None;
                 };
                 let pre_meta = &cached.pre_meta;
@@ -4617,7 +4630,7 @@ async fn try_execute_pg_root_rollback(
             if pm.lifecycle == Lifecycle::Active
                 && !planned_active_slots.insert(pm.slug_fold.as_str())
             {
-                park_pooled(pooled);
+                park_pg_rollback_connection(store, pooled);
                 return None;
             }
             if acts[i] == 5 && dr.is_full {
@@ -4636,13 +4649,13 @@ async fn try_execute_pg_root_rollback(
             && current_full_active_slugs.contains(dr.metadata.pre_meta.slug_fold.as_str())
         {
             // Guard against intra-statement active slug swaps between two `is_full` restores.
-            park_pooled(pooled);
+            park_pg_rollback_connection(store, pooled);
             return None;
         }
     }
 
     let Ok(total_seqs) = i64::try_from((trash_mut_cnt + restore_mut_cnt).max(1)) else {
-        park_pooled(pooled);
+        park_pg_rollback_connection(store, pooled);
         return None;
     };
 
@@ -4651,7 +4664,7 @@ async fn try_execute_pg_root_rollback(
         now_utc_timestamp(),
         ordered_ids_batch(trash_mut_cnt + restore_mut_cnt + 3),
     ) else {
-        park_pooled(pooled);
+        park_pg_rollback_connection(store, pooled);
         return None;
     };
     let cfg = writer.config();
@@ -4741,7 +4754,7 @@ async fn try_execute_pg_root_rollback(
                 let rev_idx = m_rev_ids.len();
                 if let Some(d) = head.digest {
                     let Some(pub_arc) = active_pubs.get(d.as_bytes()) else {
-                        park_pooled(pooled);
+                        park_pg_rollback_connection(store, pooled);
                         return None;
                     };
                     let pub_s = pub_arc.as_str();
@@ -4760,7 +4773,7 @@ async fn try_execute_pg_root_rollback(
                 let Some(meta) = metadata.and_then(|source| {
                     encode_rollback_note(&source, None, true, RollbackRevision::Trash).ok()
                 }) else {
-                    park_pooled(pooled);
+                    park_pg_rollback_connection(store, pooled);
                     return None;
                 };
                 m_nids.push(nid_ref.as_str());
@@ -4808,7 +4821,7 @@ async fn try_execute_pg_root_rollback(
         let rev_idx = m_rev_ids.len();
         if let Some(d) = pm.content_digest {
             let Some(pub_arc) = active_pubs.get(d.as_bytes()) else {
-                park_pooled(pooled);
+                park_pg_rollback_connection(store, pooled);
                 return None;
             };
             let pub_s = pub_arc.as_str();
@@ -4937,7 +4950,7 @@ async fn try_execute_pg_root_rollback(
         notarium_core::ports::CommandSeqRange::new(sentinel_first, sentinel_vis),
         MutationReceiptToken::new(scope.clone(), sentinel_vis),
     ) else {
-        park_pooled(pooled);
+        park_pg_rollback_connection(store, pooled);
         return None;
     };
     let Ok(effect_draft) = build_effect_payload_draft(
@@ -4950,7 +4963,7 @@ async fn try_execute_pg_root_rollback(
         },
         owner_vec,
     ) else {
-        park_pooled(pooled);
+        park_pg_rollback_connection(store, pooled);
         return None;
     };
 
@@ -4983,7 +4996,7 @@ async fn try_execute_pg_root_rollback(
             receipt: sentinel_receipt,
         }),
     ) else {
-        park_pooled(pooled);
+        park_pg_rollback_connection(store, pooled);
         return None;
     };
 
@@ -5007,11 +5020,11 @@ async fn try_execute_pg_root_rollback(
         find_unique_u64_be_payload_offset_1based(&sanitized, SEQ_SENTINEL_VIS_U64),
     )
     else {
-        park_pooled(pooled);
+        park_pg_rollback_connection(store, pooled);
         return None;
     };
     if (off_eff_first - off_eff_vis).abs() < 9 {
-        park_pooled(pooled);
+        park_pg_rollback_connection(store, pooled);
         return None;
     }
 
@@ -5034,7 +5047,7 @@ async fn try_execute_pg_root_rollback(
         .then(std::time::Instant::now);
 
     if let Err(err) = ctx.auth().authorize_direct_write(&root_facts, &root_facts) {
-        park_pooled(pooled);
+        park_pg_rollback_connection(store, pooled);
         return Some(Err(err.into()));
     }
     let (room_leases, room_lineages): (Vec<Option<i64>>, Vec<Option<i64>>) = rows
@@ -5176,10 +5189,10 @@ async fn try_execute_pg_root_rollback(
         // answers, including when the caller stops waiting for the ACK.
         let _gate = _commit_gate;
         fences_guard.armed_for_drop_consume = true;
-        match sqlx::raw_sql("COMMIT").execute(transaction.conn()).await {
+        let connection = match sqlx::raw_sql("COMMIT").execute(transaction.conn()).await {
             Ok(_) => {
-                transaction.complete();
                 fences_guard.armed_for_drop_consume = false;
+                transaction.into_completed_connection()
             }
             Err(sqlx::Error::Database(err)) => {
                 fences_guard.armed_for_drop_consume = false;
@@ -5192,7 +5205,7 @@ async fn try_execute_pg_root_rollback(
                     "rollback COMMIT reply was lost",
                 ));
             }
-        }
+        };
 
         if let Some(t0) = phase2_start {
             let dur_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -5245,6 +5258,7 @@ async fn try_execute_pg_root_rollback(
             ));
         }
 
+        park_pg_rollback_connection(&store, connection);
         Ok(Committed {
             value: result_value,
             receipt,

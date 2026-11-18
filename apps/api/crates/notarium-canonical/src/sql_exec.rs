@@ -11,31 +11,36 @@ pub enum BackendConn<'a> {
 
 /// PostgreSQL may already have opened the transaction when its BEGIN future is dropped.
 pub(crate) struct PgTransactionLease<C: std::borrow::BorrowMut<StorePgConnection>> {
-    pooled: C,
-    completed: bool,
+    pooled: Option<C>,
 }
 
 impl<C: std::borrow::BorrowMut<StorePgConnection>> PgTransactionLease<C> {
     pub(crate) fn new(pooled: C) -> Self {
         Self {
-            pooled,
-            completed: false,
+            pooled: Some(pooled),
         }
     }
 
     pub(crate) fn conn(&mut self) -> &mut PgConnection {
-        self.pooled.borrow_mut()
+        self.pooled
+            .as_mut()
+            .expect("active PostgreSQL lease")
+            .borrow_mut()
     }
 
-    pub(crate) fn complete(mut self) {
-        self.completed = true;
+    pub(crate) fn complete(self) {
+        drop(self.into_completed_connection());
+    }
+
+    pub(crate) fn into_completed_connection(mut self) -> C {
+        self.pooled.take().expect("active PostgreSQL lease")
     }
 }
 
 impl<C: std::borrow::BorrowMut<StorePgConnection>> Drop for PgTransactionLease<C> {
     fn drop(&mut self) {
-        if !self.completed {
-            self.pooled.borrow_mut().close_on_drop();
+        if let Some(pooled) = self.pooled.as_mut() {
+            pooled.borrow_mut().close_on_drop();
         }
     }
 }

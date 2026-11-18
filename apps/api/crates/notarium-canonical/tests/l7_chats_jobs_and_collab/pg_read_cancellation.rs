@@ -3,8 +3,24 @@ use notarium_canonical::SqlBackendConfig;
 use notarium_core::error::CommitEffect;
 use sqlx::Connection;
 
+async fn waiting_reader_pid(observer: &mut sqlx::PgConnection, blocker: i32) -> i32 {
+    loop {
+        if let Some(pid) = sqlx::query_scalar::<_, i32>(
+            "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(blocker)
+        .fetch_optional(&mut *observer)
+        .await
+        .unwrap()
+        {
+            return pid;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test]
-async fn fast_pg_chat_read_releases_single_pool_slot_on_cancel_and_drop() {
+async fn fast_pg_chat_read_releases_slots_on_cancel_drop_and_shutdown() {
     let fixtures = StorageTestFixtures::load_required();
     let schema = fixtures.fresh_pg_schema();
     let data = TempDataRoot::new("fast-pg-read-cancel");
@@ -13,7 +29,7 @@ async fn fast_pg_chat_read_releases_single_pool_slot_on_cancel_and_drop() {
         unreachable!()
     };
     *pool_size = 1;
-    let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+    let (store, runtime) = CanonicalRuntime::open(cfg.clone()).await.unwrap();
     let owner = sample_principal_id(97);
     let scope = store
         .create_space(CreateSpaceSpec {
@@ -92,21 +108,7 @@ async fn fast_pg_chat_read_releases_single_pool_slot_on_cancel_and_drop() {
         let active = ctx();
         let cancel = active.budget.cancellation.clone();
         let mut read = store.read_chat(active, request.clone());
-        let blocked = async {
-            loop {
-                if let Some(pid) = sqlx::query_scalar::<_, i32>(
-                    "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
-                )
-                .bind(blocker_pid)
-                .fetch_optional(&mut observer)
-                .await
-                .unwrap()
-                {
-                    break pid;
-                }
-                tokio::task::yield_now().await;
-            }
-        };
+        let blocked = waiting_reader_pid(&mut observer, blocker_pid);
         let pid = tokio::select! {
             result = &mut read => panic!("expected the chat query to block: {result:?}"),
             pid = blocked => pid,
@@ -149,6 +151,44 @@ async fn fast_pg_chat_read_releases_single_pool_slot_on_cancel_and_drop() {
         .expect("the cancelled connection must leave the pool");
     }
     runtime.shutdown().await.unwrap();
+    // With a cacheable pool, a successful in-flight read must return its
+    // connection if shutdown has already drained the idle cache.
+    let SqlBackendConfig::Postgres { pool_size, .. } = &mut cfg.sql else {
+        unreachable!()
+    };
+    *pool_size = 3;
+    let (store, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
+    let mut lock = blocker.begin().await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {schema}.chat_entries IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(&mut *lock)
+    .await
+    .unwrap();
+    let mut read = store.read_chat(ctx(), request);
+    tokio::select! {
+        result = &mut read => panic!("expected an in-flight read: {result:?}"),
+        _ = waiting_reader_pid(&mut observer, blocker_pid) => {}
+    }
+    let stopping = tokio::spawn(runtime.shutdown());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match store.read_space(&scope.space_id).await {
+                Err(PortError::Unavailable(_)) => break,
+                Ok(_) => tokio::task::yield_now().await,
+                other => panic!("unexpected Space read during shutdown: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("shutdown must stop new reads");
+    lock.rollback().await.unwrap();
+    assert_eq!(read.await.unwrap().entries.len(), 1);
+    tokio::time::timeout(Duration::from_secs(2), stopping)
+        .await
+        .expect("shutdown must drain a late cache return")
+        .unwrap()
+        .unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }
 

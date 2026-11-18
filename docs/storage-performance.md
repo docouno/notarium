@@ -76,6 +76,13 @@ These results rule out promoting 3,500/s to a High release floor.
 Across 24 additional High chat profiles on `7e7ef4fb` and `c2925d8d`, the
 largest p95 was 0.329 ms rounded upward.
 
+Two paired PostgreSQL experiments on High alternated ordinary pool checkouts
+and reuse of one idle rollback session, with 500 fresh commands per mode in
+each experiment. The ordinary checkouts used six backend processes and gave
+p95 of 9.13 and 5.86 ms. Session reuse gave 4.20 and 4.00 ms. Median latency
+rose from approximately 3.14–3.15 to 3.20–3.21 ms. Each run also verified the
+17 closed rooms and restored history after every rollback.
+
 A full-sized repeat on Medium at `f6651e2c` measured 7.80 ms in
 SQLite and 11.51 ms in PostgreSQL. A separate 200-command diagnostic on
 each backend timed the phases of each individual rollback. At SQLite's

@@ -1008,7 +1008,7 @@ impl CanonicalStore {
             // slot is occupied or the runtime is shutting down.
             pooled.close_on_drop();
             let mut slot = fast_read_conn.lock().expect("pg fast_read_conn mutex");
-            if slot.is_none() {
+            if slot.is_none() && !self.inner.shutting_down.load(Ordering::SeqCst) {
                 *slot = Some(pooled);
             }
         } else {

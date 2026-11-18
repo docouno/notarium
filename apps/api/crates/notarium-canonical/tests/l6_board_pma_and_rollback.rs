@@ -2611,7 +2611,12 @@ async fn l6_note_only_rollback_dual_dialect_parity() {
         admin_ensure_bucket(&s3_cfg, Some("Enabled"))
             .await
             .expect("ensure S3 bucket");
-        let cfg = fixtures.pg_s3_config(sample_installation_id(2), &schema, s3_cfg);
+        let mut cfg = fixtures.pg_s3_config(sample_installation_id(2), &schema, s3_cfg);
+        // Exercise the smallest pool that can keep a warm rollback session.
+        let notarium_canonical::SqlBackendConfig::Postgres { pool_size, .. } = &mut cfg.sql else {
+            unreachable!()
+        };
+        *pool_size = 3;
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
         let mut conn = fixtures.open_raw_pg().await;
         sqlx::query(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
