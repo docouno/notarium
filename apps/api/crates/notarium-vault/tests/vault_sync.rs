@@ -1767,3 +1767,189 @@ async fn a_name_collision_does_not_hide_an_unclaimed_purge_inode() {
         "a colliding spelling hid the remaining purged inode"
     );
 }
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlapping_conversion_and_purge_keep_both_handoffs() {
+    const ARMOR: &str = include_str!("../../notarium-syntax/tests/fixtures/age-v1.asc");
+    let fixture = Fixture::open().await;
+    let converted = fixture.create("switch", 151).await;
+    let retired = fixture.create("retired", 152).await;
+    assert!(converted.as_str() < retired.as_str());
+    let conversion_path = fixture.root.join("switch.md");
+    let retired_path = fixture.root.join("retired.md");
+    let worker = fixture.start();
+    ready(&mut worker.status(), |_| {
+        disk_id(&conversion_path) == Some(converted.clone())
+            && disk_id(&retired_path) == Some(retired.clone())
+    })
+    .await;
+    worker.shutdown().await.unwrap();
+
+    let ctx = context(&fixture.scope);
+    let conversion_base = fixture
+        .store
+        .read_vault_note(&ctx, &converted)
+        .await
+        .unwrap()
+        .unwrap();
+    let retired_base = fixture
+        .store
+        .read_vault_note(&ctx, &retired)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .mint_and_purge(
+            ctx.clone(),
+            Mutation {
+                identity: identity(&fixture.scope, 153),
+                preconditions: Preconditions {
+                    revision: Some(conversion_base.note.revision.clone()),
+                    ..Default::default()
+                },
+                input: MintAndPurge {
+                    old_note: converted.clone(),
+                    expected_revision: conversion_base.note.revision,
+                    new_note: NoteId::from_bytes([153; 16]),
+                    new_slug: Some("encrypted".into()),
+                    encrypted_carrier: format!(
+                        "---\nclass: encrypted-note\n---\n\x60\x60\x60age\n{ARMOR}\x60\x60\x60\n"
+                    ),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .store
+        .delete_note(
+            ctx.clone(),
+            Mutation {
+                identity: identity(&fixture.scope, 154),
+                preconditions: Preconditions {
+                    revision: Some(retired_base.note.revision),
+                    ..Default::default()
+                },
+                input: DeleteNote {
+                    note: retired.clone(),
+                    disposition: DeleteDisposition::Purge,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let edited = "# A saved edit from the retired file\n";
+    fs::write(&retired_path, edited).unwrap();
+    fs::rename(&retired_path, &conversion_path).unwrap();
+    let worker = fixture.start();
+    ready(&mut worker.status(), |status| {
+        status
+            .conflicts
+            .iter()
+            .any(|issue| issue.path == "switch.md")
+    })
+    .await;
+    let binding = fixture.store.vault_binding(&ctx).await.unwrap().unwrap();
+    let handoffs = fixture.store.vault_handoffs(&ctx, &binding).await.unwrap();
+    assert!(
+        handoffs
+            .iter()
+            .any(|handoff| handoff.old_note == retired && handoff.new_note.is_none())
+    );
+    assert!(
+        handoffs
+            .iter()
+            .any(|handoff| handoff.old_note == converted && handoff.new_note.is_some())
+    );
+    assert_eq!(fs::read_to_string(&conversion_path).unwrap(), edited);
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_asserted_id_does_not_hide_the_purged_inode() {
+    let fixture = Fixture::open().await;
+    let old = fixture.create("purged", 141).await;
+    let foreign = fixture.create("other", 142).await;
+    let original = fixture.root.join("purged.md");
+    let moved = fixture.root.join("moved.md");
+    let fresh = fixture.root.join("fresh.md");
+    let worker = fixture.start();
+    ready(&mut worker.status(), |_| {
+        disk_id(&original) == Some(old.clone())
+    })
+    .await;
+    worker.shutdown().await.unwrap();
+
+    let body = "# Old body after an external edit\n";
+    let edited = carrier::materialize(body, DocClass::UserDoc, &foreign).unwrap();
+    fs::write(&original, edited).unwrap();
+    fs::rename(&original, &moved).unwrap();
+    assert_eq!(disk_id(&moved), Some(foreign));
+
+    let ctx = context(&fixture.scope);
+    let head = fixture
+        .store
+        .read_vault_note(&ctx, &old)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .delete_note(
+            ctx.clone(),
+            Mutation {
+                identity: identity(&fixture.scope, 143),
+                preconditions: Preconditions {
+                    revision: Some(head.note.revision),
+                    ..Default::default()
+                },
+                input: DeleteNote {
+                    note: old.clone(),
+                    disposition: DeleteDisposition::Purge,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let worker = fixture.start();
+    let mut status = worker.status();
+    ready(&mut status, |status| {
+        status.conflicts.iter().any(|issue| {
+            issue.path == "moved.md"
+                && issue.reason == notarium_vault::ConflictReason::ClaimedPurgedIdentity
+        })
+    })
+    .await;
+    let binding = fixture.store.vault_binding(&ctx).await.unwrap().unwrap();
+    let retained = fixture
+        .store
+        .vault_handoffs(&ctx, &binding)
+        .await
+        .unwrap()
+        .iter()
+        .any(|handoff| handoff.old_note == old);
+    worker.shutdown().await.unwrap();
+
+    fs::write(&moved, body).unwrap();
+    fs::rename(&moved, &fresh).unwrap();
+    let worker = fixture.start();
+    ready(&mut worker.status(), |_| true).await;
+    let reminted = fixture
+        .store
+        .vault_observation_at(&ctx, &binding, "fresh.md")
+        .await
+        .unwrap()
+        .is_some();
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+    assert!(
+        retained,
+        "another asserted ID hid the old inode from acknowledgement"
+    );
+    assert!(!reminted, "the same inode was imported at the second path");
+    assert!(disk_id(&fresh).is_none());
+}

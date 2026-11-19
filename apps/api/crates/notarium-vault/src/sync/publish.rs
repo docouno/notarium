@@ -607,14 +607,26 @@ impl Worker<'_> {
         handoffs: &[VaultHandoff],
     ) -> Result<bool, VaultError> {
         let locator = vault_path(path)?;
-        let current = handoffs.iter().find(|handoff| {
-            handoff.observation.path.key == locator.key
-                || carrier.asserted_id.as_ref() == Some(&handoff.old_note)
-                || (carrier.asserted_id.is_none()
-                    && (handoff.observation.file.identity == file_identity(&stamp.identity)
-                        || handoff.observation.file.digest == stamp.digest))
-        });
-        if let Some(handoff) = current {
+        let identity = file_identity(&stamp.identity);
+        let mut matching = handoffs
+            .iter()
+            .filter(|handoff| {
+                handoff.observation.path.key == locator.key
+                    || handoff.observation.file.identity == identity
+                    || carrier.asserted_id.as_ref() == Some(&handoff.old_note)
+                    || (carrier.asserted_id.is_none()
+                        && handoff.observation.file.digest == stamp.digest)
+            })
+            .peekable();
+        if let Some(handoff) = matching.next() {
+            if matching.peek().is_some() {
+                // Path and inode can point to different interrupted
+                // operations. Neither one alone authorizes withdrawal.
+                self.inventory_incomplete |=
+                    handoff.new_note.is_none() || matching.any(|other| other.new_note.is_none());
+                self.conflict(path, ConflictReason::ClaimedPurgedIdentity, None)?;
+                return Ok(true);
+            }
             if handoff.new_note.is_none()
                 && carrier
                     .asserted_id
