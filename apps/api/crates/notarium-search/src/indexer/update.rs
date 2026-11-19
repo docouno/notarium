@@ -155,16 +155,13 @@ pub(super) async fn apply(
     }
     disk.manifest.tantivy_seq = cutoff.after;
     if !chat.removed.is_empty() {
-        publisher.publish(disk);
+        publisher.replace(None);
         publisher.drain().await;
         lexical.collect_obsolete(&cx.services.writers)?;
-        // Closing the durable cut also certifies that the redacted files have
-        // been removed. Interrupted scrubs are replayed from the older cut.
-        disk.layout.publish_search(&disk.manifest)?;
-    } else {
-        disk.layout.publish_search(&disk.manifest)?;
-        publisher.publish(disk);
     }
+    // Publishing the cut certifies that any redacted files have been removed.
+    disk.layout.publish_search(&disk.manifest)?;
+    publisher.publish(disk);
     Ok(())
 }
 

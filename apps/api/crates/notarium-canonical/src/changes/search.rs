@@ -256,6 +256,26 @@ impl CanonicalStore {
         .await
     }
 
+    /// Check whether a durable search cut still describes retained history.
+    /// This needs neither an index reader nor access to any carrier bytes.
+    pub async fn validate_search_index_cut(
+        &self,
+        authority: &ServiceAuthority,
+        budget: CallBudget,
+        cursor: ChangeCursor,
+    ) -> Result<(), PortError> {
+        authority.require(ServicePurpose::Search)?;
+        self.with_read_tx_budget(Some(&budget), |tx| {
+            Box::pin(async move {
+                let space = active_space(tx, &cursor.scope).await?;
+                let cutoff =
+                    validate_snapshot_cutoff_tx(tx, &cursor.scope, Some(cursor.after)).await?;
+                check_seed(tx, &space, cutoff).await
+            })
+        })
+        .await
+    }
+
     pub async fn read_searchable_notes_seed_page(
         &self,
         authority: &ServiceAuthority,

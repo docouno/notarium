@@ -327,6 +327,8 @@ pub struct ControlledCarriers {
     pub hold_chat: AtomicBool,
     pub chat_held: Notify,
     pub release_chat: Notify,
+    pub hold_note_reads: AtomicBool,
+    pub note_read_held: Notify,
 }
 
 impl ControlledCarriers {
@@ -339,6 +341,8 @@ impl ControlledCarriers {
             hold_chat: AtomicBool::new(false),
             chat_held: Notify::new(),
             release_chat: Notify::new(),
+            hold_note_reads: AtomicBool::new(false),
+            note_read_held: Notify::new(),
         }
     }
 }
@@ -410,6 +414,12 @@ impl SearchCarrierReadPort for ControlledCarriers {
         ctx: SpaceContext,
         targets: Vec<SearchDocumentTarget>,
     ) -> PortFuture<'_, Vec<Option<Arc<ClassifiedDocument>>>> {
+        if self.hold_note_reads.load(Ordering::SeqCst) {
+            return Box::pin(async {
+                self.note_read_held.notify_one();
+                std::future::pending().await
+            });
+        }
         SearchCarrierReadPort::read_authorized_documents_for_search(&*self.canonical, ctx, targets)
     }
 

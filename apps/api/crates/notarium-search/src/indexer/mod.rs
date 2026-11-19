@@ -96,6 +96,21 @@ impl Context<'_> {
             after: rec.last_seq,
         })
     }
+
+    async fn requires_scrub(&self, cut: ChangeCursor) -> Result<bool, IndexError> {
+        let result = self
+            .services
+            .deps
+            .canonical
+            .validate_search_index_cut(&self.services.authority, self.budget(), cut)
+            .await
+            .map_err(IndexError::from);
+        match result {
+            Ok(()) => Ok(false),
+            Err(error) if error.requires_scrub() => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 struct Disk {
@@ -227,7 +242,7 @@ async fn consume(
     if scope != starting_scope {
         layout.clear_lexical_manifests()?;
     }
-    let mut disk = open_disk(cx, layout.clone())?;
+    let mut disk = open_disk(cx, publisher, layout.clone(), latest.after).await?;
     let start = disk
         .as_ref()
         .map(Disk::cursor)
@@ -294,6 +309,16 @@ async fn consume(
             return Ok(Some(target.scope));
         }
         let mut seed_at = (force_seed || disk.is_none()).then(|| target.clone());
+        if !force_seed
+            && let Some(current) = disk.as_ref()
+            && current.lexical.is_none()
+            && current.manifest.tantivy_seq < target.after
+            && cx.requires_scrub(current.cursor()).await?
+        {
+            drop(disk.take());
+            build::scrub(cx, publisher, &layout).await?;
+            seed_at = Some(target.clone());
+        }
         if !force_seed && let Some(current) = &mut disk {
             if current.resume_reader(cx)? {
                 publisher.publish(current);
@@ -412,9 +437,27 @@ async fn consume(
     }
 }
 
-fn open_disk(cx: &Context<'_>, layout: Arc<SearchLayout>) -> Result<Option<Disk>, IndexError> {
+async fn open_disk(
+    cx: &Context<'_>,
+    publisher: &mut Publisher<'_>,
+    layout: Arc<SearchLayout>,
+    latest: SpaceSeq,
+) -> Result<Option<Disk>, IndexError> {
+    let manifest = layout.search_manifest();
+    if let Ok(Some(manifest)) = &manifest
+        && manifest.tantivy_seq < latest
+        && cx
+            .requires_scrub(ChangeCursor {
+                scope: manifest.scope.clone(),
+                after: manifest.tantivy_seq,
+            })
+            .await?
+    {
+        build::scrub(cx, publisher, &layout).await?;
+        return Ok(None);
+    }
     let opened = (|| {
-        let Some(manifest) = layout.search_manifest()? else {
+        let Some(manifest) = manifest? else {
             return Ok(None);
         };
         if manifest.tokenizer_version != TOKENIZER_VERSION {
@@ -474,8 +517,12 @@ fn open_disk(cx: &Context<'_>, layout: Arc<SearchLayout>) -> Result<Option<Disk>
             build::remove_generation(cx, &layout, generation)?;
         }
     }
+    let vector_model = disk
+        .as_ref()
+        .and_then(|disk| disk.epoch.as_ref().and(disk.manifest.active_model.as_ref()))
+        .map(crate::ports::ResolvedEmbeddingTarget::vector_model);
+    layout.remove_vector_epochs(vector_model.as_ref())?;
     if disk.is_none() {
-        layout.remove_vector_epochs(None)?;
         // A corrupt dictionary cannot be used with an empty replacement index.
         if layout.folder_dictionary().is_err() {
             layout.clear_lexical_manifests()?;

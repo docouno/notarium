@@ -33,6 +33,7 @@ use notarium_search::{
     SearchDependencies, SearchEngine,
     config::{SearchConfig, VectorMode},
     layout::{SearchLayout, SearchManifest},
+    lexical::LexicalIndex,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -596,26 +597,65 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         .await
         .unwrap()
         .thread;
-    let redacted = store
-        .redact_chat_entry(
-            ctx.clone(),
-            mutation(
-                &ctx,
-                RedactChatEntry {
-                    thread,
-                    entry: appended.value.seq,
-                    expected_thread_revision: old_thread.revision,
-                },
-            ),
-        )
+    let layout = SearchLayout::open(&root, scope.clone()).unwrap();
+    let before = layout.search_manifest().unwrap().unwrap();
+    let index_path = layout.index_dir(&before).unwrap();
+    carriers.hold_chat.store(true, Ordering::SeqCst);
+    let (held, redacted_seq) = tokio::join!(engine.search(ctx.clone(), chat.clone()), async {
+        tokio::time::timeout(Duration::from_secs(3), carriers.chat_held.notified())
+            .await
+            .unwrap();
+        let redacted = store
+            .redact_chat_entry(
+                ctx.clone(),
+                mutation(
+                    &ctx,
+                    RedactChatEntry {
+                        thread,
+                        entry: appended.value.seq,
+                        expected_thread_revision: old_thread.revision,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let seq = redacted.receipt.seq();
+        projection.snapshot.write().unwrap().advance(seq);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while LexicalIndex::open(&index_path)
+                .unwrap()
+                .commit_id()
+                .unwrap()
+                == before.tantivy_commit
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
         .unwrap();
-    projection
-        .snapshot
-        .write()
-        .unwrap()
-        .advance(redacted.receipt.seq());
-    acknowledged(&store, &root, scope, redacted.receipt.seq()).await;
+        let mut waiting = chat.clone();
+        waiting.causal = CausalBasis::Await(AwaitWatermarks::from_receipts([redacted.receipt]));
+        let mut short = ctx.clone();
+        short.budget.remaining = Duration::from_millis(500);
+        assert!(matches!(
+            engine.search(short, waiting).await,
+            Err(PortError::DeadlineExceeded(_))
+        ));
+        assert_eq!(
+            layout.search_manifest().unwrap().unwrap().tantivy_seq,
+            before.tantivy_seq
+        );
+        assert!(
+            store
+                .min_consumer_watermark(&scope.space_id, &scope.incarnation)
+                .unwrap()
+                < seq
+        );
+        carriers.release_chat.notify_one();
+        seq
+    });
+    assert!(held.unwrap().chat_hits.is_empty());
+    acknowledged(&store, &root, scope, redacted_seq).await;
     assert!(
         engine
             .search(ctx.clone(), chat)
@@ -632,7 +672,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
             &authority,
             ctx.budget.clone(),
             scope.clone(),
-            redacted.receipt.seq(),
+            redacted_seq,
             vec![vault.clone()],
         )
         .await
@@ -819,16 +859,27 @@ async fn reader_capacity(store: Arc<CanonicalStore>, root: DataRoot) {
         snapshot: RwLock::new(view),
         live: RwLock::new(BTreeSet::from([note.clone()])),
     });
-    let engine = SearchEngine::start(
-        SearchConfig::new(root.clone(), VectorMode::Disabled),
-        SearchDependencies::new(store.clone(), projection.clone()),
-    );
+    let carriers = Arc::new(ControlledCarriers::new(store.clone()));
+    let start = || {
+        let mut deps = SearchDependencies::new(store.clone(), projection.clone());
+        deps.carriers = carriers.clone();
+        SearchEngine::start(
+            SearchConfig::new(
+                root.clone(),
+                VectorMode::DeterministicTest { dimension: 64 },
+            ),
+            deps,
+        )
+    };
+    let engine = start();
     engine.start_space(first.clone()).unwrap();
     acknowledged(&store, &root, &first, first_seq).await;
+    let mut other_spaces = Vec::new();
     for tag in (tag + 1)..=(tag + 32) {
         let (scope, seq, _) = seed(&store, tag).await;
         engine.start_space(scope.clone()).unwrap();
         acknowledged(&store, &root, &scope, seq).await;
+        other_spaces.push((tag, scope, seq));
     }
     let ctx = context(&first, &sample_principal_id(tag));
     let hits = engine
@@ -836,6 +887,13 @@ async fn reader_capacity(store: Arc<CanonicalStore>, root: DataRoot) {
         .await
         .unwrap();
     assert_eq!(hits.hits[0].card.title, "Capacity receipt");
+    engine.shutdown().await;
+    let vectors = root.search(&first.space_id, SearchIndexKind::Vector);
+    assert!(
+        files(&vectors)
+            .values()
+            .any(|bytes| contains(bytes, note.as_str()))
+    );
     let mut purge = mutation(
         &ctx,
         DeleteNote {
@@ -846,12 +904,60 @@ async fn reader_capacity(store: Arc<CanonicalStore>, root: DataRoot) {
     purge.preconditions.revision = Some(revision);
     let purged = store.delete_note(ctx, purge).await.unwrap();
     projection.live.write().unwrap().remove(&note);
+
+    let engine = Arc::new(start());
+    let mut held = tokio::task::JoinSet::new();
+    carriers.hold_note_reads.store(true, Ordering::SeqCst);
+    for (tag, scope, seq) in other_spaces {
+        let folder = sample_folder_id(tag);
+        let note_id = sample_note_id(tag);
+        let mut view = View::new(scope.clone(), folder.clone());
+        view.index(note_id.clone(), folder);
+        view.advance(seq);
+        *projection.snapshot.write().unwrap() = view;
+        projection.live.write().unwrap().insert(note_id);
+        let mut ctx = context(&scope, &sample_principal_id(tag));
+        ctx.budget.remaining = Duration::from_secs(30);
+        let query_engine = engine.clone();
+        held.spawn(async move {
+            query_engine
+                .search(ctx, query("readercapacitykeyword"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), carriers.note_read_held.notified())
+            .await
+            .unwrap();
+    }
+    engine.start_space(first.clone()).unwrap();
+    let layout = SearchLayout::open(&root, first.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while layout.search_manifest().unwrap().is_some()
+            || files(&vectors)
+                .values()
+                .any(|bytes| contains(bytes, note.as_str()))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        held.try_join_next().is_none(),
+        "all other readers must remain pinned"
+    );
+    assert!(
+        store
+            .min_consumer_watermark(&first.space_id, &first.incarnation)
+            .is_none_or(|seq| seq < purged.receipt.seq())
+    );
+    held.shutdown().await;
+    carriers.hold_note_reads.store(false, Ordering::SeqCst);
     acknowledged(&store, &root, &first, purged.receipt.seq()).await;
     assert_absent(
         &root.search(&first.space_id, SearchIndexKind::Tantivy),
         "readercapacitykeyword",
     );
-    engine.shutdown().await;
+    Arc::try_unwrap(engine).ok().unwrap().shutdown().await;
 }
 
 async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
