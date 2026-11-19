@@ -833,6 +833,42 @@ fn windows_keeps_broad_acl_captures_and_unproved_subtrees_in_the_vault() {
 
 #[cfg(windows)]
 #[test]
+fn windows_busy_historical_parent_keeps_the_capture_unconfirmed() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ};
+
+    let fixture = Fixture::new();
+    let folder = fixture.vault.join("history");
+    fs::create_dir(&folder).unwrap();
+    let roots = fixture.open();
+    let vault = roots.vault().unwrap();
+    let target = Path::new("history/note.md");
+    let slot = VaultDir::operation_slot(target, OPERATION).unwrap();
+    let expected = vault.stage(target, &slot, b"retained").unwrap();
+    let old = fixture.vault.join(&slot);
+    let moved = fixture.vault.join("moved");
+    fs::rename(&old, &moved).unwrap();
+    let reader = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&folder)
+        .unwrap();
+
+    assert!(matches!(
+        vault.clean_capture(&slot, &expected).unwrap(),
+        CaptureCleanup::Retained { path } if path == old
+    ));
+    assert_eq!(fs::read(&moved).unwrap(), b"retained");
+    drop(reader);
+    assert!(matches!(
+        vault.clean_capture(&slot, &expected).unwrap(),
+        CaptureCleanup::Absent
+    ));
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_disposes_of_a_verified_matching_shared_capture_without_changing_its_acl() {
     let fixture = Fixture::new();
     let roots = fixture.open();

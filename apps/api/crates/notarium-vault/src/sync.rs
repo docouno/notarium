@@ -456,12 +456,23 @@ impl<'a> Worker<'a> {
             self.report(SyncPhase::WaitingForGit);
             return Ok(reconcile);
         }
-        let needs_seed = reconcile || dirty.rescan;
+        let retry_blocked_subtree = self.inventory_incomplete
+            && dirty.paths.iter().any(|path| {
+                self.conflicts
+                    .get(path.to_string_lossy().as_ref())
+                    .is_some_and(|issue| issue.reason == ConflictReason::UnsafePath)
+            });
+        // An installation of the native watch needs its own inventory cut.
+        let restore_coverage =
+            self.inventory_incomplete && (reconcile || dirty.rescan || retry_blocked_subtree);
+        let restored = self.watcher.restore_native(restore_coverage)?;
+        let needs_seed = reconcile || dirty.rescan || retry_blocked_subtree || restored;
         let handoffs = self
             .store
             .vault_handoffs(&self.config.context, &self.binding)
             .await?;
-        let settled = if needs_seed || handoffs.iter().any(|handoff| handoff.new_note.is_none()) {
+        let pending_purge = handoffs.iter().any(|handoff| handoff.new_note.is_none());
+        let settled = if needs_seed || (pending_purge && !self.inventory_incomplete) {
             self.report(SyncPhase::Reconciling);
             *dirty = Dirty::default();
             self.reconcile_all(handoffs).await?
@@ -488,7 +499,8 @@ impl<'a> Worker<'a> {
 
     async fn reconcile_all(&mut self, mut handoffs: Vec<VaultHandoff>) -> Result<bool, VaultError> {
         let loss = self.watcher.loss();
-        self.inventory_incomplete = false;
+        // A polling backend can miss brief namespace transitions between samples.
+        self.inventory_incomplete = self.watcher.is_polling();
         // Events received before the inventory are covered by the inventory.
         let _before_inventory = self.watcher.take();
         self.recover_captures(None)?;
@@ -507,11 +519,7 @@ impl<'a> Worker<'a> {
         let mut paths = self.inventory(Path::new(""))?;
         self.add_previous_paths(&mut paths, None).await?;
         let unsettled = self.watcher.take();
-        if unsettled.rescan
-            || self.watcher.loss() != loss
-            || self.git_busy()
-            || (self.inventory_incomplete && !handoffs.is_empty())
-        {
+        if unsettled.rescan || self.watcher.loss() != loss || self.git_busy() {
             return Ok(false);
         }
         paths.extend(self.expand(unsettled.paths).await?);
@@ -546,6 +554,9 @@ impl<'a> Worker<'a> {
             }
         }
         // Ordinary purge work is only retired after the stable full cut.
+        if self.inventory_incomplete {
+            return Ok(true);
+        }
         for handoff in handoffs
             .into_iter()
             .filter(|handoff| handoff.new_note.is_none())

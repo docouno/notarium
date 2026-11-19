@@ -8,17 +8,21 @@ use std::{
 };
 
 use notify::{
-    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+    Config, Event, EventKind, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
     event::{ModifyKind, RenameMode},
 };
 use tokio::{sync::Notify, time::Instant};
 
-use crate::paths::{PathUse, path_use};
+use crate::{
+    filesystem::path_error,
+    paths::{PathUse, path_use},
+};
 
 const MAX_PATHS: usize = 4096;
 const BURST_EVENTS: u16 = 50;
 const QUIET: Duration = Duration::from_millis(100);
 const MAX_WINDOW: Duration = Duration::from_secs(1);
+const POLL_FALLBACK: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 pub(crate) struct Dirty {
@@ -263,7 +267,51 @@ fn ignored(path: &Path) -> bool {
 
 pub(crate) struct VaultWatch {
     inbox: Arc<Inbox>,
-    _watcher: RecommendedWatcher,
+    backend: WatchBackend,
+}
+
+enum WatchBackend {
+    Native {
+        _watcher: RecommendedWatcher,
+    },
+    Polling {
+        _watcher: PollWatcher,
+        next_retry: Instant,
+    },
+}
+
+fn native_watch(inbox: &Arc<Inbox>) -> notify::Result<RecommendedWatcher> {
+    let sender = Arc::clone(inbox);
+    let mut watcher = RecommendedWatcher::new(
+        move |event| sender.push(event),
+        Config::default().with_follow_symlinks(false),
+    )?;
+    watcher.watch(&inbox.root, RecursiveMode::Recursive)?;
+    Ok(watcher)
+}
+
+fn inaccessible_descendant(error: &notify::Error, root: &Path) -> bool {
+    matches!(&error.kind, notify::ErrorKind::Io(error) if path_error(error))
+        && !error.paths.is_empty()
+        && error
+            .paths
+            .iter()
+            .all(|path| path != root && path.starts_with(root))
+}
+
+fn polling_watch(inbox: &Arc<Inbox>) -> notify::Result<WatchBackend> {
+    let sender = Arc::clone(inbox);
+    let mut watcher = PollWatcher::new(
+        move |event| sender.push(event),
+        Config::default()
+            .with_follow_symlinks(false)
+            .with_poll_interval(POLL_FALLBACK),
+    )?;
+    watcher.watch(&inbox.root, RecursiveMode::Recursive)?;
+    Ok(WatchBackend::Polling {
+        _watcher: watcher,
+        next_retry: Instant::now() + POLL_FALLBACK,
+    })
 }
 
 impl VaultWatch {
@@ -273,16 +321,43 @@ impl VaultWatch {
             state: Mutex::default(),
             ready: Notify::new(),
         });
-        let sender = inbox.clone();
-        let mut watcher = RecommendedWatcher::new(
-            move |event| sender.push(event),
-            Config::default().with_follow_symlinks(false),
-        )?;
-        watcher.watch(root, RecursiveMode::Recursive)?;
-        Ok(Self {
-            inbox,
-            _watcher: watcher,
-        })
+        let backend = match native_watch(&inbox) {
+            Ok(watcher) => WatchBackend::Native { _watcher: watcher },
+            Err(error) if inaccessible_descendant(&error, root) => polling_watch(&inbox)?,
+            Err(error) => return Err(error),
+        };
+        Ok(Self { inbox, backend })
+    }
+
+    pub fn is_polling(&self) -> bool {
+        matches!(self.backend, WatchBackend::Polling { .. })
+    }
+
+    pub fn restore_native(&mut self, restore_coverage: bool) -> notify::Result<bool> {
+        match &mut self.backend {
+            WatchBackend::Polling { next_retry, .. } => {
+                let now = Instant::now();
+                if now < *next_retry {
+                    return Ok(false);
+                }
+                *next_retry = now + POLL_FALLBACK;
+            }
+            WatchBackend::Native { .. } if !restore_coverage => return Ok(false),
+            WatchBackend::Native { .. } => {}
+        }
+        match native_watch(&self.inbox) {
+            Ok(watcher) => {
+                self.backend = WatchBackend::Native { _watcher: watcher };
+                Ok(true)
+            }
+            Err(error) if inaccessible_descendant(&error, &self.inbox.root) => {
+                if !self.is_polling() {
+                    self.backend = polling_watch(&self.inbox)?;
+                }
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn loss(&self) -> u64 {

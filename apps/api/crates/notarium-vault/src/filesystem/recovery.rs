@@ -9,8 +9,8 @@ use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::{Dir, OpenOptions};
 
 use super::{
-    EntryKind, FileIdentity, FileStamp, VaultDir, conflict, entry_kind, open_child_dir, platform,
-    present, read_matching_stamp, roots, split_target, stamp_from_file, sync_dir,
+    EntryKind, FileIdentity, FileStamp, VaultDir, conflict, entry_kind, open_child_dir, path_error,
+    platform, present, read_matching_stamp, roots, split_target, stamp_from_file, sync_dir,
     validate_slot_name,
 };
 
@@ -250,18 +250,7 @@ impl VaultDir {
             .open_dir_exact(path)
             .and_then(|dir| dir.map(probe).transpose())
         {
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound
-                        | io::ErrorKind::InvalidInput
-                        | io::ErrorKind::NotADirectory
-                        | io::ErrorKind::PermissionDenied
-                        | io::ErrorKind::Unsupported
-                ) =>
-            {
-                Ok(None)
-            }
+            Err(error) if path_error(&error) => Ok(None),
             result => result,
         }
     }
@@ -306,6 +295,11 @@ impl VaultDir {
 
         let source = self.probe_capture_source(source_path, |parent| {
             let occupied = present(parent.symlink_metadata(name))?.is_some();
+            #[cfg(windows)]
+            if !occupied {
+                // Replay can observe an earlier disposition before a directory flush.
+                sync_dir(&parent)?;
+            }
             Ok((parent, occupied))
         })?;
         let Some((parent, occupied)) = source else {
@@ -314,9 +308,6 @@ impl VaultDir {
             return Ok(Parked::Shared(shared));
         };
         if !occupied {
-            #[cfg(windows)]
-            // A process may have stopped before syncing a handle disposal.
-            sync_dir(&parent)?;
             return Ok(Parked::Absent);
         }
 

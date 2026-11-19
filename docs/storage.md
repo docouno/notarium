@@ -171,10 +171,15 @@ source volume through a verified handle that excludes writers. When an earlier
 shared capture can no longer be found at its exact path, the vault retains its
 recovery record and reports the capture without a confirmed location. On macOS,
 an atomic exchange publishes the replacement while the private archive
-retains the displaced inode. Ordinary
-replacements report retained captures in vault status. Conversions return
+retains the displaced inode. Ordinary replacements report retained captures in
+vault status. Conversions return
 `CleanupPending` while that inode remains. The archive writes no plaintext
 copy. `Complete` requires safe retirement of the displaced inode.
+
+If an inaccessible subtree prevents native watch coverage, the synchronizer
+can poll the accessible paths until it restores the native watch. Inferred
+Trash and ordinary purge acknowledgement wait for a complete inventory with
+native notifications. Imports and publications at accessible paths continue.
 
 Schema version 6 orders the existing retirement index by status and then Space.
 Both the installation-wide and per-Space pending checks can seek directly to

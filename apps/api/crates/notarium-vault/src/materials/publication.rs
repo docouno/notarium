@@ -210,6 +210,28 @@ impl ReservedMaterials {
             .flat_map(|record| record.conflicts.iter())
     }
 
+    pub(crate) fn blocked_publications_at(&self, observed: &Path) -> (bool, BTreeSet<AbilityId>) {
+        let mut schema = false;
+        let mut abilities = BTreeSet::new();
+        for (target, record) in &self.records {
+            let path = target.path();
+            if !observed.starts_with(&path) && !path.starts_with(observed) {
+                continue;
+            }
+            if record.conflicts.iter().any(|issue| {
+                issue.path == path && issue.kind == ReservedConflictKind::ExternalChange
+            }) {
+                match target {
+                    Target::Schema => schema = true,
+                    Target::Ability(id) => {
+                        abilities.insert(id.clone());
+                    }
+                }
+            }
+        }
+        (schema, abilities)
+    }
+
     pub fn recover(&mut self, vault: &VaultDir) -> Result<(), MaterialError> {
         self.check_root(vault)?;
         let targets: Vec<_> = self.records.keys().cloned().collect();
@@ -820,9 +842,14 @@ fn retire_tree(
         Err(error) => return Err(error),
     };
     if archive == shared {
-        // A cross-volume or busy capture still occupies the shared name.
-        // No retirement step may delete anything under that name.
-        retained.push((slot.to_owned(), Some(archive)));
+        // A busy capture can stay at the shared name or move with its parent.
+        // No retirement step may delete anything under this name.
+        let known = match vault.entry_kind_exact(slot) {
+            Ok(kind) => kind.is_some(),
+            Err(error) if path_error(&error) => false,
+            Err(error) => return Err(error),
+        };
+        retained.push((slot.to_owned(), known.then_some(archive)));
         return Ok(());
     }
     if vault.entry_kind(slot)?.is_some() {

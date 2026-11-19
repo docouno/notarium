@@ -71,7 +71,16 @@ impl Worker<'_> {
             self.check_stop()?;
             self.work.enumerated_directories += 1;
             let entries = match self.vault.list(&directory) {
-                Ok(entries) => entries,
+                Ok(entries) => {
+                    if self
+                        .conflicts
+                        .get(directory.to_string_lossy().as_ref())
+                        .is_some_and(|issue| issue.reason == ConflictReason::UnsafePath)
+                    {
+                        self.clear_conflict(&directory)?;
+                    }
+                    entries
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) if path_error(&error) && !directory.as_os_str().is_empty() => {
                     self.inventory_incomplete = true;
@@ -131,7 +140,27 @@ impl Worker<'_> {
         for path in paths {
             self.check_stop()?;
             match path_use(&path) {
-                PathUse::Reserved => self.reserved.observe_reserved(self.vault, &path)?,
+                PathUse::Reserved => {
+                    let (schema, abilities) = self.reserved.blocked_publications_at(&path);
+                    self.reserved.observe_reserved(self.vault, &path)?;
+                    if schema {
+                        self.reserved
+                            .sync_schema(self.vault, &self.store, &self.config.context)
+                            .await?;
+                    }
+                    for ability in &self.config.owned_abilities {
+                        if abilities.contains(&ability.id) {
+                            self.reserved
+                                .sync_ability(
+                                    self.vault,
+                                    &self.store,
+                                    &self.config.context,
+                                    ability,
+                                )
+                                .await?;
+                        }
+                    }
+                }
                 PathUse::Notes => {
                     // A Markdown name is still allowed to be a directory.
                     match self.vault.entry_kind(&path) {
@@ -247,6 +276,14 @@ impl Worker<'_> {
             if let Some(binding) = &binding
                 && same_file(&binding.file, &observed.stamp)
             {
+                if self
+                    .conflicts
+                    .get(&path.relative)
+                    .is_some_and(|issue| issue.reason == ConflictReason::UnsafePath)
+                {
+                    self.clear_conflict(&relative)?;
+                    self.materialize(&binding.note).await?;
+                }
                 continue;
             }
             let carrier = match self.inspect_disk(&observed) {
@@ -330,7 +367,11 @@ impl Worker<'_> {
             if moved.contains(&old.note) || protected.contains(&old.note) {
                 continue;
             }
-            if allow_delete && self.watcher.quiet_since(loss) && !self.git_busy() {
+            if allow_delete
+                && !self.inventory_incomplete
+                && self.watcher.quiet_since(loss)
+                && !self.git_busy()
+            {
                 self.delete_missing(old, loss).await?;
             } else {
                 self.missing_paths.insert(PathBuf::from(old.path.relative));

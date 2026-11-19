@@ -417,24 +417,27 @@ impl Worker<'_> {
         successor: Option<NoteId>,
     ) -> Result<bool, VaultError> {
         let shared = self.vault.path_for_watcher().join(&captured.path);
-        let cleanup = self.vault.clean_capture(&captured.path, &captured.stamp)?;
-        let retained = match cleanup {
-            CaptureCleanup::Removed => None,
-            CaptureCleanup::Absent
+        let retained = match self.vault.clean_capture(&captured.path, &captured.stamp) {
+            Ok(CaptureCleanup::Removed) => None,
+            Ok(CaptureCleanup::Absent)
                 if self
                     .captures
                     .get(&operation)
-                    .is_some_and(|record| record.retained_at != shared) =>
+                    .is_some_and(|record| !record.unlocated && record.retained_at != shared) =>
             {
                 // A previous attempt verified the private recovery location.
                 None
             }
-            CaptureCleanup::Absent => Some((shared, true)),
-            CaptureCleanup::Retained { path } => {
+            Ok(CaptureCleanup::Absent) => Some((shared, true)),
+            Ok(CaptureCleanup::Retained { path }) => {
                 let unlocated = path == shared
                     && !matches!(self.vault.entry_kind_exact(&captured.path), Ok(Some(_)));
                 Some((path, unlocated))
             }
+            // A local access failure can also interrupt the namespace flush.
+            // Keep the capture record until the location and disposal are proved.
+            Err(error) if path_error(&error) => Some((shared, true)),
+            Err(error) => return Err(error.into()),
         };
         match retained {
             None => {

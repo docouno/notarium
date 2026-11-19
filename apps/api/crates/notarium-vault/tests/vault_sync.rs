@@ -379,8 +379,76 @@ async fn a_blocked_reserved_path_does_not_stop_note_import() {
     assert_eq!(fs::read(&reserved_path).unwrap(), b"user-owned entry");
 
     fs::remove_file(reserved_path).unwrap();
-    worker.reconcile().await.unwrap();
     ready(&mut status, |status| status.conflicts.is_empty()).await;
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_edit_is_published_when_the_existing_file_becomes_readable() {
+    use notarium_core::ports::{ExternalObservation, ExternalObservationResult, ObservedContent};
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::open().await;
+    let note = fixture.create("temporarily-blocked", 108).await;
+    let file = fixture.root.join("temporarily-blocked.md");
+    let worker = fixture.start();
+    let mut status = worker.status();
+    ready(&mut status, |_| disk_id(&file) == Some(note.clone())).await;
+    let ctx = context(&fixture.scope);
+    let before = fixture
+        .store
+        .read_vault_note(&ctx, &note)
+        .await
+        .unwrap()
+        .unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&file).is_ok() {
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        worker.shutdown().await.unwrap();
+        fixture.runtime.shutdown().await.unwrap();
+        return;
+    }
+    let body = "# Updated canonical note\n";
+    let update = fixture
+        .store
+        .accept_external_observation(
+            ctx,
+            Mutation {
+                identity: identity(&fixture.scope, 109),
+                preconditions: Preconditions::default(),
+                input: ExternalObservation {
+                    note: note.clone(),
+                    observed_digest: ContentDigest::from_bytes(
+                        *blake3::hash(body.as_bytes()).as_bytes(),
+                    ),
+                    base_revision: before.note.revision,
+                    disk_identity: ContentDigest::from_bytes([109; 32]),
+                    content: ObservedContent::Carrier(body.into()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let ExternalObservationResult::Committed(updated) = update else {
+        panic!("expected a canonical edit");
+    };
+    ready(&mut status, |value| {
+        value.cursor >= updated.receipt.seq()
+            && value
+                .conflicts
+                .iter()
+                .any(|issue| issue.path == "temporarily-blocked.md")
+    })
+    .await;
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    ready(&mut status, |value| {
+        value.conflicts.is_empty()
+            && fs::read_to_string(&file).is_ok_and(|text| text.contains(body))
+    })
+    .await;
+    assert_eq!(disk_id(&file), Some(note));
     worker.shutdown().await.unwrap();
     fixture.runtime.shutdown().await.unwrap();
 }
@@ -1221,4 +1289,97 @@ async fn remote_conversion_replaces_plaintext_at_the_old_name_after_restart() {
     );
     supervisor.shutdown().await.unwrap();
     fixture.runtime.shutdown().await.unwrap();
+}
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_purge_with_a_blocked_directory_allows_other_vault_paths() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::open().await;
+    let old = fixture.create("purged", 117).await;
+    let worker = fixture.start();
+    let old_path = fixture.root.join("purged.md");
+    ready(&mut worker.status(), |_| {
+        disk_id(&old_path) == Some(old.clone())
+    })
+    .await;
+    worker.shutdown().await.unwrap();
+
+    let ctx = context(&fixture.scope);
+    let prior_head = fixture
+        .store
+        .read_vault_note(&ctx, &old)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .delete_note(
+            ctx.clone(),
+            Mutation {
+                identity: identity(&fixture.scope, 118),
+                preconditions: Preconditions {
+                    revision: Some(prior_head.note.revision),
+                    ..Default::default()
+                },
+                input: DeleteNote {
+                    note: old,
+                    disposition: DeleteDisposition::Purge,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let projected_id = fixture.create("projected", 119).await;
+    let projected = fixture.root.join("projected.md");
+    let incoming = fixture.root.join("independent.md");
+    fs::write(&incoming, "# Independent offline note\n").unwrap();
+    let blocked = fixture.root.join("blocked");
+    fs::create_dir(&blocked).unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&blocked).is_ok() {
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.runtime.shutdown().await.unwrap();
+        return;
+    }
+    let worker = fixture.start();
+    let mut status = worker.status();
+    let observed = tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|_| {
+            disk_id(&incoming).is_some() && disk_id(&projected) == Some(projected_id.clone())
+        }),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
+    let binding = fixture.store.vault_binding(&ctx).await.unwrap().unwrap();
+    let retained = !fixture
+        .store
+        .vault_handoffs(&ctx, &binding)
+        .await
+        .unwrap()
+        .is_empty();
+    let current = status.borrow().clone();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    let acknowledged = tokio::time::timeout(Duration::from_secs(15), async {
+        while !fixture
+            .store
+            .vault_handoffs(&ctx, &binding)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .is_ok();
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+    assert!(observed, "unrelated notes did not converge: {current:?}");
+    assert!(retained, "partial inventory acknowledged the pending purge");
+    assert!(
+        acknowledged,
+        "purge was not acknowledged after native watch recovery"
+    );
 }
