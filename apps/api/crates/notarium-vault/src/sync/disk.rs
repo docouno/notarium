@@ -11,8 +11,8 @@ use notarium_core::{
     ids::{CommandKey, ContentDigest, FolderId, NoteId, RevisionId},
     ports::{
         Committed, CreateNote, DeleteDisposition, DeleteNote, ExternalObservation,
-        ExternalObservationResult, MoveNote, Mutation, NoteRevision, ObservedContent,
-        Preconditions,
+        ExternalObservationResult, MoveNote, Mutation, NoteRevision, NoteWritePort,
+        ObservedContent, Preconditions, RenameFolder,
     },
     receipt::CommandIdentity,
 };
@@ -182,6 +182,7 @@ impl Worker<'_> {
     ) -> Result<(), VaultError> {
         let mut file_paths = paths.into_iter().collect::<Vec<_>>();
         let loss = self.watcher.loss();
+        let renames: HashMap<_, _> = renames.into_iter().map(|(from, to)| (to, from)).collect();
         file_paths.sort_unstable();
         let mut claims = HashMap::<NoteId, usize>::new();
         let mut missing = Vec::new();
@@ -298,7 +299,7 @@ impl Worker<'_> {
                 self.write_batch(std::mem::take(&mut batch)).await?;
                 batch_bytes = 0;
             }
-            if let Some(write) = self.prepare_candidate(candidate, &renames).await? {
+            if let Some(write) = self.prepare_candidate(candidate).await? {
                 let size = write.byte_size();
                 if batch.len() >= usize::from(PAGE)
                     || (batch_bytes + size > MAX_NOTE_BYTES as u64 && !batch.is_empty())
@@ -377,7 +378,7 @@ impl Worker<'_> {
         relative: &Path,
         stamp: &FileStamp,
         carrier: &NoteCarrier,
-        renames: &[(PathBuf, PathBuf)],
+        renames: &HashMap<PathBuf, PathBuf>,
     ) -> Result<Option<VaultObservation>, VaultError> {
         let proposed = if let Some(note) = &carrier.asserted_id {
             self.store
@@ -398,7 +399,7 @@ impl Worker<'_> {
         };
         // Any error from a capability-relative probe fails the absence
         // predicate. Only a confirmed missing name authorizes a move.
-        if !self.old_name_left(&old, relative, stamp, renames)? {
+        if !self.old_name_left(&old, relative)? {
             return Ok(None);
         }
         let current = self
@@ -413,7 +414,6 @@ impl Worker<'_> {
     async fn prepare_candidate(
         &mut self,
         candidate: Candidate,
-        renames: &[(PathBuf, PathBuf)],
     ) -> Result<Option<Write>, VaultError> {
         let Some(observed) = self.read_disk(&candidate.relative)? else {
             return Ok(None);
@@ -434,7 +434,6 @@ impl Worker<'_> {
                 old,
                 observed.stamp.clone(),
                 text,
-                renames,
             )
             .await?;
             Ok(None)
@@ -450,13 +449,27 @@ impl Worker<'_> {
         old: VaultObservation,
         stamp: FileStamp,
         source: &str,
-        renames: &[(PathBuf, PathBuf)],
     ) -> Result<(), VaultError> {
-        if !self.old_name_left(&old, &relative, &stamp, renames)? || self.git_busy() {
+        if !self.old_name_left(&old, &relative)? || self.git_busy() {
             return self.conflict(&relative, ConflictReason::CanonicalDiverged, None);
         }
+        if path.key == old.path.key {
+            match self
+                .reconcile_folder_spelling(Path::new(&old.path.relative), &relative)
+                .await
+            {
+                Ok(()) => {}
+                Err(VaultError::Canonical(PortError::Domain(_)) | VaultError::Domain(_)) => {
+                    return self.conflict(&relative, ConflictReason::NameCollision, None);
+                }
+                Err(VaultError::Filesystem(error)) if path_error(&error) => {
+                    return self.conflict(&relative, ConflictReason::UnsafePath, None);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let (parent, slug) = self.destination(&relative).await?;
-        if !self.old_name_left(&old, &relative, &stamp, renames)? || self.git_busy() {
+        if !self.old_name_left(&old, &relative)? || self.git_busy() {
             return self.conflict(&relative, ConflictReason::CanonicalDiverged, None);
         }
         let identity = self.identity("move", &path, &stamp, Some(&old.revision));
@@ -765,17 +778,24 @@ impl Worker<'_> {
         }
         match self
             .store
-            .trash_vault_note(
+            .trash_vault_note_with_fence(
                 self.config.context.clone(),
                 &self.binding,
                 old.clone(),
                 request,
+                self.watcher.deletion_fence(loss),
             )
             .await
         {
             Ok(_) => {
                 self.known.remove(&old.path.key);
                 self.clear_conflict(path)
+            }
+            Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                if diagnostic.reason == ValidationReason::CursorStale =>
+            {
+                self.missing_paths.insert(path.to_owned());
+                Ok(())
             }
             Err(PortError::Domain(_)) => {
                 self.conflict(path, ConflictReason::CanonicalDiverged, None)
@@ -784,27 +804,71 @@ impl Worker<'_> {
         }
     }
 
-    fn old_name_left(
-        &self,
-        old: &VaultObservation,
-        new: &Path,
-        stamp: &FileStamp,
-        renames: &[(PathBuf, PathBuf)],
-    ) -> Result<bool, VaultError> {
+    fn old_name_left(&self, old: &VaultObservation, new: &Path) -> Result<bool, VaultError> {
         let previous = Path::new(&old.path.relative);
-        match self.vault.entry_kind(previous) {
-            Ok(None) => Ok(true),
-            Ok(Some(EntryKind::File))
-                if previous != new && old.path.key == vault_path(new)?.key =>
-            {
-                // Case-insensitive volumes may still resolve the former
-                // spelling to the same file. Require an OS rename pair and
-                // the same file identity to distinguish this from a copy.
-                Ok(old.file.identity == file_identity(&stamp.identity)
-                    && paired_source(new, renames).is_some_and(|source| source == previous))
-            }
-            _ => Ok(false),
+        let entry = if previous != new && old.path.key == vault_path(new)?.key {
+            self.vault.entry_kind_exact(previous)
+        } else {
+            self.vault.entry_kind(previous)
+        };
+        Ok(matches!(entry, Ok(None)))
+    }
+
+    async fn reconcile_folder_spelling(&self, old: &Path, new: &Path) -> Result<(), VaultError> {
+        let previous_parent = old.parent().unwrap_or(Path::new(""));
+        let new_parent = new.parent().unwrap_or(Path::new(""));
+        if previous_parent == new_parent {
+            return Ok(());
         }
+        let mut parent = None;
+        let mut previous_prefix = PathBuf::new();
+        let mut new_prefix = PathBuf::new();
+        let invalid = || DomainError::validation(ValidationReason::InvalidPathComponent);
+        for (previous, new) in previous_parent.components().zip(new_parent.components()) {
+            let previous = previous.as_os_str().to_str().ok_or_else(invalid)?;
+            let new = new.as_os_str().to_str().ok_or_else(invalid)?;
+            previous_prefix.push(previous);
+            new_prefix.push(new);
+            let folder = self
+                .store
+                .vault_folder_at(&self.config.context, &self.binding, parent.as_ref(), new)
+                .await?
+                .ok_or_else(invalid)?;
+            if folder.name != new {
+                if folder.name != previous
+                    || self.vault.entry_kind_exact(&previous_prefix)?.is_some()
+                    || self.vault.entry_kind(&new_prefix)? != Some(EntryKind::Directory)
+                {
+                    return Err(invalid().into());
+                }
+                let identity = self.command(
+                    "folder spelling",
+                    &[
+                        folder.id.as_str().as_bytes(),
+                        folder.revision.as_str().as_bytes(),
+                        new.as_bytes(),
+                    ],
+                );
+                self.store
+                    .rename_folder(
+                        self.config.context.clone(),
+                        Mutation {
+                            identity,
+                            preconditions: Preconditions {
+                                revision: Some(folder.revision),
+                                ..Preconditions::default()
+                            },
+                            input: RenameFolder {
+                                folder: folder.id.clone(),
+                                name: new.to_owned(),
+                            },
+                        },
+                    )
+                    .await?;
+            }
+            parent = Some(folder.id);
+        }
+        Ok(())
     }
 
     async fn destination(&self, relative: &Path) -> Result<(Option<FolderId>, String), VaultError> {
@@ -909,8 +973,9 @@ impl Worker<'_> {
     }
 }
 
-fn paired_source(path: &Path, renames: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
-    renames.iter().find_map(|(from, to)| {
+fn paired_source(path: &Path, renames: &HashMap<PathBuf, PathBuf>) -> Option<PathBuf> {
+    path.ancestors().find_map(|to| {
+        let from = renames.get(to)?;
         let suffix = path.strip_prefix(to).ok()?;
         if suffix.as_os_str().is_empty() {
             Some(from.clone())

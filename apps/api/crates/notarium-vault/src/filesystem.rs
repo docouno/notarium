@@ -7,7 +7,9 @@ use std::{
     sync::Arc,
 };
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
+use cap_fs_ext::{
+    DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt, OpenOptionsSyncExt,
+};
 use cap_std::fs::{Dir, File as CapFile, Metadata, OpenOptions};
 use notarium_core::ids::ContentDigest;
 use notarium_syntax::unicode::{PortableFilename, lookup_key};
@@ -29,6 +31,12 @@ use windows as platform;
 
 pub use recovery::CaptureCleanup;
 pub use roots::{ValidatedRoots, platform_data_root};
+
+#[cfg(all(test, windows))]
+pub(crate) fn create_owner_only_test_vault(parent: &Path, name: &OsStr) -> io::Result<()> {
+    let parent = Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    platform::create_private_dir(&parent, name)
+}
 
 pub type FsError = io::Error;
 
@@ -219,6 +227,52 @@ impl VaultDir {
         Ok(present(parent.symlink_metadata(name))?
             .as_ref()
             .map(entry_kind))
+    }
+
+    /// Checks the exact spelling of each component. A case or normalization
+    /// alias can resolve to an object whose former spelling is now absent.
+    pub fn entry_kind_exact(&self, path: &Path) -> io::Result<Option<EntryKind>> {
+        let (parent, leaf) = split_target(path)?;
+        let mut dir = self.dir.try_clone()?;
+        for component in parent.components() {
+            let name = relative_component(component)?;
+            let Some(metadata) = present(dir.symlink_metadata(name))? else {
+                return Ok(None);
+            };
+            if entry_kind(&metadata) != EntryKind::Directory {
+                return Err(invalid("exact path traversal requires a regular directory"));
+            }
+            let next = dir.open_dir_nofollow(name)?;
+            if entry_kind(&next.dir_metadata()?) != EntryKind::Directory {
+                return Err(invalid("exact path traversal requires a regular directory"));
+            }
+            platform::require_same_mount(&dir, &next)?;
+            if !platform::directory_name_matches(&next, name)? {
+                return Ok(None);
+            }
+            dir = next;
+        }
+        let Some(metadata) = present(dir.symlink_metadata(leaf))? else {
+            return Ok(None);
+        };
+        let kind = entry_kind(&metadata);
+        // Never follow a special entry in order to infer its physical name.
+        if kind == EntryKind::Special {
+            return Ok(Some(kind));
+        }
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .maybe_dir(true)
+            .nonblock(true)
+            .follow(FollowSymlinks::No);
+        platform::set_metadata_options(&mut options);
+        let file = dir.open_with(leaf, &options)?;
+        if kind != entry_kind(&file.metadata()?) {
+            return Err(conflict("vault entry kind changed during exact lookup"));
+        }
+        platform::require_file_mount(&dir, &file)?;
+        Ok(platform::file_name_matches(&file, leaf)?.then_some(kind))
     }
 
     pub fn read(&self, path: &Path, max_bytes: usize) -> io::Result<Option<ObservedFile>> {
@@ -728,22 +782,53 @@ fn matches_stamp(parent: &Dir, name: &OsStr, stamp: &FileStamp) -> io::Result<bo
     Ok(read_matching_stamp(parent, name, stamp)?.is_some())
 }
 
+fn private_file_entry(dir: &Dir, name: &OsStr) -> io::Result<Option<CapFile>> {
+    let Some(metadata) = present(dir.symlink_metadata(name))? else {
+        return Ok(None);
+    };
+    if entry_kind(&metadata) != EntryKind::File {
+        return Err(invalid(
+            "private data paths require single-link regular files",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).nonblock(true).follow(FollowSymlinks::No);
+    platform::set_private_metadata_options(&mut options);
+    let Some(file) = present(dir.open_with(name, &options))? else {
+        // SQLite can remove a regular WAL or SHM between the two reads.
+        return Ok(None);
+    };
+    checked_file_metadata(&file)?;
+    platform::require_file_mount(dir, &file)?;
+    platform::verify_name(&file, name)?;
+    platform::verify_private_file(&file)?;
+    Ok(Some(file))
+}
+
 fn acquire_lock(dir: &Dir, name: &OsStr) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options
         .read(true)
         .write(true)
-        .create(true)
+        .create_new(true)
         .nonblock(true)
         .follow(FollowSymlinks::No);
     platform::set_lock_options(&mut options);
-    if let Some(existing) = present(dir.symlink_metadata(name))?
-        && entry_kind(&existing) != EntryKind::File
-    {
-        return Err(invalid("sidecar lock is not a regular file"));
-    }
-    let file = dir.open_with(name, &options)?;
+    let file = if let Some(existing) = private_file_entry(dir, name)? {
+        platform::open_existing_lock(dir, name, &existing)?
+    } else {
+        match dir.open_with(name, &options) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = private_file_entry(dir, name)?.ok_or_else(|| {
+                    conflict("sidecar lock disappeared after another process created it")
+                })?;
+                platform::open_existing_lock(dir, name, &existing)?
+            }
+            result => result?,
+        }
+    };
     checked_file_metadata(&file)?;
+    platform::verify_private_file(&file)?;
     let file = file.into_std();
     match file.try_lock() {
         Ok(()) => Ok(file),

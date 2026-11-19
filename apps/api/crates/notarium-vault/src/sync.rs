@@ -132,7 +132,17 @@ pub struct VaultStatus {
 
 pub struct Conversion {
     pub committed: Committed<MintAndPurgeResult>,
-    pub published: bool,
+    pub publication: ConversionPublication,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversionPublication {
+    /// The encrypted replacement has not been confirmed at the selected path.
+    Pending,
+    /// The replacement is in place. The displaced inode is held for recovery.
+    CleanupPending,
+    /// The replacement is in place and the displaced inode was safely retired.
+    Complete,
 }
 
 enum Control {
@@ -216,8 +226,8 @@ impl VaultSupervisor {
     }
 
     /// Local transport can probe the exact destination volume before requesting
-    /// the destructive canonical conversion. The return value distinguishes a
-    /// committed conversion from a completed filesystem publication.
+    /// the destructive canonical conversion. The canonical receipt and the
+    /// state of the replacement and its capture are observable separately.
     pub async fn mint_and_purge(
         &self,
         request: Mutation<MintAndPurge>,

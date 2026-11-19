@@ -25,7 +25,7 @@ use notarium_core::{
 use notarium_vault::{
     carrier,
     filesystem::ValidatedRoots,
-    sync::{SyncPhase, VaultConfig, VaultStatus, VaultSupervisor},
+    sync::{ConversionPublication, SyncPhase, VaultConfig, VaultStatus, VaultSupervisor},
 };
 use tempfile::TempDir;
 use tokio::sync::watch;
@@ -311,6 +311,146 @@ async fn copy_and_move_use_disk_identity_and_offline_purge_never_remints() {
             .is_none()
     );
     supervisor.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_case_only_folder_rename_keeps_the_folder_and_note_ids() {
+    let fixture = Fixture::open().await;
+    let old_folder = fixture.root.join("Folder");
+    fs::create_dir(&old_folder).unwrap();
+    let note_file = old_folder.join("note.md");
+    fs::write(&note_file, "# Same folder\n").unwrap();
+    let worker = fixture.start();
+    let mut status = worker.status();
+    ready(&mut status, |_| disk_id(&note_file).is_some()).await;
+    let id = disk_id(&note_file).unwrap();
+    let ctx = context(&fixture.scope);
+    let before = fixture
+        .store
+        .read_vault_note(&ctx, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    let cutoff = fixture.store.vault_head(&ctx).await.unwrap();
+    worker.shutdown().await.unwrap();
+
+    let hop = fixture.root.join("spelling-change");
+    let new_folder = fixture.root.join("folder");
+    fs::rename(old_folder, &hop).unwrap();
+    fs::rename(hop, &new_folder).unwrap();
+    let worker = fixture.start();
+    let mut status = worker.status();
+    ready(&mut status, |state| state.cursor > cutoff).await;
+    let after = fixture
+        .store
+        .read_vault_note(&ctx, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.parent, before.parent);
+    assert_eq!(after.folders, ["folder"]);
+    assert_eq!(disk_id(&new_folder.join("note.md")), Some(id));
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_replaces_a_proven_unapplied_stage_with_the_current_revision() {
+    use notarium_core::ports::{ExternalObservation, ExternalObservationResult, ObservedContent};
+    use notarium_vault::filesystem::VaultDir;
+
+    let fixture = Fixture::open().await;
+    let id = fixture.create("staged", 81).await;
+    let worker = fixture.start();
+    let mut status = worker.status();
+    let name = Path::new("staged.md");
+    let path = fixture.root.join(name);
+    ready(&mut status, |_| disk_id(&path) == Some(id.clone())).await;
+    worker.shutdown().await.unwrap();
+
+    let ctx = context(&fixture.scope);
+    let before = fixture
+        .store
+        .read_vault_note(&ctx, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    let hash = |body: &str| ContentDigest::from_bytes(*blake3::hash(body.as_bytes()).as_bytes());
+    let apply = |base, body: &'static str, tag| {
+        let ctx = ctx.clone();
+        let id = id.clone();
+        let store = fixture.store.clone();
+        let command = identity(&fixture.scope, tag);
+        async move {
+            let result = store
+                .accept_external_observation(
+                    ctx,
+                    Mutation {
+                        identity: command,
+                        preconditions: Preconditions::default(),
+                        input: ExternalObservation {
+                            note: id,
+                            observed_digest: hash(body),
+                            base_revision: base,
+                            disk_identity: ContentDigest::from_bytes([tag; 32]),
+                            content: ObservedContent::Carrier(body.into()),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            let ExternalObservationResult::Committed(receipt) = result else {
+                panic!("expected a new revision: {result:?}");
+            };
+            receipt.value.revision
+        }
+    };
+    let staged_body = "# Superseded preparation\n";
+    let revision = apply(before.note.revision, staged_body, 82).await;
+    let projected = carrier::materialize(staged_body, DocClass::UserDoc, &id).unwrap();
+    let binding = fixture.store.vault_binding(&ctx).await.unwrap().unwrap();
+    let vault = fixture.roots.vault().unwrap();
+    let expected = vault.read(name, 8192).unwrap().unwrap().stamp;
+    let operation = ContentDigest::from_bytes([84; 32]);
+    let slot = VaultDir::operation_slot(name, &operation.to_hex()).unwrap();
+    let staged = vault.stage(name, &slot, projected.as_bytes()).unwrap();
+    // Durable cut after staging and before the namespace operation.
+    let intent = serde_json::json!({
+        "scope": binding.scope,
+        "generation": binding.generation,
+        "id": operation,
+        "target": name,
+        "action": { "Publish": {
+            "desired": { "note": id, "revision": revision,
+                "carrier_digest": hash(staged_body), "disk_digest": hash(&projected) },
+            "purpose": "Note", "expected": expected, "staged": staged, "retire": null,
+            "abandoned": false,
+        }}
+    });
+    let record = fixture
+        .roots
+        .data_root()
+        .root()
+        .join(format!("vault-notes-{}", binding.generation.to_hex()))
+        .join(format!("{}.intent", operation.to_hex()));
+    let file = fs::File::create(&record).unwrap();
+    serde_json::to_writer(&file, &intent).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let latest = "# Current authorized revision\n";
+    apply(revision, latest, 83).await;
+
+    let worker = fixture.start();
+    let mut status = worker.status();
+    let target = carrier::materialize(latest, DocClass::UserDoc, &id).unwrap();
+    ready(&mut status, |_| {
+        fs::read_to_string(&path).is_ok_and(|bytes| bytes == target)
+    })
+    .await;
+    assert!(!record.exists());
+    assert!(!fixture.root.join(slot).exists());
+    worker.shutdown().await.unwrap();
     fixture.runtime.shutdown().await.unwrap();
 }
 
@@ -609,10 +749,7 @@ async fn local_conversion_replays_its_receipt_and_keeps_the_checked_path() {
     };
     let editor = fs::OpenOptions::new().write(true).open(&target).unwrap();
     let result = supervisor.mint_and_purge(request.clone()).await.unwrap();
-    assert!(
-        !result.published,
-        "retained plaintext must keep completion pending"
-    );
+    assert_eq!(result.publication, ConversionPublication::CleanupPending);
     assert_eq!(disk_id(&target), Some(new.clone()));
     let retained = ready(&mut state, |state| {
         state
@@ -634,7 +771,7 @@ async fn local_conversion_replays_its_receipt_and_keeps_the_checked_path() {
     );
     drop(editor);
     let repeated = supervisor.mint_and_purge(request).await.unwrap();
-    assert!(repeated.published);
+    assert_eq!(repeated.publication, ConversionPublication::Complete);
     assert!(!capture.exists());
     assert_eq!(
         result.committed.receipt.seq(),

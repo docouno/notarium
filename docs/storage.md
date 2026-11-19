@@ -168,8 +168,9 @@ the adapter parks it in private recovery when the roots support an atomic
 same-volume move. Existing-file replacement on Windows requires a volume that
 passes the transaction probe. When macOS can perform the exchange but cannot
 establish exclusive cleanup, the replacement can appear at its original path
-while conversion completion remains pending. The archive retains the displaced
-inode without copying plaintext.
+with a `CleanupPending` publication result. The archive retains the displaced
+inode without copying plaintext. `Complete` requires safe retirement of that
+inode.
 
 Schema version 6 orders the existing retirement index by status and then Space.
 Both the installation-wide and per-Space pending checks can seek directly to

@@ -872,7 +872,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(directory.path()).unwrap();
         let vault_path = root.join("vault");
+        #[cfg(not(windows))]
         fs::create_dir(&vault_path).unwrap();
+        #[cfg(windows)]
+        crate::filesystem::create_owner_only_test_vault(&root, std::ffi::OsStr::new("vault"))
+            .unwrap();
         let roots =
             ValidatedRoots::open(&DataRoot::new(root.join("private")), Some(&vault_path)).unwrap();
         let binding = VaultBinding {

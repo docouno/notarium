@@ -131,8 +131,11 @@ pub struct ItemExecCtx {
     pending_dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
+    before_commit: Option<BeforeCommit>,
     after_commit: Option<Box<dyn FnOnce() + Send>>,
 }
+
+type BeforeCommit = Box<dyn FnOnce() -> Result<(), PortError> + Send>;
 
 impl ItemExecCtx {
     pub fn effective_cut_before(&self) -> SpaceSeq {
@@ -195,6 +198,16 @@ impl ItemExecCtx {
         self.after_commit = Some(Box::new(action));
     }
 
+    /// Recheck an in-process authority immediately before the outer SQL COMMIT.
+    /// A failed check rolls back the batch. Use the standard retryable
+    /// pre-commit error so other coalesced callers may retry their commands.
+    pub(crate) fn require_before_commit(
+        &mut self,
+        check: impl FnOnce() -> Result<(), PortError> + Send + 'static,
+    ) {
+        self.before_commit = Some(Box::new(check));
+    }
+
     pub(crate) fn new_for_batch(
         scope: HistoryScope,
         space: notarium_core::auth::Space,
@@ -214,6 +227,7 @@ impl ItemExecCtx {
             pending_dir_syncs: PendingDirSyncs::default(),
             retained_tickets: Vec::new(),
             retained_guards: Vec::new(),
+            before_commit: None,
             after_commit: None,
         }
     }
@@ -227,8 +241,8 @@ impl ItemExecCtx {
         Vec<Box<dyn Send>>,
     ) {
         debug_assert!(
-            self.after_commit.is_none(),
-            "native items have no post-commit side effects"
+            self.before_commit.is_none() && self.after_commit.is_none(),
+            "native items have no commit callbacks"
         );
         (
             self.receipt_status,
@@ -1912,6 +1926,7 @@ async fn execute_batch_on_conn(
 
     let mut space_states: BTreeMap<SpaceId, SpaceBatchEntry> = BTreeMap::new();
     let mut batch_dir_syncs = PendingDirSyncs::default();
+    let mut before_commit = Vec::new();
     let mut after_commit = Vec::new();
     // Retain all StagedBlobTickets and runtime lock guards until AFTER outer COMMIT/ROLLBACK!
     let mut batch_retained_tickets: Vec<StagedBlobTicket> = Vec::new();
@@ -2015,6 +2030,7 @@ async fn execute_batch_on_conn(
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
+                before_commit: item_before_commit,
                 after_commit: item_after_commit,
             }) => {
                 if use_savepoints && let Err(err) = tx.release_savepoint(idx).await {
@@ -2039,6 +2055,7 @@ async fn execute_batch_on_conn(
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
                 batch_retained_guards.extend(retained_guards);
+                before_commit.extend(item_before_commit);
                 after_commit.extend(item_after_commit);
                 slots.push(ItemOutcomeSlot::Succeeded {
                     response_bytes,
@@ -2145,6 +2162,12 @@ async fn execute_batch_on_conn(
         return BatchExecOutcome::AbortedBeforeCommit(sync_err);
     }
 
+    for check in before_commit {
+        if let Err(error) = check() {
+            transaction.rollback().await;
+            return BatchExecOutcome::AbortedBeforeCommit(error);
+        }
+    }
     // Commit outer SQL transaction bracketed by SQLite's seqlock commit
     // generation (even->odd before COMMIT, odd->even strictly after COMMIT and
     // BEFORE releasing fence guards or publishing broadcasts) so linearizable
@@ -2239,6 +2262,7 @@ struct SingleItemSuccess {
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
+    before_commit: Option<BeforeCommit>,
     after_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -2288,6 +2312,7 @@ async fn execute_single_item_in_savepoint(
                 dir_syncs: PendingDirSyncs::default(),
                 retained_tickets: Vec::new(),
                 retained_guards: Vec::new(),
+                before_commit: None,
                 after_commit: None,
                 item_changes: crate::projection_fence::VisibilityChanges::default(),
             }),
@@ -2331,6 +2356,7 @@ async fn execute_single_item_in_savepoint(
         pending_dir_syncs: PendingDirSyncs::default(),
         retained_tickets: Vec::new(),
         retained_guards: Vec::new(),
+        before_commit: None,
         after_commit: None,
     };
 
@@ -2437,6 +2463,7 @@ async fn execute_single_item_in_savepoint(
         dir_syncs: item_ctx.pending_dir_syncs,
         retained_tickets: item_ctx.retained_tickets,
         retained_guards: item_ctx.retained_guards,
+        before_commit: item_ctx.before_commit,
         after_commit: item_ctx.after_commit,
     })
 }

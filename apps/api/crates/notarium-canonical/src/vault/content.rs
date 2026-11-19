@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use notarium_core::{
     DomainError,
@@ -438,6 +438,7 @@ impl CanonicalStore {
         check_file(&request.input.file)?;
         let guard = VaultWrite {
             binding: binding.clone(),
+            watch_fence: None,
             change: VaultChange::Import {
                 note: request.input.create.note.clone(),
                 claimed: request.input.claimed_note,
@@ -483,6 +484,7 @@ impl CanonicalStore {
             request,
             Some(VaultWrite {
                 binding: binding.clone(),
+                watch_fence: None,
                 change: VaultChange::Move {
                     expected,
                     destination,
@@ -493,28 +495,38 @@ impl CanonicalStore {
         .await
     }
 
-    pub async fn trash_vault_note(
+    /// Applies a deletion inferred from filesystem absence only while the
+    /// watcher still confirms the observation cut. The synchronous fence
+    /// runs in the writer and must perform only a bounded in-process check.
+    pub async fn trash_vault_note_with_fence(
         &self,
         ctx: SpaceContext,
         binding: &VaultBinding,
         expected: VaultObservation,
         mut request: Mutation<DeleteNote>,
+        still_safe: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Result<Committed<NoteRevision>, PortError> {
         if request.input.disposition != DeleteDisposition::Trash {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
         let target = request.input.note.clone();
         set_expected_revision(&mut request, &expected, &target)?;
-        notes::delete_note_with_vault(
+        let fence: WatchFence = Arc::new(still_safe);
+        match notes::delete_note_with_vault(
             self,
             ctx,
             request,
             Some(VaultWrite {
                 binding: binding.clone(),
+                watch_fence: Some(fence.clone()),
                 change: VaultChange::Trash { expected },
             }),
         )
         .await
+        {
+            Err(PortError::Unavailable(_)) if !fence() => Err(observation_changed()),
+            result => result,
+        }
     }
 
     pub async fn accept_vault_observation(
@@ -533,6 +545,7 @@ impl CanonicalStore {
             request,
             Some(VaultWrite {
                 binding: binding.clone(),
+                watch_fence: None,
                 change: VaultChange::Edit { expected },
             }),
         )
@@ -573,10 +586,13 @@ fn set_expected_revision<T>(
     Ok(())
 }
 
-#[derive(Clone, Serialize)]
+type WatchFence = Arc<dyn Fn() -> bool + Send + Sync>;
+
+#[derive(Clone)]
 pub(crate) struct VaultWrite {
     binding: VaultBinding,
     change: VaultChange,
+    watch_fence: Option<WatchFence>,
 }
 
 #[derive(Clone, Serialize)]
@@ -714,9 +730,29 @@ impl VaultWrite {
         intent.execute = Box::new(move |tx, item| {
             Box::pin(async move {
                 self.check(tx, &ctx).await?;
+                let fence = self.watch_fence.clone();
+                if fence.as_ref().is_some_and(|fence| !fence()) {
+                    return Err(observation_changed());
+                }
                 let result = original(tx, item).await?;
                 self.apply(tx, &result.response_bytes, create_digest)
                     .await?;
+                if let Some(fence) = fence {
+                    if !fence() {
+                        return Err(observation_changed());
+                    }
+                    item.require_before_commit(move || {
+                        if fence() {
+                            Ok(())
+                        } else {
+                            Err(unavailable_retryable(
+                                "vault_watch_cut_changed",
+                                "filesystem observation changed before writer commit",
+                                Duration::from_millis(25),
+                            ))
+                        }
+                    });
+                }
                 Ok(result)
             })
         });

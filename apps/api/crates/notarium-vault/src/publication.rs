@@ -38,6 +38,7 @@ pub(crate) fn plan(
             expected,
             staged: None,
             retire,
+            abandoned: false,
         })),
     )
 }
@@ -58,9 +59,10 @@ pub(crate) fn place(
         purpose,
         expected,
         staged,
+        abandoned,
         ..
     } = action.as_mut();
-    if digest(bytes) != desired.disk_digest {
+    if *abandoned || digest(bytes) != desired.disk_digest {
         return Err(invalid());
     }
     let displaced = VaultDir::displaced_slot(&slot)?;
@@ -132,6 +134,36 @@ pub(crate) fn recover_published(
         expected.as_ref(),
         [&slot, &displaced],
     )
+}
+
+/// A newer canonical head alone carries no evidence about the namespace.
+/// The old name and both slots must still describe an unapplied operation.
+pub(crate) fn is_unapplied(vault: &VaultDir, intent: &Intent) -> io::Result<bool> {
+    let Action::Publish(action) = &intent.action else {
+        return Err(invalid());
+    };
+    match (
+        &action.expected,
+        vault.read(&intent.target, MAX_NOTE_BYTES)?,
+    ) {
+        (None, None) => {}
+        (Some(expected), Some(actual)) if same(expected, &actual.stamp) => {}
+        _ => return Ok(false),
+    }
+    let stage = slot(intent)?;
+    let displaced = VaultDir::displaced_slot(&stage)?;
+    if vault.entry_kind(&displaced)?.is_some()
+        || vault.recovered_capture(&displaced)?.is_some()
+        || vault.recovered_capture(&stage)?.is_some()
+    {
+        return Ok(false);
+    }
+    if let Some(expected) = &action.staged
+        && let Some(actual) = vault.read(&stage, MAX_NOTE_BYTES)?
+    {
+        return Ok(same(expected, &actual.stamp));
+    }
+    Ok(true)
 }
 
 fn already_published(

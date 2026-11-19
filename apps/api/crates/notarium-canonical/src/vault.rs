@@ -107,6 +107,15 @@ pub struct VaultNote {
     pub carrier_digest: ContentDigest,
 }
 
+/// A live canonical folder at a binding-relative sibling name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultFolder {
+    pub id: FolderId,
+    pub parent: FolderId,
+    pub name: String,
+    pub revision: RevisionId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VaultSchema {
     pub revision: RevisionId,

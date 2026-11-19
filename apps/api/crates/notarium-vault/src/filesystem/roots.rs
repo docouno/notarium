@@ -1,13 +1,9 @@
 use super::recovery::RecoveryRoot;
 use super::{
-    EntryKind, FileIdentity, VaultDir, acquire_lock, checked_file_metadata, entry_kind, invalid,
-    open_child_dir, platform, present, sync_dir,
+    FileIdentity, VaultDir, acquire_lock, invalid, open_child_dir, platform, private_file_entry,
+    sync_dir,
 };
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
-use cap_std::{
-    ambient_authority,
-    fs::{Dir, OpenOptions},
-};
+use cap_std::{ambient_authority, fs::Dir};
 use notarium_core::epoch::DataRoot;
 use std::{
     ffi::{OsStr, OsString},
@@ -93,6 +89,9 @@ impl ValidatedRoots {
             return Err(invalid("private desktop data directory was replaced"));
         }
         platform::verify_private_dir(&private.dir)?;
+        let lock = self.data.sidecar_lock();
+        let name = lock.file_name().expect("DataRoot defines a lock filename");
+        drop(private_file_entry(&private.dir, name)?);
         self.storage.verify(&private.dir)?;
         if let Some(vault) = &self.vault {
             let current = walk_absolute(&vault.path)?;
@@ -108,8 +107,8 @@ impl ValidatedRoots {
     /// directory. Leaving the lock file after closing the handle is intentional.
     pub fn acquire_sidecar_lock(&self) -> io::Result<File> {
         self.verify_current()?;
-        let path = self.data.sidecar_lock();
-        let name = path.file_name().expect("DataRoot defines a lock filename");
+        let lock = self.data.sidecar_lock();
+        let name = lock.file_name().expect("DataRoot defines a lock filename");
         acquire_lock(&self.private, name)
     }
 }
@@ -153,25 +152,8 @@ impl StorageLayout {
     }
 
     fn verify_files(dir: &Dir) -> io::Result<()> {
-        let mut options = OpenOptions::new();
-        options.read(true).nonblock(true).follow(FollowSymlinks::No);
-        platform::set_metadata_options(&mut options);
         for name in STORAGE_FILES.iter().copied().map(OsStr::new) {
-            let Some(metadata) = present(dir.symlink_metadata(name))? else {
-                continue;
-            };
-            if entry_kind(&metadata) != EntryKind::File {
-                return Err(invalid(
-                    "private SQLite paths require unlinked regular files",
-                ));
-            }
-            // SQLite can remove a regular WAL or SHM between the two reads.
-            let Some(file) = present(dir.open_with(name, &options))? else {
-                continue;
-            };
-            checked_file_metadata(&file)?;
-            platform::require_file_mount(dir, &file)?;
-            platform::verify_name(&file, name)?;
+            drop(private_file_entry(dir, name)?);
         }
         Ok(())
     }

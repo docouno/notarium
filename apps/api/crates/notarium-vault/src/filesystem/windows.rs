@@ -38,11 +38,13 @@ use windows_sys::Win32::{
         CommitTransaction, CreateDirectoryW, CreateFileTransactedW, CreateTransaction, DELETE,
         DeleteFileTransactedW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_FLAG_WRITE_THROUGH, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED,
-        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+        FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO,
+        FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
         FileDispositionInfo, FileIdInfo, FileRenameInfo, FileStandardInfo,
-        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OPEN_EXISTING, ReOpenFile,
-        RollbackTransaction, SetFileInformationByHandle, VOLUME_NAME_DOS, VOLUME_NAME_GUID,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL,
+        ReOpenFile, RollbackTransaction, SetFileInformationByHandle, VOLUME_NAME_DOS,
+        VOLUME_NAME_GUID,
     },
     System::{
         Com::CoTaskMemFree,
@@ -121,24 +123,40 @@ pub fn create_private_dir(parent: &Dir, name: &OsStr) -> io::Result<()> {
 }
 
 pub fn verify_private_dir(dir: &Dir) -> io::Result<()> {
-    verify_directory_acl(dir, true)
+    verify_owner_acl(
+        dir.as_raw_handle(),
+        AclPolicy::Directory { protected: true },
+    )
 }
 
 pub fn verify_storage_dir(dir: &Dir) -> io::Result<()> {
     // Older installations may inherit their owner-only ACL from DataRoot.
-    verify_directory_acl(dir, false)
+    verify_owner_acl(
+        dir.as_raw_handle(),
+        AclPolicy::Directory { protected: false },
+    )
 }
 
-fn verify_directory_acl(dir: &Dir, require_protected: bool) -> io::Result<()> {
+pub fn verify_private_file(file: &File) -> io::Result<()> {
+    verify_owner_acl(file.as_raw_handle(), AclPolicy::File)
+}
+
+enum AclPolicy {
+    Directory { protected: bool },
+    File,
+}
+
+fn verify_owner_acl(handle: HANDLE, policy: AclPolicy) -> io::Result<()> {
     let user = UserSid::get()?;
     let mut owner = null_mut();
     let mut dacl = null_mut::<ACL>();
     let mut descriptor = null_mut();
-    // SAFETY: The directory handle stays live. The result pointers live in
+    // SAFETY: The caller keeps the exact file or directory handle live for
+    // the whole call. The result pointers live in
     // one LocalAlloc result buffer which is retained through all validation.
     let result = unsafe {
         GetSecurityInfo(
-            dir.as_raw_handle(),
+            handle,
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
@@ -170,7 +188,9 @@ fn verify_directory_acl(dir: &Dir, require_protected: bool) -> io::Result<()> {
             &mut control,
             &mut revision,
         ))?;
-        if require_protected && control & SE_DACL_PROTECTED == 0 {
+        if matches!(policy, AclPolicy::Directory { protected: true })
+            && control & SE_DACL_PROTECTED == 0
+        {
             return Err(unsafe_acl());
         }
         succeeded(GetAclInformation(
@@ -180,7 +200,7 @@ fn verify_directory_acl(dir: &Dir, require_protected: bool) -> io::Result<()> {
             AclSizeInformation,
         ))?;
     }
-    let mut directory_rights = 0;
+    let mut object_rights = 0;
     let mut child_file_rights = 0;
     let mut child_dir_rights = 0;
     for index in 0..information.AceCount {
@@ -208,7 +228,7 @@ fn verify_directory_acl(dir: &Dir, require_protected: bool) -> io::Result<()> {
             }
             let flags = u32::from(header.AceFlags);
             if flags & INHERIT_ONLY_ACE == 0 {
-                directory_rights |= ace.Mask;
+                object_rights |= ace.Mask;
             }
             if flags & NO_PROPAGATE_INHERIT_ACE == 0 {
                 if flags & OBJECT_INHERIT_ACE != 0 {
@@ -220,10 +240,16 @@ fn verify_directory_acl(dir: &Dir, require_protected: bool) -> io::Result<()> {
             }
         }
     }
-    if [directory_rights, child_file_rights, child_dir_rights]
-        .into_iter()
-        .any(|rights| rights & FILE_ALL_ACCESS != FILE_ALL_ACCESS)
-    {
+    let sufficient = match policy {
+        AclPolicy::Directory { .. } => [object_rights, child_file_rights, child_dir_rights]
+            .into_iter()
+            .all(|rights| rights & FILE_ALL_ACCESS == FILE_ALL_ACCESS),
+        AclPolicy::File => {
+            let required = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+            object_rights & required == required
+        }
+    };
+    if !sufficient {
         return Err(unsafe_acl());
     }
     Ok(())
@@ -232,7 +258,7 @@ fn verify_directory_acl(dir: &Dir, require_protected: bool) -> io::Result<()> {
 fn unsafe_acl() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        "the desktop data directory requires a protected owner-only DACL",
+        "private desktop data requires an owner-only DACL on the object itself",
     )
 }
 
@@ -334,13 +360,25 @@ pub fn verify_name(file: &File, name: &OsStr) -> io::Result<()> {
     verify_handle_name(file, name)
 }
 
+pub fn directory_name_matches(dir: &Dir, name: &OsStr) -> io::Result<bool> {
+    handle_name_matches(dir, name)
+}
+
+pub fn file_name_matches(file: &File, name: &OsStr) -> io::Result<bool> {
+    handle_name_matches(file, name)
+}
+
 fn verify_handle_name(handle: &impl AsRawHandle, name: &OsStr) -> io::Result<()> {
-    if final_path(handle.as_raw_handle(), VOLUME_NAME_DOS)?.file_name() != Some(name) {
+    if !handle_name_matches(handle, name)? {
         return Err(conflict(
             "the requested vault path aliases another filename",
         ));
     }
     Ok(())
+}
+
+fn handle_name_matches(handle: &impl AsRawHandle, name: &OsStr) -> io::Result<bool> {
+    Ok(final_path(handle.as_raw_handle(), VOLUME_NAME_DOS)?.file_name() == Some(name))
 }
 
 pub fn set_stage_options(options: &mut OpenOptions) {
@@ -358,10 +396,27 @@ pub fn set_read_options(options: &mut OpenOptions) {
 }
 
 pub fn set_metadata_options(options: &mut OpenOptions) {
-    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
     options
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+}
+
+pub fn set_private_metadata_options(options: &mut OpenOptions) {
+    set_metadata_options(options);
+    options.access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL);
+}
+
+pub fn open_existing_lock(_dir: &Dir, _name: &OsStr, checked: &File) -> io::Result<File> {
+    // SAFETY: ReOpenFile operates on the exact regular object validated through
+    // its read-control handle. The returned handle is newly owned.
+    cap_file(unsafe {
+        ReOpenFile(
+            checked.as_raw_handle(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_FLAG_WRITE_THROUGH,
+        )
+    })
 }
 
 pub fn sync_dir(dir: &Dir) -> io::Result<()> {
@@ -389,6 +444,98 @@ pub fn rename_no_replace_between(
     target: &Dir,
     to: &OsStr,
 ) -> io::Result<()> {
+    let file = open_rename_source(source, from)?;
+    rename_held(target, &file, to)
+}
+
+pub fn park_private_capture(
+    source: &Dir,
+    from: &OsStr,
+    target: &Dir,
+    to: &OsStr,
+) -> io::Result<()> {
+    open_protected_capture(source, from)
+        .and_then(|file| rename_held(target, &file, to))
+        .map_err(|error| {
+            if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) {
+                // Rust does not map this Win32 code to a portable kind.
+                io::Error::new(io::ErrorKind::WouldBlock, error)
+            } else {
+                error
+            }
+        })
+}
+
+fn open_protected_capture(source: &Dir, from: &OsStr) -> io::Result<File> {
+    let file = open_rename_source(source, from)?;
+    if file.metadata()?.is_dir() {
+        let dir = Dir::from_std_file(file.try_clone()?.into_std());
+        verify_capture_tree(&dir)?;
+    } else {
+        super::checked_file_metadata(&file)?;
+        verify_private_file(&file)?;
+    }
+    Ok(file)
+}
+
+pub fn verify_parked_capture(dir: &Dir, name: &OsStr) -> io::Result<()> {
+    let metadata = dir.symlink_metadata(name)?;
+    if is_link(&metadata) {
+        return Err(unsafe_acl());
+    }
+    if metadata.is_dir() {
+        let captured = open_child_dir(dir, name)?;
+        require_same_mount(dir, &captured)?;
+        verify_capture_tree(&captured)?;
+    } else {
+        drop(
+            super::private_file_entry(dir, name)?
+                .ok_or_else(|| conflict("the private recovery entry disappeared"))?,
+        );
+    }
+    Ok(())
+}
+
+fn verify_capture_tree(tree: &Dir) -> io::Result<()> {
+    use notarium_core::ports::{MAX_ABILITY_AUX_FILES, MAX_ABILITY_AUX_PATH_BYTES};
+    const MAX_COMPONENTS: usize = MAX_ABILITY_AUX_PATH_BYTES.div_ceil(2);
+    let mut remaining = (MAX_ABILITY_AUX_FILES + 1) * MAX_COMPONENTS;
+    verify_capture_subtree(tree, MAX_COMPONENTS, &mut remaining)
+}
+
+fn verify_capture_subtree(dir: &Dir, depth: usize, remaining: &mut usize) -> io::Result<()> {
+    // A same-volume NTFS rename preserves the child DACLs. Start at the held
+    // owner-only tree root so no other account can alter names while the
+    // captured directory entries are being verified.
+    verify_storage_dir(dir)?;
+    for entry in dir.entries()? {
+        if depth == 0 || *remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a Windows capture tree exceeds the bounded ACL verification",
+            ));
+        }
+        *remaining -= 1;
+        let name = entry?.file_name();
+        let metadata = dir.symlink_metadata(&name)?;
+        if is_link(&metadata) {
+            return Err(unsafe_acl());
+        }
+        if metadata.is_dir() {
+            let child = open_child_dir(dir, &name)?;
+            require_same_mount(dir, &child)?;
+            verify_capture_subtree(&child, depth - 1, remaining)?;
+        } else {
+            drop(
+                super::private_file_entry(dir, &name)?
+                    .ok_or_else(|| conflict("the private recovery entry disappeared"))?,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn open_rename_source(source: &Dir, from: &OsStr) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -401,7 +548,7 @@ pub fn rename_no_replace_between(
         return Err(invalid("cannot rename a reparse point"));
     }
     require_file_mount(source, &file)?;
-    rename_held(target, &file, to)
+    Ok(file)
 }
 
 pub fn exchange_dirs(parent: &Dir, from: &OsStr, to: &OsStr) -> io::Result<()> {
@@ -576,6 +723,7 @@ pub fn clean_slot(parent: &Dir, name: &OsStr, expected: &FileStamp) -> io::Resul
     {
         return Ok(false);
     }
+    verify_private_file(&file)?;
     let max =
         usize::try_from(expected.size).map_err(|_| invalid("file size exceeds platform limit"))?;
     if !same_file_content(&observe_open(&mut file, max)?.stamp, expected) {

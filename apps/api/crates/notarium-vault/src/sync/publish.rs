@@ -8,7 +8,7 @@ use notarium_core::{
     ports::FilenamePin,
 };
 
-use super::{VaultError, Worker, disk::path_error};
+use super::{ConversionPublication, VaultError, Worker, disk::path_error};
 use crate::{
     carrier::{self, NoteCarrier},
     filesystem::{CaptureCleanup, CapturedFile, FileStamp},
@@ -209,21 +209,26 @@ impl Worker<'_> {
         retire: Option<(PathBuf, FileStamp)>,
         bytes: &[u8],
     ) -> Result<Option<(Intent, Placement)>, VaultError> {
-        let existing = self
+        let mut previous = self
             .pending
             .iter()
-            .position(|intent| intent.target == target);
-        let mut intent = match existing {
-            Some(index) => {
-                let intent = self.pending[index].clone();
-                if !matches!(&intent.action, Action::Publish(prior)
-                    if prior.desired == desired && prior.purpose == purpose)
-                {
-                    self.conflict(&target, ConflictReason::UnresolvedPublication, None)?;
-                    return Ok(None);
-                }
-                intent
+            .find(|intent| intent.target == target)
+            .cloned();
+        if let Some(intent) = &mut previous
+            && !matches!(&intent.action, Action::Publish(prior)
+                if prior.desired == desired && prior.purpose == purpose && !prior.abandoned)
+        {
+            let superseded = matches!(&intent.action, Action::Publish(prior)
+                if prior.desired.note == desired.note && prior.purpose == purpose
+                    && (prior.abandoned || prior.desired.revision != desired.revision));
+            if !superseded || !self.abandon_preparation(intent)? {
+                self.conflict(&target, ConflictReason::UnresolvedPublication, None)?;
+                return Ok(None);
             }
+            previous = None;
+        }
+        let mut intent = match previous {
+            Some(intent) => intent,
             None => {
                 let intent = publication::plan(
                     &self.journal,
@@ -258,6 +263,56 @@ impl Worker<'_> {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn abandon_preparation(&mut self, intent: &mut Intent) -> Result<bool, VaultError> {
+        let Action::Publish(action) = &intent.action else {
+            return Ok(false);
+        };
+        if !action.abandoned {
+            match publication::is_unapplied(self.vault, intent) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(error) if path_error(&error) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            }
+            if let Action::Publish(action) = &mut intent.action {
+                action.abandoned = true;
+            }
+            // Persist the decision before moving the staged object. Replay
+            // can clean its exact witness even if it is already parked.
+            self.journal.save(intent)?;
+            if let Some(saved) = self.pending.iter_mut().find(|saved| saved.id == intent.id) {
+                *saved = intent.clone();
+            }
+        }
+        let Action::Publish(action) = &intent.action else {
+            unreachable!("checked above")
+        };
+        let slot = publication::slot(intent)?;
+        if let Some(expected) = &action.staged {
+            self.clean_captured(
+                intent.id,
+                &intent.target,
+                CapturedFile {
+                    path: slot,
+                    stamp: expected.clone(),
+                },
+                None,
+            )?;
+        } else if self.vault.entry_kind(&slot)?.is_some() {
+            // There is no recorded stamp for this file. Preserve it out
+            // of admission without preventing the new publication.
+            self.conflict(
+                &slot,
+                ConflictReason::UnresolvedPublication,
+                Some(slot.clone()),
+            )?;
+        }
+        self.journal.finish(intent)?;
+        self.pending.retain(|saved| saved.id != intent.id);
+        self.clear_conflict(&intent.target)?;
+        Ok(true)
     }
 
     fn finish_publication(
@@ -489,9 +544,10 @@ impl Worker<'_> {
             self.known.remove(&handoff.observation.path.key);
             let path = PathBuf::from(&handoff.observation.path.relative);
             if let Some(new_note) = &handoff.new_note {
-                if !self
+                if self
                     .apply_conversion(handoff, &path, &new_note.note)
                     .await?
+                    == ConversionPublication::Pending
                 {
                     self.conversion_paths.insert(new_note.note.clone());
                 }
@@ -568,23 +624,32 @@ impl Worker<'_> {
         handoff: &VaultHandoff,
         target: &Path,
         successor: &NoteId,
-    ) -> Result<bool, VaultError> {
+    ) -> Result<ConversionPublication, VaultError> {
         let Some(current) = self
             .store
             .read_vault_note(&self.config.context, successor)
             .await?
         else {
             self.conflict(target, ConflictReason::UnresolvedPublication, None)?;
-            return Ok(false);
+            return Ok(ConversionPublication::Pending);
         };
         if current.class != DocClass::EncryptedNote {
             self.conflict(target, ConflictReason::InvalidCarrier, None)?;
-            return Ok(false);
+            return Ok(ConversionPublication::Pending);
         }
         let bytes = carrier::materialize(&current.carrier, current.class, successor)?;
-        let already_pending = self.pending.iter().any(|intent| intent.target == target);
-        let expected = if already_pending {
-            None
+        let prepared = self.pending.iter().find_map(|intent| {
+            if intent.target == target
+                && let Action::Publish(action) = &intent.action
+                && action.purpose == PublishPurpose::Conversion
+            {
+                Some(action.expected.clone())
+            } else {
+                None
+            }
+        });
+        let expected = if let Some(expected) = prepared {
+            expected
         } else {
             match self.read_disk(target) {
                 Ok(Some(file)) if same_file(&handoff.observation.file, &file.stamp) => {
@@ -592,15 +657,15 @@ impl Worker<'_> {
                 }
                 Ok(Some(_)) => {
                     self.conflict(target, ConflictReason::ChangedWhilePublishing, None)?;
-                    return Ok(false);
+                    return Ok(ConversionPublication::Pending);
                 }
                 Ok(None) => {
                     self.conflict(target, ConflictReason::UnresolvedPublication, None)?;
-                    return Ok(false);
+                    return Ok(ConversionPublication::Pending);
                 }
                 Err(error) if path_error(&error) => {
                     self.conflict(target, ConflictReason::UnsafePath, None)?;
-                    return Ok(false);
+                    return Ok(ConversionPublication::Pending);
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -614,7 +679,7 @@ impl Worker<'_> {
             bytes.as_bytes(),
         )?
         else {
-            return Ok(false);
+            return Ok(ConversionPublication::Pending);
         };
         let observation = observation(&current, target, &stamp)?;
         // Mint-and-Purge hands the checked path to the new ID. Remember
@@ -640,20 +705,28 @@ impl Worker<'_> {
             )
             .await?;
         self.known.insert(observation.path.key.clone(), observation);
-        self.finish_publication(intent, captured)
+        Ok(if self.finish_publication(intent, captured)? {
+            ConversionPublication::Complete
+        } else {
+            ConversionPublication::CleanupPending
+        })
     }
 
     pub(super) async fn recover_publications(
         &mut self,
         handoffs: &[VaultHandoff],
     ) -> Result<(), VaultError> {
-        for intent in self.pending.clone() {
+        for mut intent in self.pending.clone() {
             self.check_stop()?;
             let Action::Publish(action) = &intent.action else {
                 self.finish_withdrawal(&intent)?;
                 continue;
             };
             let desired = &action.desired;
+            if action.abandoned {
+                self.abandon_preparation(&mut intent)?;
+                continue;
+            }
             if action.purpose == PublishPurpose::Conversion
                 && handoffs.iter().any(|handoff| {
                     handoff
@@ -709,6 +782,15 @@ impl Worker<'_> {
                         }
                     }
                     self.finish_publication(intent, captured)?;
+                }
+                Ok(None) if action.purpose != PublishPurpose::ConflictCopy => {
+                    let latest = self
+                        .store
+                        .read_vault_note(&self.config.context, &desired.note)
+                        .await?;
+                    if latest.is_none_or(|note| note.note.revision != desired.revision) {
+                        self.abandon_preparation(&mut intent)?;
+                    }
                 }
                 Ok(None) => {}
                 Ok(Some(Placement::Conflict(path))) => {

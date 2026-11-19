@@ -123,6 +123,7 @@ impl VaultDir {
         if present(recovery.symlink_metadata(name))?.is_none() {
             return Ok(None);
         }
+        platform::verify_parked_capture(&recovery, name)?;
         let source = match present(self.parent(slot)) {
             Err(error)
                 if matches!(
@@ -242,6 +243,7 @@ impl VaultDir {
         if let Some(recovery) = self.recovery.open(false)?
             && present(recovery.symlink_metadata(name))?.is_some()
         {
+            platform::verify_parked_capture(&recovery, name)?;
             // Replay may have observed the private name before the first
             // operation reached its directory barriers.
             sync_recovery(&recovery, source.as_ref().map(|(dir, _)| dir))?;
@@ -276,7 +278,7 @@ impl VaultDir {
             result => result?,
         }
         before_park();
-        match platform::rename_no_replace_between(&parent, name, &recovery, name) {
+        match platform::park_private_capture(&parent, name, &recovery, name) {
             Err(error)
                 if matches!(
                     error.kind(),
@@ -285,6 +287,7 @@ impl VaultDir {
                         | io::ErrorKind::Unsupported
                         | io::ErrorKind::PermissionDenied
                         | io::ErrorKind::InvalidInput
+                        | io::ErrorKind::WouldBlock
                 ) =>
             {
                 Ok(Parked::Shared(shared))

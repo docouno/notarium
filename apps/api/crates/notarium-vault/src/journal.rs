@@ -60,6 +60,8 @@ pub(crate) struct PublishAction {
     pub expected: Option<FileStamp>,
     pub staged: Option<FileStamp>,
     pub retire: Option<(PathBuf, FileStamp)>,
+    #[serde(default)]
+    pub abandoned: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

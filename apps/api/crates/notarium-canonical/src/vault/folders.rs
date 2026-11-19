@@ -3,15 +3,15 @@ use notarium_core::{
     auth::EngineAuthContext,
     classes::DocClass,
     error::{PortError, ValidationReason},
-    ids::FolderId,
+    ids::{FolderId, RevisionId, SpaceId},
     model::{FolderRef, Lifecycle, PathTarget},
     ports::{CommandSeqRange, SpaceContext},
     receipt::{CommandIdentity, MutationReceiptToken},
 };
-use notarium_syntax::unicode::{PortableFilename, lookup_key};
+use notarium_syntax::unicode::PortableFilename;
 
 use super::{
-    VaultBinding,
+    VaultBinding, VaultFolder,
     storage::{observation_changed, require_binding_for_actor_tx, require_binding_tx},
 };
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
     },
     domain::{
         common::{
-            CommandDeadline, MAX_FOLDER_DEPTH, StoredCommittedFolderRefV1,
+            CommandDeadline, FolderAncestryCache, MAX_FOLDER_DEPTH, StoredCommittedFolderRefV1,
             active_note_sibling_exists_tx, build_resource_facts_tx, derive_command_identity_spec,
             validate_mutation_identity,
         },
@@ -41,7 +41,7 @@ use crate::{
 };
 
 #[derive(Clone, Debug)]
-struct VaultFolder {
+struct FolderAttempt {
     parent: FolderId,
     slug: String,
     folded: String,
@@ -51,7 +51,7 @@ struct VaultFolder {
 #[derive(Clone, Debug)]
 pub(crate) struct VaultFolderReplay {
     binding: VaultBinding,
-    folder: VaultFolder,
+    folder: FolderAttempt,
 }
 
 impl VaultFolderReplay {
@@ -85,7 +85,44 @@ impl VaultFolderReplay {
     }
 }
 
-impl VaultFolder {
+fn vault_folder_key(name: &str) -> Result<String, PortError> {
+    PortableFilename::parse(name)?;
+    let key = normalize_slug_key(name)?;
+    if matches!(key.as_str(), ".notarium" | ".git") || key.starts_with(".notarium-") {
+        return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
+    }
+    Ok(key)
+}
+
+async fn active_folder_at_tx(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceId,
+    parent: &FolderId,
+    folded: &str,
+) -> Result<Option<VaultFolder>, PortError> {
+    let row: Option<(String, String, String)> = query!(
+        tx,
+        query_as,
+        "SELECT folder_id, slug, head_rev_id FROM folder_heads
+         WHERE space_id = $1 AND parent_folder_id = $2 AND slug_fold = $3
+           AND lifecycle_state = 'active'",
+        fetch_optional,
+        space.as_str(),
+        parent.as_str(),
+        folded
+    )?;
+    row.map(|(id, name, revision)| {
+        Ok(VaultFolder {
+            id: FolderId::parse(&id)?,
+            parent: parent.clone(),
+            name,
+            revision: RevisionId::parse(&revision)?,
+        })
+    })
+    .transpose()
+}
+
+impl FolderAttempt {
     fn conflict(&self, space: &SpaceRecord) -> PortError {
         DomainError::PathConflict {
             target: PathTarget {
@@ -120,23 +157,13 @@ impl VaultFolder {
         space: &SpaceRecord,
         class: DocClass,
     ) -> Result<Option<FolderId>, PortError> {
-        let row: Option<String> = query!(
-            tx,
-            query_scalar,
-            "SELECT folder_id FROM folder_heads
-             WHERE space_id = $1 AND parent_folder_id = $2 AND slug_fold = $3
-               AND lifecycle_state = 'active'",
-            fetch_optional,
-            space.scope.space_id.as_str(),
-            self.parent.as_str(),
-            &self.folded
-        )?;
-        if let Some(folder) = row {
-            let id = FolderId::parse(&folder)?;
+        if let Some(folder) =
+            active_folder_at_tx(tx, &space.scope.space_id, &self.parent, &self.folded).await?
+        {
             let (facts, _) =
-                build_resource_facts_tx(tx, &space.space, &id, class, None, true).await?;
+                build_resource_facts_tx(tx, &space.space, &folder.id, class, None, true).await?;
             ctx.auth().authorize_direct_write(&facts, &facts)?;
-            return Ok(Some(id));
+            return Ok(Some(folder.id));
         }
         if active_note_sibling_exists_tx(
             tx,
@@ -154,6 +181,45 @@ impl VaultFolder {
 }
 
 impl CanonicalStore {
+    /// Looks up a folder by its portable sibling key and returns its exact
+    /// current spelling and revision under the active vault binding.
+    pub async fn vault_folder_at(
+        &self,
+        ctx: &SpaceContext,
+        binding: &VaultBinding,
+        parent: Option<&FolderId>,
+        name: &str,
+    ) -> Result<Option<VaultFolder>, PortError> {
+        let folded = vault_folder_key(name)?;
+        let parent = parent.cloned();
+        self.with_read_tx_budget(Some(&ctx.budget), |tx| {
+            let ctx = ctx.clone();
+            let binding = binding.clone();
+            Box::pin(async move {
+                let space = load_space_record(tx, &ctx.scope().space_id).await?;
+                require_binding_tx(tx, &ctx, &space, &binding).await?;
+                let parent = parent.as_ref().unwrap_or(&space.root_folder_id);
+                let mut ancestry = FolderAncestryCache::default();
+                let parent_facts = ancestry
+                    .load_ancestry_tx(tx, &space.scope.space_id, parent, true)
+                    .await?;
+                ctx.auth()
+                    .authorize_folder_read(&space.space, parent, &parent_facts.ancestors)?;
+                let folder =
+                    active_folder_at_tx(tx, &space.scope.space_id, parent, &folded).await?;
+                if let Some(folder) = &folder {
+                    let facts = ancestry
+                        .load_ancestry_tx(tx, &space.scope.space_id, &folder.id, true)
+                        .await?;
+                    ctx.auth()
+                        .authorize_folder_read(&space.space, &folder.id, &facts.ancestors)?;
+                }
+                Ok(folder)
+            })
+        })
+        .await
+    }
+
     /// Resolves or creates an ordinary path component with live user authority.
     /// Replays use the same command key and reauthorize both parent and result.
     pub async fn resolve_vault_folder(
@@ -166,11 +232,7 @@ impl CanonicalStore {
         identity: CommandIdentity,
     ) -> Result<FolderId, PortError> {
         validate_mutation_identity(&ctx, &identity)?;
-        PortableFilename::parse(name)?;
-        let key = lookup_key(name);
-        if matches!(key.as_str(), ".notarium" | ".git") || key.starts_with(".notarium-") {
-            return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
-        }
+        let folded = vault_folder_key(name)?;
         let deadline = CommandDeadline::start(&ctx.budget, "resolve_vault_folder");
         let space = deadline
             .prepare(&ctx.budget, || {
@@ -178,10 +240,10 @@ impl CanonicalStore {
             })
             .await?;
         let class = folder_mutation_class(ctx.auth(), &space.scope.space_id)?;
-        let folder = VaultFolder {
+        let folder = FolderAttempt {
             parent: parent.unwrap_or_else(|| space.root_folder_id.clone()),
             slug: name.to_owned(),
-            folded: normalize_slug_key(name)?,
+            folded,
             candidate,
         };
         let fingerprint = Self::encode_command_outcome(&(
@@ -357,7 +419,7 @@ impl CanonicalStore {
         &self,
         ctx: &SpaceContext,
         binding: &VaultBinding,
-        folder: &VaultFolder,
+        folder: &FolderAttempt,
         class: DocClass,
         idempotency: &CommandIdentitySpec,
     ) -> Result<Option<FolderId>, PortError> {

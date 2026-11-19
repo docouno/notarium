@@ -13,6 +13,8 @@ use notify::{
 };
 use tokio::{sync::Notify, time::Instant};
 
+use crate::paths::{PathUse, path_use};
+
 const MAX_PATHS: usize = 4096;
 const BURST_EVENTS: u16 = 50;
 const QUIET: Duration = Duration::from_millis(100);
@@ -55,6 +57,10 @@ impl Dirty {
 struct Window {
     dirty: Dirty,
     split: HashMap<usize, SplitRename>,
+    untracked: HashSet<PathBuf>,
+    completed: HashSet<usize>,
+    completed_from: HashSet<PathBuf>,
+    completed_to: HashSet<PathBuf>,
     count: u16,
     first: Option<Instant>,
     last: Option<Instant>,
@@ -93,12 +99,15 @@ impl Inbox {
         if matches!(event.kind, EventKind::Access(_)) {
             return;
         }
-        let paths = event
+        let relative = event
             .paths
             .iter()
             .filter_map(|path| path.strip_prefix(&self.root).ok())
-            .filter(|path| !ignored(path))
             .map(Path::to_owned)
+            .collect::<Vec<_>>();
+        let paths = relative
+            .iter()
+            .filter(|path| !ignored(path))
             .collect::<Vec<_>>();
         if paths.is_empty() {
             return;
@@ -112,13 +121,13 @@ impl Inbox {
         }
         let window = &mut state.window;
         if !window.dirty.rescan {
-            window.dirty.paths.extend(paths.iter().cloned());
+            window.dirty.paths.extend(paths.into_iter().cloned());
             if window.dirty.paths.len() > MAX_PATHS {
                 Self::lose(&mut state, now);
                 self.ready.notify_one();
                 return;
             }
-            window.collect_rename(&event, &paths);
+            window.collect_rename(&event, &relative);
         }
         window.count = window.count.saturating_add(1);
         window.dirty.storm = window.count > BURST_EVENTS;
@@ -135,6 +144,7 @@ impl Inbox {
             ..Dirty::default()
         };
         window.split.clear();
+        window.untracked.clear();
         window.first.get_or_insert(now);
         window.last = Some(now);
     }
@@ -143,23 +153,65 @@ impl Inbox {
         let state = self.state.lock().expect("vault watcher inbox");
         state.loss == loss && state.window.dirty.is_empty()
     }
+
+    fn finish_window(state: &mut State) -> Dirty {
+        let Window {
+            mut dirty,
+            split,
+            untracked,
+            ..
+        } = std::mem::take(&mut state.window);
+        if !split.is_empty() || !untracked.is_empty() {
+            // A tracked rename straddled this cut. Its missing half may
+            // still be in flight, so reopen admission from an inventory.
+            state.loss = state.loss.wrapping_add(1);
+            dirty.rescan = true;
+        }
+        dirty
+    }
 }
 
 impl Window {
     fn collect_rename(&mut self, event: &Event, paths: &[PathBuf]) {
-        // A rename from an ignored area is not evidence of a vault move.
-        if paths.len() != event.paths.len() || self.dirty.renames.len() == MAX_PATHS {
+        // Raw pairs involving Git bookkeeping or a staging name still
+        // prove a rename completed. They never prove a note identity.
+        if paths.len() != event.paths.len() {
+            return;
+        }
+        if self.dirty.renames.len() == MAX_PATHS
+            || self.completed.len() == MAX_PATHS
+            || self.completed_to.len() == MAX_PATHS
+        {
+            self.dirty.rescan = true;
             return;
         }
         match (event.kind, paths) {
             (EventKind::Modify(ModifyKind::Name(RenameMode::Both)), [from, to]) => {
-                self.dirty.renames.push((from.clone(), to.clone()));
+                self.record_pair(event.tracker(), from.clone(), to.clone());
             }
-            (EventKind::Modify(ModifyKind::Name(mode)), [path]) => {
+            (
+                EventKind::Modify(ModifyKind::Name(mode @ (RenameMode::From | RenameMode::To))),
+                [path],
+            ) => {
+                if path_use(path) != PathUse::Notes {
+                    return;
+                }
                 let Some(tracker) = event.tracker() else {
+                    let observed = if mode == RenameMode::From {
+                        self.completed_from.contains(path)
+                    } else {
+                        self.completed_to.contains(path)
+                    };
+                    if !observed {
+                        self.untracked.insert(path.clone());
+                    }
                     return;
                 };
+                if self.completed.contains(&tracker) {
+                    return;
+                }
                 if self.split.len() == MAX_PATHS && !self.split.contains_key(&tracker) {
+                    self.dirty.rescan = true;
                     return;
                 }
                 let (from, to) = {
@@ -172,11 +224,26 @@ impl Window {
                     (pair.from.clone(), pair.to.clone())
                 };
                 if let (Some(from), Some(to)) = (from, to) {
-                    self.dirty.renames.push((from, to));
-                    self.split.remove(&tracker);
+                    self.record_pair(Some(tracker), from, to);
                 }
             }
             _ => {}
+        }
+    }
+
+    fn record_pair(&mut self, tracker: Option<usize>, from: PathBuf, to: PathBuf) {
+        if let Some(tracker) = tracker {
+            self.split.remove(&tracker);
+            if !self.completed.insert(tracker) {
+                return;
+            }
+        }
+        self.untracked.remove(&from);
+        self.untracked.remove(&to);
+        self.completed_from.insert(from.clone());
+        self.completed_to.insert(to.clone());
+        if path_use(&from) == PathUse::Notes && path_use(&to) == PathUse::Notes {
+            self.dirty.renames.push((from, to));
         }
     }
 
@@ -226,9 +293,14 @@ impl VaultWatch {
         self.inbox.quiet_since(loss)
     }
 
+    pub fn deletion_fence(&self, loss: u64) -> impl Fn() -> bool + Send + Sync + 'static {
+        let inbox = self.inbox.clone();
+        move || inbox.quiet_since(loss)
+    }
+
     pub fn take(&self) -> Dirty {
         let mut state = self.inbox.state.lock().expect("vault watcher inbox");
-        std::mem::take(&mut state.window).dirty
+        Inbox::finish_window(&mut state)
     }
 
     /// Wait for a quiet window, bounded even when notifications keep arriving.
@@ -240,7 +312,7 @@ impl VaultWatch {
                 let mut state = self.inbox.state.lock().expect("vault watcher inbox");
                 let deadline = state.window.deadline();
                 if state.window.dirty.rescan || deadline.is_some_and(|end| end <= Instant::now()) {
-                    return std::mem::take(&mut state.window).dirty;
+                    return Inbox::finish_window(&mut state);
                 }
                 deadline
             };
@@ -324,5 +396,54 @@ mod tests {
         }
         assert!(!inbox.quiet_since(0));
         assert!(inbox.quiet_since(1));
+    }
+
+    #[test]
+    fn split_rename_at_a_window_boundary_requires_inventory() {
+        let inbox = inbox();
+        let half = |mode, path: &str| {
+            Event::new(EventKind::Modify(ModifyKind::Name(mode)))
+                .set_tracker(11)
+                .add_path(path.into())
+        };
+        inbox.push(Ok(half(RenameMode::From, "/vault/old.md")));
+        {
+            let mut state = inbox.state.lock().unwrap();
+            let window = Inbox::finish_window(&mut state);
+            assert!(window.rescan);
+            assert_eq!(state.loss, 1);
+        }
+        inbox.push(Ok(half(RenameMode::To, "/vault/new.md")));
+        assert!(!inbox.quiet_since(1));
+        let mut state = inbox.state.lock().unwrap();
+        assert!(Inbox::finish_window(&mut state).rescan);
+    }
+
+    #[test]
+    fn git_lock_and_staging_renames_do_not_request_inventory() {
+        let inbox = inbox();
+        let rename = |mode, tracker| {
+            Event::new(EventKind::Modify(ModifyKind::Name(mode))).set_tracker(tracker)
+        };
+        inbox.push(Ok(
+            rename(RenameMode::From, 5).add_path("/vault/.git/index.lock".into())
+        ));
+        inbox.push(Ok(rename(RenameMode::Both, 5)
+            .add_path("/vault/.git/index.lock".into())
+            .add_path("/vault/.git/index".into())));
+        inbox.push(Ok(
+            rename(RenameMode::From, 6).add_path("/vault/.notarium-stage-witness".into())
+        ));
+        inbox.push(Ok(
+            rename(RenameMode::From, 7).add_path("/vault/note.md".into())
+        ));
+        inbox.push(Ok(rename(RenameMode::Both, 7)
+            .add_path("/vault/note.md".into())
+            .add_path("/vault/.notarium-stage-witness".into())));
+        let mut state = inbox.state.lock().unwrap();
+        let window = Inbox::finish_window(&mut state);
+        assert!(!window.rescan);
+        assert!(window.renames.is_empty());
+        assert!(window.paths.contains(Path::new(".git/index.lock")));
     }
 }

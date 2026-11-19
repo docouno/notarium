@@ -5,10 +5,9 @@ use std::{
     path::{Path, PathBuf, Prefix},
 };
 
-#[cfg(target_os = "linux")]
-use cap_fs_ext::OpenOptionsSyncExt;
 use cap_fs_ext::{
     DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt, OpenOptionsMaybeDirExt,
+    OpenOptionsSyncExt,
 };
 use cap_std::fs::{Dir, DirBuilder, DirBuilderExt, File, Metadata, OpenOptions, OpenOptionsExt};
 use rustix::fs::{RenameFlags, renameat_with};
@@ -109,16 +108,28 @@ pub fn directory_identity(dir: &Dir) -> io::Result<FileIdentity> {
 
 pub fn open_child_dir(parent: &Dir, name: &OsStr) -> io::Result<Dir> {
     let child = parent.open_dir_nofollow(name)?;
-    #[cfg(target_os = "linux")]
-    let actual = linux::physical_path(&child)?;
-    #[cfg(target_os = "macos")]
-    let actual = apple::physical_path(&child)?;
-    if actual.file_name() != Some(name) {
+    if !directory_name_matches(&child, name)? {
         return Err(conflict(
             "the requested vault path aliases another directory name",
         ));
     }
     Ok(child)
+}
+
+pub fn directory_name_matches(dir: &Dir, requested: &OsStr) -> io::Result<bool> {
+    exact_name(dir, requested)
+}
+
+pub fn file_name_matches(file: &File, requested: &OsStr) -> io::Result<bool> {
+    exact_name(file, requested)
+}
+
+fn exact_name(object: &impl std::os::fd::AsRawFd, requested: &OsStr) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    let actual = apple::physical_path(object)?;
+    #[cfg(target_os = "linux")]
+    let actual = linux::physical_path(object)?;
+    Ok(actual.file_name() == Some(requested))
 }
 
 pub fn is_link(metadata: &Metadata) -> bool {
@@ -210,12 +221,33 @@ pub fn set_read_options(_options: &mut OpenOptions) {}
 
 pub fn set_metadata_options(_options: &mut OpenOptions) {}
 
+pub fn set_private_metadata_options(options: &mut OpenOptions) {
+    set_metadata_options(options);
+}
+
+pub fn verify_private_file(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+pub fn open_existing_lock(dir: &Dir, name: &OsStr, checked: &File) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .nonblock(true)
+        .follow(FollowSymlinks::No);
+    set_lock_options(&mut options);
+    let file = dir.open_with(name, &options)?;
+    if identity(&file.metadata()?) != identity(&checked.metadata()?) {
+        return Err(conflict(
+            "sidecar lock changed before its handle was acquired",
+        ));
+    }
+    Ok(file)
+}
+
 pub fn verify_name(file: &File, requested: &OsStr) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    let actual = apple::physical_path(file)?;
-    #[cfg(target_os = "linux")]
-    let actual = linux::physical_path(file)?;
-    if actual.file_name() != Some(requested) {
+    if !file_name_matches(file, requested)? {
         return Err(conflict(
             "the requested vault path aliases another filename",
         ));
@@ -241,6 +273,21 @@ pub fn rename_no_replace_between(
     to: &OsStr,
 ) -> io::Result<()> {
     renameat_with(source, from, target, to, RenameFlags::NOREPLACE).map_err(Into::into)
+}
+
+pub fn park_private_capture(
+    source: &Dir,
+    from: &OsStr,
+    target: &Dir,
+    to: &OsStr,
+) -> io::Result<()> {
+    rename_no_replace_between(source, from, target, to)
+}
+
+pub fn verify_parked_capture(_dir: &Dir, _name: &OsStr) -> io::Result<()> {
+    // POSIX traversal of the private recovery directory already excludes
+    // other accounts.
+    Ok(())
 }
 
 pub fn exchange_dirs(parent: &Dir, from: &OsStr, to: &OsStr) -> io::Result<()> {

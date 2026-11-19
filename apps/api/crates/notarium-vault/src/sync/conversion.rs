@@ -16,7 +16,7 @@ use notarium_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{Conversion, VaultError, Worker, disk::markdown};
+use super::{Conversion, ConversionPublication, VaultError, Worker, disk::markdown};
 use crate::{
     carrier,
     filesystem::{CapturedFile, FileStamp, VaultDir},
@@ -154,7 +154,7 @@ impl Worker<'_> {
                 .mint_and_purge(self.config.context.clone(), request)
                 .await?;
             return Ok(Conversion {
-                published: self.finish_committed_mint(&committed).await,
+                publication: self.finish_committed_mint(&committed).await,
                 committed,
             });
         };
@@ -169,13 +169,13 @@ impl Worker<'_> {
             self.journal.save_mint(&prepared)?;
         }
         let committed = self.commit_prepared(&prepared, request).await?;
-        let published = self.finish_committed_mint(&committed).await;
+        let publication = self.finish_committed_mint(&committed).await;
         if let Err(error) = self.retire_preparation(&prepared) {
             tracing::warn!(%error, "could not retire encrypted conversion preparation");
         }
         Ok(Conversion {
             committed,
-            published,
+            publication,
         })
     }
 
@@ -206,7 +206,10 @@ impl Worker<'_> {
             .await?)
     }
 
-    async fn finish_committed_mint(&mut self, committed: &Committed<MintAndPurgeResult>) -> bool {
+    async fn finish_committed_mint(
+        &mut self,
+        committed: &Committed<MintAndPurgeResult>,
+    ) -> ConversionPublication {
         let result = async {
             let successor = &committed.value.new_note.note;
             self.recover_captures(Some(successor))?;
@@ -236,14 +239,20 @@ impl Worker<'_> {
                 &intent.action, Action::Publish(action)
                     if action.purpose == PublishPurpose::Conversion && &action.desired.note == successor
             ));
-            Ok(observation.is_some() && !capture_pending && !publication_pending)
+            Ok(if observation.is_none() || publication_pending {
+                ConversionPublication::Pending
+            } else if capture_pending {
+                ConversionPublication::CleanupPending
+            } else {
+                ConversionPublication::Complete
+            })
         }
         .await;
         match result {
-            Ok(published) => published,
+            Ok(publication) => publication,
             Err(error) => {
                 tracing::warn!(%error, "encrypted conversion publication remains pending");
-                false
+                ConversionPublication::Pending
             }
         }
     }

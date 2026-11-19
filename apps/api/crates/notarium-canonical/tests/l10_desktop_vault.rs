@@ -2,7 +2,15 @@
 
 mod support;
 
-use std::{collections::BTreeMap, fs, sync::atomic::Ordering, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use notarium_canonical::{
     CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateSpaceSpec,
@@ -750,6 +758,193 @@ async fn postgres_mint_purge_handoff_keeps_path_and_completes_with_authenticated
             .vault_is_purge_fenced(&ctx, &binding, &original.value.note)
             .await
             .unwrap()
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn case_only_folder_rename_keeps_folder_and_note_identity_and_records_exact_path() {
+    let root = TempDataRoot::new("vault-folder-case-change");
+    let config = CanonicalConfig::local_default(sample_installation_id(31), root.data_root());
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let ctx = seed_space(&store).await;
+    let binding = store
+        .bind_vault(
+            ctx.clone(),
+            ContentDigest::from_bytes([1; 32]),
+            ContentDigest::from_bytes([2; 32]),
+            None,
+        )
+        .await
+        .unwrap();
+    let id = sample_folder_id(3);
+    store
+        .resolve_vault_folder(
+            ctx.clone(),
+            &binding,
+            None,
+            "alpha",
+            id.clone(),
+            identity(&ctx),
+        )
+        .await
+        .unwrap();
+    let initial = store
+        .vault_folder_at(&ctx, &binding, None, "Alpha")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(initial.name, "alpha");
+    assert_eq!(initial.id, id);
+    let mut input = candidate(41, None, "nested", "note body");
+    input.create.parent = Some(id.clone());
+    input.path = path("alpha/nested.md");
+    let created = store
+        .import_vault_note(ctx.clone(), &binding, mutation(&ctx, input))
+        .await
+        .unwrap();
+    let previous = store
+        .vault_observation_for(&ctx, &binding, &created.value.note)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut rename = mutation(
+        &ctx,
+        RenameFolder {
+            folder: id.clone(),
+            name: "Alpha".into(),
+        },
+    );
+    rename.preconditions.revision = Some(initial.revision.clone());
+    store.rename_folder(ctx.clone(), rename).await.unwrap();
+    let renamed = store
+        .vault_folder_at(&ctx, &binding, None, "alpha")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(renamed.name, "Alpha");
+    assert_eq!(renamed.id, id);
+    assert_eq!(renamed.parent, initial.parent);
+    assert_ne!(renamed.revision, initial.revision);
+
+    // The note's logical parent ID and slug are both unchanged.
+    let updated = store
+        .move_vault_note(
+            ctx.clone(),
+            &binding,
+            previous.clone(),
+            path("Alpha/nested.md"),
+            mutation(
+                &ctx,
+                MoveNote {
+                    note: created.value.note.clone(),
+                    parent: Some(id),
+                    slug: "nested".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.value.note, created.value.note);
+    let current = store
+        .vault_observation_at(&ctx, &binding, "alpha/nested.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.revision, updated.value.revision);
+    assert_eq!(current.path.relative, "Alpha/nested.md");
+    assert_eq!(current.file, previous.file);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn watcher_fence_invalidated_at_commit_rolls_back_trash_receipt_and_stamp() {
+    let root = TempDataRoot::new("vault-watch-cut-invalidated");
+    let config = CanonicalConfig::local_default(sample_installation_id(31), root.data_root());
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let ctx = seed_space(&store).await;
+    let binding = store
+        .bind_vault(
+            ctx.clone(),
+            ContentDigest::from_bytes([1; 32]),
+            ContentDigest::from_bytes([2; 32]),
+            None,
+        )
+        .await
+        .unwrap();
+    let created = store
+        .import_vault_note(
+            ctx.clone(),
+            &binding,
+            mutation(&ctx, candidate(41, None, "missing", "note body")),
+        )
+        .await
+        .unwrap();
+    let stamp = store
+        .vault_observation_for(&ctx, &binding, &created.value.note)
+        .await
+        .unwrap()
+        .unwrap();
+    let action = mutation(
+        &ctx,
+        DeleteNote {
+            note: created.value.note.clone(),
+            disposition: DeleteDisposition::Trash,
+        },
+    );
+    let checks = Arc::new(AtomicUsize::new(0));
+    let writer_checks = checks.clone();
+
+    // Admit the mutation through both item checks, then invalidate the watch
+    // generation at the writer callback immediately before committing SQL.
+    let result = store
+        .trash_vault_note_with_fence(
+            ctx.clone(),
+            &binding,
+            stamp.clone(),
+            action.clone(),
+            move || writer_checks.fetch_add(1, Ordering::SeqCst) < 2,
+        )
+        .await;
+    assert_validation_err(&result, ValidationReason::CursorStale);
+    assert!(checks.load(Ordering::SeqCst) >= 3);
+    assert_eq!(store.vault_head(&ctx).await.unwrap(), created.receipt.seq());
+    assert_eq!(
+        store
+            .read_vault_note(&ctx, &created.value.note)
+            .await
+            .unwrap()
+            .unwrap()
+            .note,
+        created.value,
+    );
+    assert_eq!(
+        store
+            .vault_observation_for(&ctx, &binding, &created.value.note)
+            .await
+            .unwrap(),
+        Some(stamp.clone()),
+    );
+
+    // A new stable reconciliation can use the same command identity.
+    store
+        .trash_vault_note_with_fence(ctx.clone(), &binding, stamp, action, || true)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .read_vault_note(&ctx, &created.value.note)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .vault_observation_for(&ctx, &binding, &created.value.note)
+            .await
+            .unwrap()
+            .is_none()
     );
     runtime.shutdown().await.unwrap();
 }

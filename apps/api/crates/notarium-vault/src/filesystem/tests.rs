@@ -22,7 +22,10 @@ impl Fixture {
         // macOS exposes the system temp directory through /var.
         let root = fs::canonicalize(temp.path()).unwrap();
         let vault = root.join("vault");
+        #[cfg(not(windows))]
         fs::create_dir(&vault).unwrap();
+        #[cfg(windows)]
+        create_owner_only_test_vault(&root, OsStr::new("vault")).unwrap();
         let data = DataRoot::new(root.join("private"));
         Self {
             _temp: temp,
@@ -162,14 +165,77 @@ fn insecure_data_root_and_vault_links_are_rejected() {
         Some(EntryKind::Special)
     );
     assert!(vault.read(Path::new("link.md"), 99).is_err());
+    assert_eq!(
+        vault.entry_kind_exact(Path::new("link.md")).unwrap(),
+        Some(EntryKind::Special)
+    );
     assert!(vault.read(Path::new("hard.md"), 99).is_err());
     assert!(vault.read(Path::new("child/secret"), 99).is_err());
+    assert!(vault.entry_kind_exact(Path::new("child/secret")).is_err());
     assert!(vault.create_dir_all(Path::new("child/new")).is_err());
     assert!(vault.create_dir_all(Path::new("../outside")).is_err());
     assert!(vault.create_dir_all(Path::new("valid/./child")).is_err());
     assert!(vault.read(Path::new("note.md/."), 32).is_err());
     assert!(!fixture.data.root().join("new").exists());
     assert_eq!(fs::read(secret).unwrap(), b"private");
+}
+
+#[test]
+fn exact_entry_checks_the_leaf_and_every_parent_spelling() {
+    let fixture = Fixture::new();
+    let roots = fixture.open();
+    let vault = roots.vault().unwrap();
+    fs::create_dir(fixture.vault.join("Drafts")).unwrap();
+    fixture.write("Drafts/Note.md", b"content");
+    fixture.write("Alpha.md", b"root content");
+
+    #[cfg(windows)]
+    {
+        // Default NTFS lookup reaches those objects despite the wrong spelling.
+        assert!(fixture.vault.join("drafts/note.md").is_file());
+        assert!(fixture.vault.join("alpha.md").is_file());
+    }
+    assert_eq!(
+        vault.entry_kind_exact(Path::new("Drafts/Note.md")).unwrap(),
+        Some(EntryKind::File)
+    );
+    assert_eq!(
+        vault.entry_kind_exact(Path::new("Drafts")).unwrap(),
+        Some(EntryKind::Directory)
+    );
+    assert_eq!(
+        vault.entry_kind_exact(Path::new("drafts/Note.md")).unwrap(),
+        None
+    );
+    assert_eq!(
+        vault.entry_kind_exact(Path::new("Drafts/note.md")).unwrap(),
+        None
+    );
+    assert_eq!(vault.entry_kind_exact(Path::new("alpha.md")).unwrap(), None);
+    assert_eq!(
+        vault.entry_kind_exact(Path::new("Alpha.md")).unwrap(),
+        Some(EntryKind::File)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_entry_does_not_treat_denied_traversal_as_absence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if rustix::process::geteuid().as_raw() == 0 {
+        return;
+    }
+    let fixture = Fixture::new();
+    let roots = fixture.open();
+    let vault = roots.vault().unwrap();
+    let denied = fixture.vault.join("Denied");
+    fs::create_dir(&denied).unwrap();
+    fixture.write("Denied/note.md", b"content");
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+    let result = vault.entry_kind_exact(Path::new("Denied/note.md"));
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
 }
 
 #[test]
@@ -537,4 +603,108 @@ fn windows_rejects_hard_links_even_when_the_alias_is_inside_the_vault() {
     fs::hard_link(&secret, fixture.vault.join("hard.md")).unwrap();
     assert!(vault.read(Path::new("hard.md"), 99).is_err());
     assert_eq!(fs::read(secret).unwrap(), b"private");
+}
+
+#[cfg(windows)]
+#[test]
+fn inherited_owner_only_dacls_pass_private_file_validation() {
+    let fixture = Fixture::new();
+    let roots = fixture.open();
+    let v1 = roots.data_root().root().join("v1");
+    for name in super::roots::STORAGE_FILES {
+        fs::write(v1.join(name), b"inherited owner-only DACL").unwrap();
+    }
+    fs::write(fixture.data.sidecar_lock(), []).unwrap();
+    roots.verify_current().unwrap();
+    assert!(fixture.open().acquire_sidecar_lock().is_ok());
+}
+
+#[cfg(windows)]
+#[test]
+fn owner_only_directories_reject_same_volume_moved_sqlite_and_lock_files_with_broad_acl() {
+    let fixture = Fixture::new();
+    let roots = fixture.open();
+    let v1 = roots.data_root().root().join("v1");
+    for name in super::roots::STORAGE_FILES
+        .iter()
+        .map(|name| v1.join(name))
+        .chain(std::iter::once(fixture.data.sidecar_lock()))
+    {
+        let sibling = fixture.vault.join("broad-acl");
+        fs::write(&sibling, b"unchanged").unwrap();
+        grant_everyone_read(&sibling);
+        fs::rename(&sibling, &name).unwrap();
+        assert_eq!(
+            ValidatedRoots::open(&fixture.data, Some(&fixture.vault))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            roots.verify_current().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            roots.acquire_sidecar_lock().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(fs::read(&name).unwrap(), b"unchanged");
+        fs::remove_file(name).unwrap();
+    }
+    assert!(roots.acquire_sidecar_lock().is_ok());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_keeps_a_capture_with_an_open_writer_in_its_original_slot() {
+    let fixture = Fixture::new();
+    let roots = fixture.open();
+    let vault = roots.vault().unwrap();
+    let slot = slot();
+    let stamp = vault.stage(path(), &slot, b"before").unwrap();
+    let full = fixture.vault.join(&slot);
+    let mut writer = fs::OpenOptions::new().write(true).open(&full).unwrap();
+
+    assert_eq!(assert_retained(vault, &slot, &stamp, b"before"), full);
+    writer.write_all(b"edited").unwrap();
+    writer.sync_all().unwrap();
+    assert_eq!(fs::read(full).unwrap(), b"edited");
+    assert!(vault.recovered_capture(&slot).unwrap().is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_keeps_broad_acl_captures_and_unproved_subtrees_in_the_vault() {
+    let fixture = Fixture::new();
+    let roots = fixture.open();
+    let vault = roots.vault().unwrap();
+    let slot = slot();
+    let stamp = vault.stage(path(), &slot, b"preserve").unwrap();
+    let full = fixture.vault.join(&slot);
+    grant_everyone_read(&full);
+    assert_eq!(assert_retained(vault, &slot, &stamp, b"preserve"), full);
+    assert!(vault.recovered_capture(&slot).unwrap().is_none());
+
+    let tree_slot = VaultDir::operation_slot(Path::new("package"), "0303030303030303").unwrap();
+    let tree = fixture.vault.join(&tree_slot);
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("member.md"), b"preserve subtree").unwrap();
+    grant_everyone_read(&tree.join("member.md"));
+    assert_eq!(vault.retain_tree(&tree_slot).unwrap(), tree);
+    assert!(vault.recovered_capture(&tree_slot).unwrap().is_none());
+    assert_eq!(
+        fs::read(tree.join("member.md")).unwrap(),
+        b"preserve subtree"
+    );
+}
+
+#[cfg(windows)]
+fn grant_everyone_read(path: &Path) {
+    let root = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows has SystemRoot"));
+    let status = std::process::Command::new(root.join("System32/icacls.exe"))
+        .arg(path)
+        .args(["/grant", "*S-1-1-0:(R)"])
+        .status()
+        .expect("Windows includes icacls");
+    assert!(status.success());
 }
