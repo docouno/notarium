@@ -703,14 +703,18 @@ impl PeerGuard {
 
     fn close_locked(&self, mut state: MutexGuard<'_, PeerState>, close: SessionClose) {
         let retired = std::mem::replace(&mut *state, PeerState::Closed(close));
-        // Publish the close only after releasing the registration, which
-        // can unblock the transaction that initiated revocation.
+        // Record pending revocation settlement and remove the peer from the
+        // hub BEFORE dropping `retired` (which releases `RevocationLease` and
+        // unblocks Phase-1 `fence_provider`) and while `state` is still held
+        // (so no reader observes `Ending::Closed` before the lease is released).
+        // Lock order: `PeerGuard::state` -> `hub_peer` -> `HubInner::{peers,
+        // active, pending_revoke_settlement}`.
+        self.unregister_hub_peer();
         drop(retired);
         self.input_stopped.cancel();
         drop(state);
         self.lease_lost.cancel();
         self.stopped.cancel();
-        self.unregister_hub_peer();
     }
 }
 

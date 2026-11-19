@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, LazyLock, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -489,7 +489,7 @@ pub(crate) async fn edit_note_phase1_sqlite_local(
     let prec = preconditions.clone();
     let idemp_cl = idemp.clone();
     let wal_for_err = Arc::clone(wal);
-    let writer_gen_before = store.inner.sqlite_writer_commit_gen.load(Ordering::Acquire);
+    let writer_gen_before = store.sqlite_commit_generation();
     let has_any_purge_fences = store
         .inner
         .sqlite_has_any_purge_fences
@@ -585,7 +585,7 @@ pub(crate) async fn edit_note_phase1_sqlite_local(
                 base_anc: Some(anc),
                 base_digest,
                 base_read,
-                phase1_receipt_checked_gen: Some(writer_gen_before),
+                phase1_receipt_checked_gen: writer_gen_before,
             })
         })
         .await?;
@@ -1655,7 +1655,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
             fast_items,
             cfg,
             wal_stage1.as_deref(),
-            &inner_stage1.sqlite_writer_commit_gen,
+            &inner_stage1,
             has_external_stagings,
             current_writer_gen,
             &mut approval_tx_opt,
@@ -1844,7 +1844,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
                     store
                         .inner
                         .sqlite_writer_commit_gen
-                        .fetch_add(1, Ordering::Release);
+                        .fetch_add(2, Ordering::Release);
                     drop(pending.batch_retained_tickets);
                     drop(pending.batch_retained_guards);
                     BatchExecOutcome::AbortedBeforeCommit(io_err)
@@ -1854,10 +1854,9 @@ pub(crate) async fn execute_sqlite_fast_batch(
                     let inner_stage2 = Arc::clone(&store.inner);
                     let commit_join = tokio::task::spawn_blocking(move || {
                         let _ = crate::wal::take_last_wal_commit_frames();
+                        let commit_seq = crate::runtime::SqliteCommitSeqGuard::begin(&inner_stage2);
                         let res = rconn.execute_batch("COMMIT");
-                        inner_stage2
-                            .sqlite_writer_commit_gen
-                            .fetch_add(1, Ordering::Release);
+                        commit_seq.finish();
                         let frames = crate::wal::take_last_wal_commit_frames();
                         if let Err(ref err) = res
                             && let Some(w) = wal_stage2.as_deref()
@@ -1875,10 +1874,16 @@ pub(crate) async fn execute_sqlite_fast_batch(
                             (res.map_err(|e| format!("{e:?}")), frames)
                         }
                         Err(join_err) => {
-                            store
+                            if !store
                                 .inner
-                                .sqlite_writer_commit_gen
-                                .fetch_add(1, Ordering::Release);
+                                .sqlite_commit_drain_needed
+                                .load(Ordering::Acquire)
+                            {
+                                store
+                                    .inner
+                                    .sqlite_writer_commit_gen
+                                    .fetch_add(2, Ordering::Release);
+                            }
                             if let Ok(reopened) = open_rusqlite_writer_connection(&pair.db_path) {
                                 pair.rusqlite_conn = Some(reopened);
                             }
@@ -1988,7 +1993,7 @@ fn run_sqlite_fast_sql_stage(
     items: Vec<(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)>,
     cfg: WriterConfig,
     wal: Option<&SqliteWalCoordinator>,
-    commit_gen: &AtomicU64,
+    inner: &crate::runtime::CanonicalInner,
     has_external_stagings: bool,
     current_writer_gen: u64,
     approval_tx_opt: &mut Option<tokio::sync::oneshot::Sender<EarlyWaveApproval>>,
@@ -1999,7 +2004,7 @@ fn run_sqlite_fast_sql_stage(
             &items,
             cfg,
             wal,
-            commit_gen,
+            inner,
             has_external_stagings,
             current_writer_gen,
         );
@@ -2009,7 +2014,7 @@ fn run_sqlite_fast_sql_stage(
         &items,
         cfg,
         wal,
-        commit_gen,
+        inner,
         has_external_stagings,
         current_writer_gen,
         approval_tx_opt,
@@ -2023,7 +2028,7 @@ fn run_sqlite_fast_sql_stage(
                 &items,
                 cfg,
                 wal,
-                commit_gen,
+                inner,
                 has_external_stagings,
                 current_writer_gen,
             )
@@ -2050,7 +2055,7 @@ fn try_run_optimistic_fast_sql_stage(
     items: &[(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)],
     cfg: WriterConfig,
     wal: Option<&SqliteWalCoordinator>,
-    commit_gen: &AtomicU64,
+    inner: &crate::runtime::CanonicalInner,
     has_external_stagings: bool,
     current_writer_gen: u64,
     approval_tx_opt: &mut Option<tokio::sync::oneshot::Sender<EarlyWaveApproval>>,
@@ -2208,7 +2213,7 @@ fn try_run_optimistic_fast_sql_stage(
         cache.batch_committed,
         slots,
         wal,
-        commit_gen,
+        inner,
         has_external_stagings,
     ))
 }
@@ -2218,7 +2223,7 @@ fn run_savepoint_fallback_sql_stage(
     items: &[(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)],
     cfg: WriterConfig,
     wal: Option<&SqliteWalCoordinator>,
-    commit_gen: &AtomicU64,
+    inner: &crate::runtime::CanonicalInner,
     has_external_stagings: bool,
     current_writer_gen: u64,
 ) -> FastSqlStageResult {
@@ -2391,7 +2396,7 @@ fn run_savepoint_fallback_sql_stage(
         cache.batch_committed,
         slots,
         wal,
-        commit_gen,
+        inner,
         has_external_stagings,
     )
 }
@@ -2406,7 +2411,7 @@ fn finish_fast_sql_stage(
     batch_committed: Arc<AtomicBool>,
     slots: Vec<ItemOutcomeSlot>,
     wal: Option<&SqliteWalCoordinator>,
-    commit_gen: &AtomicU64,
+    inner: &crate::runtime::CanonicalInner,
     has_external_stagings: bool,
 ) -> FastSqlStageResult {
     for entry in space_states.values() {
@@ -2441,10 +2446,12 @@ fn finish_fast_sql_stage(
 
     if !has_external_stagings && !has_deferred_publish && !has_dir_syncs {
         let _ = crate::wal::take_last_wal_commit_frames();
+        // Bracket SQLite COMMIT with the seqlock generation (even->odd before
+        // COMMIT, odd->even immediately after COMMIT and strictly BEFORE
+        // dropping fence guards or waking readers).
+        let commit_seq = crate::runtime::SqliteCommitSeqGuard::begin(inner);
         let commit_res = conn.execute_batch("COMMIT");
-        // Advance SQLite commit generation immediately after COMMIT (both Ok
-        // and Err) and strictly BEFORE dropping fence guards or waking readers.
-        commit_gen.fetch_add(1, Ordering::Release);
+        commit_seq.finish();
         match commit_res {
             Ok(()) => {
                 let wal_frames = crate::wal::take_last_wal_commit_frames();

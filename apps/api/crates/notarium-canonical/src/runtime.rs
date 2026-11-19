@@ -162,7 +162,13 @@ pub(crate) struct CanonicalInner {
     pub last_backup_memory_stats:
         std::sync::Mutex<Option<crate::backup::BackupExporterMemoryStats>>,
     pub backup_step_delay_us: std::sync::atomic::AtomicU64,
+    /// Seqlock-style SQLite writer commit generation: even when idle, odd while
+    /// a SQLite `COMMIT` is in flight (or a cancelled `sqlx` commit is draining).
     pub sqlite_writer_commit_gen: std::sync::atomic::AtomicU64,
+    /// Set when a direct SQLite write future is dropped mid-commit, leaving
+    /// `sqlite_writer_commit_gen` odd until the next writer lock holder drains
+    /// `pair.sqlx_conn` FIFO.
+    pub sqlite_commit_drain_needed: AtomicBool,
     pub sqlite_has_any_purge_fences: AtomicBool,
     pub sqlite_has_any_space_schemas: AtomicBool,
     pub sqlite_has_any_collab_sessions: AtomicBool,
@@ -170,7 +176,84 @@ pub(crate) struct CanonicalInner {
     pub owner_locks: Mutex<Vec<DataRootOwnerLock>>,
 }
 
+/// RAII seqlock guard around every SQLite `COMMIT`.
+///
+/// Advances `sqlite_writer_commit_gen` from even to odd strictly BEFORE
+/// issuing `COMMIT` and from odd to even strictly AFTER `COMMIT` returns. If
+/// dropped before `finish()` (for example, when a caller cancels a direct
+/// `with_write_tx` future mid-commit), leaves the counter odd and flags
+/// `sqlite_commit_drain_needed` so readers bypass generation caches until the
+/// next writer lock holder drains the connection worker FIFO.
+pub(crate) struct SqliteCommitSeqGuard<'a> {
+    inner: &'a CanonicalInner,
+    finished: bool,
+}
+
+impl<'a> SqliteCommitSeqGuard<'a> {
+    pub(crate) fn begin(inner: &'a CanonicalInner) -> Self {
+        let prev = inner
+            .sqlite_writer_commit_gen
+            .fetch_add(1, Ordering::Release);
+        debug_assert_eq!(prev & 1, 0, "nested SQLite commit seqlock");
+        Self {
+            inner,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.finished = true;
+        let prev = self
+            .inner
+            .sqlite_writer_commit_gen
+            .fetch_add(1, Ordering::Release);
+        debug_assert_eq!(prev & 1, 1, "unbalanced SQLite commit seqlock");
+    }
+}
+
+impl Drop for SqliteCommitSeqGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.inner
+                .sqlite_commit_drain_needed
+                .store(true, Ordering::Release);
+        }
+    }
+}
+
 impl CanonicalInner {
+    /// If an earlier direct SQLite write future was cancelled mid-commit, drain
+    /// the `sqlx-sqlite` connection worker FIFO before the next write and
+    /// restore `sqlite_writer_commit_gen` from odd back to even.
+    pub(crate) async fn drain_pending_sqlite_commit_if_needed(
+        &self,
+        pair: &mut crate::sqlite_fast::SqliteWriterPair,
+    ) -> Result<(), PortError> {
+        if !self.sqlite_commit_drain_needed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        sqlx::query("SELECT 1")
+            .execute(&mut pair.sqlx_conn)
+            .await
+            .map_err(|err| {
+                unavailable_retryable(
+                    "sqlite_writer_commit_drain",
+                    err.to_string(),
+                    Duration::from_millis(50),
+                )
+            })?;
+        if self
+            .sqlite_commit_drain_needed
+            .swap(false, Ordering::AcqRel)
+        {
+            let prev = self
+                .sqlite_writer_commit_gen
+                .fetch_add(1, Ordering::Release);
+            debug_assert_eq!(prev & 1, 1, "unbalanced SQLite commit seqlock drain");
+        }
+        Ok(())
+    }
+
     /// PostgreSQL write authority is granted only by provisioning, takeover, or restore.
     pub(crate) fn grant_writer_epoch(&self, space: &SpaceId, epoch: LeaseEpoch) {
         if matches!(&self.sql, SqlDriverState::Postgres { .. }) {
@@ -457,6 +540,7 @@ impl CanonicalRuntime {
             last_backup_memory_stats: std::sync::Mutex::new(None),
             backup_step_delay_us: std::sync::atomic::AtomicU64::new(0),
             sqlite_writer_commit_gen: std::sync::atomic::AtomicU64::new(0),
+            sqlite_commit_drain_needed: AtomicBool::new(false),
             sqlite_has_any_purge_fences: AtomicBool::new(init_has_purge_fences),
             sqlite_has_any_space_schemas: AtomicBool::new(init_has_space_schemas),
             sqlite_has_any_collab_sessions: AtomicBool::new(init_has_collab_sessions),
@@ -620,11 +704,14 @@ impl CanonicalStore {
         )
     }
 
-    /// Monotonic SQLite writer commit generation, or `None` on multi-writer backends.
-    /// Incremented with `Release` strictly after every committed SQLite write transaction.
+    /// Monotonic SQLite writer commit generation, or `None` on multi-writer
+    /// backends or while a SQLite `COMMIT` is in flight (odd seqlock parity).
     pub fn sqlite_commit_generation(&self) -> Option<u64> {
-        matches!(self.inner.sql, SqlDriverState::Sqlite { .. })
-            .then(|| self.inner.sqlite_writer_commit_gen.load(Ordering::Acquire))
+        if !matches!(self.inner.sql, SqlDriverState::Sqlite { .. }) {
+            return None;
+        }
+        let commit_gen = self.inner.sqlite_writer_commit_gen.load(Ordering::Acquire);
+        (commit_gen & 1 == 0).then_some(commit_gen)
     }
 
     pub async fn read_space(&self, space_id: &SpaceId) -> Result<SpaceRecord, PortError> {
@@ -815,13 +902,15 @@ impl CanonicalStore {
                         Duration::from_millis(100),
                     )
                 })?;
+                self.inner
+                    .drain_pending_sqlite_commit_if_needed(pair)
+                    .await?;
                 let mut conn = BackendConn::Sqlite(&mut pair.sqlx_conn);
                 let mut transaction = WriteTransaction::begin(&mut conn).await?;
                 let value = op(&mut transaction.conn()).await?;
+                let commit_seq = SqliteCommitSeqGuard::begin(&self.inner);
                 let commit_res = transaction.commit().await;
-                self.inner
-                    .sqlite_writer_commit_gen
-                    .fetch_add(1, Ordering::Release);
+                commit_seq.finish();
                 commit_res?;
                 if let Some(wal) = self.inner.wal_coord.get() {
                     wal.note_writer_commit();
@@ -3182,4 +3271,81 @@ pub(crate) async fn read_immutable_revision_tx(
         restored_from_rev_id,
         created_at,
     }))
+}
+
+#[cfg(test)]
+mod seqlock_tests {
+    use super::*;
+
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let mut rnd = [0u8; 8];
+            let _ = getrandom::fill(&mut rnd);
+            let path = std::env::temp_dir()
+                .join(format!("notarium-{tag}-{:016x}", u64::from_le_bytes(rnd)));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_commit_seqlock_brackets_commit_and_drains_on_drop() {
+        let dir = TestDir::new("seqlock");
+        let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+            InstallationId::from_bytes([88; 16]),
+            notarium_core::epoch::DataRoot::new(&dir.0),
+        ))
+        .await
+        .unwrap();
+
+        let g0 = store.sqlite_commit_generation().expect("even idle gen");
+        assert_eq!(g0 & 1, 0);
+
+        // Normal bracket: even -> None (odd) -> even (+2).
+        let guard = SqliteCommitSeqGuard::begin(&store.inner);
+        assert_eq!(store.sqlite_commit_generation(), None);
+        guard.finish();
+        let g1 = store
+            .sqlite_commit_generation()
+            .expect("even gen after finish");
+        assert_eq!(g1, g0 + 2);
+
+        // Dropped mid-commit: stays odd (None) and sets drain flag until next
+        // writer transaction drains `sqlx_conn` FIFO and commits.
+        {
+            let _dropped = SqliteCommitSeqGuard::begin(&store.inner);
+            assert_eq!(store.sqlite_commit_generation(), None);
+        }
+        assert_eq!(store.sqlite_commit_generation(), None);
+        assert!(
+            store
+                .inner
+                .sqlite_commit_drain_needed
+                .load(Ordering::Acquire)
+        );
+
+        store
+            .with_write_tx(|_tx| Box::pin(async { Ok(()) }))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .inner
+                .sqlite_commit_drain_needed
+                .load(Ordering::Acquire)
+        );
+        let g2 = store
+            .sqlite_commit_generation()
+            .expect("even gen restored after drain + commit");
+        // +1 from drain (odd->even) and +2 from the write tx commit bracket.
+        assert_eq!(g2, g1 + 4);
+
+        runtime.shutdown().await.unwrap();
+    }
 }

@@ -856,7 +856,7 @@ impl Room {
         original: &[u8],
         prefix: &mut Vec<PendingUpdate>,
     ) -> Result<Option<PendingUpdate>, PortError> {
-        let Some(peer) = self.peers.get_mut(&id) else {
+        let Some(peer) = self.peers.get(&id) else {
             return Ok(None);
         };
         if peer.role != PeerRole::Editor || peer.outbound.guard.check().is_err() {
@@ -868,47 +868,73 @@ impl Room {
         if original == [0, 0] {
             return self.ack_noop_update(id, prefix).await;
         }
-        match self
-            .twin
-            .stage_peer(original, &self.carrier, &self.lease.note)
-        {
-            Ok(staged) => {
-                if peer.outbound.guard.check().is_err() {
+        let mut staged_after_flush = false;
+        loop {
+            match self
+                .twin
+                .stage_peer(original, &self.carrier, &self.lease.note)
+            {
+                Ok(staged) => {
+                    let Some(peer) = self.peers.get_mut(&id) else {
+                        self.reset_staging(prefix)?;
+                        return Ok(None);
+                    };
+                    if peer.outbound.guard.check().is_err() {
+                        self.reset_staging(prefix)?;
+                        return Ok(None);
+                    }
+                    // A duplicate/already-applied update normalizes to the empty
+                    // Yjs update `[0, 0]`: ACK at the durable watermark without
+                    // writing a no-op WAL row. When uncommitted `prefix` writes
+                    // exist, flush them first and re-stage against `live` so a
+                    // rejected earlier author in `prefix` cannot silently drop
+                    // an overlapping edit from an authorized peer.
+                    if staged.bytes == [0, 0] {
+                        if !prefix.is_empty() && !staged_after_flush {
+                            self.flush_batch(prefix).await?;
+                            let Some(peer) = self.peers.get(&id) else {
+                                return Ok(None);
+                            };
+                            if peer.role != PeerRole::Editor || peer.outbound.guard.check().is_err()
+                            {
+                                return Ok(None);
+                            }
+                            staged_after_flush = true;
+                            continue;
+                        }
+                        return self.ack_noop_update(id, prefix).await;
+                    }
+                    let Some(next) = peer.write_seq.checked_add(1) else {
+                        return Err(
+                            DomainError::validation(ValidationReason::SequenceOverflow).into()
+                        );
+                    };
+                    peer.write_seq = next;
+                    return Ok(Some(PendingUpdate {
+                        peer: id,
+                        peer_seq: next,
+                        auth: peer.ctx.auth().clone(),
+                        original: original.to_vec(),
+                        staged: staged.bytes,
+                    }));
+                }
+                Err(reason) => {
+                    if let Some(peer) = self.peers.get(&id) {
+                        peer.outbound.guard.stop_input();
+                    }
                     self.reset_staging(prefix)?;
+                    // The terminal transition retires the guard for WAL admission.
+                    // Settle and queue the valid prefix before entering that state.
+                    self.flush_batch(prefix).await?;
+                    if let Some(peer) = self.peers.get(&id) {
+                        peer.outbound.finish(
+                            encode_policy_rejected(reason),
+                            self.lease.authority(peer.role),
+                            SessionClose::POLICY,
+                        );
+                    }
                     return Ok(None);
                 }
-                // A duplicate/already-applied update normalizes to the empty
-                // Yjs update `[0, 0]`: ACK at the durable watermark without
-                // writing a no-op WAL row.
-                if staged.bytes == [0, 0] {
-                    return self.ack_noop_update(id, prefix).await;
-                }
-                let Some(next) = peer.write_seq.checked_add(1) else {
-                    return Err(DomainError::validation(ValidationReason::SequenceOverflow).into());
-                };
-                peer.write_seq = next;
-                Ok(Some(PendingUpdate {
-                    peer: id,
-                    peer_seq: next,
-                    auth: peer.ctx.auth().clone(),
-                    original: original.to_vec(),
-                    staged: staged.bytes,
-                }))
-            }
-            Err(reason) => {
-                peer.outbound.guard.stop_input();
-                self.reset_staging(prefix)?;
-                // The terminal transition retires the guard for WAL admission.
-                // Settle and queue the valid prefix before entering that state.
-                self.flush_batch(prefix).await?;
-                if let Some(peer) = self.peers.get(&id) {
-                    peer.outbound.finish(
-                        encode_policy_rejected(reason),
-                        self.lease.authority(peer.role),
-                        SessionClose::POLICY,
-                    );
-                }
-                Ok(None)
             }
         }
     }
@@ -1116,10 +1142,10 @@ struct StopRoom {
 
 impl Drop for StopRoom {
     fn drop(&mut self) {
-        self.handle.stopped.cancel();
         if let Some(hub) = self.hub.upgrade() {
             hub.room_stopped(&self.handle);
         }
+        self.handle.stopped.cancel();
     }
 }
 

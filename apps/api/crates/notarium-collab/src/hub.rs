@@ -121,9 +121,15 @@ pub(crate) struct HubInner {
     slots: Mutex<HashMap<RoomKey, Weak<RoomSlot>>>,
     active: Mutex<HashMap<RoomKey, RoomHandle>>,
     peers: Mutex<HashMap<u64, PeerRegistration>>,
-    pending_revoke_settlement: Mutex<HashMap<RoomKey, HashMap<u64, PendingRevoke>>>,
+    pending_revoke_settlement: Mutex<PendingRevokeSettlement>,
     accept_closed: Cancellation,
     shutdown: Cancellation,
+}
+
+#[derive(Default)]
+struct PendingRevokeSettlement {
+    seq: u64,
+    rooms: HashMap<RoomKey, HashMap<u64, PendingRevoke>>,
 }
 
 struct PendingRevoke {
@@ -374,8 +380,8 @@ impl CollabHub {
     ) -> Result<(), PortError> {
         ctx.authority.require(ServicePurpose::Revocation)?;
         let mut affected = self.0.evict_matching(selector);
-        let snapshot_seq = self.0.next_id.fetch_add(1, Ordering::AcqRel);
-        affected.extend(self.0.matching_pending_revoke_settlement(selector));
+        let (pending_rooms, snapshot_seq) = self.0.matching_pending_revoke_settlement(selector);
+        affected.extend(pending_rooms);
         let close_space = match (selector, reason) {
             (RevocationSelector::Space(space), RevocationReason::SpaceClosed) => Some(space),
             _ => None,
@@ -441,10 +447,8 @@ impl CollabHub {
             }
         }
         for key in affected {
-            if !self.0.room_is_live(&key) {
-                self.0
-                    .clear_pending_revoke_settlement(&key, selector, snapshot_seq);
-            }
+            self.0
+                .clear_pending_if_inactive(&key, selector, snapshot_seq);
         }
         if let Some(space) = close_space {
             self.settle_unhosted_before_archive(space, ctx.budget.clone(), deadline)
@@ -524,71 +528,48 @@ impl HubInner {
     }
 
     pub fn current_revoke_seq(&self) -> u64 {
-        self.next_id.load(Ordering::Acquire)
-    }
-
-    fn room_is_live(&self, key: &RoomKey) -> bool {
-        if self.active.lock().expect("active rooms").contains_key(key) {
-            return true;
-        }
-        self.slots
-            .lock()
-            .expect("room registry")
-            .get(key)
-            .and_then(Weak::upgrade)
-            .is_some()
-    }
-
-    fn record_pending_revoke_entry(&self, key: RoomKey, peer_id: u64, ctx: SpaceContext) {
-        let rev_seq = self.next_id.fetch_add(1, Ordering::AcqRel);
         self.pending_revoke_settlement
             .lock()
             .expect("pending revoke settlement")
-            .entry(key)
-            .or_default()
-            .entry(peer_id)
-            .or_insert(PendingRevoke { rev_seq, ctx });
+            .seq
     }
 
+    /// Lock order across `HubInner` is strictly:
+    /// `peers` -> `active` -> `pending_revoke_settlement`.
     pub fn unregister_peer(&self, id: u64, revoked: bool) {
-        let removed = self.peers.lock().expect("peer registry").remove(&id);
-        if revoked && let Some(peer) = removed {
-            let key = (peer.ctx.scope().space_id.clone(), peer.note);
-            if self.room_is_live(&key) {
-                self.record_pending_revoke_entry(key, id, peer.ctx);
-            }
-        }
-    }
-
-    fn record_matching_for_settlement(&self, selectors: &[RevocationSelector]) {
-        let matched: Vec<(u64, RoomKey, SpaceContext)> = self
-            .peers
-            .lock()
-            .expect("peer registry")
-            .iter()
-            .filter(|(_, peer)| selectors.iter().any(|s| matches_selector(&peer.ctx, s)))
-            .map(|(&id, peer)| {
-                (
+        let mut peers = self.peers.lock().expect("peer registry");
+        if revoked && let Some(peer) = peers.get(&id) {
+            let key = (peer.ctx.scope().space_id.clone(), peer.note.clone());
+            let active = self.active.lock().expect("active rooms");
+            if active.contains_key(&key) {
+                let mut pending = self
+                    .pending_revoke_settlement
+                    .lock()
+                    .expect("pending revoke settlement");
+                pending.seq = pending.seq.saturating_add(1);
+                let rev_seq = pending.seq;
+                pending.rooms.entry(key).or_default().insert(
                     id,
-                    (peer.ctx.scope().space_id.clone(), peer.note.clone()),
-                    peer.ctx.clone(),
-                )
-            })
-            .collect();
-        for (id, key, ctx) in matched {
-            if self.room_is_live(&key) {
-                self.record_pending_revoke_entry(key, id, ctx);
+                    PendingRevoke {
+                        rev_seq,
+                        ctx: peer.ctx.clone(),
+                    },
+                );
             }
         }
+        peers.remove(&id);
     }
 
     fn matching_pending_revoke_settlement(
         &self,
         selector: &RevocationSelector,
-    ) -> HashSet<RoomKey> {
-        self.pending_revoke_settlement
+    ) -> (HashSet<RoomKey>, u64) {
+        let pending = self
+            .pending_revoke_settlement
             .lock()
-            .expect("pending revoke settlement")
+            .expect("pending revoke settlement");
+        let matched = pending
+            .rooms
             .iter()
             .filter(|(_, entries)| {
                 entries
@@ -596,7 +577,8 @@ impl HubInner {
                     .any(|entry| matches_selector(&entry.ctx, selector))
             })
             .map(|(key, _)| key.clone())
-            .collect()
+            .collect();
+        (matched, pending.seq)
     }
 
     fn clear_pending_revoke_settlement(
@@ -609,12 +591,36 @@ impl HubInner {
             .pending_revoke_settlement
             .lock()
             .expect("pending revoke settlement");
-        if let Some(entries) = pending.get_mut(key) {
+        if let Some(entries) = pending.rooms.get_mut(key) {
             entries.retain(|_, entry| {
                 entry.rev_seq > through_seq || !matches_selector(&entry.ctx, selector)
             });
             if entries.is_empty() {
-                pending.remove(key);
+                pending.rooms.remove(key);
+            }
+        }
+    }
+
+    fn clear_pending_if_inactive(
+        &self,
+        key: &RoomKey,
+        selector: &RevocationSelector,
+        through_seq: u64,
+    ) {
+        let active = self.active.lock().expect("active rooms");
+        if active.contains_key(key) {
+            return;
+        }
+        let mut pending = self
+            .pending_revoke_settlement
+            .lock()
+            .expect("pending revoke settlement");
+        if let Some(entries) = pending.rooms.get_mut(key) {
+            entries.retain(|_, entry| {
+                entry.rev_seq > through_seq || !matches_selector(&entry.ctx, selector)
+            });
+            if entries.is_empty() {
+                pending.rooms.remove(key);
             }
         }
     }
@@ -629,10 +635,10 @@ impl HubInner {
             .pending_revoke_settlement
             .lock()
             .expect("pending revoke settlement");
-        if let Some(entries) = pending.get_mut(key) {
+        if let Some(entries) = pending.rooms.get_mut(key) {
             entries.retain(|&peer_id, entry| entry.rev_seq > through_seq || !is_peer_gone(peer_id));
             if entries.is_empty() {
-                pending.remove(key);
+                pending.rooms.remove(key);
             }
         }
     }
@@ -700,22 +706,16 @@ impl HubInner {
 
     pub fn room_stopped(&self, room: &RoomHandle) {
         let key = (room.scope().space_id.clone(), room.note().clone());
-        let removed = {
-            let mut active = self.active.lock().expect("active rooms");
-            if active
-                .get(&key)
-                .is_some_and(|registered| registered.same_lease(room))
-            {
-                active.remove(&key);
-                true
-            } else {
-                false
-            }
-        };
-        if removed {
+        let mut active = self.active.lock().expect("active rooms");
+        if active
+            .get(&key)
+            .is_some_and(|registered| registered.same_lease(room))
+        {
+            active.remove(&key);
             self.pending_revoke_settlement
                 .lock()
                 .expect("pending revoke settlement")
+                .rooms
                 .remove(&key);
         }
     }
@@ -729,26 +729,35 @@ impl HubInner {
     }
 
     fn evict_matching(&self, selector: &RevocationSelector) -> HashSet<RoomKey> {
-        let selected: Vec<_> = self
-            .peers
-            .lock()
-            .expect("peer registry")
-            .iter()
-            .filter(|(_, peer)| matches_selector(&peer.ctx, selector))
-            .filter_map(|(&id, peer)| {
-                Some((
-                    id,
-                    (peer.ctx.scope().space_id.clone(), peer.note.clone()),
-                    peer.ctx.clone(),
-                    peer.guard.upgrade()?,
-                ))
-            })
-            .collect();
+        let selected: Vec<_> = {
+            let peers = self.peers.lock().expect("peer registry");
+            let active = self.active.lock().expect("active rooms");
+            let mut pending = self
+                .pending_revoke_settlement
+                .lock()
+                .expect("pending revoke settlement");
+            peers
+                .iter()
+                .filter(|(_, peer)| matches_selector(&peer.ctx, selector))
+                .filter_map(|(&id, peer)| {
+                    let key = (peer.ctx.scope().space_id.clone(), peer.note.clone());
+                    if active.contains_key(&key) {
+                        pending.seq = pending.seq.saturating_add(1);
+                        let rev_seq = pending.seq;
+                        pending.rooms.entry(key.clone()).or_default().insert(
+                            id,
+                            PendingRevoke {
+                                rev_seq,
+                                ctx: peer.ctx.clone(),
+                            },
+                        );
+                    }
+                    Some((key, peer.guard.upgrade()?))
+                })
+                .collect()
+        };
         let mut affected = HashSet::new();
-        for (id, key, ctx, guard) in selected {
-            if self.room_is_live(&key) {
-                self.record_pending_revoke_entry(key.clone(), id, ctx);
-            }
+        for (key, guard) in selected {
             guard.close(SessionClose::POLICY);
             affected.insert(key);
         }
@@ -1440,9 +1449,6 @@ impl SessionRevocationPort for CollabRevocations {
         ctx: MaintenanceContext,
         selectors: Vec<RevocationSelector>,
     ) -> PortFuture<'_, Box<dyn RevocationLease>> {
-        if let Some(hub) = self.hub.upgrade() {
-            hub.record_matching_for_settlement(&selectors);
-        }
         self.registry.fence_provider(ctx, selectors)
     }
 
@@ -1461,9 +1467,6 @@ impl SessionRevocationPort for CollabRevocations {
         reason: RevocationReason,
     ) -> PortFuture<'_, ()> {
         Box::pin(async move {
-            if let Some(hub) = self.hub.upgrade() {
-                hub.record_matching_for_settlement(std::slice::from_ref(&selector));
-            }
             self.registry
                 .revoke(ctx.clone(), selector.clone(), reason)
                 .await?;
@@ -1472,5 +1475,152 @@ impl SessionRevocationPort for CollabRevocations {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use notarium_canonical::{CanonicalConfig, CanonicalRuntime};
+    use notarium_core::{
+        auth::{EngineAuthContext, SpaceGrant, SpaceRole, VerifiedHuman},
+        ids::{AuthSessionId, GrantId, HistoryIncarnation, InstallationId, PrincipalId},
+    };
+
+    use super::*;
+    use crate::session::SessionEvent;
+
+    struct NoopLease;
+    impl RevocationLease for NoopLease {
+        fn check(&self) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    fn session_ctx(
+        scope: &HistoryScope,
+        seed: u8,
+        principal: PrincipalId,
+        session: AuthSessionId,
+    ) -> SpaceContext {
+        let grant = SpaceGrant {
+            role: SpaceRole::Editor,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: None,
+        };
+        let verified = VerifiedHuman::attest(
+            principal,
+            GrantId::from_bytes([seed; 16]),
+            BTreeMap::from([(scope.space_id.clone(), grant)]),
+            false,
+        )
+        .with_credential(AuthenticatedCredential::Session(session));
+        SpaceContext::new(
+            EngineAuthContext::for_human(verified),
+            scope.clone(),
+            CallBudget {
+                request: RequestId::from_bytes([seed; 16]),
+                cancellation: Cancellation::default(),
+                remaining: Duration::from_secs(5),
+            },
+        )
+        .unwrap()
+    }
+
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new(tag: &str) -> Self {
+            let mut rnd = [0u8; 8];
+            let _ = getrandom::fill(&mut rnd);
+            let path = std::env::temp_dir()
+                .join(format!("notarium-{tag}-{:016x}", u64::from_le_bytes(rnd)));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn admit_closes_with_going_away_when_accept_closed_and_transient_slots_do_not_leak_pending_revokes()
+     {
+        let dir = TestDir::new("hub-admit");
+        let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
+            InstallationId::from_bytes([89; 16]),
+            notarium_core::epoch::DataRoot::new(&dir.0),
+        ))
+        .await
+        .unwrap();
+        let hub = CollabHub::new(store.clone(), CollabConfig::default()).unwrap();
+        let scope = HistoryScope {
+            space_id: SpaceId::from_bytes([11; 16]),
+            incarnation: HistoryIncarnation::from_bytes([12; 16]),
+        };
+        let note_a = NoteId::from_bytes([21; 16]);
+        let p_a = PrincipalId::from_bytes([31; 16]);
+        let s_a = AuthSessionId::from_bytes([41; 16]);
+        let ctx_a = session_ctx(&scope, 1, p_a, s_a.clone());
+
+        // 1. Transient RoomSlot without an active room must NOT record pending
+        //    revoke settlement on peer cancellation (no memory leak).
+        let _transient_slot = hub.0.slot(&scope, &note_a);
+        let cancel_a = Cancellation::default();
+        let guard_a = PeerGuard::new(CollabSessionAuth::new(
+            Box::new(NoopLease),
+            cancel_a.clone(),
+            None,
+        ));
+        hub.0.peers.lock().unwrap().insert(
+            101,
+            PeerRegistration {
+                note: note_a.clone(),
+                ctx: ctx_a.clone(),
+                guard: Arc::downgrade(&guard_a),
+            },
+        );
+        guard_a.attach_hub_registration(Arc::downgrade(&hub.0), 101);
+        cancel_a.cancel();
+        guard_a.close(SessionClose::POLICY);
+        let (matched, _) = hub
+            .0
+            .matching_pending_revoke_settlement(&RevocationSelector::Session(s_a));
+        assert!(
+            matched.is_empty(),
+            "transient slot without active room must not leak pending_revoke_settlement"
+        );
+        drop(_transient_slot);
+
+        // 2. Direct call into HubInner::admit() after `accept_closed` is
+        //    cancelled must close the peer with 1001 GOING_AWAY and return Ok(None).
+        hub.0.accept_closed.cancel();
+        let guard_b = PeerGuard::new(CollabSessionAuth::new(
+            Box::new(NoopLease),
+            Cancellation::default(),
+            None,
+        ));
+        let (mut sess_b, outbound_b, _ingress_b) =
+            CollabPeerSession::pair(store.clone(), ctx_a.clone(), note_a.clone(), guard_b);
+        let admitted = hub
+            .0
+            .admit(
+                &ctx_a,
+                &note_a,
+                &LineageHello::Fresh,
+                &outbound_b,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert!(admitted.is_none());
+        let ev = sess_b.recv().await;
+        assert_eq!(ev, Some(SessionEvent::Close(SessionClose::GOING_AWAY)));
+
+        drop(hub);
+        runtime.shutdown().await.unwrap();
     }
 }

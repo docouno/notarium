@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-use notarium_canonical::{CanonicalConfig, CanonicalRuntime, OpenCollabSession};
+use notarium_canonical::{
+    CanonicalConfig, CanonicalRuntime, CreateFolderSpec, FenceCollabSession, OpenCollabSession,
+};
 use notarium_collab::{
     CollabConfig, CollabHub, CollabSessionAuth, SessionEvent,
     wire::{self, LineageHello},
@@ -21,8 +23,8 @@ use notarium_core::{
     patch::{BodyPatchPlan, CarrierEditOrigin, HeaderMutation},
     ports::{
         BackupParticipantPort, Cancellation, InterceptedMutation, InterceptedPayload,
-        InterceptionResult, LiveCollabInterceptor, MaintenanceContext, MoveNote, NoteWritePort,
-        PortFuture, Preconditions, RenameNote, RevocationLease, RevocationReason,
+        InterceptionResult, LiveCollabInterceptor, MaintenanceContext, MoveFolder, MoveNote,
+        NoteWritePort, PortFuture, Preconditions, RenameNote, RevocationLease, RevocationReason,
         RevocationSelector, ServicePurpose, SessionRevocationPort, SpaceContext,
     },
     receipt::ChangeCursor,
@@ -31,7 +33,7 @@ use notarium_syntax::carrier::Carrier;
 use support::*;
 use tokio::time::timeout;
 use yrs::{
-    Map, ReadTxn, Transact,
+    Map, ReadTxn, Text, Transact,
     encoding::write::Write,
     sync::{Message, SyncMessage},
 };
@@ -735,16 +737,21 @@ impl SessionRevocationPort for MiniRevocationRegistry {
     }
 }
 
-fn session_editor_context(
+fn session_role_context(
     scope: &HistoryScope,
     seed: u8,
     principal: PrincipalId,
+    role: SpaceRole,
     session_id: AuthSessionId,
 ) -> SpaceContext {
     let grant = SpaceGrant {
-        role: SpaceRole::Editor,
+        role,
         read_classes: DocClass::all(),
-        write_classes: DocClass::all(),
+        write_classes: if role == SpaceRole::Viewer {
+            Default::default()
+        } else {
+            DocClass::all()
+        },
         project_root: None,
     };
     let verified = VerifiedHuman::attest(
@@ -815,15 +822,21 @@ async fn split_sender_drop_closes_disconnected_and_concurrent_revocations_settle
     assert_eq!(note_head(&store, &owner, &n_disc.note).await.1, "Base.\n");
     drop(editor2);
 
-    // 2. Concurrent revocations of distinct sessions in distinct dirty rooms do not
-    //    steal each other's pending settlement markers, and overlapping Session +
-    //    Principal revocations on the same room both wait for settlement.
+    // 2. Independent and overlapping revocations settle strictly their own rooms:
+    //    Use live owner editors to make rooms A/B/C dirty and registered Viewer
+    //    sessions so Phase-1 peer reap does NOT auto-checkpoint on its own.
+    //    Revoking `s_a` must settle ONLY room A and leave B/C unsettled until
+    //    their own revocations run (catching any premature `std::mem::take` theft).
     let registry = Arc::new(MiniRevocationRegistry::default());
     let revocations = hub.revocations(registry.clone());
 
     let n_a = create_note(&store, &owner, 32, "Room A.\n", None).await;
     let n_b = create_note(&store, &owner, 33, "Room B.\n", None).await;
     let n_c = create_note(&store, &owner, 34, "Room C.\n", None).await;
+
+    let (mut ed_a, _) = synced_client(&hub, &owner, &n_a.note, 705).await;
+    let (mut ed_b, _) = synced_client(&hub, &owner, &n_b.note, 706).await;
+    let (mut ed_c, _) = synced_client(&hub, &owner, &n_c.note, 707).await;
 
     let p_a = PrincipalId::from_bytes([61; 16]);
     let s_a = AuthSessionId::from_bytes([71; 16]);
@@ -832,9 +845,27 @@ async fn split_sender_drop_closes_disconnected_and_concurrent_revocations_settle
     let p_c = PrincipalId::from_bytes([63; 16]);
     let s_c = AuthSessionId::from_bytes([73; 16]);
 
-    let ctx_a = session_editor_context(owner.scope(), 61, p_a.clone(), s_a.clone());
-    let ctx_b = session_editor_context(owner.scope(), 62, p_b.clone(), s_b.clone());
-    let ctx_c = session_editor_context(owner.scope(), 63, p_c.clone(), s_c.clone());
+    let ctx_a = session_role_context(
+        owner.scope(),
+        61,
+        p_a.clone(),
+        SpaceRole::Viewer,
+        s_a.clone(),
+    );
+    let ctx_b = session_role_context(
+        owner.scope(),
+        62,
+        p_b.clone(),
+        SpaceRole::Viewer,
+        s_b.clone(),
+    );
+    let ctx_c = session_role_context(
+        owner.scope(),
+        63,
+        p_c.clone(),
+        SpaceRole::Viewer,
+        s_c.clone(),
+    );
 
     let connect_registered =
         |ctx: SpaceContext, note: NoteId, p: PrincipalId, s: AuthSessionId, cid: u64| {
@@ -866,26 +897,15 @@ async fn split_sender_drop_closes_disconnected_and_concurrent_revocations_settle
     let mut c_b = connect_registered(ctx_b, n_b.note.clone(), p_b.clone(), s_b.clone(), 712).await;
     let mut c_c = connect_registered(ctx_c, n_c.note.clone(), p_c.clone(), s_c.clone(), 713).await;
 
-    // Keep an unaffected viewer in each room so rooms stay active across peer reap
-    // until revocation settles them (and dirty WAL must still be checkpointed).
-    let viewer_ctx = context(
-        owner.scope(),
-        PrincipalId::from_bytes([69; 16]),
-        SpaceRole::Viewer,
-        None,
-    );
-    let (_v_a, _) = synced_client(&hub, &viewer_ctx, &n_a.note, 721).await;
-    let (_v_b, _) = synced_client(&hub, &viewer_ctx, &n_b.note, 722).await;
-    let (_v_c, _) = synced_client(&hub, &viewer_ctx, &n_c.note, 723).await;
+    ed_a.send_update(&ed_a.append("Edit A.\n")).await;
+    ed_a.ack().await;
+    ed_b.send_update(&ed_b.append("Edit B.\n")).await;
+    ed_b.ack().await;
+    ed_c.send_update(&ed_c.append("Edit C.\n")).await;
+    ed_c.ack().await;
 
-    c_a.send_update(&c_a.append("Edit A.\n")).await;
-    c_a.ack().await;
-    c_b.send_update(&c_b.append("Edit B.\n")).await;
-    c_b.ack().await;
-    c_c.send_update(&c_c.append("Edit C.\n")).await;
-    c_c.ack().await;
-
-    // Phase 1 fence both A and B (cancels & unregisters peers from hub.peers before revoke).
+    // Phase 1 fence all three sessions and wait for their PeerGuards to close
+    // (guaranteed removed from `hub.peers` and recorded in `pending_revoke_settlement`).
     let _fence_a = revocations
         .fence_provider(
             maintenance_ctx(ServicePurpose::Revocation),
@@ -907,19 +927,57 @@ async fn split_sender_drop_closes_disconnected_and_concurrent_revocations_settle
         )
         .await
         .unwrap();
+    assert_eq!(close_code(&mut c_a.peer).await, 1008);
+    assert_eq!(close_code(&mut c_b.peer).await, 1008);
+    assert_eq!(close_code(&mut c_c.peer).await, 1008);
+    tokio::time::sleep(Duration::from_millis(30)).await;
 
-    // Phase 2 concurrent revokes across independent and overlapping selectors.
-    let (r_a, r_b, r_c1, r_c2) = tokio::join!(
-        revocations.revoke(
+    // None of A/B/C auto-checkpointed on viewer disconnect.
+    assert_eq!(note_head(&store, &owner, &n_a.note).await.1, "Room A.\n");
+    assert_eq!(note_head(&store, &owner, &n_b.note).await.1, "Room B.\n");
+    assert_eq!(note_head(&store, &owner, &n_c.note).await.1, "Room C.\n");
+
+    // Step 1: Revoking ONLY `s_a` settles room A and MUST NOT steal or touch B/C.
+    revocations
+        .revoke(
             maintenance_ctx(ServicePurpose::Revocation),
             RevocationSelector::Session(s_a),
             RevocationReason::Logout,
-        ),
-        revocations.revoke(
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        note_head(&store, &owner, &n_a.note).await.1,
+        "Room A.\nEdit A.\n"
+    );
+    assert_eq!(
+        note_head(&store, &owner, &n_b.note).await.1,
+        "Room B.\n",
+        "revoke(s_a) must not steal room B"
+    );
+    assert_eq!(
+        note_head(&store, &owner, &n_c.note).await.1,
+        "Room C.\n",
+        "revoke(s_a) must not steal room C"
+    );
+
+    // Step 2: Revoking `s_b` still finds its own preserved pending marker and settles B.
+    revocations
+        .revoke(
             maintenance_ctx(ServicePurpose::Revocation),
             RevocationSelector::Session(s_b),
             RevocationReason::Logout,
-        ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        note_head(&store, &owner, &n_b.note).await.1,
+        "Room B.\nEdit B.\n"
+    );
+    assert_eq!(note_head(&store, &owner, &n_c.note).await.1, "Room C.\n");
+
+    // Step 3: Overlapping Session + Principal revokes on room C both succeed and settle C.
+    let (r_c1, r_c2) = tokio::join!(
         revocations.revoke(
             maintenance_ctx(ServicePurpose::Revocation),
             RevocationSelector::Session(s_c),
@@ -931,30 +989,199 @@ async fn split_sender_drop_closes_disconnected_and_concurrent_revocations_settle
             RevocationReason::PermissionChanged,
         ),
     );
-    r_a.unwrap();
-    r_b.unwrap();
     r_c1.unwrap();
     r_c2.unwrap();
-
-    // Immediately after revoke completes, all three rooms must be settled into canonical.
-    assert_eq!(
-        note_head(&store, &owner, &n_a.note).await.1,
-        "Room A.\nEdit A.\n"
-    );
-    assert_eq!(
-        note_head(&store, &owner, &n_b.note).await.1,
-        "Room B.\nEdit B.\n"
-    );
     assert_eq!(
         note_head(&store, &owner, &n_c.note).await.1,
         "Room C.\nEdit C.\n"
     );
 
-    // 3. Peer waiting pre-Hello during hub.shutdown receives 1001 GOING_AWAY (not 1011).
-    let mut shutting_peer = open(&hub, &owner, &n_a.note).await;
     hub.shutdown(&budget()).await.unwrap();
-    assert_eq!(close_code(&mut shutting_peer).await, 1001);
+    drop((c_a, c_b, c_c, ed_a, ed_b, ed_c, hub));
+    runtime.shutdown().await.unwrap();
+}
 
-    drop((c_a, c_b, c_c, _v_a, _v_b, _v_c, hub));
+#[tokio::test]
+async fn duplicate_edit_over_revoked_prefix_is_restaged_and_persisted() {
+    let mut cfg = CollabConfig::default();
+    cfg.idle_checkpoint = Duration::from_secs(60);
+    cfg.periodic_checkpoint = Duration::from_secs(60);
+    cfg.idle_unload = Duration::from_secs(60);
+    cfg.wal_coalesce = Duration::from_millis(2);
+    let (_root, store, runtime, hub, owner) = open_sqlite_env("dup-revoked-prefix", cfg).await;
+
+    let space_rec = store.read_space(&owner.scope().space_id).await.unwrap();
+    let folder_a = FolderId::from_bytes([88; 16]);
+    let branch = FolderId::from_bytes([87; 16]);
+    store
+        .create_folder(CreateFolderSpec {
+            scope: owner.scope().clone(),
+            active_epoch: space_rec.active_epoch,
+            folder_id: folder_a.clone(),
+            parent: None,
+            slug: "proj-a".to_owned(),
+            display_name: "Project A".to_owned(),
+            is_project: true,
+            project_slug: Some("proj-a".to_owned()),
+            actor: test_owner(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    store
+        .create_folder(CreateFolderSpec {
+            scope: owner.scope().clone(),
+            active_epoch: space_rec.active_epoch,
+            folder_id: branch.clone(),
+            parent: Some(folder_a.clone()),
+            slug: "branch".to_owned(),
+            display_name: "Branch".to_owned(),
+            is_project: false,
+            project_slug: None,
+            actor: test_owner(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let seed = create_note(&store, &owner, 41, "Hello World\n", Some(branch.clone())).await;
+
+    let scoped_ctx = context(
+        owner.scope(),
+        PrincipalId::from_bytes([81; 16]),
+        SpaceRole::Editor,
+        Some(folder_a),
+    );
+    let (mut peer_a, _) = synced_client(&hub, &scoped_ctx, &seed.note, 801).await;
+    let (mut peer_b, _) = synced_client(&hub, &owner, &seed.note, 802).await;
+
+    // Both editors delete the exact same range "World" (UTF-16 offsets 6..11).
+    // With `wal_coalesce = 2ms` and two editors, peer_a's `del_a` enters
+    // `prefix` and peer_b's `del_b` stages against `staging` to `[0, 0]`,
+    // triggering `flush_batch([del_a])` which pauses inside `append`.
+    let (entered, release) = pause_wal_admission(&store);
+    let del_a = peer_a.update(|txn| peer_a.body.remove_range(txn, 6, 5));
+    let del_b = peer_b.update(|txn| peer_b.body.remove_range(txn, 6, 5));
+    peer_a.send_update(&del_a).await;
+    peer_b.send_update(&del_b).await;
+    timeout(WAIT, entered).await.unwrap().unwrap();
+
+    // Move the parent folder `branch` out of `folder_a` while `flush_batch([del_a])`
+    // is paused. Now `peer_a` loses DB write authority while `peer_b` (Owner) keeps it.
+    store
+        .move_folder(
+            owner.clone(),
+            mutation(
+                &owner,
+                MoveFolder {
+                    folder: branch,
+                    new_parent: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+
+    // `del_a` fails with AccessDenied and is dropped in `retry_authorized`;
+    // `peer_b`'s overlapping `del_b` MUST be re-staged against live and persisted.
+    let ack_del = peer_b.ack().await;
+    assert_eq!(ack_del.peer_write_seq, 1);
+    assert_eq!(
+        ack_del.room_update_seq, 1,
+        "overlapping authorized edit must be persisted into WAL, not no-op ACKed at seq 0"
+    );
+    assert_eq!(close_code(&mut peer_a.peer).await, 1008);
+
+    // Settle via shutdown and verify canonical text has "World" deleted.
+    hub.shutdown(&budget()).await.unwrap();
+    assert_eq!(note_head(&store, &owner, &seed.note).await.1, "Hello \n");
+
+    drop((peer_a, peer_b, hub));
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn room_error_exit_drains_buffered_intercept_and_shutdown_reports_stop_timeout() {
+    let (_root, store, runtime, hub, owner) =
+        open_sqlite_env("error-drain-stop", fast_config()).await;
+
+    // 1. Buffered `Intercept` queued while the room is blocked in a failing WAL
+    //    append receives `RoomClosingNotStarted` (via `Room::run` error-exit
+    //    `drain_on_close`) and succeeds cleanly instead of `CommitEffect::Unknown`.
+    let n1 = create_note(&store, &owner, 42, "Start.\n", None).await;
+    let (c1, _) = synced_client(&hub, &owner, &n1.note, 811).await;
+
+    let (entered, release) = pause_wal_admission(&store);
+    c1.send_update(&c1.append("InFlight.\n")).await;
+    timeout(WAIT, entered).await.unwrap().unwrap();
+
+    // Fence the active room directly in canonical storage so the paused append
+    // fails with `InvalidAuthority` and forces `Room::run_loop` to exit with Err.
+    let stored = store
+        .read_collab_session(None, owner.scope(), &n1.note)
+        .await
+        .unwrap()
+        .unwrap()
+        .session;
+    store
+        .fence_collab_session(
+            &budget(),
+            FenceCollabSession {
+                scope: owner.scope().clone(),
+                note: n1.note.clone(),
+                owner_id: stored.owner_id.expect("active owner"),
+                expected_lease: stored.lease_epoch,
+                expected_lineage: stored.lineage_epoch,
+            },
+        )
+        .await
+        .unwrap();
+
+    let store_for_edit = store.clone();
+    let owner_for_edit = owner.clone();
+    let n1_id = n1.note.clone();
+    let edit_task = tokio::spawn(async move {
+        let cmd = edit(
+            &owner_for_edit,
+            &n1_id,
+            "Start.\n",
+            CarrierEditOrigin::Body,
+            "Start.\n".len(),
+            "Start.\n".len(),
+            "AfterError.\n",
+        );
+        store_for_edit.edit_note(owner_for_edit, cmd).await
+    });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    release.send(()).unwrap();
+
+    let edit_res = timeout(WAIT, edit_task).await.unwrap().unwrap();
+    assert!(
+        edit_res.is_ok(),
+        "buffered Intercept must fall back cleanly on Room error exit, got {edit_res:?}"
+    );
+    assert_eq!(
+        note_head(&store, &owner, &n1.note).await.1,
+        "Start.\nAfterError.\n"
+    );
+    drop(c1);
+
+    // 2. `CollabHub::shutdown` surfaces `DeadlineExceeded` when a busy room
+    //    cannot settle and stop within the shutdown budget.
+    let n2 = create_note(&store, &owner, 43, "Busy.\n", None).await;
+    let (c2, _) = synced_client(&hub, &owner, &n2.note, 812).await;
+    let (entered2, release2) = pause_wal_admission(&store);
+    c2.send_update(&c2.append("Blocked.\n")).await;
+    timeout(WAIT, entered2).await.unwrap().unwrap();
+
+    let mut short_budget = budget();
+    short_budget.remaining = Duration::from_millis(50);
+    let shutdown_err = hub.shutdown(&short_budget).await.unwrap_err();
+    assert!(
+        matches!(shutdown_err, PortError::DeadlineExceeded(_)),
+        "expected DeadlineExceeded from hub.shutdown on blocked room, got {shutdown_err:?}"
+    );
+    let _ = release2.send(());
+    drop((c2, hub));
     runtime.shutdown().await.unwrap();
 }

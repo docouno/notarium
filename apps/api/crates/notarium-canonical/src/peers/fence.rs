@@ -142,7 +142,7 @@ fn publish_lookup_state(
     store
         .inner
         .sqlite_writer_commit_gen
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        .fetch_add(2, std::sync::atomic::Ordering::Release);
 }
 
 async fn read_durable_fence(

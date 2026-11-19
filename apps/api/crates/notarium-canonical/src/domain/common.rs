@@ -596,7 +596,6 @@ impl RoomFenceTable {
     ) {
         let mut fences = self.fences.lock().expect("room fence table mutex");
         fences.entries.retain(|(id, _), _| !spaces.contains(id));
-        fences.advance_eviction_gen();
         let slot_gen = fences.eviction_gen;
         for (key, entry) in restored
             .fences

@@ -1524,7 +1524,13 @@ async fn flush_single_batch(
             let mut guard = writer.lock().await;
             match guard.as_mut() {
                 Some(pair) => {
-                    if can_fast {
+                    if let Err(err) = store
+                        .inner
+                        .drain_pending_sqlite_commit_if_needed(pair)
+                        .await
+                    {
+                        BatchExecOutcome::AbortedBeforeCommit(err)
+                    } else if can_fast {
                         let sq_items = items
                             .into_iter()
                             .map(|(it, fp, _)| (it.prepared, fp))
@@ -2018,16 +2024,15 @@ async fn execute_batch_on_conn(
         return BatchExecOutcome::AbortedBeforeCommit(sync_err);
     }
 
-    // Commit outer SQL transaction and immediately advance SQLite's commit
-    // generation BEFORE releasing fence guards or publishing broadcasts so
-    // linearizable generation caches never observe pre-commit authorization.
+    // Commit outer SQL transaction bracketed by SQLite's seqlock commit
+    // generation (even->odd before COMMIT, odd->even strictly after COMMIT and
+    // BEFORE releasing fence guards or publishing broadcasts) so linearizable
+    // generation caches never observe pre-commit authorization.
+    let commit_seq = is_sqlite.then(|| crate::runtime::SqliteCommitSeqGuard::begin(&store.inner));
     let commit_res = transaction.commit().await;
-    if is_sqlite {
+    if let Some(seq) = commit_seq {
         store.inner.latch_sqlite_aux_tables_populated();
-        store
-            .inner
-            .sqlite_writer_commit_gen
-            .fetch_add(1, Ordering::Release);
+        seq.finish();
     }
     match commit_res {
         Ok(()) => {

@@ -813,11 +813,10 @@ fn plain_lines(body: &str) -> Result<Vec<Range<usize>>, Reject> {
         if !chunk_safe {
             continue;
         }
-        if source.chars().all(prose_inner)
-            && let Some(first_text) = visible
-                .peek()
-                .copied()
-                .filter(|span| span.start() < end && span.end() > start)
+        if let Some(first_text) = visible
+            .peek()
+            .copied()
+            .filter(|span| span.start() < end && span.end() > start)
         {
             let plain_start = first_text.start().max(start);
             let prefix = &body[start..plain_start];
