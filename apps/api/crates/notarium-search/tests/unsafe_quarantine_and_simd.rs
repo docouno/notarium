@@ -39,7 +39,7 @@ fn simd_matches_scalar_bit_for_bit() {
 #[test]
 fn search_unsafe_is_limited_to_audited_leaves() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut directories = vec![root.join("src"), root.join("tests")];
+    let mut directories = vec![root.join("src"), root.join("tests"), root.join("examples")];
     let permitted = ["src/vector/mmap_segment.rs", "src/vector/simd.rs"];
     let block = ["un", "safe {"].concat();
     let function = ["un", "safe fn"].concat();

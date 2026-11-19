@@ -66,19 +66,15 @@ impl<'a> Similarity<'a> {
     }
 }
 
-pub(super) fn greedily_descend(
+fn greedily_descend(
     graph: &impl Graph,
     scorer: Similarity<'_>,
     entry: u32,
     levels: impl Iterator<Item = u8>,
-    budget: Option<SearchBudget<'_>>,
-) -> Result<Neighbor, VectorError> {
+) -> Neighbor {
     let mut nearest = scorer.score_node(graph, entry);
     for level in levels {
         loop {
-            if let Some(budget) = budget {
-                budget.check()?;
-            }
             let next = graph
                 .neighbors(nearest.slot, level)
                 .map(|node| scorer.score_node(graph, node))
@@ -89,7 +85,7 @@ pub(super) fn greedily_descend(
             }
         }
     }
-    Ok(nearest)
+    nearest
 }
 
 pub(super) struct Exploration<'a> {
@@ -107,18 +103,22 @@ pub(super) struct Explored {
 pub(super) fn explore(
     graph: &impl Graph,
     scorer: Similarity<'_>,
-    entry: Neighbor,
+    entries: impl IntoIterator<Item = Neighbor>,
     config: Exploration<'_>,
     eligible: impl Fn(u32) -> bool,
     mut visit: impl FnMut(u32) -> bool,
 ) -> Result<Explored, VectorError> {
     let mut wave = BinaryHeap::new();
     let mut best = BinaryHeap::with_capacity(config.result_capacity + 1);
-    let mut evaluations = 1;
-    visit(entry.slot);
-    wave.push(entry);
-    if eligible(entry.slot) {
-        best.push(Reverse(entry));
+    let mut evaluations = 0usize;
+    for entry in entries {
+        if visit(entry.slot) {
+            evaluations += 1;
+            wave.push(entry);
+            if eligible(entry.slot) {
+                keep_best(&mut best, entry, config.result_capacity);
+            }
+        }
     }
     'walk: while let Some(candidate) = wave.pop() {
         if best.len() == config.result_capacity
@@ -162,10 +162,8 @@ pub(super) fn explore(
 pub(super) fn keep_best(heap: &mut BinaryHeap<Reverse<Neighbor>>, item: Neighbor, limit: usize) {
     if heap.len() < limit {
         heap.push(Reverse(item));
-    } else if let Some(mut lowest) = heap.peek_mut()
-        && item > lowest.0
-    {
-        *lowest = Reverse(item);
+    } else if heap.peek().is_some_and(|lowest| item > lowest.0) {
+        *heap.peek_mut().expect("heap already has a minimum") = Reverse(item);
     }
 }
 
@@ -186,12 +184,35 @@ pub(super) fn query_graph(
     eligible: impl Fn(u32) -> bool,
 ) -> Result<Explored, VectorError> {
     let width = top_k.saturating_mul(2).clamp(64, 256);
-    let anchor = greedily_descend(graph, scorer, entry, (1..=max_level).rev(), Some(budget))?;
     let mut visited = HashSet::with_capacity(width * 8);
+    // Carry several upper-layer candidates into layer zero. A single
+    // greedy entry can settle in a nearby dense cluster and miss the target.
+    const UPPER_WIDTH: usize = 12;
+    let mut anchors = vec![scorer.score_node(graph, entry)];
+    let mut upper_evaluations = 0;
+    for level in (1..=max_level).rev() {
+        visited.clear();
+        let explored = explore(
+            graph,
+            scorer,
+            anchors,
+            Exploration {
+                level,
+                result_capacity: UPPER_WIDTH,
+                max_evaluations: UPPER_WIDTH * 32,
+                budget: Some(budget),
+            },
+            |_| true,
+            |slot| visited.insert(slot),
+        )?;
+        upper_evaluations += explored.evaluations;
+        anchors = explored.neighbors;
+    }
+    visited.clear();
     let mut explored = explore(
         graph,
         scorer,
-        anchor,
+        anchors,
         Exploration {
             level: 0,
             result_capacity: width,
@@ -201,6 +222,7 @@ pub(super) fn query_graph(
         eligible,
         |slot| visited.insert(slot),
     )?;
+    explored.evaluations += upper_evaluations;
     explored.neighbors.truncate(top_k);
     Ok(explored)
 }
@@ -292,14 +314,13 @@ impl BuilderGraph {
                 scorer,
                 self.entry,
                 (level.saturating_add(1)..=self.max_level).rev(),
-                None,
-            )?;
+            );
             for layer in (0..=self.max_level.min(level)).rev() {
                 self.visits.next(self.nodes.len());
                 let explored = explore(
                     &graph,
                     scorer,
-                    anchor,
+                    [anchor],
                     Exploration {
                         level: layer,
                         result_capacity: EF_CONSTRUCTION,
@@ -398,4 +419,60 @@ fn node_level(key: &[u8; 32], slot: u32) -> u8 {
     // Each additional layer occurs with probability 1 / M. With M=16 this
     // is the geometric distribution of leading groups of four zero bits.
     (sample.leading_zeros() as u8 / 4).min(MAX_LEVEL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vector::QuantizedVector;
+    use notarium_core::ports::Cancellation;
+    use std::time::{Duration, Instant};
+
+    struct TwoBranches(Vec<QuantizedVector>);
+
+    impl Graph for TwoBranches {
+        fn vector(&self, node: u32) -> (&[i8], f32) {
+            let vector = &self.0[node as usize];
+            (vector.values(), vector.scale())
+        }
+
+        fn neighbors(&self, node: u32, level: u8) -> impl Iterator<Item = u32> + '_ {
+            let edges: &[u32] = match (level, node) {
+                (1, 0) => &[1, 2],
+                (1, 1) => &[0],
+                (1, 2) => &[0, 3],
+                (1, 3) => &[2],
+                (0, 3) => &[4],
+                (0, 4) => &[3],
+                _ => &[],
+            };
+            edges.iter().copied()
+        }
+    }
+
+    #[test]
+    fn query_carries_a_lower_scoring_upper_layer_bridge_into_the_search() {
+        let vector = |similarity: f32| {
+            let mut components = [0.0f32; 64];
+            components[0] = similarity;
+            components[1] = (1.0 - similarity.powi(2)).sqrt();
+            QuantizedVector::quantize(&components).unwrap()
+        };
+        let graph = TwoBranches(
+            [0.45, 0.8, 0.25, 0.95, 1.0]
+                .into_iter()
+                .map(vector)
+                .collect(),
+        );
+        let query = vector(1.0);
+        let scorer = Similarity::new(query.values(), query.scale()).unwrap();
+        assert_eq!(greedily_descend(&graph, scorer, 0, [1].into_iter()).slot, 1);
+        let cancellation = Cancellation::default();
+        let budget = SearchBudget {
+            cancellation: &cancellation,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let nearest = query_graph(&graph, scorer, 0, 1, 1, budget, |_| true).unwrap();
+        assert_eq!(nearest.neighbors[0].slot, 4);
+    }
 }

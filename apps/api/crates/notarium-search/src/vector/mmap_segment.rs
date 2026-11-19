@@ -173,11 +173,7 @@ impl MmapSegment {
         self.row(VECTORS, slot as usize, self.stride)
     }
     fn values(&self, slot: u32) -> &[i8] {
-        let bytes = self.vector_bytes(slot);
-        // SAFETY: this is a borrowed view into a validated in-bounds row.
-        // i8 and u8 have the same size and alignment and every bit pattern
-        // is valid; the slice retains the mapping's lifetime.
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) }
+        signed_bytes(self.vector_bytes(slot))
     }
     fn upper_range(&self, slot: u32) -> Option<Range<usize>> {
         let offsets = self.section(UPPER_OFFSETS);
@@ -434,19 +430,26 @@ impl MmapSegment {
         let scorer = Similarity::new(query.values(), query.scale())?;
         if exact {
             let mut best = BinaryHeap::with_capacity(top_k);
-            for (index, slot) in eligible
-                .iter()
-                .take_while(|slot| *slot < self.len())
-                .enumerate()
-            {
-                if index.is_multiple_of(128) {
-                    budget.check()?;
+            let vectors = signed_bytes(self.section(VECTORS));
+            let scales = self.section(SCALES).as_chunks::<4>().0;
+            let mut slots = [0; 256];
+            let mut eligible = eligible.iter();
+            'scan: loop {
+                budget.check()?;
+                let count = eligible.next_many(&mut slots);
+                if count == 0 {
+                    break;
                 }
-                hnsw::keep_best(
-                    &mut best,
-                    scorer.score(slot, self.values(slot), self.scale(slot)),
-                    top_k,
-                );
+                for &slot in &slots[..count] {
+                    let index = slot as usize;
+                    if index >= self.nodes {
+                        break 'scan;
+                    }
+                    let start = index * self.stride;
+                    let values = &vectors[start..start + self.stride];
+                    let scale = f32::from_le_bytes(scales[index]);
+                    hnsw::keep_best(&mut best, scorer.score(slot, values, scale), top_k);
+                }
             }
             budget.check()?;
             return Ok(SegmentSearch {
@@ -468,6 +471,12 @@ impl MmapSegment {
             hnsw_hops: explored.evaluations,
         })
     }
+}
+
+fn signed_bytes(bytes: &[u8]) -> &[i8] {
+    // SAFETY: i8 and u8 have the same size and alignment, and every bit
+    // pattern is valid. The view borrows the original slice's lifetime.
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) }
 }
 
 impl Graph for MmapSegment {
