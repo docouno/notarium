@@ -897,17 +897,8 @@ impl CanonicalStore {
                         Duration::from_millis(100),
                     )
                 })?;
-                let mut conn = BackendConn::Sqlite(&mut pair.sqlx_conn);
-                let mut transaction = WriteTransaction::begin(&mut conn).await?;
-                let value = op(&mut transaction.conn()).await?;
-                transaction.commit().await?;
-                self.inner
-                    .sqlite_writer_commit_gen
-                    .fetch_add(1, Ordering::Release);
-                if let Some(wal) = self.inner.wal_coord.get() {
-                    wal.note_writer_commit();
-                }
-                value
+                self.write_sqlite_transaction(&mut pair.sqlx_conn, op, || Ok(()))
+                    .await?
             }
             SqlDriverState::Postgres { pool, .. } => {
                 let mut pooled = pool.acquire().await.map_err(|err| {
@@ -934,6 +925,37 @@ impl CanonicalStore {
                 value
             }
         };
+        Ok(value)
+    }
+
+    pub(crate) async fn write_sqlite_transaction<F, T>(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        op: F,
+        authorize_commit: impl FnOnce() -> Result<(), PortError>,
+    ) -> Result<T, PortError>
+    where
+        F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
+    {
+        let mut conn = BackendConn::Sqlite(connection);
+        let mut transaction = WriteTransaction::begin(&mut conn).await?;
+        let value = op(&mut transaction.conn()).await?;
+        if let Err(error) = authorize_commit() {
+            if !transaction.rollback().await {
+                return Err(internal_not_committed(
+                    "sqlite_write_rollback",
+                    "SQLite rollback was not acknowledged",
+                ));
+            }
+            return Err(error);
+        }
+        transaction.commit().await?;
+        self.inner
+            .sqlite_writer_commit_gen
+            .fetch_add(1, Ordering::Release);
+        if let Some(wal) = self.inner.wal_coord.get() {
+            wal.note_writer_commit();
+        }
         Ok(value)
     }
 

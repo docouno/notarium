@@ -10,14 +10,16 @@ use notarium_core::{
     DomainError,
     error::{PortError, ValidationReason},
     ids::{ArtifactId, BackupId, ContentDigest},
+    ports::Cancellation,
 };
 use sqlx::{PgConnection, Row};
 
 use super::{
     BACKUP_CLEANUP_GRACE, BackendConn, BackupArtifactEncoding, CanonicalInner, CanonicalStore,
-    SqlDriverState, create_private_tmp_file, deadline_not_committed, fsync_parent_dir,
-    internal_not_committed, mint_artifact_id, open_backup_connection, register_cleanup_task,
-    remove_tmp_artifacts, resolve_spool_dir, rollback_backup_connection, unavailable_retryable,
+    SqlDriverState, cancelled_not_committed, create_private_tmp_file, deadline_not_committed,
+    fsync_parent_dir, internal_not_committed, mint_artifact_id, open_backup_connection,
+    register_cleanup_task, remove_tmp_artifacts, resolve_spool_dir, rollback_backup_connection,
+    unavailable_retryable,
 };
 
 const HOLD_LOCK_SQL: &str = "SELECT pg_try_advisory_lock(hashtextextended(current_schema() || ':' || $1, 7311230)), set_config('application_name', $2, false), pg_backend_pid(), set_config('statement_timeout', $3, false)";
@@ -49,6 +51,49 @@ pub(super) enum HoldOwnership {
         connection: Option<Box<PgConnection>>,
         pid: i32,
     },
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct HoldWriteBudget<'a> {
+    pub(super) deadline: tokio::time::Instant,
+    pub(super) cancellation: Option<&'a Cancellation>,
+}
+
+impl HoldWriteBudget<'_> {
+    fn cancelled() -> PortError {
+        cancelled_not_committed("backup_owner_write", "backup SQL cancelled before COMMIT")
+    }
+
+    fn expired() -> PortError {
+        deadline_not_committed("backup_owner_write", "backup SQL deadline expired")
+    }
+
+    fn check(self) -> Result<(), PortError> {
+        if self.cancellation.is_some_and(Cancellation::is_cancelled) {
+            return Err(Self::cancelled());
+        }
+        if tokio::time::Instant::now() >= self.deadline {
+            return Err(Self::expired());
+        }
+        Ok(())
+    }
+
+    pub(super) async fn admit<T>(self, action: impl Future<Output = T>) -> Result<T, PortError> {
+        self.check()?;
+        let wait = tokio::time::timeout_at(self.deadline, action);
+        let result = if let Some(cancellation) = self.cancellation {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(Self::cancelled()),
+                result = wait => result,
+            }
+        } else {
+            wait.await
+        };
+        let result = result.map_err(|_| Self::expired())?;
+        self.check()?;
+        Ok(result)
+    }
 }
 
 impl HoldOwnership {
@@ -117,42 +162,56 @@ impl HoldOwnership {
     pub(super) async fn with_write_tx<F, T>(
         &mut self,
         store: &CanonicalStore,
-        deadline: tokio::time::Instant,
+        budget: HoldWriteBudget<'_>,
         op: F,
     ) -> Result<T, PortError>
     where
         F: for<'c> FnOnce(&'c mut BackendConn<'_>) -> crate::BoxFuture<'c, Result<T, PortError>>,
     {
+        store.ensure_open()?;
+        let _gate = budget
+            .admit(store.inner.writer()?.acquire_commit_read_guard())
+            .await?;
         let Self::Postgres { connection, .. } = self else {
-            return store.with_write_tx(op).await;
+            let SqlDriverState::Sqlite { writer, .. } = &store.inner.sql else {
+                unreachable!("local hold on PostgreSQL")
+            };
+            let mut guard = budget.admit(writer.lock()).await?;
+            let pair = guard.as_mut().ok_or_else(hold_connection_closed)?;
+            // Once SQLite admits BEGIN the writer owns the transaction through
+            // rollback or COMMIT. Only the reversible waits above may be abandoned.
+            return store
+                .write_sqlite_transaction(&mut pair.sqlx_conn, op, || budget.check())
+                .await;
         };
         let conn = connection.as_mut().ok_or_else(hold_connection_closed)?;
-        let expired =
-            || deadline_not_committed("backup_owner_write", "backup SQL deadline expired");
         let unknown = || {
             crate::codec::unknown_commit_non_idempotent(
                 "backup_owner_commit",
                 "backup transaction commit was not acknowledged",
             )
         };
-        let _gate =
-            tokio::time::timeout_at(deadline, store.inner.writer()?.acquire_commit_read_guard())
-                .await
-                .map_err(|_| expired())?;
         let mut committing = false;
         let write = async {
-            let mut backend = BackendConn::Postgres(&mut **conn);
+            let mut backend = BackendConn::Postgres(conn);
             let mut transaction = crate::sql_exec::WriteTransaction::begin(&mut backend).await?;
             let value = op(&mut transaction.conn()).await?;
+            budget.check()?;
             committing = true;
             tokio::time::timeout(BACKUP_CLEANUP_GRACE, transaction.commit())
                 .await
                 .map_err(|_| unknown())??;
             Ok(value)
         };
-        let result = tokio::time::timeout_at(deadline, write)
+        let result = tokio::time::timeout_at(budget.deadline, write)
             .await
-            .unwrap_or_else(|_| Err(if committing { unknown() } else { expired() }));
+            .unwrap_or_else(|_| {
+                Err(if committing {
+                    unknown()
+                } else {
+                    HoldWriteBudget::expired()
+                })
+            });
         if result.is_err()
             && rollback_backup_connection(conn, "backup_owner_rollback")
                 .await

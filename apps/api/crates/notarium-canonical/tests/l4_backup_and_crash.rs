@@ -1279,6 +1279,157 @@ async fn postgres_artifact_recovery_waits_for_publication_resolution() {
 }
 
 #[tokio::test]
+async fn sqlite_cancelled_spool_and_delayed_release_settle_behind_a_writer_pause() {
+    let case = BackendCase::open_sqlite().await;
+    case.store
+        .create_space(backup_test_space(0xcd))
+        .await
+        .unwrap();
+    let id = BackupId::from_bytes([0xcd; 16]);
+    let budget = case.store.default_backup_budget();
+    let mut prepared = case
+        .store
+        .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
+        .await
+        .unwrap();
+    let hold = prepared.acquire_hold().await.unwrap();
+    let mut paused = prepared.pause_writes().await.unwrap();
+    let mut cut = paused.open_cut().await.unwrap();
+    paused.resume().await.unwrap();
+    let writer_pause = case.store.acquire_writer_safe_point().await.unwrap();
+    let cancellation = Cancellation::default();
+
+    {
+        let spooling = cut.spool(budget, cancellation.clone());
+        tokio::pin!(spooling);
+        tokio::select! {
+            result = &mut spooling => panic!("publication must wait for the writer: {result:?}"),
+            () = wait_for_spool_file(&case.spool_dir, "sqlite") => {},
+        }
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), spooling).await.unwrap(),
+            Err(PortError::Cancelled(failure)) if failure.effect() == CommitEffect::NotCommitted
+        ));
+    }
+    cut.close().await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(8), hold.release()).await.unwrap(),
+        Err(PortError::DeadlineExceeded(failure)) if failure.effect() == CommitEffect::NotCommitted
+    ));
+    drop(writer_pause);
+
+    let rows = |table: &str| {
+        rusqlite::Connection::open(case.temp_root.data_root().canonical())
+            .unwrap()
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE backup_id=?1"),
+                [id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while rows("backup_holds") != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(rows("backup_artifacts"), 0);
+    prepared.abort().await.unwrap();
+    case.shutdown().await;
+}
+
+async fn wait_for_spool_file(directory: &Path, extension: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fs::read_dir(directory).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == extension)
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the spool must be copied before publication admission");
+}
+
+#[tokio::test]
+async fn cancelled_postgres_spool_does_not_commit_after_an_admitted_insert() {
+    let case = BackendCase::open_pg_s3_with_pool(1).await;
+    case.store
+        .create_space(backup_test_space(0xce))
+        .await
+        .unwrap();
+    let (fixtures, schema) = case.pg_cleanup.as_ref().unwrap();
+    let id = BackupId::from_bytes([0xce; 16]);
+    let budget = case.store.default_backup_budget();
+    let mut prepared = case
+        .store
+        .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
+        .await
+        .unwrap();
+    let hold = prepared.acquire_hold().await.unwrap();
+    let mut paused = prepared.pause_writes().await.unwrap();
+    let mut cut = paused.open_cut().await.unwrap();
+    paused.resume().await.unwrap();
+    let mut locker = fixtures.open_raw_pg().await;
+    let mut probe = fixtures.open_raw_pg().await;
+    let locker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut locker)
+        .await
+        .unwrap();
+    let mut transaction = locker.begin().await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {schema}.backup_artifacts IN ACCESS EXCLUSIVE MODE",
+    )))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let cancellation = Cancellation::default();
+
+    {
+        let spooling = cut.spool(budget, cancellation.clone());
+        tokio::pin!(spooling);
+        tokio::select! {
+            result = &mut spooling => panic!("publication must wait on INSERT: {result:?}"),
+            _ = wait_for_blocked_backend(&mut probe, locker_pid) => {},
+        }
+        cancellation.cancel();
+        transaction.rollback().await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(10), spooling).await.unwrap(),
+            Err(PortError::Cancelled(failure)) if failure.effect() == CommitEffect::NotCommitted
+        ));
+    }
+    cut.close().await.unwrap();
+    let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {schema}.backup_artifacts WHERE backup_id=$1",
+    )))
+    .bind(id.as_str())
+    .fetch_one(&mut probe)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+    assert!(!fs::read_dir(&case.spool_dir).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "pgspool")
+    }));
+    hold.release().await.unwrap();
+    prepared.abort().await.unwrap();
+    case.shutdown().await;
+}
+
+#[tokio::test]
 async fn failed_postgres_spool_open_waits_for_rollback() {
     let case = BackendCase::open_pg_s3_with_pool(1).await;
     case.store

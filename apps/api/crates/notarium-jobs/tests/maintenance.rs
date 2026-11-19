@@ -22,11 +22,11 @@ use notarium_core::{
     ids::*,
     model::HistoryScope,
     ports::*,
-    receipt::CommandIdentity,
+    receipt::{CausalBasis, ChangeCursor, CommandIdentity, ReceiptSet},
 };
 use notarium_jobs::{
-    ArchiveInput, BackupOptions, FsckInput, RestoreKeyring, RestoreTarget, run_backup, run_fsck,
-    run_restore,
+    ArchiveInput, BackupArchive, BackupOptions, FsckInput, RestoreKeyring, RestoreTarget,
+    run_backup, run_fsck, run_restore,
 };
 
 #[path = "maintenance/cloud_takeover.rs"]
@@ -87,6 +87,132 @@ fn auth(scope: &HistoryScope, owner: &PrincipalId) -> SpaceContext {
 
 fn open(path: &Path) -> ArchiveInput {
     ArchiveInput::new(File::open(path).unwrap()).unwrap()
+}
+
+struct CaptureWrite {
+    note: NoteId,
+    before: SpaceSeq,
+    after: SpaceSeq,
+}
+
+impl CaptureWrite {
+    async fn check_restored(
+        &self,
+        restored: &CanonicalStore,
+        owner: &PrincipalId,
+        cutoff: &ChangeCursor,
+    ) {
+        assert!(cutoff.after == self.before || cutoff.after == self.after);
+        let result = restored
+            .get_note(
+                auth(&cutoff.scope, owner),
+                GetNote {
+                    note: self.note.clone(),
+                    revision: None,
+                    causal: CausalBasis::Exact(ReceiptSet::default()),
+                },
+            )
+            .await;
+        if cutoff.after == self.after {
+            result.expect("the restored note must be visible at its committed cutoff");
+        } else {
+            assert!(matches!(
+                result,
+                Err(notarium_core::error::PortError::Domain(
+                    notarium_core::DomainError::ResourceNotFound
+                ))
+            ));
+        }
+    }
+}
+
+async fn capture_with_a_live_write(
+    canonical: &CanonicalStore,
+    control: &ControlBackup,
+    scope: &HistoryScope,
+    owner: &PrincipalId,
+    path: &Path,
+    carrier: &str,
+    options: BackupOptions,
+) -> (BackupArchive, CaptureWrite) {
+    let spools = path.with_extension("capture-spools");
+    canonical.set_backup_spool_dir(spools.clone());
+    canonical.set_backup_step_delay_for_test(Duration::from_millis(15));
+    let before = canonical
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    let note = NoteId::from_bytes(codec::ordered_id_16().unwrap());
+    let write = async {
+        // A fresh pending marker proves that this backup has entered prepare.
+        loop {
+            if fs::read_dir(&spools).is_ok_and(|mut entries| {
+                entries.any(|entry| {
+                    entry
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext == "pending")
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        canonical
+            .create_note(
+                auth(scope, owner),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: scope.clone(),
+                        actor: owner.clone(),
+                        key: CommandKey::from_bytes(codec::ordered_id_16().unwrap()),
+                        hash: ContentDigest::from_bytes([0; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: note.clone(),
+                        parent: None,
+                        slug: "saved-during-backup".into(),
+                        class: DocClass::UserDoc,
+                        carrier: carrier.into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        canonical
+            .read_space(&scope.space_id)
+            .await
+            .unwrap()
+            .last_seq
+    };
+    let backup = run_backup(
+        authority(ServicePurpose::Backup),
+        canonical,
+        control,
+        path,
+        options,
+    );
+    tokio::pin!(backup);
+    let after = tokio::select! {
+        biased;
+        result = &mut backup => panic!("backup finished before the live write completed: {result:?}"),
+        seq = tokio::time::timeout(Duration::from_secs(10), write) => seq.unwrap(),
+    };
+    assert!(after > before);
+    let backup = backup.await.unwrap();
+    canonical.set_backup_step_delay_for_test(Duration::ZERO);
+    eprintln!("live write committed at {after:?} before paired backup completed");
+    (
+        backup,
+        CaptureWrite {
+            note,
+            before,
+            after,
+        },
+    )
 }
 
 fn sqlite_backup_options() -> BackupOptions {
@@ -313,15 +439,16 @@ async fn sqlite_archive_verification_restore_and_rejection() {
     .unwrap();
     assert_eq!((live.spaces, live.blobs, live.readable_keys), (1, 1, 1));
     let destination = scratch.0.join("backup.zip");
-    let backup = run_backup(
-        authority(ServicePurpose::Backup),
+    let (backup, concurrent_write) = capture_with_a_live_write(
         &canonical,
         &binding,
+        &scope,
+        &owner,
         &destination,
+        body,
         sqlite_backup_options(),
     )
-    .await
-    .unwrap();
+    .await;
     export.release().await.unwrap();
     let report = run_fsck(
         authority(ServicePurpose::Fsck),
@@ -474,12 +601,14 @@ async fn sqlite_archive_verification_restore_and_rejection() {
             use std::os::unix::fs::MetadataExt;
             assert_eq!(fs::metadata(restored.root()).unwrap().ino(), initial);
         }
-        let (restored_canonical, owner) = CanonicalRuntime::open(CanonicalConfig::local_default(
-            installation.clone(),
-            restored.clone(),
-        ))
+        let (restored_canonical, restored_runtime) = CanonicalRuntime::open(
+            CanonicalConfig::local_default(installation.clone(), restored.clone()),
+        )
         .await
         .unwrap();
+        concurrent_write
+            .check_restored(&restored_canonical, &owner, &result.histories[0])
+            .await;
         let bytes = restored_canonical
             .read_verified_blob(
                 &result.histories[0].scope,
@@ -500,7 +629,7 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         assert_eq!(keys.inspect(budget()).await.unwrap().len(), 1);
         drop(keys);
         restored_control.close().await;
-        owner.shutdown().await.unwrap();
+        restored_runtime.shutdown().await.unwrap();
     }
     paired_load::capture_under_load(&canonical, &binding, &root, &scope, &owner, "sqlite").await;
     drop(binding);
@@ -817,15 +946,16 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
         .bind(export.hold_id.as_str()).bind(scope.space_id.as_str()).bind(export.seq.get() as i64)
         .execute(&mut src_sql).await.unwrap();
     let path = scratch.0.join("cloud.zip");
-    let backup = run_backup(
-        authority(ServicePurpose::Backup),
+    let (backup, concurrent_write) = capture_with_a_live_write(
         &store,
         &adapter,
+        &scope,
+        &owner,
         &path,
+        &carrier,
         BackupOptions::default(),
     )
-    .await
-    .unwrap();
+    .await;
     export.release().await.unwrap();
     let validated = run_fsck(
         authority(ServicePurpose::Fsck),
@@ -871,6 +1001,9 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     ))
     .await
     .unwrap();
+    concurrent_write
+        .check_restored(&restored_store, &owner, &restored.histories[0])
+        .await;
     let content = notarium_syntax::content_digest(&carrier);
     assert_eq!(
         restored_store

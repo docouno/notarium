@@ -488,6 +488,8 @@ same example against an isolated prefix.
   Startup reconciles abandoned holds and pending local artifacts. PostgreSQL
   maintenance also reaps holds whose ownership lock was lost. An unacknowledged
   hold commit is reconciled using its exact generation once the old session ends.
+  A Local hold whose release timed out waiting for a writer retains ownership
+  while the runtime retries cleanup of its exact generation.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
   API verifies the trailer and recognizes the exact manifests for schemas 1 through 7.
   It returns typed rows in the original table and column order within the
