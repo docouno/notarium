@@ -4978,7 +4978,7 @@ fn bind_local_blob_ref_after_open_check_rusqlite(
         let mut upd_cat = conn
             .prepare_cached(
                 "UPDATE blob_catalog
-                 SET ref_count = ref_count + ?1, current_publication_id = ?2, blob_state = 'active', touched_at_ms = ?3
+                 SET quarantined_at_ms = NULL, legacy_cleanup = 0, ref_count = ref_count + ?1, current_publication_id = ?2, blob_state = 'active', touched_at_ms = ?3
                  WHERE space_id = ?4 AND content_blake3 = ?5",
             )
             .map_err(|err| internal_not_committed("sqlite_update_cat_active", err.to_string()))?;
@@ -6505,7 +6505,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                 let mut upd_cat = conn
                     .prepare_cached(
                         "UPDATE blob_catalog
-                         SET ref_count = ref_count + ?1, touched_at_ms = ?2
+                         SET quarantined_at_ms = NULL, legacy_cleanup = 0, ref_count = ref_count + ?1, touched_at_ms = ?2
                          WHERE space_id = ?3 AND content_blake3 = ?4",
                     )
                     .map_err(|err| {
@@ -6627,7 +6627,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                 let mut upd_cat = conn
                     .prepare_cached(
                         "UPDATE blob_catalog
-                         SET ref_count = ref_count + ?1, touched_at_ms = ?2
+                         SET quarantined_at_ms = NULL, legacy_cleanup = 0, ref_count = ref_count + ?1, touched_at_ms = ?2
                          WHERE space_id = ?3 AND content_blake3 = ?4",
                     )
                     .map_err(|err| {

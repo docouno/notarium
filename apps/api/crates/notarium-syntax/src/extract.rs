@@ -73,6 +73,15 @@ pub fn extract(
     }))
 }
 
+/// Extract links with physical source spans, ignoring code and Markdown links.
+pub fn wikilinks(
+    source: &str,
+    parsed: &markdown::MarkdownAnalysis,
+) -> DomainResult<Vec<WikiTarget>> {
+    let (links, _) = links_and_tags(source, &parsed.text_ranges)?;
+    Ok(links)
+}
+
 /// Combine explicit field edits and permitted view-ID insertions on one original
 /// carrier. Ordinary incomplete views remain authored text with local diagnostics.
 pub fn finalize_document(

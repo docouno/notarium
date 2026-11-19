@@ -1,6 +1,8 @@
+pub mod gc;
 pub mod local;
 pub(crate) mod retirement_worker;
 pub mod s3;
+mod stream;
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -2093,6 +2095,25 @@ async fn register_s3_staging_or_reuse_tx(
     .await?;
 
     if let Some(active_pub_id) = existing {
+        const REOPEN_GRACE: &str =
+            "UPDATE blob_catalog SET quarantined_at_ms=NULL, legacy_cleanup=0
+            WHERE space_id=$1 AND content_blake3=$2
+              AND (quarantined_at_ms IS NOT NULL OR legacy_cleanup<>0)";
+        match tx {
+            BackendConn::Sqlite(conn) => sqlx::query(REOPEN_GRACE)
+                .bind(space_id.as_str())
+                .bind(prepared.digest.as_bytes().as_slice())
+                .execute(&mut **conn)
+                .await
+                .map(|_| ()),
+            BackendConn::Postgres(conn) => sqlx::query(REOPEN_GRACE)
+                .bind(space_id.as_str())
+                .bind(prepared.digest.as_bytes().as_slice())
+                .execute(&mut **conn)
+                .await
+                .map(|_| ()),
+        }
+        .map_err(|err| internal_not_committed("reset_gc_on_stage_reuse", err.to_string()))?;
         return Ok(S3StageRegistration::ReusedActive {
             publication_id: active_pub_id,
         });
@@ -2560,7 +2581,7 @@ pub(crate) async fn activate_and_bind_blob_ref_tx(
             BackendConn::Sqlite(conn) => {
                 sqlx::query(
                     "UPDATE blob_catalog
-                     SET ref_count = ref_count + ?, current_publication_id = ?, blob_state = 'active', touched_at_ms = ?
+                     SET quarantined_at_ms = NULL, legacy_cleanup = 0, ref_count = ref_count + ?, current_publication_id = ?, blob_state = 'active', touched_at_ms = ?
                      WHERE space_id = ? AND content_blake3 = ?",
                 )
                 .bind(ref_delta)
@@ -2575,7 +2596,7 @@ pub(crate) async fn activate_and_bind_blob_ref_tx(
             BackendConn::Postgres(conn) => {
                 sqlx::query(
                     "UPDATE blob_catalog
-                     SET ref_count = ref_count + $1, current_publication_id = $2, blob_state = 'active', touched_at_ms = $3
+                     SET quarantined_at_ms = NULL, legacy_cleanup = 0, ref_count = ref_count + $1, current_publication_id = $2, blob_state = 'active', touched_at_ms = $3
                      WHERE space_id = $4 AND content_blake3 = $5",
                 )
                 .bind(ref_delta)
@@ -2706,7 +2727,7 @@ pub(crate) async fn bind_existing_active_blob_ref_tx(
         BackendConn::Sqlite(conn) => {
             sqlx::query(
                 "UPDATE blob_catalog
-                 SET ref_count = ref_count + ?, touched_at_ms = ?
+                 SET quarantined_at_ms = NULL, legacy_cleanup = 0, ref_count = ref_count + ?, touched_at_ms = ?
                  WHERE space_id = ? AND content_blake3 = ?",
             )
             .bind(ref_delta)
@@ -2720,7 +2741,7 @@ pub(crate) async fn bind_existing_active_blob_ref_tx(
         BackendConn::Postgres(conn) => {
             sqlx::query(
                 "UPDATE blob_catalog
-                 SET ref_count = ref_count + $1, touched_at_ms = $2
+                 SET quarantined_at_ms = NULL, legacy_cleanup = 0, ref_count = ref_count + $1, touched_at_ms = $2
                  WHERE space_id = $3 AND content_blake3 = $4",
             )
             .bind(ref_delta)
@@ -2948,7 +2969,7 @@ pub(crate) async fn bind_existing_active_blob_refs_batch_tx(
             if !cat_digests.is_empty() {
                 sqlx::query(
                     "UPDATE blob_catalog AS bc
-                     SET ref_count = bc.ref_count + v.delta
+                     SET quarantined_at_ms = NULL, legacy_cleanup = 0, ref_count = bc.ref_count + v.delta
                      FROM UNNEST($2::BYTEA[], $3::BIGINT[]) AS v(digest, delta)
                      WHERE bc.space_id = $1 AND bc.content_blake3 = v.digest",
                 )
@@ -2980,7 +3001,7 @@ pub(crate) async fn bind_existing_active_blob_refs_batch_tx(
             BackendConn::Sqlite(conn) => {
                 for chunk in single_digests.chunks(200) {
                     let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                        "UPDATE blob_catalog SET ref_count = ref_count + 1, touched_at_ms = ",
+                        "UPDATE blob_catalog SET quarantined_at_ms = NULL, legacy_cleanup = 0, ref_count = ref_count + 1, touched_at_ms = ",
                     );
                     qb.push_bind(now_ms)
                         .push(" WHERE space_id = ")
@@ -2999,7 +3020,7 @@ pub(crate) async fn bind_existing_active_blob_refs_batch_tx(
             BackendConn::Postgres(conn) => {
                 for chunk in single_digests.chunks(200) {
                     let mut qb = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-                        "UPDATE blob_catalog SET ref_count = ref_count + 1, touched_at_ms = ",
+                        "UPDATE blob_catalog SET quarantined_at_ms = NULL, legacy_cleanup = 0, ref_count = ref_count + 1, touched_at_ms = ",
                     );
                     qb.push_bind(now_ms)
                         .push(" WHERE space_id = ")
@@ -3023,7 +3044,7 @@ pub(crate) async fn bind_existing_active_blob_refs_batch_tx(
             BackendConn::Sqlite(conn) => {
                 sqlx::query(
                     "UPDATE blob_catalog
-                     SET ref_count = ref_count + ?, touched_at_ms = ?
+                     SET quarantined_at_ms = NULL, legacy_cleanup = 0, ref_count = ref_count + ?, touched_at_ms = ?
                      WHERE space_id = ? AND content_blake3 = ?",
                 )
                 .bind(delta)
@@ -3037,7 +3058,7 @@ pub(crate) async fn bind_existing_active_blob_refs_batch_tx(
             BackendConn::Postgres(conn) => {
                 sqlx::query(
                     "UPDATE blob_catalog
-                     SET ref_count = ref_count + $1, touched_at_ms = $2
+                     SET quarantined_at_ms = NULL, legacy_cleanup = 0, ref_count = ref_count + $1, touched_at_ms = $2
                      WHERE space_id = $3 AND content_blake3 = $4",
                 )
                 .bind(delta)
@@ -3658,6 +3679,7 @@ async fn pending_retirement_for_digest_tx(
     .map_err(|err| crate::runtime::pg_read_error("find_pending_digest_retirement", err))
 }
 
+#[cfg(test)]
 macro_rules! zero_ref_page {
     ($index:literal) => {
         concat!(
@@ -3670,60 +3692,8 @@ macro_rules! zero_ref_page {
         )
     };
 }
+#[cfg(test)]
 const SQLITE_ZERO_REF_PAGE: &str = zero_ref_page!("INDEXED BY idx_blob_catalog_zero_ref");
-const PG_ZERO_REF_PAGE: &str = zero_ref_page!("");
-
-/// Older redaction receipts could release their last reference while a backup
-/// prevented GC planning. Reconcile those catalog rows when opening saved state.
-pub(crate) async fn plan_unowned_active_blobs_tx(
-    tx: &mut BackendConn<'_>,
-    scope: &HistoryScope,
-    epoch: LeaseEpoch,
-) -> Result<bool, PortError> {
-    let mut after = (i64::MIN, Vec::new());
-    let mut planned = false;
-    loop {
-        let rows: Vec<(i64, Vec<u8>)> = match tx {
-            BackendConn::Sqlite(conn) => {
-                sqlx::query_as(SQLITE_ZERO_REF_PAGE)
-                    .bind(scope.space_id.as_str())
-                    .bind(after.0)
-                    .bind(&after.1)
-                    .fetch_all(&mut **conn)
-                    .await
-            }
-            BackendConn::Postgres(conn) => {
-                sqlx::query_as(PG_ZERO_REF_PAGE)
-                    .bind(scope.space_id.as_str())
-                    .bind(after.0)
-                    .bind(&after.1)
-                    .fetch_all(&mut **conn)
-                    .await
-            }
-        }
-        .map_err(|err| internal_not_committed("scan_unowned_blobs", err.to_string()))?;
-        let Some(last) = rows.last() else {
-            return Ok(planned);
-        };
-        after = last.clone();
-        for (_, raw) in rows {
-            let digest = ContentDigest::from_bytes(raw.try_into().map_err(|_| {
-                internal_not_committed("corrupt_blob_digest", "invalid digest length")
-            })?);
-            planned |= initiate_digest_retirement_tx(
-                tx,
-                scope,
-                epoch,
-                digest,
-                RetirementReason::Gc,
-                None,
-                None,
-            )
-            .await?
-            .is_some();
-        }
-    }
-}
 
 pub(crate) async fn initiate_digest_retirement_tx(
     tx: &mut BackendConn<'_>,
@@ -4537,7 +4507,9 @@ mod zero_ref_tests {
         db.execute_batch(crate::schema::SQLITE_BASELINE_DDL)
             .unwrap();
         let mut insert = db
-            .prepare("INSERT INTO blob_catalog VALUES ('s',?1,1,1,?2,NULL,'open','active',?3)")
+            .prepare("INSERT INTO blob_catalog (space_id, content_blake3, raw_size, compressed_size, ref_count,
+                current_publication_id, admission_state, blob_state, touched_at_ms)
+                VALUES ('s',?1,1,1,?2,NULL,'open','active',?3)")
             .unwrap();
         for n in 0..10_000u32 {
             let digest = *blake3::hash(&n.to_be_bytes()).as_bytes();

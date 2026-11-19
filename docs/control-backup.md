@@ -1,5 +1,9 @@
 # Control backup participant
 
+The installation coordinator uses the control participant alongside canonical
+storage. See [archive jobs and recovery](archive-jobs.md) for the paired archive,
+external keyring verification and offline restore entry points.
+
 `ControlBackup::new` composes an existing `ControlStore`, validated `Keyring`,
 `DataRoot` and explicit `BackupConfig`. It implements the core
 `BackupParticipantPort` for trusted Backup/Restore maintenance authority. It does

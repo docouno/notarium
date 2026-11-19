@@ -26,6 +26,9 @@ impl DataRoot {
     pub fn manifest(&self) -> PathBuf {
         self.0.join("v1-epoch.json")
     }
+    pub fn restore_guard(&self) -> PathBuf {
+        self.0.join("v1-restore-in-progress")
+    }
     pub fn blob(&self, space: &SpaceId, digest: ContentDigest) -> PathBuf {
         let hex = digest.to_hex();
         self.0

@@ -3956,7 +3956,7 @@ async fn execute_pg_rollback_domain_writes_cte(
         ),
         upd_cat AS (
             UPDATE blob_catalog AS bc
-            SET ref_count = bc.ref_count + v.delta
+            SET ref_count = bc.ref_count + v.delta, quarantined_at_ms = NULL, legacy_cleanup = 0
             FROM UNNEST($30::BYTEA[], $31::BIGINT[]) AS v(digest, delta)
             WHERE bc.space_id = $1 AND bc.content_blake3 = v.digest AND $7::BIGINT >= 0
         ),

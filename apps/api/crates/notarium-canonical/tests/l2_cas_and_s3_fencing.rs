@@ -1009,3 +1009,117 @@ async fn l2_s3_minio_ce_modes_negative_controls_and_fencing_races() {
         fixtures.drop_pg_schema(&pg_schema).await;
     }
 }
+
+#[tokio::test]
+async fn local_gc_quarantine_survives_restart_and_reacquisition() {
+    use notarium_canonical::blobs::gc::GC_QUARANTINE;
+    use notarium_core::{ids::BackupId, ports::BackupParticipantPort};
+
+    let fixture = TempDataRoot::new("quarantine");
+    let config = CanonicalConfig::local_default(sample_installation_id(98), fixture.data_root());
+    let (store, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
+    let (scope, epoch) = init_test_space(&store, 98).await;
+    let raw = b"A refcounted blob with an ordinary orphan lifecycle";
+    let prepared = store.prepare_blob(raw).unwrap();
+    let digest = prepared.digest();
+    let path = fixture.data_root().blob(&scope.space_id, digest);
+    let physical = || zstd::stream::decode_all(std::fs::File::open(&path).unwrap()).unwrap();
+    let note = NoteId::from_bytes([99; 16]);
+    let bind = |store: CanonicalStore| {
+        let (scope, prepared, note) = (scope.clone(), prepared.clone(), note.clone());
+        async move {
+            let ticket = store.stage_blob(&scope, epoch, &prepared).await.unwrap();
+            store
+                .commit_blob_reference_claim(
+                    &scope,
+                    epoch,
+                    BlobReferenceClaim {
+                        owner_kind: BlobOwnerKind::NoteRevision,
+                        owner_id: note.to_string(),
+                        owner_rev_id: "quarantine-reacquisition".into(),
+                        resource_key: "carrier".into(),
+                        ticket,
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let sweep = |store: CanonicalStore| {
+        let scope = scope.clone();
+        async move {
+            store
+                .sweep_blob_gc(
+                    &maintenance_ctx(ServicePurpose::Backup).budget,
+                    &scope,
+                    epoch,
+                    None,
+                )
+                .await
+                .unwrap()
+        }
+    };
+    bind(store.clone()).await;
+    store
+        .release_blob_owner_references(&scope, epoch, BlobOwnerKind::NoteRevision, note.as_str())
+        .await
+        .unwrap();
+    assert_eq!(sweep(store.clone()).await.quarantined, 1);
+    assert_eq!(sweep(store.clone()).await.quarantined, 0);
+    assert_eq!(physical(), raw);
+
+    runtime.shutdown().await.unwrap();
+    let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    let observer = rusqlite::Connection::open(fixture.data_root().canonical()).unwrap();
+    observer
+        .busy_timeout(std::time::Duration::from_secs(3))
+        .unwrap();
+    let stamp = || {
+        observer.query_row("SELECT quarantined_at_ms FROM blob_catalog WHERE space_id=?1 AND content_blake3=?2",
+        rusqlite::params![scope.space_id.as_str(), digest.as_bytes().as_slice()], |row| row.get::<_, Option<i64>>(0)).unwrap()
+    };
+    assert!(stamp().is_some());
+    assert_eq!(physical(), raw);
+    bind(store.clone()).await;
+    assert_eq!(stamp(), None);
+    assert_eq!(store.read_verified_blob(&scope, digest).await.unwrap(), raw);
+    assert_eq!(sweep(store.clone()).await.inspected, 0);
+    store
+        .release_blob_owner_references(&scope, epoch, BlobOwnerKind::NoteRevision, note.as_str())
+        .await
+        .unwrap();
+    assert_eq!(sweep(store.clone()).await.quarantined, 1);
+
+    let mut prepared = store
+        .prepare(
+            maintenance_ctx(ServicePurpose::Backup),
+            BackupId::from_bytes([4; 16]),
+            store.default_backup_budget(),
+        )
+        .await
+        .unwrap();
+    let hold = prepared.acquire_hold().await.unwrap();
+    // An old stamp is seeded explicitly so the wait stays deterministic. The
+    // first check is within the 5-minute safety margin of the real cutoff.
+    let age = |millis| {
+        observer.execute("UPDATE blob_catalog SET quarantined_at_ms=CAST(unixepoch('subsec')*1000 AS INTEGER)-?1 WHERE space_id=?2 AND content_blake3=?3",
+            rusqlite::params![millis, scope.space_id.as_str(), digest.as_bytes().as_slice()]).unwrap();
+    };
+    age(24_i64 * 60 * 60 * 1000);
+    assert_eq!(sweep(store.clone()).await.retirements, 0);
+    age(GC_QUARANTINE.as_millis() as i64 + 1);
+    assert_eq!(sweep(store.clone()).await.retirements, 0);
+    assert_eq!(physical(), raw);
+    hold.release().await.unwrap();
+    assert_eq!(sweep(store.clone()).await.retirements, 1);
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    runtime.shutdown().await.unwrap();
+}

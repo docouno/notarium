@@ -1,0 +1,828 @@
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
+
+use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions as CapOpenOptions},
+};
+use notarium_canonical::{CanonicalConfig, CanonicalRuntime, codec};
+use notarium_control::{
+    backup::{BackupConfig, ControlBackup},
+    keyring::{Keyring, KeyringLocation},
+    store::ControlStore,
+};
+use notarium_core::{
+    DomainError,
+    epoch::{DataRoot, EpochManifestV1, ReadyState, SUPPORTED_V1_EPOCH},
+    error::{PortError, ValidationReason},
+    ids::{ContentDigest, HistoryIncarnation, InstallationId},
+    ports::{
+        BackupArtifactKind, BackupParticipantPort, CallBudget, MaintenanceContext, ServicePurpose,
+    },
+    receipt::ChangeCursor,
+};
+use rusqlite::{Connection, OpenFlags};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    ArchiveInput, BackupOptions,
+    backup_format::{copy_hash, invalid, io_error},
+    fsck::{VerifiedArchive, verify_archive},
+    import::check_cancelled,
+    sqlite_range::sql_error,
+};
+
+const JOURNAL_MAX: u64 = 32 * 1024 * 1024;
+const LOCAL_MANIFEST: &str = "v1-epoch.json";
+const GUARD_LENGTH: usize = 64;
+
+#[derive(Clone, Debug)]
+pub enum RestoreKeyring {
+    External(PathBuf),
+    ProvisionDefault { separately_saved: PathBuf },
+}
+
+impl RestoreKeyring {
+    fn source(&self) -> &Path {
+        match self {
+            Self::External(path)
+            | Self::ProvisionDefault {
+                separately_saved: path,
+            } => path,
+        }
+    }
+
+    fn is_provisioned(&self) -> bool {
+        matches!(self, Self::ProvisionDefault { .. })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum RestoreTarget {
+    Local {
+        root: DataRoot,
+        keyring: RestoreKeyring,
+    },
+    Cloud(Box<CloudRestoreTarget>),
+}
+
+#[derive(Clone, Debug)]
+pub struct RestoreReport {
+    pub installation: InstallationId,
+    pub archive_digest: ContentDigest,
+    pub histories: Vec<ChangeCursor>,
+}
+
+/// Verify the entire archive and external keys before creating a target
+/// generation. Only an offline maintenance authority can publish it.
+pub async fn run_restore(
+    ctx: MaintenanceContext,
+    input: ArchiveInput,
+    target: RestoreTarget,
+    options: BackupOptions,
+) -> Result<RestoreReport, PortError> {
+    ctx.authority.require(ServicePurpose::Restore)?;
+    options.validate()?;
+    crate::maintenance::bounded(ctx, "archive_restore", |ctx| {
+        run_restore_inner(ctx, input, target, options)
+    })
+    .await
+}
+
+async fn run_restore_inner(
+    ctx: MaintenanceContext,
+    input: ArchiveInput,
+    target: RestoreTarget,
+    options: BackupOptions,
+) -> Result<RestoreReport, PortError> {
+    let verification_keys = match &target {
+        RestoreTarget::Local { keyring, .. } => keyring.source().to_owned(),
+        RestoreTarget::Cloud(target) => target.external_keyring.clone(),
+    };
+    let budget = ctx.budget.clone();
+    let verified = tokio::task::spawn_blocking(move || {
+        verify_archive(input, &verification_keys, &budget, options)
+    })
+    .await
+    .map_err(join_error)??;
+    match target {
+        RestoreTarget::Local { root, keyring }
+            if verified.manifest.backend == BackupArtifactKind::SqliteSnapshotV1 =>
+        {
+            restore_local(ctx, root, keyring, verified).await
+        }
+        RestoreTarget::Cloud(target)
+            if verified.manifest.backend == BackupArtifactKind::PostgresSpoolV1 =>
+        {
+            cloud::restore(ctx, *target, verified, options).await
+        }
+        _ => Err(invalid(ValidationReason::ScopeMismatch)),
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Journal {
+    version: u32,
+    installation: InstallationId,
+    digest: ContentDigest,
+    existing: Option<Identity>,
+    external_keyring: bool,
+    histories: Vec<ChangeCursor>,
+    stage: String,
+    phase: Phase,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "name", deny_unknown_fields)]
+enum Phase {
+    Build,
+    Install {
+        directory: Identity,
+        components: Vec<(String, Identity)>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct Identity {
+    device: u64,
+    inode: u64,
+}
+
+async fn restore_local(
+    ctx: MaintenanceContext,
+    root: DataRoot,
+    keyring: RestoreKeyring,
+    verified: VerifiedArchive,
+) -> Result<RestoreReport, PortError> {
+    if !cfg!(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "redox"
+    )) {
+        return Err(invalid(ValidationReason::UnsupportedContainer));
+    }
+    let digest = verified
+        .report
+        .archive_digest
+        .ok_or_else(|| invalid(ValidationReason::InvalidDigest))?;
+    let parent_path = root
+        .root()
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = fs::canonicalize(parent_path).map_err(io_error)?;
+    let target_name = root
+        .root()
+        .file_name()
+        .ok_or_else(|| invalid(ValidationReason::InvalidPathComponent))?;
+    let root = DataRoot::new(parent.join(target_name));
+    if keyring.source().starts_with(root.root()) {
+        return Err(invalid(ValidationReason::ScopeMismatch));
+    }
+    let lock_key = blake3::hash(target_name.as_encoded_bytes());
+    let journal_path = parent.join(format!(".notarium-restore-{lock_key}.json"));
+    let lock = acquire_lock(&parent.join(format!(".notarium-restore-{lock_key}.lock")))?;
+    let mut journal = if exists(&journal_path)? {
+        let journal = read_journal(&journal_path)?;
+        if journal.version != 1
+            || journal.digest != digest
+            || journal.installation != verified.report.installation
+            || journal.external_keyring == keyring.is_provisioned()
+            || !same_cuts(&journal.histories, &verified.histories)
+            || !valid_stage(&journal.stage)
+        {
+            return Err(invalid(ValidationReason::InvalidDigest));
+        }
+        journal
+    } else {
+        let existing = directory_identity(root.root())?;
+        if existing.is_some()
+            && fs::read_dir(root.root())
+                .map_err(io_error)?
+                .next()
+                .is_some()
+        {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        let mut histories = verified.histories.clone();
+        for cursor in &mut histories {
+            cursor.scope.incarnation = HistoryIncarnation::from_bytes(codec::csprng_16()?);
+        }
+        let journal = Journal {
+            version: 1,
+            installation: verified.report.installation.clone(),
+            digest,
+            existing,
+            external_keyring: !keyring.is_provisioned(),
+            histories,
+            stage: codec::new_prefixed_hex_id(".notarium-restore-generation-")?,
+            phase: Phase::Build,
+        };
+        save_journal(&journal_path, &journal)?;
+        journal
+    };
+
+    if matches!(journal.phase, Phase::Build) {
+        check_cancelled(&ctx.budget.cancellation)?;
+        require_empty_target(&root, journal.existing)?;
+        let initial_stage = parent.join(&journal.stage);
+        if exists(&initial_stage)? {
+            // A prior unexposed attempt may have stopped during either DB
+            // COMMIT. Rebuild privately with the same chosen incarnations.
+            journal.stage = codec::new_prefixed_hex_id(".notarium-restore-generation-")?;
+            save_journal(&journal_path, &journal)?;
+        }
+        let stage = DataRoot::new(parent.join(&journal.stage));
+        let work = stage.clone();
+        let keys = keyring.clone();
+        let budget = ctx.budget.clone();
+        let worker_lock = lock.try_clone().map_err(io_error)?;
+        tokio::task::spawn_blocking(move || {
+            let _lock = worker_lock;
+            materialize_local(&verified, &work, &keys, &budget)
+        })
+        .await
+        .map_err(join_error)??;
+        rebind_local(&stage, &journal, &keyring, &ctx).await?;
+        write_new(&stage.manifest(), &epoch_manifest(&journal.installation)?)?;
+        sync_dir(stage.root())?;
+        verify_installed(&stage, &journal)?;
+        journal.phase = Phase::Install {
+            directory: directory_identity(stage.root())?
+                .ok_or_else(|| invalid(ValidationReason::InvalidState))?,
+            components: ["v1", "blobs", "secret-keyring"]
+                .into_iter()
+                .filter(|name| *name != "secret-keyring" || keyring.is_provisioned())
+                .map(|name| {
+                    let id = directory_identity(&stage.root().join(name))?
+                        .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                    Ok((name.to_owned(), id))
+                })
+                .collect::<Result<_, PortError>>()?,
+        };
+        save_journal(&journal_path, &journal)?;
+    }
+    check_cancelled(&ctx.budget.cancellation)?;
+    install_local(&parent, &root, &journal)?;
+    verify_installed(&root, &journal)?;
+    fs::remove_file(&journal_path).map_err(io_error)?;
+    sync_dir(&parent)?;
+    if let Phase::Install { directory, .. } = &journal.phase {
+        let stage = parent.join(&journal.stage);
+        if journal.existing.is_some()
+            && directory_identity(&stage).ok().flatten() == Some(*directory)
+        {
+            let _ = fs::remove_file(stage.join(LOCAL_MANIFEST));
+            let _ = fs::remove_dir(stage);
+        }
+    }
+    Ok(RestoreReport {
+        installation: journal.installation,
+        archive_digest: digest,
+        histories: journal.histories,
+    })
+}
+
+fn materialize_local(
+    archive: &VerifiedArchive,
+    root: &DataRoot,
+    keyring: &RestoreKeyring,
+    budget: &CallBudget,
+) -> Result<(), PortError> {
+    private_dir(root.root())?;
+    private_dir(&root.root().join("v1"))?;
+    private_dir(&root.root().join("blobs"))?;
+    for (path, expected, mut input) in [
+        (
+            root.control(),
+            archive.manifest.control,
+            Box::new(archive.control()?) as Box<dyn Read>,
+        ),
+        (
+            root.canonical(),
+            archive.manifest.canonical,
+            Box::new(archive.canonical()?) as Box<dyn Read>,
+        ),
+    ] {
+        let mut output = create_file(&path)?;
+        if copy_hash(
+            &mut input,
+            &mut output,
+            expected.bytes,
+            &budget.cancellation,
+        )? != expected
+        {
+            return Err(invalid(ValidationReason::InvalidDigest));
+        }
+        output.sync_all().map_err(io_error)?;
+    }
+    let mut canonical = Connection::open(root.canonical()).map_err(sql_error)?;
+    let tx = canonical.transaction().map_err(sql_error)?;
+    let mut index = archive.index()?;
+    for ordinal in 0..index.count {
+        check_cancelled(&budget.cancellation)?;
+        let record = index.read(ordinal)?;
+        let blob = root.blob(&record.space, record.digest);
+        let parent = blob.parent().expect("generated CAS path has parent");
+        fs::create_dir_all(parent).map_err(io_error)?;
+        let mut file = create_file(&blob)?;
+        let mut source = archive.blob(&record)?;
+        let compressed = copy_hash(
+            &mut source,
+            &mut file,
+            record.compressed,
+            &budget.cancellation,
+        )?;
+        if compressed.bytes != record.compressed {
+            return Err(invalid(ValidationReason::InvalidDigest));
+        }
+        file.sync_all().map_err(io_error)?;
+        sync_dir(parent)?;
+        // Verify the bytes read a second time before they can become live.
+        let mut decoder = zstd::stream::read::Decoder::new(File::open(&blob).map_err(io_error)?)
+            .map_err(io_error)?;
+        decoder.window_log_max(23).map_err(io_error)?;
+        let raw = copy_hash(
+            &mut decoder,
+            &mut std::io::sink(),
+            record.raw,
+            &budget.cancellation,
+        )?;
+        if raw.bytes != record.raw || raw.digest != record.digest {
+            return Err(invalid(ValidationReason::InvalidDigest));
+        }
+        let params = rusqlite::params![
+            record.compressed as i64,
+            record.space.as_str(),
+            record.digest.as_bytes().as_slice()
+        ];
+        tx.execute(
+            "UPDATE blob_catalog SET compressed_size=?1 WHERE space_id=?2 AND content_blake3=?3",
+            params,
+        )
+        .map_err(sql_error)?;
+        tx.execute("UPDATE blob_publications SET compressed_size=?1 WHERE space_id=?2 AND content_blake3=?3 AND state='active'", params).map_err(sql_error)?;
+    }
+    tx.commit().map_err(sql_error)?;
+    canonical.close().map_err(|(_, error)| sql_error(error))?;
+    sync_dir(&root.root().join("v1"))?;
+    for space in fs::read_dir(root.root().join("blobs")).map_err(io_error)? {
+        let space = space.map_err(io_error)?;
+        sync_dir(&space.path())?;
+    }
+    sync_dir(&root.root().join("blobs"))?;
+    if let RestoreKeyring::ProvisionDefault { separately_saved } = keyring {
+        provision_keys(separately_saved, &root.keyring(), &archive.keys, budget)?;
+    }
+    sync_dir(root.root())
+}
+
+fn provision_keys(
+    source: &Path,
+    destination: &Path,
+    keys: &[notarium_core::ports::KeyCanary],
+    budget: &CallBudget,
+) -> Result<(), PortError> {
+    let source = cap_std::fs::Dir::open_ambient_dir(source, cap_std::ambient_authority())
+        .map_err(io_error)?;
+    private_dir(destination)?;
+    private_dir(&destination.join("keys"))?;
+    let mut files = vec!["active.json".to_owned()];
+    files.extend(keys.iter().map(|key| format!("keys/{}.json", key.key)));
+    for name in files {
+        let mut input = source.open(&name).map_err(io_error)?;
+        let mut output = create_file(&destination.join(name))?;
+        copy_hash(&mut input, &mut output, 16 * 1024, &budget.cancellation)?;
+        output.sync_all().map_err(io_error)?;
+    }
+    sync_dir(&destination.join("keys"))?;
+    sync_dir(destination)
+}
+
+async fn rebind_local(
+    stage: &DataRoot,
+    journal: &Journal,
+    keyring: &RestoreKeyring,
+    ctx: &MaintenanceContext,
+) -> Result<(), PortError> {
+    clear_operational_rows(stage)?;
+    let config = CanonicalConfig::local_default(journal.installation.clone(), stage.clone());
+    let (canonical, runtime) = CanonicalRuntime::open(config).await?;
+    let control = ControlStore::sqlite(stage).await?;
+    let keyring = match keyring {
+        RestoreKeyring::External(path) => KeyringLocation::External(path.clone()),
+        RestoreKeyring::ProvisionDefault { .. } => KeyringLocation::LocalDefault(stage.clone()),
+    };
+    let result = async {
+        if control.installation().await?.as_ref() != Some(&journal.installation) {
+            return Err(invalid(ValidationReason::InvalidAuthority));
+        }
+        let keys = Keyring::open(control.clone(), keyring, ctx.budget.clone()).await?;
+        let backup = ControlBackup::new(
+            control.clone(),
+            keys,
+            stage.clone(),
+            BackupConfig::default(),
+        )?;
+        canonical
+            .restore_cursors(ctx.clone(), journal.histories.clone())
+            .await?;
+        backup
+            .restore_cursors(ctx.clone(), journal.histories.clone())
+            .await?;
+        Ok::<_, PortError>(())
+    }
+    .await;
+    drop(canonical);
+    let (_closed, canonical_shutdown) = tokio::join!(control.close(), runtime.shutdown());
+    result?;
+    canonical_shutdown?;
+    sync_database_files(stage)
+}
+
+fn clear_operational_rows(stage: &DataRoot) -> Result<(), PortError> {
+    let mut db = Connection::open(stage.canonical()).map_err(sql_error)?;
+    db.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")
+        .map_err(sql_error)?;
+    let tx = db.transaction().map_err(sql_error)?;
+    if tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='archive_artifacts')", [], |row| row.get::<_, bool>(0)).map_err(sql_error)? {
+        tx.execute_batch("DELETE FROM archive_artifacts; DELETE FROM archive_uploads; DELETE FROM archive_import_sources;").map_err(sql_error)?;
+    }
+    tx.execute_batch(
+        "
+         DELETE FROM backup_holds;
+         DELETE FROM backup_artifacts;
+         DELETE FROM blob_retirement_targets;
+         DELETE FROM blob_retirements;
+         DELETE FROM pending_purges WHERE phase<>'completed';
+         DELETE FROM blob_parts AS p WHERE NOT EXISTS(
+             SELECT 1 FROM blob_references r WHERE r.space_id=p.space_id AND r.publication_id=p.publication_id
+         );
+         DELETE FROM blob_publications AS p WHERE NOT EXISTS(
+             SELECT 1 FROM blob_references r WHERE r.space_id=p.space_id AND r.publication_id=p.publication_id
+         );
+         DELETE FROM blob_catalog WHERE ref_count=0;
+         UPDATE content_jobs SET lease_owner=NULL, lease_until_ms=NULL, artifacts_json='[]',
+             result_msgpack=NULL, state=CASE WHEN state IN ('queued','running') THEN 'failed' ELSE state END;",
+    ).map_err(sql_error)?;
+    tx.commit().map_err(sql_error)
+}
+
+fn sync_database_files(stage: &DataRoot) -> Result<(), PortError> {
+    let db = Connection::open(stage.canonical()).map_err(sql_error)?;
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(sql_error)?;
+    drop(db);
+    for path in [stage.canonical(), stage.control()] {
+        File::open(path)
+            .and_then(|file| file.sync_all())
+            .map_err(io_error)?;
+    }
+    sync_dir(&stage.root().join("v1"))
+}
+
+fn require_empty_target(root: &DataRoot, expected: Option<Identity>) -> Result<(), PortError> {
+    if directory_identity(root.root())? != expected
+        || (expected.is_some()
+            && fs::read_dir(root.root())
+                .map_err(io_error)?
+                .next()
+                .is_some())
+    {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    Ok(())
+}
+
+fn install_local(parent: &Path, root: &DataRoot, journal: &Journal) -> Result<(), PortError> {
+    let Phase::Install {
+        directory,
+        components,
+    } = &journal.phase
+    else {
+        return Err(invalid(ValidationReason::InvalidState));
+    };
+    let stage = parent.join(&journal.stage);
+    if let Some(initial) = journal.existing {
+        if directory_identity(root.root())? != Some(initial)
+            || directory_identity(&stage)? != Some(*directory)
+        {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        validate_components(root, &stage, components)?;
+        if !exists(&root.manifest())? {
+            ensure_guard(root, journal.digest)?;
+            for (name, id) in components {
+                let target = root.root().join(name);
+                if directory_identity(&target)?.is_none() {
+                    let source = stage.join(name);
+                    if directory_identity(&source)? != Some(*id) {
+                        return Err(invalid(ValidationReason::InvalidState));
+                    }
+                    rename_noreplace(&source, &target)?;
+                    sync_dir(root.root())?;
+                    sync_dir(&stage)?;
+                }
+            }
+            validate_components(root, &stage, components)?;
+            fs::hard_link(stage.join(LOCAL_MANIFEST), root.manifest()).map_err(io_error)?;
+            sync_dir(root.root())?;
+        }
+        verify_installed(root, journal)?;
+        if exists(&root.restore_guard())? {
+            ensure_guard(root, journal.digest)?;
+            fs::remove_file(root.restore_guard()).map_err(io_error)?;
+            sync_dir(root.root())?;
+        }
+    } else if directory_identity(root.root())? != Some(*directory) {
+        require_empty_target(root, None)?;
+        if directory_identity(&stage)? != Some(*directory) {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        rename_noreplace(&stage, root.root())?;
+    }
+    sync_dir(parent)
+}
+
+fn validate_components(
+    root: &DataRoot,
+    stage: &Path,
+    components: &[(String, Identity)],
+) -> Result<(), PortError> {
+    for entry in fs::read_dir(root.root()).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let name = entry.file_name();
+        if name == LOCAL_MANIFEST || name == "v1-restore-in-progress" {
+            if !entry.file_type().map_err(io_error)?.is_file() {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            continue;
+        }
+        if !components
+            .iter()
+            .any(|(expected, _)| name == expected.as_str())
+        {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+    }
+    for (name, id) in components {
+        let installed = directory_identity(&root.root().join(name))?;
+        let pending = directory_identity(&stage.join(name))?;
+        if (installed, pending) != (Some(*id), None) && (installed, pending) != (None, Some(*id)) {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+    }
+    Ok(())
+}
+
+fn verify_installed(root: &DataRoot, journal: &Journal) -> Result<(), PortError> {
+    let mut marker = String::new();
+    File::open(root.manifest())
+        .map_err(io_error)?
+        .take(4096)
+        .read_to_string(&mut marker)
+        .map_err(io_error)?;
+    let epoch: EpochManifestV1 =
+        serde_json::from_str(&marker).map_err(|_| invalid(ValidationReason::InvalidState))?;
+    if epoch.installation_id != journal.installation || epoch.epoch_version != SUPPORTED_V1_EPOCH {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    let canonical = Connection::open_with_flags(root.canonical(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(sql_error)?;
+    let control = Connection::open_with_flags(root.control(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(sql_error)?;
+    let installation: String = control
+        .query_row(
+            "SELECT installation_id FROM v1_storage_epoch WHERE singleton=1 AND state='ready'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if installation != journal.installation.as_str() {
+        return Err(invalid(ValidationReason::InvalidAuthority));
+    }
+    for cursor in &journal.histories {
+        let (history, seq): (Vec<u8>, i64) = canonical
+            .query_row(
+                "SELECT history_incarnation,last_seq FROM spaces WHERE space_id=?1",
+                [cursor.scope.space_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error)?;
+        if history != cursor.scope.incarnation.as_bytes() || seq != cursor.after.get() as i64 {
+            return Err(invalid(ValidationReason::HistoryIncarnationMismatch));
+        }
+        for table in ["mcp_delta_owner_cursors", "mcp_delta_session_cursors"] {
+            let sql = format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE space_id=?1 AND (history_incarnation<>?2 OR acked_space_seq>?3))"
+            );
+            let changed: bool = control
+                .query_row(
+                    &sql,
+                    rusqlite::params![
+                        cursor.scope.space_id.as_str(),
+                        cursor.scope.incarnation.as_bytes().as_slice(),
+                        seq
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if changed {
+                return Err(invalid(ValidationReason::HistoryIncarnationMismatch));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn same_cuts(proposed: &[ChangeCursor], source: &[ChangeCursor]) -> bool {
+    proposed.len() == source.len()
+        && proposed.iter().zip(source).all(|(next, original)| {
+            next.scope.space_id == original.scope.space_id
+                && next.after == original.after
+                && next.scope.incarnation != original.scope.incarnation
+        })
+}
+
+fn valid_stage(name: &str) -> bool {
+    name.strip_prefix(".notarium-restore-generation-")
+        .is_some_and(|suffix| {
+            suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+fn ensure_guard(root: &DataRoot, digest: ContentDigest) -> Result<(), PortError> {
+    let text = digest.to_hex();
+    let path = root.restore_guard();
+    if !exists(&path)? {
+        write_new(&path, text.as_bytes())?;
+        return sync_dir(root.root());
+    }
+    let mut saved = String::new();
+    File::open(path)
+        .map_err(io_error)?
+        .take(GUARD_LENGTH as u64 + 1)
+        .read_to_string(&mut saved)
+        .map_err(io_error)?;
+    if saved != text {
+        return Err(invalid(ValidationReason::InvalidDigest));
+    }
+    Ok(())
+}
+
+fn directory_identity(path: &Path) -> Result<Option<Identity>, PortError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            let (parent, name) = open_parent(path)?;
+            let directory = parent.open_dir_nofollow(name).map_err(io_error)?;
+            let meta = directory.dir_metadata().map_err(io_error)?;
+            Ok(Some(Identity {
+                device: meta.dev(),
+                inode: meta.ino(),
+            }))
+        }
+        Ok(_) => Err(invalid(ValidationReason::InvalidPathComponent)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(io_error(err)),
+    }
+}
+
+fn exists(path: &Path) -> Result<bool, PortError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(io_error(err)),
+    }
+}
+
+fn acquire_lock(path: &Path) -> Result<File, PortError> {
+    let (parent, name) = open_parent(path)?;
+    let mut options = CapOpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    cap_std::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = parent
+        .open_with(name, &options)
+        .map_err(io_error)?
+        .into_std();
+    if !file.metadata().map_err(io_error)?.is_file() {
+        return Err(invalid(ValidationReason::InvalidPathComponent));
+    }
+    file.try_lock()
+        .map_err(|_| DomainError::MigrationInProgress)?;
+    Ok(file)
+}
+
+fn open_parent(path: &Path) -> Result<(Dir, &std::ffi::OsStr), PortError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid(ValidationReason::InvalidPathComponent))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid(ValidationReason::InvalidPathComponent))?;
+    Ok((
+        Dir::open_ambient_dir(parent, ambient_authority()).map_err(io_error)?,
+        name,
+    ))
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+))]
+fn rename_noreplace(source: &Path, target: &Path) -> Result<(), PortError> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        source,
+        rustix::fs::CWD,
+        target,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|err| io_error(err.into()))
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "redox"
+)))]
+fn rename_noreplace(_: &Path, _: &Path) -> Result<(), PortError> {
+    Err(invalid(ValidationReason::UnsupportedContainer))
+}
+
+fn read_journal(path: &Path) -> Result<Journal, PortError> {
+    let mut input = File::open(path).map_err(io_error)?.take(JOURNAL_MAX + 1);
+    let mut bytes = Vec::new();
+    input.read_to_end(&mut bytes).map_err(io_error)?;
+    if bytes.len() as u64 > JOURNAL_MAX {
+        return Err(invalid(ValidationReason::BudgetExceeded));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| invalid(ValidationReason::InvalidState))
+}
+
+fn save_journal(path: &Path, value: &Journal) -> Result<(), PortError> {
+    let parent = path.parent().expect("journal path has parent");
+    let tmp = parent.join(codec::new_prefixed_hex_id(".notarium-restore-journal-")?);
+    let data = serde_json::to_vec(value).map_err(|_| invalid(ValidationReason::InvalidState))?;
+    write_new(&tmp, &data)?;
+    fs::rename(&tmp, path).map_err(io_error)?;
+    sync_dir(parent)
+}
+
+fn epoch_manifest(installation: &InstallationId) -> Result<Vec<u8>, PortError> {
+    serde_json::to_vec(&EpochManifestV1 {
+        epoch_version: SUPPORTED_V1_EPOCH,
+        installation_id: installation.clone(),
+        state: ReadyState::V1Ready,
+        receipt_sha256: None,
+    })
+    .map_err(|_| invalid(ValidationReason::InvalidState))
+}
+
+fn create_file(path: &Path) -> Result<File, PortError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path).map_err(io_error)
+}
+
+fn write_new(path: &Path, data: &[u8]) -> Result<(), PortError> {
+    let mut output = create_file(path)?;
+    output
+        .write_all(data)
+        .and_then(|()| output.sync_all())
+        .map_err(io_error)
+}
+
+fn private_dir(path: &Path) -> Result<(), PortError> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path).map_err(io_error)
+}
+
+fn sync_dir(path: &Path) -> Result<(), PortError> {
+    File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .map_err(io_error)
+}
+
+fn join_error(error: tokio::task::JoinError) -> PortError {
+    codec::internal_not_committed("offline_restore_worker", error.to_string())
+}
+mod cloud;
+pub use cloud::CloudRestoreTarget;

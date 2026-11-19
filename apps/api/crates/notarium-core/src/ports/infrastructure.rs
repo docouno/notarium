@@ -579,6 +579,16 @@ pub trait SessionRevocationPort: Send + Sync {
         selectors: Vec<RevocationSelector>,
         cancellation: Cancellation,
     ) -> PortFuture<'_, Box<dyn RevocationLease>>;
+    /// Deferred archive work participates in the same distributed fences as
+    /// active provider calls for account, credential and membership revocation.
+    fn register_content_job(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.register_provider(ctx, selectors, cancellation)
+    }
     /// Close matching admissions, cancel active calls, and wait for their leases
     /// to drop. The caller already holds database authority locks and retains
     /// this fence through COMMIT/ROLLBACK, including cancellation of its waiter.

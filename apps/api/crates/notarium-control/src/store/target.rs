@@ -248,6 +248,17 @@ macro_rules! target_tables {
                 }
             }
 
+            /// One named logical column for offline relational validation.
+            pub fn relational_value(&self, name: &str) -> Result<serde_json::Value, PortError> {
+                match self {
+                    $(Self::$variant { $($col,)+ } => match name {
+                        $(stringify!($col) => serde_json::to_value($col)
+                            .map_err(|_| invalid(ValidationReason::InvalidState)),)+
+                        _ => Err(invalid(ValidationReason::InvalidState)),
+                    },)+
+                }
+            }
+
             /// Canonical byte-ordered primary key used by the backup stream.
             pub(crate) fn position(&self) -> TargetPosition {
                 match self {

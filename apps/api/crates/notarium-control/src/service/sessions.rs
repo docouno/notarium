@@ -58,6 +58,114 @@ fn restrict(
         .collect())
 }
 impl ControlService {
+    /// Acquire active revocation registration under the same authority locks
+    /// used for synchronous effects. A runner drops it after stopping work.
+    pub async fn register_archive_job(
+        &self,
+        budget: CallBudget,
+        delegation: &JobDelegation,
+    ) -> Result<(SpaceContext, Box<dyn RevocationLease>), PortError> {
+        let operation = OperationBudget::new(budget.clone());
+        let mut tx = self.store.write(operation.clone()).await?;
+        let credential = delegation.credential_reference();
+        let (auth, lease) = operation
+            .run(
+                async {
+                    let current_user =
+                        user(tx.inner_mut(), delegation.principal().as_str()).await?;
+                    let current = self
+                        .credential_context(
+                            tx.inner_mut(),
+                            &current_user,
+                            credential.clone(),
+                            false,
+                            false,
+                            true,
+                            None,
+                        )
+                        .await?;
+                    let auth = delegation.limit(&current)?;
+                    let scope = delegation.scope();
+                    let mut selectors = vec![
+                        RevocationSelector::Principal(delegation.principal().clone()),
+                        RevocationSelector::Grant(delegation.grant().clone()),
+                        RevocationSelector::Space(scope.space_id.clone()),
+                        RevocationSelector::Membership {
+                            space: scope.space_id.clone(),
+                            principal: delegation.principal().clone(),
+                        },
+                    ];
+                    match credential {
+                        AuthenticatedCredential::Session(id) => {
+                            selectors.push(RevocationSelector::Session(id));
+                        }
+                        AuthenticatedCredential::OAuth {
+                            token,
+                            grant,
+                            family,
+                        } => {
+                            selectors.push(RevocationSelector::OAuthAccess(token));
+                            selectors.push(RevocationSelector::OAuthGrant(grant));
+                            selectors.extend(family.map(RevocationSelector::OAuthFamily));
+                        }
+                        _ => {}
+                    }
+                    let lease = self
+                        .revoker
+                        .register_content_job(
+                            MaintenanceContext {
+                                authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+                                budget: operation.context(budget.request.clone()),
+                            },
+                            selectors,
+                            budget.cancellation.clone(),
+                        )
+                        .await?;
+                    lease.check()?;
+                    Ok((auth, lease))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        operation.run(tx.commit(), CommitEffect::Unknown).await?;
+        let ctx = SpaceContext::new(auth, delegation.scope().clone(), budget)?;
+        Ok((ctx, lease))
+    }
+
+    /// Refresh the delegation without acquiring a new registry lease. This is
+    /// also used to observe natural credential expiration while a job runs.
+    pub async fn refresh_archive_job(
+        &self,
+        budget: CallBudget,
+        delegation: &JobDelegation,
+    ) -> Result<SpaceContext, PortError> {
+        let operation = OperationBudget::new(budget.clone());
+        let mut tx = self.store.read(operation.clone()).await?;
+        let auth = operation
+            .run(
+                async {
+                    let current_user =
+                        user_read(tx.inner_mut(), delegation.principal().as_str()).await?;
+                    let current = self
+                        .credential_context(
+                            tx.inner_mut(),
+                            &current_user,
+                            delegation.credential_reference(),
+                            false,
+                            false,
+                            false,
+                            None,
+                        )
+                        .await?;
+                    delegation.limit(&current).map_err(Into::into)
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        tx.finish().await?;
+        SpaceContext::new(auth, delegation.scope().clone(), budget).map_err(Into::into)
+    }
+
     pub(super) async fn revalidate(
         &self,
         tx: &mut Transaction,

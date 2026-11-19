@@ -1,4 +1,5 @@
 mod materialize;
+pub use materialize::import_postgres_spool;
 mod ownership;
 mod phase;
 mod restore;
@@ -26,8 +27,8 @@ use notarium_core::{
     model::HistoryScope,
     ports::{
         BackupArtifactKind, BackupBudget, BackupHold, BackupParticipantPort, BackupProgress,
-        BackupSnapshot, BackupSpool, BackupWitness, Cancellation, MaintenanceContext, PausedBackup,
-        PortFuture, PreparedBackup, ServicePurpose,
+        BackupSnapshot, BackupSpool, BackupWitness, CallBudget, Cancellation, MaintenanceContext,
+        PausedBackup, PortFuture, PreparedBackup, ServicePurpose,
     },
     ports::{BackupRetentionBudget, BackupRetentionProgress},
     receipt::ChangeCursor,
@@ -120,7 +121,7 @@ pub struct BackupExporterMemoryStats {
     pub step_or_slice_count: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PostgresSpoolValue {
     Null,
     Int(i64),
@@ -1732,7 +1733,10 @@ async fn stream_postgres_spool_v1(
             let pk_order = table
                 .primary_key
                 .iter()
-                .map(|pk| format!("\"{pk}\" ASC"))
+                .map(|pk| {
+                    let is_text = table.columns.iter().any(|c| c.name == *pk && c.kind == LogicalColKind::Text);
+                    if is_text { format!("\"{pk}\" COLLATE \"C\" ASC") } else { format!("\"{pk}\" ASC") }
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             let cursor_name = format!("backup_cur_{t_idx}");
@@ -2003,11 +2007,26 @@ async fn sleep_async_interruptible(
     Ok(())
 }
 
-fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone {
+pub fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone {
     CANONICAL_TABLES
         .iter()
         .copied()
         .filter_map(move |mut table| {
+            if schema_version < 7 {
+                match table.name {
+                    "archive_privacy"
+                    | "archive_artifacts"
+                    | "archive_export_cuts"
+                    | "archive_export_shadows"
+                    | "archive_uploads"
+                    | "archive_import_sources" => return None,
+                    "blob_catalog" => {
+                        table.columns = &table.columns[..9];
+                        table.indexes = &["idx_blob_catalog_zero_ref"];
+                    }
+                    _ => {}
+                }
+            }
             if schema_version < 5 && table.name == "command_receipts" {
                 table.indexes = &["idx_command_receipts_expires"];
             }
@@ -2039,7 +2058,18 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         })
 }
 
-/// Materializes a verified schema 1 through 6 spool for offline inspection within the default budget.
+/// Validate the canonical schema witness of an offline SQLite image.
+pub fn verify_schema_witness(schema_version: u32, observed: &[u8]) -> Result<(), PortError> {
+    if (schema_version == CANONICAL_SCHEMA_VERSION && observed == manifest_checksum().as_bytes())
+        || crate::schema::migrate::recognized_predecessor(i64::from(schema_version), observed)
+    {
+        Ok(())
+    } else {
+        Err(DomainError::validation(ValidationReason::InvalidDigest).into())
+    }
+}
+
+/// Materializes a verified canonical spool for offline inspection within the default budget.
 pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, PortError> {
     decode_postgres_spool_v1_bounded(
         path,
@@ -2058,14 +2088,43 @@ pub fn decode_postgres_spool_v1_bounded(
         .metadata()
         .map_err(|err| internal_not_committed("stat_pg_spool_decode", err.to_string()))?
         .len();
-    if total_file_len > max_bytes {
+    read_postgres_spool(file, total_file_len, max_bytes, max_bytes, true, |_, _| {
+        Ok(())
+    })
+}
+
+/// Visit a canonical logical spool in format order with a bounded row buffer.
+/// The returned witness is available only after the table counts and trailer
+/// have been checked. Consumers stage side effects until the walk succeeds.
+pub fn scan_postgres_spool_v1(
+    reader: impl Read,
+    bytes: u64,
+    byte_limit: u64,
+    row_limit: u64,
+    visit: impl FnMut(TableSpec, &[PostgresSpoolValue]) -> Result<(), PortError>,
+) -> Result<BackupWitness, PortError> {
+    read_postgres_spool(reader, bytes, byte_limit, row_limit, false, visit)
+        .map(|spool| spool.witness)
+}
+
+fn read_postgres_spool(
+    file: impl Read,
+    total_file_len: u64,
+    max_bytes: u64,
+    row_bytes: u64,
+    materialize: bool,
+    mut visit: impl FnMut(TableSpec, &[PostgresSpoolValue]) -> Result<(), PortError>,
+) -> Result<DecodedPostgresSpoolV1, PortError> {
+    if total_file_len > max_bytes || row_bytes == 0 {
         return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
     }
-    let mut remaining_capacity = max_bytes;
-    let mut charge = |bytes: u64| -> Result<(), PortError> {
-        remaining_capacity = remaining_capacity
+    let capacity = std::cell::Cell::new(row_bytes);
+    let charge = |bytes: u64| -> Result<(), PortError> {
+        let remaining = capacity
+            .get()
             .checked_sub(bytes)
             .ok_or_else(|| DomainError::validation(ValidationReason::BudgetExceeded))?;
+        capacity.set(remaining);
         Ok(())
     };
     if total_file_len < (POSTGRES_SPOOL_V1_MAGIC.len() as u64 + 4 + 32 + 4 + 4 + 32) {
@@ -2111,7 +2170,7 @@ pub fn decode_postgres_spool_v1_bounded(
     let expected_tables = spool_tables(schema_version);
     let expected_checksum = match schema_version {
         CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1..=5 => {
+        1..=6 => {
             let digest = checksum_tables(schema_version, expected_tables.clone());
             if !crate::schema::migrate::recognized_predecessor(
                 i64::from(schema_version),
@@ -2153,7 +2212,7 @@ pub fn decode_postgres_spool_v1_bounded(
     }
 
     charge((table_count * std::mem::size_of::<DecodedPostgresSpoolTable>()) as u64)?;
-    let mut tables = Vec::with_capacity(table_count);
+    let mut tables = Vec::with_capacity(if materialize { table_count } else { 0 });
     let mut u16_buf = [0u8; 2];
     let mut u64_buf = [0u8; 8];
     let mut tag_buf = [0u8; 1];
@@ -2182,12 +2241,28 @@ pub fn decode_postgres_spool_v1_bounded(
             charge((std::mem::size_of::<String>() + col.name.len()) as u64)?;
         }
 
+        let pk: Vec<usize> = expected_table
+            .primary_key
+            .iter()
+            .map(|key| {
+                expected_table
+                    .columns
+                    .iter()
+                    .position(|column| column.name == *key)
+                    .expect("primary key in schema")
+            })
+            .collect();
+        let mut last_pk = None::<Vec<PostgresSpoolValue>>;
+        let mut row_count = 0_u64;
         let mut rows = Vec::new();
         loop {
             reader.read_exact_body(&mut tag_buf, body_limit)?;
             match tag_buf[0] {
                 0 => break,
                 1 => {
+                    if !materialize {
+                        capacity.set(row_bytes);
+                    }
                     charge(
                         (std::mem::size_of::<Vec<PostgresSpoolValue>>()
                             + col_count * std::mem::size_of::<PostgresSpoolValue>())
@@ -2268,7 +2343,16 @@ pub fn decode_postgres_spool_v1_bounded(
                             }
                         }
                     }
-                    rows.push(row_vals);
+                    let key: Vec<_> = pk.iter().map(|&index| row_vals[index].clone()).collect();
+                    if last_pk.as_ref().is_some_and(|previous| previous >= &key) {
+                        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                    }
+                    last_pk = Some(key);
+                    row_count += 1;
+                    visit(expected_table, &row_vals)?;
+                    if materialize {
+                        rows.push(row_vals);
+                    }
                 }
                 _ => return Err(DomainError::validation(ValidationReason::InvalidState).into()),
             }
@@ -2276,19 +2360,21 @@ pub fn decode_postgres_spool_v1_bounded(
 
         reader.read_exact_body(&mut u64_buf, body_limit)?;
         let declared_row_count = u64::from_be_bytes(u64_buf);
-        if declared_row_count != rows.len() as u64 {
+        if declared_row_count != row_count {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
 
-        tables.push(DecodedPostgresSpoolTable {
-            name: table_name,
-            columns: expected_table
-                .columns
-                .iter()
-                .map(|c| c.name.to_owned())
-                .collect(),
-            rows,
-        });
+        if materialize {
+            tables.push(DecodedPostgresSpoolTable {
+                name: table_name,
+                columns: expected_table
+                    .columns
+                    .iter()
+                    .map(|c| c.name.to_owned())
+                    .collect(),
+                rows,
+            });
+        }
     }
 
     if reader.pos != body_limit {
@@ -3025,6 +3111,90 @@ async fn abort_pinned_driver(st: PinnedSnapshotDriver) {
     }
 }
 
+async fn open_cas_hold(
+    store: CanonicalStore,
+    backup_id: BackupId,
+    scope: Option<HistoryScope>,
+    caller: Cancellation,
+    deadline: tokio::time::Instant,
+) -> Result<CanonicalBackupHold, PortError> {
+    let abandoned = Cancellation::default();
+    let _cancel_on_drop = CancelOnDrop(abandoned.clone());
+    let worker = store.inner.backup_executor.clone().spawn(async move {
+        let generation = mint_artifact_id()?;
+        let stop = async {
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) =>
+                    DomainError::validation(ValidationReason::BudgetExceeded).into(),
+                () = caller.cancelled() => cancelled_not_committed("backup_cancelled", "backup cancelled"),
+                () = abandoned.cancelled() => cancelled_not_committed("backup_hold_abandoned", "hold acquisition dropped"),
+                () = store.inner.backup_shutdown.cancelled() => cancelled_not_committed("backup_shutdown", "backup shutting down"),
+            }
+        };
+        let (owner, witness) = acquire_owned_hold(&store, &backup_id, &generation, scope.as_ref(), deadline, stop).await?;
+        let held_count = witness.histories.len() as u64;
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let proof = HoldProof {
+            generation,
+            owner: Arc::new(tokio::sync::Mutex::new(Some(owner))),
+            release: Cancellation::default(),
+            copying: Default::default(),
+        };
+        let hold = CanonicalBackupHold {
+            witness,
+            proof: proof.clone(),
+            finished,
+        };
+        let inner = Arc::clone(&store.inner);
+        let cleanup = inner.backup_executor.spawn(async move {
+            tokio::select! {
+                () = proof.release.cancelled() => {},
+                () = store.inner.backup_shutdown.cancelled() => {},
+            }
+            proof.release.cancel();
+            let _drained = proof.copying.write().await;
+            let mut owner = proof.owner.lock().await.take().expect("hold owns session");
+            let result = delete_backup_hold_rows(
+                &store,
+                &mut owner,
+                &backup_id,
+                &proof.generation,
+                held_count,
+            )
+            .await;
+            drop(owner);
+            let _ = done.send(result);
+        });
+        register_cleanup_task(&inner, cleanup);
+        Ok::<_, PortError>(hold)
+    });
+    worker
+        .await
+        .map_err(|err| internal_not_committed("backup_hold_worker", err.to_string()))?
+}
+
+impl CanonicalStore {
+    /// Retain physical CAS publications for one Space while an export runs.
+    pub(crate) async fn export_cas_hold(
+        &self,
+        scope: HistoryScope,
+        budget: &CallBudget,
+        id: BackupId,
+    ) -> Result<Box<dyn BackupHold>, PortError> {
+        let deadline =
+            crate::runtime::deadline_after(tokio::time::Instant::now(), budget.remaining);
+        let hold = open_cas_hold(
+            self.clone(),
+            id,
+            Some(scope),
+            budget.cancellation.clone(),
+            deadline,
+        )
+        .await?;
+        Ok(Box::new(hold))
+    }
+}
+
 impl PreparedBackup for CanonicalPreparedBackup {
     fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
         Box::pin(async move {
@@ -3034,67 +3204,18 @@ impl PreparedBackup for CanonicalPreparedBackup {
             if self.held_histories.is_some() {
                 return Err(DomainError::validation(ValidationReason::InvalidState).into());
             }
-            let backup_id = self.backup_id.clone();
-            let store = self.store.clone();
-            let caller = self.caller_cancel.clone();
-            let deadline = tokio::time::Instant::now()
-                + self
-                    .prepare_budget
-                    .deadline
-                    .saturating_sub(self.prepared_at.elapsed());
-            let abandoned = Cancellation::default();
-            let _cancel_on_drop = CancelOnDrop(abandoned.clone());
-            let worker = self.store.inner.backup_executor.spawn(async move {
-                let generation = mint_artifact_id()?;
-                let stop = async {
-                    tokio::select! {
-                        () = tokio::time::sleep_until(deadline) =>
-                            DomainError::validation(ValidationReason::BudgetExceeded).into(),
-                        () = caller.cancelled() => cancelled_not_committed("backup_cancelled", "backup cancelled"),
-                        () = abandoned.cancelled() => cancelled_not_committed("backup_hold_abandoned", "hold acquisition dropped"),
-                        () = store.inner.backup_shutdown.cancelled() => cancelled_not_committed("backup_shutdown", "backup shutting down"),
-                    }
-                };
-                let (owner, witness) = acquire_owned_hold(&store, &backup_id, &generation, deadline, stop).await?;
-                let held_count = witness.histories.len() as u64;
-                let (done, finished) = tokio::sync::oneshot::channel();
-                let proof = HoldProof {
-                    generation,
-                    owner: Arc::new(tokio::sync::Mutex::new(Some(owner))),
-                    release: Cancellation::default(),
-                    copying: Default::default(),
-                };
-                let hold = CanonicalBackupHold {
-                    witness,
-                    proof: proof.clone(),
-                    finished,
-                };
-                let inner = Arc::clone(&store.inner);
-                let cleanup = inner.backup_executor.spawn(async move {
-                    tokio::select! {
-                        () = proof.release.cancelled() => {},
-                        () = store.inner.backup_shutdown.cancelled() => {},
-                    }
-                    proof.release.cancel();
-                    let _drained = proof.copying.write().await;
-                    let mut owner = proof.owner.lock().await.take().expect("hold owns session");
-                    let result = delete_backup_hold_rows(
-                        &store,
-                        &mut owner,
-                        &backup_id,
-                        &proof.generation,
-                        held_count,
-                    )
-                    .await;
-                    drop(owner);
-                    let _ = done.send(result);
-                });
-                register_cleanup_task(&inner, cleanup);
-                Ok::<_, PortError>(hold)
-            });
-            let hold = worker
-                .await
-                .map_err(|err| internal_not_committed("backup_hold_worker", err.to_string()))??;
+            let hold = open_cas_hold(
+                self.store.clone(),
+                self.backup_id.clone(),
+                None,
+                self.caller_cancel.clone(),
+                tokio::time::Instant::now()
+                    + self
+                        .prepare_budget
+                        .deadline
+                        .saturating_sub(self.prepared_at.elapsed()),
+            )
+            .await?;
             self.held_histories = Some((hold.proof.clone(), hold.witness.histories.clone()));
             Ok(Box::new(hold) as Box<dyn BackupHold>)
         })
@@ -3430,6 +3551,7 @@ async fn acquire_owned_hold(
     store: &CanonicalStore,
     id: &BackupId,
     generation: &ArtifactId,
+    scope: Option<&HistoryScope>,
     deadline: tokio::time::Instant,
     stop: impl std::future::Future<Output = PortError>,
 ) -> Result<(HoldOwnership, BackupWitness), PortError> {
@@ -3446,6 +3568,7 @@ async fn acquire_owned_hold(
         &mut owner,
         id,
         generation,
+        scope,
         Arc::clone(&committing),
     ));
     let reason = tokio::select! {
@@ -3481,6 +3604,7 @@ async fn acquire_durable_backup_holds(
     owner: &mut HoldOwnership,
     backup_id: &BackupId,
     generation: &ArtifactId,
+    scope: Option<&HistoryScope>,
     committing: Arc<AtomicBool>,
 ) -> Result<BackupWitness, PortError> {
     let bid = backup_id.clone();
@@ -3488,6 +3612,7 @@ async fn acquire_durable_backup_holds(
     let now_ms = now_unix_ms()?;
 
     let generation = generation.clone();
+    let scope = scope.cloned();
     owner.with_write_tx(store, |tx| {
             Box::pin(async move {
                 // Under the same session lock, only remnants of a disconnected predecessor may exist.
@@ -3510,8 +3635,10 @@ async fn acquire_durable_backup_holds(
                         let rows = sqlx::query(
                             "SELECT space_id, history_incarnation, last_seq
                              FROM spaces
+                             WHERE CAST($1 AS TEXT) IS NULL OR space_id = $1
                              ORDER BY space_id ASC",
                         )
+                        .bind(scope.as_ref().map(|scope| scope.space_id.as_str()))
                         .fetch_all(&mut **conn)
                         .await
                         .map_err(|err| {
@@ -3531,9 +3658,11 @@ async fn acquire_durable_backup_holds(
                         let rows = sqlx::query(
                             "SELECT space_id, history_incarnation, last_seq
                              FROM spaces
+                             WHERE CAST($1 AS TEXT) IS NULL OR space_id = $1
                              ORDER BY space_id ASC
                              FOR UPDATE",
                         )
+                        .bind(scope.as_ref().map(|scope| scope.space_id.as_str()))
                         .fetch_all(&mut **conn)
                         .await
                         .map_err(|err| {
@@ -3581,6 +3710,10 @@ async fn acquire_durable_backup_holds(
                     });
                 }
 
+                if let Some(expected) = &scope {
+                    let [found] = histories.as_slice() else { return Err(DomainError::ResourceNotFound.into()); };
+                    found.scope.check(expected)?;
+                }
                 let witness = BackupWitness {
                     installation: inst_id.clone(),
                     schema_version: CANONICAL_SCHEMA_VERSION,
@@ -4029,7 +4162,7 @@ async fn apply_restore_cursor_tx(
     }
 
     rebound_retirements |=
-        crate::blobs::plan_unowned_active_blobs_tx(tx, &target.scope, next_epoch).await?;
+        crate::blobs::gc::reconcile_unowned_tx(tx, &target.scope, next_epoch).await?;
     Ok(rebound_retirements)
 }
 

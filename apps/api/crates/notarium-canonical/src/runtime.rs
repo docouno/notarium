@@ -329,7 +329,29 @@ impl CanonicalRuntime {
         config: CanonicalConfig,
         custom_s3_transport: Option<Arc<dyn S3Transport>>,
     ) -> Result<(CanonicalStore, Self), PortError> {
+        Self::open_internal(config, custom_s3_transport, false).await
+    }
+
+    pub async fn open_for_restore(
+        config: CanonicalConfig,
+        authority: &notarium_core::ports::ServiceAuthority,
+    ) -> Result<(CanonicalStore, Self), PortError> {
+        authority.require(notarium_core::ports::ServicePurpose::Restore)?;
+        Self::open_internal(config, None, true).await
+    }
+
+    async fn open_internal(
+        config: CanonicalConfig,
+        custom_s3_transport: Option<Arc<dyn S3Transport>>,
+        restoring: bool,
+    ) -> Result<(CanonicalStore, Self), PortError> {
         config.validate_timer_intervals()?;
+        if let SqlBackendConfig::Sqlite { data_root, .. } = &config.sql {
+            match std::fs::symlink_metadata(data_root.restore_guard()) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return Err(DomainError::MigrationInProgress.into()),
+            }
+        }
         let mut locks = Vec::new();
         match (&config.sql, &config.blobs) {
             (
@@ -409,11 +431,19 @@ impl CanonicalRuntime {
                     pool_size,
                     statement_timeout,
                 } => {
+                    let namespace = match &config.blobs {
+                        BlobBackendConfig::S3(remote) => {
+                            Some(crate::blobs::s3::namespace_fingerprint(remote)?)
+                        }
+                        BlobBackendConfig::Local { .. } => None,
+                    };
                     let (pool, witness, validated_schema) = open_and_bootstrap_postgres(
                         connect,
                         schema,
                         &config.installation_id,
+                        namespace,
                         *pool_size,
+                        restoring,
                     )
                     .await?;
                     (
@@ -609,6 +639,23 @@ impl CanonicalRuntime {
 }
 
 impl CanonicalStore {
+    pub fn uses_cloud_blobs(&self) -> bool {
+        matches!(self.inner.config.blobs, BlobBackendConfig::S3(_))
+    }
+
+    pub fn accepts_archive_namespace(
+        &self,
+        archives: Option<&crate::blobs::s3::S3BlobStore>,
+    ) -> bool {
+        match (&self.inner.blobs, archives) {
+            (BlobBackendDriver::Local(_), None) => true,
+            (BlobBackendDriver::S3(content), Some(archives)) => {
+                !content.overlaps_namespace(archives)
+            }
+            _ => false,
+        }
+    }
+
     pub fn installation_id(&self) -> &InstallationId {
         &self.inner.config.installation_id
     }
@@ -1196,6 +1243,26 @@ impl CanonicalStore {
         &self,
         spec: CreateFolderSpec,
     ) -> Result<(FolderRef, RevisionId, SpaceSeq), PortError> {
+        self.create_folder_inner(spec, None).await
+    }
+
+    pub(crate) async fn create_folder_import(
+        &self,
+        spec: CreateFolderSpec,
+        budget: &CallBudget,
+        guard: crate::peers::archive_import::ImportFolderCommit,
+    ) -> Result<(FolderRef, RevisionId, SpaceSeq), PortError> {
+        self.create_folder_inner(spec, Some((budget, guard))).await
+    }
+
+    async fn create_folder_inner(
+        &self,
+        spec: CreateFolderSpec,
+        import: Option<(
+            &CallBudget,
+            crate::peers::archive_import::ImportFolderCommit,
+        )>,
+    ) -> Result<(FolderRef, RevisionId, SpaceSeq), PortError> {
         self.inner
             .check_writer_epoch(&spec.scope.space_id, spec.active_epoch)?;
         let slug_fold = normalize_slug_key(&spec.slug)?;
@@ -1212,19 +1279,39 @@ impl CanonicalStore {
         let now_ms = now_unix_ms()?;
         let rev_id = new_revision_id()?;
         let cmd_id = new_prefixed_hex_id("cmd_")?;
+        let (timing, import_guard) = match import {
+            Some((budget, guard)) => (
+                Some((
+                    budget,
+                    crate::domain::common::CommandDeadline::start(budget, "create_import_folder"),
+                )),
+                Some(guard),
+            ),
+            None => (None, None),
+        };
+        let committed_scope = spec.scope.clone();
 
         let out = self
-            .with_write_tx(|tx| {
-                let spec_cl = spec.clone();
-                let slug_fold_cl = slug_fold.clone();
-                let proj_fold_cl = project_slug_fold.clone();
-                let rev_cl = rev_id.clone();
-                let cmd_cl = cmd_id.clone();
+            .with_auxiliary_command(timing, Ok, move |tx| {
+                let spec_cl = spec;
+                let slug_fold_cl = slug_fold;
+                let proj_fold_cl = project_slug_fold;
+                let rev_cl = rev_id;
+                let cmd_cl = cmd_id;
                 Box::pin(async move {
+                if let Some(guard) = &import_guard {
+                    guard.fence.scope.check(&spec_cl.scope)?;
+                    crate::blobs::lock_and_check_space_tx(
+                        tx, &spec_cl.scope, spec_cl.active_epoch,
+                    ).await?;
+                }
                 let space_rec = load_space_record(tx, &spec_cl.scope.space_id).await?;
                 space_rec.scope.check(&spec_cl.scope)?;
                 if space_rec.active_epoch != spec_cl.active_epoch {
                     return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+                }
+                if let Some(guard) = import_guard {
+                    guard.check_tx(tx, &space_rec).await?;
                 }
 
                 // Checked sequence bump BEFORE any effect!
@@ -1427,7 +1514,7 @@ impl CanonicalStore {
         self.inner
             .broadcast_hub
             .publish(BroadcastSignal::Committed {
-                scope: spec.scope,
+                scope: committed_scope,
                 new_last_seq: out.2,
             });
         Ok(out)

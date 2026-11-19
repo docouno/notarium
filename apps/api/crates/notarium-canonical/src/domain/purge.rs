@@ -118,7 +118,7 @@ impl CanonicalStore {
         self.with_write_tx(|tx| {
             Box::pin(async move {
                 crate::blobs::lock_and_check_space_tx(tx, &current, epoch).await?;
-                crate::blobs::plan_unowned_active_blobs_tx(tx, &current, epoch).await
+                crate::blobs::gc::reconcile_unowned_tx(tx, &current, epoch).await
             })
         })
         .await?;

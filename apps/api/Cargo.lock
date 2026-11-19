@@ -2984,11 +2984,24 @@ dependencies = [
 name = "notarium-jobs"
 version = "1.0.0-dev.0"
 dependencies = [
+ "blake3",
+ "bytes",
+ "cap-fs-ext",
+ "cap-std",
+ "http",
+ "libsqlite3-sys",
  "notarium-canonical",
  "notarium-control",
  "notarium-core",
  "notarium-syntax",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
  "zip",
+ "zstd",
 ]
 
 [[package]]

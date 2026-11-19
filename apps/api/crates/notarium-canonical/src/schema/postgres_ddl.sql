@@ -33,6 +33,11 @@ CREATE TABLE IF NOT EXISTS spaces (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_spaces_slug_fold
     ON spaces (slug_fold);
 
+CREATE TABLE IF NOT EXISTS archive_privacy (
+    space_id TEXT NOT NULL PRIMARY KEY REFERENCES spaces (space_id),
+    generation BIGINT NOT NULL CHECK (generation > 0)
+);
+
 CREATE TABLE IF NOT EXISTS folder_heads (
     space_id TEXT NOT NULL,
     folder_id TEXT NOT NULL,
@@ -288,12 +293,18 @@ CREATE TABLE IF NOT EXISTS blob_catalog (
     admission_state TEXT NOT NULL CHECK (admission_state IN ('open', 'retiring')),
     blob_state TEXT NOT NULL CHECK (blob_state IN ('staging', 'active', 'quarantined', 'retired', 'corrupt')),
     touched_at_ms BIGINT NOT NULL,
+    quarantined_at_ms BIGINT,
+    legacy_cleanup INTEGER NOT NULL DEFAULT 0 CHECK (legacy_cleanup IN (0, 1)),
     PRIMARY KEY (space_id, content_blake3)
 ) WITH (fillfactor = 80);
 
 CREATE INDEX IF NOT EXISTS idx_blob_catalog_zero_ref
     ON blob_catalog (space_id, touched_at_ms)
     WHERE ref_count = 0;
+
+CREATE INDEX IF NOT EXISTS idx_blob_catalog_gc
+    ON blob_catalog (space_id, touched_at_ms, content_blake3)
+    WHERE ref_count = 0 AND admission_state = 'open' AND blob_state = 'active';
 
 CREATE TABLE IF NOT EXISTS blob_publications (
     space_id TEXT NOT NULL,
@@ -403,6 +414,27 @@ CREATE TABLE IF NOT EXISTS backup_holds (
 
 CREATE INDEX IF NOT EXISTS idx_backup_holds_space
     ON backup_holds (space_id, backup_id);
+
+CREATE TABLE IF NOT EXISTS archive_export_cuts (
+    backup_id TEXT NOT NULL,
+    space_id TEXT NOT NULL,
+    cutoff_seq BIGINT NOT NULL CHECK (cutoff_seq >= 0),
+    PRIMARY KEY (backup_id, space_id),
+    FOREIGN KEY (backup_id, space_id) REFERENCES backup_holds (backup_id, space_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_export_cuts_space
+    ON archive_export_cuts (space_id, backup_id);
+
+CREATE TABLE IF NOT EXISTS archive_export_shadows (
+    backup_id TEXT NOT NULL,
+    space_id TEXT NOT NULL,
+    entity_kind TEXT NOT NULL CHECK (entity_kind IN ('folder', 'note', 'schema', 'package', 'thread')),
+    entity_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (backup_id, space_id, entity_kind, entity_id),
+    FOREIGN KEY (backup_id, space_id) REFERENCES archive_export_cuts (backup_id, space_id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS backup_artifacts (
     artifact_id TEXT NOT NULL PRIMARY KEY,
@@ -701,6 +733,49 @@ CREATE TABLE IF NOT EXISTS content_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_content_jobs_claim
     ON content_jobs (space_id, state, lease_until_ms, job_id);
+
+CREATE TABLE IF NOT EXISTS archive_artifacts (
+    space_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    privacy_generation BIGINT NOT NULL CHECK (privacy_generation >= 0),
+    expires_at_ms BIGINT NOT NULL,
+    object_msgpack BYTEA NOT NULL,
+    PRIMARY KEY (space_id, artifact_id),
+    FOREIGN KEY (space_id, job_id) REFERENCES content_jobs (space_id, job_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_artifacts_expiry
+    ON archive_artifacts (expires_at_ms, space_id, artifact_id);
+
+CREATE TABLE IF NOT EXISTS archive_import_sources (
+    space_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    object_msgpack BYTEA NOT NULL,
+    PRIMARY KEY (space_id, job_id),
+    FOREIGN KEY (space_id, job_id) REFERENCES content_jobs (space_id, job_id)
+);
+
+CREATE TABLE IF NOT EXISTS archive_uploads (
+    space_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    job_id TEXT,
+    history_incarnation BYTEA NOT NULL CHECK (octet_length(history_incarnation) = 16),
+    lease_epoch BIGINT CHECK (lease_epoch >= 1),
+    object_kind TEXT NOT NULL CHECK (object_kind IN ('input', 'plan', 'export')),
+    object_bytes BIGINT NOT NULL CHECK (object_bytes > 0),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'pinned', 'retiring')),
+    created_at_ms BIGINT NOT NULL,
+    object_namespace BYTEA NOT NULL CHECK (octet_length(object_namespace) = 32),
+    source_deadline_ms BIGINT,
+    PRIMARY KEY (space_id, artifact_id),
+    CHECK ((object_kind = 'input' AND job_id IS NULL AND lease_epoch IS NULL AND source_deadline_ms IS NOT NULL)
+        OR (object_kind <> 'input' AND job_id IS NOT NULL AND lease_epoch IS NOT NULL AND source_deadline_ms IS NULL)),
+    FOREIGN KEY (space_id, job_id) REFERENCES content_jobs (space_id, job_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_uploads_created
+    ON archive_uploads (created_at_ms, space_id, artifact_id);
 
 CREATE TABLE IF NOT EXISTS materialized_observations (
     space_id TEXT NOT NULL,
