@@ -197,7 +197,20 @@ impl Worker<'_> {
                 continue;
             };
             let binding = self.observation_at(&path).await?;
-            let read = self.read_disk(&relative);
+            let read = match self.read_disk(&relative) {
+                Err(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists
+                        && binding
+                            .as_ref()
+                            .is_some_and(|old| old.path.relative == path.relative)
+                        && matches!(self.vault.entry_kind_exact(&relative), Ok(None)) =>
+                {
+                    // A case-insensitive lookup can see the new spelling
+                    // while this inventory also includes the old SQL path.
+                    Ok(None)
+                }
+                result => result,
+            };
             let observed = match read {
                 Ok(Some(observed)) => observed,
                 Ok(None) => {
@@ -498,6 +511,14 @@ impl Worker<'_> {
         {
             Ok(result) => {
                 self.known.remove(&old.path.key);
+                if path.key == old.path.key
+                    && self
+                        .conflicts
+                        .get(old.path.relative.as_str())
+                        .is_some_and(|issue| issue.reason == ConflictReason::UnsafePath)
+                {
+                    self.clear_conflict(Path::new(&old.path.relative))?;
+                }
                 let current = self
                     .store
                     .vault_observation_for(&self.config.context, &self.binding, &old.note)

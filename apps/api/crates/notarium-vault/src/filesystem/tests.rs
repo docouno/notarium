@@ -527,6 +527,57 @@ fn cleanup_parks_a_raced_slot_before_deciding_what_to_remove() {
     );
 }
 
+#[test]
+fn parked_capture_replays_after_the_original_parent_changes_case() {
+    let fixture = Fixture::new();
+    let old_dir = fixture.vault.join("Drafts");
+    let new_dir = fixture.vault.join("drafts");
+    let intermediate = fixture.vault.join("renaming");
+    fs::create_dir(&old_dir).unwrap();
+    let target = Path::new("Drafts/note.md");
+    let slot = VaultDir::operation_slot(target, OPERATION).unwrap();
+    let unparked = VaultDir::operation_slot(target, "0303030303030303").unwrap();
+    let roots = fixture.open();
+    let vault = roots.vault().unwrap();
+    let expected = vault.stage(target, &slot, b"before").unwrap();
+    let unparked_stamp = vault.stage(target, &unparked, b"still shared").unwrap();
+    fs::write(fixture.vault.join(&slot), b"edited").unwrap();
+    let parked = assert_retained(vault, &slot, &expected, b"edited");
+    assert!(parked.starts_with(fixture.data.root()));
+
+    drop(roots);
+    fs::rename(&old_dir, &intermediate).unwrap();
+    fs::rename(&intermediate, &new_dir).unwrap();
+    let unrelated = new_dir.join(slot.file_name().unwrap());
+    let still_shared = new_dir.join(unparked.file_name().unwrap());
+    fs::write(&unrelated, b"unrelated").unwrap();
+
+    let roots = fixture.open();
+    let vault = roots.vault().unwrap();
+    if old_dir.is_dir() {
+        // On a case-insensitive volume, the strict shared lookup rejects the
+        // alias. Only an already verified private capture may bypass it.
+        assert_eq!(
+            vault.open_dir(Path::new("Drafts")).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            vault
+                .clean_capture(&unparked, &unparked_stamp)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
+    assert_eq!(
+        vault.recovered_capture(&slot).unwrap(),
+        Some(parked.clone())
+    );
+    assert_eq!(assert_retained(vault, &slot, &expected, b"edited"), parked);
+    assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
+    assert_eq!(fs::read(&still_shared).unwrap(), b"still shared");
+}
+
 fn assert_retained(vault: &VaultDir, slot: &Path, expected: &FileStamp, bytes: &[u8]) -> PathBuf {
     let CaptureCleanup::Retained { path } = vault.clean_capture(slot, expected).unwrap() else {
         panic!("unverified capture was removed");
@@ -663,6 +714,7 @@ fn windows_keeps_a_capture_with_an_open_writer_in_its_original_slot() {
     let slot = slot();
     let stamp = vault.stage(path(), &slot, b"before").unwrap();
     let full = fixture.vault.join(&slot);
+    grant_everyone_read(&full);
     let mut writer = fs::OpenOptions::new().write(true).open(&full).unwrap();
 
     assert_eq!(assert_retained(vault, &slot, &stamp, b"before"), full);
@@ -682,7 +734,8 @@ fn windows_keeps_broad_acl_captures_and_unproved_subtrees_in_the_vault() {
     let stamp = vault.stage(path(), &slot, b"preserve").unwrap();
     let full = fixture.vault.join(&slot);
     grant_everyone_read(&full);
-    assert_eq!(assert_retained(vault, &slot, &stamp, b"preserve"), full);
+    fs::write(&full, b"modified").unwrap();
+    assert_eq!(assert_retained(vault, &slot, &stamp, b"modified"), full);
     assert!(vault.recovered_capture(&slot).unwrap().is_none());
 
     let tree_slot = VaultDir::operation_slot(Path::new("package"), "0303030303030303").unwrap();
@@ -696,6 +749,33 @@ fn windows_keeps_broad_acl_captures_and_unproved_subtrees_in_the_vault() {
         fs::read(tree.join("member.md")).unwrap(),
         b"preserve subtree"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_disposes_of_a_verified_matching_shared_capture_without_changing_its_acl() {
+    let fixture = Fixture::new();
+    let roots = fixture.open();
+    let vault = roots.vault().unwrap();
+    let slot = slot();
+    let stamp = vault.stage(path(), &slot, b"displaced").unwrap();
+    let full = fixture.vault.join(&slot);
+    grant_everyone_read(&full);
+    let mut reader = fs::File::open(&full).unwrap();
+
+    assert!(matches!(
+        vault.clean_capture(&slot, &stamp).unwrap(),
+        CaptureCleanup::Removed
+    ));
+    assert!(
+        fs::read_dir(&fixture.vault)
+            .unwrap()
+            .all(|entry| entry.unwrap().file_name() != slot.as_os_str())
+    );
+    let mut original = String::new();
+    reader.read_to_string(&mut original).unwrap();
+    assert_eq!(original, "displaced");
+    assert!(vault.recovered_capture(&slot).unwrap().is_none());
 }
 
 #[cfg(windows)]

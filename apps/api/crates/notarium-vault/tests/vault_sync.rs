@@ -454,6 +454,162 @@ async fn restart_replaces_a_proven_unapplied_stage_with_the_current_revision() {
     fixture.runtime.shutdown().await.unwrap();
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_acknowledges_an_applied_conversion_before_publishing_the_new_head() {
+    use notarium_core::ports::{ExternalObservation, ExternalObservationResult, ObservedContent};
+    use notarium_vault::filesystem::{Publication, PublishMode, VaultDir};
+
+    const ARMOR: &str = include_str!("../../notarium-syntax/tests/fixtures/age-v1.asc");
+    let fixture = Fixture::open().await;
+    let old = fixture.create("old-name", 91).await;
+    let worker = fixture.start();
+    let mut status = worker.status();
+    let name = Path::new("old-name.md");
+    let path = fixture.root.join(name);
+    ready(&mut status, |_| disk_id(&path) == Some(old.clone())).await;
+    worker.shutdown().await.unwrap();
+
+    let ctx = context(&fixture.scope);
+    let old_revision = fixture
+        .store
+        .read_vault_note(&ctx, &old)
+        .await
+        .unwrap()
+        .unwrap()
+        .note
+        .revision;
+    let successor = NoteId::from_bytes([92; 16]);
+    let encrypted = |title| {
+        format!(
+            "---\nclass: encrypted-note\n---\n# {title}\n\n\x60\x60\x60age\n{ARMOR}\x60\x60\x60\n"
+        )
+    };
+    let first = encrypted("Conversion");
+    let converted = fixture
+        .store
+        .mint_and_purge(
+            ctx.clone(),
+            Mutation {
+                identity: identity(&fixture.scope, 92),
+                preconditions: Preconditions {
+                    revision: Some(old_revision.clone()),
+                    ..Default::default()
+                },
+                input: MintAndPurge {
+                    old_note: old,
+                    expected_revision: old_revision,
+                    new_note: successor.clone(),
+                    new_slug: Some("requested-name".into()),
+                    encrypted_carrier: first.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let binding = fixture.store.vault_binding(&ctx).await.unwrap().unwrap();
+    let vault = fixture.roots.vault().unwrap();
+    let expected = vault.read(name, 8192).unwrap().unwrap().stamp;
+    let bytes = carrier::materialize(&first, DocClass::EncryptedNote, &successor).unwrap();
+    let operation = ContentDigest::from_bytes([93; 32]);
+    let slot = VaultDir::operation_slot(name, &operation.to_hex()).unwrap();
+    let staged = vault.stage(name, &slot, bytes.as_bytes()).unwrap();
+    let digest = |body: &str| ContentDigest::from_bytes(*blake3::hash(body.as_bytes()).as_bytes());
+    let revision = converted.value.new_note.revision;
+    let intent = serde_json::json!({
+        "scope": binding.scope,
+        "generation": binding.generation,
+        "id": operation,
+        "target": name,
+        "action": { "Publish": {
+            "desired": { "note": successor, "revision": revision,
+                "carrier_digest": digest(&first), "disk_digest": digest(&bytes),
+                "conversion_path": "requested-name.md" },
+            "purpose": "Conversion", "expected": expected, "staged": staged,
+            "retire": null, "abandoned": false,
+        }}
+    });
+    let record = fixture
+        .roots
+        .data_root()
+        .root()
+        .join(format!("vault-notes-{}", binding.generation.to_hex()))
+        .join(format!("{}.intent", operation.to_hex()));
+    let file = fs::File::create(&record).unwrap();
+    serde_json::to_writer(&file, &intent).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let published = vault
+        .publish(
+            name,
+            &slot,
+            Some(&expected),
+            &staged,
+            PublishMode::Conversion,
+        )
+        .unwrap();
+    let Publication::Applied {
+        displaced: Some(capture),
+        ..
+    } = published
+    else {
+        panic!("the fixture must stop after the filesystem exchange");
+    };
+    assert_eq!(disk_id(&path), Some(successor.clone()));
+
+    let latest = encrypted("Current head");
+    let update = fixture
+        .store
+        .accept_external_observation(
+            ctx.clone(),
+            Mutation {
+                identity: identity(&fixture.scope, 94),
+                preconditions: Preconditions::default(),
+                input: ExternalObservation {
+                    note: successor.clone(),
+                    observed_digest: digest(&latest),
+                    base_revision: revision,
+                    disk_identity: operation,
+                    content: ObservedContent::Carrier(latest.clone()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let ExternalObservationResult::Committed(update) = update else {
+        panic!("the fixture must advance the encrypted head before recovery");
+    };
+
+    let worker = fixture.start();
+    let mut status = worker.status();
+    let target = carrier::materialize(&latest, DocClass::EncryptedNote, &successor).unwrap();
+    let settled = ready(&mut status, |_| {
+        fs::read_to_string(&path).is_ok_and(|bytes| bytes == target)
+    })
+    .await;
+    assert!(settled.conflicts.is_empty(), "{settled:?}");
+    assert!(!fixture.root.join("requested-name.md").exists());
+    assert!(!record.exists());
+    assert!(!fixture.root.join(capture.path).exists());
+    assert!(
+        fixture
+            .store
+            .vault_handoffs(&ctx, &binding)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let actual = fixture
+        .store
+        .vault_observation_for(&ctx, &binding, &successor)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual.revision, update.value.revision);
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diverged_ciphertext_keeps_both_complete_carriers() {
     use notarium_core::ports::{ExternalObservation, ExternalObservationResult, ObservedContent};

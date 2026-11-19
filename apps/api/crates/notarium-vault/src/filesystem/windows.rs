@@ -18,8 +18,8 @@ use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeD
 use cap_std::fs::{Dir, File, Metadata, MetadataExt, OpenOptions, OpenOptionsExt};
 use windows_sys::Win32::{
     Foundation::{
-        ERROR_INVALID_FUNCTION, ERROR_NO_TOKEN, ERROR_NOT_SUPPORTED, ERROR_RM_NOT_ACTIVE,
-        ERROR_SHARING_VIOLATION, ERROR_TRANSACTIONAL_CONFLICT,
+        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NO_TOKEN, ERROR_NOT_SUPPORTED,
+        ERROR_RM_NOT_ACTIVE, ERROR_SHARING_VIOLATION, ERROR_TRANSACTIONAL_CONFLICT,
         ERROR_TRANSACTIONS_UNSUPPORTED_REMOTE, GENERIC_READ, GENERIC_WRITE, HANDLE,
         INVALID_HANDLE_VALUE, LocalFree,
     },
@@ -37,11 +37,12 @@ use windows_sys::Win32::{
     Storage::FileSystem::{
         CommitTransaction, CreateDirectoryW, CreateFileTransactedW, CreateTransaction, DELETE,
         DeleteFileTransactedW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+        FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_FLAG_WRITE_THROUGH, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO,
         FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-        FileDispositionInfo, FileIdInfo, FileRenameInfo, FileStandardInfo,
+        FileDispositionInfo, FileDispositionInfoEx, FileIdInfo, FileRenameInfo, FileStandardInfo,
         GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL,
         ReOpenFile, RollbackTransaction, SetFileInformationByHandle, VOLUME_NAME_DOS,
         VOLUME_NAME_GUID,
@@ -54,6 +55,7 @@ use windows_sys::Win32::{
 };
 use windows_sys::core::BOOL;
 
+use super::recovery::ParkAction;
 use super::{
     CapturedAt, FileIdentity, FileStamp, PublishMode, conflict, invalid, observe_open, present,
     same_file_content, stamp_from_file,
@@ -453,29 +455,47 @@ pub fn park_private_capture(
     from: &OsStr,
     target: &Dir,
     to: &OsStr,
-) -> io::Result<()> {
-    open_protected_capture(source, from)
-        .and_then(|file| rename_held(target, &file, to))
-        .map_err(|error| {
-            if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) {
-                // Rust does not map this Win32 code to a portable kind.
-                io::Error::new(io::ErrorKind::WouldBlock, error)
-            } else {
-                error
-            }
-        })
+    expected: Option<&FileStamp>,
+) -> io::Result<ParkAction> {
+    relocate_or_dispose_capture(source, from, target, to, expected).map_err(|error| {
+        if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) {
+            // Rust does not map this Win32 code to a portable kind.
+            io::Error::new(io::ErrorKind::WouldBlock, error)
+        } else {
+            error
+        }
+    })
 }
 
-fn open_protected_capture(source: &Dir, from: &OsStr) -> io::Result<File> {
-    let file = open_rename_source(source, from)?;
+fn relocate_or_dispose_capture(
+    source: &Dir,
+    from: &OsStr,
+    target: &Dir,
+    to: &OsStr,
+    expected: Option<&FileStamp>,
+) -> io::Result<ParkAction> {
+    let mut file = open_rename_source(source, from)?;
+    verify_name(&file, from)?;
     if file.metadata()?.is_dir() {
-        let dir = Dir::from_std_file(file.try_clone()?.into_std());
-        verify_capture_tree(&dir)?;
+        verify_capture_tree(&Dir::from_std_file(file.try_clone()?.into_std()))?;
     } else {
         super::checked_file_metadata(&file)?;
-        verify_private_file(&file)?;
+        if let Err(error) = verify_private_file(&file) {
+            // A same-volume move could preserve this DACL across the private
+            // boundary. A verified unchanged file can instead be disposed of
+            // through its held handle while excluding writers and renames.
+            if error.kind() == io::ErrorKind::PermissionDenied
+                && let Some(expected) = expected
+                && matches_open(&mut file, expected)?
+            {
+                dispose_shared_held(file)?;
+                return Ok(ParkAction::Disposed);
+            }
+            return Err(error);
+        }
     }
-    Ok(file)
+    rename_held(target, &file, to)?;
+    Ok(ParkAction::Relocated)
 }
 
 pub fn verify_parked_capture(dir: &Dir, name: &OsStr) -> io::Result<()> {
@@ -704,7 +724,9 @@ pub fn clean_slot(parent: &Dir, name: &OsStr, expected: &FileStamp) -> io::Resul
     options
         .read(true)
         .access_mode(GENERIC_READ | DELETE)
-        .share_mode(FILE_SHARE_READ)
+        // Classic disposition unlinks on the last close. Exclude readers
+        // as well so this function can confirm the name is gone on return.
+        .share_mode(0)
         .follow(FollowSymlinks::No);
     let mut file = match parent.open_with(name, &options) {
         Ok(file) => file,
@@ -731,8 +753,8 @@ pub fn clean_slot(parent: &Dir, name: &OsStr, expected: &FileStamp) -> io::Resul
     }
 
     let delete = FILE_DISPOSITION_INFO { DeleteFile: true };
-    // SAFETY: This deletion targets the very handle verified above. No opens
-    // for writing or deletion can coexist with this handle's sharing mode.
+    // SAFETY: This deletion targets the exact file checked above while its
+    // exclusive sharing mode keeps other readers, writers and renames out.
     succeeded(unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle(),
@@ -744,6 +766,30 @@ pub fn clean_slot(parent: &Dir, name: &OsStr, expected: &FileStamp) -> io::Resul
     drop(file);
     sync_dir(parent)?;
     Ok(true)
+}
+
+fn dispose_shared_held(file: File) -> io::Result<()> {
+    // POSIX disposition removes the name on closing this handle even when a
+    // different handle already had read access. It keeps existing readers valid.
+    let delete = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: This no-follow regular file handle was verified in place and
+    // excludes writing and renaming. The buffer matches FileDispositionInfoEx.
+    succeeded(unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            ptr::from_ref(&delete).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    })
+    .map_err(|error| match error.raw_os_error().map(|code| code as u32) {
+        Some(ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED | ERROR_INVALID_PARAMETER) => {
+            io::Error::new(io::ErrorKind::Unsupported, error)
+        }
+        _ => error,
+    })
 }
 
 fn pinned_path(parent: &Dir) -> io::Result<PathBuf> {

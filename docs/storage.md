@@ -166,11 +166,11 @@ remain separate. A displaced file with uncertain ownership or stability stays
 available for recovery without holding the live path open. On Linux and macOS,
 the adapter parks it in private recovery when the roots support an atomic
 same-volume move. Existing-file replacement on Windows requires a volume that
-passes the transaction probe. When macOS can perform the exchange but cannot
-establish exclusive cleanup, the replacement can appear at its original path
-with a `CleanupPending` publication result. The archive retains the displaced
-inode without copying plaintext. `Complete` requires safe retirement of that
-inode.
+passes the transaction probe. On macOS, an atomic exchange can publish the
+replacement while the private archive retains the displaced inode. Ordinary
+replacements report retained captures in vault status. Conversions return
+`CleanupPending` while that inode remains. The archive writes no plaintext
+copy. `Complete` requires safe retirement of the displaced inode.
 
 Schema version 6 orders the existing retirement index by status and then Space.
 Both the installation-wide and per-Space pending checks can seek directly to
@@ -568,7 +568,7 @@ same example against an isolated prefix.
   volume, where lookup checks file size and BLAKE3 before returning the path.
   Startup reconciles abandoned holds and pending local artifacts.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
-  API verifies the trailer and recognizes the exact manifests for schemas 1 through 8.
+  API verifies the trailer and recognizes the exact manifests for schemas 1 through 9.
   It returns typed rows in the original table and column order within the
   caller's byte budget. To materialize a historical spool, create an empty
   target with `schema::POSTGRES_BASELINE_DDL`. For version 7, apply
@@ -580,6 +580,8 @@ same example against an isolated prefix.
   For versions 1 and 2, drop
   `collab_checkpoints` and `backup_holds.owner_generation`. For version 1,
   also drop `account_catalog_receipts` and `chat_pending_inputs.ext_space_tainted`.
+  For versions 1 through 8, drop `vault_handoffs`, `vault_observations`, and
+  `vault_bindings` in that order.
   For versions 1 through 4, drop `idx_receipt_exception_pointer` and
   `idx_payload_owners_job`, and restore the `payload_owners` primary key to
   `(space_id, payload_kind, payload_id, note_id)`.

@@ -12,6 +12,7 @@ use cap_fs_ext::{
 use cap_std::fs::{Dir, DirBuilder, DirBuilderExt, File, Metadata, OpenOptions, OpenOptionsExt};
 use rustix::fs::{RenameFlags, renameat_with};
 
+use super::recovery::ParkAction;
 use super::{CapturedAt, FileIdentity, FileStamp, PublishMode, conflict, invalid};
 #[cfg(target_os = "linux")]
 use super::{observe_open, same_file_content};
@@ -280,8 +281,10 @@ pub fn park_private_capture(
     from: &OsStr,
     target: &Dir,
     to: &OsStr,
-) -> io::Result<()> {
-    rename_no_replace_between(source, from, target, to)
+    _expected: Option<&FileStamp>,
+) -> io::Result<ParkAction> {
+    rename_no_replace_between(source, from, target, to)?;
+    Ok(ParkAction::Relocated)
 }
 
 pub fn verify_parked_capture(_dir: &Dir, _name: &OsStr) -> io::Result<()> {

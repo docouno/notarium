@@ -233,25 +233,9 @@ impl VaultDir {
     /// alias can resolve to an object whose former spelling is now absent.
     pub fn entry_kind_exact(&self, path: &Path) -> io::Result<Option<EntryKind>> {
         let (parent, leaf) = split_target(path)?;
-        let mut dir = self.dir.try_clone()?;
-        for component in parent.components() {
-            let name = relative_component(component)?;
-            let Some(metadata) = present(dir.symlink_metadata(name))? else {
-                return Ok(None);
-            };
-            if entry_kind(&metadata) != EntryKind::Directory {
-                return Err(invalid("exact path traversal requires a regular directory"));
-            }
-            let next = dir.open_dir_nofollow(name)?;
-            if entry_kind(&next.dir_metadata()?) != EntryKind::Directory {
-                return Err(invalid("exact path traversal requires a regular directory"));
-            }
-            platform::require_same_mount(&dir, &next)?;
-            if !platform::directory_name_matches(&next, name)? {
-                return Ok(None);
-            }
-            dir = next;
-        }
+        let Some(dir) = self.open_dir_exact(parent)? else {
+            return Ok(None);
+        };
         let Some(metadata) = present(dir.symlink_metadata(leaf))? else {
             return Ok(None);
         };
@@ -273,6 +257,31 @@ impl VaultDir {
         }
         platform::require_file_mount(&dir, &file)?;
         Ok(platform::file_name_matches(&file, leaf)?.then_some(kind))
+    }
+
+    /// Returns only a held directory whose components have the requested spelling.
+    fn open_dir_exact(&self, path: &Path) -> io::Result<Option<Dir>> {
+        validate_relative_path(path)?;
+        let mut dir = self.dir.try_clone()?;
+        for component in path.components() {
+            let name = relative_component(component)?;
+            let Some(metadata) = present(dir.symlink_metadata(name))? else {
+                return Ok(None);
+            };
+            if entry_kind(&metadata) != EntryKind::Directory {
+                return Err(invalid("exact path traversal requires a regular directory"));
+            }
+            let next = dir.open_dir_nofollow(name)?;
+            if entry_kind(&next.dir_metadata()?) != EntryKind::Directory {
+                return Err(invalid("exact path traversal requires a regular directory"));
+            }
+            platform::require_same_mount(&dir, &next)?;
+            if !platform::directory_name_matches(&next, name)? {
+                return Ok(None);
+            }
+            dir = next;
+        }
+        Ok(Some(dir))
     }
 
     pub fn read(&self, path: &Path, max_bytes: usize) -> io::Result<Option<ObservedFile>> {

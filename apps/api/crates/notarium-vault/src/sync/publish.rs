@@ -216,7 +216,8 @@ impl Worker<'_> {
             .cloned();
         if let Some(intent) = &mut previous
             && !matches!(&intent.action, Action::Publish(prior)
-                if prior.desired == desired && prior.purpose == purpose && !prior.abandoned)
+                if prior.desired.same_revision_bytes(&desired)
+                    && prior.purpose == purpose && !prior.abandoned)
         {
             let superseded = matches!(&intent.action, Action::Publish(prior)
                 if prior.desired.note == desired.note && prior.purpose == purpose
@@ -637,18 +638,37 @@ impl Worker<'_> {
             self.conflict(target, ConflictReason::InvalidCarrier, None)?;
             return Ok(ConversionPublication::Pending);
         }
-        let bytes = carrier::materialize(&current.carrier, current.class, successor)?;
         let prepared = self.pending.iter().find_map(|intent| {
             if intent.target == target
                 && let Action::Publish(action) = &intent.action
                 && action.purpose == PublishPurpose::Conversion
+                && &action.desired.note == successor
             {
-                Some(action.expected.clone())
+                Some((intent.clone(), action.expected.clone(), action.abandoned))
             } else {
                 None
             }
         });
-        let expected = if let Some(expected) = prepared {
+        let expected = if let Some((intent, expected, abandoned)) = prepared {
+            if !abandoned {
+                match publication::recover_published(self.vault, &intent) {
+                    Ok(Some(Placement::Applied { stamp, captured })) => {
+                        return self
+                            .finish_conversion_handoff(handoff, intent, stamp, captured)
+                            .await;
+                    }
+                    Ok(Some(Placement::Conflict(path))) => {
+                        self.conflict(target, ConflictReason::ChangedWhilePublishing, path)?;
+                        return Ok(ConversionPublication::Pending);
+                    }
+                    Ok(None) => {}
+                    Err(error) if path_error(&error) => {
+                        self.conflict(target, ConflictReason::UnsafePath, None)?;
+                        return Ok(ConversionPublication::Pending);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             expected
         } else {
             match self.read_disk(target) {
@@ -670,10 +690,13 @@ impl Worker<'_> {
                 Err(error) => return Err(error.into()),
             }
         };
+        let bytes = carrier::materialize(&current.carrier, current.class, successor)?;
+        let mut desired = desired(&current, bytes.as_bytes());
+        desired.conversion_path = note_path(&current.folders, &current.slug).ok();
         let Some((intent, Placement::Applied { stamp, captured })) = self.place(
             target.to_owned(),
             expected,
-            desired(&current, bytes.as_bytes()),
+            desired,
             PublishPurpose::Conversion,
             None,
             bytes.as_bytes(),
@@ -681,18 +704,39 @@ impl Worker<'_> {
         else {
             return Ok(ConversionPublication::Pending);
         };
-        let observation = observation(&current, target, &stamp)?;
+        self.finish_conversion_handoff(handoff, intent, stamp, captured)
+            .await
+    }
+
+    async fn finish_conversion_handoff(
+        &mut self,
+        handoff: &VaultHandoff,
+        intent: Intent,
+        stamp: FileStamp,
+        captured: Option<CapturedFile>,
+    ) -> Result<ConversionPublication, VaultError> {
+        let Action::Publish(action) = &intent.action else {
+            unreachable!("conversion uses a publication intent");
+        };
+        let desired = &action.desired;
+        let observation = VaultObservation {
+            note: desired.note.clone(),
+            revision: desired.revision.clone(),
+            path: vault_path(&intent.target)?,
+            file: file_stamp(&stamp),
+            carrier_digest: desired.carrier_digest,
+        };
         // Mint-and-Purge hands the checked path to the new ID. Remember
         // the canonical placement it had at conversion so equivalent
         // changes or a seed cannot immediately move the replacement.
-        if let Ok(canonical) = note_path(&current.folders, &current.slug)
-            && canonical != target
+        if let Some(canonical) = &desired.conversion_path
+            && *canonical != intent.target
         {
             self.journal.remember_conversion(
-                successor,
+                &desired.note,
                 &ConversionName {
-                    published: target.to_owned(),
-                    canonical,
+                    published: intent.target.clone(),
+                    canonical: canonical.clone(),
                 },
             )?;
         }
@@ -812,6 +856,7 @@ fn desired(current: &VaultNote, bytes: &[u8]) -> DesiredFile {
         revision: current.note.revision.clone(),
         carrier_digest: current.carrier_digest,
         disk_digest: digest(bytes),
+        conversion_path: None,
     }
 }
 

@@ -35,6 +35,16 @@ pub(crate) struct DesiredFile {
     pub revision: RevisionId,
     pub carrier_digest: ContentDigest,
     pub disk_digest: ContentDigest,
+    pub conversion_path: Option<PathBuf>,
+}
+
+impl DesiredFile {
+    pub fn same_revision_bytes(&self, other: &Self) -> bool {
+        self.note == other.note
+            && self.revision == other.revision
+            && self.carrier_digest == other.carrier_digest
+            && self.disk_digest == other.disk_digest
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
