@@ -994,6 +994,7 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     let other = sample_principal_id(0x68);
     let folder = sample_folder_id(0x67);
     let project = sample_folder_id(0x68);
+    let destination = sample_folder_id(0x69);
     let lease = LeaseEpoch::new(1).unwrap();
     let space = store
         .create_space(CreateSpaceSpec {
@@ -1024,6 +1025,21 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
         })
         .await
         .unwrap();
+    store
+        .create_folder(CreateFolderSpec {
+            scope: space.scope.clone(),
+            active_epoch: lease,
+            folder_id: destination.clone(),
+            parent: None,
+            slug: "destination".into(),
+            display_name: "Destination".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
     let owner_ctx = context(&space.scope, &owner);
     let other_ctx = context_with_grant(
         &space.scope,
@@ -1036,6 +1052,7 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
         },
     );
     let shared = ChatThreadId::from_bytes([0x67; 16]);
+    let movable = ChatThreadId::from_bytes([0x6a; 16]);
     let mut last = SpaceSeq::ZERO;
     for (thread, ctx, kind, folder, body) in [
         (
@@ -1058,6 +1075,13 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
             ChatThreadKind::Personal,
             None,
             "rankingterm rankingterm".to_owned(),
+        ),
+        (
+            movable.clone(),
+            &owner_ctx,
+            ChatThreadKind::SpaceGroup,
+            Some(destination.clone()),
+            "moveterm".to_owned(),
         ),
     ] {
         store
@@ -1096,7 +1120,8 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
         last = appended.receipt.seq();
     }
     let mut view = View::new(space.scope.clone(), folder.clone());
-    view.folder(project.clone(), folder);
+    view.project(project.clone(), folder.clone());
+    view.folder(destination.clone(), folder);
     view.advance(last);
     let projection = Arc::new(Projection {
         store: store.clone(),
@@ -1105,14 +1130,14 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
     });
     let engine = SearchEngine::start(
         SearchConfig::new(root.clone(), VectorMode::Disabled),
-        SearchDependencies::new(store.clone(), projection),
+        SearchDependencies::new(store.clone(), projection.clone()),
     );
     engine.start_space(space.scope.clone()).unwrap();
     acknowledged(&store, &root, &space.scope, last).await;
     let mut req = query("rankingterm");
     req.include_chats = true;
     req.top_k = PageLimit::new(1).unwrap();
-    let owner_results = engine.search(owner_ctx, req.clone()).await.unwrap();
+    let owner_results = engine.search(owner_ctx.clone(), req.clone()).await.unwrap();
     assert_eq!(owner_results.chat_hits.len(), 1);
     assert_eq!(owner_results.chat_hits[0].thread, shared);
     assert!(!owner_results.truncated);
@@ -1125,11 +1150,177 @@ async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
             role: SpaceRole::Viewer,
             read_classes: DocClass::all(),
             write_classes: BTreeSet::new(),
-            project_root: Some(project),
+            project_root: Some(project.clone()),
         },
     );
-    let viewer_results = engine.search(viewer, req).await.unwrap();
+    let viewer_results = engine.search(viewer.clone(), req.clone()).await.unwrap();
     assert_eq!(viewer_results.chat_hits[0].thread, shared);
+    let mut moved_request = query("moveterm");
+    moved_request.include_chats = true;
+    moved_request.folder = Some(project.clone());
+    assert!(
+        engine
+            .search(owner_ctx.clone(), moved_request.clone())
+            .await
+            .unwrap()
+            .chat_hits
+            .is_empty()
+    );
+    let layout = SearchLayout::open(&root, space.scope.clone()).unwrap();
+    let before = layout.search_manifest().unwrap().unwrap();
+    let index = layout.index_dir(&before).unwrap();
+    let old_files = files(&index);
+    let moved = store
+        .move_folder(
+            owner_ctx.clone(),
+            mutation(
+                &owner_ctx,
+                MoveFolder {
+                    folder: destination.clone(),
+                    new_parent: Some(project.clone()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    {
+        let mut view = projection.snapshot.write().unwrap();
+        view.folder(destination, project);
+        view.advance(moved.receipt.seq());
+    }
+    let after = acknowledged(&store, &root, &space.scope, moved.receipt.seq()).await;
+    assert_eq!(before.tantivy_commit, after.tantivy_commit);
+    assert_eq!(old_files, files(&index));
+    let moved = engine
+        .search(owner_ctx, moved_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(moved.chat_hits[0].thread, movable);
+    assert!(
+        engine
+            .search(viewer.clone(), moved_request)
+            .await
+            .unwrap()
+            .chat_hits
+            .is_empty()
+    );
+    assert_eq!(
+        engine.search(viewer, req).await.unwrap().chat_hits[0].thread,
+        shared
+    );
+    engine.shutdown().await;
+
+    tainted_chat_below_limit(store, root, owner).await;
+}
+
+async fn tainted_chat_below_limit(
+    store: Arc<CanonicalStore>,
+    root: DataRoot,
+    owner: notarium_core::ids::PrincipalId,
+) {
+    let tag = 0x6e;
+    let folder = sample_folder_id(tag);
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(tag),
+            incarnation: sample_incarnation(tag),
+            root_folder_id: folder.clone(),
+            slug: "chat-taint-limit".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let ctx = context(&scope, &owner);
+    let thread = ChatThreadId::from_bytes([tag; 16]);
+    store
+        .create_chat(
+            ctx.clone(),
+            mutation(
+                &ctx,
+                CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: owner.clone(),
+                    project_folder: None,
+                    title: "Chat taint limit".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let highest = store
+        .append_chat(
+            ctx.clone(),
+            mutation(
+                &ctx,
+                AppendChat {
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("filterterm filterterm".into()),
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let lower = store
+        .append_chat(
+            ctx.clone(),
+            mutation(
+                &ctx,
+                AppendChat {
+                    thread,
+                    parent: highest.value.seq,
+                    kind: ChatEntryKind::Model,
+                    body: ChatInputBody::Text(format!("filterterm {}", "details ".repeat(32))),
+                    referenced_notes: vec![],
+                    tainted: true,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(lower.value.tainted);
+    let mut view = View::new(scope.clone(), folder);
+    view.advance(lower.receipt.seq());
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::default(),
+    });
+    let engine = SearchEngine::start(
+        SearchConfig::new(root.clone(), VectorMode::Disabled),
+        SearchDependencies::new(store.clone(), projection),
+    );
+    engine.start_space(scope.clone()).unwrap();
+    acknowledged(&store, &root, &scope, lower.receipt.seq()).await;
+    let mut request = query("filterterm");
+    request.include_chats = true;
+    request.top_k = PageLimit::new(1).unwrap();
+    let viewer = context(&scope, &owner);
+    let result = engine
+        .search(viewer.clone(), request.clone())
+        .await
+        .unwrap();
+    assert_eq!(result.chat_hits[0].entry, highest.value.seq);
+    assert!(result.truncated);
+    assert!(!viewer.auth().taint().is_tainted());
+    request.top_k = PageLimit::new(2).unwrap();
+    let result = engine.search(viewer.clone(), request).await.unwrap();
+    assert!(
+        result
+            .chat_hits
+            .iter()
+            .any(|hit| hit.entry == lower.value.seq)
+    );
+    assert!(viewer.auth().taint().is_tainted());
     engine.shutdown().await;
 }
 

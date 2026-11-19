@@ -173,6 +173,11 @@ async fn apply_vectors(
     deleted: BTreeSet<NoteId>,
     embedder: Option<&Embedder>,
 ) -> Result<(), IndexError> {
+    let selected = cx.services.model_target(&cutoff.scope, None, None).await;
+    let embedder = match selected {
+        Ok(selected) if selected == disk.manifest.active_model => embedder,
+        _ => None,
+    };
     let epoch = disk.epoch.as_mut().ok_or(IndexError::Inconsistent)?;
     for note in deleted {
         epoch.apply(cutoff.after, MutableOperation::Delete(note))?;
@@ -250,6 +255,15 @@ impl EmbeddingRepair {
         disk: &mut Disk,
         publisher: &mut Publisher<'_>,
     ) -> Result<(), IndexError> {
+        if !cx
+            .services
+            .model_target(&disk.manifest.scope, None, None)
+            .await
+            .is_ok_and(|selected| selected == disk.manifest.active_model)
+        {
+            self.defer();
+            return Ok(());
+        }
         if disk.embedder.is_none()
             && let Some(target) = disk.manifest.active_model.clone()
         {

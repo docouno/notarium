@@ -383,9 +383,15 @@ impl VectorEpoch {
     }
 
     pub fn apply(&mut self, seq: SpaceSeq, operation: MutableOperation) -> Result<(), VectorError> {
-        if seq < self.manifest.vector_seq || operation.count() > L0_MAX_CHUNKS {
+        if seq == SpaceSeq::ZERO || seq < self.manifest.vector_seq.max(self.mutable.last_seq()) {
             return Err(VectorError::InvalidChunk);
         }
+        let operation = match operation {
+            MutableOperation::Upsert { note, chunks } if chunks.len() > L0_MAX_CHUNKS => {
+                return self.apply_large_upsert(seq, note, chunks);
+            }
+            operation => operation,
+        };
         if matches!(
             self.mutable.admit(seq, &operation),
             Err(VectorError::BufferFull)
@@ -393,6 +399,23 @@ impl VectorEpoch {
             self.flush()?;
         }
         self.mutable.apply(seq, operation)
+    }
+
+    pub(super) fn apply_large_upsert(
+        &mut self,
+        seq: SpaceSeq,
+        note: NoteId,
+        chunks: Vec<VectorChunk>,
+    ) -> Result<(), VectorError> {
+        let mut builder = self.builder()?;
+        for chunk in chunks {
+            if chunk.metadata.note != note {
+                return Err(VectorError::InvalidChunk);
+            }
+            builder.push(chunk)?;
+        }
+        self.flush()?;
+        self.append_replacement(builder, seq, &[note])
     }
 
     pub fn should_flush(&self, now: Instant) -> bool {
@@ -407,11 +430,22 @@ impl VectorEpoch {
         for chunk in self.mutable.chunks() {
             builder.push(chunk.clone())?;
         }
+        let replaced: Vec<_> = self.mutable.notes().cloned().collect();
+        self.append_replacement(builder, self.mutable.last_seq(), &replaced)?;
+        self.mutable.reset_after_flush()
+    }
+
+    fn append_replacement(
+        &mut self,
+        builder: SegmentBuilder,
+        seq: SpaceSeq,
+        replaced: &[NoteId],
+    ) -> Result<(), VectorError> {
         let added = self.seal(builder)?;
         let mut segments = self.segments.clone();
         for segment in &mut segments {
             let before = segment.tombstones.bitmap().cardinality();
-            for note in self.mutable.notes() {
+            for note in replaced {
                 if let Some(slots) = segment.index.notes.get(note) {
                     for &slot in slots {
                         segment.tombstones.mark(slot);
@@ -425,12 +459,7 @@ impl VectorEpoch {
             }
         }
         segments.extend(added);
-        self.publish(
-            segments,
-            self.mutable.last_seq(),
-            self.manifest.complete_backfill,
-        )?;
-        self.mutable.reset_after_flush()
+        self.publish(segments, seq, self.manifest.complete_backfill)
     }
 
     pub fn seed(&mut self, builder: SegmentBuilder, seq: SpaceSeq) -> Result<(), VectorError> {

@@ -787,7 +787,10 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
     assert_eq!(disclosed, BTreeSet::from([DocClass::UserDoc]));
     let result = setup
         .provider
-        .embed(setup.space.clone(), query(100, DocClass::UserDoc))
+        .embed(
+            setup.space.clone(),
+            query(100, DocClass::UserDoc).with_runtime_epoch(setup.selection.runtime_epoch),
+        )
         .await
         .unwrap();
     assert_eq!(result.vectors, vec![Ok(vec![0.25, -0.5])]);
@@ -822,6 +825,20 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             .is_ok()
     );
     let count = requests.lock().unwrap().len();
+    let stale_epoch = (setup.selection.runtime_epoch.get() + 1)
+        .try_into()
+        .unwrap();
+    assert!(
+        setup
+            .provider
+            .embed(
+                setup.space.clone(),
+                query(106, DocClass::UserDoc).with_runtime_epoch(stale_epoch),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(requests.lock().unwrap().len(), count);
     assert!(matches!(
         setup
             .provider

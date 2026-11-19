@@ -38,21 +38,27 @@ terms and fast fields without stored note or chat text. A durable folder
 dictionary assigns stable ordinals, so moving a folder requires only a search
 watermark update. A manifest identifies the active lexical generation and
 the vector checkpoint. The reader pins both together through ArcSwap. Idle
-Spaces release their lexical reader pins and retain their subscriptions. Disk
-and receipt-overlay writers share the four-writer pool.
+Spaces release their lexical reader pins and retain their subscriptions. After
+60 seconds without vector activity, they release the in-memory vector state
+and embedder. The next access reopens the durable epoch and journal. Disk and
+receipt-overlay writers share the four-writer pool.
 
 Vectors use a bounded mutable journal and read-only, checksummed mmap
 segments. The segment contains normalized, per-vector i8 embeddings and a
-CSR-HNSW graph built in Rust. SIMD scans serve selective filters up to 16,384
-eligible slots per segment. Epoch identity includes the profile, backend
-resource, dimension and input token cap. The active reader and embedder stay
-available while a replacement backfills. Publication switches both together.
+CSR-HNSW graph built in Rust. An individual upsert that exceeds the journal
+capacity writes a replacement segment directly. SIMD scans serve selective
+filters up to 16,384 eligible slots per segment. Epoch identity includes the
+profile, dimension and input token cap. Remote epochs also bind the resource,
+its runtime generation and the selected project. The previous compatible
+epoch remains available while the replacement embeds its eligible corpus.
+Publication switches both together.
 
 Encrypted notes are excluded. A purge invalidates the affected search cut and
-removes its retired disk copies before building a clean generation. Chat
-redaction commits and merges the affected Tantivy segments, waits for pinned
-readers, and acknowledges the new cut once obsolete files are removed. The
-worker checks history and durability on restart and rebuilds invalid cuts.
+removes its retired disk copies before building a clean generation. On restart
+the canonical purge fence is checked before the reader pool can delay cleanup.
+Chat redaction commits and merges affected Tantivy segments, waits for pinned
+readers, and publishes and acknowledges the new cut once obsolete files are
+removed. The worker discards abandoned epochs and rebuilds invalid cuts.
 Search checks live note visibility after asynchronous hydration and before
 returning results.
 
@@ -76,8 +82,8 @@ port. Background indexing obtains a current disclosure grant for the revision
 actor before reusing a vector or sending a part. Interactive requests require
 an untainted context, a matching project scope, and a nonempty intersection
 of search classes and provider disclosure. Provider admission rechecks current
-access and token limits, and outbound dispatch checks the shared taint. Chat
-text stays in the lexical index.
+access and token limits. Dispatch compares the resolved provider runtime
+generation and checks the shared taint. Chat text stays in the lexical index.
 
 The embedding worker runs one bounded batch at a time. It checks interactive
 requests first, then live edits, then import and backfill. Batches contain at
@@ -116,7 +122,8 @@ the production candidate limit, hybrid retrieval and fusion, and the selective
 SIMD path. Independent RRF over exact quantized search gives the hybrid recall
 reference. The report includes the sampled peak allocated index bytes, verified
 canonical descendants of a moved folder, index file changes, background chunks
-processed before interactive work starts, and the cgroup and SIMD settings.
+processed before interactive work starts, the queue depths at release of the
+active batch, and the cgroup and SIMD settings.
 The gate fails when a threshold is missed and removes its temporary data on
 exit. The latency samples cover index operations. Canonical hydration, provider
 calls, and transport have separate tests and budgets.

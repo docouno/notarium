@@ -103,6 +103,7 @@ pub struct View {
     cut: SnapshotCut,
     rows: Vec<(NoteId, FolderId)>,
     parents: BTreeMap<FolderId, Option<FolderId>>,
+    projects: BTreeSet<FolderId>,
     edges: BTreeMap<u32, Vec<u32>>,
     fields: BTreeMap<NoteId, BTreeMap<String, FieldObservation<FieldValue>>>,
 }
@@ -118,6 +119,7 @@ impl View {
             },
             rows: Vec::new(),
             parents: BTreeMap::from([(root, None)]),
+            projects: BTreeSet::new(),
             edges: BTreeMap::new(),
             fields: BTreeMap::new(),
         }
@@ -134,6 +136,11 @@ impl View {
 
     pub fn folder(&mut self, folder: FolderId, parent: FolderId) {
         self.parents.insert(folder, Some(parent));
+    }
+
+    pub fn project(&mut self, folder: FolderId, parent: FolderId) {
+        self.folder(folder.clone(), parent);
+        self.projects.insert(folder);
     }
 
     pub fn link(&mut self, from: u32, to: u32) {
@@ -199,8 +206,12 @@ impl StructuralSnapshot for View {
             .collect())
     }
 
-    fn enclosing_project(&self, _: &FolderId) -> DomainResult<Option<FolderId>> {
-        Ok(None)
+    fn enclosing_project(&self, folder: &FolderId) -> DomainResult<Option<FolderId>> {
+        Ok(std::iter::successors(Some(folder), |id| {
+            self.parents.get(*id).and_then(Option::as_ref)
+        })
+        .find(|ancestor| self.projects.contains(*ancestor))
+        .cloned())
     }
 
     fn filter_notes(&self, filter: &FieldFilterAstV1) -> DomainResult<Option<DenseNodeIter<'_>>> {

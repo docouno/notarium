@@ -1,6 +1,6 @@
 use super::{
     EmbeddingError,
-    preprocess::{Normalizer, PreTokenizer},
+    preprocess::{Normalizer, PreTokenizer, Pretokenized},
     tokenizer_model::{Model, ModelInput},
 };
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
@@ -187,7 +187,6 @@ impl LocalTokenizerBudget {
         if added_tokens.len() > 4096 || added_tokens.iter().any(|token| token.content.is_empty()) {
             return Err(EmbeddingError::InvalidModel);
         }
-        added_tokens.sort_by_key(|token| std::cmp::Reverse(token.content.len()));
         let pad_id = input
             .padding
             .map(|padding| padding.pad_id)
@@ -220,9 +219,17 @@ impl LocalTokenizerBudget {
         if wrapper >= max_tokens as usize {
             return Err(EmbeddingError::InvalidModel);
         }
+        if let Some(normalizer) = &input.normalizer {
+            for token in added_tokens.iter_mut().filter(|token| token.normalized) {
+                token.content = normalizer.apply(std::mem::take(&mut token.content))?;
+            }
+        }
+        added_tokens.sort_by_key(|token| std::cmp::Reverse(token.content.len()));
         let mut buckets: [HashMap<_, Vec<_>>; 2] = Default::default();
         for token in added_tokens {
-            let first = token.content.chars().next().expect("validated added token");
+            let Some(first) = token.content.chars().next() else {
+                continue;
+            };
             buckets[usize::from(token.normalized)]
                 .entry(first)
                 .or_default()
@@ -252,7 +259,7 @@ impl LocalTokenizerBudget {
         for piece in split_added(text, &self.added_tokens[0]) {
             match piece {
                 Piece::Token(id) => ids.push(id),
-                Piece::Text(raw) => {
+                Piece::Text(raw, raw_starts_input) => {
                     let normalized = match &self.normalizer {
                         Some(normalizer) => normalizer.apply(raw.to_owned())?,
                         None => raw.to_owned(),
@@ -260,13 +267,16 @@ impl LocalTokenizerBudget {
                     for piece in split_added(&normalized, &self.added_tokens[1]) {
                         match piece {
                             Piece::Token(id) => ids.push(id),
-                            Piece::Text(text) => {
-                                let mut parts = vec![text.to_owned()];
+                            Piece::Text(text, starts_input) => {
                                 if let Some(tokenizer) = &self.pre_tokenizer {
-                                    parts = tokenizer.split(parts);
-                                }
-                                for part in parts {
-                                    self.model.encode(&part, &mut ids)?;
+                                    for part in tokenizer.split(vec![Pretokenized {
+                                        text: text.to_owned(),
+                                        starts_input: raw_starts_input && starts_input,
+                                    }]) {
+                                        self.model.encode(&part.text, &mut ids)?;
+                                    }
+                                } else {
+                                    self.model.encode(text, &mut ids)?;
                                 }
                             }
                         }
@@ -293,13 +303,13 @@ impl LocalTokenizerBudget {
 }
 
 enum Piece<'a> {
-    Text(&'a str),
+    Text(&'a str, bool),
     Token(u32),
 }
 
 fn split_added<'a>(text: &'a str, tokens: &HashMap<char, Vec<AddedToken>>) -> Vec<Piece<'a>> {
     if tokens.is_empty() {
-        return vec![Piece::Text(text)];
+        return vec![Piece::Text(text, true)];
     }
     let mut pieces = Vec::new();
     let mut start = 0;
@@ -321,7 +331,7 @@ fn split_added<'a>(text: &'a str, tokens: &HashMap<char, Vec<AddedToken>>) -> Ve
             prefix
         };
         if !prefix.is_empty() {
-            pieces.push(Piece::Text(prefix));
+            pieces.push(Piece::Text(prefix, start == 0));
         }
         pieces.push(Piece::Token(token.id));
         offset += token.content.len();
@@ -332,7 +342,7 @@ fn split_added<'a>(text: &'a str, tokens: &HashMap<char, Vec<AddedToken>>) -> Ve
         start = offset;
     }
     if start < text.len() {
-        pieces.push(Piece::Text(&text[start..]));
+        pieces.push(Piece::Text(&text[start..], start == 0));
     }
     pieces
 }

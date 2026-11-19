@@ -1,6 +1,6 @@
 use super::{PortFuture, PortStream, context::*, provider::*, types::*};
 use crate::{auth::*, classes::*, ids::*, model::*, receipt::*, value::Timestamp};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, num::NonZeroU64};
 
 /// Opaque continuation bound by the producer to scope, filters and revisions.
 #[derive(Clone, Debug)]
@@ -309,6 +309,7 @@ pub use super::schedules::*;
 pub struct ProviderSelection {
     pub provider: ProviderResourceId,
     pub model: ModelProfileId,
+    pub runtime_epoch: NonZeroU64,
     pub project: Option<FolderRef>,
     pub policy: ProviderPolicy,
 }

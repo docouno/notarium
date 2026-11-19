@@ -488,6 +488,48 @@ fn exact_ties_survive_compaction_and_the_epoch_rejects_mixed_dimensions() {
 }
 
 #[test]
+fn direct_segment_upsert_preserves_unrelated_pending_chunks_on_reopen() {
+    use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
+
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([1; 16]),
+        incarnation: HistoryIncarnation::from_bytes([1; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let seq = |seq| SpaceSeq::new(seq).unwrap();
+    let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
+    let old = fixture(1, 64);
+    let other = fixture(2, 64);
+    let mut builder = SegmentBuilder::new(&model(), 64).unwrap();
+    builder.push(old.clone()).unwrap();
+    epoch.seed(builder, seq(1)).unwrap();
+    epoch
+        .apply(
+            seq(2),
+            MutableOperation::Upsert {
+                note: other.metadata.note.clone(),
+                chunks: vec![other.clone()],
+            },
+        )
+        .unwrap();
+    let mut first = fixture(3, 64);
+    let mut second = fixture(4, 64);
+    first.metadata.note = old.metadata.note.clone();
+    second.metadata.note = old.metadata.note.clone();
+    let replacement = [first, second];
+    epoch
+        .apply_large_upsert(seq(3), old.metadata.note.clone(), replacement.to_vec())
+        .unwrap();
+    drop(epoch);
+
+    let epoch = VectorEpoch::open(layout, model(), 64).unwrap();
+    assert!(epoch.is_checkpointed(seq(3)));
+    assert!(epoch.matches_note_chunks(&old.metadata.note, &replacement));
+    assert!(epoch.matches_note_chunks(&other.metadata.note, std::slice::from_ref(&other)));
+}
+
+#[test]
 fn epoch_restarts_compacts_and_scrubs_obsolete_carriers() {
     use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
     use std::collections::BTreeSet;

@@ -26,6 +26,7 @@ use notarium_core::{
 use notarium_search::{
     SearchDependencies, SearchEngine,
     config::{SearchConfig, VectorMode},
+    layout::SearchLayout,
     ports::{
         EmbeddingBackendTarget, RemoteIndexingGrant, ResolvedEmbeddingTarget,
         SearchModelResolverPort,
@@ -205,12 +206,27 @@ pub async fn search_with_dynamic_models(store: Arc<CanonicalStore>, root: DataRo
     .unwrap();
     missing.shutdown().await;
 
-    models.install(&fast_model, false);
-    models.install(&slow_model, true);
     let engine = start(VectorMode::DynamicOrt {
         dylib_path: library(),
         model_dir: models.0.clone(),
     });
+    engine.start_space(fast.scope().clone()).unwrap();
+    let pending = acknowledged(&store, &root, fast.scope(), fast_seq).await;
+    assert!(pending.vector_seq.is_none() && pending.embeddings_pending);
+    models.install(&fast_model, false);
+    models.install(&slow_model, true);
+    let layout = SearchLayout::open(&root, fast.scope().clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let manifest = layout.search_manifest().unwrap().unwrap();
+            if manifest.vector_seq.is_some() && !manifest.embeddings_pending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let result = engine.search(fast.clone(), query("red")).await.unwrap();

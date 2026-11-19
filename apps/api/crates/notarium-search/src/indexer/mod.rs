@@ -1,4 +1,6 @@
 mod build;
+#[cfg(test)]
+mod tests;
 mod update;
 
 use crate::{
@@ -25,6 +27,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::time::{MissedTickBehavior, interval, sleep};
+
+const VECTOR_IDLE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 enum IndexError {
@@ -121,6 +125,7 @@ struct Disk {
     epoch: Option<VectorEpoch>,
     embedder: Option<Arc<crate::model::Embedder>>,
     embedding_failures: u64,
+    vector_last_use: Instant,
 }
 
 impl Disk {
@@ -132,7 +137,7 @@ impl Disk {
     }
 
     fn needs_embedding_repair(&self) -> bool {
-        self.epoch.is_some() && self.manifest.embeddings_pending
+        self.manifest.vector_seq.is_some() && self.manifest.embeddings_pending
     }
 
     fn resume_reader(&mut self, cx: &Context<'_>) -> Result<bool, IndexError> {
@@ -148,6 +153,25 @@ impl Disk {
         }
         self.lexical = Some(reader);
         Ok(true)
+    }
+
+    async fn resume_vectors(&mut self) -> Result<(), IndexError> {
+        self.vector_last_use = Instant::now();
+        if self.epoch.is_none() && self.manifest.vector_seq.is_some() {
+            let layout = self.layout.clone();
+            let manifest = self.manifest.clone();
+            self.epoch = tokio::task::spawn_blocking(move || open_vector_epoch(layout, &manifest))
+                .await
+                .map_err(|_| IndexError::Inconsistent)??;
+        }
+        Ok(())
+    }
+
+    fn release_idle_vectors(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.vector_last_use) >= VECTOR_IDLE {
+            self.epoch.take();
+            self.embedder.take();
+        }
     }
 }
 
@@ -258,6 +282,8 @@ async fn consume(
     let mut ticker = interval(Duration::from_secs(1));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut next_model_check = Instant::now();
+    let mut retry_model = false;
+    let mut model_retry_delay = Duration::from_secs(1);
     let mut repair = update::EmbeddingRepair::default();
     loop {
         let event = {
@@ -272,6 +298,7 @@ async fn consume(
                     () = cx.handle.wake.notified() => ChangeNotice::Lagged { resume },
                     _ = tokio::time::sleep_until(repair.next()), if disk.as_ref().is_some_and(Disk::needs_embedding_repair) => {
                         if let Some(current) = &mut disk {
+                            current.resume_vectors().await?;
                             repair.page(cx, current, publisher).await?;
                         }
                         continue;
@@ -279,13 +306,46 @@ async fn consume(
                     _ = ticker.tick() => {
                         // Resolving a consumed ring signal can require a durable read.
                         // Keep that read alive across idle vector maintenance.
+                        if Instant::now() >= next_model_check
+                            && let Some(current) = &mut disk
+                            && (retry_model || (current.manifest.embeddings_pending
+                                && current.manifest.vector_seq.is_none()))
+                        {
+                            match build::refresh_model(cx, publisher, current).await {
+                                Ok(seeded) => {
+                                    if let Some(seeded) = seeded {
+                                        drop(disk.replace(seeded));
+                                        repair = update::EmbeddingRepair::default();
+                                        build::publish_seed(cx, publisher, disk.as_ref().expect("refreshed seed")).await?;
+                                    }
+                                    retry_model = false;
+                                    model_retry_delay = Duration::from_secs(1);
+                                }
+                                Err(error) if error.requires_reseed() => {
+                                    if error.requires_scrub() {
+                                        drop(disk.take());
+                                        build::scrub(cx, publisher, &layout).await?;
+                                    }
+                                    return Err(error);
+                                }
+                                Err(error) => {
+                                    tracing::warn!(kind = %error, "search model refresh will retry");
+                                    retry_model = true;
+                                    next_model_check = Instant::now() + model_retry_delay;
+                                    model_retry_delay = (model_retry_delay * 2).min(Duration::from_secs(300));
+                                }
+                            }
+                        }
                         if let Some(disk) = &mut disk {
                             update::maintain_vectors(disk, publisher).await?;
-                            if cx.handle.active_queries.load(Ordering::Acquire) == 0
-                                && disk.lexical.take().is_some()
-                            {
+                            if cx.handle.active_queries.load(Ordering::Acquire) == 0 {
                                 // Keep the subscription and durable cut while the reader is idle.
-                                publisher.replace(None);
+                                if disk.lexical.take().is_some() {
+                                    publisher.replace(None);
+                                }
+                                disk.release_idle_vectors(Instant::now());
+                            } else {
+                                disk.vector_last_use = Instant::now();
                             }
                         }
                         continue;
@@ -320,6 +380,7 @@ async fn consume(
             seed_at = Some(target.clone());
         }
         if !force_seed && let Some(current) = &mut disk {
+            current.resume_vectors().await?;
             if current.resume_reader(cx)? {
                 publisher.publish(current);
             }
@@ -364,26 +425,10 @@ async fn consume(
                 current.embedder = cx.services.embedder(active).await.ok().map(Arc::new);
                 publisher.publish(current);
             }
-            let selection_changed = current
-                .manifest
-                .active_model
-                .as_ref()
-                .map(|target| target.vector_model())
-                != selected.as_ref().map(|target| target.vector_model());
-            let backfill = if !selection_changed
-                && current.epoch.is_none()
-                && let Some(target) = selected.as_ref()
-            {
-                cx.services.embedder(target.clone()).await.is_ok()
-            } else {
-                false
-            };
+            let selection_changed = current.manifest.active_model != selected;
+            let backfill = current.manifest.vector_seq.is_none() && selected.is_some();
             if selection_changed || backfill {
                 seed_at = Some(target.clone());
-            } else if current.manifest.active_model != selected {
-                current.manifest.active_model = selected;
-                current.layout.publish_search(&current.manifest)?;
-                publisher.publish(current);
             }
         }
         if let Some(mut cutoff) = seed_at {
@@ -396,6 +441,8 @@ async fn consume(
                     Ok(seeded) => {
                         drop(disk.replace(seeded));
                         repair = update::EmbeddingRepair::default();
+                        retry_model = false;
+                        model_retry_delay = Duration::from_secs(1);
                         build::publish_seed(cx, publisher, disk.as_ref().expect("seed installed"))
                             .await?;
                         break;
@@ -420,7 +467,9 @@ async fn consume(
                     }
                     Err(error) if disk.is_some() => {
                         tracing::warn!(kind = %error, "search model replacement will retry");
-                        next_model_check = Instant::now() + Duration::from_secs(1);
+                        retry_model = true;
+                        next_model_check = Instant::now() + model_retry_delay;
+                        model_retry_delay = (model_retry_delay * 2).min(Duration::from_secs(300));
                         break;
                     }
                     Err(error) => return Err(error),
@@ -472,23 +521,7 @@ async fn open_disk(
         if lexical.commit_id()? != manifest.tantivy_commit {
             return Err(IndexError::Inconsistent);
         }
-        let epoch = match (&manifest.active_model, manifest.vector_seq) {
-            (Some(model), Some(seq)) if seq <= manifest.tantivy_seq => {
-                let model = model.vector_model();
-                let epoch = layout
-                    .epoch_manifest(&model)?
-                    .ok_or(IndexError::Inconsistent)?;
-                let opened = VectorEpoch::open_model(layout.clone(), model)?;
-                if !opened.is_checkpointed(seq) || !epoch.complete_backfill {
-                    return Err(IndexError::Inconsistent);
-                }
-                opened.collect_obsolete()?;
-                Some(opened)
-            }
-            (None, None) => None,
-            (Some(_), None) if manifest.embeddings_pending => None,
-            _ => return Err(IndexError::Inconsistent),
-        };
+        let epoch = open_vector_epoch(layout.clone(), &manifest)?;
         Ok(Some(Disk {
             layout: layout.clone(),
             manifest,
@@ -497,6 +530,7 @@ async fn open_disk(
             epoch,
             embedder: None,
             embedding_failures: 0,
+            vector_last_use: Instant::now(),
         }))
     })();
     let disk = match opened {
@@ -529,6 +563,29 @@ async fn open_disk(
         }
     }
     Ok(disk)
+}
+
+fn open_vector_epoch(
+    layout: Arc<SearchLayout>,
+    manifest: &SearchManifest,
+) -> Result<Option<VectorEpoch>, IndexError> {
+    match (&manifest.active_model, manifest.vector_seq) {
+        (Some(model), Some(seq)) if seq <= manifest.tantivy_seq => {
+            let model = model.vector_model();
+            let epoch = layout
+                .epoch_manifest(&model)?
+                .ok_or(IndexError::Inconsistent)?;
+            let opened = VectorEpoch::open_model(layout, model)?;
+            if !opened.is_checkpointed(seq) || !epoch.complete_backfill {
+                return Err(IndexError::Inconsistent);
+            }
+            opened.collect_obsolete()?;
+            Ok(Some(opened))
+        }
+        (None, None) => Ok(None),
+        (Some(_), None) if manifest.embeddings_pending => Ok(None),
+        _ => Err(IndexError::Inconsistent),
+    }
 }
 
 /// Returns true when any event requires a physical replacement generation.

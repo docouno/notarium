@@ -9,13 +9,13 @@ use cap_std::{
 use notarium_core::{
     epoch::{DataRoot, SearchIndexKind},
     ids::{FolderId, ModelProfileId, ProviderResourceId, SpaceSeq},
-    model::HistoryScope,
+    model::{FolderRef, HistoryScope},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::HashMap,
     io::{self, Read, Write},
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -156,30 +156,44 @@ impl SearchManifest {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct VectorModel {
     pub profile: ModelProfileId,
-    pub provider: Option<ProviderResourceId>,
+    pub remote: Option<RemoteVectorModel>,
     pub dimension: u32,
     pub max_input_tokens: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteVectorModel {
+    pub provider: ProviderResourceId,
+    pub runtime_epoch: NonZeroU64,
+    pub project: Option<FolderRef>,
 }
 
 impl VectorModel {
     pub fn local(profile: ModelProfileId, dimension: u32) -> Self {
         Self {
             profile,
-            provider: None,
+            remote: None,
             dimension,
             max_input_tokens: 512,
         }
     }
 
     pub(crate) fn hash(&self) -> [u8; 32] {
-        match &self.provider {
+        match &self.remote {
             None => crate::vector::model_hash(&self.profile),
-            Some(provider) => {
+            Some(remote) => {
                 let mut hash =
                     blake3::Hasher::new_derive_key("notarium/search/remote-vector-model/v1");
-                hash.update(provider.as_str().as_bytes());
+                hash.update(remote.provider.as_str().as_bytes());
                 hash.update(&[0]);
                 hash.update(self.profile.as_str().as_bytes());
+                hash.update(&remote.runtime_epoch.get().to_le_bytes());
+                if let Some(project) = &remote.project {
+                    hash.update(project.space_id.as_str().as_bytes());
+                    hash.update(&[0]);
+                    hash.update(project.folder_id.as_str().as_bytes());
+                }
                 *hash.finalize().as_bytes()
             }
         }

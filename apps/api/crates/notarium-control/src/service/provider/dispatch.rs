@@ -4,7 +4,7 @@ use super::{
     admission::DispatchAuthority,
     execution::{CancelOnDrop, Job, Request, Runtime},
     records::*,
-    wire,
+    selection, wire,
 };
 use crate::{
     error::{invalid, unavailable},
@@ -287,6 +287,13 @@ impl ProviderService {
                 CommitEffect::NotCommitted,
             )
             .await?;
+        if let Request::Embedding(request) = &job.request
+            && request
+                .runtime_epoch()
+                .is_some_and(|epoch| epoch.get() != snapshot.resource.runtime_epoch as u64)
+        {
+            return Err(selection::unavailable());
+        }
         let primary = if let Some(scope) = &job.scope {
             let ctx = SpaceContext::new(job.ctx.auth().clone(), scope.clone(), runtime.context())?;
             Some(

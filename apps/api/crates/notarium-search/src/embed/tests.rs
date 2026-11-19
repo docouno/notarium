@@ -85,6 +85,43 @@ fn local_wordpiece_bpe_unigram_and_remote_counts_match_served_input() {
 }
 
 #[test]
+fn tokenizer_uses_scalar_case_mapping_and_original_metaspace_start() {
+    for normalizer in [
+        r#"{"type":"Lowercase"}"#,
+        r#"{"type":"BertNormalizer","lowercase":true}"#,
+    ] {
+        let input = format!(
+            r###"{{"normalizer":{normalizer},
+                "model":{{"type":"WordPiece","vocab":{{"[UNK]":0,"οσ":1,"ο":2,"##ς":3}},
+                "unk_token":"[UNK]","continuing_subword_prefix":"##","max_input_chars_per_word":100}}}}"###
+        );
+        let tokenizer = LocalTokenizerBudget::from_json(input.as_bytes(), profile(), 512).unwrap();
+        assert_eq!(tokenizer.encode("ΟΣ").unwrap().ids, [1]);
+        assert_eq!(tokenizer.count("ΟΣ").unwrap(), 1);
+    }
+
+    let input = r###"{
+        "normalizer":{"type":"Lowercase"},
+        "pre_tokenizer":{"type":"Sequence","pretokenizers":[
+            {"type":"WhitespaceSplit"},
+            {"type":"Metaspace","replacement":"▁","prepend_scheme":"first"}
+        ]},
+        "added_tokens":[
+            {"id":9,"content":"[T]","normalized":false},
+            {"id":10,"content":"TAG","normalized":true}
+        ],
+        "model":{"type":"WordPiece","vocab":{"[UNK]":0,"▁hi":1,"hi":2,"world":3,"▁world":4},
+            "unk_token":"[UNK]","continuing_subword_prefix":"##","max_input_chars_per_word":100}
+    }"###;
+    let tokenizer = LocalTokenizerBudget::from_json(input.as_bytes(), profile(), 512).unwrap();
+    assert_eq!(tokenizer.encode("hi[T]world").unwrap().ids, [1, 9, 3]);
+    assert_eq!(tokenizer.encode("[T]world").unwrap().ids, [9, 3]);
+    assert_eq!(tokenizer.encode(" hi").unwrap().ids, [2]);
+    assert_eq!(tokenizer.encode("TAG").unwrap().ids, [10]);
+    assert_eq!(tokenizer.count("hi[T]world").unwrap(), 3);
+}
+
+#[test]
 fn tokenizer_matches_reference_on_fallback_controls_and_whitespace() {
     let cases = [
         (
@@ -303,6 +340,7 @@ async fn remote_queries_are_typed_and_tainted_or_oversize_input_never_dispatches
         ProviderResourceId::from_bytes([9; 16]),
         64,
         16,
+        std::num::NonZeroU64::MIN,
     );
     let input = EmbeddingQueryInput {
         text: "literal query".to_owned(),

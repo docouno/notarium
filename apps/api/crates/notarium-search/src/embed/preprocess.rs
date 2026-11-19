@@ -56,7 +56,7 @@ impl Normalizer {
             Self::Nfd => text.nfd().collect(),
             Self::Nfkc => text.nfkc().collect(),
             Self::Nfkd => text.nfkd().collect(),
-            Self::Lowercase => text.to_lowercase(),
+            Self::Lowercase => text.chars().flat_map(char::to_lowercase).collect(),
             Self::StripAccents => text.chars().filter(|&c| !is_combining_mark(c)).collect(),
             Self::Bert {
                 clean_text,
@@ -88,7 +88,7 @@ impl Normalizer {
                     output = strip_accents(&output);
                 }
                 if *lowercase {
-                    output = output.to_lowercase();
+                    output = output.chars().flat_map(char::to_lowercase).collect();
                 }
                 output
             }
@@ -206,30 +206,44 @@ static BYTELEVEL_RUNS: LazyLock<RegexTokenizer> = LazyLock::new(|| {
         .expect("static byte-level pattern")
 });
 
+pub(super) struct Pretokenized {
+    pub text: String,
+    pub starts_input: bool,
+}
+
 impl PreTokenizer {
-    pub fn split(&self, parts: Vec<String>) -> Vec<String> {
+    pub fn split(&self, parts: Vec<Pretokenized>) -> Vec<Pretokenized> {
         if let Self::Sequence { pretokenizers } = self {
             return pretokenizers
                 .iter()
                 .fold(parts, |parts, pretokenizer| pretokenizer.split(parts));
         }
         let mut output = Vec::new();
-        for (index, input) in parts.into_iter().enumerate() {
+        for Pretokenized {
+            text: mut input,
+            starts_input,
+        } in parts
+        {
             if input.is_empty() {
                 continue;
             }
+            let mut split_parts = Vec::new();
             match self {
-                Self::WhitespaceSplit => output.extend(input.split_whitespace().map(str::to_owned)),
-                Self::Whitespace => push_regex(&mut output, &input, &WORD_RUNS),
+                Self::WhitespaceSplit => {
+                    split_parts.extend(input.split_whitespace().map(str::to_owned))
+                }
+                Self::Whitespace => push_regex(&mut split_parts, &input, &WORD_RUNS),
                 Self::Bert => {
                     for part in input.split_whitespace() {
-                        split_punctuation(&mut output, part, SplitBehavior::Isolated);
+                        split_punctuation(&mut split_parts, part, SplitBehavior::Isolated);
                     }
                 }
                 Self::Digits { individual_digits } => {
-                    split_digits(&mut output, &input, *individual_digits)
+                    split_digits(&mut split_parts, &input, *individual_digits)
                 }
-                Self::Punctuation { behavior } => split_punctuation(&mut output, &input, *behavior),
+                Self::Punctuation { behavior } => {
+                    split_punctuation(&mut split_parts, &input, *behavior)
+                }
                 Self::Metaspace {
                     replacement,
                     prepend_scheme,
@@ -238,7 +252,7 @@ impl PreTokenizer {
                 } => {
                     let prepend = add_prefix_space.unwrap_or(match prepend_scheme {
                         PrependScheme::Always => true,
-                        PrependScheme::First => index == 0,
+                        PrependScheme::First => starts_input,
                         PrependScheme::Never => false,
                     });
                     let mut replaced = input.replace(' ', &replacement.to_string());
@@ -249,35 +263,48 @@ impl PreTokenizer {
                         let mut start = 0;
                         for (offset, c) in replaced.char_indices() {
                             if c == *replacement && offset > start {
-                                output.push(replaced[start..offset].to_owned());
+                                split_parts.push(replaced[start..offset].to_owned());
                                 start = offset;
                             }
                         }
-                        output.push(replaced[start..].to_owned());
+                        split_parts.push(replaced[start..].to_owned());
                     } else {
-                        output.push(replaced);
+                        split_parts.push(replaced);
                     }
                 }
                 Self::ByteLevel {
                     add_prefix_space,
                     use_regex,
                 } => {
-                    let mut input = input;
                     if *add_prefix_space && !input.starts_with(' ') {
                         input.insert(0, ' ');
                     }
                     if *use_regex {
-                        output.extend(
+                        split_parts.extend(
                             bytelevel_pieces(&input)
                                 .into_iter()
                                 .map(|piece| encode_bytes(&piece)),
                         );
                     } else {
-                        output.push(encode_bytes(&input));
+                        split_parts.push(encode_bytes(&input));
                     }
                 }
                 Self::Sequence { .. } => unreachable!("handled before splitting"),
             }
+            let first_starts_input = starts_input
+                && (matches!(self, Self::Metaspace { .. } | Self::ByteLevel { .. })
+                    || split_parts
+                        .first()
+                        .is_some_and(|first| input.starts_with(first)));
+            output.extend(
+                split_parts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, text)| Pretokenized {
+                        text,
+                        starts_input: first_starts_input && index == 0,
+                    }),
+            );
         }
         output
     }

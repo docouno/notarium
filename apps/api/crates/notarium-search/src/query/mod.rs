@@ -249,6 +249,14 @@ impl SearchEngine {
                 )
                 .await?
                 .ok_or(EmbeddingError::ModelUnavailable)?;
+            if let EmbeddingBackendTarget::Remote {
+                project: Some(expected),
+                ..
+            } = &requested.backend
+                && filter.project.as_ref() != Some(expected)
+            {
+                return Err(EmbeddingError::ProviderUnavailable);
+            }
             let Some(indexed) = &state.vectors else {
                 handle.wake.notify_one();
                 if state
@@ -273,6 +281,11 @@ impl SearchEngine {
                     .as_ref()
                     .ok_or(EmbeddingError::ModelUnavailable)?
             };
+            if matches!(target.backend, EmbeddingBackendTarget::Remote { .. })
+                && matches!(requested.backend, EmbeddingBackendTarget::LocalOnnx)
+            {
+                return Ok(None);
+            }
             if let EmbeddingBackendTarget::Remote { project, .. } = &target.backend
                 && (ctx.auth().taint().is_tainted()
                     || project

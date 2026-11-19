@@ -332,7 +332,11 @@ impl ProviderService {
                 return Err(unavailable());
             }
             let admission=policy(tx.inner_mut(),&auth,&resource,credential_epoch,&space.space,request.project.as_ref(),now,false).await?;
-            Ok(ProviderSelection{provider:id,model:model_id,project:request.project,policy:admission.policy})
+            let runtime_epoch = u64::try_from(resource.runtime_epoch)
+                .ok()
+                .and_then(std::num::NonZeroU64::new)
+                .ok_or_else(unavailable)?;
+            Ok(ProviderSelection{provider:id,model:model_id,runtime_epoch,project:request.project,policy:admission.policy})
         },CommitEffect::NotCommitted).await?;
         budget
             .run(tx.rollback(), CommitEffect::NotCommitted)

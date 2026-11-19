@@ -14,7 +14,7 @@ use notarium_core::{
     DomainError,
     classes::{ClassEgressFence, ClassifiedDocument, ContentPart, DocClass, SearchContent},
     document::{ChunkDescriptor, ChunkPlan},
-    error::ValidationReason,
+    error::{PortError, ValidationReason},
     ids::{ContentDigest, FolderId, ModelProfileId},
     model::{FolderRef, HistoryScope},
     ports::{CallBudget, EmbeddingQueryInput, SpaceContext},
@@ -103,7 +103,14 @@ impl Services {
                 (VectorMode::DeterministicTest { .. }, _) => {
                     return Err(EmbeddingError::InvalidModel);
                 }
-                (_, EmbeddingBackendTarget::Remote { provider, .. }) => {
+                (
+                    _,
+                    EmbeddingBackendTarget::Remote {
+                        provider,
+                        runtime_epoch,
+                        ..
+                    },
+                ) => {
                     let port = self
                         .deps
                         .providers
@@ -115,6 +122,7 @@ impl Services {
                         provider.clone(),
                         target.dimension,
                         target.max_input_tokens,
+                        *runtime_epoch,
                     );
                     (Backend::Remote(Arc::new(backend)), conservative())
                 }
@@ -275,13 +283,14 @@ impl Embedder {
             return Ok((Vec::new(), false));
         }
         let remote = if let Backend::Remote(backend) = &self.backend {
-            let Some((grant, project)) = self
+            match self
                 .indexing_grant(services, scope, note, budget.clone())
                 .await
-            else {
-                return Ok((Vec::new(), true));
-            };
-            Some((backend, grant, project))
+            {
+                Ok(Some((grant, project))) => Some((backend, grant, project)),
+                Ok(None) => return Ok((Vec::new(), false)),
+                Err(_) => return Ok((Vec::new(), true)),
+            }
         } else {
             None
         };
@@ -349,10 +358,15 @@ impl Embedder {
         scope: &HistoryScope,
         note: &SearchIndexedNote,
         budget: CallBudget,
-    ) -> Option<(RemoteIndexingGrant, Option<FolderRef>)> {
-        let resolver = services.deps.model_resolver.as_ref()?;
-        let EmbeddingBackendTarget::Remote { project, provider } = &self.target.backend else {
-            return None;
+    ) -> Result<Option<(RemoteIndexingGrant, Option<FolderRef>)>, PortError> {
+        let Some(resolver) = services.deps.model_resolver.as_ref() else {
+            return Ok(None);
+        };
+        let EmbeddingBackendTarget::Remote {
+            project, provider, ..
+        } = &self.target.backend
+        else {
+            return Ok(None);
         };
         let actual_project = note.enclosing_project.clone().map(|folder_id| FolderRef {
             space_id: scope.space_id.clone(),
@@ -362,9 +376,9 @@ impl Embedder {
             .as_ref()
             .is_some_and(|project| Some(project) != actual_project.as_ref())
         {
-            return None;
+            return Ok(None);
         }
-        let grant = resolver
+        let Some(grant) = resolver
             .acquire_remote_indexing_grant(
                 &services.authority,
                 scope,
@@ -373,15 +387,17 @@ impl Embedder {
                 actual_project.as_ref(),
                 budget,
             )
-            .await
-            .ok()??;
+            .await?
+        else {
+            return Ok(None);
+        };
         if &grant.policy.provider != provider
             || ClassEgressFence::provider(note.document.clone(), grant.ctx.auth(), &grant.policy)
                 .is_err()
         {
-            return None;
+            return Ok(None);
         }
-        Some((grant, actual_project))
+        Ok(Some((grant, actual_project)))
     }
 
     #[allow(clippy::too_many_arguments)]

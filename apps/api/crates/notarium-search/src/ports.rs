@@ -1,6 +1,6 @@
 //! Read and model-selection contracts for the search engine.
 
-use crate::layout::VectorModel;
+use crate::layout::{RemoteVectorModel, VectorModel};
 pub use notarium_canonical::changes::search::{
     SearchDocumentTarget, SearchIndexedNote, SearchNotesSeedPage, SearchOverlayNote,
 };
@@ -15,7 +15,7 @@ use notarium_core::{
     ports::{CallBudget, PageLimit, PortFuture, ServiceAuthority, SpaceContext},
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{num::NonZeroU64, sync::Arc};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedEmbeddingTarget {
@@ -29,9 +29,17 @@ impl ResolvedEmbeddingTarget {
     pub(crate) fn vector_model(&self) -> VectorModel {
         VectorModel {
             profile: self.model.clone(),
-            provider: match &self.backend {
+            remote: match &self.backend {
                 EmbeddingBackendTarget::LocalOnnx => None,
-                EmbeddingBackendTarget::Remote { provider, .. } => Some(provider.clone()),
+                EmbeddingBackendTarget::Remote {
+                    provider,
+                    runtime_epoch,
+                    project,
+                } => Some(RemoteVectorModel {
+                    provider: provider.clone(),
+                    runtime_epoch: *runtime_epoch,
+                    project: project.clone(),
+                }),
             },
             dimension: self.dimension,
             max_input_tokens: self.max_input_tokens,
@@ -44,6 +52,7 @@ pub enum EmbeddingBackendTarget {
     LocalOnnx,
     Remote {
         provider: ProviderResourceId,
+        runtime_epoch: NonZeroU64,
         project: Option<FolderRef>,
     },
 }

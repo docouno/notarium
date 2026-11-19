@@ -64,6 +64,7 @@ impl SearchModelResolverPort for Probe {
                 max_input_tokens: 1024,
                 backend: EmbeddingBackendTarget::Remote {
                     provider: ProviderResourceId::from_bytes([0x19; 16]),
+                    runtime_epoch: std::num::NonZeroU64::MIN,
                     project: None,
                 },
             }))

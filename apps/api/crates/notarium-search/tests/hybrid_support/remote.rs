@@ -27,7 +27,7 @@ use std::{
     collections::BTreeSet,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -40,6 +40,7 @@ fn remote_target(resource: u8, cap: u32) -> ResolvedEmbeddingTarget {
         max_input_tokens: cap,
         backend: EmbeddingBackendTarget::Remote {
             provider: ProviderResourceId::from_bytes([resource; 16]),
+            runtime_epoch: std::num::NonZeroU64::MIN,
             project: None,
         },
     }
@@ -47,7 +48,29 @@ fn remote_target(resource: u8, cap: u32) -> ResolvedEmbeddingTarget {
 
 struct SwitchingResolver {
     provider: AtomicU8,
+    runtime_epoch: AtomicU64,
     cap: u32,
+    project: RwLock<Option<FolderRef>>,
+}
+
+impl SwitchingResolver {
+    fn current_target(&self) -> ResolvedEmbeddingTarget {
+        let mut target = remote_target(self.provider.load(Ordering::SeqCst), self.cap);
+        if let EmbeddingBackendTarget::Remote {
+            runtime_epoch,
+            project,
+            ..
+        } = &mut target.backend
+        {
+            *runtime_epoch = self
+                .runtime_epoch
+                .load(Ordering::SeqCst)
+                .try_into()
+                .unwrap();
+            *project = self.project.read().unwrap().clone();
+        }
+        target
+    }
 }
 
 impl SearchModelResolverPort for SwitchingResolver {
@@ -57,12 +80,7 @@ impl SearchModelResolverPort for SwitchingResolver {
         _: Option<&'a FolderId>,
         _: Option<&'a ModelProfileId>,
     ) -> PortFuture<'a, Option<ResolvedEmbeddingTarget>> {
-        Box::pin(async move {
-            Ok(Some(remote_target(
-                self.provider.load(Ordering::SeqCst),
-                self.cap,
-            )))
-        })
+        Box::pin(async move { Ok(Some(self.current_target())) })
     }
 
     fn acquire_remote_indexing_grant<'a>(
@@ -93,6 +111,7 @@ impl SearchModelResolverPort for SwitchingResolver {
 struct ModelProvider {
     queries: Mutex<Vec<ProviderResourceId>>,
     parts: AtomicUsize,
+    outside_parts: AtomicUsize,
     fail_indexing: AtomicBool,
 }
 
@@ -113,12 +132,19 @@ impl EmbeddingProviderPort for ModelProvider {
                 self.queries.lock().unwrap().push(request.provider.clone());
             } else {
                 self.parts.fetch_add(request.inputs.len(), Ordering::SeqCst);
+                if request.project.is_none() {
+                    self.outside_parts
+                        .fetch_add(request.inputs.len(), Ordering::SeqCst);
+                }
                 if self.fail_indexing.load(Ordering::SeqCst) {
                     return Err(DomainError::AccessDenied.into());
                 }
             }
             let mut vector = vec![0.0; 64];
-            vector[usize::from(request.provider == ProviderResourceId::from_bytes([6; 16]))] = 1.0;
+            let runtime_epoch = request.runtime_epoch().unwrap().get() as usize;
+            let provider_offset =
+                usize::from(request.provider == ProviderResourceId::from_bytes([6; 16]));
+            vector[2 * runtime_epoch + provider_offset] = 1.0;
             Ok(EmbeddingResult {
                 model: request.model,
                 dimension: 64,
@@ -176,7 +202,9 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
     });
     let resolver = Arc::new(SwitchingResolver {
         provider: AtomicU8::new(5),
+        runtime_epoch: AtomicU64::new(1),
         cap: 512,
+        project: RwLock::new(None),
     });
     let provider = Arc::new(ModelProvider::default());
     let carriers = Arc::new(ControlledCarriers::new(store.clone()));
@@ -229,9 +257,31 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
             .iter()
             .all(|id| id == &ProviderResourceId::from_bytes([5; 16]))
     );
+    provider.fail_indexing.store(true, Ordering::SeqCst);
     carriers.release_seed.notify_one();
     carriers.reject_seed.store(false, Ordering::SeqCst);
     let layout = SearchLayout::open(&root, space.scope.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let _ = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
+            if provider.parts.load(Ordering::SeqCst) > 1
+                && layout.index_generations().unwrap() == [seeded.generation().unwrap()]
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let still_served = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
+    assert_eq!(still_served.hits[0].card.title, "Repeated note");
+    assert_eq!(
+        layout.search_manifest().unwrap().unwrap().active_model,
+        Some(remote_target(5, 512))
+    );
+    let attempts = provider.parts.load(Ordering::SeqCst);
+    provider.fail_indexing.store(false, Ordering::SeqCst);
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let _ = engine.search(ctx.clone(), semantic.clone()).await.unwrap();
@@ -259,7 +309,7 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         provider.queries.lock().unwrap().last(),
         Some(&ProviderResourceId::from_bytes([6; 16]))
     );
-    assert_eq!(provider.parts.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.parts.load(Ordering::SeqCst), attempts + 1);
 
     provider.fail_indexing.store(true, Ordering::SeqCst);
     let edited = sample_note_id(0x6b);
@@ -276,16 +326,21 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
         .unwrap();
     {
         let mut snapshot = projection.snapshot.write().unwrap();
-        snapshot.index(edited.clone(), folder);
+        snapshot.index(edited.clone(), folder.clone());
         snapshot.set_status(edited.clone(), "done");
         snapshot.advance(edit.last_seq);
     }
-    projection.live.write().unwrap().insert(edited);
+    projection.live.write().unwrap().insert(edited.clone());
     let before_restart = acknowledged(&store, &root, &space.scope, edit.last_seq).await;
     assert!(before_restart.embeddings_pending);
     engine.shutdown().await;
+    let orphan = root
+        .search(&space.scope.space_id, SearchIndexKind::Vector)
+        .join("ffffffffffffffff");
+    std::fs::create_dir(&orphan).unwrap();
+    std::fs::write(orphan.join("pending-segment"), b"abandoned epoch").unwrap();
     provider.fail_indexing.store(false, Ordering::SeqCst);
-    let engine = start(resolver);
+    let engine = start(resolver.clone());
     engine.start_space(space.scope.clone()).unwrap();
     tokio::time::timeout(Duration::from_secs(8), async {
         while layout
@@ -299,6 +354,10 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
     })
     .await
     .unwrap();
+    assert!(
+        !orphan.exists(),
+        "reopen must drop an abandoned replacement"
+    );
     let mut recovered_query = semantic;
     recovered_query.filter.predicate = notarium_core::query::Predicate::Eq {
         key: "status".to_owned(),
@@ -307,12 +366,137 @@ pub async fn model_epochs_and_repair(store: Arc<CanonicalStore>, root: DataRoot)
     let recovered = engine.search(ctx.clone(), recovered_query).await.unwrap();
     assert!(recovered.degraded.is_none());
     assert_eq!(recovered.hits[0].card.title, "Recoverable note");
+
+    resolver.runtime_epoch.store(2, Ordering::SeqCst);
+    let version_two = resolver.current_target();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let result = engine
+                .search(ctx.clone(), query("vectorprobe"))
+                .await
+                .unwrap();
+            if layout
+                .search_manifest()
+                .unwrap()
+                .unwrap()
+                .active_model
+                .as_ref()
+                == Some(&version_two)
+                && !result.hits.is_empty()
+                && result.degraded.is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let project = sample_folder_id(0x6c);
+    store
+        .create_folder(CreateFolderSpec {
+            scope: space.scope.clone(),
+            active_epoch: lease,
+            folder_id: project.clone(),
+            parent: Some(folder.clone()),
+            slug: "embedding-scope".into(),
+            display_name: "Embedding scope".into(),
+            is_project: true,
+            project_slug: Some("embedding-scope".into()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let scoped_note = sample_note_id(0x6c);
+    let (range, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &space.scope,
+            lease,
+            &owner,
+            vec![note(&scoped_note, &project, "Project note", "inside scope")],
+        )
+        .await
+        .unwrap();
+    {
+        let mut view = projection.snapshot.write().unwrap();
+        view.project(project.clone(), folder.clone());
+        view.index(scoped_note.clone(), project.clone());
+        view.advance(range.last_seq);
+    }
+    projection.live.write().unwrap().insert(scoped_note.clone());
+    acknowledged(&store, &root, &space.scope, range.last_seq).await;
+    let previous_outside_parts = provider.outside_parts.load(Ordering::SeqCst);
+    *resolver.project.write().unwrap() = Some(FolderRef {
+        space_id: space.scope.space_id.clone(),
+        folder_id: project.clone(),
+    });
+    let narrowed = resolver.current_target();
+    let (outside, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &space.scope,
+            lease,
+            &owner,
+            vec![note(
+                &edited,
+                &folder,
+                "Recoverable note",
+                "durable retry content changed",
+            )],
+        )
+        .await
+        .unwrap();
+    projection
+        .snapshot
+        .write()
+        .unwrap()
+        .advance(outside.last_seq);
+    acknowledged(&store, &root, &space.scope, outside.last_seq).await;
+    let mut scoped = query("vectorprobe");
+    scoped.folder = Some(project);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let result = engine.search(ctx.clone(), scoped.clone()).await.unwrap();
+            if layout
+                .search_manifest()
+                .unwrap()
+                .unwrap()
+                .active_model
+                .as_ref()
+                == Some(&narrowed)
+                && result
+                    .hits
+                    .iter()
+                    .any(|hit| hit.card.document.provenance().reference().note_id == scoped_note)
+                && result.degraded.is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        provider.outside_parts.load(Ordering::SeqCst),
+        previous_outside_parts
+    );
     engine.shutdown().await;
 
-    let undersized = start(Arc::new(SwitchingResolver {
+    let cold_root = DataRoot::new(root.root().join("undersized"));
+    std::fs::create_dir(cold_root.root()).unwrap();
+    let layout = SearchLayout::open(&cold_root, space.scope.clone()).unwrap();
+    let mut deps = SearchDependencies::new(store, projection);
+    deps.model_resolver = Some(Arc::new(SwitchingResolver {
         provider: AtomicU8::new(6),
+        runtime_epoch: AtomicU64::new(1),
         cap: 8,
+        project: RwLock::new(None),
     }));
+    deps.providers = Some(provider);
+    let undersized =
+        SearchEngine::start(SearchConfig::new(cold_root, VectorMode::RemoteOnly), deps);
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let result = undersized
@@ -358,6 +542,7 @@ impl SearchModelResolverPort for Resolver {
                 max_input_tokens: 1024,
                 backend: EmbeddingBackendTarget::Remote {
                     provider: self.provider.clone(),
+                    runtime_epoch: std::num::NonZeroU64::MIN,
                     project: None,
                 },
             }))

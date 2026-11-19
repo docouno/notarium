@@ -79,7 +79,12 @@ pub(super) async fn seed(
     let embedder = match &target {
         Some(target) => match cx.services.embedder(target.clone()).await {
             Ok(embedder) => Some(Arc::new(embedder)),
-            Err(error) if prior.and_then(|disk| disk.epoch.as_ref()).is_some() => {
+            Err(error)
+                if prior.is_some_and(|disk| {
+                    disk.manifest.vector_seq.is_some()
+                        || disk.manifest.active_model.as_ref() == Some(target)
+                }) =>
+            {
                 return Err(error.into());
             }
             Err(_) => None,
@@ -103,6 +108,13 @@ pub(super) async fn seed(
             embedder.as_deref().zip(vectors.as_mut()),
         )
         .await?;
+        if prior.is_some_and(|disk| disk.manifest.vector_seq.is_some())
+            && vectors.as_ref().is_some_and(|vectors| vectors.pending)
+        {
+            // Keep serving the prior epoch until the selected backend can
+            // embed the eligible replacement corpus.
+            return Err(crate::embed::EmbeddingError::ModelUnavailable.into());
+        }
         seed_chats(cx, &layout, &lexical, &mut folders, cutoff).await?;
         lexical.commit_seed(&cx.services.writers)?;
         if let Some(model) = &model {
@@ -115,6 +127,9 @@ pub(super) async fn seed(
             }
             None => (None, target.is_some()),
         };
+        if prior.is_some() && cx.services.model_target(&cutoff.scope, None, None).await? != target {
+            return Err(IndexError::Inconsistent);
+        }
         let manifest = SearchManifest {
             scope: cutoff.scope.clone(),
             tantivy_seq: cutoff.after,
@@ -133,6 +148,7 @@ pub(super) async fn seed(
             epoch,
             embedder,
             embedding_failures: 0,
+            vector_last_use: std::time::Instant::now(),
         })
     }
     .await;
@@ -154,6 +170,33 @@ pub(super) async fn seed(
     // startup removes all unreferenced generations before exposing the cut.
     disk.layout.publish_search(&disk.manifest)?;
     Ok(disk)
+}
+
+pub(super) async fn refresh_model(
+    cx: &Context<'_>,
+    publisher: &mut Publisher<'_>,
+    disk: &mut Disk,
+) -> Result<Option<Disk>, IndexError> {
+    let cutoff = disk.cursor();
+    let selected = cx.services.model_target(&cutoff.scope, None, None).await?;
+    if disk.manifest.active_model == selected
+        && (selected.is_none() || disk.manifest.vector_seq.is_some())
+    {
+        return Ok(None);
+    }
+    disk.resume_vectors().await?;
+    if disk.resume_reader(cx)? {
+        if disk.embedder.is_none()
+            && let Some(active) = disk.manifest.active_model.clone()
+            && disk.epoch.is_some()
+        {
+            disk.embedder = cx.services.embedder(active).await.ok().map(Arc::new);
+        }
+        publisher.publish(disk);
+    }
+    seed(cx, disk.layout.clone(), &cutoff, Some(disk))
+        .await
+        .map(Some)
 }
 
 pub(super) async fn publish_seed(
