@@ -1,0 +1,262 @@
+use super::*;
+use notarium_core::{
+    auth::{EngineAuthContext, SpaceGrant, SpaceRole, VerifiedHuman},
+    classes::DocClass,
+    ids::{
+        GrantId, HistoryIncarnation, ModelProfileId, PrincipalId, ProviderResourceId, RequestId,
+        SpaceId,
+    },
+    model::HistoryScope,
+    ports::{
+        CallBudget, Cancellation, EmbeddingInput, EmbeddingProviderPort, EmbeddingQueryInput,
+        EmbeddingRequest, EmbeddingResult, PortFuture, ProviderUsage, SpaceContext,
+    },
+};
+use notarium_syntax::chunk::TokenizerBudget;
+use std::{
+    collections::BTreeMap,
+    future::{Future, poll_fn},
+    pin::{Pin, pin},
+    sync::{Arc, Mutex},
+    task::Poll,
+    time::Duration,
+};
+use tokio::sync::oneshot;
+
+fn profile() -> ModelProfileId {
+    ModelProfileId::from_bytes([1; 16])
+}
+
+fn budget(remaining: Duration) -> CallBudget {
+    CallBudget {
+        request: RequestId::from_bytes([2; 16]),
+        cancellation: Cancellation::default(),
+        remaining,
+    }
+}
+
+#[test]
+fn local_wordpiece_bpe_unigram_and_remote_counts_match_served_input() {
+    let wordpiece = LocalTokenizerBudget::from_json(
+        br###"{
+        "normalizer":{"type":"BertNormalizer","lowercase":true},
+        "pre_tokenizer":{"type":"BertPreTokenizer"},
+        "post_processor":{"type":"BertProcessing","cls":["[CLS]",101],"sep":["[SEP]",102]},
+        "model":{"type":"WordPiece","vocab":{"[UNK]":0,"run":2,"##ning":3,"!":4,"cafe":5},
+        "unk_token":"[UNK]","continuing_subword_prefix":"##","max_input_chars_per_word":100}
+    }"###,
+        profile(),
+        512,
+    )
+    .unwrap();
+    assert_eq!(
+        wordpiece.encode("Running café!").unwrap().ids,
+        [101, 2, 3, 5, 4, 102]
+    );
+    assert_eq!(wordpiece.count("Running café!").unwrap(), 6);
+
+    let bpe = LocalTokenizerBudget::from_json(
+        br#"{
+        "pre_tokenizer":{"type":"WhitespaceSplit"},
+        "model":{"type":"BPE","unk_token":"?","vocab":{"?":0,"a":1,"b":2,"c":3,"ab":4,"bc":5},
+        "merges":[["b","c"],"a b"]}
+    }"#,
+        profile(),
+        512,
+    )
+    .unwrap();
+    assert_eq!(bpe.encode("abc ab").unwrap().ids, [1, 5, 4]);
+    assert_eq!(bpe.count("  ").unwrap(), 1);
+
+    let unigram = LocalTokenizerBudget::from_json(r#"{
+        "pre_tokenizer":{"type":"Metaspace","replacement":"▁","prepend_scheme":"always"},
+        "model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",-3],["▁",-1],["кот",-1],["▁кот",-0.5],["dog",-1]]}
+    }"#.as_bytes(), profile(), 512).unwrap();
+    assert_eq!(unigram.encode("кот dog").unwrap().ids, [3, 1, 4]);
+    assert_eq!(unigram.count("кот dog").unwrap(), 3);
+
+    let remote = RemoteConservativeTokenizerBudget::new(profile(), 1024);
+    assert_eq!(remote.max_tokens(), 512);
+    assert_eq!(remote.count("abcё🦀").unwrap(), 11);
+    assert_eq!(remote.split_hint("abcё🦀", 9), Some(3));
+}
+
+#[test]
+fn background_quanta_preserve_order_and_enforce_aggregate_caps() {
+    let chunks = bounded_batches(0..8, |_| 400, 1024).unwrap();
+    assert_eq!(chunks, [vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]]);
+    let chunks = bounded_batches(0..17, |_| 1, 1024).unwrap();
+    assert_eq!(chunks.iter().map(Vec::len).collect::<Vec<_>>(), [16, 1]);
+    assert!(matches!(
+        bounded_batches([0], |_| 1025, 1024),
+        Err(EmbeddingError::BudgetExceeded)
+    ));
+}
+
+// Polling through to the first await fixes enqueue order in the test.
+async fn queued<T>(mut task: Pin<&mut impl Future<Output = T>>) {
+    poll_fn(|ctx| {
+        assert!(task.as_mut().poll(ctx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn scheduler_prioritizes_interactive_then_live_edits_and_removes_expired_jobs() {
+    let (scheduler, worker) = EmbeddingScheduler::start();
+    let (started, running) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    let long = || budget(Duration::from_secs(5));
+    let first = scheduler.submit(Priority::BulkImportBackfill, long(), |_| async move {
+        started.send(()).unwrap();
+        released.await.unwrap();
+        Ok(vec![])
+    });
+    let mut first = pin!(first);
+    queued(first.as_mut()).await;
+    running.await.unwrap();
+
+    let expired = scheduler
+        .submit(
+            Priority::InteractiveSearchQuery,
+            budget(Duration::from_millis(5)),
+            |_| async { panic!("expired queued work must not reach the executor") },
+        )
+        .await;
+    assert!(matches!(expired, Err(EmbeddingError::BudgetExceeded)));
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let execute = |id| {
+        let events = events.clone();
+        move |_| async move {
+            events.lock().unwrap().push(id);
+            Ok(vec![])
+        }
+    };
+    let mut bulk = pin!(scheduler.submit(Priority::BulkImportBackfill, long(), execute(3)));
+    let mut live = pin!(scheduler.submit(Priority::LiveNoteEdit, long(), execute(2)));
+    let mut query = pin!(scheduler.submit(Priority::InteractiveSearchQuery, long(), execute(1)));
+    queued(bulk.as_mut()).await;
+    queued(live.as_mut()).await;
+    queued(query.as_mut()).await;
+    release.send(()).unwrap();
+    for outcome in [first.await, query.await, live.await, bulk.await] {
+        outcome.unwrap();
+    }
+    assert_eq!(*events.lock().unwrap(), [1, 2, 3]);
+    scheduler.shutdown();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn scheduler_signals_running_work_when_query_times_out_or_is_dropped() {
+    let (scheduler, worker) = EmbeddingScheduler::start();
+    let (timed_out, stopped) = oneshot::channel();
+    let result = scheduler
+        .submit(
+            Priority::InteractiveSearchQuery,
+            budget(Duration::from_secs(5)),
+            |budget| async move {
+                assert!(budget.remaining <= Duration::from_millis(150));
+                budget.cancellation.cancelled().await;
+                timed_out.send(()).unwrap();
+                Err(EmbeddingError::Cancelled)
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(EmbeddingError::BudgetExceeded)));
+    stopped.await.unwrap();
+
+    let (started, running) = oneshot::channel();
+    let (dropped, stopped) = oneshot::channel();
+    {
+        let mut abandoned = pin!(scheduler.submit(
+            Priority::LiveNoteEdit,
+            budget(Duration::from_secs(5)),
+            |budget| async move {
+                started.send(()).unwrap();
+                budget.cancellation.cancelled().await;
+                dropped.send(()).unwrap();
+                Err(EmbeddingError::Cancelled)
+            }
+        ));
+        queued(abandoned.as_mut()).await;
+        running.await.unwrap();
+    }
+    stopped.await.unwrap();
+    scheduler.shutdown();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn remote_queries_are_typed_and_tainted_or_oversize_input_never_dispatches() {
+    #[derive(Default)]
+    struct Provider(Mutex<Vec<EmbeddingRequest>>);
+    impl EmbeddingProviderPort for Provider {
+        fn embed(
+            &self,
+            _: SpaceContext,
+            request: EmbeddingRequest,
+        ) -> PortFuture<'_, EmbeddingResult> {
+            Box::pin(async move {
+                let model = request.model.clone();
+                self.0.lock().unwrap().push(request);
+                Ok(EmbeddingResult {
+                    model,
+                    dimension: 64,
+                    vectors: vec![Ok(vec![2.0; 64])],
+                    usage: ProviderUsage::Unknown,
+                })
+            })
+        }
+    }
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([5; 16]),
+        incarnation: HistoryIncarnation::from_bytes([6; 16]),
+    };
+    let classes = [DocClass::UserDoc].into_iter().collect();
+    let grant = SpaceGrant {
+        role: SpaceRole::Viewer,
+        read_classes: classes,
+        write_classes: Default::default(),
+        project_root: None,
+    };
+    let auth = EngineAuthContext::for_human(VerifiedHuman::attest(
+        PrincipalId::from_bytes([7; 16]),
+        GrantId::from_bytes([8; 16]),
+        BTreeMap::from([(scope.space_id.clone(), grant)]),
+        false,
+    ));
+    let ctx = SpaceContext::new(auth, scope, budget(Duration::from_secs(5))).unwrap();
+    let provider = Arc::new(Provider::default());
+    let remote = RemoteEmbedder::new(
+        provider.clone(),
+        profile(),
+        ProviderResourceId::from_bytes([9; 16]),
+        64,
+        16,
+    );
+    let input = EmbeddingQueryInput {
+        text: "literal query".to_owned(),
+        tokens: 12,
+        classes: [DocClass::UserDoc].into_iter().collect(),
+        project_scope: None,
+    };
+    let mut oversized = input.clone();
+    oversized.tokens = 17;
+    assert!(matches!(
+        remote.query(ctx.clone(), oversized).await,
+        Err(EmbeddingError::BudgetExceeded)
+    ));
+    let result = remote.query(ctx.clone(), input.clone()).await.unwrap();
+    assert_eq!(result, [Some(vec![0.125; 64])]);
+    ctx.auth().taint().mark_external_read();
+    assert!(matches!(
+        remote.query(ctx, input).await,
+        Err(EmbeddingError::ProviderUnavailable)
+    ));
+    let calls = provider.0.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(matches!(&calls[0].inputs[..], [EmbeddingInput::Query(_)]));
+}
