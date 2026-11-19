@@ -284,6 +284,208 @@ fn tombstones_are_durable_and_validate_slot_bounds() {
 }
 
 #[test]
+fn wal_rewrites_obsolete_overwrites_and_replays_the_latest_frame() {
+    let scratch = Scratch::new();
+    let mut buffer = MutableBuffer::open(&scratch.0, 4096).unwrap();
+    let mut chunk = fixture(1, 4096);
+    for number in 1u64..=512 {
+        let mut digest = [0; 32];
+        digest[..8].copy_from_slice(&number.to_le_bytes());
+        chunk.metadata.source = ContentDigest::from_bytes(digest);
+        buffer
+            .apply(
+                SpaceSeq::new(number).unwrap(),
+                MutableOperation::Upsert {
+                    note: chunk.metadata.note.clone(),
+                    chunks: vec![chunk.clone()],
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(buffer.len(), 1);
+    assert!(fs::metadata(scratch.0.join("l0.wal")).unwrap().len() < 1_100_000);
+    let reopened = MutableBuffer::open(&scratch.0, 4096).unwrap();
+    assert_eq!(reopened.last_seq(), SpaceSeq::new(512).unwrap());
+    assert_eq!(reopened.chunks().next().unwrap().metadata, chunk.metadata);
+}
+
+#[test]
+fn equal_vectors_stay_reachable_in_a_sealed_graph() {
+    let scratch = Scratch::new();
+    let vector = fixture(0, 64).vector;
+    let count = 128;
+    let mut builder = SegmentBuilder::new(&model(), 64).unwrap();
+    for slot in 0..count {
+        let mut chunk = fixture(slot, 64);
+        chunk.vector = vector.clone();
+        let mut key = [0; 32];
+        key[..4].copy_from_slice(&slot.to_le_bytes());
+        for salt in 0u32.. {
+            key[4..8].copy_from_slice(&salt.to_le_bytes());
+            if hnsw::node_level(&key, slot) == u8::from(slot == 0) {
+                break;
+            }
+        }
+        chunk.metadata.key = ContentDigest::from_bytes(key);
+        builder.push(chunk).unwrap();
+    }
+    let segment = builder
+        .finish(&scratch.0.join("equal.seg"))
+        .unwrap()
+        .unwrap();
+    let mut stack = vec![0];
+    let mut seen = Bitmap::new();
+    while let Some(slot) = stack.pop() {
+        if !seen.contains(slot) {
+            seen.add(slot);
+            stack.extend(segment.layer0_neighbors(slot));
+        }
+    }
+    assert_eq!(seen.cardinality(), u64::from(count));
+    let cancellation = Cancellation::default();
+    let budget = SearchBudget {
+        cancellation: &cancellation,
+        deadline: Instant::now() + Duration::from_secs(3),
+    };
+    let mut tail = Bitmap::new();
+    tail.add_range(33..count);
+    let approximate = segment
+        .search_mode(&vector, &tail, 10, budget, false)
+        .unwrap();
+    assert_eq!(approximate.neighbors.len(), 10);
+    assert!(approximate.hnsw_hops > 0);
+    assert!(
+        approximate
+            .neighbors
+            .iter()
+            .all(|row| tail.contains(row.slot))
+    );
+}
+
+#[test]
+fn selective_exact_uses_each_sealed_segment_cardinality() {
+    use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
+    use std::collections::BTreeSet;
+
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([1; 16]),
+        incarnation: HistoryIncarnation::from_bytes([1; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let mut epoch = VectorEpoch::open(layout, model(), 64).unwrap();
+    let vector = fixture(0, 64).vector;
+    let count = EXACT_SCAN_LIMIT as u32;
+    let rows = (0..count)
+        .map(|slot| {
+            let mut row = fixture(slot, 64);
+            row.metadata.folder = 1;
+            row
+        })
+        .collect();
+    epoch
+        .seed(
+            SegmentBuilder::with_test_rows(&model(), 64, rows),
+            SpaceSeq::new(1).unwrap(),
+        )
+        .unwrap();
+    let mut mutable = fixture(count + 1, 64);
+    mutable.metadata.folder = 1;
+    epoch
+        .apply(
+            SpaceSeq::new(2).unwrap(),
+            MutableOperation::Upsert {
+                note: mutable.metadata.note.clone(),
+                chunks: vec![mutable],
+            },
+        )
+        .unwrap();
+    let folders = Bitmap::of(&[1]);
+    let classes = BTreeSet::from([DocClass::UserDoc]);
+    let filter = VectorFilter {
+        classes: &classes,
+        folders: Some(&folders),
+        notes: None,
+        excluded: None,
+    };
+    let snapshot = epoch.snapshot();
+    let cancellation = Cancellation::default();
+    let budget = SearchBudget {
+        cancellation: &cancellation,
+        deadline: Instant::now() + Duration::from_secs(3),
+    };
+    let exact = snapshot.search(&vector, &filter, 10, budget).unwrap();
+    assert_eq!(exact.hnsw_hops, 0);
+    assert_eq!(exact.hits[0].metadata.note, fixture(0, 64).metadata.note);
+}
+
+#[test]
+fn exact_ties_survive_compaction_and_the_epoch_rejects_mixed_dimensions() {
+    use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
+    use std::collections::BTreeSet;
+
+    let scratch = Scratch::new();
+    let scope = HistoryScope {
+        space_id: SpaceId::from_bytes([1; 16]),
+        incarnation: HistoryIncarnation::from_bytes([1; 16]),
+    };
+    let layout = Arc::new(SearchLayout::open(&DataRoot::new(&scratch.0), scope).unwrap());
+    let directory = layout.model_epoch(&model()).unwrap();
+    let mut epoch = VectorEpoch::open(layout.clone(), model(), 64).unwrap();
+    let first = fixture(1, 64);
+    let mut second = fixture(2, 64);
+    second.vector = first.vector.clone();
+    let mut builder = SegmentBuilder::new(&model(), 64).unwrap();
+    builder.push(second).unwrap();
+    epoch.seed(builder, SpaceSeq::new(1).unwrap()).unwrap();
+    epoch
+        .apply(
+            SpaceSeq::new(2).unwrap(),
+            MutableOperation::Upsert {
+                note: first.metadata.note.clone(),
+                chunks: vec![first.clone()],
+            },
+        )
+        .unwrap();
+    let cancellation = Cancellation::default();
+    let budget = SearchBudget {
+        cancellation: &cancellation,
+        deadline: Instant::now() + Duration::from_secs(3),
+    };
+    let classes = BTreeSet::from([DocClass::UserDoc]);
+    let filter = VectorFilter {
+        classes: &classes,
+        folders: None,
+        notes: None,
+        excluded: None,
+    };
+    let best = |epoch: &VectorEpoch| {
+        epoch
+            .snapshot()
+            .search(&first.vector, &filter, 1, budget)
+            .unwrap()
+            .hits
+            .remove(0)
+            .metadata
+            .note
+    };
+    assert_eq!(best(&epoch), first.metadata.note);
+    epoch.compact().unwrap();
+    assert_eq!(best(&epoch), first.metadata.note);
+    let id = epoch.snapshot().manifest().active_segments[0];
+    let path = directory.join(format!("seg_{id:016x}.seg"));
+    drop(epoch);
+    fs::remove_file(&path).unwrap();
+    let mut wrong = SegmentBuilder::new(&model(), 128).unwrap();
+    wrong.push(fixture(1, 128)).unwrap();
+    wrong.finish(&path).unwrap().unwrap();
+    assert!(matches!(
+        VectorEpoch::open(layout, model(), 64),
+        Err(VectorError::InvalidDimension)
+    ));
+}
+
+#[test]
 fn epoch_restarts_compacts_and_scrubs_obsolete_carriers() {
     use notarium_core::{epoch::DataRoot, ids::HistoryIncarnation, model::HistoryScope};
     use std::collections::BTreeSet;

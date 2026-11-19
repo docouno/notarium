@@ -123,7 +123,7 @@ pub(super) async fn seed(
             layout: layout.clone(),
             manifest,
             folders: Arc::new(folders),
-            lexical,
+            lexical: Some(lexical),
             epoch,
         })
     }

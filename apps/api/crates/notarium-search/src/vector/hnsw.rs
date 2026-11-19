@@ -36,6 +36,36 @@ impl Ord for Neighbor {
     }
 }
 
+pub(super) struct ExactNeighbor<'a> {
+    pub hit: Neighbor,
+    pub note: &'a [u8],
+    pub span: usize,
+    pub key: &'a [u8],
+}
+
+impl PartialEq for ExactNeighbor<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for ExactNeighbor<'_> {}
+impl PartialOrd for ExactNeighbor<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ExactNeighbor<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.hit
+            .score
+            .total_cmp(&other.hit.score)
+            .then_with(|| {
+                (other.note, other.span, other.key).cmp(&(self.note, self.span, self.key))
+            })
+            .then_with(|| other.hit.slot.cmp(&self.hit.slot))
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Similarity<'a> {
     dot: Dot<'a>,
@@ -159,7 +189,7 @@ pub(super) fn explore(
     })
 }
 
-pub(super) fn keep_best(heap: &mut BinaryHeap<Reverse<Neighbor>>, item: Neighbor, limit: usize) {
+pub(super) fn keep_best<T: Ord>(heap: &mut BinaryHeap<Reverse<T>>, item: T, limit: usize) {
     if heap.len() < limit {
         heap.push(Reverse(item));
     } else if heap.peek().is_some_and(|lowest| item > lowest.0) {
@@ -167,7 +197,7 @@ pub(super) fn keep_best(heap: &mut BinaryHeap<Reverse<Neighbor>>, item: Neighbor
     }
 }
 
-pub(super) fn finish(heap: BinaryHeap<Reverse<Neighbor>>) -> Vec<Neighbor> {
+pub(super) fn finish<T: Ord>(heap: BinaryHeap<Reverse<T>>) -> Vec<T> {
     heap.into_sorted_vec()
         .into_iter()
         .map(|item| item.0)
@@ -337,6 +367,14 @@ impl BuilderGraph {
                     diversify(&graph, explored.neighbors, degree(layer))?;
             }
         }
+        // Keep a bounded spanning tree at layer zero. Equal vectors can otherwise
+        // make every full reverse list prefer earlier slots over a new node.
+        let parent = (slot - 1) / 2;
+        let base = &mut neighbors_by_level[0];
+        if !base.contains(&parent) {
+            base.truncate(M0 - 1);
+            base.push(parent);
+        }
         self.nodes.push(Node {
             chunk,
             edges: neighbors_by_level,
@@ -368,10 +406,23 @@ impl BuilderGraph {
             .map(|candidate| scorer.score_node(&graph, candidate))
             .collect();
         candidates.sort_unstable_by(|left, right| right.cmp(left));
-        self.nodes[node as usize].edges[usize::from(layer)] =
-            diversify(&graph, candidates, degree(layer))?;
+        let (required, candidates): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|candidate| layer == 0 && linked_at_base(node, candidate.slot));
+        let mut chosen = diversify(&graph, candidates, degree(layer) - required.len())?;
+        chosen.extend(required.into_iter().map(|candidate| candidate.slot));
+        self.nodes[node as usize].edges[usize::from(layer)] = chosen;
         Ok(())
     }
+}
+
+fn linked_at_base(left: u32, right: u32) -> bool {
+    let (early, late) = if left < right {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    late > early && (late - 1) / 2 == early
 }
 
 fn diversify(
@@ -383,6 +434,17 @@ fn diversify(
         return Ok(candidates
             .into_iter()
             .map(|neighbor| neighbor.slot)
+            .collect());
+    }
+    let (first, scale) = graph.vector(candidates[0].slot);
+    if candidates[1..].iter().all(|candidate| {
+        let (vector, candidate_scale) = graph.vector(candidate.slot);
+        candidate_scale.to_bits() == scale.to_bits() && vector == first
+    }) {
+        return Ok(candidates
+            .into_iter()
+            .take(limit)
+            .map(|candidate| candidate.slot)
             .collect());
     }
     let mut keep = Vec::with_capacity(limit);
@@ -410,7 +472,7 @@ fn degree(layer: u8) -> usize {
     if layer == 0 { M0 } else { M }
 }
 
-fn node_level(key: &[u8; 32], slot: u32) -> u8 {
+pub(super) fn node_level(key: &[u8; 32], slot: u32) -> u8 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(key);
     hasher.update(&slot.to_le_bytes());

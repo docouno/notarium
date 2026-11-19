@@ -22,14 +22,15 @@ use std::{
 };
 
 pub(super) fn requires_scrub(disk: &Disk, changes: &[Change]) -> Result<bool, IndexError> {
-    let searcher = disk.lexical.searcher();
+    let lexical = disk.lexical.as_ref().ok_or(IndexError::Inconsistent)?;
+    let searcher = lexical.searcher();
     for change in changes {
         if change.kind == ChangeKind::Purge || change.lifecycle == Lifecycle::Purged {
             return Ok(true);
         }
         if change.class == Some(DocClass::EncryptedNote)
             && let EntityId::Note(note) = &change.entity
-            && disk.lexical.contains_note(&searcher, note)?
+            && lexical.contains_note(&searcher, note)?
         {
             return Ok(true);
         }
@@ -64,7 +65,12 @@ pub(super) async fn apply(
         return Ok(());
     }
 
-    let previous = disk.lexical.searcher();
+    let lexical = disk
+        .lexical
+        .as_ref()
+        .ok_or(IndexError::Inconsistent)?
+        .clone();
+    let previous = lexical.searcher();
     let folders = Arc::make_mut(&mut disk.folders);
     let old_folder_count = folders.len();
     let mut deleted = BTreeSet::new();
@@ -72,7 +78,7 @@ pub(super) async fn apply(
     for (note, (lifecycle, class)) in notes {
         if lifecycle == Lifecycle::Active && class != Some(DocClass::EncryptedNote) {
             active.push(note);
-        } else if disk.lexical.contains_note(&previous, &note)? {
+        } else if lexical.contains_note(&previous, &note)? {
             deleted.insert(note);
         }
     }
@@ -99,7 +105,7 @@ pub(super) async fn apply(
                     content,
                     folder,
                 });
-            } else if disk.lexical.contains_note(&previous, &id)? {
+            } else if lexical.contains_note(&previous, &id)? {
                 deleted.insert(id);
             }
         }
@@ -124,11 +130,11 @@ pub(super) async fn apply(
     if !updates.is_empty() {
         // The opstamp detects interrupted updates before a newer vector cut
         // could be paired with an older lexical publication on restart.
-        disk.lexical.apply(&cx.services.writers, &updates)?;
+        lexical.apply(&cx.services.writers, &updates)?;
         if !chat.removed.is_empty() {
-            disk.lexical.merge_deleted(&cx.services.writers)?;
+            lexical.merge_deleted(&cx.services.writers)?;
         }
-        disk.manifest.tantivy_commit = disk.lexical.commit_id()?;
+        disk.manifest.tantivy_commit = lexical.commit_id()?;
     }
     if disk.epoch.is_some() && (!updated_notes.is_empty() || !deleted.is_empty()) {
         let target = cx
@@ -147,7 +153,7 @@ pub(super) async fn apply(
     if !chat.removed.is_empty() {
         publisher.publish(disk);
         publisher.drain().await;
-        disk.lexical.collect_obsolete(&cx.services.writers)?;
+        lexical.collect_obsolete(&cx.services.writers)?;
         // Closing the durable cut also certifies that the redacted files have
         // been removed. Interrupted scrubs are replayed from the older cut.
         disk.layout.publish_search(&disk.manifest)?;
@@ -256,7 +262,8 @@ async fn reconcile_chats(
 ) -> Result<ChatChanges, IndexError> {
     let mut changes = ChatChanges::default();
     for thread in threads {
-        let mut obsolete = disk.lexical.live_chat_entries(previous, &thread)?;
+        let lexical = disk.lexical.as_ref().ok_or(IndexError::Inconsistent)?;
+        let mut obsolete = lexical.live_chat_entries(previous, &thread)?;
         let mut before = None;
         loop {
             let (page, next) = build::chat_page(cx, cutoff, &thread, before).await?;

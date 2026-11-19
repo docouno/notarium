@@ -23,20 +23,20 @@ type Entry = Arc<Mutex<Lease>>;
 
 #[derive(Clone, Default)]
 pub struct WriterPool {
-    leases: Arc<Mutex<HashMap<PathBuf, Entry>>>,
+    slots: Arc<Mutex<WriterSlots>>,
 }
 
-impl WriterPool {
-    fn checkout(&self, path: &Path) -> Result<Entry, LexicalError> {
-        let mut leases = self
-            .leases
-            .lock()
-            .map_err(|_| LexicalError::WriterUnavailable)?;
-        if let Some(lease) = leases.get(path) {
-            return Ok(lease.clone());
-        }
-        if leases.len() >= MAX_ACTIVE_WRITERS {
-            let oldest = leases
+#[derive(Default)]
+struct WriterSlots {
+    leases: HashMap<PathBuf, Entry>,
+    temporary: usize,
+}
+
+impl WriterSlots {
+    fn admit(&mut self) -> Result<(), LexicalError> {
+        if self.leases.len() + self.temporary >= MAX_ACTIVE_WRITERS {
+            let oldest = self
+                .leases
                 .iter()
                 .filter(|(_, entry)| Arc::strong_count(entry) == 1)
                 .filter_map(|(path, lease)| {
@@ -46,15 +46,57 @@ impl WriterPool {
                 .min_by_key(|(_, last_used)| *last_used)
                 .map(|(path, _)| path.clone())
                 .ok_or(LexicalError::WriterUnavailable)?;
-            leases.remove(&oldest);
+            self.leases.remove(&oldest);
         }
+        Ok(())
+    }
+}
+
+struct TemporarySlot<'a>(&'a Mutex<WriterSlots>);
+
+impl Drop for TemporarySlot<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = self.0.lock() {
+            slots.temporary -= 1;
+        }
+    }
+}
+
+impl WriterPool {
+    fn checkout(&self, path: &Path) -> Result<Entry, LexicalError> {
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| LexicalError::WriterUnavailable)?;
+        if let Some(lease) = slots.leases.get(path) {
+            return Ok(lease.clone());
+        }
+        slots.admit()?;
         let lease = Arc::new(Mutex::new(Lease {
             writer: None,
             last_used: Instant::now(),
             staged: false,
         }));
-        leases.insert(path.to_owned(), lease.clone());
+        slots.leases.insert(path.to_owned(), lease.clone());
         Ok(lease)
+    }
+
+    pub(super) fn with_temporary_writer<T>(
+        &self,
+        index: &Index,
+        operation: impl FnOnce(&mut IndexWriter) -> Result<T, LexicalError>,
+    ) -> Result<T, LexicalError> {
+        {
+            let mut slots = self
+                .slots
+                .lock()
+                .map_err(|_| LexicalError::WriterUnavailable)?;
+            slots.admit()?;
+            slots.temporary += 1;
+        }
+        let _slot = TemporarySlot(&self.slots);
+        let mut writer = index.writer_with_num_threads(1, WRITER_BUDGET)?;
+        operation(&mut writer)
     }
 
     pub(super) fn with_writer<T>(
@@ -84,34 +126,35 @@ impl WriterPool {
     }
 
     pub fn open_leases(&self) -> Result<usize, LexicalError> {
-        Ok(self
-            .leases
+        let slots = self
+            .slots
             .lock()
-            .map_err(|_| LexicalError::WriterUnavailable)?
-            .len())
+            .map_err(|_| LexicalError::WriterUnavailable)?;
+        Ok(slots.leases.len() + slots.temporary)
     }
 
     pub fn release(&self, path: &Path) -> Result<(), LexicalError> {
-        let mut leases = self
-            .leases
+        let mut slots = self
+            .slots
             .lock()
             .map_err(|_| LexicalError::WriterUnavailable)?;
-        if leases
+        if slots
+            .leases
             .get(path)
             .is_some_and(|lease| Arc::strong_count(lease) > 1)
         {
             return Err(LexicalError::WriterUnavailable);
         }
-        leases.remove(path);
+        slots.leases.remove(path);
         Ok(())
     }
 
     fn reap_idle(&self) -> Result<(), LexicalError> {
-        let mut leases = self
-            .leases
+        let mut slots = self
+            .slots
             .lock()
             .map_err(|_| LexicalError::WriterUnavailable)?;
-        leases.retain(|_, entry| {
+        slots.leases.retain(|_, entry| {
             Arc::strong_count(entry) > 1
                 || entry
                     .lock()

@@ -21,7 +21,10 @@ use notarium_core::{
 use std::{
     collections::HashMap,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -89,6 +92,15 @@ pub(super) struct SpaceHandle {
     pub epoch: watch::Sender<u64>,
     pub wake: Notify,
     pub stop: Cancellation,
+    pub active_queries: AtomicUsize,
+}
+
+pub(super) struct QueryPin<'a>(&'a AtomicUsize);
+
+impl Drop for QueryPin<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
 }
 
 impl SpaceHandle {
@@ -98,7 +110,13 @@ impl SpaceHandle {
             epoch: watch::channel(0).0,
             wake: Notify::new(),
             stop: Cancellation::default(),
+            active_queries: AtomicUsize::new(0),
         }
+    }
+
+    pub fn pin_query(&self) -> QueryPin<'_> {
+        self.active_queries.fetch_add(1, Ordering::AcqRel);
+        QueryPin(&self.active_queries)
     }
 
     pub fn replace(&self, state: Option<Arc<Published>>) -> Option<Arc<Published>> {

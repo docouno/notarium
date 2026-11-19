@@ -22,7 +22,7 @@ use notarium_canonical::chats::search::HydratedChatHit;
 use notarium_core::{
     DomainError,
     classes::{DocClass, SearchContent},
-    ids::{ChatThreadId, NoteId, ThreadEntrySeq},
+    ids::{ChatThreadId, NoteId, PrincipalId, ThreadEntrySeq},
     ports::{ChatThreadKind, StructuralSnapshot},
 };
 use std::{
@@ -93,10 +93,9 @@ pub struct LexicalIndex {
 }
 
 impl LexicalIndex {
-    pub(crate) fn validate_query(text: &str, filtered: bool) -> Result<(), LexicalError> {
+    pub(crate) fn is_empty_query(text: &str, filtered: bool) -> Result<bool, LexicalError> {
         static FIELDS: std::sync::LazyLock<Fields> = std::sync::LazyLock::new(Fields::new);
-        QueryPlan::parse(text, &FIELDS.bodies, filtered)?;
-        Ok(())
+        Ok(QueryPlan::parse(text, &FIELDS.bodies, filtered)?.is_empty())
     }
 
     pub fn create(path: &Path) -> Result<Self, LexicalError> {
@@ -345,6 +344,7 @@ impl LexicalIndex {
     /// Score only receipt-bound rows already admitted by the query filters.
     /// A RAM directory uses the same schema, tokenizers and query parser.
     pub(crate) fn rank_overlay(
+        writers: &WriterPool,
         text: &str,
         updates: &[Update<'_>],
         filtered: bool,
@@ -355,13 +355,13 @@ impl LexicalIndex {
         let fields = Fields::new();
         let index = Index::create_in_ram(fields.schema.clone());
         let lexical = Self::from_index(PathBuf::new(), index, fields)?;
-        let mut writer = lexical
-            .index
-            .writer_with_num_threads(1, pool::WRITER_BUDGET)?;
-        for (_, document) in lexical.mutations(updates)? {
-            writer.add_document(document.ok_or(LexicalError::CorruptIndex)?)?;
-        }
-        writer.commit()?;
+        writers.with_temporary_writer(&lexical.index, |writer| {
+            for (_, document) in lexical.mutations(updates)? {
+                writer.add_document(document.ok_or(LexicalError::CorruptIndex)?)?;
+            }
+            writer.commit()?;
+            Ok(())
+        })?;
         lexical.reader.reload()?;
         let searcher = lexical.searcher();
         let plan = QueryPlan::parse(text, &lexical.fields.bodies[..3], filtered)?;
@@ -474,12 +474,18 @@ impl<'a> LexicalFilter<'a> {
             notes,
             classes,
             include_chats,
+            chat_viewer: None,
             excluded: None,
         }
     }
 
     pub fn excluding(mut self, notes: &'a BTreeSet<NoteId>) -> Self {
         self.excluded = Some(notes);
+        self
+    }
+
+    pub fn visible_chats_for(mut self, principal: &'a PrincipalId) -> Self {
+        self.chat_viewer = Some(principal);
         self
     }
 }

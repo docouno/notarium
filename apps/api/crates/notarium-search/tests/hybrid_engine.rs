@@ -739,6 +739,8 @@ async fn sqlite_hybrid_seed_causal_boundaries_and_scrub() {
     let store = Arc::new(store);
     run_scenario(store.clone(), data.data_root(), 0x42).await;
     hybrid_support::remote::lexical_fallback(store.clone(), data.data_root()).await;
+    chat_candidate_visibility(store.clone(), data.data_root()).await;
+    reader_capacity(store.clone(), data.data_root()).await;
     purge_and_rebind(store, data.data_root()).await;
     runtime.shutdown().await.unwrap();
 }
@@ -757,9 +759,240 @@ async fn postgres_hybrid_seed_causal_boundaries_and_scrub() {
     let store = Arc::new(store);
     run_scenario(store.clone(), data.data_root(), 0x43).await;
     hybrid_support::remote::lexical_fallback(store.clone(), data.data_root()).await;
+    chat_candidate_visibility(store.clone(), data.data_root()).await;
     purge_and_rebind(store, data.data_root()).await;
     runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
+}
+
+async fn reader_capacity(store: Arc<CanonicalStore>, root: DataRoot) {
+    async fn seed(
+        store: &CanonicalStore,
+        tag: u8,
+    ) -> (HistoryScope, SpaceSeq, notarium_core::ids::RevisionId) {
+        let owner = sample_principal_id(tag);
+        let folder = sample_folder_id(tag);
+        let note_id = sample_note_id(tag);
+        let lease = LeaseEpoch::new(1).unwrap();
+        let space = store
+            .create_space(CreateSpaceSpec {
+                space_id: sample_space_id(tag),
+                incarnation: sample_incarnation(tag),
+                root_folder_id: folder.clone(),
+                slug: format!("reader-{tag}"),
+                kind: SpaceKind::Personal,
+                owner: owner.clone(),
+                active_epoch: lease,
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap();
+        let (range, revisions) = store
+            .commit_synthetic_note_batch_for_test(
+                &space.scope,
+                lease,
+                &owner,
+                vec![note(
+                    &note_id,
+                    &folder,
+                    "Capacity receipt",
+                    "readercapacitykeyword",
+                )],
+            )
+            .await
+            .unwrap();
+        (space.scope, range.last_seq, revisions[0].1.clone())
+    }
+    let tag = 0x90;
+    let (first, first_seq, revision) = seed(&store, tag).await;
+    let note = sample_note_id(tag);
+    let folder = sample_folder_id(tag);
+    let mut view = View::new(first.clone(), folder.clone());
+    view.index(note.clone(), folder);
+    view.advance(first_seq);
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(BTreeSet::from([note.clone()])),
+    });
+    let engine = SearchEngine::start(
+        SearchConfig::new(root.clone(), VectorMode::Disabled),
+        SearchDependencies::new(store.clone(), projection.clone()),
+    );
+    engine.start_space(first.clone()).unwrap();
+    acknowledged(&store, &root, &first, first_seq).await;
+    for tag in (tag + 1)..=(tag + 32) {
+        let (scope, seq, _) = seed(&store, tag).await;
+        engine.start_space(scope.clone()).unwrap();
+        acknowledged(&store, &root, &scope, seq).await;
+    }
+    let ctx = context(&first, &sample_principal_id(tag));
+    let hits = engine
+        .search(ctx.clone(), query("readercapacitykeyword"))
+        .await
+        .unwrap();
+    assert_eq!(hits.hits[0].card.title, "Capacity receipt");
+    let mut purge = mutation(
+        &ctx,
+        DeleteNote {
+            note: note.clone(),
+            disposition: DeleteDisposition::Purge,
+        },
+    );
+    purge.preconditions.revision = Some(revision);
+    let purged = store.delete_note(ctx, purge).await.unwrap();
+    projection.live.write().unwrap().remove(&note);
+    acknowledged(&store, &root, &first, purged.receipt.seq()).await;
+    assert_absent(
+        &root.search(&first.space_id, SearchIndexKind::Tantivy),
+        "readercapacitykeyword",
+    );
+    engine.shutdown().await;
+}
+
+async fn chat_candidate_visibility(store: Arc<CanonicalStore>, root: DataRoot) {
+    let owner = sample_principal_id(0x67);
+    let other = sample_principal_id(0x68);
+    let folder = sample_folder_id(0x67);
+    let project = sample_folder_id(0x68);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let space = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(0x67),
+            incarnation: sample_incarnation(0x67),
+            root_folder_id: folder.clone(),
+            slug: "shared-chat-search".to_owned(),
+            kind: SpaceKind::Shared,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    store
+        .create_folder(CreateFolderSpec {
+            scope: space.scope.clone(),
+            active_epoch: lease,
+            folder_id: project.clone(),
+            parent: None,
+            slug: "project".to_owned(),
+            display_name: "Project".to_owned(),
+            is_project: true,
+            project_slug: Some("project".to_owned()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let owner_ctx = context(&space.scope, &owner);
+    let other_ctx = context_with_grant(
+        &space.scope,
+        &other,
+        SpaceGrant {
+            role: SpaceRole::Editor,
+            read_classes: DocClass::all(),
+            write_classes: DocClass::all(),
+            project_root: None,
+        },
+    );
+    let shared = ChatThreadId::from_bytes([0x67; 16]);
+    let mut last = SpaceSeq::ZERO;
+    for (thread, ctx, kind, folder, body) in [
+        (
+            shared.clone(),
+            &owner_ctx,
+            ChatThreadKind::SpaceGroup,
+            Some(project.clone()),
+            format!("rankingterm {}", "background ".repeat(32)),
+        ),
+        (
+            ChatThreadId::from_bytes([0x68; 16]),
+            &other_ctx,
+            ChatThreadKind::Personal,
+            None,
+            "rankingterm rankingterm".to_owned(),
+        ),
+        (
+            ChatThreadId::from_bytes([0x69; 16]),
+            &other_ctx,
+            ChatThreadKind::Personal,
+            None,
+            "rankingterm rankingterm".to_owned(),
+        ),
+    ] {
+        store
+            .create_chat(
+                ctx.clone(),
+                mutation(
+                    ctx,
+                    CreateChat {
+                        thread: thread.clone(),
+                        kind,
+                        owner: ctx.auth().principal().clone(),
+                        project_folder: folder,
+                        title: "Search transcript".to_owned(),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let appended = store
+            .append_chat(
+                ctx.clone(),
+                mutation(
+                    ctx,
+                    AppendChat {
+                        thread,
+                        parent: ThreadEntrySeq::ZERO,
+                        kind: ChatEntryKind::Human,
+                        body: ChatInputBody::Text(body),
+                        referenced_notes: Vec::new(),
+                        tainted: false,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        last = appended.receipt.seq();
+    }
+    let mut view = View::new(space.scope.clone(), folder.clone());
+    view.folder(project.clone(), folder);
+    view.advance(last);
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(BTreeSet::new()),
+    });
+    let engine = SearchEngine::start(
+        SearchConfig::new(root.clone(), VectorMode::Disabled),
+        SearchDependencies::new(store.clone(), projection),
+    );
+    engine.start_space(space.scope.clone()).unwrap();
+    acknowledged(&store, &root, &space.scope, last).await;
+    let mut req = query("rankingterm");
+    req.include_chats = true;
+    req.top_k = PageLimit::new(1).unwrap();
+    let owner_results = engine.search(owner_ctx, req.clone()).await.unwrap();
+    assert_eq!(owner_results.chat_hits.len(), 1);
+    assert_eq!(owner_results.chat_hits[0].thread, shared);
+    assert!(!owner_results.truncated);
+    let other_results = engine.search(other_ctx, req.clone()).await.unwrap();
+    assert_eq!(other_results.chat_hits[0].kind, ChatThreadKind::Personal);
+    let viewer = context_with_grant(
+        &space.scope,
+        &other,
+        SpaceGrant {
+            role: SpaceRole::Viewer,
+            read_classes: DocClass::all(),
+            write_classes: BTreeSet::new(),
+            project_root: Some(project),
+        },
+    );
+    let viewer_results = engine.search(viewer, req).await.unwrap();
+    assert_eq!(viewer_results.chat_hits[0].thread, shared);
+    engine.shutdown().await;
 }
 
 async fn purge_and_rebind(store: Arc<CanonicalStore>, root: DataRoot) {

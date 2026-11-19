@@ -41,9 +41,11 @@ fn search_unsafe_is_limited_to_audited_leaves() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut directories = vec![root.join("src"), root.join("tests"), root.join("examples")];
     let permitted = ["src/vector/mmap_segment.rs", "src/vector/simd.rs"];
-    let block = ["un", "safe {"].concat();
+    let keyword = ["un", "safe"].concat();
     let function = ["un", "safe fn"].concat();
-    let allowance = ["allow(un", "safe_code)"].concat();
+    let lint = ["un", "safe_code"].concat();
+    assert!(has_word(&format!("#[allow(unused,\n{lint})]"), &lint));
+    assert!(has_word(&format!("{keyword}\n{{}}"), &keyword));
     while let Some(dir) = directories.pop() {
         for entry in fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
@@ -57,23 +59,31 @@ fn search_unsafe_is_limited_to_audited_leaves() {
             }
             let source = fs::read_to_string(&path).unwrap();
             let relative = path.strip_prefix(root).unwrap().to_str().unwrap();
+            if !permitted.contains(&relative) {
+                // The workspace lint rejects all executable occurrences. Only
+                // these two leaves may override the lint at any nesting level.
+                assert!(!has_word(&source, &lint), "{relative}: lint override");
+                continue;
+            }
             let mut proof = false;
             for line in source.lines() {
                 let trimmed = line.trim();
-                if trimmed.starts_with("// SAFETY:") {
-                    proof = true;
+                if let Some(safety) = trimmed.strip_prefix("// SAFETY:") {
+                    proof = !safety.trim().is_empty();
                 } else if trimmed.starts_with("//") {
                     continue;
-                } else if trimmed.contains(&block) {
-                    assert!(permitted.contains(&relative) && proof, "{relative}: {line}");
+                } else if has_word(trimmed, &keyword) && !trimmed.contains(&function) {
+                    assert!(proof, "{relative}: {line}");
                     proof = false;
                 } else {
-                    if trimmed.contains(&function) || trimmed.contains(&allowance) {
-                        assert!(permitted.contains(&relative), "{relative}: {line}");
-                    }
                     proof = false;
                 }
             }
         }
     }
+}
+
+fn has_word(text: &str, word: &str) -> bool {
+    text.split(|character: char| character != '_' && !character.is_alphanumeric())
+        .any(|token| token == word)
 }

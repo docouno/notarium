@@ -25,6 +25,7 @@ const FRAME_MAGIC: &[u8; 4] = b"L0W1";
 const FRAME_HEADER: usize = 17;
 const CHECKSUM_BYTES: usize = 32;
 const MAX_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
+const MIN_REWRITE_BYTES: u64 = 1024 * 1024;
 const WAL_NAME: &str = "l0.wal";
 
 pub enum MutableOperation {
@@ -52,6 +53,7 @@ struct Record {
     seq: SpaceSeq,
     chunks: Arc<Vec<VectorChunk>>,
     deleted: bool,
+    frame_bytes: u64,
 }
 
 pub struct MutableBuffer {
@@ -62,6 +64,8 @@ pub struct MutableBuffer {
     last_seq: SpaceSeq,
     first_dirty: Option<Instant>,
     failed_write: bool,
+    journal_bytes: u64,
+    live_bytes: u64,
 }
 
 impl MutableBuffer {
@@ -78,6 +82,8 @@ impl MutableBuffer {
             last_seq: SpaceSeq::ZERO,
             first_dirty: None,
             failed_write: false,
+            journal_bytes: 0,
+            live_bytes: 0,
         };
         let meta = match buffer.directory.symlink_metadata(WAL_NAME) {
             Ok(meta) => meta,
@@ -93,9 +99,9 @@ impl MutableBuffer {
             .clone();
         let file = buffer.directory.open_with(WAL_NAME, &options)?;
         let mut input = BufReader::new(file);
-        while let Some((seq, operation)) = read_record(&mut input, dimension)? {
+        while let Some((seq, operation, frame_bytes)) = read_record(&mut input, dimension)? {
             buffer.admit(seq, &operation)?;
-            buffer.apply_memory(seq, operation);
+            buffer.apply_memory(seq, operation, frame_bytes);
         }
         Ok(buffer)
     }
@@ -171,7 +177,16 @@ impl MutableBuffer {
             self.failed_write = true;
             return Err(error);
         }
-        self.apply_memory(seq, operation);
+        self.apply_memory(seq, operation, frame.len() as u64);
+        if self.journal_bytes - self.live_bytes >= self.live_bytes.max(MIN_REWRITE_BYTES) {
+            match self.rewrite(None) {
+                Ok(bytes) => self.journal_bytes = bytes,
+                Err(error) => {
+                    self.failed_write = true;
+                    return Err(error);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -203,21 +218,25 @@ impl MutableBuffer {
         Ok(())
     }
 
-    fn apply_memory(&mut self, seq: SpaceSeq, operation: MutableOperation) {
+    fn apply_memory(&mut self, seq: SpaceSeq, operation: MutableOperation, frame_bytes: u64) {
         let (note, chunks, deleted) = match operation {
             MutableOperation::Upsert { note, chunks } => (note, chunks, false),
             MutableOperation::Delete(note) => (note, Vec::new(), true),
         };
         self.chunks += chunks.len();
+        self.journal_bytes += frame_bytes;
+        self.live_bytes += frame_bytes;
         if let Some(old) = self.entries.insert(
             note,
             Record {
                 seq,
                 chunks: Arc::new(chunks),
                 deleted,
+                frame_bytes,
             },
         ) {
             self.chunks -= old.chunks.len();
+            self.live_bytes -= old.frame_bytes;
         }
         self.last_seq = seq;
         self.first_dirty.get_or_insert_with(Instant::now);
@@ -228,6 +247,8 @@ impl MutableBuffer {
         atomic_file(&self.directory, WAL_NAME, &[])?;
         self.entries.clear();
         self.chunks = 0;
+        self.journal_bytes = 0;
+        self.live_bytes = 0;
         self.first_dirty = None;
         self.failed_write = false;
         Ok(())
@@ -235,10 +256,20 @@ impl MutableBuffer {
 
     /// Remove every on-disk frame for a purged note after L1 has been scrubbed.
     pub fn scrub_note(&mut self, purged: &NoteId) -> Result<(), VectorError> {
+        self.journal_bytes = self.rewrite(Some(purged))?;
+        if let Some(record) = self.entries.remove(purged) {
+            self.chunks -= record.chunks.len();
+            self.live_bytes -= record.frame_bytes;
+        }
+        self.failed_write = false;
+        Ok(())
+    }
+
+    fn rewrite(&self, excluded: Option<&NoteId>) -> Result<u64, VectorError> {
         let mut records: Vec<_> = self
             .entries
             .iter()
-            .filter(|(note, _)| *note != purged)
+            .filter(|(note, _)| Some(*note) != excluded)
             .collect();
         records.sort_unstable_by_key(|(_, record)| record.seq);
         let mut replacement = Vec::new();
@@ -252,11 +283,7 @@ impl MutableBuffer {
             )?;
         }
         atomic_file(&self.directory, WAL_NAME, &replacement)?;
-        if let Some(record) = self.entries.remove(purged) {
-            self.chunks -= record.chunks.len();
-        }
-        self.failed_write = false;
-        Ok(())
+        Ok(replacement.len() as u64)
     }
 }
 
@@ -309,7 +336,7 @@ fn encode_record(
 fn read_record(
     input: &mut impl Read,
     dimension: usize,
-) -> Result<Option<(SpaceSeq, MutableOperation)>, VectorError> {
+) -> Result<Option<(SpaceSeq, MutableOperation, u64)>, VectorError> {
     let mut header = [0u8; FRAME_HEADER];
     if input.read(&mut header[..1])? == 0 {
         return Ok(None);
@@ -373,7 +400,11 @@ fn read_record(
     if !bytes.is_empty() {
         return Err(VectorError::CorruptIndex);
     }
-    Ok(Some((seq, operation)))
+    Ok(Some((
+        seq,
+        operation,
+        (FRAME_HEADER + len + CHECKSUM_BYTES) as u64,
+    )))
 }
 
 fn read_complete(input: &mut impl Read, buf: &mut [u8]) -> Result<(), VectorError> {

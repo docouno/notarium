@@ -7,7 +7,7 @@ use super::{
     ChunkMetadata, EXACT_SCAN_LIMIT, M, M0, MAX_DIMENSION, MAX_LEVEL, MIN_DIMENSION,
     QuantizedVector, SearchBudget, VectorError,
     format::*,
-    hnsw::{self, Graph, Neighbor, Similarity},
+    hnsw::{self, ExactNeighbor, Graph, Neighbor, Similarity},
     simd::Dot,
 };
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
@@ -21,7 +21,12 @@ use notarium_core::{
     ids::{ContentDigest, NoteId},
     span::ByteSpan,
 };
-use std::{collections::BinaryHeap, ops::Range, path::Path};
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::BinaryHeap,
+    ops::Range,
+    path::Path,
+};
 
 pub struct MmapSegment {
     bytes: Mmap,
@@ -296,6 +301,10 @@ impl MmapSegment {
         self.nodes as u32
     }
 
+    pub(super) fn dimension(&self) -> usize {
+        self.dimension
+    }
+
     pub fn is_empty(&self) -> bool {
         self.nodes == 0
     }
@@ -328,12 +337,16 @@ impl MmapSegment {
             return None;
         }
         let meta = self.row(METADATA, slot as usize, META_BYTES);
+        NoteId::parse(std::str::from_utf8(self.note_bytes(meta)).ok()?).ok()
+    }
+
+    fn note_bytes(&self, meta: &[u8]) -> &[u8] {
         let note = read_u32(meta, 64) as usize;
         let notes = self.section(NOTES);
         let offset = (self.notes + 1) * 4;
         let from = offset + read_u32(notes, note * 4) as usize;
         let to = offset + read_u32(notes, (note + 1) * 4) as usize;
-        NoteId::parse(std::str::from_utf8(&notes[from..to]).ok()?).ok()
+        &notes[from..to]
     }
 
     pub fn chunk_key(&self, slot: u32) -> Option<ContentDigest> {
@@ -428,54 +441,91 @@ impl MmapSegment {
                 hnsw_hops: 0,
             });
         }
-        if exact {
-            let dot = Dot::new(query.values()).ok_or(VectorError::InvalidDimension)?;
-            let mut best = BinaryHeap::with_capacity(top_k);
-            let vectors = signed_bytes(self.section(VECTORS));
-            let scales = self.section(SCALES).as_chunks::<4>().0;
-            let mut slots = [0; 256];
-            let mut scores = [0; 256];
-            let mut eligible = eligible.iter();
-            loop {
-                budget.check()?;
-                let count = eligible.next_many(&mut slots);
-                if count == 0 {
-                    break;
-                }
-                let bounded = slots[..count].partition_point(|&slot| (slot as usize) < self.nodes);
-                let current = &slots[..bounded];
-                let scores = &mut scores[..bounded];
-                dot.dot_rows(vectors, current, scores)
-                    .ok_or(VectorError::CorruptIndex)?;
-                for (&slot, &score) in current.iter().zip(scores.iter()) {
-                    let scale = f32::from_le_bytes(scales[slot as usize]);
-                    let score = score as f32 * query.scale() * scale;
-                    hnsw::keep_best(&mut best, Neighbor { slot, score }, top_k);
-                }
-                if bounded < count {
-                    break;
-                }
+        let mut hnsw_hops = 0;
+        if !exact {
+            let scorer = Similarity::new(query.values(), query.scale())?;
+            let explored = hnsw::query_graph(
+                self,
+                scorer,
+                self.entry,
+                self.max_level,
+                top_k,
+                budget,
+                |slot| eligible.contains(slot),
+            )?;
+            hnsw_hops = explored.evaluations;
+            if explored.neighbors.len() >= top_k.min(eligible.cardinality() as usize) {
+                return Ok(SegmentSearch {
+                    neighbors: explored.neighbors,
+                    hnsw_hops,
+                });
             }
-            budget.check()?;
-            return Ok(SegmentSearch {
-                neighbors: hnsw::finish(best),
-                hnsw_hops: 0,
-            });
+            // A selective filter can exhaust the bounded graph walk before it
+            // fills top-k. Score the remaining eligible domain within the query budget.
         }
-        let scorer = Similarity::new(query.values(), query.scale())?;
-        let explored = hnsw::query_graph(
-            self,
-            scorer,
-            self.entry,
-            self.max_level,
-            top_k,
-            budget,
-            |slot| eligible.contains(slot),
-        )?;
         Ok(SegmentSearch {
-            neighbors: explored.neighbors,
-            hnsw_hops: explored.evaluations,
+            neighbors: self.exact_neighbors(query, eligible, top_k, budget)?,
+            hnsw_hops,
         })
+    }
+
+    fn exact_neighbors(
+        &self,
+        query: &QuantizedVector,
+        eligible: &Bitmap,
+        top_k: usize,
+        budget: SearchBudget<'_>,
+    ) -> Result<Vec<Neighbor>, VectorError> {
+        let dot = Dot::new(query.values()).ok_or(VectorError::InvalidDimension)?;
+        let mut best = BinaryHeap::<Reverse<ExactNeighbor<'_>>>::with_capacity(top_k);
+        let vectors = signed_bytes(self.section(VECTORS));
+        let scales = self.section(SCALES).as_chunks::<4>().0;
+        let mut slots = [0; 256];
+        let mut scores = [0; 256];
+        let mut eligible = eligible.iter();
+        loop {
+            budget.check()?;
+            let count = eligible.next_many(&mut slots);
+            if count == 0 {
+                break;
+            }
+            let bounded = slots[..count].partition_point(|&slot| (slot as usize) < self.nodes);
+            let current = &slots[..bounded];
+            let scores = &mut scores[..bounded];
+            dot.dot_rows(vectors, current, scores)
+                .ok_or(VectorError::CorruptIndex)?;
+            for (&slot, &score) in current.iter().zip(scores.iter()) {
+                let scale = f32::from_le_bytes(scales[slot as usize]);
+                let score = score as f32 * query.scale() * scale;
+                if best.len() == top_k
+                    && best
+                        .peek()
+                        .is_some_and(|worst| score.total_cmp(&worst.0.hit.score) == Ordering::Less)
+                {
+                    continue;
+                }
+                let meta = self.row(METADATA, slot as usize, META_BYTES);
+                let first_body_span = read_u32(meta, 72) as usize + usize::from(read_u16(meta, 78));
+                hnsw::keep_best(
+                    &mut best,
+                    ExactNeighbor {
+                        hit: Neighbor { slot, score },
+                        note: self.note_bytes(meta),
+                        span: read_u32(self.section(SPANS), first_body_span * 8) as usize,
+                        key: &meta[..32],
+                    },
+                    top_k,
+                );
+            }
+            if bounded < count {
+                break;
+            }
+        }
+        budget.check()?;
+        Ok(hnsw::finish(best)
+            .into_iter()
+            .map(|neighbor| neighbor.hit)
+            .collect())
     }
 }
 

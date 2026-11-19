@@ -63,7 +63,7 @@ pub(super) struct WordPiece {
 pub(super) struct Bpe {
     vocab: HashMap<String, u32>,
     ranks: HashMap<String, HashMap<String, usize>>,
-    unknown: Option<u32>,
+    unknown: Option<String>,
     prefix: String,
     suffix: String,
     byte_fallback: bool,
@@ -119,15 +119,12 @@ impl Model {
                 if dropout.is_some_and(|dropout| dropout != 0.0) || vocab.is_empty() {
                     return Err(EmbeddingError::InvalidModel);
                 }
-                let unknown = unk_token
+                if unk_token
                     .as_ref()
-                    .map(|token| {
-                        vocab
-                            .get(token)
-                            .copied()
-                            .ok_or(EmbeddingError::InvalidModel)
-                    })
-                    .transpose()?;
+                    .is_some_and(|token| !vocab.contains_key(token))
+                {
+                    return Err(EmbeddingError::InvalidModel);
+                }
                 let mut ranks = HashMap::<String, HashMap<String, usize>>::new();
                 for (index, merge) in merges.into_iter().enumerate() {
                     let [left, right] = match merge {
@@ -152,7 +149,7 @@ impl Model {
                 Ok(Self::Bpe(Bpe {
                     vocab,
                     ranks,
-                    unknown,
+                    unknown: unk_token,
                     prefix: continuing_subword_prefix.unwrap_or_default(),
                     suffix: end_of_word_suffix.unwrap_or_default(),
                     byte_fallback,
@@ -283,22 +280,45 @@ impl Bpe {
         }
         let mut symbols = Vec::new();
         let mut chars = text.chars().peekable();
+        let mut first = true;
+        let mut unknown = false;
         while let Some(c) = chars.next() {
-            let index = symbols.len();
             let mut value = String::new();
-            if index != 0 {
+            if !first {
                 value.push_str(&self.prefix);
             }
+            first = false;
             value.push(c);
             if chars.peek().is_none() {
                 value.push_str(&self.suffix);
             }
-            symbols.push(Symbol {
-                value,
-                previous: index.checked_sub(1),
-                next: chars.peek().map(|_| index + 1),
-                active: true,
-            });
+            if self.vocab.contains_key(&value) {
+                if unknown {
+                    push_symbol(
+                        &mut symbols,
+                        self.unknown.as_ref().expect("pending unknown").clone(),
+                    );
+                    unknown = false;
+                }
+                push_symbol(&mut symbols, value);
+            } else if self.byte_fallback
+                && let Some(tokens) = byte_tokens(&self.vocab, &value)
+            {
+                for symbol in tokens {
+                    push_symbol(&mut symbols, symbol);
+                }
+            } else if let Some(token) = &self.unknown {
+                if unknown && !self.fuse_unk {
+                    push_symbol(&mut symbols, token.clone());
+                }
+                unknown = true;
+            }
+        }
+        if unknown {
+            push_symbol(
+                &mut symbols,
+                self.unknown.as_ref().expect("pending unknown").clone(),
+            );
         }
         let mut queue = MergeQueue::new();
         for (left, symbol) in symbols.iter().enumerate() {
@@ -330,19 +350,13 @@ impl Bpe {
                 self.queue_pair(&symbols, previous, &mut queue);
             }
         }
-        let mut last_unknown = false;
         for symbol in symbols.into_iter().filter(|symbol| symbol.active) {
-            if let Some(&id) = self.vocab.get(&symbol.value) {
-                out.push(id);
-                last_unknown = false;
-            } else if self.byte_fallback && emit_bytes(&self.vocab, &symbol.value, out) {
-                last_unknown = false;
-            } else {
-                if !self.fuse_unk || !last_unknown {
-                    out.push(self.unknown.ok_or(EmbeddingError::InvalidModel)?);
-                }
-                last_unknown = true;
-            }
+            out.push(
+                *self
+                    .vocab
+                    .get(&symbol.value)
+                    .ok_or(EmbeddingError::InvalidModel)?,
+            );
         }
         Ok(())
     }
@@ -358,6 +372,19 @@ impl Bpe {
             queue.push(Reverse((rank, left, right)));
         }
     }
+}
+
+fn push_symbol(symbols: &mut Vec<Symbol>, value: String) {
+    let index = symbols.len();
+    if let Some(last) = symbols.last_mut() {
+        last.next = Some(index);
+    }
+    symbols.push(Symbol {
+        value,
+        previous: index.checked_sub(1),
+        next: None,
+        active: true,
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -422,18 +449,18 @@ impl Unigram {
             path.push((step.previous..end, step.token));
             end = step.previous;
         }
-        let mut last_unknown = false;
-        for (range, token) in path.into_iter().rev() {
+        let mut path = path.into_iter().rev().peekable();
+        while let Some((mut range, token)) = path.next() {
             if let Some(id) = token {
                 out.push(id);
-                last_unknown = false;
-            } else if self.byte_fallback && emit_bytes(&self.vocab, &text[range], out) {
-                last_unknown = false;
             } else {
-                if !last_unknown {
+                while let Some((next, None)) = path.peek() {
+                    range.end = next.end;
+                    path.next();
+                }
+                if !self.byte_fallback || !emit_bytes(&self.vocab, &text[range], out) {
                     out.push(self.unknown);
                 }
-                last_unknown = true;
             }
         }
         Ok(())
@@ -457,4 +484,13 @@ fn emit_bytes(vocab: &HashMap<String, u32>, text: &str, out: &mut Vec<u32>) -> b
         out.push(id);
     }
     true
+}
+
+fn byte_tokens(vocab: &HashMap<String, u32>, text: &str) -> Option<Vec<String>> {
+    text.bytes()
+        .map(|byte| {
+            let token = format!("<0x{byte:02X}>");
+            vocab.contains_key(&token).then_some(token)
+        })
+        .collect()
 }

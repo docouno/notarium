@@ -22,6 +22,7 @@ pub(super) struct Fields {
     kind: Field,
     note_id: Field,
     chat_locator: Field,
+    chat_owner: Field,
     class: Field,
     folder: Field,
     pub bodies: [TextFields; 4],
@@ -50,6 +51,7 @@ impl Fields {
         let kind = schema.add_u64_field("doc_kind", FAST | INDEXED);
         let note_id = schema.add_bytes_field("note_id_raw", FAST);
         let chat_locator = schema.add_bytes_field("chat_locator", FAST);
+        let chat_owner = schema.add_bytes_field("chat_owner", FAST);
         let class = schema.add_u64_field("doc_class_ord", FAST | INDEXED);
         let folder = schema.add_u64_field("parent_folder_ord", FAST | INDEXED);
         let bodies = [
@@ -70,6 +72,7 @@ impl Fields {
             kind,
             note_id,
             chat_locator,
+            chat_owner,
             class,
             folder,
             bodies,
@@ -110,6 +113,9 @@ impl Fields {
             folder.map_or(0, |folder| u64::from(folder.get())),
         );
         indexed.add_bytes(self.chat_locator, &chat_locator(hit));
+        if hit.kind == ChatThreadKind::Personal {
+            indexed.add_bytes(self.chat_owner, hit.owner.as_str().as_bytes());
+        }
         self.add_text(&mut indexed, self.bodies[3], &hit.text);
         indexed
     }

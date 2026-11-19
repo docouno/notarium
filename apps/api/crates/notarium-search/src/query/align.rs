@@ -141,7 +141,7 @@ impl SearchEngine {
         })
     }
 
-    async fn projection(
+    pub(super) async fn projection(
         &self,
         ctx: &SpaceContext,
         causal: CausalBasis,

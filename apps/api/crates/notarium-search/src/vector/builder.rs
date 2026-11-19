@@ -50,6 +50,34 @@ impl SegmentBuilder {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn with_test_rows(
+        model: &ModelProfileId,
+        dimension: usize,
+        rows: Vec<VectorChunk>,
+    ) -> Self {
+        let mut builder = Self::new(model, dimension).unwrap();
+        let count = rows.len() as u32;
+        for (slot, chunk) in (0u32..).zip(rows) {
+            chunk.validate(dimension).unwrap();
+            let neighbors = slot
+                .checked_sub(1)
+                .map(|previous| previous / 2)
+                .into_iter()
+                .chain(
+                    [slot * 2 + 1, slot * 2 + 2]
+                        .into_iter()
+                        .filter(|&next| next < count),
+                )
+                .collect();
+            builder.graph.nodes.push(super::hnsw::Node {
+                chunk,
+                edges: vec![neighbors],
+            });
+        }
+        builder
+    }
+
     pub fn find_vector(&self, key: ContentDigest) -> Option<&QuantizedVector> {
         let &slot = self.keys.get(&key)?;
         Some(&self.graph.nodes[slot].chunk.vector)

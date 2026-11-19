@@ -57,21 +57,25 @@ impl Normalizer {
             Self::Nfkc => text.nfkc().collect(),
             Self::Nfkd => text.nfkd().collect(),
             Self::Lowercase => text.to_lowercase(),
-            Self::StripAccents => strip_accents(&text),
+            Self::StripAccents => text.chars().filter(|&c| !is_combining_mark(c)).collect(),
             Self::Bert {
                 clean_text,
                 handle_chinese_chars,
                 strip_accents: accents,
                 lowercase,
             } => {
+                let mut tokenizer = BERT_DISCARDED.clone();
+                let mut discarded = tokenizer.token_stream(&text);
+                let mut next =
+                    (*clean_text && discarded.advance()).then(|| discarded.token().offset_from);
                 let mut output = String::with_capacity(text.len());
-                for c in text.chars() {
+                for (offset, c) in text.char_indices() {
+                    if next == Some(offset) {
+                        next = discarded.advance().then(|| discarded.token().offset_from);
+                        continue;
+                    }
                     if *clean_text && c.is_whitespace() {
                         output.push(' ');
-                    } else if *clean_text
-                        && (c.is_control() || matches!(c, '\u{0000}' | '\u{fffd}'))
-                    {
-                        continue;
                     } else if *handle_chinese_chars && is_cjk(c) {
                         output.push(' ');
                         output.push(c);
@@ -188,6 +192,10 @@ pub(super) enum PreTokenizer {
 
 static WORD_RUNS: LazyLock<RegexTokenizer> =
     LazyLock::new(|| RegexTokenizer::new(r"\w+|[^\w\s]+").expect("static word boundary pattern"));
+static BERT_DISCARDED: LazyLock<RegexTokenizer> = LazyLock::new(|| {
+    RegexTokenizer::new(r"[\p{C}&&[^\t\n\r]]|\u{fffd}")
+        .expect("static BERT control character pattern")
+});
 static PUNCTUATION: LazyLock<RegexTokenizer> = LazyLock::new(|| {
     RegexTokenizer::new(r"[\p{P}\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]")
         .expect("static punctuation pattern")
@@ -335,31 +343,28 @@ fn split_digits(output: &mut Vec<String>, text: &str, single: bool) {
     output.push(text[start..].to_owned());
 }
 
-fn bytelevel_pieces(text: &str) -> Vec<String> {
-    let mut raw = Vec::new();
-    push_regex(&mut raw, text, &BYTELEVEL_RUNS);
-    let mut pieces = Vec::with_capacity(raw.len());
-    let mut attach_space = false;
-    let mut raw = raw.into_iter().peekable();
-    while let Some(mut piece) = raw.next() {
-        if attach_space {
-            piece.insert(0, ' ');
-            attach_space = false;
-        }
-        if piece.chars().all(char::is_whitespace)
-            && piece.chars().count() > 1
-            && raw.peek().is_some()
-        {
-            let last = piece.pop().expect("nonempty whitespace");
-            pieces.push(piece);
-            if last == ' ' {
-                attach_space = true;
-            } else {
-                pieces.push(last.to_string());
+fn bytelevel_pieces(mut text: &str) -> Vec<String> {
+    let mut tokenizer = BYTELEVEL_RUNS.clone();
+    let mut pieces = Vec::new();
+    while !text.is_empty() {
+        let mut stream = tokenizer.token_stream(text);
+        let mut remainder = "";
+        while stream.advance() {
+            let token = stream.token();
+            let piece = &text[token.offset_from..token.offset_to];
+            if token.offset_to < text.len()
+                && piece.chars().all(char::is_whitespace)
+                && let Some((last, _)) = piece.char_indices().next_back()
+                && last != 0
+            {
+                // The look-ahead leaves the final space for the next regex alternative.
+                pieces.push(piece[..last].to_owned());
+                remainder = &text[token.offset_from + last..];
+                break;
             }
-        } else {
-            pieces.push(piece);
+            pieces.push(piece.to_owned());
         }
+        text = remainder;
     }
     pieces
 }

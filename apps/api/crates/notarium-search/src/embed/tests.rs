@@ -85,6 +85,52 @@ fn local_wordpiece_bpe_unigram_and_remote_counts_match_served_input() {
 }
 
 #[test]
+fn tokenizer_matches_reference_on_fallback_controls_and_whitespace() {
+    let cases = [
+        (
+            r#"{"model":{"type":"BPE","byte_fallback":true,
+            "vocab":{"<0xC3>":1,"<0xA9>":2,"<0xC3><0xA9>":3},
+            "merges":[["<0xC3>","<0xA9>"]]}}"#,
+            "é",
+            &[3][..],
+        ),
+        (
+            r#"{"model":{"type":"Unigram","byte_fallback":true,"unk_id":0,
+            "vocab":[["<unk>",0],["<0xC3>",-1],["<0xA9>",-1]]}}"#,
+            "é🙂",
+            &[0],
+        ),
+        (
+            r###"{"normalizer":{"type":"StripAccents"},
+            "model":{"type":"WordPiece","vocab":{"[UNK]":0,"é":1,"e":2},"unk_token":"[UNK]",
+            "continuing_subword_prefix":"##","max_input_chars_per_word":100}}"###,
+            "é",
+            &[1],
+        ),
+        (
+            r###"{"normalizer":{"type":"BertNormalizer","clean_text":true},
+            "model":{"type":"WordPiece","vocab":{"[UNK]":0,"cooperate":1},"unk_token":"[UNK]",
+            "continuing_subword_prefix":"##","max_input_chars_per_word":100}}"###,
+            "co\u{00ad}operate",
+            &[1],
+        ),
+        (
+            r#"{"pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false},
+            "model":{"type":"BPE","vocab":{"Ġ":1,"'":2,"Ġ'":3,"s":4,"Ġ's":5},
+            "merges":[["Ġ","'"],["Ġ'","s"]]}}"#,
+            "  's",
+            &[1, 3, 4],
+        ),
+    ];
+    for (json, text, expected) in cases {
+        let tokenizer = LocalTokenizerBudget::from_json(json.as_bytes(), profile(), 512)
+            .unwrap_or_else(|error| panic!("tokenizer for {text:?}: {error:?}"));
+        assert_eq!(tokenizer.encode(text).unwrap().ids, expected, "{text:?}");
+        assert_eq!(tokenizer.count(text).unwrap() as usize, expected.len());
+    }
+}
+
+#[test]
 fn background_quanta_preserve_order_and_enforce_aggregate_caps() {
     let chunks = bounded_batches(0..8, |_| 400, 1024).unwrap();
     assert_eq!(chunks, [vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]]);

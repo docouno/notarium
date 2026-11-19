@@ -88,7 +88,7 @@ impl Tokenizer for Exact {
             let span = raw.trim_matches(['.', ':', '-', '/']);
             let mut terms = BTreeSet::new();
             terms.insert(normalize(span));
-            for segment in span.split(['/', ':']) {
+            for segment in span.split(['/', ':', '@']) {
                 terms.insert(normalize(segment));
             }
             terms.extend(atoms(span));

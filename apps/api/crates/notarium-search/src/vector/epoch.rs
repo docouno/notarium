@@ -4,7 +4,7 @@ use super::{
     ChunkMetadata, EXACT_SCAN_LIMIT, L0_MAX_CHUNKS, MmapSegment, MutableBuffer, MutableOperation,
     QuantizedVector, SearchBudget, SegmentBuilder, Tombstones, VectorChunk, VectorError,
     format::class_number,
-    hnsw::{self, Similarity},
+    hnsw::{self, ExactNeighbor, Similarity},
     model_hash,
 };
 use crate::layout::{EpochManifest, SearchLayout};
@@ -135,16 +135,11 @@ impl VectorSnapshot {
         }
         let mut hits = Vec::new();
         let mut hnsw_hops = 0;
-        let filters = self
-            .segments
-            .iter()
-            .map(|segment| self.allowed_slots(segment, filter, budget))
-            .collect::<Result<Vec<_>, _>>()?;
-        let sealed_slots = filters.iter().map(Bitmap::cardinality).sum::<u64>();
-        let mutable_slots = self.search_mutable(query, filter, limit, budget, &mut hits)? as u64;
-        let exact = force_exact || sealed_slots + mutable_slots <= EXACT_SCAN_LIMIT;
-        for (segment, allowed) in self.segments.iter().zip(filters) {
+        self.search_mutable(query, filter, limit, budget, &mut hits)?;
+        for segment in &self.segments {
             budget.check()?;
+            let allowed = self.allowed_slots(segment, filter, budget)?;
+            let exact = force_exact || allowed.cardinality() <= EXACT_SCAN_LIMIT;
             let result = segment
                 .index
                 .data
@@ -171,6 +166,12 @@ impl VectorSnapshot {
                     left.metadata.spans[0]
                         .start()
                         .cmp(&right.metadata.spans[0].start())
+                })
+                .then_with(|| {
+                    left.metadata
+                        .key
+                        .as_bytes()
+                        .cmp(right.metadata.key.as_bytes())
                 })
         });
         hits.truncate(limit);
@@ -243,7 +244,7 @@ impl VectorSnapshot {
         limit: usize,
         budget: SearchBudget<'_>,
         hits: &mut Vec<VectorHit>,
-    ) -> Result<usize, VectorError> {
+    ) -> Result<(), VectorError> {
         let scorer = Similarity::new(query.values(), query.scale())?;
         let mut eligible = Vec::new();
         let mut best = BinaryHeap::with_capacity(limit);
@@ -269,18 +270,24 @@ impl VectorSnapshot {
             eligible.push(chunk);
             hnsw::keep_best(
                 &mut best,
-                scorer.score(slot, chunk.vector.values(), chunk.vector.scale()),
+                ExactNeighbor {
+                    hit: scorer.score(slot, chunk.vector.values(), chunk.vector.scale()),
+                    note: meta.note.as_str().as_bytes(),
+                    span: meta.spans[0].start(),
+                    key: meta.key.as_bytes(),
+                },
                 limit,
             );
         }
-        for hit in hnsw::finish(best) {
+        for neighbor in hnsw::finish(best) {
+            let hit = neighbor.hit;
             let metadata = eligible[hit.slot as usize].metadata.clone();
             hits.push(VectorHit {
                 metadata,
                 score: hit.score,
             });
         }
-        Ok(eligible.len())
+        Ok(())
     }
 }
 
@@ -318,6 +325,9 @@ impl VectorEpoch {
         let mut segments = Vec::with_capacity(manifest.active_segments.len());
         for &id in &manifest.active_segments {
             let data = MmapSegment::open(&segment_path(&path, id), &model_hash(&model))?;
+            if data.dimension() != dimension {
+                return Err(VectorError::InvalidDimension);
+            }
             let tombstones = Tombstones::open(&tombstone_path(&path, id), data.len())?;
             segments.push(Segment {
                 id,

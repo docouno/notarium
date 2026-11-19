@@ -33,6 +33,7 @@ pub struct HydratedChatHit {
     pub entry: ThreadEntrySeq,
     pub kind: ChatThreadKind,
     pub project_folder: Option<FolderId>,
+    pub owner: PrincipalId,
     pub author: PrincipalId,
     pub text: String,
 }
@@ -163,11 +164,17 @@ impl CanonicalStore {
                         .and_then(|entry| entry.parent_seq)
                         .map(entry_seq)
                         .transpose()?;
-                    Ok(Some((meta.kind, meta.project_folder_id, rows, next)))
+                    Ok(Some((
+                        meta.kind,
+                        meta.project_folder_id,
+                        meta.owner_id,
+                        rows,
+                        next,
+                    )))
                 })
             })
             .await?;
-        let Some((kind, project, rows, next_before)) = planned else {
+        let Some((kind, project, owner, rows, next_before)) = planned else {
             return Ok(SearchChatEntriesPage {
                 entries: vec![],
                 next_before: None,
@@ -179,7 +186,14 @@ impl CanonicalStore {
                 .read_search_chat_text(scope, budget, &deadline, &entry)
                 .await?
             {
-                entries.push(make_hit(thread, kind, project.clone(), &entry, text)?);
+                entries.push(make_hit(
+                    thread,
+                    kind,
+                    project.clone(),
+                    owner.clone(),
+                    &entry,
+                    text,
+                )?);
             }
         }
         let history = scope.clone();
@@ -248,6 +262,7 @@ impl CanonicalStore {
                 &thread.thread_id,
                 thread.kind,
                 thread.project_folder,
+                thread.owner,
                 &row,
                 text,
             )?);
@@ -366,6 +381,7 @@ fn make_hit(
     thread: &ChatThreadId,
     kind: ChatThreadKind,
     project_folder: Option<FolderId>,
+    owner: PrincipalId,
     row: &Entry,
     text: String,
 ) -> Result<HydratedChatHit, PortError> {
@@ -374,6 +390,7 @@ fn make_hit(
         entry: row.seq()?,
         kind,
         project_folder,
+        owner,
         author: PrincipalId::parse(&row.author_id)?,
         text,
     })

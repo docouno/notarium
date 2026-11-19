@@ -94,7 +94,7 @@ struct Disk {
     layout: Arc<SearchLayout>,
     manifest: SearchManifest,
     folders: Arc<FolderDictionary>,
-    lexical: Arc<LexicalIndex>,
+    lexical: Option<Arc<LexicalIndex>>,
     epoch: Option<VectorEpoch>,
 }
 
@@ -104,6 +104,21 @@ impl Disk {
             scope: self.manifest.scope.clone(),
             after: self.manifest.tantivy_seq,
         }
+    }
+
+    fn resume_reader(&mut self, cx: &Context<'_>) -> Result<bool, IndexError> {
+        if self.lexical.is_some() {
+            return Ok(false);
+        }
+        let reader = cx
+            .services
+            .readers
+            .open(&self.layout.index_dir(&self.manifest)?)?;
+        if reader.commit_id()? != self.manifest.tantivy_commit {
+            return Err(IndexError::Inconsistent);
+        }
+        self.lexical = Some(reader);
+        Ok(true)
     }
 }
 
@@ -121,11 +136,12 @@ impl Publisher<'_> {
     }
 
     fn publish(&mut self, disk: &Disk) {
+        let Some(lexical) = &disk.lexical else { return };
         self.replace(Some(Arc::new(Published {
             scope: disk.manifest.scope.clone(),
             seq: disk.manifest.tantivy_seq,
-            lexical: disk.lexical.clone(),
-            searcher: disk.lexical.searcher(),
+            lexical: lexical.clone(),
+            searcher: lexical.searcher(),
             folders: disk.folders.clone(),
             vectors: disk.epoch.as_ref().map(|epoch| Arc::new(epoch.snapshot())),
             embeddings_pending: disk.manifest.embeddings_pending,
@@ -243,6 +259,12 @@ async fn consume(
                         // Keep that read alive across idle vector maintenance.
                         if let Some(disk) = &mut disk {
                             update::maintain_vectors(disk, publisher).await?;
+                            if cx.handle.active_queries.load(Ordering::Acquire) == 0
+                                && disk.lexical.take().is_some()
+                            {
+                                // Keep the subscription and durable cut while the reader is idle.
+                                publisher.replace(None);
+                            }
                         }
                         continue;
                     }
@@ -265,11 +287,16 @@ async fn consume(
             return Ok(Some(target.scope));
         }
         let mut seed_at = (force_seed || disk.is_none()).then(|| target.clone());
-        if let Some(current) = &mut disk
-            && !force_seed
-            && current.manifest.tantivy_seq < target.after
-        {
-            match catch_up(cx, current, publisher, target.clone()).await {
+        if !force_seed && let Some(current) = &mut disk {
+            if current.resume_reader(cx)? {
+                publisher.publish(current);
+            }
+            let catch_up = if current.manifest.tantivy_seq < target.after {
+                catch_up(cx, current, publisher, target.clone()).await
+            } else {
+                Ok(false)
+            };
+            match catch_up {
                 Ok(false) => {}
                 Ok(true) => {
                     seed_at = Some(target.clone());
@@ -386,7 +413,7 @@ fn open_disk(cx: &Context<'_>, layout: Arc<SearchLayout>) -> Result<Option<Disk>
             layout: layout.clone(),
             manifest,
             folders,
-            lexical,
+            lexical: Some(lexical),
             epoch,
         }))
     })();
@@ -396,6 +423,7 @@ fn open_disk(cx: &Context<'_>, layout: Arc<SearchLayout>) -> Result<Option<Disk>
             layout.clear_lexical_manifests()?;
             None
         }
+        Err(error @ IndexError::Lexical(LexicalError::ReaderUnavailable)) => return Err(error),
         Err(_) => None,
     };
     let preserve = disk

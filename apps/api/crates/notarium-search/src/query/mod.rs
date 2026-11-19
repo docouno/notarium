@@ -16,7 +16,7 @@ use notarium_core::{
     DomainError,
     classes::{ClassEgressFence, DocClass},
     error::{PortError, ValidationReason},
-    ids::{FolderId, NoteId},
+    ids::{FolderId, NoteId, PrincipalId},
     model::{DenseNodeId, FolderRef, SnapshotCut},
     ports::{
         PortFuture, RecallQuery, SearchDegradation, SearchPort, SearchQuery, SearchResult,
@@ -79,8 +79,26 @@ impl SearchEngine {
         let filtered = request.folder.is_some()
             || (!request.classes.is_empty() && request.classes != DocClass::all())
             || !matches!(&request.filter.predicate, Predicate::All(items) if items.is_empty());
-        LexicalIndex::validate_query(&request.text, filtered).map_err(lexical_error)?;
+        let empty_query =
+            LexicalIndex::is_empty_query(&request.text, filtered).map_err(lexical_error)?;
+        let encrypted_only = (recall.is_some() || !request.include_chats)
+            && !request.classes.is_empty()
+            && request
+                .classes
+                .iter()
+                .all(|class| *class == DocClass::EncryptedNote);
+        if empty_query || encrypted_only {
+            let snapshot = self.projection(&ctx, request.causal, clock).await?;
+            return Ok(SearchResult {
+                hits: Vec::new(),
+                chat_hits: Vec::new(),
+                cut: snapshot.cut().clone(),
+                degraded: None,
+                truncated: false,
+            });
+        }
         let handle = self.space(ctx.scope().clone())?;
+        let _pin = handle.pin_query();
         let aligned = self.align(&ctx, &request.causal, &handle, clock).await?;
         let snapshot = aligned.snapshot;
         let state = aligned.state;
@@ -130,7 +148,7 @@ impl SearchEngine {
                     .unwrap_or(false)
             })
         });
-        let overlay = rank_overlay(self, &request, &aligned.overlay, &filter, filtered)?;
+        let overlay = rank_overlay(self, &request, &aligned.overlay, &filter, filtered).await?;
         if browse {
             notes.extend(overlay);
             notes.sort_by(|left, right| note_key(left).cmp(&note_key(right)));
@@ -365,6 +383,8 @@ struct Eligible {
     project: Option<FolderRef>,
     folders: Option<BTreeSet<FolderId>>,
     ordinals: Option<Arc<Bitmap>>,
+    chat_folders: Option<Arc<Bitmap>>,
+    chat_viewer: PrincipalId,
     nodes: Option<Bitmap>,
     vector_notes: Option<BTreeSet<NoteId>>,
 }
@@ -415,9 +435,23 @@ impl Eligible {
                             .and_then(|state| state.folders.get(id))
                             .map(crate::layout::FolderOrd::get)
                     })
-                    .collect(),
+                    .collect::<Bitmap>(),
             )
         });
+        let chat_folders = match root {
+            Some(root) => {
+                let mut pinned = Bitmap::new();
+                if let Some(ordinal) = state.and_then(|state| state.folders.get(root))
+                    && ordinals
+                        .as_ref()
+                        .is_none_or(|folders| folders.contains(ordinal.get()))
+                {
+                    pinned.add(ordinal.get());
+                }
+                Some(Arc::new(pinned))
+            }
+            None => ordinals.clone(),
+        };
         let project = match root {
             Some(folder) => Some(folder.clone()),
             None => query
@@ -476,6 +510,8 @@ impl Eligible {
             project,
             folders,
             ordinals,
+            chat_folders,
+            chat_viewer: ctx.auth().principal().clone(),
             nodes,
             vector_notes,
         })
@@ -538,8 +574,14 @@ async fn lexical_candidates(
         let chats = if chat_k == 0 {
             Vec::new()
         } else {
-            let chat_filter =
-                LexicalFilter::new(snapshot.as_ref(), filter.ordinals.clone(), None, [], true);
+            let chat_filter = LexicalFilter::new(
+                snapshot.as_ref(),
+                filter.chat_folders.clone(),
+                None,
+                [],
+                true,
+            )
+            .visible_chats_for(&filter.chat_viewer);
             state
                 .lexical
                 .search_pinned(&state.searcher, &text, &chat_filter, chat_k, filtered)
@@ -551,7 +593,7 @@ async fn lexical_candidates(
     .map_err(|_| internal("lexical_search_worker"))?
 }
 
-fn rank_overlay(
+async fn rank_overlay(
     engine: &SearchEngine,
     query: &SearchQuery,
     overlay: &align::Overlay,
@@ -571,18 +613,27 @@ fn rank_overlay(
             let folder = dictionary
                 .insert(row.parent_folder_id.clone())
                 .map_err(|_| internal("overlay_folder"))?;
-            notes.push((row, content, folder));
+            notes.push((row.title.clone(), content, folder));
         }
     }
-    let updates: Vec<_> = notes
-        .iter()
-        .map(|(row, content, folder)| Update::Note {
-            content,
-            title: &row.title,
-            folder: *folder,
-        })
-        .collect();
-    LexicalIndex::rank_overlay(&query.text, &updates, filtered).map_err(lexical_error)
+    if notes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let text = query.text.clone();
+    let writers = engine.services.writers.clone();
+    tokio::task::spawn_blocking(move || {
+        let updates: Vec<_> = notes
+            .iter()
+            .map(|(title, content, folder)| Update::Note {
+                content,
+                title,
+                folder: *folder,
+            })
+            .collect();
+        LexicalIndex::rank_overlay(&writers, &text, &updates, filtered).map_err(lexical_error)
+    })
+    .await
+    .map_err(|_| internal("overlay_search_worker"))?
 }
 
 fn note_key(hit: &LexicalHit) -> Option<&NoteId> {

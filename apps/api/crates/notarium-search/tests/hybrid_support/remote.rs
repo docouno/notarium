@@ -5,7 +5,7 @@ use notarium_core::{
     DomainError,
     auth::{SpaceGrant, SpaceKind, SpaceRole},
     classes::DocClass,
-    epoch::DataRoot,
+    epoch::{DataRoot, SearchIndexKind},
     error::ValidationReason,
     ids::{FolderId, LeaseEpoch, ModelProfileId, PrincipalId, ProviderResourceId, SpaceSeq},
     model::{FolderRef, HistoryScope},
@@ -176,11 +176,24 @@ pub async fn lexical_fallback(store: Arc<CanonicalStore>, root: DataRoot) {
         SearchConfig::new(root.clone(), VectorMode::RemoteOnly),
         deps,
     );
+    let ctx = context(&space.scope, &owner);
+    let mut encrypted = query("evidencekeyword");
+    encrypted.classes = BTreeSet::from([DocClass::EncryptedNote]);
+    let encrypted = engine.search(ctx.clone(), encrypted).await.unwrap();
+    assert!(encrypted.hits.is_empty() && encrypted.degraded.is_none());
+    assert_eq!(encrypted.cut.projected_seq, range.last_seq);
+    assert!(
+        !root
+            .search(&space.scope.space_id, SearchIndexKind::Tantivy)
+            .exists()
+    );
     engine.start_space(space.scope.clone()).unwrap();
     acknowledged(&store, &root, &space.scope, range.last_seq).await;
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
 
-    let ctx = context(&space.scope, &owner);
+    let useless = engine.search(ctx.clone(), query("---")).await.unwrap();
+    assert!(useless.hits.is_empty() && useless.degraded.is_none());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     let scoped = context_with_grant(
         &space.scope,
         &owner,

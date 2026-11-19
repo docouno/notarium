@@ -96,6 +96,10 @@ impl QueryPlan {
     pub fn can_fallback(&self) -> bool {
         self.clauses.len() > 2
     }
+
+    pub fn is_empty(&self) -> bool {
+        !self.browse && self.clauses.is_empty()
+    }
 }
 
 fn term(field: Field, token: &str) -> Box<dyn Query> {
@@ -144,10 +148,10 @@ fn phrase(prose: &mut Prose, text: &str, fields: &[TextFields]) -> Option<Box<dy
 }
 
 fn free_token(prose: &mut Prose, text: &str, fields: &[TextFields]) -> Option<Box<dyn Query>> {
-    let prose = prose.tokens(text);
     let exact = exact_phrase(text);
     let atoms = atoms(text);
     if atoms.len() <= 1 {
+        let prose = prose.tokens(text);
         let mut clauses = Vec::with_capacity(fields.len() * 2);
         for field in fields {
             if let Some(query) = in_order(field.prose, &prose) {
@@ -159,7 +163,11 @@ fn free_token(prose: &mut Prose, text: &str, fields: &[TextFields]) -> Option<Bo
         }
         return disjunction(clauses);
     }
-    let mut clauses = Vec::with_capacity(fields.len() * 2);
+    let stems = atoms
+        .iter()
+        .flat_map(|atom| prose.tokens(atom))
+        .collect::<Vec<_>>();
+    let mut clauses = Vec::with_capacity(fields.len() * 3);
     for field in fields {
         if let Some(query) = in_order(field.exact, &exact) {
             clauses.push(boosted(query, field.exact_weight));
@@ -172,6 +180,16 @@ fn free_token(prose: &mut Prose, text: &str, fields: &[TextFields]) -> Option<Bo
             Box::new(BooleanQuery::new(parts)),
             field.prose_weight,
         ));
+        if stems.len() == atoms.len() {
+            let parts = stems
+                .iter()
+                .map(|stem| (Occur::Must, term(field.prose, &stem.text)))
+                .collect();
+            clauses.push(boosted(
+                Box::new(BooleanQuery::new(parts)),
+                field.prose_weight,
+            ));
+        }
     }
     disjunction(clauses)
 }

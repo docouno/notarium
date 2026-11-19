@@ -1,6 +1,9 @@
 use super::schema::{CHAT, NOTE};
 use croaring::Bitmap;
-use notarium_core::{ids::NoteId, ports::StructuralSnapshot};
+use notarium_core::{
+    ids::{NoteId, PrincipalId},
+    ports::StructuralSnapshot,
+};
 use std::{collections::BTreeSet, sync::Arc};
 use tantivy::{
     DocId, Score, SegmentReader,
@@ -14,6 +17,7 @@ pub struct LexicalFilter<'a> {
     pub notes: Option<&'a Bitmap>,
     pub(super) classes: u64,
     pub include_chats: bool,
+    pub(super) chat_viewer: Option<&'a PrincipalId>,
     pub(super) excluded: Option<&'a BTreeSet<NoteId>>,
 }
 
@@ -33,6 +37,8 @@ pub(super) struct SegmentFilter<T> {
     allowed_note_ords: Vec<u64>,
     classes: u64,
     include_chats: bool,
+    chat_owners: Option<Column<u64>>,
+    viewer_ord: Option<u64>,
 }
 
 impl<T: Collector> Collector for DocFilterCollector<'_, T> {
@@ -82,6 +88,18 @@ impl<T: Collector> Collector for DocFilterCollector<'_, T> {
             }
             notes = Some(column.ords().clone());
         }
+        let include_chats = self.filter.include_chats && !self.browse;
+        let owners = if include_chats {
+            fields.bytes("chat_owner")?
+        } else {
+            None
+        };
+        let viewer_ord = match (&owners, self.filter.chat_viewer) {
+            (Some(owners), Some(viewer)) => {
+                owners.dictionary().term_ord(viewer.as_str().as_bytes())?
+            }
+            _ => None,
+        };
         Ok(SegmentFilter {
             inner: self.inner.for_segment(index, segment)?,
             kind: fields.u64("doc_kind")?,
@@ -91,7 +109,9 @@ impl<T: Collector> Collector for DocFilterCollector<'_, T> {
             notes,
             allowed_note_ords,
             classes: self.filter.classes,
-            include_chats: self.filter.include_chats && !self.browse,
+            include_chats,
+            chat_owners: owners.map(|owners| owners.ords().clone()),
+            viewer_ord,
         })
     }
 
@@ -121,7 +141,14 @@ impl<T: SegmentCollector> SegmentCollector for SegmentFilter<T> {
             return;
         }
         let allowed = match self.kind.first(doc) {
-            Some(CHAT) => self.include_chats,
+            Some(CHAT) => {
+                self.include_chats
+                    && self
+                        .chat_owners
+                        .as_ref()
+                        .and_then(|column| column.first(doc))
+                        .is_none_or(|owner| self.viewer_ord == Some(owner))
+            }
             Some(NOTE) => {
                 self.class
                     .first(doc)

@@ -127,7 +127,7 @@ fn lexical_queries_use_morphology_code_and_exact_phrase_positions() {
     let mut dictionary = FolderDictionary::default();
     let root = dictionary.insert(FolderId::from_bytes([1; 16])).unwrap();
     let source = note(
-        "---\ninternal: yamlmarker\n---\n\nРасчётами и running\n\nfoo_bar `SearchPort::recall` [linked label](https://example.org) [[some-target|Visible alias]].\n\n    indented_code\n\n```nota\nprivateDslMarker\n```",
+        "---\ninternal: yamlmarker\n---\n\nРасчётами и running. They searched indexes.\n\nfoo_bar `SearchPort::recall` [linked label](https://example.org) [[some-target|Visible alias]].\n\n    indented_code\n\n```nota\nprivateDslMarker\n```",
         1,
         &snapshot.cut.scope,
     );
@@ -164,6 +164,7 @@ fn lexical_queries_use_morphology_code_and_exact_phrase_positions() {
         "расчет",
         "runs",
         "SearchPort::recall",
+        "SearchIndex",
         "indented_code",
         "\"linked label\"",
         "\"visible alias\"",
@@ -178,6 +179,39 @@ fn lexical_queries_use_morphology_code_and_exact_phrase_positions() {
     let browsing = index.search("", &allowed, 20, true).unwrap();
     assert_eq!(browsing[0].key, HitKey::Note(NoteId::from_bytes([1; 16])));
     assert_eq!(browsing[1].key, HitKey::Note(NoteId::from_bytes([2; 16])));
+
+    use tantivy::tokenizer::{TokenStream, Tokenizer};
+    let mut exact = super::analysis::Exact;
+    let mut terms = exact.token_stream("user@docs.reference/path");
+    let mut found = false;
+    while terms.advance() {
+        found |= terms.token().text == "docs.reference";
+    }
+    assert!(found);
+}
+
+#[test]
+fn temporary_overlay_writers_share_disk_admission() {
+    fn hold_overlay_slots(pool: &WriterPool, remaining: usize) -> Result<(), LexicalError> {
+        let index = Index::create_in_ram(schema::Fields::new().schema);
+        if remaining == 0 {
+            assert_eq!(pool.open_leases()?, 4);
+            assert!(matches!(
+                pool.with_temporary_writer(&index, |_| Ok(())),
+                Err(LexicalError::WriterUnavailable)
+            ));
+            return Ok(());
+        }
+        pool.with_temporary_writer(&index, |_| hold_overlay_slots(pool, remaining - 1))
+    }
+    let scratch = TestDir::new();
+    let lexical = LexicalIndex::create(&scratch.0).unwrap();
+    let pool = WriterPool::default();
+    pool.with_writer(&scratch.0, &lexical.index, false, |_| {
+        hold_overlay_slots(&pool, 3)
+    })
+    .unwrap();
+    assert_eq!(pool.open_leases().unwrap(), 1);
 }
 
 #[test]
@@ -219,6 +253,7 @@ fn segment_filters_exclude_chats_outside_folders_and_notes_outside_the_snapshot(
         entry: ThreadEntrySeq::new(1).unwrap(),
         kind: ChatThreadKind::SpaceGroup,
         project_folder: None,
+        owner: PrincipalId::from_bytes([1; 16]),
         author: PrincipalId::from_bytes([1; 16]),
         text: "rare heading".to_owned(),
     };
