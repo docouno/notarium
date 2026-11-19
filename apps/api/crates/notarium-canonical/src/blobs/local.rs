@@ -171,7 +171,18 @@ impl PinnedDir {
         })
     }
     fn sync(&self) -> io::Result<()> {
-        self.dir.try_clone()?.into_std_file().sync_all()
+        #[cfg(windows)]
+        {
+            // FlushFileBuffers requires GENERIC_WRITE. Reopen the pinned
+            // directory through its own handle with backup semantics.
+            self.dir
+                .open_with(".", OpenOptions::new().write(true).maybe_dir(true))?
+                .sync_all()
+        }
+        #[cfg(not(windows))]
+        {
+            self.dir.try_clone()?.into_std_file().sync_all()
+        }
     }
 }
 

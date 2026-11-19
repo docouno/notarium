@@ -218,7 +218,24 @@ The server runs as UID 1000, defaults to `PORT=3000` and serves `/health`. Overr
 `PORT=8080` for the Compose web proxy.
 
 Desktop output lives in `apps/desktop/release/`. The executable
-`resources/notarium-sidecar` sits beside `app.asar`. It does not yet implement
-the protected desktop service. Both sidecar and migrator support only `--help`
-and exit 2 for normal invocation. The starter desktop connects to the development
-API through its platform bridge.
+`resources/notarium-sidecar` sits beside `app.asar`. The Compose desktop
+development path connects to `DEVKIT_API_TARGET` through its platform bridge.
+Native development and packaged Electron start a local child. The launcher
+expects the sidecar readiness frame on stdout and keeps its stdin pipe open
+for the lifetime of the session. The current packaged executable reports a
+startup failure until the application composition is wired.
+
+The `notarium-vault` test composition runs the same protected listener and
+shutdown path with live canonical SQLite and CAS. Run the tests with
+`make test app=api`. Its standalone fixture can also be built with
+`make exec app=api command='cargo build --locked --offline -p notarium-vault --example sidecar_fixture'`.
+Use an isolated private data root when running that example. It creates test
+notes and serves fixture-only endpoints.
+
+Native data defaults to `$XDG_DATA_HOME/notarium` (or
+`$HOME/.local/share/notarium`) on Linux, `~/Library/Application Support/ai.notarium.desktop`
+on macOS, and `%LOCALAPPDATA%\Notarium` on Windows. The startup adapter checks
+the owner and permissions of an existing private root before opening storage.
+The host can read the saved vault selection from the private root before
+validating and reopening the pair. Packaged distribution and the full runtime
+still require target-OS checks.

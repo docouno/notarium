@@ -104,7 +104,18 @@ package. Product SDK generation and transport APIs come later.
 The shared React client has no Electron privileges. Main/preload/renderer belong
 to one desktop app, which packages the Rust sidecar as an external resource.
 The target desktop separates user Markdown files from private SQLite/CAS/index
-data. Its protected sidecar lifecycle is not implemented yet.
+data. `notarium-vault` implements the capability-scoped Markdown reconciler,
+the loopback perimeter, and the sidecar startup and shutdown protocol.
+The reconciler consumes canonical changes and uses writer-owned path stamps
+and purge handoffs to recover across filesystem and database commits.
+The Electron supervisor holds the launch capability in main and delivers it
+over stdin. It consumes one readiness frame and grants the renderer access
+to the bound endpoint in a dedicated Chromium session.
+
+The components can run together in a test composition with canonical SQLite
+and CAS. The production binary still needs application composition and a
+production WebSocket ticket issuer. Compose desktop uses its separately
+configured API connection.
 
 The server container runs as UID/GID 1000 without Node and defaults to port 3000.
 Dev Compose uses port 8080 behind the web proxy. `/health` and `/api/greeting`

@@ -1652,6 +1652,12 @@ async fn run_domain_and_security_suite(
         .unwrap();
     assert_eq!(authorized.explicit_read(ctx.auth()).unwrap(), helper_v1);
     for reader in [project_reader(&proj_a), b_reader.clone()] {
+        assert!(matches!(
+            store
+                .read_vault_ability_manifest(&reader, &placed(&pkg_v1.value.revision).identity())
+                .await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
         let descriptor = notarium_core::ports::ControlCatalogPort::ability(
             store,
             account(&reader),
@@ -1700,6 +1706,25 @@ async fn run_domain_and_security_suite(
     )
     .await
     .unwrap();
+    let owned = placed(&pkg_v2.value.revision).identity();
+    let manifest = store
+        .read_vault_ability_manifest(&b_reader, &owned)
+        .await
+        .unwrap();
+    assert_eq!(manifest.revision, pkg_v2.value.revision);
+    assert_eq!(manifest.manifest, pkg_v2.value.manifest);
+    assert!(matches!(
+        store
+            .read_vault_ability_manifest(
+                &ctx,
+                &notarium_core::ports::AbilityIdentity {
+                    id: ability_id.clone(),
+                    placement: notarium_core::ports::AbilityPlacement::System,
+                },
+            )
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
     let current = store
         .read_ability_resource(
             b_reader.clone(),

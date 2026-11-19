@@ -89,7 +89,11 @@ impl PausedRoom {
                     InterceptedOutcome::NoteRevision(committed),
                 )))
             }
-            InterceptedPayload::ExternalObservation { observation, .. } => {
+            InterceptedPayload::ExternalObservation {
+                observation,
+                vault_witness,
+                ..
+            } => {
                 let outcome = self
                     .store
                     .commit_intercepted_external_observation(
@@ -98,6 +102,7 @@ impl PausedRoom {
                         request.preconditions,
                         observation,
                         settlement,
+                        vault_witness,
                     )
                     .await?;
                 Ok(InterceptionResult::Applied(Box::new(

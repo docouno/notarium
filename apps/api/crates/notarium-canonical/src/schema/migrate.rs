@@ -26,6 +26,7 @@ pub(crate) const V5_HASH: &str = "e32b31f85aeb41b99c19c355bad2f9103eac552a0fe4b9
 pub(crate) const V6_HASH: &str = "f91526e264d8000bf5d72a4efcb4e9701b350636c37da24d2b34bb19f50a8772";
 
 pub(crate) const V7_HASH: &str = "1a3cfcfe1c2d78948310fb1dafb04dba99e243ea821626e2de4d7009c3aa22b9";
+pub(crate) const V8_HASH: &str = "085e724d4cf969a85265d36b616fe04bc78a51c3beadf86dee7f1664bee2dcd7";
 
 pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
     match version {
@@ -36,6 +37,7 @@ pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
         5 => hex::encode(hash) == V5_HASH,
         6 => hex::encode(hash) == V6_HASH,
         7 => hex::encode(hash) == V7_HASH,
+        8 => hex::encode(hash) == V8_HASH,
         _ => false,
     }
 }
@@ -295,6 +297,23 @@ macro_rules! upgrade {
                 }
             }
             chat_refs::$name(&mut *conn, version).await?;
+            for sql in split_sql_statements($ddl).into_iter().filter(|sql| {
+                sql.starts_with("CREATE TABLE IF NOT EXISTS vault_")
+                    || sql.starts_with("CREATE INDEX IF NOT EXISTS idx_vault_")
+                    || sql.starts_with("CREATE UNIQUE INDEX IF NOT EXISTS uq_vault_")
+            }) {
+                sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("migration_v9_vault_state", e.to_string()))?;
+            }
+            // Legacy command metadata inferred a path from note placement and
+            // carried no trusted file identity or binding. Start with no stamps.
+            for sql in [
+                "DELETE FROM materialized_observations",
+                "DELETE FROM payload_owners WHERE payload_kind = 'materialized_observation'",
+            ] {
+                sqlx::query(sql).execute(&mut *conn).await
+                    .map_err(|e| internal_not_committed("migration_v9_discard_legacy_stamps", e.to_string()))?;
+            }
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
             sqlx::query(WRITE_WITNESS)
@@ -330,6 +349,70 @@ mod tests {
     use super::*;
     use crate::schema::bootstrap_sqlite_schema;
     use sqlx::{Connection, Row};
+
+    #[tokio::test]
+    async fn v6_upgrade_discards_unverified_observations_and_preserves_note_heads() {
+        let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+        let installation = InstallationId::from_bytes([6; 16]);
+        for statement in split_sql_statements(SQLITE_BASELINE_DDL) {
+            if statement.starts_with("CREATE TABLE IF NOT EXISTS vault_")
+                || statement.starts_with("CREATE INDEX IF NOT EXISTS idx_vault_")
+                || statement.starts_with("CREATE UNIQUE INDEX IF NOT EXISTS uq_vault_")
+            {
+                continue;
+            }
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&mut db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO schema_meta VALUES (1,6,1,$1,'ready',$2,0,0,0,0)")
+            .bind(installation.as_str())
+            .bind(hex::decode(V6_HASH).unwrap())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO spaces VALUES('space',zeroblob(16),'root','s','s','personal',
+                 'owner','active',0,0,'{}',0,0);
+             INSERT INTO folder_heads (space_id,folder_id,is_root,slug,slug_fold,display_name,
+                 is_project,lifecycle_state,rev_seq,head_rev_id,created_seq,updated_seq,updated_at_sec,updated_at_nsec)
+                 VALUES ('space','root',1,'','','',0,'active',0,'folder_rev',0,0,0,0);
+             INSERT INTO note_heads (space_id,note_id,parent_folder_id,slug,slug_fold,title,title_fold,
+                 doc_class,head_rev_id,content_blake3,byte_size,lifecycle_state,created_seq,updated_seq,
+                 created_at_sec,created_at_nsec,updated_at_sec,updated_at_nsec,last_actor_id)
+                 VALUES ('space','note','root','note','note','Title','title','user-doc','old_rev',
+                     zeroblob(32),0,'active',1,1,0,0,0,0,'owner');
+             INSERT INTO materialized_observations VALUES ('space','note','inferred.md',NULL,NULL,0,
+                 zeroblob(32),zeroblob(32),'old_rev',1);
+             INSERT INTO payload_owners VALUES ('space','materialized_observation','inferred.md','note');
+             CREATE TEMP TABLE before_heads AS SELECT * FROM note_heads;",
+        )
+        .execute(&mut db)
+        .await
+        .unwrap();
+
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        let counts: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM materialized_observations),
+                    (SELECT count(*) FROM payload_owners),
+                    (SELECT count(*) FROM vault_observations),
+                    (SELECT count(*) FROM (SELECT * FROM before_heads EXCEPT SELECT * FROM note_heads))",
+        )
+        .fetch_one(&mut db)
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0, 0, 0));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT schema_version FROM schema_meta")
+                .fetch_one(&mut db)
+                .await
+                .unwrap(),
+            i64::from(CANONICAL_SCHEMA_VERSION)
+        );
+    }
 
     #[tokio::test]
     async fn v5_retirement_upgrade_preserves_rows_and_indexes_global_pending_work() {

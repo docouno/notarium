@@ -578,6 +578,8 @@ pub enum InterceptedPayload {
         observation: ExternalObservation,
         body: BodyPatchPlan,
         header: HeaderMutation,
+        /// Opaque storage precondition forwarded to the canonical room writer.
+        vault_witness: Option<crate::ids::ContentDigest>,
     },
 }
 #[derive(Clone, Debug)]

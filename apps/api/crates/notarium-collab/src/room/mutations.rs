@@ -74,6 +74,7 @@ impl Room {
                 observation,
                 body,
                 header,
+                ..
             } => (
                 Some(body),
                 Some(header),
@@ -458,7 +459,11 @@ async fn commit(
             let seq = edit.receipt.seq().get();
             Ok((revision, seq, InterceptedOutcome::NoteRevision(edit)))
         }
-        InterceptedPayload::ExternalObservation { observation, .. } => {
+        InterceptedPayload::ExternalObservation {
+            observation,
+            vault_witness,
+            ..
+        } => {
             let lineage = settlement.expected_lineage;
             match store
                 .commit_intercepted_external_observation(
@@ -467,6 +472,7 @@ async fn commit(
                     preconditions,
                     observation,
                     settlement,
+                    vault_witness,
                 )
                 .await?
             {

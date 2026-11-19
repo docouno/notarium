@@ -78,6 +78,11 @@ document. There is no whole-header reserialization to bypass an ambiguous edit.
 Class evidence in an opaque header comes from semantic root events, including
 explicit YAML keys; partial editing support cannot hide a protected declaration.
 
+The desktop vault writes a protected identity key when it publishes Markdown.
+The file's claim is checked against the current vault binding before it can
+affect routing. New imports omit the claim from canonical content. Edits to a
+bound note preserve its canonical identity metadata, including an absent key.
+
 ## Saving a work-in-progress view
 
 Each actual fenced `nota` block has a local analysis state:

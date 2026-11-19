@@ -36,6 +36,7 @@ pub(crate) enum ReplayPolicy {
     Schema(Vec<ReplayResource>),
     Chat(ChatThreadId, Vec<NoteRef>, bool),
     Job(Option<JobId>, Vec<NoteId>),
+    VaultFolder(crate::vault::VaultFolderReplay),
 }
 
 /// A domain fingerprint becomes usable by the writer only after binding a policy.
@@ -170,6 +171,7 @@ impl CommandIdentitySpec {
                 crate::peers::authorize_job_replay_tx(tx, &srec.space, auth, job.as_ref(), notes)
                     .await?
             }
+            ReplayPolicy::VaultFolder(attempt) => attempt.authorize(tx, &srec, auth).await?,
             ReplayPolicy::Documents(targets) | ReplayPolicy::Schema(targets) => {
                 auth.authorize_space_write(&srec.space)?;
                 if matches!(policy, ReplayPolicy::Schema(_)) {

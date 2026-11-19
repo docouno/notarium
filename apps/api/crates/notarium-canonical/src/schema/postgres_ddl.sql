@@ -839,3 +839,81 @@ CREATE TABLE IF NOT EXISTS collab_checkpoints (
     PRIMARY KEY (space_id, note_id),
     FOREIGN KEY (space_id, note_id) REFERENCES collab_sessions (space_id, note_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS vault_bindings (
+    space_id TEXT NOT NULL,
+    binding_generation BYTEA NOT NULL CHECK (octet_length(binding_generation) = 32),
+    history_incarnation BYTEA NOT NULL CHECK (octet_length(history_incarnation) = 16),
+    root_identity BYTEA NOT NULL CHECK (octet_length(root_identity) = 32),
+    actor_id TEXT NOT NULL,
+    acknowledged_seq BIGINT NOT NULL CHECK (acknowledged_seq >= 0),
+    active INTEGER NOT NULL CHECK (active IN (0, 1)),
+    PRIMARY KEY (space_id, binding_generation),
+    FOREIGN KEY (space_id) REFERENCES spaces (space_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vault_bindings_active
+    ON vault_bindings (space_id) WHERE active = 1;
+
+CREATE TABLE IF NOT EXISTS vault_observations (
+    space_id TEXT NOT NULL,
+    binding_generation BYTEA NOT NULL CHECK (octet_length(binding_generation) = 32),
+    note_id TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    path_key TEXT COLLATE "C" NOT NULL,
+    disk_identity BYTEA NOT NULL CHECK (octet_length(disk_identity) = 32),
+    byte_size BIGINT NOT NULL CHECK (byte_size >= 0),
+    mtime_seconds BIGINT NOT NULL,
+    mtime_nanos INTEGER NOT NULL CHECK (mtime_nanos BETWEEN 0 AND 999999999),
+    disk_digest BYTEA NOT NULL CHECK (octet_length(disk_digest) = 32),
+    observed_revision TEXT NOT NULL,
+    carrier_digest BYTEA NOT NULL CHECK (octet_length(carrier_digest) = 32),
+    PRIMARY KEY (space_id, binding_generation, note_id),
+    FOREIGN KEY (space_id, binding_generation) REFERENCES vault_bindings (space_id, binding_generation),
+    FOREIGN KEY (space_id, note_id) REFERENCES note_heads (space_id, note_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vault_observations_path
+    ON vault_observations (space_id, binding_generation, path_key);
+
+CREATE INDEX IF NOT EXISTS idx_vault_observations_note
+    ON vault_observations (space_id, note_id);
+
+CREATE INDEX IF NOT EXISTS idx_vault_observations_identity
+    ON vault_observations (space_id, binding_generation, disk_identity);
+
+CREATE INDEX IF NOT EXISTS idx_vault_observations_digest
+    ON vault_observations (space_id, binding_generation, disk_digest);
+
+CREATE TABLE IF NOT EXISTS vault_handoffs (
+    space_id TEXT NOT NULL,
+    binding_generation BYTEA NOT NULL CHECK (octet_length(binding_generation) = 32),
+    note_id TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    path_key TEXT COLLATE "C" NOT NULL,
+    disk_identity BYTEA NOT NULL CHECK (octet_length(disk_identity) = 32),
+    byte_size BIGINT NOT NULL CHECK (byte_size >= 0),
+    mtime_seconds BIGINT NOT NULL,
+    mtime_nanos INTEGER NOT NULL CHECK (mtime_nanos BETWEEN 0 AND 999999999),
+    disk_digest BYTEA NOT NULL CHECK (octet_length(disk_digest) = 32),
+    observed_revision TEXT NOT NULL,
+    carrier_digest BYTEA NOT NULL CHECK (octet_length(carrier_digest) = 32),
+    successor_note_id TEXT,
+    successor_revision TEXT,
+    purge_seq BIGINT NOT NULL CHECK (purge_seq >= 1),
+    PRIMARY KEY (space_id, binding_generation, note_id),
+    FOREIGN KEY (space_id, binding_generation) REFERENCES vault_bindings (space_id, binding_generation),
+    CHECK ((successor_note_id IS NULL) = (successor_revision IS NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_handoffs_successor
+    ON vault_handoffs (space_id, successor_note_id);
+
+CREATE INDEX IF NOT EXISTS idx_vault_handoffs_path
+    ON vault_handoffs (space_id, binding_generation, path_key);
+
+CREATE INDEX IF NOT EXISTS idx_vault_handoffs_identity
+    ON vault_handoffs (space_id, binding_generation, disk_identity);
+
+CREATE INDEX IF NOT EXISTS idx_vault_handoffs_digest
+    ON vault_handoffs (space_id, binding_generation, disk_digest);

@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 8;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {
@@ -813,6 +813,71 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("carrier_dirty", Int, false),
         ],
         indexes: &[],
+    },
+    TableSpec {
+        name: "vault_bindings",
+        primary_key: &["space_id", "binding_generation"],
+        columns: &[
+            col("space_id", Text, false),
+            col("binding_generation", Bytes, false),
+            col("history_incarnation", Bytes, false),
+            col("root_identity", Bytes, false),
+            col("actor_id", Text, false),
+            col("acknowledged_seq", Int, false),
+            col("active", Int, false),
+        ],
+        indexes: &["uq_vault_bindings_active"],
+    },
+    TableSpec {
+        name: "vault_observations",
+        primary_key: &["space_id", "binding_generation", "note_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("binding_generation", Bytes, false),
+            col("note_id", Text, false),
+            col("rel_path", Text, false),
+            col("path_key", Text, false),
+            col("disk_identity", Bytes, false),
+            col("byte_size", Int, false),
+            col("mtime_seconds", Int, false),
+            col("mtime_nanos", Int, false),
+            col("disk_digest", Bytes, false),
+            col("observed_revision", Text, false),
+            col("carrier_digest", Bytes, false),
+        ],
+        indexes: &[
+            "uq_vault_observations_path",
+            "idx_vault_observations_note",
+            "idx_vault_observations_identity",
+            "idx_vault_observations_digest",
+        ],
+    },
+    TableSpec {
+        name: "vault_handoffs",
+        primary_key: &["space_id", "binding_generation", "note_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("binding_generation", Bytes, false),
+            col("note_id", Text, false),
+            col("rel_path", Text, false),
+            col("path_key", Text, false),
+            col("disk_identity", Bytes, false),
+            col("byte_size", Int, false),
+            col("mtime_seconds", Int, false),
+            col("mtime_nanos", Int, false),
+            col("disk_digest", Bytes, false),
+            col("observed_revision", Text, false),
+            col("carrier_digest", Bytes, false),
+            col("successor_note_id", Text, true),
+            col("successor_revision", Text, true),
+            col("purge_seq", Int, false),
+        ],
+        indexes: &[
+            "idx_vault_handoffs_successor",
+            "idx_vault_handoffs_path",
+            "idx_vault_handoffs_identity",
+            "idx_vault_handoffs_digest",
+        ],
     },
 ];
 

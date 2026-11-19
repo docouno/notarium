@@ -1,10 +1,14 @@
-//! Reserved for the vault subsystem. Domain behavior is added in later waves.
+//! Desktop filesystem materialization and the loopback sidecar boundary.
 
-#[cfg(test)]
-mod tests {
-    // A compile smoke test for the initial scaffold, not domain certification.
-    #[test]
-    fn scaffold_has_the_expected_package_identity() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "notarium-vault");
-    }
-}
+pub mod carrier;
+pub mod filesystem;
+pub mod materials;
+pub mod sidecar;
+pub mod sync;
+
+mod journal;
+mod paths;
+mod publication;
+mod watch;
+
+pub use journal::{ConflictReason, DiskConflict};

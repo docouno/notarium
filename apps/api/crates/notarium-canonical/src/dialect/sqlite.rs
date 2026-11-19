@@ -1,5 +1,6 @@
-use std::{fs, path::Path, time::Duration};
+use std::{fs, io, path::Path, time::Duration};
 
+use cap_std::{ambient_authority, fs::Dir};
 use notarium_core::{
     epoch::{DataRoot, DatabaseState, DatabaseWitness, MarkerObservation},
     error::PortError,
@@ -22,6 +23,20 @@ use crate::{
 mod bootstrap_tests;
 
 pub const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
+fn check_canonical_files(data_root: &DataRoot) -> io::Result<bool> {
+    let root = Dir::open_ambient_dir(data_root.root(), ambient_authority())?;
+    let directory = super::service_dir(&root)?;
+    let present = super::service_file_is_present(&directory, "canonical.sqlite")?;
+    for name in [
+        "canonical.sqlite-wal",
+        "canonical.sqlite-shm",
+        "canonical.sqlite-journal",
+    ] {
+        super::service_file_is_present(&directory, name)?;
+    }
+    Ok(present)
+}
 
 #[cfg(target_os = "linux")]
 fn suppress_database_access_times(directory: &std::path::Path) {
@@ -54,10 +69,10 @@ pub async fn open_and_bootstrap_sqlite(
     PortError,
 > {
     let db_path = data_root.canonical();
+    check_canonical_files(data_root)
+        .map_err(|err| internal_not_committed("sqlite_service_file", err.to_string()))?;
+    #[cfg(target_os = "linux")]
     if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| internal_not_committed("sqlite_parent_mkdir", err.to_string()))?;
-        #[cfg(target_os = "linux")]
         suppress_database_access_times(parent);
     }
 
@@ -111,7 +126,8 @@ pub fn open_rusqlite_writer_connection(db_path: &Path) -> Result<rusqlite::Conne
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
             | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|err| internal_not_committed("rusqlite_writer_connect", err.to_string()))?;
 
@@ -210,7 +226,9 @@ pub fn open_rusqlite_readonly_connection(
 ) -> Result<rusqlite::Connection, PortError> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|err| internal_not_committed("rusqlite_readonly_connect", err.to_string()))?;
 
@@ -234,7 +252,9 @@ pub fn open_rusqlite_checkpoint_connection(
 ) -> Result<rusqlite::Connection, PortError> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|err| internal_not_committed("rusqlite_ckpt_connect", err.to_string()))?;
 
@@ -407,8 +427,11 @@ pub async fn observe_sqlite_canonical_witness(
     data_root: &DataRoot,
 ) -> MarkerObservation<DatabaseWitness> {
     let db_path = data_root.canonical();
-    if !db_path.exists() {
-        return MarkerObservation::Missing;
+    match check_canonical_files(data_root) {
+        Ok(true) => {}
+        Ok(false) => return MarkerObservation::Missing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return MarkerObservation::Missing,
+        Err(_) => return MarkerObservation::Unreadable,
     }
     let options = SqliteConnectOptions::new()
         .filename(&db_path)

@@ -1,5 +1,6 @@
 import { expect, it } from 'vitest';
-import { requestGreeting } from './api.js';
+import { requestGreeting } from '../greeting.js';
+import { parseComposeTarget } from './api.js';
 it('uses the configured backend and encodes the name', async () => {
   let requested = '';
   const fetcher: typeof fetch = (input) => {
@@ -23,4 +24,19 @@ it('rejects invalid names and backend failures', async () => {
       Promise.resolve(new Response('{"message":42}')),
     ),
   ).rejects.toThrow('invalid greeting');
+});
+
+it('distinguishes an unset Compose target from an invalid configuration', () => {
+  expect(parseComposeTarget(undefined)).toBeUndefined();
+  expect(parseComposeTarget('http://api:8080')).toBe('http://api:8080');
+  expect(parseComposeTarget('https://backend.example/')).toBe('https://backend.example');
+  for (const value of [
+    '',
+    'file:///tmp/api',
+    'http://user:pass@api',
+    'http://api/other',
+    'http://api/?query',
+  ]) {
+    expect(() => parseComposeTarget(value)).toThrow('DEVKIT_API_TARGET');
+  }
 });

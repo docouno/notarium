@@ -92,8 +92,9 @@ docker run --rm -p 127.0.0.1:3000:3000 notarium:local
 The contract comes from actual `notarium-http` declarations; a test detects drift
 in `packages/api-contract/openapi.v1.json`. Desktop packaging builds Rust first
 and includes the executable sidecar outside `app.asar`. Sidecar startup/security
-and migration remain scaffolds: their binaries only support `--help` and reject
-normal operation. The server image runs as UID 1000 without a Node runtime.
+components and Markdown reconciliation can run in a test composition with
+canonical storage. The packaged executable still needs application composition.
+The server image runs as UID 1000 without a Node runtime.
 
 ## License
 
