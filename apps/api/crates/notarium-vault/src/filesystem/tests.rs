@@ -555,20 +555,16 @@ fn parked_capture_replays_after_the_original_parent_changes_case() {
     let roots = fixture.open();
     let vault = roots.vault().unwrap();
     if old_dir.is_dir() {
-        // On a case-insensitive volume, the strict shared lookup rejects the
-        // alias. Only an already verified private capture may bypass it.
+        // On a case-insensitive volume, ordinary reads still reject aliases.
         assert_eq!(
             vault.open_dir(Path::new("Drafts")).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
-        assert_eq!(
-            vault
-                .clean_capture(&unparked, &unparked_stamp)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
     }
+    assert!(matches!(
+        vault.clean_capture(&unparked, &unparked_stamp).unwrap(),
+        CaptureCleanup::Retained { path } if path == fixture.vault.join(&unparked)
+    ));
     assert_eq!(
         vault.recovered_capture(&slot).unwrap(),
         Some(parked.clone())

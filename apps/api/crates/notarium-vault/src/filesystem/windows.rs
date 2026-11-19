@@ -498,6 +498,39 @@ fn relocate_or_dispose_capture(
     Ok(ParkAction::Relocated)
 }
 
+pub fn dispose_cross_volume_capture(
+    parent: &Dir,
+    name: &OsStr,
+    expected: &FileStamp,
+) -> io::Result<bool> {
+    let result: io::Result<bool> = (|| {
+        let mut file = open_rename_source(parent, name)?;
+        verify_name(&file, name)?;
+        super::checked_file_metadata(&file)?;
+        if !matches_open(&mut file, expected)? {
+            return Ok(false);
+        }
+        dispose_shared_held(file)?;
+        Ok(true)
+    })();
+    match result {
+        Err(error)
+            if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
+                || matches!(
+                    error.kind(),
+                    io::ErrorKind::AlreadyExists
+                        | io::ErrorKind::InvalidInput
+                        | io::ErrorKind::NotFound
+                        | io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::Unsupported
+                ) =>
+        {
+            Ok(false)
+        }
+        result => result,
+    }
+}
+
 pub fn verify_parked_capture(dir: &Dir, name: &OsStr) -> io::Result<()> {
     let metadata = dir.symlink_metadata(name)?;
     if is_link(&metadata) {

@@ -60,6 +60,8 @@ pub(crate) struct ArchivedCapture {
     pub slot: PathBuf,
     pub expected: FileStamp,
     pub retained_at: PathBuf,
+    #[serde(default)]
+    pub unlocated: bool,
     pub successor: Option<NoteId>,
 }
 

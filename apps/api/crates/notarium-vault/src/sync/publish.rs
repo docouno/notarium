@@ -414,12 +414,15 @@ impl Worker<'_> {
                 Ok(true)
             }
             CaptureCleanup::Retained { path } => {
+                let unlocated = path == self.vault.path_for_watcher().join(&captured.path)
+                    && !matches!(self.vault.entry_kind_exact(&captured.path), Ok(Some(_)));
                 let record = ArchivedCapture {
                     operation,
                     target: target.to_owned(),
                     slot: captured.path,
                     expected: captured.stamp,
                     retained_at: path,
+                    unlocated,
                     successor,
                 };
                 self.journal.archive_capture(&record)?;
@@ -441,8 +444,25 @@ impl Worker<'_> {
             .filter(|capture| successor.is_none_or(|note| capture.successor.as_ref() == Some(note)))
             .cloned()
             .collect::<Vec<_>>();
-        for capture in captures {
+        for mut capture in captures {
             self.check_stop()?;
+            if capture.retained_at == self.vault.path_for_watcher().join(&capture.slot) {
+                let shared_present = match self.vault.entry_kind_exact(&capture.slot) {
+                    Ok(kind) => kind.is_some(),
+                    Err(error) if path_error(&error) => false,
+                    Err(error) => return Err(error.into()),
+                };
+                if !shared_present && self.vault.recovered_capture(&capture.slot)?.is_none() {
+                    // The shared slot travels with its folder. An absent
+                    // spelling cannot distinguish a move from a deletion.
+                    if !capture.unlocated {
+                        capture.unlocated = true;
+                        self.journal.archive_capture(&capture)?;
+                        self.captures.insert(capture.operation, capture);
+                    }
+                    continue;
+                }
+            }
             self.clean_captured(
                 capture.operation,
                 &capture.target,
@@ -740,14 +760,25 @@ impl Worker<'_> {
                 },
             )?;
         }
-        self.store
+        match self
+            .store
             .complete_vault_handoff(
                 self.config.context.clone(),
                 &self.binding,
                 handoff.clone(),
                 Some(observation.clone()),
             )
-            .await?;
+            .await
+        {
+            Ok(()) => {}
+            Err(PortError::Domain(_)) => {
+                // A later canonical change can replace the handoff while
+                // this publication is in flight. Keep the intent for replay.
+                self.conflict(&intent.target, ConflictReason::UnresolvedPublication, None)?;
+                return Ok(ConversionPublication::Pending);
+            }
+            Err(error) => return Err(error.into()),
+        }
         self.known.insert(observation.path.key.clone(), observation);
         Ok(if self.finish_publication(intent, captured)? {
             ConversionPublication::Complete

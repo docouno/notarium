@@ -273,8 +273,8 @@ impl VaultDir {
             });
         }
 
-        let Some((parent, _)) = present(self.parent(slot))? else {
-            return Ok(Parked::Missing);
+        let Some(parent) = self.open_dir_exact(source_path)? else {
+            return Ok(Parked::Shared(shared));
         };
         if present(parent.symlink_metadata(name))?.is_none() {
             #[cfg(windows)]
@@ -289,6 +289,13 @@ impl VaultDir {
             .expect("create opens the recovery directory");
         match platform::require_same_mount(&parent, &recovery) {
             Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                #[cfg(windows)]
+                if let Some(expected) = expected
+                    && platform::dispose_cross_volume_capture(&parent, name, expected)?
+                {
+                    sync_dir(&parent)?;
+                    return Ok(Parked::Missing);
+                }
                 return Ok(Parked::Shared(shared));
             }
             result => result?,

@@ -166,8 +166,12 @@ remain separate. A displaced file with uncertain ownership or stability stays
 available for recovery without holding the live path open. On Linux and macOS,
 the adapter parks it in private recovery when the roots support an atomic
 same-volume move. Existing-file replacement on Windows requires a volume that
-passes the transaction probe. On macOS, an atomic exchange can publish the
-replacement while the private archive retains the displaced inode. Ordinary
+passes the transaction probe. A matching Windows capture can be retired on the
+source volume through a verified handle that excludes writers. When an earlier
+shared capture can no longer be found at its exact path, the vault retains its
+recovery record and reports the capture without a confirmed location. On macOS,
+an atomic exchange publishes the replacement while the private archive
+retains the displaced inode. Ordinary
 replacements report retained captures in vault status. Conversions return
 `CleanupPending` while that inode remains. The archive writes no plaintext
 copy. `Complete` requires safe retirement of the displaced inode.

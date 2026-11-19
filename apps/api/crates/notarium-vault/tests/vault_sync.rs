@@ -356,6 +356,70 @@ async fn cold_case_only_folder_rename_keeps_the_folder_and_note_ids() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_keeps_an_unlocated_shared_capture_and_continues_importing() {
+    use notarium_vault::filesystem::VaultDir;
+
+    let fixture = Fixture::open().await;
+    let worker = fixture.start();
+    ready(&mut worker.status(), |_| true).await;
+    worker.shutdown().await.unwrap();
+    let ctx = context(&fixture.scope);
+    let binding = fixture.store.vault_binding(&ctx).await.unwrap().unwrap();
+    let vault = fixture.roots.vault().unwrap();
+
+    let old_parent = fixture.root.join("Drafts");
+    let new_parent = fixture.root.join("drafts");
+    fs::create_dir(&old_parent).unwrap();
+    let target = Path::new("Drafts/note.md");
+    let operation = ContentDigest::from_bytes([84; 32]);
+    let slot = VaultDir::operation_slot(target, &operation.to_hex()).unwrap();
+    let stamp = vault.stage(target, &slot, b"captured bytes").unwrap();
+    let record = fixture
+        .roots
+        .data_root()
+        .root()
+        .join(format!("vault-notes-{}", binding.generation.to_hex()))
+        .join(format!("{}.capture", operation.to_hex()));
+    let file = fs::File::create(&record).unwrap();
+    serde_json::to_writer(
+        &file,
+        &serde_json::json!({
+            "operation": operation,
+            "target": target,
+            "slot": slot,
+            "expected": stamp,
+            "retained_at": fixture.root.join(&slot),
+            "successor": null,
+        }),
+    )
+    .unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let intermediate = fixture.root.join("renaming");
+    fs::rename(old_parent, &intermediate).unwrap();
+    fs::rename(&intermediate, &new_parent).unwrap();
+    let note = fixture.root.join("independent.md");
+    fs::write(&note, "# Independent note\n").unwrap();
+
+    let worker = fixture.start();
+    let status = ready(&mut worker.status(), |_| disk_id(&note).is_some()).await;
+    assert!(
+        status
+            .conflicts
+            .iter()
+            .any(|issue| { issue.path == "Drafts/note.md" && issue.preserved_path.is_none() }),
+        "{status:?}"
+    );
+    assert!(record.exists());
+    assert_eq!(
+        fs::read(new_parent.join(slot.file_name().unwrap())).unwrap(),
+        b"captured bytes"
+    );
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_replaces_a_proven_unapplied_stage_with_the_current_revision() {
     use notarium_core::ports::{ExternalObservation, ExternalObservationResult, ObservedContent};
     use notarium_vault::filesystem::VaultDir;

@@ -358,7 +358,7 @@ impl<'a> Worker<'a> {
         conflicts.extend(self.captures.values().map(|capture| DiskConflict {
             path: capture.target.to_string_lossy().into_owned(),
             reason: ConflictReason::CaptureUnverified,
-            preserved_path: Some(capture.retained_at.clone()),
+            preserved_path: (!capture.unlocated).then(|| capture.retained_at.clone()),
         }));
         conflicts.extend(self.reserved.conflicts().map(|issue| DiskConflict {
             path: issue.path.to_string_lossy().into_owned(),
