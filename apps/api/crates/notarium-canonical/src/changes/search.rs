@@ -302,14 +302,14 @@ impl CanonicalStore {
                         .bind(cutoff)
                         .fetch_one(&mut **conn)
                         .await
-                        .map_err(|err| internal_not_committed("sqlite_search_redaction", err.to_string()).into()),
+                        .map_err(|err| internal_not_committed("sqlite_search_redaction", err.to_string())),
                     BackendConn::Postgres(conn) => sqlx::query_scalar(SQL)
                         .bind(scope.space_id.as_str())
                         .bind(scope.incarnation.as_bytes().as_slice())
                         .bind(cutoff)
                         .fetch_one(&mut **conn)
                         .await
-                        .map_err(|err| pg_read_error("pg_search_redaction", err).into()),
+                        .map_err(|err| pg_read_error("pg_search_redaction", err)),
                 }
             })
         })
