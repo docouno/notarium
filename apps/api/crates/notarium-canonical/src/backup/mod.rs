@@ -59,6 +59,8 @@ use crate::{
 
 pub const POSTGRES_SPOOL_V1_MAGIC: &[u8] = b"NOTARIUM_PG_SPOOL_V1\n";
 pub const PG_SLICE_MAX_BYTES: usize = 64 * 1024;
+const PG_SPOOL_PAGE_ROWS: usize = 16;
+const PG_SPOOL_INLINE_BYTES: usize = 4096;
 pub const SQLITE_BACKUP_PAGES_PER_STEP: i32 = 16;
 const SQLITE_CACHE_KIB: i32 = 512;
 const STREAM_IO_BUF_BYTES: usize = 64 * 1024;
@@ -670,8 +672,21 @@ const SQLITE_CUT_SCHEMA: &str = "SELECT schema_version, installation_id, manifes
     FROM schema_meta WHERE singleton_id = 1 AND epoch_version = 1 AND migration_state = 'ready'";
 const SQLITE_CUT_HISTORIES: &str =
     "SELECT space_id, history_incarnation, last_seq FROM spaces ORDER BY space_id ASC";
+
+// A provisional upload owns its immutable part keys under a publication ID.
+// Its discard never touches the live generation included in the cut.
+macro_rules! pending_live_retirement {
+    ($prefix:literal, $suffix:literal) => {
+        concat!(
+            $prefix,
+            "status = 'pending' AND (reason <> 'gc' OR substr(retirement_id,1,4) <> 'pub_')",
+            $suffix
+        )
+    };
+}
+
 const SQLITE_CUT_RETIREMENTS: &str =
-    "SELECT EXISTS (SELECT 1 FROM blob_retirements WHERE status = 'pending')";
+    pending_live_retirement!("SELECT EXISTS (SELECT 1 FROM blob_retirements WHERE ", ")");
 
 fn warm_sqlite_backup_schema(
     conn: &rusqlite::Connection,
@@ -1430,7 +1445,7 @@ async fn warm_pg_backup_barrier(
     Ok(())
 }
 
-const PG_PIN_WITNESS_SQL: &str =
+const PG_PIN_WITNESS_SQL: &str = pending_live_retirement!(
     "SELECT 0::int2 AS kind, schema_version::bigint AS num_col, installation_id AS id_col,
             manifest_checksum AS bytes_col,
             set_config('statement_timeout', $1, true), set_config('idle_in_transaction_session_timeout', $1, true)
@@ -1440,8 +1455,9 @@ const PG_PIN_WITNESS_SQL: &str =
      SELECT 1::int2, last_seq, space_id, history_incarnation, NULL, NULL FROM spaces
      UNION ALL
      SELECT 2::int2, NULL, NULL, NULL, NULL, NULL
-     WHERE EXISTS (SELECT 1 FROM blob_retirements WHERE status = 'pending')
-     ORDER BY kind, id_col";
+     WHERE EXISTS (SELECT 1 FROM blob_retirements WHERE ",
+    ") ORDER BY kind, id_col"
+);
 
 async fn warm_pg_backup_connection(
     conn: &mut PgConnection,
@@ -1759,35 +1775,34 @@ async fn stream_postgres_spool_v1(
                 .collect::<Vec<_>>()
                 .join(", ");
             let cursor_name = format!("backup_cur_{t_idx}");
+            let mut projections = vec!["ctid::text".to_owned()];
+            for column in table.columns {
+                match column.kind {
+                    LogicalColKind::Int => {
+                        projections.push(format!("\"{}\"::BIGINT", column.name));
+                        projections.push("NULL::bytea".to_owned());
+                    }
+                    LogicalColKind::Text | LogicalColKind::Bytes => {
+                        let value = if column.kind == LogicalColKind::Text {
+                            format!("convert_to(\"{}\", 'UTF8')", column.name)
+                        } else {
+                            format!("\"{}\"", column.name)
+                        };
+                        projections.push(format!("octet_length({value})::BIGINT"));
+                        projections.push(format!(
+                            "CASE WHEN octet_length({value}) <= {PG_SPOOL_INLINE_BYTES} THEN {value} END"
+                        ));
+                    }
+                }
+            }
+            // Fetch bounded rows together with ordinary field data. Oversized
+            // fields still use the existing fixed-size TOAST slices.
             let declare_sql = format!(
-                "DECLARE {cursor_name} NO SCROLL CURSOR FOR SELECT ctid::text FROM \"{}\" ORDER BY {pk_order}",
-                table.name
+                "DECLARE {cursor_name} NO SCROLL CURSOR FOR SELECT {} FROM \"{}\" ORDER BY {pk_order}",
+                projections.join(", "), table.name,
             );
-            let fetch_sql = format!("FETCH 1 FROM {cursor_name}");
+            let fetch_sql = format!("FETCH {PG_SPOOL_PAGE_ROWS} FROM {cursor_name}");
             let close_sql = format!("CLOSE {cursor_name}");
-
-            let meta_projections = table
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(c_idx, c)| match c.kind {
-                    LogicalColKind::Int => format!("\"{}\"::BIGINT AS m{c_idx}", c.name),
-                    LogicalColKind::Text => {
-                        format!(
-                            "octet_length(convert_to(\"{}\", 'UTF8'))::BIGINT AS m{c_idx}",
-                            c.name
-                        )
-                    }
-                    LogicalColKind::Bytes => {
-                        format!("octet_length(\"{}\")::BIGINT AS m{c_idx}", c.name)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let meta_sql = format!(
-                "SELECT {meta_projections} FROM \"{}\" WHERE ctid = $1::tid",
-                table.name
-            );
 
             run_pg_query_bounded(
                 started,
@@ -1811,38 +1826,26 @@ async fn stream_postgres_spool_v1(
                     .await?;
                 }
 
-                let ctid_opt: Option<String> = run_pg_query_bounded(
-                    started,
-                    budget,
-                    cancellation,
-                    sqlx::query_scalar(sqlx::AssertSqlSafe(fetch_sql.clone()))
-                        .persistent(false)
-                        .fetch_optional(&mut *conn),
-                )
-                .await?;
-
-                let Some(ctid_str) = ctid_opt else {
+                let page = run_pg_query_bounded(
+                    started, budget, cancellation,
+                    sqlx::query(sqlx::AssertSqlSafe(fetch_sql.clone()))
+                        .persistent(false).fetch_all(&mut *conn),
+                ).await?;
+                if page.is_empty() {
                     break;
-                };
-
-                // Row frame present tag = 1 (`ctid` is NEVER written to the spool artifact!).
-                spool_writer.write_body(&[1u8])?;
-                row_count += 1;
-                slice_or_row_ops += 1;
-
-                let meta_row = run_pg_query_bounded(
-                    started,
-                    budget,
-                    cancellation,
-                    sqlx::query(sqlx::AssertSqlSafe(meta_sql.clone()))
-                        .bind(&ctid_str)
-                        .persistent(false)
-                        .fetch_one(&mut *conn),
-                )
-                .await?;
+                }
+                for row in page {
+                    let ctid: &str = row.try_get(0).map_err(|err| {
+                        internal_not_committed("pg_backup_ctid", err.to_string())
+                    })?;
+                    // The storage row identity is used only inside this snapshot.
+                    spool_writer.write_body(&[1])?;
+                    row_count += 1;
+                    slice_or_row_ops += 1;
 
                 for (c_idx, col) in table.columns.iter().enumerate() {
-                    let meta_val: Option<i64> = meta_row.try_get(c_idx).map_err(|err| {
+                    let column_index = c_idx * 2 + 1;
+                    let meta_val: Option<i64> = row.try_get(column_index).map_err(|err| {
                         internal_not_committed("pg_backup_meta_col", err.to_string())
                     })?;
 
@@ -1870,6 +1873,17 @@ async fn stream_postgres_spool_v1(
                             spool_writer.write_body(&[1u8])?;
                             spool_writer.write_body(&total_len.to_be_bytes())?;
 
+                            if (1..=PG_SPOOL_INLINE_BYTES as u64).contains(&total_len) {
+                                let inline: &[u8] = row.try_get(column_index + 1)
+                                    .map_err(|err| internal_not_committed("pg_backup_inline", err.to_string()))?;
+                                if inline.len() as u64 != total_len {
+                                    return Err(internal_not_committed("pg_backup_inline_len", "field length changed inside the snapshot"));
+                                }
+                                spool_writer.write_body(&(inline.len() as u32).to_be_bytes())?;
+                                spool_writer.write_body(inline)?;
+                                slice_or_row_ops += 1;
+                                continue;
+                            }
                             if total_len > 0 {
                                 let slice_sql = match col.kind {
                                     LogicalColKind::Text => format!(
@@ -1911,7 +1925,7 @@ async fn stream_postgres_spool_v1(
                                         budget,
                                         cancellation,
                                         sqlx::query_scalar(sqlx::AssertSqlSafe(slice_sql.clone()))
-                                            .bind(&ctid_str)
+                                            .bind(ctid)
                                             .bind(start_1based)
                                             .bind(want_i32)
                                             .persistent(false)
@@ -1941,6 +1955,8 @@ async fn stream_postgres_spool_v1(
                         }
                     }
                 }
+            }
+
             }
 
             // End-of-table row marker = 0 followed by verified row_count.
@@ -1988,7 +2004,14 @@ async fn stream_postgres_spool_v1(
     pg.abort_cleanly().await;
 
     let max_chunk = max_slice_seen.max(STREAM_IO_BUF_BYTES);
-    let working_bytes = STREAM_IO_BUF_BYTES + PG_SLICE_MAX_BYTES;
+    let widest_table = CANONICAL_TABLES
+        .iter()
+        .map(|table| table.columns.len())
+        .max()
+        .unwrap_or(0);
+    let working_bytes = STREAM_IO_BUF_BYTES
+        + PG_SLICE_MAX_BYTES
+        + PG_SPOOL_PAGE_ROWS * widest_table * (PG_SPOOL_INLINE_BYTES + 16);
 
     Ok((
         total_bytes,
@@ -3815,23 +3838,25 @@ async fn has_pending_blob_retirements_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
 ) -> Result<bool, PortError> {
-    let found: Option<i64> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT 1 FROM blob_retirements WHERE space_id = ? AND status = 'pending' LIMIT 1",
-        )
-        .bind(space_id.as_str())
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_check_pending_retirements", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT 1::BIGINT FROM blob_retirements WHERE space_id = $1 AND status = 'pending' LIMIT 1",
-        )
-        .bind(space_id.as_str())
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_check_pending_retirements", err.to_string()))?,
-    };
-    Ok(found.is_some())
+    const CHECK: &str = pending_live_retirement!(
+        "SELECT EXISTS (SELECT 1 FROM blob_retirements WHERE space_id = $1 AND ",
+        ")"
+    );
+    match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_scalar(CHECK)
+                .bind(space_id.as_str())
+                .fetch_one(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_scalar(CHECK)
+                .bind(space_id.as_str())
+                .fetch_one(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|err| internal_not_committed("backup_check_pending_retirements", err.to_string()))
 }
 
 async fn delete_backup_hold_rows(

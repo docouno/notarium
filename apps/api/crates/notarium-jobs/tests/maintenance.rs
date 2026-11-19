@@ -29,6 +29,11 @@ use notarium_jobs::{
     run_restore,
 };
 
+#[path = "maintenance/cloud_takeover.rs"]
+mod cloud_takeover;
+#[path = "maintenance/paired_load.rs"]
+mod paired_load;
+
 struct Scratch(PathBuf);
 
 impl Scratch {
@@ -343,6 +348,36 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         Err(notarium_core::error::PortError::Domain(notarium_core::DomainError::ValidationFailed { diagnostic }))
             if diagnostic.reason == notarium_core::error::ValidationReason::BudgetExceeded
     ));
+    if std::env::var_os("NOTARIUM_SQLITE_FSCK_LARGE").is_some() {
+        for page_size in [512, 65_536] {
+            let image = repackage_sqlite(
+                &destination,
+                &scratch.0,
+                &format!(
+                    "PRAGMA page_size={page_size}; VACUUM;
+                     PRAGMA secure_delete=OFF;
+                     CREATE TABLE verification_padding(data BLOB);
+                     INSERT INTO verification_padding VALUES(zeroblob(167772160));
+                     DROP TABLE verification_padding;"
+                ),
+            );
+            let before = fs::read_dir(&scratch.0).unwrap().count();
+            let result = run_fsck(
+                authority(ServicePurpose::Fsck),
+                FsckInput::Archive(image),
+                &root.keyring(),
+                sqlite_backup_options(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), before);
+            let peak = result.sqlite_native_peak_bytes.unwrap();
+            assert!(peak < 80 * 1024 * 1024);
+            eprintln!(
+                "SQLite archive page size {page_size}, image exceeds 160 MiB, native verifier peak {peak} B"
+            );
+        }
+    }
 
     let mut zip = zip::ZipArchive::new(File::open(&destination).unwrap()).unwrap();
     assert_eq!(
@@ -466,6 +501,8 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         restored_control.close().await;
         owner.shutdown().await.unwrap();
     }
+    paired_load::capture_under_load(&canonical, &binding, &scratch.0, &scope, &owner, "sqlite")
+        .await;
     drop(binding);
     control.close().await;
     runtime.shutdown().await.unwrap();
@@ -612,7 +649,7 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     }
     let bucket = codec::new_prefixed_hex_id("jobs-backup-").unwrap();
     let source_s3 = fixture.s3("source-content", bucket.clone());
-    let target_s3 = fixture.s3("target-content", bucket);
+    let target_s3 = fixture.s3("target-content", bucket.clone());
     admin_ensure_bucket(&source_s3, Some("Enabled"))
         .await
         .unwrap();
@@ -759,10 +796,13 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
         .await
         .is_err()
     );
-    let (restored_store, restored_runtime) =
-        CanonicalRuntime::open(cloud_config(installation, target.clone(), target_s3))
-            .await
-            .unwrap();
+    let (restored_store, restored_runtime) = CanonicalRuntime::open(cloud_config(
+        installation.clone(),
+        target.clone(),
+        target_s3,
+    ))
+    .await
+    .unwrap();
     let content = notarium_syntax::content_digest(carrier);
     assert_eq!(
         restored_store
@@ -791,6 +831,16 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     drop(new_keys);
     restored_control.close().await;
     restored_runtime.shutdown().await.unwrap();
+    paired_load::capture_under_load(&store, &adapter, &scratch.0, &scope, &owner, "postgres").await;
+    cloud_takeover::exercise(
+        &store,
+        control.clone(),
+        &source,
+        &installation,
+        &bucket,
+        &scratch.0,
+    )
+    .await;
     drop(adapter);
     control.close().await;
     runtime.shutdown().await.unwrap();

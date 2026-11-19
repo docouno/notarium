@@ -205,6 +205,7 @@ async fn l1_sqlite_bootstrap_witness_owner_lock_and_fail_closed_guards() {
         let mut raw = temp.open_raw_sqlite().await;
         sqlx::raw_sql("DROP TABLE collab_checkpoints;
             ALTER TABLE backup_holds DROP COLUMN owner_generation;
+            ALTER TABLE backup_holds DROP COLUMN scoped_export;
             UPDATE schema_meta SET schema_version=2,
                 manifest_checksum=X'4375964FA9CF7DE29749E52C6387A9F72D1A4538FB9F97240A9FE356061BDBDF'")
             .execute(&mut raw).await.unwrap();
@@ -339,7 +340,9 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
             .await
             .unwrap();
         sqlx::raw_sql(
-            "DROP TABLE collab_checkpoints; ALTER TABLE backup_holds DROP COLUMN owner_generation",
+            "DROP TABLE collab_checkpoints;
+             ALTER TABLE backup_holds DROP COLUMN owner_generation;
+             ALTER TABLE backup_holds DROP COLUMN scoped_export;",
         )
         .execute(&mut raw)
         .await
@@ -374,6 +377,7 @@ async fn l1_postgres_bootstrap_idempotence_and_fail_closed_guards() {
     .unwrap();
     sqlx::raw_sql("DROP TABLE collab_checkpoints;
         ALTER TABLE backup_holds DROP COLUMN owner_generation;
+        ALTER TABLE backup_holds DROP COLUMN scoped_export;
         ALTER TABLE account_catalog_receipts DROP CONSTRAINT account_catalog_receipts_result_msgpack_check;
         ALTER TABLE content_jobs ADD CHECK (length(result_msgpack) BETWEEN 1 AND 4096);
         UPDATE schema_meta SET schema_version=2,

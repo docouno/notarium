@@ -3820,6 +3820,7 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
 
 #[tokio::test]
 async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
+    use notarium_canonical::UpdateSpaceSchema;
     use notarium_canonical::peers::archive_export::{ExportChatBody, ExportData};
     let local = TempDataRoot::new("paged-archive-export");
     let fixtures = StorageTestFixtures::load_required();
@@ -3846,6 +3847,41 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
             .unwrap()
             .scope;
         let ctx = || owner_ctx(&scope, owner.clone());
+        let original_schema = "# Schema at the cut\n";
+        let schema_note = sample_note_id(0xbe);
+        let schema = store
+            .update_space_schema(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    UpdateSpaceSchema {
+                        schema_note: schema_note.clone(),
+                        parent: None,
+                        slug: "original-schema".into(),
+                        carrier: original_schema.into(),
+                        schema: BTreeMap::new(),
+                        expected_schema_revision: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .value;
+        store
+            .delete_note(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::DeleteNote {
+                        note: schema_note,
+                        disposition: notarium_core::ports::DeleteDisposition::Trash,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
         let first = sample_note_id(0xb7);
         store
             .create_note(
@@ -3924,9 +3960,44 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
             .unwrap()
             .unwrap();
         assert_eq!(claim.job.id, job.id);
+        let check_schema =
+            |entries: &[notarium_canonical::peers::archive_export::ExportEntry]| {
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.path == ".notarium/fields/schema.yaml")
+                    .unwrap();
+                assert!(
+                    matches!(entry.data, ExportData::Blob(hash) if hash == notarium_syntax::content_digest(original_schema))
+                );
+                assert!(
+                    !entries
+                        .iter()
+                        .any(|entry| entry.path == "original-schema.md")
+                );
+            };
+        let compact = store.capture_archive_export(&ctx(), &claim).await.unwrap();
+        check_schema(&compact.entries);
+        compact.release().await.unwrap();
         let mut latest_leaf = None;
         let cut = store
             .capture_archive_export_paged(&ctx(), &claim, async {
+                store
+                    .update_space_schema(
+                        ctx(),
+                        next_mutation(
+                            &scope,
+                            &owner,
+                            UpdateSpaceSchema {
+                                schema_note: sample_note_id(0xbd),
+                                parent: None,
+                                slug: "new-schema".into(),
+                                carrier: "# After the cut\n".into(),
+                                schema: BTreeMap::new(),
+                                expected_schema_revision: Some(schema.schema_revision),
+                            },
+                        ),
+                    )
+                    .await?;
                 latest_leaf = Some(
                     store
                         .append_chat(ctx(), append(entry.seq, "written after the cut"))
@@ -3970,7 +4041,8 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
             .unwrap();
         eprintln!("versioned export registration: {:?}", cut.snapshot_elapsed);
         assert!(cut.snapshot_elapsed < Duration::from_millis(50));
-        assert_eq!(cut.entries.len(), 2);
+        assert_eq!(cut.entries.len(), 3);
+        check_schema(&cut.entries);
         assert!(cut.entries.iter().any(|entry| entry.path == "before.md"));
         let (header, chat) = cut
             .entries
@@ -4025,7 +4097,152 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
             .await
             .unwrap();
         assert!(chat.page(&store, &make_budget(), 0).await.is_err());
+        store
+            .delete_note(
+                ctx(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    notarium_core::ports::DeleteNote {
+                        note: sample_note_id(0xb7),
+                        disposition: notarium_core::ports::DeleteDisposition::Purge,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .read_verified_blob(
+                    &scope,
+                    notarium_syntax::content_digest("# Before\n\nKeep this cut.\n"),
+                )
+                .await
+                .is_err()
+        );
         cut.release().await.unwrap();
+
+        use notarium_canonical::peers::archive_import::ArchiveCommitAuthority;
+        use notarium_canonical::{ArchiveJobClass, JobCompletionOutcome};
+        use notarium_core::{
+            error::{CommitEffect, PortError},
+            ports::{MaintenanceContext, RevocationLease, ServiceAuthority, ServicePurpose},
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        store
+            .advance_space_lease(
+                &MaintenanceContext {
+                    authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+                    budget: make_budget(),
+                },
+                &scope,
+                LeaseEpoch::new(2).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .heartbeat_job_lease(
+                    &make_budget(),
+                    &scope,
+                    &job.id,
+                    &claim.lease_owner,
+                    claim.job.lease,
+                    Duration::from_secs(30),
+                    0,
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        let new_claim = store
+            .claim_next_archive_job(
+                &make_budget(),
+                &scope,
+                "second-export-probe",
+                Duration::from_secs(30),
+                ArchiveJobClass::Export,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_claim.job.id, job.id);
+        assert!(new_claim.job.lease > claim.job.lease);
+
+        struct Registration {
+            entered: Arc<AtomicBool>,
+            released: Arc<AtomicBool>,
+        }
+        impl RevocationLease for Registration {
+            fn check(&self) -> Result<(), PortError> {
+                self.entered.store(true, Ordering::Release);
+                Ok(())
+            }
+        }
+        impl Drop for Registration {
+            fn drop(&mut self) {
+                self.released.store(true, Ordering::Release);
+            }
+        }
+        let entered = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let authority = ArchiveCommitAuthority::new(Box::new(Registration {
+            entered: entered.clone(),
+            released: released.clone(),
+        }));
+        let fault = store.writer_faults().unwrap();
+        fault
+            .pre_commit_space_delays
+            .lock()
+            .await
+            .insert(scope.space_id.clone(), Duration::from_millis(350));
+        let mut budget = make_budget();
+        budget.remaining = Duration::from_secs(5);
+        let cancelled = budget.cancellation.clone();
+        let writer = store.clone();
+        let writing_scope = scope.clone();
+        let waiter = tokio::spawn(async move {
+            writer
+                .complete_archive_job(
+                    &budget,
+                    &writing_scope,
+                    &new_claim,
+                    JobCompletionOutcome::Failed {
+                        completed_units: 0,
+                        total_units: None,
+                        error_ref: notarium_core::ids::ContentDigest::from_bytes([0; 32]),
+                    },
+                    authority,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancelled.cancel();
+        assert!(
+            matches!(waiter.await.unwrap(), Err(PortError::Internal(failure)) if failure.effect() == CommitEffect::Unknown)
+        );
+        assert!(!released.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !released.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            store.get_job(ctx(), job.id).await.unwrap().state,
+            notarium_core::ports::JobState::Failed
+        );
         runtime.shutdown().await.unwrap();
     }
     fixtures.drop_pg_schema(&schema).await;

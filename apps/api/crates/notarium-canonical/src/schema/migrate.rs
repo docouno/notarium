@@ -589,6 +589,9 @@ mod tests {
         for sql in split_sql_statements(SQLITE_BASELINE_DDL) {
             if sql.starts_with("CREATE TABLE IF NOT EXISTS account_catalog_receipts")
                 || sql.starts_with("CREATE TABLE IF NOT EXISTS collab_checkpoints")
+                || sql.starts_with("CREATE TABLE IF NOT EXISTS archive_")
+                || sql.starts_with("CREATE INDEX IF NOT EXISTS idx_archive_")
+                || sql.starts_with("CREATE INDEX IF NOT EXISTS idx_blob_catalog_gc")
             {
                 continue;
             }
@@ -596,7 +599,11 @@ mod tests {
                 || sql.starts_with("CREATE TABLE IF NOT EXISTS backup_holds")
             {
                 sql.lines()
-                    .filter(|l| !l.contains("ext_space_tainted") && !l.contains("owner_generation"))
+                    .filter(|l| {
+                        !l.contains("ext_space_tainted")
+                            && !l.contains("owner_generation")
+                            && !l.contains("scoped_export")
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             } else {

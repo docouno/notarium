@@ -106,7 +106,7 @@ fn zip(entries: impl IntoIterator<Item = (String, String)>) -> Vec<u8> {
 
 async fn terminal(store: &CanonicalStore, ctx: &SpaceContext, job: &ContentJob) -> ContentJob {
     let mut read_timeouts = 0;
-    tokio::time::timeout(Duration::from_secs(180), async {
+    tokio::time::timeout(Duration::from_secs(900), async {
         loop {
             let current = match store.get_job(ctx.clone(), job.id.clone()).await {
                 Ok(current) => current,
@@ -171,6 +171,47 @@ async fn local_archive_worker_preflights_and_revokes_downloads() {
 #[ignore = "large archive acceptance workload"]
 async fn ten_thousand_linked_notes_import_and_export() {
     exercise_local_archive_worker(10_000).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "foreground throughput acceptance workload"]
+async fn fifty_thousand_imports_with_foreground_saves() {
+    exercise_local_archive_worker(50_000).await;
+}
+
+async fn sample_saves(
+    store: CanonicalStore,
+    mut ctx: SpaceContext,
+    limit: usize,
+) -> serde_json::Value {
+    let mut samples = Vec::with_capacity(limit);
+    let mut errors = 0;
+    for _ in 0..limit {
+        let id = NoteId::from_bytes(codec::ordered_id_16().unwrap());
+        ctx.budget = budget();
+        let request = mutation(
+            &ctx,
+            CreateNote {
+                note: id.clone(),
+                parent: None,
+                slug: format!("foreground-{}", id.as_str()),
+                class: notarium_core::classes::DocClass::UserDoc,
+                carrier: "# Foreground save\n\nNote saved through the canonical writer.\n".into(),
+            },
+        );
+        let start = std::time::Instant::now();
+        if store.create_note(ctx.clone(), request).await.is_err() {
+            errors += 1;
+        }
+        samples.push(start.elapsed().as_nanos() as u64);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    samples.sort_unstable();
+    let rank = |p: usize| samples[(limit * p).div_ceil(100) - 1];
+    serde_json::json!({
+        "count": limit, "errors": errors, "p50_ns": rank(50), "p95_ns": rank(95),
+        "p99_ns": rank(99), "max_ns": samples.last(),
+    })
 }
 
 async fn exercise_local_archive_worker(entries: usize) {
@@ -271,17 +312,24 @@ async fn exercise_local_archive_worker(entries: usize) {
             )
         })
     };
-    let invalid = zip(valid().chain(std::iter::once((
-        "../last.md".to_owned(),
-        "# Forbidden\n".to_owned(),
-    ))));
-    let rejected = import(&jobs, &store, &ctx, &invalid).await;
-    assert_eq!(
-        (rejected.state, rejected.completed_units),
-        (JobState::Failed, 0)
-    );
+    if entries < 50_000 {
+        let invalid = zip(valid().chain(std::iter::once((
+            "../last.md".to_owned(),
+            "# Forbidden\n".to_owned(),
+        ))));
+        let rejected = import(&jobs, &store, &ctx, &invalid).await;
+        assert_eq!(
+            (rejected.state, rejected.completed_units),
+            (JobState::Failed, 0)
+        );
+    }
     assert_eq!(note_count(root, &scope), 0);
 
+    let baseline = if entries == 50_000 {
+        Some(sample_saves(store.clone(), ctx.clone(), 1000).await)
+    } else {
+        None
+    };
     let started = std::time::Instant::now();
     let input = jobs
         .stage_import(ctx.clone(), zip(valid()).as_slice())
@@ -298,9 +346,74 @@ async fn exercise_local_archive_worker(entries: usize) {
         .await
         .unwrap()
         .value;
+    let baseline_notes = if baseline.is_some() {
+        note_count(root, &scope)
+    } else {
+        0
+    };
+    let foreground = if baseline.is_some() {
+        // Start the paired sample after the first durable batch so the active
+        // run measures foreground work during import writes.
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                match store.get_job(ctx.clone(), accepted_job.id.clone()).await {
+                    Ok(job) if job.state == JobState::Running && job.completed_units > 1 => break,
+                    Ok(job) => assert!(matches!(job.state, JobState::Queued | JobState::Running)),
+                    Err(PortError::DeadlineExceeded(_) | PortError::Unavailable(_)) => {}
+                    Err(err) => panic!("cannot observe active import: {err:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        Some(tokio::spawn(sample_saves(store.clone(), ctx.clone(), 1000)))
+    } else {
+        None
+    };
     let accepted = terminal(&store, &ctx, &accepted_job).await;
     eprintln!("import of {entries} linked notes: {:?}", started.elapsed());
     assert_eq!(accepted.state, JobState::Succeeded);
+    if let (Some(baseline), Some(foreground)) = (baseline, foreground) {
+        let during = foreground.await.unwrap();
+        let memory = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with("VmHWM:"))
+                    .map(str::to_owned)
+            });
+        let wal = rusqlite::Connection::open(root.canonical())
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(RESTART)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap();
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "import_notes": entries, "baseline": baseline, "during_import": during,
+                "memory": memory, "restart_checkpoint": wal, "seconds": started.elapsed().as_secs_f64(),
+            })
+        );
+        assert_eq!(baseline["errors"], 0);
+        assert_eq!(during["errors"], 0);
+        assert_eq!(
+            note_count(root, &scope),
+            entries as i64 + baseline_notes + 1000
+        );
+        assert_eq!(wal.0, 0);
+        stop.cancel();
+        running.await.unwrap().unwrap();
+        control.close().await;
+        runtime.shutdown().await.unwrap();
+        return;
+    }
     assert_eq!(note_count(root, &scope), entries as i64);
 
     let started = std::time::Instant::now();
@@ -420,6 +533,135 @@ async fn exercise_local_archive_worker(entries: usize) {
     );
     stop.cancel();
     running.await.unwrap().unwrap();
+    if entries == 10_000 {
+        probe_slow_cut(&jobs, &store, &ctx, root).await;
+    }
     control.close().await;
     runtime.shutdown().await.unwrap();
+}
+
+async fn probe_slow_cut(
+    jobs: &ArchiveJobs,
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    root: &DataRoot,
+) {
+    use notarium_canonical::ArchiveJobClass;
+    use notarium_canonical::peers::archive_export::ExportData;
+
+    let note = NoteId::from_bytes(codec::ordered_id_16().unwrap());
+    let carrier = format!(
+        "# Slow sink\n\n{}",
+        "A bounded carrier line.\n".repeat(16_000)
+    );
+    let digest = notarium_syntax::content_digest(&carrier);
+    store
+        .create_note(
+            ctx.clone(),
+            mutation(
+                ctx,
+                CreateNote {
+                    note: note.clone(),
+                    parent: None,
+                    slug: "slow-sink".into(),
+                    class: notarium_core::classes::DocClass::UserDoc,
+                    carrier,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let queued = jobs
+        .enqueue(
+            ctx.clone(),
+            mutation(ctx, ContentJobKind::ExportSpace { encrypted: false }),
+        )
+        .await
+        .unwrap()
+        .value;
+    let claimed = store
+        .claim_next_archive_job(
+            &budget(),
+            ctx.scope(),
+            "checkpoint-probe",
+            Duration::from_secs(30),
+            ArchiveJobClass::Export,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.job.id, queued.id);
+    let began = std::time::Instant::now();
+    let cut = store.capture_archive_export(ctx, &claimed).await.unwrap();
+    let capture = began.elapsed();
+    let snapshot = cut.snapshot_elapsed;
+    assert!(snapshot < Duration::from_millis(50));
+    assert_eq!(cut.entries.len(), 10_000);
+    assert!(cut.entries.iter().any(|entry| {
+        entry.path == "slow-sink.md"
+            && matches!(entry.data, ExportData::Blob(hash) if hash == digest)
+    }));
+    let (sink, mut output) = tokio::sync::mpsc::channel(1);
+    let call = budget();
+    let cancel = call.cancellation.clone();
+    let store_for_copy = store.clone();
+    let hold = cut.hold_id.clone();
+    let scope = ctx.scope().clone();
+    let streaming = tokio::spawn(async move {
+        store_for_copy
+            .stream_held_blob(&call, &hold, &scope, digest, &sink)
+            .await
+    });
+    assert!(output.recv().await.is_some());
+    assert!(!streaming.is_finished());
+    store
+        .delete_note(
+            ctx.clone(),
+            mutation(
+                ctx,
+                DeleteNote {
+                    note,
+                    disposition: DeleteDisposition::Trash,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .check_export_generation(&budget(), ctx.scope(), cut.generation)
+            .await
+            .is_err()
+    );
+
+    let image = root.canonical();
+    let (passive, restart) = tokio::task::spawn_blocking(move || {
+        let db = rusqlite::Connection::open(image).unwrap();
+        let check = |sql| {
+            db.query_row(sql, [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+        };
+        (
+            check("PRAGMA wal_checkpoint(PASSIVE)"),
+            check("PRAGMA wal_checkpoint(RESTART)"),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(passive.1, passive.2);
+    assert_eq!(restart.0, 0);
+    assert_eq!(restart.1, restart.2);
+    cancel.cancel();
+    drop(output);
+    assert!(streaming.await.unwrap().is_err());
+    cut.release().await.unwrap();
+    eprintln!(
+        "10k export capture complete {capture:?}, SQL {snapshot:?}, WAL passive {passive:?}, restart {restart:?}"
+    );
 }

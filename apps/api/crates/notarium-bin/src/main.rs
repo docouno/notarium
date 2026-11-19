@@ -1,8 +1,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == [notarium_jobs::SQLITE_VERIFIER_ARGUMENT] {
         return notarium_jobs::run_sqlite_verifier().map_err(std::io::Error::other);
@@ -19,5 +18,8 @@ async fn main() -> std::io::Result<()> {
             "unknown arguments; use --help",
         ));
     }
-    notarium_bin::serve().await
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(notarium_bin::serve())
 }

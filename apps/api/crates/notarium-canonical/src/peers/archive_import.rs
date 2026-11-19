@@ -538,6 +538,11 @@ impl CanonicalStore {
         .await
     }
 
+    /// Upper bound on a physical writer group.
+    pub fn import_write_group_limit(&self) -> usize {
+        IMPORT_BATCH_LIMIT.min(self.inner.config.writer.max_batch_items)
+    }
+
     /// Each item and its increasing plan ordinal commit in the same writer
     /// savepoint. A conflicting item prevents every later ordinal from applying.
     pub async fn apply_import_notes(
@@ -548,7 +553,7 @@ impl CanonicalStore {
         notes: Vec<PlannedImportNote>,
         authority: ArchiveCommitAuthority,
     ) -> Result<Vec<Result<(), PortError>>, PortError> {
-        if notes.len() > IMPORT_BATCH_LIMIT
+        if notes.len() > self.import_write_group_limit()
             || notes
                 .iter()
                 .map(|note| note.note.carrier.len())
@@ -616,33 +621,15 @@ impl CanonicalStore {
             });
             intents.push(intent);
         }
-        let capacity = intents.len();
-        let mut pending = intents.into_iter();
-        let mut outcomes = Vec::with_capacity(capacity);
-        while pending.len() > 0 {
-            let mut budget = ctx.budget.clone();
-            budget.remaining = deadline.remaining(&ctx.budget)?;
-            let group = pending
-                .by_ref()
-                .take(self.inner.config.writer.max_batch_items)
-                .collect();
-            let (committed, _) = self
-                .submit_write_batch::<StoredCommittedNoteRevV1>(
-                    &budget,
-                    &space.scope.space_id,
-                    group,
-                )
-                .await?;
-            for outcome in committed {
-                let outcome = outcome.map(drop);
-                let stop = outcome.is_err();
-                outcomes.push(outcome);
-                if stop {
-                    return Ok(outcomes);
-                }
-            }
-        }
-        Ok(outcomes)
+        let mut budget = ctx.budget.clone();
+        budget.remaining = deadline.remaining(&ctx.budget)?;
+        let (outcomes, _) = self
+            .submit_write_batch::<StoredCommittedNoteRevV1>(&budget, &space.scope.space_id, intents)
+            .await?;
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| outcome.map(drop))
+            .collect())
     }
 }
 

@@ -25,6 +25,8 @@ use crate::{
 };
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+// Remote preparation performs network I/O before the writer admits the group.
+const CLOUD_IMPORT_GROUP_LIMIT: usize = 32;
 
 /// Library entry points for archive admission and execution. Transport owns
 /// authentication, request deadlines and upload/download protocol.
@@ -372,6 +374,12 @@ impl ArchiveJobs {
         mut applied: u64,
         plan: &PinnedImportPlan,
     ) -> Result<(), PortError> {
+        let writer_limit = self.store.import_write_group_limit();
+        let group_limit = if self.artifacts.is_cloud() {
+            writer_limit.min(CLOUD_IMPORT_GROUP_LIMIT)
+        } else {
+            writer_limit
+        };
         while applied < plan.entries {
             let batch = job
                 .blocking({
@@ -381,9 +389,9 @@ impl ArchiveJobs {
                 })
                 .await?
                 .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
-            let ctx = job.authorize().await?;
             match batch {
                 ImportBatch::Folder(folder) => {
+                    let ctx = job.authorize().await?;
                     self.store
                         .apply_import_folder(
                             &ctx,
@@ -397,20 +405,26 @@ impl ArchiveJobs {
                     job.report_progress(applied, Some(plan.entries));
                 }
                 ImportBatch::Notes(notes) => {
-                    let outcomes = self
-                        .store
-                        .apply_import_notes(
-                            ctx,
-                            job.claim(),
-                            plan.object.digest,
-                            notes,
-                            job.commit_authority(),
-                        )
-                        .await?;
-                    for outcome in outcomes {
-                        outcome?;
-                        applied += 1;
-                        job.report_progress(applied, Some(plan.entries));
+                    let mut notes = notes.into_iter();
+                    while notes.len() > 0 {
+                        let ctx = job.authorize().await?;
+                        let group = notes.by_ref().take(group_limit).collect();
+                        let outcomes = self
+                            .store
+                            .apply_import_notes(
+                                ctx,
+                                job.claim(),
+                                plan.object.digest,
+                                group,
+                                job.commit_authority(),
+                            )
+                            .await?;
+                        for outcome in outcomes {
+                            outcome?;
+                            applied += 1;
+                            job.report_progress(applied, Some(plan.entries));
+                        }
+                        tokio::task::yield_now().await;
                     }
                 }
             }

@@ -102,3 +102,19 @@ Run the Local and Cloud integration tests through `make test app=api` with the
 pinned PostgreSQL 16 and MinIO fixtures. The tests exercise backup, archive
 verification and restore on both storage profiles. The large linked-note
 workload is available as an opt-in test in `notarium-jobs`.
+
+The maintenance integration test can run the full paired backup under
+foreground note and chat writes with `NOTARIUM_PAIRED_ARCHIVE_CAPTURES=1000`.
+It reports confirmed pause, pause including drain, and complete backup latency
+for 1 and 64 Spaces. Select `NOTARIUM_ARCHIVE_BENCH_TIER=high` or `medium` on the
+matching hardware from [Storage performance](storage-performance.md) to apply
+the corresponding p95 threshold. Set `NOTARIUM_CLOUD_ARCHIVE_TAKEOVER=10000`
+to kill the first Cloud worker after 201 durable units, remove its local
+staging directory, and finish the import in a separate process. Pass these
+variables to the pinned container with `env` under the storage fixture wrapper.
+Run the maintenance test with `-- --test-threads=1 --nocapture` for isolated
+samples. `NOTARIUM_SQLITE_FSCK_LARGE=1` verifies SQLite images larger than
+160 MiB at both 512-byte and 64 KiB page sizes and prints the native peak.
+The ignored `fifty_thousand_imports_with_foreground_saves` test compares
+foreground write latency before and during Local import and records memory and
+checkpoint observations.

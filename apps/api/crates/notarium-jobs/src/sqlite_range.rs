@@ -114,6 +114,7 @@ fn configure(database: &Connection, cancellation: Cancellation) -> Result<(), Po
     unsafe {
         let conn = database.handle();
         ffi::sqlite3_limit(conn, ffi::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES);
+        ffi::sqlite3_limit(conn, ffi::SQLITE_LIMIT_SQL_LENGTH, 64 * 1024);
         ffi::sqlite3_limit(conn, ffi::SQLITE_LIMIT_ATTACHED, 0);
         ffi::sqlite3_limit(conn, ffi::SQLITE_LIMIT_COLUMN, 256);
         ffi::sqlite3_limit(conn, ffi::SQLITE_LIMIT_EXPR_DEPTH, 128);

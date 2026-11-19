@@ -20,7 +20,9 @@ SELECT s.space_id,t.thread_id,n,parent,CAST(n AS TEXT),entries.kind,s.owner_id,
     CASE WHEN parent IS NULL THEN 1 ELSE 2 END,n+1,CASE WHEN n=1 THEN 6 END,stale
 FROM spaces s JOIN chat_threads t ON t.space_id=s.space_id CROSS JOIN entries CROSS JOIN fixture_blob
 WHERE s.slug IN ('stale-alone','stale-shared');
-INSERT INTO blob_catalog SELECT space_id,body_digest,600,compressed_size,CASE WHEN slug='stale-alone' THEN 1 ELSE 2 END,
+INSERT INTO blob_catalog(space_id,content_blake3,raw_size,compressed_size,ref_count,
+    current_publication_id,admission_state,blob_state,touched_at_ms)
+    SELECT space_id,body_digest,600,compressed_size,CASE WHEN slug='stale-alone' THEN 1 ELSE 2 END,
     'pub1','open','active',0 FROM spaces CROSS JOIN fixture_blob WHERE slug IN ('stale-alone','stale-shared');
 INSERT INTO blob_publications SELECT space_id,'pub1',body_digest,1,'local_zstd_v1','active',1,1,600,compressed_size,0,0
     FROM spaces CROSS JOIN fixture_blob WHERE slug IN ('stale-alone','stale-shared');

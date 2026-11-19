@@ -36,7 +36,7 @@ use crate::{
         Payload, ZIP_NAMES, authenticated_payload, copy_hash, invalid, io_error,
     },
     db_integrity::{
-        PgRowChecks, Relations, check_sqlite_blob_owners, check_sqlite_canonical,
+        Partition, PgRowChecks, Relations, check_sqlite_blob_owners, check_sqlite_canonical,
         check_sqlite_control,
     },
     import::check_cancelled,
@@ -244,7 +244,8 @@ pub(crate) fn verify_archive(
             .map_err(io_error)
     };
     let mut index = CasIndex::open(view(3)?, manifest.index.bytes)?;
-    let (blobs, raw_blob_bytes) = check_index_and_data(&mut index, view(4)?, budget, &options)?;
+    let data = view(4)?;
+    let (blobs, raw_blob_bytes) = check_index_and_data(&mut index, data.clone(), budget, &options)?;
     let databases = verify_databases(
         view(1)?,
         view(2)?,
@@ -252,7 +253,7 @@ pub(crate) fn verify_archive(
         keyring,
         budget,
         &options,
-        Some(&mut index),
+        Some((&mut index, &data)),
     )?;
     let mut whole = source.clone();
     let archive_digest = copy_hash(
@@ -295,7 +296,7 @@ fn verify_databases(
     keyring: &Path,
     budget: &CallBudget,
     options: &BackupOptions,
-    index: Option<&mut CasIndex>,
+    cas: Option<(&mut CasIndex, &ArchiveRange)>,
 ) -> Result<Databases, PortError> {
     if control.len() != manifest.control.bytes || canonical.len() != manifest.canonical.bytes {
         return Err(invalid(ValidationReason::InvalidDigest));
@@ -309,7 +310,7 @@ fn verify_databases(
                 manifest,
                 control,
                 canonical,
-                index.as_deref(),
+                cas.as_ref().map(|(index, _)| &**index),
                 &budget.cancellation,
             )?;
             native_peak = Some(peak);
@@ -322,7 +323,7 @@ fn verify_databases(
         BackupArtifactKind::PostgresSpoolV1 => {
             let keys =
                 verify_control_spool(control, manifest, keyring, budget, &mut control_cursors)?;
-            let histories = verify_canonical_spool(canonical, manifest, budget, options, index)?;
+            let histories = verify_canonical_spool(canonical, manifest, budget, options, cas)?;
             (keys, histories)
         }
     };
@@ -639,9 +640,10 @@ fn verify_canonical_spool(
     manifest: &Manifest,
     budget: &CallBudget,
     options: &BackupOptions,
-    mut index: Option<&mut CasIndex>,
+    cas: Option<(&mut CasIndex, &ArchiveRange)>,
 ) -> Result<Vec<ChangeCursor>, PortError> {
     use PostgresSpoolValue::{Bytes, Int, Text};
+    let (mut index, data) = cas.unzip();
     let mut histories = Vec::new();
     let mut schema_version = 0;
     let count = index.as_ref().map_or(0, |index| index.count);
@@ -720,7 +722,7 @@ fn verify_canonical_spool(
         || witness.installation != manifest.installation
         || !witness.canaries.is_empty()
         || histories != witness.histories
-        || index.is_some_and(|index| index.count != ordinal)
+        || index.as_ref().is_some_and(|index| index.count != ordinal)
         || expected_references
             .into_iter()
             .any(|references| references != 0)
@@ -735,6 +737,27 @@ fn verify_canonical_spool(
             options.max_pg_row_bytes,
             |table, row| {
                 check_cancelled(&budget.cancellation)?;
+                if let (
+                    "blob_catalog",
+                    [
+                        Text(space),
+                        Bytes(hash),
+                        _,
+                        _,
+                        Int(refs),
+                        Text(publication),
+                        ..,
+                    ],
+                    Some((index, data)),
+                ) = (table.name, row, index.as_deref_mut().zip(data))
+                    && *refs > 0
+                    && keys.includes_publication(space, publication)
+                {
+                    let ordinal = index
+                        .find(space, hash)?
+                        .ok_or_else(|| invalid(ValidationReason::InvalidDigest))?;
+                    note_archived_parts(keys, data, index.read(ordinal)?, publication, budget)?;
+                }
                 checks.check(table, row, Some(keys))?;
                 keys.canonical(table, row)
             },
@@ -742,6 +765,44 @@ fn verify_canonical_spool(
         Ok(())
     })?;
     Ok(histories)
+}
+
+fn note_archived_parts(
+    keys: &mut Partition<'_>,
+    data: &ArchiveRange,
+    record: CasRecord,
+    publication: &str,
+    budget: &CallBudget,
+) -> Result<(), PortError> {
+    const CHUNK: u64 = notarium_canonical::blobs::S3_MAX_RAW_CHUNK_BYTES as u64;
+    let compressed = data
+        .view(record.offset, record.compressed)
+        .map_err(io_error)?;
+    let mut decoder = zstd::stream::read::Decoder::new(compressed).map_err(io_error)?;
+    decoder.window_log_max(23).map_err(io_error)?;
+    let mut left = record.raw;
+    for part in 0..record.raw.div_ceil(CHUNK).max(1) {
+        let size = left.min(CHUNK);
+        let actual = copy_hash(
+            &mut (&mut decoder).take(size),
+            &mut io::sink(),
+            size,
+            &budget.cancellation,
+        )?;
+        if actual.bytes != size {
+            return Err(invalid(ValidationReason::InvalidDigest));
+        }
+        keys.note_part_digest(
+            record.space.as_str(),
+            publication,
+            part as i64,
+            size as i64,
+            actual.digest.as_bytes(),
+            true,
+        );
+        left -= size;
+    }
+    Ok(())
 }
 
 pub(crate) struct CasIndex {

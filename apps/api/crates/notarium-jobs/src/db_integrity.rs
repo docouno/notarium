@@ -918,12 +918,13 @@ impl Partition<'_> {
                     Int(index),
                     Int(raw),
                     Int(compressed),
-                    _,
+                    Bytes(hash),
                     Text(key),
                     _,
                     Int(confirmed),
                 ],
             ) => {
+                self.note_part_digest(space, publication, *index, *raw, hash, false);
                 if self
                     .parts
                     .as_ref()
@@ -975,6 +976,45 @@ impl Partition<'_> {
             _ => {}
         }
         Ok(())
+    }
+
+    pub(crate) fn includes_publication(&self, space: &str, publication: &str) -> bool {
+        if self.full {
+            return false;
+        }
+        let mut key = blake3::Hasher::new();
+        scalar(&mut key, b's', space.as_bytes());
+        scalar(&mut key, b'p', publication.as_bytes());
+        let hash = key.finalize();
+        let prefix = u16::from_be_bytes([hash.as_bytes()[0], hash.as_bytes()[1]]);
+        self.bits == 0 || prefix >> (16 - self.bits) == self.prefix
+    }
+
+    pub(crate) fn note_part_digest(
+        &mut self,
+        space: &str,
+        publication: &str,
+        index: i64,
+        size: i64,
+        digest: &[u8],
+        required: bool,
+    ) {
+        if !self.includes_publication(space, publication) {
+            return;
+        }
+        let mut key = blake3::Hasher::new();
+        scalar(&mut key, b'p', space.as_bytes());
+        scalar(&mut key, b't', publication.as_bytes());
+        scalar(&mut key, b'i', &index.to_be_bytes());
+        scalar(&mut key, b'i', &size.to_be_bytes());
+        scalar(&mut key, b'b', digest);
+        self.full = Self::record_key(
+            &mut self.keys,
+            0,
+            0,
+            *key.finalize().as_bytes(),
+            if required { REQUIRED } else { PRESENT },
+        );
     }
 
     fn finish_parts(&mut self) {
