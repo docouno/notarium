@@ -1,16 +1,34 @@
 use super::{PortFuture, PortStream, context::*, types::*};
 use crate::{
-    DomainError, DomainResult, classes::ProviderPart, error::ValidationReason, ids::*, model::*,
-    patch::*, receipt::*, value::YamlValue,
+    DomainError, DomainResult,
+    classes::{DocClass, ProviderPart},
+    error::ValidationReason,
+    ids::*,
+    model::*,
+    patch::*,
+    query::FieldFilterAstV1,
+    receipt::*,
+    value::YamlValue,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 pub trait StructuralSnapshot: Send + Sync {
     fn cut(&self) -> &SnapshotCut;
     fn lookup(&self, note: &NoteId) -> Option<DenseNodeId>;
     fn note_id(&self, node: DenseNodeId) -> DomainResult<&NoteId>;
+    fn doc_class(&self, node: DenseNodeId) -> DomainResult<DocClass>;
     fn folder_subtree(&self, folder: &FolderId) -> DomainResult<DenseNodeIter<'_>>;
+    /// Return the active folder itself followed by its active descendants.
+    fn folder_descendants(&self, folder: &FolderId) -> DomainResult<Vec<FolderId>>;
+    /// Include the folder itself when it is an active project root.
+    fn enclosing_project(&self, folder: &FolderId) -> DomainResult<Option<FolderId>>;
+    /// Return `None` when the predicate does not restrict the note set.
+    fn filter_notes(&self, filter: &FieldFilterAstV1) -> DomainResult<Option<DenseNodeIter<'_>>>;
     fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;
     fn incoming(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;
 }
@@ -57,26 +75,117 @@ pub trait ChangeBroadcast: Send + Sync {
     ) -> PortFuture<'_, ChangeReadResult>;
 }
 
+#[derive(Clone)]
+pub struct EmbeddingQueryInput {
+    pub text: String,
+    pub tokens: u32,
+    pub classes: BTreeSet<DocClass>,
+    pub project_scope: Option<FolderRef>,
+}
+impl std::fmt::Debug for EmbeddingQueryInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingQueryInput")
+            .field("tokens", &self.tokens)
+            .field("classes", &self.classes)
+            .field("project_scope", &self.project_scope)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Clone, Debug)]
+pub enum EmbeddingInput {
+    Part(ProviderPart),
+    Query(EmbeddingQueryInput),
+}
+impl EmbeddingInput {
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Part(part) => part.text(),
+            Self::Query(query) => &query.text,
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct EmbeddingRequest {
     pub intent: CommandKey,
     pub model: ModelProfileId,
     pub provider: ProviderResourceId,
     pub project: Option<FolderRef>,
-    pub chunks: Vec<ProviderPart>,
+    pub inputs: Vec<EmbeddingInput>,
     pub declared_tokens: u32,
 }
 impl EmbeddingRequest {
+    pub fn parts(
+        intent: CommandKey,
+        model: ModelProfileId,
+        provider: ProviderResourceId,
+        project: Option<FolderRef>,
+        chunks: Vec<ProviderPart>,
+        declared_tokens: u32,
+    ) -> Self {
+        Self {
+            intent,
+            model,
+            provider,
+            project,
+            inputs: chunks.into_iter().map(EmbeddingInput::Part).collect(),
+            declared_tokens,
+        }
+    }
+
+    pub fn query(
+        intent: CommandKey,
+        model: ModelProfileId,
+        provider: ProviderResourceId,
+        input: EmbeddingQueryInput,
+    ) -> Self {
+        Self {
+            intent,
+            model,
+            provider,
+            project: input.project_scope.clone(),
+            declared_tokens: input.tokens,
+            inputs: vec![EmbeddingInput::Query(input)],
+        }
+    }
+
     /// Provider owners check this before dispatch, then enforce their real model
     /// tokenizer and service budget. Declared tokens never replace actual counting.
     pub fn validate(&self) -> DomainResult<()> {
+        if !(1..=256).contains(&self.inputs.len()) {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit));
+        }
         let mut total = 0u32;
-        for chunk in &self.chunks {
-            if chunk.provider() != &self.provider || chunk.part().model() != &self.model {
-                return Err(DomainError::validation(ValidationReason::ScopeMismatch));
-            }
+        for input in &self.inputs {
+            let tokens = match input {
+                EmbeddingInput::Part(part) => {
+                    if part.provider() != &self.provider || part.part().model() != &self.model {
+                        return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+                    }
+                    part.part().tokens()
+                }
+                EmbeddingInput::Query(query) => {
+                    if query.project_scope != self.project {
+                        return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+                    }
+                    if query.text.trim().is_empty() || query.text.len() > 32 * 1024 {
+                        return Err(DomainError::validation(ValidationReason::InvalidLimit));
+                    }
+                    if query.classes.is_empty() || query.classes.contains(&DocClass::EncryptedNote)
+                    {
+                        return Err(DomainError::validation(
+                            ValidationReason::ClassEgressForbidden,
+                        ));
+                    }
+                    if query.tokens == 0 {
+                        return Err(DomainError::validation(
+                            ValidationReason::TokenBudgetExceeded,
+                        ));
+                    }
+                    query.tokens
+                }
+            };
             total = total
-                .checked_add(chunk.part().tokens())
+                .checked_add(tokens)
                 .ok_or_else(|| DomainError::validation(ValidationReason::TokenBudgetExceeded))?;
         }
         if total != self.declared_tokens {

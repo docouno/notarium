@@ -19,7 +19,7 @@ use notarium_core::{
     classes::{ProviderAudience, ProviderPolicy},
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
-    model::FolderRef,
+    model::{FolderRef, HistoryScope},
     ports::{control::*, *},
 };
 
@@ -191,6 +191,70 @@ async fn shared_attachment(
         .ok_or_else(unavailable)
 }
 impl ProviderService {
+    /// Admit the revision author in a Shared Space or the owner of a Personal
+    /// Space. Dispatch rechecks membership and disclosure before sending.
+    pub async fn admit_search_indexing(
+        &self,
+        authority: &ServiceAuthority,
+        scope: HistoryScope,
+        revision_actor: &PrincipalId,
+        provider: &ProviderResourceId,
+        project: Option<&FolderRef>,
+        call: CallBudget,
+    ) -> Result<(SpaceContext, ProviderPolicy), PortError> {
+        authority.require(ServicePurpose::Search)?;
+        let budget = OperationBudget::new(call.clone());
+        let space = budget
+            .run(
+                self.control
+                    .catalog
+                    .space(budget.context(call.request.clone()), scope.space_id.clone()),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        scope.check(&space.history)?;
+        let mut ctx = self
+            .control
+            .admit_search_indexing(
+                authority,
+                &space,
+                revision_actor,
+                provider,
+                budget.context(call.request.clone()),
+            )
+            .await?;
+        let space = self.selection_catalog(&ctx, project).await?;
+        let (mut tx, auth) = self
+            .control
+            .open_revalidated_read(&budget, &call.request, ctx.auth())
+            .await?;
+        let admitted = budget
+            .run(
+                async {
+                    let resource = resource_read(tx.inner_mut(), provider.as_str()).await?;
+                    let epoch = epochs_read(tx.inner_mut(), &resource).await?;
+                    policy(
+                        tx.inner_mut(),
+                        &auth,
+                        &resource,
+                        epoch,
+                        &space.space,
+                        project,
+                        self.control.clock.now_ms()?,
+                        false,
+                    )
+                    .await
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget
+            .run(tx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        ctx.budget = budget.context(call.request);
+        Ok((ctx, admitted?.policy))
+    }
+
     pub(super) async fn selection_catalog(
         &self,
         ctx: &SpaceContext,

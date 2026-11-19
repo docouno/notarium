@@ -439,17 +439,17 @@ impl Setup {
             },
         )
         .unwrap();
-        EmbeddingRequest {
-            intent: CommandKey::from_bytes([id; 16]),
-            model: ModelProfileId::from_bytes([4; 16]),
-            provider: self.selection.provider.clone(),
-            project: None,
-            chunks: vec![
+        EmbeddingRequest::parts(
+            CommandKey::from_bytes([id; 16]),
+            ModelProfileId::from_bytes([4; 16]),
+            self.selection.provider.clone(),
+            None,
+            vec![
                 ClassEgressFence::provider_part(part, self.ctx.auth(), &self.selection.policy)
                     .unwrap(),
             ],
-            declared_tokens: 3,
-        }
+            3,
+        )
     }
     async fn close(self) {
         self.other_store.close().await;
@@ -703,7 +703,86 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             .is_ok(),
         "budget_mismatch records audit spend without cross-user 60s DoS lockout"
     );
+    let query = |intent, class| {
+        EmbeddingRequest::query(
+            CommandKey::from_bytes([intent; 16]),
+            ModelProfileId::from_bytes([4; 16]),
+            setup.selection.provider.clone(),
+            EmbeddingQueryInput {
+                text: "related search".into(),
+                tokens: 3,
+                classes: BTreeSet::from([class]),
+                project_scope: None,
+            },
+        )
+    };
+    let result = setup
+        .provider
+        .embed(setup.space.clone(), query(100, DocClass::UserDoc))
+        .await
+        .unwrap();
+    assert_eq!(result.vectors, vec![Ok(vec![0.25, -0.5])]);
+    {
+        let requests = requests.lock().unwrap();
+        let body: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        assert_eq!(body["input"], json!(["related search"]));
+    }
+    let (indexing, _) = setup
+        .provider
+        .admit_search_indexing(
+            &ServiceAuthority::admit(ServicePurpose::Search),
+            setup.space.scope().clone(),
+            &PrincipalId::from_bytes([100; 16]),
+            &setup.selection.provider,
+            None,
+            budget(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(indexing.auth().principal(), setup.space.auth().principal());
+    assert!(
+        indexing.auth().spaces()[&indexing.scope().space_id]
+            .write_classes
+            .is_empty()
+    );
+    assert!(
+        setup
+            .provider
+            .embed(indexing.clone(), setup.embedding(101))
+            .await
+            .is_ok()
+    );
     let count = requests.lock().unwrap().len();
+    assert!(matches!(
+        setup
+            .provider
+            .embed(indexing, query(102, DocClass::UserDoc))
+            .await,
+        Err(PortError::Domain(DomainError::AccessDenied))
+    ));
+    assert!(
+        setup
+            .provider
+            .embed(setup.space.clone(), query(103, DocClass::Profile))
+            .await
+            .is_err()
+    );
+    let auth = setup
+        .provider
+        .control
+        .resolve(evidence(AuthEvidenceKind::Session, setup.session.expose()))
+        .await
+        .unwrap();
+    auth.taint().mark_external_read();
+    let tainted = SpaceContext::new(auth, setup.space.scope().clone(), budget()).unwrap();
+    assert!(matches!(
+        setup
+            .provider
+            .embed(tainted, query(104, DocClass::UserDoc))
+            .await,
+        Err(PortError::Domain(DomainError::CrossSpaceTainted))
+    ));
+    assert_eq!(requests.lock().unwrap().len(), count);
     // A retry still resolves the old intent after mutable configuration changes.
     let changed = setup
         .other

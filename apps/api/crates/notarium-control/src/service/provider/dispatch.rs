@@ -329,6 +329,7 @@ impl ProviderService {
             primary: primary.as_ref(),
             project: job.project(),
             parts: &parts,
+            embedding_inputs: job.embedding_inputs(),
             current: &current,
             keeper: keeper.as_ref(),
         };

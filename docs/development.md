@@ -8,14 +8,15 @@ needed for optional `npx` CLI entry points.
 `make setup` downloads images and caches dependencies — including the pinned
 `pnpm 12.21.0` binary, shared caches under `DEVKIT_CACHE_DIR` (default
 `~/.cache/docouno/devkit`, with hardlinked `pnpm-store` and reusable derived
-container images), the digest-pinned PostgreSQL 16 image and the source-built
-MinIO Community storage test fixture (`compose.storage-tests.yaml`) — and requires
-networking. Subsequent check/test/build commands use `--network none`, read-only
-sources, manifests, lockfiles and `node_modules/.pnpm`, with writable declared
-cache/output paths. `make test` automatically launches and tears down isolated
-Unix-domain-socket PostgreSQL 16 and MinIO Community fixtures for `apps/api`
-without network access; integration tests fail closed if fixtures are absent
-(see [canonical storage](storage.md)).
+container images), the digest-pinned PostgreSQL 16 image, the source-built
+MinIO Community storage test fixture (`compose.storage-tests.yaml`), and the
+SHA-256-pinned ONNX Runtime 1.31 CPU test library (using host `curl`, `unzip`
+and `sha256sum`) — and requires networking. Subsequent check/test/build commands
+use `--network none`, read-only sources, manifests, lockfiles and
+`node_modules/.pnpm`, with writable declared cache/output paths. `make test`
+automatically launches and tears down isolated Unix-domain-socket PostgreSQL 16
+and MinIO Community fixtures for `apps/api` without network access; integration
+tests fail closed if fixtures are absent (see [canonical storage](storage.md)).
 
 | Command | Purpose |
 | --- | --- |

@@ -14,7 +14,8 @@ starter examples, not a production application.
 
 ## Start developing
 
-Use Linux x86_64, local Docker Engine, Docker Compose **5.0.0+**, Git and GNU Make.
+Use Linux x86_64, local Docker Engine, Docker Compose **5.0.0+**, Git, GNU Make,
+`curl`, `unzip` and `sha256sum`.
 Host Node **24.22.1** is optional and only needed for `npx` CLI entry points.
 Development tools run in pinned containers; no private services or additional agent
 tooling are needed.

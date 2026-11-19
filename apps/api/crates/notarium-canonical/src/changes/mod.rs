@@ -46,6 +46,8 @@ use crate::{
     writer::ChangePayloadDraft,
 };
 
+pub mod search;
+
 pub const EFFECT_CODEC_V1: &str = "effect_v1";
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 1024;
 const PG_CHANGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);

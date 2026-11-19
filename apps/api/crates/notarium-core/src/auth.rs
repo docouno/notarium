@@ -49,6 +49,11 @@ pub enum AuthenticatedCredential {
         run: AgentRunId,
         lease: LeaseEpoch,
     },
+    /// Internal, read-only authority scoped to one search indexing destination.
+    SearchIndexing {
+        space: SpaceId,
+        provider: ProviderResourceId,
+    },
     TrustedNone,
 }
 

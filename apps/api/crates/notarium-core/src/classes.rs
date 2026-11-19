@@ -9,6 +9,7 @@ use crate::{
         ThreadEntrySeq,
     },
     model::{AbilityResourceRef, Lifecycle, NoteRef},
+    ports::{ServiceAuthority, ServicePurpose},
     span::ByteSpan,
 };
 use serde::{Deserialize, Serialize};
@@ -87,7 +88,7 @@ impl DocumentFacts {
         auth.authorize_read(&self.recorded)
     }
 
-    fn allow_egress(&self, lifecycle: Lifecycle, auth: &EngineAuthContext) -> DomainResult<()> {
+    fn check_egress(&self, lifecycle: Lifecycle) -> DomainResult<()> {
         if self
             .iter()
             .any(|facts| facts.class == DocClass::EncryptedNote)
@@ -104,6 +105,11 @@ impl DocumentFacts {
         {
             return Err(DomainError::ResourceNotFound);
         }
+        Ok(())
+    }
+
+    fn allow_egress(&self, lifecycle: Lifecycle, auth: &EngineAuthContext) -> DomainResult<()> {
+        self.check_egress(lifecycle)?;
         self.authorize(auth)
     }
 
@@ -920,6 +926,14 @@ impl ClassEgressFence {
         auth: &EngineAuthContext,
     ) -> DomainResult<SearchContent> {
         Self::check(&document, auth)?;
+        Ok(SearchContent(document))
+    }
+    pub fn index_for_search(
+        document: ClassifiedDocument,
+        authority: &ServiceAuthority,
+    ) -> DomainResult<SearchContent> {
+        authority.require(ServicePurpose::Search)?;
+        document.facts.check_egress(document.lifecycle)?;
         Ok(SearchContent(document))
     }
     pub fn provider(

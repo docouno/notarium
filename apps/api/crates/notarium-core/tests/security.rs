@@ -1,3 +1,4 @@
+use notarium_core::ports::{ServiceAuthority, ServicePurpose};
 use notarium_core::{DomainError, auth::*, classes::*, ids::*, model::*};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -350,6 +351,35 @@ fn shared_chat_cannot_read_external_spaces_or_sender_profile() {
     assert!(agent.authorize_read(&facts(2, DocClass::UserDoc)).is_err());
     assert!(agent.authorize_read(&facts(1, DocClass::Profile)).is_err());
     assert!(agent.authorize_read(&facts(1, DocClass::UserDoc)).is_ok());
+}
+
+#[test]
+fn service_search_egress_checks_recorded_and_current_facts() {
+    let search = ServiceAuthority::admit(ServicePurpose::Search);
+    let projection = ServiceAuthority::admit(ServicePurpose::Projection);
+    let active = doc(facts(1, DocClass::UserDoc));
+
+    assert!(ClassEgressFence::index_for_search(active.clone(), &search).is_ok());
+    assert!(ClassEgressFence::index_for_search(active.clone(), &projection).is_err());
+    assert!(
+        ClassEgressFence::index_for_search(doc(facts(1, DocClass::EncryptedNote)), &search)
+            .is_err()
+    );
+
+    let mut encrypted_now = active.clone();
+    encrypted_now
+        .bind_current(facts(1, DocClass::EncryptedNote), Lifecycle::Active)
+        .unwrap();
+    assert!(ClassEgressFence::index_for_search(encrypted_now, &search).is_err());
+
+    let mut purged_now = active;
+    purged_now
+        .bind_current(facts(1, DocClass::UserDoc), Lifecycle::Purged)
+        .unwrap();
+    assert!(matches!(
+        ClassEgressFence::index_for_search(purged_now, &search),
+        Err(DomainError::ResourceNotFound)
+    ));
 }
 
 #[test]

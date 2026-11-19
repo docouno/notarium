@@ -689,6 +689,9 @@ pub struct SearchQuery {
     pub text: String,
     pub filter: FieldFilterAstV1,
     pub classes: BTreeSet<DocClass>,
+    pub folder: Option<FolderId>,
+    pub causal: CausalBasis,
+    pub include_chats: bool,
     pub top_k: PageLimit,
     pub model: Option<ModelProfileId>,
 }
@@ -705,8 +708,19 @@ pub struct SearchHit {
     pub chunks: Vec<SearchPart>,
 }
 #[derive(Clone, Debug)]
+pub struct ChatSearchHit {
+    pub thread: ChatThreadId,
+    pub entry: ThreadEntrySeq,
+    pub kind: ChatThreadKind,
+    pub project_folder: Option<FolderId>,
+    pub author: PrincipalId,
+    pub snippet: String,
+    pub score: f64,
+}
+#[derive(Clone, Debug)]
 pub struct SearchResult {
     pub hits: Vec<SearchHit>,
+    pub chat_hits: Vec<ChatSearchHit>,
     pub cut: SnapshotCut,
     pub degraded: Option<SearchDegradation>,
     pub truncated: bool,

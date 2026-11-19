@@ -159,6 +159,39 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
     assert_eq!(range_ab.first_seq.get(), 101);
     assert_eq!(range_ab.last_seq.get(), 102);
 
+    let search = maintenance_ctx(ServicePurpose::Search);
+    let index_page = store
+        .read_searchable_notes_seed_page(
+            &search.authority,
+            search.budget.clone(),
+            scope1.clone(),
+            None,
+            None,
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .expect("read search seed");
+    assert_eq!(index_page.cutoff.after, range_ab.last_seq);
+    assert_eq!(index_page.next_after.as_ref(), Some(&note_a));
+    let indexed = &index_page.notes[0];
+    assert_eq!(indexed.title, "Note A");
+    assert_eq!(indexed.parent_folder_id, s1.root_folder_id);
+    assert_eq!(indexed.revision_actor, actor);
+    assert_eq!(indexed.enclosing_project, None);
+    let next_page = store
+        .read_searchable_notes_seed_page(
+            &search.authority,
+            search.budget.clone(),
+            scope1.clone(),
+            Some(index_page.cutoff.after),
+            index_page.next_after,
+            PageLimit::new(1).unwrap(),
+        )
+        .await
+        .expect("read search seed continuation");
+    assert_eq!(next_page.notes[0].note_id, note_b);
+    assert!(next_page.next_after.is_none());
+
     // Confirm broadcast hint arrived at 102 AFTER commit!
     let adv_102 = sub_at_100.next().await.expect("next").expect("some notice");
     match adv_102 {
@@ -459,6 +492,32 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
         .commit_synthetic_note_purge_for_test(&scope1, epoch, &note_a)
         .await
         .expect("purge note_a");
+
+    let stale_search_seed = store
+        .read_searchable_notes_seed_page(
+            &search.authority,
+            search.budget.clone(),
+            scope1.clone(),
+            Some(range_ab.last_seq),
+            None,
+            PageLimit::new(1).unwrap(),
+        )
+        .await;
+    assert_validation_err(&stale_search_seed, ValidationReason::CursorStale);
+    let selected = store
+        .read_note_documents_at_cutoff(
+            &search.authority,
+            search.budget,
+            scope1.clone(),
+            range_ab.last_seq,
+            vec![note_b.clone(), note_a.clone()],
+        )
+        .await
+        .expect("load ordered changes at the pinned cut");
+    assert_eq!(selected[0].0, note_b);
+    assert!(selected[0].1.is_some());
+    assert_eq!(selected[1].0, note_a);
+    assert!(selected[1].1.is_none());
 
     let lag_over_purged = store
         .catch_up(
