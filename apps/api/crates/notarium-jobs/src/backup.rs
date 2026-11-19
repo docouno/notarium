@@ -8,7 +8,7 @@ use std::{
 
 use bytes::Bytes;
 use notarium_canonical::{
-    BackupArtifactEncoding, CanonicalStore,
+    CanonicalStore,
     backup::{PostgresSpoolValue, scan_postgres_spool_v1},
     codec,
 };
@@ -19,8 +19,8 @@ use notarium_core::{
     ids::{BackupId, ContentDigest, SpaceId},
     model::HistoryScope,
     ports::{
-        BackupArtifactKind, BackupHold, BackupParticipantPort, BackupSpool, CallBudget,
-        Cancellation, MaintenanceContext, PreparedBackup, ServicePurpose,
+        BackupArtifactKind, BackupHold, BackupParticipantPort, CallBudget, Cancellation,
+        MaintenanceContext, PreparedBackup, ServicePurpose, TemporaryBackupSpool,
     },
     receipt::ChangeCursor,
 };
@@ -91,9 +91,8 @@ pub(crate) struct Pair {
     pub(crate) id: BackupId,
     pub(crate) control: File,
     pub(crate) canonical: File,
-    pub(crate) canonical_path: PathBuf,
-    pub(crate) control_spool: BackupSpool,
-    pub(crate) canonical_spool: BackupSpool,
+    pub(crate) control_spool: TemporaryBackupSpool,
+    pub(crate) canonical_spool: TemporaryBackupSpool,
     pub(crate) pause: PairedPause,
     control_hold: Box<dyn BackupHold>,
     canonical_hold: Box<dyn BackupHold>,
@@ -147,15 +146,15 @@ async fn run_backup_inner(
         let data_path = work.path("cas.data");
         let manifest = Manifest {
             version: 1,
-            installation: pair.canonical_spool.witness.installation.clone(),
-            backend: pair.canonical_spool.kind,
+            installation: pair.canonical_spool.receipt().witness.installation.clone(),
+            backend: pair.canonical_spool.receipt().kind,
             control: Payload {
-                bytes: pair.control_spool.bytes,
-                digest: pair.control_spool.digest,
+                bytes: pair.control_spool.receipt().bytes,
+                digest: pair.control_spool.receipt().digest,
             },
             canonical: Payload {
-                bytes: pair.canonical_spool.bytes,
-                digest: pair.canonical_spool.digest,
+                bytes: pair.canonical_spool.receipt().bytes,
+                digest: pair.canonical_spool.receipt().digest,
             },
             index: cas.0,
             cas: cas.1,
@@ -174,8 +173,10 @@ async fn run_backup_inner(
         }
         let mut control_input = pair.control.try_clone().map_err(io_error)?;
         let mut canonical_input = pair.canonical.try_clone().map_err(io_error)?;
+        let spools = (pair.control_spool.clone(), pair.canonical_spool.clone());
         let cancellation = budget.cancellation.clone();
         tokio::task::spawn_blocking(move || {
+            let _spools = spools;
             let mut index = File::open(index_path).map_err(io_error)?;
             let mut data = File::open(data_path).map_err(io_error)?;
             let mut archive = new_file(&temporary)?;
@@ -269,65 +270,73 @@ pub(crate) async fn capture_pair(
             nb,
         )
         .await?;
-        if control_spool.kind != canonical_spool.kind
-            || control_spool.witness.installation != canonical_spool.witness.installation
+        if control_spool.receipt().kind != canonical_spool.receipt().kind
+            || control_spool.receipt().witness.installation
+                != canonical_spool.receipt().witness.installation
         {
             return Err(invalid(ValidationReason::ScopeMismatch));
         }
-        let ((verified_control, control_file), canonical_record) = tokio::try_join!(
-            control.open_artifact(ctx, control_spool.artifact.clone()),
-            canonical.get_backup_artifact(&canonical_spool.artifact),
-        )?;
-        let encoding = match canonical_spool.kind {
-            BackupArtifactKind::SqliteSnapshotV1 => BackupArtifactEncoding::SqliteSnapshotV1,
-            BackupArtifactKind::PostgresSpoolV1 => BackupArtifactEncoding::PostgresSpoolV1,
-        };
-        if verified_control.digest != control_spool.digest
-            || verified_control.bytes != control_spool.bytes
-            || canonical_record.digest != canonical_spool.digest
-            || canonical_record.byte_size != canonical_spool.bytes
-            || canonical_record.encoding != encoding
-            || canonical_record.backup_id != id
-            || canonical_record.installation_id != canonical_spool.witness.installation
-        {
-            return Err(invalid(ValidationReason::InvalidDigest));
-        }
-        let canonical_path = canonical_record.artifact_path;
-        let canonical_file = File::open(&canonical_path).map_err(io_error)?;
-        Ok((
-            control_file,
-            canonical_file,
-            canonical_path,
-            control_spool,
-            canonical_spool,
-            pause,
-        ))
+        let cancellation = ctx.budget.cancellation.clone();
+        tokio::task::spawn_blocking(move || {
+            let control_file = open_temporary_spool(&control_spool, &cancellation)?;
+            let canonical_file = open_temporary_spool(&canonical_spool, &cancellation)?;
+            Ok((
+                control_file,
+                canonical_file,
+                control_spool,
+                canonical_spool,
+                pause,
+            ))
+        })
+        .await
+        .map_err(join_error)?
     }
     .await;
-    let (control_file, canonical_file, canonical_path, control_spool, canonical_spool, pause) =
-        match captured {
-            Ok(pair) => pair,
-            Err(error) => {
-                let _ = tokio::join!(
-                    ctrl.abort(),
-                    canon.abort(),
-                    control_hold.release(),
-                    canonical_hold.release(),
-                );
-                return Err(error);
-            }
-        };
+    let (control_file, canonical_file, control_spool, canonical_spool, pause) = match captured {
+        Ok(pair) => pair,
+        Err(error) => {
+            let _ = tokio::join!(
+                ctrl.abort(),
+                canon.abort(),
+                control_hold.release(),
+                canonical_hold.release(),
+            );
+            return Err(error);
+        }
+    };
     Ok(Pair {
         id,
         control: control_file,
         canonical: canonical_file,
-        canonical_path,
         control_spool,
         canonical_spool,
         pause,
         control_hold,
         canonical_hold,
     })
+}
+
+fn open_temporary_spool(
+    spool: &TemporaryBackupSpool,
+    cancellation: &Cancellation,
+) -> Result<File, PortError> {
+    let receipt = spool.receipt();
+    let expected = Payload {
+        bytes: receipt.bytes,
+        digest: receipt.digest,
+    };
+    if !spool.path().symlink_metadata().map_err(io_error)?.is_file() {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    let mut file = File::open(spool.path()).map_err(io_error)?;
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file()
+        || metadata.len() != receipt.bytes
+        || measure_file(&mut file, receipt.bytes, cancellation)? != expected
+    {
+        return Err(invalid(ValidationReason::InvalidDigest));
+    }
+    Ok(file)
 }
 
 async fn join_phases<L, R>(
@@ -379,7 +388,7 @@ async fn capture_spools(
     held_histories: &[ChangeCursor],
     cb: notarium_core::ports::BackupBudget,
     nb: notarium_core::ports::BackupBudget,
-) -> Result<(BackupSpool, BackupSpool, PairedPause), PortError> {
+) -> Result<(TemporaryBackupSpool, TemporaryBackupSpool, PairedPause), PortError> {
     let inclusive = Instant::now();
     let mut control_paused = ctrl.pause_writes().await?;
     let confirmed = Instant::now();
@@ -426,8 +435,8 @@ async fn capture_spools(
         }
         let spools = join_phases(
             &ctx.budget.cancellation,
-            control_cut.spool(cb, ctx.budget.cancellation.clone()),
-            canonical_cut.spool(nb, ctx.budget.cancellation.clone()),
+            control_cut.spool_temporary(cb, ctx.budget.cancellation.clone()),
+            canonical_cut.spool_temporary(nb, ctx.budget.cancellation.clone()),
         )
         .await;
         let (control_spool, canonical_spool) = acknowledge_pair(
@@ -463,11 +472,21 @@ async fn pack_cas(
     let reader = tokio::task::spawn_blocking({
         let options = options.clone();
         let file = pair.canonical.try_clone().map_err(io_error)?;
-        let path = pair.canonical_path.clone();
-        let kind = pair.canonical_spool.kind;
-        let size = pair.canonical_spool.bytes;
+        let spool = pair.canonical_spool.clone();
+        let kind = spool.receipt().kind;
+        let size = spool.receipt().bytes;
         let cancellation = budget.cancellation.clone();
-        move || snapshot_references(file, &path, kind, size, options, references, &cancellation)
+        move || {
+            snapshot_references(
+                file,
+                spool.path(),
+                kind,
+                size,
+                options,
+                references,
+                &cancellation,
+            )
+        }
     });
     let (cas_tx, cas_rx) = mpsc::channel(1);
     let writer = tokio::task::spawn_blocking({
@@ -476,7 +495,7 @@ async fn pack_cas(
         let cancellation = budget.cancellation.clone();
         move || write_cas(&index, &data, cas_rx, options, &cancellation)
     });
-    let histories = &pair.canonical_spool.witness.histories;
+    let histories = &pair.canonical_spool.receipt().witness.histories;
     let produce = async {
         while let Some((space, digest)) = ref_rx.recv().await {
             check_cancelled(&budget.cancellation)?;
@@ -516,13 +535,23 @@ pub(crate) async fn verify_live_cas(
     let reader = tokio::task::spawn_blocking({
         let options = options.clone();
         let file = pair.canonical.try_clone().map_err(io_error)?;
-        let path = pair.canonical_path.clone();
-        let kind = pair.canonical_spool.kind;
-        let size = pair.canonical_spool.bytes;
+        let spool = pair.canonical_spool.clone();
+        let kind = spool.receipt().kind;
+        let size = spool.receipt().bytes;
         let cancellation = budget.cancellation.clone();
-        move || snapshot_references(file, &path, kind, size, options, references, &cancellation)
+        move || {
+            snapshot_references(
+                file,
+                spool.path(),
+                kind,
+                size,
+                options,
+                references,
+                &cancellation,
+            )
+        }
     });
-    let history = &pair.canonical_spool.witness.histories;
+    let history = &pair.canonical_spool.receipt().witness.histories;
     let verify = async {
         let mut summary = (0_u64, 0_u64);
         while let Some((space, digest)) = rx.recv().await {

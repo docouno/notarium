@@ -28,7 +28,7 @@ use notarium_core::{
     ports::{
         BackupArtifactKind, BackupBudget, BackupHold, BackupParticipantPort, BackupProgress,
         BackupSnapshot, BackupSpool, BackupWitness, CallBudget, Cancellation, MaintenanceContext,
-        PausedBackup, PortFuture, PreparedBackup, ServicePurpose,
+        PausedBackup, PortFuture, PreparedBackup, ServicePurpose, TemporaryBackupSpool,
     },
     ports::{BackupRetentionBudget, BackupRetentionProgress},
     receipt::ChangeCursor,
@@ -2891,12 +2891,48 @@ impl Drop for CanonicalBackupSnapshot {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum SpoolRetention {
+    Durable,
+    Temporary,
+}
+
+pub(super) struct CapturedSpool {
+    receipt: BackupSpool,
+    path: PathBuf,
+    lease: ArtifactLease,
+}
+
+struct TemporaryArtifact(ArtifactLease);
+
+impl Drop for TemporaryArtifact {
+    fn drop(&mut self) {
+        let _ = self.0.remove_temporary();
+    }
+}
+
+impl CapturedSpool {
+    pub(super) fn accept(self) -> Result<BackupSpool, PortError> {
+        self.lease.accepted()?;
+        Ok(self.receipt)
+    }
+
+    pub(super) fn temporary(self) -> TemporaryBackupSpool {
+        TemporaryBackupSpool::new(self.receipt, self.path, TemporaryArtifact(self.lease))
+    }
+
+    pub(super) async fn discard(self) -> Result<(), PortError> {
+        self.lease.reconcile_pending().await
+    }
+}
+
 impl CanonicalBackupSnapshot {
     fn run_spool(
         &mut self,
         budget: BackupBudget,
         cancellation: Cancellation,
-    ) -> PortFuture<'_, BackupSpool> {
+        retention: SpoolRetention,
+    ) -> PortFuture<'_, (BackupSpool, PathBuf)> {
         Box::pin(async move {
             if cancellation.is_cancelled() {
                 if let Some(st) = self.state.take() {
@@ -3097,25 +3133,34 @@ impl CanonicalBackupSnapshot {
                     "spool cancelled",
                 ));
             }
-            persist_backup_artifact_ready(
-                &self.store,
-                &self.artifact_id,
-                &self.backup_id,
-                &self.hold,
-                encoding,
-                &lease.key(&rel_name),
-                bytes,
-                digest,
-                &self.witness,
+            if matches!(retention, SpoolRetention::Durable) {
+                lease.offer_durable()?;
+                persist_backup_artifact_ready(
+                    &self.store,
+                    &self.artifact_id,
+                    &self.backup_id,
+                    &self.hold,
+                    encoding,
+                    &lease.key(&rel_name),
+                    bytes,
+                    digest,
+                    &self.witness,
+                    HoldWriteBudget {
+                        deadline,
+                        cancellation: Some(&cancellation),
+                    },
+                )
+                .await?;
+            } else {
                 HoldWriteBudget {
                     deadline,
                     cancellation: Some(&cancellation),
-                },
-            )
-            .await?;
-            lease.accepted()?;
+                }
+                .admit(self.hold.verify())
+                .await??;
+            }
 
-            Ok(BackupSpool {
+            let receipt = BackupSpool {
                 kind: match encoding {
                     BackupArtifactEncoding::SqliteSnapshotV1 => {
                         BackupArtifactKind::SqliteSnapshotV1
@@ -3126,21 +3171,19 @@ impl CanonicalBackupSnapshot {
                 bytes,
                 digest,
                 witness: self.witness.as_ref().clone(),
-            })
+            };
+            Ok((receipt, self.spool_dir.join(rel_name)))
         })
     }
 }
 
-impl BackupSnapshot for CanonicalBackupSnapshot {
-    fn witness(&self) -> &BackupWitness {
-        &self.witness
-    }
-
-    fn spool(
+impl CanonicalBackupSnapshot {
+    pub(super) fn spool(
         &mut self,
         budget: BackupBudget,
         cancellation: Cancellation,
-    ) -> PortFuture<'_, BackupSpool> {
+        retention: SpoolRetention,
+    ) -> PortFuture<'_, CapturedSpool> {
         Box::pin(async move {
             let shutdown = self.store.inner.backup_shutdown.clone();
             let hold = self.hold.clone();
@@ -3174,7 +3217,7 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
             // finish, preserving its native and database cleanup acknowledgements.
             let owner_cancel = Cancellation::default();
             let result = {
-                let work = self.run_spool(budget, owner_cancel.clone());
+                let work = self.run_spool(budget, owner_cancel.clone(), retention);
                 tokio::pin!(work);
                 tokio::select! {
                     biased;
@@ -3182,17 +3225,26 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
                     result = &mut work => result,
                 }
             };
-            if let Some(lease) = self.artifact_lease.take()
-                && result.is_err()
-                && let Err(error) = lease.reconcile_pending().await
-            {
-                self.cleanup_failure.get_or_insert(error);
+            let lease = self.artifact_lease.take();
+            match result {
+                Ok((receipt, path)) => Ok(CapturedSpool {
+                    receipt,
+                    path,
+                    lease: lease.expect("finished copy owns a spool lease"),
+                }),
+                Err(error) => {
+                    if let Some(lease) = lease
+                        && let Err(cleanup) = lease.reconcile_pending().await
+                    {
+                        self.cleanup_failure.get_or_insert(cleanup);
+                    }
+                    Err(error)
+                }
             }
-            result
         })
     }
 
-    fn close(mut self: Box<Self>) -> PortFuture<'static, ()> {
+    pub(super) fn close(mut self: Box<Self>) -> PortFuture<'static, ()> {
         Box::pin(async move {
             let source = match self.state.take() {
                 Some(st) => abort_pinned_driver(st).await,

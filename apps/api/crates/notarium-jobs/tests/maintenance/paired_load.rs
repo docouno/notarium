@@ -125,10 +125,8 @@ pub(super) async fn capture_under_load(
                 total.push(elapsed.as_nanos() as u64);
             }
             fs::remove_file(path).unwrap();
-            // The fixture reclaims its newly accepted spools after packaging,
-            // so consecutive samples can reuse disk space.
-            remove_consumed_spools(&control_spools, &existing_control, 2);
-            remove_consumed_spools(&canonical_spools, &existing_canonical, 1);
+            assert_eq!(artifact_files(&control_spools), existing_control);
+            assert_eq!(artifact_files(&canonical_spools), existing_canonical);
         }
         if tier != "unrated" {
             assert!(
@@ -161,9 +159,13 @@ pub(super) async fn capture_under_load(
     );
 }
 
-fn artifact_files(dir: &Path) -> BTreeSet<PathBuf> {
-    fs::read_dir(dir)
-        .unwrap()
+pub(super) fn artifact_files(dir: &Path) -> BTreeSet<PathBuf> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return BTreeSet::new(),
+        Err(err) => panic!("read backup spools at {}: {err}", dir.display()),
+    };
+    entries
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
             path.file_stem()
@@ -171,14 +173,6 @@ fn artifact_files(dir: &Path) -> BTreeSet<PathBuf> {
                 .is_some_and(|id| ArtifactId::parse_v1(id).is_ok())
         })
         .collect()
-}
-
-fn remove_consumed_spools(dir: &Path, existing: &BTreeSet<PathBuf>, count: usize) {
-    let artifacts = artifact_files(dir);
-    assert_eq!(artifacts.difference(existing).count(), count);
-    for path in artifacts.difference(existing) {
-        fs::remove_file(path).unwrap();
-    }
 }
 
 async fn foreground(

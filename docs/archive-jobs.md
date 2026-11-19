@@ -108,6 +108,11 @@ workers own the physical operation and recover durable work after interruption.
   requires a dedicated, empty PostgreSQL database and a fresh S3 prefix. A
   durable marker ties readiness to the database installation and S3 namespace.
 
+Paired backup and live verification use private temporary database spools. The
+coordinator releases them when their last reader finishes, including cancelled
+and failed operations. An abandoned pending marker lets each participant
+recover its own spool after a process exits.
+
 Restore assigns a new incarnation to every Space and clamps control cursors to
 its recorded cutoff. Both stores must agree before the target is published.
 A restart with the same archive and target can recover the pending generation.

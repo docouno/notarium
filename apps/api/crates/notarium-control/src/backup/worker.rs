@@ -34,6 +34,11 @@ pub(crate) enum Command {
         cancellation: Cancellation,
         reply: oneshot::Sender<Result<BackupSpool, PortError>>,
     },
+    SpoolTemporary {
+        budget: BackupBudget,
+        cancellation: Cancellation,
+        reply: oneshot::Sender<Result<TemporaryBackupSpool, PortError>>,
+    },
 }
 enum Source {
     Sqlite(Box<SqliteCut>),
@@ -237,6 +242,18 @@ impl Worker {
         // or packaging later cannot retain a database snapshot through this handle.
         self.close_source().await?;
         self.session.finish_tracking()?;
+        self.metrics.spool = started.elapsed();
+        self.metrics.bytes = bytes;
+        Ok(receipt)
+    }
+
+    async fn spool_durable(
+        &mut self,
+        budget: BackupBudget,
+        cancellation: Cancellation,
+    ) -> Result<BackupSpool, PortError> {
+        let started = Instant::now();
+        let receipt = self.spool(budget, cancellation).await?;
         self.artifacts
             .as_ref()
             .ok_or_else(failure)?
@@ -244,8 +261,23 @@ impl Worker {
         self.session.check()?;
         self.phase = Phase::Offered;
         self.metrics.spool = started.elapsed();
-        self.metrics.bytes = bytes;
         Ok(receipt)
+    }
+
+    async fn spool_temporary(
+        &mut self,
+        budget: BackupBudget,
+        cancellation: Cancellation,
+    ) -> Result<TemporaryBackupSpool, PortError> {
+        let receipt = self.spool(budget, cancellation).await?;
+        self.session.check()?;
+        let spool = self
+            .artifacts
+            .as_mut()
+            .ok_or_else(failure)?
+            .temporary(receipt)?;
+        self.phase = Phase::Finished;
+        Ok(spool)
     }
     async fn run(&mut self, commands: &mut mpsc::Receiver<Command>) -> Result<(), PortError> {
         loop {
@@ -287,7 +319,18 @@ impl Worker {
                     cancellation,
                     reply,
                 }) => {
-                    let result = self.spool(budget, cancellation).await;
+                    let result = self.spool_durable(budget, cancellation).await;
+                    let failed = result.is_err();
+                    if reply.send(result).is_err() || failed {
+                        return Err(failure());
+                    }
+                }
+                Some(Command::SpoolTemporary {
+                    budget,
+                    cancellation,
+                    reply,
+                }) => {
+                    let result = self.spool_temporary(budget, cancellation).await;
                     let failed = result.is_err();
                     if reply.send(result).is_err() || failed {
                         return Err(failure());

@@ -6,6 +6,7 @@ use super::{
     CanonicalInner, CanonicalStore, PausedBackup, PortError, PortFuture, PreparedBackup,
     cancelled_not_committed,
 };
+use notarium_core::ports::TemporaryBackupSpool;
 use std::{
     future::Future,
     sync::{Arc, Mutex},
@@ -277,7 +278,13 @@ impl Snapshot {
         let cancellation = raw.caller_cancel.token.clone();
         Ok(Self {
             witness: raw.witness.clone(),
-            source: Phase::new(&inner, raw, cancellation, BackupSnapshot::close).await?,
+            source: Phase::new(
+                &inner,
+                raw,
+                cancellation,
+                super::CanonicalBackupSnapshot::close,
+            )
+            .await?,
         })
     }
 }
@@ -292,10 +299,23 @@ impl BackupSnapshot for Snapshot {
         budget: BackupBudget,
         cancellation: Cancellation,
     ) -> PortFuture<'_, BackupSpool> {
-        self.source.with(
-            move |p| p.spool(budget, cancellation),
-            |_| std::future::ready(Ok(())),
-        )
+        let offered = self.source.with(
+            move |p| p.spool(budget, cancellation, super::SpoolRetention::Durable),
+            super::CapturedSpool::discard,
+        );
+        Box::pin(async move { offered.await?.accept() })
+    }
+
+    fn spool_temporary(
+        &mut self,
+        budget: BackupBudget,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, TemporaryBackupSpool> {
+        let offered = self.source.with(
+            move |p| p.spool(budget, cancellation, super::SpoolRetention::Temporary),
+            super::CapturedSpool::discard,
+        );
+        Box::pin(async move { Ok(offered.await?.temporary()) })
     }
 
     fn close(self: Box<Self>) -> PortFuture<'static, ()> {

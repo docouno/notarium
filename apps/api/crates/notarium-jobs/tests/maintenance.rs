@@ -204,6 +204,7 @@ async fn capture_with_a_live_write(
     assert!(after > before);
     let backup = backup.await.unwrap();
     canonical.set_backup_step_delay_for_test(Duration::ZERO);
+    assert!(paired_load::artifact_files(&spools).is_empty());
     eprintln!("live write committed at {after:?} before paired backup completed");
     (
         backup,
@@ -438,6 +439,8 @@ async fn sqlite_archive_verification_restore_and_rejection() {
     .await
     .unwrap();
     assert_eq!((live.spaces, live.blobs, live.readable_keys), (1, 1, 1));
+    assert!(paired_load::artifact_files(&root.staging().join("control")).is_empty());
+    assert!(paired_load::artifact_files(&root.staging().join("backups")).is_empty());
     let destination = scratch.0.join("backup.zip");
     let (backup, concurrent_write) = capture_with_a_live_write(
         &canonical,
@@ -450,6 +453,7 @@ async fn sqlite_archive_verification_restore_and_rejection() {
     )
     .await;
     export.release().await.unwrap();
+    assert!(paired_load::artifact_files(&root.staging().join("control")).is_empty());
     let report = run_fsck(
         authority(ServicePurpose::Fsck),
         FsckInput::Archive(open(&destination)),
@@ -876,6 +880,8 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
         .await
         .unwrap();
     let wrong_count = scratch.0.join("wrong-ref-count.zip");
+    let failed_spools = scratch.0.join("failed-capture-spools");
+    store.set_backup_spool_dir(failed_spools.clone());
     sqlx::query("UPDATE v1_canonical.blob_catalog SET ref_count=2 WHERE space_id=$1")
         .bind(scope.space_id.as_str())
         .execute(&mut src_sql)
@@ -906,6 +912,8 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
         .is_err()
     );
     assert!(!wrong_count.exists());
+    assert!(paired_load::artifact_files(&failed_spools).is_empty());
+    assert!(paired_load::artifact_files(&root.staging().join("control")).is_empty());
     sqlx::query("UPDATE v1_canonical.blob_catalog SET ref_count=1 WHERE space_id=$1")
         .bind(scope.space_id.as_str())
         .execute(&mut src_sql)
@@ -957,6 +965,7 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     )
     .await;
     export.release().await.unwrap();
+    assert!(paired_load::artifact_files(&root.staging().join("control")).is_empty());
     let validated = run_fsck(
         authority(ServicePurpose::Fsck),
         FsckInput::Archive(open(&path)),

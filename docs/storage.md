@@ -485,6 +485,8 @@ same example against an isolated prefix.
   rows in slices of up to 64 KiB. Both participants release their source after
   durable spool or abort. A canonical artifact ID resolves on its original spool
   volume, where lookup checks file size and BLAKE3 before returning the path.
+  The registry keeps a durable spool after the caller claims its receipt. An
+  unclaimed spool remains eligible for recovery and exact registry cleanup.
   Startup reconciles abandoned holds and pending local artifacts. PostgreSQL
   maintenance also reaps holds whose ownership lock was lost. An unacknowledged
   hold commit is reconciled using its exact generation once the old session ends.

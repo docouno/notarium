@@ -1341,6 +1341,65 @@ async fn sqlite_cancelled_spool_and_delayed_release_settle_behind_a_writer_pause
     case.shutdown().await;
 }
 
+#[tokio::test]
+async fn an_unread_durable_spool_reply_reclaims_the_file_and_registry_row() {
+    for postgres in [false, true] {
+        let case = if postgres {
+            BackendCase::open_pg_s3_with_pool(1).await
+        } else {
+            BackendCase::open_sqlite().await
+        };
+        case.store
+            .create_space(backup_test_space(0xcf))
+            .await
+            .unwrap();
+        let id = BackupId::from_bytes([0xcf; 16]);
+        let budget = case.store.default_backup_budget();
+        let mut prepared = case
+            .store
+            .prepare(maintenance_ctx(ServicePurpose::Backup), id, budget)
+            .await
+            .unwrap();
+        let hold = prepared.acquire_hold().await.unwrap();
+        let mut paused = prepared.pause_writes().await.unwrap();
+        let mut cut = paused.open_cut().await.unwrap();
+        paused.resume().await.unwrap();
+
+        let mut spooling = cut.spool(budget, Cancellation::default());
+        assert!(futures_util::poll!(&mut spooling).is_pending());
+        let (artifact, file) = tokio::time::timeout(Duration::from_secs(8), async {
+            'produced: loop {
+                for entry in fs::read_dir(&case.spool_dir).unwrap() {
+                    let marker = entry.unwrap().path();
+                    if marker.extension().is_some_and(|ext| ext == "unclaimed") {
+                        let artifact =
+                            ArtifactId::parse_v1(marker.file_stem().unwrap().to_str().unwrap())
+                                .unwrap();
+                        if let Ok(record) = case.store.get_backup_artifact(&artifact).await {
+                            break 'produced (artifact, record.artifact_path);
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the worker published an offer");
+        drop(spooling);
+        cut.close().await.unwrap();
+        assert!(!file.exists());
+        assert!(!file.with_extension("pending").exists());
+        assert!(!file.with_extension("unclaimed").exists());
+        assert!(matches!(
+            case.store.get_backup_artifact(&artifact).await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+        hold.release().await.unwrap();
+        prepared.abort().await.unwrap();
+        case.shutdown().await;
+    }
+}
+
 async fn wait_for_spool_file(directory: &Path, extension: &str) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -2139,15 +2198,15 @@ async fn exit_during_backup_reconciles_the_hold_and_owned_artifact() {
             .await
             .unwrap();
         let _hold = prepared.acquire_hold().await.unwrap();
-        let directory = root.staging().join("backups");
-        let pending = fs::read_dir(&directory)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|ext| ext == "pending"))
+        let mut paused = prepared.pause_writes().await.unwrap();
+        let mut cut = paused.open_cut().await.unwrap();
+        paused.resume().await.unwrap();
+        let working = cut
+            .spool_temporary(store.default_backup_budget(), Cancellation::default())
+            .await
             .unwrap();
-        // Model the file rename just before publication's SQL COMMIT then exit without destructors.
-        fs::write(pending.with_extension("sqlite"), b"unacknowledged snapshot").unwrap();
+        cut.close().await.unwrap();
+        assert!(working.path().exists());
         std::process::exit(37);
     }
     let fixture = TempDataRoot::new("l4-exit-during-backup");
@@ -2179,6 +2238,12 @@ async fn exit_during_backup_reconciles_the_hold_and_owned_artifact() {
                 .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM backup_artifacts", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
         );
     }
     let (store, runtime) =

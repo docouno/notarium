@@ -96,6 +96,11 @@ the complete digest and returns a file positioned at the start. Callers cannot
 supply arbitrary paths. The packaging consumer owns accepted artifacts and their
 eventual retention/deletion policy.
 
+The paired backup coordinator uses private working spools. Each reader keeps
+a lease on the file after the database worker finishes. The last reader
+releases the file, and the pending marker lets recovery remove it after a
+process exits with readers still active.
+
 `SqliteSnapshotV1` is a standalone SQLite database produced with the safe native
 backup API in bounded page steps. Destination close and integrity checking occur
 before its source cut is released. No database-wide RAM serialization is used.

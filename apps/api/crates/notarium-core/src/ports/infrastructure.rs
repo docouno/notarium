@@ -4,7 +4,12 @@ use crate::{
     patch::*, receipt::*, value::YamlValue,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 pub trait StructuralSnapshot: Send + Sync {
     fn cut(&self) -> &SnapshotCut;
@@ -706,6 +711,39 @@ pub struct BackupSpool {
     pub witness: BackupWitness,
 }
 
+/// Private working file for an in-process backup consumer. Keep a lease alive
+/// for every reader. The participant reclaims its file after the last lease.
+#[derive(Clone)]
+pub struct TemporaryBackupSpool {
+    inner: Arc<TemporaryBackupFile>,
+}
+
+struct TemporaryBackupFile {
+    receipt: BackupSpool,
+    path: PathBuf,
+    _owner: Box<dyn Send + Sync>,
+}
+
+impl TemporaryBackupSpool {
+    pub fn new(receipt: BackupSpool, path: PathBuf, owner: impl Send + Sync + 'static) -> Self {
+        Self {
+            inner: Arc::new(TemporaryBackupFile {
+                receipt,
+                path,
+                _owner: Box::new(owner),
+            }),
+        }
+    }
+
+    pub fn receipt(&self) -> &BackupSpool {
+        &self.inner.receipt
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.inner.path
+    }
+}
+
 /// Dropping any phase must abort and release the resources it owns. Implementations
 /// retain source snapshots until stable spool or abort, and CAS holds through copy.
 pub trait BackupParticipantPort: Send + Sync {
@@ -749,5 +787,12 @@ pub trait BackupSnapshot: Send {
         budget: BackupBudget,
         cancellation: Cancellation,
     ) -> PortFuture<'_, BackupSpool>;
+    fn spool_temporary(
+        &mut self,
+        _budget: BackupBudget,
+        _cancellation: Cancellation,
+    ) -> PortFuture<'_, TemporaryBackupSpool> {
+        Box::pin(async { Err(DomainError::validation(ValidationReason::InvalidState).into()) })
+    }
     fn close(self: Box<Self>) -> PortFuture<'static, ()>;
 }

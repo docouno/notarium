@@ -991,14 +991,16 @@ async fn verify_live(
         control,
     )
     .await?;
-    let installation = pair.canonical_spool.witness.installation.clone();
-    let backend = pair.canonical_spool.kind;
+    let installation = pair.canonical_spool.receipt().witness.installation.clone();
+    let backend = pair.canonical_spool.receipt().kind;
     let verified: Result<_, PortError> = async {
         let (manifest, database_inputs) = live_inputs(&mut pair)?;
         let keys = external_keyring.to_owned();
         let database_budget = budget.clone();
         let verify_options = options.clone();
+        let spools = (pair.control_spool.clone(), pair.canonical_spool.clone());
         let databases = tokio::task::spawn_blocking(move || {
+            let _spools = spools;
             verify_databases(
                 database_inputs.0,
                 database_inputs.1,
@@ -1042,15 +1044,15 @@ fn live_inputs(
     };
     let manifest = Manifest {
         version: 1,
-        installation: pair.canonical_spool.witness.installation.clone(),
-        backend: pair.canonical_spool.kind,
+        installation: pair.canonical_spool.receipt().witness.installation.clone(),
+        backend: pair.canonical_spool.receipt().kind,
         control: Payload {
-            bytes: pair.control_spool.bytes,
-            digest: pair.control_spool.digest,
+            bytes: pair.control_spool.receipt().bytes,
+            digest: pair.control_spool.receipt().digest,
         },
         canonical: Payload {
-            bytes: pair.canonical_spool.bytes,
-            digest: pair.canonical_spool.digest,
+            bytes: pair.canonical_spool.receipt().bytes,
+            digest: pair.canonical_spool.receipt().digest,
         },
         index: empty,
         cas: empty,

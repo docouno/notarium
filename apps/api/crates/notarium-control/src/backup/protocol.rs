@@ -228,6 +228,28 @@ impl BackupSnapshot for Snapshot {
             Ok(receipt)
         })
     }
+    fn spool_temporary(
+        &mut self,
+        budget: BackupBudget,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, TemporaryBackupSpool> {
+        Box::pin(async move {
+            if !self.owns || self.spooled {
+                return Err(failure());
+            }
+            let spool = self
+                .client
+                .request(|reply| Command::SpoolTemporary {
+                    budget,
+                    cancellation,
+                    reply,
+                })
+                .await?;
+            self.spooled = true;
+            self.owns = false;
+            Ok(spool)
+        })
+    }
     fn close(mut self: Box<Self>) -> PortFuture<'static, ()> {
         Box::pin(async move {
             if self.spooled {

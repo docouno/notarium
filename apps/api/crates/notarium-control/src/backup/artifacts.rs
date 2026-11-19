@@ -10,10 +10,11 @@ use notarium_core::{
     epoch::DataRoot,
     error::PortError,
     ids::{ArtifactId, BackupId},
-    ports::BackupSpool,
+    ports::{BackupSpool, TemporaryBackupSpool},
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    fs::{File, TryLockError},
     io::{Read, Write},
     path::PathBuf,
 };
@@ -31,7 +32,23 @@ pub(crate) struct Artifacts {
     root: Dir,
     path: PathBuf,
     _owner: FileFence,
-    owned: Option<ArtifactId>,
+    owned: Option<OwnedArtifact>,
+}
+
+struct OwnedArtifact {
+    id: ArtifactId,
+    marker: File,
+}
+
+struct TemporaryArtifact {
+    root: Dir,
+    owned: OwnedArtifact,
+}
+
+impl Drop for TemporaryArtifact {
+    fn drop(&mut self) {
+        let _ = remove_owned_files(&self.root, &self.owned.id);
+    }
 }
 fn sync(root: &Dir) -> Result<(), PortError> {
     root.open(".")
@@ -48,9 +65,9 @@ fn create_file(root: &Dir, name: &str) -> Result<cap_std::fs::File, PortError> {
     }
     root.open_with(name, &options).map_err(|_| failure())
 }
-fn open_regular(root: &Dir, name: &str) -> Result<cap_std::fs::File, PortError> {
+fn open_regular(root: &Dir, name: &str, lockable: bool) -> Result<cap_std::fs::File, PortError> {
     let mut options = OpenOptions::new();
-    options.read(true).nonblock(true);
+    options.read(true).write(lockable).nonblock(true);
     let file = root.open_with(name, &options).map_err(|_| failure())?;
     if !file.metadata().map_err(|_| failure())?.is_file() {
         return Err(failure());
@@ -58,7 +75,7 @@ fn open_regular(root: &Dir, name: &str) -> Result<cap_std::fs::File, PortError> 
     Ok(file)
 }
 fn read_json<T: serde::de::DeserializeOwned>(root: &Dir, name: &str) -> Result<T, PortError> {
-    let mut file = open_regular(root, name)?;
+    let mut file = open_regular(root, name, false)?;
     let meta = file.metadata().map_err(|_| failure())?;
     if !meta.is_file() || meta.len() > MAX_MARKER as u64 {
         return Err(failure());
@@ -94,6 +111,22 @@ fn remove(root: &Dir, name: &str) -> Result<(), PortError> {
         Err(_) => Err(failure()),
     }
 }
+
+fn remove_owned_files(root: &Dir, id: &ArtifactId) -> Result<(), PortError> {
+    for suffix in [
+        ".partial",
+        ".partial-journal",
+        ".partial-wal",
+        ".partial-shm",
+        ".data",
+        ".ready",
+        ".pending",
+    ] {
+        remove(root, &name(id, suffix))?;
+    }
+    sync(root)
+}
+
 impl Artifacts {
     pub(crate) fn open(
         data: &DataRoot,
@@ -154,6 +187,19 @@ impl Artifacts {
             let Ok(id) = ArtifactId::parse_v1(raw) else {
                 continue;
             };
+            let lock = match open_regular(&self.root, file, true) {
+                Ok(marker) => marker.into_std(),
+                Err(_) if !self.root.try_exists(file).map_err(|_| failure())? => continue,
+                Err(error) => return Err(error),
+            };
+            match lock.try_lock() {
+                Ok(()) => {}
+                Err(TryLockError::WouldBlock) => continue,
+                Err(TryLockError::Error(_)) => return Err(failure()),
+            }
+            if !self.root.try_exists(file).map_err(|_| failure())? {
+                continue;
+            }
             let marker: Pending = read_json(&self.root, file)?;
             if marker.format != "notarium-control-pending-v1" || marker.artifact != id {
                 return Err(failure());
@@ -171,7 +217,7 @@ impl Artifacts {
                 }
                 remove(&self.root, file)?;
             } else {
-                self.remove_owned_files(&id)?;
+                remove_owned_files(&self.root, &id)?;
             }
         }
         sync(&self.root)
@@ -204,13 +250,18 @@ impl Artifacts {
             backup: backup.clone(),
         })
         .map_err(|_| failure())?;
-        let mut marker = create_file(&self.root, &name(artifact, ".pending"))?;
+        let marker = create_file(&self.root, &name(artifact, ".pending"))?.into_std();
         // Ownership starts only after exclusive marker creation. A colliding ID must
         // never authorize deleting a previous worker's files.
-        self.owned = Some(artifact.clone());
-        marker
+        let owned = self.owned.insert(OwnedArtifact {
+            id: artifact.clone(),
+            marker,
+        });
+        owned.marker.try_lock().map_err(|_| failure())?;
+        owned
+            .marker
             .write_all(&bytes)
-            .and_then(|()| marker.sync_all())
+            .and_then(|()| owned.marker.sync_all())
             .map_err(|_| failure())?;
         sync(&self.root)?;
         create_file(&self.root, &name(artifact, ".partial"))?
@@ -233,27 +284,27 @@ impl Artifacts {
         sync(&self.root)
     }
     pub(crate) fn abort(&mut self) -> Result<(), PortError> {
-        if let Some(id) = self.owned.take() {
-            self.remove_owned_files(&id)?;
+        if let Some(owned) = self.owned.take() {
+            remove_owned_files(&self.root, &owned.id)?;
         }
         Ok(())
     }
     pub(crate) fn retain(&mut self) {
         self.owned = None;
     }
-    fn remove_owned_files(&self, id: &ArtifactId) -> Result<(), PortError> {
-        for suffix in [
-            ".partial",
-            ".partial-journal",
-            ".partial-wal",
-            ".partial-shm",
-            ".data",
-            ".ready",
-            ".pending",
-        ] {
-            remove(&self.root, &name(id, suffix))?;
-        }
-        sync(&self.root)
+
+    pub(crate) fn temporary(
+        &mut self,
+        receipt: BackupSpool,
+    ) -> Result<TemporaryBackupSpool, PortError> {
+        let root = self.root.try_clone().map_err(|_| failure())?;
+        let owned = self.owned.take().ok_or_else(failure)?;
+        let path = self.path.join(name(&owned.id, ".partial"));
+        Ok(TemporaryBackupSpool::new(
+            receipt,
+            path,
+            TemporaryArtifact { root, owned },
+        ))
     }
 }
 /// Only participant-owned immutable artifacts are resolved; callers never supply
@@ -271,7 +322,7 @@ pub(crate) fn open_completed(
     if &receipt.artifact != id {
         return Err(failure());
     }
-    let mut file = open_regular(&dir, &name(id, ".data"))?.into_std();
+    let mut file = open_regular(&dir, &name(id, ".data"), false)?.into_std();
     if !file.metadata().map_err(|_| failure())?.is_file() {
         return Err(failure());
     }
