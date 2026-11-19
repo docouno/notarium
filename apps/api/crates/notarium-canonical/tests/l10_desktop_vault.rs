@@ -13,7 +13,7 @@ use std::{
 };
 
 use notarium_canonical::{
-    CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateSpaceSpec,
+    CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateSpaceSpec, SqlBackendConfig,
     vault::{VaultFileStamp, VaultImport, VaultObservation, VaultPath},
 };
 use notarium_core::{
@@ -25,14 +25,14 @@ use notarium_core::{
     ports::{
         CallBudget, CreateNote, DeleteDisposition, DeleteNote, ExternalObservation,
         ExternalObservationResult, MintAndPurge, MoveNote, Mutation, NoteRevision, NoteWritePort,
-        ObservedContent, RenameFolder, SpaceContext,
+        ObservedContent, RenameFolder, ServicePurpose, SpaceContext,
     },
     receipt::CommandIdentity,
 };
 use support::{
-    StorageTestFixtures, TempDataRoot, assert_validation_err, random_bytes_16, sample_folder_id,
-    sample_incarnation, sample_installation_id, sample_note_id, sample_principal_id,
-    sample_space_id,
+    StorageTestFixtures, TempDataRoot, assert_validation_err, maintenance_ctx, random_bytes_16,
+    sample_folder_id, sample_incarnation, sample_installation_id, sample_note_id,
+    sample_principal_id, sample_space_id,
 };
 
 async fn seed_space(store: &CanonicalStore) -> SpaceContext {
@@ -422,6 +422,22 @@ fn canonical_owner_lock_refuses_aliased_v1_directory() {
 async fn vault_move_guard_persists_purge_handoff_and_blocks_delayed_fenced_import() {
     let root = TempDataRoot::new("vault-binding-purge");
     let config = CanonicalConfig::local_default(sample_installation_id(31), root.data_root());
+    guarded_purge_roundtrip(config).await;
+}
+
+#[tokio::test]
+async fn postgres_vault_move_guard_preserves_the_purge_fence() {
+    let fixtures = StorageTestFixtures::load_required();
+    let root = TempDataRoot::new("vault-pg-binding-purge");
+    let config = fixtures.pg_local_config(
+        sample_installation_id(31),
+        &fixtures.fresh_pg_schema(),
+        root.data_root(),
+    );
+    guarded_purge_roundtrip(config).await;
+}
+
+async fn guarded_purge_roundtrip(config: CanonicalConfig) {
     let (store, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
     let ctx = seed_space(&store).await;
     let binding = store
@@ -583,7 +599,18 @@ async fn vault_move_guard_persists_purge_handoff_and_blocks_delayed_fenced_impor
         .unwrap();
     runtime.shutdown().await.unwrap();
 
+    let postgres = matches!(&config.sql, SqlBackendConfig::Postgres { .. });
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
+    if postgres {
+        store
+            .advance_space_lease(
+                &maintenance_ctx(ServicePurpose::Revocation),
+                ctx.scope(),
+                LeaseEpoch::new(2).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
     let saved_binding = store.vault_binding(&ctx).await.unwrap().unwrap();
     assert_eq!(saved_binding.generation, binding.generation);
     assert_eq!(saved_binding.cursor, created.receipt.seq());
@@ -613,15 +640,31 @@ async fn vault_move_guard_persists_purge_handoff_and_blocks_delayed_fenced_impor
             .await
             .unwrap()
     );
-    assert!(matches!(
-        store
-            .import_vault_note(ctx.clone(), &binding, delayed.clone())
-            .await,
-        Err(PortError::Domain(DomainError::ResourceNotFound))
-    ));
+    let denied = store
+        .import_vault_note(ctx.clone(), &binding, delayed.clone())
+        .await;
+    assert!(
+        matches!(
+            denied,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ),
+        "the purged identity must remain fenced: {denied:?}"
+    );
 
+    let checks = AtomicUsize::new(0);
+    assert!(matches!(
+        store.complete_vault_purge(ctx.clone(), &binding, handoff.clone(), move || {
+                checks.fetch_add(1, Ordering::Relaxed) == 0
+        }).await,
+        Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == ValidationReason::CursorStale
+    ));
+    assert_eq!(
+        store.vault_handoffs(&ctx, &binding).await.unwrap(),
+        vec![handoff.clone()]
+    );
     store
-        .complete_vault_handoff(ctx.clone(), &binding, handoff.clone(), None)
+        .complete_vault_purge(ctx.clone(), &binding, handoff.clone(), || true)
         .await
         .unwrap();
     assert!(
@@ -730,12 +773,7 @@ async fn postgres_mint_purge_handoff_keeps_path_and_completes_with_authenticated
     };
     for _ in 0..2 {
         store
-            .complete_vault_handoff(
-                ctx.clone(),
-                &binding,
-                handoff.clone(),
-                Some(stamp_after.clone()),
-            )
+            .complete_vault_handoff(ctx.clone(), &binding, handoff.clone(), stamp_after.clone())
             .await
             .unwrap();
     }

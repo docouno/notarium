@@ -684,10 +684,21 @@ impl Worker<'_> {
         Ok(())
     }
 
-    pub(super) fn holds_shared_purge_capture(&self, handoff: &VaultHandoff) -> bool {
-        self.captures.values().any(|capture| {
-            (capture.target == Path::new(&handoff.observation.path.relative)
-                || file_identity(&capture.expected.identity) == handoff.observation.file.identity)
+    pub(super) fn has_unresolved_purge_work(&self, handoff: &VaultHandoff) -> bool {
+        let former_path = Path::new(&handoff.observation.path.relative);
+        let matches_file =
+            |stamp: &FileStamp| file_identity(&stamp.identity) == handoff.observation.file.identity;
+        self.pending.iter().any(|intent| {
+            intent.target == former_path
+                || match &intent.action {
+                    Action::Withdraw { expected } => matches_file(expected),
+                    Action::Publish(action) => {
+                        action.desired.note == handoff.old_note
+                            || action.expected.as_ref().is_some_and(matches_file)
+                    }
+                }
+        }) || self.captures.values().any(|capture| {
+            (capture.target == former_path || matches_file(&capture.expected))
                 && (capture.unlocated
                     || capture.retained_at == self.vault.path_for_watcher().join(&capture.slot))
         })
@@ -819,7 +830,7 @@ impl Worker<'_> {
                 self.config.context.clone(),
                 &self.binding,
                 handoff.clone(),
-                Some(observation.clone()),
+                observation.clone(),
             )
             .await
         {

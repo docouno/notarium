@@ -249,6 +249,7 @@ impl Worker<'_> {
         for relative in file_paths {
             self.check_stop()?;
             let Ok(path) = vault_path(&relative) else {
+                self.inventory_incomplete = true;
                 self.conflict(&relative, ConflictReason::UnsafePath, None)?;
                 continue;
             };
@@ -290,6 +291,7 @@ impl Worker<'_> {
                     Err(error) => return Err(error.into()),
                 };
             if let Some(previous) = spelling.insert(path.key.clone(), relative.clone()) {
+                self.inventory_incomplete = true;
                 self.conflict(&previous, ConflictReason::NameCollision, None)?;
                 self.conflict(&relative, ConflictReason::NameCollision, None)?;
                 collisions.insert(path.key.clone());
@@ -303,8 +305,16 @@ impl Worker<'_> {
                 // Seeing an ambiguous spelling must not trash the bound note.
                 protected.insert(old.note.clone());
             }
+            let may_be_purged = handoffs.iter().any(|handoff| {
+                handoff.new_note.is_none()
+                    && (handoff.observation.path.key == path.key
+                        || handoff.observation.file.identity
+                            == file_identity(&observed.stamp.identity)
+                        || handoff.observation.file.digest == observed.stamp.digest)
+            });
             if let Some(binding) = &binding
                 && same_file(&binding.file, &observed.stamp)
+                && !may_be_purged
             {
                 if self
                     .conflicts
@@ -319,13 +329,7 @@ impl Worker<'_> {
             let carrier = match self.inspect_disk(&observed) {
                 Ok(carrier) => carrier,
                 Err(_) => {
-                    if handoffs.iter().any(|handoff| {
-                        handoff.new_note.is_none()
-                            && (handoff.observation.path.key == path.key
-                                || handoff.observation.file.identity
-                                    == file_identity(&observed.stamp.identity)
-                                || handoff.observation.file.digest == observed.stamp.digest)
-                    }) {
+                    if may_be_purged {
                         self.inventory_incomplete = true;
                     }
                     self.conflict(&relative, ConflictReason::InvalidCarrier, None)?;

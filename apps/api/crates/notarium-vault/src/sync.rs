@@ -15,7 +15,7 @@ use notarium_canonical::{
 };
 use notarium_core::{
     DomainError,
-    error::{CommitEffect, PortError, RetryAdvice},
+    error::{CommitEffect, PortError, RetryAdvice, ValidationReason},
     ids::{ContentDigest, NoteId, SpaceSeq},
     model::HistoryScope,
     ports::{
@@ -463,7 +463,9 @@ impl<'a> Worker<'a> {
                     .is_some_and(|issue| {
                         matches!(
                             issue.reason,
-                            ConflictReason::UnsafePath | ConflictReason::ClaimedPurgedIdentity
+                            ConflictReason::UnsafePath
+                                | ConflictReason::ClaimedPurgedIdentity
+                                | ConflictReason::NameCollision
                         )
                     })
                     || self.captures.values().any(|capture| {
@@ -569,13 +571,31 @@ impl<'a> Worker<'a> {
             .into_iter()
             .filter(|handoff| handoff.new_note.is_none())
         {
-            if self.holds_shared_purge_capture(&handoff) {
+            if self.has_unresolved_purge_work(&handoff) {
                 self.inventory_incomplete = true;
                 continue;
             }
-            self.store
-                .complete_vault_handoff(self.config.context.clone(), &self.binding, handoff, None)
-                .await?;
+            if !self.watcher.quiet_since(loss) || self.git_busy() {
+                return Ok(false);
+            }
+            match self
+                .store
+                .complete_vault_purge(
+                    self.config.context.clone(),
+                    &self.binding,
+                    handoff,
+                    self.watcher.deletion_fence(loss),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(PortError::Domain(DomainError::ValidationFailed { ref diagnostic }))
+                    if diagnostic.reason == ValidationReason::CursorStale =>
+                {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(true)
     }

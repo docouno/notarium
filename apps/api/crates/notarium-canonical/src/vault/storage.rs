@@ -567,23 +567,50 @@ impl CanonicalStore {
         ctx: SpaceContext,
         binding: &VaultBinding,
         expected: VaultHandoff,
-        successor: Option<VaultObservation>,
+        successor: VaultObservation,
     ) -> Result<(), PortError> {
-        if let Some(stamp) = &successor {
-            check_file(&stamp.file)?;
-            if expected.new_note.as_ref().map(|n| &n.note) != Some(&stamp.note)
-                || expected.observation.path != stamp.path
-            {
-                return Err(DomainError::validation(ValidationReason::InvalidState).into());
-            }
-        } else if expected.new_note.is_some() {
-            // A conversion is complete only once the successor is observed.
+        check_file(&successor.file)?;
+        if expected.new_note.as_ref().map(|n| &n.note) != Some(&successor.note)
+            || expected.observation.path != successor.path
+        {
             return Err(DomainError::validation(ValidationReason::InvalidState).into());
         }
+        self.complete_handoff(ctx, binding, expected, Some(successor), || true)
+            .await
+    }
+
+    /// Retire an ordinary purge witness only while its observed filesystem
+    /// cut is valid. The callback runs inside the write transaction and must
+    /// perform a bounded in-process check.
+    pub async fn complete_vault_purge(
+        &self,
+        ctx: SpaceContext,
+        binding: &VaultBinding,
+        expected: VaultHandoff,
+        still_safe: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<(), PortError> {
+        if expected.new_note.is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidState).into());
+        }
+        self.complete_handoff(ctx, binding, expected, None, still_safe)
+            .await
+    }
+
+    async fn complete_handoff(
+        &self,
+        ctx: SpaceContext,
+        binding: &VaultBinding,
+        expected: VaultHandoff,
+        successor: Option<VaultObservation>,
+        still_safe: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), PortError> {
         let binding = binding.clone();
         self.write_vault_state(ctx, "complete_vault_handoff", move |tx, ctx, space| {
             Box::pin(async move {
                 require_binding_tx(tx, &ctx, &space, &binding).await?;
+                if !still_safe() {
+                    return Err(observation_changed());
+                }
                 let row: Option<HandoffRow> = query!(
                     tx,
                     query_as,
@@ -625,6 +652,9 @@ impl CanonicalStore {
                     binding.generation.as_bytes().as_slice(),
                     expected.old_note.as_str()
                 )?;
+                if !still_safe() {
+                    return Err(observation_changed());
+                }
                 Ok(())
             })
         })

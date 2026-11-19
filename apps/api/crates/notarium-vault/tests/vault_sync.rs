@@ -1565,3 +1565,205 @@ async fn pending_canonical_edit_resumes_when_parent_is_writable() {
     assert!(resumed, "pending publication did not resume: {actual:?}");
     assert_eq!(disk_id(&file), Some(note));
 }
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unresolved_withdrawal_keeps_its_purge_handoff() {
+    use notarium_vault::filesystem::{VaultDir, Withdrawal};
+
+    let fixture = Fixture::open().await;
+    let old = fixture.create("purged", 135).await;
+    let target = Path::new("purged.md");
+    let file = fixture.root.join(target);
+    let worker = fixture.start();
+    ready(&mut worker.status(), |_| {
+        disk_id(&file) == Some(old.clone())
+    })
+    .await;
+    worker.shutdown().await.unwrap();
+    let ctx = context(&fixture.scope);
+    let head = fixture
+        .store
+        .read_vault_note(&ctx, &old)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .delete_note(
+            ctx.clone(),
+            Mutation {
+                identity: identity(&fixture.scope, 136),
+                preconditions: Preconditions {
+                    revision: Some(head.note.revision),
+                    ..Default::default()
+                },
+                input: DeleteNote {
+                    note: old.clone(),
+                    disposition: DeleteDisposition::Purge,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let binding = fixture.store.vault_binding(&ctx).await.unwrap().unwrap();
+
+    let vault = fixture.roots.vault().unwrap();
+    let expected = vault.read(target, 8192).unwrap().unwrap().stamp;
+    let operation = ContentDigest::from_bytes([137; 32]);
+    let slot = VaultDir::operation_slot(target, &operation.to_hex()).unwrap();
+    let record = fixture
+        .roots
+        .data_root()
+        .root()
+        .join(format!("vault-notes-{}", binding.generation.to_hex()))
+        .join(format!("{}.intent", operation.to_hex()));
+    let journal_file = fs::File::create(&record).unwrap();
+    serde_json::to_writer(
+        &journal_file,
+        &serde_json::json!({
+            "scope": binding.scope,
+            "generation": binding.generation,
+            "id": operation,
+            "target": target,
+            "action": { "Withdraw": { "expected": expected } },
+        }),
+    )
+    .unwrap();
+    journal_file.sync_all().unwrap();
+    drop(journal_file);
+    assert!(matches!(
+        vault.withdraw(target, &slot, &expected).unwrap(),
+        Withdrawal::Captured(_)
+    ));
+    let capture = fixture.root.join(&slot);
+    fs::write(&capture, "# Updated through the old editor handle\n").unwrap();
+    let unrelated = fixture.create("unrelated", 138).await;
+    let unrelated_file = fixture.root.join("unrelated.md");
+
+    let worker = fixture.start();
+    let status = ready(&mut worker.status(), |_| {
+        disk_id(&unrelated_file) == Some(unrelated.clone())
+    })
+    .await;
+    assert!(
+        status
+            .conflicts
+            .iter()
+            .any(|issue| issue.path == "purged.md")
+    );
+    assert!(record.exists() && capture.exists());
+    assert_eq!(
+        fixture
+            .store
+            .vault_handoffs(&ctx, &binding)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_collision_does_not_hide_an_unclaimed_purge_inode() {
+    let fixture = Fixture::open().await;
+    let old = fixture.create("purged", 131).await;
+    let original = fixture.root.join("purged.md");
+    let worker = fixture.start();
+    ready(&mut worker.status(), |_| {
+        disk_id(&original) == Some(old.clone())
+    })
+    .await;
+    worker.shutdown().await.unwrap();
+
+    let first = fixture.root.join("Alias.md");
+    let moved = fixture.root.join("alias.md");
+    fs::write(&original, "# Start\n\nInitial words.\n").unwrap();
+    assert!(disk_id(&original).is_none());
+    fs::rename(&original, &moved).unwrap();
+    let first_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&first);
+    let mut first_file = match first_file {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            fixture.runtime.shutdown().await.unwrap();
+            return;
+        }
+        Err(error) => panic!("cannot create the distinct case alias: {error}"),
+    };
+    std::io::Write::write_all(&mut first_file, b"# Unrelated Markdown\n").unwrap();
+    drop(first_file);
+
+    let ctx = context(&fixture.scope);
+    let head = fixture
+        .store
+        .read_vault_note(&ctx, &old)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .delete_note(
+            ctx.clone(),
+            Mutation {
+                identity: identity(&fixture.scope, 132),
+                preconditions: Preconditions {
+                    revision: Some(head.note.revision),
+                    ..Default::default()
+                },
+                input: DeleteNote {
+                    note: old.clone(),
+                    disposition: DeleteDisposition::Purge,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let worker = fixture.start();
+    ready(&mut worker.status(), |status| {
+        status
+            .conflicts
+            .iter()
+            .any(|issue| issue.path == "alias.md")
+            && status
+                .conflicts
+                .iter()
+                .any(|issue| issue.path == "Alias.md")
+    })
+    .await;
+    let binding = fixture.store.vault_binding(&ctx).await.unwrap().unwrap();
+    let retained = fixture
+        .store
+        .vault_handoffs(&ctx, &binding)
+        .await
+        .unwrap()
+        .iter()
+        .any(|handoff| handoff.old_note == old);
+    fs::remove_file(first).unwrap();
+    ready(&mut worker.status(), |status| {
+        status.conflicts.iter().any(|issue| {
+            issue.path == "alias.md"
+                && issue.reason == notarium_vault::ConflictReason::ClaimedPurgedIdentity
+        })
+    })
+    .await;
+    assert!(
+        fixture
+            .store
+            .vault_observation_at(&ctx, &binding, "alias.md")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(disk_id(&moved).is_none());
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+    assert!(
+        retained,
+        "a colliding spelling hid the remaining purged inode"
+    );
+}
