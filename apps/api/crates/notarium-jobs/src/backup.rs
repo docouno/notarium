@@ -424,13 +424,19 @@ async fn capture_spools(
         {
             return Err(invalid(ValidationReason::InvalidAuthority));
         }
-        let (control_spool, canonical_spool) = join_phases(
+        let spools = join_phases(
             &ctx.budget.cancellation,
             control_cut.spool(cb, ctx.budget.cancellation.clone()),
             canonical_cut.spool(nb, ctx.budget.cancellation.clone()),
         )
         .await;
-        Ok::<_, PortError>((control_spool?, canonical_spool?, pause))
+        let (control_spool, canonical_spool) = acknowledge_pair(
+            spools,
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+        )
+        .await?;
+        Ok::<_, PortError>((control_spool, canonical_spool, pause))
     }
     .await;
     let (control_close, canonical_close) = tokio::join!(control_cut.close(), canonical_cut.close());
@@ -787,5 +793,31 @@ mod phase_tests {
         .await;
         assert_eq!(result, Err(error));
         assert!(closed);
+    }
+
+    #[tokio::test]
+    async fn peer_cancellation_preserves_the_spool_failure() {
+        let cancellation = Cancellation::default();
+        let failure = codec::unavailable_retryable(
+            "canonical_spool_failed",
+            "lost backup hold",
+            Duration::from_millis(10),
+        );
+        let phases = join_phases(
+            &cancellation,
+            async {
+                cancellation.cancelled().await;
+                check_cancelled(&cancellation)
+            },
+            async { Err::<(), _>(failure.clone()) },
+        )
+        .await;
+        let result = acknowledge_pair(
+            phases,
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+        )
+        .await;
+        assert_eq!(result, Err(failure));
     }
 }

@@ -397,8 +397,12 @@ impl ArchiveStorage {
                 segment: None,
             });
         }
-        let mut file =
-            tokio::fs::File::from_std(open_file(&self.local.objects, &base_key(object))?);
+        let local = self.local.clone();
+        let key = base_key(object);
+        let file =
+            crate::maintenance::read_source(cancellation, move || open_file(&local.objects, &key))
+                .await?;
+        let mut file = tokio::fs::File::from_std(file);
         if file.metadata().await.map_err(storage_io)?.len() != object.bytes {
             return Err(invalid(ValidationReason::InvalidDigest));
         }

@@ -713,6 +713,24 @@ impl ReadTransaction {
     pub(crate) async fn rollback(self) -> Result<(), PortError> {
         self.finish().await
     }
+    pub(crate) async fn finish_with_budget(
+        self,
+        budget: &lease::OperationBudget,
+    ) -> Result<(), PortError> {
+        // The cleanup holds the read permit until the database acknowledges
+        // rollback, even if the caller's budget expires while waiting.
+        let cleanup = tokio::spawn(self.finish());
+        budget
+            .run(
+                async {
+                    cleanup.await.map_err(|_| {
+                        unavailable("control read cleanup", CommitEffect::NotCommitted)
+                    })?
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await
+    }
 }
 impl Drop for ReadTransaction {
     fn drop(&mut self) {

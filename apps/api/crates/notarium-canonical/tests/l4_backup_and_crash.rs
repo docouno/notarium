@@ -943,6 +943,55 @@ async fn reused_sqlite_wal_frames_exhaust_the_pinned_budget() {
 }
 
 #[tokio::test]
+async fn postgres_spool_import_cancels_during_a_blocked_source_read() {
+    struct StalledRead {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        unlock: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl std::io::Read for StalledRead {
+        fn read(&mut self, _bytes: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+                let _ = self.unlock.recv();
+            }
+            Ok(0)
+        }
+    }
+
+    let mut sql = StorageTestFixtures::load_required().open_raw_pg().await;
+    let mut target = sql.begin().await.unwrap();
+    let cancellation = Cancellation::default();
+    let (started, reading) = tokio::sync::oneshot::channel();
+    let (release, unlock) = std::sync::mpsc::channel();
+    let operation = {
+        let importing = notarium_canonical::backup::import_postgres_spool(
+            StalledRead {
+                started: Some(started),
+                unlock,
+            },
+            4096,
+            4096,
+            cancellation.clone(),
+            &mut target,
+        );
+        tokio::pin!(importing);
+        tokio::select! {
+            result = &mut importing => panic!("import finished before cancellation: {result:?}"),
+            status = reading => status.unwrap(),
+        }
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(2), importing).await
+    };
+    release.send(()).unwrap();
+    assert!(matches!(
+        operation.expect("caller must stop waiting while the source is blocked"),
+        Err(PortError::Cancelled(failure)) if failure.effect() == CommitEffect::NotCommitted
+    ));
+    target.rollback().await.unwrap();
+}
+
+#[tokio::test]
 async fn disconnected_pg_hold_cannot_confirm_or_release_its_successor() {
     let case = BackendCase::open_pg_s3_with_pool(1).await;
     case.store
@@ -975,6 +1024,25 @@ async fn disconnected_pg_hold_cannot_confirm_or_release_its_successor() {
                     .unwrap();
             }
             Some(snapshot)
+        };
+        let pinned_source: Option<i32> = if phase == "before_spool" {
+            Some(
+                sqlx::query_scalar(
+                    "SELECT DISTINCT locks.pid FROM pg_locks AS locks
+                     JOIN pg_class AS relation ON relation.oid = locks.relation
+                     JOIN pg_namespace AS ns ON ns.oid = relation.relnamespace
+                     JOIN pg_stat_activity AS activity ON activity.pid = locks.pid
+                     WHERE ns.nspname = $1 AND relation.relname = 'schema_meta'
+                       AND activity.backend_xmin IS NOT NULL
+                       AND activity.state = 'idle in transaction'",
+                )
+                .bind(schema)
+                .fetch_one(&mut sql)
+                .await
+                .expect("pinned source owns a transaction on the test schema"),
+            )
+        } else {
+            None
         };
         let generation: String = sqlx::query_scalar(sqlx::AssertSqlSafe(&*read_generation))
             .bind(id.as_str())
@@ -1021,6 +1089,17 @@ async fn disconnected_pg_hold_cannot_confirm_or_release_its_successor() {
         }
         if let Some(snapshot) = snapshot {
             snapshot.close().await.unwrap();
+        }
+        if let Some(pid) = pinned_source {
+            let still_pinned: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+                 WHERE pid = $1 AND xact_start IS NOT NULL)",
+            )
+            .bind(pid)
+            .fetch_one(&mut sql)
+            .await
+            .unwrap();
+            assert!(!still_pinned, "snapshot close must acknowledge rollback");
         }
         assert!(
             old_hold.release().await.is_err(),

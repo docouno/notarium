@@ -501,8 +501,7 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         restored_control.close().await;
         owner.shutdown().await.unwrap();
     }
-    paired_load::capture_under_load(&canonical, &binding, &scratch.0, &scope, &owner, "sqlite")
-        .await;
+    paired_load::capture_under_load(&canonical, &binding, &root, &scope, &owner, "sqlite").await;
     drop(binding);
     control.close().await;
     runtime.shutdown().await.unwrap();
@@ -945,7 +944,7 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     drop(new_keys);
     restored_control.close().await;
     restored_runtime.shutdown().await.unwrap();
-    paired_load::capture_under_load(&store, &adapter, &scratch.0, &scope, &owner, "postgres").await;
+    paired_load::capture_under_load(&store, &adapter, &root, &scope, &owner, "postgres").await;
     cloud_takeover::exercise(
         &store,
         control.clone(),

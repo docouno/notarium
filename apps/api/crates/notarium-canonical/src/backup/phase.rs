@@ -34,12 +34,10 @@ pub(super) fn prepare(
 ) -> PortFuture<'static, Box<dyn PreparedBackup>> {
     Box::pin(async move {
         let (mut reply, result) = oneshot::channel();
-        let shutdown = store.inner.backup_shutdown.clone();
         let inner = store.inner.clone();
         spawn_owner(&inner, async move {
             let prepared = tokio::select! {
                 biased;
-                () = shutdown.cancelled() => return,
                 () = reply.closed() => return,
                 result = store.prepare_source(ctx, backup, budget) => result,
             };

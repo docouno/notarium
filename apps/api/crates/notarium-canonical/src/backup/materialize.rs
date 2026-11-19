@@ -23,9 +23,10 @@ pub async fn import_postgres_spool(
     use tokio::sync::mpsc;
     type Row = (TableSpec, Vec<PostgresSpoolValue>);
     let (sender, mut rows) = mpsc::channel::<Row>(1);
+    let parser_cancel = cancellation.clone();
     let parser = tokio::task::spawn_blocking(move || {
         super::scan_postgres_spool_v1(input, bytes, bytes, row_limit, |table, row| {
-            if cancellation.is_cancelled() {
+            if parser_cancel.is_cancelled() {
                 return Err(crate::codec::cancelled_not_committed(
                     "pg_spool_import",
                     "restore cancelled",
@@ -89,14 +90,20 @@ pub async fn import_postgres_spool(
             finish_staged_table(target, table.name, &columns).await?;
         }
         Ok::<_, PortError>(())
+    };
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(crate::codec::cancelled_not_committed(
+            "pg_spool_import",
+            "restore cancelled",
+        )),
+        result = async {
+            insert_rows.await?;
+            parser.await.map_err(|err| {
+                internal_not_committed("pg_restore_spool_worker", err.to_string())
+            })?
+        } => result,
     }
-    .await;
-    drop(rows);
-    let validated = parser
-        .await
-        .map_err(|err| internal_not_committed("pg_restore_spool_worker", err.to_string()))?;
-    insert_rows?;
-    validated
 }
 
 fn self_referencing(table: &str) -> bool {

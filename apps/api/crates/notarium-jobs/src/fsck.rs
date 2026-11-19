@@ -178,7 +178,7 @@ pub(crate) fn verify_archive(
     options: BackupOptions,
 ) -> Result<VerifiedArchive, PortError> {
     check_cancelled(&budget.cancellation)?;
-    let source = input.source;
+    let source = input.source.with_cancellation(budget.cancellation.clone());
     let (mut zip, spans) = open_zip(
         source.clone(),
         ZipLimits {

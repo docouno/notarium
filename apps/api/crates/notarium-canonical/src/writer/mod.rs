@@ -973,6 +973,7 @@ impl crate::CanonicalStore {
 
     /// Submits a typed idempotent or non-idempotent canonical mutation through `WriteBatchActor`,
     /// automatically handling MessagePack receipt serialization and replay.
+    #[cfg(feature = "test-support")]
     pub(crate) async fn submit_write_command<R>(
         &self,
         budget: &CallBudget,

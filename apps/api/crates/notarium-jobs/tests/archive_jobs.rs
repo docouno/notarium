@@ -16,7 +16,7 @@ use notarium_core::{
     ids::*,
     model::HistoryScope,
     ports::*,
-    receipt::CommandIdentity,
+    receipt::{CausalBasis, CommandIdentity, ReceiptSet},
 };
 use notarium_jobs::{ArchiveJobs, ArchiveStorage, ImportLimits, JobWorkerConfig};
 
@@ -179,13 +179,16 @@ async fn fifty_thousand_imports_with_foreground_saves() {
     exercise_local_archive_worker(50_000).await;
 }
 
-async fn sample_saves(
+async fn sample_foreground(
     store: CanonicalStore,
     mut ctx: SpaceContext,
     limit: usize,
 ) -> serde_json::Value {
-    let mut samples = Vec::with_capacity(limit);
-    let mut errors = 0;
+    const CARRIER: &str = "# Foreground save\n\nNote saved through the canonical writer.\n";
+    let mut saves = Vec::with_capacity(limit);
+    let mut reads = Vec::with_capacity(limit);
+    let mut save_errors = 0;
+    let mut read_errors = 0;
     for _ in 0..limit {
         let id = NoteId::from_bytes(codec::ordered_id_16().unwrap());
         ctx.budget = budget();
@@ -196,22 +199,47 @@ async fn sample_saves(
                 parent: None,
                 slug: format!("foreground-{}", id.as_str()),
                 class: notarium_core::classes::DocClass::UserDoc,
-                carrier: "# Foreground save\n\nNote saved through the canonical writer.\n".into(),
+                carrier: CARRIER.into(),
             },
         );
         let start = std::time::Instant::now();
-        if store.create_note(ctx.clone(), request).await.is_err() {
-            errors += 1;
+        let saved = store.create_note(ctx.clone(), request).await;
+        saves.push(start.elapsed().as_nanos() as u64);
+        if let Ok(saved) = saved {
+            ctx.budget = budget();
+            let request = GetNote {
+                note: id,
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::new(vec![saved.receipt]).unwrap()),
+            };
+            let start = std::time::Instant::now();
+            let verified = store
+                .get_note(ctx.clone(), request)
+                .await
+                .is_ok_and(|snapshot| {
+                    snapshot
+                        .document
+                        .explicit_read(ctx.auth())
+                        .is_ok_and(|body| body == CARRIER)
+                });
+            reads.push(start.elapsed().as_nanos() as u64);
+            read_errors += usize::from(!verified);
+        } else {
+            save_errors += 1;
         }
-        samples.push(start.elapsed().as_nanos() as u64);
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    samples.sort_unstable();
-    let rank = |p: usize| samples[(limit * p).div_ceil(100) - 1];
-    serde_json::json!({
-        "count": limit, "errors": errors, "p50_ns": rank(50), "p95_ns": rank(95),
-        "p99_ns": rank(99), "max_ns": samples.last(),
-    })
+    let distribution = |mut samples: Vec<u64>, errors| {
+        samples.sort_unstable();
+        let rank = |p: usize| samples.get((samples.len() * p).div_ceil(100).saturating_sub(1));
+        serde_json::json!({
+            "count": samples.len(), "errors": errors, "p50_ns": rank(50), "p95_ns": rank(95),
+            "p99_ns": rank(99), "max_ns": samples.last(),
+        })
+    };
+    let mut saves = distribution(saves, save_errors);
+    saves["read"] = distribution(reads, read_errors);
+    saves
 }
 
 async fn exercise_local_archive_worker(entries: usize) {
@@ -331,7 +359,7 @@ async fn exercise_local_archive_worker(entries: usize) {
     assert_eq!(note_count(root, &scope), 0);
 
     let baseline = if entries == 50_000 {
-        Some(sample_saves(store.clone(), ctx.clone(), 1000).await)
+        Some(sample_foreground(store.clone(), ctx.clone(), 1000).await)
     } else {
         None
     };
@@ -372,7 +400,11 @@ async fn exercise_local_archive_worker(entries: usize) {
         })
         .await
         .unwrap();
-        Some(tokio::spawn(sample_saves(store.clone(), ctx.clone(), 1000)))
+        Some(tokio::spawn(sample_foreground(
+            store.clone(),
+            ctx.clone(),
+            1000,
+        )))
     } else {
         None
     };
@@ -408,6 +440,10 @@ async fn exercise_local_archive_worker(entries: usize) {
         );
         assert_eq!(baseline["errors"], 0);
         assert_eq!(during["errors"], 0);
+        assert_eq!(baseline["read"]["errors"], 0);
+        assert_eq!(during["read"]["errors"], 0);
+        assert_eq!(baseline["read"]["count"], 1000);
+        assert_eq!(during["read"]["count"], 1000);
         assert_eq!(
             note_count(root, &scope),
             entries as i64 + baseline_notes + 1000

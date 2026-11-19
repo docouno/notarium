@@ -94,28 +94,37 @@ impl ArchiveJobs {
         let request = RequestDeadline::new(ctx.budget.clone())?;
         let caller =
             JobDelegation::capture(ctx.auth(), ctx.scope()).ok_or(DomainError::AccessDenied)?;
-        let mut live = self
-            .control
-            .refresh_archive_job(request.remaining()?, &caller)
+        let mut live = request
+            .wait(
+                self.control
+                    .refresh_archive_job(request.remaining()?, &caller),
+            )
             .await?;
         live.budget = request.remaining()?;
-        let pointer = self.store.open_committed_export(live, artifact).await?;
-        let origin = self
-            .store
-            .archive_job_delegation(&request.remaining()?, ctx.scope(), &pointer.job)
+        let pointer = request
+            .wait(self.store.open_committed_export(live, artifact))
+            .await?;
+        let origin = request
+            .wait(self.store.archive_job_delegation(
+                &request.remaining()?,
+                ctx.scope(),
+                &pointer.job,
+            ))
             .await?
             .ok_or(DomainError::ResourceNotFound)?;
         if origin.principal() != caller.principal() {
             return Err(DomainError::ResourceNotFound.into());
         }
         if origin != caller {
-            let mut live_origin = self
-                .control
-                .refresh_archive_job(request.remaining()?, &origin)
+            let mut live_origin = request
+                .wait(
+                    self.control
+                        .refresh_archive_job(request.remaining()?, &origin),
+                )
                 .await?;
             live_origin.budget = request.remaining()?;
-            self.store
-                .open_committed_export(live_origin, artifact)
+            request
+                .wait(self.store.open_committed_export(live_origin, artifact))
                 .await?;
         }
         let file = request
@@ -205,16 +214,16 @@ impl ArchiveDownload {
                 .register_archive_job(request.remaining()?, &self.origin)
                 .await?;
             source.budget = request.remaining()?;
-            self.jobs.store.open_committed_export(source, id).await?;
+            request
+                .wait(self.jobs.store.open_committed_export(source, id))
+                .await?;
             Some(registration)
         } else {
             None
         };
         ctx.budget = request.remaining()?;
-        let current = self
-            .jobs
-            .store
-            .open_committed_export(ctx.clone(), id)
+        let current = request
+            .wait(self.jobs.store.open_committed_export(ctx.clone(), id))
             .await?;
         if current.object != self.pointer.object || current.job != self.pointer.job {
             return Err(DomainError::ResourceNotFound.into());

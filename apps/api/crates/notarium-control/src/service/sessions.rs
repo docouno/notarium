@@ -162,7 +162,8 @@ impl ControlService {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        tx.finish().await?;
+        tx.finish_with_budget(&operation).await?;
+        let budget = operation.context(budget.request);
         SpaceContext::new(auth, delegation.scope().clone(), budget).map_err(Into::into)
     }
 
