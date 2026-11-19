@@ -79,7 +79,6 @@ make setup
 
 # Rust workspace
 make exec app=api write=1 network=bridge command='cargo update'
-make sync reconcile=1
 make setup
 ```
 
