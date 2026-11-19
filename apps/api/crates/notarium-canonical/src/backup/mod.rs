@@ -1377,18 +1377,18 @@ impl Drop for PgPreparedSource {
 }
 
 impl PgPreparedSource {
-    async fn abort_cleanly(&mut self) {
+    async fn abort_cleanly(&mut self) -> Result<(), PortError> {
         if let Some(mut conn) = self.source.take() {
-            let _ = sqlx::raw_sql("ROLLBACK").execute(&mut conn).await;
-            let _ = conn.close().await;
+            rollback_backup_connection(&mut conn, "pg_backup_source_close").await?;
         }
+        Ok(())
     }
 
-    async fn cancel_and_close(&mut self) {
+    async fn cancel_and_close(&mut self) -> Result<(), PortError> {
         if self.source.is_some() {
             self.cancel_backend(self.backend_pid).await;
         }
-        self.abort_cleanly().await;
+        self.abort_cleanly().await
     }
 
     async fn cancel_backend(&self, backend_pid: i32) {
@@ -1418,6 +1418,22 @@ impl PgPreparedSource {
             );
         }
     }
+}
+
+async fn rollback_backup_connection(
+    conn: &mut PgConnection,
+    diagnostic: &'static str,
+) -> Result<(), PortError> {
+    // Bound a missing network acknowledgement independently of the expired
+    // operation budget. The connection is dedicated to this backup.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        sqlx::raw_sql("ROLLBACK").execute(conn),
+    )
+    .await
+    .map_err(|_| deadline_not_committed(diagnostic, "backup rollback was not acknowledged"))?
+    .map(drop)
+    .map_err(|err| internal_not_committed(diagnostic, err.to_string()))
 }
 
 const PG_BACKUP_BARRIER_SQL: &str =
@@ -1989,10 +2005,11 @@ async fn stream_postgres_spool_v1(
     let (file, total_bytes, whole_digest) = match stream_res {
         Ok(complete) => complete,
         Err(error) => {
-            pg.cancel_and_close().await;
+            let _ = pg.cancel_and_close().await;
             return Err(error);
         }
     };
+    pg.abort_cleanly().await?;
     if let Err(err) = file.sync_all() {
         drop(file);
         remove_tmp_artifacts_best_effort(&pg.tmp_path);
@@ -2008,8 +2025,6 @@ async fn stream_postgres_spool_v1(
         return Err(internal_not_committed("pg_spool_rename", err.to_string()));
     }
     fsync_parent_dir(final_path)?;
-
-    pg.abort_cleanly().await;
 
     let max_chunk = max_slice_seen.max(STREAM_IO_BUF_BYTES);
     let widest_table = CANONICAL_TABLES
@@ -2461,15 +2476,19 @@ enum PreparedBackendDriver {
 }
 
 impl PreparedBackendDriver {
-    async fn abort(self) {
+    async fn abort(self) -> Result<(), PortError> {
         match self {
-            Self::Sqlite(mut worker) => worker.abort_and_join().await,
+            Self::Sqlite(mut worker) => {
+                worker.abort_and_join().await;
+                Ok(())
+            }
             Self::Postgres(mut pg) => {
-                if let Some(mut barrier) = pg.barrier.take() {
-                    let _ = sqlx::raw_sql("ROLLBACK").execute(&mut barrier).await;
-                    let _ = barrier.close().await;
-                }
-                pg.abort_cleanly().await;
+                let barrier = if let Some(mut barrier) = pg.barrier.take() {
+                    rollback_backup_connection(&mut barrier, "pg_backup_barrier_close").await
+                } else {
+                    Ok(())
+                };
+                barrier.and(pg.abort_cleanly().await)
             }
         }
     }
@@ -2556,10 +2575,7 @@ struct PauseLocks {
 impl PauseLocks {
     async fn release(self) -> Result<(), PortError> {
         if let Some(mut conn) = self.database {
-            sqlx::raw_sql("ROLLBACK")
-                .execute(&mut conn)
-                .await
-                .map_err(|err| internal_not_committed("pg_resume_backup", err.to_string()))?;
+            rollback_backup_connection(&mut conn, "pg_resume_backup").await?;
         }
         drop(self.local);
         Ok(())
@@ -2576,7 +2592,7 @@ struct CanonicalPausedBackup {
     spool_dir: PathBuf,
     artifact_lease: Option<ArtifactLease>,
     locks: Arc<std::sync::Mutex<Option<PauseLocks>>>,
-    watchdog: tokio::task::JoinHandle<Result<(), PortError>>,
+    watchdog: Option<tokio::task::JoinHandle<Result<(), PortError>>>,
     held_histories: Option<(HoldProof, Vec<ChangeCursor>)>,
     unpinned_driver: Option<PreparedBackendDriver>,
 }
@@ -2603,9 +2619,18 @@ impl CanonicalPausedBackup {
 
 impl Drop for CanonicalPausedBackup {
     fn drop(&mut self) {
-        // If the watchdog already took ownership, let its rollback finish.
-        if self.locks.lock().expect("backup pause").take().is_some() {
-            self.watchdog.abort();
+        let locks = self.locks.lock().expect("backup pause").take();
+        if let Some(watchdog) = self.watchdog.take() {
+            if locks.is_some() {
+                watchdog.abort();
+            } else {
+                register_cleanup_task(
+                    &self.store.inner,
+                    self.store.inner.backup_executor.spawn(async move {
+                        let _ = watchdog.await;
+                    }),
+                );
+            }
         }
         if let Some(mut drv) = self.unpinned_driver.take() {
             drv.detach_abort_cleanup(&self.store.inner);
@@ -2731,7 +2756,7 @@ impl PausedBackup for CanonicalPausedBackup {
                     let witness = match pin_res {
                         Ok(w) => w,
                         Err(err) => {
-                            pg.cancel_and_close().await;
+                            let _ = pg.cancel_and_close().await;
                             return Err(err);
                         }
                     };
@@ -2740,7 +2765,7 @@ impl PausedBackup for CanonicalPausedBackup {
                 }
             };
             if let Err(error) = self.validate_cut(&witness) {
-                abort_pinned_driver(state).await;
+                let _ = abort_pinned_driver(state).await;
                 return Err(error);
             }
             let snapshot = CanonicalBackupSnapshot {
@@ -2762,19 +2787,20 @@ impl PausedBackup for CanonicalPausedBackup {
                     .clone(),
                 state: Some(state),
             };
-            Ok(Box::new(phase::Snapshot::new(snapshot)?) as Box<dyn BackupSnapshot>)
+            Ok(Box::new(phase::Snapshot::new(snapshot).await?) as Box<dyn BackupSnapshot>)
         })
     }
 
     fn resume(mut self: Box<Self>) -> PortFuture<'static, ()> {
         Box::pin(async move {
             let locks = self.locks.lock().expect("backup pause").take();
+            let watchdog = self.watchdog.take().expect("backup pause watchdog");
             let unpinned = self.unpinned_driver.take();
             let result = if let Some(locks) = locks {
-                self.watchdog.abort();
+                watchdog.abort();
                 locks.release().await
             } else {
-                (&mut self.watchdog)
+                watchdog
                     .await
                     .map_err(|err| internal_not_committed("backup_pause_watchdog", err.to_string()))
                     .flatten()
@@ -2784,7 +2810,7 @@ impl PausedBackup for CanonicalPausedBackup {
                     .into()))
             };
             if let Some(drv) = unpinned {
-                drv.abort().await;
+                return result.and(drv.abort().await);
             }
             result
         })
@@ -2859,7 +2885,7 @@ impl CanonicalBackupSnapshot {
         Box::pin(async move {
             if cancellation.is_cancelled() {
                 if let Some(st) = self.state.take() {
-                    abort_pinned_driver(st).await;
+                    let _ = abort_pinned_driver(st).await;
                 }
                 return Err(cancelled_not_committed(
                     "backup_spool_cancelled_pre_start",
@@ -2878,15 +2904,15 @@ impl CanonicalBackupSnapshot {
             let eff_budget = match remaining_budget {
                 Ok(limit) => limit,
                 Err(err) => {
-                    abort_pinned_driver(pinned).await;
+                    let _ = abort_pinned_driver(pinned).await;
                     return Err(err);
                 }
             };
 
-            let lease = self
-                .artifact_lease
-                .as_mut()
-                .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
+            let Some(lease) = self.artifact_lease.as_mut() else {
+                let _ = abort_pinned_driver(pinned).await;
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            };
             lease.begin_publication();
             let step_delay_us = self.store.inner.backup_step_delay_us.load(Ordering::SeqCst);
 
@@ -3013,7 +3039,7 @@ impl CanonicalBackupSnapshot {
                         BackupArtifactEncoding::PostgresSpoolV1.extension()
                     );
                     let final_path = self.spool_dir.join(&rel_name);
-                    match stream_postgres_spool_v1(
+                    let streamed = stream_postgres_spool_v1(
                         &mut pg,
                         &self.witness,
                         eff_budget,
@@ -3021,8 +3047,10 @@ impl CanonicalBackupSnapshot {
                         &final_path,
                         step_delay_us,
                     )
-                    .await
-                    {
+                    .await;
+                    // Early setup failures can precede the stream's rollback.
+                    let closed = pg.abort_cleanly().await;
+                    match streamed.and_then(|value| closed.map(|()| value)) {
                         Ok((bytes, digest, stats)) => (
                             BackupArtifactEncoding::PostgresSpoolV1,
                             rel_name,
@@ -3131,7 +3159,7 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
                 let _copy_guard = hold.copying.read().await;
                 if let Err(error) = hold.verify().await {
                     if let Some(source) = job.state.take() {
-                        abort_pinned_driver(source).await;
+                        let _ = abort_pinned_driver(source).await;
                     }
                     return Err(error);
                 }
@@ -3179,17 +3207,18 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
                 self.active.take();
             }
             if let Some(st) = self.state.take() {
-                abort_pinned_driver(st).await;
+                abort_pinned_driver(st).await?;
             }
             Ok(())
         })
     }
 }
 
-async fn abort_pinned_driver(st: PinnedSnapshotDriver) {
+async fn abort_pinned_driver(st: PinnedSnapshotDriver) -> Result<(), PortError> {
     match st {
         PinnedSnapshotDriver::Sqlite { mut worker, .. } => {
             worker.abort_and_join().await;
+            Ok(())
         }
         PinnedSnapshotDriver::Postgres(mut pg) => pg.abort_cleanly().await,
     }
@@ -3291,7 +3320,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
     fn abort(mut self: Box<Self>) -> PortFuture<'static, ()> {
         Box::pin(async move {
             if let Some(driver) = self.driver.take() {
-                driver.abort().await;
+                driver.abort().await?;
             }
             Ok(())
         })
@@ -3375,7 +3404,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
                     {
                         pg.cancel_backend(pg.barrier_pid).await;
                     }
-                    drv.abort().await;
+                    let _ = drv.abort().await;
                     return Err(error);
                 }
             };
@@ -3421,11 +3450,12 @@ impl PreparedBackup for CanonicalPreparedBackup {
                 spool_dir: self.spool_dir.clone(),
                 artifact_lease: self.artifact_lease.take(),
                 locks,
-                watchdog,
+                watchdog: Some(watchdog),
                 held_histories: self.held_histories.take(),
                 unpinned_driver: Some(drv),
             };
-            Ok(Box::new(phase::Phase::new(&self.store.inner, paused)?) as Box<dyn PausedBackup>)
+            let phase = phase::Phase::new(&self.store.inner, paused, PausedBackup::resume).await?;
+            Ok(Box::new(phase) as Box<dyn PausedBackup>)
         })
     }
 }
@@ -3531,31 +3561,48 @@ impl CanonicalStore {
                 }
             }
             (_, SqlDriverState::Postgres { .. }) => {
+                let BackupRetentionBudget::PostgresSnapshot { max_age } = budget.retention else {
+                    return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+                };
                 let remaining = budget.deadline.saturating_sub(prepared_at.elapsed());
-                let (source, barrier, backend_pid, barrier_pid) = wait_for_phase(
+                let (mut source, mut barrier) = wait_for_phase(
                     remaining,
                     &ctx.budget.cancellation,
                     &store.inner.backup_shutdown,
                     async {
-                        let (mut source, mut barrier) = tokio::try_join!(
+                        tokio::try_join!(
                             open_backup_connection(&store),
                             open_backup_connection(&store)
-                        )?;
-                        let BackupRetentionBudget::PostgresSnapshot { max_age } = budget.retention
-                        else {
-                            return Err(
-                                DomainError::validation(ValidationReason::ScopeMismatch).into()
-                            );
-                        };
-                        let (backend_pid, barrier_pid) = tokio::try_join!(
-                            warm_pg_backup_connection(&mut source, remaining, max_age),
-                            warm_pg_backup_barrier(&mut barrier, remaining)
-                        )?;
-                        Ok((source, barrier, backend_pid, barrier_pid))
+                        )
                     },
                 )
                 .await?;
-                create_private_tmp_file(&tmp_path)?;
+                let remaining = budget.deadline.saturating_sub(prepared_at.elapsed());
+                let prepared = wait_for_phase(
+                    remaining,
+                    &ctx.budget.cancellation,
+                    &store.inner.backup_shutdown,
+                    async {
+                        tokio::try_join!(
+                            warm_pg_backup_connection(&mut source, remaining, max_age),
+                            warm_pg_backup_barrier(&mut barrier, remaining)
+                        )
+                    },
+                )
+                .await;
+                let (backend_pid, barrier_pid) = match prepared.and_then(|pids| {
+                    create_private_tmp_file(&tmp_path)?;
+                    Ok(pids)
+                }) {
+                    Ok(pids) => pids,
+                    Err(error) => {
+                        let _ = tokio::join!(
+                            rollback_backup_connection(&mut source, "pg_backup_prepare_source"),
+                            rollback_backup_connection(&mut barrier, "pg_backup_prepare_barrier"),
+                        );
+                        return Err(error);
+                    }
+                };
                 (
                     PreparedBackendDriver::Postgres(PgPreparedSource {
                         source: Some(source),

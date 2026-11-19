@@ -26,7 +26,10 @@ use notarium_core::{
     model::HistoryScope,
     ports::Cancellation,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::Semaphore,
+};
 
 use crate::import::check_cancelled;
 
@@ -36,6 +39,7 @@ const MAX_OBJECT_BYTES: u64 = (MAX_SEGMENTS * SEGMENT_BYTES) as u64;
 const RETIRED_SEGMENT: &[u8] = b"notarium-archive-segment-retired-v1\n";
 const SCRATCH_GRACE: Duration = Duration::from_secs(3600);
 const SCRATCH_LOCK: &str = ".owner";
+static LOCAL_DOWNLOAD_OPENS: Semaphore = Semaphore::const_new(16);
 
 /// Private operational artifacts bound to an installation. Cloud staging and
 /// results live in a separately configured S3 namespace, with local work files
@@ -399,9 +403,17 @@ impl ArchiveStorage {
         }
         let local = self.local.clone();
         let key = base_key(object);
-        let file =
-            crate::maintenance::read_source(cancellation, move || open_file(&local.objects, &key))
-                .await?;
+        let slot = LOCAL_DOWNLOAD_OPENS
+            .acquire()
+            .await
+            .expect("download open limit is never closed");
+        check_cancelled(cancellation)?;
+        let file = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            open_file(&local.objects, &key)
+        })
+        .await
+        .map_err(|err| codec::internal_not_committed("open_archive_download", err.to_string()))??;
         let mut file = tokio::fs::File::from_std(file);
         if file.metadata().await.map_err(storage_io)?.len() != object.bytes {
             return Err(invalid(ValidationReason::InvalidDigest));

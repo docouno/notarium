@@ -1,5 +1,5 @@
 use std::{
-    io::{Cursor, Read, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
     sync::Arc,
     time::Duration,
 };
@@ -18,7 +18,10 @@ use notarium_core::{
     ports::*,
     receipt::{CausalBasis, CommandIdentity, ReceiptSet},
 };
-use notarium_jobs::{ArchiveJobs, ArchiveStorage, ImportLimits, JobWorkerConfig};
+use notarium_jobs::{
+    ArchiveDownload, ArchiveInput, ArchiveJobs, ArchiveStorage, BackupOptions, FsckInput,
+    ImportLimits, JobWorkerConfig, run_fsck,
+};
 
 struct FixtureRoot(DataRoot);
 
@@ -475,12 +478,19 @@ async fn exercise_local_archive_worker(entries: usize) {
     eprintln!("export of {entries} linked notes: {:?}", started.elapsed());
     assert_eq!(exported.state, JobState::Succeeded);
     let id = &exported.artifacts[0];
-    let download = jobs.open_export(ctx.clone(), id).await.unwrap();
+    let download = open_export_during_stalled_fsck(&jobs, ctx.clone(), id, root).await;
     let metadata = download.metadata();
-    let last = download
-        .read_chunk(budget(), metadata.bytes - 5, 5)
+    let (sender, mut chunks) = tokio::sync::mpsc::channel(1);
+    download
+        .read_chunk_into(
+            budget(),
+            metadata.bytes - 5,
+            5,
+            sender.reserve_owned().await.unwrap(),
+        )
         .await
         .unwrap();
+    let last = chunks.try_recv().unwrap();
     let mut bytes = Vec::new();
     while (bytes.len() as u64) < metadata.bytes {
         let part = download
@@ -625,6 +635,71 @@ async fn exercise_local_archive_worker(entries: usize) {
     }
     control.close().await;
     runtime.shutdown().await.unwrap();
+}
+
+async fn open_export_during_stalled_fsck(
+    jobs: &Arc<ArchiveJobs>,
+    mut ctx: SpaceContext,
+    artifact: &ArtifactId,
+    root: &DataRoot,
+) -> ArchiveDownload {
+    struct StalledSource {
+        started: Option<tokio::sync::oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl Read for StalledSource {
+        fn read(&mut self, _out: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+                let _ = self.release.recv();
+            }
+            Ok(0)
+        }
+    }
+    impl Seek for StalledSource {
+        fn seek(&mut self, _from: SeekFrom) -> std::io::Result<u64> {
+            Ok(0)
+        }
+    }
+    let start = || {
+        let (started, reading) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let keys = root.keyring();
+        let budget = budget();
+        let cancel = budget.cancellation.clone();
+        let call = tokio::spawn(async move {
+            run_fsck(
+                MaintenanceContext {
+                    authority: ServiceAuthority::admit(ServicePurpose::Fsck),
+                    budget,
+                },
+                FsckInput::Archive(ArchiveInput::with_length(
+                    StalledSource {
+                        started: Some(started),
+                        release: wait,
+                    },
+                    4096,
+                )),
+                &keys,
+                BackupOptions::default(),
+            )
+            .await
+        });
+        (reading, cancel, release, call)
+    };
+    let (first_ready, first_cancel, first_release, first) = start();
+    let (second_ready, second_cancel, second_release, second) = start();
+    tokio::try_join!(first_ready, second_ready).unwrap();
+    first_cancel.cancel();
+    second_cancel.cancel();
+    for result in [first.await.unwrap(), second.await.unwrap()] {
+        assert!(matches!(result, Err(PortError::Cancelled(_))));
+    }
+    ctx.budget = budget();
+    ctx.budget.remaining = Duration::from_secs(2);
+    let opened = jobs.open_export(ctx, artifact).await;
+    drop((first_release, second_release));
+    opened.expect("opening an export has its own read admission")
 }
 
 async fn probe_slow_cut(

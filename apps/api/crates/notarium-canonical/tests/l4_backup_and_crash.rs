@@ -992,6 +992,77 @@ async fn postgres_spool_import_cancels_during_a_blocked_source_read() {
 }
 
 #[tokio::test]
+async fn failed_postgres_spool_open_waits_for_rollback() {
+    let case = BackendCase::open_pg_s3_with_pool(1).await;
+    case.store
+        .create_space(backup_test_space(0xC5))
+        .await
+        .unwrap();
+    let (fixtures, schema) = case.pg_cleanup.as_ref().unwrap();
+    let mut sql = fixtures.open_raw_pg().await;
+    let budget = case.store.default_backup_budget();
+    let mut prepared = case
+        .store
+        .prepare(
+            maintenance_ctx(ServicePurpose::Backup),
+            BackupId::from_bytes([0xC5; 16]),
+            budget,
+        )
+        .await
+        .unwrap();
+    let hold = prepared.acquire_hold().await.unwrap();
+    let mut pause = prepared.pause_writes().await.unwrap();
+    let mut snapshot = pause.open_cut().await.unwrap();
+    pause.resume().await.unwrap();
+    let source = pinned_backend(&mut sql, schema).await;
+    let temporary: Vec<_> = fs::read_dir(&case.spool_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("tmp"))
+        .collect();
+    assert_eq!(temporary.len(), 1);
+    fs::remove_file(&temporary[0]).unwrap();
+    assert!(
+        snapshot
+            .spool(budget, Cancellation::default())
+            .await
+            .is_err()
+    );
+    assert!(pg_transaction_ended(&mut sql, source).await);
+    snapshot.close().await.unwrap();
+    hold.release().await.unwrap();
+    drop(sql);
+    case.shutdown().await;
+}
+
+async fn pinned_backend(sql: &mut sqlx::PgConnection, schema: &str) -> i32 {
+    sqlx::query_scalar(
+        "SELECT DISTINCT locks.pid FROM pg_locks AS locks
+         JOIN pg_class AS relation ON relation.oid = locks.relation
+         JOIN pg_namespace AS ns ON ns.oid = relation.relnamespace
+         JOIN pg_stat_activity AS activity ON activity.pid = locks.pid
+         WHERE ns.nspname = $1 AND relation.relname = 'schema_meta'
+           AND activity.backend_xmin IS NOT NULL
+           AND activity.state = 'idle in transaction'",
+    )
+    .bind(schema)
+    .fetch_one(sql)
+    .await
+    .expect("pinned source owns a transaction on the test schema")
+}
+
+async fn pg_transaction_ended(sql: &mut sqlx::PgConnection, pid: i32) -> bool {
+    sqlx::query_scalar(
+        "SELECT NOT EXISTS(SELECT 1 FROM pg_stat_activity
+         WHERE pid = $1 AND xact_start IS NOT NULL)",
+    )
+    .bind(pid)
+    .fetch_one(sql)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
 async fn disconnected_pg_hold_cannot_confirm_or_release_its_successor() {
     let case = BackendCase::open_pg_s3_with_pool(1).await;
     case.store
@@ -1025,22 +1096,8 @@ async fn disconnected_pg_hold_cannot_confirm_or_release_its_successor() {
             }
             Some(snapshot)
         };
-        let pinned_source: Option<i32> = if phase == "before_spool" {
-            Some(
-                sqlx::query_scalar(
-                    "SELECT DISTINCT locks.pid FROM pg_locks AS locks
-                     JOIN pg_class AS relation ON relation.oid = locks.relation
-                     JOIN pg_namespace AS ns ON ns.oid = relation.relnamespace
-                     JOIN pg_stat_activity AS activity ON activity.pid = locks.pid
-                     WHERE ns.nspname = $1 AND relation.relname = 'schema_meta'
-                       AND activity.backend_xmin IS NOT NULL
-                       AND activity.state = 'idle in transaction'",
-                )
-                .bind(schema)
-                .fetch_one(&mut sql)
-                .await
-                .expect("pinned source owns a transaction on the test schema"),
-            )
+        let pinned_source = if phase == "before_spool" {
+            Some(pinned_backend(&mut sql, schema).await)
         } else {
             None
         };
@@ -1091,15 +1148,10 @@ async fn disconnected_pg_hold_cannot_confirm_or_release_its_successor() {
             snapshot.close().await.unwrap();
         }
         if let Some(pid) = pinned_source {
-            let still_pinned: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity
-                 WHERE pid = $1 AND xact_start IS NOT NULL)",
-            )
-            .bind(pid)
-            .fetch_one(&mut sql)
-            .await
-            .unwrap();
-            assert!(!still_pinned, "snapshot close must acknowledge rollback");
+            assert!(
+                pg_transaction_ended(&mut sql, pid).await,
+                "snapshot close must acknowledge rollback"
+            );
         }
         assert!(
             old_hold.release().await.is_err(),
@@ -1145,8 +1197,8 @@ async fn failed_temp_unlink_retains_its_recovery_marker() {
         }
         // unlink on a directory fails without relying on effective user privileges.
         fs::create_dir(&blocker).unwrap();
-        drop(prepared);
-        assert!(marker.exists(), "drop lost its retry marker for {ext}");
+        prepared.abort().await.unwrap();
+        assert!(marker.exists(), "abort lost its retry marker for {ext}");
         assert!(
             case.store
                 .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
@@ -1162,7 +1214,7 @@ async fn failed_temp_unlink_retains_its_recovery_marker() {
             .await
             .unwrap();
         assert!(!marker.exists() && !blocker.exists());
-        drop(recovered);
+        recovered.abort().await.unwrap();
     }
     case.shutdown().await;
 }
@@ -3635,10 +3687,16 @@ async fn shutdown_closes_retained_backup_phases(mut case: BackendCase) {
             !resources().is_empty(),
             "the backup must own its staging files"
         );
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            case.runtime.take().unwrap().shutdown(),
-        )
+        let shutdown = case.runtime.take().unwrap().shutdown();
+        let close_snapshot = async {
+            if let Some(cut) = snapshot {
+                cut.close().await.unwrap();
+                assert!(resources().is_empty(), "close must await source cleanup");
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(biased; shutdown, close_snapshot).0
+        })
         .await
         .expect("shutdown must finish with retained backup handles")
         .unwrap();
@@ -3650,9 +3708,6 @@ async fn shutdown_closes_retained_backup_phases(mut case: BackendCase) {
         store.set_backup_spool_dir(case.spool_dir.clone());
         assert_eq!(store.read_space(&id).await.unwrap().space.id, id);
         assert!(prepared.acquire_hold().await.is_err());
-        if let Some(cut) = snapshot {
-            cut.close().await.unwrap();
-        }
         drop((pause, hold, prepared));
         case.store = store;
         case.runtime = Some(runtime);

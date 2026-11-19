@@ -257,13 +257,14 @@ pub(crate) async fn capture_pair(
                 return Err(error);
             }
         };
+    let held_histories = &canonical_hold.witness().histories;
     let captured = async {
         let (control_spool, canonical_spool, pause) = capture_spools(
             &ctx,
             canonical,
             &mut *ctrl,
             &mut *canon,
-            &*canonical_hold,
+            held_histories,
             cb,
             nb,
         )
@@ -375,7 +376,7 @@ async fn capture_spools(
     canonical: &CanonicalStore,
     ctrl: &mut dyn PreparedBackup,
     canon: &mut dyn PreparedBackup,
-    canonical_hold: &dyn BackupHold,
+    held_histories: &[ChangeCursor],
     cb: notarium_core::ports::BackupBudget,
     nb: notarium_core::ports::BackupBudget,
 ) -> Result<(BackupSpool, BackupSpool, PairedPause), PortError> {
@@ -415,9 +416,7 @@ async fn capture_spools(
                 .canaries
                 .iter()
                 .all(|key| key.readable)
-            || !canonical_hold
-                .witness()
-                .histories
+            || !held_histories
                 .iter()
                 .map(|c| &c.scope)
                 .eq(canonical_cut.witness().histories.iter().map(|c| &c.scope))

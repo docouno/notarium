@@ -3821,7 +3821,10 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
 #[tokio::test]
 async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
     use notarium_canonical::UpdateSpaceSchema;
-    use notarium_canonical::peers::archive_export::{ExportChatBody, ExportData};
+    use notarium_canonical::peers::{
+        archive_export::{CommittedExport, ExportChatBody, ExportData},
+        archive_import::{ArchiveObject, ArchiveObjectKind},
+    };
     let local = TempDataRoot::new("paged-archive-export");
     let fixtures = StorageTestFixtures::load_required();
     let pg_root = TempDataRoot::new("paged-export-postgres");
@@ -4189,6 +4192,34 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
                 .iter()
                 .all(|entry| entry.path != ".notarium/fields/schema.yaml")
         );
+        let pointer = CommittedExport {
+            object: ArchiveObject {
+                installation: store.installation_id().clone(),
+                namespace: ContentDigest::from_bytes([1; 32]),
+                scope: scope.clone(),
+                id: notarium_core::ids::ArtifactId::from_bytes([1; 16]),
+                kind: ArchiveObjectKind::Export,
+                digest: ContentDigest::from_bytes([2; 32]),
+                bytes: 1,
+                segments: Vec::new(),
+            },
+            job: claim.job.id.clone(),
+            privacy_generation: after_purge.generation,
+            expires_at_ms: i64::MAX,
+        };
+        let (send, mut queue) = tokio::sync::mpsc::channel(1);
+        let slot = send.reserve_owned().await.unwrap();
+        let transfer = make_budget();
+        let cancel = transfer.cancellation.clone();
+        store
+            .handoff_export_chunk(&transfer, &scope, &pointer, move || {
+                slot.send(b'x');
+                cancel.cancel();
+                Ok(())
+            })
+            .await
+            .expect("an enqueued chunk has a committed receipt");
+        assert_eq!(queue.try_recv().unwrap(), b'x');
         after_purge.release().await.unwrap();
 
         use notarium_canonical::peers::archive_import::ArchiveCommitAuthority;

@@ -53,7 +53,8 @@ generations in their own namespace.
 `ArchiveJobs::open_export` returns an authorized reader with a bounded
 `read_chunk` method. Check its metadata for content length and expiry. Each
 chunk revalidates authority and crosses the canonical privacy fence before
-handoff. Archive bytes already handed off belong to the caller. An artifact
+handoff. A successful enqueue into a reserved transport slot is the receipt for
+that chunk. Archive bytes already handed off belong to the caller. An artifact
 expires seven days after publication. The maintenance loop retires its sealed
 storage generation and then removes the pointer.
 
@@ -78,7 +79,9 @@ workers own the physical operation and recover durable work after interruption.
 
 - `run_backup` takes the paired canonical and control cut while both writers are
   paused. It resumes writes before materializing the database spools and CAS
-  bytes. The ZIP64 archive contains `manifest.json`, `db/control`, `db/canonical`,
+  bytes. Each phase owner confirms resource cleanup on close, including during
+  shutdown. A missing PostgreSQL rollback acknowledgement ends the operation
+  with an error. The ZIP64 archive contains `manifest.json`, `db/control`, `db/canonical`,
   `cas/index` and `cas/data`. Keep the external keyring separately. The archive
   contains encrypted canary witnesses and credential envelopes. Before publishing,
   backup checks that retained CAS counts match actual owners and that the decoded

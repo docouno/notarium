@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -21,8 +22,8 @@ use sqlx::Row;
 use crate::{
     CanonicalStore, ClaimedContentJob,
     codec::{
-        MAX_MSGPACK_DECODE_BYTES, decode_msgpack_bounded, doc_class_from_db, encode_msgpack,
-        internal_not_committed, ordered_id_16,
+        MAX_MSGPACK_DECODE_BYTES, cancelled_not_committed, decode_msgpack_bounded,
+        doc_class_from_db, encode_msgpack, internal_not_committed, ordered_id_16,
     },
     domain::common::CommandDeadline,
     runtime::{SqlDriverState, load_space_record},
@@ -117,6 +118,31 @@ pub struct CommittedExport {
     pub job: JobId,
     pub privacy_generation: u64,
     pub expires_at_ms: i64,
+}
+
+enum ChunkState {
+    Pending,
+    Delivered,
+    Closed,
+}
+
+struct ChunkDelivery(Arc<Mutex<ChunkState>>);
+
+impl ChunkDelivery {
+    fn settle(&self) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        if matches!(*state, ChunkState::Delivered) {
+            return true;
+        }
+        *state = ChunkState::Closed;
+        false
+    }
+}
+
+impl Drop for ChunkDelivery {
+    fn drop(&mut self) {
+        self.settle();
+    }
 }
 
 impl CanonicalStore {
@@ -404,35 +430,50 @@ impl CanonicalStore {
         let expires = pointer.expires_at_ms;
         let deadline = CommandDeadline::start(budget, "handoff_archive_chunk");
         let check = budget.clone();
-        self.with_auxiliary_command(Some((budget, deadline)), Ok, move |tx| {
-            Box::pin(async move {
-                // SQLite BEGIN IMMEDIATE owns the database writer. PostgreSQL
-                // privacy triggers take the exclusive half of this Space lock.
-                if let BackendConn::Postgres(conn) = tx {
-                    let admitted: bool = sqlx::query_scalar(
-                        "SELECT pg_try_advisory_xact_lock_shared(
+        let delivery = ChunkDelivery(Arc::new(Mutex::new(ChunkState::Pending)));
+        let state = delivery.0.clone();
+        let result = self
+            .with_auxiliary_command(Some((budget, deadline)), Ok, move |tx| {
+                Box::pin(async move {
+                    // SQLite BEGIN IMMEDIATE owns the database writer. PostgreSQL
+                    // privacy triggers take the exclusive half of this Space lock.
+                    if let BackendConn::Postgres(conn) = tx {
+                        let admitted: bool = sqlx::query_scalar(
+                            "SELECT pg_try_advisory_xact_lock_shared(
                              hashtextextended(current_schema() || ':' || $1, 7311231))",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .fetch_one(&mut **conn)
-                    .await
-                    .map_err(sql_error)?;
-                    if !admitted {
+                        )
+                        .bind(scope.space_id.as_str())
+                        .fetch_one(&mut **conn)
+                        .await
+                        .map_err(sql_error)?;
+                        if !admitted {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                    }
+                    let live = load_space_record(tx, &scope.space_id).await?;
+                    live.scope.check(&scope)?;
+                    if expires <= job_clock_ms(tx).await?
+                        || privacy_generation_tx(tx, &scope.space_id).await? != generation
+                    {
                         return Err(DomainError::ResourceNotFound.into());
                     }
-                }
-                let live = load_space_record(tx, &scope.space_id).await?;
-                live.scope.check(&scope)?;
-                if expires <= job_clock_ms(tx).await?
-                    || privacy_generation_tx(tx, &scope.space_id).await? != generation
-                {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                deadline.remaining(&check)?;
-                handoff()
+                    // Serialize the synchronous enqueue with revocation of the
+                    // caller's wait. An accepted transfer has its own receipt.
+                    let mut state = state.lock().unwrap_or_else(|err| err.into_inner());
+                    if matches!(*state, ChunkState::Closed) {
+                        return Err(cancelled_not_committed(
+                            "handoff_archive_chunk",
+                            "download closed before handoff",
+                        ));
+                    }
+                    deadline.remaining(&check)?;
+                    handoff()?;
+                    *state = ChunkState::Delivered;
+                    Ok(())
+                })
             })
-        })
-        .await
+            .await;
+        if delivery.settle() { Ok(()) } else { result }
     }
 
     /// Read the pointer and authorize the selected notes or whole scope in the

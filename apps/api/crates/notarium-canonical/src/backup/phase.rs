@@ -13,16 +13,17 @@ fn closed() -> PortError {
     cancelled_not_committed("backup_phase_closed", "backup phase has ended")
 }
 
-fn spawn_owner(
+fn spawn_owner<T, F: Future<Output = ()> + Send + 'static>(
     inner: &CanonicalInner,
-    task: impl Future<Output = ()> + Send + 'static,
-) -> Result<(), PortError> {
+    resource: T,
+    task: impl FnOnce(T) -> F,
+) -> Result<(), T> {
     let mut tasks = inner.backup_cleanups.lock().expect("backup cleanups mutex");
     if inner.backup_shutdown.is_cancelled() {
-        return Err(closed());
+        return Err(resource);
     }
     tasks.retain(|task| !task.is_finished());
-    tasks.push(inner.backup_executor.spawn(task));
+    tasks.push(inner.backup_executor.spawn(task(resource)));
     Ok(())
 }
 
@@ -35,34 +36,43 @@ pub(super) fn prepare(
     Box::pin(async move {
         let (mut reply, result) = oneshot::channel();
         let inner = store.inner.clone();
-        spawn_owner(&inner, async move {
+        spawn_owner(&inner, (), |()| async move {
             let prepared = tokio::select! {
                 biased;
                 () = reply.closed() => return,
                 result = store.prepare_source(ctx, backup, budget) => result,
             };
-            let _ = reply.send(prepared.and_then(|handle| {
-                Phase::new(&store.inner, handle).map(|p| Box::new(p) as Box<dyn PreparedBackup>)
-            }));
-        })?;
+            let handle = match prepared {
+                Ok(raw) => Phase::new(&store.inner, raw, PreparedBackup::abort)
+                    .await
+                    .map(|phase| Box::new(phase) as Box<dyn PreparedBackup>),
+                Err(error) => Err(error),
+            };
+            let _ = reply.send(handle);
+        })
+        .map_err(|()| closed())?;
         result.await.map_err(|_| closed())?
     })
 }
 
-type PhaseCall<T> = Box<
-    dyn for<'a> FnOnce(&'a mut Option<T>) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send,
->;
+type PhaseCall<T> =
+    Box<dyn for<'a> FnOnce(&'a mut T) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send>;
 
 pub(super) struct Phase<T> {
     commands: mpsc::Sender<PhaseCall<T>>,
+    finished: oneshot::Receiver<Result<(), PortError>>,
 }
 
 impl<T: Send + 'static> Phase<T> {
-    pub(super) fn new(inner: &CanonicalInner, resource: T) -> Result<Self, PortError> {
+    pub(super) async fn new(
+        inner: &CanonicalInner,
+        resource: T,
+        close: fn(Box<T>) -> PortFuture<'static, ()>,
+    ) -> Result<Self, PortError> {
         let (commands, mut queue) = mpsc::channel::<PhaseCall<T>>(1);
+        let (done, finished) = oneshot::channel();
         let shutdown = inner.backup_shutdown.clone();
-        spawn_owner(inner, async move {
-            let mut resource = Some(resource);
+        let owner = spawn_owner(inner, resource, |mut resource| async move {
             loop {
                 let command = tokio::select! {
                     biased;
@@ -74,13 +84,21 @@ impl<T: Send + 'static> Phase<T> {
                 // database phase observes shutdown while it still owns the work.
                 call(&mut resource).await;
             }
-        })?;
-        Ok(Self { commands })
+            drop(queue);
+            // Shutdown, explicit close, and a dropped handle all use the
+            // same resource owner and await the same database cleanup.
+            let _ = done.send(close(Box::new(resource)).await);
+        });
+        if let Err(resource) = owner {
+            close(Box::new(resource)).await?;
+            return Err(closed());
+        }
+        Ok(Self { commands, finished })
     }
 
-    fn call<R: Send + 'static>(
+    fn with<R: Send + 'static>(
         &self,
-        op: impl for<'a> FnOnce(&'a mut Option<T>) -> PortFuture<'a, R> + Send + 'static,
+        op: impl for<'a> FnOnce(&'a mut T) -> PortFuture<'a, R> + Send + 'static,
     ) -> PortFuture<'static, R> {
         let commands = self.commands.clone();
         Box::pin(async move {
@@ -98,28 +116,17 @@ impl<T: Send + 'static> Phase<T> {
             result.await.map_err(|_| closed())?
         })
     }
-    fn with<R: Send + 'static>(
-        &self,
-        op: impl for<'a> FnOnce(&'a mut T) -> PortFuture<'a, R> + Send + 'static,
-    ) -> PortFuture<'static, R> {
-        self.call(move |state| {
-            Box::pin(async move { op(state.as_mut().ok_or_else(closed)?).await })
-        })
-    }
-
-    fn finish<R: Send + 'static>(
-        &self,
-        op: impl FnOnce(Box<T>) -> PortFuture<'static, R> + Send + 'static,
-    ) -> PortFuture<'static, R> {
-        self.call(move |state| {
-            Box::pin(async move { op(Box::new(state.take().ok_or_else(closed)?)).await })
+    fn finish(self) -> PortFuture<'static, ()> {
+        Box::pin(async move {
+            drop(self.commands);
+            self.finished.await.map_err(|_| closed())?
         })
     }
 }
 
 impl PreparedBackup for Phase<super::CanonicalPreparedBackup> {
     fn abort(self: Box<Self>) -> PortFuture<'static, ()> {
-        self.finish(PreparedBackup::abort)
+        self.finish()
     }
 
     fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
@@ -137,7 +144,7 @@ impl PausedBackup for Phase<super::CanonicalPausedBackup> {
     }
 
     fn resume(self: Box<Self>) -> PortFuture<'static, ()> {
-        self.finish(PausedBackup::resume)
+        self.finish()
     }
 }
 
@@ -147,11 +154,11 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
-    pub(super) fn new(raw: super::CanonicalBackupSnapshot) -> Result<Self, PortError> {
+    pub(super) async fn new(raw: super::CanonicalBackupSnapshot) -> Result<Self, PortError> {
         let inner = raw.store.inner.clone();
         Ok(Self {
             witness: raw.witness.clone(),
-            source: Phase::new(&inner, raw)?,
+            source: Phase::new(&inner, raw, BackupSnapshot::close).await?,
         })
     }
 }
@@ -170,14 +177,6 @@ impl BackupSnapshot for Snapshot {
     }
 
     fn close(self: Box<Self>) -> PortFuture<'static, ()> {
-        Box::pin(async move {
-            let result = self.source.finish(BackupSnapshot::close).await;
-            if result.as_ref().is_err_and(|error| *error == closed())
-                && self.source.commands.is_closed()
-            {
-                return Ok(());
-            }
-            result
-        })
+        self.source.finish()
     }
 }

@@ -138,6 +138,9 @@ impl PostgresCut {
     pub(crate) async fn pause(&mut self, session: &Session) -> Result<(), PortError> {
         session.check()?;
         let connection = self.lock.as_mut().ok_or_else(failure)?;
+        // Cleanup issues UNLOCK if the lock could have reached the server,
+        // including when the caller timed out before receiving the reply.
+        self.locked = true;
         session
             .operation
             .run(
@@ -152,7 +155,6 @@ impl PostgresCut {
                 CommitEffect::NotCommitted,
             )
             .await?;
-        self.locked = true;
         session.check()
     }
     pub(crate) async fn pin(
