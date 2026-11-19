@@ -9,7 +9,7 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::{
         ChatThreadId, CommandKey, ContentDigest, FolderId, GrantId, NoteId, PrincipalId,
-        ProjectionGeneration, RequestId, RevisionId, SpaceSeq, ThreadEntrySeq,
+        ProjectionGeneration, RequestId, RevisionId, SpaceId, SpaceSeq, ThreadEntrySeq,
     },
     model::{DenseNodeId, DenseNodeIter, HistoryScope, SnapshotCut},
     ports::{
@@ -31,8 +31,8 @@ use notarium_search::ports::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex as StdMutex, RwLock,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -340,6 +340,10 @@ pub struct ControlledCarriers {
     pub release_chat: Notify,
     pub hold_note_reads: AtomicBool,
     pub note_read_held: Notify,
+    hold_seed_tail_spaces: StdMutex<BTreeSet<SpaceId>>,
+    seed_tail_held_count: AtomicUsize,
+    seed_tail_held: Notify,
+    release_seed_tail: Notify,
 }
 
 impl ControlledCarriers {
@@ -354,7 +358,38 @@ impl ControlledCarriers {
             release_chat: Notify::new(),
             hold_note_reads: AtomicBool::new(false),
             note_read_held: Notify::new(),
+            hold_seed_tail_spaces: StdMutex::new(BTreeSet::new()),
+            seed_tail_held_count: AtomicUsize::new(0),
+            seed_tail_held: Notify::new(),
+            release_seed_tail: Notify::new(),
         }
+    }
+
+    pub fn hold_seed_tail_for(&self, space: SpaceId) {
+        self.hold_seed_tail_spaces.lock().unwrap().insert(space);
+    }
+
+    pub fn seed_tail_held_count(&self) -> usize {
+        self.seed_tail_held_count.load(Ordering::SeqCst)
+    }
+
+    pub async fn wait_seed_tail_held(&self, expected: usize) {
+        loop {
+            let notified = self.seed_tail_held.notified();
+            if self.seed_tail_held_count.load(Ordering::SeqCst) >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn release_seed_tails(&self) {
+        self.hold_seed_tail_spaces.lock().unwrap().clear();
+        self.release_seed_tail.notify_waiters();
+    }
+
+    fn is_seed_tail_held(&self, space: &SpaceId) -> bool {
+        self.hold_seed_tail_spaces.lock().unwrap().contains(space)
     }
 }
 
@@ -375,15 +410,44 @@ impl SearchCarrierReadPort for ControlledCarriers {
                 Err(DomainError::ResourceNotFound.into())
             });
         }
-        SearchCarrierReadPort::read_searchable_notes_seed_page(
-            &*self.canonical,
-            authority,
-            budget,
-            scope,
-            cutoff,
-            after_note,
-            limit,
-        )
+        Box::pin(async move {
+            let limit = if self.is_seed_tail_held(&scope.space_id) {
+                if after_note.is_some() {
+                    struct HoldGuard<'a>(&'a AtomicUsize);
+                    impl Drop for HoldGuard<'_> {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    }
+                    self.seed_tail_held_count.fetch_add(1, Ordering::SeqCst);
+                    let _guard = HoldGuard(&self.seed_tail_held_count);
+                    self.seed_tail_held.notify_waiters();
+                    loop {
+                        let release = self.release_seed_tail.notified();
+                        if !self.is_seed_tail_held(&scope.space_id) {
+                            break;
+                        }
+                        tokio::select! {
+                            () = budget.cancellation.cancelled() => return Err(DomainError::validation(ValidationReason::NotReady).into()),
+                            () = release => {},
+                        }
+                    }
+                }
+                PageLimit::new(1).unwrap()
+            } else {
+                limit
+            };
+            SearchCarrierReadPort::read_searchable_notes_seed_page(
+                &*self.canonical,
+                authority,
+                budget,
+                scope,
+                cutoff,
+                after_note,
+                limit,
+            )
+            .await
+        })
     }
 
     fn read_note_documents_at_cutoff(
@@ -407,15 +471,13 @@ impl SearchCarrierReadPort for ControlledCarriers {
     fn read_note_revisions_for_overlay(
         &self,
         authority: ServiceAuthority,
-        budget: CallBudget,
-        scope: HistoryScope,
+        ctx: SpaceContext,
         targets: Vec<(NoteId, RevisionId)>,
     ) -> PortFuture<'_, Vec<(NoteId, Option<SearchOverlayNote>)>> {
         SearchCarrierReadPort::read_note_revisions_for_overlay(
             &*self.canonical,
             authority,
-            budget,
-            scope,
+            ctx,
             targets,
         )
     }

@@ -152,16 +152,13 @@ impl SearchEngine {
             .iter()
             .map(|(note, _)| (note.clone(), None))
             .collect();
+        let mut context = ctx.clone();
+        context.budget = clock.remaining()?;
         overlay.extend(
             self.services
                 .deps
                 .carriers
-                .read_note_revisions_for_overlay(
-                    self.services.authority.clone(),
-                    clock.remaining()?,
-                    ctx.scope().clone(),
-                    targets,
-                )
+                .read_note_revisions_for_overlay(self.services.authority.clone(), context, targets)
                 .await?,
         );
         Ok(Some(overlay))

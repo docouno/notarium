@@ -1039,7 +1039,7 @@ impl CanonicalStore {
                     };
 
                     let effect = match &row.payload_id {
-                        None => default_effect_for_op(&row.op_kind),
+                        None => default_effect_for_op(&row.entity_type, &row.op_kind),
                         Some(pid) => {
                             if let Some(cached) = payload_cache.get(pid) {
                                 cached.clone()
@@ -1615,22 +1615,28 @@ fn parse_change_kind(op_kind: &str) -> Result<ChangeKind, PortError> {
     }
 }
 
-fn default_effect_for_op(op_kind: &str) -> MutationEffect {
-    match op_kind {
-        "purge" | "move" | "rename" => MutationEffect::AwaitProjection {
-            reason: AwaitReason::Structural,
-        },
+fn default_effect_for_op(entity_type: &str, op_kind: &str) -> MutationEffect {
+    match (entity_type, op_kind) {
+        (_, "purge" | "move" | "rename") | ("folder", "create" | "trash" | "restore") => {
+            MutationEffect::AwaitProjection {
+                reason: AwaitReason::Structural,
+            }
+        }
         _ => MutationEffect::NoRelevantEffect,
     }
 }
 
 fn default_effect_without_payload(command_kind: &str) -> MutationEffect {
     match command_kind {
-        "move_folder" | "rename_folder" | "rename_project" | "purge_note" | "mint_and_purge" => {
-            MutationEffect::AwaitProjection {
-                reason: AwaitReason::Structural,
-            }
-        }
+        "create_folder"
+        | "set_folder_lifecycle"
+        | "move_folder"
+        | "rename_folder"
+        | "rename_project"
+        | "purge_note"
+        | "mint_and_purge" => MutationEffect::AwaitProjection {
+            reason: AwaitReason::Structural,
+        },
         "rollback_agent_run" => MutationEffect::AwaitProjection {
             reason: AwaitReason::Bulk,
         },

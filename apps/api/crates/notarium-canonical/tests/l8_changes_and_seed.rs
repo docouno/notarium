@@ -11,14 +11,14 @@ use notarium_canonical::{
     codec::EFFECT_PAYLOAD_BUDGET_BYTES,
 };
 use notarium_core::{
-    auth::SpaceKind,
+    auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
     classes::DocClass,
     error::{Diagnostic, ValidationReason},
-    ids::{ChatThreadId, HistoryIncarnation, LeaseEpoch, NoteId, SpaceSeq},
+    ids::{ChatThreadId, GrantId, HistoryIncarnation, LeaseEpoch, NoteId, SpaceSeq},
     model::{HistoryScope, Lifecycle},
     ports::{
         BackupParticipantPort, ChangeBroadcast, ChangeKind, ChangeNotice, ChangeRead,
-        ChangeReadResult, PageLimit, SeedPosition, ServicePurpose,
+        ChangeReadResult, PageLimit, SeedPosition, ServicePurpose, SpaceContext,
     },
     query::{FieldObservation, FieldValue},
     receipt::{
@@ -191,11 +191,29 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
         .expect("read search seed continuation");
     assert_eq!(next_page.notes[0].note_id, note_b);
     assert!(next_page.next_after.is_none());
+    let search_context = SpaceContext::new(
+        EngineAuthContext::for_human(VerifiedHuman::attest(
+            actor.clone(),
+            GrantId::from_bytes([seed; 16]),
+            BTreeMap::from([(
+                scope1.space_id.clone(),
+                SpaceGrant {
+                    role: SpaceRole::Owner,
+                    read_classes: DocClass::all(),
+                    write_classes: DocClass::all(),
+                    project_root: None,
+                },
+            )]),
+            true,
+        )),
+        scope1.clone(),
+        search.budget.clone(),
+    )
+    .unwrap();
     let overlay = store
         .read_note_revisions_for_overlay(
             &search.authority,
-            search.budget.clone(),
-            scope1.clone(),
+            search_context,
             vec![
                 (note_b.clone(), pairs_ab[0].1.clone()),
                 (note_a.clone(), pairs_ab[0].1.clone()),
@@ -1090,6 +1108,110 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
         &catch_up_stale_inc,
         ValidationReason::HistoryIncarnationMismatch,
     );
+
+    // Structural folder commands without change_payloads must resolve as
+    // AwaitProjection(Structural) in both receipt resolution and log reads.
+    let before_folder_seq = store
+        .read_space(&scope1.space_id)
+        .await
+        .expect("read space1 head")
+        .last_seq;
+    let structural_folder = sample_folder_id(seed.wrapping_add(0x41));
+    let (_, folder_rev, create_folder_seq) = store
+        .create_folder(notarium_canonical::CreateFolderSpec {
+            scope: scope1.clone(),
+            active_epoch: epoch,
+            folder_id: structural_folder.clone(),
+            parent: None,
+            slug: "structural-receipt-folder".to_owned(),
+            display_name: "Structural receipt folder".to_owned(),
+            is_project: false,
+            project_slug: None,
+            actor: actor.clone(),
+            timestamp: None,
+        })
+        .await
+        .expect("create folder for structural receipt check");
+    let (trashed_rev, trash_folder_seq) = store
+        .set_folder_lifecycle(
+            &scope1,
+            epoch,
+            &structural_folder,
+            &folder_rev,
+            Lifecycle::Trashed,
+            &actor,
+            None,
+        )
+        .await
+        .expect("trash folder for structural receipt check");
+    let (_, restore_folder_seq) = store
+        .set_folder_lifecycle(
+            &scope1,
+            epoch,
+            &structural_folder,
+            &trashed_rev,
+            Lifecycle::Active,
+            &actor,
+            None,
+        )
+        .await
+        .expect("restore folder for structural receipt check");
+    for seq in [create_folder_seq, trash_folder_seq, restore_folder_seq] {
+        let token = MutationReceiptToken::new(scope1.clone(), seq).unwrap();
+        let set = ReceiptSet::new([token.clone()]).unwrap();
+        let resolved = store
+            .resolve_receipt_effects(&scope1, &set)
+            .await
+            .expect("resolve structural folder receipt");
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(
+            resolved[0].effect,
+            MutationEffect::AwaitProjection {
+                reason: AwaitReason::Structural
+            }
+        ));
+        let decision = plan_overlay(
+            &scope1,
+            before_folder_seq,
+            &set,
+            &resolved,
+            EFFECT_PAYLOAD_BUDGET_BYTES,
+        )
+        .expect("plan overlay for structural folder receipt");
+        assert!(matches!(
+            decision,
+            OverlayDecision::AwaitProjection {
+                reason: AwaitReason::Structural,
+                ..
+            }
+        ));
+    }
+    let ChangeReadResult::Log(folder_log) = store
+        .catch_up(
+            maintenance_ctx(ServicePurpose::Projection),
+            ChangeRead::Log {
+                after: ChangeCursor {
+                    scope: scope1.clone(),
+                    after: before_folder_seq,
+                },
+                through: restore_folder_seq,
+                limit: PageLimit::new(10).unwrap(),
+            },
+        )
+        .await
+        .expect("read folder structural log page")
+    else {
+        panic!("expected ChangeReadResult::Log");
+    };
+    assert_eq!(folder_log.changes.len(), 3);
+    for change in &folder_log.changes {
+        assert!(matches!(
+            change.effect,
+            MutationEffect::AwaitProjection {
+                reason: AwaitReason::Structural
+            }
+        ));
+    }
 }
 
 // Exercise real command entrypoints in both directions, including a retry after the base head moved.

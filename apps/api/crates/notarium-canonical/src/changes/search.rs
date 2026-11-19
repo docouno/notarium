@@ -88,8 +88,7 @@ impl CanonicalStore {
     pub async fn read_note_revisions_for_overlay(
         &self,
         authority: &ServiceAuthority,
-        budget: CallBudget,
-        scope: HistoryScope,
+        ctx: SpaceContext,
         targets: Vec<(NoteId, RevisionId)>,
     ) -> Result<Vec<(NoteId, Option<SearchOverlayNote>)>, PortError> {
         authority.require(ServicePurpose::Search)?;
@@ -104,7 +103,9 @@ impl CanonicalStore {
                 projected_at: None,
             })
             .collect();
-        self.read_search_targets(budget, scope, targets, None)
+        let scope = ctx.scope().clone();
+        let auth = ctx.auth().clone();
+        self.read_search_targets(ctx.budget, scope, targets, auth)
             .await?
             .into_iter()
             .map(|(key, row)| {
@@ -142,7 +143,7 @@ impl CanonicalStore {
         let scope = ctx.scope().clone();
         let auth = ctx.auth().clone();
         let rows = self
-            .read_search_targets(ctx.budget, scope, targets, Some(auth.clone()))
+            .read_search_targets(ctx.budget, scope, targets, auth.clone())
             .await?;
         Ok(rows
             .into_iter()
@@ -160,7 +161,7 @@ impl CanonicalStore {
         mut budget: CallBudget,
         scope: HistoryScope,
         targets: Vec<SearchDocumentTarget>,
-        auth: Option<EngineAuthContext>,
+        auth: EngineAuthContext,
     ) -> Result<Vec<(NoteId, Option<SearchTargetNote>)>, PortError> {
         let deadline = CommandDeadline::start(&budget, "read_search_targets");
         let mut tx_budget = budget.clone();
@@ -175,7 +176,6 @@ impl CanonicalStore {
                     let mut historical = BTreeMap::new();
                     let mut slots = Vec::with_capacity(targets.len());
                     for target in targets {
-                        let auth = auth_for_tx.as_ref();
                         let row = if let Some(cutoff) = target.projected_at {
                             let ancestry = match historical.entry(cutoff) {
                                 std::collections::btree_map::Entry::Occupied(entry) => {
@@ -194,7 +194,7 @@ impl CanonicalStore {
                                 cutoff,
                                 ancestry,
                                 &mut live,
-                                auth,
+                                Some(&auth_for_tx),
                             )
                             .await?
                             .filter(|pending| pending.revision == target.revision)
@@ -206,7 +206,7 @@ impl CanonicalStore {
                                 &target.note_id,
                                 target.revision,
                                 &mut live,
-                                auth,
+                                &auth_for_tx,
                             )
                             .await?
                         };
@@ -240,11 +240,7 @@ impl CanonicalStore {
                         continue;
                     };
                     match live_search_facts(tx, &space, key, &mut live).await? {
-                        Some(facts)
-                            if auth
-                                .as_ref()
-                                .is_none_or(|auth| auth.can_view_resource(&facts).is_ok()) =>
-                        {
+                        Some(facts) if auth.can_view_resource(&facts).is_ok() => {
                             note.document.bind_current(facts, Lifecycle::Active)?;
                         }
                         _ => *row = None,
@@ -514,21 +510,23 @@ async fn load_exact_note(
     note: &NoteId,
     revision: RevisionId,
     live: &mut FolderAncestryCache,
-    auth: Option<&EngineAuthContext>,
+    auth: &EngineAuthContext,
 ) -> Result<Option<(PendingNote, String)>, PortError> {
     let Some(current) = live_search_facts(tx, space, note, live).await? else {
         return Ok(None);
     };
-    if auth.is_some_and(|auth| auth.can_view_resource(&current).is_err()) {
+    if auth.can_view_resource(&current).is_err() {
         return Ok(None);
     }
     const SQL: &str = "SELECT metadata_msgpack, visibility_seq, actor_id FROM revisions
-        WHERE space_id = $1 AND rev_id = $2 AND entity_type = 'note' AND entity_key = $3";
+        WHERE space_id = $1 AND rev_id = $2 AND entity_type = 'note' AND entity_key = $3
+          AND history_incarnation = $4";
     let row: Option<(Vec<u8>, i64, String)> = match tx {
         BackendConn::Sqlite(conn) => sqlx::query_as(SQL)
             .bind(space.scope.space_id.as_str())
             .bind(revision.as_str())
             .bind(note.as_str())
+            .bind(space.scope.incarnation.as_bytes().as_slice())
             .fetch_optional(&mut **conn)
             .await
             .map_err(|err| internal_not_committed("sqlite_search_exact", err.to_string()))?,
@@ -536,6 +534,7 @@ async fn load_exact_note(
             .bind(space.scope.space_id.as_str())
             .bind(revision.as_str())
             .bind(note.as_str())
+            .bind(space.scope.incarnation.as_bytes().as_slice())
             .fetch_optional(&mut **conn)
             .await
             .map_err(|err| pg_read_error("pg_search_exact", err))?,
@@ -570,7 +569,7 @@ async fn load_exact_note(
             false,
         )
         .await?;
-    if auth.is_some_and(|auth| auth.can_view_resource(&facts).is_err()) {
+    if auth.can_view_resource(&facts).is_err() {
         return Ok(None);
     }
     let path = if ancestry.folder_path.is_empty() {

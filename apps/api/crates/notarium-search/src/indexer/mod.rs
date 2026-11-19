@@ -115,6 +115,15 @@ impl Context<'_> {
             Err(error) => Err(error),
         }
     }
+
+    async fn has_pending_redaction(&self, cutoff: ChangeCursor) -> Result<bool, IndexError> {
+        self.services
+            .deps
+            .canonical
+            .has_search_redaction_after(&self.services.authority, self.budget(), cutoff)
+            .await
+            .map_err(IndexError::from)
+    }
 }
 
 struct Disk {
@@ -380,37 +389,54 @@ async fn consume(
             seed_at = Some(target.clone());
         }
         if !force_seed && let Some(current) = &mut disk {
-            current.resume_vectors().await?;
-            if current.resume_reader(cx)? {
-                publisher.publish(current);
-            }
-            let catch_up = if current.manifest.tantivy_seq < target.after {
-                catch_up(cx, current, publisher, target.clone()).await
-            } else {
-                Ok(false)
-            };
-            match catch_up {
-                Ok(false) => {}
-                Ok(true) => {
-                    seed_at = Some(target.clone());
-                    scrub = true;
+            let resumed = match current.resume_reader(cx) {
+                Ok(reopened) => {
+                    current.resume_vectors().await?;
+                    if reopened {
+                        publisher.publish(current);
+                    }
+                    true
                 }
-                Err(error) if error.requires_reseed() => {
-                    let retired = error.requires_scrub();
-                    if retired {
-                        drop(disk.take());
-                        build::scrub(cx, publisher, &layout).await?;
-                    }
-                    let latest = cx.latest(&scope).await?;
-                    if latest.scope != scope {
-                        layout.clear_lexical_manifests()?;
-                        return Ok(Some(latest.scope));
-                    }
-                    rebind |= latest.after != target.after;
-                    seed_at = Some(latest);
-                    scrub = !retired;
+                Err(IndexError::Lexical(LexicalError::ReaderUnavailable))
+                    if current.manifest.tantivy_seq < target.after
+                        && cx.has_pending_redaction(current.cursor()).await? =>
+                {
+                    drop(disk.take());
+                    build::scrub(cx, publisher, &layout).await?;
+                    seed_at = Some(target.clone());
+                    false
                 }
                 Err(error) => return Err(error),
+            };
+            if resumed && let Some(current) = &mut disk {
+                let catch_up = if current.manifest.tantivy_seq < target.after {
+                    catch_up(cx, current, publisher, target.clone()).await
+                } else {
+                    Ok(false)
+                };
+                match catch_up {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        seed_at = Some(target.clone());
+                        scrub = true;
+                    }
+                    Err(error) if error.requires_reseed() => {
+                        let retired = error.requires_scrub();
+                        if retired {
+                            drop(disk.take());
+                            build::scrub(cx, publisher, &layout).await?;
+                        }
+                        let latest = cx.latest(&scope).await?;
+                        if latest.scope != scope {
+                            layout.clear_lexical_manifests()?;
+                            return Ok(Some(latest.scope));
+                        }
+                        rebind |= latest.after != target.after;
+                        seed_at = Some(latest);
+                        scrub = !retired;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         if seed_at.is_none()
@@ -542,12 +568,7 @@ async fn open_disk(
         }
         Err(error @ IndexError::Lexical(LexicalError::ReaderUnavailable)) => {
             if let Some(cursor) = unapplied
-                && cx
-                    .services
-                    .deps
-                    .canonical
-                    .has_search_redaction_after(&cx.services.authority, cx.budget(), cursor)
-                    .await?
+                && cx.has_pending_redaction(cursor).await?
             {
                 build::scrub(cx, publisher, &layout).await?;
                 return Ok(None);
@@ -646,7 +667,8 @@ async fn catch_up(
             if update::requires_scrub(disk, &complete)? {
                 return Ok(true);
             }
-            update::apply(
+            let committed = disk.cursor();
+            let updated = update::apply(
                 cx,
                 disk,
                 publisher,
@@ -656,7 +678,17 @@ async fn catch_up(
                 },
                 complete,
             )
-            .await?;
+            .await;
+            if matches!(
+                updated,
+                Err(IndexError::Lexical(LexicalError::WriterUnavailable))
+            ) && cx.has_pending_redaction(committed).await?
+            {
+                // Redacted postings must be retired even when unrelated seeds
+                // occupy the writers needed for the incremental merge.
+                return Ok(true);
+            }
+            updated?;
         }
         after = page.next;
         if page.complete {

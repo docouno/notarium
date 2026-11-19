@@ -109,8 +109,7 @@ pub trait SearchCarrierReadPort: Send + Sync {
     fn read_note_revisions_for_overlay(
         &self,
         authority: ServiceAuthority,
-        budget: CallBudget,
-        scope: HistoryScope,
+        ctx: SpaceContext,
         targets: Vec<(NoteId, RevisionId)>,
     ) -> PortFuture<'_, Vec<(NoteId, Option<SearchOverlayNote>)>>;
 
@@ -163,12 +162,11 @@ impl SearchCarrierReadPort for CanonicalStore {
     fn read_note_revisions_for_overlay(
         &self,
         authority: ServiceAuthority,
-        budget: CallBudget,
-        scope: HistoryScope,
+        ctx: SpaceContext,
         targets: Vec<(NoteId, RevisionId)>,
     ) -> PortFuture<'_, Vec<(NoteId, Option<SearchOverlayNote>)>> {
         Box::pin(async move {
-            self.read_note_revisions_for_overlay(&authority, budget, scope, targets)
+            self.read_note_revisions_for_overlay(&authority, ctx, targets)
                 .await
         })
     }

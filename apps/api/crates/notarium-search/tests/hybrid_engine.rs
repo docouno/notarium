@@ -142,7 +142,55 @@ fn assert_absent(path: &Path, marker: &str) {
             !contains(&bytes, marker),
             "indexed marker found in {file:?}"
         );
+        if file.extension().is_some_and(|ext| ext == "term") {
+            assert!(
+                !term_file_contains(&bytes, marker),
+                "indexed term {marker:?} found in term dictionary {file:?}"
+            );
+        }
     }
+}
+
+fn term_file_contains(bytes: &[u8], marker: &str) -> bool {
+    const FOOTER_MAGIC: u32 = 1337;
+    assert!(bytes.len() >= 8, "truncated tantivy .term file");
+    let footer_len =
+        u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap());
+    let footer_magic = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+    assert_eq!(
+        footer_magic, FOOTER_MAGIC,
+        "unexpected tantivy .term footer magic"
+    );
+    let body_len = bytes
+        .len()
+        .checked_sub(footer_len as usize + 8)
+        .expect("invalid tantivy .term footer length");
+    let body = tantivy::directory::FileSlice::from(bytes[..body_len].to_vec());
+    let composite =
+        tantivy::directory::CompositeFile::open(&body).expect("open tantivy .term composite file");
+    for field_id in 0u32..32 {
+        let field = tantivy::schema::Field::from_field_id(field_id);
+        let Some(slice) = composite.open_read(field) else {
+            continue;
+        };
+        let dict =
+            tantivy::termdict::TermDictionary::open(slice).expect("open tantivy term dictionary");
+        let mut stream = dict.stream().expect("stream tantivy term dictionary");
+        while stream.advance() {
+            if contains(stream.key(), marker) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn tantivy_contains_term(path: &Path, marker: &str) -> bool {
+    files(path).into_iter().any(|(file, bytes)| {
+        contains(&bytes, marker)
+            || (file.extension().is_some_and(|ext| ext == "term")
+                && term_file_contains(&bytes, marker))
+    })
 }
 
 fn contains(bytes: &[u8], marker: &str) -> bool {
@@ -811,6 +859,8 @@ async fn sqlite_hybrid_seed_causal_boundaries_and_scrub() {
     hybrid_support::remote::lexical_fallback(store.clone(), data.data_root()).await;
     chat_candidate_visibility(store.clone(), data.data_root()).await;
     reader_capacity(store.clone(), data.data_root()).await;
+    writer_saturation_retires_redacted_chat_across_pages(store.clone(), data.data_root()).await;
+    exact_overlay_auth_and_structural_folder_receipts(store.clone(), data.data_root()).await;
     hybrid_support::remote::model_epochs_and_repair(store.clone(), data.data_root()).await;
     hybrid_support::remote::scoped_backfill_recovers_and_rechecks_selection(
         store.clone(),
@@ -838,6 +888,8 @@ async fn postgres_hybrid_seed_causal_boundaries_and_scrub() {
     hybrid_support::remote::lexical_fallback(store.clone(), data.data_root()).await;
     chat_candidate_visibility(store.clone(), data.data_root()).await;
     reader_capacity(store.clone(), data.data_root()).await;
+    writer_saturation_retires_redacted_chat_across_pages(store.clone(), data.data_root()).await;
+    exact_overlay_auth_and_structural_folder_receipts(store.clone(), data.data_root()).await;
     hybrid_support::remote::scoped_backfill_recovers_and_rechecks_selection(
         store.clone(),
         data.data_root(),
@@ -1610,5 +1662,509 @@ async fn purge_and_rebind(store: Arc<CanonicalStore>, root: DataRoot) {
         .unwrap();
     assert_eq!(hits.cut.scope, scope);
     assert_eq!(hits.hits[0].card.title, "Restored history");
+    engine.shutdown().await;
+}
+
+async fn writer_saturation_retires_redacted_chat_across_pages(
+    store: Arc<CanonicalStore>,
+    root: DataRoot,
+) {
+    let chat_tag = 0xc0;
+    let lease = LeaseEpoch::new(1).unwrap();
+    let owner = sample_principal_id(chat_tag);
+    let folder = sample_folder_id(chat_tag);
+    let chat_scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(chat_tag),
+            incarnation: sample_incarnation(chat_tag),
+            root_folder_id: folder.clone(),
+            slug: "writer-cap-chat".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    let chat_ctx = context(&chat_scope, &owner);
+    let thread = ChatThreadId::from_bytes([chat_tag; 16]);
+    store
+        .create_chat(
+            chat_ctx.clone(),
+            mutation(
+                &chat_ctx,
+                CreateChat {
+                    thread: thread.clone(),
+                    kind: ChatThreadKind::Personal,
+                    owner: owner.clone(),
+                    project_folder: None,
+                    title: "Writer cap chat".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let appended = store
+        .append_chat(
+            chat_ctx.clone(),
+            mutation(
+                &chat_ctx,
+                AppendChat {
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text(REDACTED.into()),
+                    referenced_notes: vec![],
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let expected_thread_revision = store
+        .read_chat(
+            chat_ctx.clone(),
+            ChatRead {
+                thread: thread.clone(),
+                leaf: appended.value.seq,
+                before: None,
+                max_entries: PageLimit::new(1).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .thread
+        .revision;
+
+    let mut view = View::new(chat_scope.clone(), folder.clone());
+    view.advance(appended.receipt.seq());
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(BTreeSet::new()),
+    });
+    let carriers = Arc::new(ControlledCarriers::new(store.clone()));
+    let start = || {
+        let mut deps = SearchDependencies::new(store.clone(), projection.clone());
+        deps.carriers = carriers.clone();
+        SearchEngine::start(SearchConfig::new(root.clone(), VectorMode::Disabled), deps)
+    };
+    let engine = start();
+    engine.start_space(chat_scope.clone()).unwrap();
+    let initial_manifest = acknowledged(&store, &root, &chat_scope, appended.receipt.seq()).await;
+    let mut chat_query = query(REDACTED);
+    chat_query.include_chats = true;
+    let initial_hits = engine.search(chat_ctx.clone(), chat_query).await.unwrap();
+    assert_eq!(initial_hits.chat_hits.len(), 1);
+    assert_eq!(initial_hits.chat_hits[0].snippet, REDACTED);
+    let chat_layout = SearchLayout::open(&root, chat_scope.clone()).unwrap();
+    let old_index = chat_layout.index_dir(&initial_manifest).unwrap();
+    let chat_tantivy = root.search(&chat_scope.space_id, SearchIndexKind::Tantivy);
+    assert!(tantivy_contains_term(&chat_tantivy, REDACTED));
+    engine.shutdown().await;
+
+    // Commit >100 note events so catch_up's first log page contains only notes
+    // before the redaction event on the following page.
+    for idx in 0u16..105 {
+        let mut raw = [0u8; 16];
+        raw[0] = chat_tag;
+        raw[14..16].copy_from_slice(&(idx + 1).to_be_bytes());
+        let id = NoteId::from_bytes(raw);
+        store
+            .commit_synthetic_note_batch_for_test(
+                &chat_scope,
+                lease,
+                &owner,
+                vec![note(&id, &folder, "Filler", "writerfiller")],
+            )
+            .await
+            .unwrap();
+    }
+    let redacted = store
+        .redact_chat_entry(
+            chat_ctx.clone(),
+            mutation(
+                &chat_ctx,
+                RedactChatEntry {
+                    thread,
+                    entry: appended.value.seq,
+                    expected_thread_revision,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    // Saturate all 4 WriterPool slots with unrelated spaces held mid-seed after
+    // staging their first page.
+    let mut writer_spaces = Vec::new();
+    for offset in 1u8..=4 {
+        let tag = chat_tag + offset;
+        let other_owner = sample_principal_id(tag);
+        let other_folder = sample_folder_id(tag);
+        let other_scope = store
+            .create_space(CreateSpaceSpec {
+                space_id: sample_space_id(tag),
+                incarnation: sample_incarnation(tag),
+                root_folder_id: other_folder.clone(),
+                slug: format!("writer-sat-{offset}"),
+                kind: SpaceKind::Personal,
+                owner: other_owner.clone(),
+                active_epoch: lease,
+                initial_last_seq: SpaceSeq::ZERO,
+                created_at: None,
+            })
+            .await
+            .unwrap()
+            .scope;
+        let first_note = NoteId::from_bytes([tag; 16]);
+        let mut second_raw = [tag; 16];
+        second_raw[15] = tag.wrapping_add(1);
+        let second_note = NoteId::from_bytes(second_raw);
+        let (range, _) = store
+            .commit_synthetic_note_batch_for_test(
+                &other_scope,
+                lease,
+                &other_owner,
+                vec![
+                    note(&first_note, &other_folder, "Seed page 1", "satpageone"),
+                    note(&second_note, &other_folder, "Seed page 2", "satpagetwo"),
+                ],
+            )
+            .await
+            .unwrap();
+        carriers.hold_seed_tail_for(other_scope.space_id.clone());
+        writer_spaces.push((other_scope, range.last_seq));
+    }
+
+    let engine = start();
+    for (scope, _) in &writer_spaces {
+        engine.start_space(scope.clone()).unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(10), carriers.wait_seed_tail_held(4))
+        .await
+        .expect("four unrelated spaces hold all staged writers");
+
+    // Now start the cold chat space while all four writers are occupied.
+    // Even though the first log page contains only notes and hits
+    // WriterUnavailable, the redaction guard must retire the old generation on
+    // disk before waiting for a free writer.
+    engine.start_space(chat_scope.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while chat_layout.search_manifest().unwrap().is_some() || old_index.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("old chat index retired on disk while writers remain saturated");
+    assert_eq!(carriers.seed_tail_held_count(), 4);
+    assert_absent(&chat_tantivy, REDACTED);
+    assert!(
+        store
+            .min_consumer_watermark(&chat_scope.space_id, &chat_scope.incarnation)
+            .is_none_or(|seq| seq < redacted.receipt.seq())
+    );
+
+    carriers.release_seed_tails();
+    for (scope, seq) in &writer_spaces {
+        acknowledged(&store, &root, scope, *seq).await;
+    }
+    acknowledged(&store, &root, &chat_scope, redacted.receipt.seq()).await;
+    assert_absent(&chat_tantivy, REDACTED);
+    engine.shutdown().await;
+}
+
+async fn exact_overlay_auth_and_structural_folder_receipts(
+    store: Arc<CanonicalStore>,
+    root: DataRoot,
+) {
+    let tag = 0xd0;
+    let lease = LeaseEpoch::new(1).unwrap();
+    let owner = sample_principal_id(tag);
+    let viewer_id = sample_principal_id(tag + 1);
+    let root_folder = sample_folder_id(tag);
+    let project = sample_folder_id(tag + 1);
+    let moving_folder = sample_folder_id(tag + 2);
+    let scope = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(tag),
+            incarnation: sample_incarnation(tag),
+            root_folder_id: root_folder.clone(),
+            slug: "exact-auth-structural".into(),
+            kind: SpaceKind::Shared,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: lease,
+            folder_id: project.clone(),
+            parent: None,
+            slug: "project-p".into(),
+            display_name: "Project P".into(),
+            is_project: true,
+            project_slug: Some("project-p".into()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: lease,
+            folder_id: moving_folder.clone(),
+            parent: Some(project.clone()),
+            slug: "folder-f".into(),
+            display_name: "Folder F".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+
+    let note_a = sample_note_id(tag + 1);
+    let note_b = sample_note_id(tag + 2);
+    let (seeded, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            vec![
+                note(&note_a, &moving_folder, "Note A", "exactauthshared"),
+                note(&note_b, &project, "Note B", "exactauthshared"),
+            ],
+        )
+        .await
+        .unwrap();
+    let mut view = View::new(scope.clone(), root_folder.clone());
+    view.project(project.clone(), root_folder.clone());
+    view.folder(moving_folder.clone(), project.clone());
+    view.index(note_a.clone(), moving_folder.clone());
+    view.index(note_b.clone(), project.clone());
+    view.advance(seeded.last_seq);
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(BTreeSet::from([note_a.clone(), note_b.clone()])),
+    });
+    let pages = Arc::new(HeldPages::new(store.clone()));
+    let mut deps = SearchDependencies::new(store.clone(), projection.clone());
+    deps.changes = pages.clone();
+    let engine = SearchEngine::start(SearchConfig::new(root.clone(), VectorMode::Disabled), deps);
+    engine.start_space(scope.clone()).unwrap();
+    acknowledged(&store, &root, &scope, seeded.last_seq).await;
+
+    let owner_ctx = context(&scope, &owner);
+    let project_viewer = context_with_grant(
+        &scope,
+        &viewer_id,
+        SpaceGrant {
+            role: SpaceRole::Viewer,
+            read_classes: [DocClass::UserDoc].into_iter().collect(),
+            write_classes: BTreeSet::new(),
+            project_root: Some(project.clone()),
+        },
+    );
+
+    // Part A: Move F outside P, edit A with higher term frequency, then move F
+    // back into P while the index and projection remain on the base cut.
+    pages.hold(seeded.last_seq);
+    store
+        .move_folder(
+            owner_ctx.clone(),
+            mutation(
+                &owner_ctx,
+                MoveFolder {
+                    folder: moving_folder.clone(),
+                    new_parent: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let (edited, edited_revs) = store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            vec![note(
+                &note_a,
+                &moving_folder,
+                "Moved edit A",
+                "exactauthshared exactauthshared exactauthshared",
+            )],
+        )
+        .await
+        .unwrap();
+    let returned = store
+        .move_folder(
+            owner_ctx.clone(),
+            mutation(
+                &owner_ctx,
+                MoveFolder {
+                    folder: moving_folder.clone(),
+                    new_parent: Some(project.clone()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), pages.reached.notified())
+        .await
+        .unwrap();
+
+    let edit_receipt = MutationReceiptToken::new(scope.clone(), edited.last_seq).unwrap();
+    let mut viewer_req = query("exactauthshared");
+    viewer_req.top_k = PageLimit::new(1).unwrap();
+    viewer_req.causal = CausalBasis::Exact(ReceiptSet::new([edit_receipt.clone()]).unwrap());
+    let top1 = engine
+        .search(project_viewer.clone(), viewer_req.clone())
+        .await
+        .unwrap();
+    assert_eq!(top1.hits.len(), 1);
+    assert_eq!(
+        top1.hits[0].card.document.provenance().reference().note_id,
+        note_b
+    );
+    viewer_req.top_k = PageLimit::new(10).unwrap();
+    let all_allowed = engine
+        .search(project_viewer, viewer_req.clone())
+        .await
+        .unwrap();
+    assert_eq!(all_allowed.hits.len(), 1);
+    assert_eq!(
+        all_allowed.hits[0]
+            .card
+            .document
+            .provenance()
+            .reference()
+            .note_id,
+        note_b
+    );
+    viewer_req.top_k = PageLimit::new(1).unwrap();
+    let owner_top1 = engine.search(owner_ctx.clone(), viewer_req).await.unwrap();
+    assert_eq!(owner_top1.hits.len(), 1);
+    assert_eq!(owner_top1.hits[0].card.title, "Moved edit A");
+    assert_eq!(
+        owner_top1.hits[0].card.document.provenance().revision(),
+        &edited_revs[0].1
+    );
+
+    // Advance cleanly before Part B.
+    projection
+        .snapshot
+        .write()
+        .unwrap()
+        .advance(returned.receipt.seq());
+    pages.release();
+    acknowledged(&store, &root, &scope, returned.receipt.seq()).await;
+
+    // Part B: Exact([CreateFolder, CreateNote]) and Exact([SetFolderLifecycle])
+    // must wait for full catch-up instead of scoring against a stale folder tree.
+    pages.hold(returned.receipt.seq());
+    let created_folder = sample_folder_id(tag + 3);
+    let (_, created_folder_rev, created_folder_seq) = store
+        .create_folder(CreateFolderSpec {
+            scope: scope.clone(),
+            active_epoch: lease,
+            folder_id: created_folder.clone(),
+            parent: None,
+            slug: "fresh-folder".into(),
+            display_name: "Fresh folder".into(),
+            is_project: false,
+            project_slug: None,
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let fresh_note = sample_note_id(tag + 3);
+    let (fresh_note_range, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            vec![note(
+                &fresh_note,
+                &created_folder,
+                "Fresh folder note",
+                "freshfoldertoken",
+            )],
+        )
+        .await
+        .unwrap();
+    projection.live.write().unwrap().insert(fresh_note.clone());
+    tokio::time::timeout(Duration::from_secs(3), pages.reached.notified())
+        .await
+        .unwrap();
+
+    let folder_receipt = MutationReceiptToken::new(scope.clone(), created_folder_seq).unwrap();
+    let note_receipt = MutationReceiptToken::new(scope.clone(), fresh_note_range.last_seq).unwrap();
+    let mut structural_req = query("freshfoldertoken");
+    structural_req.folder = Some(created_folder.clone());
+    structural_req.causal =
+        CausalBasis::Exact(ReceiptSet::new([folder_receipt, note_receipt]).unwrap());
+    let mut short = owner_ctx.clone();
+    short.budget.remaining = Duration::from_millis(60);
+    assert!(matches!(
+        engine.search(short, structural_req.clone()).await,
+        Err(PortError::DeadlineExceeded(_))
+    ));
+
+    {
+        let mut view = projection.snapshot.write().unwrap();
+        view.folder(created_folder.clone(), root_folder);
+        view.index(fresh_note, created_folder.clone());
+        view.advance(fresh_note_range.last_seq);
+    }
+    pages.release();
+    acknowledged(&store, &root, &scope, fresh_note_range.last_seq).await;
+    let found = engine
+        .search(owner_ctx.clone(), structural_req)
+        .await
+        .unwrap();
+    assert_eq!(found.hits.len(), 1);
+    assert_eq!(found.hits[0].card.title, "Fresh folder note");
+
+    pages.hold(fresh_note_range.last_seq);
+    let (_, trash_seq) = store
+        .set_folder_lifecycle(
+            &scope,
+            lease,
+            &created_folder,
+            &created_folder_rev,
+            Lifecycle::Trashed,
+            &owner,
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), pages.reached.notified())
+        .await
+        .unwrap();
+    let trash_receipt = MutationReceiptToken::new(scope.clone(), trash_seq).unwrap();
+    let mut trashed_req = query("freshfoldertoken");
+    trashed_req.folder = Some(created_folder);
+    trashed_req.causal = CausalBasis::Exact(ReceiptSet::new([trash_receipt]).unwrap());
+    let mut short = owner_ctx;
+    short.budget.remaining = Duration::from_millis(60);
+    assert!(matches!(
+        engine.search(short, trashed_req).await,
+        Err(PortError::DeadlineExceeded(_))
+    ));
+    projection.snapshot.write().unwrap().advance(trash_seq);
+    pages.release();
+    acknowledged(&store, &root, &scope, trash_seq).await;
     engine.shutdown().await;
 }

@@ -22,8 +22,10 @@ before shutting down canonical storage.
 - Wait watermarks require a caught-up search cut. A bounded set of exact
   receipts can score the named canonical revisions while the indexes catch up.
   The overlay applies predicates to the receipt revisions' evaluated fields
-  and masks their older indexed hits. Base postings, structural filters and
-  note carriers share a projected cut. When the indexes and projection have
+  and masks their older indexed hits. Exact carriers pass both historical and
+  current authorization before ranking. Structural receipts wait for full
+  catch-up. Base postings, structural filters and note carriers share a
+  projected cut. When the indexes and projection have
   different cuts, search waits within the call budget. The response reports
   its cut, truncation, and any embedding degradation.
 
@@ -59,8 +61,8 @@ removes its retired disk copies before building a clean generation. On restart
 the canonical purge fence is checked before the reader pool can delay cleanup.
 Chat redaction commits and merges affected Tantivy segments, waits for pinned
 readers, and publishes and acknowledges the new cut once obsolete files are
-removed. If the reader pool blocks that merge, the worker retires the old
-generation on disk before waiting for a reader to rebuild it. The worker
+removed. If the reader or writer pool blocks the update, the worker retires
+the old generation on disk before waiting to rebuild it. The worker
 discards abandoned epochs and rebuilds invalid cuts.
 Search checks live note visibility after asynchronous hydration and before
 returning results.

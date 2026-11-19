@@ -153,12 +153,12 @@ pub(super) async fn apply(
         )
         .await?;
     }
-    disk.manifest.tantivy_seq = cutoff.after;
     if !chat.removed.is_empty() {
         publisher.replace(None);
         publisher.drain().await;
         lexical.collect_obsolete(&cx.services.writers)?;
     }
+    disk.manifest.tantivy_seq = cutoff.after;
     // Publishing the cut certifies that any redacted files have been removed.
     disk.layout.publish_search(&disk.manifest)?;
     publisher.publish(disk);
