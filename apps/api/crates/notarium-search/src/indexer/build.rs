@@ -27,13 +27,14 @@ pub(super) async fn scrub(
     // An absent manifest forces cleanup before reopening either index.
     layout.invalidate_search()?;
     let vectors = layout.remove_vector_epochs(None);
-    let lexical = layout
-        .index_generations()?
-        .into_iter()
-        .map(|generation| remove_generation(cx, layout, generation))
-        .fold(Ok(()), |result, next| result.and(next));
+    let mut lexical_error = None;
+    for generation in layout.index_generations()? {
+        if let Err(error) = remove_generation(cx, layout, generation) {
+            lexical_error.get_or_insert(error);
+        }
+    }
     vectors?;
-    lexical
+    lexical_error.map_or(Ok(()), Err)
 }
 
 pub(super) async fn seed(

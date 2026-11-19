@@ -134,7 +134,7 @@ impl Fixture {
             let mut writes = Vec::with_capacity(group.len());
             for (slot, note_id) in group.iter().enumerate() {
                 let ordinal = (page * 150 + slot) as u32;
-                let (title, carrier, _) = super::source_note(ordinal)?;
+                let super::SourceNote { title, carrier, .. } = super::source_note(ordinal)?;
                 let parent = if u64::from(ordinal * super::CHUNKS)
                     < notarium_search::vector::EXACT_SCAN_LIMIT
                 {

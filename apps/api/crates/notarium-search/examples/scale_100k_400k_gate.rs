@@ -122,7 +122,11 @@ fn build(fixture: &Fixture, count: u32) -> Result<(LexicalIndex, VectorEpoch), B
     let mut builder = SegmentBuilder::new(&fixture.model, DIMENSION)?;
     let mut staged = Vec::with_capacity(PAGE as usize);
     for ordinal in 0..count {
-        let (title, carrier, spans) = source_note(ordinal)?;
+        let SourceNote {
+            title,
+            carrier,
+            spans,
+        } = source_note(ordinal)?;
         let source = notarium_syntax::content_digest(&carrier);
         let note = fixture.projection.notes[ordinal as usize].clone();
         let (ordinal_folder, folder_id) = if u64::from(ordinal * CHUNKS) < EXACT_SCAN_LIMIT {
@@ -209,7 +213,13 @@ fn build(fixture: &Fixture, count: u32) -> Result<(LexicalIndex, VectorEpoch), B
     Ok((index, epoch))
 }
 
-fn source_note(ordinal: u32) -> Result<(String, String, Vec<ByteSpan>), Box<dyn Error>> {
+struct SourceNote {
+    title: String,
+    carrier: String,
+    spans: Vec<ByteSpan>,
+}
+
+fn source_note(ordinal: u32) -> notarium_core::DomainResult<SourceNote> {
     let topic = ordinal % TOPICS;
     let title = format!("Workspace brief for facet{topic:04}");
     let mut carrier = format!("# {title}\n\n");
@@ -219,7 +229,11 @@ fn source_note(ordinal: u32) -> Result<(String, String, Vec<ByteSpan>), Box<dyn 
         carrier.push_str(&chunk_line(ordinal, part));
         spans.push(ByteSpan::new(start, carrier.len())?);
     }
-    Ok((title, carrier, spans))
+    Ok(SourceNote {
+        title,
+        carrier,
+        spans,
+    })
 }
 
 fn embedding(
