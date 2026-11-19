@@ -1109,8 +1109,10 @@ async fn checkout_sized_batch_does_not_scan_unrelated_subtrees() {
     let fixture = Fixture::open().await;
     let folder = fixture.root.join("before");
     let unrelated = fixture.root.join("unrelated");
+    let git = fixture.root.join(".git");
     fs::create_dir(&folder).unwrap();
     fs::create_dir(&unrelated).unwrap();
+    fs::create_dir(&git).unwrap();
     for index in 0..80 {
         let branch = unrelated.join(format!("folder-{index}"));
         fs::create_dir(&branch).unwrap();
@@ -1135,10 +1137,16 @@ async fn checkout_sized_batch_does_not_scan_unrelated_subtrees() {
     if std::env::var_os("NOTARIUM_TEST_GIT_CHECKOUT").is_some() {
         real_checkout(&fixture, &folder, NOTES);
     } else {
-        let git = fixture.root.join(".git");
-        fs::create_dir(&git).unwrap();
         let lock = git.join("index.lock");
         fs::write(&lock, "").unwrap();
+        // Let the worker observe the lock before modifying the working tree.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|state| state.phase == SyncPhase::WaitingForGit),
+        )
+        .await
+        .expect("the worker must observe the Git lock")
+        .unwrap();
         fs::rename(&folder, &after_folder).unwrap();
         for index in 0..NOTES {
             let path = after_folder.join(format!("doc-{index}.md"));

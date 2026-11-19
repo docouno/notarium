@@ -89,6 +89,15 @@ struct State {
 }
 
 impl Inbox {
+    fn push_polled(&self, event: notify::Result<Event>) {
+        if matches!(&event, Err(error) if inaccessible_descendant(error, &self.root)) {
+            // The partial inventory diagnoses this path. Polling already
+            // excludes destructive decisions that require native coverage.
+            return;
+        }
+        self.push(event);
+    }
+
     fn push(&self, event: notify::Result<Event>) {
         let now = Instant::now();
         let mut state = self.state.lock().expect("vault watcher inbox");
@@ -302,7 +311,7 @@ fn inaccessible_descendant(error: &notify::Error, root: &Path) -> bool {
 fn polling_watch(inbox: &Arc<Inbox>) -> notify::Result<WatchBackend> {
     let sender = Arc::clone(inbox);
     let mut watcher = PollWatcher::new(
-        move |event| sender.push(event),
+        move |event| sender.push_polled(event),
         Config::default()
             .with_follow_symlinks(false)
             .with_poll_interval(POLL_FALLBACK),
@@ -413,6 +422,18 @@ mod tests {
             state: Mutex::default(),
             ready: Notify::new(),
         }
+    }
+
+    #[test]
+    fn known_inaccessible_polled_subtrees_do_not_invalidate_accessible_work() {
+        use std::io;
+
+        let inbox = inbox();
+        let denied = || notify::Error::io(io::Error::from(io::ErrorKind::PermissionDenied));
+        inbox.push_polled(Err(denied().add_path("/vault/blocked".into())));
+        assert!(inbox.quiet_since(0));
+        inbox.push_polled(Err(denied().add_path("/vault".into())));
+        assert!(!inbox.quiet_since(0));
     }
 
     #[test]
