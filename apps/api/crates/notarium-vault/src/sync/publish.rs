@@ -622,8 +622,13 @@ impl Worker<'_> {
                     .is_none_or(|id| *id == handoff.old_note)
                 && same_file(&handoff.observation.file, stamp)
             {
-                self.withdraw(path, stamp)?;
+                if !self.withdraw(path, stamp)? {
+                    self.inventory_incomplete = true;
+                }
             } else {
+                if handoff.new_note.is_none() {
+                    self.inventory_incomplete = true;
+                }
                 self.conflict(path, ConflictReason::ClaimedPurgedIdentity, None)?;
             }
             return Ok(true);
@@ -648,16 +653,44 @@ impl Worker<'_> {
     fn withdraw_handoff(&mut self, path: &Path, handoff: &VaultHandoff) -> Result<(), VaultError> {
         match self.read_disk(path) {
             Ok(Some(file)) if same_file(&handoff.observation.file, &file.stamp) => {
-                self.withdraw(path, &file.stamp)?;
+                if !self.withdraw(path, &file.stamp)? {
+                    self.inventory_incomplete = true;
+                }
             }
-            Ok(Some(_)) => self.conflict(path, ConflictReason::ClaimedPurgedIdentity, None)?,
-            Ok(None) => {}
+            Ok(Some(_)) => {
+                self.inventory_incomplete = true;
+                self.conflict(path, ConflictReason::ClaimedPurgedIdentity, None)?;
+            }
+            Ok(None) => {
+                if self
+                    .conflicts
+                    .get(path.to_string_lossy().as_ref())
+                    .is_some_and(|issue| {
+                        matches!(
+                            issue.reason,
+                            ConflictReason::UnsafePath | ConflictReason::ClaimedPurgedIdentity
+                        )
+                    })
+                {
+                    self.clear_conflict(path)?;
+                }
+            }
             Err(error) if path_error(&error) => {
-                self.conflict(path, ConflictReason::UnsafePath, None)?
+                self.inventory_incomplete = true;
+                self.conflict(path, ConflictReason::UnsafePath, None)?;
             }
             Err(error) => return Err(error.into()),
         }
         Ok(())
+    }
+
+    pub(super) fn holds_shared_purge_capture(&self, handoff: &VaultHandoff) -> bool {
+        self.captures.values().any(|capture| {
+            (capture.target == Path::new(&handoff.observation.path.relative)
+                || file_identity(&capture.expected.identity) == handoff.observation.file.identity)
+                && (capture.unlocated
+                    || capture.retained_at == self.vault.path_for_watcher().join(&capture.slot))
+        })
     }
 
     pub(super) async fn apply_conversion(

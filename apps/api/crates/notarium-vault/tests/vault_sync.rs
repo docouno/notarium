@@ -1391,3 +1391,177 @@ async fn a_pending_purge_with_a_blocked_directory_allows_other_vault_paths() {
         "purge was not acknowledged after native watch recovery"
     );
 }
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unreadable_markdown_does_not_acknowledge_ordinary_purge() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::open().await;
+    let old = fixture.create("purged", 121).await;
+    let path = fixture.root.join("purged.md");
+    let worker = fixture.start();
+    ready(&mut worker.status(), |_| {
+        disk_id(&path) == Some(old.clone())
+    })
+    .await;
+    worker.shutdown().await.unwrap();
+
+    // An editor already removed the ID. The inode witness must survive until
+    // the sidecar can inspect and reconcile the residual Markdown.
+    fs::write(&path, "# Start\n\nInitial words.\n").unwrap();
+    assert_eq!(disk_id(&path), None);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&path).is_ok() {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fixture.runtime.shutdown().await.unwrap();
+        return;
+    }
+    let ctx = context(&fixture.scope);
+    let head = fixture
+        .store
+        .read_vault_note(&ctx, &old)
+        .await
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .delete_note(
+            ctx.clone(),
+            Mutation {
+                identity: identity(&fixture.scope, 122),
+                preconditions: Preconditions {
+                    revision: Some(head.note.revision),
+                    ..Default::default()
+                },
+                input: DeleteNote {
+                    note: old.clone(),
+                    disposition: DeleteDisposition::Purge,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let independent = fixture.create("independent", 123).await;
+    let worker = fixture.start();
+    ready(&mut worker.status(), |status| {
+        status
+            .conflicts
+            .iter()
+            .any(|issue| issue.path == "purged.md")
+            && disk_id(&fixture.root.join("independent.md")) == Some(independent.clone())
+    })
+    .await;
+    let binding = fixture.store.vault_binding(&ctx).await.unwrap().unwrap();
+    let retained = fixture
+        .store
+        .vault_handoffs(&ctx, &binding)
+        .await
+        .unwrap()
+        .iter()
+        .any(|handoff| handoff.old_note == old);
+    let moved = fixture.root.join("moved.md");
+    fs::rename(&path, &moved).unwrap();
+    fs::set_permissions(&moved, fs::Permissions::from_mode(0o600)).unwrap();
+    ready(&mut worker.status(), |status| {
+        status
+            .conflicts
+            .iter()
+            .any(|issue| issue.path == "moved.md")
+    })
+    .await;
+    let moved_observation = fixture
+        .store
+        .vault_observation_at(&ctx, &binding, "moved.md")
+        .await
+        .unwrap();
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+    assert!(
+        retained,
+        "purge witness was dropped while its file remained unreadable"
+    );
+    assert!(moved_observation.is_none());
+    assert!(disk_id(&moved).is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_canonical_edit_resumes_when_parent_is_writable() {
+    use notarium_core::ports::{ExternalObservation, ExternalObservationResult, ObservedContent};
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::open().await;
+    let folder = fixture.root.join("folder");
+    fs::create_dir(&folder).unwrap();
+    let file = folder.join("blocked.md");
+    fs::write(&file, "# Original content\n").unwrap();
+    let worker = fixture.start();
+    let mut status = worker.status();
+    ready(&mut status, |_| disk_id(&file).is_some()).await;
+    let note = disk_id(&file).unwrap();
+    let ctx = context(&fixture.scope);
+    let before = fixture
+        .store
+        .read_vault_note(&ctx, &note)
+        .await
+        .unwrap()
+        .unwrap();
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = folder.join(".permission-probe");
+    if fs::write(&probe, b"probe").is_ok() {
+        fs::remove_file(&probe).unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        worker.shutdown().await.unwrap();
+        fixture.runtime.shutdown().await.unwrap();
+        return;
+    }
+    assert!(fs::read(&file).is_ok());
+    let body = "# Revised canonical content\n";
+    let update = fixture
+        .store
+        .accept_external_observation(
+            ctx,
+            Mutation {
+                identity: identity(&fixture.scope, 124),
+                preconditions: Preconditions::default(),
+                input: ExternalObservation {
+                    note: note.clone(),
+                    observed_digest: ContentDigest::from_bytes(
+                        *blake3::hash(body.as_bytes()).as_bytes(),
+                    ),
+                    base_revision: before.note.revision,
+                    disk_identity: ContentDigest::from_bytes([124; 32]),
+                    content: ObservedContent::Carrier(body.into()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let ExternalObservationResult::Committed(updated) = update else {
+        panic!("expected a canonical edit")
+    };
+    ready(&mut status, |value| {
+        value.cursor >= updated.receipt.seq()
+            && value
+                .conflicts
+                .iter()
+                .any(|issue| issue.path == "folder/blocked.md")
+    })
+    .await;
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|value| {
+            value.phase == SyncPhase::Watching
+                && value.conflicts.is_empty()
+                && fs::read_to_string(&file).is_ok_and(|text| text.contains(body))
+        }),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
+    let actual = status.borrow().clone();
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+    assert!(resumed, "pending publication did not resume: {actual:?}");
+    assert_eq!(disk_id(&file), Some(note));
+}

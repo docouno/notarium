@@ -21,7 +21,7 @@ use super::{PAGE, VaultError, Worker};
 use crate::{
     carrier::{self, NoteCarrier},
     filesystem::{EntryKind, FileStamp, ObservedFile, path_error},
-    journal::ConflictReason,
+    journal::{Action, ConflictReason, PublishPurpose},
     paths::{PathUse, digest, file_identity, file_stamp, is_note, path_use, same_file, vault_path},
     publication::MAX_NOTE_BYTES,
     watch::Dirty,
@@ -197,6 +197,33 @@ impl Worker<'_> {
         handoffs: &[VaultHandoff],
     ) -> Result<(), VaultError> {
         dirty.paths.extend(self.missing_paths.drain());
+        let publications: HashSet<_> = self
+            .pending
+            .iter()
+            .filter_map(|intent| {
+                let Action::Publish(action) = &intent.action else {
+                    return None;
+                };
+                if action.purpose == PublishPurpose::Note
+                    && self
+                        .conflicts
+                        .get(intent.target.to_string_lossy().as_ref())
+                        .is_some_and(|issue| issue.reason == ConflictReason::UnsafePath)
+                    && dirty
+                        .paths
+                        .iter()
+                        .any(|path| intent.target.starts_with(path))
+                {
+                    Some(action.desired.note.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for note in publications {
+            self.check_stop()?;
+            self.materialize(&note).await?;
+        }
         let paths = self.expand(dirty.paths).await?;
         self.reconcile_disk(paths, dirty.renames, handoffs, true)
             .await
@@ -240,22 +267,28 @@ impl Worker<'_> {
                 }
                 result => result,
             };
-            let observed = match read {
-                Ok(Some(observed)) => observed,
-                Ok(None) => {
-                    if let Some(binding) = binding
-                        && binding.path.relative == path.relative
-                    {
-                        missing.push(binding);
+            let observed =
+                match read {
+                    Ok(Some(observed)) => observed,
+                    Ok(None) => {
+                        if let Some(binding) = binding
+                            && binding.path.relative == path.relative
+                        {
+                            missing.push(binding);
+                        } else if self.conflicts.get(&path.relative).is_some_and(|issue| {
+                            issue.reason == ConflictReason::ClaimedPurgedIdentity
+                        }) {
+                            self.clear_conflict(&relative)?;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                Err(error) if path_error(&error) => {
-                    self.conflict(&relative, ConflictReason::UnsafePath, None)?;
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
+                    Err(error) if path_error(&error) => {
+                        self.inventory_incomplete = true;
+                        self.conflict(&relative, ConflictReason::UnsafePath, None)?;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
             if let Some(previous) = spelling.insert(path.key.clone(), relative.clone()) {
                 self.conflict(&previous, ConflictReason::NameCollision, None)?;
                 self.conflict(&relative, ConflictReason::NameCollision, None)?;
@@ -269,9 +302,6 @@ impl Worker<'_> {
             if let Some(old) = &renamed_alias {
                 // Seeing an ambiguous spelling must not trash the bound note.
                 protected.insert(old.note.clone());
-            }
-            if self.blocks_ordinary_input(&relative) {
-                continue;
             }
             if let Some(binding) = &binding
                 && same_file(&binding.file, &observed.stamp)
@@ -289,6 +319,15 @@ impl Worker<'_> {
             let carrier = match self.inspect_disk(&observed) {
                 Ok(carrier) => carrier,
                 Err(_) => {
+                    if handoffs.iter().any(|handoff| {
+                        handoff.new_note.is_none()
+                            && (handoff.observation.path.key == path.key
+                                || handoff.observation.file.identity
+                                    == file_identity(&observed.stamp.identity)
+                                || handoff.observation.file.digest == observed.stamp.digest)
+                    }) {
+                        self.inventory_incomplete = true;
+                    }
                     self.conflict(&relative, ConflictReason::InvalidCarrier, None)?;
                     continue;
                 }
@@ -297,6 +336,9 @@ impl Worker<'_> {
                 .filter_handoffs(&relative, &observed.stamp, &carrier, handoffs)
                 .await?
             {
+                continue;
+            }
+            if self.blocks_ordinary_input(&relative) {
                 continue;
             }
             let source = if let Some(old) = renamed_alias {
@@ -473,6 +515,7 @@ impl Worker<'_> {
             Ok(Some(observed)) => observed,
             Ok(None) => return Ok(None),
             Err(error) if path_error(&error) => {
+                self.inventory_incomplete = true;
                 self.conflict(&candidate.relative, ConflictReason::UnsafePath, None)?;
                 return Ok(None);
             }

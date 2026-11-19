@@ -460,7 +460,15 @@ impl<'a> Worker<'a> {
             && dirty.paths.iter().any(|path| {
                 self.conflicts
                     .get(path.to_string_lossy().as_ref())
-                    .is_some_and(|issue| issue.reason == ConflictReason::UnsafePath)
+                    .is_some_and(|issue| {
+                        matches!(
+                            issue.reason,
+                            ConflictReason::UnsafePath | ConflictReason::ClaimedPurgedIdentity
+                        )
+                    })
+                    || self.captures.values().any(|capture| {
+                        capture.target.starts_with(path) || capture.slot.starts_with(path)
+                    })
             });
         // An installation of the native watch needs its own inventory cut.
         let restore_coverage =
@@ -561,6 +569,10 @@ impl<'a> Worker<'a> {
             .into_iter()
             .filter(|handoff| handoff.new_note.is_none())
         {
+            if self.holds_shared_purge_capture(&handoff) {
+                self.inventory_incomplete = true;
+                continue;
+            }
             self.store
                 .complete_vault_handoff(self.config.context.clone(), &self.binding, handoff, None)
                 .await?;

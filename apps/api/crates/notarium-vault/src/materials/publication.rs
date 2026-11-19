@@ -237,10 +237,10 @@ impl ReservedMaterials {
         let targets: Vec<_> = self.records.keys().cloned().collect();
         for target in targets {
             let record = self.record(&target);
-            if record.pending.is_some() {
-                if let Err(error) = self.recover_record(vault, record, false) {
-                    self.flag_path_error(&target, error)?;
-                }
+            if record.pending.is_some()
+                && let Err(error) = self.recover_record(vault, record, false)
+            {
+                self.flag_path_error(&target, error)?;
             }
         }
         Ok(())
@@ -788,6 +788,14 @@ fn nested_capture(path: &Path, package_slot: &Path) -> io::Result<PathBuf> {
 
 type RetainedCaptures = Vec<(PathBuf, Option<PathBuf>)>;
 
+fn shared_slot_present(vault: &VaultDir, slot: &Path) -> io::Result<bool> {
+    match vault.entry_kind_exact(slot) {
+        Ok(kind) => Ok(kind.is_some()),
+        Err(error) if path_error(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn retire(vault: &VaultDir, slot: &Path, artifact: &Artifact) -> io::Result<RetainedCaptures> {
     let mut retained = Vec::new();
     match artifact {
@@ -799,12 +807,14 @@ fn retire(vault: &VaultDir, slot: &Path, artifact: &Artifact) -> io::Result<Reta
                     CaptureCleanup::Removed => {}
                     CaptureCleanup::Absent => retained.push((slot.to_owned(), None)),
                     CaptureCleanup::Retained { path } => {
-                        retained.push((slot.to_owned(), Some(path)));
+                        let known = path != vault.path_for_watcher().join(slot)
+                            || shared_slot_present(vault, slot)?;
+                        retained.push((slot.to_owned(), known.then_some(path)));
                     }
                 }
             }
             let shared = vault.path_for_watcher().join(slot);
-            if vault.entry_kind(slot)?.is_some()
+            if shared_slot_present(vault, slot)?
                 && !retained
                     .iter()
                     .any(|(_, path)| path.as_ref() == Some(&shared))
@@ -844,15 +854,11 @@ fn retire_tree(
     if archive == shared {
         // A busy capture can stay at the shared name or move with its parent.
         // No retirement step may delete anything under this name.
-        let known = match vault.entry_kind_exact(slot) {
-            Ok(kind) => kind.is_some(),
-            Err(error) if path_error(&error) => false,
-            Err(error) => return Err(error),
-        };
+        let known = shared_slot_present(vault, slot)?;
         retained.push((slot.to_owned(), known.then_some(archive)));
         return Ok(());
     }
-    if vault.entry_kind(slot)?.is_some() {
+    if shared_slot_present(vault, slot)? {
         retained.push((slot.to_owned(), Some(shared)));
     }
     // Darwin cannot establish the writer exclusion needed for retirement.
