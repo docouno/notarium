@@ -42,10 +42,14 @@ pub struct PrincipalInfo {
     pub principal: PrincipalId,
     pub kind: PrincipalKind,
     pub grant: GrantId,
+    pub account_revision: ControlRevision,
+    pub personal_space: Option<SpaceId>,
+    pub has_completion_provider: bool,
 }
 #[derive(Clone, Debug)]
 pub struct AccessibleSpace {
     pub space: Space,
+    pub slug: String,
     pub role: SpaceRole,
     pub history: HistoryScope,
 }
@@ -53,6 +57,7 @@ pub struct AccessibleSpace {
 pub struct ProjectInfo {
     pub folder: FolderRef,
     pub name: String,
+    pub project_slug: String,
 }
 #[derive(Clone, Debug)]
 pub struct AccountMutation<T> {
@@ -129,6 +134,7 @@ impl AbilityRef {
 /// Maximum number of auxiliary resource names in a published ability descriptor.
 pub const MAX_ABILITY_AUX_FILES: usize = 256;
 pub const MAX_ABILITY_AUX_PATH_BYTES: usize = 1024;
+pub const MAX_ATTACHED_SKILLS: usize = 32;
 
 #[derive(Clone, Debug)]
 pub struct AbilityDescriptor {
@@ -138,8 +144,10 @@ pub struct AbilityDescriptor {
     pub enabled: bool,
     pub healthy: bool,
     pub lifecycle: Lifecycle,
-    pub entrypoint: NoteRef,
+    /// The canonical entrypoint of an owned package. Built-ins have no note.
+    pub entrypoint: Option<NoteRef>,
     pub auxiliary_files: Vec<String>,
+    pub attached_skills: Vec<AbilityRef>,
 }
 #[derive(Clone, Debug)]
 pub struct AbilityQuery {
@@ -175,6 +183,14 @@ pub enum AbilitySelection {
 pub enum AbilityProjects {
     All,
     Selected(Vec<FolderRef>),
+}
+#[derive(Clone, Debug)]
+pub struct AbilityInspection {
+    pub descriptor: AbilityDescriptor,
+    pub availability: AbilityProjects,
+    pub binding_enabled: bool,
+    pub preference_enabled: bool,
+    pub binding_revision: ControlRevision,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityBindingUpdate {
@@ -310,6 +326,7 @@ pub struct ProviderSelection {
     pub provider: ProviderResourceId,
     pub model: ModelProfileId,
     pub project: Option<FolderRef>,
+    pub project_only: Option<FolderRef>,
     pub policy: ProviderPolicy,
 }
 #[derive(Clone, Debug)]
@@ -322,6 +339,8 @@ pub struct CompletionBudget {
 pub struct CompletionRequest {
     pub intent: CommandKey,
     pub selection: ProviderSelection,
+    /// Project context for sources outside the primary history.
+    pub secondary_projects: Vec<FolderRef>,
     pub messages: Vec<CompletionMessage>,
     pub tools: Vec<ProviderToolDefinition>,
     pub budget: CompletionBudget,
@@ -346,6 +365,9 @@ impl std::fmt::Debug for CompletionEvent {
 
 pub trait ControlPort: Send + Sync {
     fn resolve_auth(&self, ctx: PreAuthContext) -> PortFuture<'_, EngineAuthContext>;
+    /// Refreshes a previously verified credential and intersects its current
+    /// authority with the original delegation, project pin and branch taint.
+    fn revalidate_auth(&self, ctx: AccountContext) -> PortFuture<'_, EngineAuthContext>;
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo>;
     fn list_spaces(
         &self,
@@ -422,6 +444,11 @@ pub trait ControlPort: Send + Sync {
         reference: AbilityRef,
         project: Option<FolderRef>,
     ) -> PortFuture<'_, AbilityDescriptor>;
+    fn inspect_ability(
+        &self,
+        ctx: AccountContext,
+        identity: AbilityIdentity,
+    ) -> PortFuture<'_, AbilityInspection>;
     fn update_ability_binding(
         &self,
         ctx: AccountContext,
@@ -449,11 +476,22 @@ pub trait ControlPort: Send + Sync {
         target: MemoryTarget,
         category: String,
     ) -> PortFuture<'_, ResolvedMemoryTarget>;
+    fn inspect_memory_target(
+        &self,
+        ctx: AccountContext,
+        target: MemoryTarget,
+        category: String,
+    ) -> PortFuture<'_, MemoryTargetSnapshot>;
     fn create_schedule(
         &self,
         ctx: AccountContext,
         request: AccountMutation<CreateSchedule>,
     ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
+    fn schedule_ability_candidate(
+        &self,
+        ctx: AccountContext,
+        selection: ScheduleAbilitySelection,
+    ) -> PortFuture<'_, ScheduleAbilityCandidate>;
     fn get_schedule(
         &self,
         ctx: SpaceContext,
@@ -480,6 +518,12 @@ pub trait ControlPort: Send + Sync {
         now: Timestamp,
         page: ControlPageRequest,
     ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
+    fn list_expired_schedule_runs(
+        &self,
+        ctx: MaintenanceContext,
+        now: Timestamp,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
     fn get_schedule_run(
         &self,
         ctx: ScheduleRunContext,

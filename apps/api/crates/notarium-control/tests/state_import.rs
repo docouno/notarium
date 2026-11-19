@@ -64,6 +64,7 @@ async fn state_import(pg: bool) {
     f.catalog.project_entries.lock().unwrap().insert(
         (space.clone(), project.folder_id.clone()),
         ProjectInfo {
+            project_slug: "project".into(),
             folder: project.clone(),
             name: "Imported project".into(),
         },

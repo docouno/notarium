@@ -46,6 +46,7 @@ async fn postgres_rollback_deadline_covers_safe_point_pool_and_commit_ack() {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: sample_note_id(76),
                     parent: None,
                     slug: "sample".into(),
@@ -246,6 +247,7 @@ async fn postgres_read_admission_statements_and_snapshot_have_distinct_deadlines
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "timing".into(),

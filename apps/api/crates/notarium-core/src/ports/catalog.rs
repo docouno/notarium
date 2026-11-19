@@ -1,10 +1,12 @@
 //! Metadata-only canonical ownership consumed by control. No document bodies or SQL.
 use super::{PortFuture, context::*, control::*, types::*};
+use crate::classes::CanonicalMetadataContent;
 use crate::{auth::*, ids::*, model::*, receipt::AccountCommandIdentity};
 
 #[derive(Clone, Debug)]
 pub struct CatalogSpace {
     pub space: Space,
+    pub slug: String,
     pub history: HistoryScope,
     pub last_seq: SpaceSeq,
 }
@@ -25,10 +27,23 @@ pub struct CatalogFolder {
 }
 
 #[derive(Clone, Debug)]
+pub enum CatalogDisclosure {
+    Folder(FolderRef),
+    Space(HistoryScope),
+}
+
+#[derive(Clone, Debug)]
 pub struct EnsureCatalogSpace {
     pub identity: AccountCommandIdentity,
     pub owner: PrincipalId,
     pub space: CreateSpace,
+}
+
+/// The owner holds these current package tips stable for the lifetime of the
+/// lease. Control uses it through the commit that binds scheduling authority.
+pub trait ScheduleAbilityLease: Send {
+    fn history(&self) -> &HistoryScope;
+    fn abilities(&self) -> &[AbilityDescriptor];
 }
 
 /// Implementations check exact identity/placement and return only admitted metadata.
@@ -39,6 +54,11 @@ pub struct EnsureCatalogSpace {
 /// Control binds the outer cursor to its own current authority.
 /// Cross-owner writes are idempotent on the supplied identity and exact payload.
 pub trait ControlCatalogPort: Send + Sync {
+    fn disclosure(
+        &self,
+        ctx: AccountContext,
+        source: CatalogDisclosure,
+    ) -> PortFuture<'_, CanonicalMetadataContent>;
     fn space(&self, budget: CallBudget, space: SpaceId) -> PortFuture<'_, CatalogSpace>;
     fn projects(
         &self,
@@ -62,6 +82,15 @@ pub trait ControlCatalogPort: Send + Sync {
         ctx: AccountContext,
         identity: AbilityIdentity,
     ) -> PortFuture<'_, AbilityDescriptor>;
+    /// Pin current exact package tips together with the context's single Space
+    /// and its optional project. A missing project or changed or unreadable
+    /// package makes the entire acquisition fail. Empty references still pin
+    /// the scope for a schedule composed entirely of built-in abilities.
+    fn pin_schedule_abilities(
+        &self,
+        ctx: AccountContext,
+        refs: Vec<AbilityRef>,
+    ) -> PortFuture<'_, Box<dyn ScheduleAbilityLease>>;
     fn note(&self, ctx: AccountContext, note: NoteRef) -> PortFuture<'_, CatalogNote>;
     fn folder(&self, ctx: AccountContext, folder: FolderRef) -> PortFuture<'_, CatalogFolder>;
     fn ensure_space(
@@ -82,4 +111,10 @@ pub trait ControlCatalogPort: Send + Sync {
         target: MemoryTarget,
         category: String,
     ) -> PortFuture<'_, ResolvedMemoryTarget>;
+    fn inspect_memory_target(
+        &self,
+        ctx: AccountContext,
+        target: MemoryTarget,
+        category: String,
+    ) -> PortFuture<'_, MemoryTargetSnapshot>;
 }

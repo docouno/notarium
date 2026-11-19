@@ -64,6 +64,63 @@ fn explicit_ids_survive_invalid_edits_and_duplicate_ids_never_execute() {
     assert!(views(&example, true).blocks.is_empty());
 }
 #[test]
+fn view_patch_changes_only_the_named_block_in_nested_markdown() {
+    use notarium_core::{ports::ViewRef, value::YamlValue};
+    use notarium_syntax::frontmatter::FieldEdit;
+
+    let note = NoteId::from_bytes([9; 16]);
+    let key = ViewKey::from_bytes([7; 16]);
+    let other = ViewKey::from_bytes([8; 16]);
+    let suffix = format!(
+        "\r\nKeep this.\r\n\r\n\x60\x60\x60nota\r\nid: {other}\r\ntype: board\r\n\x60\x60\x60\r\n"
+    );
+    let carrier = format!(
+        "Intro.\r\n\r\n> \x60\x60\x60nota\r\n> id: {key}\r\n> type: table # retain\r\n> source: {{tag: old}}\r\n> \x60\x60\x60\r\n{suffix}"
+    );
+    let edits = nota::ViewBlockPatch {
+        source: vec![FieldEdit::Set {
+            key: "tag".into(),
+            value: YamlValue::String("new".into()),
+        }],
+        options: vec![FieldEdit::Set {
+            key: "collapsed".into(),
+            value: YamlValue::Bool(true),
+        }],
+        ..Default::default()
+    };
+    let view = ViewRef {
+        note,
+        key: key.clone(),
+    };
+    let changed = patch::apply(
+        &carrier,
+        &nota::patch_view_block(&carrier, DocClass::UserDoc, &view, &edits).unwrap(),
+    )
+    .unwrap();
+    assert!(changed.starts_with("Intro.\r\n\r\n"));
+    assert!(changed.ends_with(&suffix));
+    assert!(changed.contains("> type: table # retain\r\n"));
+    let parsed = views(&changed, false);
+    let config = parsed.blocks[0].config.as_ref().unwrap();
+    let YamlValue::Mapping(fields) = config else {
+        panic!("expected view mapping")
+    };
+    assert_eq!(parsed.blocks[0].id.as_ref(), Some(&key));
+    assert_eq!(
+        fields["source"],
+        YamlValue::Mapping([("tag".into(), YamlValue::String("new".into()))].into())
+    );
+    assert_eq!(
+        fields["options"],
+        YamlValue::Mapping([("collapsed".into(), YamlValue::Bool(true))].into())
+    );
+    let protected = nota::ViewBlockPatch {
+        common: vec![FieldEdit::Unset { key: "id".into() }],
+        ..Default::default()
+    };
+    assert!(nota::patch_view_block(&changed, DocClass::UserDoc, &view, &protected).is_err());
+}
+#[test]
 fn links_tags_and_headings_share_byte_offsets_but_never_parse_code_or_escapes() {
     let note = NoteId::from_bytes([2; 16]);
     let source = format!(

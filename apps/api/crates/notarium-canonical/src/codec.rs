@@ -14,7 +14,7 @@ use notarium_core::{
         PrincipalId, RevisionId, SpaceSeq, ThreadEntrySeq, ViewKey,
     },
     model::Lifecycle,
-    ports::{ChatThreadKind, GroupKey},
+    ports::{AbilityRef, ChatThreadKind, GroupKey},
     query::{FieldObservation, FieldSchema, FieldValue},
     value::{Timestamp, YamlValue},
 };
@@ -406,6 +406,8 @@ pub enum RevisionMetadataPayload {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NoteRevisionMetadata {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folder_page: bool,
     pub note_id: NoteId,
     pub parent_folder_id: FolderId,
     pub is_root_child: bool,
@@ -461,6 +463,8 @@ pub struct AbilityRevisionMetadata {
     pub lifecycle: Lifecycle,
     pub resources: BTreeMap<String, ContentDigest>,
     pub total_bytes: u64,
+    #[serde(default)]
+    pub attached_skills: Vec<AbilityRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

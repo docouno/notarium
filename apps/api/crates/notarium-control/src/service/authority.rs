@@ -204,6 +204,24 @@ impl ControlService {
         ability_write: bool,
         lock: bool,
     ) -> Result<EngineAuthContext, PortError> {
+        let spaces = self.active_space_grants(tx, user, lock).await?;
+        Ok(EngineAuthContext::for_human(
+            VerifiedHuman::attest(
+                PrincipalId::parse(&user.user_id)?,
+                source,
+                spaces,
+                ability_write,
+            )
+            .with_human_management(human_management)
+            .with_credential(credential),
+        ))
+    }
+    pub(super) async fn active_space_grants(
+        &self,
+        tx: &mut Transaction,
+        user: &UsersRow,
+        lock: bool,
+    ) -> Result<BTreeMap<SpaceId, SpaceGrant>, PortError> {
         if user.disabled_at.is_some() {
             return Err(denied());
         }
@@ -244,16 +262,7 @@ impl ControlService {
                 },
             );
         }
-        Ok(EngineAuthContext::for_human(
-            VerifiedHuman::attest(
-                PrincipalId::parse(&user.user_id)?,
-                source,
-                spaces,
-                ability_write,
-            )
-            .with_human_management(human_management)
-            .with_credential(credential),
-        ))
+        Ok(spaces)
     }
     pub(super) async fn revoke_principal(
         &self,

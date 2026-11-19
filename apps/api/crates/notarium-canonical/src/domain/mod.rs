@@ -4,16 +4,17 @@ use notarium_core::{
     DomainError,
     classes::ClassifiedAbilityResource,
     error::{PortError, ValidationReason},
-    ids::{FolderId, NoteId},
+    ids::{AgentRunId, FolderId, NoteId},
     model::{FolderRef, NoteRef, SnapshotCut},
     ports::{
         AbilityPackageRevision, AcceptBatch, AppendMemory, BatchResult, BoardMoveResult,
-        BoardMutationFactsProvider, BoardPlannerAuthority, ChangeRead, ChangeReadResult, Committed,
-        CreateNote, DeleteDisposition, DeleteNote, EditNote, ExternalObservation,
-        ExternalObservationResult, GetNote, Link, LinkBatch, LiveCollabInterceptor, MintAndPurge,
-        MintAndPurgeResult, MoveBoardCard, MoveFolder, MoveNote, Mutation, NoteCard, NoteRevision,
-        NoteSnapshot, NoteWritePort, PortFuture, PublishAbilityPackage, ReadAbilityResource,
-        RenameFolder, RenameNote, RenameProject, RollbackAgentRun, RollbackResult, SpaceContext,
+        BoardMutationFactsProvider, BoardPlannerAuthority, ChangeRead, ChangeReadResult,
+        ChildFolders, Committed, CreateNote, DeleteDisposition, DeleteNote, EditNote,
+        EnsureFolderPath, ExternalObservation, ExternalObservationResult, FolderSnapshot, GetNote,
+        Link, LinkBatch, LiveCollabInterceptor, MintAndPurge, MintAndPurgeResult, MoveBoardCard,
+        MoveFolder, MoveNote, Mutation, NoteCard, NoteRevision, NoteSnapshot, NoteWritePort,
+        PageLimit, PortFuture, PublishAbilityPackage, ReadAbilityResource, RenameFolder,
+        RenameNote, RenameProject, RollbackAgentRun, RollbackResult, SpaceContext,
     },
 };
 
@@ -24,6 +25,8 @@ use crate::{
 pub mod board;
 pub(crate) mod change_visibility;
 pub mod common;
+pub(crate) mod folder_cover;
+mod folder_paths;
 pub mod folders;
 pub mod notes;
 pub mod packages;
@@ -33,6 +36,14 @@ pub mod rollback;
 pub use common::{RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
 
 impl NoteWritePort for CanonicalStore {
+    fn ensure_folder_path(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<EnsureFolderPath>,
+    ) -> PortFuture<'_, FolderRef> {
+        Box::pin(folder_paths::ensure(self, ctx, request))
+    }
+
     fn create_note(
         &self,
         ctx: SpaceContext,
@@ -182,6 +193,50 @@ impl NoteWritePort for CanonicalStore {
 }
 
 impl CanonicalStore {
+    pub async fn resolve_folder_path(
+        &self,
+        ctx: SpaceContext,
+        base: Option<FolderId>,
+        path: String,
+    ) -> Result<Option<FolderSnapshot>, PortError> {
+        folder_paths::resolve(self, ctx, base, path).await
+    }
+
+    pub async fn list_child_folders(
+        &self,
+        ctx: SpaceContext,
+        base: Option<FolderId>,
+        after: Option<FolderId>,
+        limit: PageLimit,
+    ) -> Result<ChildFolders, PortError> {
+        folder_paths::list_children(self, ctx, base, after, limit).await
+    }
+
+    pub async fn resolve_note_target(
+        &self,
+        ctx: SpaceContext,
+        parent: Option<FolderId>,
+        target: String,
+    ) -> Result<Option<NoteRef>, PortError> {
+        folder_paths::resolve_note(self, ctx, parent, target).await
+    }
+
+    pub async fn space_schema(
+        &self,
+        ctx: SpaceContext,
+    ) -> Result<std::collections::BTreeMap<String, notarium_core::query::FieldSchema>, PortError>
+    {
+        folder_paths::space_schema(self, ctx).await
+    }
+
+    pub async fn prepare_agent_run_rollback(
+        &self,
+        ctx: SpaceContext,
+        run: AgentRunId,
+    ) -> Result<RollbackAgentRun, PortError> {
+        rollback::prepare_agent_run_rollback(self, ctx, run).await
+    }
+
     pub fn room_fences(&self) -> &Arc<RoomFenceTable> {
         &self.inner.room_fences
     }
@@ -261,7 +316,8 @@ impl CanonicalStore {
         ctx: SpaceContext,
         request: ChangeRead,
     ) -> Result<ChangeReadResult, PortError> {
-        self.read_changes(ctx, request).await
+        self.execute_change_read(ChangeCaller::Activity(&ctx), request)
+            .await
     }
 
     pub async fn is_live_visible(

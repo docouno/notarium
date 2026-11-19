@@ -931,114 +931,124 @@ pub(crate) async fn resolve_folder_alias_impl(
 
                 let parent_id = parent.unwrap_or_else(|| space_rec.root_folder_id.clone());
 
-                // 1. Exact active sibling takes priority over any historical alias!
-                let active_sibling: Option<String> = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query_scalar(
-                        "SELECT folder_id FROM folder_heads
-                         WHERE space_id = ? AND parent_folder_id = ? AND slug_fold = ?
-                           AND lifecycle_state = 'active' AND is_root = 0
-                         LIMIT 1",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(parent_id.as_str())
-                    .bind(&slug_fold)
-                    .fetch_optional(&mut **conn)
+                resolve_folder_component_tx(tx, &space_rec, &auth, &parent_id, &slug_fold, true)
                     .await
-                    .map_err(|err| {
-                        internal_not_committed("sqlite_resolve_folder_exact", err.to_string())
-                    })?,
-                    BackendConn::Postgres(conn) => sqlx::query_scalar(
-                        "SELECT folder_id FROM folder_heads
-                         WHERE space_id = $1 AND parent_folder_id = $2 AND slug_fold = $3
-                           AND lifecycle_state = 'active' AND is_root = 0
-                         LIMIT 1",
-                    )
-                    .bind(scope.space_id.as_str())
-                    .bind(parent_id.as_str())
-                    .bind(&slug_fold)
-                    .fetch_optional(&mut **conn)
-                    .await
-                    .map_err(|err| {
-                        crate::runtime::pg_read_error("pg_resolve_folder_exact", err)
-                    })?,
-                };
-
-                if let Some(fid_raw) = active_sibling {
-                    let fid = FolderId::parse(&fid_raw).map_err(|_| {
-                        internal_not_committed("corrupt_folder_id", "invalid folder_id")
-                    })?;
-                    if is_folder_readable_tx(tx, &space_rec.space, &auth, &fid).await? {
-                        return Ok(Some(FolderRef {
-                            space_id: scope.space_id,
-                            folder_id: fid,
-                        }));
-                    }
-                    return Ok(None);
-                }
-
-                // 2. Newest valid active alias target (with cycle/depth guard via ancestry check).
-                let candidates: Vec<String> = match tx {
-                    BackendConn::Sqlite(conn) => {
-                        let rows = sqlx::query(
-                            "SELECT target_folder_id FROM folder_aliases
-                             WHERE space_id = ? AND old_parent_folder_id = ? AND old_slug_fold = ?
-                             ORDER BY created_seq DESC
-                             LIMIT ?",
-                        )
-                        .bind(scope.space_id.as_str())
-                        .bind(parent_id.as_str())
-                        .bind(&slug_fold)
-                        .bind(MAX_FOLDER_DEPTH as i64)
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            internal_not_committed("sqlite_resolve_folder_alias", err.to_string())
-                        })?;
-                        rows.into_iter()
-                            .map(|r| r.get("target_folder_id"))
-                            .collect()
-                    }
-                    BackendConn::Postgres(conn) => {
-                        let rows = sqlx::query(
-                            "SELECT target_folder_id FROM folder_aliases
-                             WHERE space_id = $1 AND old_parent_folder_id = $2 AND old_slug_fold = $3
-                             ORDER BY created_seq DESC
-                             LIMIT $4",
-                        )
-                        .bind(scope.space_id.as_str())
-                        .bind(parent_id.as_str())
-                        .bind(&slug_fold)
-                        .bind(MAX_FOLDER_DEPTH as i64)
-                        .fetch_all(&mut **conn)
-                        .await
-                        .map_err(|err| {
-                            crate::runtime::pg_read_error("pg_resolve_folder_alias", err)
-                        })?;
-                        rows.into_iter()
-                            .map(|r| r.get("target_folder_id"))
-                            .collect()
-                    }
-                };
-
-                let mut seen = BTreeSet::new();
-                for cand_raw in candidates {
-                    if !seen.insert(cand_raw.clone()) {
-                        continue;
-                    }
-                    let fid = FolderId::parse(&cand_raw).map_err(|_| {
-                        internal_not_committed("corrupt_alias_folder_id", "invalid target_folder_id")
-                    })?;
-                    if is_folder_readable_tx(tx, &space_rec.space, &auth, &fid).await? {
-                        return Ok(Some(FolderRef {
-                            space_id: scope.space_id,
-                            folder_id: fid,
-                        }));
-                    }
-                }
-                Ok(None)
             })
         })
         .await
+}
+
+pub(super) async fn resolve_folder_component_tx(
+    tx: &mut BackendConn<'_>,
+    space_rec: &crate::SpaceRecord,
+    auth: &notarium_core::auth::EngineAuthContext,
+    parent_id: &FolderId,
+    slug_fold: &str,
+    aliases: bool,
+) -> Result<Option<FolderRef>, PortError> {
+    let scope = &space_rec.scope;
+    // 1. Exact active sibling takes priority over any historical alias!
+    let active_sibling: Option<String> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT folder_id FROM folder_heads
+             WHERE space_id = ? AND parent_folder_id = ? AND slug_fold = ?
+               AND lifecycle_state = 'active' AND is_root = 0
+             LIMIT 1",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(parent_id.as_str())
+        .bind(slug_fold)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_resolve_folder_exact", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT folder_id FROM folder_heads
+             WHERE space_id = $1 AND parent_folder_id = $2 AND slug_fold = $3
+               AND lifecycle_state = 'active' AND is_root = 0
+             LIMIT 1",
+        )
+        .bind(scope.space_id.as_str())
+        .bind(parent_id.as_str())
+        .bind(slug_fold)
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| crate::runtime::pg_read_error("pg_resolve_folder_exact", err))?,
+    };
+
+    if let Some(fid_raw) = active_sibling {
+        let fid = FolderId::parse(&fid_raw)
+            .map_err(|_| internal_not_committed("corrupt_folder_id", "invalid folder_id"))?;
+        if is_folder_readable_tx(tx, &space_rec.space, auth, &fid).await? {
+            return Ok(Some(FolderRef {
+                space_id: scope.space_id.clone(),
+                folder_id: fid,
+            }));
+        }
+        return Ok(None);
+    }
+
+    if !aliases {
+        return Ok(None);
+    }
+
+    // 2. Newest valid active alias target (with cycle/depth guard via ancestry check).
+    let candidates: Vec<String> = match tx {
+        BackendConn::Sqlite(conn) => {
+            let rows = sqlx::query(
+                "SELECT target_folder_id FROM folder_aliases
+                 WHERE space_id = ? AND old_parent_folder_id = ? AND old_slug_fold = ?
+                 ORDER BY created_seq DESC
+                 LIMIT ?",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(parent_id.as_str())
+            .bind(slug_fold)
+            .bind(MAX_FOLDER_DEPTH as i64)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| {
+                internal_not_committed("sqlite_resolve_folder_alias", err.to_string())
+            })?;
+            rows.into_iter()
+                .map(|r| r.get("target_folder_id"))
+                .collect()
+        }
+        BackendConn::Postgres(conn) => {
+            let rows = sqlx::query(
+                "SELECT target_folder_id FROM folder_aliases
+                 WHERE space_id = $1 AND old_parent_folder_id = $2 AND old_slug_fold = $3
+                 ORDER BY created_seq DESC
+                 LIMIT $4",
+            )
+            .bind(scope.space_id.as_str())
+            .bind(parent_id.as_str())
+            .bind(slug_fold)
+            .bind(MAX_FOLDER_DEPTH as i64)
+            .fetch_all(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_resolve_folder_alias", err))?;
+            rows.into_iter()
+                .map(|r| r.get("target_folder_id"))
+                .collect()
+        }
+    };
+
+    let mut seen = BTreeSet::new();
+    for cand_raw in candidates {
+        if !seen.insert(cand_raw.clone()) {
+            continue;
+        }
+        let fid = FolderId::parse(&cand_raw).map_err(|_| {
+            internal_not_committed("corrupt_alias_folder_id", "invalid target_folder_id")
+        })?;
+        if is_folder_readable_tx(tx, &space_rec.space, auth, &fid).await? {
+            return Ok(Some(FolderRef {
+                space_id: scope.space_id.clone(),
+                folder_id: fid,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) async fn resolve_note_alias_impl(

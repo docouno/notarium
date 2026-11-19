@@ -17,7 +17,7 @@ use notarium_control::{
 };
 use notarium_core::{
     DomainError,
-    auth::SecretString,
+    auth::{Cap, SecretString},
     error::{CommitEffect, PortError},
     ids::*,
     ports::{control::*, *},
@@ -186,6 +186,106 @@ async fn issue(
         .await
         .unwrap()
 }
+
+async fn oauth_authoring(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(pg, "oauth_authoring").await;
+    let (control, oauth, session) = service(&mut fixture).await;
+    let actor = context(&control, session.token.expose()).await;
+    let client = oauth
+        .register_client(
+            budget(),
+            RegisterOAuthClient {
+                client_name: "Authoring client".into(),
+                redirect_uris: vec!["http://127.0.0.1:1234/callback".into()],
+            },
+        )
+        .await
+        .unwrap();
+    let id = &client.client_id;
+    let mut request = authorization(id, true);
+    request.scope = "write offline_access mcp:ability-write".into();
+    request.selected_spaces = Some(vec![session.account.personal_space.clone().unwrap()]);
+    let prepared = oauth
+        .prepare_authorization(actor.clone(), request)
+        .await
+        .unwrap();
+    assert!(prepared.scope.ability_write);
+    let code = oauth
+        .approve_authorization(
+            actor,
+            OAuthConsent::attest_checked(prepared.intent, secret(BROWSER)),
+        )
+        .await
+        .unwrap();
+    let tokens = oauth
+        .exchange_code(budget(), exchange(id, code.code.expose()))
+        .await
+        .unwrap();
+    let rotated = oauth
+        .refresh(
+            budget(),
+            refresh(id, tokens.refresh_token.as_ref().unwrap().expose()),
+        )
+        .await
+        .unwrap();
+    for issued in [&tokens, &rotated] {
+        assert!(issued.scope.ability_write);
+        let auth = control
+            .resolve(evidence(
+                AuthEvidenceKind::OAuth,
+                issued.access_token.expose(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(auth.bearer_scope(), Some(BearerScope::Write));
+        assert!(auth.has_cap(Cap::AbilityWrite));
+        assert!(!auth.human_management());
+    }
+    fixture
+        .observer
+        .execute("UPDATE oauth_grants SET ability_write=0")
+        .await;
+    let auth = control
+        .resolve(evidence(
+            AuthEvidenceKind::OAuth,
+            rotated.access_token.expose(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(auth.bearer_scope(), Some(BearerScope::Write));
+    assert!(
+        !auth.has_cap(Cap::AbilityWrite),
+        "access token cannot outlive consent to author"
+    );
+    fixture
+        .observer
+        .execute("UPDATE oauth_refresh_families SET revoked_at=1")
+        .await;
+    assert!(matches!(
+        control
+            .resolve(evidence(
+                AuthEvidenceKind::OAuth,
+                rotated.access_token.expose()
+            ))
+            .await,
+        Err(PortError::Domain(DomainError::AuthenticationFailed))
+    ));
+    drop(oauth);
+    drop(control);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_oauth_opt_in_survives_refresh_and_respects_live_grant() {
+    oauth_authoring(false).await;
+}
+
+#[tokio::test]
+async fn postgres_oauth_opt_in_survives_refresh_and_respects_live_grant() {
+    oauth_authoring(true).await;
+}
+
 async fn lifecycle(pg: bool) {
     let _serial = AUTH_TEST_LOCK.lock().await;
     let mut f = Fixture::new(pg, "oauth_lifecycle").await;
@@ -624,6 +724,7 @@ async fn both_databases_imported_native_tokens_keep_their_verifiers_and_expiry()
                 last_seen_at: Some(now),
             },
             TargetRecord::OauthGrants {
+                ability_write: 0,
                 grant_id: grant.clone(),
                 user_id: owner.account.id.to_string(),
                 client_id: "imported-client".into(),
@@ -653,6 +754,7 @@ async fn both_databases_imported_native_tokens_keep_their_verifiers_and_expiry()
                 rotated_to: None,
             },
             TargetRecord::OauthAccessTokens {
+                ability_write: 0,
                 token_id: id("access"),
                 token_hash: digest("access"),
                 grant_id: grant,

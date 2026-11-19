@@ -76,75 +76,13 @@ impl ControlService {
         target: MemoryTarget,
         category: String,
     ) -> Result<ResolvedMemoryTarget, PortError> {
-        if category.is_empty()
-            || category.len() > 64
-            || !category.as_bytes()[0].is_ascii_lowercase()
-            || !category
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        {
-            return Err(invalid(ValidationReason::InvalidQuery));
-        }
         let budget = OperationBudget::new(ctx.budget.clone());
-        let (mut rtx, auth) = self
-            .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
-            .await?;
-        let (current, personal_space) = budget
-            .run(
-                async {
-                    let personal = if let MemoryTarget::User { owner } = &target {
-                        if owner != auth.principal() {
-                            return Err(DomainError::ResourceNotFound.into());
-                        }
-                        let user =
-                            super::authority::user_read(rtx.inner_mut(), owner.as_str()).await?;
-                        Some(SpaceId::parse(
-                            user.personal_space_id
-                                .as_deref()
-                                .ok_or(DomainError::ResourceNotFound)?,
-                        )?)
-                    } else {
-                        None
-                    };
-                    Ok((
-                        AccountContext::new(auth, budget.context(ctx.budget.request.clone())),
-                        personal,
-                    ))
-                },
-                CommitEffect::NotCommitted,
-            )
-            .await?;
-        budget
-            .run(rtx.rollback(), CommitEffect::NotCommitted)
+        let (current, space) = self
+            .memory_authority(&ctx, &budget, &target, &category)
             .await?;
         budget
             .run(
                 async {
-                    let space = match &target {
-                        MemoryTarget::User { .. } => {
-                            personal_space.ok_or(DomainError::ResourceNotFound)?
-                        }
-                        MemoryTarget::Project { folder } => {
-                            self.catalog_project(&current, folder).await?;
-                            folder.space_id.clone()
-                        }
-                    };
-                    let grant = current
-                        .auth()
-                        .spaces()
-                        .get(&space)
-                        .ok_or(DomainError::ResourceNotFound)?;
-                    if (matches!(&target, MemoryTarget::User { .. })
-                        && grant.project_root.is_some())
-                        || grant.role == notarium_core::auth::SpaceRole::Viewer
-                        || !grant
-                            .write_classes
-                            .contains(&notarium_core::classes::DocClass::AgentMemory)
-                        || current.auth().taint().is_tainted()
-                    {
-                        return Err(DomainError::SpaceReadOnly.into());
-                    }
-                    self.catalog_space(&current, &space).await?;
                     let value = self
                         .catalog
                         .resolve_or_ensure_memory_target(
@@ -155,7 +93,7 @@ impl ControlService {
                         .await?;
                     if value.target != target
                         || value.category != category
-                        || value.note.space_id != space
+                        || value.note.space_id != space.space.id
                     {
                         return Err(invalid(ValidationReason::InvalidState));
                     }
@@ -172,12 +110,119 @@ impl ControlService {
                         return Err(invalid(ValidationReason::InvalidState));
                     }
                     Ok(value)
-                    // The canonical owner may commit idempotent creation before response loss.
                 },
+                // The canonical owner may create the missing slot before response loss.
                 CommitEffect::Unknown,
             )
             .await
     }
+
+    pub async fn inspect_memory_target(
+        &self,
+        ctx: AccountContext,
+        target: MemoryTarget,
+        category: String,
+    ) -> Result<MemoryTargetSnapshot, PortError> {
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let (current, space) = self
+            .memory_authority(&ctx, &budget, &target, &category)
+            .await?;
+        let value = budget
+            .run(
+                self.catalog
+                    .inspect_memory_target(current, target.clone(), category.clone()),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        space.history.check(&value.scope)?;
+        if value.resolved.target != target
+            || value.resolved.category != category
+            || value.resolved.note.space_id != space.space.id
+            || matches!(&target, MemoryTarget::Project { folder } if folder.folder_id != value.parent)
+        {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        Ok(value)
+    }
+
+    async fn memory_authority(
+        &self,
+        ctx: &AccountContext,
+        budget: &OperationBudget,
+        target: &MemoryTarget,
+        category: &str,
+    ) -> Result<(AccountContext, CatalogSpace), PortError> {
+        if category.is_empty()
+            || category.len() > 64
+            || !category.as_bytes()[0].is_ascii_lowercase()
+            || !category
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(invalid(ValidationReason::InvalidQuery));
+        }
+        let (mut rtx, auth) = self
+            .open_revalidated_read(budget, &ctx.budget.request, ctx.auth())
+            .await?;
+        let personal = budget
+            .run(
+                async {
+                    let MemoryTarget::User { owner } = target else {
+                        return Ok(None);
+                    };
+                    if owner != auth.principal() {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    let user = super::authority::user_read(rtx.inner_mut(), owner.as_str()).await?;
+                    Ok(Some(SpaceId::parse(
+                        user.personal_space_id
+                            .as_deref()
+                            .ok_or(DomainError::ResourceNotFound)?,
+                    )?))
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await;
+        budget
+            .run(rtx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        let personal = personal?;
+        let current = AccountContext::new(auth, budget.context(ctx.budget.request.clone()));
+        let space = match target {
+            MemoryTarget::User { .. } => personal.ok_or(DomainError::ResourceNotFound)?,
+            MemoryTarget::Project { folder } => {
+                budget
+                    .run(
+                        self.catalog_project(&current, folder),
+                        CommitEffect::NotCommitted,
+                    )
+                    .await?;
+                folder.space_id.clone()
+            }
+        };
+        let grant = current
+            .auth()
+            .spaces()
+            .get(&space)
+            .ok_or(DomainError::ResourceNotFound)?;
+        if (matches!(target, MemoryTarget::User { .. }) && grant.project_root.is_some())
+            || grant.role == notarium_core::auth::SpaceRole::Viewer
+            || !grant
+                .write_classes
+                .contains(&notarium_core::classes::DocClass::AgentMemory)
+            || current.auth().taint().is_tainted()
+        {
+            return Err(DomainError::SpaceReadOnly.into());
+        }
+        let catalog = budget
+            .run(
+                self.catalog_space(&current, &space),
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        Ok((current, catalog))
+    }
+
     pub(super) async fn current_account(
         &self,
         ctx: &AccountContext,

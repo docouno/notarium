@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use notarium_core::{
     DomainError,
-    classes::{ClassifiedAbilityResource, DocClass},
+    classes::{AbilityKind, ClassifiedAbilityResource, DocClass},
     error::{PortError, ValidationReason},
     ids::{AbilityId, ContentDigest, RevisionId},
     model::{AbilityResourceName, AbilityResourceRef, Lifecycle, PathTarget},
@@ -183,12 +183,26 @@ pub(crate) async fn publish_ability_package_impl(
     let deadline =
         crate::domain::common::CommandDeadline::start(&ctx.budget, "publish_ability_package");
     validate_mutation_identity(&ctx, &request.identity)?;
-    // Cap::AbilityWrite + DirectHuman is strictly mandatory!
     ctx.auth().authorize_ability_mutation()?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
 
     if request.input.files.len() > MAX_ABILITY_AUX_FILES {
         return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
+    }
+    let attached_skills = request.input.attached_skills;
+    if attached_skills.len() > notarium_core::ports::MAX_ATTACHED_SKILLS
+        || request.input.kind == AbilityKind::Skill && !attached_skills.is_empty()
+    {
+        return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+    }
+    for (index, skill) in attached_skills.iter().enumerate() {
+        if request.input.ability == skill.id
+            || attached_skills[..index]
+                .iter()
+                .any(|other| other.identity() == skill.identity())
+        {
+            return Err(DomainError::validation(ValidationReason::DuplicateKey).into());
+        }
     }
 
     let mut seen_paths = BTreeSet::new();
@@ -234,6 +248,10 @@ pub(crate) async fn publish_ability_package_impl(
         fp_hasher.update(&[0]);
         fp_hasher.update(path.as_bytes());
         fp_hasher.update(digest.as_bytes());
+    }
+    if !attached_skills.is_empty() {
+        fp_hasher.update(b"\0attached-skills-v1\0");
+        fp_hasher.update(&crate::codec::encode_msgpack(&attached_skills)?);
     }
     let idemp = derive_command_identity_spec(
         &request.identity,
@@ -508,6 +526,7 @@ pub(crate) async fn publish_ability_package_impl(
                         lifecycle: Lifecycle::Active,
                         resources: manifest.clone(),
                         total_bytes: entry_head.byte_size.saturating_add(aux_raw_bytes),
+                        attached_skills,
                     },
                 ))
                 .encode()?;
@@ -633,7 +652,7 @@ pub(crate) async fn read_ability_resource_impl(
     let content = String::from_utf8(raw_bytes)
         .map_err(|err| internal_not_committed("ability_resource_utf8", err.to_string()))?;
 
-    let (checked_digest, facts) = lookup().await?;
+    let (checked_digest, provenance) = lookup().await?;
     if checked_digest != digest {
         return Err(DomainError::validation(ValidationReason::InvalidDigest).into());
     }
@@ -644,7 +663,7 @@ pub(crate) async fn read_ability_resource_impl(
             package_revision: request.package_revision,
             resource: request.resource,
         },
-        facts,
+        provenance,
         Lifecycle::Active,
         content,
         digest,

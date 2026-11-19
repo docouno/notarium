@@ -202,16 +202,67 @@ impl Job {
     }
     pub fn egress(&self, parts: &[ProviderMessage]) -> Result<ProviderEgressRequest, PortError> {
         let mut origins = BTreeMap::new();
+        let mut projects = BTreeMap::new();
+        let primary = self
+            .scope
+            .clone()
+            .ok_or_else(|| invalid(ValidationReason::ScopeMismatch))?;
+        let mut add_project = |project: &FolderRef| {
+            if project.space_id != primary.space_id {
+                projects.insert(
+                    (project.space_id.clone(), project.folder_id.clone()),
+                    project.clone(),
+                );
+            }
+        };
+        if let Request::Completion(request) = &self.request {
+            if request.secondary_projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS
+                || request
+                    .secondary_projects
+                    .iter()
+                    .any(|project| project.space_id == primary.space_id)
+            {
+                return Err(invalid(ValidationReason::InvalidLimit));
+            }
+            for project in &request.secondary_projects {
+                add_project(project);
+            }
+        }
         for part in parts {
             let origin = part.origin();
+            if let Some(project) = origin.owning_project() {
+                add_project(project);
+            }
             origins.insert(json(&origin)?, origin);
+            if let Some(proof) = part.provenance() {
+                if proof.origins.len() > MAX_PROVIDER_ORIGINS
+                    || proof.projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS
+                {
+                    return Err(invalid(ValidationReason::InvalidLimit));
+                }
+                for origin in &proof.origins {
+                    if let Some(project) = origin.owning_project() {
+                        add_project(project);
+                    }
+                    origins.insert(json(origin)?, origin.clone());
+                    if origins.len() > MAX_PROVIDER_ORIGINS {
+                        return Err(invalid(ValidationReason::InvalidLimit));
+                    }
+                }
+                for project in &proof.projects {
+                    add_project(project);
+                }
+            }
         }
-        if origins.len() > 4096 {
+        if origins.len() > MAX_PROVIDER_ORIGINS || projects.len() > MAX_PROVIDER_SECONDARY_PROJECTS
+        {
             return Err(invalid(ValidationReason::InvalidLimit));
         }
         Ok(ProviderEgressRequest {
             origins: origins.into_values().collect(),
+            primary,
             project: self.project().cloned(),
+            secondary_projects: projects.into_values().collect(),
         })
     }
     pub fn encode(&self, snapshot: &Snapshot) -> Result<Vec<u8>, PortError> {

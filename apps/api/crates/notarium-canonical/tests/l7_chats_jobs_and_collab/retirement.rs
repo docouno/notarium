@@ -91,6 +91,9 @@ async fn held_redactions(
                     &scope,
                     &actor,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        proposed_diff: None,
                         thread: thread.clone(),
                         parent: *leaves.last().unwrap(),
                         kind: ChatEntryKind::Human,
@@ -336,6 +339,9 @@ async fn committed_redaction_and_replay_return_while_local_stager_holds_bytes() 
                 &scope,
                 &actor,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -428,6 +434,15 @@ async fn retrying_owner_keeps_its_upload_and_cleans_a_dropped_caller_executor() 
         )
         .await
         .unwrap();
+    claim_run(
+        &store,
+        owner_ctx(&scope, actor.clone()),
+        ChatAudience::Personal,
+        &thread,
+        &sample_run_id(0xdf),
+        ThreadEntrySeq::ZERO,
+    )
+    .await;
     for lose_caller in [false, true] {
         let text = format!("published by a short-lived executor {lose_caller} ").repeat(24);
         let prepared = store.prepare_blob(text.as_bytes()).unwrap();

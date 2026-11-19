@@ -153,6 +153,7 @@ pub(super) async fn check(
                 scope,
                 actor,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     class: DocClass::UserDoc,
                     parent: None,
@@ -359,6 +360,7 @@ async fn check_move_pin(store: &CanonicalStore, ctx: &SpaceContext, room: &Pause
         scope,
         actor,
         BatchItem::Create(CreateNote {
+            folder_page: false,
             note: note.clone(),
             parent: None,
             slug: "before-room-move".into(),
@@ -729,6 +731,7 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
                 scope,
                 actor,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "room-carrier-command".into(),
@@ -1036,6 +1039,7 @@ async fn committed_room_observation_survives_process_exit() {
                 &scope,
                 &actor,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "crash-room-note".into(),

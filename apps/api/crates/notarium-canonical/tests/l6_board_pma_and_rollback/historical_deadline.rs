@@ -38,6 +38,7 @@ fn sqlite_note_reads_and_edits_preserve_the_budget_across_cas_and_writer_ack() {
                         &scope,
                         &owner,
                         CreateNote {
+                            folder_page: false,
                             note: note.clone(),
                             parent: None,
                             slug: "before".into(),
@@ -87,6 +88,7 @@ fn sqlite_note_reads_and_edits_preserve_the_budget_across_cas_and_writer_ack() {
             ).unwrap();
             let edit = next_mutation(&scope, &owner, EditNote { note: note.clone(), plan });
             let link = next_mutation(&scope, &owner, Link {
+                target_title: None,
                 source: note.clone(), target: LinkTarget::Note(note.clone()), relation: "related".into()
             });
             let cut = SnapshotCut {

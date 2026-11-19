@@ -304,6 +304,9 @@ fn create_note_identity(
         hash.update(&[0]);
     }
     hash.update(digest.as_bytes());
+    if input.folder_page {
+        hash.update(b"folder-page");
+    }
     derive_command_identity_spec(identity, "create_note", hash.finalize().as_bytes()).for_create(
         ctx.auth(),
         &input.note,
@@ -427,7 +430,7 @@ pub(crate) async fn create_note_impl(
     let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
-    let slug_fold = normalize_slug_key(&request.input.slug)?;
+    let slug_fold = super::folder_cover::validate_create(&request.input)?;
     if request.input.class == DocClass::Skill {
         ctx.auth().authorize_ability_mutation()?;
     }
@@ -474,7 +477,7 @@ pub(crate) async fn create_note_impl(
         &space_rec.root_folder_id,
         info.prepared_blob.digest,
     );
-    let (intent, fast_plan) = if store.is_sqlite_local() {
+    let (intent, fast_plan) = if store.is_sqlite_local() && !request.input.folder_page {
         let (intent, plan) = crate::sqlite_fast::build_create_note_fast_intent(
             &space_rec.scope,
             space_rec.active_epoch,
@@ -568,6 +571,19 @@ pub(crate) fn build_create_note_intent(
                 )
                 .await?;
                 auth.authorize_direct_write(&facts, &facts)?;
+                if input.folder_page {
+                    let class = super::folders::folder_mutation_class(&auth, &scope_cl.space_id)?;
+                    let (folder_facts, _) = build_resource_facts_tx(
+                        tx,
+                        &live_space.space,
+                        &parent_id,
+                        class,
+                        None,
+                        true,
+                    )
+                    .await?;
+                    auth.authorize_direct_write(&folder_facts, &folder_facts)?;
+                }
 
                 if let Some(current) = super::common::authorized_collision_revision_tx(
                     tx,
@@ -707,9 +723,24 @@ pub(crate) fn build_create_note_intent(
                 };
 
                 let run_opt = extract_agent_run_from_auth(&auth);
+                if input.folder_page {
+                    super::folder_cover::assign(
+                        tx,
+                        &scope_cl,
+                        &parent_id,
+                        Some(&input.note),
+                        seq,
+                        seq,
+                        auth.principal(),
+                        run_opt.as_ref(),
+                        now_ts,
+                    )
+                    .await?;
+                }
                 let changed_fields = changed_note_fields(&EvaluatedFields::new(), &eval_fields);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
+                        folder_page: input.folder_page,
                         note_id: input.note.clone(),
                         parent_folder_id: parent_id,
                         is_root_child: anc.is_root_child,
@@ -1359,6 +1390,12 @@ pub(crate) fn build_carrier_replacement_intent(
 
                 let (final_slug, final_slug_fold) = match &explicit_slug_override {
                     Some((s, sf)) => {
+                        super::folder_cover::validate_slug_change(
+                            &head.slug_fold,
+                            sf,
+                            s,
+                            anc.cover_note.as_ref() == Some(&note_id),
+                        )?;
                         if sf != &head.slug_fold
                             && active_note_sibling_exists_tx(
                                 tx,
@@ -1522,6 +1559,7 @@ pub(crate) fn build_carrier_replacement_intent(
                         .await?;
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
+                        folder_page: anc.cover_note.as_ref() == Some(&note_id),
                         note_id: note_id.clone(),
                         parent_folder_id: head.parent_folder_id,
                         is_root_child: anc.is_root_child,
@@ -1941,8 +1979,26 @@ fn build_trash_or_restore_intent(
                 }
 
                 let run_opt = extract_agent_run_from_auth(&auth);
+                let was_bound = anc.cover_note.as_ref() == Some(&note_id);
+                let folder_page = was_bound || prev.folder_page;
+                if was_bound || (folder_page && target_lc == Lifecycle::Active) {
+                    let cover = (target_lc == Lifecycle::Active).then_some(&note_id);
+                    super::folder_cover::assign(
+                        tx,
+                        &scope_cl,
+                        &head.parent_folder_id,
+                        cover,
+                        seq,
+                        seq,
+                        auth.principal(),
+                        run_opt.as_ref(),
+                        now_ts,
+                    )
+                    .await?;
+                }
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
+                        folder_page,
                         note_id: note_id.clone(),
                         parent_folder_id: head.parent_folder_id,
                         is_root_child: anc.is_root_child,
@@ -2269,6 +2325,26 @@ fn build_move_note_intent(
                     ));
                 }
 
+                let folder_page = if head.slug_fold == super::folder_cover::SLUG {
+                    crate::runtime::load_folder_head_row(
+                        tx,
+                        &scope_cl.space_id,
+                        &head.parent_folder_id,
+                    )
+                    .await?
+                    .cover_note_id
+                    .as_ref()
+                        == Some(&note_id)
+                } else {
+                    false
+                };
+                super::folder_cover::validate_slug_change(
+                    &head.slug_fold,
+                    &new_slug_fold,
+                    &input.slug,
+                    folder_page,
+                )?;
+
                 if (dest_parent != head.parent_folder_id || new_slug_fold != head.slug_fold)
                     && active_note_sibling_exists_tx(
                         tx,
@@ -2425,8 +2501,35 @@ fn build_move_note_intent(
                 }
 
                 let run_opt = extract_agent_run_from_auth(&auth);
+                if folder_page && dest_parent != head.parent_folder_id {
+                    super::folder_cover::assign(
+                        tx,
+                        &scope_cl,
+                        &head.parent_folder_id,
+                        None,
+                        seq,
+                        seq,
+                        auth.principal(),
+                        run_opt.as_ref(),
+                        now_ts,
+                    )
+                    .await?;
+                    super::folder_cover::assign(
+                        tx,
+                        &scope_cl,
+                        &dest_parent,
+                        Some(&note_id),
+                        seq,
+                        seq,
+                        auth.principal(),
+                        run_opt.as_ref(),
+                        now_ts,
+                    )
+                    .await?;
+                }
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
+                        folder_page,
                         note_id: note_id.clone(),
                         parent_folder_id: dest_parent,
                         is_root_child: after_anc.is_root_child,
@@ -3028,7 +3131,7 @@ async fn prepare_batch_intents(
         match item_mut.input {
             BatchItem::Create(cr) => {
                 let res: Result<PreparedWriteIntent, PortError> = async {
-                    let slug_fold = normalize_slug_key(&cr.slug)?;
+                    let slug_fold = super::folder_cover::validate_create(&cr)?;
                     if cr.class == DocClass::Skill {
                         ctx.auth().authorize_ability_mutation()?;
                     }
@@ -3389,6 +3492,7 @@ fn build_batch_edit_intent(
                         .await?;
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
+                        folder_page: anc.cover_note.as_ref() == Some(&note_id),
                         note_id: note_id.clone(),
                         parent_folder_id: head.parent_folder_id,
                         is_root_child: anc.is_root_child,
@@ -3709,12 +3813,7 @@ pub(crate) async fn append_memory_impl(
 
 fn validate_and_format_link_line(link: &Link) -> Result<String, PortError> {
     let rel = link.relation.trim();
-    if rel.is_empty()
-        || rel.contains('\r')
-        || rel.contains('\n')
-        || rel.contains('\0')
-        || rel.contains(':')
-    {
+    if rel.is_empty() || rel.contains(['\r', '\n', '\0', ':', '[', ']', '|', '\\']) {
         return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
     }
     authorize_field_key(rel)?;
@@ -3728,15 +3827,27 @@ fn validate_and_format_link_line(link: &Link) -> Result<String, PortError> {
                 || trimmed.contains('\r')
                 || trimmed.contains('\n')
                 || trimmed.contains('\0')
-                || trimmed.contains('[')
-                || trimmed.contains(']')
+                || trimmed.contains(['[', ']', '|'])
             {
                 return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
             }
             trimmed.to_owned()
         }
     };
-    Ok(format!("- {rel}: [[{target_token}]]\n"))
+    let label = match link.target_title.as_deref() {
+        Some(title) => {
+            let title = title.trim();
+            if !matches!(link.target, LinkTarget::Note(_))
+                || title.is_empty()
+                || title.contains(['\r', '\n', '\0', '[', ']', '|'])
+            {
+                return Err(DomainError::validation(ValidationReason::InvalidPathComponent).into());
+            }
+            format!("|{title}")
+        }
+        None => String::new(),
+    };
+    Ok(format!("- {rel}: [[{target_token}{label}]]\n"))
 }
 
 fn link_identity(
@@ -3894,7 +4005,12 @@ async fn prepare_link_intent(
         internal_not_committed("link_source_utf8", "source carrier not valid UTF-8")
     })?;
 
-    let new_carrier = append_link_line_to_carrier(&base_carrier, base_head.doc_class, link_line)?;
+    let new_carrier = append_link_line_to_carrier(
+        &base_carrier,
+        base_head.doc_class,
+        &request.input.source,
+        link_line,
+    )?;
     let info = analyze_and_prepare_carrier(
         &new_carrier,
         base_head.doc_class,
@@ -4104,9 +4220,29 @@ async fn prepare_link_batch_item(
 fn append_link_line_to_carrier(
     carrier: &str,
     class: DocClass,
+    source: &NoteId,
     link_line: &str,
 ) -> Result<String, PortError> {
     let hdr = notarium_syntax::frontmatter::analyze(carrier, class)?;
+    let (prefix, target) = link_line
+        .trim_end_matches('\n')
+        .strip_suffix("]]")
+        .and_then(|line| line.split_once("[["))
+        .ok_or_else(|| internal_not_committed("invalid_link_line", "missing link target"))?;
+    let target = target.split_once('|').map_or(target, |(target, _)| target);
+    if carrier.contains(&format!("{prefix}[[{target}"))
+        && let notarium_syntax::extract::ExtractedDocDelta::Plain(parsed) =
+            notarium_syntax::extract::extract(carrier, class, source, "", None)?
+        && parsed.links.iter().any(|link| {
+            let before = carrier[..link.span.start()].rsplit('\n').next();
+            let after = carrier[link.span.end()..].split('\n').next();
+            link.raw == target
+                && before == Some(prefix)
+                && after.is_some_and(|line| line.trim().is_empty())
+        })
+    {
+        return Ok(carrier.to_owned());
+    }
     let needs_nl = !carrier.is_empty() && !carrier.ends_with('\n');
     let insertion = if needs_nl {
         format!("\n{link_line}")
@@ -4294,6 +4430,7 @@ fn build_link_item_intent(
                         .await?;
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
+                        folder_page: anc.cover_note.as_ref() == Some(&source_id),
                         note_id: source_id.clone(),
                         parent_folder_id: head.parent_folder_id,
                         is_root_child: anc.is_root_child,
@@ -4378,6 +4515,7 @@ fn build_link_item_intent(
                         other => crate::domain::common::StoredLinkTargetV1::from(other),
                     },
                     relation: link.relation,
+                    target_title: None,
                     receipt,
                 };
                 let sanitized_bytes = CanonicalStore::encode_command_outcome(&sanitized_resp)?;
@@ -5023,6 +5161,7 @@ pub(crate) async fn accept_external_observation_impl(
                         .await?;
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
+                        folder_page: anc.cover_note.as_ref() == Some(&obs_input.note),
                         note_id: obs_input.note.clone(),
                         parent_folder_id: head.parent_folder_id,
                         is_root_child: anc.is_root_child,
@@ -5659,6 +5798,7 @@ pub(crate) async fn update_space_schema_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
+                        folder_page: false,
                         note_id: input.schema_note.clone(),
                         parent_folder_id: parent_id,
                         is_root_child: anc.is_root_child,
@@ -5798,6 +5938,7 @@ pub(super) async fn get_note_impl(
         byte_size,
         fields,
         diagnostics,
+        provenance,
         fast_local_read,
     ) = store
         .with_read_tx_budget(Some(&ctx.budget), |tx| {
@@ -5850,7 +5991,7 @@ pub(super) async fn get_note_impl(
                 }
 
                 // Always enforce CURRENT LIVE canonical ResourceFacts (including class/folder/lock changes)!
-                let (live_facts, _) = build_resource_facts_tx(
+                let (live_facts, live_ancestry) = build_resource_facts_tx(
                     tx,
                     &space_rec.space,
                     &live_head.parent_folder_id,
@@ -5863,9 +6004,9 @@ pub(super) async fn get_note_impl(
 
                 let historical = req_rev_opt.is_some();
                 let target_rev_id = req_rev_opt.unwrap_or_else(|| live_head.head_rev_id.clone());
-                let revision: Option<(Vec<u8>, i64)> = match tx {
+                let revision: Option<(Vec<u8>, i64, String, i64, i32)> = match tx {
                     BackendConn::Sqlite(conn) => sqlx::query_as(
-                        "SELECT metadata_msgpack, visibility_seq FROM revisions
+                        "SELECT metadata_msgpack, visibility_seq, actor_id, created_at_sec, created_at_nsec FROM revisions
                          WHERE space_id = ? AND rev_id = ? AND entity_type = 'note' AND entity_key = ?",
                     )
                     .bind(scope.space_id.as_str())
@@ -5877,7 +6018,7 @@ pub(super) async fn get_note_impl(
                         internal_not_committed("sqlite_get_note_rev", err.to_string())
                     })?,
                     BackendConn::Postgres(conn) => sqlx::query_as(
-                        "SELECT metadata_msgpack, visibility_seq FROM revisions
+                        "SELECT metadata_msgpack, visibility_seq, actor_id, created_at_sec, created_at_nsec FROM revisions
                          WHERE space_id = $1 AND rev_id = $2 AND entity_type = 'note' AND entity_key = $3",
                     )
                     .bind(scope.space_id.as_str())
@@ -5888,7 +6029,7 @@ pub(super) async fn get_note_impl(
                     .map_err(|err| crate::runtime::pg_read_error("pg_get_note_rev", err))?,
                 };
 
-                let Some((raw_meta, visibility_seq)) = revision else {
+                let Some((raw_meta, visibility_seq, actor, seconds, nanos)) = revision else {
                     return Err(DomainError::ResourceNotFound.into());
                 };
                 let env = RevisionMetadataEnvelope::decode(&raw_meta)?;
@@ -5904,16 +6045,20 @@ pub(super) async fn get_note_impl(
                 let digest = nm.content_digest.ok_or_else(|| {
                     internal_not_committed("note_rev_missing_digest", "note revision lacks digest")
                 })?;
-                let facts = if historical {
+                let (facts, ancestry) = if historical {
                     let cutoff = crate::codec::i64_to_space_seq(visibility_seq)?;
-                    let (facts, _) = FolderAncestryCache::at_cut(&scope, cutoff)
+                    let (facts, ancestry) = FolderAncestryCache::at_cut(&scope, cutoff)
                         .build_resource_facts_tx(tx, &space_rec.space, &nm.parent_folder_id,
                             nm.doc_class, nm.ability_id.clone(), false).await?;
                     auth.authorize_read(&facts)?;
-                    facts
+                    (facts, ancestry)
                 } else {
-                    live_facts
+                    (live_facts, live_ancestry)
                 };
+                let provenance = ancestry.note_provenance(
+                    &req_note, &nm.slug, nm.title, notarium_core::ids::PrincipalId::parse(&actor)?,
+                    crate::codec::decode_timestamp_parts(seconds, nanos)?,
+                );
                 let parent_opt = (nm.parent_folder_id != space_rec.root_folder_id).then_some(nm.parent_folder_id);
                 let effective_lc = if target_rev_id == live_head.head_rev_id {
                     live_head.lifecycle
@@ -5949,6 +6094,7 @@ pub(super) async fn get_note_impl(
                     nm.byte_size,
                     fields,
                     nm.diagnostics,
+                    provenance,
                     fast_local_read,
                 ))
             })
@@ -5991,6 +6137,7 @@ pub(super) async fn get_note_impl(
         byte_size,
         fields,
         diagnostics,
+        provenance: Some(provenance),
     })
 }
 

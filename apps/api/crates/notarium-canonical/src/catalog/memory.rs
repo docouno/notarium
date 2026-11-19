@@ -51,68 +51,88 @@ pub(super) async fn personal_space(
     Ok(space)
 }
 
+pub(super) async fn inspect(
+    store: &CanonicalStore,
+    ctx: &AccountContext,
+    target: MemoryTarget,
+    category: String,
+) -> Result<MemoryTargetSnapshot, PortError> {
+    let note_id = fixed_note_id(&target, &category)?;
+    let auth = ctx.auth().clone();
+    store
+        .with_read_tx_budget(Some(&ctx.budget), move |tx| {
+            Box::pin(async move {
+                let space = match &target {
+                    MemoryTarget::User { owner } => personal_space(tx, &auth, owner).await?,
+                    MemoryTarget::Project { folder } => folder.space_id.clone(),
+                };
+                let rec = load_space_record(tx, &space).await?;
+                let parent = match &target {
+                    MemoryTarget::User { .. } => rec.root_folder_id.clone(),
+                    MemoryTarget::Project { folder } => {
+                        let (_, row) = folder_metadata(tx, &auth, &rec, folder.clone()).await?;
+                        if !row.is_project {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        folder.folder_id.clone()
+                    }
+                };
+                let (facts, _) = build_resource_facts_tx(
+                    tx,
+                    &rec.space,
+                    &parent,
+                    DocClass::AgentMemory,
+                    None,
+                    true,
+                )
+                .await?;
+                auth.authorize_direct_write(&facts, &facts)?;
+                let head =
+                    crate::domain::common::load_note_head_row_opt_tx(tx, &space, &note_id).await?;
+                if let Some(head) = &head
+                    && (head.parent_folder_id != parent
+                        || head.doc_class != DocClass::AgentMemory
+                        || head.lifecycle != Lifecycle::Active)
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                Ok(MemoryTargetSnapshot {
+                    resolved: ResolvedMemoryTarget {
+                        target,
+                        note: NoteRef {
+                            space_id: space,
+                            note_id,
+                        },
+                        category,
+                    },
+                    scope: rec.scope,
+                    parent,
+                    revision: head.map(|head| head.head_rev_id),
+                })
+            })
+        })
+        .await
+}
+
 pub(super) async fn resolve(
     store: &CanonicalStore,
     ctx: AccountContext,
     target: MemoryTarget,
     category: String,
 ) -> Result<ResolvedMemoryTarget, PortError> {
-    let note = fixed_note_id(&target, &category)?;
-    let (scope, parent, existing) = {
-        let target = target.clone();
-        let note = note.clone();
-        let auth = ctx.auth().clone();
-        store
-            .with_read_tx_budget(Some(&ctx.budget), move |tx| {
-                Box::pin(async move {
-                    let space = match &target {
-                        MemoryTarget::User { owner } => personal_space(tx, &auth, owner).await?,
-                        MemoryTarget::Project { folder } => folder.space_id.clone(),
-                    };
-                    let rec = load_space_record(tx, &space).await?;
-                    let parent = match target {
-                        MemoryTarget::User { .. } => rec.root_folder_id.clone(),
-                        MemoryTarget::Project { folder } => {
-                            let (_, row) = folder_metadata(tx, &auth, &rec, folder.clone()).await?;
-                            if !row.is_project {
-                                return Err(DomainError::ResourceNotFound.into());
-                            }
-                            folder.folder_id
-                        }
-                    };
-                    let (facts, _) = build_resource_facts_tx(
-                        tx,
-                        &rec.space,
-                        &parent,
-                        DocClass::AgentMemory,
-                        None,
-                        true,
-                    )
-                    .await?;
-                    auth.authorize_direct_write(&facts, &facts)?;
-                    let head =
-                        crate::domain::common::load_note_head_row_opt_tx(tx, &space, &note).await?;
-                    if let Some(head) = &head
-                        && (head.parent_folder_id != parent
-                            || head.doc_class != DocClass::AgentMemory
-                            || head.lifecycle != Lifecycle::Active)
-                    {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
-                    Ok((rec.scope, parent, head.is_some()))
-                })
-            })
-            .await?
-    };
-    let reference = NoteRef {
-        space_id: scope.space_id.clone(),
-        note_id: note.clone(),
-    };
-    if !existing {
+    let MemoryTargetSnapshot {
+        resolved,
+        scope,
+        parent,
+        revision,
+    } = inspect(store, &ctx, target, category).await?;
+    if revision.is_none() {
+        let reference = &resolved.note;
+        let category = &resolved.category;
         let hash = blake3::hash(&crate::codec::encode_msgpack(&(
             "ensure-memory-v1",
-            &reference,
-            &category,
+            reference,
+            category,
         ))?);
         let scoped = SpaceContext::new(ctx.auth().clone(), scope.clone(), ctx.budget.clone())?;
         let identity = CommandIdentity {
@@ -125,7 +145,8 @@ pub(super) async fn resolve(
             identity,
             preconditions: Preconditions::default(),
             input: CreateNote {
-                note,
+                folder_page: false,
+                note: reference.note_id.clone(),
                 parent: Some(parent.clone()),
                 slug: format!("memory-{category}"),
                 class: DocClass::AgentMemory,
@@ -138,7 +159,7 @@ pub(super) async fn resolve(
             return Err(e);
         }
     }
-    let current = ControlCatalogPort::note(store, ctx.clone(), reference.clone()).await?;
+    let current = ControlCatalogPort::note(store, ctx.clone(), resolved.note.clone()).await?;
     if current.facts.class != DocClass::AgentMemory
         || current.facts.ancestor_folders.first() != Some(&parent)
     {
@@ -146,9 +167,5 @@ pub(super) async fn resolve(
     }
     ctx.auth()
         .authorize_direct_write(&current.facts, &current.facts)?;
-    Ok(ResolvedMemoryTarget {
-        target,
-        note: reference,
-        category,
-    })
+    Ok(resolved)
 }

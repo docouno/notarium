@@ -689,6 +689,7 @@ async fn l3_postgres_and_s3_writer_cross_space_independence_and_epoch_takeover()
             hash: ContentDigest::from_bytes([201; 32]),
         },
         input: CreateNote {
+            folder_page: false,
             note: NoteId::from_bytes([201; 16]),
             parent: None,
             slug: "successor".into(),

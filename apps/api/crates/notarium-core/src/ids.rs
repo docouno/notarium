@@ -20,8 +20,14 @@ fn valid_legacy(value: &str) -> bool {
         || (value.len() == 16 && value.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+fn valid_legacy_episode(value: &str) -> bool {
+    value
+        .strip_prefix("ses_")
+        .is_some_and(|suffix| suffix.len() == 12 && valid_legacy(suffix))
+}
+
 macro_rules! ids {
-    ($($name:ident => $prefix:literal),+ $(,)?) => {$ (
+    ($($name:ident => $prefix:literal $(=> $legacy:ident)?),+ $(,)?) => {$ (
         #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
         #[serde(try_from = "String", into = "String")]
         pub struct $name(String);
@@ -35,7 +41,9 @@ macro_rules! ids {
                 else { Err(DomainError::validation(ValidationReason::InvalidId)) }
             }
             pub fn parse(value: &str) -> DomainResult<Self> {
-                if valid_v1(value, Self::PREFIX) || valid_legacy(value) { Ok(Self(value.to_owned())) }
+                if valid_v1(value, Self::PREFIX) || valid_legacy(value) $(|| $legacy(value))? {
+                    Ok(Self(value.to_owned()))
+                }
                 else { Err(DomainError::validation(ValidationReason::InvalidId)) }
             }
             pub fn as_str(&self) -> &str { &self.0 }
@@ -57,7 +65,8 @@ macro_rules! ids {
 ids! {
     SpaceId => "sp_", FolderId => "fld_", NoteId => "nt_", RevisionId => "rev_",
     ViewKey => "v_", ChatThreadId => "thr_", AgentRunId => "run_", ScheduleId => "sch_",
-    JobId => "job_", EpisodeId => "ses_", AbilityId => "ab_", ProviderResourceId => "prv_",
+    JobId => "job_", EpisodeId => "ses_" => valid_legacy_episode,
+    AbilityId => "ab_", ProviderResourceId => "prv_",
     CredentialId => "crd_", PrincipalId => "principal_", InstallationId => "install_",
     GrantId => "grant_", AuthSessionId => "auth_", RequestId => "request_",
     CommandKey => "cmd_", ModelProfileId => "model_", BodyIdentity => "body_",

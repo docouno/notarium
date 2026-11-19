@@ -1678,6 +1678,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                         &scope,
                         &actor,
                         CreateNote {
+                            folder_page: false,
                             note: note_1,
                             parent: None,
                             slug: "note-select1-control".to_owned(),
@@ -1706,6 +1707,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                         &scope,
                         &actor,
                         CreateNote {
+                            folder_page: false,
                             note: note_1,
                             parent: None,
                             slug: "note-select1-control".to_owned(),
@@ -1785,6 +1787,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: note_pre_pause.clone(),
                         parent: None,
                         slug: "note-pre-pause".to_owned(),
@@ -1822,6 +1825,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                         &scope_bg,
                         &actor_bg,
                         CreateNote {
+                            folder_page: false,
                             note: note_post_cl,
                             parent: None,
                             slug: "note-post-resume".to_owned(),
@@ -1910,6 +1914,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                             &scope,
                             &actor,
                             CreateNote {
+                                folder_page: false,
                                 note: nid,
                                 parent: None,
                                 slug: format!("wal-unpinned-probe-{idx}"),
@@ -2155,6 +2160,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &new_scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: NoteId::from_bytes([0x39; 16]),
                         parent: None,
                         slug: "new-incarnation-same-seq".to_owned(),
@@ -2270,6 +2276,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: note_step1.clone(),
                         parent: None,
                         slug: "interrupted-purge-blocks-hold".to_owned(),
@@ -2352,6 +2359,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: note_after_abort,
                         parent: None,
                         slug: "after-second-participant-abort".to_owned(),
@@ -2476,6 +2484,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                                 &scope_w,
                                 &actor_w,
                                 CreateNote {
+                                    folder_page: false,
                                     note: NoteId::from_bytes([0x90 + k; 16]),
                                     parent: None,
                                     slug: format!("wal-budget-grow-{k}"),
@@ -2548,6 +2557,7 @@ async fn l4_paired_backup_cut_holds_budgets_cleanup_and_restore_cursors_dual_dia
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: secret_note.clone(),
                         parent: None,
                         slug: format!("slug-{secret_token}").to_ascii_lowercase(),
@@ -3199,6 +3209,7 @@ async fn seed_64m_and_50_medium_rows(store: &CanonicalStore, expected_hex: &str)
                 &space.scope,
                 &actor,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "peer-64m-carrier".to_owned(),
@@ -3415,6 +3426,7 @@ async fn run_sigkill_victim_child() {
                 &space.scope,
                 &actor,
                 CreateNote {
+                    folder_page: false,
                     note: collab_note.clone(),
                     parent: None,
                     slug: "collab-victim-note".to_owned(),
@@ -3456,6 +3468,7 @@ async fn run_sigkill_victim_child() {
                 &space.scope,
                 &actor,
                 CreateNote {
+                    folder_page: false,
                     note: purge_note.clone(),
                     parent: None,
                     slug: "purge-victim-note".to_owned(),

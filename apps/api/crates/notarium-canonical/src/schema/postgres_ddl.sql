@@ -566,6 +566,8 @@ CREATE TABLE IF NOT EXISTS chat_threads (
     created_at_nsec INTEGER NOT NULL CHECK (created_at_nsec >= 0 AND created_at_nsec < 1000000000),
     updated_at_sec BIGINT NOT NULL,
     updated_at_nsec INTEGER NOT NULL CHECK (updated_at_nsec >= 0 AND updated_at_nsec < 1000000000),
+    active_run_epoch BIGINT CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0),
+    active_run_generation TEXT,
     PRIMARY KEY (space_id, thread_id),
     FOREIGN KEY (space_id) REFERENCES spaces (space_id),
     FOREIGN KEY (space_id, project_folder_id) REFERENCES folder_heads (space_id, folder_id)
@@ -595,6 +597,9 @@ CREATE TABLE IF NOT EXISTS chat_entries (
     created_space_seq BIGINT NOT NULL CHECK (created_space_seq >= 1),
     redacted_at_seq BIGINT,
     checkpoint_stale INTEGER NOT NULL DEFAULT 0 CHECK (checkpoint_stale IN (0, 1)),
+    human_origin INTEGER CHECK (human_origin IN (0, 1)),
+    body_format INTEGER NOT NULL DEFAULT 0 CHECK (body_format IN (0, 1, 2)),
+    provenance_json TEXT,
     PRIMARY KEY (space_id, thread_id, entry_seq),
     CHECK (
         (kind = 'redacted' AND inline_text IS NULL AND payload_blake3 IS NULL AND redacted_at_seq IS NOT NULL)
@@ -650,6 +655,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_chat_pending_inputs_ordinal
 CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_active
     ON chat_pending_inputs (space_id, thread_id, ordinal)
     WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_consumed
+    ON chat_pending_inputs (space_id, thread_id, consumed_entry_seq)
+    WHERE status = 'consumed';
 
 CREATE TABLE IF NOT EXISTS collab_sessions (
     space_id TEXT NOT NULL,

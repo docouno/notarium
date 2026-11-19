@@ -92,16 +92,14 @@ async fn exercise(pg: bool) {
         .lock()
         .unwrap()
         .push(AbilityDescriptor {
+            attached_skills: vec![],
             reference: role.clone(),
             kind: AbilityKind::Role,
             name: "scheduled-guide".into(),
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
-            entrypoint: NoteRef {
-                space_id: personal.space.id.clone(),
-                note_id: NoteId::from_bytes([7; 16]),
-            },
+            entrypoint: None,
             auxiliary_files: vec![],
         });
     let now = fixture.clock.0.load(Ordering::SeqCst);
@@ -121,6 +119,7 @@ async fn exercise(pg: bool) {
         input: CreateSchedule {
             id: ScheduleId::from_bytes([1; 16]),
             definition: definition.clone(),
+            approved_skills: vec![],
             next_slot: tick(now),
             paused: false,
         },
@@ -194,7 +193,7 @@ async fn exercise(pg: bool) {
         slot: tick(now),
         current_role: role.clone(),
         expected: created.revision,
-        next_slot: tick(now + 60_000),
+        next_slot: Some(tick(now + 60_000)),
     };
     let mut workers = Vec::new();
     for _ in 0..3 {
@@ -266,7 +265,7 @@ async fn exercise(pg: bool) {
         ScheduleRunStatus::Claimed
     );
     let mut different = claim.clone();
-    different.next_slot = tick(now + 120_000);
+    different.next_slot = Some(tick(now + 120_000));
     assert!(
         restarted
             .claim_schedule(scheduler(), different)
@@ -282,7 +281,7 @@ async fn exercise(pg: bool) {
                 slot: tick(now + 60_000),
                 current_role: role.clone(),
                 expected: advanced.revision,
-                next_slot: tick(now + 120_000),
+                next_slot: Some(tick(now + 120_000)),
             },
         )
         .await
@@ -368,6 +367,7 @@ async fn exercise(pg: bool) {
             schedule: created.id.clone(),
             expected: current.revision,
             definition: definition.clone(),
+            approved_skills: None,
             next_slot: current.next_slot,
             paused: true,
         },
@@ -423,7 +423,8 @@ async fn exercise(pg: bool) {
                     schedule: created.id.clone(),
                     expected: paused.revision,
                     definition: definition.clone(),
-                    next_slot: tick(now + 120_000),
+                    approved_skills: None,
+                    next_slot: Some(tick(now + 120_000)),
                     paused: false,
                 },
             },
@@ -443,7 +444,7 @@ async fn exercise(pg: bool) {
                 slot: tick(now + 120_000),
                 current_role: role.clone(),
                 expected: resumed.revision,
-                next_slot: tick(now + 180_000),
+                next_slot: Some(tick(now + 180_000)),
             },
         )
         .await
@@ -478,7 +479,8 @@ async fn exercise(pg: bool) {
                     schedule: created.id.clone(),
                     expected: changed.revision,
                     definition: definition.clone(),
-                    next_slot: tick(now + 120_000),
+                    approved_skills: None,
+                    next_slot: Some(tick(now + 120_000)),
                     paused: false,
                 },
             },
@@ -494,7 +496,7 @@ async fn exercise(pg: bool) {
                 slot: tick(now + 120_000),
                 current_role: role.clone(),
                 expected: active.revision,
-                next_slot: tick(now + 180_000),
+                next_slot: Some(tick(now + 180_000)),
             },
         )
         .await
@@ -611,6 +613,7 @@ async fn exercise(pg: bool) {
                         input: CreateSchedule {
                             id: ScheduleId::from_bytes([i; 16]),
                             definition: def,
+                            approved_skills: vec![],
                             next_slot: tick(now),
                             paused: false
                         }
@@ -692,6 +695,7 @@ async fn authority_changes(
         ProjectInfo {
             folder: project.clone(),
             name: "Scheduled project".into(),
+            project_slug: "scheduled-project".into(),
         },
     );
     let now = fixture.clock.0.load(Ordering::SeqCst);
@@ -713,6 +717,7 @@ async fn authority_changes(
                 input: CreateSchedule {
                     id: ScheduleId::from_bytes([30; 16]),
                     definition,
+                    approved_skills: vec![],
                     next_slot: tick(now),
                     paused: false,
                 },
@@ -727,7 +732,7 @@ async fn authority_changes(
             ClaimSchedule {
                 schedule: created.id.clone(),
                 slot: tick(now),
-                next_slot: tick(now + 60_000),
+                next_slot: Some(tick(now + 60_000)),
                 current_role: role.clone(),
                 expected: created.revision,
             },
@@ -796,7 +801,7 @@ async fn authority_changes(
                 ClaimSchedule {
                     schedule: created.id.clone(),
                     slot: tick(now + 60_000),
-                    next_slot: tick(now + 120_000),
+                    next_slot: Some(tick(now + 120_000)),
                     current_role: role.clone(),
                     expected: advanced.revision
                 }
@@ -841,6 +846,7 @@ async fn authority_changes(
                 input: CreateSchedule {
                     id: ScheduleId::from_bytes([31; 16]),
                     definition,
+                    approved_skills: vec![],
                     next_slot: tick(now + 60_000),
                     paused: false,
                 },
@@ -855,7 +861,7 @@ async fn authority_changes(
             ClaimSchedule {
                 schedule: created.id,
                 slot: tick(now + 60_000),
-                next_slot: tick(now + 120_000),
+                next_slot: Some(tick(now + 120_000)),
                 current_role: role,
                 expected: created.revision,
             },
@@ -981,6 +987,7 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
             ProjectInfo {
                 folder: proj.clone(),
                 name: title.into(),
+                project_slug: title.to_ascii_lowercase().replace(' ', "-"),
             },
         );
     }
@@ -1005,13 +1012,14 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
             .lock()
             .unwrap()
             .push(AbilityDescriptor {
+                attached_skills: vec![],
                 reference: reference.clone(),
                 kind: AbilityKind::Role,
                 name: name.into(),
                 enabled: true,
                 healthy: true,
                 lifecycle: Lifecycle::Active,
-                entrypoint: note.clone(),
+                entrypoint: (reference.placement != AbilityPlacement::System).then(|| note.clone()),
                 auxiliary_files: vec![],
             });
         fixture.catalog.note_entries.lock().unwrap().insert(
@@ -1097,7 +1105,7 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
                     episode: ep_id.clone(),
                     expected: ControlRevision::new(1).unwrap(),
                     name: Some("scope-ep".into()),
-                    active_role: Some(role_space_a),
+                    active_role: Some(role_space_a.clone()),
                     project_hint: Some(project_b),
                     lifecycle: EpisodeLifecycle::Active,
                 },
@@ -1149,6 +1157,7 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
                         approved_role: role_pa1.clone(),
                         limits: RunLimits::default(),
                     },
+                    approved_skills: vec![],
                     next_slot: now_ts,
                     paused: false,
                 },
@@ -1174,7 +1183,7 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
                     id: good_sched_id.clone(),
                     definition: ScheduleDefinition {
                         space: shared_a.space.id.clone(),
-                        project: Some(project_a1),
+                        project: Some(project_a1.clone()),
                         title: "Project A1 schedule".into(),
                         init_prompt: "Check".into(),
                         cron: "0 */5 * * * *".into(),
@@ -1182,6 +1191,7 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
                         approved_role: role_pa1.clone(),
                         limits: RunLimits::default(),
                     },
+                    approved_skills: vec![],
                     next_slot: Timestamp::parse("2023-11-14T22:15:00Z").unwrap(),
                     paused: false,
                 },
@@ -1196,7 +1206,7 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
             ClaimSchedule {
                 schedule: good_sched_id.clone(),
                 slot: Timestamp::parse("2023-11-14T22:15:00Z").unwrap(),
-                next_slot: Timestamp::parse("2023-11-14T22:20:00Z").unwrap(),
+                next_slot: Some(Timestamp::parse("2023-11-14T22:20:00Z").unwrap()),
                 current_role: role_pa1,
                 expected: ControlRevision::ZERO,
             },
@@ -1241,8 +1251,8 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
         .auth()
         .for_keeper(
             AgentRunId::from_bytes([73; 16]),
-            shared_a.space.id,
-            Some(project_a2.folder_id),
+            shared_a.space.id.clone(),
+            Some(project_a2.folder_id.clone()),
             BTreeSet::new(),
         )
         .unwrap();
@@ -1259,6 +1269,269 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
         PortError::Domain(DomainError::ResourceNotFound)
     ));
 
+    // An ordinary schedule owner can review and explicitly approve current
+    // dependency tips without authority to edit the Role or Skill.
+    let interactive = AccountContext::new(
+        control
+            .resolve(evidence(AuthEvidenceKind::Session, raw_token.expose()))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    assert!(!interactive.auth().has_cap(Cap::AbilityWrite));
+    let skill = seed_role(
+        &shared_a.space,
+        AbilityPlacement::OwnedSpace(shared_a.space.id.clone()),
+        63,
+        "schedule-skill",
+        vec![],
+    );
+    {
+        let mut abilities = fixture.catalog.ability_entries.lock().unwrap();
+        abilities
+            .iter_mut()
+            .find(|entry| entry.reference == skill)
+            .unwrap()
+            .kind = AbilityKind::Skill;
+        abilities
+            .iter_mut()
+            .find(|entry| entry.reference == role_space_a)
+            .unwrap()
+            .attached_skills = vec![skill.clone()];
+    }
+    let selection = ScheduleAbilitySelection {
+        space: shared_a.space.id.clone(),
+        project: Some(project_a1.clone()),
+        role: role_space_a.identity(),
+    };
+    let reviewed = control
+        .schedule_ability_candidate(interactive.clone(), selection.clone())
+        .await
+        .unwrap();
+    assert_eq!(reviewed.approved_skills, vec![skill.clone()]);
+    let id = ScheduleId::from_bytes([78; 16]);
+    let definition = ScheduleDefinition {
+        space: selection.space.clone(),
+        project: selection.project.clone(),
+        title: "Review project memory".into(),
+        init_prompt: "Review".into(),
+        cron: "0 */5 * * * *".into(),
+        timezone: "UTC".into(),
+        approved_role: reviewed.approved_role.clone(),
+        limits: RunLimits::default(),
+    };
+    let created = control
+        .create_schedule(
+            interactive.clone(),
+            AccountMutation {
+                identity: command(
+                    interactive.auth().principal(),
+                    interactive.auth().principal(),
+                    91,
+                    reviewed.account_revision,
+                ),
+                input: CreateSchedule {
+                    id: id.clone(),
+                    definition: definition.clone(),
+                    approved_skills: reviewed.approved_skills,
+                    next_slot: now_ts,
+                    paused: false,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let next_slot = Timestamp::parse("2023-11-14T22:20:00Z").unwrap();
+    let third_slot = Timestamp::parse("2023-11-14T22:25:00Z").unwrap();
+    let first = control
+        .claim_schedule(
+            scheduler(),
+            ClaimSchedule {
+                schedule: id.clone(),
+                slot: now_ts,
+                next_slot: Some(next_slot),
+                current_role: role_space_a.clone(),
+                expected: created.revision,
+            },
+        )
+        .await
+        .unwrap();
+    let ScheduleClaim::Claimed {
+        run,
+        lease,
+        schedule: advanced,
+        context,
+    } = first
+    else {
+        panic!("approved run was not claimed");
+    };
+    let log_a1 = context.auth().keeper_log().unwrap().clone();
+    assert!(context.auth().readonly_abilities().contains(&skill.id));
+    control
+        .record_schedule_result(
+            scheduler(),
+            ScheduleResult {
+                schedule: id.clone(),
+                run: run.clone(),
+                lease,
+                outcome: ScheduleOutcome::Succeeded,
+            },
+        )
+        .await
+        .unwrap();
+
+    let change_skill = |revision: u8| {
+        let mut abilities = fixture.catalog.ability_entries.lock().unwrap();
+        let reference = &mut abilities
+            .iter_mut()
+            .find(|entry| entry.reference.id == skill.id)
+            .unwrap()
+            .reference;
+        reference.revision = RevisionId::from_bytes([revision; 16]);
+        reference.clone()
+    };
+    let skill2 = change_skill(64);
+    fixture
+        .clock
+        .0
+        .store(next_slot.unix_seconds() * 1000, Ordering::SeqCst);
+    assert!(matches!(
+        control
+            .claim_schedule(
+                scheduler(),
+                ClaimSchedule {
+                    schedule: id.clone(),
+                    slot: next_slot,
+                    next_slot: Some(third_slot),
+                    current_role: role_space_a.clone(),
+                    expected: advanced.revision,
+                }
+            )
+            .await
+            .unwrap(),
+        ScheduleClaim::Paused(SchedulePauseReason::RoleChanged)
+    ));
+
+    let scope_ctx = SpaceContext::new(
+        interactive.auth().clone(),
+        shared_a.history.clone(),
+        budget(),
+    )
+    .unwrap();
+    let paused = control.get_schedule(scope_ctx, id.clone()).await.unwrap();
+    let selection = ScheduleAbilitySelection {
+        project: Some(project_a2.clone()),
+        ..selection
+    };
+    let reviewed = control
+        .schedule_ability_candidate(interactive.clone(), selection.clone())
+        .await
+        .unwrap();
+    assert_eq!(reviewed.approved_skills, vec![skill2]);
+    let skill3 = change_skill(65);
+    let mut definition = definition;
+    definition.project = Some(project_a2.clone());
+    let update = |key, reviewed: ScheduleAbilityCandidate| AccountMutation {
+        identity: command(
+            interactive.auth().principal(),
+            interactive.auth().principal(),
+            key,
+            reviewed.account_revision,
+        ),
+        input: UpdateSchedule {
+            schedule: id.clone(),
+            expected: paused.revision,
+            definition: definition.clone(),
+            approved_skills: Some(reviewed.approved_skills),
+            next_slot: paused.next_slot,
+            paused: false,
+        },
+    };
+    assert!(
+        control
+            .update_schedule(interactive.clone(), update(92, reviewed))
+            .await
+            .is_err()
+    );
+    let reviewed = control
+        .schedule_ability_candidate(interactive.clone(), selection)
+        .await
+        .unwrap();
+    assert_eq!(reviewed.approved_skills, vec![skill3.clone()]);
+    let reapproved = control
+        .update_schedule(interactive.clone(), update(93, reviewed))
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(reapproved.approved_skills, vec![skill3]);
+    let second = control
+        .claim_schedule(
+            scheduler(),
+            ClaimSchedule {
+                schedule: id.clone(),
+                slot: next_slot,
+                next_slot: Some(third_slot),
+                current_role: role_space_a,
+                expected: reapproved.revision,
+            },
+        )
+        .await
+        .unwrap();
+    let ScheduleClaim::Claimed {
+        run: second,
+        context,
+        ..
+    } = second
+    else {
+        panic!("reapproved run was not claimed");
+    };
+    assert_ne!(context.auth().keeper_log(), Some(&log_a1));
+    let old = control
+        .get_schedule_run(
+            ScheduleRunContext::Owner(Box::new(AccountContext::new(
+                context.auth().clone(),
+                budget(),
+            ))),
+            id,
+            run,
+        )
+        .await
+        .unwrap();
+    assert!(
+        old.keeper_log.is_none(),
+        "the project grant cannot disclose the former project's log"
+    );
+
+    let expired_at = next_slot.unix_seconds() * 1000 + 300_000;
+    fixture.clock.0.store(expired_at, Ordering::SeqCst);
+    let expired = control
+        .list_expired_schedule_runs(
+            scheduler(),
+            tick(expired_at),
+            ControlPageRequest::new(10, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    let second = expired
+        .items
+        .into_iter()
+        .find(|item| item.run == second)
+        .unwrap();
+    assert_eq!(second.keeper_log.as_ref(), context.auth().keeper_log());
+    control
+        .record_schedule_result(
+            scheduler(),
+            ScheduleResult {
+                schedule: second.schedule,
+                run: second.run,
+                lease: second.lease,
+                outcome: ScheduleOutcome::Unknown,
+            },
+        )
+        .await
+        .unwrap();
+
     drop(control);
     fixture.close().await;
 }
@@ -1270,4 +1543,207 @@ async fn sqlite_role_placement_scope_and_run_inspection_access() {
 #[tokio::test]
 async fn postgres_role_placement_scope_and_run_inspection_access() {
     role_placement_scope_and_run_inspection_access(true).await;
+}
+
+async fn terminal_slots_and_migrated_folds(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let mut fixture = Fixture::new(pg, "schedule_civil_windows").await;
+    let service = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let issued = service
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: None,
+                display_name: "Owner".into(),
+                password: Some(SecretString::new("calendar scenario password".into())),
+            },
+        )
+        .await
+        .unwrap();
+    let token = issued.session.unwrap().token;
+    let ctx = AccountContext::new(
+        service
+            .resolve(evidence(AuthEvidenceKind::Session, token.expose()))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let space = service
+        .list_spaces(ctx.clone(), ControlPageRequest::new(10, None).unwrap())
+        .await
+        .unwrap()
+        .items
+        .pop()
+        .unwrap()
+        .space
+        .id;
+    let role = AbilityRef {
+        id: AbilityId::from_bytes([173; 16]),
+        placement: AbilityPlacement::System,
+        revision: RevisionId::from_bytes([173; 16]),
+    };
+    fixture
+        .catalog
+        .ability_entries
+        .lock()
+        .unwrap()
+        .push(AbilityDescriptor {
+            reference: role.clone(),
+            kind: AbilityKind::Role,
+            name: "calendar-test".into(),
+            enabled: true,
+            healthy: true,
+            lifecycle: Lifecycle::Active,
+            entrypoint: None,
+            auxiliary_files: vec![],
+            attached_skills: vec![],
+        });
+    let parse = |date| Timestamp::parse(date).unwrap();
+    let first = parse("2026-11-01T05:30:00Z");
+    let late = parse("2026-11-01T06:30:00Z");
+    let next = parse("2026-11-08T06:30:00Z");
+    let terminal = parse("2026-12-01T12:00:00Z");
+    let calendars = [
+        (
+            "Repeated local hour",
+            "0 30 1 * * Sun *",
+            "America/New_York",
+            first,
+        ),
+        (
+            "Unclaimed local hour",
+            "0 30 1 * * Sun *",
+            "America/New_York",
+            first,
+        ),
+        ("Finite UTC calendar", "0 0 12 1 12 * 2026", "UTC", terminal),
+    ];
+    let mut schedules = Vec::new();
+    for (key, (title, cron, timezone, slot)) in (81..).zip(calendars) {
+        let created = service
+            .create_schedule(
+                ctx.clone(),
+                AccountMutation {
+                    identity: identity(&service, &ctx, key).await,
+                    input: CreateSchedule {
+                        id: ScheduleId::from_bytes([key; 16]),
+                        definition: ScheduleDefinition {
+                            space: space.clone(),
+                            project: None,
+                            title: title.into(),
+                            init_prompt: "Review space".into(),
+                            cron: cron.into(),
+                            timezone: timezone.into(),
+                            approved_role: role.clone(),
+                            limits: RunLimits::default(),
+                        },
+                        approved_skills: Vec::new(),
+                        next_slot: slot,
+                        paused: false,
+                    },
+                },
+            )
+            .await
+            .unwrap()
+            .value;
+        schedules.push(created);
+    }
+    let late_time = late.unix_seconds() * 1000;
+    fixture
+        .clock
+        .0
+        .store(late_time - 20 * 60_000, Ordering::SeqCst);
+    let make_claim = |schedule: &AgentSchedule, slot, next_slot| ClaimSchedule {
+        schedule: schedule.id.clone(),
+        expected: schedule.revision,
+        slot,
+        next_slot,
+        current_role: role.clone(),
+    };
+    let first_claim = service
+        .claim_schedule(scheduler(), make_claim(&schedules[0], first, Some(next)))
+        .await
+        .unwrap();
+    let ScheduleClaim::Claimed {
+        schedule: advanced,
+        run,
+        ..
+    } = first_claim
+    else {
+        panic!("early civil occurrence was not retained");
+    };
+    // B04 allowed both UTC representations in persisted schedules. Simulate
+    // that old state after an early-slot receipt and with an unclaimed schedule.
+    fixture.observer.execute(
+        "UPDATE agent_schedules SET next_slot_utc_ms=1793514600000 WHERE title IN ('Repeated local hour','Unclaimed local hour')"
+    ).await;
+    assert_eq!(1793514600000, late_time);
+    fixture.clock.0.store(late_time, Ordering::SeqCst);
+    let duplicate = make_claim(&advanced, late, Some(next));
+    for _ in 0..2 {
+        assert!(matches!(
+            service.claim_schedule(scheduler(), duplicate.clone()).await.unwrap(),
+            ScheduleClaim::SkippedDuplicate(previous) if previous.run == run
+        ));
+    }
+    assert!(matches!(
+        service
+            .claim_schedule(scheduler(), make_claim(&schedules[1], late, Some(next)))
+            .await
+            .unwrap(),
+        ScheduleClaim::Claimed { .. }
+    ));
+
+    fixture
+        .clock
+        .0
+        .store(terminal.unix_seconds() * 1000 + 15_000, Ordering::SeqCst);
+    let final_claim = make_claim(&schedules[2], terminal, None);
+    let last = service
+        .claim_schedule(scheduler(), final_claim.clone())
+        .await
+        .unwrap();
+    let ScheduleClaim::Claimed {
+        run,
+        context,
+        schedule,
+        ..
+    } = last
+    else {
+        panic!("finite calendar lost its final due");
+    };
+    assert!(schedule.next_slot.is_none());
+    let restarted = fixture.service(AuthenticationMode::Password).await.unwrap();
+    restarted
+        .whoami(AccountContext::new(context.auth().clone(), budget()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        restarted.claim_schedule(scheduler(), final_claim).await.unwrap(),
+        ScheduleClaim::AlreadyClaimed(previous) if previous.run == run && previous.reserved_next_slot.is_none()
+    ));
+    let page = restarted
+        .list_due_schedules(
+            scheduler(),
+            terminal,
+            ControlPageRequest::new(10, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!page.items.iter().any(|item| item.id == schedule.id));
+    drop(restarted);
+    drop(service);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_terminal_slots_and_migrated_folds() {
+    terminal_slots_and_migrated_folds(false).await;
+}
+
+#[tokio::test]
+async fn postgres_terminal_slots_and_migrated_folds() {
+    terminal_slots_and_migrated_folds(true).await;
 }

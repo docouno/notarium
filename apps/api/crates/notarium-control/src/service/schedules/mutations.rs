@@ -5,6 +5,13 @@ enum Change {
     Update(UpdateSchedule),
     Delete(DeleteSchedule),
 }
+fn pause_only(input: &UpdateSchedule, previous: &AgentSchedule) -> bool {
+    input.paused
+        && input.approved_skills.is_none()
+        && input.definition == previous.definition
+        && input.next_slot == previous.next_slot
+}
+
 impl ControlService {
     fn mutate_schedule<'a>(
         &'a self,
@@ -17,18 +24,42 @@ impl ControlService {
             command.require(ctx.auth().principal(), ctx.auth().principal())?;
             let budget = OperationBudget::new(ctx.budget.clone());
             let prechecked = match &change {
-                Change::Create(input) => Some(
-                    self.precheck_schedule_definition(&ctx, &budget, &input.definition)
-                        .await
-                        .map(|(_, raw)| raw),
-                ),
-                Change::Update(input) => Some(
-                    self.precheck_schedule_definition(&ctx, &budget, &input.definition)
-                        .await
-                        .map(|(_, raw)| raw),
-                ),
-                Change::Delete(_) => None,
+                Change::Create(input) => self
+                    .precheck_schedule_definition(
+                        &ctx,
+                        &budget,
+                        &input.definition,
+                        &input.approved_skills,
+                    )
+                    .await
+                    .map(Some),
+                Change::Update(input) => {
+                    async {
+                        let row = self.observe_schedule(&budget, &input.schedule).await?;
+                        if row.owner_id != ctx.auth().principal().as_str()
+                            || row.deleted_at.is_some()
+                        {
+                            return Err(DomainError::ResourceNotFound.into());
+                        }
+                        let previous = schedule_info(&row)?;
+                        if pause_only(input, &previous) {
+                            return Ok(None);
+                        }
+                        let skills = input
+                            .approved_skills
+                            .as_deref()
+                            .unwrap_or(&previous.approved_skills);
+                        self.precheck_schedule_definition(&ctx, &budget, &input.definition, skills)
+                            .await
+                            .map(Some)
+                    }
+                    .await
+                }
+                Change::Delete(_) => Ok(None),
             };
+            let approved = prechecked
+                .as_ref()
+                .map(|pin| pin.as_deref().map(ScheduleAbilityLease::abilities));
             let mut tx = self.store.write(budget.clone()).await?;
             let (revision,saved) = budget.run(async {
             let (owner,_) = self.manager(tx.inner_mut(),ctx.auth(),ctx.auth().principal()).await?;
@@ -39,16 +70,22 @@ impl ControlService {
             let now = self.clock.now_ms()?;
             let (id, revoke) = match change {
                 Change::Create(input) => {
-                    validate(&input.definition,input.next_slot,self.config.schedule_limits)?;
-                    let raw = prechecked.expect("create prechecked")?;
-                    self.verify_schedule_definition_db(tx.inner_mut(),&current,&input.definition,raw).await?;
+                    validate(&input.definition,Some(input.next_slot),self.config.schedule_limits,false)?;
+                    let scope = ScheduleScope::from(&input.definition);
+                    scope.check(current.auth())?;
+                    let descriptors = approved.map_err(Clone::clone)?
+                        .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                    if !self.verify_schedule_approval_db(tx.inner_mut(),&current,scope,descriptors).await? {
+                        return Err(invalid(ValidationReason::InvalidState));
+                    }
                     if rows!(tx.inner_mut(),(i64,),fetch_optional,"SELECT 1 FROM agent_schedules WHERE schedule_id=$1","SELECT 1 FROM v1_control.agent_schedules WHERE schedule_id=$1";input.id.as_str())?.is_some() {return Err(DomainError::IdempotencyKeyReused.into());}
                     let row = AgentSchedulesRow {
                         schedule_id:input.id.to_string(),owner_id:owner.user_id.clone(),space_id:input.definition.space.to_string(),
                         project_folder_id:input.definition.project.as_ref().map(|p|p.folder_id.to_string()),title:input.definition.title,init_prompt:input.definition.init_prompt,
                         cron_expr:input.definition.cron,timezone:input.definition.timezone,approved_role:json(&input.definition.approved_role)?,
+                        approved_skills:json(&input.approved_skills)?,
                         paused_reason:input.paused.then(||"manual".into()),write_class_mask:1,budgets:json(&input.definition.limits)?,misfire_policy:"coalesce_latest".into(),
-                        next_slot_utc_ms:ms(input.next_slot)?,deleted_at:None,revision:0,config_revision:0,created_at:now,updated_at:now,
+                        next_slot_utc_ms:Some(ms(input.next_slot)?),deleted_at:None,revision:0,config_revision:0,created_at:now,updated_at:now,
                     };
                     let record = TargetRecord::from(row);
                     record.validate()?;
@@ -75,25 +112,36 @@ impl ControlService {
                     expect(&row,input.expected)?;
                     if row.space_id!=input.definition.space.as_str() {return Err(invalid(ValidationReason::ScopeMismatch));}
                     let previous = schedule_info(&row)?;
-                    let pause_only = input.paused && input.definition == previous.definition && input.next_slot == previous.next_slot;
-                    if pause_only {
-                        // Stopping the exact existing configuration must remain
-                        // possible after a role or project has disappeared.
-                        let grant = current.auth().spaces().get(&input.definition.space).ok_or(DomainError::ResourceNotFound)?;
-                        if grant.role==SpaceRole::Viewer || !grant.write_classes.contains(&DocClass::AgentMemory) {return Err(access_denied());}
-                    } else {
-                        validate(&input.definition,input.next_slot,self.config.schedule_limits)?;
-                        let raw = prechecked.expect("update prechecked")?;
-                        self.verify_schedule_definition_db(tx.inner_mut(),&current,&input.definition,raw).await?;
+                    let scope = ScheduleScope::from(&input.definition);
+                    scope.check(current.auth())?;
+                    let calendar_unchanged = input.definition.cron == previous.definition.cron
+                        && input.definition.timezone == previous.definition.timezone;
+                    if !pause_only(&input, &previous) {
+                        // Only a claim can exhaust a calendar. Ordinary
+                        // updates may preserve its already exhausted state.
+                        if input.next_slot.is_none() && (previous.next_slot.is_some() || !calendar_unchanged) {
+                            return Err(invalid(ValidationReason::InvalidTimestamp));
+                        }
+                        if input.approved_skills.is_none() && input.definition.approved_role != previous.definition.approved_role {
+                            return Err(invalid(ValidationReason::InvalidState));
+                        }
+                        let unchanged_due = calendar_unchanged && input.next_slot == previous.next_slot;
+                        validate(&input.definition,input.next_slot,self.config.schedule_limits,unchanged_due)?;
+                        let descriptors = approved.map_err(Clone::clone)?
+                            .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+                        if !self.verify_schedule_approval_db(tx.inner_mut(),&current,scope,descriptors).await? {
+                            return Err(invalid(ValidationReason::InvalidState));
+                        }
                     }
                     let project = input.definition.project.as_ref().map(|p|p.folder_id.to_string());
                     let approved = json(&input.definition.approved_role)?;
+                    let skills = json(input.approved_skills.as_ref().unwrap_or(&previous.approved_skills))?;
                     let limits = json(&input.definition.limits)?;
                     let reason:Option<&str> = input.paused.then_some("manual");
                     execute!(tx.inner_mut(),
-                        "UPDATE agent_schedules SET project_folder_id=$1,title=$2,init_prompt=$3,cron_expr=$4,timezone=$5,approved_role=$6,budgets=$7,next_slot_utc_ms=$8,paused_reason=$9,revision=$10,config_revision=$11,updated_at=$12 WHERE schedule_id=$13",
-                        "UPDATE v1_control.agent_schedules SET project_folder_id=$1,title=$2,init_prompt=$3,cron_expr=$4,timezone=$5,approved_role=$6,budgets=$7,next_slot_utc_ms=$8,paused_reason=$9,revision=$10,config_revision=$11,updated_at=$12 WHERE schedule_id=$13";
-                        project,&input.definition.title,&input.definition.init_prompt,&input.definition.cron,&input.definition.timezone,approved,limits,ms(input.next_slot)?,reason,next(row.revision)?,next(row.config_revision)?,now,input.schedule.as_str())?;
+                        "UPDATE agent_schedules SET project_folder_id=$1,title=$2,init_prompt=$3,cron_expr=$4,timezone=$5,approved_role=$6,approved_skills=$7,budgets=$8,next_slot_utc_ms=$9,paused_reason=$10,revision=$11,config_revision=$12,updated_at=$13 WHERE schedule_id=$14",
+                        "UPDATE v1_control.agent_schedules SET project_folder_id=$1,title=$2,init_prompt=$3,cron_expr=$4,timezone=$5,approved_role=$6,approved_skills=$7,budgets=$8,next_slot_utc_ms=$9,paused_reason=$10,revision=$11,config_revision=$12,updated_at=$13 WHERE schedule_id=$14";
+                        project,&input.definition.title,&input.definition.init_prompt,&input.definition.cron,&input.definition.timezone,approved,skills,limits,input.next_slot.map(ms).transpose()?,reason,next(row.revision)?,next(row.config_revision)?,now,input.schedule.as_str())?;
                     (input.schedule,true)
                 }
                 Change::Delete(input) => {
@@ -118,6 +166,9 @@ impl ControlService {
             command.save(tx.inner_mut(),revision,&saved,now).await?;
             Ok((revision,saved))
         },CommitEffect::NotCommitted).await?;
+            if let Ok(Some(pin)) = prechecked {
+                tx.hold_schedule_pin(pin);
+            }
             self.commit_revocations(tx, &budget, &saved.events).await?;
             for event in &saved.events {
                 self.flush_event(&budget, event).await?;

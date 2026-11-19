@@ -111,6 +111,7 @@ async fn exercise(pg: bool) {
     fixture.catalog.project_entries.lock().unwrap().insert(
         (personal.clone(), project.folder_id.clone()),
         ProjectInfo {
+            project_slug: "project".into(),
             folder: project.clone(),
             name: "Project".into(),
         },
@@ -119,7 +120,7 @@ async fn exercise(pg: bool) {
         identity: identity(&service, &ctx, 1).await,
         input: StartEpisode {
             selector: EpisodeSelector::New {
-                requested: EpisodeId::from_bytes([2; 16]),
+                requested: EpisodeId::parse("ses_A0b1C2d3E4_-").unwrap(),
                 name: Some("working".into()),
             },
             project_hint: Some(project.clone()),
@@ -133,6 +134,7 @@ async fn exercise(pg: bool) {
     let replay = replay.unwrap();
     assert_eq!(one.revision, replay.revision);
     let mut original = result(one.value);
+    assert_eq!(original.id.as_str(), "ses_A0b1C2d3E4_-");
     assert_eq!(original.id, result(replay.value).id);
     assert_eq!(original.project_hint, Some(project.clone()));
     assert_eq!(
@@ -266,16 +268,14 @@ async fn exercise(pg: bool) {
         revision: RevisionId::from_bytes([5; 16]),
     };
     let descriptor = AbilityDescriptor {
+        attached_skills: vec![],
         reference: role.clone(),
         kind: AbilityKind::Role,
         name: "fixture-role".into(),
         enabled: true,
         healthy: true,
         lifecycle: Lifecycle::Active,
-        entrypoint: NoteRef {
-            space_id: personal.clone(),
-            note_id: NoteId::from_bytes([6; 16]),
-        },
+        entrypoint: None,
         auxiliary_files: vec![],
     };
     fixture

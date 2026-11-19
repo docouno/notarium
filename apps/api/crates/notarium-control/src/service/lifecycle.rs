@@ -2,6 +2,7 @@ use super::{
     ControlService,
     authority::*,
     commands::{Command, SavedResult},
+    provisioning::save_space_receipt,
     spaces::{admission, expect_space, require_owner},
 };
 use crate::{
@@ -139,6 +140,7 @@ impl ControlService {
             revision,
             value: AccessibleSpace {
                 space: current.space,
+                slug: current.slug,
                 role: SpaceRole::Owner,
                 history: current.history,
             },
@@ -171,15 +173,14 @@ impl ControlService {
             let pending:PendingLifecycle=serde_json::from_str(&row.payload).map_err(|_|invalid(ValidationReason::InvalidState))?;
             if pending.version!=1 || pending.scope.space_id.as_str()!=row.target_space || pending.lifecycle==SpaceLifecycle::Closing {return Err(invalid(ValidationReason::InvalidState));}
             if row.state=="committed" {
-                let (space,history,last_seq)=serde_json::from_str(row.canonical_receipt.as_deref().ok_or_else(||invalid(ValidationReason::InvalidState))?).map_err(|_|invalid(ValidationReason::InvalidState))?;
-                return Ok(CatalogSpace{space,history,last_seq});
+                return self.load_space_receipt(budget, id, &pending.scope.space_id, row.canonical_receipt.as_deref()).await;
             }
             self.flush_event(budget,&pending.event).await?;
             let identity=AccountCommandIdentity{owner:pending.owner.clone(),actor:pending.owner,key:pending.key,hash:pending.hash,expected:pending.expected};
             let result=budget.run(self.catalog.change_lifecycle(budget.context(id.clone()),identity,pending.scope.clone(),pending.lifecycle),CommitEffect::Unknown).await?;
             result.history.check(&pending.scope)?;
             if result.space.id!=pending.scope.space_id || result.space.lifecycle!=pending.lifecycle {return Err(invalid(ValidationReason::InvalidState));}
-            let receipt=serde_json::to_string(&(result.space.clone(),result.history.clone(),result.last_seq)).map_err(|_|invalid(ValidationReason::InvalidState))?;
+            let receipt=save_space_receipt(&result)?;
             let mut tx=self.store.write(budget.clone()).await?;
             budget.run(async {
                 let current=rows!(tx.inner_mut(),ControlOperationsRow,fetch_one,"SELECT * FROM control_operations WHERE operation_id=$1","SELECT * FROM v1_control.control_operations WHERE operation_id=$1 FOR UPDATE";id.as_str())?;

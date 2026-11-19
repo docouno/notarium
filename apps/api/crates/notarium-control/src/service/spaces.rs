@@ -190,14 +190,38 @@ impl ControlService {
     }
     pub async fn whoami(&self, ctx: AccountContext) -> Result<PrincipalInfo, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
-        let (rtx, auth) = self
+        let (mut rtx, auth) = self
             .open_revalidated_read(&budget, &ctx.budget.request, ctx.auth())
             .await?;
+        let metadata = budget.run(async {
+            let account = account_info(&user_read(rtx.inner_mut(), auth.principal().as_str()).await?)?;
+            let personal_space = account.personal_space.filter(|space| {
+                auth.spaces().get(space).is_some_and(|grant| {
+                    grant.project_root.is_none() && !grant.read_classes.is_empty()
+                })
+            });
+            // A configuration hint for the caller's visible Personal Space.
+            // Model selection still performs disclosure and live admission checks.
+            let has_completion_provider = if let Some(space) = &personal_space {
+                let now = self.clock.now_ms()?;
+                rows!(rtx.inner_mut(),(i64,),fetch_optional,
+                    "SELECT CAST(1 AS BIGINT) FROM provider_attachments a JOIN provider_resources r ON r.id=a.resource_id JOIN provider_models m ON m.resource_id=r.id WHERE a.target_kind='personal' AND a.target_owner=$1 AND a.target_space=$2 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$3) AND r.disabled_at IS NULL AND m.kind='completion' LIMIT 1",
+                    "SELECT CAST(1 AS BIGINT) FROM v1_control.provider_attachments a JOIN v1_control.provider_resources r ON r.id=a.resource_id JOIN v1_control.provider_models m ON m.resource_id=r.id WHERE a.target_kind='personal' AND a.target_owner=$1 AND a.target_space=$2 AND a.state='approved' AND a.resource_epoch=r.consent_epoch AND (a.expires_at IS NULL OR a.expires_at>$3) AND r.disabled_at IS NULL AND m.kind='completion' LIMIT 1";
+                    auth.principal().as_str(),space.as_str(),now)?.is_some()
+            } else {
+                false
+            };
+            Ok((account.revision, personal_space, has_completion_provider))
+        }, CommitEffect::NotCommitted).await;
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
+        let (account_revision, personal_space, has_completion_provider) = metadata?;
         Ok(PrincipalInfo {
             principal: auth.principal().clone(),
             kind: auth.kind().clone(),
             grant: auth.grant().clone(),
+            account_revision,
+            personal_space,
+            has_completion_provider,
         })
     }
     pub async fn list_spaces(
@@ -270,6 +294,7 @@ impl ControlService {
             if current.space.lifecycle == SpaceLifecycle::Active {
                 items.push(AccessibleSpace {
                     space: current.space,
+                    slug: current.slug,
                     role: grant.role,
                     history: current.history,
                 });
@@ -328,6 +353,7 @@ impl ControlService {
             revision,
             value: AccessibleSpace {
                 space: current.space,
+                slug: current.slug,
                 role: SpaceRole::Owner,
                 history: current.history,
             },

@@ -115,7 +115,7 @@ use notarium_core::{ids::RequestId, ports::Cancellation};
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum SqlDriverState {
     Sqlite {
-        writer: Mutex<Option<crate::sqlite_fast::SqliteWriterPair>>,
+        writer: Arc<Mutex<Option<crate::sqlite_fast::SqliteWriterPair>>>,
         fast_read_pool: crate::sqlite_fast::SqliteFastReadPool,
         read_pool: SqlitePool,
         #[allow(dead_code)]
@@ -138,6 +138,7 @@ pub(crate) struct CanonicalInner {
     pub sql: SqlDriverState,
     pub blobs: BlobBackendDriver,
     writer_leases: std::sync::Mutex<std::collections::HashMap<SpaceId, LeaseEpoch>>,
+    pub chat_run_generation: String,
     pub writer_coord: OnceLock<Arc<WriteCoordinator>>,
     pub wal_coord: OnceLock<Arc<SqliteWalCoordinator>>,
     pub broadcast_hub: BroadcastHub,
@@ -385,11 +386,13 @@ impl CanonicalRuntime {
                     let db_path = data_root.canonical();
                     (
                         SqlDriverState::Sqlite {
-                            writer: Mutex::new(Some(crate::sqlite_fast::SqliteWriterPair {
-                                sqlx_conn: writer,
-                                rusqlite_conn: Some(rusqlite_writer),
-                                db_path: db_path.clone(),
-                            })),
+                            writer: Arc::new(Mutex::new(Some(
+                                crate::sqlite_fast::SqliteWriterPair {
+                                    sqlx_conn: writer,
+                                    rusqlite_conn: Some(rusqlite_writer),
+                                    db_path: db_path.clone(),
+                                },
+                            ))),
                             fast_read_pool: crate::sqlite_fast::SqliteFastReadPool::new(
                                 db_path,
                                 fast_readers,
@@ -439,6 +442,7 @@ impl CanonicalRuntime {
             sql,
             blobs,
             writer_leases: Default::default(),
+            chat_run_generation: crate::codec::new_prefixed_hex_id("crg_")?,
             writer_coord: OnceLock::new(),
             wal_coord: OnceLock::new(),
             broadcast_hub: BroadcastHub::new(DEFAULT_BROADCAST_CAPACITY),

@@ -381,6 +381,17 @@ async fn purge_note_inner(
                 .await?;
 
                 let run_opt = extract_agent_run_from_auth(&auth);
+                super::folder_cover::clear_purged(
+                    tx,
+                    &scope,
+                    &old_note,
+                    purge_seq,
+                    purge_seq,
+                    auth.principal(),
+                    run_opt.as_ref(),
+                    now_ts,
+                )
+                .await?;
                 if let Some(run_id) = &run_opt {
                     upsert_agent_run_head_tx(
                         tx,
@@ -753,6 +764,11 @@ pub(crate) async fn mint_and_purge_impl(
                     .clone()
                     .unwrap_or_else(|| old_head.slug.clone());
                 let succ_slug_fold = normalize_slug_key(&succ_slug)?;
+                if succ_slug_fold == super::folder_cover::SLUG {
+                    return Err(
+                        DomainError::validation(ValidationReason::InvalidPathComponent).into(),
+                    );
+                }
 
                 // Exclude `old_note` since it transitions to `'purged'` in this exact atomic transaction!
                 if active_note_sibling_exists_tx(
@@ -898,6 +914,7 @@ pub(crate) async fn mint_and_purge_impl(
                 let run_opt = extract_agent_run_from_auth(&auth);
                 let new_meta = RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(
                     NoteRevisionMetadata {
+                        folder_page: false,
                         note_id: input.new_note.clone(),
                         parent_folder_id: old_head.parent_folder_id.clone(),
                         is_root_child: new_anc.is_root_child,
@@ -936,6 +953,17 @@ pub(crate) async fn mint_and_purge_impl(
                 )
                 .await?;
 
+                super::folder_cover::clear_purged(
+                    tx,
+                    &scope,
+                    &input.old_note,
+                    purge_seq,
+                    create_seq,
+                    auth.principal(),
+                    run_opt.as_ref(),
+                    now_ts,
+                )
+                .await?;
                 if let Some(run_id) = &run_opt {
                     upsert_agent_run_head_tx(
                         tx,
@@ -1215,20 +1243,11 @@ async fn execute_sql_erasure_for_old_note_tx(
         }
     }
 
-    // 2. Clear cover_note_id, overlays, rank revisions, note aliases, observations, collab sessions/logs, and note revisions!
+    // 2. Clear overlays, rank revisions, note aliases, observations, collab sessions/logs, and note revisions!
     let rank_prefix = format!("{old_id_str}:");
     let rank_suffix = format!(":{old_id_str}");
     match tx {
         BackendConn::Sqlite(conn) => {
-            sqlx::query(
-                "UPDATE folder_heads SET cover_note_id = NULL WHERE space_id = ? AND cover_note_id = ?",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(old_id_str)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("sqlite_purge_clear_cover", err.to_string()))?;
-
             sqlx::query(
                 "DELETE FROM view_rank_overlays WHERE space_id = ? AND (target_note_id = ? OR view_note_id = ?)",
             )
@@ -1294,15 +1313,6 @@ async fn execute_sql_erasure_for_old_note_tx(
             .map_err(|err| internal_not_committed("sqlite_purge_del_revs", err.to_string()))?;
         }
         BackendConn::Postgres(conn) => {
-            sqlx::query(
-                "UPDATE folder_heads SET cover_note_id = NULL WHERE space_id = $1 AND cover_note_id = $2",
-            )
-            .bind(scope.space_id.as_str())
-            .bind(old_id_str)
-            .execute(&mut **conn)
-            .await
-            .map_err(|err| internal_not_committed("pg_purge_clear_cover", err.to_string()))?;
-
             sqlx::query(
                 "DELETE FROM view_rank_overlays WHERE space_id = $1 AND (target_note_id = $2 OR view_note_id = $2)",
             )

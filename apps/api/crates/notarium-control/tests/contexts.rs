@@ -233,6 +233,7 @@ async fn exercise(pg: bool) {
     fixture.catalog.project_entries.lock().unwrap().insert(
         (project.space_id.clone(), project.folder_id.clone()),
         ProjectInfo {
+            project_slug: "project".into(),
             folder: project.clone(),
             name: "Project".into(),
         },

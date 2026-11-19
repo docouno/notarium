@@ -172,7 +172,9 @@ impl ControlService {
                 version: 1,
                 scope,
                 last: last.schedule_id.clone(),
-                slot: last.next_slot_utc_ms,
+                slot: last
+                    .next_slot_utc_ms
+                    .ok_or_else(|| invalid(ValidationReason::InvalidState))?,
             })?)
         } else {
             None
@@ -185,12 +187,60 @@ impl ControlService {
             continuation,
         })
     }
+    pub async fn list_expired_schedule_runs(
+        &self,
+        ctx: MaintenanceContext,
+        now: Timestamp,
+        page: ControlPageRequest,
+    ) -> Result<ControlPage<ScheduleRunReceipt>, PortError> {
+        ctx.authority.require(ServicePurpose::Scheduler)?;
+        let at = floor_ms(now)?;
+        if at > self.clock.now_ms()? {
+            return Err(invalid(ValidationReason::InvalidTimestamp));
+        }
+        let scope = ContentDigest::from_bytes(
+            *blake3::hash(json(&(1, "expired-schedule-runs", &self.installation, at))?.as_bytes())
+                .as_bytes(),
+        );
+        let cursor = cursor(&page, scope)?;
+        let expires = cursor.as_ref().map_or(i64::MIN, |value| value.slot);
+        let id = cursor.as_ref().map_or("", |value| value.last.as_str());
+        let budget = OperationBudget::new(ctx.budget);
+        let mut rows = budget.run(async {
+            read_rows!(&self.store.backend,AgentScheduleRunsRow,fetch_all,
+                "SELECT * FROM agent_schedule_runs WHERE status IN ('claimed','running') AND expires_at<=$1 AND (expires_at,run_id)>($2,$3) ORDER BY expires_at,run_id LIMIT $4",
+                "SELECT * FROM v1_control.agent_schedule_runs WHERE status IN ('claimed','running') AND expires_at<=$1 AND (expires_at,run_id COLLATE \"C\")>($2,$3) ORDER BY expires_at,run_id COLLATE \"C\" LIMIT $4";
+                at,expires,id,i64::from(page.limit())+1)
+        }, CommitEffect::NotCommitted).await?;
+        let continuation = if rows.len() > usize::from(page.limit()) {
+            rows.pop();
+            let last = rows.last().expect("positive page");
+            Some(json(&Cursor {
+                version: 1,
+                scope,
+                last: last.run_id.clone(),
+                slot: last.expires_at,
+            })?)
+        } else {
+            None
+        };
+        Ok(ControlPage {
+            items: rows.iter().map(receipt).collect::<Result<_, _>>()?,
+            continuation,
+        })
+    }
     async fn open_run_reader(
         &self,
         budget: &OperationBudget,
         ctx: &ScheduleRunContext,
         schedule_id: &ScheduleId,
-    ) -> Result<(crate::store::ReadTransaction, Option<EngineAuthContext>), PortError> {
+    ) -> Result<
+        (
+            crate::store::ReadTransaction,
+            Option<(EngineAuthContext, SpaceId)>,
+        ),
+        PortError,
+    > {
         match ctx {
             ScheduleRunContext::Scheduler(ctx) => {
                 ctx.authority.require(ServicePurpose::Scheduler)?;
@@ -226,16 +276,18 @@ impl ControlService {
                             {
                                 return Err(DomainError::ResourceNotFound.into());
                             }
-                            Ok::<_, PortError>(())
+                            Ok::<_, PortError>(space)
                         },
                         CommitEffect::NotCommitted,
                     )
                     .await;
-                if let Err(err) = check {
-                    let _ = tx.finish().await;
-                    return Err(err);
+                match check {
+                    Ok(space) => Ok((tx, Some((auth, space)))),
+                    Err(err) => {
+                        let _ = tx.finish().await;
+                        Err(err)
+                    }
                 }
-                Ok((tx, Some(auth)))
             }
         }
     }
@@ -249,13 +301,16 @@ impl ControlService {
             ScheduleRunContext::Owner(c) => c.budget.clone(),
             ScheduleRunContext::Scheduler(c) => c.budget.clone(),
         });
-        let (mut tx, _) = self.open_run_reader(&budget, &ctx, &schedule_id).await?;
+        let (mut tx, owner) = self.open_run_reader(&budget, &ctx, &schedule_id).await?;
         let result = budget
             .run(
                 async {
                     let row = rows!(tx.inner_mut(),AgentScheduleRunsRow,fetch_optional,"SELECT * FROM agent_schedule_runs WHERE schedule_id=$1 AND run_id=$2","SELECT * FROM v1_control.agent_schedule_runs WHERE schedule_id=$1 AND run_id=$2";schedule_id.as_str(),run.as_str())?
                         .ok_or(DomainError::ResourceNotFound)?;
-                    receipt(&row)
+                    match &owner {
+                        Some((auth, space)) => scoped_receipt(&row, auth, space),
+                        None => receipt(&row),
+                    }
                 },
                 CommitEffect::NotCommitted,
             )
@@ -278,7 +333,7 @@ impl ControlService {
             .run(
                 async {
                     let scope = match &revalidated_owner {
-                        Some(auth) => digest(auth, ("runs", &self.installation, &schedule_id))?,
+                        Some((auth, _)) => digest(auth, ("runs", &self.installation, &schedule_id))?,
                         None => ContentDigest::from_bytes(
                             *blake3::hash(
                                 json(&(
@@ -311,7 +366,10 @@ impl ControlService {
                         None
                     };
                     Ok(ControlPage {
-                        items: selected.iter().map(receipt).collect::<Result<_, _>>()?,
+                        items: selected.iter().map(|row| match &revalidated_owner {
+                            Some((auth, space)) => scoped_receipt(row, auth, space),
+                            None => receipt(row),
+                        }).collect::<Result<_, _>>()?,
                         continuation,
                     })
                 },

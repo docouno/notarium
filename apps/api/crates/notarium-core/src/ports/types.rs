@@ -50,6 +50,45 @@ pub struct NoteSnapshot {
     pub byte_size: u64,
     pub fields: BTreeMap<String, FieldObservation<FieldValue>>,
     pub diagnostics: Vec<Diagnostic>,
+    pub provenance: Option<NoteProvenance>,
+}
+/// Metadata associated with the exact note revision returned by the store.
+#[derive(Clone, Debug)]
+pub struct NoteProvenance {
+    pub title: String,
+    pub path: String,
+    pub project: Option<FolderId>,
+    pub principal: PrincipalId,
+    pub modified_at: Timestamp,
+    pub folder_page: bool,
+}
+#[derive(Clone, Debug)]
+pub struct FolderSnapshot {
+    pub reference: FolderRef,
+    pub history: HistoryScope,
+    pub revision: RevisionId,
+    pub path: String,
+    pub name: String,
+    pub parent: Option<FolderId>,
+    pub project: Option<FolderId>,
+    pub cover_note: Option<NoteId>,
+}
+#[derive(Clone, Debug)]
+pub struct ChildFolders {
+    pub items: Vec<FolderSnapshot>,
+    pub next: Option<FolderId>,
+}
+/// Counts over an authorized projection cut for one exact project.
+#[derive(Clone, Debug)]
+pub struct ProjectNoteCounts {
+    pub project: FolderRef,
+    pub cut: SnapshotCut,
+    pub counts: BTreeMap<DocClass, u64>,
+}
+#[derive(Clone, Debug)]
+pub struct EnsureFolderPath {
+    pub base: Option<FolderId>,
+    pub path: String,
 }
 #[derive(Clone, Debug)]
 pub struct NoteCard {
@@ -65,12 +104,15 @@ pub struct NoteListCard {
     pub document: ListedDocument,
     pub title: String,
     pub path: String,
+    pub tags: Vec<String>,
+    pub view_type: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub struct FolderPage {
     pub folder: FolderRef,
     pub page: Option<NoteSnapshot>,
     pub children: CursorPage<NoteListCard>,
+    pub total: u64,
 }
 #[derive(Clone, Debug)]
 pub struct NoteQuery {
@@ -79,6 +121,7 @@ pub struct NoteQuery {
     pub classes: BTreeSet<DocClass>,
     pub lifecycle: LifecycleMask,
     pub filter: FieldFilterAstV1,
+    pub tag: Option<String>,
     pub sort: SortSpec,
     pub limit: PageLimit,
 }
@@ -88,13 +131,15 @@ pub struct GetNote {
     pub revision: Option<RevisionId>,
     pub causal: CausalBasis,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateNote {
     pub note: NoteId,
     pub parent: Option<FolderId>,
     pub slug: String,
     pub class: DocClass,
     pub carrier: String,
+    #[serde(default)]
+    pub folder_page: bool,
 }
 #[derive(Clone, Debug)]
 pub struct EditNote {
@@ -185,6 +230,15 @@ pub struct ResolvedMemoryTarget {
     pub note: NoteRef,
     pub category: String,
 }
+/// An authorized memory target observed without materializing it.
+#[derive(Clone, Debug)]
+pub struct MemoryTargetSnapshot {
+    pub resolved: ResolvedMemoryTarget,
+    pub scope: HistoryScope,
+    pub parent: FolderId,
+    /// None represents a target that has yet to be created.
+    pub revision: Option<RevisionId>,
+}
 #[derive(Clone, Debug)]
 pub struct AppendMemory {
     pub target: ResolvedMemoryTarget,
@@ -201,6 +255,7 @@ pub struct Link {
     pub source: NoteId,
     pub target: LinkTarget,
     pub relation: String,
+    pub target_title: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub struct LinkBatch {
@@ -218,6 +273,7 @@ pub struct PublishAbilityPackage {
     pub kind: AbilityKind,
     pub entrypoint: NoteId,
     pub files: Vec<AbilityFile>,
+    pub attached_skills: Vec<super::AbilityRef>,
     pub expected_package_revision: Option<RevisionId>,
 }
 #[derive(Clone, Debug)]
@@ -320,6 +376,7 @@ pub struct Change {
     pub lifecycle: Lifecycle,
     pub class: Option<DocClass>,
     pub effect: MutationEffect,
+    pub provenance: Option<NoteProvenance>,
 }
 #[derive(Clone, Debug)]
 pub struct ChangePage {
@@ -384,9 +441,11 @@ pub struct ChatThread {
     pub kind: ChatThreadKind,
     pub owner: PrincipalId,
     pub project_folder: Option<FolderId>,
+    pub title: String,
     pub head: ThreadEntrySeq,
     pub revision: RevisionId,
     pub tainted: bool,
+    pub active_run: Option<AgentRunId>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChatEntryKind {
@@ -489,6 +548,30 @@ pub struct ChatBranch {
     pub entries: Vec<ChatEntry>,
     pub next_ancestor: Option<ThreadEntrySeq>,
 }
+/// A bounded batch of entry identities from one already selected branch.
+#[derive(Clone, Debug)]
+pub struct ChatContentRead {
+    pub thread: ChatThreadId,
+    pub leaf: ThreadEntrySeq,
+    pub entries: Vec<ThreadEntrySeq>,
+}
+#[derive(Clone, Debug)]
+pub struct HydratedChatEntry {
+    pub seq: ThreadEntrySeq,
+    pub content: CanonicalChatContent,
+    pub tool_calls: Vec<super::ProviderToolCall>,
+}
+/// Immutable sources of a derived chat entry. Missing provenance on a legacy
+/// derived entry cannot establish provider egress authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+pub struct ChatProvenance {
+    pub origins: Vec<ProviderOrigin>,
+    pub projects: Vec<FolderRef>,
+}
+impl ChatProvenance {
+    pub const MAX_ORIGINS: usize = 256;
+    pub const MAX_BYTES: usize = 256 * 1024;
+}
 #[derive(Clone, Debug)]
 pub struct CreateChat {
     pub thread: ChatThreadId,
@@ -508,6 +591,9 @@ pub struct AppendChat {
     pub parent: ThreadEntrySeq,
     pub kind: ChatEntryKind,
     pub body: ChatInputBody,
+    pub tool_calls: Vec<super::ProviderToolCall>,
+    pub provenance: Option<ChatProvenance>,
+    pub proposed_diff: Option<String>,
     pub referenced_notes: Vec<NoteRef>,
     pub tainted: bool,
 }
@@ -521,10 +607,21 @@ pub struct PendingChatInput {
     pub in_flight_run: AgentRunId,
     pub mentions_agent: bool,
 }
+/// Queue metadata visible to the supervisor. The pending body is transferred
+/// inside the consume transaction, after the sender's live admission.
+#[derive(Clone, Debug)]
+pub struct QueuedChatInput {
+    pub id: PendingInputId,
+    pub sender: PrincipalId,
+    pub queued_base_leaf: ThreadEntrySeq,
+    pub in_flight_run: AgentRunId,
+    pub mentions_agent: bool,
+}
 #[derive(Clone, Debug)]
 pub enum QueueInputOutcome {
     Queued(Committed<QueuedInput>),
     Full { limit: u8 },
+    Changed,
 }
 #[derive(Clone, Debug)]
 pub struct QueuedInput {
@@ -540,12 +637,61 @@ pub struct ConsumePending {
 }
 #[derive(Clone, Debug)]
 pub enum ConsumedPending {
-    Appended(ChatEntry),
+    Appended {
+        entry: ChatEntry,
+        intervening_human: bool,
+    },
     AlreadyConsumed,
     BranchChanged {
         queued: ThreadEntrySeq,
         current: ThreadEntrySeq,
     },
+}
+#[derive(Clone, Debug)]
+pub struct DismissPending {
+    pub thread: ChatThreadId,
+    pub input: PendingInputId,
+}
+#[derive(Clone, Debug)]
+pub struct ClaimChatRun {
+    pub thread: ChatThreadId,
+    pub run: AgentRunId,
+    pub expected_leaf: ThreadEntrySeq,
+    pub previous_run: Option<AgentRunId>,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClaimChatRunOutcome {
+    Claimed,
+    Busy(AgentRunId),
+    Changed,
+}
+#[derive(Clone, Debug)]
+pub struct ChatRunRequest {
+    pub thread: ChatThreadId,
+    pub expected_run: AgentRunId,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FinishChatRunOutcome {
+    Cleared,
+    Pending,
+    Changed,
+}
+#[derive(Clone, Debug)]
+pub struct ChatProposalRead {
+    pub thread: ChatThreadId,
+    pub entry: ThreadEntrySeq,
+}
+/// Trusted content from an unredacted tool entry and its immutable model call.
+#[derive(Clone, Debug)]
+pub struct CanonicalChatProposal {
+    pub content: CanonicalChatContent,
+    pub call_id: CommandKey,
+    pub revision: RevisionId,
+    pub digest: ContentDigest,
+    pub model_entry: ThreadEntrySeq,
+    pub model_revision: RevisionId,
+    pub model_digest: ContentDigest,
+    pub envelope: String,
 }
 #[derive(Clone, Debug)]
 pub struct RedactChatEntry {
@@ -645,7 +791,7 @@ pub struct GraphQuery {
 }
 impl GraphQuery {
     pub fn validate(&self) -> DomainResult<()> {
-        if matches!(self.tier,GraphTier::Neighborhood{hops,..} if !(1..=2).contains(&hops)) {
+        if matches!(self.tier,GraphTier::Neighborhood{hops,..} if !(1..=3).contains(&hops)) {
             return Err(DomainError::validation(ValidationReason::InvalidLimit));
         }
         Ok(())
@@ -691,12 +837,14 @@ pub struct SearchQuery {
     pub classes: BTreeSet<DocClass>,
     pub top_k: PageLimit,
     pub model: Option<ModelProfileId>,
+    pub project: Option<FolderId>,
 }
 #[derive(Clone, Debug)]
 pub struct RecallQuery {
     pub query: SearchQuery,
     pub graph_depth: u8,
     pub token_budget: u32,
+    pub max_per_source: Option<u16>,
 }
 #[derive(Clone, Debug)]
 pub struct SearchHit {

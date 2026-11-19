@@ -1,7 +1,7 @@
 //! Typed account-state payloads have the same import and service invariants.
 use super::target::{AbilityTrailPayload, TargetRecord};
 use super::values::{closed_json as parse, schedule_timestamp};
-use crate::error::invalid;
+use crate::{error::invalid, service::validate_stored_calendar};
 use notarium_core::{
     error::{PortError, ValidationReason},
     ids::*,
@@ -9,9 +9,6 @@ use notarium_core::{
     ports::{control::*, telemetry::*},
 };
 use serde::{Serialize, de::DeserializeOwned};
-use std::str::FromStr;
-
-pub(crate) const MIN_SCHEDULE_INTERVAL_MS: i64 = 60_000;
 
 // These strings are SQL keys, so semantic JSON equality is insufficient. The
 // importer accepts exactly the representation produced by ordinary mutations.
@@ -23,6 +20,20 @@ fn canonical<T: DeserializeOwned + Serialize>(s: &str) -> Result<T, PortError> {
         return Err(invalid(ValidationReason::InvalidState));
     }
     Ok(value)
+}
+
+fn skill_pins(value: &str) -> Result<(), PortError> {
+    let refs: Vec<AbilityRef> = parse(value)?;
+    if refs.len() > MAX_ATTACHED_SKILLS
+        || refs.iter().enumerate().any(|(index, reference)| {
+            refs[..index]
+                .iter()
+                .any(|other| other.identity() == reference.identity())
+        })
+    {
+        return Err(invalid(ValidationReason::InvalidState));
+    }
+    Ok(())
 }
 fn scope(kind: &str, id: &str, space: &str, owner: &str) -> Result<(), PortError> {
     let valid = match kind {
@@ -38,6 +49,28 @@ fn scope(kind: &str, id: &str, space: &str, owner: &str) -> Result<(), PortError
 }
 pub(super) fn validate(record: &TargetRecord) -> Result<(), PortError> {
     match record {
+        TargetRecord::Pats {
+            scope,
+            ability_write,
+            ..
+        }
+        | TargetRecord::OauthGrants {
+            scope,
+            ability_write,
+            ..
+        }
+        | TargetRecord::OauthAccessTokens {
+            scope,
+            ability_write,
+            ..
+        } => {
+            if !matches!(scope.as_str(), "read" | "write")
+                || !matches!(ability_write, 0 | 1)
+                || (*ability_write == 1 && scope != "write")
+            {
+                return Err(invalid(ValidationReason::InvalidAuthority));
+            }
+        }
         TargetRecord::ProviderResources { wire, .. } => {
             if !matches!(wire.as_str(), "openai-compatible" | "ollama") {
                 return Err(invalid(ValidationReason::InvalidState));
@@ -284,15 +317,15 @@ pub(super) fn validate(record: &TargetRecord) -> Result<(), PortError> {
             cron_expr,
             timezone,
             approved_role,
+            approved_skills,
             budgets,
             next_slot_utc_ms,
             deleted_at,
             revision,
             ..
         } => {
-            schedule_timestamp(*next_slot_utc_ms)?;
-            let role: AbilityRef = parse(approved_role)?;
-            let _ = role;
+            let _: AbilityRef = parse(approved_role)?;
+            skill_pins(approved_skills)?;
             let limits: RunLimits = parse(budgets)?;
             let prompt_invalid = if deleted_at.is_some() {
                 init_prompt.len() > 32768
@@ -312,25 +345,8 @@ pub(super) fn validate(record: &TargetRecord) -> Result<(), PortError> {
             {
                 return Err(invalid(ValidationReason::InvalidState));
             }
-            let cron = cron::Schedule::from_str(cron_expr)
-                .map_err(|_| invalid(ValidationReason::InvalidQuery))?;
-            let zone = chrono_tz::Tz::from_str(timezone)
-                .map_err(|_| invalid(ValidationReason::InvalidQuery))?;
-            let date = chrono::DateTime::from_timestamp_millis(*next_slot_utc_ms)
-                .ok_or_else(|| invalid(ValidationReason::InvalidTimestamp))?;
-            let zoned = date.with_timezone(&zone);
-            if *next_slot_utc_ms % 1000 != 0 || !cron.includes(zoned) {
-                return Err(invalid(ValidationReason::InvalidTimestamp));
-            }
-            if deleted_at.is_none()
-                && let Some(following) = cron.after(&zoned).next()
-                && following
-                    .timestamp_millis()
-                    .saturating_sub(*next_slot_utc_ms)
-                    < MIN_SCHEDULE_INTERVAL_MS
-            {
-                return Err(invalid(ValidationReason::InvalidQuery));
-            }
+            next_slot_utc_ms.map(schedule_timestamp).transpose()?;
+            validate_stored_calendar(cron_expr, timezone, *next_slot_utc_ms, deleted_at.is_none())?;
         }
         TargetRecord::AgentScheduleRuns {
             slot_utc_ms,
@@ -341,11 +357,15 @@ pub(super) fn validate(record: &TargetRecord) -> Result<(), PortError> {
             history_scope,
             expires_at,
             reserved_next_slot,
+            approved_skills,
+            keeper_log_id,
+            keeper_project_folder_id,
             started_at,
             ..
         } => {
             schedule_timestamp(*slot_utc_ms)?;
-            schedule_timestamp(*reserved_next_slot)?;
+            reserved_next_slot.map(schedule_timestamp).transpose()?;
+            skill_pins(approved_skills)?;
             let _: HistoryScope = parse(history_scope)?;
             if history_scope.len() > 2048
                 || claim_request_hash.len() != 32
@@ -355,6 +375,8 @@ pub(super) fn validate(record: &TargetRecord) -> Result<(), PortError> {
                 || *owner_auth_version < 0
                 || *config_revision < 0
                 || *admission_epoch < 0
+                || reserved_next_slot.is_some_and(|slot| slot <= *slot_utc_ms)
+                || (keeper_log_id.is_none() && keeper_project_folder_id.is_some())
             {
                 return Err(invalid(ValidationReason::InvalidState));
             }

@@ -140,15 +140,17 @@ Sessions slide for 30 days and touch at most once per hour. Invites expire after
 seven days and resets after one day. Reissuing invalidates the previous token of
 that purpose. Consuming a token, replacing the password and revoking old authority
 are atomic. Expired or revoked credentials cannot be extended or revived.
-PAT expiry is optional; `Some(empty)` selected Spaces grants no Spaces, while
-`None` intersects all current memberships. PAT/OAuth contexts always remain
-delegated and cannot manage account credentials or acquire `AbilityWrite`.
+PAT expiry is optional. An empty Space selection grants zero Spaces. An absent
+selection intersects all current memberships. A write PAT may carry an explicit
+`ability_write` opt-in. OAuth authoring requires the opt-in on both the consented
+grant and the access token. Existing credentials default to authoring disabled.
 
 An interactive transport must explicitly attest `human_management` on session
 evidence or a checked trusted-none perimeter attestation to authorize account,
 credential, Space, provider, OAuth, OIDC, context, schedule and telemetry-settings
-mutations. `Cap::AbilityWrite` is attested separately on interactive evidence and
-additionally requires `human_management`. Trusted-none uses the configured durable owner; invalid supplied
+mutations. Interactive ability authoring requires both explicit authoring
+attestation and `human_management`. Bearer authoring uses its own durable opt-in
+and requires a current write grant. Trusted-none uses the configured durable owner; invalid supplied
 credentials never fall back to that owner. OIDC ID tokens are not bearer evidence;
 the verified RP flow issues a native session for an explicitly bound identity.
 
@@ -225,9 +227,10 @@ and keeps it visible to the backup owner's write pause.
 `OAuthService::new` takes operator-configured issuer and endpoint URLs. The resource
 URI comes from `ControlConfig`, never an incoming Host header. Only public clients
 with token authentication method `none`, authorization code and optional refresh
-grants are supported. Requested scopes are `read`, `write` and `offline_access`;
-`write` includes read permission. Unknown scopes fail validation. Refresh accepts
-the existing normalized scope only; a different scope requires new authorization.
+grants are supported. `write` includes read permission. `offline_access` allows
+refresh, and `mcp:ability-write` requires `write` plus explicit consent. Unknown
+scopes fail validation. Refresh accepts the existing normalized scope. A different
+scope requires new authorization.
 
 DCR accepts at most ten redirect URIs and 8 KiB of registration metadata. HTTPS
 redirects compare byte for byte. Native HTTP redirects allow only literal
@@ -604,8 +607,13 @@ at 16 hops and reject cycles. Discovery preserves continuation across filtered
 pages and never emits a lower candidate as a duplicate of the selected winner.
 `ControlPort` / `ControlPlane` also exposes episode touches, ability preferences
 and trails, and `mcp_dedup` idempotency lookup/recording.
-Authoring requires interactive human authority and `AbilityWrite`; package content
-remains canonical-owned.
+Authoring-view discovery and `inspect_ability` require ordinary read access to the
+package. Inspection returns its descriptor and saved availability and preference
+metadata, including for disabled packages. Package and binding mutations require
+`AbilityWrite` and write access to the target. The authoring transaction validates
+credential lineage under the owner lock, then takes ordered exclusive Space
+admission locks before applying a mutation or replaying a receipt. The canonical
+store owns package content.
 
 Memory targets are fixed account/project/category references. Categories are
 bounded lowercase slugs, not filesystem paths. Control verifies current authority,
@@ -616,51 +624,64 @@ owner to resolve or create the target. It never writes a second copy of note bod
 
 Schedule creation and updates require an interactive owner with current Editor or
 Owner membership and AgentMemory write permission. Account and schedule revisions
-provide separate CAS checks. A schedule's Space is immutable; a project is an exact
-FolderRef. Approved roles must be readable, healthy, enabled and at their exact
-current revision. Pausing the exact existing definition remains possible after
-its role or project disappears. Definitions contain a private title and initial prompt, redacted
-in Debug; receipts persist the schedule ID, not that private payload. Titles allow
+provide separate CAS checks. A schedule has an immutable Space and an optional exact
+FolderRef. The approval candidate reports the current role revision and current
+revisions of the role's declared skills within that scope. The owner submits the
+reviewed references on creation or explicit re-approval. Control pins the canonical
+Space, project and package revisions through the approval transaction and verifies
+live ability availability. An ordinary edit retains the previous approval. Pausing
+the exact existing definition remains possible after its role or project disappears.
+Definitions contain a private title and initial prompt, redacted in Debug. Receipts
+persist the schedule ID and omit private configuration. Titles allow
 128 scalars/512 UTF-8 bytes and prompts 32 KiB. Cron expressions include seconds,
-require a minimum interval of 60 seconds, and
-are validated with `cron`; timezones use the IANA `chrono-tz` catalog. A supplied
-slot must match the expression in that timezone, including second precision, while
-`list_due_schedules(now)` floors sub-millisecond wall-clock timestamps to whole
-milliseconds. Soft-deleting a schedule clears `init_prompt` on the tombstone row.
+require a minimum interval of 60 seconds and are validated with `cron`.
+Timezones use the IANA `chrono-tz` catalog. Slot
+calculation and validation share the same civil-time rules. A nonexistent local
+time is skipped and a repeated local time maps to its earlier UTC instant.
+Trusted scheduling reads floor sub-millisecond timestamps to whole milliseconds.
+Soft-deleting a schedule clears `init_prompt` on the tombstone row.
 
 Run limits default to 25 steps, 100,000 tokens and 300 seconds. The composition sets
 `ControlConfig.schedule_limits` within hard ceilings of 1,000 steps, 10,000,000 tokens
-and one hour. These limits bound a whole run; per-call provider budgets remain
-separate. Only AgentMemory writes are admitted. The ticker, slot computation, prompt
-loading and tool loop are consumer responsibilities.
+and one hour. These limits bound a whole run. Provider budgets apply separately to
+each call. A Keeper can write AgentMemory documents and its bound log. Consumers use
+`compute_next_slot` and own the ticker, prompt loading and tool loop.
 
 Trusted `Scheduler` authority lists due schedules, claims slots and records terminal
 results. A claim checks the expected revision, saved slot, current owner/membership,
-Space/project and exact role. Role drift pauses the schedule. The unique
-`(schedule, slot)` run row and next-slot advancement commit together. Only the new
+Space/project and all approved package revisions. Role or skill drift pauses the
+schedule. The unique `(schedule, slot)` run and next-slot advancement commit
+together. The next slot is computed after the current time, so a series of missed
+windows produces one catch-up run. A legacy late-fold slot advances without a run
+when its early occurrence already has a receipt under the same configuration.
+Finite calendars issue their last due slot and store a null next slot. Only the new
 winner receives a non-deserializable ScheduledRun credential and Keeper context.
-Exact retries return `AlreadyClaimed` inspection receipts, including after restart;
-changed claim payloads conflict. A lost response never authorizes a second execution.
+Exact retries return `AlreadyClaimed` inspection receipts, including after restart.
+Changed claim payloads conflict. Replayed receipts confer inspection only.
 The next distinct due slot can still be claimed through its fresh revision.
 
 Each scheduled effect checks the owner auth version, current membership, Space
 admission/history, run lease/status/expiry and schedule configuration revision,
 then intersects the original delegation. The context has one Space, an optional
-project pin, no `AbilityWrite`, AgentMemory writes and a read-only approved role.
-Provider deadlines also respect run expiry. Advancing the next slot changes the
-ordinary schedule revision; interactive edits change `config_revision` as well.
+project pin, no `AbilityWrite`, AgentMemory writes and read-only approved packages.
+Each run snapshots a Keeper log ID for that schedule, Space and project. Changing
+the project starts a separate log. A project-scoped reader cannot discover the
+old log through a run receipt. Provider deadlines also respect run expiry. Advancing
+the next slot changes the ordinary schedule revision. Interactive edits also change
+`config_revision`.
 Thus a later slot does not revoke an earlier active run. Configuration edits,
 pause/delete and terminal results use the durable SQL-to-registry revocation fence
 and wait for shutdown acknowledgement. Deletion retains audit rows and the ID.
-Canonical role mutation is checked on a new claim; an already active run still
-requires the canonical content lease at provider dispatch.
+Current approved package revisions are checked on claims and credential
+revalidation. Provider dispatch also pins the exact role and skill content under
+its canonical disclosure lease.
 
-Terminal Succeeded/Failed/Unknown results require the exact run and lease. They can
-finish audit after expiry or schedule deletion, but cannot mint authority or change
-any next slot. An identical terminal result is idempotent; a different result
-conflicts. Owner or trusted scheduler readers inspect bounded run pages without
-recovering dispatch permission. Due and audit pages are keyset views, not retained
-SQL snapshots; the ticker must revisit due work as the database changes.
+Terminal Succeeded/Failed/Unknown results require the exact run and lease. They
+record the outcome even after expiry or schedule deletion. Repeating the same
+terminal result returns the original receipt. A different result conflicts. An owner
+or trusted scheduler can inspect bounded run pages. The
+scheduler also lists expired unfinished runs for reconciliation with
+`Unknown`. Due, expiry and audit pages use keyset pagination over live SQL.
 
 ## Content-free telemetry and retention
 

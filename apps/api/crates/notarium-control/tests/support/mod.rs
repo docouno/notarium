@@ -115,7 +115,27 @@ pub struct Catalog {
     pub folder_entries: Mutex<BTreeMap<(SpaceId, FolderId), CatalogFolder>>,
     pub memory_calls: AtomicUsize,
 }
+struct TestSchedulePin {
+    history: HistoryScope,
+    descriptors: Vec<AbilityDescriptor>,
+}
+impl ScheduleAbilityLease for TestSchedulePin {
+    fn history(&self) -> &HistoryScope {
+        &self.history
+    }
+    fn abilities(&self) -> &[AbilityDescriptor] {
+        &self.descriptors
+    }
+}
+
 impl ControlCatalogPort for Catalog {
+    fn disclosure(
+        &self,
+        _: AccountContext,
+        _: CatalogDisclosure,
+    ) -> PortFuture<'_, notarium_core::classes::CanonicalMetadataContent> {
+        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
+    }
     fn space(&self, _: CallBudget, id: SpaceId) -> PortFuture<'_, CatalogSpace> {
         Box::pin(async move {
             self.space_reads.fetch_add(1, Ordering::SeqCst);
@@ -152,6 +172,7 @@ impl ControlCatalogPort for Catalog {
     ) -> PortFuture<'_, CatalogSpace> {
         Box::pin(async move {
             let space = CatalogSpace {
+                slug: request.space.id.to_string(),
                 space: Space {
                     id: request.space.id.clone(),
                     kind: request.space.kind,
@@ -313,6 +334,50 @@ impl ControlCatalogPort for Catalog {
                 .ok_or(DomainError::ResourceNotFound.into())
         })
     }
+    fn pin_schedule_abilities(
+        &self,
+        ctx: AccountContext,
+        refs: Vec<AbilityRef>,
+    ) -> PortFuture<'_, Box<dyn ScheduleAbilityLease>> {
+        Box::pin(async move {
+            let (space, grant) = ctx
+                .auth()
+                .spaces()
+                .iter()
+                .next()
+                .ok_or(DomainError::ResourceNotFound)?;
+            let facts = self.space(ctx.budget.clone(), space.clone()).await?;
+            if let Some(folder_id) = &grant.project_root {
+                self.project(
+                    SpaceContext::new(
+                        ctx.auth().clone(),
+                        facts.history.clone(),
+                        ctx.budget.clone(),
+                    )?,
+                    FolderRef {
+                        space_id: space.clone(),
+                        folder_id: folder_id.clone(),
+                    },
+                )
+                .await?;
+            }
+            let entries = self.ability_entries.lock().unwrap();
+            let mut descriptors = Vec::with_capacity(refs.len());
+            for reference in refs {
+                let descriptor = entries
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.reference.identity() == reference.identity())
+                    .filter(|entry| entry.reference == reference)
+                    .ok_or(DomainError::ResourceNotFound)?;
+                descriptors.push(descriptor.clone());
+            }
+            Ok(Box::new(TestSchedulePin {
+                history: facts.history,
+                descriptors,
+            }) as Box<dyn ScheduleAbilityLease>)
+        })
+    }
     fn note(&self, ctx: AccountContext, note: NoteRef) -> PortFuture<'_, CatalogNote> {
         Box::pin(async move {
             let value = self
@@ -378,6 +443,14 @@ impl ControlCatalogPort for Catalog {
             }
             Ok(result)
         })
+    }
+    fn inspect_memory_target(
+        &self,
+        _: AccountContext,
+        _: MemoryTarget,
+        _: String,
+    ) -> PortFuture<'_, MemoryTargetSnapshot> {
+        Box::pin(async { Err(DomainError::ResourceNotFound.into()) })
     }
     fn resolve_or_ensure_memory_target(
         &self,

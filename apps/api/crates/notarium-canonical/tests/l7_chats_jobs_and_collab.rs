@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[path = "l7_chats_jobs_and_collab/agent_turns.rs"]
+mod agent_turns;
 #[path = "l7_chats_jobs_and_collab/authority.rs"]
 mod authority;
 #[path = "l7_chats_jobs_and_collab/pg_read_cancellation.rs"]
@@ -28,20 +30,21 @@ use notarium_canonical::{
 };
 use notarium_core::{
     DomainError,
-    auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
+    auth::{ChatAudience, EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{
-        ArtifactId, ChatThreadId, CommandKey, ContentDigest, GrantId, JobId, LeaseEpoch, NoteId,
-        PendingInputId, PrincipalId, RequestId, SpaceSeq, ThreadEntrySeq,
+        AgentRunId, ArtifactId, ChatThreadId, CommandKey, ContentDigest, GrantId, JobId,
+        LeaseEpoch, NoteId, PendingInputId, PrincipalId, RequestId, SpaceSeq, ThreadEntrySeq,
     },
     model::{HistoryScope, NoteRef},
     patch::CarrierEditOrigin,
     ports::{
         AppendChat, CallBudget, CancelJob, Cancellation, ChangeKind, ChangeRead, ChangeReadResult,
-        ChatBody, ChatEntryKind, ChatInputBody, ChatPort, ChatRead, ChatThreadKind, ConsumePending,
-        ConsumedPending, ContentJobKind, ContentJobPort, CreateChat, CreateNote, DeleteDisposition,
-        DeleteNote, EditNote, EntityId, FilenamePin, ForkChat, GetNote, InterceptedMutation,
+        ChatBody, ChatEntryKind, ChatInputBody, ChatPort, ChatRead, ChatRunRequest, ChatThreadKind,
+        ClaimChatRun, ClaimChatRunOutcome, ConsumePending, ConsumedPending, ContentJobKind,
+        ContentJobPort, CreateChat, CreateNote, DeleteDisposition, DeleteNote, EditNote, EntityId,
+        FilenamePin, FinishChatRunOutcome, ForkChat, GetNote, InterceptedMutation,
         InterceptionResult, JobQuery, JobState, LiveCollabInterceptor, Mutation, NoteWritePort,
         PageLimit, PendingChatInput, PortFuture, Preconditions, QueueInputOutcome, RedactChatEntry,
         RollbackReservation, SpaceContext, StagedChatBlob,
@@ -85,6 +88,42 @@ fn owner_ctx(scope: &HistoryScope, principal: PrincipalId) -> SpaceContext {
         make_budget(),
     )
     .expect("owner SpaceContext")
+}
+
+async fn claim_run(
+    store: &CanonicalStore,
+    ctx: SpaceContext,
+    audience: ChatAudience,
+    thread: &ChatThreadId,
+    run: &AgentRunId,
+    leaf: ThreadEntrySeq,
+) -> SpaceContext {
+    let agent = ctx
+        .auth()
+        .for_agent_run(
+            run.clone(),
+            ctx.scope().space_id.clone(),
+            audience,
+            ctx.auth().spaces().clone(),
+        )
+        .unwrap();
+    let agent_ctx = SpaceContext::new(agent, ctx.scope().clone(), make_budget()).unwrap();
+    assert_eq!(
+        store
+            .claim_active_run(
+                agent_ctx.clone(),
+                ClaimChatRun {
+                    thread: thread.clone(),
+                    run: run.clone(),
+                    expected_leaf: leaf,
+                    previous_run: None,
+                }
+            )
+            .await
+            .unwrap(),
+        ClaimChatRunOutcome::Claimed,
+    );
+    agent_ctx
 }
 
 fn next_mutation<T>(scope: &HistoryScope, actor: &PrincipalId, input: T) -> Mutation<T> {
@@ -367,6 +406,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: ref_note.clone(),
                     parent: None,
                     slug: "chat-ref".to_owned(),
@@ -428,6 +468,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -455,6 +498,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: thread.clone(),
                     parent: e1.seq,
                     kind: ChatEntryKind::Model,
@@ -488,6 +534,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: thread.clone(),
                     parent: e1.seq,
                     kind: ChatEntryKind::Model,
@@ -515,6 +564,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: thread.clone(),
                     parent: e1.seq,
                     kind: ChatEntryKind::Model,
@@ -608,6 +660,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: thread.clone(),
                     parent: e1.seq,
                     kind: ChatEntryKind::Model,
@@ -654,6 +709,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     &scope,
                     &owner,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        proposed_diff: None,
                         thread: thread.clone(),
                         parent: branch_b_tip,
                         kind: ChatEntryKind::Human,
@@ -683,6 +741,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                         &scope,
                         &owner,
                         AppendChat {
+                            tool_calls: Vec::new(),
+                            provenance: None,
+                            proposed_diff: None,
                             thread: thread.clone(),
                             parent: branch_b_tip,
                             kind: ChatEntryKind::Model,
@@ -705,6 +766,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     &scope,
                     &owner,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        proposed_diff: None,
                         thread: thread.clone(),
                         parent: cur_a,
                         kind: if target_depth % 2 == 0 {
@@ -874,6 +938,15 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
 
     // 3. Bounded 16-item pending input queue (`17` concurrent `queue_chat_input` -> `16` Queued + `1` Full, zero leaked CAS refs).
     let run_id = sample_run_id(0x55);
+    claim_run(
+        store,
+        owner_ctx(&scope, owner.clone()),
+        ChatAudience::Personal,
+        &thread,
+        &run_id,
+        cur_a,
+    )
+    .await;
     let mut large_candidates = BTreeSet::new();
     let mut handles = Vec::new();
     for idx in 0..17u8 {
@@ -938,6 +1011,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                         .await;
                 }
             }
+            QueueInputOutcome::Changed => panic!("run claim changed before queue settled"),
         }
     }
     assert_eq!(queued_ids.len(), 16);
@@ -1082,7 +1156,7 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .expect("consume Appended")
         .value;
     let appended_from_queue = match consumed_ok {
-        ConsumedPending::Appended(entry) => entry,
+        ConsumedPending::Appended { entry, .. } => entry,
         other => panic!("expected Appended, got {other:?}"),
     };
     assert!(matches!(appended_from_queue.body, ChatBody::Blob(_)));
@@ -1205,7 +1279,11 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         .consume_chat_input(owner_ctx(&scope, owner.clone()), inline_request.clone())
         .await
         .unwrap();
-    let ConsumedPending::Appended(inline_entry) = added.value else {
+    let ConsumedPending::Appended {
+        entry: inline_entry,
+        ..
+    } = added.value
+    else {
         panic!("expected inline entry");
     };
     assert!(matches!(inline_entry.body, ChatBody::Inline(_)));
@@ -1239,6 +1317,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
         &scope,
         &owner,
         AppendChat {
+            tool_calls: Vec::new(),
+            provenance: None,
+            proposed_diff: None,
             thread: thread.clone(),
             parent: cur_a,
             kind: ChatEntryKind::Compaction,
@@ -1262,6 +1343,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: thread.clone(),
                     parent: comp_a.seq,
                     kind: ChatEntryKind::Model,
@@ -1284,6 +1368,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: thread.clone(),
                     parent: branch_b_tip,
                     kind: ChatEntryKind::Compaction,
@@ -1463,6 +1550,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: thread.clone(),
                     parent: cur_a,
                     kind: ChatEntryKind::Model,
@@ -1484,6 +1574,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: thread.clone(),
                     parent: tainted_append.seq,
                     kind: ChatEntryKind::Human,
@@ -1587,6 +1680,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                 &shared_scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: group_thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Model,
@@ -1636,6 +1732,9 @@ async fn run_chat_skip_pointers_inline_cas_queue_and_redaction_suite(
                     chat_scope,
                     &owner,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        proposed_diff: None,
                         thread: redact_thread.clone(),
                         parent: ThreadEntrySeq::ZERO,
                         kind: ChatEntryKind::Human,
@@ -1806,6 +1905,9 @@ async fn run_ten_thousand_entry_chat_dag_read_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -1837,6 +1939,9 @@ async fn run_ten_thousand_entry_chat_dag_read_suite(store: &CanonicalStore) {
                             &sc,
                             &own,
                             AppendChat {
+                                tool_calls: Vec::new(),
+                                provenance: None,
+                                proposed_diff: None,
                                 thread: th.clone(),
                                 parent: tip,
                                 kind: if step % 2 == 0 {
@@ -1875,6 +1980,9 @@ async fn run_ten_thousand_entry_chat_dag_read_suite(store: &CanonicalStore) {
                     &scope,
                     &owner,
                     AppendChat {
+                        tool_calls: Vec::new(),
+                        provenance: None,
+                        proposed_diff: None,
                         thread: thread.clone(),
                         parent: tip,
                         kind: ChatEntryKind::Human,
@@ -2200,6 +2308,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: secret_note.clone(),
                     parent: None,
                     slug: "export-secret".to_owned(),
@@ -2518,6 +2627,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: collab_note.clone(),
                     parent: None,
                     slug: "collab-doc".to_owned(),
@@ -3040,6 +3150,7 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
                     &crash_scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: crash_note.clone(),
                         parent: None,
                         slug: "crash-doc".to_owned(),
@@ -3121,6 +3232,9 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
             &crash_scope,
             &owner,
             AppendChat {
+                tool_calls: Vec::new(),
+                provenance: None,
+                proposed_diff: None,
                 thread: staging_thread.clone(),
                 parent: ThreadEntrySeq::ZERO,
                 kind: ChatEntryKind::Human,
@@ -3447,6 +3561,17 @@ async fn exercise_interrupted_queue_upload(
     )
     .await
     .unwrap();
+    let old_run = sample_run_id(0xad);
+    let new_run = sample_run_id(0xae);
+    claim_run(
+        &old,
+        owner_ctx(&scope, actor.clone()),
+        ChatAudience::Personal,
+        &thread,
+        &old_run,
+        ThreadEntrySeq::ZERO,
+    )
+    .await;
     let body = "payload spanning queue takeover".repeat(24);
     let prepared = old.prepare_blob(body.as_bytes()).unwrap();
     let (reached, until_put) = tokio::sync::oneshot::channel();
@@ -3467,7 +3592,11 @@ async fn exercise_interrupted_queue_upload(
                 sender: actor.clone(),
                 body: body.clone(),
                 queued_base_leaf: ThreadEntrySeq::ZERO,
-                in_flight_run: sample_run_id(0xad),
+                in_flight_run: if id == 0xe1 || cancel {
+                    old_run.clone()
+                } else {
+                    new_run.clone()
+                },
                 mentions_agent: false,
             },
         )
@@ -3514,6 +3643,28 @@ async fn exercise_interrupted_queue_upload(
             )
             .await
             .unwrap();
+        assert_eq!(
+            current
+                .recover_active_run(
+                    owner_ctx(&scope, actor.clone()),
+                    ChatRunRequest {
+                        thread: thread.clone(),
+                        expected_run: old_run.clone(),
+                    }
+                )
+                .await
+                .unwrap(),
+            FinishChatRunOutcome::Cleared,
+        );
+        claim_run(
+            &current,
+            owner_ctx(&scope, actor.clone()),
+            ChatAudience::Personal,
+            &thread,
+            &new_run,
+            ThreadEntrySeq::ZERO,
+        )
+        .await;
         (current, Some(rt))
     };
     let accepted = current
@@ -3670,6 +3821,7 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: note.clone(),
                         parent: None,
                         slug: "report".into(),
@@ -3702,6 +3854,9 @@ async fn chat_receipts_preserve_body_and_reference_boundaries() {
             &scope,
             &owner,
             AppendChat {
+                tool_calls: Vec::new(),
+                provenance: None,
+                proposed_diff: None,
                 thread: thread.clone(),
                 parent: ThreadEntrySeq::ZERO,
                 kind: ChatEntryKind::Human,

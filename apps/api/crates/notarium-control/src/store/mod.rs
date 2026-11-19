@@ -521,6 +521,7 @@ impl ControlStore {
                 let mut tx = WriteTransaction {
                     resources: Some(WriteResources {
                         revocation_fences: Vec::new(),
+                        schedule_pin: None,
                         inner,
                         _guard: guard,
                         _admission: admission,
@@ -692,6 +693,7 @@ impl Drop for ReadTransaction {
 struct WriteResources {
     inner: Transaction,
     revocation_fences: Vec<Box<dyn notarium_core::ports::RevocationLease>>,
+    schedule_pin: Option<Box<dyn notarium_core::ports::ScheduleAbilityLease>>,
     _guard: OwnedRwLockReadGuard<()>,
     _admission: OwnedSemaphorePermit,
     file_fence: Option<fence::FileFence>,
@@ -701,6 +703,7 @@ impl WriteResources {
         let Self {
             inner,
             revocation_fences,
+            schedule_pin,
             _guard,
             _admission,
             file_fence,
@@ -715,6 +718,7 @@ impl WriteResources {
             Ok(())
         };
         drop(revocation_fences);
+        drop(schedule_pin);
         drop(_guard);
         drop(_admission);
         result?;
@@ -732,6 +736,7 @@ impl WriteResources {
         let Self {
             inner,
             revocation_fences,
+            schedule_pin,
             _guard,
             _admission,
             file_fence,
@@ -746,6 +751,7 @@ impl WriteResources {
             Ok(())
         };
         drop(revocation_fences);
+        drop(schedule_pin);
         drop(_guard);
         drop(_admission);
         result?;
@@ -756,6 +762,17 @@ pub(crate) struct WriteTransaction {
     resources: Option<WriteResources>,
 }
 impl WriteTransaction {
+    /// The native writer owns this lease until commit or rollback ACK, even
+    /// when the operation abandons its wait for the native writer.
+    pub(crate) fn hold_schedule_pin(
+        &mut self,
+        pin: Box<dyn notarium_core::ports::ScheduleAbilityLease>,
+    ) {
+        self.resources
+            .as_mut()
+            .expect("live write transaction")
+            .schedule_pin = Some(pin);
+    }
     pub(crate) fn hold_revocation_fence(
         &mut self,
         fence: Box<dyn notarium_core::ports::RevocationLease>,

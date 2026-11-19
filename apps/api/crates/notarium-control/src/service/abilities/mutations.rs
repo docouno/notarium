@@ -1,7 +1,7 @@
 use super::*;
 use crate::service::commands::{Command, SavedResult};
 use crate::store::statements::execute;
-use notarium_core::auth::{PrincipalKind, SpaceRole};
+use notarium_core::auth::SpaceRole;
 use std::collections::BTreeSet;
 
 impl ControlService {
@@ -12,11 +12,15 @@ impl ControlService {
         owner: &UsersRow,
         references: &[&AbilityRef],
     ) -> Result<BTreeSet<SpaceId>, PortError> {
-        ctx.auth().authorize_ability_mutation()?;
-        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
-            return Err(access_denied());
-        }
-        self.live_human(tx, ctx.auth(), owner).await?;
+        let auth = ctx.auth();
+        let authority = self
+            .credential_authority(
+                tx,
+                owner,
+                auth.credential().cloned().ok_or_else(denied)?,
+                true,
+            )
+            .await?;
         let mut spaces = BTreeSet::new();
         for reference in references {
             let space = match &reference.placement {
@@ -32,6 +36,7 @@ impl ControlService {
                 }
                 _ => return Err(access_denied()),
             };
+            authority.authorize_ability_space(auth, &space)?;
             if ctx.auth().spaces().get(&space).is_none_or(|grant| grant.role == SpaceRole::Viewer || !grant.write_classes.contains(&DocClass::Skill) || grant.project_root.as_ref().is_some_and(|root| !matches!(&reference.placement, AbilityPlacement::OwnedProject(project) if &project.folder_id == root))) {
                 return Err(access_denied());
             }
@@ -76,9 +81,6 @@ impl ControlService {
         let command = Command::new(request.identity, "update-ability-binding", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         ctx.auth().authorize_ability_mutation()?;
-        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
-            return Err(access_denied());
-        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let current = self.current_account(&ctx, &budget).await?;
         let value = budget
@@ -145,7 +147,9 @@ impl ControlService {
     ) -> Result<ControlCommit<AbilityPreferenceUpdate>, PortError> {
         let command = Command::new(request.identity, "set-ability-preference", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
-        ctx.auth().authorize_human_management()?;
+        if !(ctx.auth().human_management() || ctx.auth().has_cap(Cap::AbilityWrite)) {
+            return Err(DomainError::AbilityWriteForbidden.into());
+        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let current = self.current_account(&ctx, &budget).await?;
         let value = budget
@@ -160,7 +164,19 @@ impl ControlService {
         let mut tx = self.store.write(budget.clone()).await?;
         let (revision, saved) = budget.run(async {
             let auth = self.revalidate(tx.inner_mut(), ctx.auth()).await?;
-            auth.authorize_human_management()?;
+            if !(auth.human_management() || auth.has_cap(Cap::AbilityWrite)) {
+                return Err(DomainError::AbilityWriteForbidden.into());
+            }
+            if !auth.human_management() {
+                let entry = value.entrypoint.as_ref().ok_or(DomainError::AbilityWriteForbidden)?;
+                let grant = auth.spaces().get(&entry.space_id).ok_or_else(access_denied)?;
+                if grant.role == SpaceRole::Viewer
+                    || !grant.write_classes.contains(&DocClass::Skill)
+                    || grant.project_root.as_ref().is_some_and(|root| !matches!(&value.reference.placement, AbilityPlacement::OwnedProject(folder) if &folder.folder_id == root))
+                {
+                    return Err(access_denied());
+                }
+            }
             if let Some(replay) = command.replay::<AbilityPreferenceUpdate>(tx.inner_mut()).await? { return Ok(replay); }
             let owner = user(tx.inner_mut(), auth.principal().as_str()).await?;
             expect_revision(&owner, command.identity.expected)?;
@@ -186,21 +202,48 @@ impl ControlService {
         let command = Command::new(request.identity, "set-ability-trail", &request.input)?;
         command.require(ctx.auth().principal(), ctx.auth().principal())?;
         ctx.auth().authorize_ability_mutation()?;
-        if ctx.auth().kind() != &PrincipalKind::DirectHuman {
-            return Err(access_denied());
-        }
         let budget = OperationBudget::new(ctx.budget.clone());
         let prechecked = if let Some(destination) = &request.input.destination {
             let current = self.current_account(&ctx, &budget).await?;
-            let source = budget
-                .run(
-                    self.raw_ability(&current, request.input.source.identity()),
-                    CommitEffect::NotCommitted,
-                )
-                .await?;
             let target = budget
                 .run(
                     self.raw_ability(&current, destination.identity()),
+                    CommitEffect::NotCommitted,
+                )
+                .await?;
+            let source = budget
+                .run(
+                    async {
+                        let original = &request.input.source;
+                        match (&original.placement, &destination.placement) {
+                            (
+                                AbilityPlacement::OwnedProject(project),
+                                AbilityPlacement::OwnedSpace(space),
+                            ) if original.id == destination.id
+                                && original.revision != destination.revision
+                                && &project.space_id == space =>
+                            {
+                                self.catalog_project(&current, project).await?;
+                                // Publishing the new placement changed the live lookup key.
+                                // The source revision is still immutable and readable there.
+                                let lookup = AbilityRef {
+                                    id: original.id.clone(),
+                                    placement: destination.placement.clone(),
+                                    revision: original.revision.clone(),
+                                };
+                                let mut previous = self
+                                    .catalog
+                                    .ability(current.clone(), lookup.clone())
+                                    .await?;
+                                if previous.reference != lookup {
+                                    return Err(DomainError::ResourceNotFound.into());
+                                }
+                                previous.reference = original.clone();
+                                Ok(previous)
+                            }
+                            _ => self.raw_ability(&current, original.identity()).await,
+                        }
+                    },
                     CommitEffect::NotCommitted,
                 )
                 .await?;

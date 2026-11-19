@@ -96,6 +96,7 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
     fixture.catalog.project_entries.lock().unwrap().insert(
         (project.space_id.clone(), project.folder_id.clone()),
         ProjectInfo {
+            project_slug: "project".into(),
             folder: project.clone(),
             name: "Shared project".into(),
         },
@@ -186,13 +187,14 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
         .lock()
         .unwrap()
         .push(AbilityDescriptor {
+            attached_skills: vec![],
             reference: ability_ref.clone(),
             kind: AbilityKind::Role,
             name: "shared-role".into(),
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
-            entrypoint: ability_note.clone(),
+            entrypoint: Some(ability_note.clone()),
             auxiliary_files: vec![],
         });
     fixture.catalog.note_entries.lock().unwrap().insert(

@@ -26,6 +26,7 @@ pub(super) async fn check(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "export-source".into(),
@@ -213,6 +214,9 @@ pub(super) async fn check(store: &CanonicalStore) {
             &scope,
             &owner,
             AppendChat {
+                tool_calls: Vec::new(),
+                provenance: None,
+                proposed_diff: None,
                 thread: thread.clone(),
                 parent: ThreadEntrySeq::ZERO,
                 kind: ChatEntryKind::Human,
@@ -236,6 +240,15 @@ pub(super) async fn check(store: &CanonicalStore) {
         .seq;
     let pending = PendingInputId::from_bytes([226; 16]);
     let run = sample_run_id(226);
+    let _agent = claim_run(
+        store,
+        admitted.clone(),
+        ChatAudience::Shared,
+        &thread,
+        &run,
+        b,
+    )
+    .await;
     store
         .queue_chat_input(
             admitted.clone(),
@@ -270,16 +283,27 @@ pub(super) async fn check(store: &CanonicalStore) {
     let tainted = owner_ctx(&scope, owner.clone());
     tainted.auth().taint().mark_external_read();
     for (leaf, already_consumed) in [(b, false), (a, true)] {
-        if already_consumed {
-            assert!(matches!(
-                store
-                    .consume_chat_input(admitted.clone(), consume(a))
-                    .await
-                    .unwrap()
-                    .value,
-                ConsumedPending::Appended(_)
-            ));
-        }
+        let leaf = if already_consumed {
+            let mut advance = message("resume A");
+            advance.input.parent = a;
+            let resumed_leaf = store
+                .append_chat(admitted.clone(), advance)
+                .await
+                .unwrap()
+                .value
+                .seq;
+            let appended = store
+                .consume_chat_input(admitted.clone(), consume(resumed_leaf))
+                .await
+                .unwrap()
+                .value;
+            let ConsumedPending::Appended { entry, .. } = appended else {
+                panic!("expected a human post on the resumed branch");
+            };
+            entry.seq
+        } else {
+            leaf
+        };
         let request = consume(leaf);
         let before = store.read_space(&scope.space_id).await.unwrap().last_seq;
         assert!(matches!(

@@ -78,6 +78,7 @@ async fn rollback_deadline_spans_room_reservations_and_writer_ack_on_both_backen
                         &scope,
                         &owner,
                         CreateNote {
+                            folder_page: false,
                             note: note.clone(),
                             parent: None,
                             slug: format!("deadline-{id}"),

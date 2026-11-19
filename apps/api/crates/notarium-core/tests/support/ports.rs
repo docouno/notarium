@@ -21,6 +21,12 @@ macro_rules! reject {
 }
 impl NoteReadPort for RejectingPorts {
     reject! {
+    fn resolve_folder_path(&self, ctx: SpaceContext, base: Option<FolderId>, path: String) -> PortFuture<'_, Option<FolderSnapshot>>;
+    fn list_child_folders(&self, ctx: SpaceContext, base: Option<FolderId>, after: Option<FolderId>, limit: PageLimit) -> PortFuture<'_, ChildFolders>;
+    fn resolve_note_target(&self, ctx: SpaceContext, parent: Option<FolderId>, slug_title_or_id: String) -> PortFuture<'_, Option<NoteRef>>;
+    fn space_schema(&self, ctx: SpaceContext) -> PortFuture<'_, std::collections::BTreeMap<String, FieldSchema>>;
+    fn project_note_counts(&self, ctx: SpaceContext, project: FolderRef, causal: CausalBasis) -> PortFuture<'_, ProjectNoteCounts>;
+    fn prepare_agent_run_rollback(&self, ctx: SpaceContext, run: AgentRunId) -> PortFuture<'_, RollbackAgentRun>;
     fn read_ability_resource(&self, ctx: SpaceContext, request: ReadAbilityResource) -> PortFuture<'_, notarium_core::classes::ClassifiedAbilityResource>;
     fn get_note(&self, ctx: SpaceContext, request: GetNote) -> PortFuture<'_, NoteSnapshot>;
     fn list_notes(
@@ -42,6 +48,7 @@ impl NoteReadPort for RejectingPorts {
 }
 impl NoteWritePort for RejectingPorts {
     reject! {
+    fn ensure_folder_path(&self, ctx: SpaceContext, request: Mutation<EnsureFolderPath>) -> PortFuture<'_, FolderRef>;
     fn create_note(
             &self,
             ctx: SpaceContext,
@@ -120,6 +127,16 @@ impl NoteWritePort for RejectingPorts {
 impl ChatPort for RejectingPorts {
     reject! {
     fn read_chat(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatBranch>;
+    fn read_chat_context(&self, ctx: SpaceContext, request: ChatRead) -> PortFuture<'_, ChatBranch>;
+    fn read_chat_contents(&self, ctx: SpaceContext, request: ChatContentRead) -> PortFuture<'_, Vec<HydratedChatEntry>>;
+    fn read_chat_proposal(&self, ctx: SpaceContext, request: ChatProposalRead) -> PortFuture<'_, CanonicalChatProposal>;
+    fn stage_chat_blob(&self, ctx: SpaceContext, text: String) -> PortFuture<'_, StagedChatBlob>;
+    fn discard_staged_chat_blob(&self, ctx: SpaceContext, staged: StagedChatBlob) -> PortFuture<'_, ()>;
+    fn list_pending_chat_inputs(&self, ctx: SpaceContext, thread: ChatThreadId) -> PortFuture<'_, Vec<QueuedChatInput>>;
+    fn dismiss_chat_input(&self, ctx: SpaceContext, request: DismissPending) -> PortFuture<'_, bool>;
+    fn claim_active_run(&self, ctx: SpaceContext, request: ClaimChatRun) -> PortFuture<'_, ClaimChatRunOutcome>;
+    fn finish_run_if_queue_empty(&self, ctx: SpaceContext, request: ChatRunRequest) -> PortFuture<'_, FinishChatRunOutcome>;
+    fn recover_active_run(&self, ctx: SpaceContext, request: ChatRunRequest) -> PortFuture<'_, FinishChatRunOutcome>;
     fn create_chat(
             &self,
             ctx: SpaceContext,
@@ -196,6 +213,7 @@ impl ContentJobPort for RejectingPorts {
 impl ControlPort for RejectingPorts {
     reject! {
     fn resolve_auth(&self, ctx: PreAuthContext) -> PortFuture<'_, EngineAuthContext>;
+    fn revalidate_auth(&self, ctx: AccountContext) -> PortFuture<'_, EngineAuthContext>;
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo>;
     fn list_spaces(&self, ctx: AccountContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<AccessibleSpace>>;
     fn list_projects(&self, ctx: AccountContext, page: ControlPageRequest) -> PortFuture<'_, ControlPage<ProjectInfo>>;
@@ -260,6 +278,11 @@ impl ControlPort for RejectingPorts {
             reference: AbilityRef,
             project: Option<FolderRef>,
         ) -> PortFuture<'_, AbilityDescriptor>;
+    fn inspect_ability(
+            &self,
+            ctx: AccountContext,
+            identity: AbilityIdentity,
+        ) -> PortFuture<'_, AbilityInspection>;
     fn update_ability_binding(
             &self,
             ctx: AccountContext,
@@ -291,11 +314,22 @@ impl ControlPort for RejectingPorts {
             target: MemoryTarget,
             category: String,
         ) -> PortFuture<'_, ResolvedMemoryTarget>;
+    fn inspect_memory_target(
+        &self,
+        ctx: AccountContext,
+        target: MemoryTarget,
+        category: String,
+    ) -> PortFuture<'_, MemoryTargetSnapshot>;
     fn create_schedule(
         &self,
         ctx: AccountContext,
         request: AccountMutation<CreateSchedule>,
     ) -> PortFuture<'_, ControlCommit<AgentSchedule>>;
+    fn schedule_ability_candidate(
+        &self,
+        ctx: AccountContext,
+        selection: ScheduleAbilitySelection,
+    ) -> PortFuture<'_, ScheduleAbilityCandidate>;
     fn get_schedule(
         &self,
         ctx: SpaceContext,
@@ -322,6 +356,12 @@ impl ControlPort for RejectingPorts {
         now: Timestamp,
         page: ControlPageRequest,
     ) -> PortFuture<'_, ControlPage<AgentSchedule>>;
+    fn list_expired_schedule_runs(
+        &self,
+        ctx: MaintenanceContext,
+        now: Timestamp,
+        page: ControlPageRequest,
+    ) -> PortFuture<'_, ControlPage<ScheduleRunReceipt>>;
     fn get_schedule_run(
         &self,
         ctx: ScheduleRunContext,

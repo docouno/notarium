@@ -4,11 +4,13 @@ use crate::{
     patch, yaml,
 };
 use notarium_core::{
-    DomainResult,
+    DomainError, DomainResult,
+    classes::{DocClass, authorize_field_key},
     document::{ViewBlock, ViewState},
     error::{Diagnostic, ValidationReason},
     ids::{NoteId, ViewKey},
     patch::{CarrierEditOrigin, CarrierPatchPlan},
+    ports::ViewRef,
     span::ByteSpan,
     value::YamlValue,
 };
@@ -18,6 +20,156 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct NotaAnalysis {
     pub blocks: Vec<ViewBlock>,
     pub plan: CarrierPatchPlan,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ViewBlockPatch {
+    pub source: Vec<FieldEdit>,
+    pub common: Vec<FieldEdit>,
+    pub options: Vec<FieldEdit>,
+}
+
+/// Edit one ready block. The stable view ID and the bytes outside the target
+/// block are preserved, including when the fence is nested in Markdown.
+pub fn patch_view_block(
+    source: &str,
+    class: DocClass,
+    view: &ViewRef,
+    edits: &ViewBlockPatch,
+) -> DomainResult<CarrierPatchPlan> {
+    let header = frontmatter::analyze(source, class)?;
+    let body = header.carrier.body;
+    let markdown = crate::markdown::analyze(source, body)?;
+    let parsed = analyze(source, body, &view.note, &markdown, false)?;
+    let (index, target) = parsed
+        .blocks
+        .iter()
+        .enumerate()
+        .find(|(_, block)| block.state == ViewState::Ready && block.id.as_ref() == Some(&view.key))
+        .ok_or_else(invalid_view)?;
+    let Some(YamlValue::Mapping(mut expected)) = target.config.clone() else {
+        return Err(invalid_view());
+    };
+    let fence = markdown
+        .fences
+        .iter()
+        .find(|fence| fence.span == target.span)
+        .ok_or_else(invalid_view)?;
+    let mut mapping_edits = edits.common.clone();
+    if mapping_edits
+        .iter()
+        .any(|edit| matches!(edit.key(), "id" | "source" | "options"))
+    {
+        return Err(invalid_view());
+    }
+
+    for (key, group) in [("source", &edits.source), ("options", &edits.options)] {
+        if group.is_empty() {
+            continue;
+        }
+        let mut fields = match expected.get(key) {
+            Some(YamlValue::Mapping(fields)) => fields.clone(),
+            Some(_) => return Err(invalid_view()),
+            None => BTreeMap::new(),
+        };
+        apply_fields(&mut fields, group)?;
+        if expected.contains_key(key) || !fields.is_empty() {
+            mapping_edits.push(FieldEdit::Set {
+                key: key.to_owned(),
+                value: YamlValue::Mapping(fields),
+            });
+        }
+    }
+    apply_fields(&mut expected, &mapping_edits)?;
+    let eol = if target.span.slice(source)?.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let physical = frontmatter::edit_mapping(&fence.text, &mapping_edits, "\n")?
+        .into_iter()
+        .map(|(span, text)| {
+            let (span, replacement) = map_view_edit(fence, span, &text.replace('\n', eol))?;
+            Ok((CarrierEditOrigin::Body, span, replacement))
+        })
+        .collect::<DomainResult<Vec<_>>>()?;
+    let plan = patch::plan(source, body, physical)?;
+    let changed = patch::apply(source, &plan)?;
+    let changed_body = crate::carrier::Carrier::scan(&changed)?.body;
+    let changed_markdown = crate::markdown::analyze(&changed, changed_body)?;
+    let reparsed = analyze(&changed, changed_body, &view.note, &changed_markdown, false)?;
+    if parsed.blocks.len() != reparsed.blocks.len()
+        || parsed
+            .blocks
+            .iter()
+            .zip(&reparsed.blocks)
+            .enumerate()
+            .any(|(i, (before, after))| {
+                if i == index {
+                    after.state != ViewState::Ready
+                        || after.config.as_ref() != Some(&YamlValue::Mapping(expected.clone()))
+                } else {
+                    before.raw_yaml != after.raw_yaml || before.state != after.state
+                }
+            })
+    {
+        return Err(invalid_view());
+    }
+    Ok(plan)
+}
+
+fn invalid_view() -> DomainError {
+    DomainError::validation(ValidationReason::InvalidView)
+}
+
+fn apply_fields(fields: &mut BTreeMap<String, YamlValue>, edits: &[FieldEdit]) -> DomainResult<()> {
+    let mut seen = BTreeSet::new();
+    for edit in edits {
+        authorize_field_key(edit.key())?;
+        if edit.key().is_empty() || !seen.insert(edit.key()) {
+            return Err(invalid_view());
+        }
+        match edit {
+            FieldEdit::Set { key, value } => {
+                value.validate_keys()?;
+                fields.insert(key.clone(), value.clone());
+            }
+            FieldEdit::Unset { key } => {
+                fields.remove(key);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn map_view_edit(
+    fence: &FencedBlock,
+    span: ByteSpan,
+    replacement: &str,
+) -> DomainResult<(ByteSpan, String)> {
+    if span.is_empty() {
+        return map_insertion(fence, span, replacement);
+    }
+    let start = fence
+        .lines
+        .iter()
+        .find(|(logical, _)| (logical.start()..logical.end()).contains(&span.start()))
+        .map(|(logical, physical)| physical.start() + span.start() - logical.start())
+        .ok_or_else(invalid_view)?;
+    let end = fence
+        .lines
+        .iter()
+        .find(|(logical, _)| (logical.start() + 1..=logical.end()).contains(&span.end()))
+        .map(|(logical, physical)| physical.start() + span.end() - logical.start())
+        .ok_or_else(invalid_view)?;
+    let mut mapped = String::new();
+    for (index, line) in crate::lines::with_endings(replacement).enumerate() {
+        if index > 0 {
+            mapped.push_str(&fence.continuation_prefix);
+        }
+        mapped.push_str(line);
+    }
+    Ok((ByteSpan::new(start, end)?, mapped))
 }
 fn diagnostic(reason: ValidationReason) -> Diagnostic {
     Diagnostic {

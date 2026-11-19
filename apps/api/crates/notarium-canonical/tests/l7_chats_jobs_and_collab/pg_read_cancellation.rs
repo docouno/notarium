@@ -85,6 +85,9 @@ async fn fast_pg_chat_read_releases_slots_on_cancel_drop_and_shutdown() {
                 &scope,
                 &owner,
                 AppendChat {
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
@@ -355,6 +358,9 @@ async fn pg_append_chat_rechecks_an_expired_read_before_writer_admission() {
             &scope,
             &owner,
             AppendChat {
+                tool_calls: Vec::new(),
+                provenance: None,
+                proposed_diff: None,
                 thread: thread.clone(),
                 parent: ThreadEntrySeq::ZERO,
                 kind: ChatEntryKind::Human,

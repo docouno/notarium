@@ -684,18 +684,19 @@ impl ChangeBroadcast for CanonicalStore {
 pub(crate) enum ChangeCaller<'a> {
     Maintenance(&'a MaintenanceContext),
     Space(&'a SpaceContext),
+    Activity(&'a SpaceContext),
 }
 
 impl<'a> ChangeCaller<'a> {
     fn budget(&self) -> &'a notarium_core::ports::CallBudget {
         match self {
             Self::Maintenance(ctx) => &ctx.budget,
-            Self::Space(ctx) => &ctx.budget,
+            Self::Space(ctx) | Self::Activity(ctx) => &ctx.budget,
         }
     }
 
     fn enforce_space_scope(&self, target_scope: &HistoryScope) -> DomainResult<()> {
-        if let Self::Space(sctx) = self {
+        if let Self::Space(sctx) | Self::Activity(sctx) = self {
             if sctx.scope().space_id != target_scope.space_id {
                 return Err(DomainError::ResourceNotFound);
             }
@@ -880,8 +881,9 @@ impl CanonicalStore {
         limit: PageLimit,
     ) -> Result<ChangePage, PortError> {
         let budget = caller.budget();
+        let with_provenance = matches!(caller, ChangeCaller::Activity(_));
         let space_auth = match caller {
-            ChangeCaller::Space(ctx) => Some(ctx.auth().clone()),
+            ChangeCaller::Space(ctx) | ChangeCaller::Activity(ctx) => Some(ctx.auth().clone()),
             ChangeCaller::Maintenance(_) => None,
         };
 
@@ -1062,9 +1064,27 @@ impl CanonicalStore {
                         lifecycle,
                         class,
                         effect,
+                        provenance: None,
                     };
                     if let Some(access) = &mut access && !access.filter(tx, &mut change).await? {
                         continue;
+                    }
+                    if with_provenance
+                        && change.lifecycle != Lifecycle::Purged
+                        && change.class != Some(notarium_core::classes::DocClass::EncryptedNote)
+                        && let EntityId::Note(note) = &change.entity
+                        && let Some(record) = read_immutable_revision_tx(
+                            tx, &after.scope, "note", note.as_str(), last_seq,
+                        ).await?
+                        && record.revision_id == change.revision
+                        && let RevisionMetadataPayload::Note(meta) = record.metadata.payload
+                    {
+                        let ancestry = crate::domain::common::FolderAncestryCache::at_cut(&after.scope, last_seq)
+                            .load_ancestry_tx(tx, &after.scope.space_id, &meta.parent_folder_id, false)
+                            .await?;
+                        change.provenance = Some(ancestry.note_provenance(
+                            note, &meta.slug, meta.title, record.actor_id, record.created_at,
+                        ));
                     }
                     changes.push(change);
                 }
@@ -1108,7 +1128,7 @@ impl CanonicalStore {
     ) -> Result<ChangeSeed, PortError> {
         let budget = caller.budget();
         let space_auth = match caller {
-            ChangeCaller::Space(sctx) => Some(sctx.auth().clone()),
+            ChangeCaller::Space(sctx) | ChangeCaller::Activity(sctx) => Some(sctx.auth().clone()),
             ChangeCaller::Maintenance(_) => None,
         };
         let store_cl = self.clone();
@@ -1258,7 +1278,7 @@ impl CanonicalStore {
                                     )
                                     .into());
                                 };
-                                let (snap_facts, _) = historical
+                                let (snap_facts, ancestry) = historical
                                     .build_resource_facts_tx(
                                         tx,
                                         &space_rec.space,
@@ -1283,6 +1303,13 @@ impl CanonicalStore {
                                         DomainError::validation(ValidationReason::CursorStale)
                                     })?;
 
+                                let provenance = ancestry.note_provenance(
+                                    &note_meta.note_id,
+                                    &note_meta.slug,
+                                    note_meta.title.clone(),
+                                    rev_rec.actor_id,
+                                    rev_rec.created_at,
+                                );
                                 collected_notes.push(PendingSeedNote {
                                     note_id: note_meta.note_id.clone(),
                                     revision_id: rev_rec.revision_id,
@@ -1292,6 +1319,7 @@ impl CanonicalStore {
                                     facts: snap_facts,
                                     meta: note_meta,
                                     digest,
+                                    provenance,
                                 });
 
                                 // If we just hit `max_items` and there are uninspected candidates in this batch,
@@ -1400,7 +1428,7 @@ impl CanonicalStore {
                                     kind,
                                     owner_id,
                                     project_folder_id,
-                                    title: _,
+                                    title,
                                     head_leaf_seq,
                                     tainted,
                                 }) = rev_rec.metadata.payload
@@ -1412,13 +1440,16 @@ impl CanonicalStore {
                                 };
 
                                 if let Some(auth) = &auth_in
-                                    && auth
-                                        .authorize_chat_read(
-                                            &space_rec.space,
-                                            project_folder_id.as_ref(),
-                                            tainted,
-                                        )
-                                        .is_err()
+                                    && crate::chats::authorize_thread_read(
+                                        auth,
+                                        &space_rec.space,
+                                        &thread_id,
+                                        kind,
+                                        &owner_id,
+                                        project_folder_id.as_ref(),
+                                        tainted,
+                                    )
+                                    .is_err()
                                 {
                                     continue;
                                 }
@@ -1429,6 +1460,8 @@ impl CanonicalStore {
                                     kind,
                                     owner: owner_id,
                                     project_folder: project_folder_id,
+                                    title,
+                                    active_run: None,
                                     head: head_leaf_seq,
                                     revision: rev_rec.revision_id,
                                     tainted,
@@ -1487,6 +1520,7 @@ impl CanonicalStore {
                 byte_size: pending.meta.byte_size,
                 fields: pending.meta.evaluated_fields,
                 diagnostics: pending.meta.diagnostics,
+                provenance: Some(pending.provenance),
             });
         }
 
@@ -1557,6 +1591,7 @@ struct PendingSeedNote {
     facts: ResourceFacts,
     meta: NoteRevisionMetadata,
     digest: ContentDigest,
+    provenance: notarium_core::ports::NoteProvenance,
 }
 
 struct RawChangeLogRow {

@@ -76,6 +76,7 @@ async fn issue(
         refresh_id: refresh.as_ref().and_then(|r| r.id.clone()),
         resource_uri: grant.resource_uri.clone(),
         scope: grant.scope.clone(),
+        ability_write: grant.ability_write,
         selected_spaces: grant.selected_spaces.clone(),
         issued_at: now,
         expires_at: expires,
@@ -92,6 +93,7 @@ async fn issue(
         scope: OAuthScope {
             access: validation::stored_scope(&grant.scope)?,
             offline_access: family.is_some(),
+            ability_write: grant.ability_write == 1,
         },
         grant: OAuthGrantId::parse(&grant.grant_id)?,
         family: family.cloned(),
@@ -183,7 +185,7 @@ impl OAuthService {
             let now=self.control.clock.now_ms()?;
             if current.client_id!=request.client_id || current.family_id!=family.family_id || current.expires_at<=now || current.revoked_at.is_some()
                 || grant.client_id!=request.client_id || grant.resource_uri!=request.resource || family.grant_id!=grant.grant_id || grant.revoked_at.is_some() || user.disabled_at.is_some() {return Err(invalid_grant());}
-            let scope=OAuthScope {access:validation::stored_scope(&grant.scope)?,offline_access:true};
+            let scope=OAuthScope {access:validation::stored_scope(&grant.scope)?,offline_access:true,ability_write:grant.ability_write==1};
             if requested_scope.is_some_and(|s|s!=scope) {return Err(rejected(OAuthErrorCode::InvalidScope));}
             if current.used_at.is_some() || current.rotated_to.is_some() || family.revoked_at.is_some() {
                 let events=revoke_family(tx.inner_mut(),&family,now,"refresh_reuse").await?;

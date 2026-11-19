@@ -61,7 +61,7 @@ pub(in crate::service::provider) fn completion_fingerprint(
         .iter()
         .flat_map(|message| message.parts.iter().map(|part| part.origin()))
         .collect();
-    fingerprint((
+    let input = (
         "completion-v1",
         &request.selection.provider,
         &request.selection.model,
@@ -74,7 +74,16 @@ pub(in crate::service::provider) fn completion_fingerprint(
         messages,
         tools,
         origins,
-    ))
+    );
+    if request.secondary_projects.is_empty() {
+        fingerprint(input)
+    } else {
+        fingerprint((
+            "completion-secondary-projects-v1",
+            input,
+            &request.secondary_projects,
+        ))
+    }
 }
 pub(in crate::service::provider) fn embedding_fingerprint(
     request: &EmbeddingRequest,
@@ -195,6 +204,19 @@ fn schema(
                 fields.insert(key.clone(), schema(value, depth + 1, nodes, bytes)?);
             }
             json!({"type":"object", "properties":fields, "required":required, "additionalProperties":false})
+        }
+        ProviderToolSchema::Map { values } => {
+            json!({"type":"object","additionalProperties":schema(values, depth + 1, nodes, bytes)?})
+        }
+        ProviderToolSchema::AnyOf(options) => {
+            if !(1..=8).contains(&options.len()) {
+                return Err(limited());
+            }
+            let options = options
+                .iter()
+                .map(|option| schema(option, depth + 1, nodes, bytes))
+                .collect::<Result<Vec<_>, _>>()?;
+            json!({"anyOf":options})
         }
     })
 }

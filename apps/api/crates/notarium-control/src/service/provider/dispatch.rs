@@ -204,8 +204,10 @@ impl ProviderService {
             response: None,
         };
         let mut result = self.perform(runtime, job, sender, &mut progress).await;
-        // Cancellation/drop only signals the transport. Keep every authority
-        // lease until its owned producer acknowledges actual network shutdown.
+        // Cancellation/drop only signals the transport. Before a response
+        // head, keep the source snapshot through actual network shutdown.
+        // Credential and consent registration remains active through shutdown
+        // even after the accepted upload releases the canonical snapshot.
         if let Some(response) = progress.response.take()
             && let Err(error) = response.close().await
         {
@@ -298,19 +300,25 @@ impl ProviderService {
             None
         };
         let parts = job.parts();
+        let mut secondary_projects = Vec::new();
         let current = if primary.is_some() {
+            let egress = job.egress(&parts)?;
+            secondary_projects.clone_from(&egress.secondary_projects);
             let lease = runtime
                 .run(
                     self.egress.acquire_egress(
                         AccountContext::new(job.ctx.auth().clone(), runtime.context()),
-                        job.egress(&parts)?,
+                        egress,
                         runtime.cancelled.clone(),
                     ),
                     CommitEffect::NotCommitted,
                 )
                 .await?;
             lease.check()?;
-            if lease.project() != job.project() || lease.current().len() > 4096 {
+            if lease.project() != job.project()
+                || lease.secondary_projects() != secondary_projects
+                || lease.current().len() > MAX_PROVIDER_ORIGINS
+            {
                 return Err(invalid(ValidationReason::SourceMismatch));
             }
             let current = lease.current().to_vec();
@@ -328,6 +336,7 @@ impl ProviderService {
             ctx: &job.ctx,
             primary: primary.as_ref(),
             project: job.project(),
+            secondary_projects: &secondary_projects,
             parts: &parts,
             current: &current,
             keeper: keeper.as_ref(),
@@ -488,6 +497,12 @@ impl ProviderService {
             401 | 403 => return Err(provider_error(ProviderErrorCode::UpstreamAuthentication)),
             429 => return Err(provider_error(ProviderErrorCode::UpstreamRateLimit)),
             _ => return Err(provider_error(ProviderErrorCode::Unavailable)),
+        }
+        // Reqwest exposes the final HTTP response head after request
+        // dispatch. The body was submitted under the pinned snapshot.
+        // Do not hold canonical writers during generation or consumer replay.
+        if let Some(lease) = &mut progress.leases.canonical {
+            lease.mark_dispatched();
         }
         responses::receive(runtime, job, &snapshot, progress, sender).await
     }

@@ -10,6 +10,8 @@ mod conflict_authority;
 mod folder_authority;
 #[path = "l5_domain_security_and_purge/folder_depth.rs"]
 mod folder_depth;
+#[path = "l5_domain_security_and_purge/folder_pages.rs"]
+mod folder_pages;
 #[path = "l5_domain_security_and_purge/observations.rs"]
 mod observations;
 #[path = "l5_domain_security_and_purge/preconditions.rs"]
@@ -47,8 +49,9 @@ use notarium_core::{
         ChangeReadResult, Committed, CreateNote, DeleteDisposition, DeleteNote, EditNote,
         ExternalObservation, ExternalObservationResult, GetNote, Link, LinkBatch, LinkTarget,
         MemoryTarget, MintAndPurge, MoveFolder, MoveNote, Mutation, NoteRevision, NoteWritePort,
-        ObservedContent, PageLimit, Preconditions, PublishAbilityPackage, ReadAbilityResource,
-        RenameFolder, RenameNote, RenameProject, ResolvedMemoryTarget, SpaceContext,
+        ObservedContent, PageLimit, Preconditions, ProviderEgressCatalogPort,
+        ProviderEgressRequest, PublishAbilityPackage, ReadAbilityResource, RenameFolder,
+        RenameNote, RenameProject, ResolvedMemoryTarget, SpaceContext,
     },
     query::{FieldObservation, FieldSchema, FieldType, FieldValue, ScalarType},
     receipt::{
@@ -470,6 +473,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: note_1.clone(),
                     parent: Some(sub_folder.clone()),
                     slug: "arch-overview".to_owned(),
@@ -503,6 +507,7 @@ async fn run_domain_and_security_suite(
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: note.clone(),
                         parent: parent.clone(),
                         slug: format!("parent-{id}"),
@@ -1013,6 +1018,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: enc_note.clone(),
                     parent: Some(proj_a.clone()),
                     slug: "secret-bad".to_owned(),
@@ -1036,6 +1042,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: enc_note.clone(),
                     parent: Some(proj_a.clone()),
                     slug: "secret-ok".to_owned(),
@@ -1086,6 +1093,7 @@ async fn run_domain_and_security_suite(
         &scope,
         &owner,
         CreateNote {
+            folder_page: false,
             note: idemp_note_a.clone(),
             parent: Some(proj_a.clone()),
             slug: "idemp-a".to_owned(),
@@ -1111,6 +1119,7 @@ async fn run_domain_and_security_suite(
         &scope,
         &owner,
         CreateNote {
+            folder_page: false,
             note: idemp_note_b,
             parent: Some(proj_a.clone()),
             slug: "idemp-b".to_owned(),
@@ -1154,6 +1163,7 @@ async fn run_domain_and_security_suite(
                         &scope,
                         &owner,
                         BatchItem::Create(CreateNote {
+                            folder_page: false,
                             note: batch_note.clone(),
                             parent: Some(proj_a.clone()),
                             slug: "batch-seq".to_owned(),
@@ -1281,6 +1291,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 Link {
+                    target_title: None,
                     source: note_1.clone(),
                     target: LinkTarget::Note(batch_note.clone()),
                     relation: "related".to_owned(),
@@ -1299,6 +1310,7 @@ async fn run_domain_and_security_suite(
                         &scope,
                         &owner,
                         Link {
+                            target_title: None,
                             source: note_1.clone(),
                             target: LinkTarget::Folder(proj_a.clone()),
                             relation: "belongs_to".to_owned(),
@@ -1308,6 +1320,7 @@ async fn run_domain_and_security_suite(
                         &scope,
                         &owner,
                         Link {
+                            target_title: None,
                             source: note_1.clone(),
                             target: LinkTarget::Note(sample_note_id(97)), // missing target
                             relation: "broken".to_owned(),
@@ -1451,6 +1464,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: typed_note.clone(),
                     parent: Some(proj_a.clone()),
                     slug: "typed-prio".to_owned(),
@@ -1492,6 +1506,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: skill_entry_note.clone(),
                     parent: Some(proj_a.clone()),
                     slug: "audit-skill".to_owned(),
@@ -1523,6 +1538,7 @@ async fn run_domain_and_security_suite(
                     &scope,
                     &owner,
                     PublishAbilityPackage {
+                        attached_skills: vec![],
                         ability: ability_id.clone(),
                         kind: AbilityKind::Skill,
                         entrypoint: skill_entry_note.clone(),
@@ -1546,6 +1562,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 PublishAbilityPackage {
+                    attached_skills: vec![],
                     ability: ability_id.clone(),
                     kind: AbilityKind::Skill,
                     entrypoint: skill_entry_note.clone(),
@@ -1568,6 +1585,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 PublishAbilityPackage {
+                    attached_skills: vec![],
                     ability: ability_id.clone(),
                     kind: AbilityKind::Skill,
                     entrypoint: skill_entry_note.clone(),
@@ -1651,6 +1669,26 @@ async fn run_domain_and_security_suite(
         .await
         .unwrap();
     assert_eq!(authorized.explicit_read(ctx.auth()).unwrap(), helper_v1);
+    let current_project = FolderRef {
+        space_id: scope.space_id.clone(),
+        folder_id: project_b.clone(),
+    };
+    assert!(!authorized.in_project(&current_project));
+    let lease = store
+        .acquire_egress(
+            account(&ctx),
+            ProviderEgressRequest {
+                origins: vec![authorized.origin()],
+                primary: scope.clone(),
+                project: Some(current_project.clone()),
+                secondary_projects: vec![],
+            },
+            Cancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!lease.current()[0].in_project(&current_project));
+    drop(lease);
     for reader in [project_reader(&proj_a), b_reader.clone()] {
         let descriptor = notarium_core::ports::ControlCatalogPort::ability(
             store,
@@ -1682,6 +1720,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 PublishAbilityPackage {
+                    attached_skills: vec![],
                     ability: ability_id.clone(),
                     kind: AbilityKind::Skill,
                     entrypoint: skill_entry_note.clone(),
@@ -1782,6 +1821,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &viewer,
                 CreateNote {
+                    folder_page: false,
                     note: sample_note_id(40),
                     parent: Some(proj_a.clone()),
                     slug: "viewer-denied".to_owned(),
@@ -1798,6 +1838,7 @@ async fn run_domain_and_security_suite(
         &scope,
         &owner,
         CreateNote {
+            folder_page: false,
             note: replay_note.clone(),
             parent: Some(proj_a.clone()),
             slug: "receipt-authority".into(),
@@ -1960,6 +2001,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: sample_note_id(41),
                     parent: Some(proj_a.clone()),
                     slug: "locked-denied".to_owned(),
@@ -2009,6 +2051,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: sample_note_id(42),
                     parent: Some(archive_root.clone()),
                     slug: "outside-proj".to_owned(),
@@ -2114,6 +2157,7 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: sample_note_id(43),
                     parent: Some(proj_a.clone()),
                     slug: "tainted-write".to_owned(),
@@ -2314,6 +2358,7 @@ async fn run_domain_and_security_suite(
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: doomed.clone(),
                         parent: Some(isolated.clone()),
                         slug: "purge-target".into(),
@@ -2369,6 +2414,7 @@ async fn run_domain_and_security_suite(
         assert_validation_err(&result, ValidationReason::CursorStale);
     }
     folder_authority::check(store, &scope, &owner).await;
+    folder_pages::check(store, &scope, &owner).await;
 }
 
 #[tokio::test]
@@ -2432,6 +2478,7 @@ async fn run_purge_and_mint_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: note_keep.clone(),
                     parent: None,
                     slug: "shared-keep".to_owned(),
@@ -2451,6 +2498,7 @@ async fn run_purge_and_mint_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: note_purge.clone(),
                     parent: None,
                     slug: "to-be-purged".to_owned(),
@@ -2791,6 +2839,7 @@ async fn run_purge_and_mint_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: old_plain.clone(),
                     parent: None,
                     slug: "sensitive-doc".to_owned(),
@@ -2901,6 +2950,7 @@ async fn run_purge_and_mint_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: note_crash.clone(),
                     parent: None,
                     slug: "crash-purge".to_owned(),

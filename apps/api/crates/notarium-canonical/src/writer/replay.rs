@@ -4,7 +4,7 @@ use notarium_core::{
     auth::{EngineAuthContext, ResourceFacts, Space},
     classes::DocClass,
     error::PortError,
-    ids::{ChatThreadId, FolderId, JobId, NoteId},
+    ids::{ChatThreadId, FolderId, JobId, NoteId, ThreadEntrySeq},
     model::{HistoryScope, NoteRef},
     ports::LinkTarget,
 };
@@ -34,7 +34,7 @@ pub(crate) enum ReplayResource {
 pub(crate) enum ReplayPolicy {
     Documents(Vec<ReplayResource>),
     Schema(Vec<ReplayResource>),
-    Chat(ChatThreadId, Vec<NoteRef>, bool),
+    Chat(ChatThreadId, Option<ThreadEntrySeq>, Vec<NoteRef>, bool),
     Job(Option<JobId>, Vec<NoteId>),
 }
 
@@ -106,7 +106,19 @@ impl UnboundCommand {
         thread: &ChatThreadId,
         reads: Vec<NoteRef>,
     ) -> CommandIdentitySpec {
-        self.with_policy(auth, ReplayPolicy::Chat(thread.clone(), reads, false))
+        self.with_policy(auth, ReplayPolicy::Chat(thread.clone(), None, reads, false))
+    }
+
+    pub(crate) fn for_chat_leaf(
+        self,
+        auth: &EngineAuthContext,
+        thread: &ChatThreadId,
+        leaf: ThreadEntrySeq,
+    ) -> CommandIdentitySpec {
+        self.with_policy(
+            auth,
+            ReplayPolicy::Chat(thread.clone(), Some(leaf), Vec::new(), false),
+        )
     }
 
     pub(crate) fn for_link(
@@ -140,12 +152,13 @@ impl CommandIdentitySpec {
         let srec = load_space_record(tx, &scope.space_id).await?;
         srec.scope.check(scope)?;
         match policy {
-            ReplayPolicy::Chat(thread, reads, legacy_staged) => {
+            ReplayPolicy::Chat(thread, leaf, reads, legacy_staged) => {
                 crate::chats::authorize_chat_replay_tx(
                     tx,
                     &srec.space,
                     auth,
                     thread,
+                    *leaf,
                     *legacy_staged,
                 )
                 .await?;

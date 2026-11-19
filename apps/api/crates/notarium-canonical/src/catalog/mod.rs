@@ -44,11 +44,13 @@ pub(crate) use abilities::{
     authorize_change_tx as authorize_ability_change_tx, resource_digest_tx,
 };
 mod commands;
+pub(crate) mod egress;
 pub(crate) mod memory;
 
 fn catalog_space(record: SpaceRecord) -> CatalogSpace {
     CatalogSpace {
         space: record.space,
+        slug: record.slug,
         history: record.scope,
         last_seq: record.last_seq,
     }
@@ -166,6 +168,13 @@ fn digest(value: impl Serialize) -> Result<String, PortError> {
 }
 
 impl ControlCatalogPort for CanonicalStore {
+    fn disclosure(
+        &self,
+        ctx: AccountContext,
+        source: CatalogDisclosure,
+    ) -> PortFuture<'_, notarium_core::classes::CanonicalMetadataContent> {
+        Box::pin(egress::metadata(self, ctx, source))
+    }
     fn space(&self, budget: CallBudget, id: SpaceId) -> PortFuture<'_, CatalogSpace> {
         Box::pin(async move {
             self.with_read_tx_budget(Some(&budget), move |tx| {
@@ -188,6 +197,9 @@ impl ControlCatalogPort for CanonicalStore {
                     Ok(ProjectInfo {
                         folder: folder.reference,
                         name: row.display_name,
+                        project_slug: row.project_slug.ok_or_else(|| {
+                            DomainError::validation(ValidationReason::InvalidState)
+                        })?,
                     })
                 })
             })
@@ -257,6 +269,9 @@ impl ControlCatalogPort for CanonicalStore {
                             Ok((folder, row)) => items.push(ProjectInfo {
                                 folder: folder.reference,
                                 name: row.display_name,
+                                project_slug: row.project_slug.ok_or_else(|| {
+                                    DomainError::validation(ValidationReason::InvalidState)
+                                })?,
                             }),
                             Err(PortError::Domain(DomainError::ResourceNotFound)) => (),
                             Err(error) => return Err(error),
@@ -312,6 +327,13 @@ impl ControlCatalogPort for CanonicalStore {
     ) -> PortFuture<'_, AbilityDescriptor> {
         Box::pin(abilities::lookup(self, ctx, id, None))
     }
+    fn pin_schedule_abilities(
+        &self,
+        ctx: AccountContext,
+        refs: Vec<AbilityRef>,
+    ) -> PortFuture<'_, Box<dyn ScheduleAbilityLease>> {
+        Box::pin(abilities::pin_schedule(self, ctx, refs))
+    }
     fn ensure_space(
         &self,
         budget: CallBudget,
@@ -335,5 +357,14 @@ impl ControlCatalogPort for CanonicalStore {
         category: String,
     ) -> PortFuture<'_, ResolvedMemoryTarget> {
         Box::pin(memory::resolve(self, ctx, target, category))
+    }
+
+    fn inspect_memory_target(
+        &self,
+        ctx: AccountContext,
+        target: MemoryTarget,
+        category: String,
+    ) -> PortFuture<'_, MemoryTargetSnapshot> {
+        Box::pin(async move { memory::inspect(self, &ctx, target, category).await })
     }
 }

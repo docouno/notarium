@@ -76,13 +76,14 @@ fn add(
         .lock()
         .unwrap()
         .push(AbilityDescriptor {
+            attached_skills: vec![],
             reference: reference.clone(),
             kind: AbilityKind::Role,
             name: name.into(),
             enabled: true,
             healthy: true,
             lifecycle: Lifecycle::Active,
-            entrypoint: note.clone(),
+            entrypoint: (reference.placement != AbilityPlacement::System).then(|| note.clone()),
             auxiliary_files: vec![],
         });
     fixture.catalog.note_entries.lock().unwrap().insert(
@@ -148,6 +149,7 @@ async fn exercise(pg: bool) {
     fixture.catalog.project_entries.lock().unwrap().insert(
         (space.id.clone(), project.folder_id.clone()),
         ProjectInfo {
+            project_slug: "project".into(),
             folder: project.clone(),
             name: "Project".into(),
         },
@@ -374,18 +376,22 @@ async fn exercise(pg: bool) {
             .iter()
             .any(|v| v.reference == scoped && !v.enabled)
     );
-    assert!(matches!(
-        service
-            .discover_abilities(
-                plain.clone(),
-                AbilityQuery {
-                    authoring: true,
-                    ..query(None, None, 20)
-                }
-            )
-            .await,
-        Err(PortError::Domain(DomainError::AbilityWriteForbidden))
-    ));
+    let read_inventory = service
+        .discover_abilities(
+            plain.clone(),
+            AbilityQuery {
+                authoring: true,
+                ..query(None, None, 20)
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        read_inventory
+            .items
+            .iter()
+            .any(|value| value.reference == scoped)
+    );
 
     // A personal preference can only narrow availability, including System packages.
     service
@@ -822,6 +828,153 @@ async fn postgres_ability_resolution_and_memory() {
     exercise(true).await;
 }
 
+async fn bearer_authoring(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let fixture = Fixture::new(pg, "ability_bearer").await;
+    let service = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let boot = service
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: None,
+                display_name: "Owner".into(),
+                password: Some(SecretString::new("bearer fixture password".into())),
+            },
+        )
+        .await
+        .unwrap();
+    let session = boot.session.unwrap();
+    let human = AccountContext::new(
+        service
+            .resolve(evidence(AuthEvidenceKind::Session, session.token.expose()))
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let owner = &boot.account.id;
+    let space_id = boot.account.personal_space.unwrap();
+    let space = fixture.catalog.entries.lock().unwrap()[&space_id]
+        .2
+        .space
+        .clone();
+    let package = add(
+        &fixture,
+        &space,
+        AbilityPlacement::OwnedPersonal(owner.clone()),
+        42,
+        "workflow",
+        vec![],
+    );
+    for (key, scope, opt_in) in [
+        (51, BearerScope::Read, false),
+        (52, BearerScope::Write, false),
+        (53, BearerScope::Write, true),
+    ] {
+        let pat = service
+            .create_pat(
+                human.clone(),
+                CreatePat {
+                    name: format!("client-{key}"),
+                    scope,
+                    ability_write: opt_in,
+                    selected_spaces: Some(vec![space_id.clone()]),
+                    expires_at_ms: None,
+                    expected: service
+                        .whoami(human.clone())
+                        .await
+                        .unwrap()
+                        .account_revision,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(pat.value.metadata.ability_write, opt_in);
+        let auth = service
+            .resolve(evidence(AuthEvidenceKind::Pat, pat.value.token.expose()))
+            .await
+            .unwrap();
+        assert_eq!(auth.bearer_scope(), Some(scope));
+        assert!(!auth.human_management());
+        assert_eq!(auth.has_cap(Cap::AbilityWrite), opt_in);
+        let caller = AccountContext::new(auth, budget());
+        let available = service
+            .discover_abilities(
+                caller.clone(),
+                AbilityQuery {
+                    authoring: true,
+                    ..query(None, None, 20)
+                },
+            )
+            .await
+            .unwrap();
+        assert!(available.items.iter().any(|card| card.reference == package));
+        let inspection = service
+            .inspect_ability(caller.clone(), package.identity())
+            .await
+            .unwrap();
+        assert_eq!(inspection.descriptor.reference, package);
+        assert!(inspection.binding_enabled);
+        let request = AccountMutation {
+            identity: command(owner, owner, key, pat.revision),
+            input: AbilityBindingUpdate {
+                ability: package.clone(),
+                enabled: false,
+                expected: inspection.binding_revision,
+                projects: AbilityProjects::All,
+            },
+        };
+        let result = service
+            .update_ability_binding(caller.clone(), request.clone())
+            .await;
+        if opt_in {
+            assert!(!result.unwrap().value.enabled);
+            assert!(
+                !service
+                    .inspect_ability(caller.clone(), package.identity())
+                    .await
+                    .unwrap()
+                    .binding_enabled
+            );
+            service
+                .revoke_pat(
+                    human.clone(),
+                    AccountMutation {
+                        identity: identity(&service, &human, 54).await,
+                        input: RevokePat {
+                            account: owner.clone(),
+                            token: pat.value.metadata.id,
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                service.update_ability_binding(caller, request).await,
+                Err(PortError::Domain(DomainError::AuthenticationFailed))
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(PortError::Domain(DomainError::AbilityWriteForbidden))
+            ));
+        }
+    }
+    drop(service);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_bearer_can_inspect_and_needs_opt_in_to_author() {
+    bearer_authoring(false).await;
+}
+
+#[tokio::test]
+async fn postgres_bearer_can_inspect_and_needs_opt_in_to_author() {
+    bearer_authoring(true).await;
+}
+
 async fn selected_project_bindings_and_paged_bulk_discovery(pg: bool) {
     let _serial = AUTH_TEST_LOCK.lock().await;
     let fixture = Fixture::new(pg, "abilities_selected_discovery").await;
@@ -880,6 +1033,7 @@ async fn selected_project_bindings_and_paged_bulk_discovery(pg: bool) {
         fixture.catalog.project_entries.lock().unwrap().insert(
             (folder.space_id.clone(), folder.folder_id.clone()),
             ProjectInfo {
+                project_slug: "project".into(),
                 folder: folder.clone(),
                 name: name.into(),
             },
@@ -1043,13 +1197,14 @@ async fn selected_project_bindings_and_paged_bulk_discovery(pg: bool) {
             .lock()
             .unwrap()
             .push(AbilityDescriptor {
+                attached_skills: vec![],
                 reference: reference.clone(),
                 kind: AbilityKind::Skill,
                 name: "dup-skill".into(),
                 enabled: true,
                 healthy: true,
                 lifecycle: Lifecycle::Active,
-                entrypoint: note.clone(),
+                entrypoint: Some(note.clone()),
                 auxiliary_files: vec![],
             });
         fixture.catalog.note_entries.lock().unwrap().insert(

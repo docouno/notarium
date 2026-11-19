@@ -325,6 +325,7 @@ pub(super) async fn series(args: &[String]) {
                     &scope,
                     &actor,
                     CreateNote {
+                        folder_page: false,
                         note: id.clone(),
                         parent: None,
                         slug: format!("field-notes-{w}"),

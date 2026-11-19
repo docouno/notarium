@@ -268,7 +268,7 @@ impl ProviderService {
                 return Err(unavailable());
             }
             let admission=policy(tx.inner_mut(),&auth,&resource,credential_epoch,&space.space,request.project.as_ref(),now,false).await?;
-            Ok(ProviderSelection{provider:id,model:model_id,project:request.project,policy:admission.policy})
+            Ok(ProviderSelection{provider:id,model:model_id,project:request.project,project_only:admission.project_only,policy:admission.policy})
         },CommitEffect::NotCommitted).await?;
         budget
             .run(tx.rollback(), CommitEffect::NotCommitted)

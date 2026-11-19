@@ -15,7 +15,7 @@ use notarium_core::{
     ids::*,
     ports::*,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 const TOUCH_WINDOW_MS: i64 = 60 * 60 * 1000;
 
@@ -36,27 +36,61 @@ pub(super) fn selected(
         })
         .transpose()
 }
-fn restrict(
-    context: &EngineAuthContext,
-    scope: &str,
-    selected: Option<BTreeSet<SpaceId>>,
-) -> Result<BTreeMap<SpaceId, SpaceGrant>, PortError> {
-    if !matches!(scope, "read" | "write") {
-        return Err(denied());
+fn bearer_scope(value: &str) -> Result<BearerScope, PortError> {
+    match value {
+        "read" => Ok(BearerScope::Read),
+        "write" => Ok(BearerScope::Write),
+        _ => Err(denied()),
     }
-    Ok(context
-        .spaces()
-        .iter()
-        .filter(|(id, _)| selected.as_ref().is_none_or(|ids| ids.contains(*id)))
-        .map(|(id, grant)| {
-            let mut grant = grant.clone();
-            if scope == "read" {
-                grant.write_classes.clear();
-            }
-            (id.clone(), grant)
-        })
-        .collect())
 }
+
+/// Credential validation precedes membership queries. Write callers hold the
+/// owner lock; authoring can then take exclusive Space locks in stable order.
+pub(super) enum CredentialAuthority {
+    Human {
+        credential: AuthenticatedCredential,
+        source: GrantId,
+    },
+    Bearer {
+        credential: BearerCredential,
+        source: GrantId,
+        scope: BearerScope,
+        ability_write: bool,
+        selected_spaces: Option<BTreeSet<SpaceId>>,
+    },
+}
+
+impl CredentialAuthority {
+    pub(super) fn authorize_ability_space(
+        &self,
+        auth: &EngineAuthContext,
+        space: &SpaceId,
+    ) -> Result<(), PortError> {
+        auth.authorize_ability_mutation()?;
+        let allowed = match self {
+            Self::Human { source, .. } => source == auth.grant() && auth.human_management(),
+            Self::Bearer {
+                source,
+                scope,
+                ability_write,
+                selected_spaces,
+                ..
+            } => {
+                source == auth.grant()
+                    && *scope == BearerScope::Write
+                    && *ability_write
+                    && selected_spaces
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(space))
+            }
+        };
+        if !allowed {
+            return Err(notarium_core::DomainError::AbilityWriteForbidden.into());
+        }
+        Ok(())
+    }
+}
+
 impl ControlService {
     pub(super) async fn revalidate(
         &self,
@@ -147,15 +181,16 @@ impl ControlService {
         lock: bool,
         keeper: Option<&super::schedules::PrecheckedKeeper>,
     ) -> Result<EngineAuthContext, PortError> {
-        let now = self.clock.now_ms()?;
-        match &credential {
-            AuthenticatedCredential::ScheduledRun { .. } => {
-                self.scheduled_context(tx, current_user, credential, lock, keeper)
-                    .await
-            }
-            AuthenticatedCredential::Session(id) => {
-                live_session(&session(tx, id.as_str()).await?, current_user, now)?;
-                let source = grant("session", id.as_str());
+        if matches!(credential, AuthenticatedCredential::ScheduledRun { .. }) {
+            return self
+                .scheduled_context(tx, current_user, credential, lock, keeper)
+                .await;
+        }
+        match self
+            .credential_authority(tx, current_user, credential, lock)
+            .await?
+        {
+            CredentialAuthority::Human { credential, source } => {
                 self.human_context(
                     tx,
                     current_user,
@@ -167,21 +202,58 @@ impl ControlService {
                 )
                 .await
             }
+            CredentialAuthority::Bearer {
+                credential,
+                source,
+                scope,
+                ability_write,
+                selected_spaces,
+            } => {
+                let mut spaces = self.active_space_grants(tx, current_user, lock).await?;
+                if let Some(selected) = selected_spaces {
+                    spaces.retain(|id, _| selected.contains(id));
+                }
+                Ok(EngineAuthContext::for_bearer(VerifiedBearer::attest(
+                    PrincipalId::parse(&current_user.user_id)?,
+                    source,
+                    credential,
+                    spaces,
+                    scope,
+                    ability_write,
+                )))
+            }
+        }
+    }
+    pub(super) async fn credential_authority(
+        &self,
+        tx: &mut Transaction,
+        current_user: &UsersRow,
+        credential: AuthenticatedCredential,
+        lock: bool,
+    ) -> Result<CredentialAuthority, PortError> {
+        if current_user.disabled_at.is_some() {
+            return Err(denied());
+        }
+        let now = self.clock.now_ms()?;
+        match credential {
+            AuthenticatedCredential::ScheduledRun { .. } => Err(denied()),
+            AuthenticatedCredential::Session(id) => {
+                live_session(&session(tx, id.as_str()).await?, current_user, now)?;
+                let source = grant("session", id.as_str());
+                Ok(CredentialAuthority::Human {
+                    credential: AuthenticatedCredential::Session(id),
+                    source,
+                })
+            }
             AuthenticatedCredential::TrustedNone => {
                 if !matches!(&self.config.authentication,AuthenticationMode::TrustedNone{owner} if owner.as_str()==current_user.user_id)
                 {
                     return Err(denied());
                 }
-                self.human_context(
-                    tx,
-                    current_user,
-                    credential,
-                    grant("none", &current_user.user_id),
-                    human_management,
-                    ability_write,
-                    lock,
-                )
-                .await
+                Ok(CredentialAuthority::Human {
+                    credential: AuthenticatedCredential::TrustedNone,
+                    source: grant("none", &current_user.user_id),
+                })
             }
             AuthenticatedCredential::Pat(id) => {
                 let current = pat(tx, id.as_str()).await?;
@@ -192,18 +264,16 @@ impl ControlService {
                     return Err(denied());
                 }
                 let source = grant("pat", id.as_str());
-                let human = self
-                    .human_context(tx, current_user, credential, source, false, false, lock)
-                    .await?;
-                let wanted = restrict(
-                    &human,
-                    &current.scope,
-                    selected(
+                Ok(CredentialAuthority::Bearer {
+                    credential: BearerCredential::Pat(id),
+                    source,
+                    scope: bearer_scope(&current.scope)?,
+                    ability_write: current.ability_write == 1,
+                    selected_spaces: selected(
                         current.selected_spaces.as_deref(),
                         self.config.max_auth_spaces,
                     )?,
-                )?;
-                human.for_pat(wanted).map_err(Into::into)
+                })
             }
             AuthenticatedCredential::OAuth {
                 token,
@@ -211,7 +281,7 @@ impl ControlService {
                 family,
             } => {
                 let current = access(tx, token.as_str()).await?;
-                let consent = oauth_grant(tx, &current.grant_id).await?;
+                let consent = oauth_grant(tx, grant_id.as_str()).await?;
                 if current.grant_id != grant_id.as_str()
                     || current.family_id.as_deref() != family.as_ref().map(|id| id.as_str())
                     || consent.user_id != current_user.user_id
@@ -223,7 +293,7 @@ impl ControlService {
                 {
                     return Err(denied());
                 }
-                if let Some(id) = family {
+                if let Some(id) = &family {
                     let family = if lock {
                         rows!(tx,OauthRefreshFamiliesRow,fetch_optional,"SELECT * FROM oauth_refresh_families WHERE family_id=$1","SELECT * FROM v1_control.oauth_refresh_families WHERE family_id=$1 FOR SHARE";id.as_str())?.ok_or_else(denied)?
                     } else {
@@ -233,40 +303,36 @@ impl ControlService {
                         return Err(denied());
                     }
                 }
-                let source = grant("oauth", &consent.grant_id);
-                let human = self
-                    .human_context(
-                        tx,
-                        current_user,
-                        credential,
-                        source.clone(),
-                        false,
-                        false,
-                        lock,
-                    )
-                    .await?;
-                let consent_context = human.for_oauth(
-                    source.clone(),
-                    restrict(
-                        &human,
-                        &consent.scope,
-                        selected(
-                            consent.selected_spaces.as_deref(),
-                            self.config.max_auth_spaces,
-                        )?,
-                    )?,
+                let scope = match (bearer_scope(&current.scope)?, bearer_scope(&consent.scope)?) {
+                    (BearerScope::Write, BearerScope::Write) => BearerScope::Write,
+                    _ => BearerScope::Read,
+                };
+                let token_spaces = selected(
+                    current.selected_spaces.as_deref(),
+                    self.config.max_auth_spaces,
                 )?;
-                let wanted = restrict(
-                    &consent_context,
-                    &current.scope,
-                    selected(
-                        current.selected_spaces.as_deref(),
-                        self.config.max_auth_spaces,
-                    )?,
+                let consent_spaces = selected(
+                    consent.selected_spaces.as_deref(),
+                    self.config.max_auth_spaces,
                 )?;
-                consent_context
-                    .for_oauth(source, wanted)
-                    .map_err(Into::into)
+                let selected_spaces = match (token_spaces, consent_spaces) {
+                    (Some(mut token), Some(consent)) => {
+                        token.retain(|id| consent.contains(id));
+                        Some(token)
+                    }
+                    (token, consent) => token.or(consent),
+                };
+                Ok(CredentialAuthority::Bearer {
+                    credential: BearerCredential::OAuth {
+                        token,
+                        grant: grant_id,
+                        family,
+                    },
+                    source: grant("oauth", &consent.grant_id),
+                    scope,
+                    ability_write: current.ability_write == 1 && consent.ability_write == 1,
+                    selected_spaces,
+                })
             }
         }
     }
@@ -514,14 +580,14 @@ impl ControlService {
             .run(
                 async {
                     let current = user_read(rtx.inner_mut(), owner.as_str()).await?;
-                    self.human_context(
+                    self.credential_context(
                         rtx.inner_mut(),
                         &current,
                         AuthenticatedCredential::TrustedNone,
-                        grant("none", owner.as_str()),
                         perimeter.human_management(),
                         perimeter.human_management() && perimeter.ability_write(),
                         false,
+                        None,
                     )
                     .await
                 },

@@ -358,6 +358,10 @@ pub enum ProviderToolSchema {
         properties: BTreeMap<String, ProviderToolSchema>,
         required: BTreeSet<String>,
     },
+    Map {
+        values: Box<ProviderToolSchema>,
+    },
+    AnyOf(Vec<ProviderToolSchema>),
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ProviderToolDefinition {
@@ -559,17 +563,28 @@ pub trait ProviderAdminPort: Send + Sync {
 /// provenance changes until dispatch releases this lease. Mutations may cancel
 /// the supplied operation and wait for its lease to drop. No body crosses this port.
 pub trait ProviderEgressLease: Send {
+    /// Exactly one result per requested origin, in the original request order.
     fn current(&self) -> &[ProviderCurrentContent];
     /// The canonical owner verifies this active project and pins its lifecycle
     /// even when the call contains only trusted orchestration instructions.
     fn project(&self) -> Option<&FolderRef>;
+    fn secondary_projects(&self) -> &[FolderRef];
+    /// The transport received a successful final response head. A database
+    /// read barrier can be released; keep revocation registration until close.
+    fn mark_dispatched(&mut self);
     fn check(&self) -> DomainResult<()>;
 }
 #[derive(Clone, Debug)]
 pub struct ProviderEgressRequest {
     pub origins: Vec<ProviderOrigin>,
+    pub primary: crate::model::HistoryScope,
     pub project: Option<FolderRef>,
+    pub secondary_projects: Vec<FolderRef>,
 }
+pub const MAX_PROVIDER_ORIGINS: usize = 4096;
+pub const MAX_PROVIDER_SECONDARY_PROJECTS: usize = 64;
+pub const MAX_PROVIDER_SOURCE_SPACES: usize = 64;
+
 pub trait ProviderEgressCatalogPort: Send + Sync {
     fn acquire_egress(
         &self,

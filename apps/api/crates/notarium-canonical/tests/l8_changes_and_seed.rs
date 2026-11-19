@@ -1094,6 +1094,7 @@ async fn check_note_effects_and_replay(store: &CanonicalStore, postgres: bool) -
         hash: ContentDigest::from_bytes([n; 32]),
     };
     let original = CreateNote {
+        folder_page: false,
         note: note_id_seq(0x62, 1),
         parent: None,
         slug: "first".into(),
@@ -1315,10 +1316,12 @@ async fn check_note_effects_and_replay(store: &CanonicalStore, postgres: bool) -
     }
     for forged in [
         CreateNote {
+            folder_page: false,
             class: DocClass::AgentMemory,
             ..equivalent.clone()
         },
         CreateNote {
+            folder_page: false,
             parent: Some(sample_folder_id(0x63)),
             ..equivalent
         },

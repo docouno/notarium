@@ -59,10 +59,24 @@ The store implements
 `NoteWritePort`, `ChatPort`, `ContentJobPort`,
 `ChangeBroadcast` and `BackupParticipantPort`, alongside canonical point reads
 (`get_note`, `hydrate_cards`, `read_ability_resource`, `read_changes`,
-`recent_activity`), `move_board_card`, `rollback_agent_run`,
+`recent_activity`, `resolve_note_target`, `resolve_folder_path`,
+`list_child_folders`, `space_schema`), `move_board_card`,
+`prepare_agent_run_rollback`, `rollback_agent_run`,
 `accept_external_observation`, and peer session/job persistence. Full query
 planning (`NoteReadPort::list_notes`), `ViewGraphPort` and `SearchPort` remain
 owned by downstream projection and search crates.
+
+Path creation admits an authorized parent and commits missing components
+together. Replaying a creation command returns its folder within the original
+base subject to current visibility. Reads resolve exact active paths before
+historical aliases and retain the current project boundary.
+
+The filename stem `index` is reserved for explicit folder pages. Creating,
+moving, trashing, restoring, purging or rolling back a folder page updates
+both the covering note and the relevant folder revisions at the same command
+boundary. Renaming its title keeps the reserved stem. Visible note snapshots
+and recent activity carry the title, path, project, actor and timestamp from
+the admitted revision and folder placement.
 
 In PostgreSQL, creating a Space grants its initial writer epoch to the
 provisioning runtime when storage receives the commit acknowledgement, even if

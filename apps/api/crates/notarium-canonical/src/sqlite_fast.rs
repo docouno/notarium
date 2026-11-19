@@ -64,6 +64,7 @@ use crate::{
         rollback::{
             CandidateAction, RollbackRevision, build_rollback_direct_single_tx_exec,
             decode_rollback_note, encode_rollback_note, rollback_fallback_board_present_err,
+            rollback_fallback_cover_change_err,
         },
     },
     runtime::{FolderHeadRow, SqlDriverState},
@@ -702,6 +703,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
         byte_size,
         fields,
         diagnostics,
+        provenance,
         eager_raw_bytes,
         deferred_plan,
     ) = fast_read_pool
@@ -782,7 +784,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
                 return Err(DomainError::ResourceNotFound.into());
             }
 
-            let (live_facts, _) = build_resource_facts_rusqlite(
+            let (live_facts, ancestry) = build_resource_facts_rusqlite(
                 conn,
                 &space_rec.space,
                 &live_head.parent_folder_id,
@@ -830,6 +832,9 @@ pub(crate) async fn get_note_sqlite_local_fast(
             let digest = nm.content_digest.ok_or_else(|| {
                 internal_not_committed("note_rev_missing_digest", "note revision lacks digest")
             })?;
+            let provenance = ancestry.note_provenance(
+                &req_note, &nm.slug, nm.title, live_head.last_actor_id, live_head.updated_at,
+            );
             let parent_opt = (nm.parent_folder_id != space_rec.root_folder_id).then_some(nm.parent_folder_id);
             let effective_lc = if target_rev_id == live_head.head_rev_id {
                 live_head.lifecycle
@@ -885,6 +890,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
                     nm.byte_size,
                     fields,
                     nm.diagnostics,
+                    provenance,
                     fast_local_read,
                 ))
             },
@@ -897,6 +903,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
                 byte_size,
                 fields,
                 diagnostics,
+                provenance,
                 fast_local_read,
             )| {
                 let (eager_raw, deferred) = match fast_local_read {
@@ -912,6 +919,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
                     byte_size,
                     fields,
                     diagnostics,
+                    provenance,
                     eager_raw,
                     deferred,
                 ))
@@ -978,6 +986,7 @@ pub(crate) async fn get_note_sqlite_local_fast(
         byte_size,
         fields,
         diagnostics,
+        provenance: Some(provenance),
     })
 }
 
@@ -2994,6 +3003,7 @@ impl SqliteSyncItemPlan for CreateNoteFastPlan {
         let run_opt = extract_agent_run_from_auth(auth);
         let meta =
             RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(NoteRevisionMetadata {
+                folder_page: false,
                 note_id: input.note.clone(),
                 parent_folder_id: parent_id.clone(),
                 is_root_child: anc.is_root_child,
@@ -3259,6 +3269,7 @@ pub(crate) fn build_carrier_replacement_fast_intent(
             evaluate_fields_with_schema(info.raw_fields.as_ref(), info.diagnostics.first(), None)
         };
         RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(NoteRevisionMetadata {
+            folder_page: cached_anc.cover_note.as_ref() == Some(&note_id),
             note_id: note_id.clone(),
             parent_folder_id: cached_head.parent_folder_id.clone(),
             is_root_child: cached_anc.is_root_child,
@@ -3530,6 +3541,7 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
             };
             let bytes =
                 RevisionMetadataEnvelope::v1(RevisionMetadataPayload::Note(NoteRevisionMetadata {
+                    folder_page: anc.cover_note.as_ref() == Some(note_id),
                     note_id: note_id.clone(),
                     parent_folder_id: head.parent_folder_id,
                     is_root_child: anc.is_root_child,
@@ -4381,6 +4393,8 @@ fn load_folder_ancestry_rusqlite(
     let mut visited = BTreeSet::new();
     let mut write_locked = false;
     let mut current = folder_id.clone();
+    let mut project = None;
+    let mut cover_note = None;
 
     for _depth in 0..=MAX_FOLDER_DEPTH {
         if !visited.insert(current.clone()) {
@@ -4396,6 +4410,12 @@ fn load_folder_ancestry_rusqlite(
         if row.write_locked {
             write_locked = true;
         }
+        if ancestors.is_empty() {
+            cover_note = row.cover_note_id;
+        }
+        if row.is_project && project.is_none() {
+            project = Some(row.folder_id.clone());
+        }
         ancestors.push(row.folder_id.clone());
         if row.is_root {
             segments_rev.reverse();
@@ -4410,6 +4430,8 @@ fn load_folder_ancestry_rusqlite(
                 write_locked,
                 is_root_child,
                 folder_path,
+                project,
+                cover_note,
             });
         }
         segments_rev.push(row.slug);
@@ -5815,6 +5837,11 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     DomainError::validation(ValidationReason::SourceMismatch).into(),
                 )
             })?;
+            if head.slug_fold == crate::domain::folder_cover::SLUG {
+                return Err(FastItemExecError::PreWrite(
+                    rollback_fallback_cover_change_err(),
+                ));
+            }
             if row.get::<_, bool>(1).map_err(map_history_error)? {
                 skipped_manual_edits.push(nid);
                 continue;
@@ -5856,6 +5883,11 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
             let bytes: Vec<u8> = row.get(3).map_err(map_history_error)?;
             let pre_meta =
                 decode_rollback_note(&bytes, &nid).map_err(FastItemExecError::PreWrite)?;
+            if pre_meta.slug_fold == crate::domain::folder_cover::SLUG {
+                return Err(FastItemExecError::PreWrite(
+                    rollback_fallback_cover_change_err(),
+                ));
+            }
             let head_unchanged_placement = head.lifecycle == pre_meta.lifecycle
                 && head.parent_folder_id == pre_meta.parent_folder_id
                 && head.slug == pre_meta.slug
@@ -5871,6 +5903,7 @@ impl SqliteSyncItemPlan for RollbackDirectSqliteFastPlan {
                     pre_carrier: None,
                     needs_note_mutation,
                     head_unchanged_placement,
+                    current_cover_parent: None,
                 },
             );
         }

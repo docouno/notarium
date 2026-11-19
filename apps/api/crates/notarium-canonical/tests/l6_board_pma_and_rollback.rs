@@ -651,6 +651,7 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: view_note.clone(),
                     parent: Some(project.clone()),
                     slug: "sprint-board".to_owned(),
@@ -682,6 +683,7 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: nid.clone(),
                         parent: (nid == &card_3).then(|| project.clone()),
                         slug: slug.to_owned(),
@@ -927,6 +929,7 @@ async fn run_move_board_card_suite(store: &CanonicalStore) -> BoardEffects {
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: note.clone(),
                         parent: None,
                         slug: format!("large-{id}"),
@@ -1121,6 +1124,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: view_note.clone(),
                     parent: None,
                     slug: "agent-board".to_owned(),
@@ -1163,6 +1167,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_anchor.clone(),
                     parent: None,
                     slug: "anchor-card".to_owned(),
@@ -1183,6 +1188,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_pre.clone(),
                     parent: None,
                     slug: "roadmap".to_owned(),
@@ -1243,6 +1249,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_manual.clone(),
                     parent: None,
                     slug: "manual-note".to_owned(),
@@ -1261,6 +1268,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_room.clone(),
                     parent: None,
                     slug: "room-note".to_owned(),
@@ -1363,6 +1371,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_created.clone(),
                     parent: None,
                     slug: "roadmap".to_owned(),
@@ -1730,6 +1739,7 @@ async fn run_rollback_agent_run_suite(store: &CanonicalStore) {
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: blocker_note,
                     parent: None,
                     slug: "roadmap".to_owned(), // Foreign note occupies `"roadmap"`!
@@ -1902,6 +1912,7 @@ async fn check_rollback_destination_authority(
                 scope,
                 owner,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: Some(destination.clone()),
                     slug: "moved-between-projects".into(),
@@ -2031,6 +2042,7 @@ async fn check_rollback_with_dirty_room(
                 scope,
                 owner,
                 CreateNote {
+                    folder_page: false,
                     note: note.clone(),
                     parent: None,
                     slug: "unsettled".into(),
@@ -2226,6 +2238,7 @@ async fn run_note_only_rollback_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_ed.clone(),
                     parent: None,
                     slug: "note-only-pre".to_owned(),
@@ -2271,6 +2284,7 @@ async fn run_note_only_rollback_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: n_cr.clone(),
                     parent: None,
                     slug: "note-only-created".to_owned(),
@@ -2291,6 +2305,7 @@ async fn run_note_only_rollback_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: sample_note_id(203),
                     parent: None,
                     slug: "opaque-created".into(),
@@ -2321,6 +2336,7 @@ async fn run_note_only_rollback_suite(
                 &scope,
                 &owner,
                 CreateNote {
+                    folder_page: false,
                     note: unrelated.clone(),
                     parent: None,
                     slug: "unrelated-live".into(),

@@ -18,6 +18,7 @@ pub(super) async fn check(
             scope,
             owner,
             BatchItem::Create(CreateNote {
+                folder_page: false,
                 note: note.clone(),
                 slug: slug.into(),
                 parent: None,
@@ -214,6 +215,7 @@ pub(super) async fn check(
             scope,
             owner,
             Link {
+                target_title: None,
                 source: source.clone(),
                 target,
                 relation: "related".into(),

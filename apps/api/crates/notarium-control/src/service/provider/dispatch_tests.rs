@@ -29,12 +29,16 @@ struct Egress {
     current: Mutex<Vec<ProviderCurrentContent>>,
     deny: AtomicBool,
     active: Arc<AtomicUsize>,
+    admitted: Arc<AtomicUsize>,
     cancellations: Mutex<Vec<Cancellation>>,
 }
 struct EgressLease {
     current: Vec<ProviderCurrentContent>,
     project: Option<FolderRef>,
+    secondary_projects: Vec<FolderRef>,
     active: Arc<AtomicUsize>,
+    admitted: Arc<AtomicUsize>,
+    dispatched: bool,
     cancellation: Cancellation,
 }
 impl Drop for EgressLease {
@@ -48,6 +52,13 @@ impl ProviderEgressLease for EgressLease {
     }
     fn project(&self) -> Option<&FolderRef> {
         self.project.as_ref()
+    }
+    fn secondary_projects(&self) -> &[FolderRef] {
+        &self.secondary_projects
+    }
+    fn mark_dispatched(&mut self) {
+        assert!(!std::mem::replace(&mut self.dispatched, true));
+        self.admitted.fetch_add(1, Ordering::SeqCst);
     }
     fn check(&self) -> notarium_core::DomainResult<()> {
         if self.cancellation.is_cancelled() {
@@ -84,7 +95,10 @@ impl ProviderEgressCatalogPort for Egress {
             Ok(Box::new(EgressLease {
                 current,
                 project: request.project,
+                secondary_projects: request.secondary_projects,
                 active: self.active.clone(),
+                admitted: self.admitted.clone(),
+                dispatched: false,
                 cancellation,
             }) as Box<dyn ProviderEgressLease>)
         })
@@ -402,6 +416,7 @@ impl Setup {
         CompletionRequest {
             intent: CommandKey::from_bytes([id; 16]),
             selection: self.selection.clone(),
+            secondary_projects: vec![],
             messages: vec![CompletionMessage {
                 role: CompletionRole::User,
                 instruction: None,

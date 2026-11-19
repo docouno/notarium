@@ -50,6 +50,7 @@ async fn observed_digest_matches_content_on_no_change_and_replay() {
                     &scope,
                     &owner,
                     CreateNote {
+                        folder_page: false,
                         note: note.clone(),
                         parent: None,
                         slug: "observed".into(),
@@ -234,6 +235,7 @@ async fn historical_observation_replay_bounds_paused_cas_read() {
             &scope,
             &owner,
             CreateNote {
+                folder_page: false,
                 note: note.clone(),
                 parent: None,
                 slug: "observed".into(),
