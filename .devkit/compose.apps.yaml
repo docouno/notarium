@@ -41,7 +41,7 @@
         },
         {
           "type": "bind",
-          "source": "${DEVKIT_PROJECT_ROOT:?}/.devkit/cache/cargo",
+          "source": "${DEVKIT_CARGO_CACHE_DIR:?}",
           "target": "/cache/cargo",
           "read_only": false,
           "bind": {
@@ -50,8 +50,11 @@
           }
         }
       ],
+      "env_file": [
+        ".devkit/runtime/api.env"
+      ],
       "ports": [
-        "127.0.0.1::8080"
+        "127.0.0.1:${DEVKIT_PORT_API:-0}:8080"
       ]
     },
     "desktop": {
@@ -67,7 +70,14 @@
       "environment": {
         "HOME": "/tmp/devkit-home",
         "NPM_CONFIG_UPDATE_NOTIFIER": "false",
-        "DEVKIT_API_TARGET": "http://api:8080"
+        "DEVKIT_API_TARGET": "http://api:8080",
+        "PATH": "/devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "XDG_CACHE_HOME": "/tmp/devkit-xdg-cache",
+        "NPM_CONFIG_CACHE": "/tmp/devkit-npm-cache",
+        "PNPM_CONFIG_PM_ON_FAIL": "ignore",
+        "PNPM_CONFIG_RUNTIME": "false",
+        "PNPM_CONFIG_RUNTIME_ON_FAIL": "ignore",
+        "PNPM_CONFIG_IGNORE_PNPMFILE": "true"
       },
       "volumes": [
         {
@@ -192,6 +202,16 @@
         },
         {
           "type": "bind",
+          "source": "${DEVKIT_PNPM_PATH:?}",
+          "target": "/devkit/bin/pnpm",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
+        },
+        {
+          "type": "bind",
           "source": "${DEVKIT_ENGINE_PATH:?}",
           "target": "/devkit/devkit",
           "read_only": true,
@@ -201,6 +221,12 @@
           }
         }
       ],
+      "depends_on": {
+        "api": {
+          "condition": "service_started",
+          "required": true
+        }
+      },
       "read_only": true,
       "tmpfs": [
         "/tmp:mode=1777"
@@ -220,7 +246,7 @@
       "user": "${DEVKIT_UID:?}:${DEVKIT_GID:?}",
       "working_dir": "/workspace/apps/web",
       "command": [
-        "npm",
+        "/devkit/bin/pnpm",
         "run",
         "dev"
       ],
@@ -228,7 +254,14 @@
         "HOME": "/tmp/devkit-home",
         "NPM_CONFIG_UPDATE_NOTIFIER": "false",
         "DEVKIT_API_TARGET": "http://api:8080",
-        "VITE_API_ENABLED": "true"
+        "VITE_API_ENABLED": "true",
+        "PATH": "/devkit/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "XDG_CACHE_HOME": "/tmp/devkit-xdg-cache",
+        "NPM_CONFIG_CACHE": "/tmp/devkit-npm-cache",
+        "PNPM_CONFIG_PM_ON_FAIL": "ignore",
+        "PNPM_CONFIG_RUNTIME": "false",
+        "PNPM_CONFIG_RUNTIME_ON_FAIL": "ignore",
+        "PNPM_CONFIG_IGNORE_PNPMFILE": "true"
       },
       "volumes": [
         {
@@ -350,10 +383,29 @@
             "create_host_path": false,
             "selinux": "z"
           }
+        },
+        {
+          "type": "bind",
+          "source": "${DEVKIT_PNPM_PATH:?}",
+          "target": "/devkit/bin/pnpm",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false,
+            "selinux": "z"
+          }
         }
       ],
+      "depends_on": {
+        "api": {
+          "condition": "service_started",
+          "required": true
+        }
+      },
+      "tmpfs": [
+        "/tmp:mode=1777"
+      ],
       "ports": [
-        "127.0.0.1::5173"
+        "127.0.0.1:${DEVKIT_PORT_WEB:-0}:5173"
       ]
     }
   }

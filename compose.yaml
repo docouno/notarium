@@ -1,5 +1,2 @@
 # Product-owned development overrides.
-services:
-  api:
-    environment:
-      PORT: '8080'
+services: {}

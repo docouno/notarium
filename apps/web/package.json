@@ -7,18 +7,18 @@
     "node": "^24.22.1"
   },
   "scripts": {
-    "check": "devkit-verify && npm run format:check && npm run lint && npm run typecheck",
-    "format:check": "prettier --check . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
-    "format": "prettier --write . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
+    "check": "devkit-verify && pnpm run format:check && pnpm run lint && pnpm run typecheck",
+    "format:check": "prettier --check . \"!package.json\" \"!pnpm-lock.yaml\" \"!pnpm-workspace.yaml\" \"!dist/**\" \"!release/**\" \"!coverage/**\" \"!**/.worktrees/**\"",
+    "format": "prettier --write . \"!package.json\" \"!pnpm-lock.yaml\" \"!pnpm-workspace.yaml\" \"!dist/**\" \"!release/**\" \"!coverage/**\" \"!**/.worktrees/**\"",
     "lint": "eslint --max-warnings 0 .",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
     "test": "vitest run --config vitest.config.mjs",
-    "fix": "npm run format && eslint --max-warnings 0 --fix . && npm run format",
+    "fix": "pnpm run format && eslint --max-warnings 0 --fix . && pnpm run format",
     "build": "vite build",
     "dev": "vite --host 0.0.0.0 --port 5173 --strictPort"
   },
   "devDependencies": {
-    "@docouno/env": "0.4.1",
+    "@docouno/env": "0.5.1",
     "@testing-library/dom": "10.4.2",
     "@testing-library/react": "16.3.3",
     "@types/node": "24.19.2",
@@ -47,8 +47,8 @@
   "dependencies": {
     "react": "19.3.1",
     "react-dom": "19.3.1",
-    "@notarium/package-client": "file:../../packages/client",
-    "@notarium/package-api-contract": "file:../../packages/api-contract"
+    "@notarium/package-client": "workspace:*",
+    "@notarium/package-api-contract": "workspace:*"
   },
   "license": "AGPL-3.0-only"
 }
