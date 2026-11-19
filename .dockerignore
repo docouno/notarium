@@ -1,5 +1,6 @@
 .git
 .artifacts
+/.worktrees/
 .devkit/cache
 .devkit/state
 **/target

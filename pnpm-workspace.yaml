@@ -1,0 +1,10 @@
+packages:
+- apps/desktop
+- apps/web
+- packages/api-contract
+- packages/client
+nodeLinker: isolated
+packageImportMethod: hardlink
+verifyDepsBeforeRun: false
+minimumReleaseAgeExclude:
+- "@docouno/env@0.5.1"

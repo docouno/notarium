@@ -17,12 +17,14 @@ starter examples, not a production application.
 ## Start developing
 
 Use Linux x86_64, local Docker Engine, Docker Compose **5.0.0+**, Git and GNU Make.
-Host Node **24.22.1** is optional for npm CLI entry points. Development tools run
-in pinned containers; no private services or additional agent tooling are needed.
+Host Node **24.22.1** is optional and only needed for `npx` CLI entry points.
+Development tools run in pinned containers; no private services or additional agent
+tooling are needed.
 
 ```sh
 git clone --branch v1 git@github.com:docouno/notarium.git
 cd notarium
+sh .devkit/runtime/devkit.sh cli doctor .
 make setup
 make doctor
 make check
@@ -30,21 +32,25 @@ make test
 make build
 ```
 
-Setup downloads images and dependencies and needs networking. Later gates use
-`--network none`, read-only sources and writable cache/output mounts. The accepted
-environment is `@docouno/devkit@0.4.1`, Rust 1.99.1 (edition 2024), Node 24.22.1,
-React 19.3.1 and Electron 45.0.0. Optional CLI host diagnostics:
-`npx --yes @docouno/devkit@0.4.1 doctor .`.
+Setup downloads images and dependencies (including pinned static `pnpm 12.21.0`)
+and needs networking. Later gates use `--network none`, read-only sources and
+writable cache/output mounts. The accepted environment is `@docouno/devkit@0.5.1`,
+Rust 1.99.1 (edition 2024), Node 24.22.1, `pnpm 12.21.0`, React 19.3.1 and
+Electron 45.0.0. Inspect checkout readiness and leases with `make info` (or
+`make info json=1`).
 
 ```sh
 make up app=web
-make status
+make info
 # Open the reported web URL and request a starter API greeting.
 make down
+# Release sticky port leases when finished with this checkout:
+make down cleanup=1
 ```
 
-Host ports are ephemeral and bound to loopback. Compose sets `PORT=8080` on the
-API for the web proxy; the standalone daemon defaults to `PORT=3000`.
+Development host ports use checkout-owned sticky loopback leases (`10000-19999`
+by default). Managed `.devkit/runtime/api.env` sets `HOST=0.0.0.0` and `PORT=8080`
+on the API for the web proxy; the standalone daemon defaults to `PORT=3000`.
 
 ## Workspace
 
@@ -57,8 +63,9 @@ API for the web proxy; the standalone daemon defaults to `PORT=3000`.
 | `apps/desktop` | `@notarium/app-desktop`: Electron main/preload/renderer and platform adapters |
 | `docker/Dockerfile` | Rust-only, non-root server image |
 
-Four npm components use local `file:` dependencies. Web and desktop consume the
-client library; all three consume api-contract. Each app owns its lifecycle.
+Four Node components share one root `pnpm` workspace (`pnpm-workspace.yaml` and
+`pnpm-lock.yaml`) linked via `workspace:*`. Web and desktop consume the client
+library; all three consume api-contract. Each app owns its lifecycle.
 
 The backend targets separate control, canonical and rebuildable derived storage.
 HTTP and agents consume core ports instead of directly importing engine storage
