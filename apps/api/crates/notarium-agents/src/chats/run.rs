@@ -1,13 +1,14 @@
 use super::*;
 use crate::{
-    completion::{CompletionActor, CompletionRunBudget, call_key, complete_step},
+    completion::{
+        CompletionActor, CompletionRunBudget, bounded_tool_text, call_key, complete_step,
+    },
     mcp::{EgressTarget, McpInvocationContext, PersonalToolInvocation, runtime_abilities},
 };
 use notarium_control::service::provider::completion_input_estimate;
 use notarium_core::receipt::AccountCommandIdentity;
 use serde_json::{Value, json};
 
-const TOOL_DISPLAY_BYTES: usize = 32 * 1024;
 const COMPACTION_ENTRIES: usize = 80;
 
 impl AgentRunSupervisor {
@@ -446,18 +447,4 @@ struct ToolReply {
     display: String,
     proof: ChatProvenance,
     proposal: Option<(ContentDigest, String)>,
-}
-
-fn bounded_tool_text(text: &str) -> String {
-    if text.len() <= TOOL_DISPLAY_BYTES {
-        return text.to_owned();
-    }
-    const SUFFIX: &str = "\n…[truncated]";
-    let mut end = TOOL_DISPLAY_BYTES - SUFFIX.len();
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut display = text[..end].to_owned();
-    display.push_str(SUFFIX);
-    display
 }

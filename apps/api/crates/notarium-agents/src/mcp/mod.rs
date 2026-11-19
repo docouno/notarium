@@ -261,7 +261,7 @@ impl ToolRegistry {
         ToolName::ALL
             .iter()
             .copied()
-            .filter(|tool| allowed(auth, *tool))
+            .filter(|tool| allowed(auth, *tool) && !tool.ability_write())
             .map(ToolName::provider_definition)
             .collect()
     }

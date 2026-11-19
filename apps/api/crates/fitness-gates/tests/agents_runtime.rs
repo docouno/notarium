@@ -5,6 +5,16 @@ mod ability_cases;
 mod content_cases;
 #[path = "agents_runtime/engine.rs"]
 mod engine;
+#[path = "agents_runtime/group_wire.rs"]
+mod group_wire;
+#[path = "agents_runtime/keeper_calendar.rs"]
+mod keeper_calendar_cases;
+#[path = "agents_runtime/keeper_turn.rs"]
+mod keeper_turn_cases;
+#[path = "agents_runtime/legacy_mcp.rs"]
+mod legacy_mcp_cases;
+#[path = "agents_runtime/moved_folder_wire.rs"]
+mod moved_folder_cases;
 #[path = "agents_runtime/proposals.rs"]
 mod proposal_cases;
 #[path = "agents_runtime/proposal_notes.rs"]
@@ -13,6 +23,8 @@ mod proposal_note_cases;
 mod runtime_ability_cases;
 #[path = "agents_runtime/supervised_chat.rs"]
 mod supervised_chat_cases;
+#[path = "agents_runtime/supervised_takeover.rs"]
+mod supervised_takeover_cases;
 #[allow(dead_code)]
 #[path = "../../notarium-control/tests/support/mod.rs"]
 mod support;
@@ -48,9 +60,14 @@ use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 use support::{Fixture, budget};
 
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 struct RuntimeFixture {
     storage: Fixture,
     canonical: CanonicalStore,
+    canonical_config: CanonicalConfig,
+    keyring: Arc<Keyring>,
     runtime: CanonicalRuntime,
     control: Arc<ControlService>,
     revocations: Arc<RevocationHub>,
@@ -62,7 +79,11 @@ struct RuntimeFixture {
 
 impl RuntimeFixture {
     async fn open(pg: bool) -> Self {
-        let mut storage = Fixture::new(pg, "agents_runtime").await;
+        Self::open_named(pg, "agents_runtime").await
+    }
+
+    async fn open_named(pg: bool, fixture_name: &str) -> Self {
+        let mut storage = Fixture::new(pg, fixture_name).await;
         let keyring = fixture_keyring(&mut storage).await;
         let root = storage.root.clone().unwrap_or_else(|| {
             let mut nonce = [0_u8; 16];
@@ -88,22 +109,55 @@ impl RuntimeFixture {
                     },
                     username: "postgres".into(),
                     password: String::new(),
-                    database: "auth_agents_runtime".into(),
+                    database: format!("auth_{fixture_name}"),
                 },
                 "v1_canonical",
             );
             config.default_backup_budget =
                 notarium_canonical::config::default_postgres_backup_budget();
         }
-        let (canonical, runtime) = CanonicalRuntime::open(config).await.unwrap();
+        let (canonical, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
+        let revocations = Arc::new(RevocationHub::new_local());
+        let projections = Arc::new(ProjectionFixtures::default());
+        let (control, registry, human) = Self::bind_owners(
+            &storage,
+            &canonical,
+            keyring.clone(),
+            revocations.clone(),
+            projections.clone(),
+            true,
+        )
+        .await;
+        Self {
+            storage,
+            canonical,
+            canonical_config: config,
+            keyring,
+            runtime,
+            control,
+            revocations,
+            registry,
+            projections,
+            human,
+            temporary_blob_root: pg.then_some(root),
+        }
+    }
+
+    async fn bind_owners(
+        storage: &Fixture,
+        canonical: &CanonicalStore,
+        keyring: Arc<Keyring>,
+        revocations: Arc<RevocationHub>,
+        projections: Arc<ProjectionFixtures>,
+        bootstrap: bool,
+    ) -> (Arc<ControlService>, Arc<ToolRegistry>, AccountContext) {
         let catalog = Arc::new(SystemAbilityCatalog::new(Arc::new(canonical.clone())));
         let owner = PrincipalId::from_bytes([4; 16]);
-        let revocations = Arc::new(RevocationHub::new_local());
         let control = Arc::new(
             ControlService::open(
                 storage.store.clone(),
                 catalog.clone(),
-                revocations.clone(),
+                revocations,
                 storage.clock.clone(),
                 ControlConfig {
                     authentication: AuthenticationMode::TrustedNone { owner },
@@ -116,19 +170,21 @@ impl RuntimeFixture {
             .await
             .unwrap(),
         );
-        control
-            .bootstrap(
-                support::empty(),
-                budget(),
-                BootstrapAccount {
-                    username: "owner".into(),
-                    email: None,
-                    display_name: "Owner".into(),
-                    password: None,
-                },
-            )
-            .await
-            .unwrap();
+        if bootstrap {
+            control
+                .bootstrap(
+                    support::empty(),
+                    budget(),
+                    BootstrapAccount {
+                        username: "owner".into(),
+                        email: None,
+                        display_name: "Owner".into(),
+                        password: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
         let human = AccountContext::new(
             control
                 .trusted_none(
@@ -149,23 +205,77 @@ impl RuntimeFixture {
             ProviderConfig::default(),
         )
         .unwrap();
-        let projections = Arc::new(ProjectionFixtures::default());
         let registry = Arc::new(ToolRegistry::new(
             Arc::new(ControlPlane::new(provider)),
             catalog,
-            Arc::new(TestEngine(canonical.clone(), projections.clone())),
+            Arc::new(TestEngine(canonical.clone(), projections)),
             control.clone(),
         ));
+        (control, registry, human)
+    }
+
+    async fn reopen_fenced(self, scope: &notarium_core::model::HistoryScope) -> Self {
+        let Self {
+            storage,
+            canonical,
+            canonical_config,
+            keyring,
+            runtime,
+            control,
+            revocations,
+            registry,
+            projections,
+            temporary_blob_root,
+            ..
+        } = self;
+        let epoch = canonical
+            .read_space(&scope.space_id)
+            .await
+            .unwrap()
+            .active_epoch;
+        revocations.close();
+        drop(registry);
+        drop(control);
+        drop(canonical);
+        runtime.shutdown().await.unwrap();
+        let (canonical, runtime) = CanonicalRuntime::open(canonical_config.clone())
+            .await
+            .unwrap();
+        if matches!(&canonical_config.sql, SqlBackendConfig::Postgres { .. }) {
+            canonical
+                .advance_space_lease(
+                    &MaintenanceContext {
+                        authority: ServiceAuthority::admit(ServicePurpose::Revocation),
+                        budget: budget(),
+                    },
+                    scope,
+                    epoch.checked_next().unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let revocations = Arc::new(RevocationHub::new_local());
+        let (control, registry, human) = Self::bind_owners(
+            &storage,
+            &canonical,
+            keyring.clone(),
+            revocations.clone(),
+            projections.clone(),
+            false,
+        )
+        .await;
         Self {
             storage,
             canonical,
+            canonical_config,
+            keyring,
             runtime,
             control,
             revocations,
             registry,
             projections,
             human,
-            temporary_blob_root: pg.then_some(root),
+            temporary_blob_root,
         }
     }
 
@@ -291,7 +401,7 @@ async fn call(
 }
 
 async fn external_registry_and_memory(pg: bool) {
-    let fixture = RuntimeFixture::open(pg).await;
+    let mut fixture = RuntimeFixture::open(pg).await;
     let read = fixture.pat(BearerScope::Read, false).await;
     let write = fixture.pat(BearerScope::Write, false).await;
     let author = fixture.pat(BearerScope::Write, true).await;
@@ -397,7 +507,12 @@ async fn external_registry_and_memory(pg: bool) {
         1
     );
     assert!(body.contains("One observation"));
-    session_delivery_is_lossless(&fixture, &read, &scoped).await;
+    session_delivery_is_lossless(&fixture, &scoped).await;
+    Box::pin(keeper_calendar_cases::calendar_scope_and_orphan(
+        &mut fixture,
+        &scoped,
+    ))
+    .await;
     ability_cases::overrides_and_promotion(&fixture).await;
     content_cases::edit_folder_cover_and_view(&fixture, &scoped).await;
     proposal_cases::explicit_confirmation_applies_once(&fixture, &scoped).await;
@@ -406,18 +521,56 @@ async fn external_registry_and_memory(pg: bool) {
     runtime_ability_cases::secondary_project_abilities_reach_the_wire(&fixture, &scoped).await;
     supervised_chat_cases::supervised_turn_survives_disconnect_and_stops_cleanly(&fixture, &scoped)
         .await;
+    Box::pin(
+        legacy_mcp_cases::stored_legacy_episodes_and_notes_round_trip_through_mcp(
+            &fixture, &scoped,
+        ),
+    )
+    .await;
+    Box::pin(
+        moved_folder_cases::relocated_empty_folder_blocks_old_and_compacted_history(
+            &fixture, &scoped,
+        ),
+    )
+    .await;
     fixture.close().await;
 }
 
-async fn session_delivery_is_lossless(
-    fixture: &RuntimeFixture,
-    reader: &AccountContext,
-    scope: &SpaceContext,
-) {
+async fn session_delivery_is_lossless(fixture: &RuntimeFixture, scope: &SpaceContext) {
+    let second = fixture
+        .control
+        .create_space(
+            fixture.human.clone(),
+            AccountMutation {
+                identity: runtime_ability_cases::identity(fixture, &fixture.human, 44).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([44; 16]),
+                    kind: notarium_core::auth::SpaceKind::Shared,
+                    name: "Second delta Space".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let authority = fixture
+        .control
+        .trusted_none(PerimeterAttestation::attest_checked(), budget())
+        .await
+        .unwrap();
+    let second = SpaceContext::new(authority, second.history, budget()).unwrap();
+    let reader = &fixture.pat(BearerScope::Read, false).await;
     let mut expected = BTreeSet::new();
     for tag in 20..=42 {
         expected.insert(append_note(fixture, scope, tag).await.to_string());
     }
+    expected.insert(append_note(fixture, &second, 44).await.to_string());
+    let second_cutoff = fixture
+        .canonical
+        .read_space(&second.scope().space_id)
+        .await
+        .unwrap()
+        .last_seq;
     let cutoff = fixture
         .canonical
         .read_space(&scope.scope().space_id)
@@ -437,10 +590,12 @@ async fn session_delivery_is_lossless(
         EpisodeId::parse(page.structured_content["session"]["id"].as_str().unwrap()).unwrap();
     assert!(page.content[0].text.contains("continue_"));
     assert!(owner_ack(fixture, reader, episode.clone(), scope).await < cutoff);
+    assert!(owner_ack(fixture, reader, episode.clone(), &second).await < second_cutoff);
     let late = append_note(fixture, scope, 43).await.to_string();
 
     let mut seen = BTreeSet::new();
     let mut key = 61;
+    let mut preview_key = 73;
     let final_receipt = loop {
         let delta = &page.structured_content["delta"];
         let changes = delta["changes"].as_array().unwrap();
@@ -456,6 +611,31 @@ async fn session_delivery_is_lossless(
                     "repeated revision in continuation"
                 );
             }
+        }
+        if let Some(receipt) = delta["deliveryReceipt"].as_str() {
+            let before = owner_ack(fixture, reader, episode.clone(), scope).await;
+            let other_before = owner_ack(fixture, reader, episode.clone(), &second).await;
+            let preview = call(
+                fixture,
+                reader,
+                preview_key,
+                "start_session",
+                json!({
+                    "deliveryReceipt":receipt, "acknowledge":false,
+                }),
+            )
+            .await
+            .unwrap();
+            preview_key += 1;
+            assert_eq!(preview.structured_content["acknowledged"], false);
+            assert_eq!(
+                owner_ack(fixture, reader, episode.clone(), scope).await,
+                before
+            );
+            assert_eq!(
+                owner_ack(fixture, reader, episode.clone(), &second).await,
+                other_before
+            );
         }
         if let Some(next) = delta["continuation"].as_str() {
             page = call(
@@ -475,7 +655,10 @@ async fn session_delivery_is_lossless(
         }
     };
     assert_eq!(seen, expected);
-    assert!(owner_ack(fixture, reader, episode.clone(), scope).await < cutoff);
+    assert!(
+        owner_ack(fixture, reader, episode.clone(), scope).await < cutoff
+            || owner_ack(fixture, reader, episode.clone(), &second).await < second_cutoff
+    );
     for key in [71, 72] {
         call(
             fixture,
@@ -487,7 +670,14 @@ async fn session_delivery_is_lossless(
         .await
         .unwrap();
     }
-    assert_eq!(owner_ack(fixture, reader, episode, scope).await, cutoff);
+    assert_eq!(
+        owner_ack(fixture, reader, episode.clone(), scope).await,
+        cutoff
+    );
+    assert_eq!(
+        owner_ack(fixture, reader, episode, &second).await,
+        second_cutoff
+    );
 }
 
 async fn append_note(fixture: &RuntimeFixture, scope: &SpaceContext, tag: u8) -> NoteId {
@@ -542,10 +732,12 @@ async fn owner_ack(
 
 #[tokio::test]
 async fn sqlite_external_registry_and_memory() {
+    let _fixture = support::AUTH_TEST_LOCK.lock().await;
     external_registry_and_memory(false).await;
 }
 
 #[tokio::test]
 async fn postgres_external_registry_and_memory() {
+    let _fixture = support::AUTH_TEST_LOCK.lock().await;
     external_registry_and_memory(true).await;
 }

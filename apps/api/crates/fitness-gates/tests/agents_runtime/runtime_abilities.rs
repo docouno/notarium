@@ -189,7 +189,7 @@ pub(super) async fn secondary_project_abilities_reach_the_wire(
         .await
         .unwrap();
     assert!(run.taint().is_tainted());
-    assert_eq!(first.secondary_projects, [project.clone()]);
+    assert_eq!(first.secondary_projects, std::slice::from_ref(&project));
     assert!(
         matches!(first.parts.as_slice(), [ProviderMessage::Ability(role), ProviderMessage::Ability(skill)]
         if role.provenance().placement() == &AbilityPlacement::OwnedProject(project.clone())
@@ -241,7 +241,7 @@ pub(super) async fn secondary_project_abilities_reach_the_wire(
     assert!(messages(&received[1]).contains("Instructions from the Space role."));
 }
 
-async fn identity(
+pub(super) async fn identity(
     fixture: &RuntimeFixture,
     human: &AccountContext,
     tag: u8,
@@ -268,6 +268,17 @@ pub(super) async fn loopback_provider(
     listener: &TcpListener,
     tag: u8,
     tools: bool,
+) -> LoopbackProvider {
+    loopback_provider_with_output(fixture, human, listener, tag, tools, 512).await
+}
+
+pub(super) async fn loopback_provider_with_output(
+    fixture: &RuntimeFixture,
+    human: &AccountContext,
+    listener: &TcpListener,
+    tag: u8,
+    tools: bool,
+    max_output_tokens: u32,
 ) -> LoopbackProvider {
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let resource = ProviderResourceId::from_bytes([tag; 16]);
@@ -311,7 +322,7 @@ pub(super) async fn loopback_provider(
                     id: resource.clone(),
                     name: format!("Runtime fixture provider {tag}"),
                     wire: ProviderWireKind::Ollama,
-                    base_url: origin.into(),
+                    base_url: origin,
                     credential: None,
                     headers: vec![],
                     limits: ProviderLimits::default(),
@@ -336,7 +347,7 @@ pub(super) async fn loopback_provider(
                         kind: ProviderModelKind::Completion,
                         accounting: TokenAccountingProfile::ConservativeModelCapV1,
                         max_input_tokens: 65_536,
-                        max_output_tokens: 512,
+                        max_output_tokens,
                         tools,
                     },
                 },

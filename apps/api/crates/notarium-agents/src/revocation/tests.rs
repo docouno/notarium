@@ -229,12 +229,23 @@ async fn revoke_clears_sender_and_stable_event_replay_does_not_revoke_a_new_run(
         input: PendingInputId::from_bytes([7; 16]),
     };
     let command = ContentDigest::from_bytes([8; 32]);
-    hub.register_pending(context(9), key.clone(), authority.clone(), command)
-        .unwrap();
+    let options = ChatRunOptions {
+        role: Some("selected-role".into()),
+        ..ChatRunOptions::default()
+    };
+    hub.register_pending(
+        context(9),
+        key.clone(),
+        authority.clone(),
+        command,
+        options.clone(),
+    )
+    .unwrap();
     let snapshot = hub.pending(&key).unwrap();
+    assert_eq!(snapshot.options(), &options);
     let different = caller(10, &space, AuthenticatedCredential::TrustedNone);
     assert!(matches!(
-        hub.register_pending(context(11), key.clone(), different, command),
+        hub.register_pending(context(11), key.clone(), different, command, options),
         Err(PortError::Domain(DomainError::IdempotencyKeyReused))
     ));
 

@@ -42,8 +42,15 @@ whereas content-bearing `authorize_read` / `authorize_folder_read` taint
 already-existing clones before external content returns. Shared chat limits reads
 to its Space (and to matching project-scoped threads when a Keeper is pinned to a
 `project_root`) and excludes the sender's profile.
-Nested Keeper runs can retain or drop approved package read exceptions; they
-cannot add exceptions outside their parent's project authority.
+A scheduled credential also binds its own Keeper log. Nested Keeper runs can
+retain or drop approved package read exceptions within their parent's project
+authority.
+
+Explicit proposal confirmation uses two independently revalidated interactive
+contexts with fresh taint latches. The proposal reader has read authority and
+cannot derive a run or perform management or document writes. The write context
+retains the original credential, project and membership ceilings. A typed
+confirmation witness binds each approved mutation step to its source chat entry.
 
 Canonical owners create classified documents. `ClassEgressFence` creates private
 projection/search/provider wrappers only after read, lifecycle and class checks.
@@ -61,9 +68,12 @@ Provider dispatch uses `ProviderEgressCatalogPort` to pin current metadata for
 every origin and the selected active project. Its lease excludes changes to class,
 lifecycle, provenance and project ancestry until release, or cancels the call and
 waits for release. Chat origins include their canonical digest and optional project;
-current taint remains authoritative. `ClassEgressFence::revalidate` checks these
-fresh facts against the exact source and current provider disclosure. No document
-bodies or SQL handles cross the metadata port.
+current taint remains authoritative. Folder and Space metadata carry their
+own canonical revision or digest. A derived chat entry retains the transitive
+origins of each source used to produce it, including earlier tool results and
+summaries. `ClassEgressFence::revalidate` checks the exact source and current
+provider disclosure before dispatch. The metadata port carries identities,
+placement, lifecycle and proofs.
 
 Completion messages retain roles, classified parts and ordered tool-call/result
 associations. `ProviderInstruction` carries trusted orchestration text on `System`,
@@ -344,8 +354,8 @@ read/write access. Revocation callbacks receive the durable event request ID for
 idempotent delivery; a committed mutation cannot return success before their ACK.
 
 Schedule claims carry the next slot computed by the scheduler. A committed claim
-advances that slot atomically; repeated claims return an inspection receipt,
-without permission to dispatch again. Terminal run results are typed and do not
+advances the slot or records calendar exhaustion atomically. Repeated claims
+return an inspection receipt. A fresh winning claim authorizes dispatch. Terminal run results are typed and do not
 carry a next slot. Only a new winning claim returns a non-deserializable
 ScheduledRun/Keeper context. Scheduler maintenance authority owns claims and
 terminal audit; human schedule edits use account commands and configuration CAS.
@@ -365,7 +375,8 @@ account episodes, abilities, schedules and provider requests. The other boundari
 are structural snapshots, change broadcast, embedding, live interception, events,
 revocation and backup participants.
 
-The following 28 tool names are consumer coverage, not a tool registry in core:
+The [agent tool registry](agents.md#tool-registry) maps these 28 names to core
+ports.
 
 | Consumer tools | Typed operations |
 | --- | --- |

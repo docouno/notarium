@@ -16,7 +16,7 @@ use notarium_core::{
         SpaceSeq,
     },
     model::{HistoryScope, Lifecycle},
-    ports::{CallBudget, ConfirmedChatStep},
+    ports::CallBudget,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::Row;
@@ -49,8 +49,7 @@ pub struct CommandIdentitySpec {
     pub actor: PrincipalId,
     pub command_key: CommandKey,
     pub command_hash: ContentDigest,
-    legacy: Option<Arc<fingerprint::LegacyFingerprint>>,
-    confirmed_chat_step: Option<(Arc<ConfirmedChatStep>, &'static str)>,
+    fingerprint_proof: Option<Arc<fingerprint::CommandProof>>,
     pub(crate) require_receipt_detail: bool,
     pub(crate) authority:
         Option<Arc<(notarium_core::auth::EngineAuthContext, replay::ReplayPolicy)>>,
@@ -62,13 +61,15 @@ impl CommandIdentitySpec {
             command_key,
             command_hash,
             authority: None,
-            legacy: None,
-            confirmed_chat_step: None,
+            fingerprint_proof: None,
             require_receipt_detail: false,
         }
     }
     pub(crate) fn has_confirmed_chat_step(&self) -> bool {
-        self.confirmed_chat_step.is_some()
+        matches!(
+            self.fingerprint_proof.as_deref(),
+            Some(fingerprint::CommandProof::Confirmed { .. })
+        )
     }
 }
 

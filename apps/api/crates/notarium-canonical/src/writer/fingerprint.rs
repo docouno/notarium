@@ -5,7 +5,7 @@ use notarium_core::{
     error::PortError,
     ids::{ContentDigest, FolderId, RevisionId},
     model::{HistoryScope, NoteRef},
-    ports::{ChatInputBody, Preconditions, SpaceContext},
+    ports::{ChatInputBody, ConfirmedChatStep, Preconditions, SpaceContext},
 };
 
 use super::{CommandIdentitySpec, replay::UnboundCommand};
@@ -14,6 +14,19 @@ use crate::{
     runtime::pg_read_error,
     sql_exec::BackendConn,
 };
+
+#[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The writer shares proofs with one Arc allocation per command"
+)]
+pub(super) enum CommandProof {
+    Legacy(LegacyFingerprint),
+    Confirmed {
+        step: Arc<ConfirmedChatStep>,
+        kind: &'static str,
+    },
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct LegacyFingerprint {
@@ -72,8 +85,10 @@ impl UnboundCommand {
                     witness.tool().digest.as_bytes(),
                 ],
             );
-            self.0.confirmed_chat_step = Some((step.clone(), kind));
-            self.0.legacy = None;
+            self.0.fingerprint_proof = Some(Arc::new(CommandProof::Confirmed {
+                step: step.clone(),
+                kind,
+            }));
         }
         self
     }
@@ -90,8 +105,8 @@ impl UnboundCommand {
         let lineage = pre.lineage.map_or(u64::MAX, |v| v.get()).to_be_bytes();
         let old = self.0.command_hash;
         self.0.command_hash = hash_parts(old, &[revision.as_bytes(), &lease, &lineage]);
-        if pre.lease.is_none() && pre.lineage.is_none() {
-            self.0.legacy = Some(Arc::new(LegacyFingerprint {
+        if pre.lease.is_none() && pre.lineage.is_none() && !self.0.has_confirmed_chat_step() {
+            self.0.fingerprint_proof = Some(Arc::new(CommandProof::Legacy(LegacyFingerprint {
                 hash: old,
                 entity_type,
                 entity_key: entity_key.to_owned(),
@@ -100,14 +115,14 @@ impl UnboundCommand {
                 schema: None,
                 chat_refs: None,
                 staged_size: None,
-            }));
+            })));
         }
         self
     }
 
     /// This revision was already part of the original typed input and fingerprint.
     pub(crate) fn with_known_base(mut self, base: &RevisionId) -> Self {
-        if let Some(proof) = self.0.legacy.as_mut().map(Arc::make_mut)
+        if let Some(proof) = self.0.legacy_proof_mut()
             && proof.revision.as_ref() == Some(base)
         {
             proof.revision = None;
@@ -118,7 +133,7 @@ impl UnboundCommand {
     pub(crate) fn with_rename_title(mut self, title: Option<&str>) -> Self {
         self.0.command_hash = hash_parts(self.0.command_hash, &[&[u8::from(title.is_some())]]);
         if matches!(title, None | Some("<none>"))
-            && let Some(proof) = self.0.legacy.as_mut().map(Arc::make_mut)
+            && let Some(proof) = self.0.legacy_proof_mut()
         {
             proof.rename_kind = Some(if title.is_some() {
                 "rename_note"
@@ -139,7 +154,7 @@ impl UnboundCommand {
             self.0.command_hash,
             &[&size.to_be_bytes(), ref_digest.as_bytes()],
         );
-        if let Some(proof) = self.0.legacy.as_mut().map(Arc::make_mut) {
+        if let Some(proof) = self.0.legacy_proof_mut() {
             // Without references the old suffix is unambiguous for a staged body:
             // a staging lease is 16 bytes and the shortest possible reference is 24.
             // An inline body can only overlap a reference if its final 24 bytes
@@ -176,7 +191,7 @@ impl UnboundCommand {
                 expected.map_or("", RevisionId::as_str).as_bytes(),
             ],
         );
-        if let Some(proof) = self.0.legacy.as_mut().map(Arc::make_mut) {
+        if let Some(proof) = self.0.legacy_proof_mut() {
             proof.schema = Some((parent.clone(), slug.to_owned(), expected.cloned()));
         }
         self
@@ -184,10 +199,23 @@ impl UnboundCommand {
 }
 
 impl CommandIdentitySpec {
+    fn legacy_proof(&self) -> Option<&LegacyFingerprint> {
+        match self.fingerprint_proof.as_deref()? {
+            CommandProof::Legacy(proof) => Some(proof),
+            CommandProof::Confirmed { .. } => None,
+        }
+    }
+
+    fn legacy_proof_mut(&mut self) -> Option<&mut LegacyFingerprint> {
+        match Arc::make_mut(self.fingerprint_proof.as_mut()?) {
+            CommandProof::Legacy(proof) => Some(proof),
+            CommandProof::Confirmed { .. } => None,
+        }
+    }
+
     pub(super) fn matches_legacy_detail(&self, stored: &[u8], detail: &[u8]) -> bool {
         let Some(refs) = self
-            .legacy
-            .as_deref()
+            .legacy_proof()
             .filter(|proof| proof.hash.as_bytes() == stored)
             .and_then(|proof| proof.chat_refs)
         else {
@@ -207,14 +235,7 @@ impl CommandIdentitySpec {
         if self.command_hash.as_bytes() == stored {
             return Ok(true);
         }
-        if self.has_confirmed_chat_step() {
-            return Ok(false);
-        }
-        let Some(proof) = self
-            .legacy
-            .as_deref()
-            .filter(|p| p.hash.as_bytes() == stored)
-        else {
+        let Some(proof) = self.legacy_proof().filter(|p| p.hash.as_bytes() == stored) else {
             return Ok(false);
         };
         macro_rules! fetch {

@@ -160,7 +160,7 @@ pub(super) async fn recent(
                     folder_id: id.clone(),
                 };
                 let key = (target.scope.space_id.clone(), id.clone());
-                let handle = match handles.get(&key) {
+                match handles.get(&key) {
                     Some(handle) => handle.clone(),
                     None => {
                         let handle = match session::project_for_folder(call, &project).await {
@@ -171,8 +171,7 @@ pub(super) async fn recent(
                         handles.insert(key, handle.clone());
                         handle
                     }
-                };
-                handle
+                }
             } else {
                 None
             }

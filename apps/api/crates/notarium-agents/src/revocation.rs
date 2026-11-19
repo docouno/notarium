@@ -18,6 +18,8 @@ use std::{
 };
 use tokio::{sync::watch, time::Instant};
 
+use crate::chats::ChatRunOptions;
+
 type Selectors = BTreeSet<RevocationSelector>;
 type RegistrationId = u64;
 const MAX_SELECTORS: usize = 512;
@@ -68,6 +70,7 @@ pub struct PendingCredentialKey {
 #[derive(Clone)]
 pub struct PendingCredential {
     auth: EngineAuthContext,
+    options: ChatRunOptions,
     cancellation: Cancellation,
     registration: RegistrationId,
     command_hash: ContentDigest,
@@ -81,6 +84,10 @@ impl PendingCredential {
 
     pub fn cancellation(&self) -> &Cancellation {
         &self.cancellation
+    }
+
+    pub(crate) fn options(&self) -> &ChatRunOptions {
+        &self.options
     }
 }
 
@@ -330,6 +337,7 @@ impl RevocationHub {
         key: PendingCredentialKey,
         auth: EngineAuthContext,
         command_hash: ContentDigest,
+        options: ChatRunOptions,
     ) -> Result<PendingRegistration, PortError> {
         let budget = RevocationBudget::new(ctx)?;
         budget.check()?;
@@ -347,6 +355,7 @@ impl RevocationHub {
         }
         if let Some(existing) = state.pending.get(&key) {
             if existing.command_hash != command_hash
+                || existing.options != options
                 || existing.auth.principal() != auth.principal()
                 || existing.auth.grant() != auth.grant()
                 || existing.auth.credential() != auth.credential()
@@ -363,6 +372,7 @@ impl RevocationHub {
             key.clone(),
             PendingCredential {
                 auth,
+                options,
                 selectors,
                 command_hash,
                 registration,

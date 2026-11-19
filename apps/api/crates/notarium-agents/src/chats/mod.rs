@@ -1,6 +1,6 @@
 //! Detached chat turns and their canonical branch ownership.
 
-mod prompt;
+pub(crate) mod prompt;
 mod queue;
 mod run;
 pub mod stream;
@@ -37,7 +37,7 @@ use stream::{RunFailure, StepStreamBuffer, StepSubscription, StreamCursor, Strea
 
 const MAINTENANCE_BUDGET: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChatRunOptions {
     pub provider: Option<ProviderResourceId>,
     pub model: Option<ModelProfileId>,
@@ -111,6 +111,17 @@ pub enum RunOwnershipTransition {
 /// register both turns under the current writer. Recovery requires a fenced
 /// predecessor. Loss of writer ownership cancels the supplied token.
 pub trait ClusterRunAuthority: SessionRevocationPort {
+    /// Admit a new input on the serving instance that owns the thread's run,
+    /// or on the Space writer when the thread is idle. Cancel the command if
+    /// this route loses ownership. An existing receipt can be read separately.
+    fn admit_input(
+        &self,
+        ctx: MaintenanceContext,
+        scope: HistoryScope,
+        thread: ChatThreadId,
+        ownership_lost: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>>;
+
     fn register_owner(
         &self,
         ctx: MaintenanceContext,

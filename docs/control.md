@@ -28,7 +28,10 @@ read-only pool; PostgreSQL separates a 6-connection write/export pool from a
 20-connection read pool, with 16 active reader slots, a bounded 512-waiter read
 queue, and per-operation `SET LOCAL statement_timeout` and
 `idle_in_transaction_session_timeout`. SQL migrations
-reject unknown migration versions; both dialects have explicit baseline DDL.
+reject unknown migration versions. Both dialects preserve the baseline
+migration and add bearer and schedule authority in migration `0002`. Existing
+bearers default to no ability-authoring opt-in. Existing schedules with
+unverified skill approvals require explicit review before a provider call.
 
 Read-only queries and fast-path credential resolution (`ControlStore::read()`)
 use read-only transactions (`BEGIN DEFERRED` on SQLite read pool, `BEGIN READ ONLY`
@@ -211,8 +214,9 @@ mutation returns success only after the injected `SessionRevocationPort` confirm
 that admitted registrations and run callbacks have been invalidated. Delivery
 uses a stable event request ID across retries. Failed delivery returns an unknown
 commit outcome while fresh admissions already see the durable denial. Logout
-evidence may resume only its own exact committed logout. Network-wide registration
-ownership and websocket/SSE disconnect delivery belong to the transport adapter.
+evidence may resume only its own exact committed logout. Local composition can share the agent `RevocationHub` with Control.
+Clustered composition supplies the shared writer and revocation authority.
+WebSocket/SSE disconnect delivery belongs to the transport adapter.
 
 Writers have one active slot on SQLite (four on PostgreSQL) and a bounded
 64-waiter queue per store owner; read transactions use an isolated read pool with
@@ -644,8 +648,9 @@ Soft-deleting a schedule clears `init_prompt` on the tombstone row.
 Run limits default to 25 steps, 100,000 tokens and 300 seconds. The composition sets
 `ControlConfig.schedule_limits` within hard ceilings of 1,000 steps, 10,000,000 tokens
 and one hour. These limits bound a whole run. Provider budgets apply separately to
-each call. A Keeper can write AgentMemory documents and its bound log. Consumers use
-`compute_next_slot` and own the ticker, prompt loading and tool loop.
+each call. A Keeper can write AgentMemory documents and its bound log.
+The Keeper scheduler uses `compute_next_slot` and owns the ticker, prompt
+loading and tool loop. See [scheduled Keepers](agents.md#scheduled-keepers).
 
 Trusted `Scheduler` authority lists due schedules, claims slots and records terminal
 results. A claim checks the expected revision, saved slot, current owner/membership,

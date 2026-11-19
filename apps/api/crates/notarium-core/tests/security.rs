@@ -423,7 +423,7 @@ fn project_consent_covers_its_own_ability_and_the_spaces_ability() {
         let current = ProviderCurrentContent::Ability {
             reference: reference.clone(),
             digest,
-            provenance,
+            provenance: Box::new(provenance),
             lifecycle: Lifecycle::Active,
             promoted_from: None,
             requires_explicit_binding: false,

@@ -327,14 +327,14 @@ impl StoredCommittedConsumedPendingV1 {
     fn into_committed(self) -> Committed<ConsumedPending> {
         let val = match self.value {
             StoredConsumedPendingV1::Appended(entry) => ConsumedPending::Appended {
-                entry: entry.into(),
+                entry: Box::new(entry.into()),
                 intervening_human: true,
             },
             StoredConsumedPendingV1::AppendedWithIntervention {
                 entry,
                 intervening_human,
             } => ConsumedPending::Appended {
-                entry: entry.into(),
+                entry: Box::new(entry.into()),
                 intervening_human,
             },
             StoredConsumedPendingV1::AlreadyConsumed => ConsumedPending::AlreadyConsumed,
@@ -2568,17 +2568,16 @@ async fn create_chat_impl(
 
                 let keeper =
                     matches!(auth.kind(), PrincipalKind::Keeper(_)) || auth.keeper_log().is_some();
-                if keeper || input.kind == ChatThreadKind::KeeperLog {
-                    if input.kind != ChatThreadKind::KeeperLog
+                if (keeper || input.kind == ChatThreadKind::KeeperLog)
+                    && (input.kind != ChatThreadKind::KeeperLog
                         || auth.keeper_log() != Some(&input.thread)
                         || auth
                             .spaces()
                             .get(&scope.space_id)
                             .and_then(|grant| grant.project_root.as_ref())
-                            != input.project_folder.as_ref()
-                    {
-                        return Err(DomainError::SpaceReadOnly.into());
-                    }
+                            != input.project_folder.as_ref())
+                {
+                    return Err(DomainError::SpaceReadOnly.into());
                 }
                 authorize_thread_read(
                     &auth,

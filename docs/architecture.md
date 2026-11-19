@@ -17,9 +17,12 @@ The core, syntax, canonical and control libraries implement [domain contracts](c
 authority/egress checks, typed ports, history-scoped receipts, exact comparisons,
 byte-preserving edits, SQLite/PostgreSQL control storage, authentication, OAuth/OIDC,
 the native keyring, guarded outbound HTTP, the AI provider gateway and the
-[control backup participant](control-backup.md). [Canonical storage](storage.md) provides SQLite and PostgreSQL persistence, CAS,
-chat history and a backup participant. Projections,
-search, collaboration and HTTP/MCP transport integration remain separate work.
+[control backup participant](control-backup.md). [Canonical storage](storage.md)
+provides SQLite and PostgreSQL persistence, CAS, chat history and a backup
+participant. [The agent library](agents.md) shares one tool registry across
+external MCP, supervised chats and scheduled Keepers. Agent services depend on
+typed engine and control ports. Projections, search engines, collaboration and
+product HTTP/MCP transport are separate integrations.
 
 ## Internal dependency allowlist
 
@@ -61,8 +64,10 @@ TLS uses rustls 0.23 with ring, reqwest 0.13 with `rustls-no-provider`, and toni
 0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
 C++/OpenSSL tools. Core/syntax tests exercise domain and document behavior;
 Canonical tests exercise dual-dialect storage and CAS. Control storage tests its SQL schema, target import/export, authentication,
-Space authority and crash recovery. Remaining per-crate scaffold tests are compile
-smoke checks.
+Space authority and crash recovery. Agent tests cover tool schemas,
+stream replay and calendar rules. Fitness tests compose the real SQLite and
+PostgreSQL storage owners with the agent services and offline provider fixtures.
+Remaining per-crate scaffold tests are compile smoke checks.
 
 `notarium-control` owns a 45-table baseline in SQLite and the PostgreSQL
 `v1_control` schema. Its typed target records support offline import and paged
@@ -74,9 +79,9 @@ authorization server, and `OidcService` verifies external identity and issues
 native sessions through explicit account bindings. `ProviderService` implements
 encrypted provider configuration, current disclosure admission, bounded completion
 and embedding calls, and durable spending reservations. `ControlPlane` composes that provider with
-its matching account-state service. Episodes, reference contexts, ability overlays,
-schedule claims and content-free telemetry are implemented without a tool loop
-or ticker. `ControlBackup` implements the control participant's writer fence,
+its matching account-state service. Control owns episodes, reference contexts,
+ability overlays, schedule claims and content-free telemetry. Agents owns the
+tool loop and ticker. `ControlBackup` implements the control participant's writer fence,
 pinned snapshots, stable artifacts and cursor rebinding. A paired canonical/control
 backup and archive coordinator remains a separate integration. See
 [control services](control.md).

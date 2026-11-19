@@ -121,6 +121,10 @@ The caller can replay a pending control operation after losing the canonical
 response. Reusing the key with a different payload is rejected. Rebinding a
 Space's history invalidates receipts issued for its earlier incarnation.
 
+Schema version 8 allows multiple canonical packages to share a folded name.
+Control binding policy selects the visible package and serializes live
+authoring operations. Canonical package identity and version remain exact.
+
 Schema version 7 stores the active chat run's writer generation, distinguishes
 human turns from derived turns after redaction, and records the source proof of
 derived turns. A legacy redaction with unknown origin counts as a peer
@@ -475,6 +479,12 @@ same example against an isolated prefix.
   uploads even when a caller closes its executor. A lease takeover adopts
   older private uploads. Retrying the same lease leaves that generation's
   active uploads with their owners.
+  Tool proposals and model calls are stored as typed chat bodies. Proposal
+  application rechecks the matching model/tool records in the target writer
+  transaction. A queued input keeps its original author. If a peer intervened
+  on the selected branch, the transaction records that fact along with the
+  consumed entry. Log and seed listings apply live and historical thread
+  visibility, including owner and Keeper log checks.
   `redact_chat_entry` applies the same thread and taint checks on first execution
   and replay. It erases target entry content, preserves DAG ancestry and
   clears the stored bodies and CAS references of dependent `Compaction` entries.
@@ -485,7 +495,9 @@ same example against an isolated prefix.
   The committed receipt remains available within the caller's remaining budget.
   Retries share the same retirement worker for a given history, lease epoch and
   retirement ID. The store recovers outstanding work after restart or takeover.
-  Taint is monotonic.
+  The thread's audit mask records whether any branch has ever been tainted.
+  Reads and effects on a selected branch use that leaf's accumulated taint.
+  An explicit fork from a clean ancestor can start a fresh run.
 - **Paired backup (`BackupParticipantPort`).** Prepare both participants and acquire
   their holds before pausing control, then canonical. PostgreSQL uses a dedicated
   connection to fence writers across runtimes sharing the canonical schema. Pin

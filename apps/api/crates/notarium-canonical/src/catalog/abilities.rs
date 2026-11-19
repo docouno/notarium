@@ -302,7 +302,7 @@ pub(super) async fn egress_current(
     Ok(notarium_core::classes::ProviderCurrentContent::Ability {
         reference: reference.clone(),
         digest,
-        provenance: package.provenance,
+        provenance: Box::new(package.provenance),
         lifecycle: package.metadata.lifecycle,
         promoted_from: package.promoted_from,
         requires_explicit_binding: package.metadata.requires_explicit_binding,

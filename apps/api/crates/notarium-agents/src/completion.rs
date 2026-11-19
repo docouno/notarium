@@ -17,6 +17,7 @@ use tokio::time::Instant;
 use crate::mcp::{ToolRegistry, derive_key};
 
 const MAX_MODEL_TEXT_BYTES: usize = 200 * 1024;
+const TOOL_DISPLAY_BYTES: usize = 32 * 1024;
 const MAX_CALL_TIME: Duration = Duration::from_secs(120);
 
 pub(crate) struct CompletionRunBudget {
@@ -247,6 +248,20 @@ async fn within<T>(
 
 pub(crate) fn call_key(call: &ProviderToolCall) -> Result<CommandKey, PortError> {
     Ok(CommandKey::parse(call.id.as_str())?)
+}
+
+pub(crate) fn bounded_tool_text(text: &str) -> String {
+    if text.len() <= TOOL_DISPLAY_BYTES {
+        return text.to_owned();
+    }
+    const SUFFIX: &str = "\n…[truncated]";
+    let mut end = TOOL_DISPLAY_BYTES - SUFFIX.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut display = text[..end].to_owned();
+    display.push_str(SUFFIX);
+    display
 }
 
 fn protocol() -> PortError {

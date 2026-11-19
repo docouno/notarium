@@ -17,7 +17,8 @@ impl AgentRunSupervisor {
         let thread = input.thread.clone();
         let gate = self.thread_gate(&scope, &thread);
         let _admission = gate.lock().await;
-        account.budget = bounded(&account.budget, MAINTENANCE_BUDGET, Cancellation::default());
+        let ownership_lost = Cancellation::default();
+        account.budget = bounded(&account.budget, MAINTENANCE_BUDGET, ownership_lost.clone());
         let ctx = SpaceContext::new(
             account.auth().clone(),
             scope.clone(),
@@ -41,19 +42,39 @@ impl AgentRunSupervisor {
         if latest.thread.kind == ChatThreadKind::KeeperLog {
             return Err(DomainError::SpaceReadOnly.into());
         }
+        let route = match &self.inner.coordination {
+            Coordination::Local => None,
+            Coordination::Clustered(authority) => {
+                let route = authority
+                    .admit_input(
+                        maintenance(account.budget.clone()),
+                        scope.clone(),
+                        thread.clone(),
+                        ownership_lost.clone(),
+                    )
+                    .await?;
+                route.check()?;
+                Some(route)
+            }
+        };
         let pending = self.inner.revocations.register_pending(
             maintenance(account.budget.clone()),
             key,
             account.auth().clone(),
             input.identity.hash,
+            options.clone(),
         )?;
         let mentions_agent = input.mentions_agent;
         let mut submitted = engine
             .submit_user_chat_input(ctx.clone(), input.clone())
             .await;
-        if submitted.as_ref().is_err_and(unknown_commit) {
+        if submitted.as_ref().is_err_and(unknown_commit)
+            && !ownership_lost.is_cancelled()
+            && route.as_ref().is_none_or(|lease| lease.check().is_ok())
+        {
             submitted = engine.submit_user_chat_input(ctx.clone(), input).await;
         }
+        drop(route);
         let outcome = match submitted {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -127,7 +148,7 @@ impl AgentRunSupervisor {
                 } else {
                     None
                 };
-            let Some(account) = account else {
+            let Some((account, options)) = account else {
                 self.dismiss(run, &key).await?;
                 continue;
             };
@@ -167,7 +188,7 @@ impl AgentRunSupervisor {
                 .await;
             let status = match content {
                 Ok(content) => content.value,
-                Err(error) if matches!(error, PortError::Cancelled(_)) => {
+                Err(PortError::Cancelled(_)) => {
                     self.dismiss(run, &key).await?;
                     continue;
                 }
@@ -189,7 +210,7 @@ impl AgentRunSupervisor {
                             scope: run.scope.clone(),
                             thread: run.thread.clone(),
                             expected_leaf: entry.seq,
-                            options: ChatRunOptions::default(),
+                            options,
                         };
                         let follow = AccountContext::new(
                             account.auth().clone(),
@@ -236,7 +257,7 @@ impl AgentRunSupervisor {
         run: &ActiveRun,
         item: &QueuedChatInput,
         credential: PendingCredential,
-    ) -> Result<Option<AccountContext>, PortError> {
+    ) -> Result<Option<(AccountContext, ChatRunOptions)>, PortError> {
         if credential.auth().principal() != &item.sender || credential.cancellation().is_cancelled()
         {
             return Ok(None);
@@ -278,7 +299,7 @@ impl AgentRunSupervisor {
                     && access.space.lifecycle == SpaceLifecycle::Active
                     && matches!(access.role, SpaceRole::Owner | SpaceRole::Editor)
                     && !credential.cancellation().is_cancelled())
-                .then_some(account));
+                .then(|| (account, credential.options().clone())));
             }
             let Some(next) = page.continuation else {
                 return Ok(None);

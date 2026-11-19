@@ -148,7 +148,9 @@ impl CommandIdentitySpec {
         scope: &HistoryScope,
         committing: bool,
     ) -> Result<(), PortError> {
-        let Some((step, kind)) = &self.confirmed_chat_step else {
+        let Some(super::fingerprint::CommandProof::Confirmed { step, kind }) =
+            self.fingerprint_proof.as_deref()
+        else {
             return Ok(());
         };
         let Some((auth, _)) = self.authority.as_deref() else {

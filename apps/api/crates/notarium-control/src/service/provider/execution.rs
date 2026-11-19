@@ -100,7 +100,7 @@ impl Runtime {
     }
 }
 pub(super) enum Request {
-    Completion(CompletionRequest),
+    Completion(Box<CompletionRequest>),
     Embedding(EmbeddingRequest),
     Check(CheckProviderConnection),
 }
@@ -114,7 +114,7 @@ impl Job {
         Self {
             ctx: AccountContext::new(ctx.auth().clone(), ctx.budget.clone()),
             scope: Some(ctx.scope().clone()),
-            request: Request::Completion(request),
+            request: Request::Completion(Box::new(request)),
         }
     }
     pub fn embedding(ctx: SpaceContext, request: EmbeddingRequest) -> Self {

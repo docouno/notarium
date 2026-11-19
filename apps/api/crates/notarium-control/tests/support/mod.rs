@@ -103,6 +103,7 @@ pub struct Catalog {
     pub fail_after_lifecycle: AtomicBool,
     pub create_gate: CallbackGate,
     pub abilities_gate: CallbackGate,
+    pub ability_tip_gate: CallbackGate,
     pub abilities_calls: AtomicUsize,
     pub space_read_fault: AtomicU8,
     pub space_reads: AtomicUsize,
@@ -340,6 +341,15 @@ impl ControlCatalogPort for Catalog {
         identity: AbilityIdentity,
     ) -> PortFuture<'_, AbilityDescriptor> {
         Box::pin(async move {
+            if self.ability_tip_gate.enabled.swap(false, Ordering::SeqCst) {
+                self.ability_tip_gate.entered.add_permits(1);
+                self.ability_tip_gate
+                    .release
+                    .acquire()
+                    .await
+                    .unwrap()
+                    .forget();
+            }
             self.ability_entries
                 .lock()
                 .unwrap()

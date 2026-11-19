@@ -706,7 +706,7 @@ pub struct ConsumePending {
 #[derive(Clone, Debug)]
 pub enum ConsumedPending {
     Appended {
-        entry: ChatEntry,
+        entry: Box<ChatEntry>,
         intervening_human: bool,
     },
     AlreadyConsumed,

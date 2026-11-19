@@ -101,7 +101,10 @@ remain strict.
 edit source fields, common view fields and options. The block keeps its ID,
 and the surrounding Markdown retains its original bytes. The proposed carrier
 is reparsed before the patch is returned, including fences inside quotations
-and lists.
+and lists. MCP exposes this operation through `edit_note.view`. Its ordinary
+text-edit modes preserve existing view blocks. Detailed note reads use a
+bounded view projection for display and retain the original carrier in the
+structured response.
 
 A missing ID is inserted only into a closed, unambiguous mapping. The seed uses
 note identity, missing-block source identity/ordinal and a policy version, with

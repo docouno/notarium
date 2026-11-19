@@ -761,7 +761,7 @@ pub enum ProviderCurrentContent {
     Ability {
         reference: AbilityResourceRef,
         digest: ContentDigest,
-        provenance: AbilityResourceProvenance,
+        provenance: Box<AbilityResourceProvenance>,
         lifecycle: Lifecycle,
         promoted_from: Option<crate::ports::AbilityRef>,
         requires_explicit_binding: bool,

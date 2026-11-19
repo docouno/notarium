@@ -53,6 +53,22 @@ pub(crate) async fn load_history(
     leaf: ThreadEntrySeq,
     selection: &ProviderSelection,
 ) -> Result<(ChatBranch, Vec<CompletionMessage>), PortError> {
+    load_history_after(engine, ctx, thread, leaf, selection, None).await
+}
+
+/// A scheduled task retains the same durable audit log while starting its
+/// prompt from the head it inherited at the beginning of this run.
+pub(crate) async fn load_history_after(
+    engine: &dyn ChatPort,
+    ctx: &SpaceContext,
+    thread: &ChatThreadId,
+    leaf: ThreadEntrySeq,
+    selection: &ProviderSelection,
+    floor: Option<ThreadEntrySeq>,
+) -> Result<(ChatBranch, Vec<CompletionMessage>), PortError> {
+    if floor.is_some_and(|floor| floor > leaf) {
+        return Err(invalid(ValidationReason::SourceMismatch));
+    }
     let mut branch = engine
         .read_chat_context(
             ctx.clone(),
@@ -66,6 +82,12 @@ pub(crate) async fn load_history(
         .await?;
     if branch.thread.id != *thread || branch.thread.space != ctx.scope().space_id {
         return Err(invalid(ValidationReason::SourceMismatch));
+    }
+    if let Some(floor) = floor {
+        branch.entries.retain(|entry| entry.seq > floor);
+        if branch.next_ancestor.is_some_and(|next| next <= floor) {
+            branch.next_ancestor = None;
+        }
     }
     if branch.next_ancestor.is_some() {
         return Err(invalid(ValidationReason::BudgetExceeded));
