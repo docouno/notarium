@@ -9,17 +9,21 @@ use yrs::ClientID;
 use yrs::sync::AwarenessUpdate;
 use yrs::sync::awareness::AwarenessUpdateEntry;
 
-use crate::wire::{MAX_AWARENESS_CLIENTS, MAX_FRAME_BYTES};
+use crate::wire::MAX_FRAME_BYTES;
 
 const MAX_CLIENTS_PER_PEER: usize = 8;
-// Reserve space for all client IDs, clocks and length prefixes plus the
+// Up to 128 concurrent peers × 8 clients per peer so no peer can starve another
+// peer's awareness slots before hitting the room byte budget.
+const MAX_ROOM_AWARENESS_CLIENTS: usize = 1024;
+// Reserve space for up to 1024 client IDs, clocks and length prefixes plus the
 // enclosing headers, so even a full snapshot fits in a single frame.
-const MAX_ROOM_JSON_BYTES: usize = MAX_FRAME_BYTES - 8 * 1024;
+const MAX_ROOM_JSON_BYTES: usize = MAX_FRAME_BYTES - 16 * 1024;
 const UNSET: &str = "null";
 
 #[derive(Default)]
 pub(crate) struct Presence {
     entries: HashMap<ClientID, OwnedState>,
+    live_entries: usize,
     json_bytes: usize,
 }
 
@@ -47,7 +51,7 @@ impl Presence {
             if null && entry.json.as_ref() != UNSET {
                 entry.json = UNSET.into();
             }
-            let old_bytes = match self.entries.get(&id) {
+            let (old_bytes, was_live) = match self.entries.get(&id) {
                 Some(current) if current.peer == peer => {
                     let old_clock = current.entry.clock;
                     let removes_live_state =
@@ -55,14 +59,14 @@ impl Presence {
                     if entry.clock <= old_clock && !removes_live_state {
                         continue;
                     }
-                    current.json_bytes()
+                    (current.json_bytes(), current.entry.json.as_ref() != UNSET)
                 }
                 Some(_) => continue,
                 None => {
-                    if null || remaining == 0 || self.entries.len() == MAX_AWARENESS_CLIENTS {
+                    if null || remaining == 0 || self.entries.len() == MAX_ROOM_AWARENESS_CLIENTS {
                         continue;
                     }
-                    0
+                    (0, false)
                 }
             };
             // Absent records keep a clock but contribute no snapshot bytes.
@@ -70,6 +74,7 @@ impl Presence {
             if json_bytes > MAX_ROOM_JSON_BYTES {
                 continue;
             }
+            let is_live = !null;
             if self
                 .entries
                 .insert(
@@ -83,6 +88,11 @@ impl Presence {
             {
                 remaining -= 1;
             }
+            if !was_live && is_live {
+                self.live_entries += 1;
+            } else if was_live && !is_live {
+                self.live_entries -= 1;
+            }
             self.json_bytes = json_bytes;
             accepted.insert(id, entry);
         }
@@ -90,6 +100,9 @@ impl Presence {
     }
 
     pub(crate) fn snapshot(&self) -> Option<AwarenessUpdate> {
+        if self.live_entries == 0 {
+            return None;
+        }
         nonempty_update(
             self.entries
                 .iter()
@@ -107,6 +120,7 @@ impl Presence {
             }
             self.json_bytes -= state.json_bytes();
             if state.entry.json.as_ref() != UNSET {
+                self.live_entries -= 1;
                 cleared.insert(
                     id,
                     AwarenessUpdateEntry {
@@ -215,7 +229,7 @@ mod tests {
         assert_eq!(presence.json_bytes, 0);
 
         let json = format!("\"{}\"", "x".repeat(16 * 1024 - 2));
-        for n in 0..MAX_AWARENESS_CLIENTS as u64 {
+        for n in 0..MAX_ROOM_AWARENESS_CLIENTS as u64 {
             presence.apply(n, update(ClientID::new(n), 1, &json));
         }
         assert!(presence.json_bytes <= MAX_ROOM_JSON_BYTES);

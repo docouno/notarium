@@ -7,7 +7,9 @@ use std::{
     time::Duration,
 };
 
-use notarium_canonical::{CanonicalStore, CollabRoomState, OpenCollabSession, SpaceSignal};
+use notarium_canonical::{
+    CanonicalStore, CollabRoomState, CommittedTargets, OpenCollabSession, SpaceSignal,
+};
 use notarium_core::{
     DomainError,
     auth::{AuthenticatedCredential, PrincipalKind},
@@ -28,7 +30,7 @@ use tokio::{
 
 use crate::{
     interceptor::WeakInterceptor,
-    room::{Room, RoomCommand, RoomHandle, recover_fenced},
+    room::{JoinOutcome, Room, RoomCommand, RoomHandle, recover_fenced},
     session::{
         CollabPeerSession, CollabSessionAuth, OutboundAuthority, PeerGuard, PeerOutbound,
         SessionClose,
@@ -38,15 +40,18 @@ use crate::{
 
 const OPEN_ATTEMPTS: usize = 3;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_MAX_ACTIVE_ROOMS: usize = 512;
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct CollabConfig {
     pub idle_checkpoint: Duration,
     pub periodic_checkpoint: Duration,
     pub checkpoint_updates: u64,
-    pub intercept_coalesce: Duration,
+    pub wal_coalesce: Duration,
     pub idle_unload: Duration,
     pub handshake_timeout: Duration,
+    pub max_active_rooms: usize,
 }
 
 impl Default for CollabConfig {
@@ -55,9 +60,10 @@ impl Default for CollabConfig {
             idle_checkpoint: Duration::from_secs(3),
             periodic_checkpoint: Duration::from_secs(60),
             checkpoint_updates: 128,
-            intercept_coalesce: Duration::from_millis(2),
+            wal_coalesce: Duration::from_millis(2),
             idle_unload: Duration::from_secs(30),
             handshake_timeout: Duration::from_secs(10),
+            max_active_rooms: DEFAULT_MAX_ACTIVE_ROOMS,
         }
     }
 }
@@ -66,15 +72,16 @@ impl CollabConfig {
     fn valid(&self) -> bool {
         let now = Instant::now();
         self.checkpoint_updates > 0
+            && self.max_active_rooms > 0
             && !self.idle_checkpoint.is_zero()
             && !self.periodic_checkpoint.is_zero()
             && !self.handshake_timeout.is_zero()
             && self.idle_unload >= self.idle_checkpoint
-            && self.intercept_coalesce < Duration::from_millis(3)
+            && self.wal_coalesce < Duration::from_millis(3)
             && [
                 self.idle_checkpoint,
                 self.periodic_checkpoint,
-                self.intercept_coalesce,
+                self.wal_coalesce,
                 self.idle_unload,
                 self.handshake_timeout,
             ]
@@ -114,6 +121,8 @@ pub(crate) struct HubInner {
     slots: Mutex<HashMap<RoomKey, Weak<RoomSlot>>>,
     active: Mutex<HashMap<RoomKey, RoomHandle>>,
     peers: Mutex<HashMap<u64, PeerRegistration>>,
+    pending_revoke_settlement: Mutex<HashSet<RoomKey>>,
+    accept_closed: Cancellation,
     shutdown: Cancellation,
 }
 
@@ -125,6 +134,7 @@ struct PeerRegistration {
 
 impl Drop for HubInner {
     fn drop(&mut self) {
+        self.accept_closed.cancel();
         self.shutdown.cancel();
     }
 }
@@ -155,6 +165,8 @@ impl CollabHub {
             slots: Mutex::default(),
             active: Mutex::default(),
             peers: Mutex::default(),
+            pending_revoke_settlement: Mutex::default(),
+            accept_closed: Cancellation::default(),
             shutdown: Cancellation::default(),
         });
         runtime.spawn(watch_storage(
@@ -185,7 +197,72 @@ impl CollabHub {
     }
 
     pub fn active_room_count(&self) -> usize {
-        self.0.active_rooms().len()
+        self.0.active.lock().expect("active rooms").len()
+    }
+
+    /// Gracefully reject new peers, settle and close all active rooms cleanly
+    /// within `budget`, and stop background watchers.
+    pub async fn shutdown(&self, budget: &CallBudget) -> Result<(), PortError> {
+        self.0.accept_closed.cancel();
+        let deadline = Instant::now()
+            .checked_add(budget.remaining)
+            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidRange))?;
+
+        // Close any peers still waiting on initial handshake or connected.
+        let guards: Vec<_> = self
+            .0
+            .peers
+            .lock()
+            .expect("peer registry")
+            .values()
+            .filter_map(|peer| peer.guard.upgrade())
+            .collect();
+        for guard in guards {
+            guard.close(SessionClose::GOING_AWAY);
+        }
+
+        // Wait for any in-flight room opens to register their handles.
+        let slots: Vec<_> = self
+            .0
+            .slots
+            .lock()
+            .expect("room registry")
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for slot in slots {
+            let mut slot_budget = budget.clone();
+            slot_budget.remaining = deadline.saturating_duration_since(Instant::now());
+            drop(lock_slot(&slot, &slot_budget).await?);
+        }
+
+        let mut first_error = None;
+        for room in self.0.active_rooms() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut room_budget = budget.clone();
+            room_budget.remaining = remaining;
+            match timeout(remaining, room.shutdown(room_budget)).await {
+                Ok(Ok(true)) => {
+                    let rem = deadline.saturating_duration_since(Instant::now());
+                    let _ = timeout(rem, room.stopped().cancelled()).await;
+                }
+                Ok(Ok(false)) => {
+                    let rem = deadline.saturating_duration_since(Instant::now());
+                    let _ = timeout(rem, room.stopped().cancelled()).await;
+                }
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(_) => {
+                    first_error.get_or_insert_with(|| deadline_error(b"collab_hub_shutdown"));
+                }
+            }
+        }
+        self.0.shutdown.cancel();
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub async fn connect(
@@ -194,6 +271,12 @@ impl CollabHub {
         note: NoteId,
         auth: CollabSessionAuth,
     ) -> Result<CollabPeerSession, PortError> {
+        if self.0.accept_closed.is_cancelled() {
+            return Err(operation_error(
+                b"collab_hub_shutting_down",
+                CommitEffect::NotCommitted,
+            ));
+        }
         if matches!(
             ctx.auth().kind(),
             PrincipalKind::AgentRun(_) | PrincipalKind::Keeper(_)
@@ -201,6 +284,9 @@ impl CollabHub {
             return Err(DomainError::AccessDenied.into());
         }
         let guard = PeerGuard::new(auth);
+        // Fail fast before running DB admission if credentials are already
+        // revoked or expired.
+        guard.check().map_err(|_| DomainError::AccessDenied)?;
         let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
         let registration = PendingPeer {
             hub: Arc::downgrade(&self.0),
@@ -216,8 +302,15 @@ impl CollabHub {
                 guard: Arc::downgrade(&guard),
             },
         );
+        guard.attach_hub_registration(Arc::downgrade(&self.0), id);
         tokio::select! {
             biased;
+            () = self.0.accept_closed.cancelled() => {
+                return Err(operation_error(
+                    b"collab_hub_shutting_down",
+                    CommitEffect::NotCommitted,
+                ));
+            }
             () = guard.stopped().cancelled() => return Err(DomainError::AccessDenied.into()),
             admission = self.0.initial_admission(&ctx, &note) => admission?,
         };
@@ -278,6 +371,7 @@ impl CollabHub {
     ) -> Result<(), PortError> {
         ctx.authority.require(ServicePurpose::Revocation)?;
         let mut affected = self.0.evict_matching(selector);
+        affected.extend(self.0.take_pending_revoke_settlement(selector));
         let close_space = match (selector, reason) {
             (RevocationSelector::Space(space), RevocationReason::SpaceClosed) => Some(space),
             _ => None,
@@ -306,13 +400,34 @@ impl CollabHub {
         }
         for room in self.0.active_rooms() {
             let close = close_space == Some(&room.scope().space_id);
-            if !room.stopped().is_cancelled()
-                && (close || affected.remove(&(room.scope().space_id.clone(), room.note().clone())))
-            {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                timeout(remaining, room.settle_after_revoke(close))
-                    .await
-                    .map_err(|_| deadline_error(b"collab_revocation_settle"))??;
+            let targeted =
+                close || affected.remove(&(room.scope().space_id.clone(), room.note().clone()));
+            if !targeted {
+                continue;
+            }
+            if room.stopped().is_cancelled() {
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match timeout(remaining, room.settle_after_revoke(close)).await {
+                Ok(Ok(true)) => {
+                    if close {
+                        let rem = deadline.saturating_duration_since(Instant::now());
+                        timeout(rem, room.stopped().cancelled())
+                            .await
+                            .map_err(|_| deadline_error(b"collab_revocation_stop"))?;
+                    }
+                }
+                Ok(Ok(false)) => {
+                    // The room began stopping naturally (e.g. idle unload) just
+                    // before our revocation command arrived. Await completion.
+                    let rem = deadline.saturating_duration_since(Instant::now());
+                    timeout(rem, room.stopped().cancelled())
+                        .await
+                        .map_err(|_| deadline_error(b"collab_revocation_stop"))?;
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => return Err(deadline_error(b"collab_revocation_settle")),
             }
         }
         if let Some(space) = close_space {
@@ -376,32 +491,106 @@ impl Drop for PendingPeer {
             self.guard.close(SessionClose::POLICY);
         }
         if let Some(room) = &self.room {
+            if self.guard.policy_closed()
+                && let Some(hub) = self.hub.upgrade()
+            {
+                hub.mark_pending_revoke_settlement((
+                    room.scope().space_id.clone(),
+                    room.note().clone(),
+                ));
+            }
             room.peer_changed();
         }
-        let hub = self.hub.clone();
-        let id = self.id;
-        let unregister = move || {
-            if let Some(hub) = hub.upgrade() {
-                hub.peers.lock().expect("peer registry").remove(&id);
-            }
-        };
-        if self.guard.lease_lost().is_cancelled() {
-            unregister();
-        } else {
-            // A draining transport can still receive data. Keep it visible
-            // to revocation and history changes until its lease is released.
-            let released = self.guard.lease_lost().clone();
-            tokio::spawn(async move {
-                released.cancelled().await;
-                unregister();
-            });
-        }
+        // PeerGuard automatically unregisters `self.id` from `hub.peers` as
+        // soon as its revocation lease is released, avoiding a background
+        // watcher task per disconnecting peer.
     }
 }
 
 impl HubInner {
     pub fn shutdown_token(&self) -> Cancellation {
         self.shutdown.clone()
+    }
+
+    pub fn accept_closed_token(&self) -> Cancellation {
+        self.accept_closed.clone()
+    }
+
+    pub fn unregister_peer(&self, id: u64) {
+        self.peers.lock().expect("peer registry").remove(&id);
+    }
+
+    pub fn mark_pending_revoke_settlement(&self, key: RoomKey) {
+        self.pending_revoke_settlement
+            .lock()
+            .expect("pending revoke settlement")
+            .insert(key);
+    }
+
+    fn record_matching_for_settlement(&self, selectors: &[RevocationSelector]) {
+        let keys: Vec<RoomKey> = self
+            .peers
+            .lock()
+            .expect("peer registry")
+            .values()
+            .filter(|peer| selectors.iter().any(|s| matches_selector(&peer.ctx, s)))
+            .map(|peer| (peer.ctx.scope().space_id.clone(), peer.note.clone()))
+            .collect();
+        if !keys.is_empty() {
+            self.pending_revoke_settlement
+                .lock()
+                .expect("pending revoke settlement")
+                .extend(keys);
+        }
+    }
+
+    fn take_pending_revoke_settlement(&self, selector: &RevocationSelector) -> HashSet<RoomKey> {
+        let mut pending = self
+            .pending_revoke_settlement
+            .lock()
+            .expect("pending revoke settlement");
+        match selector {
+            RevocationSelector::Space(space) | RevocationSelector::Membership { space, .. } => {
+                let mut matched = HashSet::new();
+                pending.retain(|key| {
+                    if &key.0 == space {
+                        matched.insert(key.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                matched
+            }
+            _ => std::mem::take(&mut *pending),
+        }
+    }
+
+    pub fn has_live_slot(&self, scope: &HistoryScope, note: &NoteId) -> bool {
+        let key = (scope.space_id.clone(), note.clone());
+        self.slots
+            .lock()
+            .expect("room registry")
+            .get(&key)
+            .and_then(Weak::upgrade)
+            .is_some()
+    }
+
+    pub fn space_has_live_rooms(&self, space: &SpaceId) -> bool {
+        if self
+            .active
+            .lock()
+            .expect("active rooms")
+            .keys()
+            .any(|(s, _)| s == space)
+        {
+            return true;
+        }
+        self.slots
+            .lock()
+            .expect("room registry")
+            .iter()
+            .any(|((s, _), slot)| s == space && slot.upgrade().is_some())
     }
 
     pub fn budget(&self) -> CallBudget {
@@ -484,6 +673,7 @@ impl HubInner {
             .store
             .read_current_history_scope(Some(&ctx.budget), &ctx.scope().space_id)
             .await?;
+        ctx.check_current(&current)?;
         let facts = self
             .store
             .read_room_resource_facts(Some(&ctx.budget), &current, note)
@@ -534,7 +724,23 @@ impl HubInner {
         if record.room_state == CollabRoomState::Active
             && record.owner_id.as_deref() == Some(self.owner.as_ref())
         {
-            Room::fence_record(&self.store, budget, scope, &record, &self.owner).await?;
+            match Room::fence_record(&self.store, budget, scope, &record, &self.owner).await {
+                Ok(()) => {}
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if matches!(
+                        diagnostic.reason,
+                        ValidationReason::InvalidState
+                            | ValidationReason::InvalidAuthority
+                            | ValidationReason::SourceMismatch
+                    ) =>
+                {
+                    // Another transition (for example, a clean idle close or
+                    // concurrent fence) advanced the lease in the meantime.
+                    // Finish recovery if it transitioned to `Fenced`.
+                    return recover_fenced(&self.store, budget, scope, note).await;
+                }
+                Err(error) => return Err(error),
+            }
         } else if record.room_state != CollabRoomState::Fenced {
             return Ok(false);
         }
@@ -549,19 +755,45 @@ impl HubInner {
         outbound: &PeerOutbound,
         deadline: Instant,
     ) -> Result<Option<(RoomHandle, PeerRole)>, PortError> {
+        if self.accept_closed.is_cancelled() {
+            return Err(operation_error(
+                b"collab_hub_shutting_down",
+                CommitEffect::NotCommitted,
+            ));
+        }
         let slot = self.slot(ctx.scope(), note);
         let mut held = lock_slot(&slot, &ctx.budget).await?;
         let mut budget = ctx.budget.clone();
-        for _ in 0..OPEN_ATTEMPTS {
+        let mut open_conflicts = 0usize;
+        let mut total_steps = 0usize;
+        const MAX_ADMIT_STEPS: usize = 8;
+        while open_conflicts < OPEN_ATTEMPTS && total_steps < MAX_ADMIT_STEPS {
+            total_steps += 1;
+            if self.accept_closed.is_cancelled() {
+                return Err(operation_error(
+                    b"collab_hub_shutting_down",
+                    CommitEffect::NotCommitted,
+                ));
+            }
             outbound
                 .guard
                 .check()
                 .map_err(|_| DomainError::AccessDenied)?;
+            // Drop any already-stopped local room handle before reading storage
+            // so a concurrent clean close is never mistaken for an unhosted row.
+            if held
+                .as_ref()
+                .is_some_and(|room| room.stopped().is_cancelled())
+            {
+                *held = None;
+            }
+            let had_live_room = held.is_some();
             budget.remaining = deadline.saturating_duration_since(Instant::now());
             let current = self
                 .store
                 .read_current_history_scope(Some(&budget), &ctx.scope().space_id)
                 .await?;
+            ctx.check_current(&current)?;
             let base = match hello {
                 LineageHello::Reconnect {
                     client_history_incarnation,
@@ -578,8 +810,20 @@ impl HubInner {
                 .store
                 .read_note_collab_admission(&read_ctx, note, base)
                 .await?;
+            ctx.check_current(&admission.scope)?;
             if admission.doc_class != DocClass::UserDoc {
                 return Err(DomainError::validation(ValidationReason::ClassMismatch).into());
+            }
+            // If the previously-live local room stopped while `admission` was
+            // being read, `admission.session` may reflect its pre-close `Active`
+            // row. Clear `held` and re-read fresh storage state.
+            if had_live_room
+                && held
+                    .as_ref()
+                    .is_some_and(|room| room.stopped().is_cancelled())
+            {
+                *held = None;
+                continue;
             }
             let stored = admission.session.as_ref().map(|value| &value.session);
             let role = if admission.can_write {
@@ -587,6 +831,74 @@ impl HubInner {
             } else {
                 PeerRole::Viewer
             };
+            // Always retire stale local actors (including from a previous
+            // incarnation) before deciding on reuse or reconnect lineage.
+            if let Some(room) = held.as_ref()
+                && !room.stopped().is_cancelled()
+            {
+                if room.scope() == &admission.scope
+                    && stored.is_some_and(|record| room.matches_durable_lease(record))
+                {
+                    if let LineageHello::Reconnect {
+                        client_history_incarnation,
+                        client_lineage_epoch,
+                        ..
+                    } = *hello
+                        && (client_history_incarnation != admission.scope.incarnation
+                            || stored
+                                .is_none_or(|record| record.lineage_epoch != client_lineage_epoch))
+                    {
+                        send_lineage_mismatch(outbound, admission, role);
+                        return Ok(None);
+                    }
+                    return Ok(Some((room.clone(), role)));
+                }
+                room.storage_changed();
+                tokio::time::timeout_at(deadline, room.stopped().cancelled())
+                    .await
+                    .map_err(|_| deadline_error(b"retire_stale_collab_room"))?;
+                *held = None;
+                continue;
+            }
+            // Recover fenced or unhosted same-process rooms BEFORE checking
+            // Reconnect lineage mismatch so clients observe settled head/lineage.
+            budget.remaining = deadline.saturating_duration_since(Instant::now());
+            if stored.is_some_and(|record| record.room_state == CollabRoomState::Fenced) {
+                recover_fenced(&self.store, &budget, &admission.scope, note).await?;
+                continue;
+            }
+            if let Some(record) = stored.filter(|record| {
+                record.room_state == CollabRoomState::Active
+                    && record.owner_id.as_deref() == Some(self.owner.as_ref())
+            }) {
+                match Room::fence_record(
+                    &self.store,
+                    &budget,
+                    &admission.scope,
+                    record,
+                    &self.owner,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        budget.remaining = deadline.saturating_duration_since(Instant::now());
+                        recover_fenced(&self.store, &budget, &admission.scope, note).await?;
+                        continue;
+                    }
+                    Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                        if matches!(
+                            diagnostic.reason,
+                            ValidationReason::InvalidState
+                                | ValidationReason::InvalidAuthority
+                                | ValidationReason::SourceMismatch
+                        ) =>
+                    {
+                        open_conflicts += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             if let LineageHello::Reconnect {
                 client_history_incarnation,
                 client_lineage_epoch,
@@ -595,60 +907,14 @@ impl HubInner {
                 && (client_history_incarnation != admission.scope.incarnation
                     || stored.is_none_or(|record| record.lineage_epoch != client_lineage_epoch))
             {
-                outbound.finish(
-                    LineageMismatch {
-                        current_history_incarnation: admission.scope.incarnation,
-                        current_rev_id: admission.head_rev_id,
-                        current_lineage_epoch: stored
-                            .map_or(LineageEpoch::ZERO, |record| record.lineage_epoch),
-                        verified_base_rev_id: admission.verified_base_rev_id,
-                    }
-                    .encode(),
-                    OutboundAuthority::Admission {
-                        scope: admission.scope,
-                        role,
-                    },
-                    SessionClose {
-                        code: 4409,
-                        reason: "lineage_mismatch",
-                    },
-                );
+                send_lineage_mismatch(outbound, admission, role);
                 return Ok(None);
             }
-            ctx.check_current(&admission.scope)?;
-            if let Some(room) = held.as_ref()
-                && room.scope() == &admission.scope
-                && !room.stopped().is_cancelled()
-            {
-                if stored.is_some_and(|record| room.matches_durable_lease(record)) {
-                    return Ok(Some((room.clone(), role)));
-                }
-                room.storage_changed();
-                tokio::time::timeout_at(deadline, room.stopped().cancelled())
-                    .await
-                    .map_err(|_| deadline_error(b"retire_stale_collab_room"))?;
-                // Re-read admission after old actor retirement to pick up the
-                // latest carrier and lineage before choosing a seed.
-                continue;
+            if self.active.lock().expect("active rooms").len() >= self.config.max_active_rooms {
+                outbound.guard.close(SessionClose::ROOM_CAPACITY);
+                return Ok(None);
             }
-            budget.remaining = deadline.saturating_duration_since(Instant::now());
-            if stored.is_some_and(|record| record.room_state == CollabRoomState::Fenced) {
-                recover_fenced(&self.store, &budget, &admission.scope, note).await?;
-                continue;
-            }
-            // A same-process actor may have stopped following an uncertain
-            // commit. Its exact durable lease must be fenced before replay.
-            if let Some(record) = stored.filter(|record| {
-                record.room_state == CollabRoomState::Active
-                    && record.owner_id.as_deref() == Some(self.owner.as_ref())
-            }) {
-                Room::fence_record(&self.store, &budget, &admission.scope, record, &self.owner)
-                    .await?;
-                budget.remaining = deadline.saturating_duration_since(Instant::now());
-                recover_fenced(&self.store, &budget, &admission.scope, note).await?;
-                continue;
-            }
-            let prepared = Room::prepare(&admission, note)?;
+            let prepared = Room::prepare(&admission)?;
             outbound
                 .guard
                 .check()
@@ -681,9 +947,17 @@ impl HubInner {
                     *held = Some(handle.clone());
                     return Ok(Some((handle, role)));
                 }
-                Err(PortError::Domain(DomainError::RevisionConflict { .. })) => {}
+                Err(PortError::Domain(DomainError::RevisionConflict { .. })) => {
+                    open_conflicts += 1;
+                }
                 Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
-                    if diagnostic.reason == ValidationReason::SourceMismatch => {}
+                    if matches!(
+                        diagnostic.reason,
+                        ValidationReason::SourceMismatch | ValidationReason::InvalidAuthority
+                    ) =>
+                {
+                    open_conflicts += 1;
+                }
                 Err(error) if unknown(&error) => {
                     // The open may finish after the handshake expires. Resolve
                     // any unpublished lease under the same slot.
@@ -696,6 +970,34 @@ impl HubInner {
         }
         Err(DomainError::validation(ValidationReason::NotReady).into())
     }
+}
+
+fn send_lineage_mismatch(
+    outbound: &PeerOutbound,
+    admission: notarium_canonical::NoteCollabAdmission,
+    role: PeerRole,
+) {
+    let current_lineage_epoch = admission
+        .session
+        .as_ref()
+        .map_or(LineageEpoch::ZERO, |record| record.session.lineage_epoch);
+    outbound.finish(
+        LineageMismatch {
+            current_history_incarnation: admission.scope.incarnation,
+            current_rev_id: admission.head_rev_id,
+            current_lineage_epoch,
+            verified_base_rev_id: admission.verified_base_rev_id,
+        }
+        .encode(),
+        OutboundAuthority::Admission {
+            scope: admission.scope,
+            role,
+        },
+        SessionClose {
+            code: 4409,
+            reason: "lineage_mismatch",
+        },
+    );
 }
 
 pub(crate) async fn lock_slot<'a>(
@@ -719,8 +1021,17 @@ async fn serve_peer(
     deadline: Instant,
 ) {
     let guard = &outbound.guard;
+    let accept_closed = hub.upgrade().map(|owner| owner.accept_closed_token());
+    let Some(accept_closed) = accept_closed else {
+        guard.close(SessionClose::GOING_AWAY);
+        return;
+    };
     let first_frame = tokio::select! {
         biased;
+        () = accept_closed.cancelled() => {
+            guard.close(SessionClose::GOING_AWAY);
+            return;
+        }
         () = guard.stopped().cancelled() => return,
         result = tokio::time::timeout_at(deadline, ingress.recv()) => match result {
             Ok(Some(frame)) => frame,
@@ -737,7 +1048,10 @@ async fn serve_peer(
             return;
         }
     };
-    let Some(owner) = hub.upgrade() else { return };
+    let Some(owner) = hub.upgrade() else {
+        guard.close(SessionClose::GOING_AWAY);
+        return;
+    };
     let room = attach_peer(&owner, &mut peer, ctx, &note, &hello, &outbound, deadline).await;
     drop(owner);
     let Some(room) = room else { return };
@@ -769,10 +1083,22 @@ async fn attach_peer(
     // lease in flight. Its independent guard blocks Ready and drops the lease.
     for _ in 0..OPEN_ATTEMPTS {
         ctx.budget.remaining = deadline.saturating_duration_since(Instant::now());
-        let (room, role) = owner
-            .admit(&ctx, note, hello, outbound, deadline)
-            .await
-            .ok()??;
+        let (room, role) = match owner.admit(&ctx, note, hello, outbound, deadline).await {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return None,
+            Err(error) => {
+                match &error {
+                    PortError::Domain(_) => {
+                        guard.close(SessionClose::POLICY);
+                    }
+                    _ => {
+                        tracing::warn!(code = error.code(), "collaboration peer admission failed");
+                        guard.close(SessionClose::UNAVAILABLE);
+                    }
+                }
+                return None;
+            }
+        };
         peer.room = Some(room.clone());
         let (reply, received) = tokio::sync::oneshot::channel();
         let join = RoomCommand::Join {
@@ -790,12 +1116,22 @@ async fn attach_peer(
             match tokio::select! {
                 biased;
                 () = guard.stopped().cancelled() => return None,
-                () = tokio::time::sleep_until(deadline) => return None,
+                () = tokio::time::sleep_until(deadline) => {
+                    guard.close(SessionClose::UNAVAILABLE);
+                    return None;
+                }
                 result = received => result,
             } {
-                Ok(true) => return Some(room),
-                Ok(false) => return None,
-                Err(_) => {}
+                Ok(JoinOutcome::Accepted) => return Some(room),
+                Ok(JoinOutcome::CapacityExceeded) => {
+                    guard.close(SessionClose::ROOM_CAPACITY);
+                    return None;
+                }
+                Ok(JoinOutcome::Denied) => {
+                    guard.close(SessionClose::POLICY);
+                    return None;
+                }
+                Ok(JoinOutcome::RoomClosing) | Err(_) => {}
             }
         }
         // The idle-unload timer may have won against a newly enqueued join.
@@ -803,10 +1139,14 @@ async fn attach_peer(
         tokio::select! {
             biased;
             () = guard.stopped().cancelled() => return None,
-            () = tokio::time::sleep_until(deadline) => return None,
+            () = tokio::time::sleep_until(deadline) => {
+                guard.close(SessionClose::UNAVAILABLE);
+                return None;
+            }
             () = room.stopped().cancelled() => {}
         }
     }
+    guard.close(SessionClose::UNAVAILABLE);
     None
 }
 
@@ -831,31 +1171,97 @@ async fn watch_storage(
             result = signals.recv() => result,
         };
         let Some(hub) = hub.upgrade() else { return };
-        let scope = match &signal {
-            Ok(
-                SpaceSignal::Committed { scope, .. }
-                | SpaceSignal::Purged { scope, .. }
-                | SpaceSignal::WriterLeaseChanged { scope },
-            ) => Some(scope),
+        match &signal {
+            Ok(SpaceSignal::Committed {
+                scope,
+                new_last_seq,
+                targets,
+            }) => {
+                for room in hub.active_rooms() {
+                    if room.scope().space_id != scope.space_id {
+                        continue;
+                    }
+                    if !targets.affects(room.note()) {
+                        continue;
+                    }
+                    // Skip waking a room for its own solo checkpoint/command
+                    // commit when no other note or Space-wide target was touched.
+                    let solo_self = matches!(
+                        targets,
+                        CommittedTargets::Notes(notes)
+                            if notes.len() == 1 && &notes[0] == room.note()
+                    ) && room.last_self_seq() == new_last_seq.get();
+                    if !solo_self {
+                        room.storage_changed();
+                    }
+                }
+            }
+            Ok(SpaceSignal::Purged { scope, .. } | SpaceSignal::WriterLeaseChanged { scope }) => {
+                for room in hub.active_rooms() {
+                    if room.scope().space_id == scope.space_id {
+                        room.storage_changed();
+                    }
+                }
+            }
             Ok(SpaceSignal::IncarnationChanged { new_scope, .. }) => {
-                let peers = hub.peers.lock().expect("peer registry");
-                for peer in peers.values().filter(|peer| {
-                    let scope = peer.ctx.scope();
-                    scope.space_id == new_scope.space_id && scope != new_scope
-                }) {
-                    if let Some(guard) = peer.guard.upgrade() {
+                let stale_guards: Vec<_> = {
+                    let peers = hub.peers.lock().expect("peer registry");
+                    peers
+                        .values()
+                        .filter(|peer| {
+                            let scope = peer.ctx.scope();
+                            scope.space_id == new_scope.space_id && scope != new_scope
+                        })
+                        .filter_map(|peer| peer.guard.upgrade())
+                        .collect()
+                };
+                for guard in stale_guards {
+                    guard.close(SessionClose::POLICY);
+                }
+                for room in hub.active_rooms() {
+                    if room.scope().space_id == new_scope.space_id {
+                        room.storage_changed();
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                // Re-verify all registered peer history incarnations after a
+                // broadcast lag so no peer survives an incarnation change.
+                let peer_scopes: Vec<(HistoryScope, Arc<PeerGuard>)> = {
+                    let peers = hub.peers.lock().expect("peer registry");
+                    peers
+                        .values()
+                        .filter_map(|peer| Some((peer.ctx.scope().clone(), peer.guard.upgrade()?)))
+                        .collect()
+                };
+                let unique_spaces: HashSet<SpaceId> = peer_scopes
+                    .iter()
+                    .map(|(scope, _)| scope.space_id.clone())
+                    .collect();
+                let mut current_scopes = HashMap::with_capacity(unique_spaces.len());
+                for space_id in unique_spaces {
+                    let budget = hub.budget();
+                    if let Ok(current) = hub
+                        .store
+                        .read_current_history_scope(Some(&budget), &space_id)
+                        .await
+                    {
+                        current_scopes.insert(space_id, current);
+                    }
+                }
+                for (peer_scope, guard) in peer_scopes {
+                    if current_scopes
+                        .get(&peer_scope.space_id)
+                        .is_none_or(|current| current != &peer_scope)
+                    {
                         guard.close(SessionClose::POLICY);
                     }
                 }
-                Some(new_scope)
+                for room in hub.active_rooms() {
+                    room.storage_changed();
+                }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => None,
             Err(broadcast::error::RecvError::Closed) => return,
-        };
-        for room in hub.active_rooms() {
-            if scope.is_none_or(|scope| scope.space_id == room.scope().space_id) {
-                room.storage_changed();
-            }
         }
     }
 }
@@ -941,6 +1347,9 @@ impl SessionRevocationPort for CollabRevocations {
         ctx: MaintenanceContext,
         selectors: Vec<RevocationSelector>,
     ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        if let Some(hub) = self.hub.upgrade() {
+            hub.record_matching_for_settlement(&selectors);
+        }
         self.registry.fence_provider(ctx, selectors)
     }
 

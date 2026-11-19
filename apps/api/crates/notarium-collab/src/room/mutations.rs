@@ -1,18 +1,17 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::atomic::Ordering};
 
 use notarium_canonical::{CanonicalStore, RoomCommandSettlement};
 use notarium_core::{
     DomainError,
     auth::PrincipalKind,
-    classes::DocClass,
+    classes::{DocClass, authorize_field_key},
     error::{CommitEffect, PortError, ValidationReason},
     ids::RevisionId,
     patch::{BodyPatchPlan, HeaderMutation},
     ports::{
-        EditNote, ExternalObservationResult, InterceptedMutation, InterceptedPayload,
-        InterceptionResult,
+        EditNote, ExternalObservationResult, InterceptedMutation, InterceptedOutcome,
+        InterceptedPayload, InterceptionResult,
     },
-    receipt::MutationReceiptToken,
     value::YamlValue,
 };
 use notarium_syntax::live::{RoomCarrierState as HeaderState, merge_raw_header};
@@ -28,22 +27,35 @@ use super::{
     persistence::{digest, invalid_state, revision_conflict},
 };
 
+pub(super) struct InterceptOutcome {
+    pub(super) reply: Result<InterceptionResult, PortError>,
+    pub(super) poison_room: bool,
+}
+
 impl Room {
     pub(super) async fn intercept_command(
         &mut self,
         request: InterceptedMutation,
-    ) -> Result<InterceptionResult, PortError> {
-        match self.apply_command(request).await {
-            Ok(receipt) => Ok(InterceptionResult::Applied(receipt)),
+    ) -> InterceptOutcome {
+        let mut poison_room = false;
+        let reply = match self.apply_command(request, &mut poison_room).await {
+            Ok(outcome) => Ok(InterceptionResult::Applied(Box::new(outcome))),
             Err(PortError::Domain(error)) => Ok(InterceptionResult::Conflict(error)),
-            Err(error) => Err(error),
-        }
+            Err(error) => {
+                if unknown(&error) {
+                    poison_room = true;
+                }
+                Err(error)
+            }
+        };
+        InterceptOutcome { reply, poison_room }
     }
 
     async fn apply_command(
         &mut self,
         mut request: InterceptedMutation,
-    ) -> Result<MutationReceiptToken, PortError> {
+        poison_room: &mut bool,
+    ) -> Result<InterceptedOutcome, PortError> {
         // Canonical callers compute identities from the persisted head. An
         // unrelated metadata commit can have advanced that revision.
         request.context.check_current(&self.lease.scope)?;
@@ -71,6 +83,14 @@ impl Room {
                 (None, None, Some(&card.fields), Some(&card.expected_note))
             }
         };
+        // Lease mismatch uses `InvalidAuthority` for parity with closed rooms.
+        if request
+            .preconditions
+            .lease
+            .is_some_and(|lease| lease != self.lease.epoch)
+        {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+        }
         let revision = &self.carrier.carrier_rev_id;
         let (body_id, header_id) = CanonicalStore::derive_carrier_identities(revision);
         if request
@@ -79,10 +99,6 @@ impl Room {
             .as_ref()
             .is_some_and(|rev| rev != revision)
             || entity_revision.is_some_and(|rev| rev != revision)
-            || request
-                .preconditions
-                .lease
-                .is_some_and(|lease| lease != self.lease.epoch)
             || request
                 .preconditions
                 .lineage
@@ -94,22 +110,33 @@ impl Room {
         }
         let live_body = self.twin.live_body();
         let live_fm = self.twin.live_overrides().map_err(invalid_state)?;
-        let pending = self.carrier.pending_fields(&live_fm);
+        let mut pending = self.carrier.pending_fields(&live_fm);
+        let live_changed = self.first_dirty.is_some()
+            && !self
+                .carrier
+                .matches_base(&self.carrier.materialize(&live_body, &live_fm)?);
         // Board facts cover the persisted view cut. Live edits can change
         // the target's group or eligibility without advancing that cut.
-        if board_fields.is_some()
-            && self.first_dirty.is_some()
-            && self.carrier.materialize(&live_body, &live_fm)? != self.carrier.base_carrier
-        {
-            self.checkpoint(&self.budget()).await?;
+        if board_fields.is_some() && live_changed {
+            self.checkpoint_for_command(poison_room).await?;
             return Err(self.conflict().into());
         }
-        if body
-            .is_some_and(|body| !body.edits.is_empty() && body.base_body_hash != digest(&live_body))
-            || header_conflict(header, board_fields, &pending)
-        {
-            self.checkpoint(&self.budget()).await?;
-            return Err(self.conflict().into());
+        let body_mismatch = body.is_some_and(|body| {
+            !body.edits.is_empty() && body.base_body_hash != digest(&live_body)
+        });
+        if body_mismatch || header_conflict(header, board_fields, &pending) {
+            let before_rev = self.carrier.carrier_rev_id.clone();
+            self.checkpoint_for_command(poison_room).await?;
+            // If checkpoint was a no-op (for example, a peer set and reverted
+            // an override back to the base value), re-evaluate pending fields
+            // instead of returning a spurious self-conflict on the same head.
+            pending = self.carrier.pending_fields(&live_fm);
+            if self.carrier.carrier_rev_id != before_rev
+                || body_mismatch
+                || header_conflict(header, board_fields, &pending)
+            {
+                return Err(self.conflict().into());
+            }
         }
 
         let projection =
@@ -124,9 +151,11 @@ impl Room {
         );
         if automated
             && self.first_dirty.is_some()
-            && self.carrier.materialize(&live_body, &live_fm)? != self.carrier.base_carrier
+            && !self
+                .carrier
+                .matches_base(&self.carrier.materialize(&live_body, &live_fm)?)
         {
-            self.checkpoint(&self.budget()).await?;
+            self.checkpoint_for_command(poison_room).await?;
             if request.preconditions.revision.is_some() || entity_revision.is_some() {
                 return Err(self.conflict().into());
             }
@@ -142,10 +171,17 @@ impl Room {
         let (staged_update, materialized, fm) = match staged {
             Ok(value) => value,
             Err(error) => {
-                self.reset_staging(&[])?;
+                if self.reset_staging(&[]).is_err() {
+                    *poison_room = true;
+                    return Err(operation_error(
+                        b"collab_command_reset_staging",
+                        CommitEffect::NotCommitted,
+                    ));
+                }
                 return Err(error);
             }
         };
+        let final_digest = digest(&materialized);
         let settlement = RoomCommandSettlement {
             owner_id: self.lease.owner.to_string(),
             expected_lease: self.lease.epoch,
@@ -177,26 +213,37 @@ impl Room {
         } else {
             result
         };
-        let (revision, receipt) = match result {
+        let (revision, seq, outcome) = match result {
             Ok(value) => value,
-            Err(error) if unknown(&error) => return Err(error),
+            Err(error) if unknown(&error) => {
+                *poison_room = true;
+                return Err(error);
+            }
             Err(error) => {
-                self.reset_staging(&[])?;
+                if self.reset_staging(&[]).is_err() {
+                    *poison_room = true;
+                    return Err(operation_error(
+                        b"collab_command_reset_staging",
+                        CommitEffect::NotCommitted,
+                    ));
+                }
                 return Err(error);
             }
         };
         // All fallible post-commit work now refers to a durable outcome. Fence
         // on an unexpected internal mismatch instead of running with two bases.
+        self.last_self_seq.store(seq, Ordering::Release);
         let installed = self
             .twin
             .publish(&staged_update)
             .map_err(invalid_state)
             .and_then(|()| {
                 self.carrier
-                    .advance(revision, digest(&materialized), materialized, fm)
+                    .advance(revision, final_digest, &materialized, fm)
                     .map_err(Into::into)
             });
         if installed.is_err() {
+            *poison_room = true;
             return Err(operation_error(
                 b"collab_command_install",
                 CommitEffect::Unknown,
@@ -206,7 +253,27 @@ impl Room {
         if staged_update != [0, 0] {
             self.broadcast(encode_update(&staged_update));
         }
-        Ok(receipt)
+        Ok(outcome)
+    }
+
+    async fn checkpoint_for_command(&mut self, poison_room: &mut bool) -> Result<(), PortError> {
+        match self.checkpoint(&self.budget()).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if is_fatal_room_error(&error) {
+                    *poison_room = true;
+                    return Err(operation_error(
+                        b"collab_command_checkpoint_fatal",
+                        if unknown(&error) {
+                            CommitEffect::Unknown
+                        } else {
+                            CommitEffect::NotCommitted
+                        },
+                    ));
+                }
+                Err(error)
+            }
+        }
     }
 
     fn conflict(&self) -> DomainError {
@@ -252,7 +319,17 @@ impl Room {
         }
         let mut overrides = AppliedFm::new();
         for (key, field) in fields.into_iter().flatten() {
-            authorize_collab_key(key)?;
+            if raw.is_some() {
+                // Raw header mutations may edit non-collab YAML keys (such as
+                // `title` or `slug`) just as on closed notes; only keys
+                // permitted in `fm_overrides` are mirrored into the CRDT map.
+                authorize_field_key(key)?;
+                if authorize_collab_key(key).is_err() {
+                    continue;
+                }
+            } else {
+                authorize_collab_key(key)?;
+            }
             match AppliedFmEntry::from_field(field.clone()) {
                 Ok(entry) => {
                     overrides.insert(key.clone(), entry);
@@ -265,7 +342,7 @@ impl Room {
             .map(|raw| {
                 let state = HeaderState {
                     header_identity: header_identity.clone(),
-                    base_carrier: self.carrier.base_carrier.clone(),
+                    base_carrier: self.carrier.header_merge_source().to_owned(),
                     pending_fields,
                 };
                 merge_raw_header(&state, raw, DocClass::UserDoc, header_identity)
@@ -277,6 +354,27 @@ impl Room {
             raw_carrier,
         })
     }
+}
+
+fn is_fatal_room_error(error: &PortError) -> bool {
+    if unknown(error) {
+        return true;
+    }
+    matches!(
+        error,
+        PortError::Domain(
+            DomainError::ResourceNotFound
+                | DomainError::ValidationFailed {
+                    diagnostic: notarium_core::error::Diagnostic {
+                        reason: ValidationReason::InvalidAuthority
+                            | ValidationReason::SourceMismatch
+                            | ValidationReason::InvalidState
+                            | ValidationReason::HistoryIncarnationMismatch,
+                        ..
+                    },
+                }
+        )
+    )
 }
 
 struct HeaderProjection {
@@ -314,7 +412,7 @@ async fn commit(
     store: &CanonicalStore,
     request: InterceptedMutation,
     settlement: RoomCommandSettlement,
-) -> Result<(RevisionId, MutationReceiptToken), PortError> {
+) -> Result<(RevisionId, u64, InterceptedOutcome), PortError> {
     let InterceptedMutation {
         context,
         identity,
@@ -332,7 +430,9 @@ async fn commit(
                     settlement,
                 )
                 .await?;
-            Ok((edit.value.revision, edit.receipt))
+            let revision = edit.value.revision.clone();
+            let seq = edit.receipt.seq().get();
+            Ok((revision, seq, InterceptedOutcome::NoteRevision(edit)))
         }
         InterceptedPayload::ExternalObservation { observation, .. } => {
             let lineage = settlement.expected_lineage;
@@ -347,7 +447,15 @@ async fn commit(
                 .await?
             {
                 ExternalObservationResult::Committed(edit) => {
-                    Ok((edit.value.revision, edit.receipt))
+                    let revision = edit.value.revision.clone();
+                    let seq = edit.receipt.seq().get();
+                    Ok((
+                        revision,
+                        seq,
+                        InterceptedOutcome::ExternalObservation(
+                            ExternalObservationResult::Committed(edit),
+                        ),
+                    ))
                 }
                 ExternalObservationResult::Conflict { current } => {
                     Err(DomainError::RevisionConflict {
@@ -373,7 +481,9 @@ async fn commit(
                     settlement,
                 )
                 .await?;
-            Ok((moved.value.revision.revision, moved.receipt))
+            let revision = moved.value.revision.revision.clone();
+            let seq = moved.receipt.seq().get();
+            Ok((revision, seq, InterceptedOutcome::BoardMove(moved)))
         }
     }
 }

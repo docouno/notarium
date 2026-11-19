@@ -64,11 +64,10 @@ const ENCRYPTED: &str = concat!(
 );
 
 fn config() -> CollabConfig {
-    CollabConfig {
-        idle_checkpoint: Duration::from_millis(100),
-        idle_unload: Duration::from_secs(1),
-        ..CollabConfig::default()
-    }
+    let mut cfg = CollabConfig::default();
+    cfg.idle_checkpoint = Duration::from_millis(100);
+    cfg.idle_unload = Duration::from_secs(1);
+    cfg
 }
 
 async fn latest_session(
@@ -195,7 +194,7 @@ async fn lost_open_reply_keeps_direct_edit_available(
         .store(true, Ordering::SeqCst);
     let mut failed = open(hub, owner, &note).await;
     failed.send(LineageHello::Fresh.encode()).await.unwrap();
-    assert_eq!(close_code(&mut failed).await, 1008);
+    assert_eq!(close_code(&mut failed).await, 1011);
     assert_eq!(hub.active_room_count(), 0);
     assert!(
         store
@@ -252,18 +251,11 @@ async fn live_collab_end_to_end_contract(store: &CanonicalStore, pg: bool) {
         SpaceRole::Viewer,
         None,
     );
-    let hub = Arc::new(
-        CollabHub::new(
-            store.clone(),
-            CollabConfig {
-                checkpoint_updates: 2,
-                idle_checkpoint: Duration::from_secs(2),
-                idle_unload: Duration::from_secs(3),
-                ..CollabConfig::default()
-            },
-        )
-        .unwrap(),
-    );
+    let mut cfg = CollabConfig::default();
+    cfg.checkpoint_updates = 2;
+    cfg.idle_checkpoint = Duration::from_secs(2);
+    cfg.idle_unload = Duration::from_secs(3);
+    let hub = Arc::new(CollabHub::new(store.clone(), cfg).unwrap());
     let duplicate_gate = Arc::new(DuplicateEditGate {
         hub: Arc::downgrade(&hub),
         key: Mutex::new(None),
@@ -808,11 +800,15 @@ async fn rejected_update_keeps_the_accepted_prefix(
     let SessionEvent::Binary(frame) = recv(&mut author.peer).await else {
         panic!("expected the committed prefix before the terminal frame");
     };
+    let parsed = messages(&frame);
     assert!(matches!(
-        messages(&frame).as_slice(),
-        [Message::Sync(SyncMessage::Update(update))] if update == &prefix
+        parsed.first(),
+        Some(Message::Sync(SyncMessage::Update(update))) if update == &prefix
     ));
-    let ack = decode_ack(&custom(&mut author.peer, wire::SERVER_ACK_WATERMARK).await);
+    let ack = match parsed.get(1) {
+        Some(Message::Custom(wire::SERVER_ACK_WATERMARK, payload)) => decode_ack(payload),
+        _ => decode_ack(&custom(&mut author.peer, wire::SERVER_ACK_WATERMARK).await),
+    };
     assert_eq!(ack.peer_write_seq, 1);
     assert_eq!(ack.room_update_seq, 1);
     let payload = custom(&mut author.peer, wire::POLICY_REJECTED).await;

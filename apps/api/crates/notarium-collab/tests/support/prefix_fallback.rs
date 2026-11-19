@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use notarium_canonical::CanonicalStore;
 use notarium_collab::{
-    CollabConfig, CollabHub, CollabPeerSession,
+    CollabConfig, CollabHub, CollabPeerSession, SessionEvent,
     wire::{self, LineageHello, PolicyRejectReason},
 };
 use notarium_core::{
@@ -19,8 +19,8 @@ use yrs::{
 };
 
 use super::support::{
-    Client, WAIT, close_code, context, create_note, custom, decode_ack, note_head,
-    pause_wal_admission, synced_client, test_auth, wait_until,
+    Client, WAIT, close_code, context, create_note, custom, decode_ack, messages, note_head,
+    pause_wal_admission, recv, synced_client, test_auth, wait_until,
 };
 
 async fn enqueue_before_release(peer: &CollabPeerSession, frame: Vec<u8>) {
@@ -42,16 +42,11 @@ pub async fn check(store: &CanonicalStore, owner: &SpaceContext) {
     let initial = "Original recovery body.\n";
     let independent = "Independent prefix. 🧭\n";
     let note = create_note(store, owner, 94, initial, None).await.note;
-    let hub = CollabHub::new(
-        store.clone(),
-        CollabConfig {
-            // Consume the queued frames without an elapsed-time cutoff.
-            intercept_coalesce: Duration::ZERO,
-            idle_checkpoint: Duration::from_millis(100),
-            ..CollabConfig::default()
-        },
-    )
-    .unwrap();
+    let mut cfg = CollabConfig::default();
+    // Consume the queued frames without an elapsed-time cutoff.
+    cfg.wal_coalesce = Duration::ZERO;
+    cfg.idle_checkpoint = Duration::from_millis(100);
+    let hub = CollabHub::new(store.clone(), cfg).unwrap();
     let (mut first, _) = synced_client(&hub, owner, &note, 420).await;
     let (mut observer, _) = synced_client(&hub, owner, &note, 421).await;
     let cancellation = Cancellation::default();
@@ -111,10 +106,25 @@ pub async fn check(store: &CanonicalStore, owner: &SpaceContext) {
     // finished before A reads its outgoing frames. A3 may not overwrite the
     // queued ACK for A1 or the policy frame for A2.
     observer.sync().await;
-    first
-        .until(|message| matches!(message, Message::Sync(SyncMessage::Update(bytes)) if bytes == &first_prefix))
-        .await;
-    let ack = decode_ack(&custom(&mut first.peer, wire::SERVER_ACK_WATERMARK).await);
+    let mut seen_prefix = false;
+    let mut ack = None;
+    while !seen_prefix || ack.is_none() {
+        let SessionEvent::Binary(frame) = recv(&mut first.peer).await else {
+            panic!("expected committed prefix and ACK before terminal frame");
+        };
+        for message in messages(&frame) {
+            match message {
+                Message::Sync(SyncMessage::Update(bytes)) if bytes == first_prefix => {
+                    seen_prefix = true;
+                }
+                Message::Custom(wire::SERVER_ACK_WATERMARK, payload) => {
+                    ack = Some(decode_ack(&payload));
+                }
+                _ => {}
+            }
+        }
+    }
+    let ack = ack.unwrap();
     assert_eq!(ack.peer_write_seq, 1);
     assert_eq!(ack.room_update_seq, 2);
     let policy = custom(&mut first.peer, wire::POLICY_REJECTED).await;

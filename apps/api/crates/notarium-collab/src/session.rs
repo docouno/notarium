@@ -3,7 +3,7 @@
 use std::{
     fmt,
     future::pending,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, Weak},
     time::Duration,
 };
 
@@ -20,7 +20,10 @@ use tokio::{
     time::{Instant, sleep_until, timeout},
 };
 
-use crate::wire::{MAX_FRAME_BYTES, PeerRole};
+use crate::{
+    hub::HubInner,
+    wire::{MAX_FRAME_BYTES, PeerRole},
+};
 
 const QUEUE_CAPACITY: usize = 8;
 const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,6 +66,11 @@ impl SessionClose {
         reason: "collaboration policy",
     };
 
+    pub const GOING_AWAY: Self = Self {
+        code: 1001,
+        reason: "server shutting down",
+    };
+
     const OVERSIZE: Self = Self {
         code: 1009,
         reason: "frame too large",
@@ -78,7 +86,12 @@ impl SessionClose {
         reason: "peer is not receiving frames",
     };
 
-    const UNAVAILABLE: Self = Self {
+    pub(crate) const ROOM_CAPACITY: Self = Self {
+        code: 1013,
+        reason: "collaboration capacity exceeded",
+    };
+
+    pub(crate) const UNAVAILABLE: Self = Self {
         code: 1011,
         reason: "collaboration unavailable",
     };
@@ -104,20 +117,238 @@ impl fmt::Debug for SessionEvent {
     }
 }
 
-/// One independently revocable binary protocol session.
-///
-/// Use `recv` when the transport is ready for its next frame. The fresh
-/// authority check is part of that call, so an adapter must keep backpressure
-/// at this boundary.
-pub struct CollabPeerSession {
+/// Inbound write half of a split collaboration session.
+pub struct CollabPeerSender {
+    guard: Arc<PeerGuard>,
+    input: mpsc::Sender<Vec<u8>>,
+}
+
+impl CollabPeerSender {
+    /// Submit an inbound binary protocol frame to the bounded peer queue.
+    pub async fn send(&self, frame: Vec<u8>) -> Result<(), SessionClosed> {
+        {
+            let state = self.guard.open_input()?;
+            if frame.len() > MAX_FRAME_BYTES {
+                self.guard.close_locked(state, SessionClose::OVERSIZE);
+                return Err(SessionClosed);
+            }
+        }
+        let permit = tokio::select! {
+            biased;
+            () = self.guard.input_stopped.cancelled() => return Err(SessionClosed),
+            permit = self.input.reserve() => permit.map_err(|_| SessionClosed)?,
+        };
+        let _state = self.guard.open_input()?;
+        permit.send(frame);
+        Ok(())
+    }
+}
+
+struct VerifiedSqliteGen {
+    commit_gen: u64,
+    lease: LeaseEpoch,
+    lineage: LineageEpoch,
+    role: PeerRole,
+    owner: Arc<str>,
+}
+
+/// Outbound authorized read half of a split collaboration session.
+pub struct CollabPeerReceiver {
     store: CanonicalStore,
     context: SpaceContext,
     note: NoteId,
     guard: Arc<PeerGuard>,
-    input: mpsc::Sender<Vec<u8>>,
     output: mpsc::Receiver<Outgoing>,
     pending: Option<Outgoing>,
+    last_verified: Option<VerifiedSqliteGen>,
     delivered_close: bool,
+}
+
+impl CollabPeerReceiver {
+    /// Receive one authorized event. Safe to call again if the waiting
+    /// future is cancelled, including during its storage check.
+    pub async fn recv(&mut self) -> Option<SessionEvent> {
+        if self.delivered_close {
+            return None;
+        }
+        loop {
+            if let Some(ending) = self.guard.ending() {
+                match ending {
+                    Ending::Closed(close) => {
+                        self.discard_queued_frames();
+                        self.delivered_close = true;
+                        return Some(SessionEvent::Close(close));
+                    }
+                    Ending::Drain(final_frame) => {
+                        self.output.close();
+                        if self.pending.is_none() {
+                            self.pending = self.output.try_recv().ok();
+                        }
+                        let last = self.pending.is_none();
+                        let authority = self
+                            .pending
+                            .as_ref()
+                            .or(final_frame.as_ref())
+                            .map(|frame| frame.authority.clone());
+                        let lease_lost = self.guard.lease_lost.clone();
+                        let result = match authority {
+                            Some(authority) => tokio::select! {
+                                biased;
+                                () = lease_lost.cancelled() => continue,
+                                result = self.authorize(&authority) => result,
+                            },
+                            None => Ok(()),
+                        };
+                        if self.guard.finish_delivery(result, last)
+                            && let Some(frame) = self.pending.take().or(final_frame)
+                        {
+                            return Some(frame.into_event());
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            if self.pending.is_none() {
+                self.pending = tokio::select! {
+                    biased;
+                    () = self.guard.stopped().cancelled() => continue,
+                    frame = self.output.recv() => frame,
+                };
+            }
+            let Some(authority) = self.pending.as_ref().map(|f| f.authority.clone()) else {
+                self.guard.close(SessionClose::UNAVAILABLE);
+                continue;
+            };
+            let stopped = self.guard.stopped().clone();
+            let result = tokio::select! {
+                biased;
+                () = stopped.cancelled() => continue,
+                result = self.authorize(&authority) => result,
+            };
+            if let Err(close) = result {
+                self.guard.close(close);
+            } else if self.guard.check().is_ok() {
+                return self.pending.take().map(Outgoing::into_event);
+            }
+        }
+    }
+
+    fn discard_queued_frames(&mut self) {
+        self.pending = None;
+        self.output.close();
+        while self.output.try_recv().is_ok() {}
+    }
+
+    async fn authorize(&mut self, authority: &OutboundAuthority) -> Result<(), SessionClose> {
+        // Linearizable zero-SQL fast path on SQLite when no canonical commit
+        // has occurred since this session last verified the exact room lease.
+        if let OutboundAuthority::Active {
+            scope,
+            role,
+            lease,
+            lineage,
+            owner,
+        } = authority
+        {
+            if scope != self.context.scope() {
+                return Err(SessionClose::POLICY);
+            }
+            if let Some(current_gen) = self.store.sqlite_commit_generation()
+                && self.last_verified.as_ref().is_some_and(|v| {
+                    v.commit_gen == current_gen
+                        && v.lease == *lease
+                        && v.lineage == *lineage
+                        && v.role == *role
+                        && v.owner == *owner
+                })
+            {
+                return Ok(());
+            }
+        }
+
+        let gen_before = self.store.sqlite_commit_generation();
+        let budget = CallBudget {
+            request: self.context.budget.request.clone(),
+            cancellation: Cancellation::default(),
+            remaining: AUTHORIZATION_TIMEOUT,
+        };
+        let store = &self.store;
+        let context = &self.context;
+        let note = &self.note;
+        let check = async {
+            let (facts, role) = match authority {
+                OutboundAuthority::Active {
+                    scope,
+                    role,
+                    lease,
+                    lineage,
+                    owner,
+                } if scope == context.scope() => (
+                    store
+                        .read_active_room_facts(Some(&budget), scope, note, *lease, *lineage, owner)
+                        .await
+                        .map(|facts| facts.resource),
+                    *role,
+                ),
+                OutboundAuthority::Admission { scope, role } if scope == context.scope() => (
+                    store
+                        .read_room_resource_facts(Some(&budget), scope, note)
+                        .await,
+                    *role,
+                ),
+                _ => return Err(SessionClose::POLICY),
+            };
+            let facts = facts.map_err(|_| SessionClose::POLICY)?;
+            if is_authorized(context, role, &facts) {
+                Ok(())
+            } else {
+                Err(SessionClose::POLICY)
+            }
+        };
+        let res = timeout(budget.remaining, check)
+            .await
+            .unwrap_or(Err(SessionClose::POLICY));
+        if res.is_ok()
+            && let (Some(before), Some(after)) = (gen_before, self.store.sqlite_commit_generation())
+            && before == after
+            && let OutboundAuthority::Active {
+                role,
+                lease,
+                lineage,
+                owner,
+                ..
+            } = authority
+        {
+            self.last_verified = Some(VerifiedSqliteGen {
+                commit_gen: after,
+                lease: *lease,
+                lineage: *lineage,
+                role: *role,
+                owner: Arc::clone(owner),
+            });
+        } else if res.is_err() {
+            self.last_verified = None;
+        }
+        res
+    }
+}
+
+impl Drop for CollabPeerReceiver {
+    fn drop(&mut self) {
+        self.guard.close(SessionClose::DISCONNECTED);
+    }
+}
+
+/// One independently revocable binary protocol session.
+///
+/// Use `recv` when the transport is ready for its next frame, or `split` into
+/// independent send and receive halves for full-duplex WebSocket adapters. The
+/// fresh authority check is part of `recv`, so an adapter must keep
+/// backpressure at this boundary.
+pub struct CollabPeerSession {
+    sender: CollabPeerSender,
+    receiver: CollabPeerReceiver,
 }
 
 #[derive(Clone)]
@@ -208,163 +439,41 @@ impl CollabPeerSession {
         let (output, receiver) = mpsc::channel(QUEUE_CAPACITY);
         (
             Self {
-                store,
-                context,
-                note,
-                guard: guard.clone(),
-                input,
-                output: receiver,
-                pending: None,
-                delivered_close: false,
+                sender: CollabPeerSender {
+                    guard: guard.clone(),
+                    input,
+                },
+                receiver: CollabPeerReceiver {
+                    store,
+                    context,
+                    note,
+                    guard: guard.clone(),
+                    output: receiver,
+                    pending: None,
+                    last_verified: None,
+                    delivered_close: false,
+                },
             },
             PeerOutbound { guard, output },
             frames,
         )
     }
 
+    /// Split into independent inbound and outbound halves so full-duplex
+    /// transports can send frames concurrently without cancelling `recv`.
+    pub fn split(self) -> (CollabPeerSender, CollabPeerReceiver) {
+        (self.sender, self.receiver)
+    }
+
     /// Submit an inbound binary protocol frame to the bounded peer queue.
     pub async fn send(&self, frame: Vec<u8>) -> Result<(), SessionClosed> {
-        {
-            let state = self.guard.open_input()?;
-            if frame.len() > MAX_FRAME_BYTES {
-                self.guard.close_locked(state, SessionClose::OVERSIZE);
-                return Err(SessionClosed);
-            }
-        }
-        let permit = tokio::select! {
-            biased;
-            () = self.guard.input_stopped.cancelled() => return Err(SessionClosed),
-            permit = self.input.reserve() => permit.map_err(|_| SessionClosed)?,
-        };
-        let _state = self.guard.open_input()?;
-        permit.send(frame);
-        Ok(())
+        self.sender.send(frame).await
     }
 
     /// Receive one authorized event. Safe to call again if the waiting
     /// future is cancelled, including during its storage check.
     pub async fn recv(&mut self) -> Option<SessionEvent> {
-        if self.delivered_close {
-            return None;
-        }
-        loop {
-            if let Some(ending) = self.guard.ending() {
-                match ending {
-                    Ending::Closed(close) => {
-                        self.discard_queued_frames();
-                        self.delivered_close = true;
-                        return Some(SessionEvent::Close(close));
-                    }
-                    Ending::Drain(final_frame) => {
-                        self.output.close();
-                        if self.pending.is_none() {
-                            self.pending = self.output.try_recv().ok();
-                        }
-                        let last = self.pending.is_none();
-                        let result = match self.pending.as_ref().or(final_frame.as_ref()) {
-                            Some(frame) => tokio::select! {
-                                biased;
-                                () = self.guard.lease_lost.cancelled() => continue,
-                                result = self.authorize(&frame.authority) => result,
-                            },
-                            None => Ok(()),
-                        };
-                        if self.guard.finish_delivery(result, last)
-                            && let Some(frame) = self.pending.take().or(final_frame)
-                        {
-                            return Some(frame.into_event());
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            if self.pending.is_none() {
-                self.pending = tokio::select! {
-                    biased;
-                    () = self.guard.stopped().cancelled() => continue,
-                    frame = self.output.recv() => frame,
-                };
-            }
-            let Some(frame) = self.pending.as_ref() else {
-                self.guard.close(SessionClose::UNAVAILABLE);
-                continue;
-            };
-            let result = tokio::select! {
-                biased;
-                () = self.guard.stopped().cancelled() => continue,
-                result = self.authorize(&frame.authority) => result,
-            };
-            if let Err(close) = result {
-                self.guard.close(close);
-            } else if self.guard.check().is_ok() {
-                return self.pending.take().map(Outgoing::into_event);
-            }
-        }
-    }
-
-    fn discard_queued_frames(&mut self) {
-        self.pending = None;
-        self.output.close();
-        while self.output.try_recv().is_ok() {}
-    }
-
-    async fn authorize(&self, authority: &OutboundAuthority) -> Result<(), SessionClose> {
-        let budget = CallBudget {
-            request: self.context.budget.request.clone(),
-            cancellation: Cancellation::default(),
-            remaining: AUTHORIZATION_TIMEOUT,
-        };
-        let facts = async {
-            let (facts, role) = match authority {
-                OutboundAuthority::Active {
-                    scope,
-                    role,
-                    lease,
-                    lineage,
-                    owner,
-                } if scope == self.context.scope() => (
-                    self.store
-                        .read_active_room_facts(
-                            Some(&budget),
-                            scope,
-                            &self.note,
-                            *lease,
-                            *lineage,
-                            owner,
-                        )
-                        .await
-                        .map(|facts| facts.resource),
-                    *role,
-                ),
-                OutboundAuthority::Admission { scope, role }
-                    if scope.space_id == self.context.scope().space_id =>
-                {
-                    (
-                        self.store
-                            .read_room_resource_facts(Some(&budget), scope, &self.note)
-                            .await,
-                        *role,
-                    )
-                }
-                _ => return Err(SessionClose::POLICY),
-            };
-            let facts = facts.map_err(|_| SessionClose::POLICY)?;
-            if is_authorized(&self.context, role, &facts) {
-                Ok(())
-            } else {
-                Err(SessionClose::POLICY)
-            }
-        };
-        timeout(budget.remaining, facts)
-            .await
-            .unwrap_or(Err(SessionClose::POLICY))
-    }
-}
-
-impl Drop for CollabPeerSession {
-    fn drop(&mut self) {
-        self.guard.close(SessionClose::DISCONNECTED);
+        self.receiver.recv().await
     }
 }
 
@@ -396,6 +505,7 @@ pub(crate) struct PeerGuard {
     cancellation: Cancellation,
     expires_at: Option<Instant>,
     state: Mutex<PeerState>,
+    hub_peer: Mutex<Option<(Weak<HubInner>, u64)>>,
     input_stopped: Cancellation,
     stopped: Cancellation,
     lease_lost: Cancellation,
@@ -418,6 +528,7 @@ impl PeerGuard {
             cancellation: auth.cancellation.clone(),
             expires_at: auth.expires_at,
             state: Mutex::new(PeerState::Open(auth.lease)),
+            hub_peer: Mutex::new(None),
             input_stopped: Cancellation::default(),
             stopped: Cancellation::default(),
             lease_lost: Cancellation::default(),
@@ -442,6 +553,32 @@ impl PeerGuard {
             }
         });
         guard
+    }
+
+    pub(crate) fn attach_hub_registration(&self, hub: Weak<HubInner>, id: u64) {
+        if self.lease_lost.is_cancelled() {
+            if let Some(hub) = hub.upgrade() {
+                hub.unregister_peer(id);
+            }
+            return;
+        }
+        *self.hub_peer.lock().unwrap_or_else(|e| e.into_inner()) = Some((hub, id));
+        if self.lease_lost.is_cancelled() {
+            self.unregister_hub_peer();
+        }
+    }
+
+    fn unregister_hub_peer(&self) {
+        let entry = self
+            .hub_peer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some((hub, id)) = entry
+            && let Some(hub) = hub.upgrade()
+        {
+            hub.unregister_peer(id);
+        }
     }
 
     pub(crate) fn check(&self) -> Result<(), SessionClosed> {
@@ -469,10 +606,6 @@ impl PeerGuard {
 
     pub(crate) fn stopped(&self) -> &Cancellation {
         &self.stopped
-    }
-
-    pub(crate) fn lease_lost(&self) -> &Cancellation {
-        &self.lease_lost
     }
 
     pub(crate) fn stop_input(&self) {
@@ -577,12 +710,14 @@ impl PeerGuard {
         drop(state);
         self.lease_lost.cancel();
         self.stopped.cancel();
+        self.unregister_hub_peer();
     }
 }
 
 impl Drop for PeerGuard {
     fn drop(&mut self) {
         self.lease_lost.cancel();
+        self.unregister_hub_peer();
     }
 }
 

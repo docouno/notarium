@@ -12,6 +12,9 @@ const ORIGIN: u8 = 0x80;
 const RIGHT_ORIGIN: u8 = 0x40;
 const MAP: u8 = 0x20;
 const MAX_CLOCK: u32 = i32::MAX as u32;
+pub(super) const MAX_PEER_UPDATE_CLIENTS: usize = 64;
+pub(super) const MAX_PEER_UPDATE_BLOCKS: usize = 4096;
+pub(super) const MAX_PEER_UPDATE_DELETE_RANGES: usize = 4096;
 
 impl From<FrameError> for Reject {
     fn from(_: FrameError) -> Self {
@@ -74,10 +77,38 @@ impl Frame<'_> {
     }
 }
 
-/// Check the actual bytes before passing them to Yrs. Lengths are bounded by
-/// remaining input, then clock arithmetic is checked before the decoder can
-/// integrate an item or split an existing block.
-pub(super) fn inspect(raw: &[u8], fm_writable: bool) -> Result<Frame<'_>, Reject> {
+/// Inspect an untrusted peer update with strict anti-DoS bounds on clients,
+/// blocks, and delete ranges before Yrs decodes or integrates it.
+pub(super) fn inspect_peer(raw: &[u8], fm_writable: bool) -> Result<Frame<'_>, Reject> {
+    inspect_with_limits(
+        raw,
+        fm_writable,
+        Some(Limits {
+            max_clients: MAX_PEER_UPDATE_CLIENTS,
+            max_blocks: MAX_PEER_UPDATE_BLOCKS,
+            max_deletes: MAX_PEER_UPDATE_DELETE_RANGES,
+        }),
+    )
+}
+
+/// Inspect a trusted snapshot, replay, or locally-encoded update without
+/// per-edit peer caps.
+pub(super) fn inspect_snapshot(raw: &[u8], fm_writable: bool) -> Result<Frame<'_>, Reject> {
+    inspect_with_limits(raw, fm_writable, None)
+}
+
+#[derive(Clone, Copy)]
+struct Limits {
+    max_clients: usize,
+    max_blocks: usize,
+    max_deletes: usize,
+}
+
+fn inspect_with_limits(
+    raw: &[u8],
+    fm_writable: bool,
+    limits: Option<Limits>,
+) -> Result<Frame<'_>, Reject> {
     let mut cursor = Cursor::new(raw);
     let mut result = Frame {
         runs: HashMap::new(),
@@ -85,8 +116,14 @@ pub(super) fn inspect(raw: &[u8], fm_writable: bool) -> Result<Frame<'_>, Reject
         deletes: Vec::new(),
     };
     let clients = cursor.count(3)?;
+    if limits.is_some_and(|l| clients > l.max_clients) {
+        return Err(Reject::MalformedUpdate);
+    }
     for _ in 0..clients {
         let blocks = cursor.count(2)?;
+        if limits.is_some_and(|l| result.blocks.len().saturating_add(blocks) > l.max_blocks) {
+            return Err(Reject::MalformedUpdate);
+        }
         let client = cursor.client_id()?;
         let mut clock = cursor.clock()?;
         if blocks == 0 || result.runs.contains_key(&client) {
@@ -107,10 +144,16 @@ pub(super) fn inspect(raw: &[u8], fm_writable: bool) -> Result<Frame<'_>, Reject
     }
 
     let clients = cursor.count(2)?;
+    if limits.is_some_and(|l| clients > l.max_clients) {
+        return Err(Reject::MalformedUpdate);
+    }
     let mut seen_clients = std::collections::HashSet::new();
     for _ in 0..clients {
         let client = cursor.client_id()?;
         let ranges = cursor.count(2)?;
+        if limits.is_some_and(|l| result.deletes.len().saturating_add(ranges) > l.max_deletes) {
+            return Err(Reject::MalformedUpdate);
+        }
         // Yjs and Yrs use different client orderings in the delete set.
         if ranges == 0 || !seen_clients.insert(client) {
             return Err(Reject::MalformedUpdate);

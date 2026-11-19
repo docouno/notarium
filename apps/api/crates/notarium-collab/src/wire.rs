@@ -15,6 +15,7 @@ use yrs::updates::{decoder::Decode, encoder::Encode};
 use yrs::{ClientID, StateVector};
 
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_MESSAGES_PER_FRAME: usize = 128;
 pub const WIRE_PROTOCOL_VERSION: u8 = 1;
 pub const LINEAGE_HELLO: u8 = 100;
 pub const LINEAGE_READY: u8 = 101;
@@ -24,6 +25,7 @@ pub const POLICY_REJECTED: u8 = 104;
 
 pub(crate) const MAX_CLIENT_ID: u64 = (1 << 53) - 1;
 pub(crate) const MAX_CLOCK: u32 = i32::MAX as u32;
+pub(crate) const MAX_STATE_VECTOR_CLIENTS: usize = 16_384;
 pub(crate) const MAX_AWARENESS_CLIENTS: usize = 256;
 const MAX_AWARENESS_JSON_BYTES: usize = 16 * 1024;
 
@@ -229,7 +231,7 @@ fn write_optional_revision(payload: &mut Vec<u8>, revision: Option<&RevisionId>)
     }
 }
 
-pub fn encode_sync_step1(state: StateVector) -> Vec<u8> {
+pub(crate) fn encode_sync_step1(state: StateVector) -> Vec<u8> {
     Message::Sync(SyncMessage::SyncStep1(state)).encode_v1()
 }
 
@@ -241,6 +243,12 @@ pub fn encode_update(update: &[u8]) -> Vec<u8> {
     encode_sync_bytes(MSG_SYNC_UPDATE, update)
 }
 
+pub(crate) fn encode_update_into(frame: &mut Vec<u8>, data: &[u8]) {
+    frame.write_var(MSG_SYNC);
+    frame.write_var(MSG_SYNC_UPDATE);
+    frame.write_buf(data);
+}
+
 fn encode_sync_bytes(tag: u8, data: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(data.len() + 8);
     frame.write_var(MSG_SYNC);
@@ -249,7 +257,7 @@ fn encode_sync_bytes(tag: u8, data: &[u8]) -> Vec<u8> {
     frame
 }
 
-pub fn encode_awareness(update: &AwarenessUpdate) -> Vec<u8> {
+pub(crate) fn encode_awareness(update: &AwarenessUpdate) -> Vec<u8> {
     let payload = update.encode_v1();
     let mut frame = Vec::with_capacity(payload.len() + 8);
     frame.write_var(MSG_AWARENESS);
@@ -259,7 +267,7 @@ pub fn encode_awareness(update: &AwarenessUpdate) -> Vec<u8> {
 
 /// An application message whose envelope has already been checked.
 #[derive(Debug)]
-pub enum InboundMessage<'a> {
+pub(crate) enum InboundMessage<'a> {
     SyncStep1(ValidatedStateVector<'a>),
     SyncStep2(&'a [u8]),
     Update(&'a [u8]),
@@ -268,22 +276,52 @@ pub enum InboundMessage<'a> {
 }
 
 #[derive(Debug)]
-pub struct ValidatedStateVector<'a>(&'a [u8]);
+pub(crate) struct ValidatedStateVector<'a>(&'a [u8]);
 
 impl ValidatedStateVector<'_> {
-    pub fn decode(self) -> Result<StateVector, FrameError> {
-        StateVector::decode_v1(self.0).map_err(|_| FrameError::Protocol)
+    /// Decode only clients already known to the live document so untrusted
+    /// peers cannot exploit `StateVector`'s non-randomized hasher with
+    /// synthetic colliding client IDs.
+    pub(crate) fn decode_known(
+        self,
+        is_known: impl Fn(ClientID) -> bool,
+    ) -> Result<StateVector, FrameError> {
+        let mut cursor = Cursor::new(self.0);
+        let count = cursor.count(2)?;
+        if count > MAX_STATE_VECTOR_CLIENTS {
+            return Err(FrameError::Protocol);
+        }
+        let mut sv = StateVector::default();
+        for _ in 0..count {
+            let id = cursor.client_id()?;
+            let clock = cursor.clock()?;
+            if is_known(id) {
+                if sv.contains_client(&id) {
+                    return Err(FrameError::Protocol);
+                }
+                sv.set_min(id, clock);
+            }
+        }
+        if !cursor.is_empty() {
+            return Err(FrameError::Protocol);
+        }
+        Ok(sv)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decode(self) -> Result<StateVector, FrameError> {
+        self.decode_known(|_| true)
     }
 }
 
 #[derive(Debug)]
-pub struct ValidatedAwareness<'a>(&'a [u8]);
+pub(crate) struct ValidatedAwareness<'a>(&'a [u8]);
 
 impl ValidatedAwareness<'_> {
-    pub fn decode(self) -> Result<AwarenessUpdate, FrameError> {
+    pub(crate) fn decode(self) -> Result<AwarenessUpdate, FrameError> {
         let update = AwarenessUpdate::decode_v1(self.0).map_err(|_| FrameError::Protocol)?;
         for entry in update.clients.values() {
-            serde_json::from_str::<serde_json::Value>(&entry.json)
+            serde_json::from_str::<serde::de::IgnoredAny>(&entry.json)
                 .map_err(|_| FrameError::Protocol)?;
         }
         Ok(update)
@@ -296,13 +334,18 @@ impl ValidatedAwareness<'_> {
 /// clocks and IDs are checked before any Yrs decoder runs. An Editor's raw
 /// update requires a second, document-aware check by the room. A Viewer's
 /// write payload is never parsed, even when followed by a valid read message.
-pub fn decode_frame<'a>(
+pub(crate) fn decode_frame<'a>(
     frame: &'a [u8],
     role: PeerRole,
     reserved_awareness_clients: &[ClientID],
 ) -> Result<FrameMessages<'a>, FrameError> {
     let mut scan = bounded_frame(frame)?;
+    let mut messages = 0usize;
     while !scan.is_empty() {
+        messages += 1;
+        if messages > MAX_MESSAGES_PER_FRAME {
+            return Err(FrameError::Protocol);
+        }
         match next_message(&mut scan, role)? {
             Some(InboundMessage::SyncStep1(state)) => prevalidate_state_vector(state.0)?,
             Some(InboundMessage::Awareness(update)) => {
@@ -318,7 +361,7 @@ pub fn decode_frame<'a>(
 }
 
 #[derive(Debug)]
-pub struct FrameMessages<'a> {
+pub(crate) struct FrameMessages<'a> {
     cursor: Cursor<'a>,
     role: PeerRole,
 }
@@ -374,7 +417,11 @@ fn bounded_frame(bytes: &[u8]) -> Result<Cursor<'_>, FrameError> {
 
 fn prevalidate_state_vector(bytes: &[u8]) -> Result<(), FrameError> {
     let mut cursor = Cursor::new(bytes);
-    for _ in 0..cursor.count(2)? {
+    let count = cursor.count(2)?;
+    if count > MAX_STATE_VECTOR_CLIENTS {
+        return Err(FrameError::Protocol);
+    }
+    for _ in 0..count {
         cursor.client_id()?;
         cursor.clock()?;
     }
@@ -390,11 +437,13 @@ fn prevalidate_awareness(bytes: &[u8], reserved: &[ClientID]) -> Result<(), Fram
     if count > MAX_AWARENESS_CLIENTS {
         return Err(FrameError::Protocol);
     }
-    for _ in 0..count {
+    let mut seen = [ClientID::new(0); MAX_AWARENESS_CLIENTS];
+    for index in 0..count {
         let id = cursor.client_id()?;
-        if reserved.contains(&id) {
+        if reserved.contains(&id) || seen[..index].contains(&id) {
             return Err(FrameError::Protocol);
         }
+        seen[index] = id;
         cursor.clock()?;
         if cursor.string()?.len() > MAX_AWARENESS_JSON_BYTES {
             return Err(FrameError::Protocol);

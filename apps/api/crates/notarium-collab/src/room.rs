@@ -4,7 +4,10 @@ mod persistence;
 use std::{
     collections::HashMap,
     future::pending,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use notarium_canonical::{CanonicalStore, CollabRoomState, CollabSessionRecord, RoomWalEntry};
@@ -23,12 +26,13 @@ use tokio::{
 use crate::{
     carrier::RoomCarrierState,
     crdt::TwinDoc,
-    hub::{CollabConfig, HubInner, RoomSlot, operation_error, unknown},
+    hub::{CollabConfig, HubInner, RoomSlot, operation_error},
     presence::Presence,
     session::{OutboundAuthority, PeerOutbound, SessionClose, is_authorized},
     wire::{
-        InboundMessage, LineageReady, PeerRole, ServerAckWatermark, decode_frame, encode_awareness,
-        encode_policy_rejected, encode_sync_step1, encode_sync_step2, encode_update,
+        InboundMessage, LineageReady, MAX_FRAME_BYTES, PeerRole, ServerAckWatermark, decode_frame,
+        encode_awareness, encode_policy_rejected, encode_sync_step1, encode_sync_step2,
+        encode_update_into,
     },
 };
 use persistence::{PendingUpdate, PreparedRoom, invalid_state};
@@ -40,13 +44,28 @@ const WAL_GROUP_SIZE: usize = 64;
 const WAL_GROUP_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PEERS: usize = 128;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JoinOutcome {
+    Accepted,
+    CapacityExceeded,
+    Denied,
+    RoomClosing,
+}
+
+pub(crate) enum InterceptReply {
+    Result(Result<InterceptionResult, PortError>),
+    /// Room entered closing before servicing this queued mutation. The caller
+    /// waits for `room.stopped()` and retries on the closed-room path.
+    RoomClosingNotStarted(Box<InterceptedMutation>),
+}
+
 pub(crate) enum RoomCommand {
     Join {
         id: u64,
         ctx: Box<SpaceContext>,
         role: PeerRole,
         outbound: PeerOutbound,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<JoinOutcome>,
         deadline: Instant,
     },
     Frame {
@@ -55,11 +74,15 @@ pub(crate) enum RoomCommand {
     },
     Intercept {
         request: Box<InterceptedMutation>,
-        reply: oneshot::Sender<Result<InterceptionResult, PortError>>,
+        reply: oneshot::Sender<InterceptReply>,
         deadline: Instant,
     },
     Revoked {
         close: bool,
+        reply: oneshot::Sender<Result<(), PortError>>,
+    },
+    Shutdown {
+        budget: CallBudget,
         reply: oneshot::Sender<Result<(), PortError>>,
     },
 }
@@ -72,6 +95,7 @@ pub(crate) struct RoomHandle {
     slug: watch::Receiver<String>,
     peers_changed: Arc<Notify>,
     storage_changed: Arc<Notify>,
+    last_self_seq: Arc<AtomicU64>,
 }
 
 impl RoomHandle {
@@ -93,6 +117,10 @@ impl RoomHandle {
 
     pub fn stopped(&self) -> &Cancellation {
         &self.stopped
+    }
+
+    pub fn last_self_seq(&self) -> u64 {
+        self.last_self_seq.load(Ordering::Acquire)
     }
 
     pub fn same_lease(&self, other: &Self) -> bool {
@@ -121,21 +149,46 @@ impl RoomHandle {
         self.storage_changed.notify_one();
     }
 
-    pub async fn settle_after_revoke(&self, close: bool) -> Result<(), PortError> {
+    /// Settle or close the room after revocation. Returns `Ok(false)` if the
+    /// room's mailbox is already closed because it began stopping naturally;
+    /// callers should await `room.stopped()` before assuming durability.
+    pub async fn settle_after_revoke(&self, close: bool) -> Result<bool, PortError> {
         let (reply, received) = oneshot::channel();
         if self
             .send(RoomCommand::Revoked { close, reply })
             .await
             .is_err()
         {
-            return Err(operation_error(
-                b"collab_revocation_room_unavailable",
-                CommitEffect::NotCommitted,
-            ));
+            return Ok(false);
         }
-        received.await.map_err(|_| {
-            operation_error(b"collab_revocation_room_stopped", CommitEffect::Unknown)
-        })?
+        match received.await {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(operation_error(
+                b"collab_revocation_room_stopped",
+                CommitEffect::Unknown,
+            )),
+        }
+    }
+
+    /// Gracefully settle and close the room during hub shutdown.
+    pub async fn shutdown(&self, budget: CallBudget) -> Result<bool, PortError> {
+        let (reply, received) = oneshot::channel();
+        if self
+            .send(RoomCommand::Shutdown { budget, reply })
+            .await
+            .is_err()
+        {
+            return Ok(false);
+        }
+        match received.await {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(operation_error(
+                b"collab_shutdown_room_stopped",
+                CommitEffect::Unknown,
+            )),
+        }
     }
 }
 
@@ -169,9 +222,10 @@ struct Peer {
 pub(crate) struct Room {
     store: CanonicalStore,
     config: CollabConfig,
-    hub: std::sync::Weak<HubInner>,
+    hub: Weak<HubInner>,
     lease: Arc<RoomLease>,
     slug: watch::Sender<String>,
+    last_self_seq: Arc<AtomicU64>,
     twin: TwinDoc,
     carrier: RoomCarrierState,
     last_seq: u64,
@@ -201,6 +255,7 @@ impl Room {
         });
         let (commands, receiver) = mpsc::channel(MAILBOX_CAPACITY);
         let (slug, file) = watch::channel(slug);
+        let last_self_seq = Arc::new(AtomicU64::new(record.updated_seq.get()));
         let handle = RoomHandle {
             lease: lease.clone(),
             commands,
@@ -208,6 +263,7 @@ impl Room {
             slug: file,
             peers_changed: Arc::new(Notify::new()),
             storage_changed: Arc::new(Notify::new()),
+            last_self_seq: Arc::clone(&last_self_seq),
         };
         let dirty = record.carrier_dirty.then(Instant::now);
         let mut room = Self {
@@ -216,6 +272,7 @@ impl Room {
             hub: Arc::downgrade(hub),
             lease,
             slug,
+            last_self_seq,
             twin: prepared.twin,
             carrier: prepared.carrier,
             last_seq: 0,
@@ -273,6 +330,37 @@ impl Room {
         )
     }
 
+    /// Close the mailbox before shutting down and reply cleanly to buffered
+    /// commands so intercepted callers fall back to the closed-room path
+    /// instead of receiving `CommitEffect::Unknown`.
+    fn drain_on_close(
+        &mut self,
+        commands: &mut mpsc::Receiver<RoomCommand>,
+        pending_cmd: Option<RoomCommand>,
+    ) -> Vec<oneshot::Sender<Result<(), PortError>>> {
+        commands.close();
+        let mut waiters = Vec::new();
+        let mut handle = |cmd: RoomCommand| match cmd {
+            RoomCommand::Join { reply, .. } => {
+                let _ = reply.send(JoinOutcome::RoomClosing);
+            }
+            RoomCommand::Intercept { request, reply, .. } => {
+                let _ = reply.send(InterceptReply::RoomClosingNotStarted(request));
+            }
+            RoomCommand::Revoked { reply, .. } | RoomCommand::Shutdown { reply, .. } => {
+                waiters.push(reply);
+            }
+            RoomCommand::Frame { .. } => {}
+        };
+        if let Some(cmd) = pending_cmd {
+            handle(cmd);
+        }
+        while let Ok(cmd) = commands.try_recv() {
+            handle(cmd);
+        }
+        waiters
+    }
+
     async fn run(
         &mut self,
         mut commands: mpsc::Receiver<RoomCommand>,
@@ -282,6 +370,7 @@ impl Room {
         let mut next_command = None;
         loop {
             if shutdown.is_cancelled() {
+                let _ = self.drain_on_close(&mut commands, next_command.take());
                 return Ok(());
             }
             let command = if let Some(command) = next_command.take() {
@@ -292,7 +381,10 @@ impl Room {
                     .empty_since
                     .map(|since| since + self.config.idle_unload);
                 tokio::select! {
-                    () = shutdown.cancelled() => return Ok(()),
+                    () = shutdown.cancelled() => {
+                        let _ = self.drain_on_close(&mut commands, None);
+                        return Ok(());
+                    }
                     () = handle.storage_changed.notified() => {
                         self.revalidate().await?;
                         continue;
@@ -300,12 +392,23 @@ impl Room {
                     () = handle.peers_changed.notified() => {
                         if self.reap_peers() {
                             self.carrier.last_writer_auth = None;
+                            self.carrier.last_writer_peer = None;
                             self.checkpoint(&self.budget()).await?;
                         }
                         continue;
                     }
                     () = wait_for(unload_at) => {
-                        self.close(&self.budget()).await?;
+                        let waiters = self.drain_on_close(&mut commands, None);
+                        let res = self.close(&self.budget()).await;
+                        for waiter in waiters {
+                            let _ = waiter.send(res.as_ref().copied().map_err(|_| {
+                                operation_error(
+                                    b"collab_idle_close_failed",
+                                    CommitEffect::Unknown,
+                                )
+                            }));
+                        }
+                        res?;
                         return Ok(());
                     }
                     () = wait_for(checkpoint_at) => {
@@ -327,26 +430,38 @@ impl Room {
                     reply,
                     deadline,
                 } => {
-                    let accepted = self.join(id, *ctx, role, outbound, deadline).await;
-                    let _ = reply.send(accepted);
+                    let outcome = self.join(id, *ctx, role, outbound, deadline).await;
+                    let _ = reply.send(outcome);
                 }
                 RoomCommand::Frame { id, frame } => {
                     let mut batch = Vec::new();
                     self.handle_frame(id, &frame, &mut batch).await?;
-                    let coalesce = Instant::now() + self.config.intercept_coalesce;
+                    let coalesce = Instant::now() + self.config.wal_coalesce;
+                    let has_multiple_editors = self
+                        .peers
+                        .values()
+                        .filter(|peer| peer.role == PeerRole::Editor)
+                        .take(2)
+                        .count()
+                        > 1;
                     let mut frames = 1;
                     while frames < MAILBOX_CAPACITY && batch.len() < WAL_GROUP_SIZE {
-                        let command =
-                            if batch.is_empty() || self.config.intercept_coalesce.is_zero() {
-                                commands.try_recv().ok()
-                            } else {
-                                tokio::select! {
-                                    biased;
-                                    () = shutdown.cancelled() => return Ok(()),
-                                    () = sleep_until(coalesce) => None,
-                                    command = commands.recv() => command,
+                        let command = if batch.is_empty()
+                            || self.config.wal_coalesce.is_zero()
+                            || !has_multiple_editors
+                        {
+                            commands.try_recv().ok()
+                        } else {
+                            tokio::select! {
+                                biased;
+                                () = shutdown.cancelled() => {
+                                    let _ = self.drain_on_close(&mut commands, None);
+                                    return Ok(());
                                 }
-                            };
+                                () = sleep_until(coalesce) => None,
+                                command = commands.recv() => command,
+                            }
+                        };
                         match command {
                             Some(RoomCommand::Frame { id, frame }) => {
                                 self.handle_frame(id, &frame, &mut batch).await?;
@@ -370,10 +485,10 @@ impl Room {
                 } => {
                     request.context.budget.remaining =
                         deadline.saturating_duration_since(Instant::now());
-                    let result = self.intercept_command(*request).await;
-                    let poison = result.as_ref().err().is_some_and(unknown);
-                    let _ = reply.send(result);
-                    if poison {
+                    let outcome = self.intercept_command(*request).await;
+                    let _ = reply.send(InterceptReply::Result(outcome.reply));
+                    if outcome.poison_room {
+                        let _ = self.drain_on_close(&mut commands, next_command.take());
                         return Err(operation_error(
                             b"collab_command_unresolved",
                             CommitEffect::Unknown,
@@ -383,16 +498,32 @@ impl Room {
                 RoomCommand::Revoked { close, reply } => {
                     self.reap_peers();
                     self.carrier.last_writer_auth = None;
-                    let result = if close {
+                    self.carrier.last_writer_peer = None;
+                    let waiters = if close {
                         for peer in self.peers.values() {
                             peer.outbound.guard.close(SessionClose::POLICY);
                         }
+                        self.drain_on_close(&mut commands, next_command.take())
+                    } else {
+                        Vec::new()
+                    };
+                    let result = if close {
                         self.close(&self.budget()).await
                     } else {
                         self.checkpoint(&self.budget()).await
                     };
                     let failed = result.is_err();
                     let _ = reply.send(result);
+                    for waiter in waiters {
+                        let _ = waiter.send(if failed {
+                            Err(operation_error(
+                                b"collab_revocation_checkpoint",
+                                CommitEffect::Unknown,
+                            ))
+                        } else {
+                            Ok(())
+                        });
+                    }
                     if failed {
                         return Err(operation_error(
                             b"collab_revocation_checkpoint",
@@ -402,6 +533,32 @@ impl Room {
                     if close {
                         return Ok(());
                     }
+                }
+                RoomCommand::Shutdown { budget, reply } => {
+                    for peer in self.peers.values() {
+                        peer.outbound.guard.close(SessionClose::GOING_AWAY);
+                    }
+                    let waiters = self.drain_on_close(&mut commands, next_command.take());
+                    let result = self.close(&budget).await;
+                    let failed = result.is_err();
+                    let _ = reply.send(result);
+                    for waiter in waiters {
+                        let _ = waiter.send(if failed {
+                            Err(operation_error(
+                                b"collab_shutdown_close",
+                                CommitEffect::Unknown,
+                            ))
+                        } else {
+                            Ok(())
+                        });
+                    }
+                    if failed {
+                        return Err(operation_error(
+                            b"collab_shutdown_close",
+                            CommitEffect::Unknown,
+                        ));
+                    }
+                    return Ok(());
                 }
             }
         }
@@ -420,19 +577,22 @@ impl Room {
         role: PeerRole,
         outbound: PeerOutbound,
         deadline: Instant,
-    ) -> bool {
-        if self.peers.len() >= MAX_PEERS || outbound.guard.check().is_err() {
-            return false;
+    ) -> JoinOutcome {
+        if self.peers.len() >= MAX_PEERS {
+            return JoinOutcome::CapacityExceeded;
+        }
+        if outbound.guard.check().is_err() {
+            return JoinOutcome::Denied;
         }
         ctx.budget.remaining = deadline.saturating_duration_since(Instant::now());
         let Ok(facts) = self.refresh_metadata(&ctx.budget).await else {
-            return false;
+            return JoinOutcome::Denied;
         };
         if Instant::now() >= deadline
             || !is_authorized(&ctx, role, &facts)
             || outbound.guard.check().is_err()
         {
-            return false;
+            return JoinOutcome::Denied;
         }
         let ready = LineageReady {
             history_incarnation: self.lease.scope.incarnation,
@@ -452,14 +612,14 @@ impl Room {
                 )
                 .is_err()
         {
-            return false;
+            return JoinOutcome::Denied;
         }
         if let Some(presence) = self.presence.snapshot()
             && outbound
                 .send(encode_awareness(&presence), self.lease.authority(role))
                 .is_err()
         {
-            return false;
+            return JoinOutcome::Denied;
         }
         self.peers.insert(
             id,
@@ -471,7 +631,7 @@ impl Room {
             },
         );
         self.empty_since = None;
-        true
+        JoinOutcome::Accepted
     }
 
     async fn revalidate(&mut self) -> Result<(), PortError> {
@@ -483,6 +643,7 @@ impl Room {
         }
         if self.reap_peers() {
             self.carrier.last_writer_auth = None;
+            self.carrier.last_writer_peer = None;
             self.checkpoint(&self.budget()).await?;
         }
         Ok(())
@@ -508,6 +669,14 @@ impl Room {
             }
             alive
         });
+        if self
+            .carrier
+            .last_writer_peer
+            .is_some_and(|writer| left.contains(&writer))
+        {
+            self.carrier.last_writer_auth = None;
+            self.carrier.last_writer_peer = None;
+        }
         for id in left {
             if let Some(update) = self.presence.remove_peer(id) {
                 self.broadcast(encode_awareness(&update));
@@ -561,7 +730,10 @@ impl Room {
             let role = peer.role;
             match message {
                 InboundMessage::SyncStep1(state) => {
-                    let Ok(state) = state.decode() else {
+                    self.flush_batch(batch).await?;
+                    bytes = 0;
+                    let Ok(state) = state.decode_known(|client| self.twin.has_client(client))
+                    else {
                         return self
                             .close_after_batch(
                                 id,
@@ -573,8 +745,6 @@ impl Room {
                             )
                             .await;
                     };
-                    self.flush_batch(batch).await?;
-                    bytes = 0;
                     if let Some(peer) = self.peers.get(&id) {
                         let update = self.twin.sync_step2(&state);
                         let _ = peer
@@ -651,6 +821,27 @@ impl Room {
             return Ok(None);
         };
         if peer.role != PeerRole::Editor || peer.outbound.guard.check().is_err() {
+            return Ok(None);
+        }
+        // An empty y-sync update (e.g. SyncStep2 confirmation) advances the
+        // peer's write watermark and ACKs with the current durable room seq
+        // after flushing preceding edits, without inserting a no-op WAL row.
+        if original == [0, 0] {
+            let Some(next) = peer.write_seq.checked_add(1) else {
+                return Err(DomainError::validation(ValidationReason::SequenceOverflow).into());
+            };
+            peer.write_seq = next;
+            self.flush_batch(prefix).await?;
+            let ack = ServerAckWatermark {
+                lease_epoch: self.lease.epoch,
+                peer_write_seq: next,
+                room_update_seq: self.last_seq,
+            };
+            if let Some(peer) = self.peers.get(&id) {
+                let _ = peer
+                    .outbound
+                    .send(ack.encode(), self.lease.authority(PeerRole::Editor));
+            }
             return Ok(None);
         }
         match self
@@ -791,11 +982,16 @@ impl Room {
                 CommitEffect::Unknown,
             ));
         }
-        let mut update_frame = Vec::new();
+        let mut chunks: Vec<Arc<Vec<u8>>> = Vec::new();
+        let mut current = Vec::new();
         let mut acknowledgments: HashMap<u64, Vec<u8>> = HashMap::new();
         for (index, write) in writes.iter().enumerate() {
             self.twin.publish(&write.staged).map_err(invalid_state)?;
-            update_frame.extend(encode_update(&write.staged));
+            let encoded_len = write.staged.len().saturating_add(12);
+            if !current.is_empty() && current.len().saturating_add(encoded_len) > MAX_FRAME_BYTES {
+                chunks.push(Arc::new(std::mem::take(&mut current)));
+            }
+            encode_update_into(&mut current, &write.staged);
             let ack = ServerAckWatermark {
                 lease_epoch: self.lease.epoch,
                 peer_write_seq: write.peer_seq,
@@ -806,16 +1002,57 @@ impl Room {
                 .or_default()
                 .extend(ack.encode());
             self.carrier.last_writer_auth = Some(write.auth.clone());
+            self.carrier.last_writer_peer = Some(write.peer);
+        }
+        if !current.is_empty() {
+            chunks.push(Arc::new(current));
         }
         self.last_seq = seq;
         self.updates_since_checkpoint += writes.len() as u64;
         self.mark_dirty();
-        self.broadcast(update_frame);
-        for (id, frame) in acknowledgments {
-            if let Some(peer) = self.peers.get(&id) {
-                let _ = peer
-                    .outbound
-                    .send(frame, self.lease.authority(PeerRole::Editor));
+
+        for (&peer_id, peer) in &self.peers {
+            if let Some(ack_bytes) = acknowledgments.get(&peer_id) {
+                // Combine the author's Update and ServerAckWatermark into a
+                // single compound binary frame when it fits within MAX_FRAME_BYTES,
+                // halving author outbound frames and per-frame authorization checks.
+                if chunks.len() == 1
+                    && chunks[0].len().saturating_add(ack_bytes.len()) <= MAX_FRAME_BYTES
+                {
+                    let mut combined = Vec::with_capacity(chunks[0].len() + ack_bytes.len());
+                    combined.extend_from_slice(&chunks[0]);
+                    combined.extend_from_slice(ack_bytes);
+                    let _ = peer
+                        .outbound
+                        .send(combined, self.lease.authority(peer.role));
+                    continue;
+                }
+                let mut ok = true;
+                for chunk in &chunks {
+                    if peer
+                        .outbound
+                        .send(Arc::clone(chunk), self.lease.authority(peer.role))
+                        .is_err()
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    let _ = peer
+                        .outbound
+                        .send(ack_bytes.clone(), self.lease.authority(PeerRole::Editor));
+                }
+            } else {
+                for chunk in &chunks {
+                    if peer
+                        .outbound
+                        .send(Arc::clone(chunk), self.lease.authority(peer.role))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
         Ok(())

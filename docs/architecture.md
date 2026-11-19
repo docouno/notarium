@@ -50,7 +50,7 @@ tests invoke compiled binaries as external processes. HTTP cannot directly impor
 canonical/projections/search/jobs. Agents cannot directly depend on `tantivy`,
 `ort` or `yrs`. Core has no internal dependencies or I/O behavior. A separate
 native gate rejects parser, storage and runtime dependencies in core, including
-renamed, optional, target, development and build declarations. Core, syntax and canonical all use `forbid(unsafe_code)` so inner modules cannot
+renamed, optional, target, development and build declarations. Core, syntax, canonical and collab all use `forbid(unsafe_code)` so inner modules cannot
 override the workspace rule.
 
 Native tests inspect `cargo metadata --no-deps` using package identities and paths,

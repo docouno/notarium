@@ -8,9 +8,9 @@ use notarium_core::{
     model::{HistoryScope, Lifecycle},
     ports::{
         BoardMoveFacts, BoardMoveResult, ClosedRoomReservation, Committed, EvaluatedBoardRow,
-        GroupKey, InterceptedMutation, InterceptedPayload, InterceptionResult, MoveBoardCard,
-        Mutation, NoteRevision, Preconditions, RankExpectation, SemanticPlacement, SpaceContext,
-        ViewRef,
+        GroupKey, InterceptedMutation, InterceptedOutcome, InterceptedPayload, InterceptionResult,
+        MoveBoardCard, Mutation, NoteRevision, Preconditions, RankExpectation, SemanticPlacement,
+        SpaceContext, ViewRef,
     },
     receipt::{CommandIdentity, MutationReceiptToken},
     value::Timestamp,
@@ -41,7 +41,7 @@ use crate::{
         },
         notes::{
             PreparedCarrierInfo, RoomCommandSettlement, analyze_and_prepare_carrier,
-            applied_outcome, changed_revision_fields_tx, prepare_room_command, replay_command,
+            changed_revision_fields_tx, prepare_room_command, replay_command,
             try_replay_completed_receipt,
         },
     },
@@ -1032,28 +1032,15 @@ pub(crate) async fn move_board_card_impl(
                 )
             };
             match response.map_err(|err| if dispatched { unknown(err) } else { err })?? {
-                InterceptionResult::Applied(receipt) => {
-                    ctx.budget.remaining = deadline.remaining(&ctx.budget).map_err(unknown)?;
-                    return deadline
-                        .wait(&ctx.budget, || {
-                            applied_outcome(
-                                store,
-                                &ctx,
-                                &idemp,
-                                receipt,
-                                |row: StoredCommittedBoardMoveV1| {
-                                    (row.revision.note == request.input.note)
-                                        .then(|| row.into_committed())
-                                },
-                            )
-                        })
-                        .await
-                        .map_err(unknown)??
-                        .ok_or_else(super::notes::missing_applied_outcome);
-                }
-                InterceptionResult::SettleCarrier(_) => {
-                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
-                }
+                InterceptionResult::Applied(outcome) => match *outcome {
+                    InterceptedOutcome::BoardMove(committed)
+                        if committed.value.revision.note == request.input.note
+                            && committed.receipt.scope() == ctx.scope() =>
+                    {
+                        return Ok(committed);
+                    }
+                    _ => return Err(super::notes::missing_applied_outcome()),
+                },
                 InterceptionResult::Conflict(err) => {
                     let cursor_stale = matches!(
                         err,

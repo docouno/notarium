@@ -35,7 +35,6 @@ pub(super) struct Work {
     pub(super) generated_binary_bytes: usize,
     pub(super) wal_copy_bytes: usize,
     pub(super) carrier_projections: usize,
-    pub(super) carrier_body_input_bytes: usize,
     pub(super) nota_finalizations: usize,
     pub(super) nota_input_bytes: usize,
 }
@@ -91,7 +90,7 @@ impl Samples {
                 );
                 assert_eq!(work.update_elements, 1);
                 assert!(
-                    work.page_lookups <= 16 && work.utf16_writes <= 132,
+                    work.page_lookups <= 16 && work.utf16_writes <= body::PAGE_UNITS as usize + 4,
                     "{work:?}"
                 );
             }
@@ -134,6 +133,7 @@ struct Fixture {
     historical_deleted_units: u32,
     note: NoteId,
     carrier: RoomCarrierState,
+    base_body: String,
     twin: TwinDoc,
     writer: Replica,
     oracle: Replica,
@@ -142,15 +142,16 @@ struct Fixture {
 impl Fixture {
     fn new(kib: usize, shape: Shape, history: History) -> Self {
         let source = cases::carrier(kib, shape);
-        let carrier = RoomCarrierState::new(
+        let (carrier, base_body) = RoomCarrierState::from_carrier(
             RevisionId::from_bytes([77; 16]),
             content_digest(&source),
-            source,
+            &source,
         )
         .unwrap();
+        let base_body = base_body.to_owned();
         let note = NoteId::from_bytes([82; 16]);
-        let mut twin = TwinDoc::seed(carrier.body()).unwrap();
-        let pad = cases::history_offset(carrier.body());
+        let mut twin = TwinDoc::seed(&base_body).unwrap();
+        let pad = cases::history_offset(&base_body);
         for author in 0..history.authors {
             let historical = replica(&twin, cases::HISTORICAL_WRITER + author as u64);
             let bytes = version(&historical, |txn| {
@@ -161,7 +162,7 @@ impl Fixture {
             });
             twin.replay(&bytes).unwrap();
         }
-        assert_eq!(twin.live_body(), carrier.body());
+        assert_eq!(twin.live_body(), base_body);
         let snapshot = twin.live.doc.transact().snapshot();
         let prior_authors = snapshot.state_map.len() - 1;
         assert_eq!(prior_authors, history.authors);
@@ -182,6 +183,7 @@ impl Fixture {
             historical_deleted_units,
             note,
             carrier,
+            base_body,
             twin,
             writer,
             oracle,
@@ -309,7 +311,7 @@ impl Fixture {
 
     fn concurrent_fallback(&mut self) {
         let stale = replica(&self.twin, cases::COMPETING);
-        let middle = cases::typing(self.carrier.body(), self.shape)[1].position;
+        let middle = cases::typing(&self.base_body, self.shape)[1].position;
         let mut samples = Samples::default();
         for index in 0..=WARMUP + SAMPLES {
             // Each collision uses a fresh gap, away from the prose-middle
@@ -391,7 +393,7 @@ fn guard_campaign() {
         for history in HISTORIES {
             for shape in Shape::ALL {
                 let mut fixture = Fixture::new(kib, shape, history);
-                for typing in cases::typing(fixture.carrier.body(), shape) {
+                for typing in cases::typing(&fixture.base_body, shape) {
                     fixture.type_and_backspace(typing);
                 }
                 if shape == Shape::NearbyNota {

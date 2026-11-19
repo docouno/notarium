@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 
 use notarium_canonical::{
     AppendCollabUpdates, CanonicalStore, CheckpointCollabSession, CloseCollabSession,
@@ -17,12 +17,14 @@ use tokio::time::Instant;
 
 use crate::{
     carrier::RoomCarrierState,
-    crdt::TwinDoc,
+    crdt::{TwinDoc, replay_for_recovery},
     hub::{operation_error, unknown},
     wire::PolicyRejectReason,
 };
 
 use super::{Room, RoomLease};
+
+const SETTLE_CONFLICT_RETRIES: usize = 3;
 
 pub(crate) struct PreparedRoom {
     pub twin: TwinDoc,
@@ -30,16 +32,13 @@ pub(crate) struct PreparedRoom {
 }
 
 impl Room {
-    pub fn prepare(
-        admission: &NoteCollabAdmission,
-        note: &NoteId,
-    ) -> Result<PreparedRoom, PortError> {
-        let mut carrier = RoomCarrierState::new(
+    pub fn prepare(admission: &NoteCollabAdmission) -> Result<PreparedRoom, PortError> {
+        let (mut carrier, base_body) = RoomCarrierState::from_carrier(
             admission.head_rev_id.clone(),
             digest(&admission.carrier),
-            admission.carrier.clone(),
+            &admission.carrier,
         )?;
-        let twin = restore(&mut carrier, note, admission.session.as_ref())?;
+        let twin = restore(&mut carrier, base_body, admission.session.as_ref())?;
         Ok(PreparedRoom { twin, carrier })
     }
 
@@ -54,6 +53,7 @@ impl Room {
         self.last_dirty = None;
         self.updates_since_checkpoint = 0;
         self.carrier.last_writer_auth = None;
+        self.carrier.last_writer_peer = None;
     }
 
     pub async fn checkpoint(&mut self, budget: &CallBudget) -> Result<(), PortError> {
@@ -68,51 +68,82 @@ impl Room {
     }
 
     async fn settle(&mut self, budget: &CallBudget, close: bool) -> Result<(), PortError> {
-        // Metadata-only commits can advance the revision without changing the
-        // bytes on which the live body and overrides are based.
-        self.refresh_metadata(budget).await?;
+        // Metadata-only commits (rename/move/tags) can advance `head_rev_id`
+        // without changing the carrier bytes. Retry boundedly on RevisionConflict
+        // after refreshing metadata so the room does not needlessly fence.
         let fm = self.twin.live_overrides().map_err(invalid_state)?;
         let body = self.twin.live_body();
         let final_carrier = self.carrier.materialize(&body, &fm)?;
-        let same = final_carrier == self.carrier.base_carrier;
-        let snapshot = self.twin.live_snapshot();
-        let settle = |actor| {
-            (!same).then(|| CollabCarrierSettlement {
+        let final_digest = digest(&final_carrier);
+        let same = final_digest == self.carrier.carrier_blob_blake3;
+        let mut snapshot = Some(self.twin.live_snapshot());
+
+        let mut last_err = None;
+        for attempt in 0..SETTLE_CONFLICT_RETRIES {
+            self.refresh_metadata(budget).await?;
+            let can_fallback_actor = !same && self.carrier.last_writer_auth.is_some();
+            let may_retry_conflict = attempt + 1 < SETTLE_CONFLICT_RETRIES;
+            let keep_snapshot = can_fallback_actor || may_retry_conflict;
+            let actor = self
+                .carrier
+                .last_writer_auth
+                .clone()
+                .map_or_else(recovery, CollabSettlementActor::writer);
+            let settlement = (!same).then(|| CollabCarrierSettlement {
                 actor,
                 carrier: final_carrier.clone(),
-            })
-        };
-        let applied = self
-            .commit_checkpoint(
-                budget,
-                close,
-                snapshot.clone(),
-                same,
-                settle(
-                    self.carrier
-                        .last_writer_auth
-                        .clone()
-                        .map_or_else(recovery, CollabSettlementActor::writer),
-                ),
-            )
-            .await;
-        let applied = match applied {
-            Err(PortError::Domain(DomainError::AccessDenied | DomainError::SpaceReadOnly))
-                if !same && self.carrier.last_writer_auth.is_some() =>
-            {
-                self.commit_checkpoint(budget, close, snapshot, false, settle(recovery()))
-                    .await?
+            });
+            let snap_for_call = if keep_snapshot {
+                snapshot.as_ref().expect("retained snapshot").clone()
+            } else {
+                snapshot.take().expect("retained snapshot")
+            };
+            let applied = self
+                .commit_checkpoint(budget, close, snap_for_call, same, settlement)
+                .await;
+            let applied = match applied {
+                Err(PortError::Domain(DomainError::AccessDenied | DomainError::SpaceReadOnly))
+                    if can_fallback_actor =>
+                {
+                    let fallback = (!same).then(|| CollabCarrierSettlement {
+                        actor: recovery(),
+                        carrier: final_carrier.clone(),
+                    });
+                    let fallback_snap = if may_retry_conflict {
+                        snapshot.as_ref().expect("retained snapshot").clone()
+                    } else {
+                        snapshot.take().expect("retained snapshot")
+                    };
+                    self.commit_checkpoint(budget, close, fallback_snap, false, fallback)
+                        .await
+                }
+                result => result,
+            };
+            match applied {
+                Ok(applied) => {
+                    self.last_self_seq
+                        .store(applied.updated_seq.get(), Ordering::Release);
+                    self.carrier.advance(
+                        applied.carrier_rev_id,
+                        final_digest,
+                        &final_carrier,
+                        fm,
+                    )?;
+                    self.settled();
+                    return Ok(());
+                }
+                Err(PortError::Domain(DomainError::RevisionConflict { .. }))
+                    if may_retry_conflict =>
+                {
+                    last_err = Some(PortError::Domain(DomainError::RevisionConflict {
+                        current: self.carrier.carrier_rev_id.clone(),
+                        lineage: Some(self.lease.lineage),
+                    }));
+                }
+                Err(error) => return Err(error),
             }
-            result => result?,
-        };
-        self.carrier.advance(
-            applied.carrier_rev_id,
-            digest(&final_carrier),
-            final_carrier,
-            fm,
-        )?;
-        self.settled();
-        Ok(())
+        }
+        Err(last_err.expect("at least one attempt ran"))
     }
 
     async fn commit_checkpoint(
@@ -201,13 +232,15 @@ impl Room {
         budget: &CallBudget,
         writes: &[PendingUpdate],
     ) -> Result<u64, PortError> {
-        let spec = AppendCollabUpdates {
-            scope: self.lease.scope.clone(),
-            note: self.lease.note.clone(),
-            owner_id: self.lease.owner.to_string(),
-            expected_lease: self.lease.epoch,
-            expected_lineage: self.lease.lineage,
-            updates: self.wal_entries(writes)?,
+        let build_spec = || -> Result<AppendCollabUpdates, PortError> {
+            Ok(AppendCollabUpdates {
+                scope: self.lease.scope.clone(),
+                note: self.lease.note.clone(),
+                owner_id: self.lease.owner.to_string(),
+                expected_lease: self.lease.epoch,
+                expected_lineage: self.lease.lineage,
+                updates: self.wal_entries(writes)?,
+            })
         };
         let mut authors: Vec<_> = writes.iter().map(|write| write.peer).collect();
         authors.sort_unstable();
@@ -239,7 +272,7 @@ impl Room {
         };
         let first = self
             .store
-            .append_collab_updates_with_admission(budget, spec.clone(), &admit)
+            .append_collab_updates_with_admission(budget, build_spec()?, &admit)
             .await;
         if first.as_ref().err().is_none_or(|error| !unknown(error)) {
             return first;
@@ -247,7 +280,7 @@ impl Room {
         // The exact replay must enter the same ordered writer as the first
         // submission. A snapshot read can run ahead of an unresolved commit.
         self.store
-            .append_collab_updates_with_admission(&self.budget(), spec, &admit)
+            .append_collab_updates_with_admission(&self.budget(), build_spec()?, &admit)
             .await
             .map_err(|error| {
                 // A rejected retry does not certify the first write was rejected.
@@ -315,14 +348,30 @@ pub(crate) async fn recover_fenced(
         return Ok(false);
     };
     let collab = input.session;
-    let mut carrier =
-        RoomCarrierState::new(input.head_rev_id, digest(&input.carrier), input.carrier)?;
-    let twin = restore(&mut carrier, note, Some(&collab))?;
-    let final_carrier = carrier.materialize(
-        &twin.live_body(),
-        &twin.live_overrides().map_err(invalid_state)?,
-    )?;
-    let same = final_carrier == carrier.base_carrier;
+    let (mut carrier, base_body) =
+        RoomCarrierState::from_carrier(input.head_rev_id, digest(&input.carrier), &input.carrier)?;
+    let updates: Vec<&[u8]> = collab
+        .updates
+        .iter()
+        .map(|entry| entry.update_bytes.as_slice())
+        .collect();
+    let replay = replay_for_recovery(
+        base_body,
+        collab.session.yrs_snapshot_blob.as_deref(),
+        &updates,
+    )
+    .map_err(|_| {
+        if collab.session.yrs_snapshot_blob.is_none() && !updates.is_empty() {
+            DomainError::validation(ValidationReason::NotReady).into()
+        } else {
+            invalid_state(PolicyRejectReason::MalformedUpdate)
+        }
+    })?;
+    if collab.session.yrs_snapshot_blob.is_some() {
+        carrier.restore_applied_fm(&replay.snapshot_overrides, collab.session.carrier_dirty);
+    }
+    let final_carrier = carrier.materialize(&replay.final_body, &replay.final_overrides)?;
+    let same = carrier.matches_base(&final_carrier);
     store
         .close_collab_session(
             budget,
@@ -332,7 +381,7 @@ pub(crate) async fn recover_fenced(
                 owner_id: None,
                 expected_lease: collab.session.lease_epoch,
                 expected_lineage: collab.session.lineage_epoch,
-                final_yrs_snapshot: Some(twin.live_snapshot()),
+                final_yrs_snapshot: Some(replay.final_snapshot),
                 compacted_through_update_seq: Some(0),
                 carrier_settlement: (!same).then(|| CollabCarrierSettlement {
                     actor: recovery(),
@@ -347,25 +396,30 @@ pub(crate) async fn recover_fenced(
 
 fn restore(
     carrier: &mut RoomCarrierState,
-    _note: &NoteId,
+    base_body: &str,
     session: Option<&CollabSessionSnapshot>,
 ) -> Result<TwinDoc, PortError> {
     let Some(session) = session else {
-        return TwinDoc::seed(carrier.body()).map_err(invalid_state);
+        return TwinDoc::seed(base_body).map_err(invalid_state);
     };
     let Some(snapshot) = &session.session.yrs_snapshot_blob else {
         if !session.updates.is_empty() {
             return Err(DomainError::validation(ValidationReason::NotReady).into());
         }
-        return TwinDoc::seed(carrier.body()).map_err(invalid_state);
+        return TwinDoc::seed(base_body).map_err(invalid_state);
     };
     let mut twin = TwinDoc::restore(snapshot).map_err(invalid_state)?;
     carrier.restore_applied_fm(
         &twin.live_overrides().map_err(invalid_state)?,
         session.session.carrier_dirty,
     );
-    for entry in &session.updates {
-        twin.replay(&entry.update_bytes).map_err(invalid_state)?;
+    if !session.updates.is_empty() {
+        let updates: Vec<&[u8]> = session
+            .updates
+            .iter()
+            .map(|entry| entry.update_bytes.as_slice())
+            .collect();
+        twin.replay_batch(&updates).map_err(invalid_state)?;
     }
     Ok(twin)
 }

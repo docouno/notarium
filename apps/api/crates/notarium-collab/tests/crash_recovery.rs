@@ -96,16 +96,11 @@ async fn crash_child() {
     let structural = create_note(&store, &owner, 106, "Draft.\n", None).await;
 
     let no_checkpoint = Duration::from_secs(3_600);
-    let hub = CollabHub::new(
-        store.clone(),
-        notarium_collab::CollabConfig {
-            idle_checkpoint: no_checkpoint,
-            periodic_checkpoint: no_checkpoint,
-            idle_unload: no_checkpoint,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut cfg = notarium_collab::CollabConfig::default();
+    cfg.idle_checkpoint = no_checkpoint;
+    cfg.periodic_checkpoint = no_checkpoint;
+    cfg.idle_unload = no_checkpoint;
+    let hub = CollabHub::new(store.clone(), cfg).unwrap();
     let (mut writer, _) = synced_client(&hub, &owner, &initial.note, 210).await;
     assert_eq!(writer.text(), INITIAL);
     writer.send_update(&writer.append(APPEND)).await;
@@ -177,15 +172,10 @@ async fn crash_child() {
             .await
             .unwrap();
         if seed == CLEAN {
-            let warm = CollabHub::new(
-                store.clone(),
-                notarium_collab::CollabConfig {
-                    idle_checkpoint: Duration::from_millis(20),
-                    idle_unload: Duration::from_millis(50),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+            let mut warm_cfg = notarium_collab::CollabConfig::default();
+            warm_cfg.idle_checkpoint = Duration::from_millis(20);
+            warm_cfg.idle_unload = Duration::from_millis(50);
+            let warm = CollabHub::new(store.clone(), warm_cfg).unwrap();
             let (warming_peer, _) = synced_client(&warm, &owner, &note, 216).await;
             drop(warming_peer);
             wait_until(async || warm.active_room_count() == 0).await;

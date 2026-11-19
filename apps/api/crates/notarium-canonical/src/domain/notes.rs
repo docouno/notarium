@@ -19,9 +19,10 @@ use notarium_core::{
     ports::{
         AcceptBatch, AppendMemory, BatchItem, BatchResult, Committed, CreateNote,
         DeleteDisposition, DeleteNote, EditNote, ExternalObservation, ExternalObservationResult,
-        FilenamePin, GetNote, InterceptedMutation, InterceptedPayload, InterceptionResult, Link,
-        LinkBatch, LinkTarget, MemoryTarget, MoveNote, Mutation, NoteCard, NoteRevision,
-        NoteSnapshot, ObservedContent, Preconditions, RenameNote, SpaceContext,
+        FilenamePin, GetNote, InterceptedMutation, InterceptedOutcome, InterceptedPayload,
+        InterceptionResult, Link, LinkBatch, LinkTarget, MemoryTarget, MoveNote, Mutation,
+        NoteCard, NoteRevision, NoteSnapshot, ObservedContent, Preconditions, RenameNote,
+        SpaceContext,
     },
     query::{FieldObservation, FieldValue},
     receipt::{CausalBasis, CommandIdentity, MutationReceiptToken},
@@ -1202,91 +1203,73 @@ pub(crate) async fn edit_note_impl(
     if let Some(interceptor) = store.inner.collab_interceptor.get()
         && base_head.doc_class == DocClass::UserDoc
     {
-        let (body_plan, header_mut) = build_collab_edit_payload(
+        if let Some(res) = interceptor.try_closed_room_reservation(
+            ctx.scope(),
             &request.input.note,
-            &base_carrier,
-            &new_carrier,
-            &request.input.plan,
-            base_head.doc_class,
-            &base_head.head_rev_id,
-        )?;
-        ctx.budget.remaining = deadline.remaining(&budget)?;
-        let mut dispatched = false;
-        let response = deadline
-            .wait(&budget, || async {
-                dispatched = true;
-                interceptor
-                    .intercept(InterceptedMutation {
-                        context: ctx.clone(),
-                        identity: request.identity.clone(),
-                        preconditions: request.preconditions.clone(),
-                        payload: InterceptedPayload::EditNote {
-                            note: request.input.note.clone(),
-                            plan: request.input.plan.clone(),
-                            body: body_plan,
-                            header: header_mut,
-                        },
-                    })
-                    .await
-            })
-            .await;
-        let unknown = || {
-            crate::codec::unknown_commit_outcome(
-                "edit_room_outcome_unknown",
-                "the room may have applied the note edit",
-            )
-        };
-        match response.map_err(|err| if dispatched { unknown() } else { err })?? {
-            InterceptionResult::Applied(receipt) => {
-                ctx.budget.remaining = deadline.remaining(&budget).map_err(|_| unknown())?;
-                let outcome = deadline
-                    .wait(&budget, || {
-                        applied_outcome(
-                            store,
-                            &ctx,
-                            &idemp,
-                            receipt,
-                            |row: StoredCommittedNoteRevV1| {
-                                (row.value.note == request.input.note).then(|| row.into_committed())
+            &request.identity,
+        ) {
+            reservation_opt = Some(CarrierRoomWrite::Reserved(res));
+        } else {
+            let (body_plan, header_mut) = build_collab_edit_payload(
+                &request.input.note,
+                &base_carrier,
+                &new_carrier,
+                &request.input.plan,
+                base_head.doc_class,
+                &base_head.head_rev_id,
+            )?;
+            ctx.budget.remaining = deadline.remaining(&budget)?;
+            let mut dispatched = false;
+            let response = deadline
+                .wait(&budget, || async {
+                    dispatched = true;
+                    interceptor
+                        .intercept(InterceptedMutation {
+                            context: ctx.clone(),
+                            identity: request.identity.clone(),
+                            preconditions: request.preconditions.clone(),
+                            payload: InterceptedPayload::EditNote {
+                                note: request.input.note.clone(),
+                                plan: request.input.plan.clone(),
+                                body: body_plan,
+                                header: header_mut,
                             },
+                        })
+                        .await
+                })
+                .await;
+            let unknown = || {
+                crate::codec::unknown_commit_outcome(
+                    "edit_room_outcome_unknown",
+                    "the room may have applied the note edit",
+                )
+            };
+            match response.map_err(|err| if dispatched { unknown() } else { err })?? {
+                InterceptionResult::Applied(outcome) => match *outcome {
+                    InterceptedOutcome::NoteRevision(committed)
+                        if committed.value.note == request.input.note
+                            && committed.receipt.scope() == ctx.scope() =>
+                    {
+                        return Ok(committed);
+                    }
+                    _ => return Err(missing_applied_outcome()),
+                },
+                InterceptionResult::Conflict(err) => {
+                    // A concurrent attempt can commit after phase one and before the room
+                    // checks this request's original body identity.
+                    if matches!(err, DomainError::RevisionConflict { .. })
+                        && let Some(replayed) = replay_command::<StoredCommittedNoteRevV1>(
+                            store, &ctx, deadline, &idemp,
                         )
-                    })
-                    .await
-                    .map_err(|_| unknown())?;
-                deadline.remaining(&budget).map_err(|_| unknown())?;
-                return outcome?.ok_or_else(missing_applied_outcome);
-            }
-            InterceptionResult::SettleCarrier(accepted) => {
-                let transition = crate::peers::RoomCarrierTransition::from(accepted);
-                ctx.budget.remaining = deadline.remaining(&budget)?;
-                deadline
-                    .wait(&budget, || {
-                        transition.check_before_staging(
-                            store,
-                            &ctx.budget,
-                            ctx.scope(),
-                            &request.input.note,
-                            ctx.auth(),
-                            Some(&base_head.head_rev_id),
-                        )
-                    })
-                    .await??;
-                reservation_opt = Some(CarrierRoomWrite::Accepted(transition));
-            }
-            InterceptionResult::Conflict(err) => {
-                // A concurrent attempt can commit after phase one and before the room
-                // checks this request's original body identity.
-                if matches!(err, DomainError::RevisionConflict { .. })
-                    && let Some(replayed) =
-                        replay_command::<StoredCommittedNoteRevV1>(store, &ctx, deadline, &idemp)
-                            .await?
-                {
-                    return Ok(replayed.into_committed());
+                        .await?
+                    {
+                        return Ok(replayed.into_committed());
+                    }
+                    return Err(err.into());
                 }
-                return Err(err.into());
-            }
-            InterceptionResult::ClosedRoomReservation(res) => {
-                reservation_opt = Some(CarrierRoomWrite::Reserved(res));
+                InterceptionResult::ClosedRoomReservation(res) => {
+                    reservation_opt = Some(CarrierRoomWrite::Reserved(res));
+                }
             }
         }
     }
@@ -1309,7 +1292,11 @@ pub(crate) async fn edit_note_impl(
         })
         .await??;
 
-    if store.is_sqlite_local() && reservation_opt.is_none() {
+    if store.is_sqlite_local() && !matches!(reservation_opt, Some(CarrierRoomWrite::Accepted(_))) {
+        let closed_reservation = match reservation_opt {
+            Some(CarrierRoomWrite::Reserved(res)) => Some(res),
+            _ => None,
+        };
         let phase1_cached = base_anc.map(|anc| (base_head.clone(), anc));
         let (intent, fast_plan) = crate::sqlite_fast::build_carrier_replacement_fast_intent(
             store,
@@ -1325,6 +1312,7 @@ pub(crate) async fn edit_note_impl(
             None,
             info,
             ticket,
+            closed_reservation,
             phase1_receipt_checked_gen,
             phase1_cached,
         )?;
@@ -5153,64 +5141,21 @@ pub(crate) async fn accept_external_observation_impl(
             () = tokio::time::sleep_until(deadline.at) => return Err(unknown()),
         };
         match reply {
-            InterceptionResult::Applied(receipt) => {
-                ctx.budget.remaining = deadline.remaining(&budget).map_err(|_| unknown())?;
-                let committed = deadline
-                    .wait(&budget, || {
-                        applied_outcome(
-                            store,
-                            &ctx,
-                            &idemp,
-                            receipt,
-                            |row: StoredExternalObsOutcomeV1| match row {
-                                StoredExternalObsOutcomeV1::Committed { result, .. }
-                                    if result.value.note == request.input.note =>
-                                {
-                                    Some(result.into_committed())
-                                }
-                                _ => None,
-                            },
-                        )
-                    })
-                    .await
-                    .map_err(|_| unknown())??
-                    .ok_or_else(missing_applied_outcome)?;
-                deadline.remaining(&budget).map_err(|_| unknown())?;
-                return Ok(ExternalObservationResult::Committed(committed));
-            }
-            InterceptionResult::SettleCarrier(accepted) => {
-                let transition = crate::peers::RoomCarrierTransition::from(accepted);
-                ctx.budget.remaining = deadline.remaining(&budget)?;
-                if let Err(error) = deadline
-                    .wait(&budget, || {
-                        transition.check_before_staging(
-                            store,
-                            &ctx.budget,
-                            ctx.scope(),
-                            &request.input.note,
-                            ctx.auth(),
-                            Some(&base_head.head_rev_id),
-                        )
-                    })
-                    .await?
-                {
-                    return match error {
-                        PortError::Domain(DomainError::RevisionConflict { current, .. }) => {
-                            replay_observation_or_conflict(
-                                store,
-                                &ctx,
-                                deadline,
-                                &request.input,
-                                &idemp,
-                                current,
-                            )
-                            .await
-                        }
-                        other => observation_error(other),
-                    };
-                }
-                reservation_opt = Some(CarrierRoomWrite::Accepted(transition));
-            }
+            InterceptionResult::Applied(outcome) => match *outcome {
+                InterceptedOutcome::ExternalObservation(outcome) => match &outcome {
+                    ExternalObservationResult::Committed(committed)
+                        if committed.value.note == request.input.note
+                            && committed.receipt.scope() == ctx.scope() =>
+                    {
+                        return Ok(outcome);
+                    }
+                    ExternalObservationResult::Committed(_) => {
+                        return Err(missing_applied_outcome());
+                    }
+                    _ => return Ok(outcome),
+                },
+                _ => return Err(missing_applied_outcome()),
+            },
             InterceptionResult::Conflict(DomainError::RevisionConflict { .. }) => {
                 if let Some(replayed) =
                     replay_external_observation(store, &ctx, deadline, &request.input, &idemp)
@@ -6843,33 +6788,6 @@ pub(crate) fn missing_applied_outcome() -> PortError {
         "interceptor_receipt_mismatch",
         "the applied receipt lacks a matching retained command outcome",
     )
-}
-
-pub(crate) async fn applied_outcome<R: serde::de::DeserializeOwned, T>(
-    store: &CanonicalStore,
-    ctx: &SpaceContext,
-    idemp: &crate::writer::CommandIdentitySpec,
-    token: MutationReceiptToken,
-    committed: impl FnOnce(R) -> Option<Committed<T>>,
-) -> Result<Option<Committed<T>>, PortError> {
-    ctx.scope().check(token.scope())?;
-    let saved = try_replay_completed_receipt(store, ctx.scope(), idemp, Some(&ctx.budget))
-        .await
-        .map_err(applied_read_error)?;
-    saved
-        .map(|row| {
-            committed(row)
-                .filter(|result| result.receipt == token)
-                .ok_or_else(missing_applied_outcome)
-        })
-        .transpose()
-}
-
-fn applied_read_error(error: PortError) -> PortError {
-    match error {
-        PortError::Domain(_) => error,
-        other => batch_error(other, true),
-    }
 }
 
 pub(crate) async fn try_replay_completed_receipt<R: serde::de::DeserializeOwned>(

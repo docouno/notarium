@@ -270,9 +270,17 @@ async fn execute_rollback(
     deadline: Instant,
 ) -> Result<Committed<RollbackResult>, PortError> {
     ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-    if request.input.associated_board_expectations.is_empty()
-        && store.inner.collab_interceptor.get().is_none()
-    {
+    let no_live_or_fenced_rooms = match store.inner.collab_interceptor.get() {
+        None => true,
+        Some(interceptor) => {
+            !interceptor.space_has_live_rooms(&ctx.scope().space_id)
+                && !store
+                    .inner
+                    .room_fences
+                    .has_any_fenced_in_space(&ctx.scope().space_id)
+        }
+    };
+    if request.input.associated_board_expectations.is_empty() && no_live_or_fenced_rooms {
         let active_op_guard = store.enter_write_op(&ctx.scope().space_id)?;
         let writer_epoch = match &store.inner.sql {
             crate::runtime::SqlDriverState::Postgres { .. } => {
@@ -4182,6 +4190,7 @@ async fn execute_pg_fast_rollback_on_conn(
                 .publish(crate::changes::BroadcastSignal::Committed {
                     scope: scope_cl.clone(),
                     new_last_seq: new_effective_cut,
+                    targets: crate::changes::CommittedTargets::All,
                 });
             if faults
                 .drop_commit_response_once
@@ -5290,6 +5299,7 @@ async fn try_execute_pg_root_rollback(
             .publish(crate::changes::BroadcastSignal::Committed {
                 scope: scope.clone(),
                 new_last_seq: visibility_seq,
+                targets: crate::changes::CommittedTargets::All,
             });
 
         if writer

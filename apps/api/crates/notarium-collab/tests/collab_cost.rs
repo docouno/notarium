@@ -64,19 +64,17 @@ async fn collab_cost() {
     let scope = test_scope();
     create_space(&store, &scope).await;
     let owner = owner_context(&scope);
-    let settings = CollabConfig {
-        idle_checkpoint: Duration::from_secs(1),
-        idle_unload: Duration::from_secs(2),
-        ..Default::default()
-    };
+    let mut settings = CollabConfig::default();
+    settings.idle_checkpoint = Duration::from_secs(1);
+    settings.idle_unload = Duration::from_secs(2);
     println!(
-        "collab_cost,profile={},allocator=mimalloc,backend=sqlite_full,tokio_workers=2,intercept_coalesce_config_us={}",
+        "collab_cost,profile={},allocator=mimalloc,backend=sqlite_full,tokio_workers=2,wal_coalesce_config_us={}",
         if cfg!(debug_assertions) {
             "debug"
         } else {
             "release"
         },
-        settings.intercept_coalesce.as_micros(),
+        settings.wal_coalesce.as_micros(),
     );
     let hub = CollabHub::new(store.clone(), settings).unwrap();
     hub.register().unwrap();

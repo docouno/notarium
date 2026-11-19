@@ -359,7 +359,7 @@ impl Client {
 
     pub async fn sync(&mut self) {
         self.peer
-            .send(wire::encode_sync_step1(self.doc.transact().state_vector()))
+            .send(encode_sync_step1(self.doc.transact().state_vector()))
             .await
             .unwrap();
         self.until(|message| matches!(message, Message::Sync(SyncMessage::SyncStep2(_))))
@@ -458,6 +458,11 @@ pub async fn wait_until(mut condition: impl AsyncFnMut() -> bool) {
     .expect("condition before test deadline");
 }
 
+pub fn encode_sync_step1(state: StateVector) -> Vec<u8> {
+    use yrs::updates::encoder::Encode;
+    Message::Sync(SyncMessage::SyncStep1(state)).encode_v1()
+}
+
 pub fn empty_sync() -> Vec<u8> {
-    wire::encode_sync_step1(StateVector::default())
+    encode_sync_step1(StateVector::default())
 }

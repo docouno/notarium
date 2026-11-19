@@ -560,6 +560,7 @@ async fn room_command_settlement_sqlite() {
             .await
             .unwrap(),
     );
+    drop(connection);
     runtime.shutdown().await.unwrap();
 }
 
@@ -587,5 +588,7 @@ async fn room_command_settlement_postgres_s3() {
             .await
             .unwrap(),
     );
+    drop(connection);
     runtime.shutdown().await.unwrap();
+    fixtures.drop_pg_schema(&schema).await;
 }

@@ -620,6 +620,13 @@ impl CanonicalStore {
         )
     }
 
+    /// Monotonic SQLite writer commit generation, or `None` on multi-writer backends.
+    /// Incremented with `Release` strictly after every committed SQLite write transaction.
+    pub fn sqlite_commit_generation(&self) -> Option<u64> {
+        matches!(self.inner.sql, SqlDriverState::Sqlite { .. })
+            .then(|| self.inner.sqlite_writer_commit_gen.load(Ordering::Acquire))
+    }
+
     pub async fn read_space(&self, space_id: &SpaceId) -> Result<SpaceRecord, PortError> {
         let sid = space_id.clone();
         self.with_read_tx(|tx| Box::pin(async move { load_space_record(tx, &sid).await }))
@@ -1429,6 +1436,7 @@ impl CanonicalStore {
             .publish(BroadcastSignal::Committed {
                 scope: spec.scope,
                 new_last_seq: out.2,
+                targets: crate::changes::CommittedTargets::All,
             });
         Ok(out)
     }
@@ -1647,6 +1655,7 @@ impl CanonicalStore {
             .publish(BroadcastSignal::Committed {
                 scope: broadcast_scope,
                 new_last_seq: out.1,
+                targets: crate::changes::CommittedTargets::All,
             });
         Ok(out)
     }

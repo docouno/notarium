@@ -246,8 +246,16 @@ fn complete_outer_prevalidation_precedes_delivery() {
             Err(FrameError::Protocol)
         ));
     }
-    let exact_cap = vec![MSG_QUERY_AWARENESS; MAX_FRAME_BYTES];
-    assert!(decode_frame(&exact_cap, PeerRole::Viewer, &[]).is_ok());
+    let exact_msg_cap = vec![MSG_QUERY_AWARENESS; MAX_MESSAGES_PER_FRAME];
+    assert!(decode_frame(&exact_msg_cap, PeerRole::Viewer, &[]).is_ok());
+    let over_msg_cap = vec![MSG_QUERY_AWARENESS; MAX_MESSAGES_PER_FRAME + 1];
+    assert!(matches!(
+        decode_frame(&over_msg_cap, PeerRole::Viewer, &[]),
+        Err(FrameError::Protocol)
+    ));
+    let exact_bytes = encode_update(&vec![0u8; MAX_FRAME_BYTES - 5]);
+    assert_eq!(exact_bytes.len(), MAX_FRAME_BYTES);
+    assert!(decode_frame(&exact_bytes, PeerRole::Viewer, &[]).is_ok());
     let too_large = vec![0xff; MAX_FRAME_BYTES + 1];
     assert!(matches!(
         decode_frame(&too_large, PeerRole::Viewer, &[]),
@@ -320,12 +328,57 @@ fn validates_awareness_counts_clocks_ids_and_json_bounds() {
         Err(FrameError::Protocol)
     ));
 
+    let duplicate = {
+        let single = awareness_bytes(7, 1, b"{}");
+        let mut bytes = vec![2];
+        bytes.extend_from_slice(&single[1..]);
+        bytes.extend_from_slice(&single[1..]);
+        message(MSG_AWARENESS, bytes)
+    };
+    assert!(matches!(
+        decode_frame(&duplicate, PeerRole::Viewer, &[]),
+        Err(FrameError::Protocol)
+    ));
+
     let invalid_json = message(MSG_AWARENESS, awareness_bytes(7, 1, b"{oops"));
     let mut messages = decode_frame(&invalid_json, PeerRole::Viewer, &[]).unwrap();
     let Some(InboundMessage::Awareness(wrapped)) = messages.next() else {
         panic!("missing awareness");
     };
     assert_eq!(wrapped.decode(), Err(FrameError::Protocol));
+}
+
+#[test]
+fn state_vector_caps_clients_and_filters_unknown_colliding_ids() {
+    let mut over_cap = Vec::new();
+    over_cap.write_var((MAX_STATE_VECTOR_CLIENTS + 1) as u32);
+    for k in 1..=(MAX_STATE_VECTOR_CLIENTS + 1) as u64 {
+        over_cap.write_var(k << 19);
+        over_cap.write_var(1_u32);
+    }
+    let over_frame = encode_sync_bytes(MSG_SYNC_STEP_1, &over_cap);
+    assert!(matches!(
+        decode_frame(&over_frame, PeerRole::Viewer, &[]),
+        Err(FrameError::Protocol)
+    ));
+
+    // Up to MAX_STATE_VECTOR_CLIENTS colliding IDs unknown to the live doc
+    // decode in linear time as an empty StateVector without inserting them.
+    let mut colliding = Vec::new();
+    let count = 4096_u64;
+    colliding.write_var(count as u32);
+    for k in 1..=count {
+        colliding.write_var(k << 19);
+        colliding.write_var(1_u32);
+    }
+    let frame = encode_sync_bytes(MSG_SYNC_STEP_1, &colliding);
+    let mut msgs = decode_frame(&frame, PeerRole::Viewer, &[]).unwrap();
+    let Some(InboundMessage::SyncStep1(sv)) = msgs.next() else {
+        panic!("expected SyncStep1");
+    };
+    let decoded = sv.decode_known(|id| id == ClientID::new(1 << 19)).unwrap();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded.get(&ClientID::new(1 << 19)), 1);
 }
 
 #[test]

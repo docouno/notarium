@@ -31,11 +31,13 @@ use yrs::{
 
 use self::{
     body::{BodyIndex, LocalEdit},
-    topology::Topology,
+    topology::{MAX_ROOM_CLIENTS, Topology},
     update::Frame,
 };
 use crate::{
-    carrier::{AppliedFm, AppliedFmEntry, RoomCarrierState, authorize_collab_key, finalize_nota},
+    carrier::{
+        AppliedFm, AppliedFmEntry, RoomCarrierState, authorize_collab_key, finalize_nota_body,
+    },
     wire::PolicyRejectReason as Reject,
 };
 
@@ -138,8 +140,7 @@ impl Replica {
         Ok(body)
     }
 
-    fn rebuild_index(&self) -> Result<(Topology, BodyIndex), Reject> {
-        let topology = Topology::from_snapshot(&update::inspect(&self.snapshot(), true)?)?;
+    fn rebuild_body_index(&self) -> Result<BodyIndex, Reject> {
         let mut txn = self.doc.transact_mut();
         guard_work!(snapshot_exports += 1);
         let hi = txn.snapshot();
@@ -167,8 +168,71 @@ impl Replica {
         if index.len != self.body.len(&txn) {
             return Err(Reject::InvalidBodyContent);
         }
+        Ok(index)
+    }
+
+    fn rebuild_index(&self) -> Result<(Topology, BodyIndex), Reject> {
+        let topology = Topology::from_snapshot(&update::inspect_snapshot(&self.snapshot(), true)?)?;
+        let index = self.rebuild_body_index()?;
         Ok((topology, index))
     }
+}
+
+pub(crate) struct RecoveryReplay {
+    pub(crate) snapshot_overrides: AppliedFm,
+    pub(crate) final_body: String,
+    pub(crate) final_overrides: AppliedFm,
+    pub(crate) final_snapshot: Vec<u8>,
+}
+
+/// Replay a fenced room's snapshot and WAL tail in a single `Replica`, without
+/// allocating a `TwinDoc`, staging replica, or `BodyIndex`.
+pub(crate) fn replay_for_recovery(
+    base_body: &str,
+    snapshot: Option<&[u8]>,
+    updates: &[&[u8]],
+) -> Result<RecoveryReplay, Reject> {
+    let Some(snapshot) = snapshot else {
+        if !updates.is_empty() {
+            return Err(Reject::MalformedUpdate);
+        }
+        validate_content(base_body).map_err(|_| Reject::InvalidBodyContent)?;
+        if base_body.encode_utf16().count() > i32::MAX as usize {
+            return Err(Reject::InvalidBodyContent);
+        }
+        let seed = Replica::new(|_| false);
+        seed.body.insert(&mut seed.doc.transact_mut(), 0, base_body);
+        return Ok(RecoveryReplay {
+            snapshot_overrides: AppliedFm::new(),
+            final_body: base_body.to_owned(),
+            final_overrides: AppliedFm::new(),
+            final_snapshot: seed.snapshot(),
+        });
+    };
+    let frame = update::inspect_snapshot(snapshot, true)?;
+    Topology::from_snapshot(&frame)?;
+    let replica = Replica::new(|id| frame.runs.contains_key(&id));
+    replica.apply(snapshot)?;
+    let snapshot_overrides = {
+        let txn = replica.doc.transact();
+        verify_roots(&txn)?;
+        replica.overrides(&txn)?
+    };
+    for bytes in updates {
+        update::inspect_snapshot(bytes, true)?;
+        replica.apply(bytes)?;
+    }
+    let (final_body, final_overrides) = {
+        let txn = replica.doc.transact();
+        verify_roots(&txn)?;
+        (replica.verified_body(&txn)?, replica.overrides(&txn)?)
+    };
+    Ok(RecoveryReplay {
+        snapshot_overrides,
+        final_body,
+        final_overrides,
+        final_snapshot: replica.snapshot(),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,8 +265,8 @@ impl TwinDoc {
     }
 
     pub(crate) fn restore(snapshot: &[u8]) -> Result<Self, Reject> {
-        let frame = update::inspect(snapshot, true)?;
-        Topology::from_snapshot(&frame)?;
+        let frame = update::inspect_snapshot(snapshot, true)?;
+        let topology = Topology::from_snapshot(&frame)?;
         let live = Replica::new(|id| frame.runs.contains_key(&id));
         let staging = Replica::new(|id| id == live.doc.client_id() || frame.runs.contains_key(&id));
         live.apply(snapshot)?;
@@ -212,13 +276,17 @@ impl TwinDoc {
             verify_roots(&txn)?;
             staging.overrides(&txn)?;
         }
-        let (topology, body) = staging.rebuild_index()?;
+        let body = staging.rebuild_body_index()?;
         Ok(Self {
             live,
             staging,
             topology,
             body,
         })
+    }
+
+    pub(crate) fn has_client(&self, id: ClientID) -> bool {
+        self.topology.has_client(id)
     }
 
     pub(crate) fn client_ids(&self) -> [ClientID; 2] {
@@ -276,7 +344,7 @@ impl TwinDoc {
         note: &NoteId,
         force_structural: bool,
     ) -> Result<(StagedUpdate, GuardPath), Reject> {
-        let frame = update::inspect(bytes, carrier.fm_writable)?;
+        let frame = update::inspect_peer(bytes, carrier.fm_writable)?;
         let input_bytes = bytes.len();
         let reserved = self.client_ids();
         let local = (!force_structural)
@@ -284,7 +352,10 @@ impl TwinDoc {
             .flatten();
         let mut evidence = local
             .is_none()
-            .then(|| self.topology.prove(&frame, &self.body, &reserved))
+            .then(|| {
+                self.topology
+                    .prove(&frame, &self.body, &reserved, Some(MAX_ROOM_CLIENTS))
+            })
             .transpose()?;
         let mut txn = self.staging.doc.transact_mut();
         apply_update(&mut txn, bytes)?;
@@ -297,9 +368,10 @@ impl TwinDoc {
             drop(txn);
             let mut local_units = edit.delete.as_ref().map_or(0, |delete| delete.len as usize);
             if let Some(insert) = &edit.insert {
+                let inserted_len = insert.units.len();
                 self.topology
-                    .append_body(insert.id, insert.id.clock + insert.units.len() as u32);
-                local_units += insert.units.len();
+                    .append_body(insert.id, insert.id.clock + inserted_len);
+                local_units += inserted_len as usize;
             }
             self.body.apply(edit);
             guard_work!(wal_copy_bytes += bytes.len());
@@ -323,7 +395,9 @@ impl TwinDoc {
         // room's proof of the pre-update state is still intact for fallback.
         let mut evidence = match evidence.take() {
             Some(evidence) => evidence,
-            None => self.topology.prove(&frame, &self.body, &reserved)?,
+            None => self
+                .topology
+                .prove(&frame, &self.body, &reserved, Some(MAX_ROOM_CLIENTS))?,
         };
         if evidence.insertions != *txn.insert_set() {
             return Err(Reject::PendingClockGap);
@@ -341,7 +415,11 @@ impl TwinDoc {
         {
             return Err(Reject::ForbiddenRootOrSubdoc);
         }
-        let body = self.staging.verified_body(&txn)?;
+        let body = if evidence.touches_body {
+            Some(self.staging.verified_body(&txn)?)
+        } else {
+            None
+        };
         let fields = self.staging.overrides(&txn)?;
         if evidence
             .fields
@@ -355,28 +433,31 @@ impl TwinDoc {
         let applied = txn.encode_update_v1();
         guard_work!(generated_binary_bytes += applied.len());
         drop(txn);
-        let encoded = update::inspect(&applied, carrier.fm_writable)?;
-        self.topology.prove(&encoded, &self.body, &reserved)?;
-        let bytes = if evidence.touches_body {
-            self.finalize(applied, carrier, note, &body, &fields)?
+        let encoded = update::inspect_snapshot(&applied, carrier.fm_writable)?;
+        let encoded_evidence =
+            self.topology
+                .prove(&encoded, &self.body, &reserved, Some(MAX_ROOM_CLIENTS))?;
+        let body_len = body.as_ref().map_or(0, String::len);
+        let bytes = if let Some(body) = &body {
+            let bytes = self.finalize(applied, carrier, note, body, &fields)?;
+            self.rebuild_staging_index()?;
+            bytes
         } else {
-            guard_work!(
-                carrier_projections += 1,
-                carrier_body_input_bytes += body.len()
-            );
+            // FM-only update: validate overrides on the header prefix alone and
+            // advance topology without rebuilding `BodyIndex`.
             carrier
-                .materialize(&body, &fields)
+                .validate_overrides(&fields)
                 .map_err(|_| Reject::FrontmatterNotWritable)?;
+            self.topology.apply_resolved(&encoded, &encoded_evidence)?;
             applied
         };
-        self.rebuild_staging_index()?;
         log_guard(
             GuardPath::Structural,
             input_bytes,
             bytes.len(),
             frame.blocks.len() + frame.deletes.len(),
             0,
-            body.len(),
+            body_len,
         );
         Ok((StagedUpdate { bytes }, GuardPath::Structural))
     }
@@ -395,6 +476,8 @@ impl TwinDoc {
             [block]
                 if block.id.clock == self.topology.clock(block.id.client)
                     && !reserved.contains(&block.id.client)
+                    && (self.topology.has_client(block.id.client)
+                        || self.topology.client_count() < MAX_ROOM_CLIENTS)
                     && self.body.len.checked_add(block.len())? <= i32::MAX as u32 =>
             {
                 self.body.local_insert(*block, delete)
@@ -420,30 +503,51 @@ impl TwinDoc {
         if let Some(plan) = body_plan {
             apply_splices(&self.staging.body, &mut txn, plan);
         }
-        for (key, value) in fields {
-            if self.staging.fields.get(&txn, key).as_ref() != Some(&Out::Any(value.clone())) {
+        for (key, entry, value) in fields {
+            let unchanged = self
+                .staging
+                .fields
+                .get(&txn, key)
+                .and_then(|out| match out {
+                    Out::Any(existing) => AppliedFmEntry::from_any(&existing).ok(),
+                    _ => None,
+                })
+                .is_some_and(|existing| existing == *entry);
+            if !unchanged {
                 self.staging.fields.insert(&mut txn, key, value);
             }
         }
         txn.commit();
         self.staging.take_field_changes();
-        let body = self.staging.verified_body(&txn)?;
-        if expected_body.is_some_and(|expected| body != expected) {
-            return Err(Reject::InvalidBodyContent);
-        }
+        let body_touched = body_plan.is_some_and(|plan| !plan.edits.is_empty());
+        let body = if body_touched || expected_body.is_some() {
+            let body = self.staging.verified_body(&txn)?;
+            if expected_body.is_some_and(|expected| body != expected) {
+                return Err(Reject::InvalidBodyContent);
+            }
+            Some(body)
+        } else {
+            None
+        };
         let fields = self.staging.overrides(&txn)?;
         let delta = txn.encode_update_v1();
         drop(txn);
-        let bytes = if body_plan.is_some_and(|plan| !plan.edits.is_empty()) {
-            self.finalize(delta, carrier, note, &body, &fields)?
+        if body_touched {
+            let body = body.expect("body_touched loaded verified body");
+            let bytes = self.finalize(delta, carrier, note, &body, &fields)?;
+            self.rebuild_staging_index()?;
+            Ok(bytes)
         } else {
             carrier
-                .materialize(&body, &fields)
+                .validate_overrides(&fields)
                 .map_err(|_| Reject::FrontmatterNotWritable)?;
-            delta
-        };
-        self.rebuild_staging_index()?;
-        Ok(bytes)
+            if delta != EMPTY_UPDATE {
+                let encoded = update::inspect_snapshot(&delta, carrier.fm_writable)?;
+                let evidence = self.topology.prove(&encoded, &self.body, &[], None)?;
+                self.topology.apply_resolved(&encoded, &evidence)?;
+            }
+            Ok(delta)
+        }
     }
 
     fn finalize(
@@ -454,23 +558,16 @@ impl TwinDoc {
         body: &str,
         fields: &AppliedFm,
     ) -> Result<Vec<u8>, Reject> {
-        guard_work!(
-            carrier_projections += 1,
-            carrier_body_input_bytes += body.len()
-        );
-        let materialized = carrier
-            .materialize(body, fields)
+        carrier
+            .validate_overrides(fields)
             .map_err(|_| Reject::FrontmatterNotWritable)?;
         let identity = CanonicalStore::derive_carrier_identities(&carrier.carrier_rev_id).0;
-        guard_work!(
-            nota_finalizations += 1,
-            nota_input_bytes += materialized.len()
-        );
-        let plan = finalize_nota(&materialized, note, identity.clone())
-            .map_err(|_| Reject::InvalidBodyContent)?;
-        if plan.edits.is_empty() {
+        guard_work!(nota_finalizations += 1, nota_input_bytes += body.len());
+        let Some(plan) = finalize_nota_body(carrier, body, fields, note, identity.clone())
+            .map_err(|_| Reject::InvalidBodyContent)?
+        else {
             return Ok(applied);
-        }
+        };
 
         let expected = validate_body_plan(body, &identity, &plan)?;
         let mut txn = self.staging.doc.transact_mut();
@@ -481,19 +578,15 @@ impl TwinDoc {
         if body != expected {
             return Err(Reject::InvalidBodyContent);
         }
-        guard_work!(
-            carrier_projections += 1,
-            carrier_body_input_bytes += body.len()
-        );
         carrier
-            .materialize(&body, fields)
+            .validate_overrides(fields)
             .map_err(|_| Reject::FrontmatterNotWritable)?;
         let normalization = txn.encode_update_v1();
         guard_work!(generated_binary_bytes += normalization.len());
         let merged = merge_updates_v1([applied.as_slice(), normalization.as_slice()])
             .map_err(|_| Reject::MalformedUpdate)?;
         guard_work!(generated_binary_bytes += merged.len());
-        update::inspect(&merged, carrier.fm_writable)?;
+        update::inspect_snapshot(&merged, carrier.fm_writable)?;
         Ok(merged)
     }
 
@@ -512,17 +605,35 @@ impl TwinDoc {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn replay(&mut self, bytes: &[u8]) -> Result<(), Reject> {
-        let frame = update::inspect(bytes, true)?;
-        self.topology.prove(&frame, &self.body, &[])?;
-        self.staging.apply(bytes)?;
-        self.rebuild_staging_index()?;
-        self.publish(bytes)
+        self.replay_batch(&[bytes])
+    }
+
+    /// Replay a durable WAL tail and rebuild `Topology` + `BodyIndex` once at
+    /// the end instead of scanning the full document per update.
+    pub(crate) fn replay_batch<T: AsRef<[u8]>>(&mut self, updates: &[T]) -> Result<(), Reject> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        for bytes in updates {
+            let bytes = bytes.as_ref();
+            update::inspect_snapshot(bytes, true)?;
+            self.staging.apply(bytes)?;
+            self.publish(bytes)?;
+        }
+        {
+            let txn = self.staging.doc.transact();
+            verify_roots(&txn)?;
+            self.staging.overrides(&txn)?;
+            self.staging.verified_body(&txn)?;
+        }
+        self.rebuild_staging_index()
     }
 
     pub(crate) fn reset_staging<T: AsRef<[u8]>>(&mut self, prefix: &[T]) -> Result<(), Reject> {
         let live = self.live.snapshot();
-        let frame = update::inspect(&live, true)?;
+        let frame = update::inspect_snapshot(&live, true)?;
         let staging =
             Replica::new(|id| id == self.live.doc.client_id() || frame.runs.contains_key(&id));
         staging.apply(&live)?;
@@ -573,7 +684,7 @@ fn local_applied(edit: &LocalEdit, before: u32, after: u32, txn: &TransactionMut
         expected -= delete.len;
     }
     if let Some(insert) = &edit.insert {
-        let len = insert.units.len() as u32;
+        let len = insert.units.len();
         insertions.insert(insert.id, len);
         expected += len;
     }
@@ -594,7 +705,10 @@ fn validate_body_plan(
     Ok(expected)
 }
 
-fn command_fields(delta: &AppliedFm, writable: bool) -> Result<Vec<(&str, Any)>, Reject> {
+fn command_fields(
+    delta: &AppliedFm,
+    writable: bool,
+) -> Result<Vec<(&str, &AppliedFmEntry, Any)>, Reject> {
     if !writable && !delta.is_empty() {
         return Err(Reject::FrontmatterNotWritable);
     }
@@ -604,6 +718,7 @@ fn command_fields(delta: &AppliedFm, writable: bool) -> Result<Vec<(&str, Any)>,
             authorize_collab_key(key).map_err(|_| Reject::ProtectedFrontmatterKey)?;
             Ok((
                 key.as_str(),
+                entry,
                 entry
                     .to_any()
                     .map_err(|_| Reject::InvalidFrontmatterValue)?,

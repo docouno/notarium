@@ -10,13 +10,14 @@ use notarium_core::{
     error::ValidationReason,
     ids::{BodyIdentity, ContentDigest, NoteId, RevisionId},
     patch::BodyPatchPlan,
+    span::ByteSpan,
     value::{ExactNumber, YamlValue},
 };
 use notarium_syntax::{
     carrier::Carrier,
-    content_digest, extract,
+    content_digest,
     frontmatter::{self, FieldEdit, HeaderAnalysis},
-    patch, unicode,
+    markdown, nota, patch, unicode,
 };
 use yrs::{Any, Number};
 
@@ -76,7 +77,14 @@ impl AppliedFmEntry {
             }
             Self::Set(YamlValue::Bool(value)) => Any::Bool(*value),
             Self::Set(YamlValue::Number(number)) => {
-                Any::Number(Number::Float(field_float(number)?))
+                let float = field_float(number)?;
+                if let Some(int) = number.as_json().as_i64()
+                    && int.unsigned_abs() <= (1_u64 << 53)
+                {
+                    Any::Number(Number::Int(int))
+                } else {
+                    Any::Number(Number::Float(float))
+                }
             }
             Self::Set(YamlValue::Sequence(values)) => Any::Array(
                 values
@@ -151,33 +159,46 @@ pub(crate) fn authorize_collab_key(key: &str) -> DomainResult<()> {
 pub(crate) struct RoomCarrierState {
     pub(crate) carrier_rev_id: RevisionId,
     pub(crate) carrier_blob_blake3: ContentDigest,
-    pub(crate) base_carrier: String,
+    /// Only the header prefix (or a tiny `<bom>x<eol>` sentinel when headerless),
+    /// avoiding retaining a full duplicate of the note body per live room.
+    header_source: String,
     pub(crate) fm_writable: bool,
     pub(crate) applied_fm: AppliedFm,
     pub(crate) last_writer_auth: Option<EngineAuthContext>,
+    pub(crate) last_writer_peer: Option<u64>,
     base_header: HeaderAnalysis,
 }
 
 impl RoomCarrierState {
-    pub(crate) fn new(
+    pub(crate) fn from_carrier(
         carrier_rev_id: RevisionId,
         carrier_blob_blake3: ContentDigest,
-        base_carrier: String,
-    ) -> DomainResult<Self> {
-        let (base_header, fm_writable) = analyze_base(&base_carrier, carrier_blob_blake3)?;
-        Ok(Self {
-            carrier_rev_id,
-            carrier_blob_blake3,
-            base_carrier,
-            fm_writable,
-            applied_fm: BTreeMap::new(),
-            last_writer_auth: None,
-            base_header,
-        })
+        carrier: &str,
+    ) -> DomainResult<(Self, &str)> {
+        let (base_header, fm_writable) = analyze_base(carrier, carrier_blob_blake3)?;
+        let body = &carrier[base_header.carrier.body.start()..];
+        let header_source = extract_header_source(carrier, &base_header.carrier);
+        Ok((
+            Self {
+                carrier_rev_id,
+                carrier_blob_blake3,
+                header_source,
+                fm_writable,
+                applied_fm: BTreeMap::new(),
+                last_writer_auth: None,
+                last_writer_peer: None,
+                base_header,
+            },
+            body,
+        ))
     }
 
-    pub(crate) fn body(&self) -> &str {
-        &self.base_carrier[self.base_header.carrier.body.start()..]
+    pub(crate) fn header_merge_source(&self) -> &str {
+        &self.header_source
+    }
+
+    pub(crate) fn matches_base(&self, candidate: &str) -> bool {
+        content_digest(candidate) == self.carrier_blob_blake3
     }
 
     pub(crate) fn restore_applied_fm(&mut self, snapshot: &AppliedFm, carrier_dirty: bool) {
@@ -198,13 +219,13 @@ impl RoomCarrierState {
         &mut self,
         revision: RevisionId,
         digest: ContentDigest,
-        carrier: String,
+        carrier: &str,
         applied_fm: AppliedFm,
     ) -> DomainResult<()> {
-        let (header, writable) = analyze_base(&carrier, digest)?;
+        let (header, writable) = analyze_base(carrier, digest)?;
         self.carrier_rev_id = revision;
         self.carrier_blob_blake3 = digest;
-        self.base_carrier = carrier;
+        self.header_source = extract_header_source(carrier, &header.carrier);
         self.base_header = header;
         self.fm_writable = writable;
         self.applied_fm = applied_fm;
@@ -229,7 +250,9 @@ impl RoomCarrierState {
             .collect()
     }
 
-    pub(crate) fn materialize(&self, body: &str, current_fm: &AppliedFm) -> DomainResult<String> {
+    /// Validate override invariants and YAML patchability on the header prefix
+    /// alone, without allocating a full materialized copy of a large body.
+    pub(crate) fn validate_overrides(&self, current_fm: &AppliedFm) -> DomainResult<()> {
         if self
             .applied_fm
             .keys()
@@ -237,14 +260,23 @@ impl RoomCarrierState {
         {
             return Err(fm_not_writable());
         }
+        let edits = self.delta_edits(current_fm)?;
+        if edits.is_empty() {
+            return Ok(());
+        }
+        frontmatter::patch_frontmatter(&self.header_source, DocClass::UserDoc, &edits)?;
+        Ok(())
+    }
+
+    fn delta_edits(&self, current_fm: &AppliedFm) -> DomainResult<Vec<FieldEdit>> {
         let mut delta = self.delta(current_fm).peekable();
         if delta.peek().is_none() {
-            return project_scanned_body(&self.base_carrier, &self.base_header.carrier, body);
+            return Ok(Vec::new());
         }
         if !self.fm_writable {
             return Err(fm_not_writable());
         }
-        let edits = delta
+        delta
             .map(|(key, entry)| {
                 authorize_collab_key(key)?;
                 Ok(match entry {
@@ -258,21 +290,37 @@ impl RoomCarrierState {
                     AppliedFmEntry::Unset => FieldEdit::Unset { key: key.clone() },
                 })
             })
-            .collect::<DomainResult<Vec<_>>>()?;
-        // An existing header alone is enough to apply the patch. When creating the
-        // first header, the syntax crate derives its line ending from the old body.
-        let source = self
-            .base_header
-            .carrier
-            .header
-            .map_or(Ok(self.base_carrier.as_str()), |span| {
-                span.slice(&self.base_carrier)
-            })?;
+            .collect()
+    }
+
+    pub(crate) fn materialize(&self, body: &str, current_fm: &AppliedFm) -> DomainResult<String> {
+        if self
+            .applied_fm
+            .keys()
+            .any(|key| !current_fm.contains_key(key))
+        {
+            return Err(fm_not_writable());
+        }
+        let edits = self.delta_edits(current_fm)?;
+        if edits.is_empty() {
+            return project_scanned_body(&self.header_source, &self.base_header.carrier, body);
+        }
         let updated = patch::apply(
-            source,
-            &frontmatter::patch_frontmatter(source, DocClass::UserDoc, &edits)?,
+            &self.header_source,
+            &frontmatter::patch_frontmatter(&self.header_source, DocClass::UserDoc, &edits)?,
         )?;
         project_body(&updated, body)
+    }
+}
+
+fn extract_header_source(source: &str, carrier: &Carrier) -> String {
+    if let Some(header) = carrier.header {
+        source[..header.end()].to_owned()
+    } else {
+        let bom = &source[..carrier.bom_end];
+        // Keep exact BOM and detected line ending while guarding against
+        // closing-fence absorption during raw header merges.
+        format!("{bom}x{}", carrier.eol)
     }
 }
 
@@ -339,26 +387,72 @@ fn append_body(prefix: &mut String, eol: &str, body: &str) {
     prefix.push_str(body);
 }
 
+/// Compute any missing `nota` view ID insertions on `body` with at most one
+/// Markdown parse and without full-carrier materialization when no `nota`
+/// fence is present.
+pub(crate) fn finalize_nota_body(
+    carrier: &RoomCarrierState,
+    body: &str,
+    fields: &AppliedFm,
+    note: &NoteId,
+    body_identity: BodyIdentity,
+) -> DomainResult<Option<BodyPatchPlan>> {
+    if !body.as_bytes().iter().any(|b| matches!(b, b'`' | b'~')) {
+        return Ok(None);
+    }
+    let body_span = ByteSpan::new(0, body.len())?;
+    let parsed = markdown::analyze(body, body_span)?;
+    if !parsed.fences.iter().any(|f| f.info == "nota") {
+        return Ok(None);
+    }
+    // When `body` starts with literal `---` or a BOM, `nota::analyze`'s own
+    // `Carrier::scan` verification needs the projected carrier framing.
+    if body.starts_with("---") || body.starts_with('\u{feff}') {
+        let materialized = carrier.materialize(body, fields)?;
+        let scan = Carrier::scan(&materialized)?;
+        let md = markdown::analyze(&materialized, scan.body)?;
+        let analysis = nota::analyze(&materialized, scan.body, note, &md, true)?;
+        if analysis.plan.edits.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(patch::body_plan(
+            &materialized,
+            &analysis.plan,
+            body_identity,
+        )?));
+    }
+    let analysis = nota::analyze(body, body_span, note, &parsed, true)?;
+    if analysis.plan.edits.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(patch::body_plan(body, &analysis.plan, body_identity)?))
+}
+
+#[cfg(test)]
 pub(crate) fn finalize_nota(
     carrier: &str,
     note: &NoteId,
     body_identity: BodyIdentity,
 ) -> DomainResult<BodyPatchPlan> {
-    let plan = extract::finalize_document(carrier, DocClass::UserDoc, note, &[])?;
-    patch::body_plan(carrier, &plan, body_identity)
+    let scan = Carrier::scan(carrier)?;
+    let md = markdown::analyze(carrier, scan.body)?;
+    let analysis = nota::analyze(carrier, scan.body, note, &md, true)?;
+    patch::body_plan(carrier, &analysis.plan, body_identity)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use notarium_syntax::extract;
 
     fn state(source: &str) -> RoomCarrierState {
-        RoomCarrierState::new(
+        RoomCarrierState::from_carrier(
             RevisionId::from_bytes([1; 16]),
             content_digest(source),
-            source.to_owned(),
+            source,
         )
         .unwrap()
+        .0
     }
 
     fn text(value: &str) -> AppliedFmEntry {
@@ -396,13 +490,13 @@ mod tests {
             room.advance(
                 revision,
                 content_digest(&carrier),
-                carrier.clone(),
+                &carrier,
                 overrides.clone(),
             )
             .unwrap();
             assert_eq!(room.materialize(&body, &overrides).unwrap(), carrier);
         }
-        assert!(room.materialize(room.body(), &AppliedFm::new()).is_err());
+        assert!(room.materialize("body", &AppliedFm::new()).is_err());
     }
 
     #[test]

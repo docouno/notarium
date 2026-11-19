@@ -318,6 +318,7 @@ enum QueuedWriteEntry {
     },
     RoomWal {
         intent: BatchWriteIntent,
+        sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         staged_bytes_reserved: StagedByteReservation,
         reply_tx: oneshot::Sender<Result<Vec<u8>, PortError>>,
     },
@@ -345,16 +346,16 @@ pub struct WriterFaultState {
 }
 
 #[cfg(feature = "test-support")]
-pub struct RoomWalAdmissionPause {
+pub struct TestPauseGate {
     pub entered: oneshot::Sender<()>,
     pub release: oneshot::Receiver<()>,
 }
 
 #[cfg(feature = "test-support")]
-pub struct PlannedObservationPause {
-    pub entered: oneshot::Sender<()>,
-    pub release: oneshot::Receiver<()>,
-}
+pub type RoomWalAdmissionPause = TestPauseGate;
+
+#[cfg(feature = "test-support")]
+pub type PlannedObservationPause = TestPauseGate;
 
 /// Holds the authors' live registrations while invoking the synchronous enqueue.
 pub type RoomWalAdmission<'a> = dyn Fn(&mut dyn FnMut()) -> Result<(), PortError> + Sync + 'a;
@@ -812,9 +813,10 @@ impl WriteCoordinator {
         let (reply_tx, reply_rx) = oneshot::channel();
         // Once sent through `permit.send(...)`, the item is admitted: caller drop/cancel NEVER aborts commit!
         let entry = if intent.room_wal.is_some() {
-            debug_assert!(sqlite_fast_plan.is_none() && pg_fast_plan.is_none());
+            debug_assert!(pg_fast_plan.is_none());
             QueuedWriteEntry::RoomWal {
                 intent,
+                sqlite_fast_plan,
                 staged_bytes_reserved: reserved_bytes,
                 reply_tx,
             }
@@ -1060,6 +1062,7 @@ impl crate::CanonicalStore {
 
     /// Submits a typed idempotent or non-idempotent canonical mutation through `WriteBatchActor`,
     /// automatically handling MessagePack receipt serialization and replay.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn submit_write_command<R>(
         &self,
         budget: &CallBudget,
@@ -1129,6 +1132,7 @@ impl crate::CanonicalStore {
         deadline: tokio::time::Instant,
         mut intent: PreparedWriteIntent,
         replay_safe: bool,
+        sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         room_wal_admission: Option<&RoomWalAdmission<'_>>,
     ) -> Result<u64, PortError> {
         let check_space_lease = matches!(&self.inner.sql, SqlDriverState::Postgres { .. });
@@ -1152,7 +1156,7 @@ impl crate::CanonicalStore {
                         replay_safe,
                     }),
                 },
-                None,
+                sqlite_fast_plan,
                 None,
                 None,
             )
@@ -1418,6 +1422,7 @@ pub(crate) enum SpaceBatchEntry {
         persisted_initial_seq: SpaceSeq,
         effective_cut: SpaceSeq,
         max_purge_seq: Option<SpaceSeq>,
+        targets: crate::changes::CommittedTargetAcc,
     },
 }
 
@@ -1477,12 +1482,13 @@ async fn flush_single_batch(
             }
             QueuedWriteEntry::RoomWal {
                 intent,
+                sqlite_fast_plan,
                 staged_bytes_reserved,
                 reply_tx,
             } => {
                 reserved_list.push(staged_bytes_reserved);
                 reply_targets.push(ReplyTarget::Single { reply_tx });
-                items.push((intent, None, None));
+                items.push((intent, sqlite_fast_plan, None));
             }
             QueuedWriteEntry::Group {
                 space_id,
@@ -1507,7 +1513,12 @@ async fn flush_single_batch(
 
     let exec_result = match &inner.sql {
         SqlDriverState::Sqlite { writer, .. } => {
+            #[cfg(feature = "test-support")]
+            let rollback_fault_armed = faults.rollback_commit_response_once.load(Ordering::Acquire);
+            #[cfg(not(feature = "test-support"))]
+            let rollback_fault_armed = false;
             let can_fast = group_spaces.is_empty()
+                && !rollback_fault_armed
                 && items.iter().all(|(_, fp, _)| fp.is_some())
                 && faults.pre_commit_space_delays.lock().await.is_empty();
             let mut guard = writer.lock().await;
@@ -1813,6 +1824,7 @@ async fn execute_batch_on_conn(
                             persisted_initial_seq: init_seq,
                             effective_cut: init_seq,
                             max_purge_seq: None,
+                            targets: crate::changes::CommittedTargetAcc::default(),
                         },
                     );
                 }
@@ -1845,6 +1857,7 @@ async fn execute_batch_on_conn(
                             persisted_initial_seq: init_seq,
                             effective_cut: init_seq,
                             max_purge_seq: None,
+                            targets: crate::changes::CommittedTargetAcc::default(),
                         },
                     );
                 }
@@ -1878,6 +1891,7 @@ async fn execute_batch_on_conn(
                 response_bytes,
                 new_effective_cut,
                 item_purge_seq,
+                committed_events,
                 dir_syncs,
                 retained_tickets,
                 retained_guards,
@@ -1890,6 +1904,7 @@ async fn execute_batch_on_conn(
                 if let Some(SpaceBatchEntry::Loaded {
                     effective_cut,
                     max_purge_seq,
+                    targets,
                     ..
                 }) = space_states.get_mut(&space_id)
                 {
@@ -1897,6 +1912,7 @@ async fn execute_batch_on_conn(
                     if let Some(pseq) = item_purge_seq {
                         *max_purge_seq = Some(max_purge_seq.map_or(pseq, |prev| prev.max(pseq)));
                     }
+                    targets.record_events(&committed_events);
                 }
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
@@ -2025,6 +2041,7 @@ async fn execute_batch_on_conn(
                     persisted_initial_seq,
                     effective_cut,
                     max_purge_seq,
+                    targets,
                 } = entry
                 {
                     space_effective_cuts.insert(sid.clone(), *effective_cut);
@@ -2042,6 +2059,7 @@ async fn execute_batch_on_conn(
                             crate::changes::BroadcastSignal::Committed {
                                 scope: record.scope.clone(),
                                 new_last_seq: *effective_cut,
+                                targets: targets.to_targets(),
                             },
                         );
                     }
@@ -2076,6 +2094,7 @@ struct SingleItemSuccess {
     response_bytes: Vec<u8>,
     new_effective_cut: SpaceSeq,
     item_purge_seq: Option<SpaceSeq>,
+    committed_events: Vec<BatchEventDraft>,
     dir_syncs: PendingDirSyncs,
     retained_tickets: Vec<StagedBlobTicket>,
     retained_guards: Vec<Box<dyn Send>>,
@@ -2124,6 +2143,7 @@ async fn execute_single_item_in_savepoint(
                 // Replay consumes ZERO new sequence numbers!
                 new_effective_cut: current_effective_cut,
                 item_purge_seq: None,
+                committed_events: Vec::new(),
                 dir_syncs: PendingDirSyncs::default(),
                 retained_tickets: Vec::new(),
                 retained_guards: Vec::new(),
@@ -2189,6 +2209,7 @@ async fn execute_single_item_in_savepoint(
             response_bytes: artifacts.response_bytes,
             new_effective_cut: current_effective_cut,
             item_purge_seq: None,
+            committed_events: Vec::new(),
             dir_syncs: item_ctx.pending_dir_syncs,
             retained_tickets: item_ctx.retained_tickets,
             retained_guards: item_ctx.retained_guards,
@@ -2267,6 +2288,7 @@ async fn execute_single_item_in_savepoint(
         response_bytes: artifacts.response_bytes,
         new_effective_cut: last_seq,
         item_purge_seq,
+        committed_events: artifacts.events,
         dir_syncs: item_ctx.pending_dir_syncs,
         retained_tickets: item_ctx.retained_tickets,
         retained_guards: item_ctx.retained_guards,

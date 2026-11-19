@@ -1,41 +1,113 @@
 use super::*;
 use notarium_canonical::{
     CloseCollabSession, CollabCarrierSettlement, CollabRoomState, CollabSessionRecord,
-    OpenCollabSession, RoomFenceTable,
+    OpenCollabSession, RoomCommandSettlement, RoomFenceTable,
 };
 use notarium_core::{
+    ids::RevisionId,
     patch::CarrierEditOrigin,
     ports::{
-        AcceptedRoomCarrier, BoardMoveResult, Committed, ExternalObservation,
-        ExternalObservationResult, FilenamePin, InterceptedMutation, InterceptedPayload,
-        InterceptionResult, LiveCollabInterceptor, ObservedContent, RollbackReservation,
-        RoomCarrierAction,
+        BoardMoveResult, Committed, ExternalObservation, ExternalObservationResult, FilenamePin,
+        InterceptedMutation, InterceptedOutcome, InterceptedPayload, InterceptionResult,
+        LiveCollabInterceptor, ObservedContent, RollbackReservation,
     },
-    receipt::MutationReceiptToken,
     span::ByteSpan,
 };
 use tokio::sync::oneshot;
 
-type Pause = (oneshot::Sender<()>, oneshot::Receiver<InterceptionResult>);
+enum PauseReply {
+    Direct(InterceptionResult),
+    Commit(RoomCommandSettlement),
+}
+
+type Pause = (oneshot::Sender<()>, oneshot::Receiver<PauseReply>);
 
 struct PausedRoom {
+    store: CanonicalStore,
     fences: Arc<RoomFenceTable>,
     pause: Mutex<Option<Pause>>,
     cancel_on_reply: AtomicBool,
-    accepted: Mutex<Option<AcceptedRoomCarrier>>,
+    settlement: Mutex<Option<RoomCommandSettlement>>,
     pinned: Mutex<Option<(NoteId, LeaseEpoch)>>,
     pin_gate: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 impl PausedRoom {
-    fn accept(&self, room: &CollabSessionRecord, action: RoomCarrierAction, through: Option<u64>) {
-        *self.accepted.lock().unwrap() = Some(AcceptedRoomCarrier {
+    fn settlement_for(
+        room: &CollabSessionRecord,
+        expected_base_rev: RevisionId,
+        final_carrier: impl Into<String>,
+        yrs_snapshot: Vec<u8>,
+        through: Option<u64>,
+    ) -> RoomCommandSettlement {
+        RoomCommandSettlement {
             owner_id: room.owner_id.clone().unwrap(),
             expected_lease: room.lease_epoch,
             expected_lineage: room.lineage_epoch,
+            expected_base_rev,
+            final_carrier: final_carrier.into(),
+            yrs_snapshot,
             compacted_through_update_seq: through,
-            action,
-        });
+        }
+    }
+
+    fn accept(
+        &self,
+        room: &CollabSessionRecord,
+        expected_base_rev: RevisionId,
+        final_carrier: impl Into<String>,
+        yrs_snapshot: Vec<u8>,
+        through: Option<u64>,
+    ) {
+        *self.settlement.lock().unwrap() = Some(Self::settlement_for(
+            room,
+            expected_base_rev,
+            final_carrier,
+            yrs_snapshot,
+            through,
+        ));
+    }
+
+    async fn commit_settlement(
+        &self,
+        request: InterceptedMutation,
+        settlement: RoomCommandSettlement,
+    ) -> Result<InterceptionResult, PortError> {
+        match request.payload {
+            InterceptedPayload::EditNote { note, plan, .. } => {
+                let committed = self
+                    .store
+                    .commit_intercepted_edit_note(
+                        request.context,
+                        request.identity,
+                        request.preconditions,
+                        EditNote { note, plan },
+                        settlement,
+                    )
+                    .await?;
+                Ok(InterceptionResult::Applied(Box::new(
+                    InterceptedOutcome::NoteRevision(committed),
+                )))
+            }
+            InterceptedPayload::ExternalObservation { observation, .. } => {
+                let outcome = self
+                    .store
+                    .commit_intercepted_external_observation(
+                        request.context,
+                        request.identity,
+                        request.preconditions,
+                        observation,
+                        settlement,
+                    )
+                    .await?;
+                Ok(InterceptionResult::Applied(Box::new(
+                    InterceptedOutcome::ExternalObservation(outcome),
+                )))
+            }
+            InterceptedPayload::MoveBoardCard { .. } => {
+                unreachable!("board room command commit is exercised separately")
+            }
+        }
     }
 
     async fn during_interception<T, U>(
@@ -43,13 +115,25 @@ impl PausedRoom {
         original: impl Future<Output = Result<T, PortError>>,
         other_writes: impl Future<Output = (InterceptionResult, U)>,
     ) -> (Result<T, PortError>, U) {
+        self.during_interception_reply(original, async {
+            let (outcome, result) = other_writes.await;
+            (PauseReply::Direct(outcome), result)
+        })
+        .await
+    }
+
+    async fn during_interception_reply<T, U>(
+        &self,
+        original: impl Future<Output = Result<T, PortError>>,
+        other_writes: impl Future<Output = (PauseReply, U)>,
+    ) -> (Result<T, PortError>, U) {
         let (entered_tx, entered) = oneshot::channel();
         let (release, outcome_rx) = oneshot::channel();
         *self.pause.lock().unwrap() = Some((entered_tx, outcome_rx));
         let writes = async {
             entered.await.unwrap();
             let (outcome, result) = other_writes.await;
-            release.send(outcome).unwrap();
+            release.send(outcome).ok().expect("room waiting for reply");
             result
         };
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -63,8 +147,9 @@ impl PausedRoom {
 impl LiveCollabInterceptor for PausedRoom {
     fn intercept(&self, request: InterceptedMutation) -> PortFuture<'_, InterceptionResult> {
         Box::pin(async move {
-            if let Some(accepted) = self.accepted.lock().unwrap().take() {
-                return Ok(InterceptionResult::SettleCarrier(accepted));
+            let settlement = self.settlement.lock().unwrap().take();
+            if let Some(settlement) = settlement {
+                return self.commit_settlement(request, settlement).await;
             }
             let pause = self.pause.lock().unwrap().take();
             if let Some((entered, result)) = pause {
@@ -74,7 +159,12 @@ impl LiveCollabInterceptor for PausedRoom {
                     // The room has a definite answer and returns it in this same poll.
                     request.context.budget.cancellation.cancel();
                 }
-                return Ok(reply);
+                return match reply {
+                    PauseReply::Direct(reply) => Ok(reply),
+                    PauseReply::Commit(settlement) => {
+                        self.commit_settlement(request, settlement).await
+                    }
+                };
             }
             let note = match request.payload {
                 InterceptedPayload::EditNote { note, .. } => note,
@@ -135,10 +225,11 @@ pub(super) async fn check(
     planner: &CanonicalTestBoardPlanner,
 ) {
     let room = Arc::new(PausedRoom {
+        store: store.clone(),
         fences: Arc::clone(store.room_fences()),
         pause: Mutex::new(None),
         cancel_on_reply: AtomicBool::new(false),
-        accepted: Mutex::new(None),
+        settlement: Mutex::new(None),
         pinned: Mutex::new(None),
         pin_gate: Mutex::new(None),
     });
@@ -189,7 +280,9 @@ pub(super) async fn check(
                 .await
                 .unwrap();
             (
-                InterceptionResult::Applied(committed_a.receipt.clone()),
+                InterceptionResult::Applied(Box::new(InterceptedOutcome::NoteRevision(
+                    committed_a.clone(),
+                ))),
                 (committed_a, committed_b),
             )
         })
@@ -257,9 +350,9 @@ pub(super) async fn check(
                     .await
                     .unwrap();
                 (
-                    InterceptionResult::Applied(
-                        MutationReceiptToken::new(scope.clone(), first.updated_seq).unwrap(),
-                    ),
+                    InterceptionResult::Applied(Box::new(InterceptedOutcome::NoteRevision(
+                        later.clone(),
+                    ))),
                     (first, later),
                 )
             },
@@ -288,7 +381,12 @@ pub(super) async fn check(
     );
     let (foreign, ()) = room
         .during_interception(store.move_board_card(ctx.clone(), card.clone()), async {
-            (InterceptionResult::Applied(created.receipt), ())
+            (
+                InterceptionResult::Applied(Box::new(InterceptedOutcome::NoteRevision(
+                    created.clone(),
+                ))),
+                (),
+            )
         })
         .await;
     assert!(matches!(foreign, Err(PortError::Unavailable(failure))
@@ -324,7 +422,7 @@ pub(super) async fn check(
             );
             let later = store.move_board_card(ctx.clone(), next).await.unwrap();
             (
-                InterceptionResult::Applied(first.receipt.clone()),
+                InterceptionResult::Applied(Box::new(InterceptedOutcome::BoardMove(first.clone()))),
                 (first, later),
             )
         })
@@ -826,7 +924,7 @@ async fn check_observation_conflict(
         );
         observation.preconditions.revision = Some(base.revision.clone());
         let (answer, (changed, cut)) = room
-            .during_interception(
+            .during_interception_reply(
                 store.accept_external_observation(caller, observation),
                 async {
                     let changed = store
@@ -856,21 +954,21 @@ async fn check_observation_conflict(
                         .unwrap()
                         .last_seq;
                     let reply = if settle {
-                        InterceptionResult::SettleCarrier(AcceptedRoomCarrier {
-                            owner_id: active.owner_id.clone().unwrap(),
-                            expected_lease: active.lease_epoch,
-                            expected_lineage: active.lineage_epoch,
-                            compacted_through_update_seq: None,
-                            action: RoomCarrierAction::Close {
-                                final_yrs_snapshot: None,
-                            },
-                        })
+                        PauseReply::Commit(PausedRoom::settlement_for(
+                            &active,
+                            base.revision.clone(),
+                            "Observed bytes.\n",
+                            b"obs-conflict-snap".to_vec(),
+                            None,
+                        ))
                     } else {
                         // This deliberately stale revision cannot establish the current head.
-                        InterceptionResult::Conflict(DomainError::RevisionConflict {
-                            current: base.revision.clone(),
-                            lineage: None,
-                        })
+                        PauseReply::Direct(InterceptionResult::Conflict(
+                            DomainError::RevisionConflict {
+                                current: base.revision.clone(),
+                                lineage: None,
+                            },
+                        ))
                     };
                     (reply, (changed.value, cut))
                 },
@@ -990,9 +1088,9 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
     let agent = agent_run_ctx(ctx, run.clone());
     room.accept(
         &active,
-        RoomCarrierAction::Close {
-            final_yrs_snapshot: None,
-        },
+        created.value.revision.clone(),
+        "---\ntitle: Before\n---\nagent edit",
+        b"edit-snap".to_vec(),
         None,
     );
     store
@@ -1007,12 +1105,31 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
     assert!(
         matches!(lost, PortError::Unavailable(f) if f.effect() == notarium_core::error::CommitEffect::Unknown)
     );
-    let closed = store
+    let settled = store
         .read_collab_session(Some(&ctx.budget), scope, &note)
         .await
         .unwrap()
         .unwrap()
         .session;
+    assert_eq!(settled.room_state, CollabRoomState::Active);
+    assert_ne!(settled.carrier_rev_id, created.value.revision);
+    let closed = store
+        .close_collab_session(
+            &ctx.budget,
+            CloseCollabSession {
+                unchanged_carrier_digest: None,
+                scope: scope.clone(),
+                note: note.clone(),
+                owner_id: active.owner_id.clone(),
+                expected_lease: active.lease_epoch,
+                expected_lineage: active.lineage_epoch,
+                final_yrs_snapshot: None,
+                compacted_through_update_seq: None,
+                carrier_settlement: None,
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(closed.room_state, CollabRoomState::Closed);
     let rollback = store
         .rollback_agent_run(
@@ -1029,7 +1146,7 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
                     run,
                     expected_entities: vec![NoteRevision {
                         note: note.clone(),
-                        revision: closed.carrier_rev_id.clone(),
+                        revision: settled.carrier_rev_id.clone(),
                     }],
                     associated_board_expectations: vec![],
                 },
@@ -1041,8 +1158,8 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
     assert_eq!(rollback.value.restored.len(), 1);
     assert_eq!(rollback.value.restored[0].note, note);
     let retried = store.edit_note(agent, edit).await.unwrap();
-    assert_eq!(retried.value.revision, closed.carrier_rev_id);
-    assert_eq!(retried.receipt.seq(), closed.updated_seq);
+    assert_eq!(retried.value.revision, settled.carrier_rev_id);
+    assert_eq!(retried.receipt.seq(), settled.updated_seq);
 
     let base = rollback.value.restored[0].revision.clone();
     let active = store
@@ -1068,7 +1185,7 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
         ExternalObservation {
             note: note.clone(),
             observed_digest: notarium_syntax::content_digest(new_file),
-            base_revision: base,
+            base_revision: base.clone(),
             disk_identity: disk,
             content: ObservedContent::Planned(plan),
         },
@@ -1088,10 +1205,13 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
         )
         .await
         .unwrap();
-    let checkpoint = || RoomCarrierAction::Checkpoint {
-        yrs_snapshot: b"checkpoint".to_vec(),
-    };
-    room.accept(&active, checkpoint(), None);
+    room.accept(
+        &active,
+        base.clone(),
+        new_file,
+        b"checkpoint".to_vec(),
+        None,
+    );
     let rejected = store
         .accept_external_observation(ctx.clone(), observation.clone())
         .await;
@@ -1107,7 +1227,7 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
         .during_interception(
             store.accept_external_observation(ctx.clone(), observation.clone()),
             async {
-                room.accept(&active, checkpoint(), Some(1));
+                room.accept(&active, base, new_file, b"checkpoint".to_vec(), Some(1));
                 let ExternalObservationResult::Committed(applied) = store
                     .accept_external_observation(ctx.clone(), observation.clone())
                     .await
@@ -1240,18 +1360,19 @@ async fn committed_room_observation_survives_process_exit() {
             .await
             .unwrap();
         let room = Arc::new(PausedRoom {
+            store: store.clone(),
             fences: Arc::clone(store.room_fences()),
             pause: Mutex::new(None),
             cancel_on_reply: AtomicBool::new(false),
-            accepted: Mutex::new(None),
+            settlement: Mutex::new(None),
             pinned: Mutex::new(None),
             pin_gate: Mutex::new(None),
         });
         room.accept(
             &active,
-            RoomCarrierAction::Close {
-                final_yrs_snapshot: None,
-            },
+            base.clone(),
+            "disk",
+            b"crash-obs-snap".to_vec(),
             None,
         );
         store.register_collab_interceptor(room).unwrap();
@@ -1308,13 +1429,34 @@ async fn committed_room_observation_survives_process_exit() {
         .unwrap();
     assert_eq!(result.code(), Some(47));
     let (restored, runtime) = CanonicalRuntime::open(cfg).await.unwrap();
-    let closed = restored
+    let settled = restored
         .read_collab_session(Some(&ctx.budget), &scope, &note)
         .await
         .unwrap()
         .unwrap()
         .session;
-    assert_eq!(closed.room_state, CollabRoomState::Closed);
+    assert_eq!(settled.room_state, CollabRoomState::Fenced);
+    assert_eq!(
+        settled.yrs_snapshot_blob.as_deref(),
+        Some(b"crash-obs-snap".as_slice())
+    );
+    restored
+        .close_collab_session(
+            &ctx.budget,
+            CloseCollabSession {
+                unchanged_carrier_digest: None,
+                scope: scope.clone(),
+                note: note.clone(),
+                owner_id: None,
+                expected_lease: settled.lease_epoch,
+                expected_lineage: settled.lineage_epoch,
+                final_yrs_snapshot: None,
+                compacted_through_update_seq: None,
+                carrier_settlement: None,
+            },
+        )
+        .await
+        .unwrap();
     let mut db = root.open_raw_sqlite().await;
     let receipt: Vec<u8> = sqlx::query_scalar(
         "SELECT p.effect_msgpack FROM command_receipts r JOIN change_payloads p
@@ -1361,8 +1503,8 @@ async fn committed_room_observation_survives_process_exit() {
     else {
         panic!("missing durable observation receipt after process exit");
     };
-    assert_eq!(replayed.value.revision, closed.carrier_rev_id);
-    assert_eq!(replayed.receipt.seq(), closed.updated_seq);
+    assert_eq!(replayed.value.revision, settled.carrier_rev_id);
+    assert_eq!(replayed.receipt.seq(), settled.updated_seq);
     assert_ne!(replayed.value, later.value);
     runtime.shutdown().await.unwrap();
 }

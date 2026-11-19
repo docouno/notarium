@@ -6,10 +6,15 @@ use std::{
 use yrs::{ID, IdSet, block::ClientID};
 
 use super::{
-    body::{BodyIndex, is_high, is_low},
+    body::{BodyIndex, UnitClass},
     update::{Block, Content, Frame, Parent},
 };
 use crate::wire::PolicyRejectReason as Reject;
+
+/// Maximum distinct CRDT client IDs permitted to be introduced via untrusted
+/// peer updates on a single live lineage. Bounds worst-case `yrs` `ClientHasher`
+/// probing while allowing thousands of distinct collaborating sessions.
+pub(super) const MAX_ROOM_CLIENTS: usize = 2048;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Root {
@@ -45,12 +50,19 @@ pub(super) struct Evidence {
     pub(super) fields: HashSet<Arc<str>>,
     pub(super) touches_body: bool,
     roots: Vec<Visit>,
-    text: HashMap<usize, Vec<u16>>,
 }
 
 impl Topology {
     pub(super) fn clock(&self, client: ClientID) -> u32 {
         self.clients.get(&client).map_or(0, |history| history.clock)
+    }
+
+    pub(super) fn has_client(&self, client: ClientID) -> bool {
+        self.clients.contains_key(&client)
+    }
+
+    pub(super) fn client_count(&self) -> usize {
+        self.clients.len()
     }
 
     fn span(&self, id: ID) -> Option<&Span> {
@@ -83,14 +95,28 @@ impl Topology {
 
     pub(super) fn from_snapshot(frame: &Frame<'_>) -> Result<Self, Reject> {
         let mut topology = Self::default();
-        let evidence = topology.prove(frame, &BodyIndex::default(), &[])?;
-        for (block, root) in frame.blocks.iter().zip(evidence.roots) {
-            let Visit::Resolved(root) = root else {
+        let evidence = topology.prove(frame, &BodyIndex::default(), &[], None)?;
+        topology.apply_resolved(frame, &evidence)?;
+        Ok(topology)
+    }
+
+    pub(super) fn apply_resolved(
+        &mut self,
+        frame: &Frame<'_>,
+        evidence: &Evidence,
+    ) -> Result<(), Reject> {
+        for (block, visit) in frame.blocks.iter().zip(&evidence.roots) {
+            let current = self.clock(block.id.client);
+            if block.end <= current {
+                continue;
+            }
+            let Visit::Resolved(root) = visit else {
                 return Err(Reject::PendingClockGap);
             };
-            topology.append(block.id, block.end, root);
+            let start = block.id.clock.max(current);
+            self.append(ID::new(block.id.client, start), block.end, root.clone());
         }
-        Ok(topology)
+        Ok(())
     }
 
     pub(super) fn prove(
@@ -98,17 +124,21 @@ impl Topology {
         frame: &Frame<'_>,
         body: &BodyIndex,
         reserved: &[ClientID],
+        max_total_clients: Option<usize>,
     ) -> Result<Evidence, Reject> {
         let mut evidence = Evidence {
             insertions: IdSet::new(),
             fields: HashSet::new(),
             touches_body: false,
             roots: (0..frame.blocks.len()).map(|_| Visit::Unseen).collect(),
-            text: HashMap::new(),
         };
 
+        let mut new_clients = 0usize;
         for (client, run) in &frame.runs {
             let current = self.clock(*client);
+            if !self.clients.contains_key(client) {
+                new_clients += 1;
+            }
             let first = &frame.blocks[run.start];
             let last = &frame.blocks[run.end - 1];
             if first.id.clock > current || (last.end > current && reserved.contains(client)) {
@@ -120,23 +150,26 @@ impl Topology {
                     .insert(ID::new(*client, current), last.end - current);
             }
         }
+        if let Some(limit) = max_total_clients
+            && self.clients.len().saturating_add(new_clients) > limit
+        {
+            return Err(Reject::MalformedUpdate);
+        }
 
         let mut maximum_body_len = body.len;
-        for (index, block) in frame.blocks.iter().enumerate() {
+        for block in &frame.blocks {
             guard_work!(causal_blocks += 1);
             let current = self.clock(block.id.client);
             if block.end <= current {
                 continue;
             }
             if let Content::String(text) = block.content {
-                let units: Vec<u16> = text.encode_utf16().collect();
-                guard_work!(utf16_writes += units.len());
                 let overlap = current.saturating_sub(block.id.clock);
-                if is_low(units[overlap as usize])
-                    || (overlap > 0
-                        && body
-                            .unit(ID::new(block.id.client, current - 1))
-                            .is_some_and(is_high))
+                if overlap > 0
+                    && (utf16_unit_class_at(text, overlap).is_some_and(UnitClass::is_low)
+                        || body
+                            .unit_class(ID::new(block.id.client, current - 1))
+                            .is_some_and(UnitClass::is_high))
                 {
                     return Err(Reject::InvalidBodyContent);
                 }
@@ -145,7 +178,6 @@ impl Topology {
                     .filter(|end| *end <= i32::MAX as u32)
                     .ok_or(Reject::InvalidBodyContent)?;
                 evidence.touches_body = true;
-                evidence.text.insert(index, units);
             }
         }
 
@@ -196,8 +228,12 @@ impl Topology {
         for deletion in &frame.deletes {
             let first = deletion.id;
             let last = ID::new(first.client, deletion.end - 1);
-            if self.unit(frame, body, &evidence, first).is_some_and(is_low)
-                || self.unit(frame, body, &evidence, last).is_some_and(is_high)
+            if self
+                .unit_class(frame, body, first)
+                .is_some_and(UnitClass::is_low)
+                || self
+                    .unit_class(frame, body, last)
+                    .is_some_and(UnitClass::is_high)
             {
                 return Err(Reject::InvalidBodyContent);
             }
@@ -239,7 +275,10 @@ impl Topology {
         };
         let (left, right) = anchors(block, current);
         let mut root = explicit;
-        for (id, rejects) in [(left, is_high as fn(u16) -> bool), (right, is_low)] {
+        for (id, rejects) in [
+            (left, UnitClass::is_high as fn(UnitClass) -> bool),
+            (right, UnitClass::is_low),
+        ] {
             if let Some(id) = id {
                 let (anchored, _) = self.locate(frame, evidence, id)?;
                 if matches!(anchored, Root::Garbage)
@@ -247,7 +286,7 @@ impl Topology {
                 {
                     return Err(Reject::ForbiddenRootOrSubdoc);
                 }
-                if self.unit(frame, body, evidence, id).is_some_and(rejects) {
+                if self.unit_class(frame, body, id).is_some_and(rejects) {
                     return Err(Reject::InvalidBodyContent);
                 }
                 root = Some(anchored.clone());
@@ -283,23 +322,44 @@ impl Topology {
         Ok((root, frame.blocks[index].end))
     }
 
-    fn unit(
-        &self,
-        frame: &Frame<'_>,
-        body: &BodyIndex,
-        evidence: &Evidence,
-        id: ID,
-    ) -> Option<u16> {
+    fn unit_class(&self, frame: &Frame<'_>, body: &BodyIndex, id: ID) -> Option<UnitClass> {
         if id.clock < self.clock(id.client) {
-            return body.unit(id);
+            return body.unit_class(id);
         }
         let index = frame.block_at(id)?;
-        evidence
-            .text
-            .get(&index)?
-            .get((id.clock - frame.blocks[index].id.clock) as usize)
-            .copied()
+        let block = frame.blocks[index];
+        let Content::String(text) = block.content else {
+            return None;
+        };
+        utf16_unit_class_at(text, id.clock - block.id.clock)
     }
+}
+
+fn utf16_unit_class_at(text: &str, utf16_offset: u32) -> Option<UnitClass> {
+    let target = utf16_offset as usize;
+    if text.is_ascii() {
+        return text
+            .as_bytes()
+            .get(target)
+            .map(|&b| UnitClass::from_utf16(u16::from(b)));
+    }
+    let mut pos = 0usize;
+    for ch in text.chars() {
+        let len = ch.len_utf16();
+        if target < pos + len {
+            return Some(if len == 2 {
+                if target == pos {
+                    UnitClass::HighSurrogate
+                } else {
+                    UnitClass::LowSurrogate
+                }
+            } else {
+                UnitClass::from_utf16(ch as u16)
+            });
+        }
+        pos += len;
+    }
+    None
 }
 
 fn anchors(block: Block<'_>, current: u32) -> (Option<ID>, Option<ID>) {

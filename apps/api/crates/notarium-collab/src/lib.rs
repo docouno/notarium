@@ -12,5 +12,6 @@ pub mod wire;
 
 pub use hub::{CollabConfig, CollabHub};
 pub use session::{
-    CollabPeerSession, CollabSessionAuth, SessionClose, SessionClosed, SessionEvent,
+    CollabPeerReceiver, CollabPeerSender, CollabPeerSession, CollabSessionAuth, SessionClose,
+    SessionClosed, SessionEvent,
 };

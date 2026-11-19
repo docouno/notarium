@@ -13,7 +13,6 @@ use std::{
 
 use collab_support::{
     Client, StorageTestFixtures, close_code, create_note, note_head, pause_wal_admission,
-    wait_until,
 };
 use control_support::{Fixture, budget, command, empty, evidence};
 use notarium_canonical::{
@@ -129,16 +128,11 @@ async fn archive_space_with_open_room(
     // registered in the archive operation's collaboration registry.
     let orphan_seed = create_note(store, &owner, 87, "Departed room.\n", None).await;
     let until_archive = Duration::from_secs(120);
-    let departed_hub = CollabHub::new(
-        store.clone(),
-        CollabConfig {
-            idle_checkpoint: until_archive,
-            periodic_checkpoint: until_archive,
-            idle_unload: until_archive,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut departed_cfg = CollabConfig::default();
+    departed_cfg.idle_checkpoint = until_archive;
+    departed_cfg.periodic_checkpoint = until_archive;
+    departed_cfg.idle_unload = until_archive;
+    let departed_hub = CollabHub::new(store.clone(), departed_cfg).unwrap();
     let auth = session_auth(registry, &session.id, &shared.space_id).await;
     let mut departed_writer = Client::new(
         departed_hub
@@ -249,16 +243,11 @@ async fn logout_with_open_collaboration_session(pg: bool) {
     };
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
     let settle_timer = Duration::from_secs(120);
-    let hub = CollabHub::new(
-        store.clone(),
-        notarium_collab::CollabConfig {
-            idle_checkpoint: settle_timer,
-            periodic_checkpoint: settle_timer,
-            idle_unload: settle_timer,
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    let mut hub_cfg = notarium_collab::CollabConfig::default();
+    hub_cfg.idle_checkpoint = settle_timer;
+    hub_cfg.periodic_checkpoint = settle_timer;
+    hub_cfg.idle_unload = settle_timer;
+    let hub = CollabHub::new(store.clone(), hub_cfg).unwrap();
     hub.register().unwrap();
     let revocations = hub.revocations(fixture.revoker.clone());
     let control = Arc::new(
@@ -419,15 +408,17 @@ async fn logout_with_open_collaboration_session(pg: bool) {
         .unwrap();
 
     let expected = format!("Seed.\n{draft}");
-    wait_until(async || {
-        let saved = store
-            .read_collab_session(None, &scope, &seed.note)
-            .await
-            .unwrap()
-            .unwrap();
-        !saved.session.carrier_dirty && saved.updates.is_empty()
-    })
-    .await;
+    // Two-phase revocation must settle the room before `logout` returns, even
+    // though phase-1 `fence_provider` already evicted the peer registration.
+    let saved = store
+        .read_collab_session(None, &scope, &seed.note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !saved.session.carrier_dirty && saved.updates.is_empty(),
+        "room must already be settled when logout returns"
+    );
     retained.sync().await;
     assert_eq!(retained.text(), expected);
     assert_eq!(

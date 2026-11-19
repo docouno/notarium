@@ -358,7 +358,8 @@ pub struct OpenCollabSession {
     pub allow_fenced_recovery: bool,
 }
 
-/// Input specification for appending an incremental Yrs update under an active room lease.
+/// Input specification for appending an incremental Yrs update under an active room lease (test-only seam).
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
 pub struct AppendCollabUpdate {
     pub scope: HistoryScope,
@@ -577,6 +578,7 @@ impl CanonicalStore {
     }
 
     /// Appends an incremental Yrs update to `collab_update_log` under exact `(lease_epoch, lineage_epoch)`.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn append_collab_update(
         &self,
         budget: &CallBudget,
@@ -4038,26 +4040,6 @@ pub(crate) struct RoomCarrierTransition {
     close_room: bool,
     client_command: bool,
     replace_at_same_prefix: bool,
-}
-
-impl From<notarium_core::ports::AcceptedRoomCarrier> for RoomCarrierTransition {
-    fn from(reply: notarium_core::ports::AcceptedRoomCarrier) -> Self {
-        use notarium_core::ports::RoomCarrierAction;
-        let (yrs_snapshot, close_room) = match reply.action {
-            RoomCarrierAction::Checkpoint { yrs_snapshot } => (Some(yrs_snapshot), false),
-            RoomCarrierAction::Close { final_yrs_snapshot } => (final_yrs_snapshot, true),
-        };
-        Self {
-            expected_owner: Some(reply.owner_id),
-            expected_lease: reply.expected_lease,
-            expected_lineage: reply.expected_lineage,
-            yrs_snapshot,
-            compacted_through: reply.compacted_through_update_seq,
-            close_room,
-            client_command: true,
-            replace_at_same_prefix: false,
-        }
-    }
 }
 
 impl RoomCarrierTransition {
