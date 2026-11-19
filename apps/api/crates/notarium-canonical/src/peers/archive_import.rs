@@ -633,6 +633,30 @@ impl CanonicalStore {
     }
 }
 
+pub(super) async fn has_pinned_plan_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    job: &JobId,
+) -> Result<bool, PortError> {
+    const SQL: &str = "SELECT EXISTS(SELECT 1 FROM content_jobs WHERE space_id=$1
+         AND job_id=$2 AND substr(result_msgpack,1,5)=$3)";
+    macro_rules! has_plan {
+        ($conn:expr) => {
+            sqlx::query_scalar(SQL)
+                .bind(scope.space_id.as_str())
+                .bind(job.as_str())
+                .bind(PLAN_TAG)
+                .fetch_one(&mut **$conn)
+                .await
+        };
+    }
+    match tx {
+        BackendConn::Sqlite(conn) => has_plan!(conn),
+        BackendConn::Postgres(conn) => has_plan!(conn),
+    }
+    .map_err(|err| internal_not_committed("check_import_plan", err.to_string()))
+}
+
 async fn check_import_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,

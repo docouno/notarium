@@ -488,6 +488,16 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version < 7 {
+                sqlx::raw_sql(
+                    "DROP TABLE archive_export_shadows, archive_export_cuts, archive_artifacts,
+                                archive_uploads, archive_import_sources, archive_privacy;
+                     DROP INDEX idx_blob_catalog_gc;
+                     ALTER TABLE blob_catalog DROP COLUMN quarantined_at_ms, DROP COLUMN legacy_cleanup;
+                     ALTER TABLE backup_holds DROP COLUMN scoped_export;
+                     ALTER TABLE content_jobs DROP COLUMN claim_space_epoch;",
+                ).execute(&mut *tx).await.unwrap();
+            }
             if decoded.schema_version <= 5 {
                 sqlx::raw_sql(
                     "DROP INDEX idx_blob_retirements_status;

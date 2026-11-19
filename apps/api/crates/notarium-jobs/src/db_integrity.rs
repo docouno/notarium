@@ -146,28 +146,35 @@ pub(crate) fn check_sqlite_canonical(db: &Connection, version: u32) -> Result<()
     {
         return Err(invalid(ValidationReason::InvalidArchive));
     }
-    if version >= CANONICAL_SCHEMA_VERSION {
-        if actual_indexes.iter().any(|(name, sql)| {
-            trusted_indexes
-                .get(name)
-                .is_none_or(|trusted| normalize_ddl(sql) != normalize_ddl(trusted))
-        }) {
+    for (name, sql) in &actual_indexes {
+        let trusted = match (version, name.as_str()) {
+            (1..=3, "idx_blob_references_non_note_owner") => Some(
+                "CREATE INDEX idx_blob_references_non_note_owner ON blob_references
+                 (space_id, owner_kind, owner_id) WHERE owner_kind <> 'note_revision'",
+            ),
+            (1..=5, "idx_blob_retirements_status") => Some(
+                "CREATE INDEX idx_blob_retirements_status ON blob_retirements(space_id, status)",
+            ),
+            _ => trusted_indexes.get(name).map(String::as_str),
+        };
+        if trusted.is_none_or(|trusted| normalize_ddl(sql) != normalize_ddl(trusted)) {
             return Err(invalid(ValidationReason::InvalidArchive));
         }
-        let actual = definitions(db, "table")?;
-        let expected = definitions(&expected, "table")?;
-        for (table, trusted) in expected {
-            let sql = actual
-                .get(&table)
-                .ok_or_else(|| invalid(ValidationReason::InvalidArchive))?;
-            if table_clauses(sql)? != table_clauses(&trusted)? {
-                return Err(invalid(ValidationReason::InvalidArchive));
-            }
-        }
     }
+    let actual_ddl = definitions(db, "table")?;
+    let trusted_ddl = definitions(&expected, "table")?;
     let mut column_query = db.prepare("SELECT name,type,\"notnull\",pk,hidden FROM pragma_table_xinfo(?1) ORDER BY cid LIMIT 257")
         .map_err(sql_error)?;
     for spec in specs {
+        let sql = actual_ddl
+            .get(spec.name)
+            .ok_or_else(|| invalid(ValidationReason::InvalidArchive))?;
+        let trusted = trusted_ddl
+            .get(spec.name)
+            .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+        if table_clauses(sql)? != expected_table_clauses(trusted, spec, version)? {
+            return Err(invalid(ValidationReason::InvalidArchive));
+        }
         if foreign_keys(db, spec.name)? != foreign_keys(&expected, spec.name)? {
             return Err(invalid(ValidationReason::InvalidArchive));
         }
@@ -222,6 +229,41 @@ fn normalize_ddl(sql: &str) -> String {
             ch => Some(ch.to_ascii_lowercase()),
         })
         .collect()
+}
+
+fn expected_table_clauses(
+    sql: &str,
+    spec: TableSpec,
+    version: u32,
+) -> Result<(Vec<String>, String), PortError> {
+    let (mut clauses, mut suffix) = table_clauses(sql)?;
+    let current = spool_tables(CANONICAL_SCHEMA_VERSION)
+        .find(|table| table.name == spec.name)
+        .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+    for column in current.columns {
+        if spec.columns.iter().any(|found| found.name == column.name) {
+            continue;
+        }
+        let kind = match column.kind {
+            LogicalColKind::Int => "integer",
+            LogicalColKind::Text => "text",
+            LogicalColKind::Bytes => "blob",
+        };
+        let declaration = format!("{}{kind}", column.name);
+        clauses.retain(|clause| !clause.starts_with(&declaration));
+    }
+    if current.primary_key != spec.primary_key {
+        let present = format!("primarykey({})", current.primary_key.join(","));
+        clauses.retain(|clause| clause != &present);
+        clauses.push(format!("primarykey({})", spec.primary_key.join(",")));
+        clauses.sort_unstable();
+    }
+    if (spec.name == "blob_catalog" && version < 4)
+        || (spec.name == "payload_owners" && version < 5)
+    {
+        suffix.clear();
+    }
+    Ok((clauses, suffix))
 }
 
 fn table_clauses(sql: &str) -> Result<(Vec<String>, String), PortError> {
@@ -1161,5 +1203,36 @@ fn canonical_scalar(value: &PostgresSpoolValue, digest: &mut blake3::Hasher) -> 
         PostgresSpoolValue::Text(value) => scalar(digest, b't', value.as_bytes()),
         PostgresSpoolValue::Bytes(value) => scalar(digest, b'b', value),
         PostgresSpoolValue::Int(value) => scalar(digest, b'i', &value.to_be_bytes()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn historical_sqlite_ddl_preserves_constraints() {
+        let db = trusted(SQLITE_BASELINE_DDL).unwrap();
+        db.execute_batch(
+            "DROP TABLE archive_export_shadows;
+             DROP TABLE archive_export_cuts;
+             DROP TABLE archive_artifacts;
+             DROP TABLE archive_uploads;
+             DROP TABLE archive_import_sources;
+             DROP TABLE archive_privacy;
+             DROP INDEX idx_blob_catalog_gc;
+             ALTER TABLE blob_catalog DROP COLUMN quarantined_at_ms;
+             ALTER TABLE blob_catalog DROP COLUMN legacy_cleanup;
+             ALTER TABLE backup_holds DROP COLUMN scoped_export;
+             ALTER TABLE content_jobs DROP COLUMN claim_space_epoch;",
+        )
+        .unwrap();
+        check_sqlite_canonical(&db, 6).unwrap();
+        db.execute_batch(
+            "DROP INDEX uq_spaces_slug_fold;
+             CREATE INDEX uq_spaces_slug_fold ON spaces (slug_fold);",
+        )
+        .unwrap();
+        assert!(check_sqlite_canonical(&db, 6).is_err());
     }
 }

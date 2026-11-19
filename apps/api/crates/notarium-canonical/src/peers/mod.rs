@@ -673,9 +673,7 @@ impl CanonicalStore {
             self,
             budget,
             scope,
-            job,
-            worker_id,
-            expected_lease,
+            (job, worker_id, expected_lease),
             outcome,
             None,
         )
@@ -696,9 +694,7 @@ impl CanonicalStore {
             self,
             budget,
             scope,
-            &claim.job.id,
-            &claim.lease_owner,
-            claim.job.lease,
+            (&claim.job.id, &claim.lease_owner, claim.job.lease),
             outcome,
             Some(authority),
         )
@@ -2566,12 +2562,11 @@ async fn complete_job_impl(
     store: &CanonicalStore,
     budget: &CallBudget,
     scope: &HistoryScope,
-    job_id: &JobId,
-    worker_id: &str,
-    expected_lease: LeaseEpoch,
+    claim: (&JobId, &str, LeaseEpoch),
     outcome: JobCompletionOutcome,
     authority: Option<archive_import::ArchiveCommitAuthority>,
 ) -> Result<Committed<ContentJob>, PortError> {
+    let (job_id, worker_id, expected_lease) = claim;
     let deadline = crate::domain::common::CommandDeadline::start(budget, "complete_job");
     let space_rec = deadline
         .prepare(budget, || {
@@ -2608,7 +2603,7 @@ async fn complete_job_impl(
                 let seq = item_ctx.alloc_next_seq()?;
                 let rev_id = new_revision_id()?;
 
-                let (new_state, comp_u64, tot_opt, final_artifacts, res_msgpack, err_ref) =
+                let (new_state, mut comp_u64, mut tot_opt, final_artifacts, res_msgpack, err_ref) =
                     match outcome {
                         JobCompletionOutcome::Exported(publication) => {
                             if erased
@@ -2679,6 +2674,16 @@ async fn complete_job_impl(
                             Some(error_ref),
                         ),
                     };
+
+                if matches!(cur_job.kind, ContentJobKind::Import { .. })
+                    && archive_import::has_pinned_plan_tx(tx, &scope_cl, &jid).await?
+                {
+                    comp_u64 = cur_job.completed_units;
+                    tot_opt = cur_job.total_units;
+                    if new_state == JobState::Succeeded && tot_opt != Some(comp_u64) {
+                        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+                    }
+                }
 
                 let art_json = serde_json::to_string(&final_artifacts).map_err(|err| {
                     internal_not_committed("encode_job_artifacts", err.to_string())
