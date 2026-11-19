@@ -36,7 +36,6 @@ pub(crate) struct Session {
     failure: Mutex<Option<PortError>>,
     notify: Notify,
     watch_notify: Notify,
-    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     commands: Mutex<Option<mpsc::WeakSender<Command>>>,
 }
 impl Session {
@@ -73,16 +72,11 @@ impl Session {
             failure: Mutex::new(None),
             notify: Notify::new(),
             watch_notify: Notify::new(),
-            worker: Mutex::new(None),
             commands: Mutex::new(None),
         })
     }
     pub(crate) fn elapsed(&self) -> Duration {
         self.started.elapsed()
-    }
-    pub(crate) fn set_worker(&self, worker: std::thread::JoinHandle<()>) -> Result<(), PortError> {
-        *self.worker.lock().map_err(|_| failure())? = Some(worker);
-        Ok(())
     }
     pub(crate) fn set_commands(&self, commands: &mpsc::Sender<Command>) -> Result<(), PortError> {
         *self.commands.lock().map_err(|_| failure())? = Some(commands.downgrade());
@@ -293,13 +287,8 @@ impl Session {
             notified.as_mut().enable();
             let result = self.result.lock().map_err(|_| failure())?.clone();
             if let Some(result) = result {
-                let worker = self.worker.lock().map_err(|_| failure())?.take();
-                if let Some(worker) = worker {
-                    tokio::task::spawn_blocking(move || worker.join())
-                        .await
-                        .map_err(|_| failure())?
-                        .map_err(|_| failure())?;
-                }
+                // The owner sends this after dropping its resources and I/O
+                // runtime, independently of the caller's blocking pool.
                 return result;
             }
             notified.await;

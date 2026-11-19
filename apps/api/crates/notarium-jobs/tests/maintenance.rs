@@ -89,6 +89,119 @@ fn open(path: &Path) -> ArchiveInput {
     ArchiveInput::new(File::open(path).unwrap()).unwrap()
 }
 
+async fn cancelled_backup_releases_hold_while_its_reader_is_queued(
+    canonical: &CanonicalStore,
+    control: &ControlBackup,
+    root: &DataRoot,
+    scratch: &Path,
+) {
+    let spools = scratch.join("queued-verification");
+    canonical.set_backup_spool_dir(spools.clone());
+    canonical.set_backup_step_delay_for_test(Duration::from_millis(20));
+    let destination = scratch.join("cancelled.zip");
+    let ctx = authority(ServicePurpose::Backup);
+    let cancellation = ctx.budget.cancellation.clone();
+    let (occupy, begin_blocking) = tokio::sync::oneshot::channel();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (unblock, blocked) = std::sync::mpsc::channel::<()>();
+    let (done, mut result) = tokio::sync::oneshot::channel();
+    let caller = std::thread::spawn({
+        let canonical = canonical.clone();
+        let control = control.clone();
+        let destination = destination.clone();
+        move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap();
+            drop(runtime.spawn(async move {
+                if begin_blocking.await.is_ok() {
+                    drop(tokio::task::spawn_blocking(move || {
+                        let _ = started.send(());
+                        let _ = blocked.recv();
+                    }));
+                }
+            }));
+            let outcome = runtime.block_on(run_backup(
+                ctx,
+                &canonical,
+                &control,
+                &destination,
+                sqlite_backup_options(),
+            ));
+            let _ = done.send(outcome);
+        }
+    });
+    let control_pending = root.staging().join("control");
+    let prepared = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if paired_load::artifact_files(&control_pending)
+                .iter()
+                .any(|path| path.extension().is_some_and(|ext| ext == "pending"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+    let _ = occupy.send(());
+    let occupied = tokio::time::timeout(Duration::from_secs(3), ready).await;
+    // Both participant workers have produced their stable copies. The
+    // caller's only blocking thread cannot start the spool verifier.
+    let produced = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if control.last_metrics().is_some_and(|m| m.bytes > 0)
+                && canonical.last_backup_memory_stats().is_some()
+                && paired_load::artifact_files(&spools)
+                    .iter()
+                    .any(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let waiting = tokio::time::timeout(Duration::from_millis(250), &mut result).await;
+    let waiting_on_verifier = waiting.is_err();
+    cancellation.cancel();
+    let finished = if waiting_on_verifier {
+        tokio::time::timeout(Duration::from_secs(3), &mut result).await
+    } else {
+        waiting
+    };
+    let remaining = canonical
+        .execute_diagnostic_read_sql_for_test(None, "SELECT count(*) FROM backup_holds")
+        .await;
+    drop(unblock);
+    tokio::task::spawn_blocking(move || caller.join().unwrap())
+        .await
+        .unwrap();
+
+    canonical.set_backup_step_delay_for_test(Duration::ZERO);
+    prepared.expect("Control finished key inspection before occupying the caller pool");
+    occupied
+        .expect("caller blocking pool became occupied")
+        .unwrap();
+    produced.expect("both participant workers finished their capture");
+    assert!(
+        waiting_on_verifier,
+        "backup must still be waiting on its spool verifier"
+    );
+    assert!(matches!(
+        finished.expect("cancelled backup must finish while verifier is queued").unwrap(),
+        Err(notarium_core::error::PortError::Cancelled(failure))
+            if failure.effect() == notarium_core::error::CommitEffect::NotCommitted
+    ));
+    assert_eq!(remaining.unwrap(), 0);
+    assert!(!destination.exists());
+    assert!(paired_load::artifact_files(&spools).is_empty());
+    assert!(paired_load::artifact_files(&root.staging().join("control")).is_empty());
+    canonical.set_backup_spool_dir(root.staging().join("backups"));
+}
+
 struct CaptureWrite {
     note: NoteId,
     before: SpaceSeq,
@@ -414,6 +527,10 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         )
         .await
         .unwrap();
+    cancelled_backup_releases_hold_while_its_reader_is_queued(
+        &canonical, &binding, &root, &scratch.0,
+    )
+    .await;
     let export = held_export(&canonical, &scope, &owner).await;
     rusqlite::Connection::open(root.canonical())
         .unwrap()

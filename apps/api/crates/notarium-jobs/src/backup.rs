@@ -15,7 +15,7 @@ use notarium_canonical::{
 use notarium_control::backup::ControlBackup;
 use notarium_core::{
     DomainError,
-    error::{PortError, ValidationReason},
+    error::{BudgetKind, PortError, ValidationReason},
     ids::{BackupId, ContentDigest, SpaceId},
     model::HistoryScope,
     ports::{
@@ -25,7 +25,7 @@ use notarium_core::{
     receipt::ChangeCursor,
 };
 use rusqlite::{Connection, OpenFlags};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
@@ -97,6 +97,9 @@ pub(crate) struct Pair {
     control_hold: Box<dyn BackupHold>,
     canonical_hold: Box<dyn BackupHold>,
 }
+
+// Private database files and caller-provided sources have separate admission.
+static SPOOL_READERS: Semaphore = Semaphore::const_new(4);
 
 impl Pair {
     pub(crate) async fn release(self) -> Result<(), PortError> {
@@ -235,6 +238,13 @@ pub(crate) async fn capture_pair(
     canonical: &CanonicalStore,
     control: &ControlBackup,
 ) -> Result<Pair, PortError> {
+    check_cancelled(&ctx.budget.cancellation)?;
+    let read_slot = SPOOL_READERS
+        .try_acquire()
+        .map_err(|_| DomainError::RateLimited {
+            retry_after_ms: 1_000,
+            budget: BudgetKind::Concurrency,
+        })?;
     let id = BackupId::from_bytes(codec::ordered_id_16()?);
     let mut cb = control.default_budget();
     let mut nb = canonical.default_backup_budget();
@@ -277,7 +287,7 @@ pub(crate) async fn capture_pair(
             return Err(invalid(ValidationReason::ScopeMismatch));
         }
         let cancellation = ctx.budget.cancellation.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::maintenance::read_blocking(&ctx.budget.cancellation, read_slot, move || {
             let control_file = open_temporary_spool(&control_spool, &cancellation)?;
             let canonical_file = open_temporary_spool(&canonical_spool, &cancellation)?;
             Ok((
@@ -289,7 +299,6 @@ pub(crate) async fn capture_pair(
             ))
         })
         .await
-        .map_err(join_error)?
     }
     .await;
     let (control_file, canonical_file, control_spool, canonical_spool, pause) = match captured {
@@ -320,6 +329,7 @@ fn open_temporary_spool(
     spool: &TemporaryBackupSpool,
     cancellation: &Cancellation,
 ) -> Result<File, PortError> {
+    check_cancelled(cancellation)?;
     let receipt = spool.receipt();
     let expected = Payload {
         bytes: receipt.bytes,

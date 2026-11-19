@@ -17,6 +17,15 @@ use crate::{backup_format::invalid, import::check_cancelled};
 
 struct CancelOnDrop(Cancellation);
 
+struct AbortQueuedRead(tokio::task::AbortHandle);
+
+impl Drop for AbortQueuedRead {
+    fn drop(&mut self) {
+        // An admitted native read still owns its input and permit until it returns.
+        self.0.abort();
+    }
+}
+
 // A caller-provided Read can stay inside blocking I/O after cancellation.
 // The worker retains its slot until that call actually returns.
 static SOURCE_WORKERS: Semaphore = Semaphore::const_new(2);
@@ -56,10 +65,21 @@ pub(crate) async fn read_source<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, PortError> + Send + 'static,
 ) -> Result<T, PortError> {
     let permit = source_slot(cancellation).await?;
+    read_blocking(cancellation, permit, work).await
+}
+
+pub(crate) async fn read_blocking<T: Send + 'static>(
+    cancellation: &Cancellation,
+    permit: SemaphorePermit<'static>,
+    work: impl FnOnce() -> Result<T, PortError> + Send + 'static,
+) -> Result<T, PortError> {
+    let worker_cancel = cancellation.clone();
     let worker = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        check_cancelled(&worker_cancel)?;
         work()
     });
+    let _abort = AbortQueuedRead(worker.abort_handle());
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(source_cancelled()),

@@ -47,6 +47,8 @@ in-flight operation signals cancellation independently of the bounded command
 queue. Stale completed phase handles cannot cancel their successor. An unread
 spool reply remains participant-owned: receipt acceptance and abort race through
 one atomic ownership transition.
+The owner reports the cleanup result after closing native resources and its
+runtime, using the session's completion signal.
 
 A background task on the owner runtime monitors event-driven cancellation,
 deadlines and retention even while the caller is idle, tracking PostgreSQL spool

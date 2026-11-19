@@ -457,6 +457,7 @@ pub(crate) async fn launch(start: Start) -> Result<Client, PortError> {
             .unwrap_or_else(|_| Err(failure()));
             drop(worker);
             drop(runtime);
+            drop(receiver);
             owner_session.finished(if run.is_err() {
                 Err(failure())
             } else {
@@ -464,7 +465,7 @@ pub(crate) async fn launch(start: Start) -> Result<Client, PortError> {
             });
         })
         .map_err(|_| failure())?;
-    session.set_worker(worker)?;
+    drop(worker);
     let result = session
         .operation
         .run(
