@@ -19,6 +19,7 @@ pub(super) struct Aligned {
     pub snapshot: Arc<dyn StructuralSnapshot>,
     pub state: Option<Arc<Published>>,
     pub cut: SnapshotCut,
+    pub base_cut: SnapshotCut,
     pub overlay: Overlay,
 }
 
@@ -123,16 +124,19 @@ impl SearchEngine {
                 return Err(unavailable("projection_behind_search"));
             }
         }
-        let mut cut = snapshot.cut().clone();
-        if !used_overlay {
-            cut.projected_seq = cut
-                .projected_seq
-                .min(state.as_ref().map_or(SpaceSeq::ZERO, |state| state.seq));
-        }
+        let mut base_cut = snapshot.cut().clone();
+        base_cut.projected_seq = base_cut
+            .projected_seq
+            .min(state.as_ref().map_or(SpaceSeq::ZERO, |state| state.seq));
         Ok(Aligned {
+            cut: if used_overlay {
+                snapshot.cut().clone()
+            } else {
+                base_cut.clone()
+            },
             snapshot,
             state,
-            cut,
+            base_cut,
             overlay,
         })
     }

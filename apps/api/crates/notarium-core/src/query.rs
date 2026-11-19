@@ -199,7 +199,8 @@ impl Predicate {
         }
         Ok(())
     }
-    fn matches(&self, fields: &BTreeMap<String, FieldObservation<FieldValue>>) -> bool {
+    /// Evaluate a predicate already validated against the snapshot's field schema.
+    pub fn matches(&self, fields: &BTreeMap<String, FieldObservation<FieldValue>>) -> bool {
         let observed = |key: &String| fields.get(key).unwrap_or(&FieldObservation::Absent);
         match self {
             Self::All(items) => items.iter().all(|p| p.matches(fields)),

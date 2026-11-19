@@ -16,11 +16,16 @@ use notarium_core::{
         ChangeSubscription, MaintenanceContext, Mutation, NoteCard, PageLimit, PortFuture,
         ServiceAuthority, ServicePurpose, SpaceContext, StructuralReadPort, StructuralSnapshot,
     },
-    query::{FieldFilterAstV1, Predicate},
+    query::{
+        FieldFilterAstV1, FieldObservation, FieldSchema, FieldType, FieldValue, Predicate,
+        ScalarType,
+    },
     receipt::{CausalBasis, ChangeCursor, CommandIdentity},
+    value::ScalarValue,
 };
 use notarium_search::ports::{
-    SearchCarrierReadPort, SearchIndexedNote, SearchNotesSeedPage, SearchOverlayNote,
+    SearchCarrierReadPort, SearchDocumentTarget, SearchIndexedNote, SearchNotesSeedPage,
+    SearchOverlayNote,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -45,8 +50,16 @@ pub fn context(scope: &HistoryScope, owner: &PrincipalId) -> SpaceContext {
         write_classes: DocClass::all(),
         project_root: None,
     };
+    context_with_grant(scope, owner, grant)
+}
+
+pub fn context_with_grant(
+    scope: &HistoryScope,
+    principal: &PrincipalId,
+    grant: SpaceGrant,
+) -> SpaceContext {
     let auth = EngineAuthContext::for_human(VerifiedHuman::attest(
-        owner.clone(),
+        principal.clone(),
         GrantId::from_bytes([1; 16]),
         BTreeMap::from([(scope.space_id.clone(), grant)]),
         true,
@@ -90,6 +103,7 @@ pub struct View {
     rows: Vec<(NoteId, FolderId)>,
     parents: BTreeMap<FolderId, Option<FolderId>>,
     edges: BTreeMap<u32, Vec<u32>>,
+    fields: BTreeMap<NoteId, BTreeMap<String, FieldObservation<FieldValue>>>,
 }
 
 impl View {
@@ -104,6 +118,7 @@ impl View {
             rows: Vec::new(),
             parents: BTreeMap::from([(root, None)]),
             edges: BTreeMap::new(),
+            fields: BTreeMap::new(),
         }
     }
 
@@ -122,6 +137,10 @@ impl View {
 
     pub fn link(&mut self, from: u32, to: u32) {
         self.edges.entry(from).or_default().push(to);
+    }
+
+    pub fn set_status(&mut self, note: NoteId, status: &str) {
+        self.fields.insert(note, status_field(status));
     }
 
     fn in_folder(&self, member: &FolderId, folder: &FolderId) -> bool {
@@ -184,11 +203,32 @@ impl StructuralSnapshot for View {
     }
 
     fn filter_notes(&self, filter: &FieldFilterAstV1) -> DomainResult<Option<DenseNodeIter<'_>>> {
-        filter.validate(&BTreeMap::new())?;
+        filter.validate(&BTreeMap::from([(
+            "status".to_owned(),
+            FieldSchema {
+                kind: FieldType::Scalar(ScalarType::String),
+                nullable: false,
+            },
+        )]))?;
         if matches!(&filter.predicate, Predicate::All(items) if items.is_empty()) {
             return Ok(None);
         }
-        Ok(Some(DenseNodeIter::from_slice(self.cut.generation, &[])))
+        let empty = BTreeMap::new();
+        let nodes = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (note, _))| {
+                filter
+                    .predicate
+                    .matches(self.fields.get(note).unwrap_or(&empty))
+                    .then_some(index as u32)
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(DenseNodeIter::from_iter(
+            self.cut.generation,
+            nodes.into_iter(),
+        )))
     }
 
     fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>> {
@@ -209,6 +249,13 @@ impl StructuralSnapshot for View {
             .map(|(point, _)| *point);
         Ok(DenseNodeIter::from_iter(self.cut.generation, sources))
     }
+}
+
+pub fn status_field(status: &str) -> BTreeMap<String, FieldObservation<FieldValue>> {
+    BTreeMap::from([(
+        "status".to_owned(),
+        FieldObservation::Ok(FieldValue::Scalar(ScalarValue::String(status.to_owned()))),
+    )])
 }
 
 impl StructuralReadPort for Projection {
@@ -360,7 +407,7 @@ impl SearchCarrierReadPort for ControlledCarriers {
     fn read_authorized_documents_for_search(
         &self,
         ctx: SpaceContext,
-        targets: Vec<(NoteId, RevisionId)>,
+        targets: Vec<SearchDocumentTarget>,
     ) -> PortFuture<'_, Vec<Option<Arc<ClassifiedDocument>>>> {
         SearchCarrierReadPort::read_authorized_documents_for_search(&*self.canonical, ctx, targets)
     }

@@ -21,9 +21,10 @@ use notarium_core::{
     ids::{ContentDigest, FolderId, NoteId, PrincipalId, RevisionId, SpaceSeq},
     model::{HistoryScope, Lifecycle, NoteRef},
     ports::{CallBudget, PageLimit, ServiceAuthority, ServicePurpose, SpaceContext},
+    query::{FieldObservation, FieldValue},
     receipt::ChangeCursor,
 };
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 #[derive(Clone, Debug)]
 pub struct SearchIndexedNote {
@@ -59,6 +60,20 @@ pub struct SearchOverlayNote {
     pub path: String,
     pub preview: String,
     pub parent_folder_id: FolderId,
+    pub fields: BTreeMap<String, FieldObservation<FieldValue>>,
+}
+
+/// The revision shown by a projected cut, or the exact revision of a receipt.
+pub struct SearchDocumentTarget {
+    pub note_id: NoteId,
+    pub revision: RevisionId,
+    pub projected_at: Option<SpaceSeq>,
+}
+
+struct SearchTargetNote {
+    note: SearchIndexedNote,
+    path: String,
+    fields: BTreeMap<String, FieldObservation<FieldValue>>,
 }
 
 enum Notes {
@@ -81,12 +96,20 @@ impl CanonicalStore {
         if targets.len() > 8 {
             return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
         }
-        self.read_exact_search_notes(budget, scope, targets, None)
+        let targets = targets
+            .into_iter()
+            .map(|(note_id, revision)| SearchDocumentTarget {
+                note_id,
+                revision,
+                projected_at: None,
+            })
+            .collect();
+        self.read_search_targets(budget, scope, targets, None)
             .await?
             .into_iter()
             .map(|(key, row)| {
                 let overlay = row
-                    .map(|(note, path)| {
+                    .map(|SearchTargetNote { note, path, fields }| {
                         let content =
                             ClassEgressFence::index_for_search(note.document.clone(), authority)?;
                         Ok::<_, DomainError>(SearchOverlayNote {
@@ -99,6 +122,7 @@ impl CanonicalStore {
                             title: note.title,
                             path,
                             parent_folder_id: note.parent_folder_id,
+                            fields,
                         })
                     })
                     .transpose()?;
@@ -110,7 +134,7 @@ impl CanonicalStore {
     pub async fn read_authorized_documents_for_search(
         &self,
         ctx: SpaceContext,
-        targets: Vec<(NoteId, RevisionId)>,
+        targets: Vec<SearchDocumentTarget>,
     ) -> Result<Vec<Option<Arc<ClassifiedDocument>>>, PortError> {
         if targets.len() > 200 {
             return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
@@ -118,12 +142,12 @@ impl CanonicalStore {
         let scope = ctx.scope().clone();
         let auth = ctx.auth().clone();
         let rows = self
-            .read_exact_search_notes(ctx.budget, scope, targets, Some(auth.clone()))
+            .read_search_targets(ctx.budget, scope, targets, Some(auth.clone()))
             .await?;
         Ok(rows
             .into_iter()
             .map(|(_, row)| {
-                row.and_then(|(note, _)| {
+                row.and_then(|SearchTargetNote { note, .. }| {
                     ClassEgressFence::search(note.document.clone(), &auth).ok()?;
                     Some(Arc::new(note.document))
                 })
@@ -131,14 +155,14 @@ impl CanonicalStore {
             .collect())
     }
 
-    async fn read_exact_search_notes(
+    async fn read_search_targets(
         &self,
         mut budget: CallBudget,
         scope: HistoryScope,
-        targets: Vec<(NoteId, RevisionId)>,
+        targets: Vec<SearchDocumentTarget>,
         auth: Option<EngineAuthContext>,
-    ) -> Result<Vec<(NoteId, Option<(SearchIndexedNote, String)>)>, PortError> {
-        let deadline = CommandDeadline::start(&budget, "read_exact_search_notes");
+    ) -> Result<Vec<(NoteId, Option<SearchTargetNote>)>, PortError> {
+        let deadline = CommandDeadline::start(&budget, "read_search_targets");
         let mut tx_budget = budget.clone();
         tx_budget.remaining = deadline.remaining(&budget)?.min(Duration::from_millis(250));
         let scope_for_tx = scope.clone();
@@ -148,18 +172,45 @@ impl CanonicalStore {
                 Box::pin(async move {
                     let space = active_space(tx, &scope_for_tx).await?;
                     let mut live = FolderAncestryCache::default();
+                    let mut historical = BTreeMap::new();
                     let mut slots = Vec::with_capacity(targets.len());
-                    for (key, revision) in targets {
-                        let row = load_exact_note(
-                            tx,
-                            &space,
-                            &key,
-                            revision,
-                            &mut live,
-                            auth_for_tx.as_ref(),
-                        )
-                        .await?;
-                        slots.push((key, row));
+                    for target in targets {
+                        let auth = auth_for_tx.as_ref();
+                        let row = if let Some(cutoff) = target.projected_at {
+                            let ancestry = match historical.entry(cutoff) {
+                                std::collections::btree_map::Entry::Occupied(entry) => {
+                                    entry.into_mut()
+                                }
+                                std::collections::btree_map::Entry::Vacant(entry) => {
+                                    validate_snapshot_cutoff_tx(tx, &scope_for_tx, Some(cutoff))
+                                        .await?;
+                                    entry.insert(FolderAncestryCache::at_cut(&scope_for_tx, cutoff))
+                                }
+                            };
+                            load_note(
+                                tx,
+                                &space,
+                                &target.note_id,
+                                cutoff,
+                                ancestry,
+                                &mut live,
+                                auth,
+                            )
+                            .await?
+                            .filter(|pending| pending.revision == target.revision)
+                            .map(|pending| (pending, String::new()))
+                        } else {
+                            load_exact_note(
+                                tx,
+                                &space,
+                                &target.note_id,
+                                target.revision,
+                                &mut live,
+                                auth,
+                            )
+                            .await?
+                        };
+                        slots.push((target.note_id, row));
                     }
                     Ok(slots)
                 })
@@ -169,10 +220,12 @@ impl CanonicalStore {
         for (key, row) in pending {
             budget.remaining = deadline.remaining(&budget)?;
             let row = match row {
-                Some((pending, path)) => self
-                    .load_search_carrier(&scope, &budget, pending)
-                    .await?
-                    .map(|note| (note, path)),
+                Some((mut pending, path)) => {
+                    let fields = std::mem::take(&mut pending.meta.evaluated_fields);
+                    self.load_search_carrier(&scope, &budget, pending)
+                        .await?
+                        .map(|note| SearchTargetNote { note, path, fields })
+                }
                 None => None,
             };
             rows.push((key, row));
@@ -183,7 +236,7 @@ impl CanonicalStore {
                 let space = active_space(tx, &scope).await?;
                 let mut live = FolderAncestryCache::default();
                 for (key, row) in &mut rows {
-                    let Some((note, _)) = row else {
+                    let Some(SearchTargetNote { note, .. }) = row else {
                         continue;
                     };
                     match live_search_facts(tx, &space, key, &mut live).await? {
@@ -304,7 +357,8 @@ impl CanonicalStore {
                     let mut pending = Vec::with_capacity(keys.len());
                     for key in keys {
                         let candidate =
-                            load_note(tx, &space, &key, cutoff, &mut historical, &mut live).await?;
+                            load_note(tx, &space, &key, cutoff, &mut historical, &mut live, None)
+                                .await?;
                         pending.push((key, candidate));
                     }
                     Ok((cutoff, pending, next_after))
@@ -523,8 +577,12 @@ async fn load_note(
     cutoff: SpaceSeq,
     historical: &mut FolderAncestryCache,
     live: &mut FolderAncestryCache,
+    auth: Option<&EngineAuthContext>,
 ) -> Result<Option<PendingNote>, PortError> {
-    if live_search_facts(tx, space, note, live).await?.is_none() {
+    let Some(current) = live_search_facts(tx, space, note, live).await? else {
+        return Ok(None);
+    };
+    if auth.is_some_and(|auth| auth.can_view_resource(&current).is_err()) {
         return Ok(None);
     }
     let Some(revision) =
@@ -554,6 +612,9 @@ async fn load_note(
             false,
         )
         .await?;
+    if auth.is_some_and(|auth| auth.can_view_resource(&facts).is_err()) {
+        return Ok(None);
+    }
     let project = historical.enclosing_project(&ancestry);
     Ok(Some(PendingNote {
         meta,

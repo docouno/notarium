@@ -130,14 +130,7 @@ impl SearchEngine {
                     .unwrap_or(false)
             })
         });
-        let overlay = rank_overlay(
-            self,
-            &request.text,
-            &aligned.overlay,
-            &filter,
-            snapshot.as_ref(),
-            filtered,
-        )?;
+        let overlay = rank_overlay(self, &request, &aligned.overlay, &filter, filtered)?;
         if browse {
             notes.extend(overlay);
             notes.sort_by(|left, right| note_key(left).cmp(&note_key(right)));
@@ -173,7 +166,7 @@ impl SearchEngine {
             .hydrate_notes(hydrate::Hydration {
                 context: &ctx,
                 clock,
-                cut: &aligned.cut,
+                cut: &aligned.base_cut,
                 overlay: &aligned.overlay,
                 candidates,
                 tokenizer,
@@ -371,7 +364,6 @@ struct Eligible {
     project: Option<FolderRef>,
     folders: Option<BTreeSet<FolderId>>,
     ordinals: Option<Arc<Bitmap>>,
-    fields: Option<Bitmap>,
     nodes: Option<Bitmap>,
     vector_notes: Option<BTreeSet<NoteId>>,
 }
@@ -483,7 +475,6 @@ impl Eligible {
             project,
             folders,
             ordinals,
-            fields,
             nodes,
             vector_notes,
         })
@@ -504,7 +495,7 @@ impl Eligible {
 
     fn overlay_allowed(
         &self,
-        snapshot: &dyn StructuralSnapshot,
+        predicate: &Predicate,
         row: &crate::ports::SearchOverlayNote,
     ) -> bool {
         self.classes.contains(&row.document.class())
@@ -512,12 +503,7 @@ impl Eligible {
                 .folders
                 .as_ref()
                 .is_none_or(|ids| ids.contains(&row.parent_folder_id))
-            && self.fields.as_ref().is_none_or(|fields| {
-                snapshot
-                    .lookup(&row.note_id)
-                    .and_then(|node| node.index(self.cut.generation).ok())
-                    .is_some_and(|index| fields.contains(index))
-            })
+            && predicate.matches(&row.fields)
     }
 }
 
@@ -566,10 +552,9 @@ async fn lexical_candidates(
 
 fn rank_overlay(
     engine: &SearchEngine,
-    text: &str,
+    query: &SearchQuery,
     overlay: &align::Overlay,
     filter: &Eligible,
-    snapshot: &dyn StructuralSnapshot,
     filtered: bool,
 ) -> Result<Vec<LexicalHit>, PortError> {
     let mut dictionary = crate::layout::FolderDictionary::default();
@@ -577,7 +562,7 @@ fn rank_overlay(
     for row in overlay
         .values()
         .flatten()
-        .filter(|row| filter.overlay_allowed(snapshot, row))
+        .filter(|row| filter.overlay_allowed(&query.filter.predicate, row))
     {
         if let Ok(content) =
             ClassEgressFence::index_for_search(row.document.clone(), &engine.services.authority)
@@ -596,7 +581,7 @@ fn rank_overlay(
             folder: *folder,
         })
         .collect();
-    LexicalIndex::rank_overlay(text, &updates, filtered).map_err(lexical_error)
+    LexicalIndex::rank_overlay(&query.text, &updates, filtered).map_err(lexical_error)
 }
 
 fn note_key(hit: &LexicalHit) -> Option<&NoteId> {

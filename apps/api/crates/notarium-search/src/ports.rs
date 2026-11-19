@@ -1,7 +1,7 @@
 //! Read and model-selection contracts for the search engine.
 
 pub use notarium_canonical::changes::search::{
-    SearchIndexedNote, SearchNotesSeedPage, SearchOverlayNote,
+    SearchDocumentTarget, SearchIndexedNote, SearchNotesSeedPage, SearchOverlayNote,
 };
 use notarium_canonical::{CanonicalStore, chats::search::HydratedChatHit};
 use notarium_core::{
@@ -89,7 +89,7 @@ pub trait SearchCarrierReadPort: Send + Sync {
     fn read_authorized_documents_for_search(
         &self,
         ctx: SpaceContext,
-        targets: Vec<(NoteId, RevisionId)>,
+        targets: Vec<SearchDocumentTarget>,
     ) -> PortFuture<'_, Vec<Option<Arc<ClassifiedDocument>>>>;
 
     fn hydrate_live_visible_chat_hits<'a>(
@@ -148,7 +148,7 @@ impl SearchCarrierReadPort for CanonicalStore {
     fn read_authorized_documents_for_search(
         &self,
         ctx: SpaceContext,
-        targets: Vec<(NoteId, RevisionId)>,
+        targets: Vec<SearchDocumentTarget>,
     ) -> PortFuture<'_, Vec<Option<Arc<ClassifiedDocument>>>> {
         Box::pin(CanonicalStore::read_authorized_documents_for_search(
             self, ctx, targets,

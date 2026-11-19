@@ -27,7 +27,8 @@ pub trait StructuralSnapshot: Send + Sync {
     fn folder_descendants(&self, folder: &FolderId) -> DomainResult<Vec<FolderId>>;
     /// Include the folder itself when it is an active project root.
     fn enclosing_project(&self, folder: &FolderId) -> DomainResult<Option<FolderId>>;
-    /// Return `None` when the predicate does not restrict the note set.
+    /// Validate against the snapshot's field schema. Return `None` when the
+    /// predicate does not restrict the note set.
     fn filter_notes(&self, filter: &FieldFilterAstV1) -> DomainResult<Option<DenseNodeIter<'_>>>;
     fn outgoing(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;
     fn incoming(&self, node: DenseNodeId) -> DomainResult<DenseNodeIter<'_>>;

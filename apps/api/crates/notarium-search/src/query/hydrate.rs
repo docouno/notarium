@@ -4,6 +4,7 @@ use crate::{
     engine::{Clock, SearchEngine, internal},
     lexical::{HitKey, LexicalHit},
     model::chunks_for,
+    ports::SearchDocumentTarget,
 };
 use notarium_core::{
     classes::{ClassEgressFence, ContentPart, SearchContent, SearchPart},
@@ -114,11 +115,10 @@ impl SearchEngine {
         }
         let targets = ordered
             .iter()
-            .map(|(candidate, card)| {
-                (
-                    candidate.note.clone(),
-                    card.document.provenance().revision().clone(),
-                )
+            .map(|(candidate, card)| SearchDocumentTarget {
+                note_id: candidate.note.clone(),
+                revision: card.document.provenance().revision().clone(),
+                projected_at: (!overlay.contains_key(&candidate.note)).then_some(cut.projected_seq),
             })
             .collect();
         ctx.budget = clock.remaining()?;

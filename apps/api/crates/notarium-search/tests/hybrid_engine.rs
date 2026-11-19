@@ -2,7 +2,10 @@ mod hybrid_support;
 #[path = "../../notarium-canonical/tests/support/mod.rs"]
 mod storage;
 
-use hybrid_support::{ControlledCarriers, HeldPages, Projection, View, context, mutation};
+use hybrid_support::{
+    ControlledCarriers, HeldPages, Projection, View, context, context_with_grant, mutation,
+    status_field,
+};
 use notarium_canonical::{
     CanonicalConfig, CanonicalRuntime, CanonicalStore, S3BucketModePolicy,
     blobs::s3::admin_ensure_bucket,
@@ -10,7 +13,7 @@ use notarium_canonical::{
     runtime::{CreateFolderSpec, CreateSpaceSpec},
 };
 use notarium_core::{
-    auth::SpaceKind,
+    auth::{SpaceGrant, SpaceKind, SpaceRole},
     classes::DocClass,
     epoch::{DataRoot, SearchIndexKind},
     error::PortError,
@@ -23,6 +26,7 @@ use notarium_core::{
     },
     query::{FieldFilterAstV1, Predicate},
     receipt::{AwaitWatermarks, CausalBasis, MutationReceiptToken, ReceiptSet},
+    value::ScalarValue,
 };
 use notarium_search::{
     SearchDependencies, SearchEngine,
@@ -167,7 +171,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         .unwrap();
     let scope = &space.scope;
     let ctx = context(scope, &owner);
-    for (id, slug) in [(&docs, "docs"), (&archive, "archive")] {
+    for (id, slug, project) in [(&docs, "docs", false), (&archive, "archive", true)] {
         store
             .create_folder(CreateFolderSpec {
                 scope: scope.clone(),
@@ -176,8 +180,8 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
                 parent: None,
                 slug: slug.to_owned(),
                 display_name: slug.to_owned(),
-                is_project: false,
-                project_slug: None,
+                is_project: project,
+                project_slug: project.then(|| slug.to_owned()),
                 actor: owner.clone(),
                 timestamp: None,
             })
@@ -187,18 +191,20 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     let a = sample_note_id(1);
     let b = sample_note_id(2);
     let vault = sample_note_id(3);
+    let mut install = note(
+        &a,
+        &docs,
+        "Install guide",
+        "A repository setup manual. needle.",
+    );
+    install.fields = status_field("todo");
     let (seeded, _) = store
         .commit_synthetic_note_batch_for_test(
             scope,
             lease,
             &owner,
             vec![
-                note(
-                    &a,
-                    &docs,
-                    "Install guide",
-                    "A repository setup manual. needle.",
-                ),
+                install,
                 note(
                     &b,
                     &folder,
@@ -214,6 +220,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     view.folder(docs.clone(), folder.clone());
     view.folder(archive.clone(), folder.clone());
     view.index(a.clone(), docs.clone());
+    view.set_status(a.clone(), "todo");
     view.index(b.clone(), folder.clone());
     view.index(vault.clone(), folder.clone());
     view.link(0, 1);
@@ -278,13 +285,13 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     );
 
     pages.hold(high);
+    let created = sample_note_id(5);
+    let mut updated = note(&a, &docs, "Receipt version", "exactoverlaytoken");
+    updated.fields = status_field("done");
+    let mut with_fields = note(&created, &folder, "Fresh receipt note", "newfieldtoken");
+    with_fields.fields = status_field("done");
     let (first, exact) = store
-        .commit_synthetic_note_batch_for_test(
-            scope,
-            lease,
-            &owner,
-            vec![note(&a, &docs, "Receipt version", "exactoverlaytoken")],
-        )
+        .commit_synthetic_note_batch_for_test(scope, lease, &owner, vec![updated, with_fields])
         .await
         .unwrap();
     let (newer, _) = store
@@ -292,7 +299,10 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
             scope,
             lease,
             &owner,
-            vec![note(&a, &docs, "Latest version", "laterrevisiontoken")],
+            vec![
+                note(&a, &docs, "Latest version", "laterrevisiontoken"),
+                note(&b, &folder, "Glossary", "Meteorology and climate."),
+            ],
         )
         .await
         .unwrap();
@@ -303,7 +313,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     let mut req = query("exactoverlaytoken");
     req.folder = Some(docs.clone());
     req.causal = CausalBasis::Exact(ReceiptSet::new([receipt.clone()]).unwrap());
-    let instant = engine.search(ctx.clone(), req).await.unwrap();
+    let instant = engine.search(ctx.clone(), req.clone()).await.unwrap();
     assert_eq!(instant.hits.len(), 1);
     assert_eq!(instant.hits[0].card.title, "Receipt version");
     assert_eq!(
@@ -315,6 +325,38 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
             .text()
             .contains("exactoverlaytoken")
     );
+    projection.live.write().unwrap().insert(created.clone());
+    req.filter.predicate = Predicate::Eq {
+        key: "status".to_owned(),
+        value: ScalarValue::String("todo".to_owned()),
+    };
+    assert!(
+        engine
+            .search(ctx.clone(), req.clone())
+            .await
+            .unwrap()
+            .hits
+            .is_empty()
+    );
+    req.filter.predicate = Predicate::Eq {
+        key: "status".to_owned(),
+        value: ScalarValue::String("done".to_owned()),
+    };
+    assert_eq!(
+        engine.search(ctx.clone(), req.clone()).await.unwrap().hits[0]
+            .card
+            .title,
+        "Receipt version"
+    );
+    req.text = "newfieldtoken".to_owned();
+    req.folder = None;
+    assert_eq!(
+        engine.search(ctx.clone(), req).await.unwrap().hits[0]
+            .card
+            .title,
+        "Fresh receipt note"
+    );
+
     let mut waiting = query("exactoverlaytoken");
     waiting.causal = CausalBasis::Await(AwaitWatermarks::from_receipts([receipt]));
     let mut short = ctx.clone();
@@ -323,7 +365,35 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         engine.search(short, waiting).await,
         Err(PortError::DeadlineExceeded(_))
     ));
-    projection.snapshot.write().unwrap().advance(newer.last_seq);
+    {
+        let mut snapshot = projection.snapshot.write().unwrap();
+        snapshot.index(created.clone(), folder.clone());
+        snapshot.set_status(created, "done");
+        snapshot.advance(newer.last_seq);
+    }
+    let mut untouched = query("satellites");
+    untouched.causal = CausalBasis::Exact(
+        ReceiptSet::new([MutationReceiptToken::new(scope.clone(), first.last_seq).unwrap()])
+            .unwrap(),
+    );
+    let old_glossary = engine.search(ctx.clone(), untouched).await.unwrap();
+    let old_glossary = old_glossary
+        .hits
+        .iter()
+        .find(|hit| hit.card.document.provenance().reference().note_id == b)
+        .unwrap();
+    assert!(
+        old_glossary
+            .chunks
+            .iter()
+            .any(|chunk| chunk.text().contains("satellites"))
+    );
+    assert!(
+        old_glossary
+            .chunks
+            .iter()
+            .all(|chunk| !chunk.text().contains("Meteorology"))
+    );
     pages.release();
     acknowledged(&store, &root, scope, newer.last_seq).await;
     assert_eq!(
@@ -369,6 +439,24 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     let before_move = acknowledged(&store, &root, scope, range.last_seq).await;
     let tantivy = root.search(&scope.space_id, SearchIndexKind::Tantivy);
     let old_vectors = files(&vectors);
+    let viewer = context_with_grant(
+        scope,
+        &sample_principal_id(tag + 1),
+        SpaceGrant {
+            role: SpaceRole::Viewer,
+            read_classes: [DocClass::UserDoc].into_iter().collect(),
+            write_classes: BTreeSet::new(),
+            project_root: Some(archive.clone()),
+        },
+    );
+    assert!(
+        engine
+            .search(viewer.clone(), query("laterrevisiontoken"))
+            .await
+            .unwrap()
+            .hits
+            .is_empty()
+    );
     let moved = store
         .move_folder(
             ctx.clone(),
@@ -400,6 +488,19 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     let contained = engine.search(ctx.clone(), scoped).await.unwrap();
     assert_eq!(contained.hits.len(), 1);
     assert_eq!(contained.hits[0].card.title, "Latest version");
+    let contained_by_grant = engine
+        .search(viewer, query("laterrevisiontoken"))
+        .await
+        .unwrap();
+    assert_eq!(contained_by_grant.hits[0].card.title, "Latest version");
+    assert_eq!(
+        contained_by_grant.hits[0]
+            .card
+            .document
+            .provenance()
+            .revision(),
+        contained.hits[0].card.document.provenance().revision()
+    );
 
     let thread = ChatThreadId::from_bytes([tag; 16]);
     store
