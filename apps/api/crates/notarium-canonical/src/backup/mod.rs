@@ -2008,6 +2008,14 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         .iter()
         .copied()
         .filter_map(move |mut table| {
+            if schema_version < 7 {
+                match table.name {
+                    "chat_threads" => table.columns = &table.columns[..18],
+                    "chat_entries" => table.columns = &table.columns[..20],
+                    "chat_pending_inputs" => table.indexes = &table.indexes[..2],
+                    _ => {}
+                }
+            }
             if schema_version < 5 && table.name == "command_receipts" {
                 table.indexes = &["idx_command_receipts_expires"];
             }
@@ -2039,7 +2047,19 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         })
 }
 
-/// Materializes a verified schema 1 through 6 spool for offline inspection within the default budget.
+#[cfg(test)]
+#[test]
+fn historical_postgres_spool_manifests_match_startup_migrations() {
+    for version in 1..CANONICAL_SCHEMA_VERSION {
+        let checksum = checksum_tables(version, spool_tables(version));
+        assert!(
+            crate::schema::migrate::recognized_predecessor(i64::from(version), checksum.as_bytes()),
+            "unrecognized manifest for canonical schema {version}"
+        );
+    }
+}
+
+/// Materializes a verified spool for offline inspection within the default budget.
 pub fn decode_postgres_spool_v1(path: &Path) -> Result<DecodedPostgresSpoolV1, PortError> {
     decode_postgres_spool_v1_bounded(
         path,
@@ -2111,7 +2131,7 @@ pub fn decode_postgres_spool_v1_bounded(
     let expected_tables = spool_tables(schema_version);
     let expected_checksum = match schema_version {
         CANONICAL_SCHEMA_VERSION => manifest_checksum(),
-        1..=5 => {
+        1..CANONICAL_SCHEMA_VERSION => {
             let digest = checksum_tables(schema_version, expected_tables.clone());
             if !crate::schema::migrate::recognized_predecessor(
                 i64::from(schema_version),

@@ -488,6 +488,12 @@ impl BackendCase {
                 .execute(&mut *tx)
                 .await
                 .unwrap();
+            if decoded.schema_version < 7 {
+                sqlx::raw_sql(include_str!("fixtures/chat-schema-v6-only.sql"))
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
             if decoded.schema_version <= 5 {
                 sqlx::raw_sql(
                     "DROP INDEX idx_blob_retirements_status;
