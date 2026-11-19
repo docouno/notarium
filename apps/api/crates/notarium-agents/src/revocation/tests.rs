@@ -109,6 +109,38 @@ async fn intersecting_fences_drain_sockets_without_waiting_for_runs() {
 }
 
 #[tokio::test]
+async fn canonical_fence_cancels_queued_effects_and_drains_active_sql() {
+    let hub = RevocationHub::new_local();
+    let selectors = vec![RevocationSelector::Space(SpaceId::from_bytes([1; 16]))];
+    let queued_cancel = Cancellation::default();
+    let queued = hub
+        .register_canonical_effect(context(1), selectors.clone(), queued_cancel.clone())
+        .await
+        .unwrap();
+    let registration = hub
+        .register_canonical_effect(context(2), selectors.clone(), Cancellation::default())
+        .await
+        .unwrap();
+    let active = registration.begin().await.unwrap();
+    let mut fence = hub.fence_provider(context(3), selectors.clone());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(fence.as_mut().poll(cx).is_pending()))
+            .await
+    );
+    assert!(queued_cancel.is_cancelled());
+    assert!(queued.clone().begin().await.is_err());
+    assert!(active.check().is_err());
+    drop(active);
+    drop(fence.await.unwrap());
+    assert!(queued.begin().await.is_err());
+    let fresh = hub
+        .register_canonical_effect(context(4), selectors, Cancellation::default())
+        .await
+        .unwrap();
+    assert!(fresh.begin().await.unwrap().check().is_ok());
+}
+
+#[tokio::test]
 async fn viewer_revocation_closes_only_that_viewer_without_draining_the_stream() {
     let hub = RevocationHub::new_local();
     let space = SpaceId::from_bytes([1; 16]);
@@ -228,7 +260,12 @@ async fn revoke_clears_sender_and_stable_event_replay_does_not_revoke_a_new_run(
         thread: ChatThreadId::from_bytes([6; 16]),
         input: PendingInputId::from_bytes([7; 16]),
     };
-    let command = ContentDigest::from_bytes([8; 32]);
+    let command = CommandIdentity {
+        scope: key.scope.clone(),
+        actor: authority.principal().clone(),
+        key: CommandKey::from_bytes([8; 16]),
+        hash: ContentDigest::from_bytes([8; 32]),
+    };
     let options = ChatRunOptions {
         role: Some("selected-role".into()),
         ..ChatRunOptions::default()
@@ -237,15 +274,15 @@ async fn revoke_clears_sender_and_stable_event_replay_does_not_revoke_a_new_run(
         context(9),
         key.clone(),
         authority.clone(),
-        command,
+        &command,
         options.clone(),
     )
     .unwrap();
     let snapshot = hub.pending(&key).unwrap();
     assert_eq!(snapshot.options(), &options);
-    let different = caller(10, &space, AuthenticatedCredential::TrustedNone);
+    let different = caller(3, &space, AuthenticatedCredential::TrustedNone);
     assert!(matches!(
-        hub.register_pending(context(11), key.clone(), different, command, options),
+        hub.register_pending(context(11), key.clone(), different, &command, options),
         Err(PortError::Domain(DomainError::IdempotencyKeyReused))
     ));
 

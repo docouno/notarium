@@ -16,7 +16,7 @@ use notarium_core::{
         SpaceSeq,
     },
     model::{HistoryScope, Lifecycle},
-    ports::{CallBudget, CanonicalEffectLease, ConfirmedChatStep},
+    ports::{CallBudget, CanonicalEffectAdmission, ConfirmedChatStep, RevocationLease},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::Row;
@@ -79,15 +79,15 @@ impl CommandIdentitySpec {
         self.has_confirmed_chat_step() || self.canonical_effect().is_some()
     }
 
-    fn canonical_effect(&self) -> Option<&CanonicalEffectLease> {
+    fn canonical_effect(&self) -> Option<&CanonicalEffectAdmission> {
         self.authority.as_deref()?.canonical_effect.as_ref()
     }
 
-    pub(crate) fn check_canonical_effect(&self) -> Result<(), PortError> {
-        if let Some(lease) = self.canonical_effect() {
-            lease.check()?;
+    async fn begin_canonical_effect(&self) -> Result<Option<Box<dyn RevocationLease>>, PortError> {
+        if let Some(effect) = self.canonical_effect() {
+            return effect.begin().await.map(Some);
         }
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -953,6 +953,7 @@ impl crate::CanonicalStore {
 
     /// Submits a typed idempotent or non-idempotent canonical mutation through `WriteBatchActor`,
     /// automatically handling MessagePack receipt serialization and replay.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn submit_write_command<R>(
         &self,
         budget: &CallBudget,
@@ -1623,16 +1624,7 @@ async fn execute_batch_on_conn(
     // Retain all StagedBlobTickets and runtime lock guards until AFTER outer COMMIT/ROLLBACK!
     let mut batch_retained_tickets: Vec<StagedBlobTicket> = Vec::new();
     let mut batch_retained_guards: Vec<Box<dyn Send>> = Vec::new();
-    // A dropped caller does not stop an admitted write. Keep each live effect
-    // registration through the actual SQL settlement of this batch.
-    batch_retained_guards.extend(intents.iter().filter_map(|intent| {
-        intent
-            .idempotency
-            .as_ref()?
-            .canonical_effect()
-            .cloned()
-            .map(|lease| Box::new(lease) as Box<dyn Send>)
-    }));
+    let mut active_effects: Vec<(usize, Box<dyn RevocationLease>)> = Vec::new();
     let mut slots: Vec<ItemOutcomeSlot> = Vec::with_capacity(intents.len());
 
     let committed_at_ms = match now_unix_ms() {
@@ -1645,7 +1637,28 @@ async fn execute_batch_on_conn(
     let receipt_ttl_ms = i64::try_from(cfg.receipt_ttl.as_millis()).unwrap_or(86_400_000);
     let expires_at_ms = committed_at_ms.saturating_add(receipt_ttl_ms);
 
-    for gspace in group_spaces {
+    // Take all PostgreSQL Space locks for guarded batches before any effect
+    // can hold up a concurrent Control revocation.
+    let all_spaces;
+    let initial_spaces = if store.is_postgres()
+        && intents.iter().any(|intent| {
+            intent
+                .idempotency
+                .as_ref()
+                .and_then(CommandIdentitySpec::canonical_effect)
+                .is_some()
+        }) {
+        all_spaces = intents
+            .iter()
+            .map(|intent| intent.scope.space_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        all_spaces.as_slice()
+    } else {
+        group_spaces
+    };
+    for gspace in initial_spaces {
         if !space_states.contains_key(gspace) {
             match lock_and_load_space_outer_tx(tx, gspace).await {
                 Ok(Some(rec)) => {
@@ -1708,12 +1721,14 @@ async fn execute_batch_on_conn(
         }
 
         let has_idemp = intent.idempotency.is_some();
+        let mut active_effect = None;
         let item_res = execute_single_item_in_savepoint(
             tx,
             space_states.get(&space_id).expect("space entry populated"),
             intent,
             committed_at_ms,
             expires_at_ms,
+            &mut active_effect,
         )
         .await;
 
@@ -1745,6 +1760,9 @@ async fn execute_batch_on_conn(
                 batch_dir_syncs.merge(&dir_syncs);
                 batch_retained_tickets.extend(retained_tickets);
                 batch_retained_guards.extend(retained_guards);
+                if let Some(effect) = active_effect {
+                    active_effects.push((slots.len(), effect));
+                }
                 after_commit.extend(item_after_commit);
                 slots.push(ItemOutcomeSlot::Succeeded {
                     response_bytes,
@@ -1839,8 +1857,51 @@ async fn execute_batch_on_conn(
         return BatchExecOutcome::AbortedBeforeCommit(sync_err);
     }
 
-    // Commit outer SQL transaction!
-    match transaction.commit().await {
+    let revoked_effects: Vec<(usize, PortError)> = active_effects
+        .iter()
+        .filter_map(|(slot_idx, effect)| effect.check().err().map(|err| (*slot_idx, err)))
+        .collect();
+    if !revoked_effects.is_empty() {
+        transaction.rollback().await;
+        drop(active_effects);
+        drop(batch_retained_tickets);
+        drop(batch_retained_guards);
+        if slots.len() == 1 {
+            return BatchExecOutcome::AbortedBeforeCommit(
+                revoked_effects.into_iter().next().unwrap().1,
+            );
+        }
+        let mut revoked_by_slot: BTreeMap<usize, PortError> = revoked_effects.into_iter().collect();
+        for (slot_idx, slot) in slots.iter_mut().enumerate() {
+            if let Some(err) = revoked_by_slot.remove(&slot_idx) {
+                *slot = ItemOutcomeSlot::Failed(err);
+            } else if matches!(slot, ItemOutcomeSlot::Succeeded { .. }) {
+                *slot = ItemOutcomeSlot::Failed(unavailable_retryable(
+                    "batch_peer_revoked",
+                    "peer write in batch was revoked before commit",
+                    Duration::from_millis(10),
+                ));
+            }
+        }
+        let mut space_effective_cuts = BTreeMap::new();
+        for (sid, entry) in &space_states {
+            if let SpaceBatchEntry::Loaded {
+                persisted_initial_seq,
+                ..
+            } = entry
+            {
+                space_effective_cuts.insert(sid.clone(), *persisted_initial_seq);
+            }
+        }
+        return BatchExecOutcome::Committed {
+            slots,
+            space_effective_cuts,
+        };
+    }
+    // Keep active effects through durable settlement, including a lost waiter.
+    let committed = transaction.commit().await;
+    drop(active_effects);
+    match committed {
         Ok(()) => {
             for action in after_commit {
                 action();
@@ -1921,6 +1982,7 @@ async fn execute_single_item_in_savepoint(
     intent: PreparedWriteIntent,
     committed_at_ms: i64,
     expires_at_ms: i64,
+    active_effect: &mut Option<Box<dyn RevocationLease>>,
 ) -> Result<SingleItemSuccess, PortError> {
     let (space_rec, current_effective_cut) = match space_entry {
         SpaceBatchEntry::Missing => return Err(DomainError::ResourceNotFound.into()),
@@ -1939,7 +2001,7 @@ async fn execute_single_item_in_savepoint(
     let effective_epoch = intent.active_epoch;
 
     if let Some(idemp) = &intent.idempotency {
-        idemp.check_canonical_effect()?;
+        *active_effect = idemp.begin_canonical_effect().await?;
         idemp
             .authorize_confirmed_chat_step(tx, &intent.scope, true)
             .await?;
@@ -1948,7 +2010,7 @@ async fn execute_single_item_in_savepoint(
     // 2. Idempotent command receipt lookup (`command_receipts`) BEFORE purge fence and stale head CAS
     //    so idempotent retries of Purge / MintAndPurge replay their sanitized receipt rather than ResourceNotFound!
     if let Some(idemp) = &intent.idempotency
-        && let Some(existing) = lookup_command_receipt_tx(tx, &intent.scope, idemp).await?
+        && let Some(existing) = lookup_active_command_receipt_tx(tx, &intent.scope, idemp).await?
     {
         if existing.command_hash != intent.idempotency.as_ref().unwrap().command_hash {
             return Err(DomainError::IdempotencyKeyReused.into());
@@ -2103,6 +2165,19 @@ pub(crate) struct StoredReceiptRow {
 type RawReceiptRow = (Vec<u8>, String, Option<String>, Vec<u8>, i64);
 
 pub(crate) async fn lookup_command_receipt_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    idemp: &CommandIdentitySpec,
+) -> Result<Option<StoredReceiptRow>, PortError> {
+    let active = idemp.begin_canonical_effect().await?;
+    let receipt = lookup_active_command_receipt_tx(tx, scope, idemp).await?;
+    if let Some(active) = active {
+        active.check()?;
+    }
+    Ok(receipt)
+}
+
+async fn lookup_active_command_receipt_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     idemp: &CommandIdentitySpec,

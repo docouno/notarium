@@ -26,6 +26,9 @@ impl AgentRunSupervisor {
         account = self.live_account(account).await?;
         let ownership_lost = Cancellation::default();
         account.budget = bounded(&account.budget, MAINTENANCE_BUDGET, ownership_lost.clone());
+        let mut route = self
+            .admit_chat_route(&scope, &thread, &account.budget)
+            .await?;
         let ctx = SpaceContext::new(
             account.auth().clone(),
             scope.clone(),
@@ -37,9 +40,21 @@ impl AgentRunSupervisor {
             thread: thread.clone(),
             input: input.id.clone(),
         };
-        if let Some(outcome) = engine.lookup_user_chat_input(ctx.clone(), &input).await? {
+        let lookup = self
+            .inner
+            .registry
+            .control()
+            .fence_canonical_effect(
+                account.auth().clone(),
+                ctx.clone(),
+                CanonicalEffect::ChatInput,
+            )
+            .await?;
+        if let Some(outcome) = engine.lookup_user_chat_input(lookup, &input).await? {
             if matches!(outcome, SubmitUserChatOutcome::Appended(_)) {
-                self.inner.revocations.finish_pending(&key);
+                self.inner
+                    .revocations
+                    .finish_pending_submission(&key, &input.identity);
             }
             return Ok(ChatSubmission { outcome, run: None });
         }
@@ -49,14 +64,11 @@ impl AgentRunSupervisor {
         if latest.thread.kind == ChatThreadKind::KeeperLog {
             return Err(DomainError::SpaceReadOnly.into());
         }
-        let mut route = self
-            .admit_chat_route(&scope, &thread, &account.budget)
-            .await?;
         let pending = self.inner.revocations.register_pending(
             maintenance(account.budget.clone()),
             key,
             account.auth().clone(),
-            input.identity.hash,
+            &input.identity,
             options.clone(),
         )?;
         let mentions_agent = input.mentions_agent;
@@ -82,7 +94,7 @@ impl AgentRunSupervisor {
         if matches!(outcome, SubmitUserChatOutcome::Queued(_)) {
             return Ok(ChatSubmission { outcome, run: None });
         }
-        self.inner.revocations.rollback_pending(pending);
+        self.inner.revocations.finish_registered_pending(pending);
         let mut run = None;
         if let SubmitUserChatOutcome::Appended(entry) = &outcome {
             if let Some(active) = self.active(&scope, &thread) {
@@ -95,8 +107,11 @@ impl AgentRunSupervisor {
                     expected_leaf: entry.value.seq,
                     options,
                 };
-                if let Ok(branch) = self.thread_at(ctx, &thread, entry.value.seq).await {
-                    run = self.launch(account, start, branch.thread, None).await.ok();
+                if let Ok(branch) = self.thread_at(ctx, &thread, entry.value.seq).await
+                    && let Ok(LaunchOutcome::Started(id)) =
+                        self.launch(account, start, branch.thread, None).await
+                {
+                    run = Some(id);
                 }
             }
         }

@@ -1,6 +1,8 @@
 use super::*;
-use notarium_core::auth::AuthenticatedCredential;
-use std::{future::Future, time::Duration};
+use notarium_agents::chats::{AgentRunSupervisor, ChatRunOptions, ExclusiveDataRoot};
+use notarium_control::auth::token::{MintedToken, TokenKind, mint};
+use notarium_core::{auth::AuthenticatedCredential, model::HistoryScope};
+use std::{future::Future, sync::atomic::Ordering, time::Duration};
 use tokio::{sync::oneshot, time::timeout};
 
 pub(super) async fn bump_account_after_publication<T>(
@@ -19,7 +21,7 @@ pub(super) async fn bump_account_after_publication<T>(
     tokio::join!(operation, bump).0
 }
 
-pub(super) async fn revoke_at_effect<T, R>(
+pub(super) async fn revoke_before_effect<T, R>(
     gate: (oneshot::Receiver<Cancellation>, oneshot::Sender<()>),
     mutation: impl Future<Output = Result<T, PortError>>,
     revocation: impl Future<Output = Result<R, PortError>>,
@@ -28,11 +30,77 @@ pub(super) async fn revoke_at_effect<T, R>(
     let revoke = async {
         let cancellation = entered
             .await
-            .expect("mutation entered its canonical operation");
+            .expect("the operation reached its Canonical admission gate");
+        revocation.await.unwrap();
+        assert!(cancellation.is_cancelled());
+        release.send(()).unwrap();
+    };
+    let (result, ()) = timeout(Duration::from_secs(10), async {
+        tokio::join!(mutation, revoke)
+    })
+    .await
+    .expect("revocation and canonical effect settled");
+    result.err().expect("the revoked effect must fail")
+}
+
+async fn revoke_while_writer_pinned<T, R>(
+    fixture: &RuntimeFixture,
+    space: &SpaceId,
+    mutation: impl Future<Output = Result<T, PortError>>,
+    revocation: impl Future<Output = Result<R, PortError>>,
+) -> PortError {
+    let pinned = fixture
+        .canonical
+        .pin_schedule_abilities(
+            AccountContext::new(
+                fixture.human.auth().restrict_to_space(space).unwrap(),
+                budget(),
+            ),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let (entered, release) = fixture.projections.pause_ability_trash();
+    let revoke = async {
+        let _ = entered
+            .await
+            .expect("the queued operation reached its Canonical admission gate");
+        release.send(()).unwrap();
+        // Give the admitted operation time to queue behind the pinned SQL writer.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        // The SQL actor cannot obtain the pinned writer. A synchronous revoke
+        // must still settle while that Canonical lock is held.
+        revocation.await.unwrap();
+        drop(pinned);
+    };
+    let (result, ()) = timeout(Duration::from_secs(10), async {
+        tokio::join!(mutation, revoke)
+    })
+    .await
+    .expect("revocation must settle before the writer pin is released");
+    result.err().expect("the revoked queued writer must fail")
+}
+
+async fn revoke_during_active_sql<T, R>(
+    fixture: &RuntimeFixture,
+    mutation: impl Future<Output = Result<T, PortError>>,
+    revocation: impl Future<Output = Result<R, PortError>>,
+) -> PortError {
+    // Pause inside the WriteBatchActor SQL transaction right after the active
+    // authority lease is acquired.
+    let (entered, release) = fixture.projections.pause_active_sql_effect();
+    let revoke = async {
+        let cancellation = entered
+            .await
+            .expect("the operation entered its active SQL transaction");
         tokio::pin!(revocation);
         tokio::select! {
             () = cancellation.cancelled() => (),
-            _ = &mut revocation => panic!("revocation returned while the canonical operation was held"),
+            _ = &mut revocation => panic!("revocation returned while the active SQL transaction was still held"),
+        }
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(50)) => (),
+            _ = &mut revocation => panic!("revocation must wait until the active SQL transaction settles"),
         }
         release.send(()).unwrap();
         revocation.await.unwrap();
@@ -41,8 +109,152 @@ pub(super) async fn revoke_at_effect<T, R>(
         tokio::join!(mutation, revoke)
     })
     .await
-    .expect("revocation and canonical effect settled");
-    result.err().expect("the revoked effect must fail")
+    .expect("active SQL transaction and revocation must settle");
+    result
+        .err()
+        .expect("the revoked active SQL write must fail")
+}
+
+pub(super) async fn native_session(
+    fixture: &mut RuntimeFixture,
+    tag: u8,
+) -> (AccountContext, MintedToken) {
+    let token = mint(TokenKind::Session).unwrap();
+    fixture
+        .storage
+        .observer
+        .seed_session(
+            fixture.human.auth().principal(),
+            &AuthSessionId::from_bytes([tag; 16]),
+            &token,
+            fixture.storage.clock.0.load(Ordering::SeqCst),
+        )
+        .await;
+    let auth = fixture
+        .control
+        .resolve(support::evidence(
+            AuthEvidenceKind::Session,
+            token.secret.expose(),
+        ))
+        .await
+        .unwrap();
+    (AccountContext::new(auth, budget()), token)
+}
+
+async fn revoked_chat_receipt(fixture: &mut RuntimeFixture, personal: &HistoryScope) {
+    let (account, token) = native_session(fixture, 196).await;
+    let scope = SpaceContext::new(account.auth().clone(), personal.clone(), budget()).unwrap();
+    let thread = ChatThreadId::from_bytes([196; 16]);
+    let command = |tag| CommandIdentity {
+        scope: personal.clone(),
+        actor: account.auth().principal().clone(),
+        key: CommandKey::from_bytes([tag; 16]),
+        hash: ContentDigest::from_bytes([tag; 32]),
+    };
+    fixture
+        .canonical
+        .create_chat(
+            scope.clone(),
+            Mutation {
+                identity: command(196),
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: thread.clone(),
+                    owner: account.auth().principal().clone(),
+                    kind: ChatThreadKind::Personal,
+                    title: "Receipt authority fixture".into(),
+                    project_folder: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let input = SubmitUserChatInput {
+        identity: command(197),
+        id: PendingInputId::from_bytes([197; 16]),
+        thread,
+        expected_leaf: ThreadEntrySeq::ZERO,
+        body: "Previously committed chat entry".into(),
+        mentions_agent: false,
+    };
+    assert!(matches!(
+        fixture
+            .canonical
+            .submit_user_chat_input(scope, input.clone())
+            .await
+            .unwrap(),
+        SubmitUserChatOutcome::Appended(_)
+    ));
+    let supervisor = AgentRunSupervisor::new_local(
+        fixture.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let before = fixture
+        .canonical
+        .read_space(&personal.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    let denied = revoke_before_effect(
+        fixture.projections.pause_chat_lookup(),
+        supervisor.enqueue_input(account, input, ChatRunOptions::default()),
+        fixture.control.logout(support::evidence(
+            AuthEvidenceKind::Session,
+            token.secret.expose(),
+        )),
+    )
+    .await;
+    assert!(matches!(denied, PortError::Cancelled(_)), "{denied:?}");
+    assert_eq!(
+        fixture
+            .canonical
+            .read_space(&personal.space_id)
+            .await
+            .unwrap()
+            .last_seq,
+        before
+    );
+}
+
+pub(super) async fn revoked_rollback(
+    fixture: &mut RuntimeFixture,
+    supervisor: &AgentRunSupervisor,
+    scope: &HistoryScope,
+    run: &AgentRunId,
+    replay_key: &CommandKey,
+) {
+    let before = fixture
+        .canonical
+        .read_space(&scope.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    for (tag, key) in [
+        (198, CommandKey::from_bytes([198; 16])),
+        (199, replay_key.clone()),
+    ] {
+        let (account, token) = native_session(fixture, tag).await;
+        let denied = revoke_before_effect(
+            fixture.projections.pause_chat_rollback(),
+            supervisor.rollback_run(account, scope.clone(), run.clone(), key),
+            fixture.control.logout(support::evidence(
+                AuthEvidenceKind::Session,
+                token.secret.expose(),
+            )),
+        )
+        .await;
+        assert!(matches!(denied, PortError::Cancelled(_)), "{denied:?}");
+        assert_eq!(
+            fixture
+                .canonical
+                .read_space(&scope.space_id)
+                .await
+                .unwrap()
+                .last_seq,
+            before
+        );
+    }
 }
 
 async fn check(pg: bool) {
@@ -84,13 +296,26 @@ async fn check(pg: bool) {
                 token: token.clone(),
             },
         };
-        let denied = revoke_at_effect(
-            fixture.projections.pause_ability_trash(),
-            call(&fixture, &author, key + 1, "delete_ability", input.clone()),
-            fixture.control.revoke_pat(owner.clone(), revocation),
-        )
-        .await;
-        assert!(matches!(denied, PortError::Cancelled(_)), "{denied:?}");
+        let mutation = call(&fixture, &author, key + 1, "delete_ability", input.clone());
+        let revocation = fixture.control.revoke_pat(owner.clone(), revocation);
+        let pinned_writer = !replay;
+        let denied = if pinned_writer {
+            revoke_while_writer_pinned(&fixture, &space_id, mutation, revocation).await
+        } else {
+            revoke_before_effect(
+                fixture.projections.pause_ability_trash(),
+                mutation,
+                revocation,
+            )
+            .await
+        };
+        assert!(
+            matches!(denied, PortError::Cancelled(_))
+                || pinned_writer
+                    && matches!(&denied, PortError::Unavailable(failure)
+                    if failure.effect() == notarium_core::error::CommitEffect::Unknown),
+            "{denied:?}"
+        );
         assert_eq!(
             fixture
                 .canonical
@@ -101,11 +326,62 @@ async fn check(pg: bool) {
             before
         );
         assert!(matches!(
-            call(&fixture, &author, key + 1, "delete_ability", input).await,
+            call(&fixture, &author, key + 1, "delete_ability", input.clone()).await,
             Err(PortError::Domain(DomainError::AuthenticationFailed))
         ));
+        if pinned_writer {
+            // Now verify the complementary half: once a transaction has already
+            // entered SQL, revocation waits for its settlement and rolls it back.
+            let active_author = fixture.pat(BearerScope::Write, true).await;
+            let Some(AuthenticatedCredential::Pat(active_token)) =
+                active_author.auth().credential()
+            else {
+                panic!("expected an opt-in PAT");
+            };
+            let active_revocation = AccountMutation {
+                identity: runtime_ability_cases::identity(&fixture, owner, 187).await,
+                input: RevokePat {
+                    account: principal.clone(),
+                    token: active_token.clone(),
+                },
+            };
+            let active_denied = revoke_during_active_sql(
+                &fixture,
+                call(
+                    &fixture,
+                    &active_author,
+                    188,
+                    "delete_ability",
+                    input.clone(),
+                ),
+                fixture.control.revoke_pat(owner.clone(), active_revocation),
+            )
+            .await;
+            assert!(
+                matches!(active_denied, PortError::Cancelled(_))
+                    || matches!(&active_denied, PortError::Unavailable(failure)
+                        if failure.effect() == notarium_core::error::CommitEffect::Unknown),
+                "{active_denied:?}"
+            );
+            assert_eq!(
+                fixture
+                    .canonical
+                    .read_space(&space_id)
+                    .await
+                    .unwrap()
+                    .last_seq,
+                before
+            );
+            // The same writer processes this new authorized command after the
+            // queued and active revoked commands. It can trash the live package once.
+            call(&fixture, owner, 186, "delete_ability", input)
+                .await
+                .unwrap();
+        }
     }
     proposal_cases::revoked_session_cannot_apply_or_replay(&mut fixture).await;
+    let scope = fixture.canonical.read_space(&space_id).await.unwrap().scope;
+    revoked_chat_receipt(&mut fixture, &scope).await;
     fixture.close().await;
 }
 

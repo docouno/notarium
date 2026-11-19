@@ -1,3 +1,4 @@
+use notarium_agents::revocation::RevocationHub;
 use notarium_canonical::CanonicalStore;
 use notarium_core::{
     DomainError,
@@ -20,6 +21,89 @@ use tokio::sync::oneshot;
 
 pub struct TestEngine(pub CanonicalStore, pub Arc<ProjectionFixtures>);
 
+pub struct TestRevocations(pub Arc<RevocationHub>, pub Arc<ProjectionFixtures>);
+
+struct ObservingEffectRegistration {
+    inner: Arc<dyn CanonicalEffectRegistration>,
+    fixtures: Arc<ProjectionFixtures>,
+    cancellation: Cancellation,
+}
+
+impl CanonicalEffectRegistration for ObservingEffectRegistration {
+    fn check(&self) -> Result<(), PortError> {
+        self.inner.check()
+    }
+
+    fn begin(self: Arc<Self>) -> PortFuture<'static, Box<dyn RevocationLease>> {
+        Box::pin(async move {
+            let lease = self.inner.clone().begin().await?;
+            let pause = self.fixtures.active_sql_effect.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(self.cancellation.clone());
+                let _ = pause.release.await;
+            }
+            Ok(lease)
+        })
+    }
+}
+
+impl SessionRevocationPort for TestRevocations {
+    fn register_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.0.register_provider(ctx, selectors, cancellation)
+    }
+
+    fn register_canonical_effect(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Arc<dyn CanonicalEffectRegistration>> {
+        let fixtures = Arc::clone(&self.1);
+        let cancel_clone = cancellation.clone();
+        Box::pin(async move {
+            let inner = self
+                .0
+                .register_canonical_effect(ctx, selectors, cancellation)
+                .await?;
+            Ok(Arc::new(ObservingEffectRegistration {
+                inner,
+                fixtures,
+                cancellation: cancel_clone,
+            }) as Arc<dyn CanonicalEffectRegistration>)
+        })
+    }
+
+    fn fence_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.0.fence_provider(ctx, selectors)
+    }
+
+    fn fence_inactive_provider(
+        &self,
+        ctx: MaintenanceContext,
+        call: RequestId,
+    ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>> {
+        self.0.fence_inactive_provider(ctx, call)
+    }
+
+    fn revoke(
+        &self,
+        ctx: MaintenanceContext,
+        selector: RevocationSelector,
+        reason: RevocationReason,
+    ) -> PortFuture<'_, ()> {
+        self.0.revoke(ctx, selector, reason)
+    }
+}
+
 #[derive(Default)]
 pub struct ProjectionFixtures {
     seed: Mutex<Option<ProjectionFixture>>,
@@ -27,10 +111,17 @@ pub struct ProjectionFixtures {
     before_ability_trash: Mutex<Option<MutationPause>>,
     after_ability_publication: Mutex<Option<MutationPause>>,
     before_memory_append: Mutex<Option<MutationPause>>,
+    lose_note_edit_ack: Mutex<bool>,
     before_chat_consume: Mutex<Option<MutationPause>>,
     chat_consume: Mutex<ChatConsumeFixture>,
     before_chat_submit: Mutex<Option<MutationPause>>,
+    before_chat_lookup: Mutex<Option<MutationPause>>,
+    before_chat_rollback: Mutex<Option<MutationPause>>,
     before_chat_claim: Mutex<Option<MutationPause>>,
+    after_chat_claim: Mutex<Option<MutationPause>>,
+    active_sql_effect: Mutex<Option<MutationPause>>,
+    lose_claim_acks: Mutex<usize>,
+    lose_finish_acks: Mutex<usize>,
 }
 
 #[derive(Default)]
@@ -79,6 +170,14 @@ impl ProjectionFixtures {
         MutationPause::install(&self.before_ability_trash)
     }
 
+    pub fn pause_chat_lookup(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.before_chat_lookup)
+    }
+
+    pub fn pause_chat_rollback(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.before_chat_rollback)
+    }
+
     pub fn pause_ability_publication(
         &self,
     ) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
@@ -87,6 +186,10 @@ impl ProjectionFixtures {
 
     pub fn pause_memory_append(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
         MutationPause::install(&self.before_memory_append)
+    }
+
+    pub fn lose_next_note_edit_ack(&self) {
+        *self.lose_note_edit_ack.lock().unwrap() = true;
     }
 
     pub fn pause_chat_consume(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
@@ -109,6 +212,24 @@ impl ProjectionFixtures {
 
     pub fn pause_chat_claim(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
         MutationPause::install(&self.before_chat_claim)
+    }
+
+    pub fn pause_and_lose_chat_claim_acks(
+        &self,
+        count: usize,
+    ) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        *self.lose_claim_acks.lock().unwrap() = count;
+        MutationPause::install(&self.after_chat_claim)
+    }
+
+    pub fn lose_chat_finish_acks(&self, count: usize) {
+        *self.lose_finish_acks.lock().unwrap() = count;
+    }
+
+    pub fn pause_active_sql_effect(
+        &self,
+    ) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.active_sql_effect)
     }
 
     pub fn install(&self, fixture: ProjectionFixture) {
@@ -147,7 +268,6 @@ macro_rules! canonical_port {
 canonical_port!(NoteWritePort;
     ensure_folder_path(Mutation<EnsureFolderPath>) -> FolderRef,
     create_note(Mutation<CreateNote>) -> Committed<NoteRevision>,
-    edit_note(Mutation<EditNote>) -> Committed<NoteRevision>,
     delete_note(Mutation<DeleteNote>) -> Committed<NoteRevision>,
     mint_and_purge(Mutation<MintAndPurge>) -> Committed<MintAndPurgeResult>,
     move_note(Mutation<MoveNote>) -> Committed<NoteRevision>,
@@ -159,8 +279,40 @@ canonical_port!(NoteWritePort;
     link(Mutation<Link>) -> Committed<Link>,
     link_many(LinkBatch) -> BatchResult<Link>,
     rollback_agent_run(Mutation<RollbackAgentRun>) -> Committed<RollbackResult>,
-    rollback_agent_run_by_id(Mutation<AgentRunId>) -> Committed<RollbackResult>,
     accept_external_observation(Mutation<ExternalObservation>) -> ExternalObservationResult;
+
+    fn rollback_agent_run_by_id(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<AgentRunId>,
+    ) -> PortFuture<'_, Committed<RollbackResult>> {
+        Box::pin(async move {
+            MutationPause::enter(&self.1.before_chat_rollback, ctx.budget.cancellation.clone()).await;
+            NoteWritePort::rollback_agent_run_by_id(&self.0, ctx, request).await
+        })
+    }
+
+    fn edit_note(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<EditNote>,
+    ) -> PortFuture<'_, Committed<NoteRevision>> {
+        Box::pin(async move {
+            let committed = NoteWritePort::edit_note(&self.0, ctx, request).await?;
+            if std::mem::take(&mut *self.1.lose_note_edit_ack.lock().unwrap()) {
+                return Err(PortError::Unavailable(
+                    OperationalFailure::new(
+                        ContentDigest::from_bytes([169; 32]),
+                        CommitEffect::Unknown,
+                        RetryAdvice::RetrySameCommand,
+                        true,
+                    )
+                    .unwrap(),
+                ));
+            }
+            Ok(committed)
+        })
+    }
 
     fn append_memory(&self, ctx: SpaceContext, request: Mutation<AppendMemory>) -> PortFuture<'_, Committed<MemoryAppendResult>> {
         Box::pin(async move {
@@ -185,7 +337,6 @@ canonical_port!(NoteWritePort;
 );
 
 canonical_port!(ChatPort;
-    lookup_user_chat_input(&SubmitUserChatInput) -> Option<SubmitUserChatOutcome>,
     read_chat(ChatRead) -> ChatBranch,
     read_chat_context(ChatRead) -> ChatBranch,
     read_chat_contents(ChatContentRead) -> Vec<HydratedChatEntry>,
@@ -198,9 +349,19 @@ canonical_port!(ChatPort;
     queue_chat_input(Mutation<PendingChatInput>) -> QueueInputOutcome,
     list_pending_chat_inputs(ChatThreadId) -> Vec<QueuedChatInput>,
     dismiss_chat_input(DismissPending) -> bool,
-    finish_run_if_queue_empty(ChatRunRequest) -> FinishChatRunOutcome,
     recover_active_run(ChatRunRequest) -> FinishChatRunOutcome,
     redact_chat_entry(Mutation<RedactChatEntry>) -> Committed<RedactedChat>;
+    fn lookup_user_chat_input(
+        &self,
+        ctx: SpaceContext,
+        request: &SubmitUserChatInput,
+    ) -> PortFuture<'_, Option<SubmitUserChatOutcome>> {
+        let request = request.clone();
+        Box::pin(async move {
+            MutationPause::enter(&self.1.before_chat_lookup, ctx.budget.cancellation.clone()).await;
+            ChatPort::lookup_user_chat_input(&self.0, ctx, &request).await
+        })
+    }
     fn submit_user_chat_input(&self, ctx: SpaceContext, request: SubmitUserChatInput) -> PortFuture<'_, SubmitUserChatOutcome> {
         Box::pin(async move {
             MutationPause::enter(&self.1.before_chat_submit, ctx.budget.cancellation.clone()).await;
@@ -217,23 +378,54 @@ canonical_port!(ChatPort;
             if matches!(&committed.value, ConsumedPending::Appended { .. })
                 && std::mem::take(&mut self.1.chat_consume.lock().unwrap().lose_ack_once)
             {
-                return Err(PortError::Unavailable(OperationalFailure::new(
-                    ContentDigest::from_bytes([0xad; 32]),
-                    CommitEffect::Unknown,
-                    RetryAdvice::RetrySameCommand,
-                    true,
-                ).unwrap()));
+                return Err(lost_chat_ack());
             }
             Ok(committed)
         })
     }
     fn claim_active_run(&self, ctx: SpaceContext, request: ClaimChatRun) -> PortFuture<'_, ClaimChatRunOutcome> {
         Box::pin(async move {
-            MutationPause::enter(&self.1.before_chat_claim, ctx.budget.cancellation.clone()).await;
-            ChatPort::claim_active_run(&self.0, ctx, request).await
+            let cancellation = ctx.budget.cancellation.clone();
+            MutationPause::enter(&self.1.before_chat_claim, cancellation.clone()).await;
+            let claim = ChatPort::claim_active_run(&self.0, ctx, request).await?;
+            if claim == ClaimChatRunOutcome::Claimed && lose_ack(&self.1.lose_claim_acks) {
+                MutationPause::enter(&self.1.after_chat_claim, cancellation).await;
+                return Err(lost_chat_ack());
+            }
+            Ok(claim)
+        })
+    }
+    fn finish_run_if_queue_empty(&self, ctx: SpaceContext, request: ChatRunRequest) -> PortFuture<'_, FinishChatRunOutcome> {
+        Box::pin(async move {
+            let finished = ChatPort::finish_run_if_queue_empty(&self.0, ctx, request).await?;
+            if finished == FinishChatRunOutcome::Cleared && lose_ack(&self.1.lose_finish_acks) {
+                return Err(lost_chat_ack());
+            }
+            Ok(finished)
         })
     }
 );
+
+fn lose_ack(slot: &Mutex<usize>) -> bool {
+    let mut remaining = slot.lock().unwrap();
+    if *remaining == 0 {
+        return false;
+    }
+    *remaining -= 1;
+    true
+}
+
+fn lost_chat_ack() -> PortError {
+    PortError::Unavailable(
+        OperationalFailure::new(
+            ContentDigest::from_bytes([0xad; 32]),
+            CommitEffect::Unknown,
+            RetryAdvice::RetrySameCommand,
+            true,
+        )
+        .unwrap(),
+    )
+}
 
 canonical_port!(ContentJobPort;
     create_job(Mutation<ContentJobKind>) -> Committed<ContentJob>,

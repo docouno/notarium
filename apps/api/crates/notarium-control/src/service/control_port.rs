@@ -194,6 +194,30 @@ impl ControlPort for ControlPlane {
     ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>> {
         Box::pin(self.control.set_ability_trail(ctx, request))
     }
+    fn compare_authored_ability_binding(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityBindingChange>,
+    ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>> {
+        Box::pin(self.control.compare_authored_ability_binding(ctx, request))
+    }
+    fn compare_authored_ability_preference(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityPreferenceChange>,
+    ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>> {
+        Box::pin(
+            self.control
+                .compare_authored_ability_preference(ctx, request),
+        )
+    }
+    fn adopt_authored_ability_promotion(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AdoptAbilityPromotion>,
+    ) -> PortFuture<'_, ControlCommit<AbilityPromotionResult>> {
+        Box::pin(self.control.adopt_authored_ability_promotion(ctx, request))
+    }
     fn lookup_mcp_dedup(
         &self,
         ctx: AccountContext,

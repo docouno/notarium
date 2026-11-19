@@ -254,8 +254,55 @@ async fn exercise(pg: bool) {
     let c = note(&fixture, &shared.space, 32, Some(project.folder_id.clone()));
     let d = note(&fixture, &shared.space, 33, Some(project.folder_id.clone()));
     let private = note(&fixture, &personal, 34, None);
+    let scope = ContextScope::Space(shared.space.id.clone());
+    Box::pin(exercise_owner_context(
+        &mut fixture,
+        &service,
+        &ctx,
+        &personal,
+        &shared,
+        &project,
+        &scope,
+        &a,
+        &b,
+        &c,
+        &d,
+        &private,
+    ))
+    .await;
+    Box::pin(exercise_shared_consumer(
+        &mut fixture,
+        &service,
+        &ctx,
+        &shared,
+        &scope,
+        &a,
+        &b,
+        &c,
+        &d,
+    ))
+    .await;
+    drop(service);
+    fixture.close().await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn exercise_owner_context(
+    fixture: &mut Fixture,
+    service: &std::sync::Arc<ControlService>,
+    ctx: &AccountContext,
+    personal: &Space,
+    shared: &AccessibleSpace,
+    project: &FolderRef,
+    scope: &ContextScope,
+    a: &NoteRef,
+    b: &NoteRef,
+    c: &NoteRef,
+    d: &NoteRef,
+    private: &NoteRef,
+) {
     let creation = AccountMutation {
-        identity: identity(&service, &ctx, 2).await,
+        identity: identity(service, ctx, 2).await,
         input: PutContextSet {
             id: ContextSetId::from_bytes([40; 16]),
             home: shared.space.id.clone(),
@@ -279,22 +326,22 @@ async fn exercise(pg: bool) {
         set.id
     );
     attach(
-        &service,
-        &ctx,
+        service,
+        ctx,
         ContextScope::Space(shared.space.id.clone()),
         &set,
         3,
     )
     .await;
     pin(
-        &service,
-        &ctx,
+        service,
+        ctx,
         ContextScope::Project(project.clone()),
         a.clone(),
         4,
     )
     .await;
-    pin(&service, &ctx, ContextScope::Personal, c.clone(), 5).await;
+    pin(service, ctx, ContextScope::Personal, c.clone(), 5).await;
     for (key, reference) in [
         (6, FavoriteRef::Note(b.clone())),
         (7, FavoriteRef::Note(d.clone())),
@@ -304,7 +351,7 @@ async fn exercise(pg: bool) {
             .set_favorite(
                 ctx.clone(),
                 AccountMutation {
-                    identity: identity(&service, &ctx, key).await,
+                    identity: identity(service, ctx, key).await,
                     input: SetFavorite {
                         reference,
                         saved: true,
@@ -315,7 +362,7 @@ async fn exercise(pg: bool) {
             .await
             .unwrap();
     }
-    let id = episode(&service, &ctx, Some(project.clone()), 9).await;
+    let id = episode(service, ctx, Some(project.clone()), 9).await;
     let first = service
         .bootstrap_context(
             ctx.clone(),
@@ -331,7 +378,7 @@ async fn exercise(pg: bool) {
         .acknowledge_delta(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 10).await,
+                identity: identity(service, ctx, 10).await,
                 input: AcknowledgeDelta {
                     owner: AckOwner::Account,
                     delivered: ChangeCursor {
@@ -353,7 +400,7 @@ async fn exercise(pg: bool) {
         .await
         .unwrap();
     assert_eq!(next.selection.pinned, vec![b.clone()]);
-    let (pinned, favorites, unavailable) = collect(&service, &ctx, &id).await;
+    let (pinned, favorites, unavailable) = collect(service, ctx, &id).await;
     assert_eq!(
         pinned,
         vec![a.clone(), b.clone(), private.clone(), c.clone()]
@@ -376,7 +423,7 @@ async fn exercise(pg: bool) {
         )
         .unwrap();
     let shared_ctx = AccountContext::new(narrowed, budget());
-    let (pinned, favorites, unavailable) = collect(&service, &shared_ctx, &id).await;
+    let (pinned, favorites, unavailable) = collect(service, &shared_ctx, &id).await;
     assert_eq!(pinned, vec![a.clone(), b.clone()]);
     assert_eq!(favorites, vec![d.clone()]);
     assert_eq!(unavailable, 1);
@@ -385,7 +432,7 @@ async fn exercise(pg: bool) {
         .await
         .unwrap();
     assert_eq!(projected.unavailable, 1);
-    assert!(!projected.notes.contains(&private));
+    assert!(!projected.notes.contains(private));
     assert!(
         service
             .bootstrap_context(
@@ -410,7 +457,7 @@ async fn exercise(pg: bool) {
         .put_context_set(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 11).await,
+                identity: identity(service, ctx, 11).await,
                 input: PutContextSet {
                     id: set.id.clone(),
                     home: set.home.clone(),
@@ -434,21 +481,20 @@ async fn exercise(pg: bool) {
             .await,
     );
     pin(
-        &service,
-        &ctx,
+        service,
+        ctx,
         ContextScope::Space(shared.space.id.clone()),
         b.clone(),
         12,
     )
     .await;
-    let scope = ContextScope::Space(shared.space.id.clone());
     service
         .set_context_order(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 13).await,
+                identity: identity(service, ctx, 13).await,
                 input: SetContextOrder {
-                    expected: scope_revision(&service, &ctx, &scope).await,
+                    expected: scope_revision(service, ctx, scope).await,
                     scope: scope.clone(),
                     entries: vec![
                         ContextRank {
@@ -476,11 +522,11 @@ async fn exercise(pg: bool) {
     assert_eq!(entries.items[0].entry, ContextEntry::Note(b.clone()));
     assert_eq!(entries.items[1].entry, ContextEntry::Set(set.id.clone()));
     assert_eq!(
-        collect(&service, &ctx, &id).await.0,
+        collect(service, ctx, &id).await.0,
         vec![a.clone(), b.clone(), c.clone()]
     );
     let deletion = AccountMutation {
-        identity: identity(&service, &ctx, 14).await,
+        identity: identity(service, ctx, 14).await,
         input: DeleteContextSet {
             id: set.id.clone(),
             expected: set.revision,
@@ -513,17 +559,30 @@ async fn exercise(pg: bool) {
         0
     );
     assert_eq!(
-        collect(&service, &ctx, &id).await.0,
+        collect(service, ctx, &id).await.0,
         vec![a.clone(), b.clone(), c.clone()]
     );
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn exercise_shared_consumer(
+    fixture: &mut Fixture,
+    service: &std::sync::Arc<ControlService>,
+    ctx: &AccountContext,
+    shared: &AccessibleSpace,
+    scope: &ContextScope,
+    a: &NoteRef,
+    b: &NoteRef,
+    c: &NoteRef,
+    d: &NoteRef,
+) {
     // A consumer's personal attachment cannot take editing authority from a
     // shared bundle author, and its cursor must observe that author's changes.
     let other = service
         .create_account(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 20).await,
+                identity: identity(service, ctx, 20).await,
                 input: NewAccount {
                     username: "reader".into(),
                     email: None,
@@ -553,7 +612,7 @@ async fn exercise(pg: bool) {
                 command: CommandKey::from_bytes([21; 16]),
                 member: other.id.clone(),
                 role: Some(SpaceRole::Editor),
-                expected: scope_revision(&service, &ctx, &scope).await,
+                expected: scope_revision(service, ctx, scope).await,
             },
         )
         .await
@@ -568,7 +627,7 @@ async fn exercise(pg: bool) {
         )
         .await
         .unwrap();
-    let other_ctx = account(&service, login.token.expose()).await;
+    let other_ctx = account(service, login.token.expose()).await;
     assert!(
         !ctx.auth()
             .spaces()
@@ -578,7 +637,7 @@ async fn exercise(pg: bool) {
         .put_context_set(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 22).await,
+                identity: identity(service, ctx, 22).await,
                 input: PutContextSet {
                     id: ContextSetId::from_bytes([60; 16]),
                     home: shared.space.id.clone(),
@@ -591,8 +650,8 @@ async fn exercise(pg: bool) {
         .await
         .unwrap()
         .value;
-    attach(&service, &other_ctx, ContextScope::Personal, &set, 23).await;
-    let other_episode = episode(&service, &other_ctx, None, 24).await;
+    attach(service, &other_ctx, ContextScope::Personal, &set, 23).await;
+    let other_episode = episode(service, &other_ctx, None, 24).await;
     let old = service
         .bootstrap_context(
             other_ctx.clone(),
@@ -607,7 +666,7 @@ async fn exercise(pg: bool) {
         .put_context_set(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 25).await,
+                identity: identity(service, ctx, 25).await,
                 input: PutContextSet {
                     id: set.id.clone(),
                     home: set.home.clone(),
@@ -631,10 +690,10 @@ async fn exercise(pg: bool) {
             .await,
     );
     assert_eq!(
-        collect(&service, &other_ctx, &other_episode).await.0,
+        collect(service, &other_ctx, &other_episode).await.0,
         vec![c.clone(), a.clone()]
     );
-    pin(&service, &other_ctx, scope.clone(), b.clone(), 26).await;
+    pin(service, &other_ctx, scope.clone(), b.clone(), 26).await;
     assert_eq!(
         fixture
             .observer
@@ -642,12 +701,12 @@ async fn exercise(pg: bool) {
             .await,
         1
     );
-    let other_scope_before = scope_revision(&service, &other_ctx, &ContextScope::Personal).await;
+    let other_scope_before = scope_revision(service, &other_ctx, &ContextScope::Personal).await;
     service
         .delete_context_set(
             ctx.clone(),
             AccountMutation {
-                identity: identity(&service, &ctx, 27).await,
+                identity: identity(service, ctx, 27).await,
                 input: DeleteContextSet {
                     id: set.id,
                     expected: set.revision,
@@ -657,10 +716,10 @@ async fn exercise(pg: bool) {
         .await
         .unwrap();
     assert!(
-        scope_revision(&service, &other_ctx, &ContextScope::Personal).await >= other_scope_before
+        scope_revision(service, &other_ctx, &ContextScope::Personal).await >= other_scope_before
     );
     assert!(
-        collect(&service, &other_ctx, &other_episode)
+        collect(service, &other_ctx, &other_episode)
             .await
             .0
             .is_empty()
@@ -673,7 +732,7 @@ async fn exercise(pg: bool) {
                 command: CommandKey::from_bytes([28; 16]),
                 member: other.id,
                 role: Some(SpaceRole::Viewer),
-                expected: scope_revision(&service, &ctx, &scope).await,
+                expected: scope_revision(service, ctx, scope).await,
             },
         )
         .await
@@ -683,10 +742,10 @@ async fn exercise(pg: bool) {
             .set_context_pin(
                 other_ctx.clone(),
                 AccountMutation {
-                    identity: identity(&service, &other_ctx, 29).await,
+                    identity: identity(service, &other_ctx, 29).await,
                     input: SetContextPin {
                         scope: scope.clone(),
-                        expected: scope_revision(&service, &ctx, &scope).await,
+                        expected: scope_revision(service, ctx, scope).await,
                         note: d.clone(),
                         pinned: true
                     }
@@ -708,12 +767,12 @@ async fn exercise(pg: bool) {
             .put_context_set(
                 ctx.clone(),
                 AccountMutation {
-                    identity: identity(&service, &ctx, 30).await,
+                    identity: identity(service, ctx, 30).await,
                     input: PutContextSet {
                         id: ContextSetId::from_bytes([61; 16]),
-                        home: shared.space.id,
+                        home: shared.space.id.clone(),
                         name: "oversized".into(),
-                        notes: vec![a; 201],
+                        notes: vec![a.clone(); 201],
                         expected: None
                     }
                 }
@@ -721,14 +780,12 @@ async fn exercise(pg: bool) {
             .await
             .is_err()
     );
-    drop(service);
-    fixture.close().await;
 }
 #[tokio::test]
 async fn sqlite_context_references_and_pagination() {
-    exercise(false).await;
+    Box::pin(exercise(false)).await;
 }
 #[tokio::test]
 async fn postgres_context_references_and_pagination() {
-    exercise(true).await;
+    Box::pin(exercise(true)).await;
 }

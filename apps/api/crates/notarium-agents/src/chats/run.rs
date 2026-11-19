@@ -12,10 +12,14 @@ impl AgentRunSupervisor {
     pub(super) fn run_task(
         &self,
         run: Arc<ActiveRun>,
-        leaf: ThreadEntrySeq,
+        start: RunTaskStart,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            let result = self.run_turn(&run, leaf).await;
+            let drain_only = matches!(&start, RunTaskStart::DrainOnly(_));
+            let result = match start {
+                RunTaskStart::Admitted(leaf) => self.run_turn(&run, leaf).await,
+                RunTaskStart::DrainOnly(error) => Err(error),
+            };
             if matches!(
                 &result,
                 Err(PortError::Domain(DomainError::RevisionConflict { .. }))
@@ -29,16 +33,25 @@ impl AgentRunSupervisor {
                     Err(error)
                         if queue::retry_cleanup(&error)
                             && run.owner.check().is_ok()
-                            && !self.inner.shutdown.is_cancelled() =>
-                    {
-                        tokio::select! {
-                            () = tokio::time::sleep(delay) => (),
-                            () = self.inner.shutdown.cancelled() => (),
+                            && !self.inner.shutdown.is_cancelled()
+                            && (!drain_only || unsettled.is_some()) => {}
+                    Err(error) if drain_only || run.owner.check().is_err() => {
+                        let gate = self.thread_gate(&run.scope, &run.thread);
+                        let _admission = gate.lock().await;
+                        if !matches!(
+                            self.settle_unpublished_claim(&run).await,
+                            ClaimSettlement::Pending
+                        ) {
+                            break Err(error);
                         }
-                        delay = (delay * 2).min(Duration::from_secs(2));
                     }
                     result => break result,
                 }
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => (),
+                    () = self.inner.shutdown.cancelled() => (),
+                }
+                delay = (delay * 2).min(Duration::from_secs(2));
             };
             let _ = self.refresh_current_peer_head(&run).await;
             let error = result.err().or_else(|| cleanup.err());

@@ -8,9 +8,11 @@ use notarium_core::{
     ids::*,
     model::HistoryScope,
     ports::{
-        Cancellation, MaintenanceContext, PortFuture, ProviderSelection, RevocationLease,
-        RevocationReason, RevocationSelector, ServicePurpose, SessionRevocationPort,
+        Cancellation, CanonicalEffectRegistration, MaintenanceContext, PortFuture,
+        ProviderSelection, RevocationLease, RevocationReason, RevocationSelector, ServicePurpose,
+        SessionRevocationPort,
     },
+    receipt::CommandIdentity,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -40,6 +42,7 @@ struct State {
     closed: bool,
     next: RegistrationId,
     provider: BTreeMap<RegistrationId, Registered>,
+    canonical_effects: BTreeMap<RegistrationId, CanonicalRegistration>,
     runs: BTreeMap<AgentRunId, Registered>,
     viewers: BTreeMap<RegistrationId, Registered>,
     fences: BTreeMap<RegistrationId, Selectors>,
@@ -51,6 +54,12 @@ struct State {
 struct Registered {
     selectors: Selectors,
     cancellation: Cancellation,
+}
+
+struct CanonicalRegistration {
+    entry: Registered,
+    active: usize,
+    revoked: bool,
 }
 
 enum EventDelivery {
@@ -73,6 +82,7 @@ pub struct PendingCredential {
     options: ChatRunOptions,
     cancellation: Cancellation,
     registration: RegistrationId,
+    command_key: CommandKey,
     command_hash: ContentDigest,
     selectors: Selectors,
 }
@@ -96,7 +106,8 @@ impl PendingCredential {
 /// status is unknown. Successful consume or dismissal removes by stable key.
 pub struct PendingRegistration {
     key: PendingCredentialKey,
-    inserted: Option<RegistrationId>,
+    id: RegistrationId,
+    inserted: bool,
 }
 
 impl State {
@@ -121,10 +132,14 @@ impl State {
             .any(|other| !other.is_disjoint(selectors))
     }
 
-    fn has_socket(&self, selectors: &Selectors) -> bool {
+    fn has_active_effect(&self, selectors: &Selectors) -> bool {
         self.provider
             .values()
             .any(|call| !call.selectors.is_disjoint(selectors))
+            || self
+                .canonical_effects
+                .values()
+                .any(|effect| effect.active != 0 && !effect.entry.selectors.is_disjoint(selectors))
     }
 
     fn take_matching(
@@ -140,6 +155,12 @@ impl State {
             .filter(|entry| matches(&entry.selectors))
             .map(|entry| entry.cancellation.clone())
             .collect::<Vec<_>>();
+        for effect in self.canonical_effects.values_mut() {
+            if matches(&effect.entry.selectors) {
+                effect.revoked = true;
+                cancellations.push(effect.entry.cancellation.clone());
+            }
+        }
         if clear_pending {
             self.pending.retain(|_, entry| {
                 if matches(&entry.selectors) {
@@ -336,11 +357,15 @@ impl RevocationHub {
         ctx: MaintenanceContext,
         key: PendingCredentialKey,
         auth: EngineAuthContext,
-        command_hash: ContentDigest,
+        identity: &CommandIdentity,
         options: ChatRunOptions,
     ) -> Result<PendingRegistration, PortError> {
         let budget = RevocationBudget::new(ctx)?;
         budget.check()?;
+        key.scope.check(&identity.scope)?;
+        if auth.principal() != &identity.actor {
+            return Err(invalid(ValidationReason::InvalidAuthority));
+        }
         if !matches!(
             auth.kind(),
             PrincipalKind::DirectHuman | PrincipalKind::Pat | PrincipalKind::OAuth { .. }
@@ -354,7 +379,8 @@ impl RevocationHub {
             return Err(revocation_unavailable());
         }
         if let Some(existing) = state.pending.get(&key) {
-            if existing.command_hash != command_hash
+            if existing.command_key != identity.key
+                || existing.command_hash != identity.hash
                 || existing.options != options
                 || existing.auth.principal() != auth.principal()
                 || existing.auth.grant() != auth.grant()
@@ -364,7 +390,8 @@ impl RevocationHub {
             }
             return Ok(PendingRegistration {
                 key,
-                inserted: None,
+                id: existing.registration,
+                inserted: false,
             });
         }
         let registration = state.allocate()?;
@@ -374,14 +401,16 @@ impl RevocationHub {
                 auth,
                 options,
                 selectors,
-                command_hash,
+                command_key: identity.key.clone(),
+                command_hash: identity.hash,
                 registration,
                 cancellation: Cancellation::default(),
             },
         );
         Ok(PendingRegistration {
             key,
-            inserted: Some(registration),
+            id: registration,
+            inserted: true,
         })
     }
 
@@ -390,8 +419,45 @@ impl RevocationHub {
     }
 
     pub fn finish_pending(&self, key: &PendingCredentialKey) {
-        let entry = self.inner.lock().pending.remove(key);
-        if let Some(entry) = entry {
+        self.remove_pending_when(key, |_| true);
+    }
+
+    /// A direct append receipt settles one submitted command. A different
+    /// command may since have queued this input ID.
+    pub(crate) fn finish_pending_submission(
+        &self,
+        key: &PendingCredentialKey,
+        identity: &CommandIdentity,
+    ) {
+        if key.scope == identity.scope {
+            self.remove_pending_when(key, |entry| {
+                entry.auth.principal() == &identity.actor
+                    && entry.command_key == identity.key
+                    && entry.command_hash == identity.hash
+            });
+        }
+    }
+
+    pub(crate) fn finish_registered_pending(&self, registration: PendingRegistration) {
+        self.remove_pending_when(&registration.key, |entry| {
+            entry.registration == registration.id
+        });
+    }
+
+    fn remove_pending_when(
+        &self,
+        key: &PendingCredentialKey,
+        matches: impl FnOnce(&PendingCredential) -> bool,
+    ) {
+        let removed = {
+            let mut state = self.inner.lock();
+            if state.pending.get(key).is_some_and(matches) {
+                state.pending.remove(key)
+            } else {
+                None
+            }
+        };
+        if let Some(entry) = removed {
             entry.cancellation.cancel();
         }
     }
@@ -411,20 +477,8 @@ impl RevocationHub {
     }
 
     pub fn rollback_pending(&self, registration: PendingRegistration) {
-        let removed = {
-            let mut state = self.inner.lock();
-            let current = state
-                .pending
-                .get(&registration.key)
-                .map(|entry| entry.registration);
-            if current.is_some() && current == registration.inserted {
-                state.pending.remove(&registration.key)
-            } else {
-                None
-            }
-        };
-        if let Some(entry) = removed {
-            entry.cancellation.cancel();
+        if registration.inserted {
+            self.finish_registered_pending(registration);
         }
     }
 }
@@ -520,14 +574,124 @@ impl Drop for RegistryLease {
     }
 }
 
+struct EffectRegistration {
+    hub: RevocationHub,
+    id: RegistrationId,
+    budget: RevocationBudget,
+    cancellation: Cancellation,
+}
+
+impl EffectRegistration {
+    fn check_state(&self, state: &State) -> Result<(), PortError> {
+        state.ensure_open()?;
+        self.budget.check()?;
+        let entry = state
+            .canonical_effects
+            .get(&self.id)
+            .ok_or_else(revocation_unavailable)?;
+        if entry.revoked || self.cancellation.is_cancelled() || state.fenced(&entry.entry.selectors)
+        {
+            return Err(cancelled());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for EffectRegistration {
+    fn drop(&mut self) {
+        self.hub.inner.lock().canonical_effects.remove(&self.id);
+    }
+}
+
+impl CanonicalEffectRegistration for EffectRegistration {
+    fn check(&self) -> Result<(), PortError> {
+        self.check_state(&self.hub.inner.lock())
+    }
+
+    fn begin(self: Arc<Self>) -> PortFuture<'static, Box<dyn RevocationLease>> {
+        Box::pin(async move {
+            let mut state = self.hub.inner.lock();
+            self.check_state(&state)?;
+            let registration = state
+                .canonical_effects
+                .get_mut(&self.id)
+                .ok_or_else(revocation_unavailable)?;
+            registration.active = registration
+                .active
+                .checked_add(1)
+                .ok_or_else(revocation_unavailable)?;
+            drop(state);
+            Ok(Box::new(ActiveCanonicalEffect(self)) as Box<dyn RevocationLease>)
+        })
+    }
+}
+
+struct ActiveCanonicalEffect(Arc<EffectRegistration>);
+
+impl RevocationLease for ActiveCanonicalEffect {
+    fn check(&self) -> Result<(), PortError> {
+        self.0.check_state(&self.0.hub.inner.lock())
+    }
+}
+
+impl Drop for ActiveCanonicalEffect {
+    fn drop(&mut self) {
+        let inner = &self.0.hub.inner;
+        if let Some(entry) = inner.lock().canonical_effects.get_mut(&self.0.id) {
+            entry.active -= 1;
+        }
+        inner.notify();
+    }
+}
+
 impl SessionRevocationPort for RevocationHub {
     fn register_canonical_effect(
         &self,
         ctx: MaintenanceContext,
         selectors: Vec<RevocationSelector>,
         cancellation: Cancellation,
-    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
-        self.register_provider(ctx, selectors, cancellation)
+    ) -> PortFuture<'_, Arc<dyn CanonicalEffectRegistration>> {
+        Box::pin(async move {
+            let budget = RevocationBudget::new(ctx)?;
+            let selectors = checked_selectors(selectors)?;
+            let mut changes = self.inner.changed.subscribe();
+            loop {
+                budget.check()?;
+                if cancellation.is_cancelled() {
+                    return Err(cancelled());
+                }
+                {
+                    let mut state = self.inner.lock();
+                    state.ensure_open()?;
+                    if !state.fenced(&selectors) {
+                        let id = state.allocate()?;
+                        state.canonical_effects.insert(
+                            id,
+                            CanonicalRegistration {
+                                entry: Registered {
+                                    selectors,
+                                    cancellation: cancellation.clone(),
+                                },
+                                active: 0,
+                                revoked: false,
+                            },
+                        );
+                        let owner = EffectRegistration {
+                            hub: self.clone(),
+                            id,
+                            budget,
+                            cancellation,
+                        };
+                        return Ok(Arc::new(owner) as Arc<dyn CanonicalEffectRegistration>);
+                    }
+                }
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(cancelled()),
+                    result = budget.changed(&mut changes) => result?,
+                }
+            }
+        })
     }
 
     fn register_provider(
@@ -603,7 +767,7 @@ impl SessionRevocationPort for RevocationHub {
                 {
                     let state = self.inner.lock();
                     state.ensure_open()?;
-                    if !state.has_socket(&selectors) {
+                    if !state.has_active_effect(&selectors) {
                         return Ok(Box::new(fence) as Box<dyn RevocationLease>);
                     }
                 }
@@ -622,7 +786,7 @@ impl SessionRevocationPort for RevocationHub {
             let selectors = Selectors::from([RevocationSelector::ProviderCall(call)]);
             let mut state = self.inner.lock();
             state.ensure_open()?;
-            if state.fenced(&selectors) || state.has_socket(&selectors) {
+            if state.fenced(&selectors) || state.has_active_effect(&selectors) {
                 return Ok(None);
             }
             let id = state.allocate()?;
@@ -643,17 +807,36 @@ impl SessionRevocationPort for RevocationHub {
     ) -> PortFuture<'_, ()> {
         Box::pin(async move {
             let request = ctx.budget.request.clone();
-            RevocationBudget::new(ctx)?.check()?;
+            let budget = RevocationBudget::new(ctx)?;
+            budget.check()?;
+            let mut changes = self.inner.changed.subscribe();
             let cancellations = {
                 let mut state = self.inner.lock();
                 state.ensure_open()?;
+                if matches!(state.events.get(&request), Some(EventDelivery::Applied)) {
+                    return Ok(());
+                }
                 state.event_targets(&request, &selector)
             };
             // An in-flight duplicate repeats the same signals. A completed
             // duplicate cannot cancel a newly authorized registration.
             cancel_all(cancellations);
-            self.inner.lock().apply_event(request);
-            Ok(())
+            loop {
+                budget.check()?;
+                {
+                    let mut state = self.inner.lock();
+                    state.ensure_open()?;
+                    if !state.canonical_effects.values().any(|effect| {
+                        effect.active != 0
+                            && effect.revoked
+                            && effect.entry.selectors.contains(&selector)
+                    }) {
+                        state.apply_event(request);
+                        return Ok(());
+                    }
+                }
+                budget.changed(&mut changes).await?;
+            }
         })
     }
 }

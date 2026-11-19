@@ -6,7 +6,7 @@ use notarium_core::{
     error::PortError,
     ids::{ChatThreadId, FolderId, JobId, NoteId, ThreadEntrySeq},
     model::{HistoryScope, NoteRef},
-    ports::{CanonicalEffectLease, LinkTarget, ResolvedMemoryTarget, SpaceContext},
+    ports::{CanonicalEffectAdmission, LinkTarget, ResolvedMemoryTarget, SpaceContext},
 };
 
 use super::CommandIdentitySpec;
@@ -43,11 +43,14 @@ pub(crate) enum ReplayPolicy {
 pub(crate) struct ReplayAuthority {
     pub(crate) auth: EngineAuthContext,
     pub(crate) policy: ReplayPolicy,
-    pub(crate) canonical_effect: Option<CanonicalEffectLease>,
+    pub(crate) canonical_effect: Option<CanonicalEffectAdmission>,
 }
 
 /// A domain fingerprint becomes usable by the writer only after binding a policy.
-pub(crate) struct UnboundCommand(pub(crate) CommandIdentitySpec, Option<CanonicalEffectLease>);
+pub(crate) struct UnboundCommand(
+    pub(crate) CommandIdentitySpec,
+    Option<CanonicalEffectAdmission>,
+);
 
 impl UnboundCommand {
     pub(crate) fn new(spec: CommandIdentitySpec) -> Self {
@@ -193,7 +196,6 @@ impl CommandIdentitySpec {
         tx: &mut BackendConn<'_>,
         scope: &HistoryScope,
     ) -> Result<(), PortError> {
-        self.check_canonical_effect()?;
         self.authorize_confirmed_chat_step(tx, scope, false).await?;
         let Some(ReplayAuthority { auth, policy, .. }) = self.authority.as_deref() else {
             return Ok(());

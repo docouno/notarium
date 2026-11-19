@@ -218,8 +218,9 @@ pub(crate) async fn rollback_agent_run_impl(
     let deadline = super::common::CommandDeadline::start(&ctx.budget, "rollback").at;
     validate_mutation_identity(&ctx, &request.identity)?;
     crate::domain::common::require_empty_preconditions(&request.preconditions)?;
-    let idemp =
-        fingerprint::current(&request)?.with_policy(ctx.auth(), rollback_policy(&request.input));
+    let idemp = fingerprint::current(&request)?
+        .with_canonical_effect(&ctx)
+        .with_policy(ctx.auth(), rollback_policy(&request.input));
 
     let result = execute_rollback(store, &mut ctx, &request, &idemp, deadline).await;
     if !matches!(
@@ -264,6 +265,7 @@ pub(crate) async fn rollback_agent_run_by_id(
         "rollback_agent_run_by_id_v1",
         input.run.as_str().as_bytes(),
     )
+    .with_canonical_effect(&ctx)
     .with_policy(ctx.auth(), rollback_policy(&input));
     let prepared = Mutation {
         identity: request.identity,
@@ -318,24 +320,29 @@ async fn execute_rollback(
             }
         };
         let mut try_pg_batch_plan = true;
-        if matches!(
-            store.inner.sql,
-            crate::runtime::SqlDriverState::Postgres { .. }
-        ) && let Some(outcome) = try_execute_pg_root_rollback(
-            store,
-            ctx,
-            idemp,
-            request,
-            writer_epoch,
-            &mut try_pg_batch_plan,
-            deadline,
-        )
-        .await
+        let standard_writer = idemp.requires_standard_writer();
+        if !standard_writer
+            && matches!(
+                store.inner.sql,
+                crate::runtime::SqlDriverState::Postgres { .. }
+            )
+            && let Some(outcome) = try_execute_pg_root_rollback(
+                store,
+                ctx,
+                idemp,
+                request,
+                writer_epoch,
+                &mut try_pg_batch_plan,
+                deadline,
+            )
+            .await
         {
             return outcome;
         }
         ctx.budget.remaining = rollback_time_left(&ctx.budget, deadline)?;
-        let single_res: Result<StoredCommittedRollbackV1, PortError> = if store.is_sqlite_local() {
+        let single_res: Result<StoredCommittedRollbackV1, PortError> = if store.is_sqlite_local()
+            && !standard_writer
+        {
             let (intent, fast_plan) = crate::sqlite_fast::build_rollback_direct_sqlite_fast_intent(
                 ctx.scope(),
                 writer_epoch,
@@ -356,7 +363,7 @@ async fn execute_rollback(
                 )
                 .await
         } else {
-            let pg_fast = try_pg_batch_plan.then(|| {
+            let pg_fast = (try_pg_batch_plan && !standard_writer).then(|| {
                 build_rollback_pg_single_item_fast(
                     ctx.scope().clone(),
                     idemp.clone(),

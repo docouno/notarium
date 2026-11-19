@@ -1,10 +1,9 @@
-use std::{collections::BTreeMap, future::Future};
+use std::collections::BTreeMap;
 
 use notarium_core::{
     auth::{SpaceKind, SpaceRole},
     model::{HistoryScope, NoteRef},
     patch::{CarrierEditOrigin, CarrierPatchPlan},
-    ports::{AccountContext, CanonicalEffect, ControlCommit},
     receipt::{CausalBasis, ReceiptSet},
 };
 use notarium_syntax::{carrier::Carrier, frontmatter::FieldEdit, patch, unicode};
@@ -149,51 +148,6 @@ async fn writer(
             CanonicalEffect::AbilityAuthoring,
         )
         .await
-}
-
-async fn terminal_authoring<T: Clone, R, Fut>(
-    call: &ToolCallContext<'_>,
-    label: &str,
-    mut expected: ControlRevision,
-    input: T,
-    write: impl Fn(AccountContext, AccountMutation<T>) -> Fut,
-) -> Result<ControlCommit<R>, PortError>
-where
-    Fut: Future<Output = Result<ControlCommit<R>, PortError>>,
-{
-    const MAX_ACCOUNT_RETRIES: u16 = 8;
-    for ordinal in 0..=MAX_ACCOUNT_RETRIES {
-        let attempt = write(
-            call.account(),
-            AccountMutation {
-                identity: call.account_identity(expected, label, ordinal),
-                input: input.clone(),
-            },
-        )
-        .await;
-        let Err(error @ PortError::Domain(DomainError::ControlRevisionConflict { .. })) = attempt
-        else {
-            return attempt;
-        };
-        if ordinal == MAX_ACCOUNT_RETRIES {
-            return Err(error);
-        }
-        let latest = call
-            .registry
-            .control
-            .whoami(call.account())
-            .await?
-            .account_revision;
-        if latest == expected {
-            return Err(error);
-        }
-        // A definitive conflict saved no effect for this key. Keep the
-        // object-level CAS unchanged and persist the next attempt identity
-        // before writing anything. Unknown replies still replay the same key.
-        let next = format!("{label}-account-retry-{}", ordinal + 1);
-        expected = call.journal(&next, || async { Ok(latest) }).await?;
-    }
-    Err(invalid(ValidationReason::InvalidState))
 }
 
 async fn select_projects(
@@ -537,19 +491,25 @@ pub(super) async fn create(
         placement: plan.home.placement,
         revision: created.value.revision,
     };
-    terminal_authoring(
-        call,
-        "initial-ability-binding",
-        plan.account_revision,
-        AbilityBindingUpdate {
-            ability: reference.clone(),
-            enabled: true,
-            projects: plan.availability,
-            expected: ControlRevision::ZERO,
-        },
-        |ctx, request| call.registry.control.update_ability_binding(ctx, request),
-    )
-    .await?;
+    call.registry
+        .control
+        .compare_authored_ability_binding(
+            call.account(),
+            AccountMutation {
+                identity: call.account_identity(
+                    plan.account_revision,
+                    "initial-ability-binding",
+                    0,
+                ),
+                input: AbilityBindingChange {
+                    ability: reference.clone(),
+                    enabled: true,
+                    projects: plan.availability,
+                    expected: None,
+                },
+            },
+        )
+        .await?;
     write_response(&bound_ability(call, &reference).await?, "created")
 }
 
@@ -561,9 +521,7 @@ struct EditPlan {
     previous_note: RevisionId,
     kind: Kind,
     slug: String,
-    binding_revision: ControlRevision,
-    binding_enabled: bool,
-    previous_preference: bool,
+    overlays: AbilityOverlayState,
     requested_skills: Option<Vec<AbilityRef>>,
     requested_availability: Option<AbilityProjects>,
     account_revision: ControlRevision,
@@ -676,9 +634,7 @@ async fn edit_plan(call: &ToolCallContext<'_>, args: &EditArgs) -> Result<EditPl
         previous_note: note.document.revision().clone(),
         kind: kind_value(descriptor.kind),
         slug: descriptor.name,
-        binding_revision: inspection.binding_revision,
-        binding_enabled: inspection.binding_enabled,
-        previous_preference: inspection.preference_enabled,
+        overlays: inspection.overlays,
         requested_skills,
         requested_availability,
         account_revision,
@@ -769,14 +725,13 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         .journal("edit-ability-plan", || edit_plan(call, &args))
         .await?;
     let mut reference = plan.original.clone();
-    let mut account_revision = plan.account_revision;
     let mut steps = Vec::new();
     let authored =
         args.description.is_some() || args.instructions.is_some() || args.attachments.is_some();
     let mut authored_changed = false;
     let mut carrier_edited = false;
     let mut published = false;
-    let mut moved = false;
+    let mut promotion = None;
     let mut phase = if authored { "authored" } else { "home" };
     let package_result: Result<(), PortError> = async {
         if !authored && !plan.promote {
@@ -893,20 +848,25 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 ..reference.clone()
             };
             reference = destination.clone();
-            let result = terminal_authoring(
-                call,
-                "adopt-promoted-ability",
-                account_revision,
-                AbilityTrailUpdate {
-                    source: plan.original.clone(),
-                    expected_destination: None,
-                    destination: Some(destination.clone()),
-                },
-                |ctx, request| call.registry.control.set_ability_trail(ctx, request),
-            )
-            .await?;
-            account_revision = result.revision;
-            moved = true;
+            let result = call
+                .registry
+                .control
+                .adopt_authored_ability_promotion(
+                    call.account(),
+                    AccountMutation {
+                        identity: call.account_identity(
+                            plan.account_revision,
+                            "adopt-promoted-ability",
+                            0,
+                        ),
+                        input: AdoptAbilityPromotion {
+                            source: plan.original.clone(),
+                            destination,
+                        },
+                    },
+                )
+                .await?;
+            promotion = Some(result.value);
         }
         Ok(())
     }
@@ -934,47 +894,51 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
     ));
     steps.push(change_step(
         "home",
-        if moved { "applied" } else { "skipped" },
+        if promotion.is_some() {
+            "applied"
+        } else {
+            "skipped"
+        },
         None,
     ));
 
-    let (binding_revision, binding_enabled, previous_preference): (ControlRevision, bool, bool) =
-        if moved && (plan.requested_availability.is_some() || args.enabled.is_some()) {
-            call.journal("promoted-ability-binding-revision", || async {
-                let inspection = bound_ability(call, &reference).await?;
-                Ok((
-                    inspection.binding_revision,
-                    inspection.binding_enabled,
-                    inspection.preference_enabled,
-                ))
-            })
-            .await?
-        } else {
-            (
-                plan.binding_revision,
-                plan.binding_enabled,
-                plan.previous_preference,
-            )
-        };
+    let overlays = promotion
+        .as_ref()
+        .map_or(&plan.overlays, |settled| &settled.destination);
     if let Some(availability) = plan.requested_availability {
-        match terminal_authoring(
-            call,
-            "edit-ability-binding",
-            account_revision,
-            AbilityBindingUpdate {
-                ability: reference.clone(),
-                enabled: binding_enabled,
-                projects: availability,
-                expected: binding_revision,
-            },
-            |ctx, request| call.registry.control.update_ability_binding(ctx, request),
-        )
-        .await
+        let result = if let Some(promotion) = &promotion
+            && promotion.source.binding_revision != plan.overlays.binding_revision
         {
-            Ok(result) => {
-                account_revision = result.revision;
-                steps.push(change_step("availability", "applied", None));
+            Err(DomainError::ControlRevisionConflict {
+                current: promotion
+                    .source
+                    .binding_revision
+                    .unwrap_or(ControlRevision::ZERO),
             }
+            .into())
+        } else {
+            call.registry
+                .control
+                .compare_authored_ability_binding(
+                    call.account(),
+                    AccountMutation {
+                        identity: call.account_identity(
+                            plan.account_revision,
+                            "edit-ability-binding",
+                            0,
+                        ),
+                        input: AbilityBindingChange {
+                            ability: reference.clone(),
+                            enabled: overlays.binding_enabled,
+                            projects: availability,
+                            expected: overlays.binding_revision,
+                        },
+                    },
+                )
+                .await
+        };
+        match result {
+            Ok(_) => steps.push(change_step("availability", "applied", None)),
             Err(error) => {
                 steps.push(change_step("availability", "failed", Some(&error)));
                 steps.push(change_step("enabled", "skipped", None));
@@ -987,23 +951,43 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
 
     if let Some(enabled) = args
         .enabled
-        .filter(|enabled| *enabled != previous_preference)
+        .filter(|enabled| *enabled != overlays.preference_enabled)
     {
-        match call
-            .registry
-            .control
-            .set_ability_preference(
-                call.account(),
-                AccountMutation {
-                    identity: call.account_identity(account_revision, "edit-ability-preference", 0),
-                    input: AbilityPreferenceUpdate {
-                        ability: reference.clone(),
-                        enabled,
+        let result = async {
+            if let Some(promotion) = &promotion
+                && promotion.source.preference_revision != plan.overlays.preference_revision
+            {
+                return Err(DomainError::ControlRevisionConflict {
+                    current: promotion
+                        .source
+                        .preference_revision
+                        .unwrap_or(ControlRevision::ZERO),
+                }
+                .into());
+            }
+            call.registry
+                .control
+                .compare_authored_ability_preference(
+                    call.account(),
+                    AccountMutation {
+                        identity: call.account_identity(
+                            plan.account_revision,
+                            "edit-ability-preference",
+                            0,
+                        ),
+                        input: AbilityPreferenceChange {
+                            preference: AbilityPreferenceUpdate {
+                                ability: reference.clone(),
+                                enabled,
+                            },
+                            expected: overlays.preference_revision,
+                        },
                     },
-                },
-            )
-            .await
-        {
+                )
+                .await
+        }
+        .await;
+        match result {
             Ok(_) => steps.push(change_step("enabled", "applied", None)),
             Err(error) => {
                 steps.push(change_step("enabled", "failed", Some(&error)));

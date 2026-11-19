@@ -1,11 +1,9 @@
 use super::*;
 use notarium_agents::mcp::{ConfirmProposedDiff, PersonalToolInvocation};
-use notarium_control::auth::token::{TokenKind, mint};
 use notarium_core::{
     auth::ChatAudience,
     ports::provider::{ProviderToolCall, ProviderToolCallId},
 };
-use std::sync::atomic::Ordering;
 
 async fn record_memory_proposal(
     fixture: &RuntimeFixture,
@@ -237,26 +235,7 @@ pub(super) async fn revoked_session_cannot_apply_or_replay(fixture: &mut Runtime
     let scope = fixture.canonical.read_space(&space).await.unwrap().scope;
     let personal = SpaceContext::new(fixture.human.auth().clone(), scope, budget()).unwrap();
     for (tag, replay) in [(190, false), (193, true)] {
-        let token = mint(TokenKind::Session).unwrap();
-        fixture
-            .storage
-            .observer
-            .seed_session(
-                &principal,
-                &AuthSessionId::from_bytes([tag; 16]),
-                &token,
-                fixture.storage.clock.0.load(Ordering::SeqCst),
-            )
-            .await;
-        let auth = fixture
-            .control
-            .resolve(support::evidence(
-                AuthEvidenceKind::Session,
-                token.secret.expose(),
-            ))
-            .await
-            .unwrap();
-        let owner = AccountContext::new(auth, budget());
+        let (owner, token) = authoring_authority_cases::native_session(fixture, tag).await;
         let category = format!("proposal-revocation-{tag}");
         let confirm = record_memory_proposal(fixture, &personal, &owner, tag, &category).await;
         if replay {
@@ -277,7 +256,7 @@ pub(super) async fn revoked_session_cannot_apply_or_replay(fixture: &mut Runtime
         };
         let before = inspect().await.unwrap().revision;
         assert_eq!(before.is_some(), replay);
-        let denied = authoring_authority_cases::revoke_at_effect(
+        let denied = authoring_authority_cases::revoke_before_effect(
             fixture.projections.pause_memory_append(),
             fixture
                 .registry

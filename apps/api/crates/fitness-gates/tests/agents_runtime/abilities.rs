@@ -1,6 +1,245 @@
 use super::*;
 use notarium_canonical::CreateFolderSpec;
 use notarium_core::{auth::SpaceKind, model::FolderRef, receipt::AccountCommandIdentity};
+use std::{future::Future, time::Duration};
+use tokio::time::timeout;
+
+#[tokio::test]
+async fn sqlite_authoring_settles_exact_overlays() {
+    let _fixture = support::AUTH_TEST_LOCK.lock().await;
+    Box::pin(authoring_settlement(false)).await;
+}
+
+#[tokio::test]
+async fn postgres_authoring_settles_exact_overlays() {
+    let _fixture = support::AUTH_TEST_LOCK.lock().await;
+    Box::pin(authoring_settlement(true)).await;
+}
+
+async fn authoring_settlement(pg: bool) {
+    let fixture = Box::pin(RuntimeFixture::open_named(pg, "agents_ability_settlement")).await;
+    Box::pin(exercise_authoring_settlement(&fixture)).await;
+    Box::pin(fixture.close()).await;
+}
+
+async fn concurrent_overlay_during_publication<T>(
+    fixture: &RuntimeFixture,
+    publication: impl Future<Output = T>,
+    concurrent: impl Future<Output = ()>,
+) -> T {
+    let (entered, release) = fixture.projections.pause_ability_publication();
+    let update = async {
+        timeout(Duration::from_secs(10), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        concurrent.await;
+        release.send(()).unwrap();
+    };
+    tokio::join!(publication, update).0
+}
+
+async fn exercise_authoring_settlement(fixture: &RuntimeFixture) {
+    let owner = &fixture.human;
+    let created = call(
+        fixture,
+        owner,
+        1,
+        "create_ability",
+        json!({
+            "kind":"role", "name":"settlement-guide", "description":"Test guide",
+            "instructions":"Initial guide", "placement":{"home":"personal"},
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let [ability]: [AbilityDescriptor; 1] = fixture
+        .control
+        .discover_abilities(
+            owner.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(10, None).unwrap(),
+                project: None,
+                kind: Some(notarium_core::classes::AbilityKind::Role),
+                name: Some("settlement-guide".into()),
+                authoring: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .try_into()
+        .unwrap();
+    let identity = ability.reference.identity();
+    let inspect = || {
+        fixture
+            .control
+            .inspect_ability(owner.clone(), identity.clone())
+    };
+    let edit = json!({
+        "ref":created["ref"], "versionToken":created["versionToken"],
+        "instructions":"Publish while the account changes", "enabled":false,
+    });
+    let updated = Box::pin(authoring_authority_cases::bump_account_after_publication(
+        fixture,
+        call(fixture, owner, 2, "edit_ability", edit.clone()),
+    ))
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(updated["outcome"], "updated", "{updated}");
+    assert_eq!(updated["steps"][3]["outcome"], "applied");
+    assert_eq!(updated["enabled"], false);
+    for _ in 0..10 {
+        fixture.pat(BearerScope::Read, false).await;
+    }
+    let saved = inspect().await.unwrap().overlays.preference_revision;
+    let replay = call(fixture, owner, 2, "edit_ability", edit.clone())
+        .await
+        .unwrap();
+    assert_eq!(replay.structured_content, updated);
+    assert_eq!(inspect().await.unwrap().overlays.preference_revision, saved);
+
+    let preferences = json!({
+        "ref":updated["ref"], "versionToken":updated["versionToken"],
+        "instructions":"Publish before a competing preference", "enabled":true,
+    });
+    let blocked = Box::pin(concurrent_overlay_during_publication(
+        fixture,
+        call(fixture, owner, 3, "edit_ability", preferences.clone()),
+        async {
+            let current = inspect().await.unwrap();
+            fixture
+                .control
+                .set_ability_preference(
+                    owner.clone(),
+                    AccountMutation {
+                        identity: runtime_ability_cases::identity(fixture, owner, 4).await,
+                        input: AbilityPreferenceUpdate {
+                            ability: current.descriptor.reference,
+                            enabled: false,
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+        },
+    ))
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(blocked["outcome"], "partial", "{blocked}");
+    assert_eq!(blocked["steps"][0]["outcome"], "applied");
+    assert_eq!(
+        blocked["steps"][3]["error"]["code"],
+        "control_revision_conflict"
+    );
+    let state = inspect().await.unwrap().overlays;
+    assert!(!state.preference_enabled);
+    assert_ne!(state.preference_revision, saved);
+    let replay = call(fixture, owner, 3, "edit_ability", preferences)
+        .await
+        .unwrap();
+    assert_eq!(replay.structured_content, blocked);
+    assert_eq!(
+        inspect().await.unwrap().overlays.preference_revision,
+        state.preference_revision
+    );
+    // Exact replay of an earlier authoring edit replays its overlay receipt
+    // without mutating state, and fails at the final current-package check
+    // rather than returning a partial overlay error or a later package version.
+    let earlier_replay = call(fixture, owner, 2, "edit_ability", edit)
+        .await
+        .err()
+        .expect("replaying an older edit after a newer publication must report RevisionConflict");
+    assert!(
+        matches!(
+            earlier_replay,
+            PortError::Domain(DomainError::RevisionConflict { .. })
+        ),
+        "{earlier_replay:?}"
+    );
+    assert_eq!(
+        inspect().await.unwrap().overlays.preference_revision,
+        state.preference_revision
+    );
+
+    let current = inspect().await.unwrap();
+    fixture
+        .control
+        .update_ability_binding(
+            owner.clone(),
+            AccountMutation {
+                identity: runtime_ability_cases::identity(fixture, owner, 5).await,
+                input: AbilityBindingUpdate {
+                    ability: current.descriptor.reference,
+                    enabled: true,
+                    expected: current.binding_revision,
+                    projects: AbilityProjects::Selected(vec![]),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let current = call(
+        fixture,
+        owner,
+        6,
+        "get_ability",
+        json!({"ref":blocked["ref"]}),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let binding = json!({
+        "ref":current["ref"], "versionToken":current["versionToken"],
+        "instructions":"Publish before a competing binding", "availability":{"mode":"all-projects"},
+    });
+    let blocked = Box::pin(concurrent_overlay_during_publication(
+        fixture,
+        call(fixture, owner, 7, "edit_ability", binding.clone()),
+        async {
+            let current = inspect().await.unwrap();
+            fixture
+                .control
+                .update_ability_binding(
+                    owner.clone(),
+                    AccountMutation {
+                        identity: runtime_ability_cases::identity(fixture, owner, 8).await,
+                        input: AbilityBindingUpdate {
+                            ability: current.descriptor.reference,
+                            enabled: false,
+                            expected: current.binding_revision,
+                            projects: AbilityProjects::Selected(vec![]),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+        },
+    ))
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(blocked["outcome"], "partial", "{blocked}");
+    assert_eq!(blocked["steps"][0]["outcome"], "applied");
+    assert_eq!(
+        blocked["steps"][2]["error"]["code"],
+        "control_revision_conflict"
+    );
+    let current = inspect().await.unwrap();
+    assert!(!current.binding_enabled);
+    assert_eq!(current.availability, AbilityProjects::Selected(vec![]));
+    let replay = call(fixture, owner, 7, "edit_ability", binding)
+        .await
+        .unwrap();
+    assert_eq!(replay.structured_content, blocked);
+    assert_eq!(
+        inspect().await.unwrap().binding_revision,
+        current.binding_revision
+    );
+}
 
 pub(super) async fn overrides_and_promotion(fixture: &RuntimeFixture) {
     let owner = fixture.human.auth().principal().clone();

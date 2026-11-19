@@ -99,7 +99,7 @@ async fn compact_prefix_preserving_recent_context(
         .unwrap();
     let mut entries = Vec::new();
     let mut leaf = ThreadEntrySeq::ZERO;
-    for ordinal in 1..=9 {
+    for ordinal in 1..=10 {
         let label = format!("ordered segment {ordinal}");
         let body = format!("{label} {}", "a".repeat(900 - label.len() - 1));
         let SubmitUserChatOutcome::Appended(entry) = fixture
@@ -123,6 +123,25 @@ async fn compact_prefix_preserving_recent_context(
         leaf = entry.value.seq;
         entries.push((leaf, label));
     }
+    let before_compaction = wait_for_idle(fixture, personal, &thread).await;
+    let independent_redaction = fixture
+        .canonical
+        .redact_chat_entry(
+            personal.clone(),
+            Mutation {
+                identity: identity(11),
+                preconditions: Preconditions::default(),
+                input: RedactChatEntry {
+                    thread: thread.clone(),
+                    entry: entries[0].0,
+                    expected_thread_revision: before_compaction.revision,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(independent_redaction.value.invalidated_contexts.is_empty());
+    let live_entries = &entries[1..];
 
     let supervisor = AgentRunSupervisor::new_local(
         provider.registry,
@@ -163,8 +182,8 @@ async fn compact_prefix_preserving_recent_context(
         .map(|message| message["content"].as_str().unwrap())
         .collect();
     let covered = shown.len();
-    assert!((2..9).contains(&covered));
-    for (text, (_, label)) in shown.iter().zip(&entries) {
+    assert!((2..live_entries.len()).contains(&covered));
+    for (text, (_, label)) in shown.iter().zip(live_entries) {
         assert!(text.starts_with(label));
     }
     send_ollama(
@@ -180,8 +199,8 @@ async fn compact_prefix_preserving_recent_context(
         .unwrap();
     let recent_messages = recent["messages"].as_array().unwrap();
     assert_eq!(recent_messages[1]["content"], "Summary of older segments.");
-    assert_eq!(recent_messages.len(), 2 + entries.len() - covered);
-    for (message, (_, label)) in recent_messages[2..].iter().zip(&entries[covered..]) {
+    assert_eq!(recent_messages.len(), 2 + live_entries.len() - covered);
+    for (message, (_, label)) in recent_messages[2..].iter().zip(&live_entries[covered..]) {
         assert!(message["content"].as_str().unwrap().starts_with(label));
     }
     send_ollama(
@@ -204,17 +223,18 @@ async fn compact_prefix_preserving_recent_context(
         .read_chat(personal.clone(), read())
         .await
         .unwrap();
-    assert_eq!(audit.entries.len(), 11);
+    assert_eq!(audit.entries.len(), 12);
+    assert_eq!(audit.entries[0].kind, ChatEntryKind::Redacted);
     assert_eq!(
-        audit.entries[..9]
+        audit.entries[..10]
             .iter()
             .map(|entry| entry.seq)
             .collect::<Vec<_>>(),
         entries.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
     );
-    let checkpoint = audit.entries[9].seq;
-    assert_eq!(audit.entries[9].kind, ChatEntryKind::Compaction);
-    assert_eq!(audit.entries[9].parent, Some(leaf));
+    let checkpoint = audit.entries[10].seq;
+    assert_eq!(audit.entries[10].kind, ChatEntryKind::Compaction);
+    assert_eq!(audit.entries[10].parent, Some(leaf));
     let summary = fixture
         .canonical
         .read_chat_contents(
@@ -228,14 +248,14 @@ async fn compact_prefix_preserving_recent_context(
         .await
         .unwrap();
     let proof = summary[0].content.provenance().unwrap();
-    assert_eq!(proof.compacts_through, Some(entries[covered - 1].0));
+    assert_eq!(proof.compacts_through, Some(live_entries[covered - 1].0));
     let context = fixture
         .canonical
         .read_chat_context(personal.clone(), read())
         .await
         .unwrap();
     assert_eq!(context.entries[0].seq, checkpoint);
-    assert_eq!(context.entries[1].seq, entries[covered].0);
+    assert_eq!(context.entries[1].seq, live_entries[covered].0);
     assert_eq!(context.entries.last().unwrap().seq, final_thread.head);
 
     let redacted = fixture
@@ -243,11 +263,11 @@ async fn compact_prefix_preserving_recent_context(
         .redact_chat_entry(
             personal.clone(),
             Mutation {
-                identity: identity(10),
+                identity: identity(12),
                 preconditions: Preconditions::default(),
                 input: RedactChatEntry {
                     thread: thread.clone(),
-                    entry: entries[0].0,
+                    entry: live_entries[0].0,
                     expected_thread_revision: final_thread.revision,
                 },
             },
@@ -260,8 +280,8 @@ async fn compact_prefix_preserving_recent_context(
         .read_chat(personal.clone(), read())
         .await
         .unwrap();
-    assert_eq!(audit.entries[0].kind, ChatEntryKind::Redacted);
-    assert_eq!(audit.entries[9].kind, ChatEntryKind::Redacted);
+    assert_eq!(audit.entries[1].kind, ChatEntryKind::Redacted);
+    assert_eq!(audit.entries[10].kind, ChatEntryKind::Redacted);
     supervisor
         .start(fixture.human.clone(), request(final_thread.head))
         .await

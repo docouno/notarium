@@ -1,9 +1,10 @@
-use std::time::Duration;
+use std::{sync::atomic::Ordering, time::Duration};
 
 use notarium_agents::chats::{
     AgentRunSupervisor, ChatRunOptions, ChatSubscription, ExclusiveDataRoot, StartChatRun,
     stream::StreamRead,
 };
+use notarium_control::auth::token::{TokenKind, mint};
 use notarium_core::{
     auth::SpaceKind,
     classes::{ClassEgressFence, DocClass},
@@ -32,7 +33,7 @@ async fn postgres_supervised_chat_conflicts_and_revocation() {
 }
 
 async fn supervised_chat_case(postgres: bool) {
-    let fixture = Box::pin(RuntimeFixture::open_named(postgres, "supervised_chat")).await;
+    let mut fixture = Box::pin(RuntimeFixture::open_named(postgres, "supervised_chat")).await;
     let personal = fixture
         .control
         .list_spaces(
@@ -47,16 +48,38 @@ async fn supervised_chat_case(postgres: bool) {
         .unwrap();
     let scoped =
         SpaceContext::new(fixture.human.auth().clone(), personal.history, budget()).unwrap();
+    let token = mint(TokenKind::Session).unwrap();
+    fixture
+        .storage
+        .observer
+        .seed_session(
+            fixture.human.auth().principal(),
+            &AuthSessionId::from_bytes([0xb8; 16]),
+            &token,
+            fixture.storage.clock.0.load(Ordering::SeqCst),
+        )
+        .await;
+    let evidence = || support::evidence(AuthEvidenceKind::Session, token.secret.expose());
+    let claimant = LogoutClaimant {
+        account: AccountContext::new(fixture.control.resolve(evidence()).await.unwrap(), budget()),
+        logout: evidence(),
+    };
     Box::pin(supervised_turn_survives_disconnect_and_stops_cleanly(
-        &fixture, &scoped,
+        &fixture, &scoped, claimant,
     ))
     .await;
     fixture.close().await;
 }
 
+struct LogoutClaimant {
+    account: AccountContext,
+    logout: PreAuthContext,
+}
+
 async fn supervised_turn_survives_disconnect_and_stops_cleanly(
     fixture: &RuntimeFixture,
     personal: &SpaceContext,
+    claimant: LogoutClaimant,
 ) {
     let owner = &fixture.human;
     let scope = personal.scope();
@@ -101,6 +124,11 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
     )
     .await;
     let supervisor = AgentRunSupervisor::new_local(
+        local.registry.clone(),
+        fixture.revocations.clone(),
+        ExclusiveDataRoot::attest_open_writer(),
+    );
+    let peer_supervisor = AgentRunSupervisor::new_local(
         local.registry,
         fixture.revocations.clone(),
         ExclusiveDataRoot::attest_open_writer(),
@@ -131,12 +159,9 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
         options.clone(),
     ))
     .await;
+    let former_input = input(242, ThreadEntrySeq::ZERO, "Start a detached turn.");
     let first = supervisor
-        .enqueue_input(
-            owner.clone(),
-            input(242, ThreadEntrySeq::ZERO, "Start a detached turn."),
-            options.clone(),
-        )
+        .enqueue_input(owner.clone(), former_input.clone(), options.clone())
         .await
         .unwrap();
     let SubmitUserChatOutcome::Appended(human) = first.outcome else {
@@ -174,11 +199,7 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
         .unwrap()
         .unwrap();
     let replay = supervisor
-        .enqueue_input(
-            owner.clone(),
-            input(242, ThreadEntrySeq::ZERO, "Start a detached turn."),
-            options.clone(),
-        )
+        .enqueue_input(owner.clone(), former_input.clone(), options.clone())
         .await
         .unwrap();
     assert!(replay.run.is_none());
@@ -313,9 +334,25 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
         personal,
         &supervisor,
         &listener,
-        &thread,
+        former_input,
         human.value.seq,
-        options,
+        options.clone(),
+    ))
+    .await;
+    let leaf = idle_leaf(fixture, personal, &thread).await;
+    Box::pin(settle_lost_claim_acknowledgements(
+        fixture,
+        personal,
+        &supervisor,
+        &peer_supervisor,
+        &listener,
+        StartChatRun {
+            scope: scope.clone(),
+            thread: thread.clone(),
+            expected_leaf: leaf,
+            options,
+        },
+        claimant,
     ))
     .await;
     let current = branch(fixture, personal, &thread, ThreadEntrySeq::ZERO)
@@ -356,12 +393,13 @@ async fn queue_conflicts_and_lost_ack(
     personal: &SpaceContext,
     supervisor: &AgentRunSupervisor,
     listener: &TcpListener,
-    thread: &ChatThreadId,
+    former_input: SubmitUserChatInput,
     leaf: ThreadEntrySeq,
     options: ChatRunOptions,
 ) {
     let owner = &fixture.human;
     let scope = personal.scope();
+    let thread = &former_input.thread;
     let identity = |index| {
         let mut key = [0xf2; 16];
         key[0] = index;
@@ -400,16 +438,20 @@ async fn queue_conflicts_and_lost_ack(
         StreamRead::CatchUpRequired(_)
     ));
     let cancelled = PendingInputId::from_bytes([0x6e; 16]);
-    let materialized = PendingInputId::from_bytes([0x6f; 16]);
+    let materialized = former_input.id.clone();
     for (index, id, body) in [
         (1, cancelled.clone(), "Dismiss this item"),
         (2, materialized.clone(), "Deliver this item once"),
     ] {
+        let mut identity = identity(index);
+        if id == materialized {
+            identity.hash = former_input.identity.hash;
+        }
         let accepted = supervisor
             .enqueue_input(
                 owner.clone(),
                 SubmitUserChatInput {
-                    identity: identity(index),
+                    identity,
                     id,
                     thread: thread.clone(),
                     expected_leaf: leaf,
@@ -422,6 +464,15 @@ async fn queue_conflicts_and_lost_ack(
             .unwrap();
         assert!(matches!(accepted.outcome, SubmitUserChatOutcome::Queued(_)));
     }
+    let prior_receipt = supervisor
+        .enqueue_input(owner.clone(), former_input.clone(), options.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        prior_receipt.outcome,
+        SubmitUserChatOutcome::Appended(saved)
+            if matches!(&saved.value.body, ChatBody::Inline(text) if text == &former_input.body)
+    ));
 
     fixture.projections.trace_chat_consume_with_lost_ack();
     let (first, resume_first) = fixture.projections.pause_chat_consume();
@@ -532,6 +583,166 @@ async fn queue_conflicts_and_lost_ack(
     assert_eq!(watermark.committed_leaf, consumed.seq);
 }
 
+async fn settle_lost_claim_acknowledgements(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+    supervisor: &AgentRunSupervisor,
+    peer: &AgentRunSupervisor,
+    listener: &TcpListener,
+    mut request: StartChatRun,
+    claimant: LogoutClaimant,
+) {
+    let thread = request.thread.clone();
+    let scope = request.scope.clone();
+    let (committed, release) = fixture.projections.pause_and_lose_chat_claim_acks(1);
+    fixture.projections.lose_chat_finish_acks(2);
+    let first = {
+        let supervisor = supervisor.clone();
+        let request = request.clone();
+        tokio::spawn(async move { supervisor.start(claimant.account, request).await })
+    };
+    let cancellation = timeout(Duration::from_secs(15), committed)
+        .await
+        .unwrap()
+        .unwrap();
+    let unpublished = branch(fixture, personal, &thread, ThreadEntrySeq::ZERO)
+        .await
+        .thread
+        .active_run
+        .unwrap();
+    timeout(
+        Duration::from_secs(15),
+        fixture.control.logout(claimant.logout),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(cancellation.is_cancelled());
+
+    let next = {
+        let supervisor = supervisor.clone();
+        let account = fixture.human.clone();
+        let request = request.clone();
+        tokio::spawn(async move { supervisor.start(account, request).await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!next.is_finished());
+    release.send(()).unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(15), first).await.unwrap().unwrap(),
+        Err(PortError::Unavailable(failure))
+            if failure.effect() == notarium_core::error::CommitEffect::Unknown
+    ));
+    let successor = timeout(Duration::from_secs(15), next)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_ne!(successor, unpublished);
+    let (mut wire, _) = timeout(Duration::from_secs(15), read_request(listener))
+        .await
+        .unwrap();
+    send_ollama(
+        &mut wire,
+        json!({"role":"assistant","content":"The current claim settled."}),
+        "stop",
+    )
+    .await;
+    request.expected_leaf = idle_leaf(fixture, personal, &thread).await;
+
+    let (committed, release) = fixture.projections.pause_and_lose_chat_claim_acks(2);
+    let dropped = {
+        let supervisor = supervisor.clone();
+        let account = fixture.human.clone();
+        let request = request.clone();
+        tokio::spawn(async move { supervisor.start(account, request).await })
+    };
+    timeout(Duration::from_secs(15), committed)
+        .await
+        .unwrap()
+        .unwrap();
+    let unpublished = branch(fixture, personal, &thread, ThreadEntrySeq::ZERO)
+        .await
+        .thread
+        .active_run
+        .unwrap();
+    let text = "Deliver the live input despite both unknown claim replies.";
+    let queued = peer
+        .enqueue_input(
+            fixture.human.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope,
+                    actor: fixture.human.auth().principal().clone(),
+                    key: CommandKey::from_bytes([0xb8; 16]),
+                    hash: ContentDigest::from_bytes([0xb8; 32]),
+                },
+                id: PendingInputId::from_bytes([0xb8; 16]),
+                thread: thread.clone(),
+                expected_leaf: request.expected_leaf,
+                body: text.into(),
+                mentions_agent: false,
+            },
+            request.options,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        queued.outcome,
+        SubmitUserChatOutcome::Queued(input) if input.in_flight_run == unpublished
+    ));
+    dropped.abort();
+    assert!(dropped.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+
+    let (mut wire, prompt) = timeout(Duration::from_secs(15), read_request(listener))
+        .await
+        .unwrap();
+    assert!(
+        prompt["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| { message["role"] == "user" && message["content"] == text })
+    );
+    let live = branch(fixture, personal, &thread, ThreadEntrySeq::ZERO)
+        .await
+        .thread;
+    assert_ne!(live.active_run.as_ref().unwrap(), &unpublished);
+    send_ollama(
+        &mut wire,
+        json!({"role":"assistant","content":"One healthy successor."}),
+        "stop",
+    )
+    .await;
+    let head = idle_leaf(fixture, personal, &thread).await;
+    let branch = branch(fixture, personal, &thread, head).await;
+    assert_eq!(
+        head,
+        request
+            .expected_leaf
+            .checked_next()
+            .unwrap()
+            .checked_next()
+            .unwrap()
+    );
+    assert_eq!(
+        branch
+            .entries
+            .iter()
+            .filter(|entry| { matches!(&entry.body, ChatBody::Inline(body) if body == text) })
+            .count(),
+        1
+    );
+    assert!(
+        branch
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == ChatEntryKind::Model)
+            .all(|entry| entry.run.as_ref() != Some(&unpublished))
+    );
+}
+
 async fn revoked_admission_cannot_publish(
     fixture: &RuntimeFixture,
     personal: &SpaceContext,
@@ -615,23 +826,18 @@ async fn revoked_admission_cannot_publish(
         timeout(Duration::from_secs(15), token.cancelled())
             .await
             .unwrap();
-        assert!(
-            !fence.is_finished(),
-            "the authority fence must wait for canonical settlement"
-        );
+        let fence = timeout(Duration::from_secs(15), fence)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         release.send(()).unwrap();
         assert!(matches!(
             timeout(Duration::from_secs(15), effect).await.unwrap().unwrap(),
             Err(PortError::Cancelled(error))
                 if error.effect() == notarium_core::error::CommitEffect::NotCommitted
         ));
-        drop(
-            timeout(Duration::from_secs(15), fence)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap(),
-        );
+        drop(fence);
         let head = branch(fixture, personal, thread, ThreadEntrySeq::ZERO)
             .await
             .thread;

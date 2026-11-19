@@ -205,11 +205,13 @@ its context has no content read/write classes while the Space is inactive.
 Authority mutations acquire SQL locks, then an exclusive registration fence
 before committing their revocation events. The fence cancels matching provider
 calls and guarded canonical operations. It waits for socket shutdown and
-canonical command settlement, including when a caller disconnects. The SQL
+active canonical command settlement, including when a caller disconnects. The SQL
 owner retains the fence until COMMIT or ROLLBACK acknowledgement. Dispatch uses
 the same SQL-then-registry order and releases registrations before settling its
-audit. A guarded canonical write registers before a read-only authority check
-and holds the guard through settlement. It releases the guard before any
+audit. A guarded canonical operation registers before a read-only authority
+check and becomes active after obtaining its storage locks. Revocation
+cancels queued registrations immediately. The storage owner holds the active
+guard through settlement and releases it before any
 subsequent Control mutation. The registry coordinates every serving instance
 and fails closed when a lease is lost. A public mutation returns success
 after the injected `SessionRevocationPort` confirms
@@ -618,7 +620,9 @@ package. Inspection returns its descriptor and saved availability and preference
 metadata, including for disabled packages. Package and binding mutations require
 `AbilityWrite` and write access to the target. The authoring transaction validates
 credential lineage under the owner lock, then takes ordered exclusive Space
-admission locks before applying a mutation or replaying a receipt. The canonical
+admission locks before applying a mutation or replaying a receipt. Authored
+binding, preference and promotion settlement compares the observed overlay
+revisions without coupling to unrelated account-revision bumps. The canonical
 store owns package content.
 
 Memory targets are fixed account/project/category references. Categories are

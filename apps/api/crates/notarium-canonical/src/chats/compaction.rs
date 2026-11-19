@@ -89,6 +89,9 @@ pub(super) async fn verify_prefix(
     if let Some(run) = &keeper {
         entries.retain(|entry| entry.run.as_ref() == Some(run));
     }
+    // A redaction preserves ancestry but has no body to disclose or cite.
+    // Proofs of surviving entries still refer to their original sources.
+    entries.retain(|entry| entry.kind != ChatEntryKind::Redacted);
     let cut = entries
         .iter()
         .position(|entry| entry.seq == through && entry.kind != ChatEntryKind::Compaction)

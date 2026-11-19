@@ -814,7 +814,13 @@ impl CanonicalStore {
                 })?;
                 let mut conn = BackendConn::Sqlite(&mut pair.sqlx_conn);
                 let mut transaction = WriteTransaction::begin(&mut conn).await?;
-                let value = op(&mut transaction.conn()).await?;
+                let value = match op(&mut transaction.conn()).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        transaction.rollback().await;
+                        return Err(error);
+                    }
+                };
                 transaction.commit().await?;
                 self.inner
                     .sqlite_writer_commit_gen

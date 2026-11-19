@@ -204,6 +204,22 @@ struct ActiveRun {
     admitted: AtomicBool,
 }
 
+enum LaunchOutcome {
+    Started(AgentRunId),
+    Draining(PortError),
+}
+
+enum ClaimSettlement {
+    Retired,
+    Changed,
+    Pending,
+}
+
+enum RunTaskStart {
+    Admitted(ThreadEntrySeq),
+    DrainOnly(PortError),
+}
+
 impl AgentRunSupervisor {
     pub fn new_local(
         registry: Arc<ToolRegistry>,
@@ -261,7 +277,13 @@ impl AgentRunSupervisor {
             let branch = service
                 .thread_at(ctx, &request.thread, request.expected_leaf)
                 .await?;
-            service.launch(account, request, branch.thread, None).await
+            match service
+                .launch(account, request, branch.thread, None)
+                .await?
+            {
+                LaunchOutcome::Started(run) => Ok(run),
+                LaunchOutcome::Draining(error) => Err(error),
+            }
         })
         .await
     }
@@ -360,6 +382,12 @@ impl AgentRunSupervisor {
             scope.clone(),
             account.budget.clone(),
         )?;
+        let ctx = self
+            .inner
+            .registry
+            .control()
+            .fence_canonical_effect(account.auth().clone(), ctx, CanonicalEffect::ChatRollback)
+            .await?;
         self.inner
             .registry
             .engine()
@@ -584,7 +612,7 @@ impl AgentRunSupervisor {
         request: StartChatRun,
         thread: ChatThread,
         predecessor: Option<&AgentRunId>,
-    ) -> Result<AgentRunId, PortError> {
+    ) -> Result<LaunchOutcome, PortError> {
         if self.inner.shutdown.is_cancelled()
             || !request.options.limits.fits(RunLimits::HARD_CEILING)
         {
@@ -760,43 +788,142 @@ impl AgentRunSupervisor {
             expected_leaf: request.expected_leaf,
             previous_run: predecessor.cloned(),
         };
-        let mut claim = self
+        // The canonical executor owns the effect lease through commit. A
+        // delayed response must not keep a subsequent logout waiting on it.
+        let claim = self
             .inner
             .registry
             .engine()
-            .claim_active_run(ctx.clone(), claim_request.clone())
+            .claim_active_run(ctx, claim_request.clone())
             .await;
-        if claim.as_ref().is_err_and(queue::unknown_commit)
-            && state.owner.check().is_ok()
-            && state.lease.check().is_ok()
-            && ctx
-                .canonical_effect()
-                .is_none_or(|effect| effect.check().is_ok())
-        {
-            claim = self
-                .inner
-                .registry
-                .engine()
-                .claim_active_run(ctx.clone(), claim_request)
-                .await;
-        }
-        drop(ctx);
-        if !matches!(&claim, Ok(ClaimChatRunOutcome::Claimed)) {
-            let mut threads = self.inner.threads.lock().expect("thread registry lock");
-            if let Some(previous) = previous {
-                threads.active.insert(key, previous);
-            } else {
-                threads.active.remove(&key);
+        let claim = match claim {
+            Err(first) if queue::unknown_commit(&first) => {
+                match self.retry_claim(&state, claim_request).await {
+                    Err(retry) if !queue::unknown_commit(&retry) => Err(first),
+                    settled => settled,
+                }
             }
-            return Err(claim.err().unwrap_or_else(owner_unavailable));
+            known => known,
+        };
+        let error = match claim {
+            Ok(ClaimChatRunOutcome::Claimed) => {
+                if let Err(error) = state.owner.check().and_then(|_| state.lease.check()) {
+                    error
+                } else {
+                    state.admitted.store(true, Ordering::Release);
+                    self.spawn_run(state, RunTaskStart::Admitted(request.expected_leaf));
+                    return Ok(LaunchOutcome::Started(run));
+                }
+            }
+            Err(error) if queue::unknown_commit(&error) => error,
+            rejected => {
+                self.restore_predecessor(key, previous);
+                return Err(rejected.err().unwrap_or_else(owner_unavailable));
+            }
+        };
+
+        state.cancellation.cancel();
+        match self.settle_unpublished_claim(&state).await {
+            ClaimSettlement::Pending => {
+                self.spawn_run(state, RunTaskStart::DrainOnly(error.clone()));
+                Ok(LaunchOutcome::Draining(error))
+            }
+            ClaimSettlement::Changed => {
+                self.restore_predecessor(key, previous);
+                Err(error)
+            }
+            ClaimSettlement::Retired => {
+                self.remove_run(&state);
+                Err(error)
+            }
         }
-        let publish = state.owner.check().and_then(|_| state.lease.check());
-        state.admitted.store(publish.is_ok(), Ordering::Release);
+    }
+
+    async fn retry_claim(
+        &self,
+        run: &ActiveRun,
+        request: ClaimChatRun,
+    ) -> Result<ClaimChatRunOutcome, PortError> {
+        let ctx = run.context(MAINTENANCE_BUDGET)?;
+        let ctx = self
+            .inner
+            .registry
+            .control()
+            .fence_canonical_effect(run.owner_auth.clone(), ctx, CanonicalEffect::ChatClaim)
+            .await?;
+        run.owner.check()?;
+        run.lease.check()?;
+        self.inner
+            .registry
+            .engine()
+            .claim_active_run(ctx, request)
+            .await
+    }
+
+    /// The thread gate remains held until an uncertain candidate is either
+    /// cleared or has proved its claim. The canonical writer decides whether
+    /// an exact close can proceed even if the application route was lost.
+    async fn settle_unpublished_claim(&self, run: &ActiveRun) -> ClaimSettlement {
+        let engine = self.inner.registry.engine();
+        let request = ChatRunRequest {
+            thread: run.thread.clone(),
+            expected_run: run.id.clone(),
+        };
+        let mut delay = Duration::from_millis(25);
+        loop {
+            let owner_live = run.owner.check().is_ok();
+            let result = match run.settlement_context() {
+                Ok(ctx) => engine.finish_run_if_queue_empty(ctx, request.clone()).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(FinishChatRunOutcome::Cleared) => {
+                    self.inner
+                        .revocations
+                        .finish_thread_pending(&run.scope, &run.thread);
+                    return ClaimSettlement::Retired;
+                }
+                Ok(FinishChatRunOutcome::Changed) => return ClaimSettlement::Changed,
+                Ok(FinishChatRunOutcome::Pending)
+                    if owner_live && !self.inner.shutdown.is_cancelled() =>
+                {
+                    return ClaimSettlement::Pending;
+                }
+                Ok(FinishChatRunOutcome::Pending) => return ClaimSettlement::Retired,
+                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
+                    if matches!(
+                        diagnostic.reason,
+                        ValidationReason::InvalidAuthority
+                            | ValidationReason::HistoryIncarnationMismatch
+                    ) =>
+                {
+                    return ClaimSettlement::Retired;
+                }
+                _ if !owner_live || self.inner.shutdown.is_cancelled() => {
+                    return ClaimSettlement::Retired;
+                }
+                _ => (),
+            }
+            tokio::select! {
+                () = tokio::time::sleep(delay) => (),
+                () = self.inner.shutdown.cancelled() => return ClaimSettlement::Retired,
+            }
+            delay = (delay * 2).min(Duration::from_secs(2));
+        }
+    }
+
+    fn spawn_run(&self, run: Arc<ActiveRun>, start: RunTaskStart) {
         let worker = self.clone();
-        tokio::spawn(async move {
-            worker.run_task(state, request.expected_leaf).await;
-        });
-        publish.map(|_| run)
+        tokio::spawn(async move { worker.run_task(run, start).await });
+    }
+
+    fn restore_predecessor(&self, key: ThreadKey, predecessor: Option<Arc<ActiveRun>>) {
+        let mut threads = self.inner.threads.lock().expect("thread registry lock");
+        if let Some(predecessor) = predecessor {
+            threads.active.insert(key, predecessor);
+        } else {
+            threads.active.remove(&key);
+        }
     }
 
     fn remove_run(&self, run: &ActiveRun) {
@@ -829,6 +956,10 @@ impl ActiveRun {
 
     fn cleanup_context(&self) -> Result<SpaceContext, PortError> {
         self.owner.check()?;
+        self.settlement_context()
+    }
+
+    fn settlement_context(&self) -> Result<SpaceContext, PortError> {
         Ok(SpaceContext::new(
             self.auth.clone(),
             self.scope.clone(),

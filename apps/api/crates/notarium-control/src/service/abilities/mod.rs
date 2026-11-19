@@ -83,11 +83,37 @@ async fn ability_control_state(
     let binding = rows!(tx,AbilityAvailabilityRow,fetch_optional,
         "SELECT * FROM ability_availability WHERE placement=$1 AND ability_id=$2",
         "SELECT * FROM v1_control.ability_availability WHERE placement=$1 AND ability_id=$2";key,id.as_str())?;
-    let preference = rows!(tx,AbilityPreferencesRow,fetch_optional,
-        "SELECT * FROM ability_preferences WHERE owner_id=$1 AND placement=$2 AND ability_id=$3",
-        "SELECT * FROM v1_control.ability_preferences WHERE owner_id=$1 AND placement=$2 AND ability_id=$3";owner.as_str(),key,id.as_str())?;
+    let preference = ability_preference(tx, owner, key, id).await?;
     Ok((binding, preference))
 }
+
+async fn ability_preference(
+    tx: &mut Transaction,
+    owner: &PrincipalId,
+    key: &str,
+    id: &AbilityId,
+) -> Result<Option<AbilityPreferencesRow>, PortError> {
+    rows!(tx,AbilityPreferencesRow,fetch_optional,
+        "SELECT * FROM ability_preferences WHERE owner_id=$1 AND placement=$2 AND ability_id=$3",
+        "SELECT * FROM v1_control.ability_preferences WHERE owner_id=$1 AND placement=$2 AND ability_id=$3";owner.as_str(),key,id.as_str())
+}
+
+fn overlay_state(
+    binding: Option<&AbilityAvailabilityRow>,
+    preference: Option<&AbilityPreferencesRow>,
+) -> Result<AbilityOverlayState, PortError> {
+    Ok(AbilityOverlayState {
+        binding_enabled: binding.is_none_or(|row| row.enabled == 1),
+        binding_revision: binding
+            .map(|row| ControlRevision::new(row.revision as u64))
+            .transpose()?,
+        preference_enabled: preference.is_none_or(|row| row.enabled == 1),
+        preference_revision: preference
+            .map(|row| ControlRevision::new(row.revision as u64))
+            .transpose()?,
+    })
+}
+
 impl ControlService {
     pub(super) async fn ability_placement(
         &self,
@@ -736,12 +762,14 @@ impl ControlService {
                 CommitEffect::NotCommitted,
             )
             .await?;
+        let state = overlay_state(binding.as_ref(), preference.as_ref())?;
         Ok(AbilityInspection {
             descriptor,
             availability,
-            binding_enabled: binding.as_ref().is_none_or(|row| row.enabled == 1),
-            preference_enabled: preference.is_none_or(|row| row.enabled == 1),
-            binding_revision: ControlRevision::new(binding.map_or(0, |row| row.revision) as u64)?,
+            binding_enabled: state.binding_enabled,
+            preference_enabled: state.preference_enabled,
+            binding_revision: state.binding_revision.unwrap_or(ControlRevision::ZERO),
+            overlays: state,
         })
     }
     async fn ability_scope(

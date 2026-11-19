@@ -291,6 +291,7 @@ pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: 
             .count(),
         1
     );
+    replay_keeps_forward_link_receipt(fixture, account, &project).await;
     let unclosed = call(
         fixture,
         account,
@@ -421,4 +422,104 @@ pub(super) async fn edit_folder_cover_and_view(fixture: &RuntimeFixture, space: 
         list.structured_content["folderPage"]["createWith"]["folderPage"],
         true
     );
+}
+
+async fn replay_keeps_forward_link_receipt(
+    fixture: &RuntimeFixture,
+    account: &AccountContext,
+    project: &str,
+) {
+    let blocker = call(
+        fixture,
+        account,
+        169,
+        "create_note",
+        json!({"project":project, "title":"Blocker", "fileName":"retry-target-b", "body":"Occupies B."}),
+    )
+    .await
+    .unwrap();
+    let args = json!({
+        "project":project,
+        "notes":[
+            {"title":"Retry source", "body":"Links to the target.",
+                "links":[{"relation":"related", "toTitle":"Retry target"}]},
+            {"title":"Retry target", "fileName":"retry-target-a", "body":"First target."},
+            {"title":"Retry target", "fileName":"retry-target-b", "body":"Second target."},
+        ],
+    });
+    fixture.projections.lose_next_note_edit_ack();
+    let first = call(fixture, account, 171, "create_notes", args.clone())
+        .await
+        .unwrap()
+        .structured_content;
+    assert!(first["results"][0]["linkError"].is_string());
+    assert_eq!(first["results"][1]["ok"], true);
+    assert_eq!(first["results"][2]["error"], "path_conflict");
+    let source = &first["results"][0]["noteId"];
+    let target_a = first["results"][1]["noteId"].as_str().unwrap();
+    let link = format!("- related: [[{target_a}|Retry target]]");
+    let observed = call(
+        fixture,
+        account,
+        172,
+        "get_note",
+        json!({"ref":source, "responseFormat":"concise"}),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let revision = &observed["versionToken"];
+    assert_ne!(*revision, first["results"][0]["versionToken"]);
+    assert!(observed["content"].as_str().unwrap().contains(&link));
+
+    call(
+        fixture,
+        account,
+        173,
+        "delete_note",
+        json!({"ref":blocker.structured_content["noteId"]}),
+    )
+    .await
+    .unwrap();
+    let replay = call(fixture, account, 171, "create_notes", args.clone())
+        .await
+        .unwrap()
+        .structured_content;
+    assert_eq!(replay["results"][2]["ok"], true);
+    assert_ne!(
+        replay["results"][1]["noteId"],
+        replay["results"][2]["noteId"]
+    );
+    assert_eq!(replay["results"][0]["versionToken"], *revision);
+    assert!(replay["results"][0].get("linkError").is_none());
+
+    let manual = call(
+        fixture,
+        account,
+        174,
+        "edit_note",
+        json!({"ref":source, "operation":"append", "content":"Manual edit.", "versionToken":revision}),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let again = call(fixture, account, 171, "create_notes", args)
+        .await
+        .unwrap()
+        .structured_content;
+    assert_eq!(again, replay);
+    let live = call(
+        fixture,
+        account,
+        175,
+        "get_note",
+        json!({"ref":source, "responseFormat":"concise"}),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(live["versionToken"], manual["versionToken"]);
+    let carrier = live["content"].as_str().unwrap();
+    assert!(carrier.contains(&link));
+    assert!(carrier.contains("Manual edit."));
 }

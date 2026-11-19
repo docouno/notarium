@@ -29,6 +29,7 @@ impl ControlService {
         match effect {
             CanonicalEffect::AbilityAuthoring => authority.authorize_ability_mutation()?,
             CanonicalEffect::ConfirmedProposal => authority.authorize_proposal_confirmation()?,
+            CanonicalEffect::ChatRollback => authority.authorize_human_management()?,
             CanonicalEffect::ChatInput
                 if authority.kind() == &PrincipalKind::DirectHuman
                     && ctx.auth().kind() == &PrincipalKind::DirectHuman => {}
@@ -47,9 +48,9 @@ impl ControlService {
             .collect();
         let budget = OperationBudget::new(ctx.budget.clone());
         let request = ctx.budget.request.clone();
-        // Registration comes before the live snapshot. This path takes only a
-        // Control reader, since revocation drains the lease under writer locks.
-        let lease = budget
+        // Register before the live snapshot so any intervening revoke cancels
+        // authorization before it can enter Canonical's SQL boundary.
+        let registration = budget
             .run(
                 self.revoker.register_canonical_effect(
                     MaintenanceContext {
@@ -64,11 +65,11 @@ impl ControlService {
             .await?;
         let account = AccountContext::new(authority, budget.context(request));
         let current = self.current_account(&account, &budget).await?;
-        lease.check()?;
+        registration.check()?;
         if source.is_some_and(|scope| !current.auth().spaces().contains_key(&scope.space_id)) {
             return Err(DomainError::ResourceNotFound.into());
         }
-        let ctx = ctx.with_canonical_effect(&current, lease)?;
+        let ctx = ctx.with_canonical_effect(&current, registration)?;
         let grant = &ctx.auth().spaces()[&ctx.scope().space_id];
         if grant.role == SpaceRole::Viewer {
             return Err(DomainError::SpaceReadOnly.into());
@@ -78,6 +79,9 @@ impl ControlService {
             if !grant.write_classes.contains(&DocClass::Skill) {
                 return Err(DomainError::SpaceReadOnly.into());
             }
+        }
+        if effect == CanonicalEffect::ChatRollback {
+            ctx.auth().authorize_human_management()?;
         }
         if let Some(step) = ctx.confirmed_chat_step() {
             step.witness().authorize_writer(ctx.auth())?;

@@ -17,9 +17,10 @@ That capability requires a separate interactive attestation or a durable
 write-token opt-in, and is unavailable to chat runs and Keepers. See the
 [tool name and port mapping](core-contracts.md#port-operation-coverage).
 
-Use the same command key when retrying a logical request. The registry binds it
-to the credential and normalized arguments. Compound actions reserve a
-content-free plan and use canonical receipts for individual effects. Tool
+Use the same command key when retrying a logical request within the seven-day
+tool journal window. The registry binds it to the credential and normalized
+arguments. Compound actions reserve a content-free plan and use canonical
+receipts for individual effects. Tool
 telemetry records typed operations, references and counters. Each result
 includes self-contained Markdown in `content[0].text` and machine-readable
 fields in `structuredContent`. The text contains the revision and continuation
@@ -32,7 +33,9 @@ preconditions when an unrelated account change advances the account revision.
 `versionToken`. `create_notes` commits each item independently and returns
 outcomes in input order. A `toTitle` link becomes a stable ID when exactly one
 committed item matches the title. Otherwise, the link remains authored by
-title. A `linkError` on a successful item reports an unconfirmed link upgrade.
+title. The tool journals each item's link decision before the edit, so retries
+recover the same receipt even when another item later succeeds. A `linkError`
+on a successful item reports an unconfirmed link upgrade.
 Confirmed creation proposals persist the title links shown during review.
 
 `start_session` opens an episode by starting, resuming or forking it. Pass the
@@ -72,11 +75,10 @@ the credential independently for read and write, so reading the tainted
 branch cannot taint the write context. Canonical storage checks the exact
 proposal and its model turn before applying each step. The observed revision
 or absence guards the effect and a repeated confirmation returns its receipt.
-The canonical writer retains the live authorization lease until the step
-settles. Applying a proposal requires no provider call.
-Each approved write or replay holds a live authority lease through canonical
-settlement. Revocation covers the credential and both the proposal source and
-destination Spaces.
+Applying a proposal requires no provider call. Revocation covers the
+credential and both the proposal source and destination Spaces. A queued
+operation can be cancelled before it acquires the canonical writer. Once its
+effect enters the transaction, it holds the authority lease through settlement.
 
 A SpaceGroup run is confined to its shared Space. The queue admits up to 16
 pending inputs per thread. Enqueue and run completion serialize on the current
@@ -96,7 +98,9 @@ at disclosure. Moving a note can invalidate its prior disclosures even when its
 revision and bytes stay the same. If admission fails, choose an authorized
 provider or an earlier clean branch. Redaction invalidates dependent summaries.
 Automatic compaction records the covered prefix and keeps newer turns in the
-next prompt. The full parent chain remains available through `read_chat`.
+next prompt. Tombstones contribute no content to a summary. Surviving entries
+retain their source proofs and may block a request when a source was redacted.
+The full parent chain remains available through `read_chat`.
 Run rollback uses canonical mutation provenance to undo eligible note effects
 while preserving later manual edits. Retrying the same run and command key
 returns the original rollback receipt under current authorization.

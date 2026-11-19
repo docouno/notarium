@@ -310,6 +310,21 @@ impl ControlPort for RejectingPorts {
             ctx: AccountContext,
             request: AccountMutation<AbilityTrailUpdate>,
         ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>>;
+    fn compare_authored_ability_binding(
+            &self,
+            ctx: AccountContext,
+            request: AccountMutation<AbilityBindingChange>,
+        ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>>;
+    fn compare_authored_ability_preference(
+            &self,
+            ctx: AccountContext,
+            request: AccountMutation<AbilityPreferenceChange>,
+        ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>>;
+    fn adopt_authored_ability_promotion(
+            &self,
+            ctx: AccountContext,
+            request: AccountMutation<AdoptAbilityPromotion>,
+        ) -> PortFuture<'_, ControlCommit<AbilityPromotionResult>>;
     fn lookup_mcp_dedup(
             &self,
             ctx: AccountContext,

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use notarium_control::service::provider::{completion_input_estimate, completion_text_estimate};
 use notarium_core::{
     DomainError,
-    classes::{ClassEgressFence, ProviderMessage},
+    classes::{ClassEgressFence, ProviderMessage, ProviderOrigin},
     error::{PortError, ValidationReason},
     ids::{ChatThreadId, ThreadEntrySeq},
     ports::{
@@ -283,8 +283,28 @@ fn assemble(
     hydrated: Vec<HydratedChatEntry>,
     selection: &ProviderSelection,
 ) -> Result<(Vec<CompletionMessage>, Vec<HistoryGroup>), PortError> {
+    // A retained answer may still rely on an erased source. Check visible
+    // dependencies before choosing a prefix from only part of this history.
+    let redacted: BTreeSet<_> = branch
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == ChatEntryKind::Redacted)
+        .map(|entry| entry.seq)
+        .collect();
     let mut content = BTreeMap::new();
     for item in hydrated {
+        if !redacted.is_empty()
+            && item.content.provenance().is_some_and(|proof| {
+                proof.origins.iter().any(|origin| {
+                    matches!(origin, ProviderOrigin::Chat { space, thread, entry, .. }
+                        if space == &branch.thread.space
+                            && thread == &branch.thread.id
+                            && redacted.contains(entry))
+                })
+            })
+        {
+            return Err(invalid(ValidationReason::SourceMismatch));
+        }
         if item.seq != item.content.entry
             || item.content.thread != branch.thread.id
             || item.content.space.id != branch.thread.space
@@ -317,7 +337,10 @@ fn assemble(
         let mut compactable = true;
         let mut tool_rows = 0;
         match &entry.kind {
-            ChatEntryKind::Redacted | ChatEntryKind::Tool { .. } => compactable = false,
+            // Retained entries still carry their original proofs, including
+            // any revoked dependency.
+            ChatEntryKind::Redacted => continue,
+            ChatEntryKind::Tool { .. } => compactable = false,
             ChatEntryKind::Compaction | ChatEntryKind::Human => {
                 let item = item.ok_or_else(|| invalid(ValidationReason::SourceMismatch))?;
                 let role = if entry.kind == ChatEntryKind::Human {

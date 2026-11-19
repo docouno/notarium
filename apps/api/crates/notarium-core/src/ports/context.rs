@@ -1,4 +1,4 @@
-use super::{ChatProposalWitness, RevocationLease};
+use super::{CanonicalEffectRegistration, ChatProposalWitness, PortFuture, RevocationLease};
 use crate::{
     DomainError, DomainResult,
     auth::{EngineAuthContext, SecretString},
@@ -220,7 +220,7 @@ pub struct SpaceContext {
     auth: EngineAuthContext,
     scope: HistoryScope,
     confirmed_chat_step: Option<Arc<ConfirmedChatStep>>,
-    canonical_effect: Option<CanonicalEffectLease>,
+    canonical_effect: Option<CanonicalEffectAdmission>,
     pub budget: CallBudget,
 }
 impl SpaceContext {
@@ -286,12 +286,12 @@ impl SpaceContext {
         step.destination = Some(destination);
         Ok(self)
     }
-    /// Bind freshly revalidated Control authority for one bounded canonical
-    /// operation. Its owned writer may retain the lease past the caller's wait.
+    /// Bind freshly revalidated Control authority for one bounded operation.
+    /// Canonical enters this registration under its own storage locks.
     pub fn with_canonical_effect(
         mut self,
         current: &AccountContext,
-        lease: Box<dyn RevocationLease>,
+        registration: Arc<dyn CanonicalEffectRegistration>,
     ) -> DomainResult<Self> {
         if self.canonical_effect.is_some() {
             return Err(DomainError::validation(ValidationReason::InvalidAuthority));
@@ -301,10 +301,10 @@ impl SpaceContext {
             return Err(DomainError::ResourceNotFound);
         }
         self.budget = current.budget.clone();
-        self.canonical_effect = Some(CanonicalEffectLease(Arc::new(Mutex::new(lease))));
+        self.canonical_effect = Some(CanonicalEffectAdmission(registration));
         Ok(self)
     }
-    pub fn canonical_effect(&self) -> Option<&CanonicalEffectLease> {
+    pub fn canonical_effect(&self) -> Option<&CanonicalEffectAdmission> {
         self.canonical_effect.as_ref()
     }
     pub fn restrict_to_project(mut self, project: &FolderRef) -> DomainResult<Self> {
@@ -319,22 +319,24 @@ impl SpaceContext {
     }
 }
 
-/// Shared lifetime of a revocable canonical operation and its writer settlement.
+/// Carry the prepared registration to each Canonical storage boundary.
 #[derive(Clone)]
-pub struct CanonicalEffectLease(Arc<Mutex<Box<dyn RevocationLease>>>);
+pub struct CanonicalEffectAdmission(Arc<dyn CanonicalEffectRegistration>);
 
-impl CanonicalEffectLease {
+impl CanonicalEffectAdmission {
+    /// Check queued authority without entering the protected SQL interval.
     pub fn check(&self) -> Result<(), crate::error::PortError> {
-        self.0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .check()
+        self.0.check()
+    }
+
+    pub fn begin(&self) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.0.clone().begin()
     }
 }
 
-impl fmt::Debug for CanonicalEffectLease {
+impl fmt::Debug for CanonicalEffectAdmission {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CanonicalEffectLease")
+        f.debug_struct("CanonicalEffectAdmission")
             .finish_non_exhaustive()
     }
 }
@@ -345,6 +347,7 @@ pub enum CanonicalEffect {
     ConfirmedProposal,
     ChatInput,
     ChatClaim,
+    ChatRollback,
 }
 
 /// The step identity and source witness travel together on the trusted writer

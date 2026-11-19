@@ -47,12 +47,12 @@ async fn postgres_keeper_turn_reconsent() {
 }
 
 async fn exercise(postgres: bool) {
-    let fixture = RuntimeFixture::open_named(postgres, "keeper_turn").await;
-    Box::pin(keeper_turn_reconsent(&fixture)).await;
+    let mut fixture = RuntimeFixture::open_named(postgres, "keeper_turn").await;
+    Box::pin(keeper_turn_reconsent(&mut fixture)).await;
     fixture.close().await;
 }
 
-async fn keeper_turn_reconsent(fixture: &RuntimeFixture) {
+async fn keeper_turn_reconsent(fixture: &mut RuntimeFixture) {
     let owner = fixture.human.auth().principal().clone();
     let shared = fixture
         .control
@@ -236,12 +236,14 @@ async fn keeper_turn_reconsent(fixture: &RuntimeFixture) {
         .await
         .unwrap();
 
-    let clock = &fixture.storage.clock.0;
-    let original_clock = clock.load(Ordering::SeqCst);
+    let clock = fixture.storage.clock.clone();
+    let original_clock = clock.0.load(Ordering::SeqCst);
     let first_due = Timestamp::parse("2023-11-12T03:00:00Z").unwrap();
     let overdue_tick = Timestamp::parse("2023-11-27T09:05:00Z").unwrap();
     let next_due = Timestamp::parse("2023-12-03T03:00:00Z").unwrap();
-    clock.store(first_due.unix_seconds() * 1000, Ordering::SeqCst);
+    clock
+        .0
+        .store(first_due.unix_seconds() * 1000, Ordering::SeqCst);
     let schedule = fixture
         .control
         .create_schedule(
@@ -280,7 +282,9 @@ async fn keeper_turn_reconsent(fixture: &RuntimeFixture) {
         fixture.revocations.clone(),
         ExclusiveDataRoot::attest_open_writer(),
     );
-    clock.store(overdue_tick.unix_seconds() * 1000, Ordering::SeqCst);
+    clock
+        .0
+        .store(overdue_tick.unix_seconds() * 1000, Ordering::SeqCst);
     let mut worker = tokio::spawn({
         let scheduler = scheduler.clone();
         async move { scheduler.tick(overdue_tick).await.unwrap() }
@@ -527,6 +531,14 @@ async fn keeper_turn_reconsent(fixture: &RuntimeFixture) {
         .await
         .unwrap();
     assert_eq!(after.last_seq, resolved.receipt.seq());
+    Box::pin(authoring_authority_cases::revoked_rollback(
+        fixture,
+        &supervisor,
+        scope.scope(),
+        &first_run.run,
+        &rollback_key,
+    ))
+    .await;
     for (id, digest) in original_memories {
         assert_eq!(
             get_note(fixture, &scope, id).await.document.digest(),
@@ -543,7 +555,9 @@ async fn keeper_turn_reconsent(fixture: &RuntimeFixture) {
         "instructions":"Keeper skill version two."
     })).await.unwrap();
     assert_eq!(edit.structured_content["outcome"], "updated");
-    clock.store(next_due.unix_seconds() * 1000, Ordering::SeqCst);
+    clock
+        .0
+        .store(next_due.unix_seconds() * 1000, Ordering::SeqCst);
     let paused = scheduler.tick(next_due).await.unwrap();
     assert_eq!((paused.paused, paused.claimed), (1, 0), "{paused:?}");
     assert!(
@@ -614,7 +628,7 @@ async fn keeper_turn_reconsent(fixture: &RuntimeFixture) {
             .len(),
         15
     );
-    clock.store(original_clock, Ordering::SeqCst);
+    clock.0.store(original_clock, Ordering::SeqCst);
 }
 
 async fn log_branch(

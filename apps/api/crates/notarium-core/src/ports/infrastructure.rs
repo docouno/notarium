@@ -579,20 +579,19 @@ pub trait SessionRevocationPort: Send + Sync {
         selectors: Vec<RevocationSelector>,
         cancellation: Cancellation,
     ) -> PortFuture<'_, Box<dyn RevocationLease>>;
-    /// Register before a short read-only credential check. An exclusive
-    /// revocation fence drains this lease through the canonical write or replay.
-    /// The holder must never wait for a Control write, model call or run completion.
+    /// Register before a short read-only credential check. Revocation cancels
+    /// queued effects without waiting for them to acquire Canonical locks.
     fn register_canonical_effect(
         &self,
         _ctx: MaintenanceContext,
         _selectors: Vec<RevocationSelector>,
         _cancellation: Cancellation,
-    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+    ) -> PortFuture<'_, Arc<dyn CanonicalEffectRegistration>> {
         Box::pin(async { Err(crate::DomainError::AccessDenied.into()) })
     }
     /// Close matching admissions, cancel provider calls and canonical effects,
-    /// and wait for their leases to drop. The caller holds Control authority locks and retains
-    /// this fence through COMMIT/ROLLBACK, including cancellation of its waiter.
+    /// and drain active effects and sockets. The caller holds Control authority
+    /// locks and retains this fence through COMMIT/ROLLBACK.
     /// Selector batches are acquired atomically; implementations must not wait
     /// for Control database settlement while draining registrations.
     fn fence_provider(
@@ -618,6 +617,18 @@ pub trait SessionRevocationPort: Send + Sync {
         selector: RevocationSelector,
         reason: RevocationReason,
     ) -> PortFuture<'_, ()>;
+}
+
+/// A cancellable registration prepared before the Control authority snapshot.
+/// Each SQL execution or receipt read enters after acquiring its storage locks.
+pub trait CanonicalEffectRegistration: Send + Sync {
+    fn check(&self) -> Result<(), crate::error::PortError>;
+
+    /// Enter atomically against a revocation fence. A canceled registration or
+    /// a matching fence denies entry without waiting for the fence to drop.
+    /// Hold the returned lease through SQL settlement. No Control mutation or
+    /// model call may run while holding this lease.
+    fn begin(self: Arc<Self>) -> PortFuture<'static, Box<dyn RevocationLease>>;
 }
 
 /// Loss of distributed registry authority invalidates a lease and cancels every

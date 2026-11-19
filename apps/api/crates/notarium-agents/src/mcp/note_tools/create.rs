@@ -339,18 +339,16 @@ async fn prepare_links(
 
 fn link_lines(
     links: &[PreparedLink],
-    titles: Option<&BTreeMap<String, BTreeSet<NoteId>>>,
+    bindings: &BTreeMap<usize, NoteId>,
 ) -> Result<String, PortError> {
     let mut lines = String::new();
-    for PreparedLink { relation, target } in links {
+    for (index, PreparedLink { relation, target }) in links.iter().enumerate() {
         if let LinkTarget::AuthoredName(title) = target
-            && let Some(ids) = titles.and_then(|titles| titles.get(&lookup_key(title)))
-            && ids.len() == 1
+            && let Some(note) = bindings.get(&index)
         {
-            let note = ids.first().expect("one batch target").clone();
             lines.push_str(&organize::format_link_line(
                 relation,
-                &LinkTarget::Note(note),
+                &LinkTarget::Note(note.clone()),
                 Some(title),
             )?);
         } else {
@@ -401,7 +399,7 @@ async fn prepare_carrier(
     draft: &PreparedDraft,
 ) -> Result<String, PortError> {
     let links = prepare_links(call, scope, draft).await?;
-    let (carrier, _) = carrier_with_links(&draft.carrier, link_lines(&links, None)?)?;
+    let (carrier, _) = carrier_with_links(&draft.carrier, link_lines(&links, &BTreeMap::new())?)?;
     Ok(carrier)
 }
 
@@ -496,7 +494,8 @@ async fn create_draft(
     let hash = derive_digest("notarium.mcp.create-note-item-arguments.v1", &[&bytes]);
     let prepared = PreparedDraft::new(call, placement, decode(raw)?, false, index, Some(hash))?;
     let links = prepare_links(call, &placement.read_scope, &prepared).await?;
-    let (carrier, link_block) = carrier_with_links(&prepared.carrier, link_lines(&links, None)?)?;
+    let (carrier, link_block) =
+        carrier_with_links(&prepared.carrier, link_lines(&links, &BTreeMap::new())?)?;
     let (committed, parent) = execute(call, placement, &prepared, carrier.clone()).await?;
     placement
         .write_scope
@@ -524,8 +523,42 @@ async fn resolve_batch_links(
     let Some(block) = draft.link_block else {
         return Ok(None);
     };
+    if !draft
+        .links
+        .iter()
+        .any(|link| matches!(link.target, LinkTarget::AuthoredName(_)))
+    {
+        return Ok(None);
+    }
+    // Neighboring creates may succeed on retry. Fix this item's choices,
+    // including an empty selection, before applying its revision-guarded edit.
+    let command = &draft.prepared.command;
+    let bindings = call
+        .journal_with_key(
+            "create_link_bindings",
+            &command.key,
+            command.hash,
+            || async {
+                Ok(draft
+                    .links
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, link)| {
+                        let LinkTarget::AuthoredName(title) = &link.target else {
+                            return None;
+                        };
+                        let ids = titles.get(&lookup_key(title))?;
+                        match ids.first() {
+                            Some(note) if ids.len() == 1 => Some((index, note.clone())),
+                            _ => None,
+                        }
+                    })
+                    .collect::<BTreeMap<_, _>>())
+            },
+        )
+        .await?;
     let header = notarium_syntax::carrier::Carrier::scan(&draft.carrier)?;
-    let resolved = link_lines(&draft.links, Some(titles))?;
+    let resolved = link_lines(&draft.links, &bindings)?;
     let resolved = if header.eol == "\r\n" {
         resolved.replace('\n', header.eol)
     } else {
@@ -534,7 +567,7 @@ async fn resolve_batch_links(
     if resolved == block.slice(&draft.carrier)? {
         return Ok(None);
     }
-    let mut identity = draft.prepared.command.clone();
+    let mut identity = command.clone();
     identity.key = derive_key(
         "notarium.mcp.create-note-link-resolution.v1",
         &[

@@ -163,7 +163,7 @@ impl RuntimeFixture {
             ControlService::open(
                 storage.store.clone(),
                 catalog.clone(),
-                revocations,
+                Arc::new(engine::TestRevocations(revocations, projections.clone())),
                 storage.clock.clone(),
                 ControlConfig {
                     authentication: AuthenticationMode::TrustedNone { owner },

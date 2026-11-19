@@ -197,6 +197,7 @@ pub struct AbilityInspection {
     pub binding_enabled: bool,
     pub preference_enabled: bool,
     pub binding_revision: ControlRevision,
+    pub overlays: AbilityOverlayState,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityBindingUpdate {
@@ -206,15 +207,48 @@ pub struct AbilityBindingUpdate {
     pub projects: AbilityProjects,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbilityBindingChange {
+    pub ability: AbilityRef,
+    pub enabled: bool,
+    pub expected: Option<ControlRevision>,
+    pub projects: AbilityProjects,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityPreferenceUpdate {
     pub ability: AbilityRef,
     pub enabled: bool,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbilityPreferenceChange {
+    pub preference: AbilityPreferenceUpdate,
+    /// `None` requires the absence of a preference row for this owner.
+    pub expected: Option<ControlRevision>,
 }
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AbilityTrailUpdate {
     pub source: AbilityRef,
     pub expected_destination: Option<AbilityRef>,
     pub destination: Option<AbilityRef>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AdoptAbilityPromotion {
+    pub source: AbilityRef,
+    pub destination: AbilityRef,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbilityOverlayState {
+    pub binding_revision: Option<ControlRevision>,
+    pub binding_enabled: bool,
+    pub preference_revision: Option<ControlRevision>,
+    pub preference_enabled: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AbilityPromotionResult {
+    pub source: AbilityOverlayState,
+    pub destination: AbilityOverlayState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -491,6 +525,23 @@ pub trait ControlPort: Send + Sync {
         ctx: AccountContext,
         request: AccountMutation<AbilityTrailUpdate>,
     ) -> PortFuture<'_, ControlCommit<AbilityTrailUpdate>>;
+    /// Authoring carries a stable command identity and exact overlay revision.
+    fn compare_authored_ability_binding(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityBindingChange>,
+    ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>>;
+    fn compare_authored_ability_preference(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AbilityPreferenceChange>,
+    ) -> PortFuture<'_, ControlCommit<AbilityPreferenceUpdate>>;
+    /// Adopt an exact canonical project-to-Space promotion at an absent trail.
+    fn adopt_authored_ability_promotion(
+        &self,
+        ctx: AccountContext,
+        request: AccountMutation<AdoptAbilityPromotion>,
+    ) -> PortFuture<'_, ControlCommit<AbilityPromotionResult>>;
     fn lookup_mcp_dedup(
         &self,
         ctx: AccountContext,
