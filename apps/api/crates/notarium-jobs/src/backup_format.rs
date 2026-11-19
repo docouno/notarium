@@ -2,6 +2,7 @@ use std::{
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use notarium_canonical::codec;
@@ -95,7 +96,12 @@ impl CasRecord {
     }
 }
 
-pub(crate) struct WorkDirectory(PathBuf);
+#[derive(Clone)]
+pub(crate) struct WorkDirectory(Arc<OwnedWorkDirectory>);
+
+struct OwnedWorkDirectory {
+    path: PathBuf,
+}
 
 impl WorkDirectory {
     pub(crate) fn sibling(destination: &Path) -> Result<Self, PortError> {
@@ -112,11 +118,11 @@ impl WorkDirectory {
             builder.mode(0o700);
         }
         builder.create(&path).map_err(io_error)?;
-        Ok(Self(path))
+        Ok(Self(Arc::new(OwnedWorkDirectory { path })))
     }
 
     pub(crate) fn path(&self, name: &'static str) -> PathBuf {
-        self.0.join(name)
+        self.0.path.join(name)
     }
 
     pub(crate) fn publish(&self, name: &'static str, destination: &Path) -> Result<(), PortError> {
@@ -136,9 +142,9 @@ impl WorkDirectory {
     }
 }
 
-impl Drop for WorkDirectory {
+impl Drop for OwnedWorkDirectory {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 

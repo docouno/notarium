@@ -89,16 +89,16 @@ fn open(path: &Path) -> ArchiveInput {
     ArchiveInput::new(File::open(path).unwrap()).unwrap()
 }
 
-async fn cancelled_backup_releases_hold_while_its_reader_is_queued(
+async fn backup_completes_with_caller_blocking_pool_occupied(
     canonical: &CanonicalStore,
     control: &ControlBackup,
     root: &DataRoot,
     scratch: &Path,
 ) {
-    let spools = scratch.join("queued-verification");
+    let spools = scratch.join("occupied-pool-spools");
     canonical.set_backup_spool_dir(spools.clone());
     canonical.set_backup_step_delay_for_test(Duration::from_millis(20));
-    let destination = scratch.join("cancelled.zip");
+    let destination = scratch.join("occupied-pool.zip");
     let ctx = authority(ServicePurpose::Backup);
     let cancellation = ctx.budget.cancellation.clone();
     let (occupy, begin_blocking) = tokio::sync::oneshot::channel();
@@ -148,30 +148,11 @@ async fn cancelled_backup_releases_hold_while_its_reader_is_queued(
     .await;
     let _ = occupy.send(());
     let occupied = tokio::time::timeout(Duration::from_secs(3), ready).await;
-    // Both participant workers have produced their stable copies. The
-    // caller's only blocking thread cannot start the spool verifier.
-    let produced = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if control.last_metrics().is_some_and(|m| m.bytes > 0)
-                && canonical.last_backup_memory_stats().is_some()
-                && paired_load::artifact_files(&spools)
-                    .iter()
-                    .any(|path| path.extension().is_some_and(|ext| ext == "sqlite"))
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await;
-    let waiting = tokio::time::timeout(Duration::from_millis(250), &mut result).await;
-    let waiting_on_verifier = waiting.is_err();
-    cancellation.cancel();
-    let finished = if waiting_on_verifier {
-        tokio::time::timeout(Duration::from_secs(3), &mut result).await
-    } else {
-        waiting
-    };
+    let occupied_before_copy = canonical.last_backup_memory_stats().is_none();
+    let finished = tokio::time::timeout(Duration::from_secs(5), &mut result).await;
+    if finished.is_err() {
+        cancellation.cancel();
+    }
     let remaining = canonical
         .execute_diagnostic_read_sql_for_test(None, "SELECT count(*) FROM backup_holds")
         .await;
@@ -185,18 +166,17 @@ async fn cancelled_backup_releases_hold_while_its_reader_is_queued(
     occupied
         .expect("caller blocking pool became occupied")
         .unwrap();
-    produced.expect("both participant workers finished their capture");
     assert!(
-        waiting_on_verifier,
-        "backup must still be waiting on its spool verifier"
+        occupied_before_copy,
+        "the caller pool must be occupied before spooling ends"
     );
-    assert!(matches!(
-        finished.expect("cancelled backup must finish while verifier is queued").unwrap(),
-        Err(notarium_core::error::PortError::Cancelled(failure))
-            if failure.effect() == notarium_core::error::CommitEffect::NotCommitted
-    ));
+    let archive = finished
+        .expect("backup must finish while the caller pool is occupied")
+        .unwrap()
+        .unwrap();
+    assert!(archive.bytes > 0);
     assert_eq!(remaining.unwrap(), 0);
-    assert!(!destination.exists());
+    assert!(destination.is_file());
     assert!(paired_load::artifact_files(&spools).is_empty());
     assert!(paired_load::artifact_files(&root.staging().join("control")).is_empty());
     canonical.set_backup_spool_dir(root.staging().join("backups"));
@@ -431,13 +411,18 @@ async fn held_export(
     store.capture_archive_export(&ctx, &claim).await.unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sqlite_archive_verification_restore_and_rejection() {
-    let scratch = Scratch::new();
-    let root = DataRoot::new(scratch.0.join("source"));
+async fn local_backup_fixture(
+    root: &DataRoot,
+) -> (
+    InstallationId,
+    ControlStore,
+    ControlBackup,
+    CanonicalStore,
+    CanonicalRuntime,
+) {
     fs::create_dir_all(root.root().join("v1")).unwrap();
     let installation = InstallationId::from_bytes([2; 16]);
-    let control = ControlStore::sqlite(&root).await.unwrap();
+    let control = ControlStore::sqlite(root).await.unwrap();
     let empty = EmptyRootAuthorization::from_classification(
         installation.clone(),
         EpochClassification {
@@ -466,6 +451,123 @@ async fn sqlite_archive_verification_restore_and_rejection() {
     ))
     .await
     .unwrap();
+    (installation, control, binding, canonical, runtime)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paired_archive_completes_with_a_single_caller_blocking_thread() {
+    let scratch = Scratch::new();
+    let root = DataRoot::new(scratch.0.join("source"));
+    let (_, control, binding, canonical, runtime) = local_backup_fixture(&root).await;
+    let owner = PrincipalId::from_bytes([0xf0; 16]);
+    let scope = canonical
+        .create_space(CreateSpaceSpec {
+            space_id: SpaceId::from_bytes([0xf1; 16]),
+            incarnation: HistoryIncarnation::from_bytes([0xf2; 16]),
+            root_folder_id: FolderId::from_bytes([0xf3; 16]),
+            slug: "single-blocking-thread".into(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap()
+        .scope;
+    for ordinal in 0..20 {
+        let mut key = [0; 16];
+        key[0] = 0xf4;
+        key[15] = ordinal;
+        canonical
+            .create_note(
+                auth(&scope, &owner),
+                Mutation {
+                    identity: CommandIdentity {
+                        scope: scope.clone(),
+                        actor: owner.clone(),
+                        key: CommandKey::from_bytes(key),
+                        hash: ContentDigest::from_bytes([0; 32]),
+                    },
+                    preconditions: Preconditions::default(),
+                    input: CreateNote {
+                        note: NoteId::from_bytes(key),
+                        parent: None,
+                        slug: format!("distinct-{ordinal}"),
+                        class: DocClass::UserDoc,
+                        carrier: format!("# Distinct body {ordinal}\n"),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let archive = scratch.0.join("single-blocking-thread.zip");
+    let caller = std::thread::spawn({
+        let store = canonical.clone();
+        let adapter = binding.clone();
+        let keyring = root.keyring();
+        let archive = archive.clone();
+        move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut backup = authority(ServicePurpose::Backup);
+                backup.budget.remaining = Duration::from_secs(5);
+                tokio::time::timeout(
+                    Duration::from_secs(8),
+                    run_backup(backup, &store, &adapter, &archive, sqlite_backup_options()),
+                )
+                .await
+                .expect("CAS packing must finish with one caller blocking thread")
+                .unwrap();
+                let mut fsck = authority(ServicePurpose::Fsck);
+                fsck.budget.remaining = Duration::from_secs(5);
+                tokio::time::timeout(
+                    Duration::from_secs(8),
+                    run_fsck(
+                        fsck,
+                        FsckInput::Live {
+                            canonical: &store,
+                            control: &adapter,
+                        },
+                        &keyring,
+                        sqlite_backup_options(),
+                    ),
+                )
+                .await
+                .expect("live verification must finish with one caller blocking thread")
+                .unwrap()
+            })
+        }
+    });
+    let report = tokio::task::spawn_blocking(move || caller.join().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(report.blobs, 20);
+    assert!(archive.is_file());
+    assert_eq!(
+        canonical
+            .execute_diagnostic_read_sql_for_test(None, "SELECT count(*) FROM backup_holds")
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(paired_load::artifact_files(&root.staging().join("backups")).is_empty());
+    assert!(paired_load::artifact_files(&root.staging().join("control")).is_empty());
+    drop(binding);
+    control.close().await;
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_archive_verification_restore_and_rejection() {
+    let scratch = Scratch::new();
+    let root = DataRoot::new(scratch.0.join("source"));
+    let (installation, control, binding, canonical, runtime) = local_backup_fixture(&root).await;
     let owner = PrincipalId::from_bytes([3; 16]);
     let scope = canonical
         .create_space(CreateSpaceSpec {
@@ -527,10 +629,8 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         )
         .await
         .unwrap();
-    cancelled_backup_releases_hold_while_its_reader_is_queued(
-        &canonical, &binding, &root, &scratch.0,
-    )
-    .await;
+    backup_completes_with_caller_blocking_pool_occupied(&canonical, &binding, &root, &scratch.0)
+        .await;
     let export = held_export(&canonical, &scope, &owner).await;
     rusqlite::Connection::open(root.canonical())
         .unwrap()

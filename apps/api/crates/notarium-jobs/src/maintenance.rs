@@ -68,7 +68,7 @@ pub(crate) async fn read_source<T: Send + 'static>(
     read_blocking(cancellation, permit, work).await
 }
 
-pub(crate) async fn read_blocking<T: Send + 'static>(
+async fn read_blocking<T: Send + 'static>(
     cancellation: &Cancellation,
     permit: SemaphorePermit<'static>,
     work: impl FnOnce() -> Result<T, PortError> + Send + 'static,
@@ -80,12 +80,22 @@ pub(crate) async fn read_blocking<T: Send + 'static>(
         work()
     });
     let _abort = AbortQueuedRead(worker.abort_handle());
+    wait_for_io(cancellation, async {
+        worker
+            .await
+            .map_err(|err| codec::internal_not_committed("read_archive_source", err.to_string()))?
+    })
+    .await
+}
+
+pub(crate) async fn wait_for_io<T>(
+    cancellation: &Cancellation,
+    work: impl Future<Output = Result<T, PortError>>,
+) -> Result<T, PortError> {
     tokio::select! {
         biased;
         () = cancellation.cancelled() => Err(source_cancelled()),
-        result = worker => result.map_err(|err| {
-            codec::internal_not_committed("read_archive_source", err.to_string())
-        })?,
+        result = work => result,
     }
 }
 

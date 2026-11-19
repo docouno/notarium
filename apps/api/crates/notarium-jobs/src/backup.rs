@@ -3,6 +3,7 @@ use std::{
     future::Future,
     io::{BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -25,7 +26,7 @@ use notarium_core::{
     receipt::ChangeCursor,
 };
 use rusqlite::{Connection, OpenFlags};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, SemaphorePermit, mpsc, oneshot};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
@@ -94,14 +95,81 @@ pub(crate) struct Pair {
     pub(crate) control_spool: TemporaryBackupSpool,
     pub(crate) canonical_spool: TemporaryBackupSpool,
     pub(crate) pause: PairedPause,
+    pub(crate) workers: BackupWorkers,
     control_hold: Box<dyn BackupHold>,
     canonical_hold: Box<dyn BackupHold>,
 }
 
-// Private database files and caller-provided sources have separate admission.
-static SPOOL_READERS: Semaphore = Semaphore::const_new(4);
+// Each admitted backup can run its scanner and writer together. Their native
+// work does not consume the caller's blocking pool or the external-source slots.
+static BACKUP_SLOTS: Semaphore = Semaphore::const_new(4);
+
+pub(crate) struct BackupWorkers(Arc<SemaphorePermit<'static>>);
+
+pub(crate) struct BackupWorker<T>(oneshot::Receiver<Result<T, PortError>>);
+
+impl BackupWorkers {
+    fn reserve() -> Result<Self, PortError> {
+        let slot = BACKUP_SLOTS
+            .try_acquire()
+            .map_err(|_| DomainError::RateLimited {
+                retry_after_ms: 1_000,
+                budget: BudgetKind::Concurrency,
+            })?;
+        Ok(Self(Arc::new(slot)))
+    }
+
+    pub(crate) fn spawn<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> Result<T, PortError> + Send + 'static,
+    ) -> Result<BackupWorker<T>, PortError> {
+        let slot = Arc::clone(&self.0);
+        let (reply, result) = oneshot::channel();
+        let worker = std::thread::Builder::new()
+            .name("notarium-backup-io".into())
+            .spawn(move || {
+                let _slot = slot;
+                let _ = reply.send(work());
+            })
+            .map_err(io_error)?;
+        drop(worker);
+        Ok(BackupWorker(result))
+    }
+}
+
+impl<T> BackupWorker<T> {
+    pub(crate) async fn wait(self, cancellation: &Cancellation) -> Result<T, PortError> {
+        crate::maintenance::wait_for_io(cancellation, async {
+            self.0
+                .await
+                .map_err(|err| codec::internal_not_committed("backup_io_worker", err.to_string()))?
+        })
+        .await
+    }
+}
 
 impl Pair {
+    fn scan_references(
+        &self,
+        options: BackupOptions,
+        cancellation: Cancellation,
+        references: mpsc::Sender<(SpaceId, ContentDigest)>,
+    ) -> Result<BackupWorker<()>, PortError> {
+        let file = self.canonical.try_clone().map_err(io_error)?;
+        let spool = self.canonical_spool.clone();
+        self.workers.spawn(move || {
+            snapshot_references(
+                file,
+                spool.path(),
+                spool.receipt().kind,
+                spool.receipt().bytes,
+                options,
+                references,
+                &cancellation,
+            )
+        })
+    }
+
     pub(crate) async fn release(self) -> Result<(), PortError> {
         let (control, canonical) =
             tokio::join!(self.control_hold.release(), self.canonical_hold.release());
@@ -144,9 +212,6 @@ async fn run_backup_inner(
     budget.remaining = budget.remaining.saturating_sub(started.elapsed());
     let archive = async {
         let cas = pack_cas(canonical, &budget, &mut pair, &work, options.clone()).await?;
-        let temporary = work.path("backup.zip");
-        let index_path = work.path("cas.index");
-        let data_path = work.path("cas.data");
         let manifest = Manifest {
             version: 1,
             installation: pair.canonical_spool.receipt().witness.installation.clone(),
@@ -178,42 +243,46 @@ async fn run_backup_inner(
         let mut canonical_input = pair.canonical.try_clone().map_err(io_error)?;
         let spools = (pair.control_spool.clone(), pair.canonical_spool.clone());
         let cancellation = budget.cancellation.clone();
-        tokio::task::spawn_blocking(move || {
-            let _spools = spools;
-            let mut index = File::open(index_path).map_err(io_error)?;
-            let mut data = File::open(data_path).map_err(io_error)?;
-            let mut archive = new_file(&temporary)?;
-            let mut zip = ZipWriter::new(LimitedFile::new(
-                archive.try_clone().map_err(io_error)?,
-                options.max_archive_bytes,
-            ));
-            let opts = SimpleFileOptions::default()
-                .compression_method(CompressionMethod::Stored)
-                .large_file(true);
-            zip.start_file(MANIFEST, opts).map_err(zip_error)?;
-            serde_json::to_writer(&mut zip, &manifest)
-                .map_err(|err| codec::internal_not_committed("backup_manifest", err.to_string()))?;
-            for (name, payload, source) in [
-                (CONTROL, manifest.control, &mut control_input),
-                (CANONICAL, manifest.canonical, &mut canonical_input),
-                (CAS_INDEX, manifest.index, &mut index),
-                (CAS_DATA, manifest.cas, &mut data),
-            ] {
-                source.seek(SeekFrom::Start(0)).map_err(io_error)?;
-                zip.start_file(name, opts).map_err(zip_error)?;
-                if copy_hash(source, &mut zip, payload.bytes, &cancellation)? != payload {
-                    return Err(invalid(ValidationReason::InvalidDigest));
+        let files = work.clone();
+        pair.workers
+            .spawn(move || {
+                let _spools = spools;
+                check_cancelled(&cancellation)?;
+                let mut index = File::open(files.path("cas.index")).map_err(io_error)?;
+                let mut data = File::open(files.path("cas.data")).map_err(io_error)?;
+                let mut archive = new_file(&files.path("backup.zip"))?;
+                let mut zip = ZipWriter::new(LimitedFile::new(
+                    archive.try_clone().map_err(io_error)?,
+                    options.max_archive_bytes,
+                ));
+                let opts = SimpleFileOptions::default()
+                    .compression_method(CompressionMethod::Stored)
+                    .large_file(true);
+                zip.start_file(MANIFEST, opts).map_err(zip_error)?;
+                serde_json::to_writer(&mut zip, &manifest).map_err(|err| {
+                    codec::internal_not_committed("backup_manifest", err.to_string())
+                })?;
+                for (name, payload, source) in [
+                    (CONTROL, manifest.control, &mut control_input),
+                    (CANONICAL, manifest.canonical, &mut canonical_input),
+                    (CAS_INDEX, manifest.index, &mut index),
+                    (CAS_DATA, manifest.cas, &mut data),
+                ] {
+                    source.seek(SeekFrom::Start(0)).map_err(io_error)?;
+                    zip.start_file(name, opts).map_err(zip_error)?;
+                    if copy_hash(source, &mut zip, payload.bytes, &cancellation)? != payload {
+                        return Err(invalid(ValidationReason::InvalidDigest));
+                    }
                 }
-            }
-            zip.finish()
-                .map_err(zip_error)?
-                .file
-                .sync_all()
-                .map_err(io_error)?;
-            measure_file(&mut archive, options.max_archive_bytes, &cancellation)
-        })
-        .await
-        .map_err(join_error)?
+                zip.finish()
+                    .map_err(zip_error)?
+                    .file
+                    .sync_all()
+                    .map_err(io_error)?;
+                measure_file(&mut archive, options.max_archive_bytes, &cancellation)
+            })?
+            .wait(&budget.cancellation)
+            .await
     }
     .await;
     let id = pair.id.clone();
@@ -239,12 +308,7 @@ pub(crate) async fn capture_pair(
     control: &ControlBackup,
 ) -> Result<Pair, PortError> {
     check_cancelled(&ctx.budget.cancellation)?;
-    let read_slot = SPOOL_READERS
-        .try_acquire()
-        .map_err(|_| DomainError::RateLimited {
-            retry_after_ms: 1_000,
-            budget: BudgetKind::Concurrency,
-        })?;
+    let workers = BackupWorkers::reserve()?;
     let id = BackupId::from_bytes(codec::ordered_id_16()?);
     let mut cb = control.default_budget();
     let mut nb = canonical.default_backup_budget();
@@ -287,18 +351,20 @@ pub(crate) async fn capture_pair(
             return Err(invalid(ValidationReason::ScopeMismatch));
         }
         let cancellation = ctx.budget.cancellation.clone();
-        crate::maintenance::read_blocking(&ctx.budget.cancellation, read_slot, move || {
-            let control_file = open_temporary_spool(&control_spool, &cancellation)?;
-            let canonical_file = open_temporary_spool(&canonical_spool, &cancellation)?;
-            Ok((
-                control_file,
-                canonical_file,
-                control_spool,
-                canonical_spool,
-                pause,
-            ))
-        })
-        .await
+        workers
+            .spawn(move || {
+                let control_file = open_temporary_spool(&control_spool, &cancellation)?;
+                let canonical_file = open_temporary_spool(&canonical_spool, &cancellation)?;
+                Ok((
+                    control_file,
+                    canonical_file,
+                    control_spool,
+                    canonical_spool,
+                    pause,
+                ))
+            })?
+            .wait(&ctx.budget.cancellation)
+            .await
     }
     .await;
     let (control_file, canonical_file, control_spool, canonical_spool, pause) = match captured {
@@ -320,6 +386,7 @@ pub(crate) async fn capture_pair(
         control_spool,
         canonical_spool,
         pause,
+        workers,
         control_hold,
         canonical_hold,
     })
@@ -479,32 +546,21 @@ async fn pack_cas(
     options: BackupOptions,
 ) -> Result<(Payload, Payload), PortError> {
     let (references, mut ref_rx) = mpsc::channel(16);
-    let reader = tokio::task::spawn_blocking({
-        let options = options.clone();
-        let file = pair.canonical.try_clone().map_err(io_error)?;
-        let spool = pair.canonical_spool.clone();
-        let kind = spool.receipt().kind;
-        let size = spool.receipt().bytes;
+    let reader = pair.scan_references(options.clone(), budget.cancellation.clone(), references)?;
+    let (cas_tx, cas_rx) = mpsc::channel(1);
+    let writer = pair.workers.spawn({
+        let files = work.clone();
         let cancellation = budget.cancellation.clone();
         move || {
-            snapshot_references(
-                file,
-                spool.path(),
-                kind,
-                size,
+            write_cas(
+                &files.path("cas.index"),
+                &files.path("cas.data"),
+                cas_rx,
                 options,
-                references,
                 &cancellation,
             )
         }
-    });
-    let (cas_tx, cas_rx) = mpsc::channel(1);
-    let writer = tokio::task::spawn_blocking({
-        let index = work.path("cas.index");
-        let data = work.path("cas.data");
-        let cancellation = budget.cancellation.clone();
-        move || write_cas(&index, &data, cas_rx, options, &cancellation)
-    });
+    })?;
     let histories = &pair.canonical_spool.receipt().witness.histories;
     let produce = async {
         while let Some((space, digest)) = ref_rx.recv().await {
@@ -524,15 +580,13 @@ async fn pack_cas(
                 .await?;
         }
         Ok::<_, PortError>(())
-    }
-    .await;
+    };
+    let produce = crate::maintenance::wait_for_io(&budget.cancellation, produce).await;
     drop(cas_tx);
     drop(ref_rx);
-    let copied = writer.await.map_err(join_error)?;
-    let enumerated = reader.await.map_err(join_error)?;
     produce?;
-    enumerated?;
-    copied
+    reader.wait(&budget.cancellation).await?;
+    writer.wait(&budget.cancellation).await
 }
 
 pub(crate) async fn verify_live_cas(
@@ -542,25 +596,7 @@ pub(crate) async fn verify_live_cas(
     options: BackupOptions,
 ) -> Result<(u64, u64), PortError> {
     let (references, mut rx) = mpsc::channel(16);
-    let reader = tokio::task::spawn_blocking({
-        let options = options.clone();
-        let file = pair.canonical.try_clone().map_err(io_error)?;
-        let spool = pair.canonical_spool.clone();
-        let kind = spool.receipt().kind;
-        let size = spool.receipt().bytes;
-        let cancellation = budget.cancellation.clone();
-        move || {
-            snapshot_references(
-                file,
-                spool.path(),
-                kind,
-                size,
-                options,
-                references,
-                &cancellation,
-            )
-        }
-    });
+    let reader = pair.scan_references(options.clone(), budget.cancellation.clone(), references)?;
     let history = &pair.canonical_spool.receipt().witness.histories;
     let verify = async {
         let mut summary = (0_u64, 0_u64);
@@ -587,12 +623,11 @@ pub(crate) async fn verify_live_cas(
             }
         }
         Ok(summary)
-    }
-    .await;
+    };
+    let verify = crate::maintenance::wait_for_io(&budget.cancellation, verify).await;
     drop(rx);
-    let enumerated = reader.await.map_err(join_error)?;
     let verified = verify?;
-    enumerated?;
+    reader.wait(&budget.cancellation).await?;
     Ok(verified)
 }
 
@@ -605,6 +640,7 @@ fn snapshot_references(
     output: mpsc::Sender<(SpaceId, ContentDigest)>,
     cancellation: &Cancellation,
 ) -> Result<(), PortError> {
+    check_cancelled(cancellation)?;
     let push = |space: &str, digest: &[u8]| -> Result<(), PortError> {
         check_cancelled(cancellation)?;
         let space = SpaceId::parse(space)?;
@@ -706,6 +742,7 @@ fn write_cas(
     options: BackupOptions,
     cancellation: &Cancellation,
 ) -> Result<(Payload, Payload), PortError> {
+    check_cancelled(cancellation)?;
     let mut index = BufWriter::new(new_file(index_path)?);
     let mut data = BufWriter::new(LimitedFile::new(
         new_file(data_path)?,
@@ -743,6 +780,7 @@ fn write_cas(
         entries += 1;
         previous = Some(key);
     }
+    check_cancelled(cancellation)?;
     index
         .seek(SeekFrom::Start(CAS_INDEX_MAGIC.len() as u64))
         .map_err(io_error)?;
@@ -797,13 +835,45 @@ fn sqlite_error(error: rusqlite::Error) -> PortError {
     codec::internal_not_committed("backup_sqlite_references", error.to_string())
 }
 
-fn join_error(error: tokio::task::JoinError) -> PortError {
-    codec::internal_not_committed("backup_worker", error.to_string())
-}
-
 #[cfg(test)]
 mod phase_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_cancelled_waiter_leaves_capacity_and_the_lease_with_its_worker() {
+        static CAPACITY: Semaphore = Semaphore::const_new(1);
+        let workers = BackupWorkers(Arc::new(CAPACITY.try_acquire().unwrap()));
+        let lease = Arc::new(());
+        let (started, observed) = oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let worker = workers
+            .spawn({
+                let lease = Arc::clone(&lease);
+                move || {
+                    let _lease = lease;
+                    started.send(()).unwrap();
+                    let _ = gate.recv();
+                    Ok(())
+                }
+            })
+            .unwrap();
+        observed.await.unwrap();
+        drop(workers);
+        let cancellation = Cancellation::default();
+        cancellation.cancel();
+        assert!(matches!(
+            worker.wait(&cancellation).await,
+            Err(PortError::Cancelled(_))
+        ));
+        assert!(CAPACITY.try_acquire().is_err());
+        assert_eq!(Arc::strong_count(&lease), 2);
+        release.send(()).unwrap();
+        let _recovered = tokio::time::timeout(Duration::from_secs(2), CAPACITY.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(Arc::strong_count(&lease), 1);
+    }
 
     #[tokio::test]
     async fn failed_participant_waits_for_the_other_phase_to_settle() {

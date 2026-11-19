@@ -7,7 +7,6 @@ use std::{
 use notarium_canonical::{
     CanonicalStore,
     backup::{PostgresSpoolValue, scan_postgres_spool_v1, verify_schema_witness},
-    codec,
 };
 use notarium_control::{
     backup::{ControlBackup, SpoolReader},
@@ -999,20 +998,23 @@ async fn verify_live(
         let database_budget = budget.clone();
         let verify_options = options.clone();
         let spools = (pair.control_spool.clone(), pair.canonical_spool.clone());
-        let databases = tokio::task::spawn_blocking(move || {
-            let _spools = spools;
-            verify_databases(
-                database_inputs.0,
-                database_inputs.1,
-                &manifest,
-                &keys,
-                &database_budget,
-                &verify_options,
-                None,
-            )
-        })
-        .await
-        .map_err(join_error)??;
+        let databases = pair
+            .workers
+            .spawn(move || {
+                let _spools = spools;
+                check_cancelled(&database_budget.cancellation)?;
+                verify_databases(
+                    database_inputs.0,
+                    database_inputs.1,
+                    &manifest,
+                    &keys,
+                    &database_budget,
+                    &verify_options,
+                    None,
+                )
+            })?
+            .wait(&budget.cancellation)
+            .await?;
         let (blobs, raw_blob_bytes) =
             crate::backup::verify_live_cas(canonical, &budget, &mut pair, options).await?;
         Ok(FsckReport {
@@ -1066,10 +1068,6 @@ fn live_inputs(
             RangeSource::new(canonical).map_err(io_error)?,
         ),
     ))
-}
-
-fn join_error(error: tokio::task::JoinError) -> PortError {
-    codec::internal_not_committed("fsck_worker", error.to_string())
 }
 
 #[cfg(test)]

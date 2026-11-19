@@ -112,9 +112,12 @@ Paired backup and live verification use private temporary database spools. The
 coordinator releases them when their last reader finishes, including cancelled
 and failed operations. An abandoned pending marker lets each participant
 recover its own spool after a process exits.
-The initial digest check has a separate reader limit for these files.
-Cancelling that check releases the CAS hold while any admitted native read
-retains its file lease until it finishes.
+Paired backup reserves capacity before preparing the databases. The spool
+digest check, CAS scanning and packing, and live verification use owned native
+workers. The scanner and writer can run together even when the caller's
+blocking pool is occupied. On cancellation the coordinator drops its channels
+before releasing the holds. Each worker retains its capacity and temporary
+files until its work returns.
 
 Restore assigns a new incarnation to every Space and clamps control cursors to
 its recorded cutoff. Both stores must agree before the target is published.
