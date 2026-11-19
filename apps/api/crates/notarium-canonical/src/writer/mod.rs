@@ -76,16 +76,14 @@ impl CommandIdentitySpec {
     }
 
     pub(crate) fn requires_standard_writer(&self) -> bool {
-        self.has_confirmed_chat_step()
+        self.has_confirmed_chat_step() || self.canonical_effect().is_some()
     }
 
     pub(crate) fn canonical_effect(&self) -> Option<&CanonicalEffectAdmission> {
         self.authority.as_deref()?.canonical_effect.as_ref()
     }
 
-    pub(crate) async fn begin_canonical_effect(
-        &self,
-    ) -> Result<Option<Box<dyn RevocationLease>>, PortError> {
+    async fn begin_canonical_effect(&self) -> Result<Option<Box<dyn RevocationLease>>, PortError> {
         if let Some(effect) = self.canonical_effect() {
             return effect.begin().await.map(Some);
         }
@@ -1347,14 +1345,8 @@ async fn flush_single_batch(
 
     let exec_result = match &inner.sql {
         SqlDriverState::Sqlite { writer, .. } => {
-            let has_canonical_effect = items.iter().any(|(it, _, _)| {
-                it.idempotency
-                    .as_ref()
-                    .is_some_and(|id| id.canonical_effect().is_some())
-            });
             let can_fast = group_spaces.is_empty()
                 && items.iter().all(|(_, fp, _)| fp.is_some())
-                && (!has_canonical_effect || items.len() == 1)
                 && faults.pre_commit_space_delays.lock().await.is_empty();
             let mut guard = writer.lock().await;
             match guard.as_mut() {

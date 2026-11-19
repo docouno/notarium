@@ -6,8 +6,8 @@ use notarium_core::{
     classes::DocClass,
     error::{CommitEffect, PortError, ValidationReason},
     ports::{
-        AccountContext, CanonicalEffect, MaintenanceContext, ServiceAuthority, ServicePurpose,
-        SpaceContext,
+        AccountContext, BearerScope, CanonicalEffect, MaintenanceContext, ServiceAuthority,
+        ServicePurpose, SpaceContext,
     },
 };
 
@@ -34,10 +34,12 @@ impl ControlService {
                 if authority.kind() == &PrincipalKind::DirectHuman
                     && ctx.auth().kind() == &PrincipalKind::DirectHuman => {}
             CanonicalEffect::ChatRedaction
-                if matches!(
-                    authority.kind(),
-                    PrincipalKind::DirectHuman | PrincipalKind::Pat | PrincipalKind::OAuth { .. }
-                ) && ctx.auth().kind() == authority.kind() => {}
+                if (authority.kind() == &PrincipalKind::DirectHuman
+                    || (matches!(
+                        authority.kind(),
+                        PrincipalKind::Pat | PrincipalKind::OAuth { .. }
+                    ) && authority.bearer_scope() == Some(BearerScope::Write)))
+                    && ctx.auth().kind() == authority.kind() => {}
             CanonicalEffect::ChatClaim
                 if authority.kind() == &PrincipalKind::DirectHuman
                     && matches!(ctx.auth().kind(), PrincipalKind::AgentRun(_)) => {}
@@ -78,7 +80,12 @@ impl ControlService {
         }
         let ctx = ctx.with_canonical_effect(&current, registration)?;
         let grant = &ctx.auth().spaces()[&ctx.scope().space_id];
-        if grant.role == SpaceRole::Viewer {
+        if grant.role == SpaceRole::Viewer
+            || (matches!(
+                ctx.auth().kind(),
+                PrincipalKind::Pat | PrincipalKind::OAuth { .. }
+            ) && ctx.auth().bearer_scope() != Some(BearerScope::Write))
+        {
             return Err(DomainError::SpaceReadOnly.into());
         }
         if effect == CanonicalEffect::AbilityAuthoring {

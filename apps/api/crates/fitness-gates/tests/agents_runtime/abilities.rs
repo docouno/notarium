@@ -640,8 +640,8 @@ async fn binding_replay_after_advance_and_trash(
     first_handle: &str,
 ) {
     let owner = human.auth().principal();
-    // IMPL-026: compare_authored_ability_binding & edit_ability(availability) exact
-    // replay after package revision advance (R1 -> R2) and after trash.
+    // Exact replay of authored bindings and availability edits after package
+    // revision advance (R1 -> R2) and after trash.
     let created = call(
         fixture,
         human,
@@ -721,20 +721,15 @@ async fn binding_replay_after_advance_and_trash(
     .await
     .unwrap()
     .structured_content;
-    let r2 = call(
-        fixture,
-        human,
-        0xe4,
-        "edit_ability",
-        json!({
-            "ref":current_view["ref"],
-            "versionToken":current_view["versionToken"],
-            "instructions":"Second binding guide",
-        }),
-    )
-    .await
-    .unwrap()
-    .structured_content;
+    let r2_edit = json!({
+        "ref":current_view["ref"],
+        "versionToken":current_view["versionToken"],
+        "instructions":"Second binding guide",
+    });
+    let r2 = call(fixture, human, 0xe4, "edit_ability", r2_edit.clone())
+        .await
+        .unwrap()
+        .structured_content;
     assert_eq!(r2["outcome"], "updated", "{r2}");
     // Direct compare_authored_ability_binding replay returns exact R1 AbilityRef even at R2.
     let replayed_direct_r2 = fixture
@@ -783,6 +778,19 @@ async fn binding_replay_after_advance_and_trash(
         ),
         "{replayed_avail_trashed:?}"
     );
+    // Replaying an authored edit after trash must propagate ResourceNotFound
+    // instead of wrapping a zero-step failure as Ok(partial).
+    let replayed_authored_trashed = call(fixture, human, 0xe4, "edit_ability", r2_edit)
+        .await
+        .err()
+        .expect("replaying authored edit after trash must return ResourceNotFound");
+    assert!(
+        matches!(
+            replayed_authored_trashed,
+            PortError::Domain(DomainError::ResourceNotFound)
+        ),
+        "{replayed_authored_trashed:?}"
+    );
 }
 
 async fn promotion_concurrent_source_overlay_conflicts(
@@ -791,8 +799,9 @@ async fn promotion_concurrent_source_overlay_conflicts(
     first_project: &FolderRef,
     first_handle: &str,
 ) {
-    // IMPL-029: promotion + concurrent source preference edit with same target boolean
-    // must report `partial` / `control_revision_conflict` instead of masking as `skipped`.
+    // Promotion with a concurrent source preference edit targeting the same
+    // boolean must report `partial` / `control_revision_conflict` instead of
+    // masking the race as `skipped`.
     let pref_src = call(
         fixture,
         human,
@@ -866,9 +875,9 @@ async fn promotion_concurrent_source_overlay_conflicts(
         .structured_content;
     assert_eq!(pref_replayed, pref_blocked);
 
-    // IMPL-029: promotion + concurrent source binding edit must report `partial` /
+    // Promotion with a concurrent source binding edit must report `partial` /
     // `control_revision_conflict`, preserve the competing binding, and replay identically.
-    let bind_src = call(
+    let bind_src_initial = call(
         fixture,
         human,
         0xe9,
@@ -877,6 +886,23 @@ async fn promotion_concurrent_source_overlay_conflicts(
             "kind":"role","name":"promo-bind-race","description":"Test guide",
             "instructions":"Initial promo bind","placement":{"home":"project","project":first_handle},
         }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    // Perform a pre-promotion authored edit so we can later verify that
+    // replaying it after promotion fails with ResourceNotFound (never partial).
+    let pre_promo_authored_edit = json!({
+        "ref":bind_src_initial["ref"],
+        "versionToken":bind_src_initial["versionToken"],
+        "instructions":"Pre-promotion authored edit",
+    });
+    let bind_src = call(
+        fixture,
+        human,
+        0xec,
+        "edit_ability",
+        pre_promo_authored_edit.clone(),
     )
     .await
     .unwrap()
@@ -957,6 +983,88 @@ async fn promotion_concurrent_source_overlay_conflicts(
         .unwrap()
         .structured_content;
     assert_eq!(bind_replayed, bind_blocked);
+    // Replaying the pre-promotion authored edit after promotion must propagate
+    // ResourceNotFound rather than returning Ok(partial).
+    let pre_promo_replayed = call(
+        fixture,
+        human,
+        0xec,
+        "edit_ability",
+        pre_promo_authored_edit,
+    )
+    .await
+    .err()
+    .expect("replaying pre-promotion authored edit after promotion must return ResourceNotFound");
+    assert!(
+        matches!(
+            pre_promo_replayed,
+            PortError::Domain(DomainError::ResourceNotFound)
+        ),
+        "{pre_promo_replayed:?}"
+    );
+    // Revoking the caller's PAT after package republication must propagate
+    // AuthenticationFailed on the trailing preference step instead of Ok(partial).
+    let revoked_author = fixture.pat(BearerScope::Write, true).await;
+    let Some(notarium_core::auth::AuthenticatedCredential::Pat(pat_id)) =
+        revoked_author.auth().credential().cloned()
+    else {
+        panic!("expected write PAT");
+    };
+    let latest_bind = call(
+        fixture,
+        human,
+        0xed,
+        "get_ability",
+        json!({"ref":bind_blocked["ref"]}),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let (entered, release) = fixture.projections.pause_ability_publication();
+    let edit_with_revocation = call(
+        fixture,
+        &revoked_author,
+        0xee,
+        "edit_ability",
+        json!({
+            "ref":latest_bind["ref"],
+            "versionToken":latest_bind["versionToken"],
+            "instructions":"Republished right before caller PAT revocation",
+            "enabled":false,
+        }),
+    );
+    let revoke_mid_edit = async {
+        tokio::time::timeout(Duration::from_secs(10), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture
+            .control
+            .revoke_pat(
+                human.clone(),
+                AccountMutation {
+                    identity: runtime_ability_cases::identity(fixture, human, 0xef).await,
+                    input: RevokePat {
+                        account: human.auth().principal().clone(),
+                        token: pat_id,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+    };
+    let (revoked_res, ()) = tokio::join!(Box::pin(edit_with_revocation), Box::pin(revoke_mid_edit));
+    let revoked_err = revoked_res
+        .err()
+        .expect("revoked trailing preference step must propagate error instead of Ok(partial)");
+    assert!(
+        matches!(
+            revoked_err,
+            PortError::Domain(DomainError::AuthenticationFailed) | PortError::Cancelled(_)
+        ),
+        "{revoked_err:?}"
+    );
 }
 
 async fn restricted_publication_waits_for_binding(

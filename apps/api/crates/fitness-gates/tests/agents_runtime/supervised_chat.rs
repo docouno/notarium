@@ -486,9 +486,9 @@ async fn resilience_submit_gate_and_archival(
     let thread = &thread;
     let leaf = seed.value.seq;
 
-    // IMPL-030: `submit()` keeps `CommitEffect::Unknown` and retains `PendingCredential`
-    // when the first `publish_input` commits `Queued` with a lost ACK and the retry
-    // fails `NotCommitted`, so `drain()` still delivers the message.
+    // `submit()` keeps `CommitEffect::Unknown` and retains `PendingCredential`
+    // when the first `publish_input` commits `Queued` with a lost ACK and the
+    // retry fails `NotCommitted`, so `drain()` still delivers the message.
     let _active_run = supervisor
         .start(
             owner.clone(),
@@ -568,57 +568,18 @@ async fn resilience_submit_gate_and_archival(
         "queued message after Unknown+NotCommitted retry must be delivered: {prompt}"
     );
 
-    // IMPL-031: a concurrent `start()` waiting while `run_task` clears `active_run_id`
-    // must wait on `thread_gate` until `remove_run` finishes and never fail with `owner_unavailable()`.
-    let (cleared_entered, cleared_release) = fixture.projections.pause_after_chat_finish_cleared();
     send_ollama(
         &mut next_wire,
         json!({"role":"assistant","content":"Delivered unknown-commit message."}),
         "stop",
     )
     .await;
-    timeout(Duration::from_secs(15), cleared_entered)
-        .await
-        .unwrap()
-        .unwrap();
-    let leaf_after = branch(fixture, personal, thread, ThreadEntrySeq::ZERO)
-        .await
-        .thread
-        .head;
-    let waiting_start = {
-        let supervisor = supervisor.clone();
-        let owner = owner.clone();
-        let start_req = StartChatRun {
-            scope: scope.clone(),
-            thread: thread.clone(),
-            expected_leaf: leaf_after,
-            options: options.clone(),
-        };
-        tokio::spawn(async move { supervisor.start(owner, start_req).await })
-    };
-    tokio::task::yield_now().await;
-    assert!(!waiting_start.is_finished());
-    cleared_release.send(()).unwrap();
-    let _next_run = timeout(Duration::from_secs(15), waiting_start)
-        .await
-        .unwrap()
-        .unwrap()
-        .expect(
-            "concurrent start waiting on run completion must succeed without owner_unavailable",
-        );
-    let (mut wire3, _) = timeout(Duration::from_secs(15), read_request(listener))
-        .await
-        .unwrap();
-    send_ollama(
-        &mut wire3,
-        json!({"role":"assistant","content":"Concurrent start succeeded."}),
-        "stop",
-    )
-    .await;
+    drop(next_wire);
     let _ = idle_leaf(fixture, personal, thread).await;
 
-    // IMPL-032: archiving a Shared Space mid-`drain()` (after `Pending`, before consume)
-    // must enter `finish_run_if_queue_empty` closing cleanup without hanging or leaking `active_run_id`.
+    // On a SpaceGroup thread, a concurrent `start()` must wait on `thread_gate`
+    // across `refresh_current_peer_head` until `remove_run` finishes, and
+    // archiving the Shared Space mid-`drain()` must settle via `closing` cleanup.
     let account_rev = fixture
         .control
         .account(owner.clone(), actor.clone())
@@ -729,9 +690,55 @@ async fn resilience_submit_gate_and_archival(
         )
         .await
         .unwrap();
-    let SubmitUserChatOutcome::Appended(first_entry) = first.outcome else {
+    let SubmitUserChatOutcome::Appended(_first_entry) = first.outcome else {
         panic!("expected Appended on shared thread");
     };
+    let (mut refresh_wire, _) = timeout(Duration::from_secs(15), read_request(listener))
+        .await
+        .unwrap();
+    // Pause inside `refresh_current_peer_head` after `finish_run_if_queue_empty`
+    // has already returned `Cleared` so a concurrent `start()` proves
+    // `thread_gate` stays held until `remove_run` completes.
+    let (refresh_entered, refresh_release) = fixture
+        .projections
+        .pause_peer_head_refresh_after_finish_cleared();
+    send_ollama(
+        &mut refresh_wire,
+        json!({"role":"assistant","content":"Finished first SpaceGroup run."}),
+        "stop",
+    )
+    .await;
+    drop(refresh_wire);
+    timeout(Duration::from_secs(15), refresh_entered)
+        .await
+        .unwrap()
+        .unwrap();
+    let leaf_after = branch(fixture, &shared_ctx, &shared_thread, ThreadEntrySeq::ZERO)
+        .await
+        .thread
+        .head;
+    let waiting_start = {
+        let supervisor = supervisor.clone();
+        let owner = refreshed_owner.clone();
+        let start_req = StartChatRun {
+            scope: shared.history.clone(),
+            thread: shared_thread.clone(),
+            expected_leaf: leaf_after,
+            options: options.clone(),
+        };
+        tokio::spawn(async move { supervisor.start(owner, start_req).await })
+    };
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !waiting_start.is_finished(),
+        "concurrent start must wait on thread_gate during SpaceGroup peer-head refresh"
+    );
+    refresh_release.send(()).unwrap();
+    let _next_run = timeout(Duration::from_secs(15), waiting_start)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("concurrent start after SpaceGroup peer-head refresh must succeed without owner_unavailable");
     let (mut shared_wire, _) = timeout(Duration::from_secs(15), read_request(listener))
         .await
         .unwrap();
@@ -758,7 +765,7 @@ async fn resilience_submit_gate_and_archival(
                 },
                 id: PendingInputId::from_bytes([0xd6; 16]),
                 thread: shared_thread.clone(),
-                expected_leaf: first_entry.value.seq,
+                expected_leaf: leaf_after,
                 body: "Pending input cancelled by archival".into(),
                 mentions_agent: true,
             },

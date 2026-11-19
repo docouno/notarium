@@ -88,17 +88,28 @@ impl ControlService {
         owner: &UsersRow,
         spaces: &BTreeSet<SpaceId>,
     ) -> Result<ControlRevision, PortError> {
+        self.bump_ability_state_at_least(tx, owner, spaces, owner.revision)
+            .await
+    }
+    async fn bump_ability_state_at_least(
+        &self,
+        tx: &mut Transaction,
+        owner: &UsersRow,
+        spaces: &BTreeSet<SpaceId>,
+        min_previous: i64,
+    ) -> Result<ControlRevision, PortError> {
         for space in spaces {
             let current = crate::service::spaces::admission(tx, space, false).await?;
             execute!(tx,"UPDATE space_admission SET revision=$1 WHERE space_id=$2","UPDATE v1_control.space_admission SET revision=$1 WHERE space_id=$2";next(current.revision)?,space.as_str())?;
         }
-        let revision = next(owner.revision)?;
+        let revision = next(owner.revision.max(min_previous))?;
         execute!(tx,"UPDATE users SET revision=$1,metadata_revision=$2 WHERE user_id=$3","UPDATE v1_control.users SET revision=$1,metadata_revision=$2 WHERE user_id=$3";revision,next(owner.metadata_revision)?,&owner.user_id)?;
         Ok(ControlRevision::new(revision as u64)?)
     }
     async fn pin_authoring_target(
         &self,
         current: &AccountContext,
+        budget: &OperationBudget,
         target: &AbilityDescriptor,
     ) -> Result<Box<dyn ScheduleAbilityLease>, PortError> {
         let entry = target
@@ -107,7 +118,7 @@ impl ControlService {
             .ok_or(DomainError::AbilityWriteForbidden)?;
         let scope = AccountContext::new(
             current.auth().restrict_to_space(&entry.space_id)?,
-            current.budget.clone(),
+            budget.context(current.budget.request.clone()),
         );
         let pin = self
             .catalog
@@ -206,7 +217,7 @@ impl ControlService {
                 Some(
                     budget
                         .run(
-                            self.pin_authoring_target(&current, &value),
+                            self.pin_authoring_target(&current, &budget, &value),
                             CommitEffect::NotCommitted,
                         )
                         .await?,
@@ -338,7 +349,7 @@ impl ControlService {
                 Some(
                     budget
                         .run(
-                            self.pin_authoring_target(&current, &value),
+                            self.pin_authoring_target(&current, &budget, &value),
                             CommitEffect::NotCommitted,
                         )
                         .await?,
@@ -389,14 +400,15 @@ impl ControlService {
             let value = prechecked?;
             self.ensure_current_ability_mutation(tx.inner_mut(), &live_ctx, &value).await?;
             let key = placement(&input.ability.placement)?;
+            let existing = ability_preference(tx.inner_mut(), live_ctx.auth().principal(), &key, &input.ability.id).await?;
             if let PreferencePrecondition::Target(expected) = precondition {
-                let row = ability_preference(tx.inner_mut(), live_ctx.auth().principal(), &key, &input.ability.id).await?;
-                let actual = row.map(|row| ControlRevision::new(row.revision as u64)).transpose()?;
+                let actual = existing.as_ref().map(|row| ControlRevision::new(row.revision as u64)).transpose()?;
                 if actual != expected { return Err(DomainError::ControlRevisionConflict { current: actual.unwrap_or(ControlRevision::ZERO) }.into()); }
             } else {
                 expect_revision(&owner, command.identity.expected)?;
             }
-            let revision = self.bump_ability_state(tx.inner_mut(), &owner, &BTreeSet::new()).await?;
+            let min_previous = existing.as_ref().map_or(0, |row| row.revision);
+            let revision = self.bump_ability_state_at_least(tx.inner_mut(), &owner, &BTreeSet::new(), min_previous).await?;
             execute!(tx.inner_mut(),"INSERT INTO ability_preferences(owner_id,ability_id,placement,enabled,revision) VALUES($1,$2,$3,$4,$5) ON CONFLICT(owner_id,ability_id,placement) DO UPDATE SET enabled=excluded.enabled,revision=excluded.revision",
                 "INSERT INTO v1_control.ability_preferences(owner_id,ability_id,placement,enabled,revision) VALUES($1,$2,$3,$4,$5) ON CONFLICT(owner_id,ability_id,placement) DO UPDATE SET enabled=excluded.enabled,revision=excluded.revision";&owner.user_id,input.ability.id.as_str(),&key,i64::from(input.enabled),revision.get() as i64)?;
             let saved = SavedResult { value: input, events: vec![] };
@@ -551,11 +563,14 @@ impl ControlService {
                     };
                     let scoped = AccountContext::new(
                         current.auth().restrict_to_space(space)?,
-                        current.budget.clone(),
+                        budget.context(ctx.budget.request.clone()),
                     );
-                    let pin = self
-                        .catalog
-                        .pin_schedule_abilities(scoped, vec![target.reference.clone()])
+                    let pin = budget
+                        .run(
+                            self.catalog
+                                .pin_schedule_abilities(scoped, vec![target.reference.clone()]),
+                            CommitEffect::NotCommitted,
+                        )
                         .await?;
                     if &pin.history().space_id != space
                         || !matches!(pin.abilities(), [pinned]

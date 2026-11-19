@@ -1368,8 +1368,8 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
         vec![],
     );
 
-    // IMPL-024: concurrent `compare_authored_ability_preference` by two members of
-    // the same Shared Space must not deadlock on PostgreSQL (`FOR SHARE -> FOR UPDATE`).
+    // Concurrent authored preference updates by two members of the same Shared
+    // Space must share a lock order and never deadlock on PostgreSQL.
     let mut owner_pref_rev: Option<ControlRevision> = None;
     let mut editor_pref_rev: Option<ControlRevision> = None;
     for round in 0..8_u8 {
@@ -1415,8 +1415,10 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
         editor_pref_rev = Some(editor_res.unwrap().revision);
     }
 
-    // IMPL-027: merging a source preference into an existing destination preference
-    // during promotion must increment destination preference revision so stale CAS fails.
+    // Merging a source preference into an existing destination preference
+    // during peer promotion must advance destination preference revision past
+    // the owner's account revision, and subsequent preference writes by that
+    // owner must remain strictly monotonic under concurrent CAS.
     let project = FolderRef {
         space_id: shared.space.id.clone(),
         folder_id: FolderId::from_bytes([73; 16]),
@@ -1567,13 +1569,15 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
             },
         );
     }
-    let promoted = service
+    // Promote via the peer editor so the owner's account revision stays behind
+    // the merged destination preference revision.
+    let _promoted = service
         .adopt_authored_ability_promotion(
-            owner_ctx.clone(),
+            editor_ctx.clone(),
             AccountMutation {
                 identity: command(
-                    owner_ctx.auth().principal(),
-                    owner_ctx.auth().principal(),
+                    editor_ctx.auth().principal(),
+                    editor_ctx.auth().principal(),
                     52,
                     ControlRevision::ZERO,
                 ),
@@ -1586,11 +1590,15 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
         .await
         .unwrap()
         .value;
-    assert!(!promoted.destination.preference_enabled);
+    let inspected_dst = service
+        .inspect_ability(owner_ctx.clone(), dst_ref.identity())
+        .await
+        .unwrap();
+    assert!(!inspected_dst.overlays.preference_enabled);
+    let merged_rev = inspected_dst.overlays.preference_revision.unwrap();
     assert!(
-        promoted.destination.preference_revision.unwrap() > stale_dst_rev,
-        "merged destination preference revision must strictly advance past {stale_dst_rev:?}: {:?}",
-        promoted.destination.preference_revision
+        merged_rev > stale_dst_rev,
+        "merged destination preference revision must strictly advance past {stale_dst_rev:?}: {merged_rev:?}",
     );
     let conflict = service
         .compare_authored_ability_preference(
@@ -1604,7 +1612,7 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
                 ),
                 input: AbilityPreferenceChange {
                     preference: AbilityPreferenceUpdate {
-                        ability: dst_ref,
+                        ability: dst_ref.clone(),
                         enabled: true,
                     },
                     expected: Some(stale_dst_rev),
@@ -1616,13 +1624,75 @@ async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
         matches!(
             conflict,
             Err(PortError::Domain(DomainError::ControlRevisionConflict { current }))
-                if current > stale_dst_rev
+                if current == merged_rev
         ),
         "{conflict:?}"
     );
+    // Two concurrent CAS writes by the owner against `merged_rev`: exactly one
+    // succeeds with a strictly higher revision and the second hits conflict.
+    let cas_a = service.compare_authored_ability_preference(
+        owner_ctx.clone(),
+        AccountMutation {
+            identity: command(
+                owner_ctx.auth().principal(),
+                owner_ctx.auth().principal(),
+                55,
+                ControlRevision::ZERO,
+            ),
+            input: AbilityPreferenceChange {
+                preference: AbilityPreferenceUpdate {
+                    ability: dst_ref.clone(),
+                    enabled: true,
+                },
+                expected: Some(merged_rev),
+            },
+        },
+    );
+    let cas_b = service.compare_authored_ability_preference(
+        owner_ctx.clone(),
+        AccountMutation {
+            identity: command(
+                owner_ctx.auth().principal(),
+                owner_ctx.auth().principal(),
+                56,
+                ControlRevision::ZERO,
+            ),
+            input: AbilityPreferenceChange {
+                preference: AbilityPreferenceUpdate {
+                    ability: dst_ref,
+                    enabled: false,
+                },
+                expected: Some(merged_rev),
+            },
+        },
+    );
+    let (res_a, res_b) = tokio::join!(cas_a, cas_b);
+    let (winner, loser) = match (res_a, res_b) {
+        (Ok(ok), Err(err)) | (Err(err), Ok(ok)) => (ok, err),
+        other => panic!("expected exactly one CAS winner and one conflict, got {other:?}"),
+    };
+    assert!(
+        winner.revision > merged_rev,
+        "owner write after peer promotion must strictly advance preference revision past {merged_rev:?}, got {:?}",
+        winner.revision
+    );
+    assert!(
+        matches!(
+            loser,
+            PortError::Domain(DomainError::ControlRevisionConflict { current })
+                if current == winner.revision
+        ),
+        "{loser:?}"
+    );
+    let owner_account_rev = service
+        .account(owner_ctx.clone(), owner_ctx.auth().principal().clone())
+        .await
+        .unwrap()
+        .revision;
+    assert!(owner_account_rev >= winner.revision);
 
-    // IMPL-026: exact replay of `compare_authored_ability_binding` succeeds even
-    // after a selected project is removed from the catalog (pre-tx error deferred past replay).
+    // Exact replay of `compare_authored_ability_binding` succeeds even after a
+    // selected project is removed from the catalog.
     let bind_req = AccountMutation {
         identity: command(
             owner_ctx.auth().principal(),

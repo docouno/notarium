@@ -708,6 +708,19 @@ fn change_step(step: &str, outcome: &str, error: Option<&PortError>) -> Value {
     value
 }
 
+fn is_partial_step_error(error: &PortError) -> bool {
+    matches!(
+        error,
+        PortError::Domain(
+            DomainError::ControlRevisionConflict { .. }
+                | DomainError::RevisionConflict { .. }
+                | DomainError::PathConflict { .. }
+                | DomainError::ValidationFailed { .. }
+                | DomainError::ResourceNotFound
+        )
+    )
+}
+
 fn edit_result(
     reference: &AbilityRef,
     steps: Vec<Value>,
@@ -730,6 +743,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         args.description.is_some() || args.instructions.is_some() || args.attachments.is_some();
     let mut authored_changed = false;
     let mut carrier_edited = false;
+    let mut carrier_moved = false;
     let mut published = false;
     let mut promotion = None;
     let mut phase = if authored { "authored" } else { "home" };
@@ -812,6 +826,7 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 )
                 .await?;
             note_revision = settled.value.revision;
+            carrier_moved = true;
         }
         if authored_changed || plan.promote {
             let package = call
@@ -871,18 +886,23 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         Ok(())
     }
     .await;
-    if let Err(error) = &package_result {
+    if let Err(error) = package_result {
+        let partial_package = carrier_edited || carrier_moved || published;
+        if !partial_package || !is_partial_step_error(&error) {
+            return Err(error);
+        }
         for step in ["authored", "home", "availability", "enabled"] {
             steps.push(if step == "authored" && authored_changed && published {
                 change_step(step, "applied", None)
             } else if step == phase || step == "authored" && carrier_edited {
-                change_step(step, "failed", Some(error))
+                change_step(step, "failed", Some(&error))
             } else {
                 change_step(step, "skipped", None)
             });
         }
-        return edit_result(&reference, steps, Some(error));
+        return edit_result(&reference, steps, Some(&error));
     }
+    let mut applied_any = authored_changed || promotion.is_some();
     steps.push(change_step(
         "authored",
         if authored_changed {
@@ -938,8 +958,14 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
                 .await
         };
         match result {
-            Ok(_) => steps.push(change_step("availability", "applied", None)),
+            Ok(_) => {
+                applied_any = true;
+                steps.push(change_step("availability", "applied", None));
+            }
             Err(error) => {
+                if !applied_any || !is_partial_step_error(&error) {
+                    return Err(error);
+                }
                 steps.push(change_step("availability", "failed", Some(&error)));
                 steps.push(change_step("enabled", "skipped", None));
                 return edit_result(&reference, steps, Some(&error));
@@ -990,6 +1016,9 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         match result {
             Ok(_) => steps.push(change_step("enabled", "applied", None)),
             Err(error) => {
+                if !applied_any || !is_partial_step_error(&error) {
+                    return Err(error);
+                }
                 steps.push(change_step("enabled", "failed", Some(&error)));
                 return edit_result(&reference, steps, Some(&error));
             }

@@ -347,6 +347,7 @@ impl AgentRunSupervisor {
         run: AgentRunId,
     ) -> Result<(), PortError> {
         let account = self.live_account(account).await?;
+        require_write_bearer(account.auth())?;
         let ctx = SpaceContext::new(
             account.auth().clone(),
             scope.clone(),
@@ -428,6 +429,7 @@ impl AgentRunSupervisor {
             let gate = service.thread_gate(&scope, &thread);
             let _admission = gate.lock().await;
             let mut account = service.live_account(account).await?;
+            require_write_bearer(account.auth())?;
             let ownership_lost = Cancellation::default();
             account.budget = bounded(&account.budget, MAINTENANCE_BUDGET, ownership_lost);
             let route = service
@@ -1081,4 +1083,15 @@ fn stream_failure(error: &PortError) -> RunFailure {
         }
         _ => RunFailure::Internal,
     }
+}
+
+fn require_write_bearer(auth: &EngineAuthContext) -> Result<(), PortError> {
+    if matches!(
+        auth.kind(),
+        PrincipalKind::Pat | PrincipalKind::OAuth { .. }
+    ) && auth.bearer_scope() != Some(BearerScope::Write)
+    {
+        return Err(DomainError::AccessDenied.into());
+    }
+    Ok(())
 }

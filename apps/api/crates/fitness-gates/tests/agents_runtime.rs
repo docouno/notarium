@@ -76,6 +76,7 @@ struct RuntimeFixture {
     keyring: Arc<Keyring>,
     runtime: CanonicalRuntime,
     control: Arc<ControlService>,
+    control_plane: Arc<ControlPlane>,
     revocations: Arc<RevocationHub>,
     registry: Arc<ToolRegistry>,
     projections: Arc<ProjectionFixtures>,
@@ -125,7 +126,7 @@ impl RuntimeFixture {
         let (canonical, runtime) = CanonicalRuntime::open(config.clone()).await.unwrap();
         let revocations = Arc::new(RevocationHub::new_local());
         let projections = Arc::new(ProjectionFixtures::default());
-        let (control, registry, human) = Self::bind_owners(
+        let (control, control_plane, registry, human) = Self::bind_owners(
             &storage,
             &canonical,
             keyring.clone(),
@@ -141,6 +142,7 @@ impl RuntimeFixture {
             keyring,
             runtime,
             control,
+            control_plane,
             revocations,
             registry,
             projections,
@@ -156,7 +158,12 @@ impl RuntimeFixture {
         revocations: Arc<RevocationHub>,
         projections: Arc<ProjectionFixtures>,
         bootstrap: bool,
-    ) -> (Arc<ControlService>, Arc<ToolRegistry>, AccountContext) {
+    ) -> (
+        Arc<ControlService>,
+        Arc<ControlPlane>,
+        Arc<ToolRegistry>,
+        AccountContext,
+    ) {
         let catalog = Arc::new(SystemAbilityCatalog::new(Arc::new(canonical.clone())));
         let owner = PrincipalId::from_bytes([4; 16]);
         let control = Arc::new(
@@ -211,13 +218,14 @@ impl RuntimeFixture {
             ProviderConfig::default(),
         )
         .unwrap();
+        let control_plane = Arc::new(ControlPlane::new(provider));
         let registry = Arc::new(ToolRegistry::new(
-            Arc::new(ControlPlane::new(provider)),
+            control_plane.clone(),
             catalog,
             Arc::new(TestEngine(canonical.clone(), projections)),
             control.clone(),
         ));
-        (control, registry, human)
+        (control, control_plane, registry, human)
     }
 
     async fn reopen_fenced(self, scope: &notarium_core::model::HistoryScope) -> Self {
@@ -228,6 +236,7 @@ impl RuntimeFixture {
             keyring,
             runtime,
             control,
+            control_plane,
             revocations,
             registry,
             projections,
@@ -241,6 +250,7 @@ impl RuntimeFixture {
             .active_epoch;
         revocations.close();
         drop(registry);
+        drop(control_plane);
         drop(control);
         drop(canonical);
         runtime.shutdown().await.unwrap();
@@ -261,7 +271,7 @@ impl RuntimeFixture {
                 .unwrap();
         }
         let revocations = Arc::new(RevocationHub::new_local());
-        let (control, registry, human) = Self::bind_owners(
+        let (control, control_plane, registry, human) = Self::bind_owners(
             &storage,
             &canonical,
             keyring.clone(),
@@ -277,6 +287,7 @@ impl RuntimeFixture {
             keyring,
             runtime,
             control,
+            control_plane,
             revocations,
             registry,
             projections,
@@ -343,11 +354,13 @@ impl RuntimeFixture {
             canonical,
             runtime,
             control,
+            control_plane,
             registry,
             temporary_blob_root,
             ..
         } = self;
         drop(registry);
+        drop(control_plane);
         drop(control);
         drop(canonical);
         runtime.shutdown().await.unwrap();

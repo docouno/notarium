@@ -109,6 +109,7 @@ pub struct ProjectionFixtures {
     seed: Mutex<Option<ProjectionFixture>>,
     directory: Mutex<BTreeMap<EffectiveReadId, NoteQuery>>,
     before_ability_trash: Mutex<Option<MutationPause>>,
+    before_note_edit: Mutex<Option<MutationPause>>,
     before_note_move: Mutex<Option<MutationPause>>,
     after_ability_publication: Mutex<Option<MutationPause>>,
     before_memory_append: Mutex<Option<MutationPause>>,
@@ -121,7 +122,8 @@ pub struct ProjectionFixtures {
     before_chat_rollback: Mutex<Option<MutationPause>>,
     before_chat_claim: Mutex<Option<MutationPause>>,
     after_chat_claim: Mutex<Option<MutationPause>>,
-    after_chat_finish_cleared: Mutex<Option<MutationPause>>,
+    arm_pause_chat_read_after_cleared: Mutex<Option<MutationPause>>,
+    before_chat_read: Mutex<Option<MutationPause>>,
     active_sql_effect: Mutex<Option<MutationPause>>,
     submit_unknown_then_not_committed: Mutex<u8>,
     lose_claim_acks: Mutex<usize>,
@@ -190,10 +192,14 @@ impl ProjectionFixtures {
         *self.submit_unknown_then_not_committed.lock().unwrap() = 2;
     }
 
-    pub fn pause_after_chat_finish_cleared(
+    pub fn pause_peer_head_refresh_after_finish_cleared(
         &self,
     ) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
-        MutationPause::install(&self.after_chat_finish_cleared)
+        MutationPause::install(&self.arm_pause_chat_read_after_cleared)
+    }
+
+    pub fn pause_note_edit(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.before_note_edit)
     }
 
     pub fn pause_note_move(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
@@ -330,6 +336,7 @@ canonical_port!(NoteWritePort;
         request: Mutation<EditNote>,
     ) -> PortFuture<'_, Committed<NoteRevision>> {
         Box::pin(async move {
+            MutationPause::enter(&self.1.before_note_edit, ctx.budget.cancellation.clone()).await;
             let committed = NoteWritePort::edit_note(&self.0, ctx, request).await?;
             if std::mem::take(&mut *self.1.lose_note_edit_ack.lock().unwrap()) {
                 return Err(PortError::Unavailable(
@@ -370,7 +377,6 @@ canonical_port!(NoteWritePort;
 
 canonical_port!(ChatPort;
     read_chat(ChatRead) -> ChatBranch,
-    read_chat_context(ChatRead) -> ChatBranch,
     read_chat_contents(ChatContentRead) -> Vec<HydratedChatEntry>,
     read_chat_proposal(ChatProposalRead) -> CanonicalChatProposal,
     stage_chat_blob(String) -> StagedChatBlob,
@@ -382,6 +388,16 @@ canonical_port!(ChatPort;
     list_pending_chat_inputs(ChatThreadId) -> Vec<QueuedChatInput>,
     dismiss_chat_input(DismissPending) -> bool,
     recover_active_run(ChatRunRequest) -> FinishChatRunOutcome;
+    fn read_chat_context(
+        &self,
+        ctx: SpaceContext,
+        request: ChatRead,
+    ) -> PortFuture<'_, ChatBranch> {
+        Box::pin(async move {
+            MutationPause::enter(&self.1.before_chat_read, ctx.budget.cancellation.clone()).await;
+            ChatPort::read_chat_context(&self.0, ctx, request).await
+        })
+    }
     fn redact_chat_entry(
         &self,
         ctx: SpaceContext,
@@ -461,10 +477,24 @@ canonical_port!(ChatPort;
     }
     fn finish_run_if_queue_empty(&self, ctx: SpaceContext, request: ChatRunRequest) -> PortFuture<'_, FinishChatRunOutcome> {
         Box::pin(async move {
-            let cancellation = ctx.budget.cancellation.clone();
             let finished = ChatPort::finish_run_if_queue_empty(&self.0, ctx, request).await?;
             if finished == FinishChatRunOutcome::Cleared {
-                MutationPause::enter(&self.1.after_chat_finish_cleared, cancellation).await;
+                if let Some(pause) = self
+                    .1
+                    .arm_pause_chat_read_after_cleared
+                    .lock()
+                    .unwrap()
+                    .take()
+                {
+                    assert!(
+                        self.1
+                            .before_chat_read
+                            .lock()
+                            .unwrap()
+                            .replace(pause)
+                            .is_none()
+                    );
+                }
                 if lose_ack(&self.1.lose_finish_acks) {
                     return Err(lost_chat_ack());
                 }

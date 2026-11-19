@@ -817,6 +817,8 @@ impl EngineAuthContext {
             .ok_or(DomainError::ResourceNotFound)?;
         if space.lifecycle != SpaceLifecycle::Active
             || grant.role == SpaceRole::Viewer
+            || (matches!(self.kind, PrincipalKind::Pat | PrincipalKind::OAuth { .. })
+                && self.bearer_scope != Some(BearerScope::Write))
             || self
                 .write_space
                 .as_ref()
