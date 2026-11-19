@@ -22,10 +22,28 @@ pub(super) async fn seed(
     publisher: &mut Publisher<'_>,
     layout: Arc<SearchLayout>,
     cutoff: &ChangeCursor,
-    target: Option<&ResolvedEmbeddingTarget>,
     scrub: bool,
-    reusable: Option<VectorEpoch>,
+    mut reusable: Option<VectorEpoch>,
 ) -> Result<Disk, IndexError> {
+    let mut generations = layout.index_generations()?;
+    let generation = generations
+        .last()
+        .copied()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(IndexError::Inconsistent)?;
+    if scrub {
+        drop(reusable.take());
+        publisher.replace(None);
+        publisher.drain().await;
+        // On restart a missing manifest forces cleanup before reopening either index.
+        layout.invalidate_search()?;
+        layout.remove_vector_epochs(None)?;
+        for previous in generations.drain(..) {
+            remove_generation(cx, &layout, previous)?;
+        }
+    }
+
     let space = cx
         .services
         .deps
@@ -38,22 +56,21 @@ pub(super) async fn seed(
     folders.insert(space.root_folder_id)?;
     save_new_folders(&layout, &folders, before)?;
 
-    let generations = layout.index_generations()?;
-    let generation = generations
-        .last()
-        .copied()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or(IndexError::Inconsistent)?;
+    let target = cx
+        .services
+        .model_target(&cutoff.scope, None, None)
+        .await
+        .ok()
+        .flatten();
     let path = layout.create_index_generation(generation)?;
     let result = async {
         let lexical = cx.services.readers.create(&path)?;
-        let embedder = match target {
+        let embedder = match &target {
             Some(target) => cx.services.embedder(target.clone(), true).await.ok(),
             None => None,
         };
-        let active = target.map(|target| &target.model);
-        if scrub || active.is_some() {
+        let active = target.as_ref().map(|target| &target.model);
+        if active.is_some() && !scrub {
             // A clean lexical generation is still being built. Keep the last
             // BM25 cut readable, and drain every generation pin before unlinking
             // any epoch that could have been referenced by it.
@@ -82,9 +99,7 @@ pub(super) async fn seed(
         if let Some(vectors) = &mut vectors {
             drop(vectors.reusable.take());
         }
-        if scrub {
-            layout.remove_vector_epochs(None)?;
-        } else if let Some(model) = active {
+        if let Some(model) = active {
             layout.remove_model_epoch(model)?;
         }
         let (epoch, pending) = match vectors {
@@ -132,6 +147,7 @@ pub(super) async fn seed(
     for previous in generations {
         remove_generation(cx, &layout, previous)?;
     }
+    layout.remove_vector_epochs(disk.manifest.active_model.as_ref())?;
     Ok(disk)
 }
 

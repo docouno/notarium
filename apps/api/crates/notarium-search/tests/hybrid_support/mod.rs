@@ -1,30 +1,32 @@
 pub mod remote;
 
-use notarium_canonical::CanonicalStore;
+use notarium_canonical::{CanonicalStore, chats::search::HydratedChatHit};
 use notarium_core::{
     DomainError, DomainResult,
     auth::{EngineAuthContext, SpaceGrant, SpaceRole, VerifiedHuman},
-    classes::{ClassEgressFence, DocClass},
+    classes::{ClassEgressFence, ClassifiedDocument, DocClass},
     error::{PortError, ValidationReason},
     ids::{
-        CommandKey, ContentDigest, FolderId, GrantId, NoteId, PrincipalId, ProjectionGeneration,
-        RequestId, SpaceSeq,
+        ChatThreadId, CommandKey, ContentDigest, FolderId, GrantId, NoteId, PrincipalId,
+        ProjectionGeneration, RequestId, RevisionId, SpaceSeq, ThreadEntrySeq,
     },
     model::{DenseNodeId, DenseNodeIter, HistoryScope, SnapshotCut},
     ports::{
         CallBudget, Cancellation, ChangeBroadcast, ChangeNotice, ChangeRead, ChangeReadResult,
-        ChangeSubscription, MaintenanceContext, Mutation, NoteCard, PortFuture, ServiceAuthority,
-        ServicePurpose, SpaceContext, StructuralReadPort, StructuralSnapshot,
+        ChangeSubscription, MaintenanceContext, Mutation, NoteCard, PageLimit, PortFuture,
+        ServiceAuthority, ServicePurpose, SpaceContext, StructuralReadPort, StructuralSnapshot,
     },
     query::{FieldFilterAstV1, Predicate},
     receipt::{CausalBasis, ChangeCursor, CommandIdentity},
 };
-use notarium_search::ports::SearchCarrierReadPort;
+use notarium_search::ports::{
+    SearchCarrierReadPort, SearchIndexedNote, SearchNotesSeedPage, SearchOverlayNote,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -265,6 +267,118 @@ impl StructuralReadPort for Projection {
                     })
                 })
                 .collect())
+        })
+    }
+}
+
+pub struct ControlledCarriers {
+    canonical: Arc<CanonicalStore>,
+    pub reject_seed: AtomicBool,
+    pub seed_rejected: Notify,
+    pub release_seed: Notify,
+    pub hold_chat: AtomicBool,
+    pub chat_held: Notify,
+    pub release_chat: Notify,
+}
+
+impl ControlledCarriers {
+    pub fn new(canonical: Arc<CanonicalStore>) -> Self {
+        Self {
+            canonical,
+            reject_seed: AtomicBool::new(false),
+            seed_rejected: Notify::new(),
+            release_seed: Notify::new(),
+            hold_chat: AtomicBool::new(false),
+            chat_held: Notify::new(),
+            release_chat: Notify::new(),
+        }
+    }
+}
+
+impl SearchCarrierReadPort for ControlledCarriers {
+    fn read_searchable_notes_seed_page(
+        &self,
+        authority: ServiceAuthority,
+        budget: CallBudget,
+        scope: HistoryScope,
+        cutoff: Option<SpaceSeq>,
+        after_note: Option<NoteId>,
+        limit: PageLimit,
+    ) -> PortFuture<'_, SearchNotesSeedPage> {
+        if self.reject_seed.load(Ordering::SeqCst) {
+            return Box::pin(async {
+                self.seed_rejected.notify_one();
+                self.release_seed.notified().await;
+                Err(DomainError::ResourceNotFound.into())
+            });
+        }
+        SearchCarrierReadPort::read_searchable_notes_seed_page(
+            &*self.canonical,
+            authority,
+            budget,
+            scope,
+            cutoff,
+            after_note,
+            limit,
+        )
+    }
+
+    fn read_note_documents_at_cutoff(
+        &self,
+        authority: ServiceAuthority,
+        budget: CallBudget,
+        scope: HistoryScope,
+        cutoff: SpaceSeq,
+        notes: Vec<NoteId>,
+    ) -> PortFuture<'_, Vec<(NoteId, Option<SearchIndexedNote>)>> {
+        SearchCarrierReadPort::read_note_documents_at_cutoff(
+            &*self.canonical,
+            authority,
+            budget,
+            scope,
+            cutoff,
+            notes,
+        )
+    }
+
+    fn read_note_revisions_for_overlay(
+        &self,
+        authority: ServiceAuthority,
+        budget: CallBudget,
+        scope: HistoryScope,
+        targets: Vec<(NoteId, RevisionId)>,
+    ) -> PortFuture<'_, Vec<(NoteId, Option<SearchOverlayNote>)>> {
+        SearchCarrierReadPort::read_note_revisions_for_overlay(
+            &*self.canonical,
+            authority,
+            budget,
+            scope,
+            targets,
+        )
+    }
+
+    fn read_authorized_documents_for_search(
+        &self,
+        ctx: SpaceContext,
+        targets: Vec<(NoteId, RevisionId)>,
+    ) -> PortFuture<'_, Vec<Option<Arc<ClassifiedDocument>>>> {
+        SearchCarrierReadPort::read_authorized_documents_for_search(&*self.canonical, ctx, targets)
+    }
+
+    fn hydrate_live_visible_chat_hits<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        candidates: &'a [(ChatThreadId, ThreadEntrySeq)],
+        limit: PageLimit,
+    ) -> PortFuture<'a, (Vec<HydratedChatHit>, bool)> {
+        Box::pin(async move {
+            if self.hold_chat.swap(false, Ordering::SeqCst) {
+                self.chat_held.notify_one();
+                self.release_chat.notified().await;
+            }
+            self.canonical
+                .hydrate_live_visible_chat_hits(ctx, candidates, limit)
+                .await
         })
     }
 }

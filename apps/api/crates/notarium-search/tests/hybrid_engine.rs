@@ -2,7 +2,7 @@ mod hybrid_support;
 #[path = "../../notarium-canonical/tests/support/mod.rs"]
 mod storage;
 
-use hybrid_support::{HeldPages, Projection, View, context, mutation};
+use hybrid_support::{ControlledCarriers, HeldPages, Projection, View, context, mutation};
 use notarium_canonical::{
     CanonicalConfig, CanonicalRuntime, CanonicalStore, S3BucketModePolicy,
     blobs::s3::admin_ensure_bucket,
@@ -33,7 +33,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, atomic::Ordering},
     time::Duration,
 };
 use storage::{
@@ -133,12 +133,16 @@ fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 fn assert_absent(path: &Path, marker: &str) {
     for (file, bytes) in files(path) {
         assert!(
-            !bytes
-                .windows(marker.len())
-                .any(|window| window == marker.as_bytes()),
+            !contains(&bytes, marker),
             "indexed marker found in {file:?}"
         );
     }
+}
+
+fn contains(bytes: &[u8], marker: &str) -> bool {
+    bytes
+        .windows(marker.len())
+        .any(|window| window == marker.as_bytes())
 }
 
 async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
@@ -220,8 +224,10 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
         live: RwLock::new(BTreeSet::from([a.clone(), b.clone(), vault.clone()])),
     });
     let pages = Arc::new(HeldPages::new(store.clone()));
+    let carriers = Arc::new(ControlledCarriers::new(store.clone()));
     let mut deps = SearchDependencies::new(store.clone(), projection.clone());
     deps.changes = pages.clone();
+    deps.carriers = carriers.clone();
     let vector_mode = VectorMode::DeterministicTest { dimension: 64 };
     let engine = SearchEngine::start(SearchConfig::new(root.clone(), vector_mode.clone()), deps);
     engine.start_space(scope.clone()).unwrap();
@@ -421,7 +427,7 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
                     thread: thread.clone(),
                     parent: ThreadEntrySeq::ZERO,
                     kind: ChatEntryKind::Human,
-                    body: ChatInputBody::Text(REDACTED.to_owned()),
+                    body: ChatInputBody::Text(format!("{REDACTED} {SECRET}")),
                     referenced_notes: vec![],
                     tainted: false,
                 },
@@ -444,8 +450,37 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
             .unwrap()
             .chat_hits[0]
             .snippet,
-        REDACTED
+        format!("{REDACTED} {SECRET}")
     );
+
+    assert!(
+        engine
+            .search(ctx.clone(), query(SECRET))
+            .await
+            .unwrap()
+            .hits
+            .iter()
+            .any(|hit| { hit.card.document.provenance().reference().note_id == vault })
+    );
+    let mut mixed = query(SECRET);
+    mixed.include_chats = true;
+    carriers.hold_chat.store(true, Ordering::SeqCst);
+    let (held, ()) = tokio::join!(engine.search(ctx.clone(), mixed), async {
+        tokio::time::timeout(Duration::from_secs(3), carriers.chat_held.notified())
+            .await
+            .unwrap();
+        projection.live.write().unwrap().remove(&vault);
+        carriers.release_chat.notify_one();
+    });
+    let held = held.unwrap();
+    assert_eq!(held.chat_hits.len(), 1);
+    assert!(
+        held.hits
+            .iter()
+            .all(|hit| { hit.card.document.provenance().reference().note_id != vault })
+    );
+    projection.live.write().unwrap().insert(vault.clone());
+
     let old_thread = store
         .read_chat(
             ctx.clone(),
@@ -646,7 +681,7 @@ async fn purge_and_rebind(store: Arc<CanonicalStore>, root: DataRoot) {
         .unwrap();
     let old = sample_note_id(0x62);
     let ctx = context(&space.scope, &owner);
-    let (cut, revisions) = store
+    let (cut, _) = store
         .commit_synthetic_note_batch_for_test(
             &space.scope,
             lease,
@@ -668,10 +703,19 @@ async fn purge_and_rebind(store: Arc<CanonicalStore>, root: DataRoot) {
         snapshot: RwLock::new(view),
         live: RwLock::new(BTreeSet::from([old.clone()])),
     });
-    let engine = SearchEngine::start(
-        SearchConfig::new(root.clone(), VectorMode::Disabled),
-        SearchDependencies::new(store.clone(), projection.clone()),
-    );
+    let carriers = Arc::new(ControlledCarriers::new(store.clone()));
+    let start = || {
+        let mut deps = SearchDependencies::new(store.clone(), projection.clone());
+        deps.carriers = carriers.clone();
+        SearchEngine::start(
+            SearchConfig::new(
+                root.clone(),
+                VectorMode::DeterministicTest { dimension: 64 },
+            ),
+            deps,
+        )
+    };
+    let engine = start();
     engine.start_space(space.scope.clone()).unwrap();
     acknowledged(&store, &root, &space.scope, cut.last_seq).await;
     assert_eq!(
@@ -683,6 +727,33 @@ async fn purge_and_rebind(store: Arc<CanonicalStore>, root: DataRoot) {
             .len(),
         1
     );
+    let (edit, revisions) = store
+        .commit_synthetic_note_batch_for_test(
+            &space.scope,
+            lease,
+            &owner,
+            vec![note(
+                &old,
+                &folder,
+                "Old incarnation",
+                "oldincarnationsecret edited",
+            )],
+        )
+        .await
+        .unwrap();
+    projection.snapshot.write().unwrap().advance(edit.last_seq);
+    acknowledged(&store, &root, &space.scope, edit.last_seq).await;
+    let vectors = root.search(&space.scope.space_id, SearchIndexKind::Vector);
+    let before_purge = files(&vectors);
+    assert!(before_purge.iter().any(|(path, bytes)| {
+        path.extension().is_some_and(|extension| extension == "seg")
+            && contains(bytes, old.as_str())
+    }));
+    assert!(before_purge.iter().any(|(path, bytes)| {
+        path.file_name().is_some_and(|name| name == "l0.wal") && contains(bytes, old.as_str())
+    }));
+    engine.shutdown().await;
+    carriers.reject_seed.store(true, Ordering::SeqCst);
     let mut request = mutation(
         &ctx,
         DeleteNote {
@@ -698,9 +769,28 @@ async fn purge_and_rebind(store: Arc<CanonicalStore>, root: DataRoot) {
         .write()
         .unwrap()
         .advance(purged.receipt.seq());
-    acknowledged(&store, &root, &space.scope, purged.receipt.seq()).await;
+    let engine = start();
+    engine.start_space(space.scope.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), carriers.seed_rejected.notified())
+        .await
+        .unwrap();
+    carriers.release_seed.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), carriers.seed_rejected.notified())
+        .await
+        .unwrap();
     let tantivy = root.search(&space.scope.space_id, SearchIndexKind::Tantivy);
     assert_absent(&tantivy, "oldincarnationsecret");
+    assert_absent(&vectors, old.as_str());
+    let layout = SearchLayout::open(&root, space.scope.clone()).unwrap();
+    assert!(layout.search_manifest().unwrap().is_none());
+    assert!(
+        store
+            .min_consumer_watermark(&space.scope.space_id, &space.scope.incarnation)
+            .is_none_or(|seq| seq < purged.receipt.seq())
+    );
+    carriers.reject_seed.store(false, Ordering::SeqCst);
+    carriers.release_seed.notify_one();
+    acknowledged(&store, &root, &space.scope, purged.receipt.seq()).await;
     assert!(
         engine
             .search(ctx.clone(), query("oldincarnationsecret"))

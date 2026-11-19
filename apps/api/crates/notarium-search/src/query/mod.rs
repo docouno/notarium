@@ -183,12 +183,14 @@ impl SearchEngine {
             .await?;
         ctx.budget = clock.remaining()?;
         let (chat_hits, chat_truncated) = self.hydrate_chats(&ctx, chats, request.top_k).await?;
+        // Chat hydration can yield while canonical access to a selected note changes.
+        let (hits, packing_truncated) = self.finish_note_hits(&ctx, clock, hits, recall)?;
         Ok(SearchResult {
             hits,
             chat_hits,
             cut: aligned.cut,
             degraded: vectors.degraded,
-            truncated: notes_truncated || chat_truncated,
+            truncated: notes_truncated || chat_truncated || packing_truncated,
         })
     }
 

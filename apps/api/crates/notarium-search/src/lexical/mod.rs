@@ -51,6 +51,8 @@ pub enum LexicalError {
     WriterUnavailable,
     #[error("lexical reader unavailable")]
     ReaderUnavailable,
+    #[error("obsolete lexical files could not be removed")]
+    IncompleteCleanup,
 }
 
 pub enum Update<'a> {
@@ -229,7 +231,10 @@ impl LexicalIndex {
                 writer.merge(&segments).wait()?;
             }
             self.reader.reload()?;
-            writer.garbage_collect_files().wait()?;
+            let result = writer.garbage_collect_files().wait()?;
+            if !result.failed_to_delete_files.is_empty() {
+                return Err(LexicalError::IncompleteCleanup);
+            }
             Ok(())
         })
     }

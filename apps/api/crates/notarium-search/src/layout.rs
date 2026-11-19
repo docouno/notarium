@@ -275,6 +275,15 @@ impl SearchLayout {
         Ok(())
     }
 
+    pub(crate) fn invalidate_search(&self) -> Result<(), LayoutError> {
+        match self.tantivy.remove_file(SEARCH_MANIFEST) {
+            Ok(()) => sync_dir(&self.tantivy)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     pub fn clear_lexical_manifests(&self) -> Result<(), LayoutError> {
         for name in [SEARCH_MANIFEST, FOLDER_DICTIONARY] {
             match self.tantivy.remove_file(name) {

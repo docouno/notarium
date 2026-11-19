@@ -252,7 +252,7 @@ async fn consume(
         if let ChangeNotice::Resync { scope } = event {
             return Ok(Some(scope));
         }
-        let (target, scrub, mut rebind, force_seed) = match event {
+        let (target, mut scrub, mut rebind, force_seed) = match event {
             ChangeNotice::SeedRequired { cutoff } => (cutoff, true, false, true),
             ChangeNotice::PurgeResync { cutoff } => (cutoff, true, false, true),
             ChangeNotice::Advanced(target) => (target, false, false, false),
@@ -264,26 +264,9 @@ async fn consume(
         if scope != target.scope {
             return Ok(Some(target.scope));
         }
-        let selected = cx.services.model_target(&scope, None, None).await;
-        let selection_changed = selected.as_ref().is_ok_and(|target| {
-            disk.as_ref().is_some_and(|disk| {
-                disk.manifest.active_model.as_ref() != target.as_ref().map(|target| &target.model)
-            })
-        });
-        let mut backfill = false;
-        if let Some(current) = &disk
-            && !selection_changed
-            && !force_seed
-            && let Ok(Some(target)) = &selected
-        {
-            let ready = cx.services.embedder(target.clone(), true).await.is_ok();
-            backfill = ready && current.epoch.is_none();
-        }
-        let mut seed_at =
-            (force_seed || disk.is_none() || selection_changed || backfill).then(|| target.clone());
-        let mut scrub = scrub || selection_changed || backfill;
+        let mut seed_at = (force_seed || disk.is_none()).then(|| target.clone());
         if let Some(current) = &mut disk
-            && seed_at.is_none()
+            && !force_seed
             && current.manifest.tantivy_seq < target.after
         {
             match catch_up(cx, current, publisher, target.clone()).await {
@@ -304,8 +287,25 @@ async fn consume(
                 Err(error) => return Err(error),
             }
         }
+        if seed_at.is_none()
+            && let Some(current) = &disk
+            && let Ok(selected) = cx.services.model_target(&scope, None, None).await
+        {
+            let selection_changed = current.manifest.active_model.as_ref()
+                != selected.as_ref().map(|target| &target.model);
+            let backfill = if !selection_changed
+                && current.epoch.is_none()
+                && let Some(target) = selected
+            {
+                cx.services.embedder(target, true).await.is_ok()
+            } else {
+                false
+            };
+            if selection_changed || backfill {
+                seed_at = Some(target.clone());
+            }
+        }
         if let Some(mut cutoff) = seed_at {
-            let selected = selected.ok().flatten();
             let mut reusable = disk.take().and_then(|prior| prior.epoch);
             loop {
                 match build::seed(
@@ -313,7 +313,6 @@ async fn consume(
                     publisher,
                     layout.clone(),
                     &cutoff,
-                    selected.as_ref(),
                     scrub,
                     reusable.take(),
                 )

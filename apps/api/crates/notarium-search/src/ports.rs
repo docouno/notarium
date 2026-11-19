@@ -1,13 +1,14 @@
 //! Read and model-selection contracts for the search engine.
 
-use notarium_canonical::CanonicalStore;
 pub use notarium_canonical::changes::search::{
     SearchIndexedNote, SearchNotesSeedPage, SearchOverlayNote,
 };
+use notarium_canonical::{CanonicalStore, chats::search::HydratedChatHit};
 use notarium_core::{
     classes::{ClassifiedDocument, ProviderPolicy},
     ids::{
-        FolderId, ModelProfileId, NoteId, PrincipalId, ProviderResourceId, RevisionId, SpaceSeq,
+        ChatThreadId, FolderId, ModelProfileId, NoteId, PrincipalId, ProviderResourceId,
+        RevisionId, SpaceSeq, ThreadEntrySeq,
     },
     model::{FolderRef, HistoryScope},
     ports::{CallBudget, PageLimit, PortFuture, ServiceAuthority, SpaceContext},
@@ -90,6 +91,13 @@ pub trait SearchCarrierReadPort: Send + Sync {
         ctx: SpaceContext,
         targets: Vec<(NoteId, RevisionId)>,
     ) -> PortFuture<'_, Vec<Option<Arc<ClassifiedDocument>>>>;
+
+    fn hydrate_live_visible_chat_hits<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        candidates: &'a [(ChatThreadId, ThreadEntrySeq)],
+        limit: PageLimit,
+    ) -> PortFuture<'a, (Vec<HydratedChatHit>, bool)>;
 }
 
 impl SearchCarrierReadPort for CanonicalStore {
@@ -144,6 +152,17 @@ impl SearchCarrierReadPort for CanonicalStore {
     ) -> PortFuture<'_, Vec<Option<Arc<ClassifiedDocument>>>> {
         Box::pin(CanonicalStore::read_authorized_documents_for_search(
             self, ctx, targets,
+        ))
+    }
+
+    fn hydrate_live_visible_chat_hits<'a>(
+        &'a self,
+        ctx: &'a SpaceContext,
+        candidates: &'a [(ChatThreadId, ThreadEntrySeq)],
+        limit: PageLimit,
+    ) -> PortFuture<'a, (Vec<HydratedChatHit>, bool)> {
+        Box::pin(CanonicalStore::hydrate_live_visible_chat_hits(
+            self, ctx, candidates, limit,
         ))
     }
 }

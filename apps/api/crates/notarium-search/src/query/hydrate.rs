@@ -158,18 +158,33 @@ impl SearchEngine {
                     ClassEgressFence::search_part(part, context.auth()).ok()
                 })
                 .collect();
-            if structural.is_live_visible(context, &candidate.note)? {
-                hits.push(SearchHit {
-                    card,
-                    score: candidate.score,
-                    chunks,
-                });
-            }
-        }
-        if let Some(recall) = recall {
-            truncated |= pack(&mut hits, recall.tokens);
+            hits.push(SearchHit {
+                card,
+                score: candidate.score,
+                chunks,
+            });
         }
         Ok((hits, truncated))
+    }
+
+    pub(super) fn finish_note_hits(
+        &self,
+        ctx: &SpaceContext,
+        clock: &Clock,
+        hits: Vec<SearchHit>,
+        recall: Option<Recall>,
+    ) -> Result<(Vec<SearchHit>, bool), PortError> {
+        let mut visible = Vec::with_capacity(hits.len());
+        let structural = &self.services.deps.structural;
+        for hit in hits {
+            clock.remaining()?;
+            let note = &hit.card.document.provenance().reference().note_id;
+            if structural.is_live_visible(ctx, note)? {
+                visible.push(hit);
+            }
+        }
+        let truncated = recall.is_some_and(|recall| pack(&mut visible, recall.tokens));
+        Ok((visible, truncated))
     }
 
     pub(super) async fn hydrate_chats(
@@ -194,7 +209,7 @@ impl SearchEngine {
         let (rows, truncated) = self
             .services
             .deps
-            .canonical
+            .carriers
             .hydrate_live_visible_chat_hits(ctx, &ids, limit)
             .await?;
         let hits = rows

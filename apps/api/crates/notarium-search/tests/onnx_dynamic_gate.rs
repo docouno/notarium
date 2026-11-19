@@ -73,6 +73,23 @@ fn library() -> PathBuf {
 
 #[test]
 fn loads_the_pinned_cpu_runtime_offline() {
+    // ort owns one environment per process. Exercise the raw initializer in a
+    // separate process from the adapter, which initializes its own environment.
+    const SMOKE_CHILD: &str = "NOTARIUM_ONNX_SMOKE_CHILD";
+    if std::env::var_os(SMOKE_CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "loads_the_pinned_cpu_runtime_offline",
+                "--nocapture",
+            ])
+            .env(SMOKE_CHILD, "1")
+            .status()
+            .expect("start isolated ONNX smoke test");
+        assert!(status.success(), "isolated ONNX smoke test failed");
+        return;
+    }
+
     let environment = ort::init_from(library())
         .expect("load ONNX Runtime with C API 31")
         .with_execution_providers([ep::CPU::default()
