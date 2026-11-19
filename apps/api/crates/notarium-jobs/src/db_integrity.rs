@@ -341,9 +341,9 @@ struct IndexRule {
     predicate: String,
 }
 
-// An index entry's uncompressed fields must fit on both sides of a portable
-// PostgreSQL backup. Allow room for tuple and per-column overhead.
-const MAX_INDEX_KEY_BYTES: usize = 2048;
+// The Control schema explicitly bounds its uncompressed index fields. In
+// canonical storage, PostgreSQL applies its own physical index limits.
+const MAX_CONTROL_INDEX_KEY_BYTES: usize = 2048;
 
 impl PgRowChecks {
     pub(crate) fn new(canonical: bool) -> Result<Self, PortError> {
@@ -399,7 +399,7 @@ impl PgRowChecks {
                 PostgresSpoolValue::Bytes(value) => ValueRef::Blob(value),
             })
             .collect::<Vec<_>>();
-        self.evaluate(&self.rules[table.name], &values, partition)
+        self.evaluate(&self.rules[table.name], &values, partition, false)
     }
 
     pub(crate) fn check_control(
@@ -426,7 +426,7 @@ impl PgRowChecks {
             .iter()
             .map(|column| row.relational_value(column).map(target_value))
             .collect::<Result<Vec<_>, _>>()?;
-        self.evaluate(rule, &values, partition)
+        self.evaluate(rule, &values, partition, true)
     }
 
     fn rule(
@@ -545,6 +545,7 @@ impl PgRowChecks {
         rule: &RowRule,
         values: &[ValueRef<'_>],
         mut partition: Option<&mut Partition<'_>>,
+        control: bool,
     ) -> Result<(), PortError> {
         if partition.is_some() && !rule.indexes.iter().any(|index| index.unique) {
             return Ok(());
@@ -577,7 +578,7 @@ impl PgRowChecks {
                 if index.unique {
                     partition.note_unique(index, values);
                 }
-            } else {
+            } else if control {
                 let bytes: usize = index
                     .columns
                     .iter()
@@ -587,7 +588,7 @@ impl PgRowChecks {
                         ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
                     })
                     .sum();
-                if bytes > MAX_INDEX_KEY_BYTES {
+                if bytes > MAX_CONTROL_INDEX_KEY_BYTES {
                     return Err(invalid(ValidationReason::InvalidArchive));
                 }
             }

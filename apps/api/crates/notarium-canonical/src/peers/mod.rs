@@ -2872,7 +2872,7 @@ async fn complete_job_impl(
         let mut budget = budget.clone();
         budget.remaining = deadline.remaining(&budget)?;
         let (mut outcome, _) = store
-            .submit_write_batch(&budget, &scope.space_id, vec![intent])
+            .submit_archive_write_batch(&budget, &scope.space_id, vec![intent])
             .await?;
         outcome.pop().ok_or_else(|| {
             internal_not_committed("complete_archive_job", "missing writer outcome")

@@ -33,6 +33,7 @@ pub struct GcPage {
     pub inspected: usize,
     pub quarantined: usize,
     pub retirements: usize,
+    pub failure: Option<PortError>,
 }
 
 struct Candidate {
@@ -77,9 +78,10 @@ impl CanonicalStore {
         let next = (inspected == PAGE as usize).then(|| candidates[inspected - 1].cursor.clone());
         let mut page = GcPage {
             next,
-            inspected,
+            inspected: 0,
             quarantined: 0,
             retirements: 0,
+            failure: None,
         };
         let local = match &self.inner.blobs {
             BlobBackendDriver::Local(local) => Some(local),
@@ -92,8 +94,16 @@ impl CanonicalStore {
                 None
             }
         };
+        let mut last = None;
         for candidate in candidates {
-            deadline.remaining(budget)?;
+            if let Err(error) = deadline.remaining(budget) {
+                let Some(last) = last else { return Err(error) };
+                page.next = Some(last);
+                page.failure.get_or_insert(error);
+                break;
+            }
+            page.inspected += 1;
+            last = Some(candidate.cursor.clone());
             let local_guard = if let Some(local) = local {
                 let Some(guard) =
                     local.try_acquire_exclusive_guard(&scope.space_id, candidate.cursor.digest)
@@ -129,11 +139,14 @@ impl CanonicalStore {
                         })
                     },
                 )
-                .await?;
+                .await;
             match decision {
-                Decision::Skip => {}
-                Decision::Quarantine => page.quarantined += 1,
-                Decision::Retire(_) => page.retirements += 1,
+                Ok(Decision::Skip) => {}
+                Ok(Decision::Quarantine) => page.quarantined += 1,
+                Ok(Decision::Retire(_)) => page.retirements += 1,
+                Err(error) => {
+                    page.failure.get_or_insert(error);
+                }
             }
             tokio::task::yield_now().await;
         }

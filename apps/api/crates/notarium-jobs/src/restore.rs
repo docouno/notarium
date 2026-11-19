@@ -881,9 +881,5 @@ fn sync_dir(path: &Path) -> Result<(), PortError> {
         .map_err(io_error)
 }
 
-fn join_error(error: tokio::task::JoinError) -> PortError {
-    codec::internal_not_committed("offline_restore_worker", error.to_string())
-}
-
 mod cloud;
 pub use cloud::CloudRestoreTarget;

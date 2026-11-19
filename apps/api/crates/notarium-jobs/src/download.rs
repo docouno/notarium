@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use notarium_canonical::peers::archive_export::CommittedExport;
+use notarium_canonical::{codec, peers::archive_export::CommittedExport};
 use notarium_core::{
     DomainError,
     auth::JobDelegation,
@@ -9,11 +9,63 @@ use notarium_core::{
     ids::{ArtifactId, ContentDigest},
     ports::{CallBudget, SpaceContext},
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::{
+    sync::{Mutex, mpsc},
+    time::Instant,
+};
 
 use crate::{ArchiveJobs, artifacts::DownloadSource, import::check_cancelled};
 
 const MAX_CHUNK_BYTES: usize = 256 * 1024;
+
+struct RequestDeadline {
+    budget: CallBudget,
+    ends: Instant,
+}
+
+impl RequestDeadline {
+    fn new(budget: CallBudget) -> Result<Self, PortError> {
+        let ends = Instant::now()
+            .checked_add(budget.remaining)
+            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidRange))?;
+        Ok(Self { budget, ends })
+    }
+
+    fn check(&self) -> Result<Duration, PortError> {
+        check_cancelled(&self.budget.cancellation)?;
+        let remaining = self.ends.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(deadline_error());
+        }
+        Ok(remaining)
+    }
+
+    fn remaining(&self) -> Result<CallBudget, PortError> {
+        Ok(CallBudget {
+            remaining: self.check()?,
+            ..self.budget.clone()
+        })
+    }
+
+    async fn wait<T>(
+        &self,
+        operation: impl Future<Output = Result<T, PortError>>,
+    ) -> Result<T, PortError> {
+        self.check()?;
+        tokio::select! {
+            biased;
+            () = self.budget.cancellation.cancelled() => {
+                Err(codec::cancelled_not_committed("archive_download", "download cancelled"))
+            }
+            () = tokio::time::sleep_until(self.ends) => Err(deadline_error()),
+            result = operation => result,
+        }
+    }
+}
+
+fn deadline_error() -> PortError {
+    codec::deadline_not_committed("archive_download", "download deadline exceeded")
+}
 
 #[derive(Clone, Debug)]
 pub struct ArchiveDownloadMetadata {
@@ -39,34 +91,40 @@ impl ArchiveJobs {
         ctx: SpaceContext,
         artifact: &ArtifactId,
     ) -> Result<ArchiveDownload, PortError> {
+        let request = RequestDeadline::new(ctx.budget.clone())?;
         let caller =
             JobDelegation::capture(ctx.auth(), ctx.scope()).ok_or(DomainError::AccessDenied)?;
-        let live = self
+        let mut live = self
             .control
-            .refresh_archive_job(ctx.budget.clone(), &caller)
+            .refresh_archive_job(request.remaining()?, &caller)
             .await?;
+        live.budget = request.remaining()?;
         let pointer = self.store.open_committed_export(live, artifact).await?;
         let origin = self
             .store
-            .archive_job_delegation(&ctx.budget, ctx.scope(), &pointer.job)
+            .archive_job_delegation(&request.remaining()?, ctx.scope(), &pointer.job)
             .await?
             .ok_or(DomainError::ResourceNotFound)?;
         if origin.principal() != caller.principal() {
             return Err(DomainError::ResourceNotFound.into());
         }
         if origin != caller {
-            let live_origin = self
+            let mut live_origin = self
                 .control
-                .refresh_archive_job(ctx.budget.clone(), &origin)
+                .refresh_archive_job(request.remaining()?, &origin)
                 .await?;
+            live_origin.budget = request.remaining()?;
             self.store
                 .open_committed_export(live_origin, artifact)
                 .await?;
         }
-        let file = self
-            .artifacts
-            .open_download(&pointer.object, &ctx.budget.cancellation)
+        let file = request
+            .wait(
+                self.artifacts
+                    .open_download(&pointer.object, &request.budget.cancellation),
+            )
             .await?;
+        request.check()?;
         Ok(ArchiveDownload {
             jobs: self.clone(),
             caller,
@@ -133,23 +191,26 @@ impl ArchiveDownload {
         if bytes == 0 || bytes > MAX_CHUNK_BYTES {
             return Err(DomainError::validation(ValidationReason::InvalidRange).into());
         }
-        let (ctx, registration) = self
+        let request = RequestDeadline::new(budget)?;
+        let (mut ctx, registration) = self
             .jobs
             .control
-            .register_archive_job(budget.clone(), &self.caller)
+            .register_archive_job(request.remaining()?, &self.caller)
             .await?;
         let id = &self.pointer.object.id;
         let source_registration = if self.origin != self.caller {
-            let (source, registration) = self
+            let (mut source, registration) = self
                 .jobs
                 .control
-                .register_archive_job(budget.clone(), &self.origin)
+                .register_archive_job(request.remaining()?, &self.origin)
                 .await?;
+            source.budget = request.remaining()?;
             self.jobs.store.open_committed_export(source, id).await?;
             Some(registration)
         } else {
             None
         };
+        ctx.budget = request.remaining()?;
         let current = self
             .jobs
             .store
@@ -158,23 +219,26 @@ impl ArchiveDownload {
         if current.object != self.pointer.object || current.job != self.pointer.job {
             return Err(DomainError::ResourceNotFound.into());
         }
-        let bytes = {
-            let mut file = self.file.lock().await;
-            self.jobs
-                .artifacts
-                .download_chunk(
-                    &current.object,
-                    &mut file,
-                    offset,
-                    bytes,
-                    &budget.cancellation,
-                )
-                .await?
-        };
-        check_cancelled(&budget.cancellation)?;
+        let bytes = request
+            .wait(async {
+                let mut file = self.file.lock().await;
+                self.jobs
+                    .artifacts
+                    .download_chunk(
+                        &current.object,
+                        &mut file,
+                        offset,
+                        bytes,
+                        &request.budget.cancellation,
+                    )
+                    .await
+            })
+            .await?;
+        let budget = request.remaining()?;
         self.jobs
             .store
             .handoff_export_chunk(&budget, ctx.scope(), &current, move || {
+                request.check()?;
                 registration.check()?;
                 if let Some(source_registration) = source_registration {
                     source_registration.check()?;
@@ -183,5 +247,29 @@ impl ArchiveDownload {
             })
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notarium_core::{ids::RequestId, ports::Cancellation};
+
+    #[tokio::test]
+    async fn a_waiting_read_uses_the_original_request_deadline() {
+        let request = RequestDeadline::new(CallBudget {
+            request: RequestId::from_bytes([1; 16]),
+            remaining: Duration::from_millis(10),
+            cancellation: Cancellation::default(),
+        })
+        .unwrap();
+        let result = request
+            .wait(std::future::pending::<Result<(), PortError>>())
+            .await;
+        assert!(matches!(result, Err(PortError::DeadlineExceeded(_))));
+        assert!(matches!(
+            request.remaining(),
+            Err(PortError::DeadlineExceeded(_))
+        ));
     }
 }

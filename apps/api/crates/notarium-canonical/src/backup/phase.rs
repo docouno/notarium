@@ -120,6 +120,10 @@ impl<T: Send + 'static> Phase<T> {
 }
 
 impl PreparedBackup for Phase<super::CanonicalPreparedBackup> {
+    fn abort(self: Box<Self>) -> PortFuture<'static, ()> {
+        self.finish(PreparedBackup::abort)
+    }
+
     fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
         self.with(PreparedBackup::acquire_hold)
     }

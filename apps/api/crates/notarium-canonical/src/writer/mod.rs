@@ -280,6 +280,7 @@ enum QueuedWriteEntry {
     Group {
         space_id: SpaceId,
         intents: Vec<PreparedWriteIntent>,
+        isolated: bool,
         staged_bytes_reserved: StagedByteReservation,
         reply_tx: oneshot::Sender<BatchGroupReply>,
     },
@@ -782,6 +783,7 @@ impl WriteCoordinator {
         budget: &CallBudget,
         space_id: &SpaceId,
         intents: Vec<PreparedWriteIntent>,
+        isolated: bool,
     ) -> Result<(Vec<Result<Vec<u8>, PortError>>, SpaceSeq), PortError> {
         let wait = WriterWait::from_budget(budget);
         for intent in &intents {
@@ -799,6 +801,7 @@ impl WriteCoordinator {
         permit.send(QueuedWriteEntry::Group {
             space_id: space_id.clone(),
             intents,
+            isolated,
             staged_bytes_reserved: reserved_bytes,
             reply_tx,
         });
@@ -1040,9 +1043,36 @@ impl crate::CanonicalStore {
     where
         R: Serialize + DeserializeOwned + Send + 'static,
     {
+        self.submit_write_group(budget, space_id, intents, false)
+            .await
+    }
+
+    pub(crate) async fn submit_archive_write_batch<R>(
+        &self,
+        budget: &CallBudget,
+        space_id: &SpaceId,
+        intents: Vec<PreparedWriteIntent>,
+    ) -> Result<(Vec<Result<R, PortError>>, SpaceSeq), PortError>
+    where
+        R: Serialize + DeserializeOwned + Send + 'static,
+    {
+        self.submit_write_group(budget, space_id, intents, true)
+            .await
+    }
+
+    async fn submit_write_group<R>(
+        &self,
+        budget: &CallBudget,
+        space_id: &SpaceId,
+        intents: Vec<PreparedWriteIntent>,
+        isolated: bool,
+    ) -> Result<(Vec<Result<R, PortError>>, SpaceSeq), PortError>
+    where
+        R: Serialize + DeserializeOwned + Send + 'static,
+    {
         let writer = self.inner.writer()?;
         let (raw_items, effective_cut) = writer
-            .submit_batch_raw(&self.inner, budget, space_id, intents)
+            .submit_batch_raw(&self.inner, budget, space_id, intents, isolated)
             .await?;
         let mut decoded = Vec::with_capacity(raw_items.len());
         for raw_res in raw_items {
@@ -1122,6 +1152,10 @@ fn compute_pipelined_batch_target(active_ops: usize, max_items: usize) -> usize 
     active_ops.clamp(1, max_items)
 }
 
+fn is_isolated(entry: &QueuedWriteEntry) -> bool {
+    matches!(entry, QueuedWriteEntry::Group { isolated: true, .. })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_batch_worker_loop(
     inner_weak: std::sync::Weak<CanonicalInner>,
@@ -1136,9 +1170,12 @@ async fn run_batch_worker_loop(
     let max_items = cfg.max_batch_items.max(1);
     let flush_window = cfg.batch_flush_window;
     let mut cached_pg_conn: Option<crate::dialect::postgres::StorePgConnection> = None;
+    let mut deferred = None;
 
     loop {
-        let next = if let Some((id, registry)) = &pg_space {
+        let next = if deferred.is_some() {
+            deferred.take()
+        } else if let Some((id, registry)) = &pg_space {
             match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
                 Ok(entry) => entry,
                 Err(_) => {
@@ -1174,66 +1211,91 @@ async fn run_batch_worker_loop(
 
         let mut item_count = entry_logical_len(&first);
         let mut batch = Vec::with_capacity(max_items.min(64));
+        let isolated = is_isolated(&first);
         batch.push(first);
 
-        let initial_target =
-            compute_pipelined_batch_target(tracker.active_ops.load(Ordering::Acquire), max_items);
-
-        // Drain up to `initial_target` so high-concurrency writer cohorts naturally split into
-        // two double-buffered platoons (zero idle gap between Phase 2 and Phase 1!).
-        while item_count < initial_target {
-            match rx.try_recv() {
-                Ok(entry) => {
-                    item_count += entry_logical_len(&entry);
-                    batch.push(entry);
-                }
-                Err(_) => break,
+        // Archive effects have a later whole-transaction fence. Keep ordinary
+        // saves outside that rollback boundary, preserving mailbox order.
+        'gather: {
+            if isolated {
+                break 'gather;
             }
-        }
+            let initial_target = compute_pipelined_batch_target(
+                tracker.active_ops.load(Ordering::Acquire),
+                max_items,
+            );
 
-        if item_count < initial_target && !flush_window.is_zero() {
-            let deadline =
-                crate::runtime::deadline_after(tokio::time::Instant::now(), flush_window);
-            while item_count < max_items {
-                let notified = tracker.notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
+            let mut add = |entry: QueuedWriteEntry, item_count: &mut usize| {
+                if is_isolated(&entry) {
+                    deferred = Some(entry);
+                    false
+                } else {
+                    *item_count += entry_logical_len(&entry);
+                    batch.push(entry);
+                    true
+                }
+            };
 
-                let active_target = compute_pipelined_batch_target(
-                    tracker.active_ops.load(Ordering::Acquire),
-                    max_items,
-                );
-                while item_count < active_target {
-                    match rx.try_recv() {
-                        Ok(entry) => {
-                            item_count += entry_logical_len(&entry);
-                            batch.push(entry);
+            // Drain up to `initial_target` so high-concurrency writer cohorts naturally split into
+            // two double-buffered platoons (zero idle gap between Phase 2 and Phase 1!).
+            while item_count < initial_target {
+                match rx.try_recv() {
+                    Ok(entry) => {
+                        if !add(entry, &mut item_count) {
+                            break 'gather;
                         }
-                        Err(_) => break,
                     }
+                    Err(_) => break,
                 }
-                if item_count >= active_target {
-                    break;
-                }
+            }
 
-                tokio::select! {
-                    biased;
-                    maybe_entry = rx.recv() => {
-                        match maybe_entry {
-                            Some(entry) => {
-                                item_count += entry_logical_len(&entry);
-                                batch.push(entry);
+            if item_count < initial_target && !flush_window.is_zero() {
+                let deadline =
+                    crate::runtime::deadline_after(tokio::time::Instant::now(), flush_window);
+                while item_count < max_items {
+                    let notified = tracker.notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+
+                    let active_target = compute_pipelined_batch_target(
+                        tracker.active_ops.load(Ordering::Acquire),
+                        max_items,
+                    );
+                    while item_count < active_target {
+                        match rx.try_recv() {
+                            Ok(entry) => {
+                                if !add(entry, &mut item_count) {
+                                    break 'gather;
+                                }
                             }
-                            None => break,
+                            Err(_) => break,
                         }
                     }
-                    _ = notified => {}
-                    _ = tokio::time::sleep_until(deadline) => break,
+                    if item_count >= active_target {
+                        break;
+                    }
+
+                    tokio::select! {
+                        biased;
+                        maybe_entry = rx.recv() => {
+                            match maybe_entry {
+                                Some(entry) => {
+                                    if !add(entry, &mut item_count) {
+                                        break 'gather;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                        _ = notified => {}
+                        _ = tokio::time::sleep_until(deadline) => break,
+                    }
                 }
             }
         }
 
         let Some(inner) = inner_weak.upgrade() else {
+            batch.extend(deferred.take());
             for entry in batch {
                 reject_queued_entry(
                     entry,
@@ -1343,6 +1405,7 @@ async fn flush_single_batch(
                 intents: group_intents,
                 staged_bytes_reserved,
                 reply_tx,
+                ..
             } => {
                 let count = group_intents.len();
                 let all_idempotent = group_intents.iter().all(|it| it.idempotency.is_some());
@@ -2764,6 +2827,7 @@ mod tests {
                 &budget,
                 &scope.space_id,
                 vec![intent()],
+                false,
             ));
             assert!(futures_util::poll!(&mut group).is_pending());
             assert_eq!(writer.byte_limiter.in_flight.load(Ordering::Acquire), 1024);

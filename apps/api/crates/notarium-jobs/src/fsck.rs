@@ -993,36 +993,42 @@ async fn verify_live(
     .await?;
     let installation = pair.canonical_spool.witness.installation.clone();
     let backend = pair.canonical_spool.kind;
-    let (manifest, database_inputs) = live_inputs(&mut pair)?;
-    let keys = external_keyring.to_owned();
-    let database_budget = budget.clone();
-    let verify_options = options.clone();
-    let databases = tokio::task::spawn_blocking(move || {
-        verify_databases(
-            database_inputs.0,
-            database_inputs.1,
-            &manifest,
-            &keys,
-            &database_budget,
-            &verify_options,
-            None,
-        )
-    })
-    .await
-    .map_err(join_error)??;
-    let (blobs, raw_blob_bytes) =
-        crate::backup::verify_live_cas(canonical, &budget, &mut pair, options).await?;
-    pair.release().await?;
-    Ok(FsckReport {
-        installation,
-        backend,
-        archive_digest: None,
-        spaces: databases.histories.len(),
-        blobs,
-        raw_blob_bytes,
-        readable_keys: databases.keys.len(),
-        sqlite_native_peak_bytes: databases.native_peak,
-    })
+    let verified: Result<_, PortError> = async {
+        let (manifest, database_inputs) = live_inputs(&mut pair)?;
+        let keys = external_keyring.to_owned();
+        let database_budget = budget.clone();
+        let verify_options = options.clone();
+        let databases = tokio::task::spawn_blocking(move || {
+            verify_databases(
+                database_inputs.0,
+                database_inputs.1,
+                &manifest,
+                &keys,
+                &database_budget,
+                &verify_options,
+                None,
+            )
+        })
+        .await
+        .map_err(join_error)??;
+        let (blobs, raw_blob_bytes) =
+            crate::backup::verify_live_cas(canonical, &budget, &mut pair, options).await?;
+        Ok(FsckReport {
+            installation,
+            backend,
+            archive_digest: None,
+            spaces: databases.histories.len(),
+            blobs,
+            raw_blob_bytes,
+            readable_keys: databases.keys.len(),
+            sqlite_native_peak_bytes: databases.native_peak,
+        })
+    }
+    .await;
+    let released = pair.release().await;
+    let report = verified?;
+    released?;
+    Ok(report)
 }
 
 fn live_inputs(

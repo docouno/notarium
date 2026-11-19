@@ -2453,6 +2453,18 @@ enum PreparedBackendDriver {
 }
 
 impl PreparedBackendDriver {
+    async fn abort(self) {
+        match self {
+            Self::Sqlite(mut worker) => worker.abort_and_join().await,
+            Self::Postgres(mut pg) => {
+                if let Some(barrier) = pg.barrier.take() {
+                    let _ = barrier.close().await;
+                }
+                pg.abort_cleanly().await;
+            }
+        }
+    }
+
     fn detach_abort_cleanup(&mut self, inner: &CanonicalInner) {
         match self {
             Self::Sqlite(w) => w.detach_abort_cleanup(inner),
@@ -2704,7 +2716,10 @@ impl PausedBackup for CanonicalPausedBackup {
                     (witness, PinnedSnapshotDriver::Postgres(pg))
                 }
             };
-            self.validate_cut(&witness)?;
+            if let Err(error) = self.validate_cut(&witness) {
+                abort_pinned_driver(state).await;
+                return Err(error);
+            }
             let snapshot = CanonicalBackupSnapshot {
                 store: self.store.clone(),
                 backup_id: self.backup_id.clone(),
@@ -2731,27 +2746,25 @@ impl PausedBackup for CanonicalPausedBackup {
     fn resume(mut self: Box<Self>) -> PortFuture<'static, ()> {
         Box::pin(async move {
             self.watchdog.abort();
-            let locks = self
-                .locks
-                .lock()
-                .expect("backup pause")
-                .take()
-                .ok_or_else(|| DomainError::validation(ValidationReason::BudgetExceeded))?;
+            let locks = self.locks.lock().expect("backup pause").take();
             let unpinned = self.unpinned_driver.take();
-            if let Some(mut conn) = locks.database {
-                sqlx::raw_sql("ROLLBACK")
-                    .execute(&mut conn)
-                    .await
-                    .map_err(|err| internal_not_committed("pg_resume_backup", err.to_string()))?;
-            }
-            drop(locks._local);
-            if let Some(drv) = unpinned {
-                match drv {
-                    PreparedBackendDriver::Sqlite(mut w) => w.abort_and_join().await,
-                    PreparedBackendDriver::Postgres(mut p) => p.abort_cleanly().await,
+            let result = if let Some(locks) = locks {
+                if let Some(mut conn) = locks.database {
+                    sqlx::raw_sql("ROLLBACK")
+                        .execute(&mut conn)
+                        .await
+                        .map(|_| ())
+                        .map_err(|err| internal_not_committed("pg_resume_backup", err.to_string()))
+                } else {
+                    Ok(())
                 }
+            } else {
+                Err(DomainError::validation(ValidationReason::BudgetExceeded).into())
+            };
+            if let Some(drv) = unpinned {
+                drv.abort().await;
             }
-            Ok(())
+            result
         })
     }
 }
@@ -3248,6 +3261,15 @@ impl CanonicalStore {
 }
 
 impl PreparedBackup for CanonicalPreparedBackup {
+    fn abort(mut self: Box<Self>) -> PortFuture<'static, ()> {
+        Box::pin(async move {
+            if let Some(driver) = self.driver.take() {
+                driver.abort().await;
+            }
+            Ok(())
+        })
+    }
+
     fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
         Box::pin(async move {
             if self.driver.is_none() {
@@ -3293,7 +3315,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
                 .prepare_budget
                 .deadline
                 .saturating_sub(self.prepared_at.elapsed());
-            let (safe_point, pg_barrier) = wait_for_phase(
+            let result = wait_for_phase(
                 remaining,
                 &self.caller_cancel,
                 &self.store.inner.backup_shutdown,
@@ -3315,7 +3337,14 @@ impl PreparedBackup for CanonicalPreparedBackup {
                     Ok::<_, PortError>((guard, barrier))
                 },
             )
-            .await?;
+            .await;
+            let (safe_point, pg_barrier) = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    drv.abort().await;
+                    return Err(error);
+                }
+            };
 
             let locks = Arc::new(std::sync::Mutex::new(Some(PauseLocks {
                 _local: safe_point,

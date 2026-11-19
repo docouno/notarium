@@ -42,17 +42,19 @@ impl Client {
             session: self.session.clone(),
             complete: false,
         };
-        self.session.check()?;
-        let (tx, rx) = oneshot::channel();
-        self.commands.try_send(command(tx)).map_err(|_| failure())?;
-        let result = self
-            .session
-            .operation
-            .run(
-                async { rx.await.map_err(|_| failure())? },
-                notarium_core::error::CommitEffect::NotCommitted,
-            )
-            .await;
+        let result = async {
+            self.session.check()?;
+            let (tx, rx) = oneshot::channel();
+            self.commands.try_send(command(tx)).map_err(|_| failure())?;
+            self.session
+                .operation
+                .run(
+                    async { rx.await.map_err(|_| failure())? },
+                    notarium_core::error::CommitEffect::NotCommitted,
+                )
+                .await
+        }
+        .await;
         match result {
             Ok(value) => {
                 operation.complete();
@@ -112,6 +114,16 @@ impl Drop for Snapshot {
     }
 }
 impl PreparedBackup for Prepared {
+    fn abort(mut self: Box<Self>) -> PortFuture<'static, ()> {
+        Box::pin(async move {
+            if self.owns {
+                self.client.close().await?;
+                self.owns = false;
+            }
+            Ok(())
+        })
+    }
+
     fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
         Box::pin(async move {
             if !self.owns || self.hold_acquired {

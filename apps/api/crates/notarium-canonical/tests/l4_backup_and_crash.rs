@@ -252,6 +252,11 @@ impl BackupSnapshot for MockSnapshot {
 }
 
 impl PreparedBackup for MockPrepared {
+    fn abort(self: Box<Self>) -> PortFuture<'static, ()> {
+        drop(self);
+        Box::pin(async { Ok(()) })
+    }
+
     fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
         let seq = self.current_seq.load(Ordering::SeqCst);
         let witness = BackupWitness {

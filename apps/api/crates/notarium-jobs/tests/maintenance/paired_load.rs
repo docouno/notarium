@@ -1,5 +1,7 @@
 use super::*;
 
+const FOREGROUND_PAIRS: usize = 4;
+
 pub(super) async fn capture_under_load(
     canonical: &CanonicalStore,
     control: &ControlBackup,
@@ -42,30 +44,30 @@ pub(super) async fn capture_under_load(
                 targets.push(write_target(canonical, space.scope, owner).await);
             }
         }
-        let stop = Cancellation::default();
-        let load = tokio::spawn(foreground(
-            canonical.clone(),
-            owner.clone(),
-            targets,
-            stop.clone(),
-        ));
         let mut confirmed = Vec::with_capacity(captures);
         let mut drained = Vec::with_capacity(captures);
         let mut total = Vec::with_capacity(captures);
         for iteration in 0..=captures {
             let path = root.join(format!("{backend}-{spaces}-{iteration}.zip"));
-            let started = std::time::Instant::now();
-            let result = run_backup(
-                authority(ServicePurpose::Backup),
-                canonical,
-                control,
-                &path,
-                BackupOptions::default(),
-            )
-            .await;
-            let elapsed = started.elapsed();
+            // Keep offered workload independent of archive length. An
+            // unlimited loop grows retained history fastest in slow samples.
+            let capture = async {
+                let started = std::time::Instant::now();
+                let result = run_backup(
+                    authority(ServicePurpose::Backup),
+                    canonical,
+                    control,
+                    &path,
+                    BackupOptions::default(),
+                )
+                .await;
+                (result, started.elapsed())
+            };
+            let ((result, elapsed), ()) = tokio::join!(
+                capture,
+                foreground(canonical, owner, &mut targets, iteration * FOREGROUND_PAIRS,)
+            );
             if let Err(err) = &result {
-                stop.cancel();
                 eprintln!("paired capture {iteration} of {backend}/{spaces} failed: {err:?}");
             }
             let backup = result.unwrap();
@@ -76,10 +78,6 @@ pub(super) async fn capture_under_load(
             }
             fs::remove_file(path).unwrap();
         }
-        stop.cancel();
-        let (updated_targets, writes) = load.await.unwrap();
-        targets = updated_targets;
-        assert!(writes > 0);
         if tier != "unrated" {
             assert!(
                 targets
@@ -92,7 +90,7 @@ pub(super) async fn capture_under_load(
             "{}",
             serde_json::json!({
                 "backend": backend, "tier": tier, "spaces": spaces, "captures": captures,
-                "foreground_writes": writes, "confirmed_ns": confirmed,
+                "foreground_writes": (captures + 1) * FOREGROUND_PAIRS * 2, "confirmed_ns": confirmed,
                 "including_drain_ns": percentiles(drained), "full_backup_ns": percentiles(total),
             })
         );
@@ -108,24 +106,26 @@ pub(super) async fn capture_under_load(
 }
 
 async fn foreground(
-    canonical: CanonicalStore,
-    owner: PrincipalId,
-    mut targets: Vec<WriteTarget>,
-    stop: Cancellation,
-) -> (Vec<WriteTarget>, usize) {
-    let mut pairs = 0;
-    while !stop.is_cancelled() {
-        let index = pairs % targets.len();
+    canonical: &CanonicalStore,
+    owner: &PrincipalId,
+    targets: &mut [WriteTarget],
+    first_pair: usize,
+) {
+    for pair in first_pair..first_pair + FOREGROUND_PAIRS {
+        if pair != first_pair {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let index = pair % targets.len();
         let target = &mut targets[index];
         let scope = &target.scope;
         let note = NoteId::from_bytes(codec::ordered_id_16().unwrap());
-        let slug = format!("load-{pairs}-{}", note.as_str());
+        let slug = format!("load-{pair}-{}", note.as_str());
         canonical
             .create_note(
-                auth(scope, &owner),
+                auth(scope, owner),
                 command(
                     scope,
-                    &owner,
+                    owner,
                     CreateNote {
                         note,
                         parent: None,
@@ -139,10 +139,10 @@ async fn foreground(
             .unwrap();
         let appended = canonical
             .append_chat(
-                auth(scope, &owner),
+                auth(scope, owner),
                 command(
                     scope,
-                    &owner,
+                    owner,
                     AppendChat {
                         thread: target.thread.clone(),
                         parent: target.leaf,
@@ -156,10 +156,7 @@ async fn foreground(
             .await
             .unwrap();
         target.leaf = appended.value.seq;
-        pairs += 1;
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    (targets, pairs * 2)
 }
 
 struct WriteTarget {

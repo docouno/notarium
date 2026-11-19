@@ -298,7 +298,7 @@ impl ArchiveStorage {
                 let key = segment_key(&base, object.segments.len());
                 let data = Bytes::copy_from_slice(data);
                 let digest = digest(&data);
-                let version = put_segment(remote, &key, data, cancellation).await?;
+                let version = put_segment(remote, &key, data, digest, cancellation).await?;
                 object.segments.push(ArchiveSegment {
                     digest,
                     bytes: len as u32,
@@ -888,8 +888,10 @@ async fn put_segment(
     store: &S3BlobStore,
     key: &str,
     bytes: Bytes,
+    expected: ContentDigest,
     cancellation: &Cancellation,
 ) -> Result<Option<String>, PortError> {
+    let len = bytes.len();
     let result = s3_request(
         store,
         S3RawRequest {
@@ -897,7 +899,7 @@ async fn put_segment(
             key: Some(remote_key(store, key)),
             query: Vec::new(),
             headers: vec![("if-none-match".to_owned(), "*".to_owned())],
-            body: bytes.clone(),
+            body: bytes,
         },
         64 * 1024,
         cancellation,
@@ -907,8 +909,8 @@ async fn put_segment(
     let version = match result {
         Ok(response) if matches!(response.status, 200 | 201) => response.version_id(),
         _ => {
-            let verified = get_segment(store, key, None, bytes.len(), cancellation).await?;
-            if verified.body != bytes {
+            let verified = get_segment(store, key, None, len, cancellation).await?;
+            if verified.body.len() != len || digest(&verified.body) != expected {
                 return Err(invalid(ValidationReason::InvalidDigest));
             }
             verified.version_id()

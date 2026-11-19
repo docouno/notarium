@@ -727,6 +727,8 @@ pub trait BackupParticipantPort: Send + Sync {
 pub trait PreparedBackup: Send {
     fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>>;
     fn pause_writes(&mut self) -> PortFuture<'_, Box<dyn PausedBackup>>;
+    /// Acknowledge the cleanup of resources still owned by this phase.
+    fn abort(self: Box<Self>) -> PortFuture<'static, ()>;
 }
 pub trait BackupHold: Send {
     fn witness(&self) -> &BackupWitness;

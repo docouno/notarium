@@ -40,6 +40,7 @@ use crate::{
     backup_format::{CasRecord, authenticated_payload, invalid, io_error},
     fsck::VerifiedArchive,
     import::check_cancelled,
+    maintenance::{limit_source, read_source},
 };
 
 /// A dedicated database and initially empty S3 prefix. Backups contain neither
@@ -89,6 +90,7 @@ async fn restore_inner(
     publishing: &AtomicBool,
 ) -> Result<RestoreReport, PortError> {
     check_cancelled(&ctx.budget.cancellation)?;
+    let archive = Arc::new(archive);
     let timeout = ctx.budget.remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
     let options_pg = build_pg_connect_options(&target.database).options([
         ("statement_timeout", timeout),
@@ -145,8 +147,9 @@ async fn restore_inner(
         .await;
         control.close().await;
         recover?;
+    } else {
+        verify_restored(&mut database, &gate, false).await?;
     }
-    verify_restored(&mut database, &gate).await?;
     Ok(RestoreReport {
         installation: gate.installation,
         archive_digest: gate.archive,
@@ -327,26 +330,41 @@ async fn restore_control_rows(
             return Err(invalid(ValidationReason::InvalidState));
         }
     } else {
-        let mut decoder = SpoolReader::open(authenticated_payload(
-            archive.control()?,
-            archive.manifest.control,
-        ))?;
-        let mut transaction = control.begin_target_import(ctx.clone()).await?;
-        while let Some(mut record) = decoder.next_record()? {
-            check_cancelled(&ctx.budget.cancellation)?;
-            if let TargetRecord::V1StorageEpoch {
-                state,
-                receipt_json,
-                receipt_sha256,
-                ..
-            } = &mut record
-            {
-                "migrating".clone_into(state);
-                *receipt_json = None;
-                *receipt_sha256 = None;
+        let input = authenticated_payload(archive.control()?, archive.manifest.control);
+        let (send, mut rows) = mpsc::channel(1);
+        let cancellation = &ctx.budget.cancellation;
+        let parsing = read_source(cancellation, move || {
+            let mut decoder = SpoolReader::open(input)?;
+            while let Some(record) = decoder.next_record()? {
+                send.blocking_send(record).map_err(|_| {
+                    codec::cancelled_not_committed(
+                        "cloud_restore_control",
+                        "restore receiver closed",
+                    )
+                })?;
             }
-            transaction.append(&[record]).await?;
-        }
+            Ok(())
+        });
+        let mut transaction = control.begin_target_import(ctx.clone()).await?;
+        let writing = async {
+            while let Some(mut record) = rows.recv().await {
+                check_cancelled(cancellation)?;
+                if let TargetRecord::V1StorageEpoch {
+                    state,
+                    receipt_json,
+                    receipt_sha256,
+                    ..
+                } = &mut record
+                {
+                    "migrating".clone_into(state);
+                    *receipt_json = None;
+                    *receipt_sha256 = None;
+                }
+                transaction.append(&[record]).await?;
+            }
+            Ok::<_, PortError>(())
+        };
+        tokio::try_join!(parsing, writing)?;
         transaction.finish().await?;
     }
     sqlx::query(
@@ -365,7 +383,7 @@ async fn restore_canonical_rows(
     gate: &Gate,
     store: &S3BlobStore,
     ctx: &MaintenanceContext,
-    archive: &VerifiedArchive,
+    archive: &Arc<VerifiedArchive>,
     options: BackupOptions,
 ) -> Result<(), PortError> {
     notarium_canonical::schema::bootstrap_postgres_schema(
@@ -379,11 +397,17 @@ async fn restore_canonical_rows(
         .execute(&mut *tx)
         .await
         .map_err(pg_error)?;
-    let witness = import_postgres_spool(
+    let cancellation = &ctx.budget.cancellation;
+    let input = limit_source(
+        cancellation,
         authenticated_payload(archive.canonical()?, archive.manifest.canonical),
+    )
+    .await?;
+    let witness = import_postgres_spool(
+        input,
         archive.manifest.canonical.bytes,
         options.max_pg_row_bytes,
-        ctx.budget.cancellation.clone(),
+        cancellation.clone(),
         &mut tx,
     )
     .await?;
@@ -406,19 +430,26 @@ async fn restore_canonical_rows(
          UPDATE content_jobs SET lease_owner=NULL, lease_until_ms=NULL,artifacts_json='[]',result_msgpack=NULL,
            state=CASE WHEN state IN ('queued','running') THEN 'failed' ELSE state END;",
     ).execute(&mut *tx).await.map_err(pg_error)?;
-    let (records, mut index) = archive.restore_index()?;
-    for _ in 0..records {
-        check_cancelled(&ctx.budget.cancellation)?;
-        let record = CasRecord::read(&mut index)?;
-        restore_publication(
-            &mut tx,
-            gate,
-            store,
-            archive,
-            record,
-            &ctx.budget.cancellation,
-        )
+    let (mut remaining, mut index) = read_source(cancellation, {
+        let archive = Arc::clone(archive);
+        move || archive.restore_index()
+    })
+    .await?;
+    while remaining > 0 {
+        let count = remaining.min(128);
+        let (decoded, remainder) = read_source(cancellation, move || {
+            let decoded = (0..count)
+                .map(|_| CasRecord::read(&mut index))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((decoded, index))
+        })
         .await?;
+        index = remainder;
+        remaining -= count;
+        for record in decoded {
+            check_cancelled(cancellation)?;
+            restore_publication(&mut tx, gate, store, archive, record, cancellation).await?;
+        }
     }
     sqlx::raw_sql(
         "UPDATE blob_catalog c SET ref_count=(SELECT count(*) FROM blob_references r
@@ -471,7 +502,7 @@ async fn restore_publication(
         .bind(part_count).bind(record.raw as i64).bind(now)
         .execute(&mut **tx).await.map_err(pg_error)?;
     let (parts, mut queue) = mpsc::channel(1);
-    let task = tokio::task::spawn_blocking({
+    let task = read_source(cancellation, {
         let reader = source.blob(&record)?;
         let cancellation = cancellation.clone();
         let record = record.clone();
@@ -504,12 +535,8 @@ async fn restore_publication(
             compressed += part.compressed.len() as u64;
         }
         Ok::<_, PortError>(compressed as i64)
-    }
-    .await;
-    drop(queue);
-    let generated = task.await.map_err(super::join_error)?;
-    let compressed = written?;
-    generated?;
+    };
+    let (compressed, ()) = tokio::try_join!(written, task)?;
     sqlx::query(
         "UPDATE blob_publications SET compressed_size=$1 WHERE space_id=$2 AND publication_id=$3",
     )
@@ -627,7 +654,7 @@ async fn rotate(
     let shutdown = runtime.shutdown().await;
     result?;
     shutdown?;
-    verify_restored(conn, gate).await
+    verify_restored(conn, gate, true).await
 }
 
 async fn read_histories(conn: &mut PgConnection) -> Result<Vec<ChangeCursor>, PortError> {
@@ -653,8 +680,29 @@ async fn read_histories(conn: &mut PgConnection) -> Result<Vec<ChangeCursor>, Po
         .collect()
 }
 
-async fn verify_restored(conn: &mut PgConnection, gate: &Gate) -> Result<(), PortError> {
-    if read_histories(conn).await? != gate.histories {
+async fn verify_restored(
+    conn: &mut PgConnection,
+    gate: &Gate,
+    require_cut: bool,
+) -> Result<(), PortError> {
+    let actual = read_histories(conn).await?;
+    let matches = if require_cut {
+        actual == gate.histories
+    } else {
+        gate.histories.iter().all(|saved| {
+            actual
+                .binary_search_by(|current| {
+                    current
+                        .scope
+                        .space_id
+                        .as_str()
+                        .cmp(saved.scope.space_id.as_str())
+                })
+                .ok()
+                .is_some_and(|i| actual[i].scope == saved.scope && actual[i].after >= saved.after)
+        })
+    };
+    if !matches {
         return Err(invalid(ValidationReason::HistoryIncarnationMismatch));
     }
     let matching: bool = sqlx::query_scalar(

@@ -4097,6 +4097,22 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
             .await
             .unwrap();
         assert!(chat.page(&store, &make_budget(), 0).await.is_err());
+        let shadows = format!(
+            "UPDATE archive_export_shadows SET payload=payload WHERE backup_id='{}'",
+            cut.hold_id.as_str(),
+        );
+        assert_eq!(
+            store
+                .execute_diagnostic_write_sql_for_test(&shadows)
+                .await
+                .unwrap(),
+            0
+        );
+        cut.release().await.unwrap();
+        let purge_cut = store
+            .capture_archive_export_paged(&ctx(), &claim, async { Ok(()) })
+            .await
+            .unwrap();
         store
             .delete_note(
                 ctx(),
@@ -4120,7 +4136,18 @@ async fn paged_archive_export_keeps_chat_appends_out_of_the_cut() {
                 .await
                 .is_err()
         );
-        cut.release().await.unwrap();
+        let shadows = format!(
+            "UPDATE archive_export_shadows SET payload=payload WHERE backup_id='{}'",
+            purge_cut.hold_id.as_str(),
+        );
+        assert_eq!(
+            store
+                .execute_diagnostic_write_sql_for_test(&shadows)
+                .await
+                .unwrap(),
+            0
+        );
+        purge_cut.release().await.unwrap();
 
         let delete_schema = async |disposition| {
             store

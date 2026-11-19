@@ -165,6 +165,9 @@ impl ArchiveJobs {
                                 next,
                             )
                             .await?;
+                        if let Some(error) = page.failure {
+                            cleanup_error = Some(error);
+                        }
                         next = page.next;
                         if next.is_none() {
                             return Ok::<(), PortError>(());

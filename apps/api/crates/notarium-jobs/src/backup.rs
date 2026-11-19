@@ -1,5 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
+    future::Future,
     io::{BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -19,7 +20,7 @@ use notarium_core::{
     model::HistoryScope,
     ports::{
         BackupArtifactKind, BackupHold, BackupParticipantPort, BackupSpool, CallBudget,
-        Cancellation, MaintenanceContext, ServicePurpose,
+        Cancellation, MaintenanceContext, PreparedBackup, ServicePurpose,
     },
     receipt::ChangeCursor,
 };
@@ -139,80 +140,84 @@ async fn run_backup_inner(
     let mut pair = capture_pair(ctx.clone(), canonical, control).await?;
     let mut budget = ctx.budget;
     budget.remaining = budget.remaining.saturating_sub(started.elapsed());
-    let cas = pack_cas(canonical, &budget, &mut pair, &work, options.clone()).await?;
-    let temporary = work.path("backup.zip");
-    let index_path = work.path("cas.index");
-    let data_path = work.path("cas.data");
-    let manifest = Manifest {
-        version: 1,
-        installation: pair.canonical_spool.witness.installation.clone(),
-        backend: pair.canonical_spool.kind,
-        control: Payload {
-            bytes: pair.control_spool.bytes,
-            digest: pair.control_spool.digest,
-        },
-        canonical: Payload {
-            bytes: pair.canonical_spool.bytes,
-            digest: pair.canonical_spool.digest,
-        },
-        index: cas.0,
-        cas: cas.1,
-    };
-    let size = [
-        manifest.control,
-        manifest.canonical,
-        manifest.index,
-        manifest.cas,
-    ]
-    .into_iter()
-    .try_fold(0_u64, |bytes, payload| bytes.checked_add(payload.bytes))
-    .filter(|size| *size <= options.max_archive_bytes);
-    if size.is_none() {
-        return Err(invalid(ValidationReason::BudgetExceeded));
-    }
-    let mut control_input = pair.control.try_clone().map_err(io_error)?;
-    let mut canonical_input = pair.canonical.try_clone().map_err(io_error)?;
-    let cancellation = budget.cancellation.clone();
-    let digest = tokio::task::spawn_blocking(move || {
-        let mut index = File::open(index_path).map_err(io_error)?;
-        let mut data = File::open(data_path).map_err(io_error)?;
-        let mut archive = new_file(&temporary)?;
-        let mut zip = ZipWriter::new(LimitedFile::new(
-            archive.try_clone().map_err(io_error)?,
-            options.max_archive_bytes,
-        ));
-        let opts = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Stored)
-            .large_file(true);
-        zip.start_file(MANIFEST, opts).map_err(zip_error)?;
-        serde_json::to_writer(&mut zip, &manifest)
-            .map_err(|err| codec::internal_not_committed("backup_manifest", err.to_string()))?;
-        for (name, payload, source) in [
-            (CONTROL, manifest.control, &mut control_input),
-            (CANONICAL, manifest.canonical, &mut canonical_input),
-            (CAS_INDEX, manifest.index, &mut index),
-            (CAS_DATA, manifest.cas, &mut data),
-        ] {
-            source.seek(SeekFrom::Start(0)).map_err(io_error)?;
-            zip.start_file(name, opts).map_err(zip_error)?;
-            if copy_hash(source, &mut zip, payload.bytes, &cancellation)? != payload {
-                return Err(invalid(ValidationReason::InvalidDigest));
-            }
+    let archive = async {
+        let cas = pack_cas(canonical, &budget, &mut pair, &work, options.clone()).await?;
+        let temporary = work.path("backup.zip");
+        let index_path = work.path("cas.index");
+        let data_path = work.path("cas.data");
+        let manifest = Manifest {
+            version: 1,
+            installation: pair.canonical_spool.witness.installation.clone(),
+            backend: pair.canonical_spool.kind,
+            control: Payload {
+                bytes: pair.control_spool.bytes,
+                digest: pair.control_spool.digest,
+            },
+            canonical: Payload {
+                bytes: pair.canonical_spool.bytes,
+                digest: pair.canonical_spool.digest,
+            },
+            index: cas.0,
+            cas: cas.1,
+        };
+        let size = [
+            manifest.control,
+            manifest.canonical,
+            manifest.index,
+            manifest.cas,
+        ]
+        .into_iter()
+        .try_fold(0_u64, |bytes, payload| bytes.checked_add(payload.bytes))
+        .filter(|size| *size <= options.max_archive_bytes);
+        if size.is_none() {
+            return Err(invalid(ValidationReason::BudgetExceeded));
         }
-        zip.finish()
-            .map_err(zip_error)?
-            .file
-            .sync_all()
-            .map_err(io_error)?;
-        measure_file(&mut archive, options.max_archive_bytes, &cancellation)
-    })
-    .await
-    .map_err(join_error)??;
+        let mut control_input = pair.control.try_clone().map_err(io_error)?;
+        let mut canonical_input = pair.canonical.try_clone().map_err(io_error)?;
+        let cancellation = budget.cancellation.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut index = File::open(index_path).map_err(io_error)?;
+            let mut data = File::open(data_path).map_err(io_error)?;
+            let mut archive = new_file(&temporary)?;
+            let mut zip = ZipWriter::new(LimitedFile::new(
+                archive.try_clone().map_err(io_error)?,
+                options.max_archive_bytes,
+            ));
+            let opts = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Stored)
+                .large_file(true);
+            zip.start_file(MANIFEST, opts).map_err(zip_error)?;
+            serde_json::to_writer(&mut zip, &manifest)
+                .map_err(|err| codec::internal_not_committed("backup_manifest", err.to_string()))?;
+            for (name, payload, source) in [
+                (CONTROL, manifest.control, &mut control_input),
+                (CANONICAL, manifest.canonical, &mut canonical_input),
+                (CAS_INDEX, manifest.index, &mut index),
+                (CAS_DATA, manifest.cas, &mut data),
+            ] {
+                source.seek(SeekFrom::Start(0)).map_err(io_error)?;
+                zip.start_file(name, opts).map_err(zip_error)?;
+                if copy_hash(source, &mut zip, payload.bytes, &cancellation)? != payload {
+                    return Err(invalid(ValidationReason::InvalidDigest));
+                }
+            }
+            zip.finish()
+                .map_err(zip_error)?
+                .file
+                .sync_all()
+                .map_err(io_error)?;
+            measure_file(&mut archive, options.max_archive_bytes, &cancellation)
+        })
+        .await
+        .map_err(join_error)?
+    }
+    .await;
     let id = pair.id.clone();
     let pause = pair.pause;
-    // Open descriptors are still owned while both hold owners acknowledge a
-    // clean release. The immutable output appears only after both ACKs.
-    pair.release().await?;
+    // Await both release acknowledgements, including failures during copy.
+    let released = pair.release().await;
+    let digest = archive?;
+    released?;
     check_cancelled(&budget.cancellation)?;
     work.publish("backup.zip", destination)?;
     Ok(BackupArchive {
@@ -234,76 +239,83 @@ pub(crate) async fn capture_pair(
     let mut nb = canonical.default_backup_budget();
     cb.deadline = cb.deadline.min(ctx.budget.remaining);
     nb.deadline = nb.deadline.min(ctx.budget.remaining);
-    let (mut ctrl, mut canon) = tokio::try_join!(
+    let cancel = ctx.budget.cancellation.clone();
+    let preparations = join_phases(
+        &cancel,
         control.prepare(ctx.clone(), id.clone(), cb),
         canonical.prepare(ctx.clone(), id.clone(), nb),
-    )?;
+    )
+    .await;
+    let (mut ctrl, mut canon) =
+        acknowledge_pair(preparations, |p| p.abort(), |p| p.abort()).await?;
+    let holds = join_phases(&cancel, ctrl.acquire_hold(), canon.acquire_hold()).await;
     let (control_hold, canonical_hold) =
-        tokio::try_join!(ctrl.acquire_hold(), canon.acquire_hold())?;
-    let inclusive = Instant::now();
-    let mut control_paused = ctrl.pause_writes().await?;
-    let confirmed = Instant::now();
-    let mut canonical_paused = canon.pause_writes().await?;
-    let (mut control_cut, mut canonical_cut) =
-        tokio::try_join!(control_paused.open_cut(), canonical_paused.open_cut(),)?;
-    let (control_resume, canonical_resume) =
-        tokio::join!(control_paused.resume(), canonical_paused.resume(),);
-    let pause = PairedPause {
-        confirmed: confirmed.elapsed(),
-        including_drain: inclusive.elapsed(),
-    };
-    control_resume?;
-    canonical_resume?;
-    if control_cut.witness().installation != *canonical.installation_id()
-        || canonical_cut.witness().installation != *canonical.installation_id()
-        || !control_cut.witness().histories.is_empty()
-        || control_cut.witness().canaries.is_empty()
-        || !control_cut
-            .witness()
-            .canaries
-            .iter()
-            .all(|key| key.readable)
-        || !canonical_hold
-            .witness()
-            .histories
-            .iter()
-            .map(|c| &c.scope)
-            .eq(canonical_cut.witness().histories.iter().map(|c| &c.scope))
-    {
-        return Err(invalid(ValidationReason::InvalidAuthority));
+        match acknowledge_pair(holds, |hold| hold.release(), |hold| hold.release()).await {
+            Ok(holds) => holds,
+            Err(error) => {
+                let _ = tokio::join!(ctrl.abort(), canon.abort());
+                return Err(error);
+            }
+        };
+    let captured = async {
+        let (control_spool, canonical_spool, pause) = capture_spools(
+            &ctx,
+            canonical,
+            &mut *ctrl,
+            &mut *canon,
+            &*canonical_hold,
+            cb,
+            nb,
+        )
+        .await?;
+        if control_spool.kind != canonical_spool.kind
+            || control_spool.witness.installation != canonical_spool.witness.installation
+        {
+            return Err(invalid(ValidationReason::ScopeMismatch));
+        }
+        let ((verified_control, control_file), canonical_record) = tokio::try_join!(
+            control.open_artifact(ctx, control_spool.artifact.clone()),
+            canonical.get_backup_artifact(&canonical_spool.artifact),
+        )?;
+        let encoding = match canonical_spool.kind {
+            BackupArtifactKind::SqliteSnapshotV1 => BackupArtifactEncoding::SqliteSnapshotV1,
+            BackupArtifactKind::PostgresSpoolV1 => BackupArtifactEncoding::PostgresSpoolV1,
+        };
+        if verified_control.digest != control_spool.digest
+            || verified_control.bytes != control_spool.bytes
+            || canonical_record.digest != canonical_spool.digest
+            || canonical_record.byte_size != canonical_spool.bytes
+            || canonical_record.encoding != encoding
+            || canonical_record.backup_id != id
+            || canonical_record.installation_id != canonical_spool.witness.installation
+        {
+            return Err(invalid(ValidationReason::InvalidDigest));
+        }
+        let canonical_path = canonical_record.artifact_path;
+        let canonical_file = File::open(&canonical_path).map_err(io_error)?;
+        Ok((
+            control_file,
+            canonical_file,
+            canonical_path,
+            control_spool,
+            canonical_spool,
+            pause,
+        ))
     }
-    let (control_spool, canonical_spool) = tokio::try_join!(
-        control_cut.spool(cb, ctx.budget.cancellation.clone()),
-        canonical_cut.spool(nb, ctx.budget.cancellation.clone()),
-    )?;
-    let (control_close, canonical_close) = tokio::join!(control_cut.close(), canonical_cut.close());
-    control_close?;
-    canonical_close?;
-    if control_spool.kind != canonical_spool.kind
-        || control_spool.witness.installation != canonical_spool.witness.installation
-    {
-        return Err(invalid(ValidationReason::ScopeMismatch));
-    }
-    let ((verified_control, control_file), canonical_record) = tokio::try_join!(
-        control.open_artifact(ctx, control_spool.artifact.clone()),
-        canonical.get_backup_artifact(&canonical_spool.artifact),
-    )?;
-    let encoding = match canonical_spool.kind {
-        BackupArtifactKind::SqliteSnapshotV1 => BackupArtifactEncoding::SqliteSnapshotV1,
-        BackupArtifactKind::PostgresSpoolV1 => BackupArtifactEncoding::PostgresSpoolV1,
-    };
-    if verified_control.digest != control_spool.digest
-        || verified_control.bytes != control_spool.bytes
-        || canonical_record.digest != canonical_spool.digest
-        || canonical_record.byte_size != canonical_spool.bytes
-        || canonical_record.encoding != encoding
-        || canonical_record.backup_id != id
-        || canonical_record.installation_id != canonical_spool.witness.installation
-    {
-        return Err(invalid(ValidationReason::InvalidDigest));
-    }
-    let canonical_path = canonical_record.artifact_path;
-    let canonical_file = File::open(&canonical_path).map_err(io_error)?;
+    .await;
+    let (control_file, canonical_file, canonical_path, control_spool, canonical_spool, pause) =
+        match captured {
+            Ok(pair) => pair,
+            Err(error) => {
+                let _ = tokio::join!(
+                    ctrl.abort(),
+                    canon.abort(),
+                    control_hold.release(),
+                    canonical_hold.release(),
+                );
+                return Err(error);
+            }
+        };
     Ok(Pair {
         id,
         control: control_file,
@@ -315,6 +327,117 @@ pub(crate) async fn capture_pair(
         control_hold,
         canonical_hold,
     })
+}
+
+async fn join_phases<L, R>(
+    cancellation: &Cancellation,
+    left: impl Future<Output = Result<L, PortError>>,
+    right: impl Future<Output = Result<R, PortError>>,
+) -> (Result<L, PortError>, Result<R, PortError>) {
+    async fn observe<T>(
+        cancellation: &Cancellation,
+        phase: impl Future<Output = Result<T, PortError>>,
+    ) -> Result<T, PortError> {
+        let result = phase.await;
+        if result.is_err() {
+            cancellation.cancel();
+        }
+        result
+    }
+    tokio::join!(observe(cancellation, left), observe(cancellation, right))
+}
+
+async fn acknowledge_pair<L, R, LF, RF>(
+    pair: (Result<L, PortError>, Result<R, PortError>),
+    close_left: impl FnOnce(L) -> LF,
+    close_right: impl FnOnce(R) -> RF,
+) -> Result<(L, R), PortError>
+where
+    LF: Future<Output = Result<(), PortError>>,
+    RF: Future<Output = Result<(), PortError>>,
+{
+    match pair {
+        (Ok(left), Ok(right)) => Ok((left, right)),
+        (Err(error), Ok(right)) => {
+            let _ = close_right(right).await;
+            Err(error)
+        }
+        (Ok(left), Err(error)) => {
+            let _ = close_left(left).await;
+            Err(error)
+        }
+        (Err(PortError::Cancelled(_)), Err(error)) | (Err(error), Err(_)) => Err(error),
+    }
+}
+
+async fn capture_spools(
+    ctx: &MaintenanceContext,
+    canonical: &CanonicalStore,
+    ctrl: &mut dyn PreparedBackup,
+    canon: &mut dyn PreparedBackup,
+    canonical_hold: &dyn BackupHold,
+    cb: notarium_core::ports::BackupBudget,
+    nb: notarium_core::ports::BackupBudget,
+) -> Result<(BackupSpool, BackupSpool, PairedPause), PortError> {
+    let inclusive = Instant::now();
+    let mut control_paused = ctrl.pause_writes().await?;
+    let confirmed = Instant::now();
+    let mut canonical_paused = match canon.pause_writes().await {
+        Ok(paused) => paused,
+        Err(error) => {
+            let _ = control_paused.resume().await;
+            return Err(error);
+        }
+    };
+    let cuts = join_phases(
+        &ctx.budget.cancellation,
+        control_paused.open_cut(),
+        canonical_paused.open_cut(),
+    )
+    .await;
+    let (control_resume, canonical_resume) =
+        tokio::join!(control_paused.resume(), canonical_paused.resume(),);
+    let pause = PairedPause {
+        confirmed: confirmed.elapsed(),
+        including_drain: inclusive.elapsed(),
+    };
+    let (mut control_cut, mut canonical_cut) =
+        acknowledge_pair(cuts, |cut| cut.close(), |cut| cut.close()).await?;
+    let result = async {
+        control_resume?;
+        canonical_resume?;
+        if control_cut.witness().installation != *canonical.installation_id()
+            || canonical_cut.witness().installation != *canonical.installation_id()
+            || !control_cut.witness().histories.is_empty()
+            || control_cut.witness().canaries.is_empty()
+            || !control_cut
+                .witness()
+                .canaries
+                .iter()
+                .all(|key| key.readable)
+            || !canonical_hold
+                .witness()
+                .histories
+                .iter()
+                .map(|c| &c.scope)
+                .eq(canonical_cut.witness().histories.iter().map(|c| &c.scope))
+        {
+            return Err(invalid(ValidationReason::InvalidAuthority));
+        }
+        let (control_spool, canonical_spool) = join_phases(
+            &ctx.budget.cancellation,
+            control_cut.spool(cb, ctx.budget.cancellation.clone()),
+            canonical_cut.spool(nb, ctx.budget.cancellation.clone()),
+        )
+        .await;
+        Ok::<_, PortError>((control_spool?, canonical_spool?, pause))
+    }
+    .await;
+    let (control_close, canonical_close) = tokio::join!(control_cut.close(), canonical_cut.close());
+    let spools = result?;
+    control_close?;
+    canonical_close?;
+    Ok(spools)
 }
 
 struct CasInput {
@@ -631,4 +754,38 @@ fn sqlite_error(error: rusqlite::Error) -> PortError {
 
 fn join_error(error: tokio::task::JoinError) -> PortError {
     codec::internal_not_committed("backup_worker", error.to_string())
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_participant_waits_for_the_other_phase_to_settle() {
+        let cancellation = Cancellation::default();
+        let error = invalid(ValidationReason::InvalidState);
+        let pair = join_phases(
+            &cancellation,
+            async { Err::<(), _>(error.clone()) },
+            async {
+                cancellation.cancelled().await;
+                Ok(())
+            },
+        )
+        .await;
+        let mut closed = false;
+        let closed_flag = &mut closed;
+        let result = acknowledge_pair(
+            pair,
+            |()| async { Ok(()) },
+            |()| async move {
+                tokio::task::yield_now().await;
+                *closed_flag = true;
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result, Err(error));
+        assert!(closed);
+    }
 }

@@ -82,8 +82,10 @@ workers own the physical operation and recover durable work after interruption.
   `cas/index` and `cas/data`. Keep the external keyring separately. The archive
   contains encrypted canary witnesses and credential envelopes. Before publishing,
   backup checks that retained CAS counts match actual owners and that the decoded
-  CAS fits the verifier's total size budget. PostgreSQL archive index keys are
-  limited to 2 KiB of uncompressed fields.
+  CAS fits the verifier's total size budget. Control snapshots preserve the
+  Control schema's index-key budget. Canonical snapshots verify logical
+  constraints, and PostgreSQL enforces physical index limits on the hidden
+  restore target before publication.
 - `run_fsck` accepts a live installation or an owned, immutable `Read + Seek +
   Send` archive source. A remote adapter must pin the object version before
   opening the source. Use `ArchiveInput::with_length` when the pinned version
@@ -116,6 +118,8 @@ workload is available as an opt-in test in `notarium-jobs`.
 
 The maintenance integration test can run the full paired backup under
 foreground note and chat writes with `NOTARIUM_PAIRED_ARCHIVE_CAPTURES=1000`.
+Each capture runs alongside four note/chat write pairs, spaced at 10 ms and
+rotated across the participating Spaces.
 It reports confirmed pause, pause including drain, and complete backup latency
 for 1 and 64 Spaces. Select `NOTARIUM_ARCHIVE_BENCH_TIER=high` or `medium` on the
 matching hardware from [Storage performance](storage-performance.md) to apply

@@ -712,8 +712,12 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
         .await
         .unwrap()
         .scope;
-    let carrier = "# Cloud round trip\n\nAn immutable version in the source bucket.\n";
-    store
+    let carrier = format!(
+        "# {}\n\nAn immutable version in the source bucket.\n",
+        "x".repeat(2100),
+    );
+    let note = NoteId::from_bytes([26; 16]);
+    let created = store
         .create_note(
             auth(&scope, &owner),
             Mutation {
@@ -725,11 +729,11 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
                 },
                 preconditions: Preconditions::default(),
                 input: CreateNote {
-                    note: NoteId::from_bytes([26; 16]),
+                    note: note.clone(),
                     parent: None,
                     slug: "cloud".into(),
                     class: DocClass::UserDoc,
-                    carrier: carrier.into(),
+                    carrier: carrier.clone(),
                 },
             },
         )
@@ -771,6 +775,36 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
         .execute(&mut src_sql)
         .await
         .unwrap();
+    store
+        .rename_note(
+            auth(&scope, &owner),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: owner.clone(),
+                    key: CommandKey::from_bytes([27; 16]),
+                    hash: ContentDigest::from_bytes([28; 32]),
+                },
+                preconditions: Preconditions {
+                    revision: Some(created.value.revision),
+                    ..Preconditions::default()
+                },
+                input: RenameNote {
+                    note,
+                    slug: "long-title-with-alias".into(),
+                    title: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let alias_bytes: i32 = sqlx::query_scalar(
+        "SELECT max(octet_length(old_title_norm)) FROM v1_canonical.note_aliases",
+    )
+    .fetch_one(&mut src_sql)
+    .await
+    .unwrap();
+    assert_eq!(alias_bytes, 2100);
     let export = held_export(&store, &scope, &owner).await;
     sqlx::query("INSERT INTO v1_canonical.archive_export_cuts(backup_id,space_id,cutoff_seq) VALUES($1,$2,$3)")
         .bind(export.hold_id.as_str()).bind(scope.space_id.as_str()).bind(export.seq.get() as i64)
@@ -813,15 +847,6 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     )
     .await
     .unwrap();
-    let replay = run_restore(
-        authority(ServicePurpose::Restore),
-        open(&path),
-        target_spec,
-        BackupOptions::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(restored.histories, replay.histories);
     assert_ne!(restored.histories[0].scope, scope);
     assert!(
         CanonicalRuntime::open(cloud_config(
@@ -839,7 +864,7 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     ))
     .await
     .unwrap();
-    let content = notarium_syntax::content_digest(carrier);
+    let content = notarium_syntax::content_digest(&carrier);
     assert_eq!(
         restored_store
             .read_verified_blob(&restored.histories[0].scope, content)
@@ -850,6 +875,59 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     assert_eq!(
         store.read_verified_blob(&scope, content).await.unwrap(),
         carrier.as_bytes()
+    );
+    let live_scope = &restored.histories[0].scope;
+    let restored_epoch = restored_store
+        .read_space(&live_scope.space_id)
+        .await
+        .unwrap()
+        .active_epoch;
+    restored_store
+        .advance_space_lease(
+            &authority(ServicePurpose::Revocation),
+            live_scope,
+            LeaseEpoch::new(restored_epoch.get() + 1).unwrap(),
+        )
+        .await
+        .unwrap();
+    restored_store
+        .create_note(
+            auth(live_scope, &owner),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: live_scope.clone(),
+                    actor: owner.clone(),
+                    key: CommandKey::from_bytes([29; 16]),
+                    hash: ContentDigest::from_bytes([30; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: NoteId::from_bytes([31; 16]),
+                    parent: None,
+                    slug: "written-after-ready".into(),
+                    class: DocClass::UserDoc,
+                    carrier: "# Written after ready\n".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let replay = run_restore(
+        authority(ServicePurpose::Restore),
+        open(&path),
+        target_spec,
+        BackupOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.histories, replay.histories);
+    assert!(
+        restored_store
+            .read_space(&scope.space_id)
+            .await
+            .unwrap()
+            .last_seq
+            > restored.histories[0].after
     );
     let restored_control = ControlStore::postgres(PostgresConfig::from_connect_options(
         build_pg_connect_options(&target),

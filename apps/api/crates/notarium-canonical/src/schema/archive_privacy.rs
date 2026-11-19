@@ -49,12 +49,16 @@ const GATES: &[(&str, &str, &str)] = &[
 const BUMP: &str = "INSERT INTO archive_privacy(space_id, generation) VALUES (NEW.space_id, 1)
     ON CONFLICT(space_id) DO UPDATE SET generation = archive_privacy.generation + 1";
 
+// An invalidated cut can never read again. Its cascade removes pre-images
+// atomically with the privacy mutation, including any just captured by it.
+const CLEAR_CUTS: &str = "DELETE FROM archive_export_cuts WHERE space_id=NEW.space_id";
+
 pub fn sqlite_statements() -> impl Iterator<Item = String> {
     GATES.iter().map(|(table, columns, condition)| {
         format!(
             "CREATE TRIGGER IF NOT EXISTS archive_privacy_{table}
              AFTER UPDATE OF {columns} ON {table} WHEN ({condition})
-             BEGIN {BUMP}; END"
+             BEGIN {BUMP}; {CLEAR_CUTS}; END"
         )
     })
 }
@@ -75,7 +79,7 @@ pub(super) async fn postgres(conn: &mut PgConnection) -> Result<(), PortError> {
          RETURNS TRIGGER LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
          BEGIN
            PERFORM pg_advisory_xact_lock(hashtextextended(current_schema() || ':' || NEW.space_id, 7311231));
-           {BUMP}; RETURN NEW;
+           {BUMP}; {CLEAR_CUTS}; RETURN NEW;
          END;
          $$"
     );

@@ -685,7 +685,11 @@ impl CanonicalStore {
         let mut budget = ctx.budget.clone();
         budget.remaining = deadline.remaining(&ctx.budget)?;
         let (outcomes, _) = self
-            .submit_write_batch::<StoredCommittedNoteRevV1>(&budget, &space.scope.space_id, intents)
+            .submit_archive_write_batch::<StoredCommittedNoteRevV1>(
+                &budget,
+                &space.scope.space_id,
+                intents,
+            )
             .await?;
         Ok(outcomes
             .into_iter()

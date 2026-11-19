@@ -1572,6 +1572,11 @@ struct PreparedFixture {
     fail: bool,
 }
 impl PreparedBackup for PreparedFixture {
+    fn abort(self: Box<Self>) -> PortFuture<'static, ()> {
+        drop(self);
+        Box::pin(async { Ok(()) })
+    }
+
     fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
         Box::pin(async {
             Ok(Box::new(HoldFixture {

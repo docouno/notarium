@@ -1,11 +1,17 @@
-use std::future::Future;
+use std::{
+    future::Future,
+    io::{self, Read},
+};
 
 use notarium_canonical::codec;
 use notarium_core::{
     error::{CommitEffect, PortError, ValidationReason},
     ports::{Cancellation, MaintenanceContext},
 };
-use tokio::{sync::Semaphore, time::Instant};
+use tokio::{
+    sync::{Semaphore, SemaphorePermit},
+    time::Instant,
+};
 
 use crate::{backup_format::invalid, import::check_cancelled};
 
@@ -15,15 +21,41 @@ struct CancelOnDrop(Cancellation);
 // The worker retains its slot until that call actually returns.
 static SOURCE_WORKERS: Semaphore = Semaphore::const_new(2);
 
+async fn source_slot(cancellation: &Cancellation) -> Result<SemaphorePermit<'static>, PortError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(source_cancelled()),
+        permit = SOURCE_WORKERS.acquire() => Ok(permit.expect("source worker limit is never closed")),
+    }
+}
+
+struct LimitedSource<R> {
+    reader: R,
+    _slot: SemaphorePermit<'static>,
+}
+
+impl<R: Read> Read for LimitedSource<R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        self.reader.read(output)
+    }
+}
+
+/// The downstream parser moves this reader into its own blocking worker.
+pub(crate) async fn limit_source<R: Read>(
+    cancellation: &Cancellation,
+    reader: R,
+) -> Result<impl Read + use<R>, PortError> {
+    Ok(LimitedSource {
+        reader,
+        _slot: source_slot(cancellation).await?,
+    })
+}
+
 pub(crate) async fn read_source<T: Send + 'static>(
     cancellation: &Cancellation,
     work: impl FnOnce() -> Result<T, PortError> + Send + 'static,
 ) -> Result<T, PortError> {
-    let permit = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => return Err(source_cancelled()),
-        permit = SOURCE_WORKERS.acquire() => permit.expect("source worker limit is never closed"),
-    };
+    let permit = source_slot(cancellation).await?;
     let worker = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         work()
