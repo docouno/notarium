@@ -19,6 +19,8 @@ memmap2 = { workspace = true }
 arc-swap = { workspace = true }
 blake3 = { workspace = true }
 caseless = { workspace = true }
+cap-std = { workspace = true }
+cap-fs-ext = { workspace = true }
 croaring = { workspace = true }
 pulldown-cmark = { workspace = true }
 serde = { workspace = true }

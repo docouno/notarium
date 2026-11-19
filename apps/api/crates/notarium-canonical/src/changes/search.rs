@@ -2,25 +2,28 @@
 
 use super::{has_post_cutoff_purge_of_prior_note_tx, list_note_keys_at_or_below_cutoff_tx};
 use crate::{
-    codec::{NoteRevisionMetadata, RevisionMetadataPayload, internal_not_committed},
-    domain::common::{CommandDeadline, FolderAncestryCache},
+    codec::{
+        NoteRevisionMetadata, RevisionMetadataEnvelope, RevisionMetadataPayload, i64_to_space_seq,
+        internal_not_committed,
+    },
+    domain::common::{CommandDeadline, FolderAncestryCache, extract_note_preview},
     runtime::{
-        CanonicalStore, SpaceRecord, load_space_record, read_immutable_revision_tx,
+        CanonicalStore, SpaceRecord, load_space_record, pg_read_error, read_immutable_revision_tx,
         validate_snapshot_cutoff_tx,
     },
     sql_exec::BackendConn,
 };
 use notarium_core::{
     DomainError,
-    auth::{ResourceFacts, SpaceLifecycle},
-    classes::{ClassifiedDocument, DocClass},
+    auth::{EngineAuthContext, ResourceFacts, SpaceLifecycle},
+    classes::{ClassEgressFence, ClassifiedDocument, DocClass},
     error::{PortError, ValidationReason},
     ids::{ContentDigest, FolderId, NoteId, PrincipalId, RevisionId, SpaceSeq},
     model::{HistoryScope, Lifecycle, NoteRef},
-    ports::{CallBudget, PageLimit, ServiceAuthority, ServicePurpose},
+    ports::{CallBudget, PageLimit, ServiceAuthority, ServicePurpose, SpaceContext},
     receipt::ChangeCursor,
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 #[derive(Clone, Debug)]
 pub struct SearchIndexedNote {
@@ -48,6 +51,16 @@ struct PendingNote {
     project: Option<FolderId>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SearchOverlayNote {
+    pub note_id: NoteId,
+    pub document: ClassifiedDocument,
+    pub title: String,
+    pub path: String,
+    pub preview: String,
+    pub parent_folder_id: FolderId,
+}
+
 enum Notes {
     Seed {
         after: Option<NoteId>,
@@ -57,6 +70,139 @@ enum Notes {
 }
 
 impl CanonicalStore {
+    pub async fn read_note_revisions_for_overlay(
+        &self,
+        authority: &ServiceAuthority,
+        budget: CallBudget,
+        scope: HistoryScope,
+        targets: Vec<(NoteId, RevisionId)>,
+    ) -> Result<Vec<(NoteId, Option<SearchOverlayNote>)>, PortError> {
+        authority.require(ServicePurpose::Search)?;
+        if targets.len() > 8 {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+        }
+        self.read_exact_search_notes(budget, scope, targets, None)
+            .await?
+            .into_iter()
+            .map(|(key, row)| {
+                let overlay = row
+                    .map(|(note, path)| {
+                        let content =
+                            ClassEgressFence::index_for_search(note.document.clone(), authority)?;
+                        Ok::<_, DomainError>(SearchOverlayNote {
+                            note_id: note.note_id,
+                            preview: extract_note_preview(
+                                content.text(),
+                                content.provenance().class(),
+                            ),
+                            document: note.document,
+                            title: note.title,
+                            path,
+                            parent_folder_id: note.parent_folder_id,
+                        })
+                    })
+                    .transpose()?;
+                Ok((key, overlay))
+            })
+            .collect()
+    }
+
+    pub async fn read_authorized_documents_for_search(
+        &self,
+        ctx: SpaceContext,
+        targets: Vec<(NoteId, RevisionId)>,
+    ) -> Result<Vec<Option<Arc<ClassifiedDocument>>>, PortError> {
+        if targets.len() > 200 {
+            return Err(DomainError::validation(ValidationReason::InvalidLimit).into());
+        }
+        let scope = ctx.scope().clone();
+        let auth = ctx.auth().clone();
+        let rows = self
+            .read_exact_search_notes(ctx.budget, scope, targets, Some(auth.clone()))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(_, row)| {
+                row.and_then(|(note, _)| {
+                    ClassEgressFence::search(note.document.clone(), &auth).ok()?;
+                    Some(Arc::new(note.document))
+                })
+            })
+            .collect())
+    }
+
+    async fn read_exact_search_notes(
+        &self,
+        mut budget: CallBudget,
+        scope: HistoryScope,
+        targets: Vec<(NoteId, RevisionId)>,
+        auth: Option<EngineAuthContext>,
+    ) -> Result<Vec<(NoteId, Option<(SearchIndexedNote, String)>)>, PortError> {
+        let deadline = CommandDeadline::start(&budget, "read_exact_search_notes");
+        let mut tx_budget = budget.clone();
+        tx_budget.remaining = deadline.remaining(&budget)?.min(Duration::from_millis(250));
+        let scope_for_tx = scope.clone();
+        let auth_for_tx = auth.clone();
+        let pending = self
+            .with_read_tx_budget(Some(&tx_budget), |tx| {
+                Box::pin(async move {
+                    let space = active_space(tx, &scope_for_tx).await?;
+                    let mut live = FolderAncestryCache::default();
+                    let mut slots = Vec::with_capacity(targets.len());
+                    for (key, revision) in targets {
+                        let row = load_exact_note(
+                            tx,
+                            &space,
+                            &key,
+                            revision,
+                            &mut live,
+                            auth_for_tx.as_ref(),
+                        )
+                        .await?;
+                        slots.push((key, row));
+                    }
+                    Ok(slots)
+                })
+            })
+            .await?;
+        let mut rows = Vec::with_capacity(pending.len());
+        for (key, row) in pending {
+            budget.remaining = deadline.remaining(&budget)?;
+            let row = match row {
+                Some((pending, path)) => self
+                    .load_search_carrier(&scope, &budget, pending)
+                    .await?
+                    .map(|note| (note, path)),
+                None => None,
+            };
+            rows.push((key, row));
+        }
+        tx_budget.remaining = deadline.remaining(&budget)?.min(Duration::from_millis(250));
+        self.with_read_tx_budget(Some(&tx_budget), |tx| {
+            Box::pin(async move {
+                let space = active_space(tx, &scope).await?;
+                let mut live = FolderAncestryCache::default();
+                for (key, row) in &mut rows {
+                    let Some((note, _)) = row else {
+                        continue;
+                    };
+                    match live_search_facts(tx, &space, key, &mut live).await? {
+                        Some(facts)
+                            if auth
+                                .as_ref()
+                                .is_none_or(|auth| auth.can_view_resource(&facts).is_ok()) =>
+                        {
+                            note.document.bind_current(facts, Lifecycle::Active)?;
+                        }
+                        _ => *row = None,
+                    }
+                }
+                Ok(rows)
+            })
+        })
+        .await
+    }
+
     pub async fn read_searchable_notes_seed_page(
         &self,
         authority: &ServiceAuthority,
@@ -246,6 +392,90 @@ impl CanonicalStore {
             revision_actor: pending.actor,
         }))
     }
+}
+
+async fn load_exact_note(
+    tx: &mut BackendConn<'_>,
+    space: &SpaceRecord,
+    note: &NoteId,
+    revision: RevisionId,
+    live: &mut FolderAncestryCache,
+    auth: Option<&EngineAuthContext>,
+) -> Result<Option<(PendingNote, String)>, PortError> {
+    let Some(current) = live_search_facts(tx, space, note, live).await? else {
+        return Ok(None);
+    };
+    if auth.is_some_and(|auth| auth.can_view_resource(&current).is_err()) {
+        return Ok(None);
+    }
+    const SQL: &str = "SELECT metadata_msgpack, visibility_seq, actor_id FROM revisions
+        WHERE space_id = $1 AND rev_id = $2 AND entity_type = 'note' AND entity_key = $3";
+    let row: Option<(Vec<u8>, i64, String)> = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_as(SQL)
+            .bind(space.scope.space_id.as_str())
+            .bind(revision.as_str())
+            .bind(note.as_str())
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_search_exact", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_as(SQL)
+            .bind(space.scope.space_id.as_str())
+            .bind(revision.as_str())
+            .bind(note.as_str())
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| pg_read_error("pg_search_exact", err))?,
+    };
+    let Some((bytes, visibility, actor)) = row else {
+        return Ok(None);
+    };
+    let RevisionMetadataPayload::Note(meta) = RevisionMetadataEnvelope::decode(&bytes)?.payload
+    else {
+        return Err(internal_not_committed(
+            "search_exact_revision",
+            "expected note metadata",
+        ));
+    };
+    if meta.doc_class == DocClass::EncryptedNote || meta.lifecycle != Lifecycle::Active {
+        return Ok(None);
+    }
+    let digest = meta.content_digest.ok_or_else(|| {
+        internal_not_committed(
+            "search_exact_revision",
+            "active note is missing its carrier",
+        )
+    })?;
+    let mut history = FolderAncestryCache::at_cut(&space.scope, i64_to_space_seq(visibility)?);
+    let (facts, ancestry) = history
+        .build_resource_facts_tx(
+            tx,
+            &space.space,
+            &meta.parent_folder_id,
+            meta.doc_class,
+            meta.ability_id.clone(),
+            false,
+        )
+        .await?;
+    if auth.is_some_and(|auth| auth.can_view_resource(&facts).is_err()) {
+        return Ok(None);
+    }
+    let path = if ancestry.folder_path.is_empty() {
+        format!("{}.md", meta.slug)
+    } else {
+        format!("{}/{}.md", ancestry.folder_path, meta.slug)
+    };
+    let project = history.enclosing_project(&ancestry);
+    Ok(Some((
+        PendingNote {
+            meta,
+            revision,
+            actor: PrincipalId::parse(&actor)?,
+            digest,
+            facts,
+            project,
+        },
+        path,
+    )))
 }
 
 async fn active_space(

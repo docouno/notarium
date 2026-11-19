@@ -191,6 +191,23 @@ async fn run_changes_and_seed_suite(store: &CanonicalStore, seed: u8) {
         .expect("read search seed continuation");
     assert_eq!(next_page.notes[0].note_id, note_b);
     assert!(next_page.next_after.is_none());
+    let overlay = store
+        .read_note_revisions_for_overlay(
+            &search.authority,
+            search.budget.clone(),
+            scope1.clone(),
+            vec![
+                (note_b.clone(), pairs_ab[0].1.clone()),
+                (note_a.clone(), pairs_ab[0].1.clone()),
+            ],
+        )
+        .await
+        .expect("hydrate only the requested note and revision pair");
+    assert!(overlay[0].1.is_none());
+    let overlay = overlay[1].1.as_ref().unwrap();
+    assert_eq!(overlay.document.revision(), &pairs_ab[0].1);
+    assert_eq!(overlay.path, "note-a.md");
+    assert!(overlay.preview.contains("Body A"));
 
     // Confirm broadcast hint arrived at 102 AFTER commit!
     let adv_102 = sub_at_100.next().await.expect("next").expect("some notice");

@@ -3020,6 +3020,8 @@ dependencies = [
  "allocation-counter",
  "arc-swap",
  "blake3",
+ "cap-fs-ext",
+ "cap-std",
  "caseless",
  "croaring",
  "getrandom 0.4.3",

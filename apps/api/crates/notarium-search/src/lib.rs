@@ -1,4 +1,7 @@
-//! Reserved for the search subsystem. Domain behavior is added in later waves.
+//! Rebuildable search indexes over canonical document and chat history.
+
+pub mod layout;
+pub mod ports;
 
 #[cfg(test)]
 mod tests {

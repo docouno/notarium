@@ -1,3 +1,4 @@
+pub mod search;
 mod staging;
 
 use std::sync::{

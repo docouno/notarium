@@ -1962,7 +1962,7 @@ async fn list_note_keys_at_or_below_cutoff_tx(
     }
 }
 
-async fn list_thread_keys_at_or_below_cutoff_tx(
+pub(crate) async fn list_thread_keys_at_or_below_cutoff_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     cutoff: SpaceSeq,
