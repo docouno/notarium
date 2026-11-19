@@ -6,7 +6,7 @@ use super::{
     CanonicalInner, CanonicalStore, PausedBackup, PortError, PortFuture, PreparedBackup,
     cancelled_not_committed,
 };
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 
 fn closed() -> PortError {
@@ -37,79 +37,112 @@ pub(super) fn prepare(
         let (mut reply, result) = oneshot::channel();
         let inner = store.inner.clone();
         spawn_owner(&inner, (), |()| async move {
+            if reply.is_closed() {
+                return;
+            }
+            let cancellation = ctx.budget.cancellation.clone();
+            let prepare = store.prepare_source(ctx, backup, budget);
+            tokio::pin!(prepare);
             let prepared = tokio::select! {
-                biased;
-                () = reply.closed() => return,
-                result = store.prepare_source(ctx, backup, budget) => result,
+                result = &mut prepare => result,
+                () = reply.closed() => {
+                    cancellation.cancel();
+                    prepare.await
+                },
             };
             let handle = match prepared {
-                Ok(raw) => Phase::new(&store.inner, raw, PreparedBackup::abort)
+                Ok(raw) => Phase::new(&store.inner, raw, cancellation, PreparedBackup::abort)
                     .await
                     .map(|phase| Box::new(phase) as Box<dyn PreparedBackup>),
                 Err(error) => Err(error),
             };
-            let _ = reply.send(handle);
+            if let Err(Ok(handle)) = reply.send(handle) {
+                let _ = handle.abort().await;
+            }
         })
         .map_err(|()| closed())?;
         result.await.map_err(|_| closed())?
     })
 }
 
-type PhaseCall<T> =
-    Box<dyn for<'a> FnOnce(&'a mut T) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> + Send>;
+type PhaseCall<T> = Box<dyn for<'a> FnOnce(&'a mut T) -> PortFuture<'a, ()> + Send>;
 
 pub(super) struct Phase<T> {
     commands: mpsc::Sender<PhaseCall<T>>,
     finished: oneshot::Receiver<Result<(), PortError>>,
+    cancellation: Cancellation,
 }
 
 impl<T: Send + 'static> Phase<T> {
     pub(super) async fn new(
         inner: &CanonicalInner,
         resource: T,
+        cancellation: Cancellation,
         close: fn(Box<T>) -> PortFuture<'static, ()>,
     ) -> Result<Self, PortError> {
         let (commands, mut queue) = mpsc::channel::<PhaseCall<T>>(1);
         let (done, finished) = oneshot::channel();
         let shutdown = inner.backup_shutdown.clone();
         let owner = spawn_owner(inner, resource, |mut resource| async move {
-            loop {
+            let settled = loop {
                 let command = tokio::select! {
                     biased;
-                    () = shutdown.cancelled() => break,
+                    () = shutdown.cancelled() => break Ok(()),
                     command = queue.recv() => command,
                 };
-                let Some(call) = command else { break };
-                // An admitted spool reports its actual publication result. Each
-                // database phase observes shutdown while it still owns the work.
-                call(&mut resource).await;
-            }
+                let Some(call) = command else { break Ok(()) };
+                if let Err(error) = call(&mut resource).await {
+                    break Err(error);
+                }
+            };
             drop(queue);
             // Shutdown, explicit close, and a dropped handle all use the
             // same resource owner and await the same database cleanup.
-            let _ = done.send(close(Box::new(resource)).await);
+            let _ = done.send(settled.and(close(Box::new(resource)).await));
         });
         if let Err(resource) = owner {
             close(Box::new(resource)).await?;
             return Err(closed());
         }
-        Ok(Self { commands, finished })
+        Ok(Self {
+            commands,
+            finished,
+            cancellation,
+        })
     }
 
-    fn with<R: Send + 'static>(
+    fn with<R, F>(
         &self,
         op: impl for<'a> FnOnce(&'a mut T) -> PortFuture<'a, R> + Send + 'static,
-    ) -> PortFuture<'static, R> {
+        dispose: impl FnOnce(R) -> F + Send + 'static,
+    ) -> PortFuture<'static, R>
+    where
+        R: Send + 'static,
+        F: Future<Output = Result<(), PortError>> + Send + 'static,
+    {
         let commands = self.commands.clone();
+        let cancellation = self.cancellation.clone();
         Box::pin(async move {
             let (mut reply, result) = oneshot::channel();
             let command: PhaseCall<T> = Box::new(move |resource| {
                 Box::pin(async move {
-                    tokio::select! {
-                        biased;
-                        () = reply.closed() => {},
-                        result = op(resource) => { let _ = reply.send(result); },
+                    if reply.is_closed() {
+                        return Ok(());
                     }
+                    let operation = op(resource);
+                    tokio::pin!(operation);
+                    let result = tokio::select! {
+                        result = &mut operation => result,
+                        () = reply.closed() => {
+                            // An admitted phase owns work until it settles.
+                            cancellation.cancel();
+                            operation.await
+                        },
+                    };
+                    if let Err(Ok(undelivered)) = reply.send(result) {
+                        dispose(undelivered).await?;
+                    }
+                    Ok(())
                 })
             });
             commands.send(command).await.map_err(|_| closed())?;
@@ -130,17 +163,17 @@ impl PreparedBackup for Phase<super::CanonicalPreparedBackup> {
     }
 
     fn acquire_hold(&mut self) -> PortFuture<'_, Box<dyn BackupHold>> {
-        self.with(PreparedBackup::acquire_hold)
+        self.with(PreparedBackup::acquire_hold, |hold| hold.release())
     }
 
     fn pause_writes(&mut self) -> PortFuture<'_, Box<dyn PausedBackup>> {
-        self.with(PreparedBackup::pause_writes)
+        self.with(PreparedBackup::pause_writes, |pause| pause.resume())
     }
 }
 
 impl PausedBackup for Phase<super::CanonicalPausedBackup> {
     fn open_cut(&mut self) -> PortFuture<'_, Box<dyn BackupSnapshot>> {
-        self.with(PausedBackup::open_cut)
+        self.with(PausedBackup::open_cut, |snapshot| snapshot.close())
     }
 
     fn resume(self: Box<Self>) -> PortFuture<'static, ()> {
@@ -156,9 +189,10 @@ pub(super) struct Snapshot {
 impl Snapshot {
     pub(super) async fn new(raw: super::CanonicalBackupSnapshot) -> Result<Self, PortError> {
         let inner = raw.store.inner.clone();
+        let cancellation = raw.caller_cancel.clone();
         Ok(Self {
             witness: raw.witness.clone(),
-            source: Phase::new(&inner, raw, BackupSnapshot::close).await?,
+            source: Phase::new(&inner, raw, cancellation, BackupSnapshot::close).await?,
         })
     }
 }
@@ -173,7 +207,10 @@ impl BackupSnapshot for Snapshot {
         budget: BackupBudget,
         cancellation: Cancellation,
     ) -> PortFuture<'_, BackupSpool> {
-        self.source.with(move |p| p.spool(budget, cancellation))
+        self.source.with(
+            move |p| p.spool(budget, cancellation),
+            |_| std::future::ready(Ok(())),
+        )
     }
 
     fn close(self: Box<Self>) -> PortFuture<'static, ()> {

@@ -131,10 +131,16 @@ the corresponding p95 threshold.
 ```sh
 sh docker/storage-fixtures/with-storage-fixtures.sh exec-custom \
   sh .devkit/runtime/devkit.sh cli exec --component apps/api --network none -- \
-  env NOTARIUM_PAIRED_ARCHIVE_CAPTURES=1000 NOTARIUM_ARCHIVE_BENCH_TIER=high \
+  env TMPDIR=/workspace/apps/api/target \
+  NOTARIUM_PAIRED_ARCHIVE_CAPTURES=1000 NOTARIUM_ARCHIVE_BENCH_TIER=high \
   cargo test --release --locked --offline -p notarium-jobs --test maintenance \
   archive_verification -- --test-threads=1 --nocapture
 ```
+
+Keep the release build identity, volume calibration and the printed mount
+information with each series. Rated runs require ext4 for the SQLite, spool and
+PostgreSQL data directories. The work directory in this command uses the
+bind-mounted Cargo target volume.
 
 Set `NOTARIUM_CLOUD_ARCHIVE_TAKEOVER=10000`
 to kill the first Cloud worker after 201 durable units, remove its local

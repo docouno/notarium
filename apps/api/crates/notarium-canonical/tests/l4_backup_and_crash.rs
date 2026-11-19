@@ -24,6 +24,7 @@ use notarium_canonical::{
     decode_postgres_spool_v1, default_backup_budget,
 };
 use notarium_core::{
+    DomainError,
     auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
     classes::DocClass,
     epoch::DataRoot,
@@ -989,6 +990,127 @@ async fn postgres_spool_import_cancels_during_a_blocked_source_read() {
         Err(PortError::Cancelled(failure)) if failure.effect() == CommitEffect::NotCommitted
     ));
     target.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropping_an_admitted_postgres_cut_waits_for_source_cleanup() {
+    let case = BackendCase::open_pg_s3_with_pool(1).await;
+    case.store
+        .create_space(backup_test_space(0xc6))
+        .await
+        .unwrap();
+    let (fixtures, schema) = case.pg_cleanup.as_ref().unwrap();
+    let budget = case.store.default_backup_budget();
+    let mut prepared = case
+        .store
+        .prepare(
+            maintenance_ctx(ServicePurpose::Backup),
+            BackupId::from_bytes([0xc6; 16]),
+            budget,
+        )
+        .await
+        .unwrap();
+    let hold = prepared.acquire_hold().await.unwrap();
+    let mut paused = prepared.pause_writes().await.unwrap();
+    let mut locker = fixtures.open_raw_pg().await;
+    let mut probe = fixtures.open_raw_pg().await;
+    let locker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut locker)
+        .await
+        .unwrap();
+    let mut transaction = locker.begin().await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "LOCK TABLE {schema}.schema_meta IN ACCESS EXCLUSIVE MODE"
+    )))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+
+    let blocked_pid = {
+        let opening = paused.open_cut();
+        tokio::pin!(opening);
+        let blocked = async {
+            loop {
+                if let Some(pid) = sqlx::query_scalar::<_, i32>(
+                    "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+                )
+                .bind(locker_pid)
+                .fetch_optional(&mut probe)
+                .await
+                .unwrap()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::select! {
+            _ = &mut opening => panic!("the pin must wait for the schema lock"),
+            pid = tokio::time::timeout(Duration::from_secs(5), blocked) =>
+                pid.expect("the server must observe the admitted pin"),
+        }
+    };
+    let release = tokio::time::timeout(Duration::from_secs(10), paused.resume())
+        .await
+        .expect("resume must settle the interrupted cut");
+    assert!(
+        release.is_ok()
+            || release == Err(DomainError::validation(ValidationReason::BudgetExceeded).into())
+    );
+    assert!(pg_transaction_ended(&mut probe, blocked_pid).await);
+    transaction.rollback().await.unwrap();
+    hold.release().await.unwrap();
+    prepared.abort().await.unwrap();
+    case.shutdown().await;
+}
+
+#[tokio::test]
+async fn blocked_postgres_hold_release_has_a_cleanup_deadline() {
+    let case = BackendCase::open_pg_s3_with_pool(1).await;
+    case.store
+        .create_space(backup_test_space(0xc7))
+        .await
+        .unwrap();
+    let (fixtures, schema) = case.pg_cleanup.as_ref().unwrap();
+    let id = BackupId::from_bytes([0xc7; 16]);
+    let budget = case.store.default_backup_budget();
+    let mut prepared = case
+        .store
+        .prepare(maintenance_ctx(ServicePurpose::Backup), id.clone(), budget)
+        .await
+        .unwrap();
+    let hold = prepared.acquire_hold().await.unwrap();
+    let mut locker = fixtures.open_raw_pg().await;
+    let mut transaction = locker.begin().await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT backup_id FROM {schema}.backup_holds WHERE backup_id=$1 FOR UPDATE"
+    )))
+    .bind(id.as_str())
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), hold.release())
+            .await
+            .expect("a blocked hold release must return before the caller's deadline")
+            .is_err()
+    );
+    transaction.rollback().await.unwrap();
+    prepared.abort().await.unwrap();
+    let mut recovered = case
+        .store
+        .prepare(maintenance_ctx(ServicePurpose::Backup), id, budget)
+        .await
+        .unwrap();
+    recovered
+        .acquire_hold()
+        .await
+        .unwrap()
+        .release()
+        .await
+        .unwrap();
+    recovered.abort().await.unwrap();
+    case.shutdown().await;
 }
 
 #[tokio::test]

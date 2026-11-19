@@ -1367,6 +1367,7 @@ struct PgPreparedSource {
     barrier_pid: i32,
     pinned_at: Option<Instant>,
     tmp_path: PathBuf,
+    rollback_failure: Option<PortError>,
 }
 
 impl Drop for PgPreparedSource {
@@ -1379,9 +1380,11 @@ impl Drop for PgPreparedSource {
 impl PgPreparedSource {
     async fn abort_cleanly(&mut self) -> Result<(), PortError> {
         if let Some(mut conn) = self.source.take() {
-            rollback_backup_connection(&mut conn, "pg_backup_source_close").await?;
+            self.rollback_failure = rollback_backup_connection(&mut conn, "pg_backup_source_close")
+                .await
+                .err();
         }
-        Ok(())
+        self.rollback_failure.clone().map_or(Ok(()), Err)
     }
 
     async fn cancel_and_close(&mut self) -> Result<(), PortError> {
@@ -1420,16 +1423,24 @@ impl PgPreparedSource {
     }
 }
 
+const BACKUP_CLEANUP_GRACE: Duration = Duration::from_secs(5);
+
 async fn rollback_backup_connection(
     conn: &mut PgConnection,
     diagnostic: &'static str,
 ) -> Result<(), PortError> {
     // Bound a missing network acknowledgement independently of the expired
     // operation budget. The connection is dedicated to this backup.
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        sqlx::raw_sql("ROLLBACK").execute(conn),
-    )
+    tokio::time::timeout(BACKUP_CLEANUP_GRACE, async {
+        let rollback = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+        if matches!(rollback, Err(sqlx::Error::Database(_))) {
+            // SQLx may receive the interrupted query's error before sending
+            // the rollback. Retry after receiving that old error.
+            sqlx::raw_sql("ROLLBACK").execute(conn).await
+        } else {
+            rollback
+        }
+    })
     .await
     .map_err(|_| deadline_not_committed(diagnostic, "backup rollback was not acknowledged"))?
     .map(drop)
@@ -2512,6 +2523,7 @@ struct CanonicalPreparedBackup {
     artifact_lease: Option<ArtifactLease>,
     driver: Option<PreparedBackendDriver>,
     held_histories: Option<(HoldProof, Vec<ChangeCursor>)>,
+    cleanup_failure: Option<PortError>,
 }
 
 impl Drop for CanonicalPreparedBackup {
@@ -2532,11 +2544,21 @@ struct HoldProof {
 
 impl HoldProof {
     async fn verify(&self) -> Result<(), PortError> {
-        let mut guard = self.owner.lock().await;
-        let owner = guard
-            .as_mut()
-            .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
-        owner.verify().await
+        tokio::time::timeout(BACKUP_CLEANUP_GRACE, async {
+            let mut guard = self.owner.lock().await;
+            let owner = guard
+                .as_mut()
+                .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
+            owner.verify().await
+        })
+        .await
+        .map_err(|_| {
+            unavailable_retryable(
+                "backup_hold_verify_timeout",
+                "backup hold verification timed out",
+                Duration::from_millis(50),
+            )
+        })?
     }
 }
 
@@ -2595,6 +2617,7 @@ struct CanonicalPausedBackup {
     watchdog: Option<tokio::task::JoinHandle<Result<(), PortError>>>,
     held_histories: Option<(HoldProof, Vec<ChangeCursor>)>,
     unpinned_driver: Option<PreparedBackendDriver>,
+    cleanup_failure: Option<PortError>,
 }
 
 impl CanonicalPausedBackup {
@@ -2756,7 +2779,7 @@ impl PausedBackup for CanonicalPausedBackup {
                     let witness = match pin_res {
                         Ok(w) => w,
                         Err(err) => {
-                            let _ = pg.cancel_and_close().await;
+                            self.cleanup_failure = pg.cancel_and_close().await.err();
                             return Err(err);
                         }
                     };
@@ -2765,7 +2788,7 @@ impl PausedBackup for CanonicalPausedBackup {
                 }
             };
             if let Err(error) = self.validate_cut(&witness) {
-                let _ = abort_pinned_driver(state).await;
+                self.cleanup_failure = abort_pinned_driver(state).await.err();
                 return Err(error);
             }
             let snapshot = CanonicalBackupSnapshot {
@@ -2778,7 +2801,7 @@ impl PausedBackup for CanonicalPausedBackup {
                 spool_dir: self.spool_dir.clone(),
                 artifact_lease: self.artifact_lease.take(),
                 witness: Arc::new(witness),
-                active: None,
+                cleanup_failure: None,
                 hold: self
                     .held_histories
                     .as_ref()
@@ -2809,10 +2832,15 @@ impl PausedBackup for CanonicalPausedBackup {
                     )
                     .into()))
             };
-            if let Some(drv) = unpinned {
-                return result.and(drv.abort().await);
-            }
-            result
+            let source = match unpinned {
+                Some(drv) => drv.abort().await,
+                None => Ok(()),
+            };
+            self.cleanup_failure
+                .take()
+                .map_or(Ok(()), Err)
+                .and(result)
+                .and(source)
         })
     }
 }
@@ -2838,13 +2866,9 @@ struct CanonicalBackupSnapshot {
     witness: Arc<BackupWitness>,
     hold: HoldProof,
     state: Option<PinnedSnapshotDriver>,
-    active: Option<ActiveSpool>,
+    cleanup_failure: Option<PortError>,
 }
 
-struct ActiveSpool {
-    cancel: Cancellation,
-    task: tokio::task::JoinHandle<Result<BackupSpool, PortError>>,
-}
 pub(crate) struct CancelOnDrop(pub(crate) Cancellation);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -2854,15 +2878,6 @@ impl Drop for CancelOnDrop {
 
 impl Drop for CanonicalBackupSnapshot {
     fn drop(&mut self) {
-        if let Some(active) = self.active.take() {
-            active.cancel.cancel();
-            register_cleanup_task(
-                &self.store.inner,
-                self.store.inner.backup_executor.spawn(async move {
-                    let _ = active.task.await;
-                }),
-            );
-        }
         if let Some(st) = self.state.take() {
             match st {
                 PinnedSnapshotDriver::Sqlite { mut worker, .. } => {
@@ -2885,7 +2900,7 @@ impl CanonicalBackupSnapshot {
         Box::pin(async move {
             if cancellation.is_cancelled() {
                 if let Some(st) = self.state.take() {
-                    let _ = abort_pinned_driver(st).await;
+                    self.cleanup_failure = abort_pinned_driver(st).await.err();
                 }
                 return Err(cancelled_not_committed(
                     "backup_spool_cancelled_pre_start",
@@ -2904,13 +2919,13 @@ impl CanonicalBackupSnapshot {
             let eff_budget = match remaining_budget {
                 Ok(limit) => limit,
                 Err(err) => {
-                    let _ = abort_pinned_driver(pinned).await;
+                    self.cleanup_failure = abort_pinned_driver(pinned).await.err();
                     return Err(err);
                 }
             };
 
             let Some(lease) = self.artifact_lease.as_mut() else {
-                let _ = abort_pinned_driver(pinned).await;
+                self.cleanup_failure = abort_pinned_driver(pinned).await.err();
                 return Err(DomainError::validation(ValidationReason::InvalidState).into());
             };
             lease.begin_publication();
@@ -3050,6 +3065,7 @@ impl CanonicalBackupSnapshot {
                     .await;
                     // Early setup failures can precede the stream's rollback.
                     let closed = pg.abort_cleanly().await;
+                    self.cleanup_failure = closed.as_ref().err().cloned();
                     match streamed.and_then(|value| closed.map(|()| value)) {
                         Ok((bytes, digest, stats)) => (
                             BackupArtifactEncoding::PostgresSpoolV1,
@@ -3120,96 +3136,63 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
         cancellation: Cancellation,
     ) -> PortFuture<'_, BackupSpool> {
         Box::pin(async move {
-            let pinned = self
-                .state
-                .take()
-                .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
-            let mut job = CanonicalBackupSnapshot {
-                store: self.store.clone(),
-                backup_id: self.backup_id.clone(),
-                artifact_id: self.artifact_id.clone(),
-                prepare_budget: self.prepare_budget,
-                caller_cancel: self.caller_cancel.clone(),
-                prepared_at: self.prepared_at,
-                spool_dir: self.spool_dir.clone(),
-                artifact_lease: self.artifact_lease.take(),
-                witness: self.witness.clone(),
-                state: Some(pinned),
-                active: None,
-                hold: self.hold.clone(),
-            };
-            let owner_cancel = Cancellation::default();
-            if cancellation.is_cancelled() {
-                owner_cancel.cancel();
-            }
-            let _cancel_on_drop = CancelOnDrop(owner_cancel.clone());
-            let worker_cancel = owner_cancel.clone();
             let shutdown = self.store.inner.backup_shutdown.clone();
             let hold = self.hold.clone();
             let caller_cancel = self.caller_cancel.clone();
-            let (done, completion) = tokio::sync::oneshot::channel::<()>();
-            register_cleanup_task(
-                &self.store.inner,
-                self.store.inner.backup_executor.spawn(async move {
-                    let _ = completion.await;
-                }),
-            );
-            let task = self.store.inner.backup_executor.spawn(async move {
-                let _done = done;
-                let _copy_guard = hold.copying.read().await;
-                if let Err(error) = hold.verify().await {
-                    if let Some(source) = job.state.take() {
-                        let _ = abort_pinned_driver(source).await;
-                    }
-                    return Err(error);
-                }
-                if hold.release.is_cancelled() {
-                    worker_cancel.cancel();
-                }
-                let result = {
-                    let work = job.run_spool(budget, worker_cancel.clone());
-                    tokio::pin!(work);
-                    tokio::select! {
-                        result = &mut work => result,
-                        () = hold.release.cancelled() => { worker_cancel.cancel(); work.await },
-                        () = caller_cancel.cancelled() => { worker_cancel.cancel(); work.await },
-                        () = shutdown.cancelled() => { worker_cancel.cancel(); work.await }
-                    }
-                };
-                if result.is_err()
-                    && let Some(lease) = job.artifact_lease.as_ref()
-                {
-                    lease.reconcile_pending().await?;
-                }
-                result
-            });
-            let active = self.active.insert(ActiveSpool {
-                cancel: owner_cancel,
-                task,
-            });
-            let result = tokio::select! {
-                result = &mut active.task => result,
-                () = cancellation.cancelled() => {
-                    active.cancel.cancel();
-                    (&mut active.task).await
+            let stopped = async {
+                tokio::select! {
+                    () = cancellation.cancelled() => {},
+                    () = hold.release.cancelled() => {},
+                    () = caller_cancel.cancelled() => {},
+                    () = shutdown.cancelled() => {},
                 }
             };
-            self.active.take();
-            result.map_err(|err| internal_not_committed("backup_spool_worker", err.to_string()))?
+            tokio::pin!(stopped);
+            let _copy_guard = hold.copying.read().await;
+            let verified = tokio::select! {
+                biased;
+                () = &mut stopped => Err(cancelled_not_committed(
+                    "backup_spool_cancelled",
+                    "backup spool cancelled before verification",
+                )),
+                result = hold.verify() => result,
+            };
+            if let Err(error) = verified {
+                if let Some(source) = self.state.take() {
+                    self.cleanup_failure = abort_pinned_driver(source).await.err();
+                }
+                drop(self.artifact_lease.take());
+                return Err(error);
+            }
+            // The phase owner drives cancellation and waits for this spool to
+            // finish, preserving its native and database cleanup acknowledgements.
+            let owner_cancel = Cancellation::default();
+            let result = {
+                let work = self.run_spool(budget, owner_cancel.clone());
+                tokio::pin!(work);
+                tokio::select! {
+                    biased;
+                    () = &mut stopped => { owner_cancel.cancel(); work.await },
+                    result = &mut work => result,
+                }
+            };
+            if let Some(lease) = self.artifact_lease.take()
+                && result.is_err()
+                && let Err(error) = lease.reconcile_pending().await
+            {
+                self.cleanup_failure.get_or_insert(error);
+            }
+            result
         })
     }
 
     fn close(mut self: Box<Self>) -> PortFuture<'static, ()> {
         Box::pin(async move {
-            if let Some(active) = self.active.as_mut() {
-                active.cancel.cancel();
-                let _ = (&mut active.task).await;
-                self.active.take();
-            }
-            if let Some(st) = self.state.take() {
-                abort_pinned_driver(st).await?;
-            }
-            Ok(())
+            let source = match self.state.take() {
+                Some(st) => abort_pinned_driver(st).await,
+                None => Ok(()),
+            };
+            self.cleanup_failure.take().map_or(Ok(()), Err).and(source)
         })
     }
 }
@@ -3267,14 +3250,23 @@ async fn open_cas_hold(
             proof.release.cancel();
             let _drained = proof.copying.write().await;
             let mut owner = proof.owner.lock().await.take().expect("hold owns session");
-            let result = delete_backup_hold_rows(
-                &store,
-                &mut owner,
-                &backup_id,
-                &proof.generation,
-                held_count,
+            let result = tokio::time::timeout(
+                BACKUP_CLEANUP_GRACE,
+                delete_backup_hold_rows(
+                    &store,
+                    &mut owner,
+                    &backup_id,
+                    &proof.generation,
+                    held_count,
+                ),
             )
-            .await;
+            .await
+            .unwrap_or_else(|_| {
+                Err(crate::codec::unknown_commit_non_idempotent(
+                    "backup_hold_release_timeout",
+                    "backup hold release was not acknowledged",
+                ))
+            });
             drop(owner);
             let _ = done.send(result);
         });
@@ -3319,10 +3311,11 @@ impl CanonicalStore {
 impl PreparedBackup for CanonicalPreparedBackup {
     fn abort(mut self: Box<Self>) -> PortFuture<'static, ()> {
         Box::pin(async move {
-            if let Some(driver) = self.driver.take() {
-                driver.abort().await?;
-            }
-            Ok(())
+            let source = match self.driver.take() {
+                Some(driver) => driver.abort().await,
+                None => Ok(()),
+            };
+            self.cleanup_failure.take().map_or(Ok(()), Err).and(source)
         })
     }
 
@@ -3404,7 +3397,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
                     {
                         pg.cancel_backend(pg.barrier_pid).await;
                     }
-                    let _ = drv.abort().await;
+                    self.cleanup_failure = drv.abort().await.err();
                     return Err(error);
                 }
             };
@@ -3453,8 +3446,15 @@ impl PreparedBackup for CanonicalPreparedBackup {
                 watchdog: Some(watchdog),
                 held_histories: self.held_histories.take(),
                 unpinned_driver: Some(drv),
+                cleanup_failure: None,
             };
-            let phase = phase::Phase::new(&self.store.inner, paused, PausedBackup::resume).await?;
+            let phase = phase::Phase::new(
+                &self.store.inner,
+                paused,
+                self.caller_cancel.clone(),
+                PausedBackup::resume,
+            )
+            .await?;
             Ok(Box::new(phase) as Box<dyn PausedBackup>)
         })
     }
@@ -3612,6 +3612,7 @@ impl CanonicalStore {
                         barrier_pid,
                         pinned_at: None,
                         tmp_path,
+                        rollback_failure: None,
                     }),
                     artifact_lease,
                 )
@@ -3636,6 +3637,7 @@ impl CanonicalStore {
             artifact_lease: Some(artifact_lease),
             driver: Some(driver),
             held_histories: None,
+            cleanup_failure: None,
         })
     }
 }
@@ -3954,7 +3956,10 @@ async fn acquire_durable_backup_holds(
                 }
 
                 if let BackendConn::Postgres(conn) = tx {
-                    sqlx::raw_sql("SET statement_timeout = 0").execute(&mut **conn).await
+                    sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+                        .bind(format!("{}ms", BACKUP_CLEANUP_GRACE.as_millis()))
+                        .execute(&mut **conn)
+                        .await
                         .map_err(|err| internal_not_committed("pg_backup_owner_timeout", err.to_string()))?;
                 }
                 committing.store(true, Ordering::Release);

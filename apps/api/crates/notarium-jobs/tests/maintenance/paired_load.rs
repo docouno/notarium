@@ -3,6 +3,45 @@ use std::collections::BTreeSet;
 
 const FOREGROUND_PAIRS: usize = 4;
 
+pub(super) fn check_rated_volume(path: &Path) {
+    if !std::env::var("NOTARIUM_ARCHIVE_BENCH_TIER")
+        .is_ok_and(|tier| matches!(tier.as_str(), "high" | "medium"))
+    {
+        return;
+    }
+    let path = path
+        .canonicalize()
+        .expect("resolve benchmark data directory");
+    let mounts = fs::read_to_string("/proc/mounts").expect("read release fixture mounts");
+    let (device, mount, filesystem) = mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let device = fields.next()?;
+            let mount = PathBuf::from(fields.next()?.replace("\\040", " "));
+            Some((device, mount, fields.next()?))
+        })
+        .filter(|(_, mount, _)| path.starts_with(mount))
+        .max_by_key(|(_, mount, _)| mount.as_os_str().len())
+        .expect("resolve the filesystem of the benchmark data directory");
+    assert_eq!(
+        filesystem,
+        "ext4",
+        "rated benchmark directory {} uses {filesystem} on {}",
+        path.display(),
+        mount.display(),
+    );
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "benchmark_data": path,
+            "device": device,
+            "mount": mount,
+            "filesystem": filesystem,
+        })
+    );
+}
+
 pub(super) async fn capture_under_load(
     canonical: &CanonicalStore,
     control: &ControlBackup,

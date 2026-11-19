@@ -38,8 +38,9 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
-        let path =
-            std::env::temp_dir().join(codec::new_prefixed_hex_id("paired_archive_test_").unwrap());
+        let parent = std::env::temp_dir();
+        paired_load::check_rated_volume(&parent);
+        let path = parent.join(codec::new_prefixed_hex_id("paired_archive_test_").unwrap());
         fs::create_dir(&path).unwrap();
         Self(path)
     }
@@ -593,6 +594,13 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     use sqlx::{Connection, PgConnection, Postgres, QueryBuilder};
 
     let fixture = StorageFixture::load();
+    paired_load::check_rated_volume(
+        &fixture
+            .pg_socket_dir_container
+            .parent()
+            .unwrap()
+            .join("pgdata"),
+    );
     let scratch = Scratch::new();
     let root = DataRoot::new(scratch.0.join("separately-saved"));
     fs::create_dir_all(root.root().join("v1")).unwrap();

@@ -416,10 +416,11 @@ async fn capture_spools(
                 .canaries
                 .iter()
                 .all(|key| key.readable)
-            || !held_histories
+            || !held_histories.iter().map(|c| &c.scope).eq(canonical_cut
+                .witness()
+                .histories
                 .iter()
-                .map(|c| &c.scope)
-                .eq(canonical_cut.witness().histories.iter().map(|c| &c.scope))
+                .map(|c| &c.scope))
         {
             return Err(invalid(ValidationReason::InvalidAuthority));
         }
