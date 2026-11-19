@@ -8,6 +8,7 @@
 /packages/*/target/
 /apps/*/release/
 /packages/*/release/
+/.worktrees/
 .devkit/cache/
 .devkit/state/
 .env

@@ -20,3 +20,4 @@ setup/packages/client: setup-node-workspace
 check/packages/client: check/packages/api-contract build/packages/api-contract
 test/packages/client: build/packages/api-contract
 build/packages/client: build/packages/api-contract
+DEVKIT_EXPECTED_PLAN := f58c7bfea7df1ace478e0746ef3378d3b648dc4cc123a6f74ed32447fdb54923

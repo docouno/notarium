@@ -18,19 +18,19 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "check": "devkit-verify && npm run format:check && npm run lint && npm run typecheck",
-    "format:check": "prettier --check . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
-    "format": "prettier --write . \"!package.json\" \"!package-lock.json\" \"!dist/**\" \"!release/**\" \"!coverage/**\"",
+    "check": "devkit-verify && pnpm run format:check && pnpm run lint && pnpm run typecheck",
+    "format:check": "prettier --check . \"!package.json\" \"!pnpm-lock.yaml\" \"!pnpm-workspace.yaml\" \"!dist/**\" \"!release/**\" \"!coverage/**\" \"!**/.worktrees/**\"",
+    "format": "prettier --write . \"!package.json\" \"!pnpm-lock.yaml\" \"!pnpm-workspace.yaml\" \"!dist/**\" \"!release/**\" \"!coverage/**\" \"!**/.worktrees/**\"",
     "lint": "eslint --max-warnings 0 .",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
-    "fix": "npm run format && eslint --max-warnings 0 --fix . && npm run format",
+    "fix": "pnpm run format && eslint --max-warnings 0 --fix . && pnpm run format",
     "test": "vitest run --config vitest.config.mjs",
     "build": "tsdown && devkit-verify --pack",
     "package": "devkit-pack"
   },
   "devDependencies": {
     "@arethetypeswrong/core": "0.18.5",
-    "@docouno/env": "0.4.1",
+    "@docouno/env": "0.5.1",
     "@types/node": "24.19.2",
     "eslint": "10.13.0",
     "prettier": "3.9.10",
