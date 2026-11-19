@@ -121,6 +121,30 @@ impl<'a> Dot<'a> {
         };
         Some(score + scalar(q_tail, v_tail))
     }
+
+    pub(super) fn dot_rows(self, vectors: &[i8], slots: &[u32], output: &mut [i32]) -> Option<()> {
+        let width = self.query.len();
+        if slots.len() != output.len()
+            || !vectors.len().is_multiple_of(width)
+            || slots
+                .iter()
+                .any(|&slot| slot as usize >= vectors.len() / width)
+        {
+            return None;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.kernel == Kernel::Avx512Vnni && self.prefix == width {
+            // SAFETY: with_kernel verified the CPU features. Query and matrix
+            // contain complete 64-byte blocks and every slot identifies a row.
+            unsafe { avx512vnni_rows(self.query, vectors, slots, output, self.query_bias) };
+            return Some(());
+        }
+        for (&slot, output) in slots.iter().zip(output) {
+            let start = slot as usize * width;
+            *output = self.dot(&vectors[start..start + width])?;
+        }
+        Some(())
+    }
 }
 
 pub fn dot_i8_scalar(query: &[i8], vector: &[i8]) -> Option<i32> {
@@ -160,6 +184,53 @@ unsafe fn avx512vnni(query: &[i8], vector: &[i8]) -> i32 {
         sum = _mm512_dpbusd_epi32(sum, _mm512_xor_si512(v, flip), q);
     }
     _mm512_reduce_add_epi32(sum)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn avx512vnni_rows(
+    query: &[i8],
+    vectors: &[i8],
+    slots: &[u32],
+    output: &mut [i32],
+    bias: i32,
+) {
+    let zero = _mm512_setzero_si512();
+    let flip = _mm512_set1_epi8(i8::MIN);
+    let width = query.len() / 64;
+    let vectors = vectors.as_chunks::<64>().0;
+    let mut packed = [zero; MAX_DIMENSION / 64];
+    for (source, target) in query.as_chunks::<64>().0.iter().zip(&mut packed) {
+        // SAFETY: source contains 64 readable bytes. Unaligned loads are valid.
+        *target = unsafe { _mm512_loadu_si512(source.as_ptr().cast()) };
+    }
+    let (query_groups, query_tail) = packed[..width].as_chunks::<4>();
+    for (position, (&slot, output)) in slots.iter().zip(output).enumerate() {
+        if let Some(&ahead) = slots.get(position + 12) {
+            let address = &vectors[ahead as usize * width];
+            _mm_prefetch::<_MM_HINT_T0>(address.as_ptr());
+        }
+        let start = slot as usize * width;
+        let (rows, row_tail) = vectors[start..start + width].as_chunks::<4>();
+        let mut sums = [zero; 4];
+        for (vectors, query) in rows.iter().zip(query_groups) {
+            for ((vector, &query), sum) in vectors.iter().zip(query).zip(&mut sums) {
+                // SAFETY: vector contains 64 readable bytes.
+                let vector = unsafe { _mm512_loadu_si512(vector.as_ptr().cast()) };
+                *sum = _mm512_dpbusd_epi32(*sum, _mm512_xor_si512(vector, flip), query);
+            }
+        }
+        for ((vector, &query), sum) in row_tail.iter().zip(query_tail).zip(&mut sums) {
+            // SAFETY: vector contains 64 readable bytes.
+            let vector = unsafe { _mm512_loadu_si512(vector.as_ptr().cast()) };
+            *sum = _mm512_dpbusd_epi32(*sum, _mm512_xor_si512(vector, flip), query);
+        }
+        let total = _mm512_add_epi32(
+            _mm512_add_epi32(sums[0], sums[1]),
+            _mm512_add_epi32(sums[2], sums[3]),
+        );
+        *output = _mm512_reduce_add_epi32(total) - bias;
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -209,4 +280,38 @@ unsafe fn neon(query: &[i8], vector: &[i8]) -> i32 {
         sum = vpadalq_s16(sum, vmull_high_s8(q, v));
     }
     vaddvq_s32(sum)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_kernel_matches_individual_signed_dots_in_slot_order() {
+        for width in [64, 100, 384, 768, MAX_DIMENSION] {
+            let bytes = |length, offset| {
+                (0..length)
+                    .map(|at| (at * 211usize + offset) as u8 as i8)
+                    .collect::<Vec<_>>()
+            };
+            let query = bytes(width, 26);
+            let data = bytes(19 * width, 81);
+            let slots = [
+                18, 0, 7, 3, 14, 2, 11, 9, 16, 4, 12, 6, 8, 10, 17, 13, 1, 5, 15,
+            ];
+            for kernel in Kernel::ALL.into_iter().filter(|kernel| kernel.available()) {
+                let dot = Dot::with_kernel(&query, kernel).unwrap();
+                let mut scores = [0; 19];
+                dot.dot_rows(&data, &slots, &mut scores).unwrap();
+                for (&slot, score) in slots.iter().zip(scores) {
+                    let start = slot as usize * width;
+                    assert_eq!(
+                        Some(score),
+                        dot_i8_scalar(&query, &data[start..start + width])
+                    );
+                }
+                assert!(dot.dot_rows(&data, &[19], &mut [0]).is_none());
+            }
+        }
+    }
 }

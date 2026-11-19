@@ -8,6 +8,7 @@ use super::{
     QuantizedVector, SearchBudget, VectorError,
     format::*,
     hnsw::{self, Graph, Neighbor, Similarity},
+    simd::Dot,
 };
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::{
@@ -427,28 +428,32 @@ impl MmapSegment {
                 hnsw_hops: 0,
             });
         }
-        let scorer = Similarity::new(query.values(), query.scale())?;
         if exact {
+            let dot = Dot::new(query.values()).ok_or(VectorError::InvalidDimension)?;
             let mut best = BinaryHeap::with_capacity(top_k);
             let vectors = signed_bytes(self.section(VECTORS));
             let scales = self.section(SCALES).as_chunks::<4>().0;
             let mut slots = [0; 256];
+            let mut scores = [0; 256];
             let mut eligible = eligible.iter();
-            'scan: loop {
+            loop {
                 budget.check()?;
                 let count = eligible.next_many(&mut slots);
                 if count == 0 {
                     break;
                 }
-                for &slot in &slots[..count] {
-                    let index = slot as usize;
-                    if index >= self.nodes {
-                        break 'scan;
-                    }
-                    let start = index * self.stride;
-                    let values = &vectors[start..start + self.stride];
-                    let scale = f32::from_le_bytes(scales[index]);
-                    hnsw::keep_best(&mut best, scorer.score(slot, values, scale), top_k);
+                let bounded = slots[..count].partition_point(|&slot| (slot as usize) < self.nodes);
+                let current = &slots[..bounded];
+                let scores = &mut scores[..bounded];
+                dot.dot_rows(vectors, current, scores)
+                    .ok_or(VectorError::CorruptIndex)?;
+                for (&slot, &score) in current.iter().zip(scores.iter()) {
+                    let scale = f32::from_le_bytes(scales[slot as usize]);
+                    let score = score as f32 * query.scale() * scale;
+                    hnsw::keep_best(&mut best, Neighbor { slot, score }, top_k);
+                }
+                if bounded < count {
+                    break;
                 }
             }
             budget.check()?;
@@ -457,6 +462,7 @@ impl MmapSegment {
                 hnsw_hops: 0,
             });
         }
+        let scorer = Similarity::new(query.values(), query.scale())?;
         let explored = hnsw::query_graph(
             self,
             scorer,
