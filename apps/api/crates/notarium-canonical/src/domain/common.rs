@@ -465,6 +465,11 @@ pub(crate) fn validate_mutation_identity(
     if identity.actor != *ctx.auth().principal() {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
+    if let Some(step) = ctx.confirmed_chat_step()
+        && step.identity() != identity
+    {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     Ok(())
 }
 

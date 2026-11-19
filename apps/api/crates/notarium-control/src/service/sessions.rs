@@ -170,6 +170,48 @@ impl ControlService {
             }
         }
     }
+
+    pub(super) async fn revalidate_proposal_human(
+        &self,
+        ctx: AccountContext,
+        access: ProposalHumanAccess,
+    ) -> Result<EngineAuthContext, PortError> {
+        let prior = ctx.auth();
+        prior.authorize_proposal_confirmation()?;
+        let credential = prior.credential().cloned().ok_or_else(denied)?;
+        let budget = OperationBudget::new(ctx.budget.clone());
+        let mut rtx = self.store.read(budget.clone()).await?;
+        let fresh = budget
+            .run(
+                async {
+                    let tx = rtx.inner_mut();
+                    let user = user_read(tx, prior.principal().as_str()).await?;
+                    let CredentialAuthority::Human { credential, source } = self
+                        .credential_authority(tx, &user, credential, false)
+                        .await?
+                    else {
+                        return Err(denied());
+                    };
+                    let spaces = self.active_space_grants(tx, &user, false).await?;
+                    let live = VerifiedHuman::attest(
+                        PrincipalId::parse(&user.user_id)?,
+                        source,
+                        spaces,
+                        false,
+                    )
+                    .with_human_management(true)
+                    .with_credential(credential);
+                    Ok(EngineAuthContext::for_proposal_human(prior, live, access)?)
+                },
+                CommitEffect::NotCommitted,
+            )
+            .await?;
+        budget
+            .run(rtx.rollback(), CommitEffect::NotCommitted)
+            .await?;
+        Ok(fresh)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn credential_context(
         &self,

@@ -1,6 +1,7 @@
 //! Shared typed payloads. Transport serialization and storage rows are separate.
 use crate::{
     DomainError, DomainResult,
+    auth::{AuthenticatedCredential, EngineAuthContext},
     classes::*,
     error::{Diagnostic, ValidationReason},
     ids::*,
@@ -11,7 +12,10 @@ use crate::{
     value::*,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PageLimit(u16);
@@ -638,6 +642,9 @@ pub struct AppendChat {
     pub referenced_notes: Vec<NoteRef>,
     pub tainted: bool,
 }
+impl AppendChat {
+    pub const MAX_STRUCTURED_BODY_BYTES: usize = 256 * 1024;
+}
 #[derive(Clone, Debug)]
 pub struct PendingChatInput {
     pub id: PendingInputId,
@@ -722,8 +729,109 @@ pub struct ChatProposalRead {
     pub thread: ChatThreadId,
     pub entry: ThreadEntrySeq,
 }
-/// Trusted content from an unredacted tool entry and its immutable model call.
 #[derive(Clone, Debug)]
+pub struct ChatProposalEntryWitness {
+    pub seq: ThreadEntrySeq,
+    pub revision: RevisionId,
+    pub digest: ContentDigest,
+}
+/// The chat owner attests these facts after verifying the immutable carrier
+/// pair. No request decoder can mint the witness.
+///
+/// ```compile_fail
+/// use notarium_core::ports::ChatProposalWitness;
+/// let _: ChatProposalWitness = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone)]
+pub struct ChatProposalWitness {
+    source: HistoryScope,
+    owner: PrincipalId,
+    credential: AuthenticatedCredential,
+    thread: ChatThreadId,
+    call_id: CommandKey,
+    tool_name: String,
+    model: ChatProposalEntryWitness,
+    tool: ChatProposalEntryWitness,
+}
+impl ChatProposalWitness {
+    /// Called by the canonical owner only after verifying authority and both
+    /// carrier digests, including the tool call in the Model envelope.
+    pub fn attest_canonical(
+        source: HistoryScope,
+        reader: &EngineAuthContext,
+        thread: ChatThreadId,
+        call_id: CommandKey,
+        tool_name: String,
+        model: ChatProposalEntryWitness,
+        tool: ChatProposalEntryWitness,
+    ) -> DomainResult<Self> {
+        reader.authorize_proposal_read()?;
+        let Some(
+            credential @ (AuthenticatedCredential::Session(_)
+            | AuthenticatedCredential::TrustedNone),
+        ) = reader.credential()
+        else {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority));
+        };
+        if model.seq == ThreadEntrySeq::ZERO || model.seq >= tool.seq {
+            return Err(DomainError::validation(ValidationReason::InvalidState));
+        }
+        Ok(Self {
+            source,
+            owner: reader.principal().clone(),
+            credential: credential.clone(),
+            thread,
+            call_id,
+            tool_name,
+            model,
+            tool,
+        })
+    }
+    pub fn authorize_writer(&self, writer: &EngineAuthContext) -> DomainResult<()> {
+        if !writer.human_management()
+            || writer.principal() != &self.owner
+            || writer.credential() != Some(&self.credential)
+        {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority));
+        }
+        if writer.taint().is_tainted() {
+            return Err(DomainError::CrossSpaceTainted);
+        }
+        Ok(())
+    }
+    pub fn source(&self) -> &HistoryScope {
+        &self.source
+    }
+    pub fn owner(&self) -> &PrincipalId {
+        &self.owner
+    }
+    pub fn thread(&self) -> &ChatThreadId {
+        &self.thread
+    }
+    pub fn call_id(&self) -> &CommandKey {
+        &self.call_id
+    }
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+    pub fn model(&self) -> &ChatProposalEntryWitness {
+        &self.model
+    }
+    pub fn tool(&self) -> &ChatProposalEntryWitness {
+        &self.tool
+    }
+}
+impl fmt::Debug for ChatProposalWitness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChatProposalWitness")
+            .field("source", &self.source)
+            .field("thread", &self.thread)
+            .field("call_id", &self.call_id)
+            .finish_non_exhaustive()
+    }
+}
+/// Trusted content from an unredacted tool entry and its immutable model call.
+#[derive(Clone)]
 pub struct CanonicalChatProposal {
     pub content: CanonicalChatContent,
     pub call_id: CommandKey,
@@ -733,6 +841,36 @@ pub struct CanonicalChatProposal {
     pub model_revision: RevisionId,
     pub model_digest: ContentDigest,
     pub envelope: String,
+    witness: ChatProposalWitness,
+}
+impl CanonicalChatProposal {
+    pub fn from_canonical(
+        content: CanonicalChatContent,
+        envelope: String,
+        witness: ChatProposalWitness,
+    ) -> Self {
+        Self {
+            content,
+            call_id: witness.call_id().clone(),
+            revision: witness.tool().revision.clone(),
+            digest: witness.tool().digest,
+            model_entry: witness.model().seq,
+            model_revision: witness.model().revision.clone(),
+            model_digest: witness.model().digest,
+            envelope,
+            witness,
+        }
+    }
+    pub fn witness(&self) -> &ChatProposalWitness {
+        &self.witness
+    }
+}
+impl fmt::Debug for CanonicalChatProposal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CanonicalChatProposal")
+            .field("witness", &self.witness)
+            .finish_non_exhaustive()
+    }
 }
 #[derive(Clone, Debug)]
 pub struct RedactChatEntry {

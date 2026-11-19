@@ -374,6 +374,15 @@ pub trait ControlPort: Send + Sync {
     /// Refreshes a previously verified credential and intersects its current
     /// authority with the original delegation, project pin and branch taint.
     fn revalidate_auth(&self, ctx: AccountContext) -> PortFuture<'_, EngineAuthContext>;
+    /// Rebuilds independent authority from the same live interactive credential.
+    /// The read variant grants proposal admission without management or write authority.
+    fn revalidate_proposal_human(
+        &self,
+        _ctx: AccountContext,
+        _access: ProposalHumanAccess,
+    ) -> PortFuture<'_, EngineAuthContext> {
+        Box::pin(async { Err(crate::DomainError::AccessDenied.into()) })
+    }
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo>;
     fn list_spaces(
         &self,

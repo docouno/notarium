@@ -1,3 +1,7 @@
+mod proposal;
+
+pub(in super::super) use proposal::{ProposalLink, apply_links, describe_links, plan_links};
+
 use std::collections::BTreeMap;
 
 use notarium_core::{
@@ -28,7 +32,7 @@ pub(in super::super) struct LinkArgs {
 #[derive(Deserialize)]
 struct LinkInput {
     #[serde(rename = "from")]
-    source: NoteId,
+    source: String,
     #[serde(flatten)]
     edge: LinkArgs,
 }
@@ -286,7 +290,7 @@ async fn authorize(
     call: &ToolCallContext<'_>,
     scope: &SpaceContext,
     plan: &LinkPlan,
-) -> Result<(), PortError> {
+) -> Result<DocClass, PortError> {
     let source = corpus::note_in_space(call, scope, &plan.source).await?;
     scope
         .auth()
@@ -312,7 +316,7 @@ async fn authorize(
             corpus::note_metadata_origin(call, scope, &current).await?;
         }
     }
-    Ok(())
+    Ok(source.facts.class)
 }
 
 async fn render(
@@ -350,8 +354,9 @@ async fn render(
 
 async fn single(call: &mut ToolCallContext<'_>, input: LinkInput) -> Result<Value, PortError> {
     let plan = call
-        .journal("link-route", || {
-            plan_link(call, input.source, &input.edge, true)
+        .journal("link-route", || async {
+            let source = NoteId::parse(&input.source)?;
+            plan_link(call, source, &input.edge, true).await
         })
         .await?;
     let scope = call.space(plan.scope.clone())?;
@@ -378,7 +383,10 @@ async fn many(call: &mut ToolCallContext<'_>, inputs: Vec<LinkInput>) -> Result<
         let label = format!("link-route-{ordinal}");
         let planned = async {
             let plan = call
-                .journal(&label, || plan_link(call, input.source, &input.edge, false))
+                .journal(&label, || async {
+                    let source = NoteId::parse(&input.source)?;
+                    plan_link(call, source, &input.edge, false).await
+                })
                 .await?;
             let scope = call.space(plan.scope.clone())?;
             authorize(call, &scope, &plan).await?;
@@ -444,6 +452,20 @@ pub(super) async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_keeps_valid_items_when_another_source_id_is_malformed() {
+        let source = NoteId::from_bytes([1; 16]);
+        let batch: LinkManyInput = decode(json!({
+            "links": [
+                {"from": "nt_bad", "relation": "related", "toTitle": "Later note"},
+                {"from": source, "relation": "related", "toTitle": "Later note"}
+            ],
+        }))
+        .unwrap();
+        assert!(NoteId::parse(&batch.links[0].source).is_err());
+        assert_eq!(NoteId::parse(&batch.links[1].source).unwrap(), source);
+    }
 
     #[test]
     fn formats_stable_alias_and_title_only_targets() {

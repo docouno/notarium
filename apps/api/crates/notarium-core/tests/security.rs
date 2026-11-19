@@ -29,6 +29,83 @@ fn human(role: SpaceRole, ability: bool) -> EngineAuthContext {
 }
 
 #[test]
+fn proposal_confirmation_separates_latches_and_keeps_the_live_scope_ceiling() {
+    let principal = PrincipalId::from_bytes([1; 16]);
+    let grant = GrantId::from_bytes([1; 16]);
+    let credential = AuthenticatedCredential::Session(AuthSessionId::from_bytes([1; 16]));
+    let verified = |spaces, credential| {
+        VerifiedHuman::attest(principal.clone(), grant.clone(), spaces, true)
+            .with_human_management(true)
+            .with_credential(credential)
+    };
+    let mut note = facts(1, DocClass::UserDoc);
+    note.space.kind = SpaceKind::Personal;
+    let project = FolderRef {
+        space_id: note.space.id.clone(),
+        folder_id: note.ancestor_folders[0].clone(),
+    };
+    let original =
+        EngineAuthContext::for_human(verified(grants(SpaceRole::Owner), credential.clone()))
+            .restrict_to_project(&project)
+            .unwrap();
+    let live = || verified(grants(SpaceRole::Editor), credential.clone());
+    let read =
+        EngineAuthContext::for_proposal_human(&original, live(), ProposalHumanAccess::ReadOnly)
+            .unwrap();
+    let write =
+        EngineAuthContext::for_proposal_human(&original, live(), ProposalHumanAccess::Write)
+            .unwrap();
+    assert_eq!(write.spaces().len(), 1);
+    assert_eq!(write.spaces()[&note.space.id].role, SpaceRole::Editor);
+    assert_eq!(
+        write.spaces()[&note.space.id].project_root.as_ref(),
+        Some(&project.folder_id)
+    );
+    assert_eq!(write.credential(), Some(&credential));
+    assert!(write.human_management());
+    assert!(!read.human_management());
+    assert!(!read.has_cap(Cap::AbilityWrite));
+    assert!(!write.has_cap(Cap::AbilityWrite));
+    assert!(read.intersect_current(&write).is_err());
+    assert!(
+        read.for_agent_run(
+            AgentRunId::from_bytes([5; 16]),
+            note.space.id.clone(),
+            ChatAudience::Personal,
+            read.spaces().clone(),
+        )
+        .is_err()
+    );
+    assert!(read.authorize_proposal_read().is_ok());
+    assert!(write.authorize_proposal_read().is_err());
+    assert!(read.authorize_direct_write(&note, &note).is_err());
+
+    read.authorize_chat_read(&note.space, Some(&project.folder_id), true)
+        .unwrap();
+    assert!(read.taint().is_tainted());
+    assert!(read.authorize_proposal_read().is_ok());
+    assert!(!original.taint().is_tainted());
+    assert!(write.authorize_direct_write(&note, &note).is_ok());
+    assert!(
+        EngineAuthContext::for_proposal_human(
+            &original,
+            verified(
+                grants(SpaceRole::Owner),
+                AuthenticatedCredential::TrustedNone
+            ),
+            ProposalHumanAccess::Write,
+        )
+        .is_err()
+    );
+    original.taint().mark_external_read();
+    assert!(
+        EngineAuthContext::for_proposal_human(&original, live(), ProposalHumanAccess::Write)
+            .is_err()
+    );
+    assert!(!write.taint().is_tainted());
+}
+
+#[test]
 fn folder_metadata_obeys_project_scope_and_shared_branch_taint() {
     let owner = human(SpaceRole::Owner, true);
     let first = facts(1, DocClass::AgentMemory).space;

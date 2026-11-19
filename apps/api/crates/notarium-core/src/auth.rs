@@ -91,6 +91,13 @@ pub enum PrincipalKind {
     OAuth { source: GrantId, narrowed: bool },
 }
 
+/// Independent authority used for explicit human confirmation of a proposal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposalHumanAccess {
+    ReadOnly,
+    Write,
+}
+
 #[derive(Clone, Debug)]
 pub struct SpaceGrant {
     pub role: SpaceRole,
@@ -203,6 +210,7 @@ pub struct EngineAuthContext {
     kind: PrincipalKind,
     spaces: BTreeMap<SpaceId, SpaceGrant>,
     human_management: bool,
+    proposal_read: bool,
     ability_write: bool,
     write_space: Option<SpaceId>,
     taint: BranchTaint,
@@ -236,6 +244,7 @@ impl EngineAuthContext {
             kind: PrincipalKind::DirectHuman,
             spaces: verified.spaces,
             human_management: verified.human_management,
+            proposal_read: false,
             ability_write: verified.human_management && verified.ability_write,
             write_space: None,
             taint: BranchTaint::default(),
@@ -279,6 +288,7 @@ impl EngineAuthContext {
                 && Self::has_writable_space(&spaces),
             spaces,
             human_management: false,
+            proposal_read: false,
             write_space: None,
             taint: BranchTaint::default(),
             readonly_abilities: BTreeSet::new(),
@@ -416,6 +426,9 @@ impl EngineAuthContext {
     }
 
     fn narrow(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
+        if self.proposal_read {
+            return Err(DomainError::AccessDenied);
+        }
         let mut spaces = BTreeMap::new();
         for (id, wanted) in requested {
             let parent = self.spaces.get(&id).ok_or(DomainError::ResourceNotFound)?;
@@ -569,6 +582,54 @@ impl EngineAuthContext {
             Ok(())
         } else {
             Err(DomainError::AccessDenied)
+        }
+    }
+    /// Check trusted interactive input before re-reading its live credential.
+    pub fn authorize_proposal_confirmation(&self) -> DomainResult<()> {
+        self.authorize_human_management()?;
+        if !matches!(
+            self.credential(),
+            Some(AuthenticatedCredential::Session(_) | AuthenticatedCredential::TrustedNone)
+        ) {
+            return Err(DomainError::AuthenticationFailed);
+        }
+        if self.taint.is_tainted() {
+            return Err(DomainError::CrossSpaceTainted);
+        }
+        Ok(())
+    }
+
+    /// Authentication owner only. Each confirmation context starts with the
+    /// latch of a separately verified human, while retaining the input ceiling.
+    pub fn for_proposal_human(
+        prior: &Self,
+        live: VerifiedHuman,
+        access: ProposalHumanAccess,
+    ) -> DomainResult<Self> {
+        prior.authorize_proposal_confirmation()?;
+        let mut fresh = Self::for_human(live);
+        fresh.authorize_proposal_confirmation()?;
+        let narrowed = prior.intersect_current(&fresh)?;
+        fresh.spaces = narrowed.spaces;
+        fresh.write_space = narrowed.write_space;
+        fresh.ability_write = false;
+        if access == ProposalHumanAccess::ReadOnly {
+            fresh.human_management = false;
+            fresh.proposal_read = true;
+            for grant in fresh.spaces.values_mut() {
+                grant.role = SpaceRole::Viewer;
+                grant.write_classes.clear();
+            }
+        }
+        Ok(fresh)
+    }
+
+    /// Dedicated read authority for the canonical proposal witness.
+    pub fn authorize_proposal_read(&self) -> DomainResult<()> {
+        if self.kind == PrincipalKind::DirectHuman && self.proposal_read {
+            Ok(())
+        } else {
+            Err(DomainError::ResourceNotFound)
         }
     }
     pub fn has_cap(&self, cap: Cap) -> bool {

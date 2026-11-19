@@ -26,6 +26,8 @@ use super::{
     receipt_result, relative_to, separator_after, session, validated_title,
 };
 
+pub(super) mod proposal;
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateInput {

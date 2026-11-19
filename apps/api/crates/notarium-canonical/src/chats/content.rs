@@ -2,7 +2,10 @@ use std::collections::{BTreeSet, HashMap};
 
 use notarium_core::{
     classes::{CanonicalChatContent, ProviderCurrentContent, ProviderOrigin},
-    ports::{CallBudget, ChatProvenance, ProviderToolCall},
+    ports::{
+        CallBudget, ChatProposalEntryWitness, ChatProposalWitness, ChatProvenance,
+        ConfirmedChatStep, ProviderToolCall,
+    },
 };
 
 use super::*;
@@ -10,7 +13,7 @@ use crate::runtime::SpaceRecord;
 
 const MODEL_MARKER: &str = "\u{FDD0}notarium_model_turn_v1\n";
 const PROPOSAL_MARKER: &str = "\u{FDD0}notarium_proposed_diff_v1\n";
-pub(super) const MAX_TURN_BYTES: usize = 256 * 1024;
+pub(super) const MAX_TURN_BYTES: usize = AppendChat::MAX_STRUCTURED_BODY_BYTES;
 const MAX_TURN_CALLS: usize = 64;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -433,9 +436,7 @@ pub(super) async fn read_chat_proposal(
     request: ChatProposalRead,
 ) -> Result<CanonicalChatProposal, PortError> {
     let auth = ctx.auth();
-    if auth.kind() != &PrincipalKind::DirectHuman || !auth.human_management() {
-        return Err(DomainError::ResourceNotFound.into());
-    }
+    auth.authorize_proposal_read()?;
     let budget = ctx.budget.clone();
     let started = tokio::time::Instant::now();
     let scope = ctx.scope().clone();
@@ -448,6 +449,7 @@ pub(super) async fn read_chat_proposal(
                 let thread = load_thread_head_tx(tx, &scope.space_id, &request.thread).await?;
                 if thread.kind != ChatThreadKind::Personal
                     || space.space.kind != SpaceKind::Personal
+                    || space.owner != *writer_auth.principal()
                 {
                     return Err(DomainError::ResourceNotFound.into());
                 }
@@ -514,13 +516,12 @@ pub(super) async fn read_chat_proposal(
             .ok_or(DomainError::ResourceNotFound)?,
     )?;
     let turn = decode_model(&raw_model)?;
-    if !turn
+    let tool_name = turn
         .tool_calls
-        .iter()
-        .any(|call| call.id.as_str() == call_id.as_str())
-    {
-        return Err(DomainError::ResourceNotFound.into());
-    }
+        .into_iter()
+        .find(|call| call.id.as_str() == call_id.as_str())
+        .ok_or(DomainError::ResourceNotFound)?
+        .name;
     let raw_tool = hydrate_body(
         store,
         &space.scope,
@@ -532,16 +533,125 @@ pub(super) async fn read_chat_proposal(
     .await?;
     let ProposalTurn { text, envelope } = decode_proposal(&raw_tool)?;
     let content = transcript(ctx.auth(), &space.space, &thread, &tool, text)?;
-    Ok(CanonicalChatProposal {
-        content,
+    let witness = ChatProposalWitness::attest_canonical(
+        space.scope.clone(),
+        ctx.auth(),
+        thread.thread_id,
         call_id,
-        revision: RevisionId::parse(&tool.revision_id)?,
-        digest: tool.digest()?,
-        model_entry: model.seq()?,
-        model_revision: RevisionId::parse(&model.revision_id)?,
-        model_digest: model.digest()?,
-        envelope,
+        tool_name,
+        proposal_entry(&model)?,
+        proposal_entry(&tool)?,
+    )?;
+    Ok(CanonicalChatProposal::from_canonical(
+        content, envelope, witness,
+    ))
+}
+
+fn proposal_entry(row: &PayloadRow) -> Result<ChatProposalEntryWitness, PortError> {
+    Ok(ChatProposalEntryWitness {
+        seq: row.seq()?,
+        revision: RevisionId::parse(&row.revision_id)?,
+        digest: row.digest()?,
     })
+}
+
+/// Validate only the exact committed authority, without reopening the tainted
+/// transcript, consulting a provider, or staging any content.
+pub(crate) async fn verify_confirmed_chat_step_tx(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    target: &HistoryScope,
+    step: &ConfirmedChatStep,
+    kind: &str,
+    committing: bool,
+) -> Result<(), PortError> {
+    let witness = step.witness();
+    target.check(&step.identity().scope)?;
+    witness.authorize_writer(auth)?;
+    if !matches!(
+        (witness.tool_name(), kind),
+        (
+            "create_note" | "create_notes",
+            "create_note" | "ensure_folder_path"
+        ) | ("move_note", "move_note" | "ensure_folder_path")
+            | ("edit_note", "edit_note")
+            | ("rename_note", "rename_note")
+            | ("delete_note", "trash_note")
+            | ("link" | "link_many", "link")
+            | (
+                "remember_about_user" | "remember_about_project",
+                "append_memory"
+            )
+    ) {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
+
+    let source = witness.source();
+    if committing
+        && source.space_id != target.space_id
+        && let BackendConn::Postgres(conn) = tx
+    {
+        // Same-Space writes already hold the canonical writer's row lock.
+        // Source locking conflicts with redaction/archival but never waits
+        // behind an unrelated batch that may itself need our target Space.
+        let locked = sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM spaces WHERE space_id = $1 FOR SHARE NOWAIT",
+        )
+        .bind(source.space_id.as_str())
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|error| {
+            if error
+                .as_database_error()
+                .and_then(|db| db.code())
+                .as_deref()
+                == Some("55P03")
+            {
+                return crate::codec::unavailable_retryable(
+                    "chat_proposal_source_busy",
+                    "proposal source is being changed",
+                    std::time::Duration::from_millis(25),
+                );
+            }
+            crate::runtime::pg_read_error("chat_proposal_source_lock", error)
+        })?;
+        if locked.is_none() {
+            return Err(DomainError::ResourceNotFound.into());
+        }
+    }
+
+    let space = load_space_record(tx, &source.space_id).await?;
+    space.scope.check(source)?;
+    let thread = load_thread_head_tx(tx, &source.space_id, witness.thread()).await?;
+    if space.space.lifecycle != SpaceLifecycle::Active
+        || space.space.kind != SpaceKind::Personal
+        || &space.owner != witness.owner()
+        || thread.kind != ChatThreadKind::Personal
+        || &thread.owner != witness.owner()
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let tool = load_payload(tx, &source.space_id, witness.thread(), witness.tool().seq).await?;
+    let model = load_payload(tx, &source.space_id, witness.thread(), witness.model().seq).await?;
+    if tool.kind != "tool"
+        || tool.body_format != BodyFormat::Proposal.db()
+        || tool.tool_call_id.as_deref() != Some(witness.call_id().as_str())
+        || tool.provenance_json.is_none()
+        || tool.ext_space_tainted == 0
+        || tool.author_id != witness.owner().as_str()
+        || tool.agent_run_id.is_none()
+        || model.kind != "model"
+        || model.body_format != BodyFormat::Model.db()
+        || model.author_id != tool.author_id
+        || model.agent_run_id != tool.agent_run_id
+        || tool.revision_id != witness.tool().revision.as_str()
+        || model.revision_id != witness.model().revision.as_str()
+        || tool.digest()? != witness.tool().digest
+        || model.digest()? != witness.model().digest
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    Ok(())
 }
 
 const COLUMNS: &str = "entry_seq, parent_seq, revision_id,

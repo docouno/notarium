@@ -5,7 +5,7 @@ use notarium_core::{
     error::PortError,
     ids::{ContentDigest, FolderId, RevisionId},
     model::{HistoryScope, NoteRef},
-    ports::{ChatInputBody, Preconditions},
+    ports::{ChatInputBody, Preconditions, SpaceContext},
 };
 
 use super::{CommandIdentitySpec, replay::UnboundCommand};
@@ -49,6 +49,35 @@ pub(crate) fn chat_reference_digest(refs: &[NoteRef]) -> ContentDigest {
 }
 
 impl UnboundCommand {
+    pub(crate) fn with_confirmed_chat_step(
+        mut self,
+        ctx: &SpaceContext,
+        kind: &'static str,
+    ) -> Self {
+        if let Some(step) = ctx.confirmed_chat_step() {
+            let witness = step.witness();
+            self.0.command_hash = hash_parts(
+                self.0.command_hash,
+                &[
+                    b"confirmed-personal-chat-step-v1",
+                    witness.source().space_id.as_str().as_bytes(),
+                    witness.source().incarnation.as_bytes(),
+                    witness.thread().as_str().as_bytes(),
+                    witness.call_id().as_str().as_bytes(),
+                    &witness.model().seq.get().to_be_bytes(),
+                    witness.model().revision.as_str().as_bytes(),
+                    witness.model().digest.as_bytes(),
+                    &witness.tool().seq.get().to_be_bytes(),
+                    witness.tool().revision.as_str().as_bytes(),
+                    witness.tool().digest.as_bytes(),
+                ],
+            );
+            self.0.confirmed_chat_step = Some((step.clone(), kind));
+            self.0.legacy = None;
+        }
+        self
+    }
+
     pub(crate) fn with_preconditions(
         mut self,
         pre: &Preconditions,
@@ -177,6 +206,9 @@ impl CommandIdentitySpec {
     ) -> Result<bool, PortError> {
         if self.command_hash.as_bytes() == stored {
             return Ok(true);
+        }
+        if self.has_confirmed_chat_step() {
+            return Ok(false);
         }
         let Some(proof) = self
             .legacy

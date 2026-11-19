@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-pub(crate) use content::load_current_chat_for_egress_tx;
+pub(crate) use content::{load_current_chat_for_egress_tx, verify_confirmed_chat_step_tx};
 use notarium_core::{
     DomainError,
     auth::{EngineAuthContext, PrincipalKind, Space, SpaceKind, SpaceLifecycle},

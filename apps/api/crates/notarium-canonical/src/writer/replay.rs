@@ -142,11 +142,36 @@ impl UnboundCommand {
 }
 
 impl CommandIdentitySpec {
+    pub(crate) async fn authorize_confirmed_chat_step(
+        &self,
+        tx: &mut BackendConn<'_>,
+        scope: &HistoryScope,
+        committing: bool,
+    ) -> Result<(), PortError> {
+        let Some((step, kind)) = &self.confirmed_chat_step else {
+            return Ok(());
+        };
+        let Some((auth, _)) = self.authority.as_deref() else {
+            return Err(DomainError::validation(
+                notarium_core::error::ValidationReason::InvalidAuthority,
+            )
+            .into());
+        };
+        if step.identity().actor != self.actor || step.identity().key != self.command_key {
+            return Err(DomainError::validation(
+                notarium_core::error::ValidationReason::InvalidAuthority,
+            )
+            .into());
+        }
+        crate::chats::verify_confirmed_chat_step_tx(tx, auth, scope, step, kind, committing).await
+    }
+
     pub(crate) async fn authorize_replay(
         &self,
         tx: &mut BackendConn<'_>,
         scope: &HistoryScope,
     ) -> Result<(), PortError> {
+        self.authorize_confirmed_chat_step(tx, scope, false).await?;
         let Some((auth, policy)) = self.authority.as_deref() else {
             return Ok(());
         };

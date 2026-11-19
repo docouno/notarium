@@ -1,7 +1,7 @@
 //! One concrete adapter binds all control operations to one authority owner.
 use super::{ControlService, provider::ProviderService};
 use notarium_core::{
-    auth::EngineAuthContext,
+    auth::{EngineAuthContext, ProposalHumanAccess},
     ids::*,
     model::*,
     ports::{control::*, *},
@@ -44,6 +44,13 @@ impl ControlPort for ControlPlane {
                 .auth()
                 .clone())
         })
+    }
+    fn revalidate_proposal_human(
+        &self,
+        ctx: AccountContext,
+        access: ProposalHumanAccess,
+    ) -> PortFuture<'_, EngineAuthContext> {
+        Box::pin(self.control.revalidate_proposal_human(ctx, access))
     }
     fn whoami(&self, ctx: AccountContext) -> PortFuture<'_, PrincipalInfo> {
         Box::pin(self.control.whoami(ctx))

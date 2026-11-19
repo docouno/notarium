@@ -1,8 +1,11 @@
 use super::*;
 use notarium_core::{
+    auth::{AuthenticatedCredential, ProposalHumanAccess},
     classes::ClassEgressFence,
+    model::FolderRef,
     ports::{
-        ChatContentRead, ChatProvenance, DismissPending, ProviderToolCall, ProviderToolCallId,
+        ChatContentRead, ChatProposalRead, ChatProvenance, DismissPending, ProviderToolCall,
+        ProviderToolCallId,
     },
 };
 
@@ -364,6 +367,209 @@ async fn model_payloads(store: &CanonicalStore) {
     }
 }
 
+async fn confirmed_source_fence(store: &CanonicalStore) {
+    let (source, owner, thread) =
+        setup(store, 0xc1, SpaceKind::Personal, ChatThreadKind::Personal).await;
+    let (target, _, _) = setup(store, 0xc2, SpaceKind::Shared, ChatThreadKind::SpaceGroup).await;
+    let project = FolderRef {
+        space_id: target.space_id.clone(),
+        folder_id: sample_folder_id(0xcd),
+    };
+    store
+        .create_folder(CreateFolderSpec {
+            scope: target.clone(),
+            active_epoch: LeaseEpoch::new(1).unwrap(),
+            folder_id: project.folder_id.clone(),
+            parent: None,
+            slug: "approved-project".into(),
+            display_name: "Approved project".into(),
+            is_project: true,
+            project_slug: Some("approved-project".into()),
+            actor: owner.clone(),
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let run = sample_run_id(0xc1);
+    let agent = claim_run(
+        store,
+        owner_ctx(&source, owner.clone()),
+        ChatAudience::Personal,
+        &thread,
+        &run,
+        ThreadEntrySeq::ZERO,
+    )
+    .await;
+    let call_id = CommandKey::from_bytes([0xc1; 16]);
+    let model = store
+        .append_chat(
+            agent.clone(),
+            next_mutation(
+                &source,
+                &owner,
+                AppendChat {
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Model,
+                    body: ChatInputBody::Text(String::new()),
+                    tool_calls: vec![ProviderToolCall {
+                        id: ProviderToolCallId::new(call_id.as_str().to_owned()).unwrap(),
+                        name: "create_note".into(),
+                        arguments: BTreeMap::new(),
+                    }],
+                    provenance: Some(ChatProvenance::default()),
+                    proposed_diff: None,
+                    referenced_notes: Vec::new(),
+                    tainted: false,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+    let tool = store
+        .append_chat(
+            agent,
+            next_mutation(
+                &source,
+                &owner,
+                AppendChat {
+                    thread: thread.clone(),
+                    parent: model.seq,
+                    kind: ChatEntryKind::Tool { call_id },
+                    body: ChatInputBody::Text("Confirmation is required".into()),
+                    tool_calls: Vec::new(),
+                    provenance: Some(ChatProvenance::default()),
+                    proposed_diff: Some("Opaque confirmed action".into()),
+                    referenced_notes: Vec::new(),
+                    tainted: true,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .value;
+
+    let role = SpaceGrant {
+        role: SpaceRole::Owner,
+        read_classes: DocClass::all(),
+        write_classes: DocClass::all(),
+        project_root: None,
+    };
+    let live = VerifiedHuman::attest(
+        owner.clone(),
+        GrantId::from_bytes([0xc3; 16]),
+        BTreeMap::from([
+            (source.space_id.clone(), role.clone()),
+            (target.space_id.clone(), role),
+        ]),
+        false,
+    )
+    .with_human_management(true)
+    .with_credential(AuthenticatedCredential::TrustedNone);
+    let prior = EngineAuthContext::for_human(live.clone());
+    let read_auth =
+        EngineAuthContext::for_proposal_human(&prior, live.clone(), ProposalHumanAccess::ReadOnly)
+            .unwrap();
+    let write_auth =
+        EngineAuthContext::for_proposal_human(&prior, live, ProposalHumanAccess::Write).unwrap();
+    let reader = SpaceContext::new(read_auth, source.clone(), make_budget()).unwrap();
+    let proposal = store
+        .read_chat_proposal(
+            reader.clone(),
+            ChatProposalRead {
+                thread: thread.clone(),
+                entry: tool.seq,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(reader.auth().taint().is_tainted());
+    assert!(!write_auth.taint().is_tainted());
+
+    let make_request = |key| {
+        next_mutation(
+            &target,
+            &owner,
+            CreateNote {
+                note: sample_note_id(key),
+                parent: Some(project.folder_id.clone()),
+                slug: format!("confirmed-{key}"),
+                class: DocClass::UserDoc,
+                carrier: "# Explicitly approved".into(),
+                folder_page: false,
+            },
+        )
+    };
+    let write = SpaceContext::new(write_auth, target.clone(), make_budget()).unwrap();
+    let request = make_request(0xc4);
+    let stale = make_request(0xc5);
+    let approved = |identity: &CommandIdentity| {
+        write
+            .clone()
+            .with_confirmed_chat_step(proposal.witness().clone(), identity)
+            .unwrap()
+            .restrict_to_project(&project)
+            .unwrap()
+    };
+    let outcome = store
+        .create_note(approved(&request.identity), request.clone())
+        .await
+        .unwrap();
+    let replay = store
+        .create_note(approved(&request.identity), request.clone())
+        .await
+        .unwrap();
+    assert_eq!(outcome.receipt, replay.receipt);
+    assert_validation_err(
+        &store
+            .create_note(approved(&request.identity), stale.clone())
+            .await,
+        ValidationReason::InvalidAuthority,
+    );
+
+    let owner_source = owner_ctx(&source, owner.clone());
+    let branch = store
+        .read_chat(
+            owner_source.clone(),
+            ChatRead {
+                thread: thread.clone(),
+                leaf: tool.seq,
+                before: None,
+                max_entries: PageLimit::new(1).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    // Redacting the referenced Model invalidates the still-visible Tool.
+    store
+        .redact_chat_entry(
+            owner_source,
+            next_mutation(
+                &source,
+                &owner,
+                RedactChatEntry {
+                    thread,
+                    entry: model.seq,
+                    expected_thread_revision: branch.thread.revision,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let cut = store.read_space(&target.space_id).await.unwrap().last_seq;
+    for item in [request, stale] {
+        assert!(matches!(
+            store.create_note(approved(&item.identity), item).await,
+            Err(PortError::Domain(DomainError::ResourceNotFound))
+        ));
+    }
+    assert_eq!(
+        store.read_space(&target.space_id).await.unwrap().last_seq,
+        cut
+    );
+}
+
 #[tokio::test]
 async fn supervised_queue_and_hydration_match_across_dialects() {
     let local = TempDataRoot::new("chat-agent-local");
@@ -375,6 +581,7 @@ async fn supervised_queue_and_hydration_match_across_dialects() {
     .unwrap();
     original_human_classifier(&store).await;
     model_payloads(&store).await;
+    confirmed_source_fence(&store).await;
     runtime.shutdown().await.unwrap();
 
     let fixtures = StorageTestFixtures::load_required();
@@ -389,6 +596,7 @@ async fn supervised_queue_and_hydration_match_across_dialects() {
     .unwrap();
     original_human_classifier(&store).await;
     model_payloads(&store).await;
+    confirmed_source_fence(&store).await;
     runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
 }

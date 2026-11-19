@@ -27,7 +27,7 @@ use super::{
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct EditInput {
+pub(in crate::mcp) struct EditInput {
     #[serde(rename = "ref")]
     pub(super) note: NoteId,
     operation: Option<EditOperation>,

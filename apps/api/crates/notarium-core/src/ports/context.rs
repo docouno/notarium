@@ -1,9 +1,11 @@
+use super::ChatProposalWitness;
 use crate::{
     DomainError, DomainResult,
     auth::{EngineAuthContext, SecretString},
     error::ValidationReason,
     ids::*,
     model::{FolderRef, HistoryScope},
+    receipt::CommandIdentity,
 };
 use std::{
     fmt,
@@ -217,6 +219,7 @@ impl AccountContext {
 pub struct SpaceContext {
     auth: EngineAuthContext,
     scope: HistoryScope,
+    confirmed_chat_step: Option<Arc<ConfirmedChatStep>>,
     pub budget: CallBudget,
 }
 impl SpaceContext {
@@ -231,6 +234,7 @@ impl SpaceContext {
         Ok(Self {
             auth,
             scope,
+            confirmed_chat_step: None,
             budget,
         })
     }
@@ -239,6 +243,27 @@ impl SpaceContext {
     }
     pub fn scope(&self) -> &HistoryScope {
         &self.scope
+    }
+    /// Bind one explicitly confirmed step to this independently authenticated
+    /// write context. Cloning the proposal read context cannot clear its taint.
+    pub fn with_confirmed_chat_step(
+        mut self,
+        witness: ChatProposalWitness,
+        identity: &CommandIdentity,
+    ) -> DomainResult<Self> {
+        self.scope.check(&identity.scope)?;
+        witness.authorize_writer(&self.auth)?;
+        if identity.actor != *self.auth.principal() || self.confirmed_chat_step.is_some() {
+            return Err(DomainError::validation(ValidationReason::InvalidAuthority));
+        }
+        self.confirmed_chat_step = Some(Arc::new(ConfirmedChatStep {
+            witness,
+            identity: identity.clone(),
+        }));
+        Ok(self)
+    }
+    pub fn confirmed_chat_step(&self) -> Option<&Arc<ConfirmedChatStep>> {
+        self.confirmed_chat_step.as_ref()
     }
     pub fn restrict_to_project(mut self, project: &FolderRef) -> DomainResult<Self> {
         if self.scope.space_id != project.space_id {
@@ -249,6 +274,22 @@ impl SpaceContext {
     }
     pub fn check_current(&self, current: &HistoryScope) -> DomainResult<()> {
         current.check(&self.scope)
+    }
+}
+
+/// The step identity and source witness travel together on the trusted writer
+/// context. Neither is accepted from transport payloads.
+#[derive(Clone, Debug)]
+pub struct ConfirmedChatStep {
+    witness: ChatProposalWitness,
+    identity: CommandIdentity,
+}
+impl ConfirmedChatStep {
+    pub fn witness(&self) -> &ChatProposalWitness {
+        &self.witness
+    }
+    pub fn identity(&self) -> &CommandIdentity {
+        &self.identity
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

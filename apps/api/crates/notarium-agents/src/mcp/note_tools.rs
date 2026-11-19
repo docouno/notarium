@@ -1,5 +1,6 @@
 use notarium_core::{
     DomainError,
+    auth::ResourceFacts,
     classes::DocClass,
     error::{PortError, ValidationReason},
     ids::{FolderId, NoteId, RevisionId},
@@ -19,9 +20,14 @@ use super::{
 
 mod create;
 mod edit;
+mod proposal;
+
+pub(super) use proposal::{
+    PreparedNoteAction, apply_proposal, describe_proposal, plan_proposal, preview_proposal,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(super) struct NoteRoute {
+pub(in crate::mcp) struct NoteRoute {
     pub(super) scope: HistoryScope,
     pub(super) note: NoteId,
     pub(super) revision: RevisionId,
@@ -72,14 +78,7 @@ pub(super) async fn observe_note(
     expected: Option<&RevisionId>,
 ) -> Result<NoteRoute, PortError> {
     let (scope, catalog) = corpus::locate_note(call, note).await?;
-    scope
-        .auth()
-        .authorize_direct_write(&catalog.facts, &catalog.facts)?;
-    // A package mutation must go through its package lifecycle, including
-    // publication/index validation and the control-side binding.
-    if catalog.facts.ability_package.is_some() {
-        return Err(DomainError::AbilityWriteForbidden.into());
-    }
+    authorize_note_write(&scope, &catalog.facts)?;
     let current = snapshot(
         call,
         &scope,
@@ -104,6 +103,15 @@ pub(super) async fn observe_note(
         note: note.clone(),
         revision,
     })
+}
+
+fn authorize_note_write(scope: &SpaceContext, facts: &ResourceFacts) -> Result<(), PortError> {
+    scope.auth().authorize_direct_write(facts, facts)?;
+    // Package writes need package validation and the control-side binding.
+    if facts.ability_package.is_some() {
+        return Err(DomainError::AbilityWriteForbidden.into());
+    }
+    Ok(())
 }
 
 async fn route(

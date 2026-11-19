@@ -5,10 +5,12 @@ mod get_note;
 mod memory;
 mod note_tools;
 mod organize;
+mod proposals;
 mod read_tools;
 mod schema;
 mod session;
 
+pub use proposals::{ConfirmProposedDiff, PersonalToolInvocation};
 pub use schema::{ToolAnnotations, ToolDescriptor};
 
 use notarium_core::{
@@ -60,6 +62,24 @@ pub struct McpToolResult {
     /// Canonical proof is consumed by the run supervisor, outside the wire result.
     #[serde(skip)]
     pub provenance: ChatProvenance,
+    #[serde(skip)]
+    proposal: Option<RecordableProposedDiff>,
+}
+
+/// The internal chat writer stores these exact bytes in the typed Tool entry.
+pub struct RecordableProposedDiff {
+    id: ContentDigest,
+    envelope: String,
+}
+
+impl RecordableProposedDiff {
+    pub fn id(&self) -> ContentDigest {
+        self.id
+    }
+
+    pub fn envelope(&self) -> &str {
+        &self.envelope
+    }
 }
 
 #[derive(Serialize)]
@@ -70,6 +90,10 @@ pub struct ToolText {
 }
 
 impl McpToolResult {
+    pub fn proposal(&self) -> Option<&RecordableProposedDiff> {
+        self.proposal.as_ref()
+    }
+
     fn new(
         tool: ToolName,
         payload: Value,
@@ -106,7 +130,36 @@ impl McpToolResult {
             content: [ToolText { kind: "text", text }],
             structured_content: payload,
             provenance,
+            proposal: None,
         })
+    }
+
+    fn proposed(
+        tool: ToolName,
+        draft: proposals::Draft,
+        provenance: ChatProvenance,
+    ) -> Result<Self, PortError> {
+        let mut result = Self::new(tool, draft.payload, None, provenance)?;
+        if result.content[0].text.len() > proposals::MAX_DISPLAY_BYTES {
+            let mut payload = result.structured_content;
+            payload["unifiedPreview"] = Value::Null;
+            payload["previewTruncated"] = Value::Bool(true);
+            result = Self::new(tool, payload, None, result.provenance)?;
+        }
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "text": result.content[0].text,
+            "envelope": draft.envelope,
+        }))
+        .map_err(|_| invalid(ValidationReason::InvalidState))?;
+        // Leave space for the canonical framing marker.
+        if encoded.len() > AppendChat::MAX_STRUCTURED_BODY_BYTES - 64 {
+            return Err(invalid(ValidationReason::BudgetExceeded));
+        }
+        result.proposal = Some(RecordableProposedDiff {
+            id: draft.id,
+            envelope: draft.envelope,
+        });
+        Ok(result)
     }
 }
 
@@ -178,7 +231,46 @@ impl ToolRegistry {
         &self,
         ctx: McpInvocationContext,
         name: &str,
+        args: Value,
+    ) -> Result<McpToolResult, PortError> {
+        self.call(ctx, name, args, None).await
+    }
+
+    /// A trusted Personal chat supervisor supplies the current branch and owner.
+    pub async fn call_personal_tool(
+        &self,
+        ctx: McpInvocationContext,
+        binding: PersonalToolInvocation,
+        name: &str,
+        args: Value,
+    ) -> Result<McpToolResult, PortError> {
+        self.call(ctx, name, args, Some(binding)).await
+    }
+
+    /// Apply an exact canonical proposal after an explicit interactive action.
+    pub async fn apply_proposed_diff(
+        &self,
+        account: AccountContext,
+        request: ConfirmProposedDiff,
+    ) -> Result<Value, PortError> {
+        proposals::confirm(self, account, request).await
+    }
+
+    /// Read the exact reviewable change using current interactive authority.
+    pub async fn preview_proposed_diff(
+        &self,
+        account: AccountContext,
+        request: ConfirmProposedDiff,
+    ) -> Result<Value, PortError> {
+        proposals::preview(self, account, request).await
+    }
+
+    async fn call(
+        &self,
+        ctx: McpInvocationContext,
+        name: &str,
         mut args: Value,
+        personal: Option<PersonalToolInvocation>,
     ) -> Result<McpToolResult, PortError> {
         let tool = ToolName::parse(name).ok_or(DomainError::ResourceNotFound)?;
         let deadline = Instant::now() + ctx.account.budget.remaining;
@@ -268,6 +360,12 @@ impl ToolRegistry {
             .await?;
 
         let result = async {
+            if let Some(binding) = &personal
+                && proposals::needs_proposal(&call, &args).await?
+            {
+                let draft = proposals::prepare(&mut call, binding, &ctx.request_key, args).await?;
+                return McpToolResult::proposed(tool, draft, std::mem::take(&mut call.provenance));
+            }
             if tool.writes() {
                 // Reserve the digest before any effect. Canonical receipts own
                 // replay, including concurrent calls that share the same plan.
@@ -404,7 +502,45 @@ struct ToolCallContext<'a> {
     provenance: ChatProvenance,
 }
 
-impl ToolCallContext<'_> {
+impl<'a> ToolCallContext<'a> {
+    fn detached_human(&self, auth: EngineAuthContext) -> ToolCallContext<'a> {
+        ToolCallContext {
+            registry: self.registry,
+            auth,
+            target: EgressTarget::ExternalMcp,
+            tool: self.tool,
+            request: self.request.clone(),
+            request_key: self.request_key.clone(),
+            request_hash: self.request_hash,
+            call_id: self.call_id.clone(),
+            deadline: self.deadline,
+            cancellation: self.cancellation.clone(),
+            provenance: ChatProvenance::default(),
+        }
+    }
+
+    fn confirmed(
+        registry: &'a ToolRegistry,
+        auth: EngineAuthContext,
+        budget: CallBudget,
+        tool: ToolName,
+        proposal: ContentDigest,
+    ) -> Result<Self, PortError> {
+        Ok(Self {
+            registry,
+            auth,
+            tool,
+            target: EgressTarget::ExternalMcp,
+            request: budget.request,
+            request_key: derive_key("notarium.proposal.approval.v1", &[proposal.as_bytes()]),
+            request_hash: proposal,
+            call_id: new_request_id()?,
+            deadline: Instant::now() + budget.remaining,
+            cancellation: budget.cancellation,
+            provenance: ChatProvenance::default(),
+        })
+    }
+
     fn account(&self) -> AccountContext {
         AccountContext::new(self.auth.clone(), self.budget())
     }

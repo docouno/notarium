@@ -16,7 +16,7 @@ use notarium_core::{
         SpaceSeq,
     },
     model::{HistoryScope, Lifecycle},
-    ports::CallBudget,
+    ports::{CallBudget, ConfirmedChatStep},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::Row;
@@ -50,6 +50,7 @@ pub struct CommandIdentitySpec {
     pub command_key: CommandKey,
     pub command_hash: ContentDigest,
     legacy: Option<Arc<fingerprint::LegacyFingerprint>>,
+    confirmed_chat_step: Option<(Arc<ConfirmedChatStep>, &'static str)>,
     pub(crate) require_receipt_detail: bool,
     pub(crate) authority:
         Option<Arc<(notarium_core::auth::EngineAuthContext, replay::ReplayPolicy)>>,
@@ -62,8 +63,12 @@ impl CommandIdentitySpec {
             command_hash,
             authority: None,
             legacy: None,
+            confirmed_chat_step: None,
             require_receipt_detail: false,
         }
+    }
+    pub(crate) fn has_confirmed_chat_step(&self) -> bool {
+        self.confirmed_chat_step.is_some()
     }
 }
 
@@ -672,12 +677,24 @@ impl WriteCoordinator {
         &self,
         inner: &Arc<CanonicalInner>,
         wait: WriterWait<'_>,
-        intent: PreparedWriteIntent,
+        mut intent: PreparedWriteIntent,
         sqlite_fast_plan: Option<Box<dyn crate::sqlite_fast::SqliteSyncItemPlan>>,
         pg_fast_plan: Option<PgSingleItemFastFn>,
         pretracked_guard: Option<ActiveWriteOpGuard>,
     ) -> Result<Vec<u8>, PortError> {
         inner.check_writer_epoch(&intent.scope.space_id, intent.active_epoch)?;
+        let (sqlite_fast_plan, pg_fast_plan) = if intent
+            .idempotency
+            .as_ref()
+            .is_some_and(CommandIdentitySpec::has_confirmed_chat_step)
+        {
+            if let Some(plan) = sqlite_fast_plan {
+                intent.execute = plan.into_async_exec();
+            }
+            (None, None)
+        } else {
+            (sqlite_fast_plan, pg_fast_plan)
+        };
         let _active_guard = match pretracked_guard {
             Some(g) => g,
             None => self.enter_write_op(&intent.scope.space_id, 1),
@@ -1891,6 +1908,12 @@ async fn execute_single_item_in_savepoint(
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
     let effective_epoch = intent.active_epoch;
+
+    if let Some(idemp) = &intent.idempotency {
+        idemp
+            .authorize_confirmed_chat_step(tx, &intent.scope, true)
+            .await?;
+    }
 
     // 2. Idempotent command receipt lookup (`command_receipts`) BEFORE purge fence and stale head CAS
     //    so idempotent retries of Purge / MintAndPurge replay their sanitized receipt rather than ResourceNotFound!

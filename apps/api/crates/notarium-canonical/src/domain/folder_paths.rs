@@ -81,11 +81,23 @@ async fn resolve_with_components(
 ) -> Result<Option<FolderSnapshot>, PortError> {
     let scope = ctx.scope().clone();
     let auth = ctx.auth().clone();
+    let confirmed = ctx.confirmed_chat_step().cloned();
     store
         .with_read_tx_budget(Some(&ctx.budget), |tx| {
             Box::pin(async move {
                 let space = load_space_record(tx, &scope.space_id).await?;
                 space.scope.check(&scope)?;
+                if let Some(step) = &confirmed {
+                    crate::chats::verify_confirmed_chat_step_tx(
+                        tx,
+                        &auth,
+                        &scope,
+                        step,
+                        "ensure_folder_path",
+                        false,
+                    )
+                    .await?;
+                }
                 let mut folders = FolderAncestryCache::default();
                 let base = base.unwrap_or_else(|| space.root_folder_id.clone());
                 let ancestry = if_visible(
@@ -296,6 +308,7 @@ pub(super) async fn ensure(
     let hash = format!("{}\0{}", base.as_str(), request.input.path);
     let idemp =
         derive_command_identity_spec(&request.identity, "ensure_folder_path", hash.as_bytes())
+            .with_confirmed_chat_step(&ctx, "ensure_folder_path")
             .with_policy(
                 ctx.auth(),
                 ReplayPolicy::Documents(vec![ReplayResource::WriteFolder(Some(base.clone()))]),
@@ -462,11 +475,23 @@ async fn verify_ensured_folder(
 ) -> Result<FolderRef, PortError> {
     let scope = ctx.scope().clone();
     let auth = ctx.auth().clone();
+    let confirmed = ctx.confirmed_chat_step().cloned();
     store
         .with_read_tx_budget(Some(&ctx.budget), |tx| {
             Box::pin(async move {
                 let space = load_space_record(tx, &scope.space_id).await?;
                 space.scope.check(&scope)?;
+                if let Some(step) = &confirmed {
+                    crate::chats::verify_confirmed_chat_step_tx(
+                        tx,
+                        &auth,
+                        &scope,
+                        step,
+                        "ensure_folder_path",
+                        false,
+                    )
+                    .await?;
+                }
                 if reference.space_id != scope.space_id {
                     return Err(DomainError::ResourceNotFound.into());
                 }

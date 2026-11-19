@@ -5,6 +5,10 @@ mod ability_cases;
 mod content_cases;
 #[path = "agents_runtime/engine.rs"]
 mod engine;
+#[path = "agents_runtime/proposals.rs"]
+mod proposal_cases;
+#[path = "agents_runtime/proposal_notes.rs"]
+mod proposal_note_cases;
 #[allow(dead_code)]
 #[path = "../../notarium-control/tests/support/mod.rs"]
 mod support;
@@ -388,6 +392,9 @@ async fn external_registry_and_memory(pg: bool) {
     session_delivery_is_lossless(&fixture, &read, &scoped).await;
     ability_cases::overrides_and_promotion(&fixture).await;
     content_cases::edit_folder_cover_and_view(&fixture, &scoped).await;
+    proposal_cases::explicit_confirmation_applies_once(&fixture, &scoped).await;
+    proposal_note_cases::confirmed_notes_use_fixed_destinations_and_revisions(&fixture, &scoped)
+        .await;
     fixture.close().await;
 }
 

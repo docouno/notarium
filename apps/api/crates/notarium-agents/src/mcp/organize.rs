@@ -4,7 +4,10 @@ pub(super) mod links;
 use notarium_core::{DomainError, error::PortError};
 use serde_json::Value;
 
-pub(super) use links::{LinkArgs, format_link_line, resolve_target};
+pub(super) use links::{
+    LinkArgs, ProposalLink as LinkPlan, apply_links, describe_links, format_link_line, plan_links,
+    resolve_target,
+};
 
 use super::{ToolCallContext, ToolName};
 

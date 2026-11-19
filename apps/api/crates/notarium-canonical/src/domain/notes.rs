@@ -18,7 +18,7 @@ use notarium_core::{
         EditNote, ExternalObservation, ExternalObservationResult, FilenamePin, GetNote,
         InterceptedMutation, InterceptedPayload, InterceptionResult, Link, LinkBatch, LinkTarget,
         MoveNote, Mutation, NoteCard, NoteRevision, NoteSnapshot, ObservedContent, Preconditions,
-        RenameNote, SpaceContext,
+        RenameNote, RollbackReservation, SpaceContext,
     },
     query::{FieldObservation, FieldValue},
     receipt::{CausalBasis, CommandIdentity, MutationReceiptToken},
@@ -307,12 +307,9 @@ fn create_note_identity(
     if input.folder_page {
         hash.update(b"folder-page");
     }
-    derive_command_identity_spec(identity, "create_note", hash.finalize().as_bytes()).for_create(
-        ctx.auth(),
-        &input.note,
-        input.parent.as_ref(),
-        input.class,
-    )
+    derive_command_identity_spec(identity, "create_note", hash.finalize().as_bytes())
+        .with_confirmed_chat_step(ctx, "create_note")
+        .for_create(ctx.auth(), &input.note, input.parent.as_ref(), input.class)
 }
 
 fn edit_note_identity(
@@ -326,6 +323,7 @@ fn edit_note_identity(
     hash_carrier_plan(&mut hash, &input.plan);
     hash_preconditions(&mut hash, preconditions);
     derive_command_identity_spec(identity, "edit_note", hash.finalize().as_bytes())
+        .with_confirmed_chat_step(ctx, "edit_note")
         .for_note(ctx.auth(), &input.note)
 }
 
@@ -516,7 +514,9 @@ pub(crate) async fn create_note_impl(
         )
         .await
     {
-        Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => {
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+            if !idemp.has_confirmed_chat_step() =>
+        {
             ctx.budget.remaining = deadline.remaining(&budget)?;
             let legacy = v1_receipts::LegacyNoteCommand::Create(created);
             let result = deadline
@@ -865,7 +865,7 @@ pub(crate) async fn edit_note_impl(
     );
 
     ctx.budget.remaining = deadline.remaining(&budget)?;
-    let phase1 = if store.is_sqlite_local() {
+    let phase1 = if store.is_sqlite_local() && !idemp.has_confirmed_chat_step() {
         deadline
             .prepare_read(&budget, || {
                 crate::sqlite_fast::edit_note_phase1_sqlite_local(
@@ -977,7 +977,9 @@ pub(crate) async fn edit_note_impl(
 
     ctx.budget.remaining = deadline.remaining(&budget)?;
     let phase1 = match phase1 {
-        Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => {
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+            if !idemp.has_confirmed_chat_step() =>
+        {
             let legacy =
                 v1_receipts::LegacyNoteCommand::Edit(&request.input, &request.preconditions);
             let result = deadline
@@ -1054,6 +1056,35 @@ pub(crate) async fn edit_note_impl(
 
     let mut reservation_opt = None;
     if let Some(interceptor) = store.inner.collab_interceptor.get()
+        && idemp.has_confirmed_chat_step()
+        && base_head.doc_class != DocClass::EncryptedNote
+    {
+        // An Applied interceptor reply means its own mutation happened before
+        // the chat source can be fenced. A closed-room reservation lets this
+        // approved edit run through the ordinary canonical transaction.
+        ctx.budget.remaining = deadline.remaining(&budget)?;
+        let reserve = deadline
+            .wait(&budget, || {
+                interceptor.reserve_rollback(
+                    ctx.clone(),
+                    request.input.note.clone(),
+                    request.identity.clone(),
+                )
+            })
+            .await??;
+        match reserve {
+            RollbackReservation::Closed(reservation) => {
+                reservation_opt = Some(CarrierRoomWrite::Reserved(reservation));
+            }
+            RollbackReservation::SkippedRoomActive => {
+                return Err(unavailable_retryable(
+                    "confirmed_edit_room_active",
+                    "close the collaborative room before applying the confirmed edit",
+                    std::time::Duration::from_millis(50),
+                ));
+            }
+        }
+    } else if let Some(interceptor) = store.inner.collab_interceptor.get()
         && base_head.doc_class != DocClass::EncryptedNote
     {
         let (body_plan, header_mut) = build_collab_edit_payload(
@@ -1151,7 +1182,7 @@ pub(crate) async fn edit_note_impl(
         })
         .await??;
 
-    if store.is_sqlite_local() && reservation_opt.is_none() {
+    if store.is_sqlite_local() && reservation_opt.is_none() && !idemp.has_confirmed_chat_step() {
         let phase1_cached = base_anc.map(|anc| (base_head.clone(), anc));
         let (intent, fast_plan) = crate::sqlite_fast::build_carrier_replacement_fast_intent(
             store,
@@ -1677,6 +1708,10 @@ pub(crate) async fn delete_note_impl(
     ctx: SpaceContext,
     request: Mutation<DeleteNote>,
 ) -> Result<Committed<NoteRevision>, PortError> {
+    if ctx.confirmed_chat_step().is_some() && request.input.disposition != DeleteDisposition::Trash
+    {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     if request.input.disposition == DeleteDisposition::Purge {
         return crate::domain::purge::purge_note_impl(store, ctx, request).await;
     }
@@ -1761,6 +1796,7 @@ async fn delete_impl(
     };
     let idemp = derive_command_identity_spec(&request.identity, disp_tag, fp.as_bytes())
         .with_preconditions(&request.preconditions, "note", note.as_str())
+        .with_confirmed_chat_step(&ctx, disp_tag)
         .for_note(ctx.auth(), note);
 
     let intent = build_trash_or_restore_intent(
@@ -2214,6 +2250,7 @@ fn move_note_identity(
     );
     derive_command_identity_spec(identity, "move_note", fp.as_bytes())
         .with_preconditions(preconditions, "note", input.note.as_str())
+        .with_confirmed_chat_step(ctx, "move_note")
         .for_move(ctx.auth(), &input.note, input.parent.as_ref())
 }
 
@@ -2746,6 +2783,7 @@ pub(crate) async fn rename_note_impl(
     let idemp = derive_command_identity_spec(&request.identity, "rename_note", fp.as_bytes())
         .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
         .with_rename_title(request.input.title.as_deref())
+        .with_confirmed_chat_step(&ctx, "rename_note")
         .for_note(ctx.auth(), &request.input.note);
 
     if let Some(replayed) = deadline
@@ -3784,11 +3822,9 @@ fn link_identity(
         hash.update(&[0]);
     }
     hash_preconditions(&mut hash, &item.preconditions);
-    derive_command_identity_spec(&item.identity, "link", hash.finalize().as_bytes()).for_link(
-        ctx.auth(),
-        &item.input.source,
-        &item.input.target,
-    )
+    derive_command_identity_spec(&item.identity, "link", hash.finalize().as_bytes())
+        .with_confirmed_chat_step(ctx, "link")
+        .for_link(ctx.auth(), &item.input.source, &item.input.target)
 }
 
 pub(crate) async fn link_impl(
@@ -3812,7 +3848,9 @@ pub(crate) async fn link_impl(
         })
         .await;
     let replay = match replay {
-        Err(PortError::Domain(DomainError::IdempotencyKeyReused)) => {
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+            if !idemp.has_confirmed_chat_step() =>
+        {
             let original = deadline
                 .prepare(&ctx.budget, || {
                     v1_receipts::link_identity(store, &ctx, &request, &link_line, idemp.clone())
@@ -4101,11 +4139,12 @@ async fn prepare_link_batch_item(
     let line = validate_and_format_link_line(&item.input)?;
     let spec = link_identity(ctx, &item, &line);
     if let Some(hash) = receipts.get(item.identity.key.as_str()) {
-        let spec = if hash == spec.command_hash.as_bytes().as_slice() {
-            spec
-        } else {
-            v1_receipts::link_identity(store, ctx, &item, &line, spec).await?
-        };
+        let spec =
+            if hash == spec.command_hash.as_bytes().as_slice() || spec.has_confirmed_chat_step() {
+                spec
+            } else {
+                v1_receipts::link_identity(store, ctx, &item, &line, spec).await?
+            };
         let mut replay = build_failing_item_intent(
             &space.scope,
             space.active_epoch,

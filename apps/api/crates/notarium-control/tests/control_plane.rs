@@ -609,6 +609,29 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
         );
     }
 
+    let proposal_reader = plane
+        .revalidate_proposal_human(ctx.clone(), ProposalHumanAccess::ReadOnly)
+        .await
+        .unwrap();
+    proposal_reader.authorize_proposal_read().unwrap();
+    assert!(
+        plane
+            .revalidate_auth(AccountContext::new(proposal_reader, budget()))
+            .await
+            .is_err()
+    );
+    control
+        .logout(evidence(AuthEvidenceKind::Session, token.expose()))
+        .await
+        .unwrap();
+    for access in [ProposalHumanAccess::ReadOnly, ProposalHumanAccess::Write] {
+        let error = plane
+            .revalidate_proposal_human(ctx.clone(), access)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "authentication_failed");
+    }
+
     drop(trusted);
     drop(plane);
     drop(control);
