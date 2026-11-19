@@ -398,6 +398,15 @@ impl EngineAuthContext {
             source,
             narrowed: true,
         };
+        derived.bearer_scope = Some(
+            if self.bearer_scope != Some(BearerScope::Read)
+                && Self::has_writable_space(&derived.spaces)
+            {
+                BearerScope::Write
+            } else {
+                BearerScope::Read
+            },
+        );
         Ok(derived)
     }
     /// Personal access tokens are delegated credentials, never interactive humans.
@@ -407,6 +416,15 @@ impl EngineAuthContext {
         }
         let mut derived = self.narrow(requested)?;
         derived.kind = PrincipalKind::Pat;
+        derived.bearer_scope = Some(
+            if self.bearer_scope != Some(BearerScope::Read)
+                && Self::has_writable_space(&derived.spaces)
+            {
+                BearerScope::Write
+            } else {
+                BearerScope::Read
+            },
+        );
         Ok(derived)
     }
 
@@ -469,7 +487,7 @@ impl EngineAuthContext {
             spaces,
             human_management: false,
             ability_write: false,
-            bearer_scope: None,
+            bearer_scope: self.bearer_scope,
             ..self.clone()
         })
     }
@@ -523,13 +541,13 @@ impl EngineAuthContext {
                 .collect();
         }
         result.human_management = self.human_management() && current.human_management();
-        result.bearer_scope =
-            self.bearer_scope
-                .zip(current.bearer_scope)
-                .map(|(previous, current)| match (previous, current) {
-                    (BearerScope::Write, BearerScope::Write) => BearerScope::Write,
-                    _ => BearerScope::Read,
-                });
+        result.bearer_scope = match (self.bearer_scope, current.bearer_scope) {
+            (Some(BearerScope::Read), _) | (_, Some(BearerScope::Read)) => Some(BearerScope::Read),
+            (Some(BearerScope::Write), Some(BearerScope::Write)) => Some(BearerScope::Write),
+            (None, Some(BearerScope::Write)) => Some(BearerScope::Write),
+            (Some(BearerScope::Write), None) => Some(BearerScope::Read),
+            (None, None) => None,
+        };
         result.ability_write = self.has_cap(Cap::AbilityWrite)
             && current.has_cap(Cap::AbilityWrite)
             && (result.human_management
@@ -817,6 +835,7 @@ impl EngineAuthContext {
             .ok_or(DomainError::ResourceNotFound)?;
         if space.lifecycle != SpaceLifecycle::Active
             || grant.role == SpaceRole::Viewer
+            || self.bearer_scope == Some(BearerScope::Read)
             || (matches!(self.kind, PrincipalKind::Pat | PrincipalKind::OAuth { .. })
                 && self.bearer_scope != Some(BearerScope::Write))
             || self

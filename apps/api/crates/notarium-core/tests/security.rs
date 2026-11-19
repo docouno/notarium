@@ -875,3 +875,130 @@ fn cancellation_future_wakes_registered_task_and_tool_call_ids_accept_provider_d
     ProviderToolCallId::new("call_abc-123.v2:4".into()).unwrap();
     assert!(ProviderToolCallId::new("call/bad".into()).is_err());
 }
+
+#[test]
+fn read_only_bearer_scope_survives_narrowing_delegation_and_intersection() {
+    use notarium_core::ports::BearerScope;
+
+    let principal = PrincipalId::from_bytes([1; 16]);
+    let grant = GrantId::from_bytes([1; 16]);
+    let space_id = SpaceId::from_bytes([1; 16]);
+    let space = facts(1, DocClass::UserDoc).space;
+
+    // Narrowing a human context via `for_pat` / `for_oauth` derives the
+    // matching bearer scope instead of erasing it to `None`.
+    let owner = human(SpaceRole::Owner, true);
+    let writable_pat = owner.for_pat(grants(SpaceRole::Owner)).unwrap();
+    assert_eq!(writable_pat.bearer_scope(), Some(BearerScope::Write));
+    assert!(writable_pat.authorize_write_space_pin(&space).is_ok());
+
+    let writable_oauth = owner
+        .for_oauth(GrantId::from_bytes([2; 16]), grants(SpaceRole::Owner))
+        .unwrap();
+    assert_eq!(writable_oauth.bearer_scope(), Some(BearerScope::Write));
+    assert!(writable_oauth.authorize_write_space_pin(&space).is_ok());
+
+    let empty_pat = owner.for_pat(BTreeMap::new()).unwrap();
+    assert_eq!(empty_pat.bearer_scope(), Some(BearerScope::Read));
+
+    for is_oauth in [false, true] {
+        let make_credential = || {
+            if is_oauth {
+                BearerCredential::OAuth {
+                    token: CredentialTokenId::parse("0123456789ab").unwrap(),
+                    grant: OAuthGrantId::from_bytes([9; 16]),
+                    family: Some(OAuthFamilyId::from_bytes([9; 16])),
+                }
+            } else {
+                BearerCredential::Pat(CredentialTokenId::parse("0123456789ab").unwrap())
+            }
+        };
+        let read_bearer = EngineAuthContext::for_bearer(VerifiedBearer::attest(
+            principal.clone(),
+            grant.clone(),
+            make_credential(),
+            grants(SpaceRole::Owner),
+            BearerScope::Read,
+            false,
+        ));
+        assert_eq!(read_bearer.bearer_scope(), Some(BearerScope::Read));
+        assert_eq!(
+            read_bearer.authorize_write_space_pin(&space),
+            Err(DomainError::SpaceReadOnly)
+        );
+        assert_eq!(
+            read_bearer.authorize_space_write(&space),
+            Err(DomainError::SpaceReadOnly)
+        );
+
+        let agent = read_bearer
+            .for_agent_run(
+                AgentRunId::from_bytes([4; 16]),
+                space_id.clone(),
+                ChatAudience::Personal,
+                read_bearer.spaces().clone(),
+            )
+            .unwrap();
+        assert_eq!(agent.bearer_scope(), Some(BearerScope::Read));
+        assert_eq!(
+            agent.authorize_write_space_pin(&space),
+            Err(DomainError::SpaceReadOnly)
+        );
+        assert_eq!(
+            agent.authorize_space_write(&space),
+            Err(DomainError::SpaceReadOnly)
+        );
+
+        let keeper = read_bearer
+            .for_keeper(
+                AgentRunId::from_bytes([5; 16]),
+                space_id.clone(),
+                None,
+                BTreeSet::new(),
+            )
+            .unwrap();
+        assert_eq!(keeper.bearer_scope(), Some(BearerScope::Read));
+        assert_eq!(
+            keeper.authorize_write_space_pin(&space),
+            Err(DomainError::SpaceReadOnly)
+        );
+
+        let narrowed_pat = read_bearer.for_pat(read_bearer.spaces().clone()).unwrap();
+        assert_eq!(narrowed_pat.bearer_scope(), Some(BearerScope::Read));
+        assert_eq!(
+            narrowed_pat.authorize_write_space_pin(&space),
+            Err(DomainError::SpaceReadOnly)
+        );
+
+        // Intersecting a previously writable bearer or delegated agent with a
+        // live read-only bearer must always narrow to `BearerScope::Read`.
+        let write_bearer = EngineAuthContext::for_bearer(VerifiedBearer::attest(
+            principal.clone(),
+            grant.clone(),
+            make_credential(),
+            grants(SpaceRole::Owner),
+            BearerScope::Write,
+            true,
+        ));
+        let write_agent = write_bearer
+            .for_agent_run(
+                AgentRunId::from_bytes([6; 16]),
+                space_id.clone(),
+                ChatAudience::Personal,
+                write_bearer.spaces().clone(),
+            )
+            .unwrap();
+        let downgraded = write_agent.intersect_current(&read_bearer).unwrap();
+        assert_eq!(downgraded.bearer_scope(), Some(BearerScope::Read));
+        assert_eq!(
+            downgraded.authorize_write_space_pin(&space),
+            Err(DomainError::SpaceReadOnly)
+        );
+        let revalidated_read = agent.intersect_current(&read_bearer).unwrap();
+        assert_eq!(revalidated_read.bearer_scope(), Some(BearerScope::Read));
+        assert_eq!(
+            revalidated_read.authorize_write_space_pin(&space),
+            Err(DomainError::SpaceReadOnly)
+        );
+    }
+}

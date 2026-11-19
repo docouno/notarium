@@ -45,8 +45,8 @@ use super::{
 
 const MAX_CONFLICT_RETRIES: usize = 3;
 
-/// The first two fields reproduce the B03 receipt. Absent metadata from an old
-/// receipt means it appended to an existing note and carried no summary.
+/// The first two fields preserve the legacy receipt layout. Absent metadata
+/// from an old receipt means it appended to an existing note and carried no summary.
 #[derive(Serialize, Deserialize)]
 struct StoredMemoryAppend {
     value: NoteRevision,

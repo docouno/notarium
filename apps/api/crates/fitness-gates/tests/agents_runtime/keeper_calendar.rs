@@ -166,8 +166,8 @@ pub(super) async fn calendar_scope_and_orphan(fixture: &mut RuntimeFixture, spac
     assert_eq!(runs[0].reserved_next_slot, Some(next_week));
     let original_log = runs[0].keeper_log.clone().unwrap();
 
-    // A B04 due could preserve the late UTC spelling of a civil slot whose
-    // canonical early counterpart was already delivered.
+    // A previously persisted due timestamp could preserve the late UTC spelling
+    // of a civil slot whose canonical early counterpart was already delivered.
     fixture.storage.observer.execute(
         "UPDATE agent_schedules SET next_slot_utc_ms=1793514600000 WHERE title='Historical fold runtime'",
     ).await;

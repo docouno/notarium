@@ -1,5 +1,8 @@
 use super::*;
-use notarium_agents::chats::{AgentRunSupervisor, ChatRunOptions, ExclusiveDataRoot};
+use notarium_agents::chats::{
+    AgentRunSupervisor, ChatRunOptions, ClusterRunAuthority, ExclusiveDataRoot, LiveRunOwner,
+    RunOwnershipRequest, StartChatRun,
+};
 use notarium_control::auth::token::{MintedToken, TokenKind, mint};
 use notarium_core::{
     auth::{AuthenticatedCredential, ChatAudience},
@@ -7,11 +10,88 @@ use notarium_core::{
     model::HistoryScope,
 };
 use std::{
+    collections::BTreeSet,
     future::Future,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 use tokio::{sync::oneshot, time::timeout};
+
+struct CountingClusterAuthority {
+    revocations: Arc<RevocationHub>,
+    admit_chat_write_calls: AtomicUsize,
+    register_owner_calls: AtomicUsize,
+}
+
+impl SessionRevocationPort for CountingClusterAuthority {
+    fn register_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.revocations
+            .register_provider(ctx, selectors, cancellation)
+    }
+
+    fn register_canonical_effect(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Arc<dyn CanonicalEffectRegistration>> {
+        self.revocations
+            .register_canonical_effect(ctx, selectors, cancellation)
+    }
+
+    fn fence_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.revocations.fence_provider(ctx, selectors)
+    }
+
+    fn fence_inactive_provider(
+        &self,
+        ctx: MaintenanceContext,
+        call: RequestId,
+    ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>> {
+        self.revocations.fence_inactive_provider(ctx, call)
+    }
+
+    fn revoke(
+        &self,
+        ctx: MaintenanceContext,
+        selector: RevocationSelector,
+        reason: RevocationReason,
+    ) -> PortFuture<'_, ()> {
+        self.revocations.revoke(ctx, selector, reason)
+    }
+}
+
+impl ClusterRunAuthority for CountingClusterAuthority {
+    fn admit_chat_write(
+        &self,
+        _ctx: MaintenanceContext,
+        _scope: HistoryScope,
+        _thread: ChatThreadId,
+        _ownership_lost: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.admit_chat_write_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(DomainError::AccessDenied.into()) })
+    }
+
+    fn register_owner(
+        &self,
+        _ctx: MaintenanceContext,
+        _request: RunOwnershipRequest,
+        _cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn LiveRunOwner>> {
+        self.register_owner_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(DomainError::AccessDenied.into()) })
+    }
+}
 
 pub(super) async fn bump_account_after_publication<T>(
     fixture: &RuntimeFixture,
@@ -129,6 +209,39 @@ async fn revoke_during_active_sql<T, R>(
         .expect("the revoked active SQL write must fail")
 }
 
+async fn revoke_during_fenced_replay<T, R>(
+    fixture: &RuntimeFixture,
+    mutation: impl Future<Output = Result<T, PortError>>,
+    revocation: impl Future<Output = Result<R, PortError>>,
+) -> PortError {
+    // Pause inside `begin_canonical_effect()` so bypassing guarded receipt
+    // lookup (for example via an unfenced SQLite Phase-1 read) can never pass.
+    let (entered, release) = fixture.projections.pause_active_sql_effect();
+    let revoke = async {
+        let cancellation = entered
+            .await
+            .expect("the replayed operation must enter begin_canonical_effect()");
+        tokio::pin!(revocation);
+        tokio::select! {
+            () = cancellation.cancelled() => {
+                let _ = release.send(());
+                revocation.await.unwrap();
+            }
+            res = &mut revocation => {
+                res.unwrap();
+                assert!(cancellation.is_cancelled());
+                let _ = release.send(());
+            }
+        }
+    };
+    let (result, ()) = timeout(Duration::from_secs(10), async {
+        tokio::join!(mutation, revoke)
+    })
+    .await
+    .expect("fenced replay and revocation must settle");
+    result.err().expect("the revoked fenced replay must fail")
+}
+
 pub(super) async fn native_session(
     fixture: &mut RuntimeFixture,
     tag: u8,
@@ -163,9 +276,10 @@ async fn revoked_chat_receipt(fixture: &mut RuntimeFixture, personal: &HistorySc
     let (account, token) = native_session(fixture, 196).await;
     let scope = SpaceContext::new(account.auth().clone(), personal.clone(), budget()).unwrap();
     let thread = ChatThreadId::from_bytes([196; 16]);
+    let actor = account.auth().principal().clone();
     let command = |tag| CommandIdentity {
         scope: personal.clone(),
-        actor: account.auth().principal().clone(),
+        actor: actor.clone(),
         key: CommandKey::from_bytes([tag; 16]),
         hash: ContentDigest::from_bytes([tag; 32]),
     };
@@ -314,10 +428,14 @@ async fn revoked_chat_receipt(fixture: &mut RuntimeFixture, personal: &HistorySc
             .last_seq,
         before
     );
-    // Read-only PAT and read-only OAuth bearer tokens must be rejected by
-    // chat redaction, run cancellation, Control fencing, and direct Canonical
-    // writes even when the underlying account owns the Space.
+    // Read-only PAT and read-only OAuth bearer tokens (and any AgentRun/Keeper
+    // narrowed from them) must be rejected by chat redaction, run cancellation,
+    // Control fencing, and direct Canonical chat/job writes even when the
+    // underlying account owns the Space. Non-DirectHuman callers must also be
+    // rejected by `start` and `enqueue_input` before any clustered ownership or
+    // route-admission side effects occur.
     let read_pat = fixture.pat(BearerScope::Read, false).await;
+    let write_pat = fixture.pat(BearerScope::Write, false).await;
     let oauth_access = mint(TokenKind::Access).unwrap();
     fixture
         .storage
@@ -336,6 +454,65 @@ async fn revoked_chat_receipt(fixture: &mut RuntimeFixture, personal: &HistorySc
         budget(),
     );
     assert_eq!(read_oauth.auth().bearer_scope(), Some(BearerScope::Read));
+    let cluster_authority = Arc::new(CountingClusterAuthority {
+        revocations: fixture.revocations.clone(),
+        admit_chat_write_calls: AtomicUsize::new(0),
+        register_owner_calls: AtomicUsize::new(0),
+    });
+    let clustered = AgentRunSupervisor::new_clustered(
+        fixture.registry.clone(),
+        fixture.revocations.clone(),
+        cluster_authority.clone(),
+    );
+    for (tag, bearer) in [
+        (205_u8, read_pat.clone()),
+        (206_u8, read_oauth.clone()),
+        (208_u8, write_pat),
+    ] {
+        assert!(matches!(
+            clustered
+                .start(
+                    bearer.clone(),
+                    StartChatRun {
+                        scope: personal.clone(),
+                        thread: thread.clone(),
+                        expected_leaf: entry_seq,
+                        options: ChatRunOptions::default(),
+                    },
+                )
+                .await,
+            Err(PortError::Domain(DomainError::AccessDenied))
+        ));
+        assert!(matches!(
+            clustered
+                .enqueue_input(
+                    bearer,
+                    SubmitUserChatInput {
+                        identity: command(tag),
+                        id: PendingInputId::from_bytes([tag; 16]),
+                        thread: thread.clone(),
+                        expected_leaf: entry_seq,
+                        body: "Bearer caller must not enqueue chat input".into(),
+                        mentions_agent: true,
+                    },
+                    ChatRunOptions::default(),
+                )
+                .await,
+            Err(PortError::Domain(DomainError::AccessDenied))
+        ));
+    }
+    assert_eq!(
+        cluster_authority
+            .register_owner_calls
+            .load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        cluster_authority
+            .admit_chat_write_calls
+            .load(Ordering::SeqCst),
+        0
+    );
     for (tag, bearer) in [(205_u8, read_pat), (206_u8, read_oauth)] {
         assert!(matches!(
             supervisor
@@ -374,6 +551,69 @@ async fn revoked_chat_receipt(fixture: &mut RuntimeFixture, personal: &HistorySc
                 .await,
             Err(PortError::Domain(DomainError::SpaceReadOnly))
         ));
+        let derived_agent = bearer
+            .auth()
+            .for_agent_run(
+                AgentRunId::from_bytes([tag; 16]),
+                personal.space_id.clone(),
+                ChatAudience::Personal,
+                bearer.auth().spaces().clone(),
+            )
+            .unwrap();
+        let derived_keeper = bearer
+            .auth()
+            .for_keeper(
+                AgentRunId::from_bytes([tag.wrapping_add(10); 16]),
+                personal.space_id.clone(),
+                None,
+                BTreeSet::new(),
+            )
+            .unwrap();
+        for derived in [derived_agent, derived_keeper] {
+            assert_eq!(derived.bearer_scope(), Some(BearerScope::Read));
+            let derived_scope = SpaceContext::new(derived, personal.clone(), budget()).unwrap();
+            assert!(matches!(
+                fixture
+                    .canonical
+                    .create_chat(
+                        derived_scope.clone(),
+                        Mutation {
+                            identity: command(tag.wrapping_add(20)),
+                            preconditions: Preconditions::default(),
+                            input: CreateChat {
+                                thread: ChatThreadId::from_bytes([tag.wrapping_add(20); 16]),
+                                owner: principal.clone(),
+                                kind: ChatThreadKind::Personal,
+                                title: "Blocked read-only delegated chat".into(),
+                                project_folder: None,
+                            },
+                        },
+                    )
+                    .await,
+                Err(PortError::Domain(DomainError::SpaceReadOnly))
+            ));
+            assert!(matches!(
+                fixture
+                    .canonical
+                    .redact_chat_entry(derived_scope.clone(), redact_request(tag))
+                    .await,
+                Err(PortError::Domain(DomainError::SpaceReadOnly))
+            ));
+            assert!(matches!(
+                fixture
+                    .canonical
+                    .create_job(
+                        derived_scope,
+                        Mutation {
+                            identity: command(tag.wrapping_add(30)),
+                            preconditions: Preconditions::default(),
+                            input: ContentJobKind::Reindex,
+                        },
+                    )
+                    .await,
+                Err(PortError::Domain(DomainError::SpaceReadOnly))
+            ));
+        }
     }
     assert_eq!(
         fixture
@@ -656,57 +896,122 @@ async fn check(pg: bool) {
                 .unwrap();
         }
     }
-    // Exact replay of an ability carrier edit (`edit_note` with a Canonical
-    // effect) must fail closed under synchronous PAT revocation on both SQLite
-    // and PostgreSQL rather than bypassing revocation via a Phase-1 receipt.
-    let edit_created = call(
-        &fixture,
-        owner,
-        190,
-        "create_ability",
-        json!({
-            "kind":"role",
-            "name":"edit-replay-authority",
-            "description":"Runtime role",
-            "instructions":"Initial instructions.",
-            "placement":{"home":"personal"},
-        }),
-    )
-    .await
-    .unwrap();
+    // Exact replay of a fenced `edit_note` (`CanonicalEffect::AbilityAuthoring`)
+    // must enter the guarded receipt-replay transaction (`begin_canonical_effect`)
+    // and fail closed under synchronous PAT revocation on both SQLite and
+    // PostgreSQL, rather than returning a Phase-1 SQLite receipt without fencing.
+    let scope = fixture.canonical.read_space(&space_id).await.unwrap().scope;
     let edit_author = fixture.pat(BearerScope::Write, true).await;
     let Some(AuthenticatedCredential::Pat(edit_pat_id)) = edit_author.auth().credential().cloned()
     else {
         panic!("expected write PAT");
     };
-    let edit_input = json!({
-        "ref":edit_created.structured_content["ref"],
-        "versionToken":edit_created.structured_content["versionToken"],
-        "instructions":"Updated instructions once.",
-    });
-    let edited = call(
-        &fixture,
-        &edit_author,
-        191,
-        "edit_ability",
-        edit_input.clone(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(edited.structured_content["outcome"], "updated");
+    let skill_note = NoteId::from_bytes([220; 16]);
+    let skill_owner_scope =
+        SpaceContext::new(owner.auth().clone(), scope.clone(), budget()).unwrap();
+    let skill_created = fixture
+        .canonical
+        .create_note(
+            skill_owner_scope.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: principal.clone(),
+                    key: CommandKey::from_bytes([220; 16]),
+                    hash: ContentDigest::from_bytes([220; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: skill_note.clone(),
+                    parent: None,
+                    slug: "edit-replay-authority".into(),
+                    class: DocClass::Skill,
+                    carrier: "# Role\n\nInitial instructions.\n".into(),
+                    folder_page: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let skill_snapshot = fixture
+        .canonical
+        .get_note(
+            skill_owner_scope,
+            GetNote {
+                note: skill_note.clone(),
+                revision: None,
+                causal: CausalBasis::Await(Default::default()),
+            },
+        )
+        .await
+        .unwrap();
+    let skill_body = skill_snapshot.document.explicit_read(owner.auth()).unwrap();
+    let skill_pos = skill_body.find("Initial instructions.").unwrap();
+    let edit_mutation = Mutation {
+        identity: CommandIdentity {
+            scope: scope.clone(),
+            actor: principal.clone(),
+            key: CommandKey::from_bytes([221; 16]),
+            hash: ContentDigest::from_bytes([221; 32]),
+        },
+        preconditions: Preconditions {
+            revision: Some(skill_created.value.revision),
+            ..Default::default()
+        },
+        input: EditNote {
+            note: skill_note,
+            plan: notarium_syntax::patch::plan(
+                skill_body,
+                notarium_core::span::ByteSpan::new(0, skill_body.len()).unwrap(),
+                vec![(
+                    notarium_core::patch::CarrierEditOrigin::Body,
+                    notarium_core::span::ByteSpan::new(
+                        skill_pos,
+                        skill_pos + "Initial instructions.".len(),
+                    )
+                    .unwrap(),
+                    "Updated instructions once.".into(),
+                )],
+            )
+            .unwrap(),
+        },
+    };
+    let fenced_first = fixture
+        .control_plane
+        .fence_canonical_effect(
+            edit_author.auth().clone(),
+            SpaceContext::new(edit_author.auth().clone(), scope.clone(), budget()).unwrap(),
+            CanonicalEffect::AbilityAuthoring,
+        )
+        .await
+        .unwrap();
+    fixture
+        .canonical
+        .edit_note(fenced_first, edit_mutation.clone())
+        .await
+        .unwrap();
     let edit_seq_before = fixture
         .canonical
         .read_space(&space_id)
         .await
         .unwrap()
         .last_seq;
-    let edit_replay_denied = revoke_before_effect(
-        fixture.projections.pause_note_edit(),
-        call(&fixture, &edit_author, 191, "edit_ability", edit_input),
+    let fenced_replay = fixture
+        .control_plane
+        .fence_canonical_effect(
+            edit_author.auth().clone(),
+            SpaceContext::new(edit_author.auth().clone(), scope.clone(), budget()).unwrap(),
+            CanonicalEffect::AbilityAuthoring,
+        )
+        .await
+        .unwrap();
+    let edit_replay_denied = revoke_during_fenced_replay(
+        &fixture,
+        fixture.canonical.edit_note(fenced_replay, edit_mutation),
         fixture.control.revoke_pat(
             owner.clone(),
             AccountMutation {
-                identity: runtime_ability_cases::identity(&fixture, owner, 192).await,
+                identity: runtime_ability_cases::identity(&fixture, owner, 222).await,
                 input: RevokePat {
                     account: principal.clone(),
                     token: edit_pat_id,
@@ -732,7 +1037,6 @@ async fn check(pg: bool) {
         &mut fixture,
     ))
     .await;
-    let scope = fixture.canonical.read_space(&space_id).await.unwrap().scope;
     Box::pin(revoked_chat_receipt(&mut fixture, &scope)).await;
     Box::pin(revoked_root_userdoc_rollback(&mut fixture, &scope)).await;
     fixture.close().await;
@@ -842,7 +1146,8 @@ async fn revoked_root_userdoc_rollback(fixture: &mut RuntimeFixture, personal: &
         &replay_key,
     ))
     .await;
-    // Commit one rollback and verify replay after commit also fails closed.
+    // Commit one rollback and verify replay after commit also fails closed
+    // both pre-SQL and during active SQL receipt replay.
     supervisor
         .rollback_run(owner, personal.clone(), run.clone(), replay_key.clone())
         .await
@@ -855,6 +1160,37 @@ async fn revoked_root_userdoc_rollback(fixture: &mut RuntimeFixture, personal: &
         &replay_key,
     ))
     .await;
+    let after_commit = fixture
+        .canonical
+        .read_space(&personal.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    let (replay_active_account, replay_active_token) = native_session(fixture, 214).await;
+    let replay_active_denied = revoke_during_fenced_replay(
+        fixture,
+        supervisor.rollback_run(replay_active_account, personal.clone(), run, replay_key),
+        fixture.control.logout(support::evidence(
+            AuthEvidenceKind::Session,
+            replay_active_token.secret.expose(),
+        )),
+    )
+    .await;
+    assert!(
+        matches!(replay_active_denied, PortError::Cancelled(_))
+            || matches!(&replay_active_denied, PortError::Unavailable(failure)
+                if failure.effect() == notarium_core::error::CommitEffect::Unknown),
+        "{replay_active_denied:?}"
+    );
+    assert_eq!(
+        fixture
+            .canonical
+            .read_space(&personal.space_id)
+            .await
+            .unwrap()
+            .last_seq,
+        after_commit
+    );
 }
 
 #[tokio::test]

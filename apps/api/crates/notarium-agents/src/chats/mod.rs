@@ -267,6 +267,9 @@ impl AgentRunSupervisor {
         let service = self.clone();
         detached(async move {
             let account = service.live_account(account).await?;
+            if account.auth().kind() != &PrincipalKind::DirectHuman {
+                return Err(DomainError::AccessDenied.into());
+            }
             let gate = service.thread_gate(&request.scope, &request.thread);
             let _admission = gate.lock().await;
             let ctx = SpaceContext::new(

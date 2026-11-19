@@ -1681,8 +1681,9 @@ async fn terminal_slots_and_migrated_folds(pg: bool) {
     else {
         panic!("early civil occurrence was not retained");
     };
-    // B04 allowed both UTC representations in persisted schedules. Simulate
-    // that old state after an early-slot receipt and with an unclaimed schedule.
+    // Earlier schedule rows could retain both UTC representations in persisted
+    // schedules. Simulate that old state after an early-slot receipt and with
+    // an unclaimed schedule.
     fixture.observer.execute(
         "UPDATE agent_schedules SET next_slot_utc_ms=1793514600000 WHERE title IN ('Repeated local hour','Unclaimed local hour')"
     ).await;

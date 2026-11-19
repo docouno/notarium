@@ -109,7 +109,6 @@ pub struct ProjectionFixtures {
     seed: Mutex<Option<ProjectionFixture>>,
     directory: Mutex<BTreeMap<EffectiveReadId, NoteQuery>>,
     before_ability_trash: Mutex<Option<MutationPause>>,
-    before_note_edit: Mutex<Option<MutationPause>>,
     before_note_move: Mutex<Option<MutationPause>>,
     after_ability_publication: Mutex<Option<MutationPause>>,
     before_memory_append: Mutex<Option<MutationPause>>,
@@ -196,10 +195,6 @@ impl ProjectionFixtures {
         &self,
     ) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
         MutationPause::install(&self.arm_pause_chat_read_after_cleared)
-    }
-
-    pub fn pause_note_edit(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
-        MutationPause::install(&self.before_note_edit)
     }
 
     pub fn pause_note_move(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
@@ -336,7 +331,6 @@ canonical_port!(NoteWritePort;
         request: Mutation<EditNote>,
     ) -> PortFuture<'_, Committed<NoteRevision>> {
         Box::pin(async move {
-            MutationPause::enter(&self.1.before_note_edit, ctx.budget.cancellation.clone()).await;
             let committed = NoteWritePort::edit_note(&self.0, ctx, request).await?;
             if std::mem::take(&mut *self.1.lose_note_edit_ack.lock().unwrap()) {
                 return Err(PortError::Unavailable(

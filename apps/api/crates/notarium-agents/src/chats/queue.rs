@@ -19,11 +19,17 @@ impl AgentRunSupervisor {
             return Err(owner_unavailable());
         }
         let mut account = self.live_account(account).await?;
+        if account.auth().kind() != &PrincipalKind::DirectHuman {
+            return Err(DomainError::AccessDenied.into());
+        }
         let scope = input.identity.scope.clone();
         let thread = input.thread.clone();
         let gate = self.thread_gate(&scope, &thread);
         let _admission = gate.lock().await;
         account = self.live_account(account).await?;
+        if account.auth().kind() != &PrincipalKind::DirectHuman {
+            return Err(DomainError::AccessDenied.into());
+        }
         let ownership_lost = Cancellation::default();
         account.budget = bounded(&account.budget, MAINTENANCE_BUDGET, ownership_lost.clone());
         let mut route = self
