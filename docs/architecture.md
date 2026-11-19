@@ -17,9 +17,11 @@ The core, syntax, canonical and control libraries implement [domain contracts](c
 authority/egress checks, typed ports, history-scoped receipts, exact comparisons,
 byte-preserving edits, SQLite/PostgreSQL control storage, authentication, OAuth/OIDC,
 the native keyring, guarded outbound HTTP, the AI provider gateway and the
-[control backup participant](control-backup.md). [Canonical storage](storage.md) provides SQLite and PostgreSQL persistence, CAS,
-chat history and a backup participant. Projections,
-search, collaboration and HTTP/MCP transport integration remain separate work.
+[control backup participant](control-backup.md). [Canonical storage](storage.md)
+provides SQLite and PostgreSQL persistence, CAS, chat history and a backup
+participant. [Live collaboration](collab.md) provides transport-independent Yrs
+rooms, durable peer updates and live canonical command interception.
+Projections, search and HTTP/MCP transport integration remain separate work.
 
 ## Internal dependency allowlist
 
@@ -60,8 +62,10 @@ locked for offline setup. `Cargo.lock` must contain none of `openssl-sys`,
 TLS uses rustls 0.23 with ring, reqwest 0.13 with `rustls-no-provider`, and tonic
 0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
 C++/OpenSSL tools. Core/syntax tests exercise domain and document behavior;
-Canonical tests exercise dual-dialect storage and CAS. Control storage tests its SQL schema, target import/export, authentication,
-Space authority and crash recovery. Remaining per-crate scaffold tests are compile
+Canonical tests exercise dual-dialect storage and CAS. Control storage tests its
+SQL schema, target import/export, authentication, Space authority and crash
+recovery. Collaboration tests exercise wire framing, CRDT policy, carrier
+round-trips and dual-dialect room recovery. The other scaffold tests are compile
 smoke checks.
 
 `notarium-control` owns a 45-table baseline in SQLite and the PostgreSQL

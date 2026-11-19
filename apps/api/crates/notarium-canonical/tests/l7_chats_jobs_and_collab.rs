@@ -6,6 +6,8 @@ mod authority;
 mod pg_read_cancellation;
 #[path = "l7_chats_jobs_and_collab/retirement.rs"]
 mod retirement;
+#[path = "l7_chats_jobs_and_collab/room_wal.rs"]
+mod room_wal;
 mod support;
 
 use std::{
@@ -1993,6 +1995,7 @@ async fn check_reopened_room_concurrency(
         .await
         .unwrap();
     let close = CloseCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: note.clone(),
         owner_id: Some(writer.clone()),
@@ -2066,6 +2069,7 @@ async fn check_reopened_room_concurrency(
     );
 
     let checkpoint = || CheckpointCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: note.clone(),
         owner_id: "writer-c".into(),
@@ -2074,7 +2078,9 @@ async fn check_reopened_room_concurrency(
         yrs_snapshot: vec![1, 2],
         compacted_through_update_seq: Some(0),
         carrier_settlement: Some(CollabCarrierSettlement {
-            auth: owner_ctx(scope, owner.clone()).auth().clone(),
+            actor: notarium_canonical::CollabSettlementActor::writer(
+                owner_ctx(scope, owner.clone()).auth().clone(),
+            ),
             carrier: "# Collab Doc\n\nClosed settled.\n".into(),
         }),
     };
@@ -2088,6 +2094,7 @@ async fn check_reopened_room_concurrency(
     .expect("overlapping settlements must release the writer");
     assert!(completed.0.is_ok() || completed.1.is_ok());
     let close = CloseCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: note.clone(),
         owner_id: Some("writer-c".into()),
@@ -2632,6 +2639,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
     assert!(bad_lease_upd.is_err());
 
     let locked_checkpoint = CheckpointCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: collab_note.clone(),
         owner_id: "room-worker-1".into(),
@@ -2640,7 +2648,9 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         yrs_snapshot: vec![9],
         compacted_through_update_seq: Some(1),
         carrier_settlement: Some(CollabCarrierSettlement {
-            auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+            actor: notarium_canonical::CollabSettlementActor::writer(
+                owner_ctx(&scope, owner.clone()).auth().clone(),
+            ),
             carrier: "# Locked settlement\n".into(),
         }),
     };
@@ -2664,7 +2674,9 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         ),
     ] {
         let settlement = CollabCarrierSettlement {
-            auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+            actor: notarium_canonical::CollabSettlementActor::writer(
+                owner_ctx(&scope, owner.clone()).auth().clone(),
+            ),
             carrier: format!("---\n{field}\n---\nChanged carrier\n"),
         };
         let denied = store
@@ -2681,6 +2693,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
             .close_collab_session(
                 &make_budget(),
                 CloseCollabSession {
+                    unchanged_carrier_digest: None,
                     scope: scope.clone(),
                     note: collab_note.clone(),
                     owner_id: Some("room-worker-1".into()),
@@ -2711,9 +2724,10 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         let pause = store.acquire_writer_safe_point().await.unwrap();
         let mut late = locked_checkpoint.clone();
         let settlement = late.carrier_settlement.as_mut().unwrap();
-        settlement.auth = owner_ctx(&scope, owner.clone()).auth().clone();
+        let writer = owner_ctx(&scope, owner.clone()).auth().clone();
+        let taint = writer.taint().clone();
+        settlement.actor = notarium_canonical::CollabSettlementActor::writer(writer);
         settlement.carrier = "# Settlement revoked after staging\n".into();
-        let taint = settlement.auth.taint().clone();
         let task_store = store.clone();
         let pending = tokio::spawn(async move {
             task_store
@@ -2765,6 +2779,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         .checkpoint_collab_session(
             &make_budget(),
             CheckpointCollabSession {
+                unchanged_carrier_digest: None,
                 scope: scope.clone(),
                 note: collab_note.clone(),
                 owner_id: "room-worker-1".to_owned(),
@@ -2773,7 +2788,9 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
                 yrs_snapshot: vec![9, 9, 9],
                 compacted_through_update_seq: Some(1),
                 carrier_settlement: Some(CollabCarrierSettlement {
-                    auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+                    actor: notarium_canonical::CollabSettlementActor::writer(
+                        owner_ctx(&scope, owner.clone()).auth().clone(),
+                    ),
                     carrier: settled_carrier_1.clone(),
                 }),
             },
@@ -2791,6 +2808,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
     assert_eq!(snap_after_ckpt.updates[0].update_seq, 2);
 
     let newest = CheckpointCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: collab_note.clone(),
         owner_id: "room-worker-1".into(),
@@ -2820,6 +2838,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         );
     }
     let stale_close = CloseCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: collab_note.clone(),
         owner_id: Some("room-worker-1".into()),
@@ -2828,7 +2847,9 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         final_yrs_snapshot: Some(vec![9, 9, 9]),
         compacted_through_update_seq: Some(1),
         carrier_settlement: Some(CollabCarrierSettlement {
-            auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+            actor: notarium_canonical::CollabSettlementActor::writer(
+                owner_ctx(&scope, owner.clone()).auth().clone(),
+            ),
             carrier: "# Stale snapshot\n".to_owned(),
         }),
     };
@@ -2852,6 +2873,7 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
         .close_collab_session(
             &make_budget(),
             CloseCollabSession {
+                unchanged_carrier_digest: None,
                 scope: scope.clone(),
                 note: collab_note.clone(),
                 owner_id: Some("room-worker-1".to_owned()),
@@ -2860,7 +2882,9 @@ async fn run_jobs_and_collab_lifecycle_suite(store: &CanonicalStore, sqlite: boo
                 final_yrs_snapshot: Some(vec![7, 7]),
                 compacted_through_update_seq: Some(2),
                 carrier_settlement: Some(CollabCarrierSettlement {
-                    auth: owner_ctx(&scope, owner.clone()).auth().clone(),
+                    actor: notarium_canonical::CollabSettlementActor::writer(
+                        owner_ctx(&scope, owner.clone()).auth().clone(),
+                    ),
                     carrier: settled_carrier_2.clone(),
                 }),
             },
@@ -3150,6 +3174,11 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
     assert_eq!(fenced_snap.session.room_state, CollabRoomState::Fenced);
     assert_eq!(fenced_snap.session.owner_id, None);
     assert_eq!(fenced_snap.session.lease_epoch, LeaseEpoch::new(2).unwrap());
+    assert!(
+        store2
+            .room_fences()
+            .is_room_fenced(&crash_scope.space_id, &crash_note)
+    );
 
     // Direct `edit_note` (even WITHOUT registering a `LiveCollabInterceptor`!) MUST be blocked while `'fenced'`!
     let base = "# Crash Doc\n\nInitial.\n";
@@ -3205,6 +3234,7 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
         .close_collab_session(
             &make_budget(),
             CloseCollabSession {
+                unchanged_carrier_digest: None,
                 scope: crash_scope.clone(),
                 note: crash_note.clone(),
                 owner_id: Some("recovery-worker".to_owned()),
@@ -3213,7 +3243,9 @@ async fn l7_sqlite_chats_jobs_collab_and_crash_fenced_recovery() {
                 final_yrs_snapshot: Some(vec![42, 43]),
                 compacted_through_update_seq: Some(0),
                 carrier_settlement: Some(CollabCarrierSettlement {
-                    auth: owner_ctx(&crash_scope, owner.clone()).auth().clone(),
+                    actor: notarium_canonical::CollabSettlementActor::writer(
+                        owner_ctx(&crash_scope, owner.clone()).auth().clone(),
+                    ),
                     carrier: "# Crash Doc\n\nRecovered cleanly.\n".to_owned(),
                 }),
             },
@@ -3350,6 +3382,11 @@ async fn l7_postgres_s3_chats_jobs_and_collab_parity() {
         .unwrap();
     assert_eq!(persisted.session.room_state, CollabRoomState::Fenced);
     assert_eq!(persisted.updates.last().unwrap().update_bytes, vec![42]);
+    assert!(
+        successor
+            .room_fences()
+            .is_room_fenced(&scope.space_id, &note)
+    );
     successor
         .open_collab_session(
             &make_budget(),

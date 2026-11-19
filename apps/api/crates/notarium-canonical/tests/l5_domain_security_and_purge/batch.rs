@@ -264,6 +264,7 @@ pub(super) async fn check(
         .close_collab_session(
             &ctx.budget,
             CloseCollabSession {
+                unchanged_carrier_digest: None,
                 scope: scope.clone(),
                 note: note.clone(),
                 owner_id: Some("batch-room".into()),

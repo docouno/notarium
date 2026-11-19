@@ -5,7 +5,7 @@ use crate::{
 };
 use notarium_core::{
     error::{CommitEffect, OperationalFailure, RetryAdvice},
-    ports::{Cancellation, MaintenanceContext, ServicePurpose},
+    ports::{Cancellation, MaintenanceContext, RoomFenceState, ServicePurpose},
 };
 use tokio::{
     sync::{broadcast, oneshot},
@@ -119,7 +119,17 @@ impl CanonicalStore {
             };
             drop(turnover);
             match result {
-                Ok(true) => store.inner.grant_writer_epoch(&scope.space_id, new_epoch),
+                Ok(true) => {
+                    store.inner.grant_writer_epoch(&scope.space_id, new_epoch);
+                    if matches!(&store.inner.sql, SqlDriverState::Postgres { .. }) {
+                        store
+                            .inner
+                            .broadcast_hub
+                            .publish(BroadcastSignal::WriterLeaseChanged {
+                                scope: scope.clone(),
+                            });
+                    }
+                }
                 Ok(false) => {} // The same runtime already owns this committed epoch.
                 Err(error) => {
                     if let Some(reply) = reply {
@@ -225,55 +235,91 @@ impl CanonicalStore {
         attempt: Arc<Attempt>,
     ) -> Result<bool, PortError> {
         if let SqlDriverState::Postgres { pool, .. } = &self.inner.sql {
-            let _gate = self.inner.writer()?.acquire_commit_read_guard().await;
-            let mut connection = pool.acquire().await.map_err(|e| {
-                unavailable_retryable("pg_acquire_lease", e.to_string(), Duration::from_millis(50))
-            })?;
-            let mut lease = PgTransactionLease::new(&mut connection);
-            let timeout_ms = attempt
-                .remaining()
-                .saturating_add(Duration::from_secs(1))
-                .as_millis()
-                .min(i32::MAX as u128);
-            let begin = format!(
-                "BEGIN; SET LOCAL statement_timeout='{timeout_ms}ms'; SET LOCAL client_connection_check_interval='10ms'; SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema(), 7311229))"
-            );
-            let mut tx = lease
-                .conn()
-                .begin_with(sqlx::AssertSqlSafe(begin))
-                .await
-                .map_err(|e| internal_not_committed("pg_begin_lease", e.to_string()))?;
-            let changed = self
-                .update_lease_rows(
-                    &mut BackendConn::Postgres(&mut tx),
-                    scope,
-                    new_epoch,
-                    &attempt,
-                )
-                .await?;
-            if changed {
-                tx.commit().await.map_err(|e| {
-                    crate::codec::unknown_commit_outcome("pg_commit_lease", e.to_string())
-                })?;
-            } else {
-                tx.rollback().await.map_err(|e| {
+            let room_fences = &self.inner.room_fences;
+            let pending: Vec<_> = {
+                let _gate = self.inner.writer()?.acquire_commit_read_guard().await;
+                let mut connection = pool.acquire().await.map_err(|e| {
                     unavailable_retryable(
-                        "pg_end_lease_recheck",
+                        "pg_acquire_lease",
                         e.to_string(),
                         Duration::from_millis(50),
                     )
                 })?;
+                let mut lease = PgTransactionLease::new(&mut connection);
+                let timeout_ms = attempt
+                    .remaining()
+                    .saturating_add(Duration::from_secs(1))
+                    .as_millis()
+                    .min(i32::MAX as u128);
+                let begin = format!(
+                    "BEGIN; SET LOCAL statement_timeout='{timeout_ms}ms'; SET LOCAL client_connection_check_interval='10ms'; SELECT pg_advisory_xact_lock_shared(hashtextextended(current_schema(), 7311229))"
+                );
+                let mut tx = lease
+                    .conn()
+                    .begin_with(sqlx::AssertSqlSafe(begin))
+                    .await
+                    .map_err(|e| internal_not_committed("pg_begin_lease", e.to_string()))?;
+                let changed = self
+                    .update_lease_rows(
+                        &mut BackendConn::Postgres(&mut tx),
+                        scope,
+                        new_epoch,
+                        &attempt,
+                    )
+                    .await?;
+                if !changed {
+                    tx.rollback().await.map_err(|e| {
+                        unavailable_retryable(
+                            "pg_end_lease_recheck",
+                            e.to_string(),
+                            Duration::from_millis(50),
+                        )
+                    })?;
+                    lease.complete();
+                    return Ok(false);
+                }
+                let fenced = crate::peers::list_fenced_collab_leases_tx(
+                    &mut BackendConn::Postgres(&mut tx),
+                    &scope.space_id,
+                    i64::MAX,
+                )
+                .await?;
+                attempt.submit()?;
+                tx.commit().await.map_err(|e| {
+                    crate::codec::unknown_commit_outcome("pg_commit_lease", e.to_string())
+                })?;
+                lease.complete();
+                // Capture these slots while the commit guard still excludes a
+                // restore. Publication itself may wait for a note guard.
+                fenced
+                    .into_iter()
+                    .map(|(note, epoch)| {
+                        let slot = room_fences.get_or_init(scope, &note);
+                        let state = RoomFenceState::new(note.clone(), scope.clone(), epoch);
+                        (note, slot, state)
+                    })
+                    .collect()
+            };
+            // Transition reconciliation may hold the note guard while it
+            // acquires the pool's only checkout and the writer commit guard.
+            for (note, slot, state) in pending {
+                let mut guard = slot.lock_owned().await;
+                room_fences
+                    .publish_persisted_transition(scope, &note, &mut guard, state, true, None);
             }
-            lease.complete();
-            return Ok(changed);
+            return Ok(true);
         }
         let scope = scope.clone();
         let store = self.clone();
         self.with_write_tx(move |tx| {
             Box::pin(async move {
-                store
+                let changed = store
                     .update_lease_rows(tx, &scope, new_epoch, &attempt)
-                    .await
+                    .await?;
+                if changed {
+                    attempt.submit()?;
+                }
+                Ok(changed)
             })
         })
         .await
@@ -331,7 +377,6 @@ impl CanonicalStore {
         if tx.is_postgres() {
             crate::peers::fence_rooms_on_takeover_tx(tx, scope).await?;
         }
-        attempt.submit()?;
         Ok(true)
     }
 }

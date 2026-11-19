@@ -260,8 +260,10 @@ pub fn build_effect_payload_draft(
     })
 }
 
+/// In-process notification to refresh canonical Space state. Consumers read
+/// current authority and metadata from the store after receiving a signal.
 #[derive(Clone, Debug)]
-pub(crate) enum BroadcastSignal {
+pub enum BroadcastSignal {
     Committed {
         scope: HistoryScope,
         new_last_seq: SpaceSeq,
@@ -275,6 +277,16 @@ pub(crate) enum BroadcastSignal {
         new_scope: HistoryScope,
         ceiling: SpaceSeq,
     },
+    WriterLeaseChanged {
+        scope: HistoryScope,
+    },
+}
+
+impl CanonicalStore {
+    /// Observes canonical Space changes without registering a change-feed cursor.
+    pub fn subscribe_space_signals(&self) -> broadcast::Receiver<BroadcastSignal> {
+        self.inner.broadcast_hub.subscribe_raw()
+    }
 }
 
 pub(crate) struct BroadcastHub {
@@ -508,6 +520,7 @@ impl ChangeSubscription for CanonicalChangeSubscription {
                             })));
                         }
                     }
+                    Ok(BroadcastSignal::WriterLeaseChanged { .. }) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         return self.durable_notice(true).await;
                     }

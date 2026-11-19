@@ -31,6 +31,7 @@ pub mod purge;
 pub mod rollback;
 
 pub use common::{RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
+pub use notes::RoomCommandSettlement;
 
 impl NoteWritePort for CanonicalStore {
     fn create_note(

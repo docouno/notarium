@@ -6,9 +6,10 @@ use notarium_canonical::{
 use notarium_core::{
     patch::CarrierEditOrigin,
     ports::{
-        AcceptedRoomCarrier, ExternalObservation, ExternalObservationResult, FilenamePin,
-        InterceptedMutation, InterceptedPayload, InterceptionResult, LiveCollabInterceptor,
-        ObservedContent, RollbackReservation, RoomCarrierAction,
+        AcceptedRoomCarrier, BoardMoveResult, Committed, ExternalObservation,
+        ExternalObservationResult, FilenamePin, InterceptedMutation, InterceptedPayload,
+        InterceptionResult, LiveCollabInterceptor, ObservedContent, RollbackReservation,
+        RoomCarrierAction,
     },
     receipt::MutationReceiptToken,
     span::ByteSpan,
@@ -233,6 +234,7 @@ pub(super) async fn check(
                     .close_collab_session(
                         &ctx.budget,
                         CloseCollabSession {
+                            unchanged_carrier_digest: None,
                             scope: scope.clone(),
                             note: note.clone(),
                             owner_id: Some("observer".into()),
@@ -241,7 +243,9 @@ pub(super) async fn check(
                             final_yrs_snapshot: None,
                             compacted_through_update_seq: None,
                             carrier_settlement: Some(CollabCarrierSettlement {
-                                auth: ctx.auth().clone(),
+                                actor: notarium_canonical::CollabSettlementActor::writer(
+                                    ctx.auth().clone(),
+                                ),
                                 carrier: "three".into(),
                             }),
                         },
@@ -264,6 +268,7 @@ pub(super) async fn check(
     assert!(matches!(answer, Err(PortError::Unavailable(f))
         if f.effect() == notarium_core::error::CommitEffect::Unknown));
     check_room_command_commit(store, ctx, &room).await;
+    check_planned_observation_conflict_replay(store, ctx).await;
 
     planner.tracked_notes.lock().unwrap().insert(note.clone());
     let card = next_mutation(
@@ -332,6 +337,8 @@ pub(super) async fn check(
     assert_eq!(answer.value.group, first.value.group);
     assert_ne!(answer.value.rank_revision, later.value.rank_revision);
     assert_ne!(answer.value.group, later.value.group);
+    let latest = check_board_conflict_replay(store, ctx, &room, &saved_card, later).await;
+    check_board_planner_conflict_replay(store, ctx, planner, &saved_card, latest).await;
     let mut changed = saved_card.clone();
     changed.preconditions.lease = Some(LeaseEpoch::MAX);
     assert!(matches!(
@@ -347,6 +354,218 @@ pub(super) async fn check(
         store.move_board_card(ctx.clone(), saved_card).await,
         Err(PortError::Domain(DomainError::ResourceNotFound))
     ));
+}
+
+async fn check_board_conflict_replay(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    room: &PausedRoom,
+    original: &Mutation<MoveBoardCard>,
+    mut latest: Committed<BoardMoveResult>,
+) -> Committed<BoardMoveResult> {
+    for (status, divergent) in [("reviewed", false), ("published", true)] {
+        let candidate_fields = |status: &str| {
+            BTreeMap::from([("status".into(), Some(YamlValue::String(status.into())))])
+        };
+        let command = next_mutation(
+            ctx.scope(),
+            ctx.auth().principal(),
+            MoveBoardCard {
+                group: GroupKey::Value(ScalarValue::String(status.into())),
+                fields: candidate_fields(status),
+                expected_note: latest.value.revision.revision.clone(),
+                expected_rank: RankExpectation::Existing(latest.value.rank_revision.clone()),
+                ..original.input.clone()
+            },
+        );
+        let mut queued = command.clone();
+        if divergent {
+            queued.input.group = GroupKey::Value(ScalarValue::String("later".into()));
+            queued.input.fields = candidate_fields("later");
+        }
+        let (queued_result, committed) = room
+            .during_interception(store.move_board_card(ctx.clone(), queued), async {
+                let committed = store.move_board_card(ctx.clone(), command).await.unwrap();
+                let error = if divergent {
+                    DomainError::RevisionConflict {
+                        current: committed.value.revision.revision.clone(),
+                        lineage: None,
+                    }
+                } else {
+                    DomainError::validation(ValidationReason::CursorStale)
+                };
+                (InterceptionResult::Conflict(error), committed)
+            })
+            .await;
+        if divergent {
+            assert!(matches!(
+                queued_result,
+                Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+            ));
+        } else {
+            let replayed = queued_result.unwrap();
+            assert_eq!(replayed.receipt, committed.receipt);
+            assert_eq!(replayed.value.rank_revision, committed.value.rank_revision);
+        }
+        assert_eq!(
+            store
+                .read_space(&ctx.scope().space_id)
+                .await
+                .unwrap()
+                .last_seq,
+            committed.receipt.seq()
+        );
+        latest = committed;
+    }
+    latest
+}
+
+async fn check_board_planner_conflict_replay(
+    store: &CanonicalStore,
+    ctx: &SpaceContext,
+    planner: &CanonicalTestBoardPlanner,
+    original: &Mutation<MoveBoardCard>,
+    latest: Committed<BoardMoveResult>,
+) {
+    let writer = next_mutation(
+        ctx.scope(),
+        ctx.auth().principal(),
+        MoveBoardCard {
+            group: GroupKey::Value(ScalarValue::String("moved-during-planning".into())),
+            fields: BTreeMap::from([(
+                "status".into(),
+                Some(YamlValue::String("moved-during-planning".into())),
+            )]),
+            expected_note: latest.value.revision.revision,
+            expected_rank: RankExpectation::Existing(latest.value.rank_revision),
+            ..original.input.clone()
+        },
+    );
+    let mut rank_only = writer.clone();
+    rank_only.input.group = latest.value.group;
+    rank_only.input.fields.clear();
+    let (entered, waiting) = oneshot::channel();
+    let (release, resume) = oneshot::channel();
+    *planner.move_pause_once.lock().unwrap() = Some((entered, resume));
+    let write = async {
+        waiting.await.unwrap();
+        let committed = store.move_board_card(ctx.clone(), writer).await.unwrap();
+        release.send(()).unwrap();
+        committed
+    };
+    let (rank_only, committed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(store.move_board_card(ctx.clone(), rank_only), write)
+    })
+    .await
+    .expect("both commands pass preflight");
+    assert!(matches!(
+        rank_only,
+        Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+    ));
+    assert_eq!(
+        store
+            .read_space(&ctx.scope().space_id)
+            .await
+            .unwrap()
+            .last_seq,
+        committed.receipt.seq()
+    );
+}
+
+async fn check_planned_observation_conflict_replay(store: &CanonicalStore, ctx: &SpaceContext) {
+    use notarium_canonical::writer::PlannedObservationPause;
+    use notarium_syntax::{content_digest, patch};
+
+    let note = sample_note_id(0xfa);
+    let mut carrier = "Before planned observation";
+    let created = store
+        .create_note(
+            ctx.clone(),
+            next_mutation(
+                ctx.scope(),
+                ctx.auth().principal(),
+                CreateNote {
+                    note: note.clone(),
+                    parent: None,
+                    slug: "planned-observation-race".into(),
+                    class: DocClass::UserDoc,
+                    carrier: carrier.into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let mut base = created.value.revision;
+    for (new_carrier, explicit_revision) in [("Changed once", false), ("Changed twice", true)] {
+        let mut queued = next_mutation(
+            ctx.scope(),
+            ctx.auth().principal(),
+            ExternalObservation {
+                note: note.clone(),
+                base_revision: base.clone(),
+                observed_digest: content_digest(carrier),
+                disk_identity: content_digest("physical file"),
+                content: ObservedContent::Planned(
+                    patch::plan(
+                        carrier,
+                        ByteSpan::new(0, carrier.len()).unwrap(),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                ),
+            },
+        );
+        queued.preconditions.revision = explicit_revision.then(|| base.clone());
+        let mut write = queued.clone();
+        write.input.observed_digest = content_digest(new_carrier);
+        write.input.content = ObservedContent::Carrier(new_carrier.into());
+
+        let (entered, waiting) = oneshot::channel();
+        let (release, resume) = oneshot::channel();
+        *store
+            .writer_faults()
+            .unwrap()
+            .planned_observation_pause_once
+            .lock()
+            .unwrap() = Some(PlannedObservationPause {
+            entered,
+            release: resume,
+        });
+        let writer = async {
+            waiting.await.unwrap();
+            let ExternalObservationResult::Committed(committed) = store
+                .accept_external_observation(ctx.clone(), write)
+                .await
+                .unwrap()
+            else {
+                panic!("the changed observation must commit");
+            };
+            release.send(()).unwrap();
+            committed
+        };
+        let (queued, committed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                store.accept_external_observation(ctx.clone(), queued),
+                writer
+            )
+        })
+        .await
+        .expect("competing write after planned observation reads its base");
+        assert!(matches!(
+            queued,
+            Err(PortError::Domain(DomainError::IdempotencyKeyReused))
+        ));
+        assert_eq!(
+            store
+                .read_space(&ctx.scope().space_id)
+                .await
+                .unwrap()
+                .last_seq,
+            committed.receipt.seq()
+        );
+        base = committed.value.revision;
+        carrier = new_carrier;
+    }
 }
 
 async fn check_move_pin(store: &CanonicalStore, ctx: &SpaceContext, room: &PausedRoom) {
@@ -832,6 +1051,17 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
         .unwrap();
     let new_file = "---\ntitle: Observed\n---\nfrom disk";
     let disk = notarium_syntax::content_digest(original);
+    let header_value = original.find("Before").unwrap();
+    let header_value = ByteSpan::new(header_value, header_value + "Before".len()).unwrap();
+    let plan = notarium_syntax::patch::plan(
+        original,
+        body,
+        vec![
+            (CarrierEditOrigin::Header, header_value, "Observed".into()),
+            (CarrierEditOrigin::Body, body, "from disk".into()),
+        ],
+    )
+    .unwrap();
     let observation = next_mutation(
         scope,
         actor,
@@ -840,7 +1070,7 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
             observed_digest: notarium_syntax::content_digest(new_file),
             base_revision: base,
             disk_identity: disk,
-            content: ObservedContent::Carrier(new_file.into()),
+            content: ObservedContent::Planned(plan),
         },
     );
     store
@@ -873,14 +1103,33 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
         .unwrap();
     assert_eq!(still_open.session.carrier_rev_id, active.carrier_rev_id);
     assert_eq!(still_open.updates.len(), 1);
-    room.accept(&active, checkpoint(), Some(1));
-    let ExternalObservationResult::Committed(applied) = store
-        .accept_external_observation(ctx.clone(), observation.clone())
-        .await
-        .unwrap()
-    else {
-        panic!("observation was not applied");
+    let (queued, applied) = room
+        .during_interception(
+            store.accept_external_observation(ctx.clone(), observation.clone()),
+            async {
+                room.accept(&active, checkpoint(), Some(1));
+                let ExternalObservationResult::Committed(applied) = store
+                    .accept_external_observation(ctx.clone(), observation.clone())
+                    .await
+                    .unwrap()
+                else {
+                    panic!("observation was not applied");
+                };
+                (
+                    InterceptionResult::Conflict(DomainError::RevisionConflict {
+                        current: applied.value.revision.clone(),
+                        lineage: Some(active.lineage_epoch),
+                    }),
+                    applied,
+                )
+            },
+        )
+        .await;
+    let ExternalObservationResult::Committed(queued) = queued.unwrap() else {
+        panic!("the same queued observation must return its committed receipt");
     };
+    assert_eq!(queued.receipt, applied.receipt);
+    assert_eq!(queued.value, applied.value);
     let checkpoint = store
         .read_collab_session(Some(&ctx.budget), scope, &note)
         .await
@@ -908,6 +1157,7 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
         .close_collab_session(
             &ctx.budget,
             CloseCollabSession {
+                unchanged_carrier_digest: None,
                 scope: scope.clone(),
                 note: note.clone(),
                 owner_id: active.owner_id,
@@ -916,7 +1166,7 @@ async fn check_room_command_commit(store: &CanonicalStore, ctx: &SpaceContext, r
                 final_yrs_snapshot: None,
                 compacted_through_update_seq: None,
                 carrier_settlement: Some(CollabCarrierSettlement {
-                    auth: ctx.auth().clone(),
+                    actor: notarium_canonical::CollabSettlementActor::writer(ctx.auth().clone()),
                     carrier: "---\ntitle: Observed\n---\nlater".into(),
                 }),
             },

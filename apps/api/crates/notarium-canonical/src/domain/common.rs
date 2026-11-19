@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex as StdMutex},
 };
 
@@ -157,10 +157,17 @@ pub(crate) fn persisted_room_fence(
 
 type RoomFenceMap = HashMap<(SpaceId, NoteId), Arc<Mutex<RoomFenceState>>>;
 
+#[derive(Default)]
+struct RoomRecoveryFences {
+    fenced: HashSet<(SpaceId, NoteId)>,
+    recovered: HashMap<(SpaceId, NoteId, RevisionId), RevisionId>,
+}
+
 /// Runtime-owned table of per-`(SpaceId, NoteId)` room fences (`tokio::sync::Mutex<RoomFenceState>`).
 #[derive(Default)]
 pub struct RoomFenceTable {
     fences: StdMutex<RoomFenceMap>,
+    recovery: StdMutex<RoomRecoveryFences>,
 }
 
 impl std::fmt::Debug for RoomFenceTable {
@@ -173,6 +180,82 @@ impl std::fmt::Debug for RoomFenceTable {
 }
 
 impl RoomFenceTable {
+    pub fn is_room_fenced(&self, space_id: &SpaceId, note: &NoteId) -> bool {
+        self.recovery
+            .lock()
+            .expect("room recovery fence table mutex")
+            .fenced
+            .contains(&(space_id.clone(), note.clone()))
+    }
+
+    pub(crate) fn set_room_fenced(&self, space_id: &SpaceId, note: &NoteId, fenced: bool) {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        let key = (space_id.clone(), note.clone());
+        if fenced {
+            recovery.fenced.insert(key);
+        } else {
+            recovery.fenced.remove(&key);
+        }
+    }
+
+    pub(crate) fn publish_persisted_transition(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+        guard: &mut tokio::sync::OwnedMutexGuard<RoomFenceState>,
+        next: RoomFenceState,
+        fenced: bool,
+        recovered: Option<(RevisionId, RevisionId)>,
+    ) -> bool {
+        let key = (scope.space_id.clone(), note.clone());
+        let map = self.fences.lock().expect("room fence table mutex");
+        let current = tokio::sync::OwnedMutexGuard::mutex(guard);
+        // A restore replaces the slot. A new room on the same slot advances
+        // its epoch. Late publication must preserve both kinds of progress.
+        if guard.epoch() > next.epoch()
+            || !map.get(&key).is_some_and(|slot| Arc::ptr_eq(slot, current))
+        {
+            return false;
+        }
+        let mut recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        if let Some((previous, revision)) = recovered {
+            recovery
+                .recovered
+                .insert((scope.space_id.clone(), note.clone(), previous), revision);
+        }
+        if fenced {
+            recovery.fenced.insert(key);
+        } else {
+            recovery.fenced.remove(&key);
+        }
+        **guard = next;
+        true
+    }
+
+    pub(crate) fn fenced_recovery_revision(
+        &self,
+        space_id: &SpaceId,
+        note: &NoteId,
+        previous: &RevisionId,
+    ) -> Option<RevisionId> {
+        self.recovery
+            .lock()
+            .expect("room recovery fence table mutex")
+            .recovered
+            .get(&(space_id.clone(), note.clone(), previous.clone()))
+            .cloned()
+    }
+
+    pub(crate) async fn observed_epoch(&self, scope: &HistoryScope, note: &NoteId) -> LeaseEpoch {
+        self.get_or_init(scope, note).lock().await.epoch()
+    }
+
     pub fn get_or_init(&self, scope: &HistoryScope, note: &NoteId) -> Arc<Mutex<RoomFenceState>> {
         let mut map = self.fences.lock().expect("room fence table mutex");
         Arc::clone(
@@ -185,6 +268,18 @@ impl RoomFenceTable {
                     )))
                 }),
         )
+    }
+
+    pub(crate) fn existing_fence(
+        &self,
+        scope: &HistoryScope,
+        note: &NoteId,
+    ) -> Option<Arc<Mutex<RoomFenceState>>> {
+        self.fences
+            .lock()
+            .expect("room fence table mutex")
+            .get(&(scope.space_id.clone(), note.clone()))
+            .cloned()
     }
 
     pub async fn open_room(&self, scope: &HistoryScope, note: &NoteId) -> Result<(), PortError> {
@@ -269,11 +364,25 @@ impl RoomFenceTable {
     pub fn remove_note(&self, space_id: &SpaceId, note: &NoteId) {
         let mut map = self.fences.lock().expect("room fence table mutex");
         map.remove(&(space_id.clone(), note.clone()));
+        let mut recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        recovery.fenced.remove(&(space_id.clone(), note.clone()));
+        recovery
+            .recovered
+            .retain(|(sid, nid, _), _| sid != space_id || nid != note);
     }
 
     pub fn remove_space(&self, space_id: &SpaceId) {
         let mut map = self.fences.lock().expect("room fence table mutex");
         map.retain(|(sid, _), _| sid != space_id);
+        let mut recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        recovery.fenced.retain(|(sid, _)| sid != space_id);
+        recovery.recovered.retain(|(sid, _, _), _| sid != space_id);
     }
 
     pub(crate) fn replace_restored_spaces(
@@ -288,6 +397,21 @@ impl RoomFenceTable {
                 .fences
                 .into_inner()
                 .expect("restored room fence table"),
+        );
+        let mut recovery = self
+            .recovery
+            .lock()
+            .expect("room recovery fence table mutex");
+        recovery.fenced.retain(|(sid, _)| !spaces.contains(sid));
+        recovery
+            .recovered
+            .retain(|(sid, _, _), _| !spaces.contains(sid));
+        recovery.fenced.extend(
+            restored
+                .recovery
+                .into_inner()
+                .expect("restored room recovery fence table")
+                .fenced,
         );
     }
 

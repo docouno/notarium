@@ -68,6 +68,7 @@ pub(super) async fn write_and_reconcile_schema(
             .is_err()
     );
     let mut close = CloseCollabSession {
+        unchanged_carrier_digest: None,
         scope: scope.clone(),
         note: note.clone(),
         owner_id: Some(open.owner_id.clone()),
@@ -180,7 +181,7 @@ pub(super) async fn write_and_reconcile_schema(
     close.final_yrs_snapshot = Some(vec![42]);
     close.compacted_through_update_seq = Some(0);
     close.carrier_settlement = Some(CollabCarrierSettlement {
-        auth: ctx.auth().clone(),
+        actor: notarium_canonical::CollabSettlementActor::writer(ctx.auth().clone()),
         carrier: input.carrier.clone(),
     });
     let settled = store.close_collab_session(&budget, close).await.unwrap();

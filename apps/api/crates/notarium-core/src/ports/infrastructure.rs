@@ -361,6 +361,7 @@ pub trait BoardMutationFactsProvider: Send + Sync {
 pub enum InterceptedPayload {
     EditNote {
         note: NoteId,
+        plan: crate::patch::CarrierPatchPlan,
         body: BodyPatchPlan,
         header: HeaderMutation,
     },

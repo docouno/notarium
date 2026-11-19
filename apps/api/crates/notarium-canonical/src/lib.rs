@@ -30,8 +30,8 @@ pub use backup::{
 };
 
 pub use changes::{
-    ChangedNoteSummaryV1, EFFECT_CODEC_V1, EffectBodyV1, EffectEnvelopeV1, StoredAwaitReasonV1,
-    build_effect_payload_draft,
+    BroadcastSignal as SpaceSignal, ChangedNoteSummaryV1, EFFECT_CODEC_V1, EffectBodyV1,
+    EffectEnvelopeV1, StoredAwaitReasonV1, build_effect_payload_draft,
 };
 pub use config::{
     BlobBackendConfig, CanonicalConfig, PgConnectConfig, PgTransport, S3AddressingStyle,
@@ -41,11 +41,13 @@ pub use config::{
 #[cfg(feature = "test-support")]
 pub use dialect::postgres::build_pg_connect_options;
 pub use dialect::{DataRootOwnerLock, sqlite::observe_sqlite_canonical_witness};
-pub use domain::{RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
+pub use domain::{RoomCommandSettlement, RoomFenceTable, SpaceSchemaRevision, UpdateSpaceSchema};
 pub use peers::{
-    AppendCollabUpdate, CheckpointCollabSession, ClaimedContentJob, CloseCollabSession,
-    CollabCarrierSettlement, CollabRoomState, CollabSessionRecord, CollabSessionSnapshot,
-    CollabUpdateEntry, JobCompletionOutcome, OpenCollabSession,
+    ActiveRoomFacts, AppendCollabUpdate, AppendCollabUpdates, CheckpointCollabSession,
+    ClaimedContentJob, CloseCollabSession, CollabCarrierSettlement, CollabRoomState,
+    CollabSessionRecord, CollabSessionSnapshot, CollabSettlementActor, CollabUpdateEntry,
+    FenceCollabSession, FencedCollabRecovery, JobCompletionOutcome, NoteCollabAdmission,
+    OpenCollabSession, RoomWalEntry,
 };
 pub use runtime::{
     CanonicalRuntime, CanonicalStore, CreateFolderSpec, CreateSpaceSpec, SpaceRecord,
