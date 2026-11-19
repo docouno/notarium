@@ -3,6 +3,7 @@
 pub mod layout;
 pub mod lexical;
 pub mod ports;
+pub mod vector;
 
 #[cfg(test)]
 mod tests {

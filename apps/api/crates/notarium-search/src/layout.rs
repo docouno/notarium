@@ -184,6 +184,10 @@ pub struct SearchLayout {
     scope: HistoryScope,
 }
 impl SearchLayout {
+    pub fn scope(&self) -> &HistoryScope {
+        &self.scope
+    }
+
     pub fn open(root: &DataRoot, scope: HistoryScope) -> Result<Self, LayoutError> {
         let dir = Dir::open_ambient_dir(root.root(), ambient_authority())?;
         let dir = open_or_create(&dir, "v1")?;
@@ -328,7 +332,7 @@ fn sync_dir(dir: &Dir) -> io::Result<()> {
         .sync_all()
 }
 
-fn atomic_file(dir: &Dir, name: &str, bytes: &[u8]) -> Result<(), LayoutError> {
+pub(crate) fn atomic_file(dir: &Dir, name: &str, bytes: &[u8]) -> Result<(), LayoutError> {
     match dir.symlink_metadata(name) {
         Ok(meta) if !meta.is_file() => return Err(LayoutError::Corrupt),
         Ok(_) => {}
