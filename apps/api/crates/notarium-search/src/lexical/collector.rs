@@ -1,7 +1,7 @@
 use super::schema::{CHAT, NOTE};
 use croaring::Bitmap;
 use notarium_core::{ids::NoteId, ports::StructuralSnapshot};
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 use tantivy::{
     DocId, Score, SegmentReader,
     collector::{Collector, SegmentCollector},
@@ -14,6 +14,7 @@ pub struct LexicalFilter<'a> {
     pub notes: Option<&'a Bitmap>,
     pub(super) classes: u64,
     pub include_chats: bool,
+    pub(super) excluded: Option<&'a BTreeSet<NoteId>>,
 }
 
 pub(super) struct DocFilterCollector<'a, T> {
@@ -55,6 +56,13 @@ impl<T: Collector> Collector for DocFilterCollector<'_, T> {
                 let Ok(note) = NoteId::parse(raw) else {
                     continue;
                 };
+                if self
+                    .filter
+                    .excluded
+                    .is_some_and(|excluded| excluded.contains(&note))
+                {
+                    continue;
+                }
                 let Some(node) = self.filter.snapshot.lookup(&note) else {
                     continue;
                 };

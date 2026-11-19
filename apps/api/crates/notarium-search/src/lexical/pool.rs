@@ -9,13 +9,14 @@ use std::{
 use tantivy::{Index, IndexWriter, indexer::LogMergePolicy};
 
 const IDLE: Duration = Duration::from_secs(5);
-const WRITER_BUDGET: usize = 16 * 1024 * 1024;
+pub(super) const WRITER_BUDGET: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_WRITERS: usize = 4;
 const MAX_READERS: usize = 32;
 
 struct Lease {
     writer: Option<IndexWriter>,
     last_used: Instant,
+    staged: bool,
 }
 
 type Entry = Arc<Mutex<Lease>>;
@@ -38,7 +39,10 @@ impl WriterPool {
             let oldest = leases
                 .iter()
                 .filter(|(_, entry)| Arc::strong_count(entry) == 1)
-                .filter_map(|(path, lease)| lease.lock().ok().map(|lease| (path, lease.last_used)))
+                .filter_map(|(path, lease)| {
+                    let lease = lease.lock().ok()?;
+                    (!lease.staged).then_some((path, lease.last_used))
+                })
                 .min_by_key(|(_, last_used)| *last_used)
                 .map(|(path, _)| path.clone())
                 .ok_or(LexicalError::WriterUnavailable)?;
@@ -47,6 +51,7 @@ impl WriterPool {
         let lease = Arc::new(Mutex::new(Lease {
             writer: None,
             last_used: Instant::now(),
+            staged: false,
         }));
         leases.insert(path.to_owned(), lease.clone());
         Ok(lease)
@@ -56,6 +61,7 @@ impl WriterPool {
         &self,
         path: &Path,
         index: &Index,
+        staged: bool,
         operation: impl FnOnce(&mut IndexWriter) -> Result<T, LexicalError>,
     ) -> Result<T, LexicalError> {
         let entry = self.checkout(path)?;
@@ -70,6 +76,7 @@ impl WriterPool {
         }
         let result = operation(lease.writer.as_mut().expect("writer admitted"));
         lease.last_used = Instant::now();
+        lease.staged = result.is_ok() && staged;
         if result.is_err() {
             lease.writer.take();
         }
@@ -108,7 +115,7 @@ impl WriterPool {
             Arc::strong_count(entry) > 1
                 || entry
                     .lock()
-                    .is_ok_and(|lease| lease.last_used.elapsed() < IDLE)
+                    .is_ok_and(|lease| lease.staged || lease.last_used.elapsed() < IDLE)
         });
         Ok(())
     }

@@ -322,6 +322,7 @@ fn epoch_restarts_compacts_and_scrubs_obsolete_carriers() {
     let cancellation = Cancellation::default();
     let classes = BTreeSet::from([DocClass::UserDoc]);
     let filter = VectorFilter {
+        excluded: None,
         classes: &classes,
         folders: None,
         notes: None,

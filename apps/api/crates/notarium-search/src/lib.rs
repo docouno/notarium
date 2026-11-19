@@ -2,10 +2,16 @@
 
 pub mod config;
 pub mod embed;
+mod engine;
+mod indexer;
 pub mod layout;
 pub mod lexical;
+mod model;
 pub mod ports;
+mod query;
 pub mod vector;
+
+pub use engine::{SearchDependencies, SearchEngine};
 
 #[cfg(test)]
 mod tests {

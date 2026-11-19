@@ -69,6 +69,7 @@ pub struct VectorFilter<'a> {
     pub classes: &'a BTreeSet<DocClass>,
     pub folders: Option<&'a Bitmap>,
     pub notes: Option<&'a BTreeSet<NoteId>>,
+    pub excluded: Option<&'a BTreeSet<NoteId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +183,15 @@ impl VectorSnapshot {
             allowed.and_inplace(&selected);
         }
         allowed.andnot_inplace(segment.tombstones.bitmap());
+        if let Some(excluded) = filter.excluded {
+            for note in excluded {
+                if let Some(slots) = index.notes.get(note) {
+                    for &slot in slots {
+                        allowed.remove(slot);
+                    }
+                }
+            }
+        }
         for (position, note) in self.mutable.keys().enumerate() {
             if position.is_multiple_of(128) {
                 budget.check()?;
@@ -210,6 +220,7 @@ impl VectorSnapshot {
             .mutable
             .iter()
             .filter(|(note, _)| filter.notes.is_none_or(|notes| notes.contains(*note)))
+            .filter(|(note, _)| filter.excluded.is_none_or(|notes| !notes.contains(*note)))
             .flat_map(|(_, chunks)| chunks.iter());
         for (index, chunk) in chunks.enumerate() {
             if index.is_multiple_of(128) {
@@ -387,6 +398,14 @@ impl VectorEpoch {
 
     pub fn checkpoint(&mut self, seq: SpaceSeq) -> Result<(), VectorError> {
         self.publish(self.segments.clone(), seq, self.manifest.complete_backfill)
+    }
+
+    pub fn is_checkpointed(&self, seq: SpaceSeq) -> bool {
+        self.manifest.vector_seq == seq && self.mutable.last_seq() <= seq
+    }
+
+    pub(crate) fn matches_profile(&self, model: &ModelProfileId, dimension: usize) -> bool {
+        &self.manifest.model_id == model && self.manifest.dimension as usize == dimension
     }
 
     pub fn should_compact(&self) -> bool {

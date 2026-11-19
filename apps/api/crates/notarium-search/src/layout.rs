@@ -51,6 +51,12 @@ pub struct FolderDictionary {
     folders: Vec<FolderId>,
 }
 impl FolderDictionary {
+    pub fn len(&self) -> usize {
+        self.folders.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.folders.is_empty()
+    }
     pub fn get(&self, folder: &FolderId) -> Option<FolderOrd> {
         self.ordinals.get(folder).copied()
     }
@@ -133,21 +139,16 @@ fn verify_footer(bytes: &[u8]) -> Result<&[u8], LayoutError> {
 pub struct SearchManifest {
     pub scope: HistoryScope,
     pub tantivy_seq: SpaceSeq,
+    pub tantivy_commit: u64,
     pub active_index_dir: String,
     pub tokenizer_version: u32,
     pub active_model: Option<ModelProfileId>,
+    pub vector_seq: Option<SpaceSeq>,
+    pub embeddings_pending: bool,
 }
 impl SearchManifest {
     pub fn generation(&self) -> Result<u64, LayoutError> {
-        let suffix = self
-            .active_index_dir
-            .strip_prefix("index_")
-            .ok_or(LayoutError::Corrupt)?;
-        let generation = u64::from_str_radix(suffix, 16).map_err(|_| LayoutError::Corrupt)?;
-        if generation == 0 || index_name(generation) != self.active_index_dir {
-            return Err(LayoutError::Corrupt);
-        }
-        Ok(generation)
+        parse_index_name(&self.active_index_dir)
     }
 }
 
@@ -214,6 +215,74 @@ impl SearchLayout {
 
     pub fn remove_index_generation(&self, generation: u64) -> Result<(), LayoutError> {
         self.tantivy.remove_dir_all(index_name(generation))?;
+        sync_dir(&self.tantivy)?;
+        Ok(())
+    }
+
+    pub fn index_generations(&self) -> Result<Vec<u64>, LayoutError> {
+        let mut generations = Vec::new();
+        for entry in self.tantivy.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str().filter(|name| name.starts_with("index_")) else {
+                continue;
+            };
+            let generation = parse_index_name(name)?;
+            if !entry.file_type()?.is_dir() {
+                return Err(LayoutError::Corrupt);
+            }
+            generations.push(generation);
+        }
+        generations.sort_unstable();
+        Ok(generations)
+    }
+
+    /// Clear all derived copies when a purge has an erased or unknown identity.
+    /// The indexing owner drains any published mmap snapshots first.
+    pub fn remove_vector_epochs(
+        &self,
+        preserve: Option<&ModelProfileId>,
+    ) -> Result<(), LayoutError> {
+        let preserve = preserve.map(model_epoch_name);
+        for entry in self.vector.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let valid = name.to_str().is_some_and(|name| {
+                name.len() == 16
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+            if !valid || !entry.file_type()?.is_dir() {
+                return Err(LayoutError::Corrupt);
+            }
+            if name.to_str() != preserve.as_deref() {
+                self.vector.remove_dir_all(name)?;
+            }
+        }
+        sync_dir(&self.vector)?;
+        Ok(())
+    }
+
+    pub fn remove_model_epoch(&self, model: &ModelProfileId) -> Result<(), LayoutError> {
+        let name = model_epoch_name(model);
+        match self.vector.open_dir_nofollow(&name) {
+            Ok(_) => self.vector.remove_dir_all(&name)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+        sync_dir(&self.vector)?;
+        Ok(())
+    }
+
+    pub fn clear_lexical_manifests(&self) -> Result<(), LayoutError> {
+        for name in [SEARCH_MANIFEST, FOLDER_DICTIONARY] {
+            match self.tantivy.remove_file(name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         sync_dir(&self.tantivy)?;
         Ok(())
     }
@@ -298,6 +367,15 @@ impl SearchLayout {
 
 pub fn index_name(generation: u64) -> String {
     format!("index_{generation:016x}")
+}
+
+fn parse_index_name(name: &str) -> Result<u64, LayoutError> {
+    let suffix = name.strip_prefix("index_").ok_or(LayoutError::Corrupt)?;
+    let generation = u64::from_str_radix(suffix, 16).map_err(|_| LayoutError::Corrupt)?;
+    if generation == 0 || index_name(generation) != name {
+        return Err(LayoutError::Corrupt);
+    }
+    Ok(generation)
 }
 
 pub fn model_epoch_name(model: &ModelProfileId) -> String {
@@ -438,9 +516,12 @@ mod tests {
         let mut manifest = SearchManifest {
             scope: scope.clone(),
             tantivy_seq: SpaceSeq::new(3).unwrap(),
+            tantivy_commit: 42,
             active_index_dir: index_name(1),
             tokenizer_version: 1,
             active_model: None,
+            vector_seq: None,
+            embeddings_pending: false,
         };
         layout.publish_search(&manifest).unwrap();
         layout.create_index_generation(2).unwrap();
@@ -529,9 +610,12 @@ mod tests {
         let manifest = SearchManifest {
             scope,
             tantivy_seq: SpaceSeq::ZERO,
+            tantivy_commit: 0,
             active_index_dir: index_name(1),
             tokenizer_version: 1,
             active_model: None,
+            vector_seq: None,
+            embeddings_pending: false,
         };
         assert!(layout.publish_search(&manifest).is_err());
         std::os::unix::fs::symlink(&scratch.0, path.join(FOLDER_DICTIONARY)).unwrap();

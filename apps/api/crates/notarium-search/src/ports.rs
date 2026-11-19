@@ -14,6 +14,7 @@ use notarium_core::{
 };
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct ResolvedEmbeddingTarget {
     pub model: ModelProfileId,
     pub dimension: u32,
@@ -21,6 +22,7 @@ pub struct ResolvedEmbeddingTarget {
     pub backend: EmbeddingBackendTarget,
 }
 
+#[derive(Clone)]
 pub enum EmbeddingBackendTarget {
     LocalOnnx,
     Remote {

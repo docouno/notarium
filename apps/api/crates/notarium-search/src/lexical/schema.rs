@@ -18,7 +18,7 @@ pub(super) const CHAT: u64 = 2;
 
 pub(super) struct Fields {
     pub schema: Schema,
-    key: Field,
+    pub(super) key: Field,
     kind: Field,
     note_id: Field,
     chat_locator: Field,
