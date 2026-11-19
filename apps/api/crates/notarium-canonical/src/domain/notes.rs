@@ -25,7 +25,7 @@ use notarium_core::{
     span::ByteSpan,
     value::YamlValue,
 };
-use notarium_syntax::{extract::ExtractedDocDelta, frontmatter::FieldEdit};
+use notarium_syntax::frontmatter::FieldEdit;
 
 use crate::{
     CanonicalStore,
@@ -2813,13 +2813,8 @@ pub(crate) async fn rename_note_impl(
             let base_carrier = String::from_utf8(raw_bytes).map_err(|_| {
                 internal_not_committed("corrupt_note_utf8", "carrier not valid UTF-8")
             })?;
-            let updated_carrier = apply_title_surgery_to_carrier(
-                &base_carrier,
-                base_head.doc_class,
-                &request.input.note,
-                &request.input.slug,
-                trimmed,
-            )?;
+            let updated_carrier =
+                apply_title_surgery_to_carrier(&base_carrier, base_head.doc_class, trimmed)?;
             let info = analyze_and_prepare_carrier(
                 &updated_carrier,
                 base_head.doc_class,
@@ -2879,14 +2874,14 @@ pub(crate) async fn rename_note_impl(
 fn apply_title_surgery_to_carrier(
     carrier: &str,
     class: DocClass,
-    note_id: &NoteId,
-    slug: &str,
     new_title: &str,
 ) -> Result<String, PortError> {
     let hdr = notarium_syntax::frontmatter::analyze(carrier, class)?;
-    if let Some(fields) = &hdr.fields
-        && fields.contains_key("title")
-    {
+    let body = hdr.carrier.body;
+    let markdown = notarium_syntax::markdown::analyze(carrier, body)?;
+    let mut edits = Vec::new();
+    let title = hdr.fields.as_ref().and_then(|fields| fields.get("title"));
+    let heading = if let Some(title) = title {
         let plan = notarium_syntax::frontmatter::patch_frontmatter(
             carrier,
             class,
@@ -2895,38 +2890,65 @@ fn apply_title_surgery_to_carrier(
                 value: YamlValue::String(new_title.to_owned()),
             }],
         )?;
-        return notarium_syntax::patch::apply(carrier, &plan).map_err(PortError::from);
-    }
-
-    let extracted = notarium_syntax::extract::extract(carrier, class, note_id, slug, None)?;
-    if let ExtractedDocDelta::Plain(plain) = extracted
-        && let Some(h1) = plain.headings.iter().find(|h| h.level == 1)
-    {
-        let plan = notarium_syntax::patch::plan(
-            carrier,
-            hdr.carrier.body,
-            vec![(
-                CarrierEditOrigin::Body,
-                h1.heading_span,
-                format!("# {new_title}"),
-            )],
-        )?;
-        return notarium_syntax::patch::apply(carrier, &plan).map_err(PortError::from);
-    }
-
-    let body_start = hdr.carrier.body.start();
-    let insert_span = ByteSpan::new(body_start, body_start)?;
-    let prefix = if hdr.carrier.body.slice(carrier)?.is_empty() {
-        format!("# {new_title}\n")
+        edits.extend(
+            plan.edits
+                .into_iter()
+                .map(|edit| (edit.origin, edit.bytes.0, edit.replacement)),
+        );
+        markdown
+            .leading_h1(carrier, body)
+            .filter(|heading| match title {
+                YamlValue::String(title) if !title.trim().is_empty() => {
+                    heading.title.trim() == title.trim()
+                }
+                _ => true,
+            })
     } else {
-        format!("# {new_title}\n\n")
+        markdown.headings.iter().find(|heading| heading.level == 1)
     };
-    let plan = notarium_syntax::patch::plan(
-        carrier,
-        hdr.carrier.body,
-        vec![(CarrierEditOrigin::Body, insert_span, prefix)],
-    )?;
+    if let Some(heading) = heading.filter(|heading| heading.title.trim() != new_title) {
+        let start = heading.heading_span.start();
+        let text = heading
+            .heading_span
+            .slice(carrier)?
+            .trim_end_matches(['\r', '\n']);
+        let span = ByteSpan::new(start, start + text.len())?;
+        edits.push((CarrierEditOrigin::Body, span, format!("# {new_title}")));
+    } else if title.is_none() && heading.is_none() {
+        let at = body.start();
+        let eol = hdr.carrier.eol;
+        let padding = if hdr.carrier.header.is_some() && !carrier[..at].ends_with('\n') {
+            eol
+        } else {
+            ""
+        };
+        let after = if body.is_empty() { "" } else { eol };
+        edits.push((
+            CarrierEditOrigin::Body,
+            ByteSpan::new(at, at)?,
+            format!("{padding}# {new_title}{eol}{after}"),
+        ));
+    }
+    let plan = notarium_syntax::patch::plan(carrier, body, edits)?;
     notarium_syntax::patch::apply(carrier, &plan).map_err(PortError::from)
+}
+
+#[cfg(test)]
+#[test]
+fn rename_synchronizes_only_the_heading_used_as_title() {
+    let matching = "---\r\ntitle: Guide\r\n---\r\n# Guide\r\nParagraph\r\n";
+    let distinct = matching.replace("# Guide", "# First chapter");
+    let delayed = matching.replace("# Guide", "Introductory paragraph\r\n\r\n# Guide");
+    for (source, expected) in [
+        (matching.to_owned(), matching.replace("Guide", "Updated")),
+        (distinct.clone(), distinct.replacen("Guide", "Updated", 1)),
+        (delayed.clone(), delayed.replacen("Guide", "Updated", 1)),
+    ] {
+        assert_eq!(
+            apply_title_surgery_to_carrier(&source, DocClass::UserDoc, "Updated").unwrap(),
+            expected
+        );
+    }
 }
 
 // Retain only carrier versions named by a remaining edit. Each savepoint decides
@@ -4151,7 +4173,18 @@ fn append_link_line_to_carrier(
         hdr.carrier.body,
         vec![(CarrierEditOrigin::Body, ByteSpan::new(end, end)?, insertion)],
     )?;
-    notarium_syntax::patch::apply(carrier, &plan).map_err(PortError::from)
+    let updated = notarium_syntax::patch::apply(carrier, &plan)?;
+    let expected_start = end + usize::from(needs_nl) + prefix.len();
+    let visible = matches!(
+        notarium_syntax::extract::extract(&updated, class, source, "", None)?,
+        notarium_syntax::extract::ExtractedDocDelta::Plain(parsed)
+            if parsed.links.iter().any(|link| link.span.start() == expected_start && link.raw == target)
+    );
+    if !visible {
+        // The carrier can end inside an authored fence or HTML block.
+        return Err(DomainError::validation(ValidationReason::InvalidQuery).into());
+    }
+    Ok(updated)
 }
 
 #[allow(clippy::too_many_arguments)]

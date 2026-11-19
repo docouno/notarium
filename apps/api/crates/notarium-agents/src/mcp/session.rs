@@ -3,8 +3,10 @@ mod address;
 mod delta;
 
 use super::{EgressTarget, ToolCallContext, ToolName, ability_tools, decode, invalid};
-pub(super) use address::{project_for_folder, resolve_project, resolve_space, space};
-use address::{readable_spaces, visible_projects};
+use address::visible_projects;
+pub(super) use address::{
+    project_for_folder, readable_space, readable_spaces, resolve_project, resolve_space, space,
+};
 pub(super) use delta::BootstrapContinuations;
 
 use notarium_core::{

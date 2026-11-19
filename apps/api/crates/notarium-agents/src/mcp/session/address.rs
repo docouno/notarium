@@ -5,7 +5,7 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::SpaceId,
     model::FolderRef,
-    ports::{AccessibleSpace, ControlPageRequest, ProjectInfo, SpaceContext},
+    ports::{AccessibleSpace, CatalogSpace, ControlPageRequest, ProjectInfo, SpaceContext},
 };
 use notarium_syntax::unicode::lookup_key;
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ const MAX_SPACES: usize = 4096;
 const CONTROL_PAGE: u16 = 128;
 const MAX_PROJECTS: usize = 4096;
 
-pub(super) async fn readable_spaces(
+pub(in super::super) async fn readable_spaces(
     call: &ToolCallContext<'_>,
 ) -> Result<BTreeMap<SpaceId, AccessibleSpace>, PortError> {
     let mut spaces = BTreeMap::new();
@@ -99,6 +99,13 @@ pub(in super::super) async fn space(
     call: &ToolCallContext<'_>,
     id: &SpaceId,
 ) -> Result<SpaceContext, PortError> {
+    call.space(readable_space(call, id).await?.history)
+}
+
+pub(in super::super) async fn readable_space(
+    call: &ToolCallContext<'_>,
+    id: &SpaceId,
+) -> Result<CatalogSpace, PortError> {
     let account = call.account();
     if account
         .auth()
@@ -119,7 +126,7 @@ pub(in super::super) async fn space(
     if space.space.lifecycle != SpaceLifecycle::Active {
         return Err(DomainError::ResourceNotFound.into());
     }
-    call.space(space.history)
+    Ok(space)
 }
 
 pub(in super::super) async fn resolve_space(

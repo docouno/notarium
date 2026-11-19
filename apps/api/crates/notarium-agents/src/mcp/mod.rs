@@ -1,6 +1,11 @@
 //! The same closed-world tool registry serves MCP, chats and scheduled runs.
 mod ability_tools;
+mod corpus;
+mod get_note;
 mod memory;
+mod note_tools;
+mod organize;
+mod read_tools;
 mod schema;
 mod session;
 
@@ -65,7 +70,12 @@ pub struct ToolText {
 }
 
 impl McpToolResult {
-    fn new(tool: ToolName, payload: Value, provenance: ChatProvenance) -> Result<Self, PortError> {
+    fn new(
+        tool: ToolName,
+        payload: Value,
+        display: Option<Value>,
+        provenance: ChatProvenance,
+    ) -> Result<Self, PortError> {
         let mut text = format!("## {}\n\n", tool.name());
         if let Some(instructions) = payload.get("instructions").and_then(Value::as_str) {
             for line in instructions.lines() {
@@ -75,8 +85,20 @@ impl McpToolResult {
             }
             text.push('\n');
         }
-        let data = serde_json::to_string_pretty(&payload)
-            .map_err(|_| invalid(ValidationReason::InvalidState))?;
+        let data = if matches!(
+            tool.operation(),
+            AgentOperation::List
+                | AgentOperation::Read
+                | AgentOperation::Search
+                | AgentOperation::Mutation
+        ) {
+            let mut display = display.unwrap_or_else(|| payload.clone());
+            corpus::sanitize_display(&mut display);
+            serde_json::to_string_pretty(&display)
+        } else {
+            serde_json::to_string_pretty(&payload)
+        }
+        .map_err(|_| invalid(ValidationReason::InvalidState))?;
         text.push_str("```json\n");
         text.push_str(&data);
         text.push_str("\n```\n");
@@ -95,6 +117,7 @@ pub struct ToolRegistry {
     telemetry: Arc<dyn AgentTelemetryPort>,
     vector_search: bool,
     bootstrap: session::BootstrapContinuations,
+    note_cursors: read_tools::NoteCursors,
 }
 
 impl ToolRegistry {
@@ -111,6 +134,7 @@ impl ToolRegistry {
             telemetry,
             vector_search: false,
             bootstrap: Default::default(),
+            note_cursors: Default::default(),
         }
     }
 
@@ -249,6 +273,7 @@ impl ToolRegistry {
                 // replay, including concurrent calls that share the same plan.
                 call.journal("invocation", || async { Ok(true) }).await?;
             }
+            let mut display = None;
             let payload = match tool {
                 ToolName::Whoami | ToolName::GetMyProjects | ToolName::StartSession => {
                     session::handle(&mut call, tool, args).await?
@@ -263,9 +288,28 @@ impl ToolRegistry {
                 ToolName::RememberAboutUser | ToolName::RememberAboutProject => {
                     memory::handle(&mut call, tool, args).await?
                 }
-                _ => return Err(DomainError::ResourceNotFound.into()),
+                ToolName::GetNote => {
+                    let note = get_note::get(&mut call, args).await?;
+                    display = Some(note.display);
+                    note.structured
+                }
+                ToolName::ListNotes
+                | ToolName::RecentActivity
+                | ToolName::Search
+                | ToolName::Recall => read_tools::handle(&mut call, tool, args).await?,
+                ToolName::CreateNote
+                | ToolName::CreateNotes
+                | ToolName::EditNote
+                | ToolName::DeleteNote
+                | ToolName::MoveNote
+                | ToolName::RenameNote => note_tools::handle(&mut call, tool, args).await?,
+                ToolName::MoveFolder
+                | ToolName::RenameFolder
+                | ToolName::RenameProject
+                | ToolName::Link
+                | ToolName::LinkMany => organize::handle(&mut call, tool, args).await?,
             };
-            McpToolResult::new(tool, payload, std::mem::take(&mut call.provenance))
+            McpToolResult::new(tool, payload, display, std::mem::take(&mut call.provenance))
         }
         .await;
 
@@ -378,14 +422,7 @@ impl ToolCallContext<'_> {
     }
 
     fn command_key(&self, label: &str, ordinal: u16) -> CommandKey {
-        derive_key(
-            "notarium.mcp.subcommand.v1",
-            &[
-                self.request_key.as_str().as_bytes(),
-                label.as_bytes(),
-                &ordinal.to_be_bytes(),
-            ],
-        )
+        subcommand_key(&self.request_key, label, ordinal)
     }
 
     fn command_identity(&self, scope: &HistoryScope, label: &str, ordinal: u16) -> CommandIdentity {
@@ -417,10 +454,24 @@ impl ToolCallContext<'_> {
         label: &str,
         build: impl FnOnce() -> F,
     ) -> Result<T, PortError> {
+        self.journal_with_key(label, &self.request_key, self.request_hash, build)
+            .await
+    }
+
+    async fn journal_with_key<
+        T: Serialize + DeserializeOwned,
+        F: Future<Output = Result<T, PortError>>,
+    >(
+        &self,
+        label: &str,
+        request_key: &CommandKey,
+        request_hash: ContentDigest,
+        build: impl FnOnce() -> F,
+    ) -> Result<T, PortError> {
         let key = McpDedupKey {
             actor: command_actor(&self.auth).to_owned(),
-            request_key: self.command_key(label, 0),
-            request_hash: self.request_hash,
+            request_key: subcommand_key(request_key, label, 0),
+            request_hash,
             operation: self.tool.name().to_owned(),
         };
         let lookup = || {
@@ -519,6 +570,17 @@ impl ToolCallContext<'_> {
         }
         Ok(())
     }
+}
+
+fn subcommand_key(request: &CommandKey, label: &str, ordinal: u16) -> CommandKey {
+    derive_key(
+        "notarium.mcp.subcommand.v1",
+        &[
+            request.as_str().as_bytes(),
+            label.as_bytes(),
+            &ordinal.to_be_bytes(),
+        ],
+    )
 }
 
 fn derive_key(context: &str, parts: &[&[u8]]) -> CommandKey {
@@ -651,8 +713,13 @@ mod tests {
             "nextAction": {"name":"list_abilities","arguments":{"cursor":"second-page"}},
             "steps": [{"step":"authored","outcome":"applied"}]
         });
-        let result =
-            McpToolResult::new(ToolName::GetAbility, payload, ChatProvenance::default()).unwrap();
+        let result = McpToolResult::new(
+            ToolName::GetAbility,
+            payload,
+            None,
+            ChatProvenance::default(),
+        )
+        .unwrap();
         for key in [
             "revision_example",
             "Review the results.",

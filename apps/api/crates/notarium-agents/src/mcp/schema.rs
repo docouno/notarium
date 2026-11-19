@@ -214,7 +214,7 @@ impl ToolName {
                 opt("project", key()),
                 opt("budgetTokens", integer(200, 32000)),
                 opt("depth", integer(0, 3)),
-                opt("maxPerSource", integer(1, 200)),
+                opt("maxPerSource", integer(1, 32000)),
             ],
             CreateNote => {
                 let mut fields = note_input();

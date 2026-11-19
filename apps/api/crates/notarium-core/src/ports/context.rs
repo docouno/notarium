@@ -3,7 +3,7 @@ use crate::{
     auth::{EngineAuthContext, SecretString},
     error::ValidationReason,
     ids::*,
-    model::HistoryScope,
+    model::{FolderRef, HistoryScope},
 };
 use std::{
     fmt,
@@ -239,6 +239,13 @@ impl SpaceContext {
     }
     pub fn scope(&self) -> &HistoryScope {
         &self.scope
+    }
+    pub fn restrict_to_project(mut self, project: &FolderRef) -> DomainResult<Self> {
+        if self.scope.space_id != project.space_id {
+            return Err(DomainError::validation(ValidationReason::ScopeMismatch));
+        }
+        self.auth = self.auth.restrict_to_project(project)?;
+        Ok(self)
     }
     pub fn check_current(&self, current: &HistoryScope) -> DomainResult<()> {
         current.check(&self.scope)

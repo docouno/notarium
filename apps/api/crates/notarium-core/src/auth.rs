@@ -2,7 +2,7 @@
 //! These types intentionally do not implement Deserialize.
 use crate::{
     DomainError, DomainResult, classes::DocClass, error::ValidationReason, ids::*,
-    ports::BearerScope,
+    model::FolderRef, ports::BearerScope,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -392,6 +392,29 @@ impl EngineAuthContext {
         derived.kind = PrincipalKind::Pat;
         Ok(derived)
     }
+
+    /// Keep the same authenticated credential and confine this operation to one
+    /// project. Canonical writes check live folder ancestry against this pin.
+    pub fn restrict_to_project(&self, project: &FolderRef) -> DomainResult<Self> {
+        let mut grant = self
+            .spaces
+            .get(&project.space_id)
+            .ok_or(DomainError::ResourceNotFound)?
+            .clone();
+        if grant
+            .project_root
+            .as_ref()
+            .is_some_and(|root| root != &project.folder_id)
+        {
+            return Err(DomainError::SpaceReadOnly);
+        }
+        grant.project_root = Some(project.folder_id.clone());
+        Ok(Self {
+            spaces: BTreeMap::from([(project.space_id.clone(), grant)]),
+            ..self.clone()
+        })
+    }
+
     fn narrow(&self, requested: BTreeMap<SpaceId, SpaceGrant>) -> DomainResult<Self> {
         let mut spaces = BTreeMap::new();
         for (id, wanted) in requested {

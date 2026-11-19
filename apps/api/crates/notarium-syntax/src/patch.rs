@@ -25,8 +25,17 @@ pub fn plan(
         }
         changed.push((origin, bytes, replacement));
     }
-    changed.sort_by_key(|(_, bytes, _)| (bytes.start(), bytes.end()));
-    check_disjoint(changed.iter().map(|(_, bytes, _)| *bytes))?;
+    changed.sort_by_key(|(origin, bytes, _)| {
+        (
+            bytes.start(),
+            bytes.end(),
+            matches!(origin, CarrierEditOrigin::Body),
+        )
+    });
+    check_disjoint(
+        body_range,
+        changed.iter().map(|(origin, bytes, _)| (*origin, *bytes)),
+    )?;
     let mut units = UnitCursor::default();
     let mut splices = Vec::with_capacity(changed.len());
     for (origin, bytes, replacement) in changed {
@@ -63,13 +72,26 @@ impl UnitCursor {
         Utf16Span::new(start, self.units)
     }
 }
-fn check_disjoint(spans: impl IntoIterator<Item = ByteSpan>) -> DomainResult<()> {
-    let mut previous: Option<ByteSpan> = None;
-    for span in spans {
-        if previous.is_some_and(|p| p.end() > span.start() || p.start() == span.start()) {
-            return Err(DomainError::validation(ValidationReason::OverlappingEdits));
+fn check_disjoint(
+    body: ByteSpan,
+    spans: impl IntoIterator<Item = (CarrierEditOrigin, ByteSpan)>,
+) -> DomainResult<()> {
+    let mut previous: Option<(CarrierEditOrigin, ByteSpan)> = None;
+    for (origin, span) in spans {
+        if let Some((previous_origin, previous_span)) = previous {
+            // A header insertion at this boundary belongs before a
+            // simultaneous edit to the first body byte.
+            let adjacent_origins = previous_origin == CarrierEditOrigin::Header
+                && previous_span.is_empty()
+                && origin == CarrierEditOrigin::Body
+                && span.start() == body.start();
+            if previous_span.end() > span.start()
+                || previous_span.start() == span.start() && !adjacent_origins
+            {
+                return Err(DomainError::validation(ValidationReason::OverlappingEdits));
+            }
         }
-        previous = Some(span);
+        previous = Some((origin, span));
     }
     Ok(())
 }
@@ -94,7 +116,10 @@ fn validate(source: &str, plan: &CarrierPatchPlan) -> DomainResult<()> {
     if plan.body_range.end() != source.len() {
         return Err(DomainError::validation(ValidationReason::OriginMismatch));
     }
-    check_disjoint(plan.edits.iter().map(|e| e.bytes.0))?;
+    check_disjoint(
+        plan.body_range,
+        plan.edits.iter().map(|e| (e.origin, e.bytes.0)),
+    )?;
     let mut units = UnitCursor::default();
     for edit in &plan.edits {
         let bytes = edit.bytes.0;

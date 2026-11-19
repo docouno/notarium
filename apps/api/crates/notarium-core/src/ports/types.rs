@@ -885,6 +885,7 @@ pub struct RecallQuery {
     pub query: SearchQuery,
     pub graph_depth: u8,
     pub token_budget: u32,
+    /// Maximum sum of admitted chunk tokens from one note.
     pub max_per_source: Option<u16>,
 }
 #[derive(Clone, Debug)]

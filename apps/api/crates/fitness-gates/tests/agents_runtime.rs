@@ -1,13 +1,15 @@
 //! Exercise agent entry points with the real control and canonical owners.
 #[path = "agents_runtime/abilities.rs"]
 mod ability_cases;
+#[path = "agents_runtime/content.rs"]
+mod content_cases;
 #[path = "agents_runtime/engine.rs"]
 mod engine;
 #[allow(dead_code)]
 #[path = "../../notarium-control/tests/support/mod.rs"]
 mod support;
 
-use engine::TestEngine;
+use engine::{ProjectionFixtures, TestEngine};
 use notarium_agents::{
     abilities::SystemAbilityCatalog,
     mcp::{EgressTarget, McpInvocationContext, McpToolResult, ToolRegistry},
@@ -43,6 +45,7 @@ struct RuntimeFixture {
     runtime: CanonicalRuntime,
     control: Arc<ControlService>,
     registry: ToolRegistry,
+    projections: Arc<ProjectionFixtures>,
     human: AccountContext,
     temporary_blob_root: Option<PathBuf>,
 }
@@ -135,10 +138,11 @@ impl RuntimeFixture {
             ProviderConfig::default(),
         )
         .unwrap();
+        let projections = Arc::new(ProjectionFixtures::default());
         let registry = ToolRegistry::new(
             Arc::new(ControlPlane::new(provider)),
             catalog,
-            Arc::new(TestEngine(canonical.clone())),
+            Arc::new(TestEngine(canonical.clone(), projections.clone())),
             control.clone(),
         );
         Self {
@@ -147,6 +151,7 @@ impl RuntimeFixture {
             runtime,
             control,
             registry,
+            projections,
             human,
             temporary_blob_root: pg.then_some(root),
         }
@@ -382,6 +387,7 @@ async fn external_registry_and_memory(pg: bool) {
     assert!(body.contains("One observation"));
     session_delivery_is_lossless(&fixture, &read, &scoped).await;
     ability_cases::overrides_and_promotion(&fixture).await;
+    content_cases::edit_folder_cover_and_view(&fixture, &scoped).await;
     fixture.close().await;
 }
 

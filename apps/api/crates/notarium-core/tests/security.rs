@@ -74,6 +74,37 @@ fn folder_metadata_obeys_project_scope_and_shared_branch_taint() {
     assert!(sibling.taint().is_tainted());
     assert!(sibling.authorize_direct_write(&memory, &memory).is_err());
 }
+
+#[test]
+fn a_project_pin_retains_the_credential_and_refuses_a_relocated_destination() {
+    let owner = human(SpaceRole::Owner, true);
+    let inside = facts(1, DocClass::UserDoc);
+    let project = FolderRef {
+        space_id: inside.space.id.clone(),
+        folder_id: inside.ancestor_folders[0].clone(),
+    };
+    let pinned = owner.restrict_to_project(&project).unwrap();
+    assert_eq!(pinned.principal(), owner.principal());
+    assert_eq!(pinned.grant(), owner.grant());
+    assert_eq!(pinned.credential(), owner.credential());
+    assert_eq!(pinned.kind(), owner.kind());
+    assert_eq!(pinned.spaces().len(), 1);
+    pinned.authorize_direct_write(&inside, &inside).unwrap();
+    let mut moved = inside.clone();
+    moved.ancestor_folders = vec![FolderId::from_bytes([4; 16])];
+    assert_eq!(
+        pinned.authorize_direct_write(&inside, &moved),
+        Err(DomainError::SpaceReadOnly)
+    );
+    assert!(
+        pinned
+            .restrict_to_project(&FolderRef {
+                space_id: project.space_id.clone(),
+                folder_id: moved.ancestor_folders[0].clone(),
+            })
+            .is_err()
+    );
+}
 fn facts(space: u8, class: DocClass) -> ResourceFacts {
     ResourceFacts {
         space: Space {
