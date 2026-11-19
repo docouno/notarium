@@ -1616,6 +1616,8 @@ async fn interactive_management_and_account_guards(pg: bool) {
         .unwrap()
         .push(AbilityDescriptor {
             attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
             reference: ability_ref.clone(),
             kind: AbilityKind::Role,
             name: "selected-guide".into(),

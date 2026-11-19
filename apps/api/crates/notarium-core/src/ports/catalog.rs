@@ -66,6 +66,9 @@ pub trait ControlCatalogPort: Send + Sync {
         page: ControlPageRequest,
     ) -> PortFuture<'_, ControlPage<ProjectInfo>>;
     fn project(&self, ctx: SpaceContext, project: FolderRef) -> PortFuture<'_, ProjectInfo>;
+    /// Look up the active project handle in one admitted Space. A current
+    /// exact slug takes precedence over an authorized historical alias.
+    fn project_by_slug(&self, ctx: SpaceContext, slug: String) -> PortFuture<'_, ProjectInfo>;
     fn abilities(
         &self,
         ctx: AccountContext,

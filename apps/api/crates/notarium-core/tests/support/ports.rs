@@ -64,6 +64,11 @@ impl NoteWritePort for RejectingPorts {
             ctx: SpaceContext,
             request: Mutation<DeleteNote>,
         ) -> PortFuture<'_, Committed<NoteRevision>>;
+    fn trash_ability_package(
+            &self,
+            ctx: SpaceContext,
+            request: Mutation<TrashAbilityPackage>,
+        ) -> PortFuture<'_, Committed<NoteRevision>>;
     fn mint_and_purge(
             &self,
             ctx: SpaceContext,
@@ -103,7 +108,7 @@ impl NoteWritePort for RejectingPorts {
             &self,
             ctx: SpaceContext,
             request: Mutation<AppendMemory>,
-        ) -> PortFuture<'_, Committed<NoteRevision>>;
+        ) -> PortFuture<'_, Committed<MemoryAppendResult>>;
     fn link(&self, ctx: SpaceContext, request: Mutation<Link>) -> PortFuture<'_, Committed<Link>>;
     fn link_many(&self, ctx: SpaceContext, request: LinkBatch)
         -> PortFuture<'_, BatchResult<Link>>;

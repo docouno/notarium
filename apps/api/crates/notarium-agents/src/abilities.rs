@@ -185,6 +185,10 @@ impl<C: ControlCatalogPort + ?Sized> ControlCatalogPort for SystemAbilityCatalog
         self.owned.project(ctx, project)
     }
 
+    fn project_by_slug(&self, ctx: SpaceContext, slug: String) -> PortFuture<'_, ProjectInfo> {
+        self.owned.project_by_slug(ctx, slug)
+    }
+
     fn abilities(
         &self,
         ctx: AccountContext,

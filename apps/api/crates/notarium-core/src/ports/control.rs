@@ -52,6 +52,8 @@ pub struct AccessibleSpace {
     pub slug: String,
     pub role: SpaceRole,
     pub history: HistoryScope,
+    /// Upper cursor bound from a complete canonical command.
+    pub last_seq: SpaceSeq,
 }
 #[derive(Clone, Debug)]
 pub struct ProjectInfo {
@@ -148,6 +150,10 @@ pub struct AbilityDescriptor {
     pub entrypoint: Option<NoteRef>,
     pub auxiliary_files: Vec<String>,
     pub attached_skills: Vec<AbilityRef>,
+    /// Scope of the old publication when an ability was promoted to its Space.
+    pub promoted_from: Option<AbilityRef>,
+    /// Activation requires a Control binding even before the first binding commit.
+    pub requires_explicit_binding: bool,
 }
 #[derive(Clone, Debug)]
 pub struct AbilityQuery {

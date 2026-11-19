@@ -77,6 +77,8 @@ fn add(
         .unwrap()
         .push(AbilityDescriptor {
             attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
             reference: reference.clone(),
             kind: AbilityKind::Role,
             name: name.into(),
@@ -1198,6 +1200,8 @@ async fn selected_project_bindings_and_paged_bulk_discovery(pg: bool) {
             .unwrap()
             .push(AbilityDescriptor {
                 attached_skills: vec![],
+                promoted_from: None,
+                requires_explicit_binding: false,
                 reference: reference.clone(),
                 kind: AbilityKind::Skill,
                 name: "dup-skill".into(),

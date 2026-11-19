@@ -78,12 +78,22 @@ pub struct ChildFolders {
     pub items: Vec<FolderSnapshot>,
     pub next: Option<FolderId>,
 }
-/// Counts over an authorized projection cut for one exact project.
+/// Maximum distinct values in each project bootstrap vocabulary list.
+pub const MAX_PROJECT_BOOTSTRAP_VALUES: usize = 50;
+
+/// Project bootstrap aggregates from a single authorized projection cut.
+/// Producers apply current visibility to the counted notes and vocabulary.
 #[derive(Clone, Debug)]
 pub struct ProjectNoteCounts {
     pub project: FolderRef,
     pub cut: SnapshotCut,
     pub counts: BTreeMap<DocClass, u64>,
+    /// Sorted distinct visible tags at the same cut as the counts, excluding
+    /// encrypted notes. At most `MAX_PROJECT_BOOTSTRAP_VALUES` values.
+    pub known_tags: Vec<String>,
+    /// Sorted distinct visible agent-memory categories at that cut. At most
+    /// `MAX_PROJECT_BOOTSTRAP_VALUES` values.
+    pub known_categories: Vec<String>,
 }
 #[derive(Clone, Debug)]
 pub struct EnsureFolderPath {
@@ -219,7 +229,8 @@ pub struct BatchResult<T> {
     pub items: Vec<Result<Committed<T>, DomainError>>,
     pub committed_high_watermark: SpaceSeq,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "scope", content = "target", rename_all = "snake_case")]
 pub enum MemoryTarget {
     User { owner: PrincipalId },
     Project { folder: FolderRef },
@@ -243,6 +254,28 @@ pub struct MemoryTargetSnapshot {
 pub struct AppendMemory {
     pub target: ResolvedMemoryTarget,
     pub text: String,
+    pub summary: Option<String>,
+    pub mode: MemoryWriteMode,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryWriteMode {
+    RequireExisting,
+    CreateIfMissing,
+    RequireAbsent,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAppendOutcome {
+    Created,
+    Appended,
+    Skipped,
+}
+#[derive(Clone, Debug)]
+pub struct MemoryAppendResult {
+    pub revision: NoteRevision,
+    pub outcome: MemoryAppendOutcome,
+    pub summary_updated: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LinkTarget {
@@ -275,6 +308,14 @@ pub struct PublishAbilityPackage {
     pub files: Vec<AbilityFile>,
     pub attached_skills: Vec<super::AbilityRef>,
     pub expected_package_revision: Option<RevisionId>,
+    pub expected_entrypoint_revision: Option<RevisionId>,
+    pub requires_explicit_binding: bool,
+}
+#[derive(Clone, Debug)]
+pub struct TrashAbilityPackage {
+    pub ability: AbilityId,
+    pub entrypoint: NoteId,
+    pub package_revision: RevisionId,
 }
 #[derive(Clone, Debug)]
 pub struct AbilityPackageRevision {

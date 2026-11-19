@@ -94,6 +94,8 @@ async fn mutation_envelopes_validate_before_replay_on_both_drivers() {
                 entrypoint: note.clone(),
                 files: vec![],
                 expected_package_revision: None,
+                expected_entrypoint_revision: None,
+                requires_explicit_binding: false,
             },
             pre
         );

@@ -8,7 +8,7 @@ const LIST_PROJECTS: &str = "SELECT folder_id, created_seq
 
 use crate::{
     CanonicalStore, SpaceRecord,
-    codec::internal_not_committed,
+    codec::{internal_not_committed, normalize_slug_key},
     domain::common::{build_resource_facts_tx, load_folder_ancestry_tx, load_note_head_row_tx},
     runtime::{load_folder_head_row, load_space_record},
     sql_exec::BackendConn,
@@ -41,7 +41,7 @@ macro_rules! db {
 }
 mod abilities;
 pub(crate) use abilities::{
-    authorize_change_tx as authorize_ability_change_tx, resource_digest_tx,
+    ability_manifest_tx, authorize_change_tx as authorize_ability_change_tx, resource_digest_tx,
 };
 mod commands;
 pub(crate) mod egress;
@@ -79,6 +79,23 @@ async fn folder_metadata(
         },
         row,
     ))
+}
+
+fn project_info(
+    folder: CatalogFolder,
+    row: crate::runtime::FolderHeadRow,
+) -> Result<ProjectInfo, PortError> {
+    if !row.is_project {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let project_slug = row
+        .project_slug
+        .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
+    Ok(ProjectInfo {
+        folder: folder.reference,
+        name: row.display_name,
+        project_slug,
+    })
 }
 
 async fn note_metadata(
@@ -191,16 +208,51 @@ impl ControlCatalogPort for CanonicalStore {
                     let space = load_space_record(tx, &ctx.scope().space_id).await?;
                     ctx.check_current(&space.scope)?;
                     let (folder, row) = folder_metadata(tx, ctx.auth(), &space, reference).await?;
-                    if !row.is_project {
-                        return Err(DomainError::ResourceNotFound.into());
-                    }
-                    Ok(ProjectInfo {
-                        folder: folder.reference,
-                        name: row.display_name,
-                        project_slug: row.project_slug.ok_or_else(|| {
-                            DomainError::validation(ValidationReason::InvalidState)
-                        })?,
-                    })
+                    project_info(folder, row)
+                })
+            })
+            .await
+        })
+    }
+    fn project_by_slug(&self, ctx: SpaceContext, slug: String) -> PortFuture<'_, ProjectInfo> {
+        Box::pin(async move {
+            let slug = normalize_slug_key(&slug)?;
+            let budget = ctx.budget.clone();
+            self.with_read_tx_budget(Some(&budget), move |tx| {
+                Box::pin(async move {
+                    let space = load_space_record(tx, &ctx.scope().space_id).await?;
+                    ctx.check_current(&space.scope)?;
+                    let id: Option<String> = db!(
+                        read tx,
+                        sqlx::query_scalar("SELECT folder_id FROM folder_heads
+                            WHERE space_id=$1 AND project_slug_fold=$2
+                              AND lifecycle_state='active' AND is_project=1"),
+                        fetch_optional,
+                        space.space.id.as_str(),
+                        &slug
+                    )?;
+                    let id: String = if let Some(id) = id {
+                        id
+                    } else {
+                        db!(
+                            read tx,
+                            sqlx::query_scalar("SELECT h.folder_id FROM folder_aliases a
+                                JOIN folder_heads h ON h.space_id=a.space_id AND h.folder_id=a.target_folder_id
+                                WHERE a.space_id=$1 AND a.old_parent_folder_id=$2 AND a.old_slug_fold=$3
+                                  AND h.parent_folder_id=$2 AND h.lifecycle_state='active' AND h.is_project=1
+                                ORDER BY a.created_seq DESC LIMIT 1"),
+                            fetch_optional,
+                            space.space.id.as_str(),
+                            space.root_folder_id.as_str(),
+                            &slug
+                        )?.ok_or(DomainError::ResourceNotFound)?
+                    };
+                    let reference = FolderRef {
+                        space_id: space.space.id.clone(),
+                        folder_id: FolderId::parse(&id)?,
+                    };
+                    let (folder, row) = folder_metadata(tx, ctx.auth(), &space, reference).await?;
+                    project_info(folder, row)
                 })
             })
             .await
@@ -266,13 +318,7 @@ impl ControlCatalogPort for CanonicalStore {
                             folder_id: FolderId::parse(&id)?,
                         };
                         match folder_metadata(tx, ctx.auth(), &rec, reference).await {
-                            Ok((folder, row)) => items.push(ProjectInfo {
-                                folder: folder.reference,
-                                name: row.display_name,
-                                project_slug: row.project_slug.ok_or_else(|| {
-                                    DomainError::validation(ValidationReason::InvalidState)
-                                })?,
-                            }),
+                            Ok((folder, row)) => items.push(project_info(folder, row)?),
                             Err(PortError::Domain(DomainError::ResourceNotFound)) => (),
                             Err(error) => return Err(error),
                         }

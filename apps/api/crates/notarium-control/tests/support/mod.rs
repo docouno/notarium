@@ -267,6 +267,22 @@ impl ControlCatalogPort for Catalog {
                 .ok_or(DomainError::ResourceNotFound.into())
         })
     }
+    fn project_by_slug(&self, ctx: SpaceContext, slug: String) -> PortFuture<'_, ProjectInfo> {
+        Box::pin(async move {
+            let project = self
+                .project_entries
+                .lock()
+                .unwrap()
+                .values()
+                .find(|entry| {
+                    entry.folder.space_id == ctx.scope().space_id
+                        && entry.project_slug.eq_ignore_ascii_case(&slug)
+                })
+                .map(|entry| entry.folder.clone())
+                .ok_or(DomainError::ResourceNotFound)?;
+            self.project(ctx, project).await
+        })
+    }
     fn abilities(
         &self,
         _: AccountContext,

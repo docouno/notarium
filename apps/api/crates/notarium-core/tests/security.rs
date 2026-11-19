@@ -317,6 +317,8 @@ fn project_consent_covers_its_own_ability_and_the_spaces_ability() {
             digest,
             provenance,
             lifecycle: Lifecycle::Active,
+            promoted_from: None,
+            requires_explicit_binding: false,
         };
         assert_eq!(part.in_project(&primary), inside);
         assert_eq!(current.in_project(&primary), inside);

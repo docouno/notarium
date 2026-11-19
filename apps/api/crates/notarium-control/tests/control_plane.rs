@@ -188,6 +188,8 @@ async fn run_concurrent_load_pool_isolation_and_untainted_metadata(pg: bool) {
         .unwrap()
         .push(AbilityDescriptor {
             attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
             reference: ability_ref.clone(),
             kind: AbilityKind::Role,
             name: "shared-role".into(),

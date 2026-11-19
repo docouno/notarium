@@ -24,6 +24,8 @@ pub(crate) const V5_HASH: &str = "e32b31f85aeb41b99c19c355bad2f9103eac552a0fe4b9
 
 pub(crate) const V6_HASH: &str = "f91526e264d8000bf5d72a4efcb4e9701b350636c37da24d2b34bb19f50a8772";
 
+pub(crate) const V7_HASH: &str = "244ce610feed9e389063805c0c36190633a082df2b743fbf340c40418797e2a0";
+
 pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
     match version {
         1 => hex::encode(hash) == V1_HASH,
@@ -32,6 +34,7 @@ pub(crate) fn recognized_predecessor(version: i64, hash: &[u8]) -> bool {
         4 => hex::encode(hash) == V4_HASH,
         5 => hex::encode(hash) == V5_HASH,
         6 => hex::encode(hash) == V6_HASH,
+        7 => hex::encode(hash) == V7_HASH,
         _ => false,
     }
 }
@@ -260,23 +263,36 @@ macro_rules! upgrade {
                 sqlx::query(sqlx::AssertSqlSafe(index)).execute(&mut *conn).await
                     .map_err(|e| internal_not_committed("migration_v6_retirement_index", e.to_string()))?;
             }
-            let add_epoch = if stringify!($variant) == "Sqlite" {
-                "ALTER TABLE chat_threads ADD COLUMN active_run_epoch INTEGER CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)"
-            } else {
-                "ALTER TABLE chat_threads ADD COLUMN active_run_epoch BIGINT CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)"
-            };
-            for sql in std::iter::once(add_epoch).chain(MIGRATE_CHAT_HISTORY) {
-                sqlx::query(sql).execute(&mut *conn).await.map_err(|e| {
-                    internal_not_committed("migration_v7_chat_history", e.to_string())
-                })?;
+            if version < 7 {
+                let add_epoch = if stringify!($variant) == "Sqlite" {
+                    "ALTER TABLE chat_threads ADD COLUMN active_run_epoch INTEGER CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)"
+                } else {
+                    "ALTER TABLE chat_threads ADD COLUMN active_run_epoch BIGINT CHECK (active_run_epoch IS NULL OR active_run_epoch >= 0)"
+                };
+                for sql in std::iter::once(add_epoch).chain(MIGRATE_CHAT_HISTORY) {
+                    sqlx::query(sql).execute(&mut *conn).await.map_err(|e| {
+                        internal_not_committed("migration_v7_chat_history", e.to_string())
+                    })?;
+                }
+                sqlx::query(sqlx::AssertSqlSafe(baseline_statement(
+                    $ddl,
+                    "CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_consumed",
+                )?))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| internal_not_committed("migration_v7_chat_handoff_index", e.to_string()))?;
             }
+            sqlx::query("DROP INDEX IF EXISTS uq_ability_packages_active_slug")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| internal_not_committed("migration_v8_ability_slot_drop", e.to_string()))?;
             sqlx::query(sqlx::AssertSqlSafe(baseline_statement(
                 $ddl,
-                "CREATE INDEX IF NOT EXISTS idx_chat_pending_inputs_consumed",
+                "CREATE INDEX IF NOT EXISTS idx_ability_packages_active_slug",
             )?))
             .execute(&mut *conn)
             .await
-            .map_err(|e| internal_not_committed("migration_v7_chat_handoff_index", e.to_string()))?;
+            .map_err(|e| internal_not_committed("migration_v8_ability_slot_index", e.to_string()))?;
             let (sec, nsec) =
                 crate::codec::encode_timestamp_parts(crate::codec::now_utc_timestamp()?);
             sqlx::query(WRITE_WITNESS)
@@ -318,6 +334,42 @@ mod tests {
             .execute(db)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn v7_upgrades_only_the_ability_slot_index() {
+        let mut db = SqliteConnection::connect(":memory:").await.unwrap();
+        let installation = InstallationId::from_bytes([7; 16]);
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "DROP INDEX idx_ability_packages_active_slug;
+             CREATE UNIQUE INDEX uq_ability_packages_active_slug
+                ON ability_packages(space_id,slug_fold) WHERE lifecycle_state='active'",
+        )
+        .execute(&mut db)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE schema_meta SET schema_version=7, manifest_checksum=$1")
+            .bind(hex::decode(V7_HASH).unwrap())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        bootstrap_sqlite_schema(&mut db, &installation)
+            .await
+            .unwrap();
+        let index_state: (i64, i64) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='uq_ability_packages_active_slug'),
+                    EXISTS(SELECT 1 FROM pragma_index_list('ability_packages')
+                           WHERE name='idx_ability_packages_active_slug' AND [unique]=0)",
+        ).fetch_one(&mut db).await.unwrap();
+        assert_eq!(index_state, (0, 1));
+        let version: i64 = sqlx::query_scalar("SELECT schema_version FROM schema_meta")
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+        assert_eq!(version, i64::from(CANONICAL_SCHEMA_VERSION));
     }
 
     #[tokio::test]

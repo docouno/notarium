@@ -192,7 +192,11 @@ async fn exercise(pg: bool) {
                 active_epoch: first.active_epoch,
                 folder_id: FolderId::from_bytes([tag; 16]),
                 parent: None,
-                slug: name.clone(),
+                slug: if tag == 1 {
+                    "physical-folder-one".into()
+                } else {
+                    name.clone()
+                },
                 display_name: name.clone(),
                 is_project: true,
                 project_slug: Some(name),
@@ -222,6 +226,44 @@ async fn exercise(pg: bool) {
         second.items[0].folder.folder_id,
         FolderId::from_bytes([2; 16])
     );
+    let named = canonical
+        .project_by_slug(scoped.clone(), "PROJECT-1".into())
+        .await
+        .unwrap();
+    assert_eq!(named.folder.folder_id, FolderId::from_bytes([1; 16]));
+    assert!(
+        canonical
+            .project_by_slug(scoped.clone(), "physical-folder-one".into())
+            .await
+            .is_err()
+    );
+    canonical
+        .rename_project(
+            scoped.clone(),
+            mutation(
+                &scoped,
+                209,
+                RenameProject {
+                    folder: FolderId::from_bytes([2; 16]),
+                    name: "renamed-project".into(),
+                    display_name: "Renamed project".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let alias = canonical
+        .project_by_slug(scoped.clone(), "project-2".into())
+        .await
+        .unwrap();
+    assert_eq!(alias.project_slug, "renamed-project");
+    assert_eq!(alias.folder.folder_id, FolderId::from_bytes([2; 16]));
+    let latest = canonical.read_space(&sid).await.unwrap();
+    let visible = control
+        .list_spaces(account.clone(), ControlPageRequest::new(1, None).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(visible.items[0].last_seq, latest.last_seq);
     let restricted = account
         .auth()
         .for_pat(std::collections::BTreeMap::from([(
@@ -234,6 +276,14 @@ async fn exercise(pg: bool) {
             },
         )]))
         .unwrap();
+    let limited_space =
+        SpaceContext::new(restricted.clone(), first.scope.clone(), budget()).unwrap();
+    assert!(matches!(
+        canonical
+            .project_by_slug(limited_space, "project-2".into())
+            .await,
+        Err(PortError::Domain(DomainError::ResourceNotFound))
+    ));
     let private = AccountContext::new(restricted, budget());
     assert!(matches!(
         canonical.note(private, memory.note.clone()).await,
@@ -295,6 +345,8 @@ async fn exercise(pg: bool) {
                     entrypoint: entry.clone(),
                     files,
                     expected_package_revision: None,
+                    expected_entrypoint_revision: None,
+                    requires_explicit_binding: false,
                 },
             ),
         )
@@ -430,6 +482,8 @@ async fn exercise(pg: bool) {
                         entrypoint: new_entry,
                         files: vec![],
                         expected_package_revision: None,
+                        expected_entrypoint_revision: None,
+                        requires_explicit_binding: false,
                     },
                 ),
             )
@@ -523,6 +577,8 @@ async fn exercise(pg: bool) {
                     entrypoint: entry,
                     files: Vec::new(),
                     expected_package_revision: Some(previous.revision.clone()),
+                    expected_entrypoint_revision: None,
+                    requires_explicit_binding: false,
                 },
             ),
         )

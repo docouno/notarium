@@ -2428,6 +2428,17 @@ async fn authorize_rollback_destination_tx(
         )
         .await?;
     auth.authorize_direct_write(&after, &after)?;
+    if meta.lifecycle == Lifecycle::Active
+        && let Some(ability) = &meta.ability_id
+    {
+        super::packages::check_restored_ability_slot_tx(
+            tx,
+            &space.id,
+            ability,
+            anc.project.as_ref(),
+        )
+        .await?;
+    }
     Ok(anc)
 }
 

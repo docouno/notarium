@@ -269,6 +269,8 @@ async fn exercise(pg: bool) {
     };
     let descriptor = AbilityDescriptor {
         attached_skills: vec![],
+        promoted_from: None,
+        requires_explicit_binding: false,
         reference: role.clone(),
         kind: AbilityKind::Role,
         name: "fixture-role".into(),

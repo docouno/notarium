@@ -121,7 +121,7 @@ pub trait NoteWritePort: Send + Sync {
         &self,
         ctx: SpaceContext,
         request: Mutation<AppendMemory>,
-    ) -> PortFuture<'_, Committed<NoteRevision>>;
+    ) -> PortFuture<'_, Committed<MemoryAppendResult>>;
     fn link(&self, ctx: SpaceContext, request: Mutation<Link>) -> PortFuture<'_, Committed<Link>>;
     fn link_many(&self, ctx: SpaceContext, request: LinkBatch)
     -> PortFuture<'_, BatchResult<Link>>;
@@ -130,6 +130,11 @@ pub trait NoteWritePort: Send + Sync {
         ctx: SpaceContext,
         request: Mutation<PublishAbilityPackage>,
     ) -> PortFuture<'_, Committed<AbilityPackageRevision>>;
+    fn trash_ability_package(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<TrashAbilityPackage>,
+    ) -> PortFuture<'_, Committed<NoteRevision>>;
     fn rollback_agent_run(
         &self,
         ctx: SpaceContext,

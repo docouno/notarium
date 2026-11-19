@@ -2,13 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use notarium_core::{
     DomainError,
+    auth::SpaceKind,
     classes::{AbilityKind, ClassifiedAbilityResource, DocClass},
     error::{PortError, ValidationReason},
     ids::{AbilityId, ContentDigest, RevisionId},
-    model::{AbilityResourceName, AbilityResourceRef, Lifecycle, PathTarget},
+    model::{
+        AbilityResourceName, AbilityResourceRef, FolderRef, HistoryScope, Lifecycle, PathTarget,
+    },
     ports::{
-        AbilityPackageRevision, Committed, Mutation, PublishAbilityPackage, ReadAbilityResource,
-        SpaceContext,
+        AbilityPackageRevision, AbilityPlacement, AbilityRef, Committed, Mutation,
+        PublishAbilityPackage, ReadAbilityResource, SpaceContext, TrashAbilityPackage,
     },
     receipt::MutationReceiptToken,
 };
@@ -28,8 +31,9 @@ use crate::{
         new_revision_id, now_utc_timestamp,
     },
     domain::common::{
-        StoredCommittedAbilityRevV1, build_resource_facts_tx, derive_command_identity_spec,
-        load_note_head_row_tx, note_rank_version_digest, validate_mutation_identity,
+        FolderAncestryCache, NoteHeadRow, StoredCommittedAbilityRevV1, build_resource_facts_tx,
+        derive_command_identity_spec, load_note_head_row_tx, note_rank_version_digest,
+        validate_mutation_identity,
     },
     runtime::{insert_revision_row, load_space_record},
     sql_exec::BackendConn,
@@ -62,38 +66,65 @@ fn validate_ability_aux_path(rel_path: &str) -> Result<(), PortError> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct PublicationExpectation<'a> {
+    package: Option<&'a RevisionId>,
+    entrypoint: Option<&'a RevisionId>,
+}
+struct AuthorizedEntrypoint {
+    space: crate::SpaceRecord,
+    head: NoteHeadRow,
+    project: Option<notarium_core::ids::FolderId>,
+}
+
+struct PublicationCheck {
+    entrypoint: AuthorizedEntrypoint,
+    digest: ContentDigest,
+    previous: Option<RevisionId>,
+}
+
+async fn authorize_entrypoint_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &notarium_core::model::HistoryScope,
+    auth: &notarium_core::auth::EngineAuthContext,
+    entrypoint: &notarium_core::ids::NoteId,
+    ability: &AbilityId,
+) -> Result<AuthorizedEntrypoint, PortError> {
+    auth.authorize_ability_mutation()?;
+    let live_space = load_space_record(tx, &scope.space_id).await?;
+    live_space.scope.check(scope)?;
+    let head = load_note_head_row_tx(tx, &scope.space_id, entrypoint).await?;
+    let (before, ancestry) = build_resource_facts_tx(
+        tx,
+        &live_space.space,
+        &head.parent_folder_id,
+        head.doc_class,
+        head.ability_id.clone(),
+        true,
+    )
+    .await?;
+    let mut after = before.clone();
+    after.ability_package = Some(ability.clone());
+    auth.authorize_direct_write(&before, &after)?;
+    Ok(AuthorizedEntrypoint {
+        space: live_space,
+        head,
+        project: ancestry.project,
+    })
+}
+
 async fn check_package_publication_tx(
     tx: &mut BackendConn<'_>,
     scope: &notarium_core::model::HistoryScope,
     auth: &notarium_core::auth::EngineAuthContext,
     entrypoint: &notarium_core::ids::NoteId,
     ability: &AbilityId,
-    expected_pkg_rev: Option<&RevisionId>,
+    expected: PublicationExpectation<'_>,
     aux_raw_bytes: u64,
-) -> Result<
-    (
-        crate::domain::common::NoteHeadRow,
-        ContentDigest,
-        Option<RevisionId>,
-    ),
-    PortError,
-> {
-    auth.authorize_ability_mutation()?;
-    let live_space = load_space_record(tx, &scope.space_id).await?;
-    live_space.scope.check(scope)?;
-    let entry_head = load_note_head_row_tx(tx, &scope.space_id, entrypoint).await?;
-    let (before_facts, _) = build_resource_facts_tx(
-        tx,
-        &live_space.space,
-        &entry_head.parent_folder_id,
-        entry_head.doc_class,
-        entry_head.ability_id.clone(),
-        true,
-    )
-    .await?;
-    let mut after_facts = before_facts.clone();
-    after_facts.ability_package = Some(ability.clone());
-    auth.authorize_direct_write(&before_facts, &after_facts)?;
+) -> Result<PublicationCheck, PortError> {
+    let entrypoint_facts = authorize_entrypoint_tx(tx, scope, auth, entrypoint, ability).await?;
+    let entry_head = &entrypoint_facts.head;
+    let live_space = &entrypoint_facts.space;
 
     if entry_head.lifecycle != Lifecycle::Active {
         return Err(DomainError::ResourceNotFound.into());
@@ -105,6 +136,15 @@ async fn check_package_publication_tx(
         && existing_ab != ability
     {
         return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+    }
+    if let Some(expected) = expected.entrypoint
+        && expected != &entry_head.head_rev_id
+    {
+        return Err(DomainError::RevisionConflict {
+            current: entry_head.head_rev_id.clone(),
+            lineage: None,
+        }
+        .into());
     }
 
     let entry_digest = entry_head.content_digest.ok_or_else(|| {
@@ -137,7 +177,7 @@ async fn check_package_publication_tx(
 
                 return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
             }
-            if expected_pkg_rev != Some(cur_rev) {
+            if expected.package != Some(cur_rev) {
                 return Err(DomainError::RevisionConflict {
                     current: cur_rev.clone(),
                     lineage: None,
@@ -147,7 +187,7 @@ async fn check_package_publication_tx(
             Some(cur_rev.clone())
         }
         None => {
-            if let Some(unexpected) = expected_pkg_rev {
+            if let Some(unexpected) = expected.package {
                 return Err(DomainError::RevisionConflict {
                     current: unexpected.clone(),
                     lineage: None,
@@ -159,7 +199,15 @@ async fn check_package_publication_tx(
     };
 
     // Enforce active package slug uniqueness across the Space.
-    if active_ability_slug_conflict_tx(tx, &scope.space_id, &entry_head.slug_fold, ability).await? {
+    if active_ability_slug_conflict_tx(
+        tx,
+        &scope.space_id,
+        &entry_head.slug_fold,
+        ability,
+        entrypoint_facts.project.as_ref(),
+    )
+    .await?
+    {
         let report_parent = (entry_head.parent_folder_id != live_space.root_folder_id)
             .then_some(entry_head.parent_folder_id.clone());
         return Err(DomainError::PathConflict {
@@ -172,7 +220,98 @@ async fn check_package_publication_tx(
         .into());
     }
 
-    Ok((entry_head, entry_digest, prev_rev_opt))
+    Ok(PublicationCheck {
+        entrypoint: entrypoint_facts,
+        digest: entry_digest,
+        previous: prev_rev_opt,
+    })
+}
+
+/// The old immutable publication establishes the origin of a Project → Space
+/// promotion. The marker survives intermediate republishes at the destination.
+async fn publication_policy(
+    tx: &mut BackendConn<'_>,
+    space: &crate::SpaceRecord,
+    ability: &AbilityId,
+    current_project: Option<&notarium_core::ids::FolderId>,
+    previous: Option<&RevisionId>,
+    requested_binding: bool,
+) -> Result<(Option<AbilityRef>, bool), PortError> {
+    let Some(previous) = previous else {
+        return Ok((None, requested_binding));
+    };
+    let (manifest, cutoff) =
+        crate::catalog::ability_manifest_tx(tx, &space.scope, ability, previous).await?;
+    let binding_required = requested_binding || manifest.requires_explicit_binding;
+    if space.space.kind != SpaceKind::Shared || current_project.is_some() {
+        return Ok((None, binding_required));
+    }
+    if manifest.promoted_from.is_some() {
+        return Ok((manifest.promoted_from, binding_required));
+    }
+    let entry = crate::runtime::read_immutable_revision_tx(
+        tx,
+        &space.scope,
+        "note",
+        manifest.entrypoint_note_id.as_str(),
+        cutoff,
+    )
+    .await?
+    .ok_or(DomainError::ResourceNotFound)?;
+    let RevisionMetadataPayload::Note(note) = entry.metadata.payload else {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    };
+    if entry.revision_id != manifest.entrypoint_revision {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+    let (_, ancestry) = FolderAncestryCache::at_cut(&space.scope, cutoff)
+        .build_resource_facts_tx(
+            tx,
+            &space.space,
+            &note.parent_folder_id,
+            note.doc_class,
+            Some(ability.clone()),
+            true,
+        )
+        .await?;
+    Ok((
+        ancestry.project.map(|folder_id| AbilityRef {
+            id: ability.clone(),
+            placement: AbilityPlacement::OwnedProject(FolderRef {
+                space_id: space.space.id.clone(),
+                folder_id,
+            }),
+            revision: previous.clone(),
+        }),
+        binding_required,
+    ))
+}
+
+pub(super) async fn check_package_trash_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    request: &TrashAbilityPackage,
+) -> Result<(), PortError> {
+    let (lifecycle, current, entrypoint) =
+        load_ability_package_row_opt_tx(tx, &scope.space_id, &request.ability)
+            .await?
+            .ok_or(DomainError::ResourceNotFound)?;
+    if lifecycle != Lifecycle::Active || entrypoint != request.entrypoint {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    if current != request.package_revision {
+        return Err(DomainError::RevisionConflict {
+            current,
+            lineage: None,
+        }
+        .into());
+    }
+    let (manifest, _) =
+        crate::catalog::ability_manifest_tx(tx, scope, &request.ability, &current).await?;
+    if manifest.resources.len() != 1 || !manifest.resources.contains_key(ABILITY_ENTRYPOINT_KEY) {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    }
+    Ok(())
 }
 
 pub(crate) async fn publish_ability_package_impl(
@@ -253,6 +392,13 @@ pub(crate) async fn publish_ability_package_impl(
         fp_hasher.update(b"\0attached-skills-v1\0");
         fp_hasher.update(&crate::codec::encode_msgpack(&attached_skills)?);
     }
+    if let Some(expected) = &request.input.expected_entrypoint_revision {
+        fp_hasher.update(b"\0entrypoint-revision-v1\0");
+        fp_hasher.update(expected.as_str().as_bytes());
+    }
+    if request.input.requires_explicit_binding {
+        fp_hasher.update(b"\0require-explicit-binding-v1\0");
+    }
     let idemp = derive_command_identity_spec(
         &request.identity,
         "publish_ability_package",
@@ -265,6 +411,8 @@ pub(crate) async fn publish_ability_package_impl(
     let input_kind = request.input.kind;
     let input_entrypoint = request.input.entrypoint.clone();
     let expected_pkg_rev = request.input.expected_package_revision.clone();
+    let expected_entry_rev = request.input.expected_entrypoint_revision.clone();
+    let requested_binding = request.input.requires_explicit_binding;
     let scope = space_rec.scope.clone();
 
     let preflight_scope = scope.clone();
@@ -272,6 +420,7 @@ pub(crate) async fn publish_ability_package_impl(
     let entrypoint = input_entrypoint.clone();
     let ability = input_ability.clone();
     let expected = expected_pkg_rev.clone();
+    let expected_entrypoint = expected_entry_rev.clone();
     let replay_key = idemp.clone();
     let preflight = || {
         store.with_read_tx_budget(Some(&ctx.budget), |tx| {
@@ -280,6 +429,14 @@ pub(crate) async fn publish_ability_package_impl(
                     crate::writer::lookup_command_receipt_tx(tx, &preflight_scope, &replay_key)
                         .await?
                 {
+                    authorize_entrypoint_tx(
+                        tx,
+                        &preflight_scope,
+                        &preflight_auth,
+                        &entrypoint,
+                        &ability,
+                    )
+                    .await?;
                     if receipt.command_hash != replay_key.command_hash {
                         return Err(DomainError::IdempotencyKeyReused.into());
                     }
@@ -291,7 +448,10 @@ pub(crate) async fn publish_ability_package_impl(
                     &preflight_auth,
                     &entrypoint,
                     &ability,
-                    expected.as_ref(),
+                    PublicationExpectation {
+                        package: expected.as_ref(),
+                        entrypoint: expected_entrypoint.as_ref(),
+                    },
                     aux_raw_bytes,
                 )
                 .await?;
@@ -331,16 +491,31 @@ pub(crate) async fn publish_ability_package_impl(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
-                let (entry_head, entry_digest, prev_rev_opt) = check_package_publication_tx(
+                let checked = check_package_publication_tx(
                     tx,
                     &scope,
                     &auth,
                     &input_entrypoint,
                     &input_ability,
-                    expected_pkg_rev.as_ref(),
+                    PublicationExpectation {
+                        package: expected_pkg_rev.as_ref(),
+                        entrypoint: expected_entry_rev.as_ref(),
+                    },
                     aux_raw_bytes,
                 )
                 .await?;
+                let (promoted_from, requires_explicit_binding) = publication_policy(
+                    tx,
+                    &checked.entrypoint.space,
+                    &input_ability,
+                    checked.entrypoint.project.as_ref(),
+                    checked.previous.as_ref(),
+                    requested_binding,
+                )
+                .await?;
+                let entry_head = checked.entrypoint.head;
+                let entry_digest = checked.digest;
+                let prev_rev_opt = checked.previous;
                 let seq = item_ctx.alloc_next_seq()?;
                 let pkg_rev = new_revision_id()?;
                 let now_ts = now_utc_timestamp()?;
@@ -527,6 +702,8 @@ pub(crate) async fn publish_ability_package_impl(
                         resources: manifest.clone(),
                         total_bytes: entry_head.byte_size.saturating_add(aux_raw_bytes),
                         attached_skills,
+                        promoted_from,
+                        requires_explicit_binding,
                     },
                 ))
                 .encode()?;
@@ -725,35 +902,71 @@ async fn load_ability_package_row_opt_tx(
     Ok(Some((lc, rev, note)))
 }
 
-async fn active_ability_slug_conflict_tx(
+pub(crate) async fn active_ability_slug_conflict_tx(
     tx: &mut BackendConn<'_>,
     space_id: &notarium_core::ids::SpaceId,
     slug_fold: &str,
     exclude_ability: &AbilityId,
+    project: Option<&notarium_core::ids::FolderId>,
 ) -> Result<bool, PortError> {
+    let sql = include_str!("ability_slot_check.sql");
+    let project = project.map_or("", notarium_core::ids::FolderId::as_str);
     let found: Option<i64> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT 1 FROM ability_packages
-             WHERE space_id = ? AND slug_fold = ? AND lifecycle_state = 'active' AND ability_id <> ?
-             LIMIT 1",
-        )
-        .bind(space_id.as_str())
-        .bind(slug_fold)
-        .bind(exclude_ability.as_str())
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_ability_slug_check", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT 1::BIGINT FROM ability_packages
-             WHERE space_id = $1 AND slug_fold = $2 AND lifecycle_state = 'active' AND ability_id <> $3
-             LIMIT 1",
-        )
-        .bind(space_id.as_str())
-        .bind(slug_fold)
-        .bind(exclude_ability.as_str())
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| crate::runtime::pg_read_error("pg_ability_slug_check", err))?,
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(sql)
+            .bind(space_id.as_str())
+            .bind(slug_fold)
+            .bind(exclude_ability.as_str())
+            .bind(project)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_ability_slug_check", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(sql)
+            .bind(space_id.as_str())
+            .bind(slug_fold)
+            .bind(exclude_ability.as_str())
+            .bind(project)
+            .fetch_optional(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_ability_slug_check", err))?,
     };
     Ok(found.is_some())
+}
+
+pub(super) async fn check_restored_ability_slot_tx(
+    tx: &mut BackendConn<'_>,
+    space: &notarium_core::ids::SpaceId,
+    ability: &AbilityId,
+    project: Option<&notarium_core::ids::FolderId>,
+) -> Result<(), PortError> {
+    let sql = "SELECT slug_fold FROM ability_packages WHERE space_id=$1 AND ability_id=$2 AND lifecycle_state='active'";
+    let slug: Option<String> = match tx {
+        BackendConn::Sqlite(conn) => {
+            sqlx::query_scalar(sql)
+                .bind(space.as_str())
+                .bind(ability.as_str())
+                .fetch_optional(&mut **conn)
+                .await
+        }
+        BackendConn::Postgres(conn) => {
+            sqlx::query_scalar(sql)
+                .bind(space.as_str())
+                .bind(ability.as_str())
+                .fetch_optional(&mut **conn)
+                .await
+        }
+    }
+    .map_err(|err| internal_not_committed("restored_ability_slot", err.to_string()))?;
+    if let Some(slug) = slug
+        && active_ability_slug_conflict_tx(tx, space, &slug, ability, project).await?
+    {
+        return Err(DomainError::PathConflict {
+            target: PathTarget {
+                space_id: space.clone(),
+                parent: project.cloned(),
+                component: slug,
+            },
+        }
+        .into());
+    }
+    Ok(())
 }

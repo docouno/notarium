@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::LazyLock};
 
 use notarium_core::ids::ContentDigest;
 
-pub const CANONICAL_SCHEMA_VERSION: u32 = 7;
+pub const CANONICAL_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalColKind {
@@ -262,7 +262,7 @@ pub const CANONICAL_TABLES: &[TableSpec] = &[
             col("updated_seq", Int, false),
         ],
         indexes: &[
-            "uq_ability_packages_active_slug",
+            "idx_ability_packages_active_slug",
             "idx_ability_packages_entrypoint",
         ],
     },

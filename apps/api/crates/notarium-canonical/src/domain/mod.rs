@@ -11,10 +11,11 @@ use notarium_core::{
         BoardMutationFactsProvider, BoardPlannerAuthority, ChangeRead, ChangeReadResult,
         ChildFolders, Committed, CreateNote, DeleteDisposition, DeleteNote, EditNote,
         EnsureFolderPath, ExternalObservation, ExternalObservationResult, FolderSnapshot, GetNote,
-        Link, LinkBatch, LiveCollabInterceptor, MintAndPurge, MintAndPurgeResult, MoveBoardCard,
-        MoveFolder, MoveNote, Mutation, NoteCard, NoteRevision, NoteSnapshot, NoteWritePort,
-        PageLimit, PortFuture, PublishAbilityPackage, ReadAbilityResource, RenameFolder,
-        RenameNote, RenameProject, RollbackAgentRun, RollbackResult, SpaceContext,
+        Link, LinkBatch, LiveCollabInterceptor, MemoryAppendResult, MintAndPurge,
+        MintAndPurgeResult, MoveBoardCard, MoveFolder, MoveNote, Mutation, NoteCard, NoteRevision,
+        NoteSnapshot, NoteWritePort, PageLimit, PortFuture, PublishAbilityPackage,
+        ReadAbilityResource, RenameFolder, RenameNote, RenameProject, RollbackAgentRun,
+        RollbackResult, SpaceContext, TrashAbilityPackage,
     },
 };
 
@@ -28,6 +29,7 @@ pub mod common;
 pub(crate) mod folder_cover;
 mod folder_paths;
 pub mod folders;
+mod memory;
 pub mod notes;
 pub mod packages;
 pub mod purge;
@@ -76,6 +78,14 @@ impl NoteWritePort for CanonicalStore {
                 DeleteDisposition::Purge => purge::purge_note_impl(&store, ctx, request).await,
             }
         })
+    }
+
+    fn trash_ability_package(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<TrashAbilityPackage>,
+    ) -> PortFuture<'_, Committed<NoteRevision>> {
+        Box::pin(notes::trash_ability_package_impl(self, ctx, request))
     }
 
     fn mint_and_purge(
@@ -145,9 +155,9 @@ impl NoteWritePort for CanonicalStore {
         &self,
         ctx: SpaceContext,
         request: Mutation<AppendMemory>,
-    ) -> PortFuture<'_, Committed<NoteRevision>> {
+    ) -> PortFuture<'_, Committed<MemoryAppendResult>> {
         let store = self.clone();
-        Box::pin(async move { notes::append_memory_impl(&store, ctx, request).await })
+        Box::pin(async move { memory::append(&store, ctx, request).await })
     }
 
     fn link(&self, ctx: SpaceContext, request: Mutation<Link>) -> PortFuture<'_, Committed<Link>> {

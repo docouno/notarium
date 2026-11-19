@@ -51,6 +51,62 @@ pub(super) async fn personal_space(
     Ok(space)
 }
 
+pub(crate) fn initial_carrier(category: &str) -> String {
+    format!("---\nclass: agent-memory\ntitle: {category}\n---\n")
+}
+
+/// Resolve the exact stable slot under a current Space snapshot. The same
+/// placement checks apply while reading a base, executing a write and replaying
+/// its receipt.
+pub(crate) async fn authorized_slot(
+    tx: &mut BackendConn<'_>,
+    auth: &EngineAuthContext,
+    rec: &SpaceRecord,
+    target: &ResolvedMemoryTarget,
+) -> Result<(FolderId, Option<crate::domain::common::NoteHeadRow>), PortError> {
+    if target.note.space_id != rec.scope.space_id
+        || target.note.note_id != fixed_note_id(&target.target, &target.category)?
+    {
+        return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
+    }
+    let parent = match &target.target {
+        MemoryTarget::User { owner }
+            if owner == auth.principal()
+                && owner == &rec.owner
+                && rec.space.kind == SpaceKind::Personal =>
+        {
+            rec.root_folder_id.clone()
+        }
+        MemoryTarget::Project { folder } if folder.space_id == rec.scope.space_id => {
+            let (_, row) = folder_metadata(tx, auth, rec, folder.clone()).await?;
+            if !row.is_project {
+                return Err(DomainError::ResourceNotFound.into());
+            }
+            folder.folder_id.clone()
+        }
+        _ => return Err(DomainError::ResourceNotFound.into()),
+    };
+    let (facts, _) =
+        build_resource_facts_tx(tx, &rec.space, &parent, DocClass::AgentMemory, None, true).await?;
+    auth.can_view_resource(&facts)?;
+    auth.authorize_direct_write(&facts, &facts)?;
+    let note = &target.note.note_id;
+    if crate::runtime::is_note_purge_fenced_tx(tx, &rec.scope.space_id, note.as_str()).await? {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    let head =
+        crate::domain::common::load_note_head_row_opt_tx(tx, &rec.scope.space_id, note).await?;
+    if let Some(head) = &head
+        && (head.parent_folder_id != parent
+            || head.doc_class != DocClass::AgentMemory
+            || head.ability_id.is_some()
+            || head.lifecycle != Lifecycle::Active)
+    {
+        return Err(DomainError::ResourceNotFound.into());
+    }
+    Ok((parent, head))
+}
+
 pub(super) async fn inspect(
     store: &CanonicalStore,
     ctx: &AccountContext,
@@ -67,44 +123,17 @@ pub(super) async fn inspect(
                     MemoryTarget::Project { folder } => folder.space_id.clone(),
                 };
                 let rec = load_space_record(tx, &space).await?;
-                let parent = match &target {
-                    MemoryTarget::User { .. } => rec.root_folder_id.clone(),
-                    MemoryTarget::Project { folder } => {
-                        let (_, row) = folder_metadata(tx, &auth, &rec, folder.clone()).await?;
-                        if !row.is_project {
-                            return Err(DomainError::ResourceNotFound.into());
-                        }
-                        folder.folder_id.clone()
-                    }
-                };
-                let (facts, _) = build_resource_facts_tx(
-                    tx,
-                    &rec.space,
-                    &parent,
-                    DocClass::AgentMemory,
-                    None,
-                    true,
-                )
-                .await?;
-                auth.authorize_direct_write(&facts, &facts)?;
-                let head =
-                    crate::domain::common::load_note_head_row_opt_tx(tx, &space, &note_id).await?;
-                if let Some(head) = &head
-                    && (head.parent_folder_id != parent
-                        || head.doc_class != DocClass::AgentMemory
-                        || head.lifecycle != Lifecycle::Active)
-                {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                Ok(MemoryTargetSnapshot {
-                    resolved: ResolvedMemoryTarget {
-                        target,
-                        note: NoteRef {
-                            space_id: space,
-                            note_id,
-                        },
-                        category,
+                let resolved = ResolvedMemoryTarget {
+                    target,
+                    note: NoteRef {
+                        space_id: space,
+                        note_id,
                     },
+                    category,
+                };
+                let (parent, head) = authorized_slot(tx, &auth, &rec, &resolved).await?;
+                Ok(MemoryTargetSnapshot {
+                    resolved,
                     scope: rec.scope,
                     parent,
                     revision: head.map(|head| head.head_rev_id),
@@ -150,7 +179,7 @@ pub(super) async fn resolve(
                 parent: Some(parent.clone()),
                 slug: format!("memory-{category}"),
                 class: DocClass::AgentMemory,
-                carrier: format!("---\nclass: agent-memory\ntitle: {category}\n---\n"),
+                carrier: initial_carrier(category),
             },
         };
         if let Err(e) = store.create_note(scoped, request).await

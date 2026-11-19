@@ -12,6 +12,8 @@ mod folder_authority;
 mod folder_depth;
 #[path = "l5_domain_security_and_purge/folder_pages.rs"]
 mod folder_pages;
+#[path = "l5_domain_security_and_purge/memory_writes.rs"]
+mod memory_writes;
 #[path = "l5_domain_security_and_purge/observations.rs"]
 mod observations;
 #[path = "l5_domain_security_and_purge/preconditions.rs"]
@@ -48,10 +50,10 @@ use notarium_core::{
         AbilityFile, AcceptBatch, AppendMemory, BatchItem, CallBudget, Cancellation, ChangeRead,
         ChangeReadResult, Committed, CreateNote, DeleteDisposition, DeleteNote, EditNote,
         ExternalObservation, ExternalObservationResult, GetNote, Link, LinkBatch, LinkTarget,
-        MemoryTarget, MintAndPurge, MoveFolder, MoveNote, Mutation, NoteRevision, NoteWritePort,
-        ObservedContent, PageLimit, Preconditions, ProviderEgressCatalogPort,
+        MemoryTarget, MemoryWriteMode, MintAndPurge, MoveFolder, MoveNote, Mutation, NoteRevision,
+        NoteWritePort, ObservedContent, PageLimit, Preconditions, ProviderEgressCatalogPort,
         ProviderEgressRequest, PublishAbilityPackage, ReadAbilityResource, RenameFolder,
-        RenameNote, RenameProject, ResolvedMemoryTarget, SpaceContext,
+        RenameNote, RenameProject, ResolvedMemoryTarget, SpaceContext, TrashAbilityPackage,
     },
     query::{FieldObservation, FieldSchema, FieldType, FieldValue, ScalarType},
     receipt::{
@@ -1247,6 +1249,8 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 AppendMemory {
+                    summary: None,
+                    mode: MemoryWriteMode::RequireExisting,
                     target: memory,
                     text: "Canonical store owns CAS references.".to_owned(),
                 },
@@ -1263,6 +1267,8 @@ async fn run_domain_and_security_suite(
                 &scope,
                 &owner,
                 AppendMemory {
+                    summary: None,
+                    mode: MemoryWriteMode::RequireExisting,
                     target: ResolvedMemoryTarget {
                         target: MemoryTarget::Project {
                             folder: FolderRef {
@@ -1544,6 +1550,8 @@ async fn run_domain_and_security_suite(
                         entrypoint: skill_entry_note.clone(),
                         files: vec![],
                         expected_package_revision: None,
+                        expected_entrypoint_revision: None,
+                        requires_explicit_binding: false,
                     },
                 ),
             )
@@ -1572,6 +1580,8 @@ async fn run_domain_and_security_suite(
                         digest: notarium_syntax::content_digest(helper_v1),
                     }],
                     expected_package_revision: None,
+                    expected_entrypoint_revision: None,
+                    requires_explicit_binding: false,
                 },
             ),
         )
@@ -1595,11 +1605,44 @@ async fn run_domain_and_security_suite(
                         digest: notarium_syntax::content_digest(helper_v1),
                     }],
                     expected_package_revision: None,
+                    expected_entrypoint_revision: None,
+                    requires_explicit_binding: false,
                 },
             ),
         )
         .await
         .expect("publish_ability_package v1");
+    let published_entrypoint = store
+        .get_note(
+            ctx.clone(),
+            GetNote {
+                note: skill_entry_note.clone(),
+                revision: None,
+                causal: CausalBasis::Exact(ReceiptSet::default()),
+            },
+        )
+        .await
+        .unwrap()
+        .document
+        .revision()
+        .clone();
+    let guarded_trash = |package_revision| {
+        next_mutation(
+            &scope,
+            &owner,
+            TrashAbilityPackage {
+                ability: ability_id.clone(),
+                entrypoint: skill_entry_note.clone(),
+                package_revision,
+            },
+        )
+    };
+    assert_validation_err(
+        &store
+            .trash_ability_package(ctx.clone(), guarded_trash(pkg_v1.value.revision.clone()))
+            .await,
+        ValidationReason::InvalidState,
+    );
 
     let project_b = sample_folder_id(95);
     store
@@ -1632,6 +1675,28 @@ async fn run_domain_and_security_suite(
         )
     };
     relocate(&project_b).await.unwrap();
+    assert!(matches!(
+        store
+            .publish_ability_package(
+                ctx.clone(),
+                next_mutation(
+                    &scope,
+                    &owner,
+                    PublishAbilityPackage {
+                        attached_skills: vec![],
+                        ability: ability_id.clone(),
+                        kind: AbilityKind::Skill,
+                        entrypoint: skill_entry_note.clone(),
+                        files: vec![],
+                        expected_package_revision: Some(pkg_v1.value.revision.clone()),
+                        expected_entrypoint_revision: Some(published_entrypoint),
+                        requires_explicit_binding: false,
+                    }
+                )
+            )
+            .await,
+        Err(PortError::Domain(DomainError::RevisionConflict { .. }))
+    ));
 
     let project_reader = |project: &FolderId| {
         make_human_ctx(
@@ -1726,11 +1791,18 @@ async fn run_domain_and_security_suite(
                     entrypoint: skill_entry_note.clone(),
                     files: vec![],
                     expected_package_revision: Some(pkg_v1.value.revision.clone()),
+                    expected_entrypoint_revision: None,
+                    requires_explicit_binding: false,
                 },
             ),
         )
         .await
         .expect("publish_ability_package v2 without helper.py");
+    assert!(matches!(
+        store.trash_ability_package(ctx.clone(), guarded_trash(pkg_v1.value.revision.clone())).await,
+        Err(PortError::Domain(DomainError::RevisionConflict { current, .. }))
+            if current == pkg_v2.value.revision
+    ));
 
     notarium_core::ports::ControlCatalogPort::ability(
         store,
@@ -2415,6 +2487,7 @@ async fn run_domain_and_security_suite(
     }
     folder_authority::check(store, &scope, &owner).await;
     folder_pages::check(store, &scope, &owner).await;
+    memory_writes::check(store, &scope, &owner, proj_a).await;
 }
 
 #[tokio::test]

@@ -577,6 +577,8 @@ fn package_reads_select_exact_entrypoint_and_auxiliary_revisions() {
             kind: AbilityKind::Skill,
             entrypoint: NoteId::from_bytes([1; 16]),
             expected_package_revision: None,
+            expected_entrypoint_revision: None,
+            requires_explicit_binding: false,
             files: ["SKILL.md", "resources/rules.md"]
                 .into_iter()
                 .map(|path| AbilityFile {

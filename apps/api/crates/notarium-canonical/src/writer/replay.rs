@@ -6,7 +6,7 @@ use notarium_core::{
     error::PortError,
     ids::{ChatThreadId, FolderId, JobId, NoteId, ThreadEntrySeq},
     model::{HistoryScope, NoteRef},
-    ports::LinkTarget,
+    ports::{LinkTarget, ResolvedMemoryTarget},
 };
 
 use super::CommandIdentitySpec;
@@ -34,6 +34,7 @@ pub(crate) enum ReplayResource {
 pub(crate) enum ReplayPolicy {
     Documents(Vec<ReplayResource>),
     Schema(Vec<ReplayResource>),
+    Memory(ResolvedMemoryTarget),
     Chat(ChatThreadId, Option<ThreadEntrySeq>, Vec<NoteRef>, bool),
     Job(Option<JobId>, Vec<NoteId>),
 }
@@ -152,6 +153,13 @@ impl CommandIdentitySpec {
         let srec = load_space_record(tx, &scope.space_id).await?;
         srec.scope.check(scope)?;
         match policy {
+            ReplayPolicy::Memory(target) => {
+                let (_, head) =
+                    crate::catalog::memory::authorized_slot(tx, auth, &srec, target).await?;
+                if head.is_none() {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
             ReplayPolicy::Chat(thread, leaf, reads, legacy_staged) => {
                 crate::chats::authorize_chat_replay_tx(
                     tx,

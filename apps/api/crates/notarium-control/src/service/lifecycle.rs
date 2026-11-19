@@ -143,6 +143,7 @@ impl ControlService {
                 slug: current.slug,
                 role: SpaceRole::Owner,
                 history: current.history,
+                last_seq: current.last_seq,
             },
         })
     }

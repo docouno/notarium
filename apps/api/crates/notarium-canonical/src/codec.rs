@@ -465,6 +465,10 @@ pub struct AbilityRevisionMetadata {
     pub total_bytes: u64,
     #[serde(default)]
     pub attached_skills: Vec<AbilityRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from: Option<AbilityRef>,
+    #[serde(default)]
+    pub requires_explicit_binding: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

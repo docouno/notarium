@@ -157,6 +157,11 @@ run within the startup transaction and preserve the trailing snapshot BLOB.
 Catalog reads use current grants and canonical folder ancestry. Keyset cursors
 bind the catalog revision and filters. Account and project memory categories
 identify stable AgentMemory notes in the personal root or project folder.
+Inspecting a memory category returns its current revision or observed absence.
+Appending an observation can create the category and set its optional summary
+in the same canonical command. An append that omits the summary preserves it.
+The writer checks explicit revision or absence predicates and replays its
+receipt only while the memory slot remains authorized.
 Published ability manifests expose up to 256 auxiliary names of at most 1024
 UTF-8 bytes each. Access to an exact package revision requires visibility at
 publication and at its current location. Resource reads check both locations

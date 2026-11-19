@@ -43,6 +43,8 @@ pub(super) async fn verify_write_admission(
         entrypoint: entry.clone(),
         files: vec![file("first-auxiliary"), file("second-auxiliary")],
         expected_package_revision: None,
+        expected_entrypoint_revision: None,
+        requires_explicit_binding: false,
     };
     let denied = store
         .create_note(

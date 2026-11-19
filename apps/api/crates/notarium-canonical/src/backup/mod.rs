@@ -2008,6 +2008,12 @@ fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Clone 
         .iter()
         .copied()
         .filter_map(move |mut table| {
+            if schema_version < 8 && table.name == "ability_packages" {
+                table.indexes = &[
+                    "uq_ability_packages_active_slug",
+                    "idx_ability_packages_entrypoint",
+                ];
+            }
             if schema_version < 7 {
                 match table.name {
                     "chat_threads" => table.columns = &table.columns[..18],

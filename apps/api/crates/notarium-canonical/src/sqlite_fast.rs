@@ -3492,6 +3492,7 @@ impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
                 &final_slug,
                 (head.parent_folder_id != item_ctx.root_folder_id)
                     .then_some(head.parent_folder_id.clone()),
+                anc.project.as_ref(),
             )
             .map_err(FastItemExecError::PreWrite)?;
             Some(ab_id.clone())
@@ -4668,17 +4669,19 @@ fn check_ability_package_slug_conflict_rusqlite(
     new_slug_fold: &str,
     new_slug: &str,
     report_parent: Option<FolderId>,
+    project: Option<&FolderId>,
 ) -> Result<(), PortError> {
     let mut stmt = conn
-        .prepare_cached(
-            "SELECT 1 FROM ability_packages
-             WHERE space_id = ?1 AND slug_fold = ?2 AND lifecycle_state = 'active' AND ability_id <> ?3
-             LIMIT 1",
-        )
+        .prepare_cached(include_str!("domain/ability_slot_check.sql"))
         .map_err(|err| internal_not_committed("sqlite_ability_rename_check", err.to_string()))?;
     let conflict: Option<i64> = stmt
         .query_row(
-            params![space_id.as_str(), new_slug_fold, ability_id.as_str()],
+            params![
+                space_id.as_str(),
+                new_slug_fold,
+                ability_id.as_str(),
+                project.map_or("", FolderId::as_str)
+            ],
             |r| r.get(0),
         )
         .optional()

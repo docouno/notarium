@@ -179,6 +179,31 @@ impl ProviderService {
         }
         let mut metadata = BTreeMap::new();
         for item in current {
+            if let ProviderCurrentContent::Ability {
+                reference,
+                provenance,
+                promoted_from,
+                requires_explicit_binding,
+                ..
+            } = item
+            {
+                let identity = AbilityIdentity {
+                    id: reference.ability.clone(),
+                    placement: provenance.current.placement.clone(),
+                };
+                if !self
+                    .control
+                    .promotion_is_committed(tx, promoted_from.as_ref(), &identity)
+                    .await?
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+                if *requires_explicit_binding
+                    && !self.control.has_ability_binding(tx, &identity).await?
+                {
+                    return Err(DomainError::ResourceNotFound.into());
+                }
+            }
             let origin = json(&item.origin())?;
             if metadata.insert(origin, item).is_some() {
                 return Err(invalid(ValidationReason::SourceMismatch));

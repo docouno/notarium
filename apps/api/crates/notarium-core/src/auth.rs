@@ -433,6 +433,17 @@ impl EngineAuthContext {
     pub fn principal(&self) -> &PrincipalId {
         &self.principal
     }
+    /// Retain the credential and its existing ceilings in one admitted Space.
+    pub fn restrict_to_space(&self, space: &SpaceId) -> DomainResult<Self> {
+        let grant = self
+            .spaces
+            .get(space)
+            .ok_or(DomainError::ResourceNotFound)?;
+        let mut scoped = self.clone();
+        scoped.spaces = BTreeMap::from([(space.clone(), grant.clone())]);
+        scoped.ability_write &= Self::has_writable_space(&scoped.spaces);
+        Ok(scoped)
+    }
     /// The authentication owner supplies freshly verified durable authority.
     /// Keep the caller's delegation, project pin, taint and write-Space pin while
     /// intersecting current permissions; refreshing cannot widen an old context.
@@ -520,6 +531,9 @@ impl EngineAuthContext {
     }
     pub fn spaces(&self) -> &BTreeMap<SpaceId, SpaceGrant> {
         &self.spaces
+    }
+    pub fn pinned_write_space(&self) -> Option<&SpaceId> {
+        self.write_space.as_ref()
     }
     pub fn taint(&self) -> &BranchTaint {
         &self.taint

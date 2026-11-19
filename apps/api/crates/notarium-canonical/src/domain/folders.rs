@@ -105,6 +105,9 @@ pub(crate) async fn move_folder_impl(
                     load_folder_ancestry_tx(tx, &scope.space_id, &input.folder, true).await?;
                 let dest_anc =
                     load_folder_ancestry_tx(tx, &scope.space_id, &dest_parent, true).await?;
+                let crosses_ability_scope =
+                    !folder_row.is_project && before_anc.project != dest_anc.project;
+                let destination_project = dest_anc.project.clone();
 
                 let would_cycle = dest_anc.ancestors.contains(&input.folder);
                 let old_depth = before_anc.ancestors.len() - 1;
@@ -236,6 +239,45 @@ pub(crate) async fn move_folder_impl(
                         .execute(&mut **conn)
                         .await
                         .map_err(|err| internal_not_committed("pg_move_folder", err.to_string()))?;
+                    }
+                }
+
+                if crosses_ability_scope {
+                    let sql = include_str!("moved_ability_slots.sql");
+                    let project = destination_project.as_ref().map_or("", FolderId::as_str);
+                    let state: i64 = match tx {
+                        BackendConn::Sqlite(conn) => {
+                            sqlx::query_scalar(sql)
+                                .bind(scope.space_id.as_str())
+                                .bind(input.folder.as_str())
+                                .bind(project)
+                                .fetch_one(&mut **conn)
+                                .await
+                        }
+                        BackendConn::Postgres(conn) => {
+                            sqlx::query_scalar(sql)
+                                .bind(scope.space_id.as_str())
+                                .bind(input.folder.as_str())
+                                .bind(project)
+                                .fetch_one(&mut **conn)
+                                .await
+                        }
+                    }
+                    .map_err(|err| {
+                        internal_not_committed("moved_ability_slots", err.to_string())
+                    })?;
+                    if state != 0 {
+                        auth.authorize_ability_mutation()?;
+                    }
+                    if state == 2 {
+                        return Err(DomainError::PathConflict {
+                            target: PathTarget {
+                                space_id: scope.space_id.clone(),
+                                parent: input.new_parent.clone(),
+                                component: folder_row.slug.clone(),
+                            },
+                        }
+                        .into());
                     }
                 }
 

@@ -243,10 +243,23 @@ impl ControlService {
         mut value: AbilityDescriptor,
         project: Option<&FolderRef>,
     ) -> Result<AbilityDescriptor, PortError> {
+        if !self
+            .promotion_is_committed(
+                tx,
+                value.promoted_from.as_ref(),
+                &value.reference.identity(),
+            )
+            .await?
+        {
+            value.enabled = false;
+        }
         let key = placement(&value.reference.placement)?;
         let id = &value.reference.id;
         let (availability, preference) =
             ability_control_state(tx, ctx.auth().principal(), &key, id).await?;
+        if value.requires_explicit_binding && availability.is_none() {
+            value.enabled = false;
+        }
         if let Some(row) = availability {
             value.enabled &= row.enabled == 1;
             if row.mode == "selected-projects" {
@@ -264,6 +277,44 @@ impl ControlService {
             value.enabled &= row.enabled == 1;
         }
         Ok(value)
+    }
+
+    pub(super) async fn promotion_is_committed(
+        &self,
+        tx: &mut Transaction,
+        source: Option<&AbilityRef>,
+        destination: &AbilityIdentity,
+    ) -> Result<bool, PortError> {
+        let Some(source) = source else {
+            return Ok(true);
+        };
+        let key = placement(&source.placement)?;
+        let row = rows!(tx,AbilityPlacementTrailRow,fetch_optional,
+            "SELECT * FROM ability_placement_trail WHERE source_placement=$1 AND ability_id=$2",
+            "SELECT * FROM v1_control.ability_placement_trail WHERE source_placement=$1 AND ability_id=$2";&key,source.id.as_str())?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let trail: Trail = serde_json::from_str(&row.manifest_ref)
+            .map_err(|_| invalid(ValidationReason::InvalidState))?;
+        Ok(trail.source == *source
+            && trail.destination.identity() == *destination
+            && trail.destination.revision != source.revision
+            && row.destination_id == destination.id.as_str()
+            && row.destination_placement == placement(&destination.placement)?)
+    }
+
+    pub(super) async fn has_ability_binding(
+        &self,
+        tx: &mut Transaction,
+        identity: &AbilityIdentity,
+    ) -> Result<bool, PortError> {
+        let key = placement(&identity.placement)?;
+        let row = rows!(tx,(i64,),fetch_optional,
+            "SELECT CAST(1 AS BIGINT) FROM ability_availability WHERE placement=$1 AND ability_id=$2",
+            "SELECT CAST(1 AS BIGINT) FROM v1_control.ability_availability WHERE placement=$1 AND ability_id=$2";
+            &key,identity.id.as_str())?;
+        Ok(row.is_some())
     }
     async fn select_overlaid_winner(
         &self,
@@ -622,7 +673,7 @@ impl ControlService {
     ) -> Result<AbilityInspection, PortError> {
         let budget = OperationBudget::new(ctx.budget.clone());
         let current = self.current_account(&ctx, &budget).await?;
-        let descriptor = budget
+        let mut descriptor = budget
             .run(
                 self.raw_ability(&current, identity.clone()),
                 CommitEffect::NotCommitted,
@@ -632,6 +683,9 @@ impl ControlService {
         let mut rtx = self.store.read(budget.clone()).await?;
         let state = budget.run(async {
             let tx = rtx.inner_mut();
+            if !self.promotion_is_committed(tx, descriptor.promoted_from.as_ref(), &identity).await? {
+                return Err(DomainError::ResourceNotFound.into());
+            }
             let (binding, preference) =
                 ability_control_state(tx, current.auth().principal(), &key, &identity.id).await?;
             let selected = match binding.as_ref().map(|row| row.mode.as_str()) {
@@ -651,11 +705,19 @@ impl ControlService {
         }, CommitEffect::NotCommitted).await;
         budget.run(rtx.finish(), CommitEffect::NotCommitted).await?;
         let (binding, preference, selected) = state?;
+        let binding_pending = descriptor.requires_explicit_binding && binding.is_none();
+        if binding_pending {
+            descriptor.enabled = false;
+        }
         let availability = budget
             .run(
                 async {
                     let Some(selected) = selected else {
-                        return Ok(AbilityProjects::All);
+                        return Ok(if binding_pending {
+                            AbilityProjects::Selected(Vec::new())
+                        } else {
+                            AbilityProjects::All
+                        });
                     };
                     let mut projects = Vec::new();
                     for row in selected {

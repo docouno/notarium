@@ -17,6 +17,27 @@ use super::*;
 use crate::codec::{AbilityRevisionMetadata, RevisionMetadataEnvelope, RevisionMetadataPayload};
 use notarium_core::classes::{AbilityResourceLocation, AbilityResourceProvenance};
 
+pub(crate) async fn ability_manifest_tx(
+    tx: &mut BackendConn<'_>,
+    scope: &HistoryScope,
+    id: &AbilityId,
+    revision: &RevisionId,
+) -> Result<(AbilityRevisionMetadata, SpaceSeq), PortError> {
+    let (bytes, visibility): (Vec<u8>, i64) = db!(
+        read tx, sqlx::query_as(READ_REVISION), fetch_optional,
+        scope.space_id.as_str(),
+        revision.as_str(),
+        scope.incarnation.as_bytes().as_slice(),
+        id.as_str()
+    )?
+    .ok_or(DomainError::ResourceNotFound)?;
+    let RevisionMetadataPayload::Ability(meta) = RevisionMetadataEnvelope::decode(&bytes)?.payload
+    else {
+        return Err(DomainError::validation(ValidationReason::InvalidState).into());
+    };
+    Ok((meta, crate::codec::i64_to_space_seq(visibility)?))
+}
+
 struct ResolvedAbility {
     reference: AbilityRef,
     entrypoint: NoteRef,
@@ -24,6 +45,7 @@ struct ResolvedAbility {
     name: String,
     provenance: AbilityResourceProvenance,
     entrypoint_matches_manifest: bool,
+    promoted_from: Option<AbilityRef>,
 }
 
 async fn resolve(
@@ -70,27 +92,13 @@ async fn resolve(
         Some(id) => id.clone(),
         None => RevisionId::parse(&tip)?,
     };
-    let (bytes, visibility): (Vec<u8>, i64) = db!(
-        read tx,
-        sqlx::query_as(READ_REVISION),
-        fetch_optional,
-        space.space.id.as_str(),
-        revision.as_str(),
-        space.scope.incarnation.as_bytes().as_slice(),
-        id.as_str()
-    )?
-    .ok_or(DomainError::ResourceNotFound)?;
-    let RevisionMetadataPayload::Ability(meta) = RevisionMetadataEnvelope::decode(&bytes)?.payload
-    else {
-        return Err(DomainError::validation(ValidationReason::InvalidState).into());
-    };
+    let (meta, cutoff) = ability_manifest_tx(tx, &space.scope, id, &revision).await?;
     if meta.entrypoint_note_id != entrypoint.note_id || meta.ability_id != *id {
         return Err(DomainError::ResourceNotFound.into());
     }
     // The manifest, including the auxiliary filenames in a current descriptor,
     // still belongs to its publication snapshot after its entrypoint moves.
     let published = {
-        let cutoff = crate::codec::i64_to_space_seq(visibility)?;
         let entry = crate::runtime::read_immutable_revision_tx(
             tx,
             &space.scope,
@@ -150,6 +158,20 @@ async fn resolve(
         placement: placement.clone(),
         facts: note.facts,
     };
+    let promoted_from = meta.promoted_from.clone().or_else(|| {
+        if let (AbilityPlacement::OwnedSpace(space), AbilityPlacement::OwnedProject(project)) =
+            (&current.placement, &published.placement)
+            && space == &project.space_id
+        {
+            Some(AbilityRef {
+                id: id.clone(),
+                revision: revision.clone(),
+                placement: published.placement.clone(),
+            })
+        } else {
+            None
+        }
+    });
     Ok(ResolvedAbility {
         name,
         reference: AbilityRef {
@@ -161,6 +183,7 @@ async fn resolve(
         metadata: meta,
         provenance: AbilityResourceProvenance { current, published },
         entrypoint_matches_manifest,
+        promoted_from,
     })
 }
 
@@ -190,6 +213,7 @@ async fn descriptor(
         metadata: meta,
         name,
         entrypoint_matches_manifest,
+        promoted_from,
         ..
     } = resolve(tx, auth, space, id, exact).await?;
     Ok(AbilityDescriptor {
@@ -206,6 +230,8 @@ async fn descriptor(
             .filter(|p| p != crate::domain::packages::ABILITY_ENTRYPOINT_KEY)
             .collect(),
         attached_skills: meta.attached_skills,
+        promoted_from,
+        requires_explicit_binding: meta.requires_explicit_binding,
     })
 }
 
@@ -278,6 +304,8 @@ pub(super) async fn egress_current(
         digest,
         provenance: package.provenance,
         lifecycle: package.metadata.lifecycle,
+        promoted_from: package.promoted_from,
+        requires_explicit_binding: package.metadata.requires_explicit_binding,
     })
 }
 

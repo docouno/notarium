@@ -93,6 +93,8 @@ async fn exercise(pg: bool) {
         .unwrap()
         .push(AbilityDescriptor {
             attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
             reference: role.clone(),
             kind: AbilityKind::Role,
             name: "scheduled-guide".into(),
@@ -1013,6 +1015,8 @@ async fn role_placement_scope_and_run_inspection_access(pg: bool) {
             .unwrap()
             .push(AbilityDescriptor {
                 attached_skills: vec![],
+                promoted_from: None,
+                requires_explicit_binding: false,
                 reference: reference.clone(),
                 kind: AbilityKind::Role,
                 name: name.into(),
@@ -1599,6 +1603,8 @@ async fn terminal_slots_and_migrated_folds(pg: bool) {
             entrypoint: None,
             auxiliary_files: vec![],
             attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
         });
     let parse = |date| Timestamp::parse(date).unwrap();
     let first = parse("2026-11-01T05:30:00Z");

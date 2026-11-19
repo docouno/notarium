@@ -754,6 +754,8 @@ pub enum ProviderCurrentContent {
         digest: ContentDigest,
         provenance: AbilityResourceProvenance,
         lifecycle: Lifecycle,
+        promoted_from: Option<crate::ports::AbilityRef>,
+        requires_explicit_binding: bool,
     },
     Chat {
         space: Space,

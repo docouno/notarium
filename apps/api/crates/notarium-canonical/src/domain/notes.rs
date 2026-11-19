@@ -14,11 +14,11 @@ use notarium_core::{
     model::{FolderRef, Lifecycle, NoteRef, PathTarget, SnapshotCut},
     patch::{CarrierEditOrigin, CarrierPatchPlan, HeaderMutation},
     ports::{
-        AcceptBatch, AppendMemory, BatchItem, BatchResult, Committed, CreateNote,
-        DeleteDisposition, DeleteNote, EditNote, ExternalObservation, ExternalObservationResult,
-        FilenamePin, GetNote, InterceptedMutation, InterceptedPayload, InterceptionResult, Link,
-        LinkBatch, LinkTarget, MemoryTarget, MoveNote, Mutation, NoteCard, NoteRevision,
-        NoteSnapshot, ObservedContent, Preconditions, RenameNote, SpaceContext,
+        AcceptBatch, BatchItem, BatchResult, Committed, CreateNote, DeleteDisposition, DeleteNote,
+        EditNote, ExternalObservation, ExternalObservationResult, FilenamePin, GetNote,
+        InterceptedMutation, InterceptedPayload, InterceptionResult, Link, LinkBatch, LinkTarget,
+        MoveNote, Mutation, NoteCard, NoteRevision, NoteSnapshot, ObservedContent, Preconditions,
+        RenameNote, SpaceContext,
     },
     query::{FieldObservation, FieldValue},
     receipt::{CausalBasis, CommandIdentity, MutationReceiptToken},
@@ -53,7 +53,7 @@ use crate::{
         upsert_agent_run_head_tx, validate_mutation_identity,
     },
     runtime::{
-        insert_revision_row, is_note_purge_fenced_tx, load_folder_head_row, load_space_record,
+        insert_revision_row, is_note_purge_fenced_tx, load_space_record,
         read_immutable_revision_tx, validate_snapshot_cutoff_tx,
     },
     sql_exec::BackendConn,
@@ -1433,6 +1433,7 @@ pub(crate) fn build_carrier_replacement_intent(
                         &final_slug,
                         (head.parent_folder_id != item_ctx.root_folder_id)
                             .then_some(head.parent_folder_id.clone()),
+                        anc.project.as_ref(),
                     )
                     .await?;
                 }
@@ -1676,10 +1677,66 @@ pub(crate) async fn delete_note_impl(
     ctx: SpaceContext,
     request: Mutation<DeleteNote>,
 ) -> Result<Committed<NoteRevision>, PortError> {
-    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "delete_note");
     if request.input.disposition == DeleteDisposition::Purge {
         return crate::domain::purge::purge_note_impl(store, ctx, request).await;
     }
+    delete_impl(
+        store,
+        ctx,
+        Mutation {
+            identity: request.identity,
+            preconditions: request.preconditions,
+            input: DeleteTarget::Note(request.input),
+        },
+    )
+    .await
+}
+
+pub(super) async fn trash_ability_package_impl(
+    store: &CanonicalStore,
+    ctx: SpaceContext,
+    request: Mutation<notarium_core::ports::TrashAbilityPackage>,
+) -> Result<Committed<NoteRevision>, PortError> {
+    ctx.auth().authorize_ability_mutation()?;
+    delete_impl(
+        store,
+        ctx,
+        Mutation {
+            identity: request.identity,
+            preconditions: request.preconditions,
+            input: DeleteTarget::Ability(request.input),
+        },
+    )
+    .await
+}
+
+enum DeleteTarget {
+    Note(DeleteNote),
+    Ability(notarium_core::ports::TrashAbilityPackage),
+}
+
+impl DeleteTarget {
+    fn note(&self) -> &NoteId {
+        match self {
+            Self::Note(request) => &request.note,
+            Self::Ability(request) => &request.entrypoint,
+        }
+    }
+
+    fn disposition(&self) -> DeleteDisposition {
+        match self {
+            Self::Note(request) => request.disposition,
+            Self::Ability(_) => DeleteDisposition::Trash,
+        }
+    }
+}
+
+async fn delete_impl(
+    store: &CanonicalStore,
+    ctx: SpaceContext,
+    request: Mutation<DeleteTarget>,
+) -> Result<Committed<NoteRevision>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "delete_note");
 
     validate_mutation_identity(&ctx, &request.identity)?;
     let space_rec = deadline
@@ -1689,15 +1746,22 @@ pub(crate) async fn delete_note_impl(
         .await?;
     space_rec.scope.check(ctx.scope())?;
 
-    let disp_tag = match request.input.disposition {
+    let disp_tag = match request.input.disposition() {
         DeleteDisposition::Trash => "trash_note",
         DeleteDisposition::Restore => "restore_note",
         DeleteDisposition::Purge => unreachable!(),
     };
-    let fp = format!("{disp_tag}={}", request.input.note.as_str());
+    let note = request.input.note();
+    let fp = match &request.input {
+        DeleteTarget::Note(_) => format!("{disp_tag}={note}"),
+        DeleteTarget::Ability(guard) => format!(
+            "trash_ability={note}:{}:{}",
+            guard.ability, guard.package_revision
+        ),
+    };
     let idemp = derive_command_identity_spec(&request.identity, disp_tag, fp.as_bytes())
-        .with_preconditions(&request.preconditions, "note", request.input.note.as_str())
-        .for_note(ctx.auth(), &request.input.note);
+        .with_preconditions(&request.preconditions, "note", note.as_str())
+        .for_note(ctx.auth(), note);
 
     let intent = build_trash_or_restore_intent(
         store,
@@ -1758,11 +1822,11 @@ fn build_trash_or_restore_intent(
     idemp: Option<crate::writer::CommandIdentitySpec>,
     auth: notarium_core::auth::EngineAuthContext,
     preconditions: Preconditions,
-    input: DeleteNote,
+    input: DeleteTarget,
 ) -> PreparedWriteIntent {
     let scope_cl = scope.clone();
     let room_fences = std::sync::Arc::clone(&store.inner.room_fences);
-    let note_id = input.note.clone();
+    let note_id = input.note().clone();
 
     PreparedWriteIntent {
         scope: scope.clone(),
@@ -1778,7 +1842,7 @@ fn build_trash_or_restore_intent(
                 if head.lifecycle == Lifecycle::Purged {
                     return Err(DomainError::ResourceNotFound.into());
                 }
-                let require_active_folders = input.disposition == DeleteDisposition::Restore;
+                let require_active_folders = input.disposition() == DeleteDisposition::Restore;
                 let (facts, anc) = build_resource_facts_tx(
                     tx,
                     &live_space.space,
@@ -1789,6 +1853,14 @@ fn build_trash_or_restore_intent(
                 )
                 .await?;
                 auth.authorize_direct_write(&facts, &facts)?;
+                if let DeleteTarget::Ability(request) = &input {
+                    if head.doc_class != DocClass::Skill
+                        || head.ability_id.as_ref() != Some(&request.ability)
+                    {
+                        return Err(DomainError::ResourceNotFound.into());
+                    }
+                    super::packages::check_package_trash_tx(tx, &scope_cl, request).await?;
+                }
 
                 if let Some(prec_rev) = &preconditions.revision
                     && *prec_rev != head.head_rev_id
@@ -1802,7 +1874,7 @@ fn build_trash_or_restore_intent(
                 check_collab_preconditions_tx(tx, &scope_cl.space_id, &note_id, &preconditions)
                     .await?;
 
-                let (target_lc, op_kind, cmd_kind) = match input.disposition {
+                let (target_lc, op_kind, cmd_kind) = match input.disposition() {
                     DeleteDisposition::Trash => {
                         if head.lifecycle != Lifecycle::Active {
                             return Err(
@@ -1839,6 +1911,26 @@ fn build_trash_or_restore_intent(
                                 target: PathTarget {
                                     space_id: scope_cl.space_id.clone(),
                                     parent: report_parent,
+                                    component: head.slug.clone(),
+                                },
+                            }
+                            .into());
+                        }
+                        if let Some(ability) = &head.ability_id
+                            && super::packages::active_ability_slug_conflict_tx(
+                                tx,
+                                &scope_cl.space_id,
+                                &head.slug_fold,
+                                ability,
+                                anc.project.as_ref(),
+                            )
+                            .await?
+                        {
+                            return Err(DomainError::PathConflict {
+                                target: PathTarget {
+                                    space_id: scope_cl.space_id.clone(),
+                                    parent: (head.parent_folder_id != item_ctx.root_folder_id)
+                                        .then_some(head.parent_folder_id.clone()),
                                     component: head.slug.clone(),
                                 },
                             }
@@ -2366,7 +2458,7 @@ fn build_move_note_intent(
                 }
 
                 if let Some(ab_id) = &head.ability_id
-                    && new_slug_fold != head.slug_fold
+                    && (new_slug_fold != head.slug_fold || dest_parent != head.parent_folder_id)
                 {
                     update_ability_package_slug_tx(
                         tx,
@@ -2375,6 +2467,7 @@ fn build_move_note_intent(
                         &new_slug_fold,
                         &input.slug,
                         input.parent.clone(),
+                        after_anc.project.as_ref(),
                     )
                     .await?;
                 }
@@ -3263,7 +3356,7 @@ async fn prepare_batch_intents(
                     Some(idemp),
                     ctx.auth().clone(),
                     item_mut.preconditions,
-                    del,
+                    DeleteTarget::Note(del),
                 ));
             }
             BatchItem::Move(mv) => match normalize_slug_key(&mv.slug) {
@@ -3612,203 +3705,6 @@ fn build_failing_item_intent(
         required_semantic_cut: None,
         execute: Box::new(move |_tx, _item_ctx| Box::pin(async move { Err(err) })),
     }
-}
-
-pub(crate) async fn append_memory_impl(
-    store: &CanonicalStore,
-    ctx: SpaceContext,
-    request: Mutation<AppendMemory>,
-) -> Result<Committed<NoteRevision>, PortError> {
-    let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "append_memory");
-    validate_mutation_identity(&ctx, &request.identity)?;
-    if request.input.target.note.space_id != ctx.scope().space_id {
-        return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
-    }
-    let category = request.input.target.category.as_str();
-    if request.input.target.note.note_id
-        != crate::catalog::memory::fixed_note_id(&request.input.target.target, category)?
-    {
-        return Err(DomainError::validation(ValidationReason::ScopeMismatch).into());
-    }
-    let text = request.input.text.trim();
-    if text.is_empty() {
-        return Err(DomainError::validation(ValidationReason::InvalidState).into());
-    }
-
-    let fp = format!(
-        "note={}\0cat={category}\0text={text}",
-        request.input.target.note.note_id.as_str()
-    );
-    let idemp = derive_command_identity_spec(&request.identity, "append_memory", fp.as_bytes())
-        .with_preconditions(
-            &request.preconditions,
-            "note",
-            request.input.target.note.note_id.as_str(),
-        )
-        .for_note(ctx.auth(), &request.input.target.note.note_id);
-    let note_id = request.input.target.note.note_id.clone();
-    let target_spec = request.input.target.target.clone();
-
-    let read_base = || {
-        store.with_read_tx_budget(Some(&ctx.budget), |tx| {
-            let scope_in = ctx.scope().clone();
-            let auth_in = ctx.auth().clone();
-            let nid_in = note_id.clone();
-            let target_in = target_spec.clone();
-            Box::pin(async move {
-                let srec = load_space_record(tx, &scope_in.space_id).await?;
-                srec.scope.check(&scope_in)?;
-                if is_note_purge_fenced_tx(tx, &scope_in.space_id, nid_in.as_str()).await? {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                let head = load_note_head_row_tx(tx, &scope_in.space_id, &nid_in).await?;
-                if head.lifecycle != Lifecycle::Active {
-                    return Err(DomainError::ResourceNotFound.into());
-                }
-                let (facts, _) = build_resource_facts_tx(
-                    tx,
-                    &srec.space,
-                    &head.parent_folder_id,
-                    head.doc_class,
-                    head.ability_id.clone(),
-                    true,
-                )
-                .await?;
-                auth_in.authorize_direct_write(&facts, &facts)?;
-
-                if head.doc_class != DocClass::AgentMemory {
-                    return Err(DomainError::validation(ValidationReason::ClassMismatch).into());
-                }
-                // Re-verify ResolvedMemoryTarget provenance!
-                match &target_in {
-                    MemoryTarget::User { owner } => {
-                        if owner != auth_in.principal()
-                            || owner != &srec.owner
-                            || srec.space.kind != notarium_core::auth::SpaceKind::Personal
-                            || head.parent_folder_id != srec.root_folder_id
-                        {
-                            return Err(DomainError::validation(
-                                ValidationReason::InvalidAuthority,
-                            )
-                            .into());
-                        }
-                    }
-                    MemoryTarget::Project { folder } => {
-                        if folder.space_id != scope_in.space_id {
-                            return Err(
-                                DomainError::validation(ValidationReason::ScopeMismatch).into()
-                            );
-                        }
-                        let proj_row =
-                            load_folder_head_row(tx, &scope_in.space_id, &folder.folder_id).await?;
-                        if proj_row.lifecycle != Lifecycle::Active || !proj_row.is_project {
-                            return Err(
-                                DomainError::validation(ValidationReason::ScopeMismatch).into()
-                            );
-                        }
-                        if head.parent_folder_id != folder.folder_id {
-                            return Err(
-                                DomainError::validation(ValidationReason::ScopeMismatch).into()
-                            );
-                        }
-                    }
-                }
-                Ok((srec, head))
-            })
-        })
-    };
-    let (space_rec, base_head) = deadline.prepare(&ctx.budget, read_base).await?;
-
-    if let Some(replayed) = deadline
-        .prepare(&ctx.budget, || {
-            try_replay_completed_receipt::<StoredCommittedNoteRevV1>(
-                store,
-                ctx.scope(),
-                &idemp,
-                Some(&ctx.budget),
-            )
-        })
-        .await?
-    {
-        return Ok(replayed.into_committed());
-    }
-
-    if let Some(prec_rev) = &request.preconditions.revision
-        && *prec_rev != base_head.head_rev_id
-    {
-        return Err(DomainError::RevisionConflict {
-            current: base_head.head_rev_id,
-            lineage: None,
-        }
-        .into());
-    }
-
-    let base_digest = base_head.content_digest.ok_or_else(|| {
-        internal_not_committed("memory_missing_digest", "AgentMemory note lacks digest")
-    })?;
-    let raw_bytes = deadline
-        .prepare(&ctx.budget, || {
-            store.read_verified_blob(&space_rec.scope, base_digest)
-        })
-        .await?;
-    let base_carrier = String::from_utf8(raw_bytes).map_err(|_| {
-        internal_not_committed("memory_corrupt_utf8", "AgentMemory carrier not valid UTF-8")
-    })?;
-
-    let hdr = notarium_syntax::frontmatter::analyze(&base_carrier, DocClass::AgentMemory)?;
-    let needs_leading_newline = !base_carrier.is_empty() && !base_carrier.ends_with('\n');
-    let appended = if needs_leading_newline {
-        format!("\n- [{category}] {text}\n")
-    } else {
-        format!("- [{category}] {text}\n")
-    };
-    let end_pos = base_carrier.len();
-    let patch_plan = notarium_syntax::patch::plan(
-        &base_carrier,
-        hdr.carrier.body,
-        vec![(
-            CarrierEditOrigin::Body,
-            ByteSpan::new(end_pos, end_pos)?,
-            appended,
-        )],
-    )?;
-    let new_carrier = notarium_syntax::patch::apply(&base_carrier, &patch_plan)?;
-    let info = analyze_and_prepare_carrier(
-        &new_carrier,
-        DocClass::AgentMemory,
-        &note_id,
-        &base_head.slug,
-        store.blob_codec(),
-    )?;
-    let ticket = deadline
-        .prepare(&ctx.budget, || {
-            store.stage_blob_for_batch(
-                &space_rec.scope,
-                space_rec.active_epoch,
-                &info.prepared_blob,
-            )
-        })
-        .await?;
-
-    let intent = build_carrier_replacement_intent(
-        store,
-        &space_rec.scope,
-        space_rec.active_epoch,
-        Some(idemp),
-        "append_memory",
-        ctx.auth().clone(),
-        request.identity,
-        request.preconditions,
-        note_id,
-        base_head.head_rev_id,
-        None,
-        info,
-        ticket,
-        None,
-    );
-
-    let stored: StoredCommittedNoteRevV1 = deadline.submit(store, &ctx.budget, intent).await?;
-    Ok(stored.into_committed())
 }
 
 fn validate_and_format_link_line(link: &Link) -> Result<String, PortError> {
@@ -6623,32 +6519,17 @@ async fn update_ability_package_slug_tx(
     new_slug_fold: &str,
     new_slug: &str,
     report_parent: Option<notarium_core::ids::FolderId>,
+    project: Option<&notarium_core::ids::FolderId>,
 ) -> Result<(), PortError> {
-    let conflict: Option<i64> = match tx {
-        BackendConn::Sqlite(conn) => sqlx::query_scalar(
-            "SELECT 1 FROM ability_packages
-             WHERE space_id = ? AND slug_fold = ? AND lifecycle_state = 'active' AND ability_id <> ?
-             LIMIT 1",
-        )
-        .bind(space_id.as_str())
-        .bind(new_slug_fold)
-        .bind(ability_id.as_str())
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("sqlite_ability_rename_check", err.to_string()))?,
-        BackendConn::Postgres(conn) => sqlx::query_scalar(
-            "SELECT 1::BIGINT FROM ability_packages
-             WHERE space_id = $1 AND slug_fold = $2 AND lifecycle_state = 'active' AND ability_id <> $3
-             LIMIT 1",
-        )
-        .bind(space_id.as_str())
-        .bind(new_slug_fold)
-        .bind(ability_id.as_str())
-        .fetch_optional(&mut **conn)
-        .await
-        .map_err(|err| internal_not_committed("pg_ability_rename_check", err.to_string()))?,
-    };
-    if conflict.is_some() {
+    if super::packages::active_ability_slug_conflict_tx(
+        tx,
+        space_id,
+        new_slug_fold,
+        ability_id,
+        project,
+    )
+    .await?
+    {
         return Err(DomainError::PathConflict {
             target: PathTarget {
                 space_id: space_id.clone(),

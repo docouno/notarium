@@ -95,6 +95,8 @@ impl Builtin {
             entrypoint: None,
             auxiliary_files: Vec::new(),
             attached_skills: self.skills.iter().map(Self::reference).collect(),
+            promoted_from: None,
+            requires_explicit_binding: false,
         }
     }
 }

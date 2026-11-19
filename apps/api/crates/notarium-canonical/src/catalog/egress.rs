@@ -389,6 +389,7 @@ async fn folder_content(
         "parent": row.parent_folder_id,
         "project": ancestry.project,
         "projectSlug": row.project_slug,
+        "spaceSlug": space.slug,
     })
     .to_string();
     let current = ProviderCurrentContent::Folder {

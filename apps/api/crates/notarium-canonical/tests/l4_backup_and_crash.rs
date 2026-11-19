@@ -494,6 +494,16 @@ impl BackendCase {
                     .await
                     .unwrap();
             }
+            if decoded.schema_version < 8 {
+                sqlx::raw_sql(
+                    "DROP INDEX idx_ability_packages_active_slug;
+                     CREATE UNIQUE INDEX uq_ability_packages_active_slug
+                        ON ability_packages(space_id,slug_fold) WHERE lifecycle_state='active'",
+                )
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            }
             if decoded.schema_version <= 5 {
                 sqlx::raw_sql(
                     "DROP INDEX idx_blob_retirements_status;
