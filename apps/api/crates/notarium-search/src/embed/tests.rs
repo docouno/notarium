@@ -6,7 +6,7 @@ use notarium_core::{
         GrantId, HistoryIncarnation, ModelProfileId, PrincipalId, ProviderResourceId, RequestId,
         SpaceId,
     },
-    model::HistoryScope,
+    model::{FolderRef, HistoryScope},
     ports::{
         CallBudget, Cancellation, EmbeddingInput, EmbeddingProviderPort, EmbeddingQueryInput,
         EmbeddingRequest, EmbeddingResult, PortFuture, ProviderUsage, SpaceContext,
@@ -14,10 +14,13 @@ use notarium_core::{
 };
 use notarium_syntax::chunk::TokenizerBudget;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::{Future, poll_fn},
     pin::{Pin, pin},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::Poll,
     time::Duration,
 };
@@ -192,8 +195,21 @@ async fn scheduler_signals_running_work_when_query_times_out_or_is_dropped() {
 #[tokio::test]
 async fn remote_queries_are_typed_and_tainted_or_oversize_input_never_dispatches() {
     #[derive(Default)]
-    struct Provider(Mutex<Vec<EmbeddingRequest>>);
+    struct Provider {
+        calls: Mutex<Vec<EmbeddingRequest>>,
+        invalid_row: AtomicBool,
+    }
     impl EmbeddingProviderPort for Provider {
+        fn query_disclosure(
+            &self,
+            _: SpaceContext,
+            _: ProviderResourceId,
+            _: ModelProfileId,
+            _: Option<FolderRef>,
+        ) -> PortFuture<'_, BTreeSet<DocClass>> {
+            Box::pin(async { Ok(BTreeSet::from([DocClass::UserDoc])) })
+        }
+
         fn embed(
             &self,
             _: SpaceContext,
@@ -201,11 +217,16 @@ async fn remote_queries_are_typed_and_tainted_or_oversize_input_never_dispatches
         ) -> PortFuture<'_, EmbeddingResult> {
             Box::pin(async move {
                 let model = request.model.clone();
-                self.0.lock().unwrap().push(request);
+                self.calls.lock().unwrap().push(request);
+                let vector = if self.invalid_row.load(Ordering::SeqCst) {
+                    Err(notarium_core::DomainError::AccessDenied)
+                } else {
+                    Ok(vec![2.0; 64])
+                };
                 Ok(EmbeddingResult {
                     model,
                     dimension: 64,
-                    vectors: vec![Ok(vec![2.0; 64])],
+                    vectors: vec![vector],
                     usage: ProviderUsage::Unknown,
                 })
             })
@@ -240,7 +261,7 @@ async fn remote_queries_are_typed_and_tainted_or_oversize_input_never_dispatches
     let input = EmbeddingQueryInput {
         text: "literal query".to_owned(),
         tokens: 12,
-        classes: [DocClass::UserDoc].into_iter().collect(),
+        classes: BTreeSet::from([DocClass::UserDoc, DocClass::Profile]),
         project_scope: None,
     };
     let mut oversized = input.clone();
@@ -251,12 +272,25 @@ async fn remote_queries_are_typed_and_tainted_or_oversize_input_never_dispatches
     ));
     let result = remote.query(ctx.clone(), input.clone()).await.unwrap();
     assert_eq!(result, [Some(vec![0.125; 64])]);
+    let mut excluded = input.clone();
+    excluded.classes.remove(&DocClass::UserDoc);
+    assert!(matches!(
+        remote.query(ctx.clone(), excluded).await,
+        Err(EmbeddingError::ProviderUnavailable)
+    ));
+    provider.invalid_row.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        remote.query(ctx.clone(), input.clone()).await,
+        Err(EmbeddingError::ProviderUnavailable)
+    ));
     ctx.auth().taint().mark_external_read();
     assert!(matches!(
         remote.query(ctx, input).await,
         Err(EmbeddingError::ProviderUnavailable)
     ));
-    let calls = provider.0.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert!(matches!(&calls[0].inputs[..], [EmbeddingInput::Query(_)]));
+    let calls = provider.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        matches!(&calls[0].inputs[..], [EmbeddingInput::Query(input)] if input.classes == BTreeSet::from([DocClass::UserDoc]))
+    );
 }

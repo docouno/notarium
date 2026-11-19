@@ -1,9 +1,10 @@
-use super::{Projection, View, context};
+use super::{Projection, View, context, context_with_grant};
 use crate::{acknowledged, note, query};
-use notarium_canonical::{CanonicalStore, CreateSpaceSpec};
+use notarium_canonical::{CanonicalStore, CreateFolderSpec, CreateSpaceSpec};
 use notarium_core::{
     DomainError,
-    auth::SpaceKind,
+    auth::{SpaceGrant, SpaceKind, SpaceRole},
+    classes::DocClass,
     epoch::DataRoot,
     error::ValidationReason,
     ids::{FolderId, LeaseEpoch, ModelProfileId, PrincipalId, ProviderResourceId, SpaceSeq},
@@ -76,13 +77,25 @@ struct SlowProvider {
 }
 
 impl EmbeddingProviderPort for SlowProvider {
+    fn query_disclosure(
+        &self,
+        _: SpaceContext,
+        _: ProviderResourceId,
+        _: ModelProfileId,
+        _: Option<FolderRef>,
+    ) -> PortFuture<'_, BTreeSet<DocClass>> {
+        Box::pin(async { Ok(BTreeSet::from([DocClass::UserDoc])) })
+    }
+
     fn embed(
         &self,
         ctx: SpaceContext,
         request: EmbeddingRequest,
     ) -> PortFuture<'_, EmbeddingResult> {
         Box::pin(async move {
-            assert!(matches!(&request.inputs[..], [EmbeddingInput::Query(_)]));
+            assert!(
+                matches!(&request.inputs[..], [EmbeddingInput::Query(input)] if input.classes == BTreeSet::from([DocClass::UserDoc]))
+            );
             assert!(ctx.budget.remaining <= Duration::from_millis(150));
             self.calls.fetch_add(1, Ordering::SeqCst);
             ctx.budget.cancellation.cancelled().await;
@@ -113,6 +126,25 @@ pub async fn lexical_fallback(store: Arc<CanonicalStore>, root: DataRoot) {
         })
         .await
         .unwrap();
+    let home = sample_folder_id(0x64);
+    let foreign = sample_folder_id(0x65);
+    for (id, slug) in [(&home, "allowed-project"), (&foreign, "excluded-project")] {
+        store
+            .create_folder(CreateFolderSpec {
+                scope: space.scope.clone(),
+                active_epoch: lease,
+                folder_id: id.clone(),
+                parent: None,
+                slug: slug.to_owned(),
+                display_name: slug.to_owned(),
+                is_project: true,
+                project_slug: Some(slug.to_owned()),
+                actor: owner.clone(),
+                timestamp: None,
+            })
+            .await
+            .unwrap();
+    }
     let source = sample_note_id(0x61);
     let (range, _) = store
         .commit_synthetic_note_batch_for_test(
@@ -124,6 +156,8 @@ pub async fn lexical_fallback(store: Arc<CanonicalStore>, root: DataRoot) {
         .await
         .unwrap();
     let mut view = View::new(space.scope.clone(), folder.clone());
+    view.folder(home.clone(), folder.clone());
+    view.folder(foreign.clone(), folder.clone());
     view.index(source.clone(), folder);
     view.advance(range.last_seq);
     let projection = Arc::new(Projection {
@@ -147,10 +181,28 @@ pub async fn lexical_fallback(store: Arc<CanonicalStore>, root: DataRoot) {
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
 
     let ctx = context(&space.scope, &owner);
+    let scoped = context_with_grant(
+        &space.scope,
+        &owner,
+        SpaceGrant {
+            role: SpaceRole::Viewer,
+            read_classes: BTreeSet::from([DocClass::UserDoc]),
+            write_classes: BTreeSet::new(),
+            project_root: Some(home),
+        },
+    );
+    let mut outside = query("evidencekeyword");
+    outside.folder = Some(foreign);
+    let outside = engine.search(scoped, outside).await.unwrap();
+    assert!(outside.hits.is_empty());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+    let mut unfiltered = query("evidencekeyword");
+    unfiltered.classes.clear();
     let started = Instant::now();
     let hits = tokio::time::timeout(
         Duration::from_secs(2),
-        engine.search(ctx.clone(), query("evidencekeyword")),
+        engine.search(ctx.clone(), unfiltered),
     )
     .await
     .expect("the lexical response returned while provider work was pending")

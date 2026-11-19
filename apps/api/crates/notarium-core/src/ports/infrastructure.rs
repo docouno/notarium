@@ -205,6 +205,17 @@ pub struct EmbeddingResult {
     pub usage: super::provider::ProviderUsage,
 }
 pub trait EmbeddingProviderPort: Send + Sync {
+    /// Resolve current disclosure for the exact provider, model and query scope.
+    fn query_disclosure(
+        &self,
+        _ctx: SpaceContext,
+        _provider: ProviderResourceId,
+        _model: ModelProfileId,
+        _project: Option<FolderRef>,
+    ) -> PortFuture<'_, BTreeSet<DocClass>> {
+        Box::pin(async { Err(DomainError::AccessDenied.into()) })
+    }
+
     fn embed(
         &self,
         ctx: SpaceContext,

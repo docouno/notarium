@@ -10,7 +10,7 @@ use crate::{
     test_support::*,
 };
 use notarium_core::{
-    auth::{ResourceFacts, SecretString},
+    auth::{BranchTaint, ResourceFacts, SecretString},
     classes::*,
     document::ChunkDescriptor,
     epoch::DataRoot,
@@ -103,7 +103,59 @@ struct Setup {
     revision: ControlRevision,
     credential: ProviderCredentialInfo,
     session: SecretString,
+    revoker: Arc<TaintOnRegistration>,
 }
+
+struct TaintOnRegistration {
+    inner: Arc<dyn SessionRevocationPort>,
+    next: Mutex<Option<BranchTaint>>,
+}
+
+impl SessionRevocationPort for TaintOnRegistration {
+    fn register_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        Box::pin(async move {
+            let lease = self
+                .inner
+                .register_provider(ctx, selectors, cancellation)
+                .await?;
+            if let Some(taint) = self.next.lock().unwrap().take() {
+                taint.mark_external_read();
+            }
+            Ok(lease)
+        })
+    }
+
+    fn fence_provider(
+        &self,
+        ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.inner.fence_provider(ctx, selectors)
+    }
+
+    fn fence_inactive_provider(
+        &self,
+        ctx: MaintenanceContext,
+        call: RequestId,
+    ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>> {
+        self.inner.fence_inactive_provider(ctx, call)
+    }
+
+    fn revoke(
+        &self,
+        ctx: MaintenanceContext,
+        selector: RevocationSelector,
+        reason: RevocationReason,
+    ) -> PortFuture<'_, ()> {
+        self.inner.revoke(ctx, selector, reason)
+    }
+}
+
 async fn keys(fixture: &mut Fixture) -> Arc<Keyring> {
     let value: Value =
         serde_json::from_str(include_str!("../../../tests/fixtures/keyring/vectors.json")).unwrap();
@@ -150,7 +202,12 @@ impl Setup {
     async fn new(pg: bool, label: &str, kind: ProviderWireKind, server: &HttpsFixture) -> Self {
         let mut fixture = Fixture::new(pg, label).await;
         let keys = keys(&mut fixture).await;
-        let control = fixture.service(AuthenticationMode::Password).await.unwrap();
+        let mut control = fixture.service(AuthenticationMode::Password).await.unwrap();
+        let revoker = Arc::new(TaintOnRegistration {
+            inner: control.revoker.clone(),
+            next: Mutex::new(None),
+        });
+        Arc::get_mut(&mut control).unwrap().revoker = revoker.clone();
         let bootstrap = control
             .bootstrap(
                 empty(),
@@ -396,6 +453,7 @@ impl Setup {
             revision: attached.revision,
             credential,
             session,
+            revoker,
         }
     }
     fn completion(&self, id: u8) -> CompletionRequest {
@@ -716,6 +774,17 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             },
         )
     };
+    let disclosed = setup
+        .provider
+        .query_disclosure(
+            setup.space.clone(),
+            setup.selection.provider.clone(),
+            ModelProfileId::from_bytes([4; 16]),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(disclosed, BTreeSet::from([DocClass::UserDoc]));
     let result = setup
         .provider
         .embed(setup.space.clone(), query(100, DocClass::UserDoc))
@@ -781,6 +850,22 @@ async fn gateway(pg: bool, kind: ProviderWireKind, label: &str) {
             .embed(tainted, query(104, DocClass::UserDoc))
             .await,
         Err(PortError::Domain(DomainError::CrossSpaceTainted))
+    ));
+    assert_eq!(requests.lock().unwrap().len(), count);
+    let auth = setup
+        .provider
+        .control
+        .resolve(evidence(AuthEvidenceKind::Session, setup.session.expose()))
+        .await
+        .unwrap();
+    let racing = SpaceContext::new(auth, setup.space.scope().clone(), budget()).unwrap();
+    *setup.revoker.next.lock().unwrap() = Some(racing.auth().taint().clone());
+    assert!(matches!(
+        setup
+            .provider
+            .embed(racing, query(105, DocClass::UserDoc))
+            .await,
+        Err(PortError::Domain(DomainError::CrossSpaceTainted)),
     ));
     assert_eq!(requests.lock().unwrap().len(), count);
     // A retry still resolves the old intent after mutable configuration changes.

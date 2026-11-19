@@ -204,6 +204,7 @@ impl SearchEngine {
         } = input;
         if browse
             || filter.classes.is_empty()
+            || filter.folders.as_ref().is_some_and(BTreeSet::is_empty)
             || matches!(self.services.config.vector_mode, VectorMode::Disabled)
         {
             return Ok(VectorCandidates::default());

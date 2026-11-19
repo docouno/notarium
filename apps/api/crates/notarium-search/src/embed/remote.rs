@@ -3,7 +3,7 @@ use crate::ports::RemoteIndexingGrant;
 use notarium_core::{
     DomainError,
     classes::{ClassEgressFence, ContentPart, DocClass},
-    error::ValidationReason,
+    error::{PortError, ValidationReason},
     ids::{CommandKey, ModelProfileId, ProviderResourceId},
     model::FolderRef,
     ports::{
@@ -11,7 +11,7 @@ use notarium_core::{
         SpaceContext,
     },
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 pub struct RemoteEmbedder {
     port: Arc<dyn EmbeddingProviderPort>,
@@ -40,8 +40,8 @@ impl RemoteEmbedder {
 
     pub async fn query(
         &self,
-        ctx: SpaceContext,
-        input: EmbeddingQueryInput,
+        mut ctx: SpaceContext,
+        mut input: EmbeddingQueryInput,
     ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
         if ctx.auth().taint().is_tainted()
             || input.classes.is_empty()
@@ -50,6 +50,25 @@ impl RemoteEmbedder {
             return Err(EmbeddingError::ProviderUnavailable);
         }
         if input.tokens > self.max_input_tokens || input.tokens == 0 {
+            return Err(EmbeddingError::BudgetExceeded);
+        }
+        let started = Instant::now();
+        let disclosed = self
+            .port
+            .query_disclosure(
+                ctx.clone(),
+                self.provider.clone(),
+                self.model.clone(),
+                input.project_scope.clone(),
+            )
+            .await
+            .map_err(port_error)?;
+        input.classes.retain(|class| disclosed.contains(class));
+        if input.classes.is_empty() || ctx.auth().taint().is_tainted() {
+            return Err(EmbeddingError::ProviderUnavailable);
+        }
+        ctx.budget.remaining = ctx.budget.remaining.saturating_sub(started.elapsed());
+        if ctx.budget.remaining.is_zero() {
             return Err(EmbeddingError::BudgetExceeded);
         }
         let mut intent = self.intent(&ctx, b"query", input.project_scope.as_ref());
@@ -64,7 +83,15 @@ impl RemoteEmbedder {
             self.provider.clone(),
             input,
         );
-        self.dispatch(ctx, request).await
+        let mut rows = self.dispatch(ctx, request).await?;
+        let vector = rows
+            .pop()
+            .ok_or(EmbeddingError::ProviderUnavailable)?
+            .map_err(provider_error)?;
+        Ok(vec![Some(
+            self.normalized_row(vector)
+                .ok_or(EmbeddingError::ProviderUnavailable)?,
+        )])
     }
 
     pub async fn parts(
@@ -116,7 +143,7 @@ impl RemoteEmbedder {
             );
             let result = self.dispatch(grant.ctx, request).await?;
             for (position, vector) in positions.into_iter().zip(result) {
-                output[position] = vector;
+                output[position] = vector.ok().and_then(|vector| self.normalized_row(vector));
             }
         }
         Ok(output)
@@ -126,40 +153,26 @@ impl RemoteEmbedder {
         &self,
         ctx: SpaceContext,
         request: EmbeddingRequest,
-    ) -> Result<Vec<Option<Vec<f32>>>, EmbeddingError> {
+    ) -> Result<Vec<Result<Vec<f32>, DomainError>>, EmbeddingError> {
         if ctx.budget.cancellation.is_cancelled() {
             return Err(EmbeddingError::Cancelled);
         }
         request.validate().map_err(provider_error)?;
         let count = request.inputs.len();
-        let result = self
-            .port
-            .embed(ctx, request)
-            .await
-            .map_err(|error| match error {
-                notarium_core::error::PortError::Domain(error) => provider_error(error),
-                notarium_core::error::PortError::Cancelled(_) => EmbeddingError::Cancelled,
-                notarium_core::error::PortError::DeadlineExceeded(_) => {
-                    EmbeddingError::BudgetExceeded
-                }
-                _ => EmbeddingError::ProviderUnavailable,
-            })?;
+        let result = self.port.embed(ctx, request).await.map_err(port_error)?;
         if result.model != self.model
             || result.dimension != self.dimension
             || result.vectors.len() != count
         {
             return Err(EmbeddingError::ProviderUnavailable);
         }
-        Ok(result
-            .vectors
-            .into_iter()
-            .map(|vector| {
-                let vector = vector.ok()?;
-                (vector.len() == self.dimension as usize)
-                    .then(|| normalize(&vector))
-                    .flatten()
-            })
-            .collect())
+        Ok(result.vectors)
+    }
+
+    fn normalized_row(&self, vector: Vec<f32>) -> Option<Vec<f32>> {
+        (vector.len() == self.dimension as usize)
+            .then(|| normalize(&vector))
+            .flatten()
     }
 
     fn intent(
@@ -180,6 +193,15 @@ impl RemoteEmbedder {
             hash_field(&mut hash, project.folder_id.as_str().as_bytes());
         }
         hash
+    }
+}
+
+fn port_error(error: PortError) -> EmbeddingError {
+    match error {
+        PortError::Domain(error) => provider_error(error),
+        PortError::Cancelled(_) => EmbeddingError::Cancelled,
+        PortError::DeadlineExceeded(_) => EmbeddingError::BudgetExceeded,
+        _ => EmbeddingError::ProviderUnavailable,
     }
 }
 
