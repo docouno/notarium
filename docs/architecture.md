@@ -9,8 +9,9 @@ The backend separates control, canonical and rebuildable derived state. Local
 delivery uses independent SQLite files without `ATTACH DATABASE`: control data,
 canonical data with a batch writer and Zstd CAS, and derived generations
 published through ArcSwap. Cloud delivery pairs PostgreSQL 16 with S3-compatible
-CAS. Search targets pure Rust i8 mmap CSR-HNSW with `std::arch` SIMD. ONNX is
-loaded dynamically through `ort`, never downloaded during offline builds.
+CAS. Search combines Tantivy with a pure Rust i8 mmap CSR-HNSW index and
+`std::arch` SIMD. The optional ONNX backend loads the CPU runtime dynamically
+through `ort`. Offline builds use cached dependencies.
 
 The core, syntax, canonical and control libraries implement [domain contracts](core-contracts.md),
 [document syntax](syntax.md) and [control-plane services](control.md), including
@@ -18,8 +19,10 @@ authority/egress checks, typed ports, history-scoped receipts, exact comparisons
 byte-preserving edits, SQLite/PostgreSQL control storage, authentication, OAuth/OIDC,
 the native keyring, guarded outbound HTTP, the AI provider gateway and the
 [control backup participant](control-backup.md). [Canonical storage](storage.md) provides SQLite and PostgreSQL persistence, CAS,
-chat history and a backup participant. Projections,
-search, collaboration and HTTP/MCP transport integration remain separate work.
+chat history and a backup participant. The [search engine](search.md) subscribes
+to canonical changes independently and consumes the structural projection port.
+Application composition provides the projection and embedding adapters. The
+current HTTP and MCP transport work remains separate.
 
 ## Internal dependency allowlist
 

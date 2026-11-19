@@ -1,8 +1,8 @@
 //! Durability order for one model's mutable buffer and immutable segments.
 
 use super::{
-    ChunkMetadata, L0_MAX_CHUNKS, MmapSegment, MutableBuffer, MutableOperation, QuantizedVector,
-    SearchBudget, SegmentBuilder, Tombstones, VectorChunk, VectorError,
+    ChunkMetadata, EXACT_SCAN_LIMIT, L0_MAX_CHUNKS, MmapSegment, MutableBuffer, MutableOperation,
+    QuantizedVector, SearchBudget, SegmentBuilder, Tombstones, VectorChunk, VectorError,
     format::class_number,
     hnsw::{self, Similarity},
     model_hash,
@@ -102,6 +102,28 @@ impl VectorSnapshot {
         limit: usize,
         budget: SearchBudget<'_>,
     ) -> Result<VectorResults, VectorError> {
+        self.search_mode(query, filter, limit, budget, false)
+    }
+
+    /// Exhaustive quantized scoring for callers that need a recall reference.
+    pub fn search_exact(
+        &self,
+        query: &QuantizedVector,
+        filter: &VectorFilter<'_>,
+        limit: usize,
+        budget: SearchBudget<'_>,
+    ) -> Result<VectorResults, VectorError> {
+        self.search_mode(query, filter, limit, budget, true)
+    }
+
+    fn search_mode(
+        &self,
+        query: &QuantizedVector,
+        filter: &VectorFilter<'_>,
+        limit: usize,
+        budget: SearchBudget<'_>,
+        force_exact: bool,
+    ) -> Result<VectorResults, VectorError> {
         budget.check()?;
         query.validate(self.epoch.dimension as usize)?;
         let limit = limit.min(4096);
@@ -113,10 +135,20 @@ impl VectorSnapshot {
         }
         let mut hits = Vec::new();
         let mut hnsw_hops = 0;
-        for segment in &self.segments {
+        let filters = self
+            .segments
+            .iter()
+            .map(|segment| self.allowed_slots(segment, filter, budget))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sealed_slots = filters.iter().map(Bitmap::cardinality).sum::<u64>();
+        let mutable_slots = self.search_mutable(query, filter, limit, budget, &mut hits)? as u64;
+        let exact = force_exact || sealed_slots + mutable_slots <= EXACT_SCAN_LIMIT;
+        for (segment, allowed) in self.segments.iter().zip(filters) {
             budget.check()?;
-            let allowed = self.allowed_slots(segment, filter, budget)?;
-            let result = segment.index.data.search(query, &allowed, limit, budget)?;
+            let result = segment
+                .index
+                .data
+                .search_mode(query, &allowed, limit, budget, exact)?;
             hnsw_hops += result.hnsw_hops;
             for neighbor in result.neighbors {
                 let metadata = segment
@@ -130,7 +162,6 @@ impl VectorSnapshot {
                 });
             }
         }
-        self.search_mutable(query, filter, limit, budget, &mut hits)?;
         hits.sort_unstable_by(|left, right| {
             right
                 .score
@@ -212,7 +243,7 @@ impl VectorSnapshot {
         limit: usize,
         budget: SearchBudget<'_>,
         hits: &mut Vec<VectorHit>,
-    ) -> Result<(), VectorError> {
+    ) -> Result<usize, VectorError> {
         let scorer = Similarity::new(query.values(), query.scale())?;
         let mut eligible = Vec::new();
         let mut best = BinaryHeap::with_capacity(limit);
@@ -249,7 +280,7 @@ impl VectorSnapshot {
                 score: hit.score,
             });
         }
-        Ok(())
+        Ok(eligible.len())
     }
 }
 

@@ -1,6 +1,6 @@
 mod align;
 mod hydrate;
-mod ranking;
+pub(crate) mod ranking;
 
 use crate::{
     config::VectorMode,
@@ -122,7 +122,14 @@ impl SearchEngine {
         });
         let (lexical, vectors) = tokio::join!(lexical, vectors);
         let (mut notes, chats) = lexical?;
-        let vectors = vectors?;
+        let mut vectors = vectors?;
+        vectors.hits.retain(|hit| {
+            snapshot.lookup(&hit.metadata.note).is_some_and(|node| {
+                filter
+                    .node_allowed(snapshot.as_ref(), node)
+                    .unwrap_or(false)
+            })
+        });
         let overlay = rank_overlay(
             self,
             &request.text,
@@ -142,7 +149,7 @@ impl SearchEngine {
             notes = fresh;
         }
 
-        let mut candidates = ranking::fuse(notes, vectors.hits, snapshot.as_ref(), browse);
+        let mut candidates = ranking::fuse(notes, vectors.hits, browse);
         if let Some(recall) = recall.filter(|recall| recall.graph_depth != 0) {
             ranking::expand(
                 &mut candidates,
@@ -233,6 +240,13 @@ impl SearchEngine {
             {
                 return Err(EmbeddingError::ProviderUnavailable);
             }
+            // The indexing side owns native session initialization, so
+            // timed-out queries cannot start duplicate blocking loads.
+            let embedder = self
+                .services
+                .embedder(target.clone(), false)
+                .await
+                .inspect_err(|_| handle.wake.notify_one())?;
             if !state.vectors.as_ref().is_some_and(|vectors| {
                 let indexed = vectors.manifest();
                 indexed.model_id == target.model && indexed.dimension == target.dimension
@@ -240,7 +254,6 @@ impl SearchEngine {
                 handle.wake.notify_one();
                 return Ok(None);
             }
-            let embedder = self.services.embedder(target).await?;
             let input = query.text.clone();
             let mut context = ctx.clone();
             context.budget = clock

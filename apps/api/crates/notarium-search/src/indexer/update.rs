@@ -138,7 +138,7 @@ pub(super) async fn apply(
             .ok()
             .flatten();
         let embedder = match target {
-            Some(target) => cx.services.embedder(target).await.ok(),
+            Some(target) => cx.services.embedder(target, true).await.ok(),
             None => None,
         };
         apply_vectors(cx, disk, &cutoff, updated_notes, deleted, embedder.as_ref()).await?;

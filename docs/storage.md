@@ -64,6 +64,13 @@ The store implements
 planning (`NoteReadPort::list_notes`), `ViewGraphPort` and `SearchPort` remain
 owned by downstream projection and search crates.
 
+Search uses read-only carriers for paged seeds, complete-command increments,
+exact receipt revisions, and current authorized hydration. Chat search reads
+the active reachable branch and hydrates ranked candidates against live facts.
+An independent `ChangeBroadcast` acknowledgement advances only after the
+derived cut is durable. Purge and redaction also retire old derived index
+files before acknowledgement. See [search index storage](search.md#storage).
+
 In PostgreSQL, creating a Space grants its initial writer epoch to the
 provisioning runtime when storage receives the commit acknowledgement, even if
 the caller has already left. If the database acknowledgement itself is lost,

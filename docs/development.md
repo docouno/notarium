@@ -27,6 +27,7 @@ tests fail closed if fixtures are absent (see [canonical storage](storage.md)).
 | `make check` | Formatting, lint and types, including all Cargo targets |
 | `make fix` | Apply Prettier, ESLint `--fix` and `rustfmt` explicitly |
 | `make test` | All component tests, architecture rules and process smoke tests |
+| `make benchmark-search` | Offline release gate on 100,000 notes and 400,000 chunks |
 | `make build` | Build all components offline |
 | `make check app=api` | Select the Rust app |
 | `make test package=api-contract` | Select the contract library |
@@ -53,6 +54,11 @@ configuration fails the database suite. The project wrapper serializes fixture
 runs within one checkout and removes its container and scratch directory on
 clean exit; logs remain in `.artifacts/control-db-fixture/` when a run fails.
 No host PostgreSQL installation is required.
+
+API setup also prepares the pinned dynamic ONNX Runtime CPU fixture. The search
+tests use both canonical storage dialects and exercise the native runtime with
+a small embedded test graph. The scale gate needs a writable Cargo target mount
+and emits a JSON report to standard output. See [search verification](search.md#verification).
 
 ## Dependencies and ownership
 

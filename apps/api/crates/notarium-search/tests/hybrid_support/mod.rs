@@ -1,3 +1,5 @@
+pub mod remote;
+
 use notarium_canonical::CanonicalStore;
 use notarium_core::{
     DomainError, DomainResult,
@@ -10,7 +12,7 @@ use notarium_core::{
     },
     model::{DenseNodeId, DenseNodeIter, HistoryScope, SnapshotCut},
     ports::{
-        CallBudget, Cancellation, ChangeBroadcast, ChangeRead, ChangeReadResult,
+        CallBudget, Cancellation, ChangeBroadcast, ChangeNotice, ChangeRead, ChangeReadResult,
         ChangeSubscription, MaintenanceContext, Mutation, NoteCard, PortFuture, ServiceAuthority,
         ServicePurpose, SpaceContext, StructuralReadPort, StructuralSnapshot,
     },
@@ -271,6 +273,7 @@ pub struct HeldPages {
     canonical: Arc<CanonicalStore>,
     from: AtomicU64,
     pub reached: Notify,
+    pub lagged: Arc<AtomicU64>,
     released: Notify,
 }
 
@@ -280,6 +283,7 @@ impl HeldPages {
             canonical,
             from: AtomicU64::new(u64::MAX),
             reached: Notify::new(),
+            lagged: Arc::new(AtomicU64::new(0)),
             released: Notify::new(),
         }
     }
@@ -300,7 +304,13 @@ impl ChangeBroadcast for HeldPages {
         ctx: MaintenanceContext,
         after: ChangeCursor,
     ) -> PortFuture<'_, Box<dyn ChangeSubscription>> {
-        self.canonical.subscribe(ctx, after)
+        Box::pin(async move {
+            let inner = self.canonical.subscribe(ctx, after).await?;
+            Ok(Box::new(Observed {
+                inner,
+                lagged: self.lagged.clone(),
+            }) as Box<dyn ChangeSubscription>)
+        })
     }
 
     fn catch_up(
@@ -324,5 +334,30 @@ impl ChangeBroadcast for HeldPages {
             }
             self.canonical.catch_up(ctx, request).await
         })
+    }
+}
+
+struct Observed {
+    inner: Box<dyn ChangeSubscription>,
+    lagged: Arc<AtomicU64>,
+}
+
+impl ChangeSubscription for Observed {
+    fn processed(&self) -> &ChangeCursor {
+        self.inner.processed()
+    }
+
+    fn next(&mut self) -> PortFuture<'_, Option<ChangeNotice>> {
+        Box::pin(async move {
+            let notice = self.inner.next().await?;
+            if matches!(notice, Some(ChangeNotice::Lagged { .. })) {
+                self.lagged.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(notice)
+        })
+    }
+
+    fn acknowledge(&mut self, cursor: ChangeCursor) -> PortFuture<'_, ()> {
+        self.inner.acknowledge(cursor)
     }
 }

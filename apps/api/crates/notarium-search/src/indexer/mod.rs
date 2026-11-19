@@ -262,9 +262,18 @@ async fn consume(
                 disk.manifest.active_model.as_ref() != target.as_ref().map(|target| &target.model)
             })
         });
+        let mut backfill = false;
+        if let Some(current) = &disk
+            && !selection_changed
+            && !force_seed
+            && let Ok(Some(target)) = &selected
+        {
+            let ready = cx.services.embedder(target.clone(), true).await.is_ok();
+            backfill = ready && current.epoch.is_none();
+        }
         let mut seed_at =
-            (force_seed || disk.is_none() || selection_changed).then(|| target.clone());
-        let mut scrub = scrub || selection_changed;
+            (force_seed || disk.is_none() || selection_changed || backfill).then(|| target.clone());
+        let mut scrub = scrub || selection_changed || backfill;
         if let Some(current) = &mut disk
             && seed_at.is_none()
             && current.manifest.tantivy_seq < target.after

@@ -3,7 +3,7 @@ use notarium_core::{
     ports::{CallBudget, Cancellation},
 };
 use notarium_search::{
-    embed::{EmbeddingScheduler, OrtModel, Pooling, Priority},
+    embed::{EmbeddingError, EmbeddingScheduler, OrtModel, Pooling, Priority},
     ports::{EmbeddingBackendTarget, ResolvedEmbeddingTarget},
 };
 use ort::{
@@ -40,6 +40,28 @@ const EMBEDDING_MODEL: &str = concat!(
     "16080712120a061204726f77730a081206746f6b656e7362310a116c6173745f68696464",
     "656e5f7374617465121c0a1a080112160a061204726f77730a081206746f6b656e730a02",
     "08404202100d",
+);
+
+// The second graph repeatedly updates a live token tensor in an ONNX Loop.
+// The trip count makes a normal run longer than the interactive deadline.
+const INTERRUPTIBLE_MODEL: &str = concat!(
+    "080a3abf040a93020a0574726970730a0772756e6e696e670a09696e7075745f69647312",
+    "0b616363756d756c6174656422044c6f6f702ae2010a04626f647932d6010a1d0a07636f",
+    "6e645f696e1208636f6e645f6f757422084964656e746974790a190a036163630a036f6e",
+    "6512086e6578745f616363220341646412096c6f6f705f626f64792a11100742036f6e65",
+    "4a0801000000000000005a0e0a046974657212060a04080712005a110a07636f6e645f69",
+    "6e12060a04080912005a1f0a0361636312180a16080712120a061204726f77730a081206",
+    "746f6b656e7362120a08636f6e645f6f757412060a040809120062240a086e6578745f61",
+    "636312180a16080712120a061204726f77730a081206746f6b656e73a001050a370a0b61",
+    "6363756d756c617465640a0564657074680a0676616c75657312116c6173745f68696464",
+    "656e5f737461746522064f6e65486f741216656d62656464696e675f6c6f6f705f666978",
+    "747572652a131007420574726970734a08404b4c00000000002a0e1009420772756e6e69",
+    "6e674a01012a131007420564657074684a0840000000000000002a160802100142067661",
+    "6c7565734a08000000000000803f5a250a09696e7075745f69647312180a16080712120a",
+    "061204726f77730a081206746f6b656e735a2a0a0e617474656e74696f6e5f6d61736b12",
+    "180a16080712120a061204726f77730a081206746f6b656e7362310a116c6173745f6869",
+    "6464656e5f7374617465121c0a1a080112160a061204726f77730a081206746f6b656e73",
+    "0a0208404202100d",
 );
 
 fn library() -> PathBuf {
@@ -155,6 +177,85 @@ async fn production_adapter_pools_real_dynamic_onnx_rows() {
         assert_eq!(rows[1].as_ref().unwrap()[2], 1.0);
         assert!(rows[2].is_none());
     }
+    let model = Arc::new(OrtModel::open(&library(), &root.0, &target, Pooling::Mean).unwrap());
+    #[cfg(target_os = "linux")]
+    let mut resident = Vec::new();
+    for batch in 0..200 {
+        let length = [12, 64, 65, 128, 129, 256, 257, 384, 385, 512][batch % 10];
+        let texts = vec!["red ".repeat(length); batch % 16 + 1];
+        let model = model.clone();
+        let rows = scheduler
+            .submit(
+                Priority::BulkImportBackfill,
+                call_budget(Duration::from_secs(5)),
+                move |budget| model.embed(texts, budget),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.iter()
+                .all(|row| row.as_ref().is_some_and(|values| values[1] == 1.0))
+        );
+        #[cfg(target_os = "linux")]
+        if batch % 10 == 9 {
+            resident.push(anonymous_kib());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let first = resident[3..10].iter().max().unwrap();
+        let last = resident[13..20].iter().min().unwrap();
+        assert!(
+            *last <= first + 16 * 1024,
+            "anonymous RSS grew from {first} to {last} KiB"
+        );
+    }
+
+    drop(model);
+    fs::write(
+        profile.join("model.onnx"),
+        hex::decode(INTERRUPTIBLE_MODEL).unwrap(),
+    )
+    .unwrap();
+    let model = Arc::new(OrtModel::open(&library(), &root.0, &target, Pooling::Mean).unwrap());
+    let expired = scheduler
+        .submit(
+            Priority::InteractiveSearchQuery,
+            call_budget(Duration::from_millis(150)),
+            move |budget| model.embed(vec!["red".to_owned()], budget),
+        )
+        .await;
+    assert!(matches!(expired, Err(EmbeddingError::BudgetExceeded)));
+    // Queued work can start only after the native call has acknowledged
+    // termination and the blocking task has returned.
+    scheduler
+        .submit(
+            Priority::LiveNoteEdit,
+            call_budget(Duration::from_secs(2)),
+            |_| async { Ok(Vec::new()) },
+        )
+        .await
+        .unwrap();
     scheduler.shutdown();
     worker.await.unwrap();
+}
+
+fn call_budget(remaining: Duration) -> CallBudget {
+    CallBudget {
+        request: RequestId::from_bytes([7; 16]),
+        cancellation: Cancellation::default(),
+        remaining,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn anonymous_kib() -> u64 {
+    fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("RssAnon:"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap()
+        .parse()
+        .unwrap()
 }

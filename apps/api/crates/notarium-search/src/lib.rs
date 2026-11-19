@@ -12,6 +12,8 @@ mod query;
 pub mod vector;
 
 pub use engine::{SearchDependencies, SearchEngine};
+#[doc(hidden)]
+pub use query::ranking::{Candidate, fuse as fuse_search_candidates};
 
 #[cfg(test)]
 mod tests {

@@ -18,8 +18,8 @@ use notarium_core::{
     model::{HistoryScope, Lifecycle},
     ports::{
         AppendChat, ChatEntryKind, ChatInputBody, ChatPort, ChatRead, ChatThreadKind, CreateChat,
-        MintAndPurge, MoveFolder, NoteWritePort, PageLimit, RecallQuery, RedactChatEntry,
-        SearchPort, SearchQuery, ServiceAuthority, ServicePurpose,
+        DeleteDisposition, DeleteNote, MintAndPurge, MoveFolder, NoteWritePort, PageLimit,
+        RecallQuery, RedactChatEntry, SearchPort, SearchQuery, ServiceAuthority, ServicePurpose,
     },
     query::{FieldFilterAstV1, Predicate},
     receipt::{AwaitWatermarks, CausalBasis, MutationReceiptToken, ReceiptSet},
@@ -232,6 +232,14 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     assert_eq!(initial.hits[0].card.title, "Install guide");
     assert!(initial.hits[0].chunks[0].text().contains("needle"));
     assert!(initial.degraded.is_none());
+    let mut rooted = query("needle");
+    rooted.folder = Some(folder.clone());
+    assert_eq!(
+        engine.search(ctx.clone(), rooted).await.unwrap().hits[0]
+            .card
+            .title,
+        "Install guide"
+    );
 
     pages.hold(seeded.last_seq);
     let (first, exact) = store
@@ -357,6 +365,32 @@ async fn run_scenario(store: Arc<CanonicalStore>, root: DataRoot, tag: u8) {
     let contained = engine.search(ctx.clone(), scoped).await.unwrap();
     assert_eq!(contained.hits.len(), 1);
     assert_eq!(contained.hits[0].card.title, "Latest version");
+
+    // Hold the log reader long enough to overflow the real broadcast queue.
+    // Durable folder commands require only a watermark advance.
+    let mut high = moved.receipt.seq();
+    pages.hold(high);
+    high = high.checked_next().unwrap();
+    store
+        .fast_forward_space_to_seq_for_test(scope, lease, high)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), pages.reached.notified())
+        .await
+        .unwrap();
+    for _ in 0..1025 {
+        high = high.checked_next().unwrap();
+        store
+            .fast_forward_space_to_seq_for_test(scope, lease, high)
+            .await
+            .unwrap();
+    }
+    projection.snapshot.write().unwrap().advance(high);
+    pages.release();
+    let after_lag = acknowledged(&store, &root, scope, high).await;
+    assert!(pages.lagged.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    assert_eq!(after_lag.tantivy_commit, after_move.tantivy_commit);
+    assert_eq!(old_vectors, files(&vectors));
 
     let thread = ChatThreadId::from_bytes([tag; 16]);
     store
@@ -562,7 +596,10 @@ async fn sqlite_hybrid_seed_causal_boundaries_and_scrub() {
     ))
     .await
     .unwrap();
-    run_scenario(Arc::new(store), data.data_root(), 0x42).await;
+    let store = Arc::new(store);
+    run_scenario(store.clone(), data.data_root(), 0x42).await;
+    hybrid_support::remote::lexical_fallback(store.clone(), data.data_root()).await;
+    purge_and_rebind(store, data.data_root()).await;
     runtime.shutdown().await.unwrap();
 }
 
@@ -576,7 +613,134 @@ async fn postgres_hybrid_seed_causal_boundaries_and_scrub() {
     admin_ensure_bucket(&s3, Some("Enabled")).await.unwrap();
     let config = fixtures.pg_s3_config(sample_installation_id(0x43), &schema, s3);
     let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
-    run_scenario(Arc::new(store), data.data_root(), 0x43).await;
+    let store = Arc::new(store);
+    run_scenario(store.clone(), data.data_root(), 0x43).await;
+    hybrid_support::remote::lexical_fallback(store.clone(), data.data_root()).await;
+    purge_and_rebind(store, data.data_root()).await;
     runtime.shutdown().await.unwrap();
     fixtures.drop_pg_schema(&schema).await;
+}
+
+async fn purge_and_rebind(store: Arc<CanonicalStore>, root: DataRoot) {
+    let owner = sample_principal_id(0x62);
+    let folder = sample_folder_id(0x62);
+    let lease = LeaseEpoch::new(1).unwrap();
+    let space = store
+        .create_space(CreateSpaceSpec {
+            space_id: sample_space_id(0x62),
+            incarnation: sample_incarnation(0x62),
+            root_folder_id: folder.clone(),
+            slug: "indexed-history".to_owned(),
+            kind: SpaceKind::Personal,
+            owner: owner.clone(),
+            active_epoch: lease,
+            initial_last_seq: SpaceSeq::ZERO,
+            created_at: None,
+        })
+        .await
+        .unwrap();
+    let old = sample_note_id(0x62);
+    let ctx = context(&space.scope, &owner);
+    let (cut, revisions) = store
+        .commit_synthetic_note_batch_for_test(
+            &space.scope,
+            lease,
+            &owner,
+            vec![note(
+                &old,
+                &folder,
+                "Old incarnation",
+                "oldincarnationsecret",
+            )],
+        )
+        .await
+        .unwrap();
+    let mut view = View::new(space.scope.clone(), folder.clone());
+    view.index(old.clone(), folder.clone());
+    view.advance(cut.last_seq);
+    let projection = Arc::new(Projection {
+        store: store.clone(),
+        snapshot: RwLock::new(view),
+        live: RwLock::new(BTreeSet::from([old.clone()])),
+    });
+    let engine = SearchEngine::start(
+        SearchConfig::new(root.clone(), VectorMode::Disabled),
+        SearchDependencies::new(store.clone(), projection.clone()),
+    );
+    engine.start_space(space.scope.clone()).unwrap();
+    acknowledged(&store, &root, &space.scope, cut.last_seq).await;
+    assert_eq!(
+        engine
+            .search(ctx.clone(), query("oldincarnationsecret"))
+            .await
+            .unwrap()
+            .hits
+            .len(),
+        1
+    );
+    let mut request = mutation(
+        &ctx,
+        DeleteNote {
+            note: old.clone(),
+            disposition: DeleteDisposition::Purge,
+        },
+    );
+    request.preconditions.revision = Some(revisions[0].1.clone());
+    let purged = store.delete_note(ctx.clone(), request).await.unwrap();
+    projection.live.write().unwrap().remove(&old);
+    projection
+        .snapshot
+        .write()
+        .unwrap()
+        .advance(purged.receipt.seq());
+    acknowledged(&store, &root, &space.scope, purged.receipt.seq()).await;
+    let tantivy = root.search(&space.scope.space_id, SearchIndexKind::Tantivy);
+    assert_absent(&tantivy, "oldincarnationsecret");
+    assert!(
+        engine
+            .search(ctx.clone(), query("oldincarnationsecret"))
+            .await
+            .unwrap()
+            .hits
+            .is_empty()
+    );
+
+    let scope = store
+        .rotate_incarnation_for_test(&space.scope, sample_incarnation(0x63))
+        .await
+        .unwrap();
+    let fresh = sample_note_id(0x63);
+    let (restored, _) = store
+        .commit_synthetic_note_batch_for_test(
+            &scope,
+            lease,
+            &owner,
+            vec![note(
+                &fresh,
+                &folder,
+                "Restored history",
+                "freshincarnationtoken",
+            )],
+        )
+        .await
+        .unwrap();
+    let mut view = View::new(scope.clone(), folder.clone());
+    view.index(fresh.clone(), folder);
+    view.advance(restored.last_seq);
+    *projection.snapshot.write().unwrap() = view;
+    projection.live.write().unwrap().insert(fresh);
+    acknowledged(&store, &root, &scope, restored.last_seq).await;
+    assert!(
+        engine
+            .search(ctx, query("freshincarnationtoken"))
+            .await
+            .is_err()
+    );
+    let hits = engine
+        .search(context(&scope, &owner), query("freshincarnationtoken"))
+        .await
+        .unwrap();
+    assert_eq!(hits.cut.scope, scope);
+    assert_eq!(hits.hits[0].card.title, "Restored history");
+    engine.shutdown().await;
 }

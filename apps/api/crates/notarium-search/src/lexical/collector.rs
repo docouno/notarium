@@ -66,6 +66,11 @@ impl<T: Collector> Collector for DocFilterCollector<'_, T> {
                 let Some(node) = self.filter.snapshot.lookup(&note) else {
                     continue;
                 };
+                if !self.filter.snapshot.doc_class(node).is_ok_and(|class| {
+                    self.filter.classes & (1 << super::schema::class_ord(class)) != 0
+                }) {
+                    continue;
+                }
                 if self
                     .filter
                     .notes

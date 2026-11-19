@@ -49,7 +49,7 @@ pub(super) async fn seed(
     let result = async {
         let lexical = cx.services.readers.create(&path)?;
         let embedder = match target {
-            Some(target) => cx.services.embedder(target.clone()).await.ok(),
+            Some(target) => cx.services.embedder(target.clone(), true).await.ok(),
             None => None,
         };
         let active = target.map(|target| &target.model);

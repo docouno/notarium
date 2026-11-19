@@ -11,12 +11,23 @@ test-api: build-api
 test-api: devkit_loader := docker/storage-fixtures/with-storage-fixtures.sh
 package-desktop: build-api
 
-.PHONY: setup-storage-fixtures setup-onnxruntime-fixture
+.PHONY: setup-storage-fixtures setup-onnxruntime-fixture benchmark-search
 setup-storage-fixtures:
 	@sh docker/storage-fixtures/with-storage-fixtures.sh setup-images
 
 setup-onnxruntime-fixture:
 	@sh scripts/setup-onnxruntime-fixture.sh
+
+benchmark-search:
+	@set -eu; tree=working-tree; \
+	if git diff --quiet HEAD && test -z "$$(git ls-files --others --exclude-standard)"; then \
+	  tree=$$(git rev-parse 'HEAD^{tree}'); \
+	fi; \
+	cpu=$$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || true); \
+	memory=$$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true); \
+	sh .devkit/runtime/devkit.sh cli exec --component apps/api --network none -- \
+	  cargo run --quiet --locked --offline --release -p notarium-search \
+	    --example scale_100k_400k_gate -- --tree "$$tree" --host-cpu "$$cpu" --host-memory "$$memory"
 
 .PHONY: contract-sync
 contract-sync:

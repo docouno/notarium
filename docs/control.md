@@ -501,6 +501,12 @@ preference order is personal, project, then Space, keyed separately by
 `PreferenceModelKind` (`Completion` versus `Embedding`). An invalid configured preference
 fails instead of silently switching providers.
 
+Search embeddings use either a typed query or source-bound parts. Query
+admission checks the caller's taint, requested classes, and project scope.
+Background search indexing supports a narrowly scoped `SearchIndexing`
+credential for the revision actor under current disclosure consent. The model
+token limit applies to the sum across a batch. See [search embeddings](search.md#embeddings).
+
 Supported wire protocols are OpenAI-compatible chat completions/embeddings and
 Ollama chat/embed (stored openly as bounded text in SQL so future wire adapters do
 not require table rewrites). Base URL paths are preserved, OpenAI-compatible

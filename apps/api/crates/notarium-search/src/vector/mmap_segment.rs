@@ -405,6 +405,23 @@ impl MmapSegment {
         top_k: usize,
         budget: SearchBudget<'_>,
     ) -> Result<SegmentSearch, VectorError> {
+        self.search_mode(
+            query,
+            eligible,
+            top_k,
+            budget,
+            eligible.cardinality() <= EXACT_SCAN_LIMIT,
+        )
+    }
+
+    pub(super) fn search_mode(
+        &self,
+        query: &QuantizedVector,
+        eligible: &Bitmap,
+        top_k: usize,
+        budget: SearchBudget<'_>,
+        exact: bool,
+    ) -> Result<SegmentSearch, VectorError> {
         budget.check()?;
         query.validate(self.dimension)?;
         let top_k = top_k.min(4096).min(self.nodes);
@@ -415,7 +432,7 @@ impl MmapSegment {
             });
         }
         let scorer = Similarity::new(query.values(), query.scale())?;
-        if eligible.cardinality() <= EXACT_SCAN_LIMIT {
+        if exact {
             let mut best = BinaryHeap::with_capacity(top_k);
             for (index, slot) in eligible
                 .iter()

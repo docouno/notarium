@@ -88,6 +88,7 @@ impl Services {
     pub async fn embedder(
         &self,
         target: ResolvedEmbeddingTarget,
+        load_local: bool,
     ) -> Result<Embedder, EmbeddingError> {
         let conservative = || {
             Arc::new(RemoteConservativeTokenizerBudget::new(
@@ -128,14 +129,21 @@ impl Services {
                     },
                     EmbeddingBackendTarget::LocalOnnx,
                 ) => {
-                    let mut installed = self.models.0.lock().await;
+                    let mut installed = if load_local {
+                        self.models.0.lock().await
+                    } else {
+                        self.models
+                            .0
+                            .try_lock()
+                            .map_err(|_| EmbeddingError::ModelUnavailable)?
+                    };
                     let model = if let Some(model) = installed.as_ref().filter(|model| {
                         model.profile == target.model
                             && model.dimension == target.dimension
                             && model.max_input_tokens == target.max_input_tokens
                     }) {
                         model.model.clone()
-                    } else {
+                    } else if load_local {
                         let library = dylib_path.clone();
                         let root = model_dir.clone();
                         let selected = target.clone();
@@ -152,6 +160,8 @@ impl Services {
                             model: model.clone(),
                         });
                         model
+                    } else {
+                        return Err(EmbeddingError::ModelUnavailable);
                     };
                     let tokenizer = model.tokenizer();
                     (Backend::Onnx(model), tokenizer)

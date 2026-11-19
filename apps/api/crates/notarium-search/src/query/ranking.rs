@@ -11,7 +11,8 @@ use std::{
     collections::{BTreeMap, HashSet},
 };
 
-pub(super) struct Candidate {
+#[doc(hidden)]
+pub struct Candidate {
     pub note: NoteId,
     pub score: f64,
     pub chunks: Vec<ChunkMetadata>,
@@ -34,10 +35,10 @@ impl Candidate {
     }
 }
 
-pub(super) fn fuse(
+#[doc(hidden)]
+pub fn fuse(
     lexical: Vec<LexicalHit>,
     vectors: Vec<crate::vector::VectorHit>,
-    snapshot: &dyn StructuralSnapshot,
     browse: bool,
 ) -> Vec<Candidate> {
     let mut rows = BTreeMap::new();
@@ -56,9 +57,6 @@ pub(super) fn fuse(
     let mut distinct = 0;
     for hit in vectors {
         let note = &hit.metadata.note;
-        if snapshot.lookup(note).is_none() {
-            continue;
-        }
         let row = rows
             .entry(note.clone())
             .or_insert_with(|| Candidate::new(note.clone()));
