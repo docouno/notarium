@@ -1001,13 +1001,16 @@ async fn dropping_an_admitted_postgres_cut_waits_for_source_cleanup() {
         .unwrap();
     let (fixtures, schema) = case.pg_cleanup.as_ref().unwrap();
     let budget = case.store.default_backup_budget();
+    let context = maintenance_ctx(ServicePurpose::Backup);
+    let shared_cancel = context.budget.cancellation.clone();
     let mut prepared = case
         .store
-        .prepare(
-            maintenance_ctx(ServicePurpose::Backup),
-            BackupId::from_bytes([0xc6; 16]),
-            budget,
-        )
+        .prepare(context.clone(), BackupId::from_bytes([0xc6; 16]), budget)
+        .await
+        .unwrap();
+    let mut independent = case
+        .store
+        .prepare(context, BackupId::from_bytes([0xc8; 16]), budget)
         .await
         .unwrap();
     let hold = prepared.acquire_hold().await.unwrap();
@@ -1029,25 +1032,9 @@ async fn dropping_an_admitted_postgres_cut_waits_for_source_cleanup() {
     let blocked_pid = {
         let opening = paused.open_cut();
         tokio::pin!(opening);
-        let blocked = async {
-            loop {
-                if let Some(pid) = sqlx::query_scalar::<_, i32>(
-                    "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
-                )
-                .bind(locker_pid)
-                .fetch_optional(&mut probe)
-                .await
-                .unwrap()
-                {
-                    break pid;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        };
         tokio::select! {
             _ = &mut opening => panic!("the pin must wait for the schema lock"),
-            pid = tokio::time::timeout(Duration::from_secs(5), blocked) =>
-                pid.expect("the server must observe the admitted pin"),
+            pid = wait_for_blocked_backend(&mut probe, locker_pid) => pid,
         }
     };
     let release = tokio::time::timeout(Duration::from_secs(10), paused.resume())
@@ -1061,6 +1048,104 @@ async fn dropping_an_admitted_postgres_cut_waits_for_source_cleanup() {
     transaction.rollback().await.unwrap();
     hold.release().await.unwrap();
     prepared.abort().await.unwrap();
+    assert!(!shared_cancel.is_cancelled());
+    independent
+        .acquire_hold()
+        .await
+        .unwrap()
+        .release()
+        .await
+        .unwrap();
+    independent.abort().await.unwrap();
+    case.shutdown().await;
+}
+
+async fn wait_for_blocked_backend(sql: &mut sqlx::PgConnection, locker: i32) -> i32 {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(pid) = sqlx::query_scalar::<_, i32>(
+                "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+            )
+            .bind(locker)
+            .fetch_optional(&mut *sql)
+            .await
+            .unwrap()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the server must observe the admitted backup command")
+}
+
+#[tokio::test]
+async fn cancelled_hold_commit_reports_an_unacknowledged_outcome() {
+    let case = BackendCase::open_pg_s3_with_pool(1).await;
+    case.store
+        .create_space(backup_test_space(0xc9))
+        .await
+        .unwrap();
+    let (fixtures, schema) = case.pg_cleanup.as_ref().unwrap();
+    let mut locker = fixtures.open_raw_pg().await;
+    let mut probe = fixtures.open_raw_pg().await;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION {schema}.hold_commit_blocker() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+            PERFORM pg_advisory_xact_lock(hashtextextended(current_schema() || ':test-hold-commit', 7311253));
+            RETURN NEW;
+         END $$;
+         CREATE CONSTRAINT TRIGGER test_hold_commit_blocker AFTER INSERT ON {schema}.backup_holds
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {schema}.hold_commit_blocker()"
+    )))
+    .execute(&mut probe)
+    .await
+    .unwrap();
+    let id = BackupId::from_bytes([0xc9; 16]);
+    let budget = case.store.default_backup_budget();
+    let ctx = maintenance_ctx(ServicePurpose::Backup);
+    let cancellation = ctx.budget.cancellation.clone();
+    let mut prepared = case.store.prepare(ctx, id.clone(), budget).await.unwrap();
+    let locker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut locker)
+        .await
+        .unwrap();
+    let mut transaction = locker.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1 || ':test-hold-commit', 7311253))",
+    )
+    .bind(schema)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let outcome = {
+        let acquiring = prepared.acquire_hold();
+        tokio::pin!(acquiring);
+        tokio::select! {
+            _ = &mut acquiring => panic!("acquire must wait for COMMIT"),
+            _ = wait_for_blocked_backend(&mut probe, locker_pid) => {},
+        }
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(12), acquiring)
+            .await
+            .expect("COMMIT acknowledgement must have a deadline")
+    };
+    assert!(matches!(
+        outcome,
+        Err(PortError::Unavailable(failure) | PortError::Internal(failure))
+            if failure.effect() == CommitEffect::Unknown
+    ));
+    transaction.rollback().await.unwrap();
+    prepared.abort().await.unwrap();
+    let surviving: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM {schema}.backup_holds WHERE backup_id=$1"
+    )))
+    .bind(id.as_str())
+    .fetch_one(&mut probe)
+    .await
+    .unwrap();
+    assert_eq!(surviving, 0);
     case.shutdown().await;
 }
 
@@ -1097,6 +1182,37 @@ async fn blocked_postgres_hold_release_has_a_cleanup_deadline() {
     );
     transaction.rollback().await.unwrap();
     prepared.abort().await.unwrap();
+    let live_id = BackupId::from_bytes([0xcc; 16]);
+    let mut live = case
+        .store
+        .prepare(
+            maintenance_ctx(ServicePurpose::Backup),
+            live_id.clone(),
+            budget,
+        )
+        .await
+        .unwrap();
+    let live_hold = live.acquire_hold().await.unwrap();
+    assert!(
+        case.store
+            .reap_abandoned_backup_holds(
+                &maintenance_ctx(ServicePurpose::Backup).budget,
+                String::new(),
+            )
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let mut probe = fixtures.open_raw_pg().await;
+    let remaining: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT backup_id FROM {schema}.backup_holds ORDER BY backup_id"
+    )))
+    .fetch_all(&mut probe)
+    .await
+    .unwrap();
+    assert_eq!(remaining, vec![live_id.as_str().to_owned()]);
+    live_hold.release().await.unwrap();
+    live.abort().await.unwrap();
     let mut recovered = case
         .store
         .prepare(maintenance_ctx(ServicePurpose::Backup), id, budget)
@@ -1109,6 +1225,55 @@ async fn blocked_postgres_hold_release_has_a_cleanup_deadline() {
         .release()
         .await
         .unwrap();
+    recovered.abort().await.unwrap();
+    case.shutdown().await;
+}
+
+#[tokio::test]
+async fn postgres_artifact_recovery_waits_for_publication_resolution() {
+    let case = BackendCase::open_pg_s3_with_pool(1).await;
+    let (fixtures, schema) = case.pg_cleanup.as_ref().unwrap();
+    let ctx = maintenance_ctx(ServicePurpose::Backup);
+    let budget = case.store.default_backup_budget();
+    let id = BackupId::from_bytes([0xcb; 16]);
+    let prepared = case
+        .store
+        .prepare(ctx.clone(), id.clone(), budget)
+        .await
+        .unwrap();
+    let marker = fs::read_dir(&case.spool_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "pending"))
+        .unwrap();
+    let identity = fs::read(&marker).unwrap();
+    let artifact = marker.file_stem().unwrap().to_str().unwrap();
+    let spool = marker.with_extension("pgspool");
+    prepared.abort().await.unwrap();
+    fs::write(&marker, identity).unwrap();
+    fs::write(&spool, b"pending publication").unwrap();
+
+    let mut locker = fixtures.open_raw_pg().await;
+    let mut transaction = locker.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1 || ':' || $2, 7311233))")
+        .bind(schema)
+        .bind(artifact)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    assert!(
+        case.store
+            .prepare(ctx.clone(), id.clone(), budget)
+            .await
+            .is_err()
+    );
+    assert!(marker.exists());
+    assert_eq!(fs::read(&spool).unwrap(), b"pending publication");
+
+    transaction.rollback().await.unwrap();
+    let recovered = case.store.prepare(ctx, id, budget).await.unwrap();
+    assert!(!marker.exists());
+    assert!(!spool.exists());
     recovered.abort().await.unwrap();
     case.shutdown().await;
 }

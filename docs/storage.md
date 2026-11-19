@@ -485,7 +485,9 @@ same example against an isolated prefix.
   rows in slices of up to 64 KiB. Both participants release their source after
   durable spool or abort. A canonical artifact ID resolves on its original spool
   volume, where lookup checks file size and BLAKE3 before returning the path.
-  Startup reconciles abandoned holds and pending local artifacts.
+  Startup reconciles abandoned holds and pending local artifacts. PostgreSQL
+  maintenance also reaps holds whose ownership lock was lost. An unacknowledged
+  hold commit is reconciled using its exact generation once the old session ends.
   The offline `notarium_canonical::backup::decode_postgres_spool_v1_bounded`
   API verifies the trailer and recognizes the exact manifests for schemas 1 through 7.
   It returns typed rows in the original table and column order within the

@@ -6,8 +6,40 @@ use super::{
     CanonicalInner, CanonicalStore, PausedBackup, PortError, PortFuture, PreparedBackup,
     cancelled_not_committed,
 };
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::{mpsc, oneshot};
+
+pub(super) struct CaptureCancellation {
+    pub(super) token: Cancellation,
+    forward: tokio::task::AbortHandle,
+}
+
+impl CaptureCancellation {
+    fn new(inner: &CanonicalInner, external: Cancellation) -> Arc<Self> {
+        let token = Cancellation::default();
+        if external.is_cancelled() {
+            token.cancel();
+        }
+        let child = token.clone();
+        let forward = inner
+            .backup_executor
+            .spawn(async move {
+                external.cancelled().await;
+                child.cancel();
+            })
+            .abort_handle();
+        Arc::new(Self { token, forward })
+    }
+}
+
+impl Drop for CaptureCancellation {
+    fn drop(&mut self) {
+        self.forward.abort();
+    }
+}
 
 fn closed() -> PortError {
     cancelled_not_committed("backup_phase_closed", "backup phase has ended")
@@ -27,9 +59,60 @@ fn spawn_owner<T, F: Future<Output = ()> + Send + 'static>(
     Ok(())
 }
 
+struct PhaseReply<R> {
+    result: Arc<Mutex<Option<R>>>,
+    received: oneshot::Sender<()>,
+}
+
+impl<R> PhaseReply<R> {
+    fn claim(self) -> Result<R, PortError> {
+        let result = self.result.lock().expect("backup phase reply").take();
+        let _ = self.received.send(());
+        result.ok_or_else(closed)
+    }
+}
+
+async fn deliver<R, F>(
+    reply: oneshot::Sender<Result<PhaseReply<R>, PortError>>,
+    result: Result<R, PortError>,
+    shutdown: &Cancellation,
+    dispose: impl FnOnce(R) -> F,
+) -> Result<(), PortError>
+where
+    F: Future<Output = Result<(), PortError>>,
+{
+    let resource = match result {
+        Ok(resource) => resource,
+        Err(error) => {
+            let _ = reply.send(Err(error));
+            return Ok(());
+        }
+    };
+    let result = Arc::new(Mutex::new(Some(resource)));
+    let (received, acknowledged) = oneshot::channel();
+    let offer = PhaseReply {
+        result: result.clone(),
+        received,
+    };
+    if reply.send(Ok(offer)).is_ok() {
+        let claimed = tokio::select! {
+            () = shutdown.cancelled() => false,
+            result = acknowledged => result.is_ok(),
+        };
+        if claimed {
+            return Ok(());
+        }
+    }
+    let undelivered = result.lock().expect("backup phase reply").take();
+    if let Some(resource) = undelivered {
+        dispose(resource).await?;
+    }
+    Ok(())
+}
+
 pub(super) fn prepare(
     store: CanonicalStore,
-    ctx: super::MaintenanceContext,
+    mut ctx: super::MaintenanceContext,
     backup: super::BackupId,
     budget: BackupBudget,
 ) -> PortFuture<'static, Box<dyn PreparedBackup>> {
@@ -40,8 +123,10 @@ pub(super) fn prepare(
             if reply.is_closed() {
                 return;
             }
-            let cancellation = ctx.budget.cancellation.clone();
-            let prepare = store.prepare_source(ctx, backup, budget);
+            let scope = CaptureCancellation::new(&store.inner, ctx.budget.cancellation);
+            let cancellation = scope.token.clone();
+            ctx.budget.cancellation = cancellation.clone();
+            let prepare = store.prepare_source(ctx, backup, budget, scope);
             tokio::pin!(prepare);
             let prepared = tokio::select! {
                 result = &mut prepare => result,
@@ -56,12 +141,11 @@ pub(super) fn prepare(
                     .map(|phase| Box::new(phase) as Box<dyn PreparedBackup>),
                 Err(error) => Err(error),
             };
-            if let Err(Ok(handle)) = reply.send(handle) {
-                let _ = handle.abort().await;
-            }
+            let shutdown = &store.inner.backup_shutdown;
+            let _ = deliver(reply, handle, shutdown, |phase| phase.abort()).await;
         })
         .map_err(|()| closed())?;
-        result.await.map_err(|_| closed())?
+        result.await.map_err(|_| closed())??.claim()
     })
 }
 
@@ -71,6 +155,7 @@ pub(super) struct Phase<T> {
     commands: mpsc::Sender<PhaseCall<T>>,
     finished: oneshot::Receiver<Result<(), PortError>>,
     cancellation: Cancellation,
+    shutdown: Cancellation,
 }
 
 impl<T: Send + 'static> Phase<T> {
@@ -83,11 +168,12 @@ impl<T: Send + 'static> Phase<T> {
         let (commands, mut queue) = mpsc::channel::<PhaseCall<T>>(1);
         let (done, finished) = oneshot::channel();
         let shutdown = inner.backup_shutdown.clone();
+        let owner_shutdown = shutdown.clone();
         let owner = spawn_owner(inner, resource, |mut resource| async move {
             let settled = loop {
                 let command = tokio::select! {
                     biased;
-                    () = shutdown.cancelled() => break Ok(()),
+                    () = owner_shutdown.cancelled() => break Ok(()),
                     command = queue.recv() => command,
                 };
                 let Some(call) = command else { break Ok(()) };
@@ -108,6 +194,7 @@ impl<T: Send + 'static> Phase<T> {
             commands,
             finished,
             cancellation,
+            shutdown,
         })
     }
 
@@ -122,6 +209,7 @@ impl<T: Send + 'static> Phase<T> {
     {
         let commands = self.commands.clone();
         let cancellation = self.cancellation.clone();
+        let shutdown = self.shutdown.clone();
         Box::pin(async move {
             let (mut reply, result) = oneshot::channel();
             let command: PhaseCall<T> = Box::new(move |resource| {
@@ -139,14 +227,11 @@ impl<T: Send + 'static> Phase<T> {
                             operation.await
                         },
                     };
-                    if let Err(Ok(undelivered)) = reply.send(result) {
-                        dispose(undelivered).await?;
-                    }
-                    Ok(())
+                    deliver(reply, result, &shutdown, dispose).await
                 })
             });
             commands.send(command).await.map_err(|_| closed())?;
-            result.await.map_err(|_| closed())?
+            result.await.map_err(|_| closed())??.claim()
         })
     }
     fn finish(self) -> PortFuture<'static, ()> {
@@ -189,7 +274,7 @@ pub(super) struct Snapshot {
 impl Snapshot {
     pub(super) async fn new(raw: super::CanonicalBackupSnapshot) -> Result<Self, PortError> {
         let inner = raw.store.inner.clone();
-        let cancellation = raw.caller_cancel.clone();
+        let cancellation = raw.caller_cancel.token.clone();
         Ok(Self {
             witness: raw.witness.clone(),
             source: Phase::new(&inner, raw, cancellation, BackupSnapshot::close).await?,
@@ -215,5 +300,54 @@ impl BackupSnapshot for Snapshot {
 
     fn close(self: Box<Self>) -> PortFuture<'static, ()> {
         self.source.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_unclaimed_reply_waits_for_resource_disposal() {
+        let shutdown = Cancellation::default();
+        let (reply, response) = oneshot::channel();
+        let (started, observed) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let worker = tokio::spawn(async move {
+            deliver(reply, Ok(()), &shutdown, |()| async move {
+                started.send(()).unwrap();
+                wait.await.unwrap();
+                Err(closed())
+            })
+            .await
+        });
+        let offered = response.await.unwrap().unwrap();
+        drop(offered);
+        observed.await.unwrap();
+        assert!(!worker.is_finished());
+        release.send(()).unwrap();
+        assert_eq!(worker.await.unwrap(), Err(closed()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_reclaims_a_reply_whose_receiver_has_stopped_polling() {
+        let shutdown = Cancellation::default();
+        let (reply, response) = oneshot::channel();
+        let (cleanup, cleaned) = oneshot::channel();
+        let worker = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                deliver(reply, Ok(()), &shutdown, |()| async move {
+                    cleanup.send(()).unwrap();
+                    Ok(())
+                })
+                .await
+            }
+        });
+        let offered = response.await.unwrap().unwrap();
+        shutdown.cancel();
+        cleaned.await.unwrap();
+        assert_eq!(offered.claim(), Err(closed()));
+        worker.await.unwrap().unwrap();
     }
 }

@@ -14,18 +14,39 @@ use notarium_core::{
 use sqlx::{PgConnection, Row};
 
 use super::{
-    BackendConn, BackupArtifactEncoding, CanonicalInner, CanonicalStore, SqlDriverState,
-    create_private_tmp_file, fsync_parent_dir, internal_not_committed, mint_artifact_id,
-    open_backup_connection, register_cleanup_task, remove_tmp_artifacts, resolve_spool_dir,
-    unavailable_retryable,
+    BACKUP_CLEANUP_GRACE, BackendConn, BackupArtifactEncoding, CanonicalInner, CanonicalStore,
+    SqlDriverState, create_private_tmp_file, deadline_not_committed, fsync_parent_dir,
+    internal_not_committed, mint_artifact_id, open_backup_connection, register_cleanup_task,
+    remove_tmp_artifacts, resolve_spool_dir, rollback_backup_connection, unavailable_retryable,
 };
 
 const HOLD_LOCK_SQL: &str = "SELECT pg_try_advisory_lock(hashtextextended(current_schema() || ':' || $1, 7311230)), set_config('application_name', $2, false), pg_backend_pid(), set_config('statement_timeout', $3, false)";
 
+pub(super) async fn fence_artifact_publication(
+    conn: &mut PgConnection,
+    id: &ArtifactId,
+) -> Result<(), PortError> {
+    let acquired: bool = sqlx::query_scalar(
+        "SELECT pg_try_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7311233))",
+    )
+    .bind(id.as_str())
+    .fetch_one(conn)
+    .await
+    .map_err(|err| internal_not_committed("pg_backup_artifact_fence", err.to_string()))?;
+    if !acquired {
+        return Err(unavailable_retryable(
+            "backup_artifact_publication_pending",
+            "artifact publication transaction is still active",
+            Duration::from_millis(50),
+        ));
+    }
+    Ok(())
+}
+
 pub(super) enum HoldOwnership {
     Local(Weak<CanonicalInner>, BackupId),
     Postgres {
-        connection: Box<PgConnection>,
+        connection: Option<Box<PgConnection>>,
         pid: i32,
     },
 }
@@ -65,7 +86,7 @@ impl HoldOwnership {
                     .map_err(|err| internal_not_committed("pg_backup_owner", err.to_string()))?;
                 if row.get::<bool, _>(0) {
                     return Ok(Self::Postgres {
-                        connection: Box::new(conn),
+                        connection: Some(Box::new(conn)),
                         pid: row.get(2),
                     });
                 }
@@ -96,6 +117,7 @@ impl HoldOwnership {
     pub(super) async fn with_write_tx<F, T>(
         &mut self,
         store: &CanonicalStore,
+        deadline: tokio::time::Instant,
         op: F,
     ) -> Result<T, PortError>
     where
@@ -104,18 +126,48 @@ impl HoldOwnership {
         let Self::Postgres { connection, .. } = self else {
             return store.with_write_tx(op).await;
         };
-        let _gate = store.inner.writer()?.acquire_commit_read_guard().await;
-        let mut backend = BackendConn::Postgres(connection);
-        let mut transaction = crate::sql_exec::WriteTransaction::begin(&mut backend).await?;
-        let value = op(&mut transaction.conn()).await?;
-        transaction.commit().await?;
-        Ok(value)
+        let conn = connection.as_mut().ok_or_else(hold_connection_closed)?;
+        let expired =
+            || deadline_not_committed("backup_owner_write", "backup SQL deadline expired");
+        let unknown = || {
+            crate::codec::unknown_commit_non_idempotent(
+                "backup_owner_commit",
+                "backup transaction commit was not acknowledged",
+            )
+        };
+        let _gate =
+            tokio::time::timeout_at(deadline, store.inner.writer()?.acquire_commit_read_guard())
+                .await
+                .map_err(|_| expired())?;
+        let mut committing = false;
+        let write = async {
+            let mut backend = BackendConn::Postgres(&mut **conn);
+            let mut transaction = crate::sql_exec::WriteTransaction::begin(&mut backend).await?;
+            let value = op(&mut transaction.conn()).await?;
+            committing = true;
+            tokio::time::timeout(BACKUP_CLEANUP_GRACE, transaction.commit())
+                .await
+                .map_err(|_| unknown())??;
+            Ok(value)
+        };
+        let result = tokio::time::timeout_at(deadline, write)
+            .await
+            .unwrap_or_else(|_| Err(if committing { unknown() } else { expired() }));
+        if result.is_err()
+            && rollback_backup_connection(conn, "backup_owner_rollback")
+                .await
+                .is_err()
+        {
+            drop(connection.take());
+        }
+        result
     }
 
     pub(super) async fn verify(&mut self) -> Result<(), PortError> {
         if let Self::Postgres { connection, .. } = self {
+            let conn = connection.as_mut().ok_or_else(hold_connection_closed)?;
             sqlx::raw_sql("SELECT 1")
-                .execute(&mut **connection)
+                .execute(&mut **conn)
                 .await
                 .map_err(|err| {
                     unavailable_retryable(
@@ -127,6 +179,14 @@ impl HoldOwnership {
         }
         Ok(())
     }
+}
+
+fn hold_connection_closed() -> PortError {
+    unavailable_retryable(
+        "pg_backup_hold_lost",
+        "backup hold connection closed",
+        Duration::from_millis(50),
+    )
 }
 
 pub(super) async fn interrupt_pg_session(
@@ -184,7 +244,7 @@ pub(super) async fn recover_holds(store: &CanonicalStore) -> Result<(), PortErro
     })).await
 }
 
-pub(super) async fn reap_scoped_exports(
+pub(super) async fn reap_abandoned_holds(
     store: &CanonicalStore,
     budget: &notarium_core::ports::CallBudget,
     after: String,
@@ -198,11 +258,11 @@ pub(super) async fn reap_scoped_exports(
             let error = |e: sqlx::Error| internal_not_committed("reap_archive_holds", e.to_string());
             let ids: Vec<String> = sqlx::query_scalar(
                 "SELECT DISTINCT backup_id FROM backup_holds
-                 WHERE scoped_export=1 AND backup_id>$1 ORDER BY backup_id LIMIT 16",
+                 WHERE backup_id>$1 ORDER BY backup_id LIMIT 16",
             ).bind(after).fetch_all(&mut **conn).await.map_err(error)?;
             for id in &ids {
                 sqlx::query(
-                    "DELETE FROM backup_holds WHERE backup_id=$1 AND scoped_export=1 AND
+                    "DELETE FROM backup_holds WHERE backup_id=$1 AND
                      pg_try_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7311230))",
                 ).bind(id).execute(&mut **conn).await.map_err(error)?;
             }
@@ -376,12 +436,20 @@ async fn reconcile(
     _lock: File,
 ) -> Result<(), PortError> {
     let lookup = id.clone();
-    let ready: bool = store.with_read_tx(|tx| Box::pin(async move {
+    // Use a fresh PostgreSQL snapshot after the fence. An unresolved COMMIT
+    // can still publish the pointer after the publishing client disconnects.
+    let ready: bool = store.with_read_tx_budget_pg_local_sql(
+        None,
+        Some("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+        |tx| Box::pin(async move {
         match tx {
             BackendConn::Sqlite(conn) => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM backup_artifacts WHERE artifact_id = ? AND state = 'ready')")
                 .bind(lookup.as_str()).fetch_one(&mut **conn).await.map_err(|e|internal_not_committed("recover_sqlite_artifact", e.to_string())),
-            BackendConn::Postgres(conn) => sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM backup_artifacts WHERE artifact_id = $1 AND state = 'ready')")
-                .bind(lookup.as_str()).fetch_one(&mut **conn).await.map_err(|e|crate::runtime::pg_read_error("recover_pg_artifact", e)),
+            BackendConn::Postgres(conn) => {
+                fence_artifact_publication(conn, &lookup).await?;
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM backup_artifacts WHERE artifact_id = $1 AND state = 'ready')")
+                    .bind(lookup.as_str()).fetch_one(&mut **conn).await.map_err(|e|crate::runtime::pg_read_error("recover_pg_artifact", e))
+            }
         }
     })).await?;
     remove_tmp_artifacts(&dir.join(format!("{}.tmp", id.as_str())))?;

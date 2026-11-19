@@ -2517,7 +2517,7 @@ struct CanonicalPreparedBackup {
     backup_id: BackupId,
     artifact_id: ArtifactId,
     prepare_budget: BackupBudget,
-    caller_cancel: Cancellation,
+    caller_cancel: Arc<phase::CaptureCancellation>,
     prepared_at: Instant,
     spool_dir: PathBuf,
     artifact_lease: Option<ArtifactLease>,
@@ -2609,7 +2609,7 @@ struct CanonicalPausedBackup {
     backup_id: BackupId,
     artifact_id: ArtifactId,
     prepare_budget: BackupBudget,
-    caller_cancel: Cancellation,
+    caller_cancel: Arc<phase::CaptureCancellation>,
     prepared_at: Instant,
     spool_dir: PathBuf,
     artifact_lease: Option<ArtifactLease>,
@@ -2720,7 +2720,7 @@ impl PausedBackup for CanonicalPausedBackup {
 
                     let result = wait_for_phase(
                         remaining,
-                        &self.caller_cancel,
+                        &self.caller_cancel.token,
                         &self.store.inner.backup_shutdown,
                         async {
                             reply_rx.await.map_err(|err| {
@@ -2764,7 +2764,7 @@ impl PausedBackup for CanonicalPausedBackup {
                     pg.pinned_at = Some(Instant::now());
                     let pin_res = wait_for_phase(
                         remaining,
-                        &self.caller_cancel,
+                        &self.caller_cancel.token,
                         &self.store.inner.backup_shutdown,
                         async {
                             let hold = &self.held_histories.as_ref().expect("pause owns hold").0;
@@ -2859,7 +2859,7 @@ struct CanonicalBackupSnapshot {
     backup_id: BackupId,
     artifact_id: ArtifactId,
     prepare_budget: BackupBudget,
-    caller_cancel: Cancellation,
+    caller_cancel: Arc<phase::CaptureCancellation>,
     prepared_at: Instant,
     spool_dir: PathBuf,
     artifact_lease: Option<ArtifactLease>,
@@ -2923,6 +2923,8 @@ impl CanonicalBackupSnapshot {
                     return Err(err);
                 }
             };
+            let deadline =
+                crate::runtime::deadline_after(tokio::time::Instant::now(), eff_budget.deadline);
 
             let Some(lease) = self.artifact_lease.as_mut() else {
                 self.cleanup_failure = abort_pinned_driver(pinned).await.err();
@@ -3105,6 +3107,7 @@ impl CanonicalBackupSnapshot {
                 bytes,
                 digest,
                 &self.witness,
+                deadline,
             )
             .await?;
             lease.accepted()?;
@@ -3138,7 +3141,7 @@ impl BackupSnapshot for CanonicalBackupSnapshot {
         Box::pin(async move {
             let shutdown = self.store.inner.backup_shutdown.clone();
             let hold = self.hold.clone();
-            let caller_cancel = self.caller_cancel.clone();
+            let caller_cancel = self.caller_cancel.token.clone();
             let stopped = async {
                 tokio::select! {
                     () = cancellation.cancelled() => {},
@@ -3250,23 +3253,14 @@ async fn open_cas_hold(
             proof.release.cancel();
             let _drained = proof.copying.write().await;
             let mut owner = proof.owner.lock().await.take().expect("hold owns session");
-            let result = tokio::time::timeout(
-                BACKUP_CLEANUP_GRACE,
-                delete_backup_hold_rows(
-                    &store,
-                    &mut owner,
-                    &backup_id,
-                    &proof.generation,
-                    held_count,
-                ),
+            let result = delete_backup_hold_rows(
+                &store,
+                &mut owner,
+                &backup_id,
+                &proof.generation,
+                Some(held_count),
             )
-            .await
-            .unwrap_or_else(|_| {
-                Err(crate::codec::unknown_commit_non_idempotent(
-                    "backup_hold_release_timeout",
-                    "backup hold release was not acknowledged",
-                ))
-            });
+            .await;
             drop(owner);
             let _ = done.send(result);
         });
@@ -3279,12 +3273,12 @@ async fn open_cas_hold(
 }
 
 impl CanonicalStore {
-    pub async fn reap_archive_export_holds(
+    pub async fn reap_abandoned_backup_holds(
         &self,
         budget: &CallBudget,
         after: String,
     ) -> Result<Option<String>, PortError> {
-        ownership::reap_scoped_exports(self, budget, after).await
+        ownership::reap_abandoned_holds(self, budget, after).await
     }
 
     /// Retain physical CAS publications for one Space while an export runs.
@@ -3331,7 +3325,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
                 self.store.clone(),
                 self.backup_id.clone(),
                 None,
-                self.caller_cancel.clone(),
+                self.caller_cancel.token.clone(),
                 tokio::time::Instant::now()
                     + self
                         .prepare_budget
@@ -3367,7 +3361,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
             let mut waiting_on_barrier = false;
             let result = wait_for_phase(
                 remaining,
-                &self.caller_cancel,
+                &self.caller_cancel.token,
                 &self.store.inner.backup_shutdown,
                 async {
                     let guard = self.store.inner.writer()?.acquire_safe_point().await;
@@ -3416,7 +3410,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
                 .deadline
                 .saturating_sub(self.prepared_at.elapsed());
             let shutdown = self.store.inner.backup_shutdown.clone();
-            let cancel = self.caller_cancel.clone();
+            let cancel = self.caller_cancel.token.clone();
             let watchdog = self.store.inner.backup_executor.spawn(async move {
                 tokio::select! {
                     () = tokio::time::sleep(lifetime) => {},
@@ -3451,7 +3445,7 @@ impl PreparedBackup for CanonicalPreparedBackup {
             let phase = phase::Phase::new(
                 &self.store.inner,
                 paused,
-                self.caller_cancel.clone(),
+                self.caller_cancel.token.clone(),
                 PausedBackup::resume,
             )
             .await?;
@@ -3466,6 +3460,7 @@ impl CanonicalStore {
         ctx: MaintenanceContext,
         backup: BackupId,
         budget: BackupBudget,
+        caller_cancel: Arc<phase::CaptureCancellation>,
     ) -> Result<CanonicalPreparedBackup, PortError> {
         let store = self.clone();
         ctx.authority.require(ServicePurpose::Backup)?;
@@ -3632,7 +3627,7 @@ impl CanonicalStore {
             artifact_id,
             prepared_at,
             prepare_budget: budget,
-            caller_cancel: ctx.budget.cancellation.clone(),
+            caller_cancel,
             spool_dir,
             artifact_lease: Some(artifact_lease),
             driver: Some(driver),
@@ -3753,34 +3748,73 @@ async fn acquire_owned_hold(
         id,
         generation,
         scope,
+        deadline,
         Arc::clone(&committing),
     ));
-    let reason = tokio::select! {
+    let (reason, result) = tokio::select! {
         biased;
-        reason = &mut stop => reason,
-        result = &mut write => {
-            let witness = result?;
-            drop(write);
-            return Ok((owner, witness));
+        reason = &mut stop => {
+            if !committing.load(Ordering::Acquire) {
+                drop(write);
+                owner.interrupt_acquisition(store, generation).await?;
+                return Err(reason);
+            }
+            (Some(reason), (&mut write).await)
         }
+        result = &mut write => (None, result),
     };
-    if committing.load(Ordering::Acquire) {
-        // An issued COMMIT may already be durable. Retain its owner and delete
-        // exactly this generation once its outcome is known.
-        let witness = write.await?;
-        delete_backup_hold_rows(
-            store,
-            &mut owner,
-            id,
-            generation,
-            witness.histories.len() as u64,
-        )
-        .await?;
-    } else {
-        drop(write);
-        owner.interrupt_acquisition(store, generation).await?;
+    drop(write);
+    match result {
+        Ok(witness) => {
+            if let Some(reason) = reason {
+                delete_backup_hold_rows(
+                    store,
+                    &mut owner,
+                    id,
+                    generation,
+                    Some(witness.histories.len() as u64),
+                )
+                .await?;
+                Err(reason)
+            } else {
+                Ok((owner, witness))
+            }
+        }
+        Err(error) => {
+            if committing.load(Ordering::Acquire) && matches!(owner, HoldOwnership::Postgres { .. })
+            {
+                // A rollback acknowledgement cannot tell whether COMMIT already took effect.
+                // End the old session and reacquire its lock before checking that generation.
+                let _ = owner.interrupt_acquisition(store, generation).await;
+                drop(owner);
+                if let Err(cleanup) = reconcile_pg_hold(store, id, generation).await {
+                    tracing::warn!(?cleanup, "backup hold remains eligible for recovery");
+                }
+            }
+            Err(error)
+        }
     }
-    Err(reason)
+}
+
+async fn reconcile_pg_hold(
+    store: &CanonicalStore,
+    id: &BackupId,
+    generation: &ArtifactId,
+) -> Result<(), PortError> {
+    let deadline = tokio::time::Instant::now() + BACKUP_CLEANUP_GRACE;
+    let recovery = mint_artifact_id()?;
+    let mut owner = tokio::time::timeout_at(
+        deadline,
+        HoldOwnership::acquire(store, id, &recovery, deadline),
+    )
+    .await
+    .map_err(|_| {
+        deadline_not_committed(
+            "backup_hold_reconcile",
+            "backup hold recovery deadline expired",
+        )
+    })??;
+    delete_backup_hold_rows(store, &mut owner, id, generation, None).await
 }
 
 async fn acquire_durable_backup_holds(
@@ -3789,6 +3823,7 @@ async fn acquire_durable_backup_holds(
     backup_id: &BackupId,
     generation: &ArtifactId,
     scope: Option<&HistoryScope>,
+    deadline: tokio::time::Instant,
     committing: Arc<AtomicBool>,
 ) -> Result<BackupWitness, PortError> {
     let bid = backup_id.clone();
@@ -3797,7 +3832,7 @@ async fn acquire_durable_backup_holds(
 
     let generation = generation.clone();
     let scope = scope.cloned();
-    owner.with_write_tx(store, |tx| {
+    owner.with_write_tx(store, deadline, |tx| {
             Box::pin(async move {
                 // Under the same session lock, only remnants of a disconnected predecessor may exist.
                 let stale = "DELETE FROM backup_holds WHERE backup_id = $1";
@@ -3999,38 +4034,48 @@ async fn delete_backup_hold_rows(
     owner: &mut HoldOwnership,
     backup_id: &BackupId,
     generation: &ArtifactId,
-    expected_count: u64,
+    expected_count: Option<u64>,
 ) -> Result<(), PortError> {
     let bid = backup_id.clone();
     let generation = generation.clone();
-    owner
-        .with_write_tx(store, |tx| {
-            Box::pin(async move {
-                let sql = "DELETE FROM backup_holds WHERE backup_id = $1 AND owner_generation = $2";
-                let deleted = match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query(sql)
-                        .bind(bid.as_str())
-                        .bind(generation.as_str())
-                        .execute(&mut **conn)
-                        .await
-                        .map(|r| r.rows_affected()),
-                    BackendConn::Postgres(conn) => sqlx::query(sql)
-                        .bind(bid.as_str())
-                        .bind(generation.as_str())
-                        .execute(&mut **conn)
-                        .await
-                        .map(|r| r.rows_affected()),
-                }
-                .map_err(|err| {
-                    internal_not_committed("delete_owned_backup_hold", err.to_string())
-                })?;
-                if deleted != expected_count {
-                    return Err(DomainError::validation(ValidationReason::InvalidState).into());
-                }
-                Ok(())
-            })
+    let postgres = matches!(owner, HoldOwnership::Postgres { .. });
+    let deadline = tokio::time::Instant::now() + BACKUP_CLEANUP_GRACE;
+    let write = owner.with_write_tx(store, deadline, |tx| {
+        Box::pin(async move {
+            let sql = "DELETE FROM backup_holds WHERE backup_id = $1 AND owner_generation = $2";
+            let deleted = match tx {
+                BackendConn::Sqlite(conn) => sqlx::query(sql)
+                    .bind(bid.as_str())
+                    .bind(generation.as_str())
+                    .execute(&mut **conn)
+                    .await
+                    .map(|r| r.rows_affected()),
+                BackendConn::Postgres(conn) => sqlx::query(sql)
+                    .bind(bid.as_str())
+                    .bind(generation.as_str())
+                    .execute(&mut **conn)
+                    .await
+                    .map(|r| r.rows_affected()),
+            }
+            .map_err(|err| internal_not_committed("delete_owned_backup_hold", err.to_string()))?;
+            if expected_count.is_some_and(|expected| deleted != expected) {
+                return Err(DomainError::validation(ValidationReason::InvalidState).into());
+            }
+            Ok(())
         })
-        .await
+    });
+    if postgres {
+        write.await
+    } else {
+        tokio::time::timeout_at(deadline, write)
+            .await
+            .map_err(|_| {
+                crate::codec::unknown_commit_non_idempotent(
+                    "backup_hold_release_timeout",
+                    "backup hold release was not acknowledged",
+                )
+            })?
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4044,6 +4089,7 @@ async fn persist_backup_artifact_ready(
     byte_size: u64,
     digest: ContentDigest,
     witness: &BackupWitness,
+    deadline: tokio::time::Instant,
 ) -> Result<(), PortError> {
     let aid = artifact_id.clone();
     let bid = backup_id.clone();
@@ -4056,11 +4102,15 @@ async fn persist_backup_artifact_ready(
     let histories = witness.histories.clone();
 
     let generation = proof.generation.clone();
-    let mut guard = proof.owner.lock().await;
+    let mut guard = tokio::time::timeout_at(deadline, proof.owner.lock())
+        .await
+        .map_err(|_| {
+            deadline_not_committed("backup_spool_owner", "backup spool deadline expired")
+        })?;
     let owner = guard
         .as_mut()
         .ok_or_else(|| DomainError::validation(ValidationReason::InvalidState))?;
-    owner.with_write_tx(store, |tx| {
+    owner.with_write_tx(store, deadline, |tx| {
             Box::pin(async move {
                 match tx {
                     BackendConn::Sqlite(conn) => {
@@ -4109,6 +4159,7 @@ async fn persist_backup_artifact_ready(
                         }
                     }
                     BackendConn::Postgres(conn) => {
+                        ownership::fence_artifact_publication(conn, &aid).await?;
                         sqlx::query(
                             "INSERT INTO backup_artifacts (
                                 artifact_id, backup_id, installation_id, encoding, schema_version,

@@ -78,7 +78,7 @@ impl ArchiveJobs {
         let mut hold = String::new();
         while let Some(after) = self
             .store
-            .reap_archive_export_holds(&command_budget(shutdown)?, hold)
+            .reap_abandoned_backup_holds(&command_budget(shutdown)?, hold)
             .await?
         {
             hold = after;
