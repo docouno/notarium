@@ -5,21 +5,20 @@ use edition 2024 and Rust 1.99.1, with unsafe code denied in first-party crates.
 The default member is `notarium-bin`; its default binary is `notariumd`.
 `notariumd` and `notarium-sidecar` use `mimalloc::MiMalloc`.
 
-The target backend separates control, canonical and rebuildable derived state.
-Local delivery uses independent SQLite files without `ATTACH DATABASE`: control
-data, canonical data with a batch writer and Zstd CAS, and derived generations
-published through ArcSwap. Cloud delivery targets PostgreSQL 16 and S3. Search
-targets pure Rust i8 mmap CSR-HNSW with `std::arch` SIMD. ONNX is loaded dynamically
-through `ort`, never downloaded during offline builds. Canonical/derived storage,
-search and live collaboration remain boundaries for upcoming work, not implemented
-behavior in this tree.
+The backend separates control, canonical and rebuildable derived state. Local
+delivery uses independent SQLite files without `ATTACH DATABASE`: control data,
+canonical data with a batch writer and Zstd CAS, and derived generations
+published through ArcSwap. Cloud delivery pairs PostgreSQL 16 with S3-compatible
+CAS. Search targets pure Rust i8 mmap CSR-HNSW with `std::arch` SIMD. ONNX is
+loaded dynamically through `ort`, never downloaded during offline builds.
 
-The core, syntax and control libraries implement [domain contracts](core-contracts.md),
+The core, syntax, canonical and control libraries implement [domain contracts](core-contracts.md),
 [document syntax](syntax.md) and [control-plane services](control.md), including
 authority/egress checks, typed ports, history-scoped receipts, exact comparisons,
 byte-preserving edits, SQLite/PostgreSQL control storage, authentication, OAuth/OIDC,
 the native keyring, guarded outbound HTTP, the AI provider gateway and the
-[control backup participant](control-backup.md). Canonical storage, projections,
+[control backup participant](control-backup.md). [Canonical storage](storage.md) provides SQLite and PostgreSQL persistence, CAS,
+chat history and a backup participant. Projections,
 search, collaboration and HTTP/MCP transport integration remain separate work.
 
 ## Internal dependency allowlist
@@ -49,8 +48,8 @@ tests invoke compiled binaries as external processes. HTTP cannot directly impor
 canonical/projections/search/jobs. Agents cannot directly depend on `tantivy`,
 `ort` or `yrs`. Core has no internal dependencies or I/O behavior. A separate
 native gate rejects parser, storage and runtime dependencies in core, including
-renamed, optional, target, development and build declarations. Core and syntax
-both use `forbid(unsafe_code)` so inner modules cannot override the workspace rule.
+renamed, optional, target, development and build declarations. Core, syntax and canonical all use `forbid(unsafe_code)` so inner modules cannot
+override the workspace rule.
 
 Native tests inspect `cargo metadata --no-deps` using package identities and paths,
 including aliases, development/build dependencies, optional and target-specific
@@ -61,7 +60,7 @@ locked for offline setup. `Cargo.lock` must contain none of `openssl-sys`,
 TLS uses rustls 0.23 with ring, reqwest 0.13 with `rustls-no-provider`, and tonic
 0.14 with `tls-ring`. Dependencies build in the pinned Rust image without adding
 C++/OpenSSL tools. Core/syntax tests exercise domain and document behavior;
-Control storage also tests its SQL schema, target import/export, authentication,
+Canonical tests exercise dual-dialect storage and CAS. Control storage tests its SQL schema, target import/export, authentication,
 Space authority and crash recovery. Remaining per-crate scaffold tests are compile
 smoke checks.
 

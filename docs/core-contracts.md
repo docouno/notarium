@@ -1,8 +1,10 @@
 # Core contracts
 
 `notarium-core` implements pure domain values, authorization checks and the port
-interfaces below. Storage, collaboration, transports and backup adapters belong
-to later deliveries. The [crate dependency matrix](architecture.md) stays in force.
+interfaces below. Canonical SQL and CAS persistence lives in
+[canonical storage](storage.md); control, projections, search, live collaboration
+and transports belong to their respective runtime owners. The
+[crate dependency matrix](architecture.md) stays in force.
 
 ## Values and admission
 
@@ -44,6 +46,9 @@ cannot add exceptions outside their parent's project authority.
 
 Canonical owners create classified documents. `ClassEgressFence` creates private
 projection/search/provider wrappers only after read, lifecycle and class checks.
+When a note moves between the captured revision and the current read, the
+document retains both sets of resource facts. A second reader must be able to
+read both locations. Metadata and derived content inherit this restriction.
 Encrypted documents have no secondary egress. Provider wrappers also bind the
 selected provider and consent audience. Completion messages distinguish document
 content from committed chat entries; chat has its own provenance and taint check.
@@ -118,8 +123,11 @@ and history checks precede sequence comparisons, snapshot lookup and idempotency
 lookup. A mismatch returns a typed `history_incarnation_mismatch` validation
 reason requiring resynchronization. It never silently restarts pagination.
 
-Restoring sequence 100 after a client received 101 must reject that client's old
-token, even when a different new mutation reaches 101. Restore invalidates old
+Canonical rebind accepts the exact head of each materialized Space, including
+zero. Each nonzero head must match a durable command boundary. A cutoff
+mismatch leaves every requested Space unchanged.
+After restoring a backup at sequence 100, a client's old token for 101 stays
+invalid even when a different mutation reaches 101. Restore invalidates old
 snapshot handles, streams and idempotency namespaces. Internal saved ack cursors
 are clamped to restored ceilings and rebound during the same cutover; this does
 not make external old tokens valid. Mutations retried with stale history must
@@ -214,6 +222,26 @@ provide any idempotency guarantee before retry is allowed. Service authority is
 not deserializable from external requests and grants no human content capability.
 Public subscriptions and revocations first pass verified scope/admission checks.
 
+## Mutation preconditions
+
+The `Mutation<T>` envelope can qualify the current entity revision and the
+lease and lineage of a note's collaborative room. Each producer accepts the
+following fields, in addition to its command-specific input.
+
+| Operation | Accepted envelope fields |
+| --- | --- |
+| Edit, trash, restore, purge, mint-and-purge, move or rename an existing note, append memory, link, accept an external observation, move a board card, update the Space schema note | `revision`, `lease`, `lineage` on the target or source note |
+| Move or rename a folder, rename a project, fork or append to a chat, consume pending input, redact a chat entry | `revision` on the folder or thread |
+| Create a note or chat, queue chat input, publish an ability package, roll back an agent run, create or cancel a content job | Empty envelope |
+
+Batch note and link items follow the corresponding single-operation rule.
+An unsupported field produces `InvalidState` after checking command identity
+and before using a receipt. It needs no knowledge of resource existence.
+Supported conditions are checked under current resource authority. A schema
+update that supplies a note revision requires an existing note. The expected
+package revision, queue base leaf, rollback run/entity/rank expectations and
+job cancellation lease belong to their typed inputs.
+
 ## Complete mutation intent across live rooms
 
 The live interceptor receives a typed mutation with the original authorization,
@@ -222,9 +250,38 @@ identity, target group, neighbour rank references, field changes and expected
 note/view/rank revisions. Equal field changes with different neighbours remain
 different commands.
 
-`Applied(receipt)` requires one canonical commit of the complete field/rank
-change. A rank conflict must not publish a partial field or CRDT update. The
-room owner performs the commit; the outer writer does not commit it again.
+`SettleCarrier` lets an active room owner accept an edit or external observation
+and supply its lease, lineage and checkpoint or close details. The canonical
+writer checks the original grant and records its ID in the note-owned receipt
+detail. The same transaction records the agent provenance, typed result,
+canonical history and room revision. An external observation records
+its disk identity and path in that transaction. A lost response can be retried
+with the original key after subsequent edits. The owner's snapshot covers the
+outstanding room updates. A room with neither a snapshot nor pending updates
+can accept a carrier while closing without a final snapshot.
+
+A note edit uses one caller deadline for the base read, room dispatch, CAS
+staging and writer acknowledgement. If the room receives the edit and its answer
+is lost, the caller receives an unknown commit outcome and can retry with
+the same command key. Historical note reads share one deadline across the
+revision lookup, object read and final authorization check.
+
+An external observation checks that its full carrier or applied patch produces
+the declared content digest before returning `NoChange` or a committed receipt.
+A replay first checks current write authority. A committed patch observation
+keeps its validated plan fingerprint in note-owned receipt detail until purge.
+For older receipts and equivalent alternative plans, verification applies the
+plan to the original revision of the same note and rechecks the receipt after
+reading storage. A missing original or a mismatched plan fails verification.
+A valid replay returns the original receipt without exposing historical bytes. The
+original caller deadline and cancellation cover the historical object read and
+the receipt check afterward. A cancelled replay submits no new mutation. A
+timeout after a live room receives a new observation can have an unknown commit
+outcome. Retry the same command key to resolve it.
+
+`Applied(receipt)` identifies the retained typed outcome of the original command.
+A Board move includes the complete field and rank change. Standalone room
+checkpoints and closes record their own room operations.
 Closed-room writes consume a reservation under a commit fence, avoiding the
 race between checking whether a room is open and writing directly.
 
@@ -240,7 +297,10 @@ pins both control and canonical database snapshots before resuming writers.
 In SQLite, `BEGIN DEFERRED; SELECT 1` does not pin a database snapshot; an actual
 database read is required. Both snapshots must retain the same original cut.
 
-The ordinary read-transaction budget remains below 250 ms. Backup source
+The ordinary read-transaction budget remains below 250 ms. PostgreSQL starts its
+240 ms snapshot budget after pool checkout and applies the configured statement
+timeout to each SQL statement. The caller deadline includes pool admission, SQL,
+external blob reads and the final access check for a note. Backup source
 snapshots have a bounded exception until a stable local database spool exists
 or the backup aborts. Incremental backup steps do not shorten this lifetime or
 eliminate its WAL checkpoint impact. Budgets specify a deadline, spool bytes and
@@ -253,9 +313,10 @@ Resume releases the writer pause, not snapshots or the CAS hold. Source snapshot
 close after the stable database spool; the reference-counted CAS hold lasts
 through blob copying. Uploading a spool does not retain source snapshots.
 Cancellation or failure of either participant releases all pauses, snapshots
-and holds; incomplete artifacts are never successful backups. Numeric budgets,
-adapter compatibility, crash recovery and the target pause below 1 ms require
-proof in the storage/backup deliveries, not core test doubles.
+and holds. Incomplete artifacts fail verification. Storage integration tests
+verify numeric budgets, adapter compatibility, crash recovery and the
+confirmed pause limit for each backend and hardware class.
+[Canonical storage](storage.md)
 
 `BackupWitness` carries installation and schema version, canonical history cursors
 when owned by that participant, and key ID/generation/active/readable/canary-digest

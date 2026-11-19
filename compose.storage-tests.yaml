@@ -1,0 +1,114 @@
+# Product-owned offline integration fixtures for canonical storage and CAS tests.
+# No host TCP ports or external networks are exposed; all test traffic flows over
+# Unix domain sockets inside .artifacts/storage-tests/<run>.
+services:
+  postgres:
+    image: postgres:16-bookworm@sha256:a49f7438ba03589f9b1ca062f2da82e899b48ea1dc50d2449fa09a70be83ebca
+    init: true
+    user: "${NOTARIUM_FIXTURE_UID:?}:${NOTARIUM_FIXTURE_GID:?}"
+    network_mode: none
+    stop_grace_period: 5s
+    environment:
+      POSTGRES_USER: "${NOTARIUM_FIXTURE_PG_USER:?}"
+      POSTGRES_PASSWORD: "${NOTARIUM_FIXTURE_PG_PASSWORD:?}"
+      POSTGRES_DB: "${NOTARIUM_FIXTURE_PG_DB:?}"
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+      PGDATA: /pgdata/db
+    command:
+      - postgres
+      - -h
+      - ""
+      - -c
+      - listen_addresses=
+      - -c
+      - fsync=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - checkpoint_timeout=30min
+      - -c
+      - min_wal_size=256MB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - max_connections=64
+    volumes:
+      - type: bind
+        source: "${NOTARIUM_FIXTURE_RUN_DIR:?}/passwd"
+        target: /etc/passwd
+        read_only: true
+      - type: bind
+        source: "${NOTARIUM_FIXTURE_RUN_DIR:?}/pgdata"
+        target: /pgdata
+      - type: bind
+        source: "${NOTARIUM_FIXTURE_RUN_DIR:?}/pgsock"
+        target: /var/run/postgresql
+    tmpfs:
+      - /tmp:mode=1777
+    labels:
+      io.notarium.storage-fixture.checkout: "${NOTARIUM_FIXTURE_CHECKOUT_HASH:?}"
+      io.notarium.storage-fixture.run: "${NOTARIUM_FIXTURE_RUN_ID:?}"
+
+  minio:
+    image: notarium-storage-fixture-minio-ce:9e49d5e7a648
+    build:
+      context: .
+      dockerfile: docker/storage-fixtures/minio-ce.Dockerfile
+    init: true
+    user: "${NOTARIUM_FIXTURE_UID:?}:${NOTARIUM_FIXTURE_GID:?}"
+    network_mode: none
+    read_only: true
+    stop_grace_period: 5s
+    environment:
+      HOME: /tmp
+      MINIO_ROOT_USER: "${NOTARIUM_FIXTURE_S3_ACCESS_KEY:?}"
+      MINIO_ROOT_PASSWORD: "${NOTARIUM_FIXTURE_S3_SECRET_KEY:?}"
+      MINIO_BROWSER: "off"
+      MINIO_UPDATE: "off"
+      MINIO_CALLHOME_ENABLE: "off"
+    command:
+      - server
+      - --address
+      - 127.0.0.1:9000
+      - --quiet
+      - /s3data/d1
+      - /s3data/d2
+      - /s3data/d3
+      - /s3data/d4
+    volumes:
+      - type: bind
+        source: "${NOTARIUM_FIXTURE_RUN_DIR:?}/s3data"
+        target: /s3data
+    tmpfs:
+      - /tmp:mode=1777
+    labels:
+      io.notarium.storage-fixture.checkout: "${NOTARIUM_FIXTURE_CHECKOUT_HASH:?}"
+      io.notarium.storage-fixture.run: "${NOTARIUM_FIXTURE_RUN_ID:?}"
+
+  s3-bridge:
+    image: notarium-storage-fixture-uds-bridge:local
+    build:
+      context: .
+      dockerfile: docker/storage-fixtures/uds-bridge.Dockerfile
+    init: true
+    user: "${NOTARIUM_FIXTURE_UID:?}:${NOTARIUM_FIXTURE_GID:?}"
+    network_mode: "service:minio"
+    read_only: true
+    stop_grace_period: 2s
+    depends_on:
+      - minio
+    command:
+      - serve
+      - /s3sock/s3.sock
+      - 127.0.0.1:9000
+    volumes:
+      - type: bind
+        source: "${NOTARIUM_FIXTURE_RUN_DIR:?}/s3sock"
+        target: /s3sock
+    tmpfs:
+      - /tmp:mode=1777
+    labels:
+      io.notarium.storage-fixture.checkout: "${NOTARIUM_FIXTURE_CHECKOUT_HASH:?}"
+      io.notarium.storage-fixture.run: "${NOTARIUM_FIXTURE_RUN_ID:?}"

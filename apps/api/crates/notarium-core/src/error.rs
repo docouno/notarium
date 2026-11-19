@@ -21,6 +21,9 @@ pub enum ValidationReason {
     HistoryIncarnationMismatch,
     CursorScopeMismatch,
     CursorStale,
+    InvalidCutoff,
+    PurgeResync,
+    NotReady,
     ReceiptLimitExceeded,
     InvalidQuery,
     UnsupportedQueryVersion,
@@ -184,7 +187,8 @@ impl DomainError {
             Self::ValidationFailed {
                 diagnostic: Diagnostic {
                     reason: ValidationReason::HistoryIncarnationMismatch
-                        | ValidationReason::CursorStale,
+                        | ValidationReason::CursorStale
+                        | ValidationReason::PurgeResync,
                     ..
                 }
             }

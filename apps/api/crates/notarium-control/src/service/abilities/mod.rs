@@ -133,17 +133,27 @@ impl ControlService {
     ) -> Result<AbilityDescriptor, PortError> {
         self.ability_placement_cached(ctx, &identity.placement, checked_spaces, checked_projects)
             .await?;
-        let value = self
+        let tip = self
             .catalog
             .current_ability(ctx.clone(), identity.clone())
             .await?;
-        if value.reference.identity() != identity
-            || valid_name(&value.name).is_err()
-            || value.auxiliary_files.len() > 64
-            || value
-                .auxiliary_files
-                .iter()
-                .any(|name| name.is_empty() || name.len() > 1024 || name.contains('\0'))
+        if tip.reference.identity() != identity {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        // A package tip may predate a move of its entrypoint. The exact lookup
+        // also checks the placement where this manifest was published.
+        let value = self
+            .catalog
+            .ability(ctx.clone(), tip.reference.clone())
+            .await?;
+        if value.reference != tip.reference {
+            return Err(invalid(ValidationReason::InvalidState));
+        }
+        if valid_name(&value.name).is_err()
+            || value.auxiliary_files.len() > MAX_ABILITY_AUX_FILES
+            || value.auxiliary_files.iter().any(|name| {
+                name.is_empty() || name.len() > MAX_ABILITY_AUX_PATH_BYTES || name.contains('\0')
+            })
         {
             return Err(invalid(ValidationReason::InvalidState));
         }

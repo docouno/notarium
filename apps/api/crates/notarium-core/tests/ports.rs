@@ -350,6 +350,9 @@ fn paginated_seed_and_jobs_preserve_their_own_identity_types_and_cut() {
                 .map(|n| ChatThread {
                     id: ChatThreadId::from_bytes([n; 16]),
                     space: scope(1).space_id,
+                    kind: ChatThreadKind::Personal,
+                    owner: PrincipalId::from_bytes([1; 16]),
+                    project_folder: None,
                     head: ThreadEntrySeq::ZERO,
                     revision: RevisionId::from_bytes([n; 16]),
                     tainted: false,
@@ -649,6 +652,7 @@ fn all_nine_port_boundaries_are_object_safe_and_use_runtime_free_send_futures() 
     let _: Arc<dyn EventBusPort> = ports.clone();
     let _: Arc<dyn SessionRevocationPort> = ports.clone();
     let _: Arc<dyn BackupParticipantPort> = ports.clone();
+    let _: Arc<dyn BoardMutationFactsProvider> = ports.clone();
     fn require_send<T: Send>(_: &T) {}
     let call = control.whoami(AccountContext::new(auth(), budget()));
     require_send(&call);
@@ -714,7 +718,9 @@ fn room_open_close_and_command_changes_invalidate_linear_reservations() {
 }
 
 #[test]
-fn board_interception_retains_rank_intent_in_addition_to_field_overrides() {
+fn board_interception_retains_rank_intent_and_unforgeable_facts() {
+    let authority = BoardPlannerAuthority::admit();
+    let other_authority = BoardPlannerAuthority::admit();
     let board = MoveBoardCard {
         view: ViewRef {
             note: NoteId::from_bytes([1; 16]),
@@ -725,13 +731,44 @@ fn board_interception_retains_rank_intent_in_addition_to_field_overrides() {
         before: None,
         after: Some(RankNeighbor {
             note: NoteId::from_bytes([3; 16]),
-            expected_rank_revision: RevisionId::from_bytes([3; 16]),
+            expected_rank: RankExpectation::Absent,
         }),
         fields: BTreeMap::from([("status".into(), Some(YamlValue::String("done".into())))]),
         expected_note: RevisionId::from_bytes([1; 16]),
         expected_view: RevisionId::from_bytes([1; 16]),
-        expected_rank: RevisionId::from_bytes([1; 16]),
+        expected_rank: RankExpectation::Absent,
     };
+    let facts = BoardMoveFacts::attest(
+        &authority,
+        BoardMoveFactsSpec {
+            scope: scope(1),
+            cutoff: SpaceSeq::new(10).unwrap(),
+            view: board.view.clone(),
+            view_revision: board.expected_view.clone(),
+            schema_revision: None,
+            descriptor_fingerprint: ContentDigest::from_bytes([7; 32]),
+            group_field: "status".into(),
+            group_field_kind: BoardGroupFieldKind::String,
+            groups: vec![EvaluatedBoardGroup {
+                group: board.group.clone(),
+                rows: vec![EvaluatedBoardRow {
+                    note: NoteId::from_bytes([3; 16]),
+                    expected_note: RevisionId::from_bytes([3; 16]),
+                    expected_rank: RankExpectation::Absent,
+                    base_order_binding: ContentDigest::from_bytes([3; 32]),
+                }],
+            }],
+            before_placement: SemanticPlacement::InGroup {
+                group: GroupKey::Value(ScalarValue::String("todo".into())),
+                predecessor: None,
+                successor: None,
+            },
+            base_order_binding: ContentDigest::from_bytes([2; 32]),
+            after_eligible_in_group: true,
+        },
+    );
+    assert!(facts.verify_authority(&authority).is_ok());
+    assert!(facts.verify_authority(&other_authority).is_err());
     let request = InterceptedMutation {
         context: context(),
         identity: identity(1),
@@ -739,12 +776,20 @@ fn board_interception_retains_rank_intent_in_addition_to_field_overrides() {
             revision: Some(board.expected_note.clone()),
             ..Preconditions::default()
         },
-        payload: InterceptedPayload::MoveBoardCard(board.clone()),
+        payload: InterceptedPayload::MoveBoardCard {
+            card: board.clone(),
+            facts: Box::new(facts.clone()),
+        },
     };
-    let InterceptedPayload::MoveBoardCard(intercepted) = request.payload else {
+    let InterceptedPayload::MoveBoardCard {
+        card: intercepted,
+        facts: intercepted_facts,
+    } = request.payload
+    else {
         panic!()
     };
     assert_eq!(intercepted, board);
+    assert_eq!(*intercepted_facts, facts);
     let moved_elsewhere = MoveBoardCard {
         before: board.after.clone(),
         after: None,
@@ -1339,6 +1384,7 @@ impl ChangeBroadcast for BroadcastFixture {
                             after: through,
                             ..after
                         },
+                        safe_ack_end: through,
                         cutoff: through,
                         complete: true,
                     }))
@@ -1623,4 +1669,48 @@ fn backup_guards_release_every_phase_on_second_participant_failure_budget_or_can
     assert!(paired_copy(&state, false, backup_budget(), cancel).is_err());
     let value = state.lock().unwrap();
     assert_eq!((value.holds, value.pauses, value.snapshots), (0, 0, 0));
+}
+
+#[test]
+fn canonical_seams_enforce_command_ranges_chat_staging_and_nanosecond_timestamps() {
+    use notarium_core::{error::ValidationReason, value::Timestamp};
+
+    let _ = <dyn NoteWritePort>::mint_and_purge;
+
+    let range =
+        CommandSeqRange::new(SpaceSeq::new(101).unwrap(), SpaceSeq::new(102).unwrap()).unwrap();
+    assert!(range.contains(SpaceSeq::new(101).unwrap()));
+    assert!(range.contains(SpaceSeq::new(102).unwrap()));
+    assert!(range.splits_cutoff(SpaceSeq::new(101).unwrap()));
+    assert!(!range.splits_cutoff(SpaceSeq::new(100).unwrap()));
+    assert!(!range.splits_cutoff(SpaceSeq::new(102).unwrap()));
+    assert!(CommandSeqRange::new(SpaceSeq::ZERO, SpaceSeq::new(1).unwrap()).is_err());
+    assert!(CommandSeqRange::new(SpaceSeq::new(5).unwrap(), SpaceSeq::new(4).unwrap()).is_err());
+
+    assert!(DomainError::validation(ValidationReason::PurgeResync).requires_resync());
+    assert!(!DomainError::validation(ValidationReason::InvalidCutoff).requires_resync());
+    assert!(!DomainError::validation(ValidationReason::NotReady).requires_resync());
+
+    assert!(
+        StagedChatBlob::attest_canonical(
+            scope(1).space_id,
+            PrincipalId::from_bytes([1; 16]),
+            ContentDigest::from_bytes([1; 32]),
+            512,
+        )
+        .is_err()
+    );
+    let staged = StagedChatBlob::attest_canonical(
+        scope(1).space_id,
+        PrincipalId::from_bytes([1; 16]),
+        ContentDigest::from_bytes([2; 32]),
+        513,
+    )
+    .unwrap();
+    assert_eq!(staged.byte_len(), 513);
+
+    let ts = Timestamp::parse("2026-11-15T12:34:56.123456789Z").unwrap();
+    let roundtrip = Timestamp::from_unix_parts(ts.unix_seconds(), ts.nanosecond()).unwrap();
+    assert_eq!(ts, roundtrip);
+    assert!(Timestamp::from_unix_parts(ts.unix_seconds(), 1_000_000_000).is_err());
 }

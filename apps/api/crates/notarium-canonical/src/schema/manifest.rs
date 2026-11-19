@@ -1,0 +1,818 @@
+use std::{collections::BTreeSet, sync::LazyLock};
+
+use notarium_core::ids::ContentDigest;
+
+pub const CANONICAL_SCHEMA_VERSION: u32 = 6;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogicalColKind {
+    Int,
+    Text,
+    Bytes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColumnSpec {
+    pub name: &'static str,
+    pub kind: LogicalColKind,
+    pub nullable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TableSpec {
+    pub name: &'static str,
+    pub primary_key: &'static [&'static str],
+    pub columns: &'static [ColumnSpec],
+    pub indexes: &'static [&'static str],
+}
+
+const fn col(name: &'static str, kind: LogicalColKind, nullable: bool) -> ColumnSpec {
+    ColumnSpec {
+        name,
+        kind,
+        nullable,
+    }
+}
+
+use LogicalColKind::{Bytes, Int, Text};
+
+pub const CANONICAL_TABLES: &[TableSpec] = &[
+    TableSpec {
+        name: "schema_meta",
+        primary_key: &["singleton_id"],
+        columns: &[
+            col("singleton_id", Int, false),
+            col("schema_version", Int, false),
+            col("epoch_version", Int, false),
+            col("installation_id", Text, false),
+            col("migration_state", Text, false),
+            col("manifest_checksum", Bytes, false),
+            col("initialized_at_sec", Int, false),
+            col("initialized_at_nsec", Int, false),
+            col("updated_at_sec", Int, false),
+            col("updated_at_nsec", Int, false),
+        ],
+        indexes: &[],
+    },
+    TableSpec {
+        name: "spaces",
+        primary_key: &["space_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("history_incarnation", Bytes, false),
+            col("root_folder_id", Text, false),
+            col("slug", Text, false),
+            col("slug_fold", Text, false),
+            col("space_kind", Text, false),
+            col("owner_id", Text, false),
+            col("lifecycle_state", Text, false),
+            col("active_epoch", Int, false),
+            col("last_seq", Int, false),
+            col("settings_json", Text, false),
+            col("created_at_sec", Int, false),
+            col("created_at_nsec", Int, false),
+        ],
+        indexes: &["uq_spaces_slug_fold"],
+    },
+    TableSpec {
+        name: "folder_heads",
+        primary_key: &["space_id", "folder_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("folder_id", Text, false),
+            col("parent_folder_id", Text, true),
+            col("is_root", Int, false),
+            col("slug", Text, false),
+            col("slug_fold", Text, false),
+            col("display_name", Text, false),
+            col("is_project", Int, false),
+            col("project_slug", Text, true),
+            col("project_slug_fold", Text, true),
+            col("description", Text, true),
+            col("cover_note_id", Text, true),
+            col("write_lock_json", Text, true),
+            col("lifecycle_state", Text, false),
+            col("rev_seq", Int, false),
+            col("head_rev_id", Text, false),
+            col("created_seq", Int, false),
+            col("updated_seq", Int, false),
+            col("updated_at_sec", Int, false),
+            col("updated_at_nsec", Int, false),
+        ],
+        indexes: &[
+            "uq_folder_heads_root",
+            "uq_folder_heads_active_sibling",
+            "uq_folder_heads_active_project",
+            "idx_folder_heads_parent_lifecycle",
+            "idx_folder_heads_cover",
+        ],
+    },
+    TableSpec {
+        name: "folder_aliases",
+        primary_key: &[
+            "space_id",
+            "old_parent_folder_id",
+            "old_slug_fold",
+            "created_seq",
+            "target_folder_id",
+        ],
+        columns: &[
+            col("space_id", Text, false),
+            col("old_parent_folder_id", Text, false),
+            col("old_slug_fold", Text, false),
+            col("target_folder_id", Text, false),
+            col("created_seq", Int, false),
+        ],
+        indexes: &["idx_folder_aliases_lookup"],
+    },
+    TableSpec {
+        name: "note_heads",
+        primary_key: &["space_id", "note_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("note_id", Text, false),
+            col("parent_folder_id", Text, false),
+            col("slug", Text, false),
+            col("slug_fold", Text, false),
+            col("title", Text, false),
+            col("title_fold", Text, false),
+            col("doc_class", Text, false),
+            col("ability_id", Text, true),
+            col("head_rev_id", Text, false),
+            col("content_blake3", Bytes, true),
+            col("byte_size", Int, false),
+            col("lifecycle_state", Text, false),
+            col("visibility_mask", Int, false),
+            col("settlement_successor_id", Text, true),
+            col("created_seq", Int, false),
+            col("updated_seq", Int, false),
+            col("created_at_sec", Int, false),
+            col("created_at_nsec", Int, false),
+            col("updated_at_sec", Int, false),
+            col("updated_at_nsec", Int, false),
+            col("last_actor_id", Text, false),
+        ],
+        indexes: &[
+            "uq_note_heads_active_sibling",
+            "idx_note_heads_parent_lifecycle",
+            "idx_note_heads_created_seq",
+        ],
+    },
+    TableSpec {
+        name: "note_aliases",
+        primary_key: &[
+            "space_id",
+            "old_parent_folder_id",
+            "old_slug_fold",
+            "created_seq",
+            "target_note_id",
+        ],
+        columns: &[
+            col("space_id", Text, false),
+            col("old_parent_folder_id", Text, false),
+            col("old_slug_fold", Text, false),
+            col("old_title_norm", Text, false),
+            col("target_note_id", Text, false),
+            col("created_seq", Int, false),
+        ],
+        indexes: &[
+            "idx_note_aliases_slug_lookup",
+            "idx_note_aliases_title_lookup",
+            "idx_note_aliases_target",
+        ],
+    },
+    TableSpec {
+        name: "space_field_schemas",
+        primary_key: &["space_id", "schema_rev_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("schema_rev_id", Text, false),
+            col("schema_note_id", Text, false),
+            col("is_current", Int, false),
+            col("descriptor_msgpack", Bytes, false),
+            col("descriptor_fingerprint", Bytes, false),
+            col("created_seq", Int, false),
+            col("visibility_seq", Int, false),
+            col("created_at_sec", Int, false),
+            col("created_at_nsec", Int, false),
+        ],
+        indexes: &[
+            "uq_space_field_schemas_current",
+            "idx_space_field_schemas_vis",
+        ],
+    },
+    TableSpec {
+        name: "revisions",
+        primary_key: &["space_id", "rev_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("history_incarnation", Bytes, false),
+            col("rev_id", Text, false),
+            col("entity_type", Text, false),
+            col("entity_key", Text, false),
+            col("space_seq", Int, false),
+            col("visibility_seq", Int, false),
+            col("parent_rev_id", Text, true),
+            col("their_rev_id", Text, true),
+            col("restored_from_rev_id", Text, true),
+            col("content_blake3", Bytes, true),
+            col("metadata_msgpack", Bytes, false),
+            col("patch_meta_json", Text, true),
+            col("actor_id", Text, false),
+            col("session_id", Text, true),
+            col("agent_run_id", Text, true),
+            col("quarantine_reason", Text, true),
+            col("created_at_sec", Int, false),
+            col("created_at_nsec", Int, false),
+        ],
+        indexes: &[
+            "idx_revisions_entity_vis_seq",
+            "idx_revisions_agent_run",
+            "idx_revisions_parent_rev",
+        ],
+    },
+    TableSpec {
+        name: "revision_purge_fences",
+        primary_key: &["space_id", "note_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("history_incarnation", Bytes, false),
+            col("note_id", Text, false),
+            col("purge_seq", Int, false),
+            col("old_identity_state", Text, false),
+            col("successor_note_id", Text, true),
+            col("created_at_sec", Int, false),
+            col("created_at_nsec", Int, false),
+        ],
+        indexes: &[],
+    },
+    TableSpec {
+        name: "ability_packages",
+        primary_key: &["space_id", "ability_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("ability_id", Text, false),
+            col("kind", Text, false),
+            col("slug_fold", Text, false),
+            col("entrypoint_note_id", Text, false),
+            col("manifest_rev_id", Text, false),
+            col("resource_manifest_json", Text, false),
+            col("lifecycle_state", Text, false),
+            col("created_seq", Int, false),
+            col("updated_seq", Int, false),
+        ],
+        indexes: &[
+            "uq_ability_packages_active_slug",
+            "idx_ability_packages_entrypoint",
+        ],
+    },
+    TableSpec {
+        name: "view_rank_overlays",
+        primary_key: &["space_id", "view_note_id", "view_key", "target_note_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("view_note_id", Text, false),
+            col("view_key", Text, false),
+            col("target_note_id", Text, false),
+            col("group_key_msgpack", Bytes, false),
+            col("group_key_hex", Text, false),
+            col("sort_rank_lexo", Text, false),
+            col("rank_rev_id", Text, false),
+            col("placement_revision", Text, false),
+            col("placement_actor_id", Text, false),
+            col("placement_run_id", Text, true),
+            col("updated_seq", Int, false),
+        ],
+        indexes: &[
+            "idx_view_rank_overlays_order",
+            "idx_view_rank_overlays_target",
+        ],
+    },
+    TableSpec {
+        name: "blob_catalog",
+        primary_key: &["space_id", "content_blake3"],
+        columns: &[
+            col("space_id", Text, false),
+            col("content_blake3", Bytes, false),
+            col("raw_size", Int, false),
+            col("compressed_size", Int, false),
+            col("ref_count", Int, false),
+            col("current_publication_id", Text, true),
+            col("admission_state", Text, false),
+            col("blob_state", Text, false),
+            col("touched_at_ms", Int, false),
+        ],
+        indexes: &["idx_blob_catalog_zero_ref"],
+    },
+    TableSpec {
+        name: "blob_publications",
+        primary_key: &["space_id", "publication_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("publication_id", Text, false),
+            col("content_blake3", Bytes, false),
+            col("owner_epoch", Int, false),
+            col("codec", Text, false),
+            col("state", Text, false),
+            col("manifest_sealed", Int, false),
+            col("part_count", Int, false),
+            col("raw_size", Int, false),
+            col("compressed_size", Int, false),
+            col("created_at_ms", Int, false),
+            col("updated_at_ms", Int, false),
+        ],
+        indexes: &[
+            "uq_blob_publications_active_digest",
+            "idx_blob_publications_digest_state",
+        ],
+    },
+    TableSpec {
+        name: "blob_parts",
+        primary_key: &["space_id", "publication_id", "part_index"],
+        columns: &[
+            col("space_id", Text, false),
+            col("publication_id", Text, false),
+            col("part_index", Int, false),
+            col("raw_size", Int, false),
+            col("compressed_size", Int, false),
+            col("part_blake3", Bytes, false),
+            col("physical_key", Text, false),
+            col("observed_version_id", Text, true),
+            col("upload_confirmed", Int, false),
+        ],
+        indexes: &["uq_blob_parts_physical_key"],
+    },
+    TableSpec {
+        name: "blob_references",
+        primary_key: &[
+            "space_id",
+            "owner_kind",
+            "owner_rev_id",
+            "owner_id",
+            "resource_key",
+        ],
+        columns: &[
+            col("space_id", Text, false),
+            col("owner_kind", Text, false),
+            col("owner_id", Text, false),
+            col("owner_rev_id", Text, false),
+            col("resource_key", Text, false),
+            col("content_blake3", Bytes, false),
+            col("publication_id", Text, false),
+            col("created_seq", Int, false),
+        ],
+        indexes: &["idx_blob_references_owner", "idx_blob_references_digest"],
+    },
+    TableSpec {
+        name: "blob_retirements",
+        primary_key: &["space_id", "retirement_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("retirement_id", Text, false),
+            col("history_incarnation", Bytes, false),
+            col("owner_epoch", Int, false),
+            col("reason", Text, false),
+            col("purge_id", Text, true),
+            col("status", Text, false),
+            col("created_at_ms", Int, false),
+            col("completed_at_ms", Int, true),
+        ],
+        indexes: &["idx_blob_retirements_status"],
+    },
+    TableSpec {
+        name: "blob_retirement_targets",
+        primary_key: &["space_id", "retirement_id", "publication_id", "part_index"],
+        columns: &[
+            col("space_id", Text, false),
+            col("retirement_id", Text, false),
+            col("publication_id", Text, false),
+            col("part_index", Int, false),
+            col("content_blake3", Bytes, false),
+            col("codec", Text, false),
+            col("physical_key", Text, false),
+            col("marker_verified", Int, false),
+            col("data_version_ids_json", Text, true),
+            col("versions_deleted", Int, false),
+            col("target_completed", Int, false),
+        ],
+        indexes: &[],
+    },
+    TableSpec {
+        name: "backup_holds",
+        primary_key: &["backup_id", "space_id"],
+        columns: &[
+            col("backup_id", Text, false),
+            col("space_id", Text, false),
+            col("history_incarnation", Bytes, false),
+            col("owner_installation_id", Text, false),
+            col("phase", Text, false),
+            col("cutoff_seq", Int, false),
+            col("witness_json", Text, false),
+            col("created_at_ms", Int, false),
+            col("owner_generation", Text, false),
+        ],
+        indexes: &["idx_backup_holds_space"],
+    },
+    TableSpec {
+        name: "backup_artifacts",
+        primary_key: &["artifact_id"],
+        columns: &[
+            col("artifact_id", Text, false),
+            col("backup_id", Text, false),
+            col("installation_id", Text, false),
+            col("encoding", Text, false),
+            col("schema_version", Int, false),
+            col("artifact_rel_path", Text, false),
+            col("byte_size", Int, false),
+            col("content_blake3", Bytes, false),
+            col("witness_json", Text, false),
+            col("state", Text, false),
+            col("created_at_ms", Int, false),
+        ],
+        indexes: &["idx_backup_artifacts_backup"],
+    },
+    TableSpec {
+        name: "command_receipts",
+        primary_key: &[
+            "space_id",
+            "history_incarnation",
+            "actor_id",
+            "idempotency_key",
+        ],
+        columns: &[
+            col("space_id", Text, false),
+            col("history_incarnation", Bytes, false),
+            col("actor_id", Text, false),
+            col("idempotency_key", Text, false),
+            col("command_hash", Bytes, false),
+            col("status", Text, false),
+            col("envelope_version", Int, false),
+            col("response_payload_id", Text, true),
+            col("sanitized_envelope_msgpack", Bytes, false),
+            col("canonical_seq", Int, false),
+            col("expires_at_ms", Int, false),
+        ],
+        indexes: &[
+            "idx_command_receipts_expires",
+            "idx_receipt_exception_pointer",
+        ],
+    },
+    TableSpec {
+        name: "change_commands",
+        primary_key: &["space_id", "history_incarnation", "command_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("history_incarnation", Bytes, false),
+            col("command_id", Text, false),
+            col("first_seq", Int, false),
+            col("last_seq", Int, false),
+            col("command_kind", Text, false),
+            col("payload_id", Text, true),
+            col("committed_at_ms", Int, false),
+        ],
+        indexes: &["uq_change_commands_last_seq"],
+    },
+    TableSpec {
+        name: "change_log",
+        primary_key: &["space_id", "space_seq"],
+        columns: &[
+            col("space_id", Text, false),
+            col("space_seq", Int, false),
+            col("history_incarnation", Bytes, false),
+            col("command_id", Text, false),
+            col("command_first_seq", Int, false),
+            col("command_last_seq", Int, false),
+            col("entity_type", Text, false),
+            col("entity_id", Text, false),
+            col("op_kind", Text, false),
+            col("rev_id", Text, false),
+            col("lifecycle_state", Text, false),
+            col("doc_class", Text, true),
+            col("payload_id", Text, true),
+            col("committed_at_ms", Int, false),
+        ],
+        indexes: &[],
+    },
+    TableSpec {
+        name: "change_payloads",
+        primary_key: &["space_id", "payload_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("payload_id", Text, false),
+            col("codec", Text, false),
+            col("erased_by_purge", Int, false),
+            col("effect_msgpack", Bytes, true),
+            col("created_seq", Int, false),
+        ],
+        indexes: &[],
+    },
+    TableSpec {
+        name: "payload_owners",
+        primary_key: &["space_id", "note_id", "payload_kind", "payload_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("payload_kind", Text, false),
+            col("payload_id", Text, false),
+            col("note_id", Text, false),
+        ],
+        indexes: &["idx_payload_owners_job"],
+    },
+    TableSpec {
+        name: "agent_run_heads",
+        primary_key: &["space_id", "run_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("history_incarnation", Bytes, false),
+            col("run_id", Text, false),
+            col("run_revision", Text, false),
+            col("last_seq", Int, false),
+            col("updated_at_sec", Int, false),
+            col("updated_at_nsec", Int, false),
+        ],
+        indexes: &[],
+    },
+    TableSpec {
+        name: "board_move_history",
+        primary_key: &["space_id", "command_end_seq", "ordinal"],
+        columns: &[
+            col("space_id", Text, false),
+            col("history_incarnation", Bytes, false),
+            col("command_end_seq", Int, false),
+            col("ordinal", Int, false),
+            col("facts_cutoff_seq", Int, false),
+            col("actor_id", Text, false),
+            col("agent_run_id", Text, true),
+            col("view_note_id", Text, false),
+            col("view_key", Text, false),
+            col("view_rev_id", Text, false),
+            col("schema_rev_id", Text, true),
+            col("descriptor_fingerprint", Bytes, false),
+            col("target_note_id", Text, false),
+            col("before_placement_revision", Text, true),
+            col("after_placement_revision", Text, false),
+            col("after_rank_rev_id", Text, false),
+            col("physical_precondition_json", Text, false),
+            col("before_placement_msgpack", Bytes, false),
+            col("after_placement_msgpack", Bytes, false),
+            col("base_order_binding", Bytes, false),
+        ],
+        indexes: &[
+            "idx_board_move_history_run",
+            "idx_board_move_history_target",
+            "idx_board_move_history_view",
+        ],
+    },
+    TableSpec {
+        name: "chat_threads",
+        primary_key: &["space_id", "thread_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("history_incarnation", Bytes, false),
+            col("thread_id", Text, false),
+            col("kind", Text, false),
+            col("owner_id", Text, false),
+            col("project_folder_id", Text, true),
+            col("title", Text, false),
+            col("head_leaf_seq", Int, false),
+            col("head_rev_id", Text, false),
+            col("next_entry_seq", Int, false),
+            col("active_run_id", Text, true),
+            col("ext_space_tainted_mask", Int, false),
+            col("created_seq", Int, false),
+            col("updated_seq", Int, false),
+            col("created_at_sec", Int, false),
+            col("created_at_nsec", Int, false),
+            col("updated_at_sec", Int, false),
+            col("updated_at_nsec", Int, false),
+        ],
+        indexes: &["idx_chat_threads_created_seq"],
+    },
+    TableSpec {
+        name: "chat_entries",
+        primary_key: &["space_id", "thread_id", "entry_seq"],
+        columns: &[
+            col("space_id", Text, false),
+            col("thread_id", Text, false),
+            col("entry_seq", Int, false),
+            col("parent_seq", Int, true),
+            col("revision_id", Text, false),
+            col("kind", Text, false),
+            col("tool_call_id", Text, true),
+            col("author_id", Text, false),
+            col("agent_run_id", Text, true),
+            col("inline_text", Text, true),
+            col("payload_blake3", Bytes, true),
+            col("referenced_notes_json", Text, false),
+            col("ext_space_tainted", Int, false),
+            col("is_chain_node", Int, false),
+            col("branch_depth", Int, false),
+            col("anc_16_seq", Int, true),
+            col("anc_256_seq", Int, true),
+            col("created_space_seq", Int, false),
+            col("redacted_at_seq", Int, true),
+            col("checkpoint_stale", Int, false),
+        ],
+        indexes: &["idx_chat_entries_parent", "idx_chat_entries_compaction"],
+    },
+    TableSpec {
+        name: "chat_pending_inputs",
+        primary_key: &["space_id", "thread_id", "input_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("thread_id", Text, false),
+            col("input_id", Text, false),
+            col("ordinal", Int, false),
+            col("author_id", Text, false),
+            col("inline_text", Text, true),
+            col("payload_blake3", Bytes, true),
+            col("queued_base_leaf_seq", Int, false),
+            col("in_flight_run_id", Text, false),
+            col("mentions_agent", Int, false),
+            col("status", Text, false),
+            col("enqueued_seq", Int, false),
+            col("consumed_entry_seq", Int, true),
+            col("ext_space_tainted", Int, false),
+        ],
+        indexes: &[
+            "uq_chat_pending_inputs_ordinal",
+            "idx_chat_pending_inputs_active",
+        ],
+    },
+    TableSpec {
+        name: "collab_sessions",
+        primary_key: &["space_id", "note_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("note_id", Text, false),
+            col("lease_epoch", Int, false),
+            col("lineage_epoch", Int, false),
+            col("carrier_rev_id", Text, false),
+            col("yrs_snapshot_blake3", Bytes, true),
+            col("room_state", Text, false),
+            col("owner_id", Text, true),
+            col("updated_seq", Int, false),
+            col("yrs_snapshot_blob", Bytes, true),
+        ],
+        indexes: &[],
+    },
+    TableSpec {
+        name: "collab_update_log",
+        primary_key: &["space_id", "note_id", "lease_epoch", "update_seq"],
+        columns: &[
+            col("space_id", Text, false),
+            col("note_id", Text, false),
+            col("lease_epoch", Int, false),
+            col("update_seq", Int, false),
+            col("update_bytes", Bytes, false),
+            col("created_at_ms", Int, false),
+        ],
+        indexes: &[],
+    },
+    TableSpec {
+        name: "content_jobs",
+        primary_key: &["space_id", "job_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("job_id", Text, false),
+            col("job_kind", Text, false),
+            col("payload_msgpack", Bytes, true),
+            col("payload_erased_by_purge", Int, false),
+            col("state", Text, false),
+            col("lease_owner", Text, true),
+            col("lease_epoch", Int, false),
+            col("lease_until_ms", Int, true),
+            col("attempts", Int, false),
+            col("completed_units", Int, false),
+            col("total_units", Int, true),
+            col("artifacts_json", Text, false),
+            col("result_msgpack", Bytes, true),
+            col("error_ref", Bytes, true),
+            col("created_seq", Int, false),
+            col("updated_seq", Int, false),
+        ],
+        indexes: &["idx_content_jobs_claim"],
+    },
+    TableSpec {
+        name: "materialized_observations",
+        primary_key: &["space_id", "note_id", "rel_path"],
+        columns: &[
+            col("space_id", Text, false),
+            col("note_id", Text, false),
+            col("rel_path", Text, false),
+            col("inode", Int, true),
+            col("mtime_ns", Int, true),
+            col("byte_size", Int, false),
+            col("blake3_hash", Bytes, false),
+            col("disk_identity", Bytes, false),
+            col("observed_revision", Text, false),
+            col("applied_seq", Int, false),
+        ],
+        indexes: &[],
+    },
+    TableSpec {
+        name: "pending_purges",
+        primary_key: &["space_id", "purge_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("purge_id", Text, false),
+            col("history_incarnation", Bytes, false),
+            col("actor_id", Text, false),
+            col("idempotency_key", Text, false),
+            col("command_hash", Bytes, false),
+            col("old_note_id", Text, false),
+            col("new_note_id", Text, true),
+            col("new_note_rev_id", Text, true),
+            col("canonical_seq", Int, false),
+            col("phase", Text, false),
+            col("retirement_ids_json", Text, false),
+            col("sanitized_response_msgpack", Bytes, false),
+            col("last_safe_error", Text, true),
+            col("created_at_ms", Int, false),
+            col("updated_at_ms", Int, false),
+        ],
+        indexes: &["idx_pending_purges_phase"],
+    },
+    TableSpec {
+        name: "account_catalog_receipts",
+        primary_key: &["owner_id", "actor_id", "command_key"],
+        columns: &[
+            col("owner_id", Text, false),
+            col("actor_id", Text, false),
+            col("command_key", Text, false),
+            col("request_hash", Bytes, false),
+            col("result_msgpack", Bytes, true),
+        ],
+        indexes: &[],
+    },
+    TableSpec {
+        name: "collab_checkpoints",
+        primary_key: &["space_id", "note_id"],
+        columns: &[
+            col("space_id", Text, false),
+            col("note_id", Text, false),
+            col("snapshot_lease_epoch", Int, false),
+            col("snapshot_update_seq", Int, false),
+            col("carrier_dirty", Int, false),
+        ],
+        indexes: &[],
+    },
+];
+
+pub fn manifest_checksum() -> ContentDigest {
+    static CHECKSUM: LazyLock<ContentDigest> = LazyLock::new(|| {
+        checksum_tables(CANONICAL_SCHEMA_VERSION, CANONICAL_TABLES.iter().copied())
+    });
+    *CHECKSUM
+}
+
+pub(crate) fn checksum_tables(
+    version: u32,
+    tables: impl Iterator<Item = TableSpec>,
+) -> ContentDigest {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"notarium-canonical-schema-manifest-v1\n");
+    hasher.update(&version.to_be_bytes());
+    for table in tables {
+        hasher.update(b"T:");
+        hasher.update(table.name.as_bytes());
+        hasher.update(b"\nPK:");
+        for pk in table.primary_key {
+            hasher.update(pk.as_bytes());
+            hasher.update(b",");
+        }
+        hasher.update(b"\nCOLS:");
+        for col in table.columns {
+            hasher.update(col.name.as_bytes());
+            hasher.update(b":");
+            hasher.update(match col.kind {
+                Int => b"int",
+                Text => b"text",
+                Bytes => b"bytes",
+            });
+            hasher.update(if col.nullable { b"?" } else { b"!" });
+            hasher.update(b",");
+        }
+        hasher.update(b"\nIDX:");
+        for idx in table.indexes {
+            hasher.update(idx.as_bytes());
+            hasher.update(b",");
+        }
+        hasher.update(b"\n");
+    }
+    ContentDigest::from_bytes(*hasher.finalize().as_bytes())
+}
+
+pub fn expected_table_names() -> BTreeSet<&'static str> {
+    CANONICAL_TABLES.iter().map(|t| t.name).collect()
+}
+
+pub fn expected_index_names() -> BTreeSet<&'static str> {
+    CANONICAL_TABLES
+        .iter()
+        .flat_map(|t| t.indexes.iter().copied())
+        .collect()
+}
+
+pub fn find_table_spec(name: &str) -> Option<&'static TableSpec> {
+    CANONICAL_TABLES.iter().find(|t| t.name == name)
+}

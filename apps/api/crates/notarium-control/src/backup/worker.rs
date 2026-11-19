@@ -36,7 +36,7 @@ pub(crate) enum Command {
     },
 }
 enum Source {
-    Sqlite(SqliteCut),
+    Sqlite(Box<SqliteCut>),
     Postgres(PostgresCut),
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -90,10 +90,10 @@ impl Worker {
         )?;
         self.source = Some(match &self.store.backend {
             Backend::Sqlite { path: source, .. } => {
-                Source::Sqlite(SqliteCut::prepare(source, &path, &self.session)?)
+                Source::Sqlite(Box::new(SqliteCut::prepare(source, &path, &self.session)?))
             }
             Backend::Postgres { pool, .. } => {
-                Source::Postgres(PostgresCut::prepare(pool, &self.session).await?)
+                Source::Postgres(PostgresCut::prepare(pool, &self.session, &self.witness).await?)
             }
         });
         self.session.check()?;
@@ -148,19 +148,14 @@ impl Worker {
         if !matches!(self.phase, Phase::Paused | Phase::Pinned) {
             return Err(failure());
         }
-        let unlocked_conn = if let Some(Source::Postgres(source)) = &mut self.source {
-            Some(source.unlock().await?)
-        } else {
-            None
-        };
+        if let Some(Source::Postgres(source)) = &mut self.source {
+            source.unlock().await?;
+        }
         if let Some(fence) = self.file_pause.take() {
             fence.release()?;
         }
         self.local_pause.take();
         self.metrics.pause = self.pause_started.ok_or_else(failure)?.elapsed();
-        if let Some(connection) = unlocked_conn {
-            PostgresCut::close_unlocked_connection(connection).await?;
-        }
         if self.phase == Phase::Paused {
             // A coordinator may resume after another participant fails before pin.
             self.close_source().await?;
@@ -258,14 +253,9 @@ impl Worker {
                 return Ok(());
             }
             self.session.check()?;
-            let cancel = self
-                .session
-                .operation
-                .context(notarium_core::ids::RequestId::from_bytes([0; 16]))
-                .cancellation;
             let command = tokio::select! {
                 cmd = commands.recv() => cmd,
-                _ = cancel.cancelled() => {
+                _ = self.session.operation.cancellation().cancelled() => {
                     return self.session.check();
                 }
             };

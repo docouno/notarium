@@ -34,7 +34,9 @@ pub struct EnsureCatalogSpace {
 /// Implementations check exact identity/placement and return only admitted metadata.
 /// Pages contain current candidates, including disabled candidates so control can
 /// enforce precedence. Continuations are bounded to 2048 UTF-8 bytes and detect
-/// catalog changes; control binds the outer cursor to its own current authority.
+/// catalog changes. Cursor positions must not disclose candidate entity IDs:
+/// control can filter additional candidates and forwards the bounded continuation.
+/// Control binds the outer cursor to its own current authority.
 /// Cross-owner writes are idempotent on the supplied identity and exact payload.
 pub trait ControlCatalogPort: Send + Sync {
     fn space(&self, budget: CallBudget, space: SpaceId) -> PortFuture<'_, CatalogSpace>;

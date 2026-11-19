@@ -174,6 +174,18 @@ impl Timestamp {
     pub fn nanosecond(self) -> u32 {
         self.0.nanosecond()
     }
+    pub fn from_unix_parts(seconds: i64, nanoseconds: u32) -> DomainResult<Self> {
+        if nanoseconds >= 1_000_000_000 {
+            return Err(DomainError::validation(ValidationReason::InvalidTimestamp));
+        }
+        let total_nanos = i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds);
+        let utc = time::OffsetDateTime::from_unix_timestamp_nanos(total_nanos)
+            .map_err(|_| DomainError::validation(ValidationReason::InvalidTimestamp))?;
+        if !(0..=9999).contains(&utc.year()) {
+            return Err(DomainError::validation(ValidationReason::InvalidTimestamp));
+        }
+        Ok(Self(utc))
+    }
 }
 impl TryFrom<String> for Timestamp {
     type Error = DomainError;

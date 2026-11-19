@@ -124,7 +124,7 @@ impl ControlStore {
                 .busy_timeout(Duration::from_millis(250))
                 .and_then(|()| {
                     connection.execute_batch(
-                        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=4194304; PRAGMA secure_delete=ON;",
+                        "PRAGMA fullfsync=ON; PRAGMA synchronous=FULL; PRAGMA journal_mode=WAL; PRAGMA journal_size_limit=4194304; PRAGMA secure_delete=ON;",
                     )
                 })
                 .map_err(|_| unavailable("control SQLite bootstrap", CommitEffect::Unknown))?;
@@ -138,6 +138,7 @@ impl ControlStore {
         // Request pools only join the already initialized WAL database.
         let write_options = SqliteConnectOptions::new()
             .filename(&path)
+            .pragma("fullfsync", "ON")
             .synchronous(SqliteSynchronous::Full)
             .foreign_keys(true)
             .busy_timeout(Duration::from_millis(2500))
@@ -214,9 +215,11 @@ impl ControlStore {
             .acquire_timeout(Duration::from_secs(2))
             .after_connect(|connection, _| {
                 Box::pin(async move {
-                    sqlx::query("SET search_path TO v1_control, pg_catalog")
-                        .execute(&mut *connection)
-                        .await?;
+                    sqlx::raw_sql(
+                        "SET synchronous_commit TO on; SET search_path TO v1_control, pg_catalog",
+                    )
+                    .execute(&mut *connection)
+                    .await?;
                     sqlx::query("SET statement_timeout TO '250ms'")
                         .execute(&mut *connection)
                         .await?;
@@ -302,6 +305,22 @@ impl ControlStore {
                     .execute(&mut *connection)
                     .await
                     .map_err(database)?;
+                // Check the server and this writer before the first persistent change.
+                let durable: bool = sqlx::query_scalar(
+                    "SELECT pg_catalog.current_setting('fsync') = 'on'
+                        AND pg_catalog.current_setting('synchronous_commit') = 'on'",
+                )
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(|_| {
+                    unavailable("control PostgreSQL durability", CommitEffect::NotCommitted)
+                })?;
+                if !durable {
+                    return Err(unavailable(
+                        "control PostgreSQL durability",
+                        CommitEffect::NotCommitted,
+                    ));
+                }
                 sqlx::query("CREATE SCHEMA IF NOT EXISTS v1_control")
                     .execute(&mut *connection)
                     .await

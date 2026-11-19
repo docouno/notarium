@@ -62,6 +62,12 @@ pulldown-cmark = "=0.13.6"
 argon2 = "0.6"
 scrypt = "0.12"
 hkdf = "0.13"
+hex = "0.4"
+percent-encoding = "2"
+bytes = "1"
+http = "1"
+quick-xml = { version = "0.39", default-features = false }
+futures-core = "0.3"
 sha2 = { version = "0.11", features = ["zeroize"] }
 aes-gcm = { version = "0.11", features = ["zeroize"] }
 age = "0.12"
@@ -91,7 +97,8 @@ unicode-normalization = "0.1"
 
 saphyr-parser = "0.3"
 
-rusqlite = { version = "=0.39.0", default-features = false, features = ["backup", "bundled", "cache"] }
+rustix = { version = "1", features = ["fs"] }
+rusqlite = { version = "=0.39.0", default-features = false, features = ["backup", "bundled", "cache", "hooks"] }
 base64 = "0.22"
 getrandom = "0.4"
 subtle = "2"

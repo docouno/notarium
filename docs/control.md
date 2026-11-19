@@ -14,13 +14,16 @@ belong to the transport composition.
 
 ## Persistence
 
-SQLite uses `<DataRoot>/v1/control.sqlite`, WAL mode, full synchronous writes,
+SQLite uses `<DataRoot>/v1/control.sqlite`, WAL mode, `synchronous=FULL`, `fullfsync=ON`,
 foreign keys, strict tables, a 4 MiB `journal_size_limit`, a 256-page
 `wal_autocheckpoint`, a 2500 ms write busy timeout and a 250 ms read busy timeout.
 The composition owner must classify the data root before opening it and create the
 approved parent directory. PostgreSQL uses the `v1_control` schema, qualified
 queries and `COLLATE "C"` on text keys so keyset pagination and export order match
-SQLite byte order. SQLite separates a 1-connection write pool from a 20-connection
+SQLite byte order. Before creating or migrating the control schema, the server
+must report `fsync=on`. Every pooled control writer sets `synchronous_commit=on`,
+including the migration connection.
+SQLite separates a 1-connection write pool from a 20-connection
 read-only pool; PostgreSQL separates a 6-connection write/export pool from a
 20-connection read pool, with 16 active reader slots, a bounded 512-waiter read
 queue, and per-operation `SET LOCAL statement_timeout` and
@@ -594,6 +597,8 @@ personal, then System. A disabled, unhealthy or wrong-kind candidate shadows low
 precedence; equal-precedence ambiguity fails rather than choosing arbitrarily.
 Exact selections and `get_ability` accept an optional contextual `project` so
 selected-project Space abilities resolve consistently, and reject stale revisions.
+Both paths enforce canonical visibility at publication and at the current location
+before returning the descriptor or its auxiliary file names.
 Trails bind exact typed references, stop
 at 16 hops and reject cycles. Discovery preserves continuation across filtered
 pages and never emits a lower candidate as a duplicate of the selected winner.

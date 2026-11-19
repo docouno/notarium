@@ -235,7 +235,7 @@ impl ProviderService {
             if admitted
                 .project_only
                 .as_ref()
-                .is_some_and(|project| !metadata.in_project(project))
+                .is_some_and(|project| !part.in_project(project) || !metadata.in_project(project))
             {
                 return Err(DomainError::AccessDenied.into());
             }

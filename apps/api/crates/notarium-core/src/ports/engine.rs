@@ -43,6 +43,11 @@ pub trait NoteWritePort: Send + Sync {
         ctx: SpaceContext,
         request: Mutation<DeleteNote>,
     ) -> PortFuture<'_, Committed<NoteRevision>>;
+    fn mint_and_purge(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<MintAndPurge>,
+    ) -> PortFuture<'_, Committed<MintAndPurgeResult>>;
     fn move_note(
         &self,
         ctx: SpaceContext,
