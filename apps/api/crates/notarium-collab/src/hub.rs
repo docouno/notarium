@@ -121,9 +121,14 @@ pub(crate) struct HubInner {
     slots: Mutex<HashMap<RoomKey, Weak<RoomSlot>>>,
     active: Mutex<HashMap<RoomKey, RoomHandle>>,
     peers: Mutex<HashMap<u64, PeerRegistration>>,
-    pending_revoke_settlement: Mutex<HashSet<RoomKey>>,
+    pending_revoke_settlement: Mutex<HashMap<RoomKey, HashMap<u64, PendingRevoke>>>,
     accept_closed: Cancellation,
     shutdown: Cancellation,
+}
+
+struct PendingRevoke {
+    rev_seq: u64,
+    ctx: SpaceContext,
 }
 
 struct PeerRegistration {
@@ -242,13 +247,12 @@ impl CollabHub {
             let mut room_budget = budget.clone();
             room_budget.remaining = remaining;
             match timeout(remaining, room.shutdown(room_budget)).await {
-                Ok(Ok(true)) => {
+                Ok(Ok(true) | Ok(false)) => {
                     let rem = deadline.saturating_duration_since(Instant::now());
-                    let _ = timeout(rem, room.stopped().cancelled()).await;
-                }
-                Ok(Ok(false)) => {
-                    let rem = deadline.saturating_duration_since(Instant::now());
-                    let _ = timeout(rem, room.stopped().cancelled()).await;
+                    if timeout(rem, room.stopped().cancelled()).await.is_err() {
+                        first_error
+                            .get_or_insert_with(|| deadline_error(b"collab_hub_shutdown_stop"));
+                    }
                 }
                 Ok(Err(error)) => {
                     first_error.get_or_insert(error);
@@ -289,7 +293,6 @@ impl CollabHub {
         guard.check().map_err(|_| DomainError::AccessDenied)?;
         let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
         let registration = PendingPeer {
-            hub: Arc::downgrade(&self.0),
             guard: guard.clone(),
             id,
             room: None,
@@ -371,7 +374,8 @@ impl CollabHub {
     ) -> Result<(), PortError> {
         ctx.authority.require(ServicePurpose::Revocation)?;
         let mut affected = self.0.evict_matching(selector);
-        affected.extend(self.0.take_pending_revoke_settlement(selector));
+        let snapshot_seq = self.0.next_id.fetch_add(1, Ordering::AcqRel);
+        affected.extend(self.0.matching_pending_revoke_settlement(selector));
         let close_space = match (selector, reason) {
             (RevocationSelector::Space(space), RevocationReason::SpaceClosed) => Some(space),
             _ => None,
@@ -399,13 +403,15 @@ impl CollabHub {
             }
         }
         for room in self.0.active_rooms() {
+            let key = (room.scope().space_id.clone(), room.note().clone());
             let close = close_space == Some(&room.scope().space_id);
-            let targeted =
-                close || affected.remove(&(room.scope().space_id.clone(), room.note().clone()));
+            let targeted = close || affected.remove(&key);
             if !targeted {
                 continue;
             }
             if room.stopped().is_cancelled() {
+                self.0
+                    .clear_pending_revoke_settlement(&key, selector, snapshot_seq);
                 continue;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -417,6 +423,8 @@ impl CollabHub {
                             .await
                             .map_err(|_| deadline_error(b"collab_revocation_stop"))?;
                     }
+                    self.0
+                        .clear_pending_revoke_settlement(&key, selector, snapshot_seq);
                 }
                 Ok(Ok(false)) => {
                     // The room began stopping naturally (e.g. idle unload) just
@@ -425,9 +433,17 @@ impl CollabHub {
                     timeout(rem, room.stopped().cancelled())
                         .await
                         .map_err(|_| deadline_error(b"collab_revocation_stop"))?;
+                    self.0
+                        .clear_pending_revoke_settlement(&key, selector, snapshot_seq);
                 }
                 Ok(Err(error)) => return Err(error),
                 Err(_) => return Err(deadline_error(b"collab_revocation_settle")),
+            }
+        }
+        for key in affected {
+            if !self.0.room_is_live(&key) {
+                self.0
+                    .clear_pending_revoke_settlement(&key, selector, snapshot_seq);
             }
         }
         if let Some(space) = close_space {
@@ -478,7 +494,6 @@ impl CollabHub {
 }
 
 struct PendingPeer {
-    hub: Weak<HubInner>,
     guard: Arc<PeerGuard>,
     id: u64,
     room: Option<RoomHandle>,
@@ -491,14 +506,6 @@ impl Drop for PendingPeer {
             self.guard.close(SessionClose::POLICY);
         }
         if let Some(room) = &self.room {
-            if self.guard.policy_closed()
-                && let Some(hub) = self.hub.upgrade()
-            {
-                hub.mark_pending_revoke_settlement((
-                    room.scope().space_id.clone(),
-                    room.note().clone(),
-                ));
-            }
             room.peer_changed();
         }
         // PeerGuard automatically unregisters `self.id` from `hub.peers` as
@@ -516,53 +523,117 @@ impl HubInner {
         self.accept_closed.clone()
     }
 
-    pub fn unregister_peer(&self, id: u64) {
-        self.peers.lock().expect("peer registry").remove(&id);
+    pub fn current_revoke_seq(&self) -> u64 {
+        self.next_id.load(Ordering::Acquire)
     }
 
-    pub fn mark_pending_revoke_settlement(&self, key: RoomKey) {
+    fn room_is_live(&self, key: &RoomKey) -> bool {
+        if self.active.lock().expect("active rooms").contains_key(key) {
+            return true;
+        }
+        self.slots
+            .lock()
+            .expect("room registry")
+            .get(key)
+            .and_then(Weak::upgrade)
+            .is_some()
+    }
+
+    fn record_pending_revoke_entry(&self, key: RoomKey, peer_id: u64, ctx: SpaceContext) {
+        let rev_seq = self.next_id.fetch_add(1, Ordering::AcqRel);
         self.pending_revoke_settlement
             .lock()
             .expect("pending revoke settlement")
-            .insert(key);
+            .entry(key)
+            .or_default()
+            .entry(peer_id)
+            .or_insert(PendingRevoke { rev_seq, ctx });
     }
 
-    fn record_matching_for_settlement(&self, selectors: &[RevocationSelector]) {
-        let keys: Vec<RoomKey> = self
-            .peers
-            .lock()
-            .expect("peer registry")
-            .values()
-            .filter(|peer| selectors.iter().any(|s| matches_selector(&peer.ctx, s)))
-            .map(|peer| (peer.ctx.scope().space_id.clone(), peer.note.clone()))
-            .collect();
-        if !keys.is_empty() {
-            self.pending_revoke_settlement
-                .lock()
-                .expect("pending revoke settlement")
-                .extend(keys);
+    pub fn unregister_peer(&self, id: u64, revoked: bool) {
+        let removed = self.peers.lock().expect("peer registry").remove(&id);
+        if revoked && let Some(peer) = removed {
+            let key = (peer.ctx.scope().space_id.clone(), peer.note);
+            if self.room_is_live(&key) {
+                self.record_pending_revoke_entry(key, id, peer.ctx);
+            }
         }
     }
 
-    fn take_pending_revoke_settlement(&self, selector: &RevocationSelector) -> HashSet<RoomKey> {
+    fn record_matching_for_settlement(&self, selectors: &[RevocationSelector]) {
+        let matched: Vec<(u64, RoomKey, SpaceContext)> = self
+            .peers
+            .lock()
+            .expect("peer registry")
+            .iter()
+            .filter(|(_, peer)| selectors.iter().any(|s| matches_selector(&peer.ctx, s)))
+            .map(|(&id, peer)| {
+                (
+                    id,
+                    (peer.ctx.scope().space_id.clone(), peer.note.clone()),
+                    peer.ctx.clone(),
+                )
+            })
+            .collect();
+        for (id, key, ctx) in matched {
+            if self.room_is_live(&key) {
+                self.record_pending_revoke_entry(key, id, ctx);
+            }
+        }
+    }
+
+    fn matching_pending_revoke_settlement(
+        &self,
+        selector: &RevocationSelector,
+    ) -> HashSet<RoomKey> {
+        self.pending_revoke_settlement
+            .lock()
+            .expect("pending revoke settlement")
+            .iter()
+            .filter(|(_, entries)| {
+                entries
+                    .values()
+                    .any(|entry| matches_selector(&entry.ctx, selector))
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    fn clear_pending_revoke_settlement(
+        &self,
+        key: &RoomKey,
+        selector: &RevocationSelector,
+        through_seq: u64,
+    ) {
         let mut pending = self
             .pending_revoke_settlement
             .lock()
             .expect("pending revoke settlement");
-        match selector {
-            RevocationSelector::Space(space) | RevocationSelector::Membership { space, .. } => {
-                let mut matched = HashSet::new();
-                pending.retain(|key| {
-                    if &key.0 == space {
-                        matched.insert(key.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
-                matched
+        if let Some(entries) = pending.get_mut(key) {
+            entries.retain(|_, entry| {
+                entry.rev_seq > through_seq || !matches_selector(&entry.ctx, selector)
+            });
+            if entries.is_empty() {
+                pending.remove(key);
             }
-            _ => std::mem::take(&mut *pending),
+        }
+    }
+
+    pub fn prune_settled_revocations(
+        &self,
+        key: &RoomKey,
+        through_seq: u64,
+        is_peer_gone: impl Fn(u64) -> bool,
+    ) {
+        let mut pending = self
+            .pending_revoke_settlement
+            .lock()
+            .expect("pending revoke settlement");
+        if let Some(entries) = pending.get_mut(key) {
+            entries.retain(|&peer_id, entry| entry.rev_seq > through_seq || !is_peer_gone(peer_id));
+            if entries.is_empty() {
+                pending.remove(key);
+            }
         }
     }
 
@@ -629,12 +700,23 @@ impl HubInner {
 
     pub fn room_stopped(&self, room: &RoomHandle) {
         let key = (room.scope().space_id.clone(), room.note().clone());
-        let mut active = self.active.lock().expect("active rooms");
-        if active
-            .get(&key)
-            .is_some_and(|registered| registered.same_lease(room))
-        {
-            active.remove(&key);
+        let removed = {
+            let mut active = self.active.lock().expect("active rooms");
+            if active
+                .get(&key)
+                .is_some_and(|registered| registered.same_lease(room))
+            {
+                active.remove(&key);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.pending_revoke_settlement
+                .lock()
+                .expect("pending revoke settlement")
+                .remove(&key);
         }
     }
 
@@ -651,17 +733,22 @@ impl HubInner {
             .peers
             .lock()
             .expect("peer registry")
-            .values()
-            .filter(|peer| matches_selector(&peer.ctx, selector))
-            .filter_map(|peer| {
+            .iter()
+            .filter(|(_, peer)| matches_selector(&peer.ctx, selector))
+            .filter_map(|(&id, peer)| {
                 Some((
+                    id,
                     (peer.ctx.scope().space_id.clone(), peer.note.clone()),
+                    peer.ctx.clone(),
                     peer.guard.upgrade()?,
                 ))
             })
             .collect();
         let mut affected = HashSet::new();
-        for (key, guard) in selected {
+        for (id, key, ctx, guard) in selected {
+            if self.room_is_live(&key) {
+                self.record_pending_revoke_entry(key.clone(), id, ctx);
+            }
             guard.close(SessionClose::POLICY);
             affected.insert(key);
         }
@@ -756,10 +843,8 @@ impl HubInner {
         deadline: Instant,
     ) -> Result<Option<(RoomHandle, PeerRole)>, PortError> {
         if self.accept_closed.is_cancelled() {
-            return Err(operation_error(
-                b"collab_hub_shutting_down",
-                CommitEffect::NotCommitted,
-            ));
+            outbound.guard.close(SessionClose::GOING_AWAY);
+            return Ok(None);
         }
         let slot = self.slot(ctx.scope(), note);
         let mut held = lock_slot(&slot, &ctx.budget).await?;
@@ -770,10 +855,8 @@ impl HubInner {
         while open_conflicts < OPEN_ATTEMPTS && total_steps < MAX_ADMIT_STEPS {
             total_steps += 1;
             if self.accept_closed.is_cancelled() {
-                return Err(operation_error(
-                    b"collab_hub_shutting_down",
-                    CommitEffect::NotCommitted,
-                ));
+                outbound.guard.close(SessionClose::GOING_AWAY);
+                return Ok(None);
             }
             outbound
                 .guard
@@ -1035,7 +1118,11 @@ async fn serve_peer(
         () = guard.stopped().cancelled() => return,
         result = tokio::time::timeout_at(deadline, ingress.recv()) => match result {
             Ok(Some(frame)) => frame,
-            _ => return,
+            Ok(None) => {
+                guard.close(SessionClose::DISCONNECTED);
+                return;
+            }
+            Err(_) => return,
         },
     };
     let hello = match decode_hello(&first_frame) {
@@ -1060,7 +1147,13 @@ async fn serve_peer(
             biased;
             () = guard.stopped().cancelled() => break,
             () = room.stopped().cancelled() => break,
-            frame = ingress.recv() => match frame { Some(frame) => frame, None => break },
+            frame = ingress.recv() => match frame {
+                Some(frame) => frame,
+                None => {
+                    guard.close(SessionClose::DISCONNECTED);
+                    break;
+                }
+            },
         };
         if !send_until_closed(&room, RoomCommand::Frame { id: peer.id, frame }, guard).await {
             break;
@@ -1368,6 +1461,9 @@ impl SessionRevocationPort for CollabRevocations {
         reason: RevocationReason,
     ) -> PortFuture<'_, ()> {
         Box::pin(async move {
+            if let Some(hub) = self.hub.upgrade() {
+                hub.record_matching_for_settlement(std::slice::from_ref(&selector));
+            }
             self.registry
                 .revoke(ctx.clone(), selector.clone(), reason)
                 .await?;

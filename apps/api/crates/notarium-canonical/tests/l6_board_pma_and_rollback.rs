@@ -1807,7 +1807,7 @@ async fn l6_move_board_card_planner_cutoff_and_pma_dual_dialect_parity() {
         let root = TempDataRoot::new("l6-move-sqlite");
         let cfg = CanonicalConfig::local_default(sample_installation_id(1), root.data_root());
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open sqlite");
-        let evidence = run_move_board_card_suite(&store).await;
+        let evidence = Box::pin(run_move_board_card_suite(&store)).await;
         let mut conn = root.open_raw_sqlite().await;
         let bytes: Vec<u8> = sqlx::query_scalar(
             "SELECT effect_msgpack FROM change_payloads WHERE created_seq=? AND codec='effect_v1'",
@@ -1835,7 +1835,7 @@ async fn l6_move_board_card_planner_cutoff_and_pma_dual_dialect_parity() {
             .expect("ensure S3 bucket");
         let cfg = fixtures.pg_s3_config(sample_installation_id(2), &schema, s3_cfg);
         let (store, runtime) = CanonicalRuntime::open(cfg).await.expect("open pg+s3");
-        let evidence = run_move_board_card_suite(&store).await;
+        let evidence = Box::pin(run_move_board_card_suite(&store)).await;
         let mut conn = fixtures.open_raw_pg().await;
         let bytes: Vec<u8> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT effect_msgpack FROM {schema}.change_payloads WHERE created_seq=$1 AND codec='effect_v1'")))
             .bind(evidence.column_change.get() as i64).fetch_one(&mut conn).await.unwrap();

@@ -523,6 +523,12 @@ mod differential_oracle {
         "```",
         "<!-- html comment -->",
         "<pre>\nraw html\n</pre>",
+        "<x>",
+        "> a | b",
+        "> --- | ---",
+        "[a]:",
+        "url bad",
+        "===",
         "[ref]: https://example.com",
         "---",
         "Кириллица и эмодзи 🚀 🦀",
@@ -538,6 +544,8 @@ mod differential_oracle {
         "🦀",
         "!",
         "-",
+        "|",
+        "=",
         "#",
         ">",
         "<",
@@ -596,6 +604,64 @@ mod differential_oracle {
             offsets.push(acc);
         }
         offsets
+    }
+
+    #[test]
+    fn block_boundary_counterexamples_take_structural_and_finalize_nota() {
+        // Counterexample A (GFM table + lazy blockquote + HTML type 7 + nota, LF and CRLF).
+        for eol in ["\n", "\r\n"] {
+            let body =
+                format!("> a | b{eol}> --- | ---{eol}<x>{eol}```nota{eol}type: table{eol}```{eol}");
+            let source = format!("---{eol}status: todo{eol}---{eol}{body}");
+            let (carrier, body_slice) = carrier(&source);
+            let mut fast = TwinDoc::seed(&body_slice).unwrap();
+            let mut oracle = TwinDoc::restore(&fast.live_snapshot()).unwrap();
+            let peer = author(&fast);
+            let pipe_offset = body_slice.find('|').unwrap() as u32;
+            let bytes = edit(&peer, |txn| peer.body.remove_range(txn, pipe_offset, 1));
+            let (f_upd, f_path) = fast
+                .stage_peer_with_path(&bytes, &carrier, &note(), false)
+                .unwrap();
+            let (o_upd, _) = oracle
+                .stage_peer_with_path(&bytes, &carrier, &note(), true)
+                .unwrap();
+            assert_eq!(f_path, GuardPath::Structural);
+            assert_eq!(fast.staging_body(), oracle.staging_body());
+            assert!(
+                fast.staging_body().contains("\"id\": \"v_"),
+                "counterexample A (eol={eol:?}) did not finalize nota:\n{}",
+                fast.staging_body()
+            );
+            fast.publish(&f_upd.bytes).unwrap();
+            oracle.publish(&o_upd.bytes).unwrap();
+            assert_eq!(fast.live_body(), oracle.live_body());
+        }
+
+        // Counterexample B (Link RefDef + Setext === + HTML type 7 + nota).
+        let body = "[a]:\nurl bad\n===\n<x>\n```nota\ntype: table\n```\n";
+        let source = format!("---\nstatus: todo\n---\n{body}");
+        let (carrier, body_slice) = carrier(&source);
+        let mut fast = TwinDoc::seed(&body_slice).unwrap();
+        let mut oracle = TwinDoc::restore(&fast.live_snapshot()).unwrap();
+        let peer = author(&fast);
+        let bad_offset = body_slice.find(" bad").unwrap() as u32;
+        let bytes = edit(&peer, |txn| peer.body.remove_range(txn, bad_offset, 4));
+        let (f_upd, f_path) = fast
+            .stage_peer_with_path(&bytes, &carrier, &note(), false)
+            .unwrap();
+        let (o_upd, _) = oracle
+            .stage_peer_with_path(&bytes, &carrier, &note(), true)
+            .unwrap();
+        assert_eq!(f_path, GuardPath::Structural);
+        assert_eq!(fast.staging_body(), oracle.staging_body());
+        assert!(
+            fast.staging_body().contains("\"id\": \"v_"),
+            "counterexample B did not finalize nota:\n{}",
+            fast.staging_body()
+        );
+        fast.publish(&f_upd.bytes).unwrap();
+        oracle.publish(&o_upd.bytes).unwrap();
+        assert_eq!(fast.live_body(), oracle.live_body());
     }
 
     proptest! {

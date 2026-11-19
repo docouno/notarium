@@ -1,23 +1,29 @@
 mod support;
 
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use notarium_canonical::{CanonicalConfig, CanonicalRuntime, OpenCollabSession};
 use notarium_collab::{
-    CollabConfig, CollabHub, SessionEvent,
+    CollabConfig, CollabHub, CollabSessionAuth, SessionEvent,
     wire::{self, LineageHello},
 };
 use notarium_core::{
     DomainError,
-    auth::SpaceRole,
+    auth::{AuthenticatedCredential, EngineAuthContext, SpaceGrant, SpaceRole, VerifiedHuman},
+    classes::DocClass,
     error::{CommitEffect, PortError, ValidationReason},
     ids::*,
     model::HistoryScope,
     patch::{BodyPatchPlan, CarrierEditOrigin, HeaderMutation},
     ports::{
         BackupParticipantPort, Cancellation, InterceptedMutation, InterceptedPayload,
-        InterceptionResult, LiveCollabInterceptor, MoveNote, NoteWritePort, Preconditions,
-        RenameNote, ServicePurpose,
+        InterceptionResult, LiveCollabInterceptor, MaintenanceContext, MoveNote, NoteWritePort,
+        PortFuture, Preconditions, RenameNote, RevocationLease, RevocationReason,
+        RevocationSelector, ServicePurpose, SessionRevocationPort, SpaceContext,
     },
     receipt::ChangeCursor,
 };
@@ -83,6 +89,26 @@ async fn empty_updates_do_not_write_wal_and_viewer_colliding_sv_is_bounded() {
         .unwrap()
         .unwrap();
     assert!(stored.updates.is_empty());
+
+    // A non-empty update that normalizes to empty [0, 0] (duplicate resend)
+    // ACKs at the existing durable room watermark without appending a no-op WAL row.
+    let real_update = editor.append("Once.\n");
+    editor.send_update(&real_update).await;
+    let ack1 = editor.ack().await;
+    assert_eq!(ack1.peer_write_seq, 17);
+    assert_eq!(ack1.room_update_seq, 1);
+
+    editor.send_update(&real_update).await;
+    let ack2 = editor.ack().await;
+    assert_eq!(ack2.lease_epoch, ready.lease_epoch);
+    assert_eq!(ack2.peer_write_seq, 18);
+    assert_eq!(ack2.room_update_seq, 1);
+    let stored_after_dup = store
+        .read_collab_session(None, owner.scope(), &seed.note)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_after_dup.updates.len(), 1);
 
     // Viewer sending > MAX_STATE_VECTOR_CLIENTS colliding IDs is closed cleanly.
     let viewer_ctx = context(
@@ -624,5 +650,311 @@ async fn stale_incarnation_rejected_raw_title_editable_lease_precondition_and_ro
     c_new.ack().await;
 
     drop((c1, c_new, hub));
+    runtime.shutdown().await.unwrap();
+}
+
+struct MiniLease(Cancellation);
+
+impl RevocationLease for MiniLease {
+    fn check(&self) -> Result<(), PortError> {
+        if self.0.is_cancelled() {
+            return Err(DomainError::AccessDenied.into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct MiniRevocationRegistry {
+    providers: Mutex<Vec<(Vec<RevocationSelector>, Cancellation)>>,
+}
+
+fn selector_matches(a: &RevocationSelector, b: &RevocationSelector) -> bool {
+    match (a, b) {
+        (RevocationSelector::Principal(x), RevocationSelector::Principal(y)) => x == y,
+        (RevocationSelector::Session(x), RevocationSelector::Session(y)) => x == y,
+        _ => false,
+    }
+}
+
+impl MiniRevocationRegistry {
+    fn cancel_matching(&self, selectors: &[RevocationSelector]) {
+        let providers = self.providers.lock().expect("providers");
+        for (registered, cancellation) in providers.iter() {
+            if registered
+                .iter()
+                .any(|r| selectors.iter().any(|s| selector_matches(r, s)))
+            {
+                cancellation.cancel();
+            }
+        }
+    }
+}
+
+impl SessionRevocationPort for MiniRevocationRegistry {
+    fn register_provider(
+        &self,
+        _ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+        cancellation: Cancellation,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.providers
+            .lock()
+            .expect("providers")
+            .push((selectors, cancellation.clone()));
+        Box::pin(async move { Ok(Box::new(MiniLease(cancellation)) as Box<dyn RevocationLease>) })
+    }
+
+    fn fence_provider(
+        &self,
+        _ctx: MaintenanceContext,
+        selectors: Vec<RevocationSelector>,
+    ) -> PortFuture<'_, Box<dyn RevocationLease>> {
+        self.cancel_matching(&selectors);
+        Box::pin(async move {
+            Ok(Box::new(MiniLease(Cancellation::default())) as Box<dyn RevocationLease>)
+        })
+    }
+
+    fn fence_inactive_provider(
+        &self,
+        _ctx: MaintenanceContext,
+        _call: RequestId,
+    ) -> PortFuture<'_, Option<Box<dyn RevocationLease>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn revoke(
+        &self,
+        _ctx: MaintenanceContext,
+        selector: RevocationSelector,
+        _reason: RevocationReason,
+    ) -> PortFuture<'_, ()> {
+        self.cancel_matching(std::slice::from_ref(&selector));
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn session_editor_context(
+    scope: &HistoryScope,
+    seed: u8,
+    principal: PrincipalId,
+    session_id: AuthSessionId,
+) -> SpaceContext {
+    let grant = SpaceGrant {
+        role: SpaceRole::Editor,
+        read_classes: DocClass::all(),
+        write_classes: DocClass::all(),
+        project_root: None,
+    };
+    let verified = VerifiedHuman::attest(
+        principal,
+        GrantId::from_bytes([seed; 16]),
+        BTreeMap::from([(scope.space_id.clone(), grant)]),
+        false,
+    )
+    .with_credential(AuthenticatedCredential::Session(session_id));
+    SpaceContext::new(
+        EngineAuthContext::for_human(verified),
+        scope.clone(),
+        budget(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn split_sender_drop_closes_disconnected_and_concurrent_revocations_settle_independently() {
+    let mut cfg = CollabConfig::default();
+    cfg.idle_checkpoint = Duration::from_secs(60);
+    cfg.periodic_checkpoint = Duration::from_secs(60);
+    cfg.idle_unload = Duration::from_secs(60);
+    let (_root, store, runtime, hub, owner) = open_sqlite_env("split-revoke", cfg).await;
+
+    // 1. Pre-Hello and post-attach drop of CollabPeerSender yields 1000 DISCONNECTED
+    //    and does not trigger a false revocation checkpoint while another editor remains.
+    let n_disc = create_note(&store, &owner, 31, "Base.\n", None).await;
+    let pre_hello = open(&hub, &owner, &n_disc.note).await;
+    let (pre_tx, mut pre_rx) = pre_hello.split();
+    drop(pre_tx);
+    let ev = timeout(WAIT, pre_rx.recv()).await.unwrap().unwrap();
+    assert!(
+        matches!(ev, SessionEvent::Close(close) if close.code == 1000),
+        "expected 1000 DISCONNECTED on pre-hello sender drop, got {ev:?}"
+    );
+
+    let (mut editor2, _) = synced_client(&hub, &owner, &n_disc.note, 701).await;
+    let peer1 = open(&hub, &owner, &n_disc.note).await;
+    let (tx1, mut rx1) = peer1.split();
+    tx1.send(LineageHello::Fresh.encode()).await.unwrap();
+    // Drain LineageReady + SyncStep1.
+    let _ready = timeout(WAIT, rx1.recv()).await.unwrap().unwrap();
+    let _step1 = timeout(WAIT, rx1.recv()).await.unwrap().unwrap();
+    // Editor2 writes an uncheckpointed edit so we can verify no false checkpoint fires.
+    editor2.send_update(&editor2.append("Pending.\n")).await;
+    editor2.ack().await;
+    // Drop only the sender half of peer1 while receiver remains alive.
+    drop(tx1);
+    let mut close_ev = None;
+    for _ in 0..8 {
+        match timeout(WAIT, rx1.recv()).await.unwrap() {
+            Some(SessionEvent::Close(close)) => {
+                close_ev = Some(close);
+                break;
+            }
+            Some(SessionEvent::Binary(_)) => continue,
+            None => break,
+        }
+    }
+    let close = close_ev.expect("expected Close event after sender drop");
+    assert_eq!(
+        close.code, 1000,
+        "expected 1000 DISCONNECTED, got {close:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    // Canonical head must still be "Base.\n" (no false revocation checkpoint).
+    assert_eq!(note_head(&store, &owner, &n_disc.note).await.1, "Base.\n");
+    drop(editor2);
+
+    // 2. Concurrent revocations of distinct sessions in distinct dirty rooms do not
+    //    steal each other's pending settlement markers, and overlapping Session +
+    //    Principal revocations on the same room both wait for settlement.
+    let registry = Arc::new(MiniRevocationRegistry::default());
+    let revocations = hub.revocations(registry.clone());
+
+    let n_a = create_note(&store, &owner, 32, "Room A.\n", None).await;
+    let n_b = create_note(&store, &owner, 33, "Room B.\n", None).await;
+    let n_c = create_note(&store, &owner, 34, "Room C.\n", None).await;
+
+    let p_a = PrincipalId::from_bytes([61; 16]);
+    let s_a = AuthSessionId::from_bytes([71; 16]);
+    let p_b = PrincipalId::from_bytes([62; 16]);
+    let s_b = AuthSessionId::from_bytes([72; 16]);
+    let p_c = PrincipalId::from_bytes([63; 16]);
+    let s_c = AuthSessionId::from_bytes([73; 16]);
+
+    let ctx_a = session_editor_context(owner.scope(), 61, p_a.clone(), s_a.clone());
+    let ctx_b = session_editor_context(owner.scope(), 62, p_b.clone(), s_b.clone());
+    let ctx_c = session_editor_context(owner.scope(), 63, p_c.clone(), s_c.clone());
+
+    let connect_registered =
+        |ctx: SpaceContext, note: NoteId, p: PrincipalId, s: AuthSessionId, cid: u64| {
+            let hub = hub.clone();
+            let rev = revocations.clone();
+            async move {
+                let cancel = Cancellation::default();
+                let lease = rev
+                    .register_provider(
+                        maintenance_ctx(ServicePurpose::Revocation),
+                        vec![
+                            RevocationSelector::Principal(p),
+                            RevocationSelector::Session(s),
+                        ],
+                        cancel.clone(),
+                    )
+                    .await
+                    .unwrap();
+                let auth = CollabSessionAuth::new(lease, cancel, None);
+                let peer = hub.connect(ctx, note, auth).await.unwrap();
+                let mut client = Client::new(peer, cid);
+                client.ready(LineageHello::Fresh).await;
+                client.sync().await;
+                client
+            }
+        };
+
+    let mut c_a = connect_registered(ctx_a, n_a.note.clone(), p_a.clone(), s_a.clone(), 711).await;
+    let mut c_b = connect_registered(ctx_b, n_b.note.clone(), p_b.clone(), s_b.clone(), 712).await;
+    let mut c_c = connect_registered(ctx_c, n_c.note.clone(), p_c.clone(), s_c.clone(), 713).await;
+
+    // Keep an unaffected viewer in each room so rooms stay active across peer reap
+    // until revocation settles them (and dirty WAL must still be checkpointed).
+    let viewer_ctx = context(
+        owner.scope(),
+        PrincipalId::from_bytes([69; 16]),
+        SpaceRole::Viewer,
+        None,
+    );
+    let (_v_a, _) = synced_client(&hub, &viewer_ctx, &n_a.note, 721).await;
+    let (_v_b, _) = synced_client(&hub, &viewer_ctx, &n_b.note, 722).await;
+    let (_v_c, _) = synced_client(&hub, &viewer_ctx, &n_c.note, 723).await;
+
+    c_a.send_update(&c_a.append("Edit A.\n")).await;
+    c_a.ack().await;
+    c_b.send_update(&c_b.append("Edit B.\n")).await;
+    c_b.ack().await;
+    c_c.send_update(&c_c.append("Edit C.\n")).await;
+    c_c.ack().await;
+
+    // Phase 1 fence both A and B (cancels & unregisters peers from hub.peers before revoke).
+    let _fence_a = revocations
+        .fence_provider(
+            maintenance_ctx(ServicePurpose::Revocation),
+            vec![RevocationSelector::Session(s_a.clone())],
+        )
+        .await
+        .unwrap();
+    let _fence_b = revocations
+        .fence_provider(
+            maintenance_ctx(ServicePurpose::Revocation),
+            vec![RevocationSelector::Session(s_b.clone())],
+        )
+        .await
+        .unwrap();
+    let _fence_c = revocations
+        .fence_provider(
+            maintenance_ctx(ServicePurpose::Revocation),
+            vec![RevocationSelector::Session(s_c.clone())],
+        )
+        .await
+        .unwrap();
+
+    // Phase 2 concurrent revokes across independent and overlapping selectors.
+    let (r_a, r_b, r_c1, r_c2) = tokio::join!(
+        revocations.revoke(
+            maintenance_ctx(ServicePurpose::Revocation),
+            RevocationSelector::Session(s_a),
+            RevocationReason::Logout,
+        ),
+        revocations.revoke(
+            maintenance_ctx(ServicePurpose::Revocation),
+            RevocationSelector::Session(s_b),
+            RevocationReason::Logout,
+        ),
+        revocations.revoke(
+            maintenance_ctx(ServicePurpose::Revocation),
+            RevocationSelector::Session(s_c),
+            RevocationReason::Logout,
+        ),
+        revocations.revoke(
+            maintenance_ctx(ServicePurpose::Revocation),
+            RevocationSelector::Principal(p_c),
+            RevocationReason::PermissionChanged,
+        ),
+    );
+    r_a.unwrap();
+    r_b.unwrap();
+    r_c1.unwrap();
+    r_c2.unwrap();
+
+    // Immediately after revoke completes, all three rooms must be settled into canonical.
+    assert_eq!(
+        note_head(&store, &owner, &n_a.note).await.1,
+        "Room A.\nEdit A.\n"
+    );
+    assert_eq!(
+        note_head(&store, &owner, &n_b.note).await.1,
+        "Room B.\nEdit B.\n"
+    );
+    assert_eq!(
+        note_head(&store, &owner, &n_c.note).await.1,
+        "Room C.\nEdit C.\n"
+    );
+
+    // 3. Peer waiting pre-Hello during hub.shutdown receives 1001 GOING_AWAY (not 1011).
+    let mut shutting_peer = open(&hub, &owner, &n_a.note).await;
+    hub.shutdown(&budget()).await.unwrap();
+    assert_eq!(close_code(&mut shutting_peer).await, 1001);
+
+    drop((c_a, c_b, c_c, _v_a, _v_b, _v_c, hub));
     runtime.shutdown().await.unwrap();
 }

@@ -446,6 +446,23 @@ pub struct ClosedRoomReservation {
     note: NoteId,
     identity: CommandIdentity,
     epoch: LeaseEpoch,
+    table_pin: Option<Arc<u64>>,
+}
+impl ClosedRoomReservation {
+    /// Attaches the runtime fence table's slot/eviction generation pin while
+    /// this reservation is in flight.
+    pub fn attach_table_pin(&mut self, pin: Arc<u64>) {
+        self.table_pin = Some(pin);
+    }
+    /// Returns the runtime fence table generation recorded when this
+    /// reservation was minted (`0` if minted directly outside a table).
+    pub fn table_gen(&self) -> u64 {
+        self.table_pin.as_deref().copied().unwrap_or(0)
+    }
+    /// Releases the runtime eviction pin once the fence lock is held.
+    pub fn release_pin(&mut self) {
+        self.table_pin = None;
+    }
 }
 #[derive(Debug)]
 pub struct CommitPermit {
@@ -496,6 +513,7 @@ impl RoomFenceState {
                 note: self.note.clone(),
                 identity,
                 epoch: self.epoch,
+                table_pin: None,
             }))
         }
     }

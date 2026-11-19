@@ -691,7 +691,7 @@ fn page(id: ID) -> Page {
 }
 
 fn prose_inner(ch: char) -> bool {
-    !matches!(ch, '\r' | '\n' | '`' | '~')
+    !matches!(ch, '\r' | '\n' | '`' | '~' | '|' | '<')
 }
 
 fn prose_start(ch: char) -> bool {
@@ -706,7 +706,59 @@ fn safe_line_prefix(prefix: &str) -> bool {
     if trimmed.starts_with('<') || trimmed.starts_with('[') {
         return false;
     }
-    !prefix.contains(['<', '`', '~'])
+    !prefix.contains(['<', '`', '~', '|'])
+}
+
+/// Strip leading spaces/tabs and blockquote markers (`>`) to inspect the start
+/// of a line's block-level content.
+fn strip_quote_prefix(mut line: &str) -> &str {
+    loop {
+        line = line.trim_start_matches([' ', '\t']);
+        if let Some(rest) = line.strip_prefix('>') {
+            line = rest;
+        } else {
+            return line;
+        }
+    }
+}
+
+/// True if `line` (after container prefixes) could act as a Setext heading
+/// underline, thematic break, or GFM delimiter line.
+fn is_setext_or_rule_candidate(line: &str) -> bool {
+    let mut s = strip_quote_prefix(line);
+    if let Some(rest) = s
+        .strip_prefix("- ")
+        .or_else(|| s.strip_prefix("* "))
+        .or_else(|| s.strip_prefix("+ "))
+    {
+        s = rest.trim_start_matches([' ', '\t']);
+    }
+    !s.is_empty() && s.bytes().all(|b| matches!(b, b'=' | b'-' | b' ' | b'\t'))
+}
+
+/// Iterate lines treating `\r\n` as a single line terminator so CRLF documents
+/// do not produce synthetic empty lines between `\r` and `\n`.
+fn iter_lines(body: &str) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let bytes = body.as_bytes();
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        if pos >= bytes.len() {
+            return None;
+        }
+        let start = pos;
+        while pos < bytes.len() && bytes[pos] != b'\r' && bytes[pos] != b'\n' {
+            pos += 1;
+        }
+        let end = pos;
+        if pos < bytes.len() {
+            if bytes[pos] == b'\r' && bytes.get(pos + 1) == Some(&b'\n') {
+                pos += 2;
+            } else {
+                pos += 1;
+            }
+        }
+        Some((start, end))
+    })
 }
 
 fn plain_lines(body: &str) -> Result<Vec<Range<usize>>, Reject> {
@@ -715,11 +767,26 @@ fn plain_lines(body: &str) -> Result<Vec<Range<usize>>, Reject> {
     let analysis = markdown::analyze(body, span).map_err(|_| Reject::InvalidBodyContent)?;
     let mut visible = analysis.text_ranges.iter().peekable();
     let mut fences = analysis.fences.iter().peekable();
-    let mut start = 0;
     let mut result = Vec::new();
-    for line in body.split_inclusive(['\r', '\n']) {
-        let source = line.trim_end_matches(['\r', '\n']);
-        let end = start + source.len();
+    let mut chunk_candidates: Vec<Range<usize>> = Vec::new();
+    let mut chunk_safe = true;
+
+    let flush_chunk =
+        |candidates: &mut Vec<Range<usize>>, safe: &mut bool, out: &mut Vec<Range<usize>>| {
+            if *safe {
+                out.append(candidates);
+            } else {
+                candidates.clear();
+            }
+            *safe = true;
+        };
+
+    for (start, end) in iter_lines(body) {
+        let source = &body[start..end];
+        if source.trim_matches([' ', '\t']).is_empty() {
+            flush_chunk(&mut chunk_candidates, &mut chunk_safe, &mut result);
+            continue;
+        }
         while visible.peek().is_some_and(|span| span.end() <= start) {
             visible.next();
         }
@@ -729,9 +796,24 @@ fn plain_lines(body: &str) -> Result<Vec<Range<usize>>, Reject> {
         let in_fence = fences
             .peek()
             .is_some_and(|fence| fence.span.start() < end && fence.span.end() > start);
-        if !in_fence
-            && !source.is_empty()
-            && source.chars().all(prose_inner)
+        let stripped = strip_quote_prefix(source);
+        // Any block-boundary construct inside a blank-line-delimited chunk
+        // (fences, GFM tables, HTML blocks/type 7, Link RefDefs, or Setext
+        // underlines) disqualifies the whole chunk from the Ordinary fast path.
+        if in_fence
+            || source.contains(['`', '~', '|', '<'])
+            || source.contains("]:")
+            || stripped.starts_with('[')
+            || is_setext_or_rule_candidate(source)
+        {
+            chunk_safe = false;
+            chunk_candidates.clear();
+            continue;
+        }
+        if !chunk_safe {
+            continue;
+        }
+        if source.chars().all(prose_inner)
             && let Some(first_text) = visible
                 .peek()
                 .copied()
@@ -741,10 +823,10 @@ fn plain_lines(body: &str) -> Result<Vec<Range<usize>>, Reject> {
             let prefix = &body[start..plain_start];
             let suffix = &body[plain_start..end];
             if safe_line_prefix(prefix) && suffix.chars().next().is_some_and(prose_start) {
-                result.push(plain_start..end);
+                chunk_candidates.push(plain_start..end);
             }
         }
-        start += line.len();
     }
+    flush_chunk(&mut chunk_candidates, &mut chunk_safe, &mut result);
     Ok(result)
 }

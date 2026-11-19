@@ -818,10 +818,11 @@ impl CanonicalStore {
                 let mut conn = BackendConn::Sqlite(&mut pair.sqlx_conn);
                 let mut transaction = WriteTransaction::begin(&mut conn).await?;
                 let value = op(&mut transaction.conn()).await?;
-                transaction.commit().await?;
+                let commit_res = transaction.commit().await;
                 self.inner
                     .sqlite_writer_commit_gen
                     .fetch_add(1, Ordering::Release);
+                commit_res?;
                 if let Some(wal) = self.inner.wal_coord.get() {
                     wal.note_writer_commit();
                 }

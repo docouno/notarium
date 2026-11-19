@@ -314,14 +314,19 @@ impl RoomCarrierState {
 }
 
 fn extract_header_source(source: &str, carrier: &Carrier) -> String {
-    if let Some(header) = carrier.header {
-        source[..header.end()].to_owned()
-    } else {
-        let bom = &source[..carrier.bom_end];
-        // Keep exact BOM and detected line ending while guarding against
-        // closing-fence absorption during raw header merges.
-        format!("{bom}x{}", carrier.eol)
+    if carrier.body.is_empty() {
+        return source.to_owned();
     }
+    // Preserve exact BOM, header bytes, and body EOL without retaining the full
+    // body text; the 1-char sentinel keeps non-empty-body line endings intact
+    // if a RawHeader edit later removes the header block.
+    let body = &source[carrier.body.start()..];
+    let body_eol = match body.find('\n') {
+        Some(idx) if idx > 0 && body.as_bytes()[idx - 1] == b'\r' => "\r\n",
+        Some(_) => "\n",
+        None => "",
+    };
+    format!("{}x{body_eol}", &source[..carrier.body.start()])
 }
 
 fn analyze_base(source: &str, digest: ContentDigest) -> DomainResult<(HeaderAnalysis, bool)> {
@@ -734,5 +739,85 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn raw_header_merge_handles_empty_note_and_preserves_crlf_on_header_removal() {
+        use notarium_core::ids::HeaderIdentity;
+        use notarium_syntax::live::{
+            RoomCarrierState as LiveHeaderState, merge_raw_header, raw_header_plan,
+        };
+
+        // 1. Empty note + RawHeader adding a header without trailing EOL.
+        let empty = "";
+        let rev1 = RevisionId::from_bytes([1; 16]);
+        let (state, body) =
+            RoomCarrierState::from_carrier(rev1, content_digest(empty), empty).unwrap();
+        assert_eq!(body, "");
+        let header_id = HeaderIdentity::from_bytes([1; 16]);
+        let added = "---\nstatus: done\n---";
+        let plan = raw_header_plan(empty, added, DocClass::UserDoc, header_id.clone()).unwrap();
+        let merged = merge_raw_header(
+            &LiveHeaderState {
+                header_identity: header_id.clone(),
+                base_carrier: state.header_merge_source().to_owned(),
+                pending_fields: BTreeMap::new(),
+            },
+            &plan,
+            DocClass::UserDoc,
+            header_id,
+        )
+        .unwrap();
+        let final_empty = project_body(&merged.final_carrier, "").unwrap();
+        assert_eq!(final_empty, added);
+
+        // 2. CRLF note with header + RawHeader removing the entire header while
+        //    a live body starting with `---` forces empty-header fence protection.
+        let crlf = "---\r\nstatus: todo\r\n---\r\nbody line\r\n";
+        let rev2 = RevisionId::from_bytes([2; 16]);
+        let (crlf_state, crlf_body) =
+            RoomCarrierState::from_carrier(rev2, content_digest(crlf), crlf).unwrap();
+        assert_eq!(crlf_body, "body line\r\n");
+        let removed_target = "body line\r\n";
+        let header_id2 = HeaderIdentity::from_bytes([2; 16]);
+        let remove_plan =
+            raw_header_plan(crlf, removed_target, DocClass::UserDoc, header_id2.clone()).unwrap();
+        let merged_crlf = merge_raw_header(
+            &LiveHeaderState {
+                header_identity: header_id2.clone(),
+                base_carrier: crlf_state.header_merge_source().to_owned(),
+                pending_fields: BTreeMap::new(),
+            },
+            &remove_plan,
+            DocClass::UserDoc,
+            header_id2,
+        )
+        .unwrap();
+        let projected = project_body(&merged_crlf.final_carrier, "---\r\nliteral\r\n").unwrap();
+        assert_eq!(projected, "---\r\n---\r\n---\r\nliteral\r\n");
+
+        // 3. Mixed LF header + CRLF body preserves body CRLF when header is removed.
+        let mixed = "---\nstatus: todo\n---\nbody line\r\n";
+        let rev3 = RevisionId::from_bytes([3; 16]);
+        let (mixed_state, mixed_body) =
+            RoomCarrierState::from_carrier(rev3, content_digest(mixed), mixed).unwrap();
+        assert_eq!(mixed_body, "body line\r\n");
+        let header_id3 = HeaderIdentity::from_bytes([3; 16]);
+        let mixed_remove =
+            raw_header_plan(mixed, removed_target, DocClass::UserDoc, header_id3.clone()).unwrap();
+        let merged_mixed = merge_raw_header(
+            &LiveHeaderState {
+                header_identity: header_id3.clone(),
+                base_carrier: mixed_state.header_merge_source().to_owned(),
+                pending_fields: BTreeMap::new(),
+            },
+            &mixed_remove,
+            DocClass::UserDoc,
+            header_id3,
+        )
+        .unwrap();
+        let projected_mixed =
+            project_body(&merged_mixed.final_carrier, "---\r\nliteral\r\n").unwrap();
+        assert_eq!(projected_mixed, "---\r\n---\r\n---\r\nliteral\r\n");
     }
 }

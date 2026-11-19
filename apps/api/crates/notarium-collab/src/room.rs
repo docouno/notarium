@@ -368,9 +368,25 @@ impl Room {
         shutdown: Cancellation,
     ) -> Result<(), PortError> {
         let mut next_command = None;
+        let result = self
+            .run_loop(&mut commands, &mut next_command, handle, shutdown)
+            .await;
+        // Drain any remaining buffered commands on every exit path (including
+        // error exits) so queued unstarted `Intercept` mutations receive
+        // `RoomClosingNotStarted` instead of spurious `CommitEffect::Unknown`.
+        let _ = self.drain_on_close(&mut commands, next_command.take());
+        result
+    }
+
+    async fn run_loop(
+        &mut self,
+        commands: &mut mpsc::Receiver<RoomCommand>,
+        next_command: &mut Option<RoomCommand>,
+        handle: &RoomHandle,
+        shutdown: Cancellation,
+    ) -> Result<(), PortError> {
         loop {
             if shutdown.is_cancelled() {
-                let _ = self.drain_on_close(&mut commands, next_command.take());
                 return Ok(());
             }
             let command = if let Some(command) = next_command.take() {
@@ -382,7 +398,6 @@ impl Room {
                     .map(|since| since + self.config.idle_unload);
                 tokio::select! {
                     () = shutdown.cancelled() => {
-                        let _ = self.drain_on_close(&mut commands, None);
                         return Ok(());
                     }
                     () = handle.storage_changed.notified() => {
@@ -398,7 +413,7 @@ impl Room {
                         continue;
                     }
                     () = wait_for(unload_at) => {
-                        let waiters = self.drain_on_close(&mut commands, None);
+                        let waiters = self.drain_on_close(commands, None);
                         let res = self.close(&self.budget()).await;
                         for waiter in waiters {
                             let _ = waiter.send(res.as_ref().copied().map_err(|_| {
@@ -455,7 +470,6 @@ impl Room {
                             tokio::select! {
                                 biased;
                                 () = shutdown.cancelled() => {
-                                    let _ = self.drain_on_close(&mut commands, None);
                                     return Ok(());
                                 }
                                 () = sleep_until(coalesce) => None,
@@ -468,7 +482,7 @@ impl Room {
                                 frames += 1;
                             }
                             other => {
-                                next_command = other;
+                                *next_command = other;
                                 break;
                             }
                         }
@@ -488,7 +502,6 @@ impl Room {
                     let outcome = self.intercept_command(*request).await;
                     let _ = reply.send(InterceptReply::Result(outcome.reply));
                     if outcome.poison_room {
-                        let _ = self.drain_on_close(&mut commands, next_command.take());
                         return Err(operation_error(
                             b"collab_command_unresolved",
                             CommitEffect::Unknown,
@@ -503,7 +516,7 @@ impl Room {
                         for peer in self.peers.values() {
                             peer.outbound.guard.close(SessionClose::POLICY);
                         }
-                        self.drain_on_close(&mut commands, next_command.take())
+                        self.drain_on_close(commands, next_command.take())
                     } else {
                         Vec::new()
                     };
@@ -538,7 +551,7 @@ impl Room {
                     for peer in self.peers.values() {
                         peer.outbound.guard.close(SessionClose::GOING_AWAY);
                     }
-                    let waiters = self.drain_on_close(&mut commands, next_command.take());
+                    let waiters = self.drain_on_close(commands, next_command.take());
                     let result = self.close(&budget).await;
                     let failed = result.is_err();
                     let _ = reply.send(result);
@@ -811,6 +824,32 @@ impl Room {
         Ok(())
     }
 
+    async fn ack_noop_update(
+        &mut self,
+        id: u64,
+        prefix: &mut Vec<PendingUpdate>,
+    ) -> Result<Option<PendingUpdate>, PortError> {
+        let Some(peer) = self.peers.get_mut(&id) else {
+            return Ok(None);
+        };
+        let Some(next) = peer.write_seq.checked_add(1) else {
+            return Err(DomainError::validation(ValidationReason::SequenceOverflow).into());
+        };
+        peer.write_seq = next;
+        self.flush_batch(prefix).await?;
+        let ack = ServerAckWatermark {
+            lease_epoch: self.lease.epoch,
+            peer_write_seq: next,
+            room_update_seq: self.last_seq,
+        };
+        if let Some(peer) = self.peers.get(&id) {
+            let _ = peer
+                .outbound
+                .send(ack.encode(), self.lease.authority(PeerRole::Editor));
+        }
+        Ok(None)
+    }
+
     async fn stage(
         &mut self,
         id: u64,
@@ -827,22 +866,7 @@ impl Room {
         // peer's write watermark and ACKs with the current durable room seq
         // after flushing preceding edits, without inserting a no-op WAL row.
         if original == [0, 0] {
-            let Some(next) = peer.write_seq.checked_add(1) else {
-                return Err(DomainError::validation(ValidationReason::SequenceOverflow).into());
-            };
-            peer.write_seq = next;
-            self.flush_batch(prefix).await?;
-            let ack = ServerAckWatermark {
-                lease_epoch: self.lease.epoch,
-                peer_write_seq: next,
-                room_update_seq: self.last_seq,
-            };
-            if let Some(peer) = self.peers.get(&id) {
-                let _ = peer
-                    .outbound
-                    .send(ack.encode(), self.lease.authority(PeerRole::Editor));
-            }
-            return Ok(None);
+            return self.ack_noop_update(id, prefix).await;
         }
         match self
             .twin
@@ -852,6 +876,12 @@ impl Room {
                 if peer.outbound.guard.check().is_err() {
                     self.reset_staging(prefix)?;
                     return Ok(None);
+                }
+                // A duplicate/already-applied update normalizes to the empty
+                // Yjs update `[0, 0]`: ACK at the durable watermark without
+                // writing a no-op WAL row.
+                if staged.bytes == [0, 0] {
+                    return self.ack_noop_update(id, prefix).await;
                 }
                 let Some(next) = peer.write_seq.checked_add(1) else {
                     return Err(DomainError::validation(ValidationReason::SequenceOverflow).into());
@@ -930,6 +960,17 @@ impl Room {
                 .twin
                 .stage_peer(&update.original, &self.carrier, &self.lease.note);
             match staged {
+                Ok(staged) if staged.bytes == [0, 0] => {
+                    let ack = ServerAckWatermark {
+                        lease_epoch: self.lease.epoch,
+                        peer_write_seq: update.peer_seq,
+                        room_update_seq: self.last_seq,
+                    };
+                    let _ = peer
+                        .outbound
+                        .send(ack.encode(), self.lease.authority(PeerRole::Editor));
+                    continue;
+                }
                 Ok(staged) => update.staged = staged.bytes,
                 Err(reason) => {
                     peer.outbound.finish(

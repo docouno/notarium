@@ -265,7 +265,7 @@ pub fn build_effect_payload_draft(
 pub enum CommittedTargets {
     /// Only the listed notes changed, with no folder, Space, or ACL changes.
     Notes(Arc<[NoteId]>),
-    /// Folder hierarchy, Space lifecycle/schema, or a large batch changed.
+    /// Folder hierarchy, Space lifecycle, or a large batch changed.
     All,
 }
 

@@ -57,10 +57,17 @@ impl Room {
     }
 
     pub async fn checkpoint(&mut self, budget: &CallBudget) -> Result<(), PortError> {
-        if self.first_dirty.is_none() {
-            return Ok(());
+        let revoke_watermark = self.hub.upgrade().map(|hub| hub.current_revoke_seq());
+        if self.first_dirty.is_some() {
+            self.settle(budget, false).await?;
         }
-        self.settle(budget, false).await
+        if let (Some(hub), Some(watermark)) = (self.hub.upgrade(), revoke_watermark) {
+            let key = (self.lease.scope.space_id.clone(), self.lease.note.clone());
+            hub.prune_settled_revocations(&key, watermark, |peer_id| {
+                !self.peers.contains_key(&peer_id)
+            });
+        }
+        Ok(())
     }
 
     pub async fn close(&mut self, budget: &CallBudget) -> Result<(), PortError> {

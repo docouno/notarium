@@ -1544,7 +1544,7 @@ async fn flush_single_batch(
                             })
                             .collect();
                         let mut backend = BackendConn::Sqlite(&mut pair.sqlx_conn);
-                        let out = execute_batch_on_conn(
+                        execute_batch_on_conn(
                             &store,
                             &mut backend,
                             intents,
@@ -1552,12 +1552,7 @@ async fn flush_single_batch(
                             cfg,
                             faults,
                         )
-                        .await;
-                        inner.latch_sqlite_aux_tables_populated();
-                        inner
-                            .sqlite_writer_commit_gen
-                            .fetch_add(1, Ordering::Release);
-                        out
+                        .await
                     }
                 }
                 None => BatchExecOutcome::AbortedBeforeCommit(unavailable_retryable(
@@ -1788,6 +1783,7 @@ async fn execute_batch_on_conn(
     cfg: WriterConfig,
     faults: &WriterFaultState,
 ) -> BatchExecOutcome {
+    let is_sqlite = matches!(tx, BackendConn::Sqlite(_));
     let mut transaction = match WriteTransaction::begin(tx).await {
         Ok(transaction) => transaction,
         Err(err) => return BatchExecOutcome::AbortedBeforeCommit(err),
@@ -2022,8 +2018,18 @@ async fn execute_batch_on_conn(
         return BatchExecOutcome::AbortedBeforeCommit(sync_err);
     }
 
-    // Commit outer SQL transaction!
-    match transaction.commit().await {
+    // Commit outer SQL transaction and immediately advance SQLite's commit
+    // generation BEFORE releasing fence guards or publishing broadcasts so
+    // linearizable generation caches never observe pre-commit authorization.
+    let commit_res = transaction.commit().await;
+    if is_sqlite {
+        store.inner.latch_sqlite_aux_tables_populated();
+        store
+            .inner
+            .sqlite_writer_commit_gen
+            .fetch_add(1, Ordering::Release);
+    }
+    match commit_res {
         Ok(()) => {
             for action in after_commit {
                 action();

@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, LazyLock, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -1643,6 +1643,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
 
     let has_external_stagings = !extracted_stagings.is_empty();
     let wal_stage1 = wal_opt.clone();
+    let inner_stage1 = Arc::clone(&store.inner);
     let current_writer_gen = store.inner.sqlite_writer_commit_gen.load(Ordering::Acquire);
 
     let (wave_approval_tx, wave_approval_rx) = tokio::sync::oneshot::channel::<EarlyWaveApproval>();
@@ -1654,6 +1655,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
             fast_items,
             cfg,
             wal_stage1.as_deref(),
+            &inner_stage1.sqlite_writer_commit_gen,
             has_external_stagings,
             current_writer_gen,
             &mut approval_tx_opt,
@@ -1765,10 +1767,6 @@ pub(crate) async fn execute_sqlite_fast_batch(
             store
                 .cleanup_unretained_local_files_async(cleanup_all_published(local_cas_res))
                 .await;
-            store
-                .inner
-                .sqlite_writer_commit_gen
-                .fetch_add(1, Ordering::Release);
             restore_writer_rconn(pair, rconn);
             BatchExecOutcome::UnknownCommit { slots, diag_reason }
         }
@@ -1778,10 +1776,6 @@ pub(crate) async fn execute_sqlite_fast_batch(
             wal_frames,
         } => {
             drop(local_cas_res);
-            store
-                .inner
-                .sqlite_writer_commit_gen
-                .fetch_add(1, Ordering::Release);
             if let Some(w) = wal_opt.as_deref() {
                 w.note_writer_commit_with_frames(wal_frames);
             }
@@ -1857,9 +1851,13 @@ pub(crate) async fn execute_sqlite_fast_batch(
                 }
                 Ok(()) => {
                     let wal_stage2 = wal_opt.clone();
+                    let inner_stage2 = Arc::clone(&store.inner);
                     let commit_join = tokio::task::spawn_blocking(move || {
                         let _ = crate::wal::take_last_wal_commit_frames();
                         let res = rconn.execute_batch("COMMIT");
+                        inner_stage2
+                            .sqlite_writer_commit_gen
+                            .fetch_add(1, Ordering::Release);
                         let frames = crate::wal::take_last_wal_commit_frames();
                         if let Err(ref err) = res
                             && let Some(w) = wal_stage2.as_deref()
@@ -1877,6 +1875,10 @@ pub(crate) async fn execute_sqlite_fast_batch(
                             (res.map_err(|e| format!("{e:?}")), frames)
                         }
                         Err(join_err) => {
+                            store
+                                .inner
+                                .sqlite_writer_commit_gen
+                                .fetch_add(1, Ordering::Release);
                             if let Ok(reopened) = open_rusqlite_writer_connection(&pair.db_path) {
                                 pair.rusqlite_conn = Some(reopened);
                             }
@@ -1887,10 +1889,6 @@ pub(crate) async fn execute_sqlite_fast_batch(
                     if commit_res.is_ok() {
                         pending.batch_committed.store(true, Ordering::Release);
                     }
-                    store
-                        .inner
-                        .sqlite_writer_commit_gen
-                        .fetch_add(1, Ordering::Release);
                     drop(pending.batch_retained_tickets);
                     drop(pending.batch_retained_guards);
 
@@ -1984,21 +1982,24 @@ fn finalize_committed_batch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sqlite_fast_sql_stage(
     conn: &rusqlite::Connection,
     items: Vec<(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)>,
     cfg: WriterConfig,
     wal: Option<&SqliteWalCoordinator>,
+    commit_gen: &AtomicU64,
     has_external_stagings: bool,
     current_writer_gen: u64,
     approval_tx_opt: &mut Option<tokio::sync::oneshot::Sender<EarlyWaveApproval>>,
 ) -> FastSqlStageResult {
-    if items.len() > 1 && items.iter().any(|(_, p)| p.requires_savepoint_isolation()) {
+    if items.iter().any(|(_, p)| p.requires_savepoint_isolation()) {
         return run_savepoint_fallback_sql_stage(
             conn,
             &items,
             cfg,
             wal,
+            commit_gen,
             has_external_stagings,
             current_writer_gen,
         );
@@ -2008,6 +2009,7 @@ fn run_sqlite_fast_sql_stage(
         &items,
         cfg,
         wal,
+        commit_gen,
         has_external_stagings,
         current_writer_gen,
         approval_tx_opt,
@@ -2021,6 +2023,7 @@ fn run_sqlite_fast_sql_stage(
                 &items,
                 cfg,
                 wal,
+                commit_gen,
                 has_external_stagings,
                 current_writer_gen,
             )
@@ -2041,11 +2044,13 @@ fn has_any_pending_blob_retirement_rusqlite(
     Ok(found.is_some())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_run_optimistic_fast_sql_stage(
     conn: &rusqlite::Connection,
     items: &[(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)],
     cfg: WriterConfig,
     wal: Option<&SqliteWalCoordinator>,
+    commit_gen: &AtomicU64,
     has_external_stagings: bool,
     current_writer_gen: u64,
     approval_tx_opt: &mut Option<tokio::sync::oneshot::Sender<EarlyWaveApproval>>,
@@ -2203,6 +2208,7 @@ fn try_run_optimistic_fast_sql_stage(
         cache.batch_committed,
         slots,
         wal,
+        commit_gen,
         has_external_stagings,
     ))
 }
@@ -2212,6 +2218,7 @@ fn run_savepoint_fallback_sql_stage(
     items: &[(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)],
     cfg: WriterConfig,
     wal: Option<&SqliteWalCoordinator>,
+    commit_gen: &AtomicU64,
     has_external_stagings: bool,
     current_writer_gen: u64,
 ) -> FastSqlStageResult {
@@ -2384,6 +2391,7 @@ fn run_savepoint_fallback_sql_stage(
         cache.batch_committed,
         slots,
         wal,
+        commit_gen,
         has_external_stagings,
     )
 }
@@ -2398,6 +2406,7 @@ fn finish_fast_sql_stage(
     batch_committed: Arc<AtomicBool>,
     slots: Vec<ItemOutcomeSlot>,
     wal: Option<&SqliteWalCoordinator>,
+    commit_gen: &AtomicU64,
     has_external_stagings: bool,
 ) -> FastSqlStageResult {
     for entry in space_states.values() {
@@ -2432,7 +2441,11 @@ fn finish_fast_sql_stage(
 
     if !has_external_stagings && !has_deferred_publish && !has_dir_syncs {
         let _ = crate::wal::take_last_wal_commit_frames();
-        match conn.execute_batch("COMMIT") {
+        let commit_res = conn.execute_batch("COMMIT");
+        // Advance SQLite commit generation immediately after COMMIT (both Ok
+        // and Err) and strictly BEFORE dropping fence guards or waking readers.
+        commit_gen.fetch_add(1, Ordering::Release);
+        match commit_res {
             Ok(()) => {
                 let wal_frames = crate::wal::take_last_wal_commit_frames();
                 batch_committed.store(true, Ordering::Release);
@@ -3381,6 +3394,10 @@ pub(crate) fn build_carrier_replacement_fast_intent(
 }
 
 impl SqliteSyncItemPlan for CarrierReplacementFastPlan {
+    fn requires_savepoint_isolation(&self) -> bool {
+        self.closed_reservation.is_some()
+    }
+
     fn take_deferred_local_staging(&self) -> Option<DeferredLocalStaging> {
         self.ticket.take_deferred_local_staging()
     }

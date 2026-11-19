@@ -76,7 +76,7 @@ impl SessionClose {
         reason: "frame too large",
     };
 
-    const DISCONNECTED: Self = Self {
+    pub(crate) const DISCONNECTED: Self = Self {
         code: 1000,
         reason: "peer disconnected",
     };
@@ -558,7 +558,7 @@ impl PeerGuard {
     pub(crate) fn attach_hub_registration(&self, hub: Weak<HubInner>, id: u64) {
         if self.lease_lost.is_cancelled() {
             if let Some(hub) = hub.upgrade() {
-                hub.unregister_peer(id);
+                hub.unregister_peer(id, self.cancellation.is_cancelled());
             }
             return;
         }
@@ -577,7 +577,7 @@ impl PeerGuard {
         if let Some((hub, id)) = entry
             && let Some(hub) = hub.upgrade()
         {
-            hub.unregister_peer(id);
+            hub.unregister_peer(id, self.cancellation.is_cancelled());
         }
     }
 
