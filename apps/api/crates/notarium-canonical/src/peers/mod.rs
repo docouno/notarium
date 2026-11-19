@@ -452,7 +452,7 @@ impl ContentJobPort for CanonicalStore {
         request: Mutation<ContentJobKind>,
     ) -> PortFuture<'_, Committed<ContentJob>> {
         let store = self.clone();
-        Box::pin(async move { create_job_impl(&store, ctx, request, None).await })
+        Box::pin(async move { create_job_impl(&store, ctx, request, false).await })
     }
 
     fn get_job(&self, ctx: SpaceContext, job: JobId) -> PortFuture<'_, ContentJob> {
@@ -669,7 +669,40 @@ impl CanonicalStore {
         expected_lease: LeaseEpoch,
         outcome: JobCompletionOutcome,
     ) -> Result<Committed<ContentJob>, PortError> {
-        complete_job_impl(self, budget, scope, job, worker_id, expected_lease, outcome).await
+        complete_job_impl(
+            self,
+            budget,
+            scope,
+            job,
+            worker_id,
+            expected_lease,
+            outcome,
+            None,
+        )
+        .await
+    }
+
+    /// Complete a delegated archive job while retaining its registration
+    /// through the canonical writer's commit, even if the waiter leaves.
+    pub async fn complete_archive_job(
+        &self,
+        budget: &CallBudget,
+        scope: &HistoryScope,
+        claim: &ClaimedContentJob,
+        outcome: JobCompletionOutcome,
+        authority: archive_import::ArchiveCommitAuthority,
+    ) -> Result<Committed<ContentJob>, PortError> {
+        complete_job_impl(
+            self,
+            budget,
+            scope,
+            &claim.job.id,
+            &claim.lease_owner,
+            claim.job.lease,
+            outcome,
+            Some(authority),
+        )
+        .await
     }
 
     /// Reads the persisted collaborative session and ordered `collab_update_log` for `note`.
@@ -1208,7 +1241,7 @@ async fn create_job_impl(
     store: &CanonicalStore,
     ctx: SpaceContext,
     request: Mutation<ContentJobKind>,
-    import_source: Option<archive_import::ArchiveObject>,
+    attach_source: bool,
 ) -> Result<Committed<ContentJob>, PortError> {
     let deadline = crate::domain::common::CommandDeadline::start(&ctx.budget, "create_job");
     validate_mutation_identity(&ctx, &request.identity)?;
@@ -1219,21 +1252,12 @@ async fn create_job_impl(
     ) {
         return Err(DomainError::AccessDenied.into());
     }
-    let import_source = import_source.map(|source| {
-        source.scope.check(ctx.scope())?;
-        if source.installation != *store.installation_id()
-            || source.kind != archive_import::ArchiveObjectKind::Source
-            || !matches!(&request.input, ContentJobKind::Import { artifact } if artifact == &source.id)
-            || JobDelegation::capture(ctx.auth(), ctx.scope()).is_none()
-        {
-            return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
-        }
-        let bytes = encode_msgpack(&source)?;
-        if bytes.len() > MAX_MSGPACK_DECODE_BYTES {
-            return Err(DomainError::validation(ValidationReason::BudgetExceeded).into());
-        }
-        Ok::<_, PortError>(bytes)
-    }).transpose()?;
+    if attach_source
+        && (!matches!(request.input, ContentJobKind::Import { .. })
+            || JobDelegation::capture(ctx.auth(), ctx.scope()).is_none())
+    {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
     let space_rec = deadline
         .prepare(&ctx.budget, || {
             store.read_space_fast_or_pool(&ctx.scope().space_id, Some(&ctx.budget))
@@ -1243,16 +1267,11 @@ async fn create_job_impl(
 
     let payload_wire = StoredJobPayloadV1::from(&request.input);
     let identity_payload = encode_msgpack(&payload_wire)?;
-    let command_payload = if let Some(source) = &import_source {
-        encode_msgpack(&(&payload_wire, blake3::hash(source).as_bytes()))?
-    } else {
-        identity_payload.clone()
-    };
     let export_notes = match &request.input {
         ContentJobKind::Export { notes, .. } => notes.as_slice(),
         _ => &[],
     };
-    let idemp = derive_command_identity_spec(&request.identity, "create_job", &command_payload)
+    let idemp = derive_command_identity_spec(&request.identity, "create_job", &identity_payload)
         .for_job(ctx.auth(), None, export_notes);
     let payload_bytes = if matches!(
         &request.input,
@@ -1384,8 +1403,18 @@ async fn create_job_impl(
                     }
                 }
 
-                if let Some(source) = import_source {
-                    archive_import::persist_import_source_tx(tx, &scope, &job_id, source).await?;
+                if attach_source && let ContentJobKind::Import { artifact } = &input {
+                    let locator = archive_uploads::attach_archive_source_tx(
+                        tx,
+                        &scope,
+                        artifact,
+                        auth.principal(),
+                    )
+                    .await?;
+                    archive_import::persist_import_source_tx(
+                        tx, &scope, &job_id, artifact, locator,
+                    )
+                    .await?;
                 }
                 let job_val = ContentJob {
                     id: job_id.clone(),
@@ -2171,7 +2200,10 @@ async fn next_claimable_job(
             concat!(
                 "SELECT job_id FROM content_jobs
                  WHERE space_id = $1
-                   AND (state = 'queued' OR (state = 'running' AND lease_until_ms <= $2))
+                   AND (state = 'queued' OR (state = 'running' AND (
+                      lease_until_ms <= $2 OR claim_space_epoch IS DISTINCT FROM
+                        (SELECT active_epoch FROM spaces WHERE space_id=$1)
+                   )))
                    AND (CAST($3 AS TEXT) IS NULL OR job_kind = $3)
                  ORDER BY created_seq, job_id LIMIT 1",
                 $suffix,
@@ -2239,6 +2271,27 @@ async fn require_active_job_lease_tx(
         || current_owner.as_deref() != Some(owner)
         || until.is_none_or(|until| until <= now)
     {
+        return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+    }
+    const LIVE_SPACE: &str = "SELECT EXISTS(
+        SELECT 1 FROM content_jobs j JOIN spaces s ON s.space_id=j.space_id
+        WHERE j.space_id=$1 AND j.job_id=$2 AND j.claim_space_epoch=s.active_epoch
+    )";
+    macro_rules! current {
+        ($conn:expr) => {
+            sqlx::query_scalar::<_, bool>(LIVE_SPACE)
+                .bind(scope.space_id.as_str())
+                .bind(id.as_str())
+                .fetch_one(&mut **$conn)
+                .await
+        };
+    }
+    let same_space_epoch = match tx {
+        BackendConn::Sqlite(conn) => current!(conn),
+        BackendConn::Postgres(conn) => current!(conn),
+    }
+    .map_err(|err| crate::runtime::pg_read_error("check_job_space_epoch", err))?;
+    if !same_space_epoch {
         return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
     }
     Ok((job, now, erased))
@@ -2317,7 +2370,8 @@ async fn claim_next_job_impl(
                                  lease_epoch = ?,
                                  lease_until_ms = ?,
                                  attempts = ?,
-                                 updated_seq = ?
+                                 updated_seq = ?,
+                                 claim_space_epoch = ?
                              WHERE space_id = ? AND job_id = ?",
                         )
                         .bind(&worker_owned)
@@ -2325,6 +2379,7 @@ async fn claim_next_job_impl(
                         .bind(lease_until_ms)
                         .bind(new_attempts as i64)
                         .bind(seq.get() as i64)
+                        .bind(item_ctx.active_epoch.get() as i64)
                         .bind(scope_cl.space_id.as_str())
                         .bind(jid.as_str())
                         .execute(&mut **conn)
@@ -2341,14 +2396,16 @@ async fn claim_next_job_impl(
                                  lease_epoch = $2,
                                  lease_until_ms = $3,
                                  attempts = $4,
-                                 updated_seq = $5
-                             WHERE space_id = $6 AND job_id = $7",
+                                 updated_seq = $5,
+                                 claim_space_epoch = $6
+                             WHERE space_id = $7 AND job_id = $8",
                         )
                         .bind(&worker_owned)
                         .bind(new_lease.get() as i64)
                         .bind(lease_until_ms)
                         .bind(i32::try_from(new_attempts).unwrap_or(i32::MAX))
                         .bind(seq.get() as i64)
+                        .bind(item_ctx.active_epoch.get() as i64)
                         .bind(scope_cl.space_id.as_str())
                         .bind(jid.as_str())
                         .execute(&mut **conn)
@@ -2513,6 +2570,7 @@ async fn complete_job_impl(
     worker_id: &str,
     expected_lease: LeaseEpoch,
     outcome: JobCompletionOutcome,
+    authority: Option<archive_import::ArchiveCommitAuthority>,
 ) -> Result<Committed<ContentJob>, PortError> {
     let deadline = crate::domain::common::CommandDeadline::start(budget, "complete_job");
     let space_rec = deadline
@@ -2536,6 +2594,12 @@ async fn complete_job_impl(
         required_semantic_cut: None,
         execute: Box::new(move |tx, item_ctx| {
             Box::pin(async move {
+                if let Some(authority) = authority {
+                    authority.check()?;
+                    item_ctx.retain_until_batch_commit(authority);
+                } else if matches!(outcome, JobCompletionOutcome::Exported(_)) {
+                    return Err(DomainError::validation(ValidationReason::InvalidAuthority).into());
+                }
                 let (mut cur_job, now, erased) =
                     require_active_job_lease_tx(tx, &scope_cl, &jid, &worker_owned, expected_lease)
                         .await?;

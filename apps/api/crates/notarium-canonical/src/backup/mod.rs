@@ -1133,10 +1133,20 @@ fn run_sqlite_spool_on_owner_thread(
         .map_err(|err| internal_not_committed("sqlite_verify_progress", err.to_string()))?;
         // Holds protect source CAS objects until the backup owner releases them.
         // Normalize the private copy before hashing and publishing its single database file.
-        dst.execute_batch("PRAGMA journal_mode = DELETE; DELETE FROM backup_holds;")
-            .map_err(|err| {
-                internal_not_committed("sqlite_backup_clear_source_holds", err.to_string())
-            })?;
+        dst.execute_batch(
+            "PRAGMA journal_mode = DELETE;
+             BEGIN;
+             DELETE FROM archive_export_shadows;
+             DELETE FROM archive_export_cuts;
+             DELETE FROM backup_holds;
+             DELETE FROM archive_artifacts;
+             DELETE FROM archive_import_sources;
+             DELETE FROM archive_uploads;
+             COMMIT;",
+        )
+        .map_err(|err| {
+            internal_not_committed("sqlite_backup_clear_source_holds", err.to_string())
+        })?;
         let dst_witness =
             read_and_verify_sqlite_conn_witness(&dst, &expected_witness.installation)?;
         if !witnesses_equal(&dst_witness, expected_witness) {
@@ -1723,8 +1733,17 @@ async fn stream_postgres_spool_v1(
             let col_count = u16::try_from(table.columns.len()).expect("col count fits in u16");
             spool_writer.write_body(&col_count.to_be_bytes())?;
 
-            if table.name == "backup_holds" {
-                // V1 requires every table frame. Source-local holds have no owner on restore.
+            if matches!(
+                table.name,
+                "backup_holds"
+                    | "archive_export_cuts"
+                    | "archive_export_shadows"
+                    | "archive_artifacts"
+                    | "archive_import_sources"
+                    | "archive_uploads"
+            ) {
+                // Include the required frames without source worker ownership,
+                // its export snapshots or pointers to unbacked job objects.
                 spool_writer.write_body(&[0])?;
                 spool_writer.write_body(&0u64.to_be_bytes())?;
                 continue;
@@ -2024,6 +2043,8 @@ pub fn spool_tables(schema_version: u32) -> impl Iterator<Item = TableSpec> + Cl
                         table.columns = &table.columns[..9];
                         table.indexes = &["idx_blob_catalog_zero_ref"];
                     }
+                    "content_jobs" => table.columns = &table.columns[..17],
+                    "backup_holds" => table.columns = &table.columns[..9],
                     _ => {}
                 }
             }
@@ -3174,6 +3195,14 @@ async fn open_cas_hold(
 }
 
 impl CanonicalStore {
+    pub async fn reap_archive_export_holds(
+        &self,
+        budget: &CallBudget,
+        after: String,
+    ) -> Result<Option<String>, PortError> {
+        ownership::reap_scoped_exports(self, budget, after).await
+    }
+
     /// Retain physical CAS publications for one Space while an export runs.
     pub(crate) async fn export_cas_hold(
         &self,
@@ -3728,8 +3757,8 @@ async fn acquire_durable_backup_holds(
                             sqlx::query(
                                 "INSERT INTO backup_holds (
                                     backup_id, space_id, history_incarnation, owner_installation_id,
-                                    phase, cutoff_seq, witness_json, created_at_ms, owner_generation
-                                ) VALUES (?, ?, ?, ?, 'holding', ?, ?, ?, ?)",
+                                    phase, cutoff_seq, witness_json, created_at_ms, owner_generation, scoped_export
+                                ) VALUES (?, ?, ?, ?, 'holding', ?, ?, ?, ?, ?)",
                             )
                             .bind(bid.as_str())
                             .bind(cur.scope.space_id.as_str())
@@ -3739,6 +3768,7 @@ async fn acquire_durable_backup_holds(
                             .bind(&witness_json)
                             .bind(now_ms)
                             .bind(generation.as_str())
+                            .bind(i32::from(scope.is_some()))
                             .execute(&mut **conn)
                             .await
                             .map_err(|err| {
@@ -3749,8 +3779,8 @@ async fn acquire_durable_backup_holds(
                             sqlx::query(
                                 "INSERT INTO backup_holds (
                                     backup_id, space_id, history_incarnation, owner_installation_id,
-                                    phase, cutoff_seq, witness_json, created_at_ms, owner_generation
-                                ) VALUES ($1, $2, $3, $4, 'holding', $5, $6, $7, $8)",
+                                    phase, cutoff_seq, witness_json, created_at_ms, owner_generation, scoped_export
+                                ) VALUES ($1, $2, $3, $4, 'holding', $5, $6, $7, $8, $9)",
                             )
                             .bind(bid.as_str())
                             .bind(cur.scope.space_id.as_str())
@@ -3760,6 +3790,7 @@ async fn acquire_durable_backup_holds(
                             .bind(&witness_json)
                             .bind(now_ms)
                             .bind(generation.as_str())
+                            .bind(i32::from(scope.is_some()))
                             .execute(&mut **conn)
                             .await
                             .map_err(|err| {

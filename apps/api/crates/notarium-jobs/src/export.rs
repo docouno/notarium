@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io::{self, Seek, SeekFrom, Write},
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -8,9 +9,10 @@ use notarium_canonical::{
     JobCompletionOutcome, codec,
     peers::{
         archive_export::{
-            ExportChatBody, ExportChatEntry, ExportChatHeader, ExportData, ExportPublication,
+            ExportChatBody, ExportChatEntry, ExportChatHeader, ExportData, ExportEntry,
+            ExportPublication,
         },
-        archive_import::ArchiveObjectKind,
+        archive_import::{ArchiveObject, ArchiveObjectKind},
     },
 };
 use notarium_core::{
@@ -24,7 +26,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use crate::{ArchiveJobs, JobExecution, import::check_cancelled};
+use crate::{ArchiveJobs, JobExecution, import::check_cancelled, worker::command_budget};
 
 const MAX_EXPORT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
@@ -51,19 +53,52 @@ impl ArchiveJobs {
             scope: cut.scope.clone(),
             generation: cut.generation,
         };
+        let entries = std::mem::take(&mut cut.entries);
+        let files = entries.len() as u64;
+        let monitor = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                self.store
+                    .check_export_generation(
+                        &command_budget(job.cancellation())?,
+                        job.scope(),
+                        source.generation,
+                    )
+                    .await?;
+            }
+        };
+        let result = tokio::select! {
+            object = self.write_export(job, &ctx.budget, &source, entries, files) => object,
+            failed = monitor => failed,
+        };
+        let seq = cut.seq;
+        let released = cut.release().await;
+        let object = result?;
+        released?;
+        Ok(JobCompletionOutcome::Exported(ExportPublication {
+            object,
+            cut: seq,
+            privacy_generation: source.generation,
+            files,
+        }))
+    }
+
+    async fn write_export(
+        &self,
+        job: &JobExecution,
+        budget: &CallBudget,
+        source: &ExportSource,
+        entries: Vec<ExportEntry>,
+        files: u64,
+    ) -> Result<ArchiveObject, PortError> {
         let scratch = self.artifacts.scratch()?;
         let file = scratch.open_new("export.zip")?;
         let (commands, receiver) = mpsc::channel(1);
         let writer = job.blocking(move |cancel| write_zip(file, receiver, cancel));
-        let entries = std::mem::take(&mut cut.entries);
-        let files = entries.len() as u64;
         let producer = async {
             for (index, entry) in entries.into_iter().enumerate() {
                 if index % 128 == 0 {
-                    let checked = job.authorize().await?;
-                    self.store
-                        .check_export_generation(&checked.budget, job.scope(), source.generation)
-                        .await?;
+                    job.authorize().await?;
                 }
                 check_cancelled(job.cancellation())?;
                 let (out, body) = mpsc::channel(2);
@@ -77,23 +112,22 @@ impl ArchiveJobs {
                 match entry.data {
                     ExportData::Blob(digest) => {
                         self.store
-                            .stream_held_blob(&ctx.budget, &source.hold, job.scope(), digest, &out)
+                            .stream_held_blob(budget, &source.hold, job.scope(), digest, &out)
                             .await?;
                     }
                     ExportData::Chat(chat) => {
-                        export_chat_header(&chat.header, &ctx.budget, &out).await?;
-                        self.export_chat_entries(&ctx.budget, &source, chat.entries, &out)
+                        export_chat_header(&chat.header, budget, &out).await?;
+                        self.export_chat_entries(budget, source, chat.entries, &out)
                             .await?;
                     }
                     ExportData::PagedChat(header, chat) => {
-                        export_chat_header(&header, &ctx.budget, &out).await?;
+                        export_chat_header(&header, budget, &out).await?;
                         let mut after = 0;
                         loop {
-                            let page = chat.page(&self.store, &ctx.budget, after).await?;
+                            let page = chat.page(&self.store, budget, after).await?;
                             let Some(last) = page.last() else { break };
                             after = last.seq;
-                            self.export_chat_entries(&ctx.budget, &source, page, &out)
-                                .await?;
+                            self.export_chat_entries(budget, source, page, &out).await?;
                         }
                     }
                 }
@@ -105,23 +139,14 @@ impl ArchiveJobs {
         let (produced, written) = tokio::join!(producer, writer);
         written?;
         produced?;
-        let object = self
-            .seal_attempt(
-                job,
-                &scratch,
-                "export.zip",
-                ArchiveObjectKind::Export,
-                MAX_EXPORT_BYTES,
-            )
-            .await?;
-        let publication = ExportPublication {
-            object,
-            cut: cut.seq,
-            privacy_generation: cut.generation,
-            files,
-        };
-        cut.release().await?;
-        Ok(JobCompletionOutcome::Exported(publication))
+        self.seal_attempt(
+            job,
+            &scratch,
+            "export.zip",
+            ArchiveObjectKind::Export,
+            MAX_EXPORT_BYTES,
+        )
+        .await
     }
 
     async fn export_chat_entries(

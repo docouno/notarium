@@ -1,7 +1,10 @@
 use std::{
     io::{Read, Seek},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use bytes::Bytes;
@@ -34,7 +37,7 @@ use tokio::sync::mpsc;
 use super::{RestoreReport, same_cuts};
 use crate::{
     BackupOptions,
-    backup_format::{CasRecord, invalid, io_error},
+    backup_format::{CasRecord, authenticated_payload, invalid, io_error},
     fsck::VerifiedArchive,
     import::check_cancelled,
 };
@@ -63,8 +66,36 @@ pub(super) async fn restore(
     archive: VerifiedArchive,
     options: BackupOptions,
 ) -> Result<RestoreReport, PortError> {
+    let cancellation = ctx.budget.cancellation.clone();
+    let publishing = AtomicBool::new(false);
+    tokio::select! {
+        biased;
+        result = restore_inner(ctx, target, archive, options, &publishing) => result,
+        () = cancellation.cancelled() => {
+            if publishing.load(Ordering::Acquire) {
+                Err(codec::unknown_commit_non_idempotent("cloud_restore_ready", "publication acknowledgement unavailable"))
+            } else {
+                Err(codec::cancelled_not_committed("cloud_restore", "restore stopped before publication"))
+            }
+        }
+    }
+}
+
+async fn restore_inner(
+    ctx: MaintenanceContext,
+    target: CloudRestoreTarget,
+    archive: VerifiedArchive,
+    options: BackupOptions,
+    publishing: &AtomicBool,
+) -> Result<RestoreReport, PortError> {
     check_cancelled(&ctx.budget.cancellation)?;
-    let options_pg = build_pg_connect_options(&target.database);
+    let timeout = ctx.budget.remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let options_pg = build_pg_connect_options(&target.database).options([
+        ("statement_timeout", timeout),
+        ("lock_timeout", timeout),
+        ("idle_in_transaction_session_timeout", timeout),
+        ("client_connection_check_interval", 1000),
+    ]);
     let mut database = PgConnection::connect_with(&options_pg)
         .await
         .map_err(pg_error)?;
@@ -75,8 +106,10 @@ pub(super) async fn restore(
     if !acquired {
         return Err(DomainError::MigrationInProgress.into());
     }
-    sqlx::raw_sql("SET synchronous_commit=on; SET statement_timeout='0'; SET idle_in_transaction_session_timeout='0';")
-        .execute(&mut database).await.map_err(pg_error)?;
+    sqlx::raw_sql("SET synchronous_commit=on")
+        .execute(&mut database)
+        .await
+        .map_err(pg_error)?;
     let gate = open_gate(&mut database, &target.object_store, &archive).await?;
     if !gate.ready {
         let control = ControlStore::postgres_for_restore(
@@ -92,6 +125,7 @@ pub(super) async fn restore(
             }
             rotate(&mut database, &control, &ctx, &target, &archive, &gate).await?;
             check_cancelled(&ctx.budget.cancellation)?;
+            publishing.store(true, Ordering::Release);
             let changed = sqlx::query(
                 "UPDATE notarium_restore.readiness SET phase='ready'
                  WHERE singleton=1 AND canonical_loaded AND phase='loading' AND archive_digest=$1",
@@ -99,7 +133,9 @@ pub(super) async fn restore(
             .bind(gate.archive.as_bytes().as_slice())
             .execute(&mut database)
             .await
-            .map_err(pg_error)?
+            .map_err(|err| {
+                codec::unknown_commit_non_idempotent("cloud_restore_ready", err.to_string())
+            })?
             .rows_affected();
             if changed != 1 {
                 return Err(invalid(ValidationReason::InvalidState));
@@ -291,7 +327,10 @@ async fn restore_control_rows(
             return Err(invalid(ValidationReason::InvalidState));
         }
     } else {
-        let mut decoder = SpoolReader::open(archive.control()?)?;
+        let mut decoder = SpoolReader::open(authenticated_payload(
+            archive.control()?,
+            archive.manifest.control,
+        ))?;
         let mut transaction = control.begin_target_import(ctx.clone()).await?;
         while let Some(mut record) = decoder.next_record()? {
             check_cancelled(&ctx.budget.cancellation)?;
@@ -341,7 +380,7 @@ async fn restore_canonical_rows(
         .await
         .map_err(pg_error)?;
     let witness = import_postgres_spool(
-        archive.canonical()?,
+        authenticated_payload(archive.canonical()?, archive.manifest.canonical),
         archive.manifest.canonical.bytes,
         options.max_pg_row_bytes,
         ctx.budget.cancellation.clone(),
@@ -360,16 +399,17 @@ async fn restore_canonical_rows(
     .await
     .map_err(pg_error)?;
     sqlx::raw_sql(
-        "DELETE FROM blob_parts;
+        "DELETE FROM account_catalog_receipts;
+         DELETE FROM blob_parts;
          DELETE FROM blob_publications;
          DELETE FROM blob_catalog WHERE ref_count=0;
          UPDATE content_jobs SET lease_owner=NULL, lease_until_ms=NULL,artifacts_json='[]',result_msgpack=NULL,
            state=CASE WHEN state IN ('queued','running') THEN 'failed' ELSE state END;",
     ).execute(&mut *tx).await.map_err(pg_error)?;
-    let mut index = archive.index()?;
-    for position in 0..index.count {
+    let (records, mut index) = archive.restore_index()?;
+    for _ in 0..records {
         check_cancelled(&ctx.budget.cancellation)?;
-        let record = index.read(position)?;
+        let record = CasRecord::read(&mut index)?;
         restore_publication(
             &mut tx,
             gate,
@@ -380,6 +420,13 @@ async fn restore_canonical_rows(
         )
         .await?;
     }
+    sqlx::raw_sql(
+        "UPDATE blob_catalog c SET ref_count=(SELECT count(*) FROM blob_references r
+             WHERE r.space_id=c.space_id AND r.content_blake3=c.content_blake3 AND r.owner_kind<>'staged_chat')
+           WHERE EXISTS(SELECT 1 FROM blob_references r
+             WHERE r.space_id=c.space_id AND r.content_blake3=c.content_blake3 AND r.owner_kind='staged_chat');
+         DELETE FROM blob_references WHERE owner_kind='staged_chat';",
+    ).execute(&mut *tx).await.map_err(pg_error)?;
     let missing: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM blob_references r
           LEFT JOIN blob_publications p ON p.space_id=r.space_id AND p.publication_id=r.publication_id

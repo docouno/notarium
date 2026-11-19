@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ArchiveInput, BackupOptions,
-    backup_format::{copy_hash, invalid, io_error},
+    backup_format::{CasRecord, copy_hash, invalid, io_error},
     fsck::{VerifiedArchive, verify_archive},
     import::check_cancelled,
     sqlite_range::sql_error,
@@ -104,8 +104,9 @@ async fn run_restore_inner(
         RestoreTarget::Cloud(target) => target.external_keyring.clone(),
     };
     let budget = ctx.budget.clone();
-    let verified = tokio::task::spawn_blocking(move || {
-        verify_archive(input, &verification_keys, &budget, options)
+    let verified = tokio::task::spawn_blocking({
+        let options = options.clone();
+        move || verify_archive(input, &verification_keys, &budget, options)
     })
     .await
     .map_err(join_error)??;
@@ -140,7 +141,9 @@ struct Journal {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "name", deny_unknown_fields)]
 enum Phase {
-    Build,
+    Build {
+        directory: Option<Identity>,
+    },
     Install {
         directory: Identity,
         components: Vec<(String, Identity)>,
@@ -222,23 +225,28 @@ async fn restore_local(
             external_keyring: !keyring.is_provisioned(),
             histories,
             stage: codec::new_prefixed_hex_id(".notarium-restore-generation-")?,
-            phase: Phase::Build,
+            phase: Phase::Build { directory: None },
         };
         save_journal(&journal_path, &journal)?;
         journal
     };
 
-    if matches!(journal.phase, Phase::Build) {
+    if let Phase::Build { directory } = journal.phase {
         check_cancelled(&ctx.budget.cancellation)?;
         require_empty_target(&root, journal.existing)?;
-        let initial_stage = parent.join(&journal.stage);
-        if exists(&initial_stage)? {
-            // A prior unexposed attempt may have stopped during either DB
-            // COMMIT. Rebuild privately with the same chosen incarnations.
-            journal.stage = codec::new_prefixed_hex_id(".notarium-restore-generation-")?;
-            save_journal(&journal_path, &journal)?;
-        }
         let stage = DataRoot::new(parent.join(&journal.stage));
+        discard_interrupted_stage(stage.root(), directory)?;
+        journal.phase = Phase::Build { directory: None };
+        save_journal(&journal_path, &journal)?;
+        private_dir(stage.root())?;
+        sync_dir(stage.root())?;
+        sync_dir(&parent)?;
+        let identity = directory_identity(stage.root())?
+            .ok_or_else(|| invalid(ValidationReason::InvalidState))?;
+        journal.phase = Phase::Build {
+            directory: Some(identity),
+        };
+        save_journal(&journal_path, &journal)?;
         let work = stage.clone();
         let keys = keyring.clone();
         let budget = ctx.budget.clone();
@@ -251,11 +259,13 @@ async fn restore_local(
         .map_err(join_error)??;
         rebind_local(&stage, &journal, &keyring, &ctx).await?;
         write_new(&stage.manifest(), &epoch_manifest(&journal.installation)?)?;
+        if journal.existing.is_some() {
+            write_new(&stage.restore_guard(), journal.digest.to_hex().as_bytes())?;
+        }
         sync_dir(stage.root())?;
         verify_installed(&stage, &journal)?;
         journal.phase = Phase::Install {
-            directory: directory_identity(stage.root())?
-                .ok_or_else(|| invalid(ValidationReason::InvalidState))?,
+            directory: identity,
             components: ["v1", "blobs", "secret-keyring"]
                 .into_iter()
                 .filter(|name| *name != "secret-keyring" || keyring.is_provisioned())
@@ -279,6 +289,7 @@ async fn restore_local(
             && directory_identity(&stage).ok().flatten() == Some(*directory)
         {
             let _ = fs::remove_file(stage.join(LOCAL_MANIFEST));
+            let _ = fs::remove_file(DataRoot::new(stage.clone()).restore_guard());
             let _ = fs::remove_dir(stage);
         }
     }
@@ -289,13 +300,34 @@ async fn restore_local(
     })
 }
 
+fn discard_interrupted_stage(path: &Path, recorded: Option<Identity>) -> Result<(), PortError> {
+    let (parent, name) = open_parent(path)?;
+    if let Some(actual) = directory_identity(path)? {
+        match recorded {
+            Some(expected) if actual == expected => {
+                let dir = parent.open_dir_nofollow(name).map_err(io_error)?;
+                let metadata = dir.dir_metadata().map_err(io_error)?;
+                if (metadata.dev(), metadata.ino()) != (expected.device, expected.inode) {
+                    return Err(invalid(ValidationReason::InvalidState));
+                }
+                dir.remove_open_dir_all().map_err(io_error)?;
+            }
+            // An interruption before the first journal fsync can leave the
+            // newly created empty directory. No payload was admitted yet.
+            None => parent.remove_dir(name).map_err(io_error)?,
+            Some(_) => return Err(invalid(ValidationReason::InvalidState)),
+        }
+    }
+    sync_dir(path.parent().expect("private stage has a parent"))?;
+    Ok(())
+}
+
 fn materialize_local(
     archive: &VerifiedArchive,
     root: &DataRoot,
     keyring: &RestoreKeyring,
     budget: &CallBudget,
 ) -> Result<(), PortError> {
-    private_dir(root.root())?;
     private_dir(&root.root().join("v1"))?;
     private_dir(&root.root().join("blobs"))?;
     for (path, expected, mut input) in [
@@ -324,10 +356,10 @@ fn materialize_local(
     }
     let mut canonical = Connection::open(root.canonical()).map_err(sql_error)?;
     let tx = canonical.transaction().map_err(sql_error)?;
-    let mut index = archive.index()?;
-    for ordinal in 0..index.count {
+    let (records, mut index) = archive.restore_index()?;
+    for _ in 0..records {
         check_cancelled(&budget.cancellation)?;
-        let record = index.read(ordinal)?;
+        let record = CasRecord::read(&mut index)?;
         let blob = root.blob(&record.space, record.digest);
         let parent = blob.parent().expect("generated CAS path has parent");
         fs::create_dir_all(parent).map_err(io_error)?;
@@ -454,6 +486,9 @@ fn clear_operational_rows(stage: &DataRoot) -> Result<(), PortError> {
     if tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='archive_artifacts')", [], |row| row.get::<_, bool>(0)).map_err(sql_error)? {
         tx.execute_batch("DELETE FROM archive_artifacts; DELETE FROM archive_uploads; DELETE FROM archive_import_sources;").map_err(sql_error)?;
     }
+    if tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='account_catalog_receipts')", [], |row| row.get::<_, bool>(0)).map_err(sql_error)? {
+        tx.execute_batch("DELETE FROM account_catalog_receipts").map_err(sql_error)?;
+    }
     tx.execute_batch(
         "
          DELETE FROM backup_holds;
@@ -468,6 +503,12 @@ fn clear_operational_rows(stage: &DataRoot) -> Result<(), PortError> {
              SELECT 1 FROM blob_references r WHERE r.space_id=p.space_id AND r.publication_id=p.publication_id
          );
          DELETE FROM blob_catalog WHERE ref_count=0;
+         UPDATE blob_catalog SET ref_count=(
+           SELECT count(*) FROM blob_references r WHERE r.space_id=blob_catalog.space_id
+             AND r.content_blake3=blob_catalog.content_blake3 AND r.owner_kind<>'staged_chat'
+         ) WHERE EXISTS(SELECT 1 FROM blob_references r WHERE r.space_id=blob_catalog.space_id
+               AND r.content_blake3=blob_catalog.content_blake3 AND r.owner_kind='staged_chat');
+         DELETE FROM blob_references WHERE owner_kind='staged_chat';
          UPDATE content_jobs SET lease_owner=NULL, lease_until_ms=NULL, artifacts_json='[]',
              result_msgpack=NULL, state=CASE WHEN state IN ('queued','running') THEN 'failed' ELSE state END;",
     ).map_err(sql_error)?;
@@ -517,7 +558,15 @@ fn install_local(parent: &Path, root: &DataRoot, journal: &Journal) -> Result<()
         }
         validate_components(root, &stage, components)?;
         if !exists(&root.manifest())? {
-            ensure_guard(root, journal.digest)?;
+            if !exists(&root.restore_guard())? {
+                fs::hard_link(
+                    DataRoot::new(stage.clone()).restore_guard(),
+                    root.restore_guard(),
+                )
+                .map_err(io_error)?;
+                sync_dir(root.root())?;
+            }
+            verify_guard(root, journal.digest)?;
             for (name, id) in components {
                 let target = root.root().join(name);
                 if directory_identity(&target)?.is_none() {
@@ -536,7 +585,7 @@ fn install_local(parent: &Path, root: &DataRoot, journal: &Journal) -> Result<()
         }
         verify_installed(root, journal)?;
         if exists(&root.restore_guard())? {
-            ensure_guard(root, journal.digest)?;
+            verify_guard(root, journal.digest)?;
             fs::remove_file(root.restore_guard()).map_err(io_error)?;
             sync_dir(root.root())?;
         }
@@ -657,13 +706,9 @@ fn valid_stage(name: &str) -> bool {
         })
 }
 
-fn ensure_guard(root: &DataRoot, digest: ContentDigest) -> Result<(), PortError> {
+fn verify_guard(root: &DataRoot, digest: ContentDigest) -> Result<(), PortError> {
     let text = digest.to_hex();
     let path = root.restore_guard();
-    if !exists(&path)? {
-        write_new(&path, text.as_bytes())?;
-        return sync_dir(root.root());
-    }
     let mut saved = String::new();
     File::open(path)
         .map_err(io_error)?

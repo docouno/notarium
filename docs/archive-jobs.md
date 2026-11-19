@@ -13,7 +13,9 @@ selection or a whole-Space export. The worker revalidates the submitting
 credential and Space grant at claim and during execution. The default runner
 admits one import and one export on its own runtime with a bounded blocking pool.
 The canonical writer fences job progress and terminal results by lease owner,
-epoch and expiry. Shut down the runner by cancelling its token and awaiting it.
+both the job and Space epochs, and lease expiry. It retains the authority
+registration until an admitted write commits or rolls back. Shut down the
+runner by cancelling its token and awaiting it.
 
 Import validates ZIP layout, portable paths, size and compression limits, and
 carrier syntax before writing notes or folders. It seals the path and link plan
@@ -21,15 +23,22 @@ and pins that plan to the job before its first content mutation. Successive
 leases use the plan's original IDs and committed ordinal. A concurrent write
 that claims a planned path can cause a conflict after a valid prefix has been
 committed. A rejected preflight commits zero content items.
+Accepted inputs expire after seven days. Admitting another import with the
+same input extends its retention. A queued or running job retains its input
+until it reaches a terminal state.
 
 Export cuts record one history, Space sequence and privacy generation. The
-compact cut has a 50 ms SQL transaction budget. It captures paths, the current
-field schema, ability package resources and chat metadata before reading CAS.
+compact cut has a 50 ms SQL transaction budget. It captures paths, the active
+field schema's immutable carrier revision, ability package resources and chat
+metadata before reading CAS. Explicit selections use the selected notes'
+paths.
 Larger whole-Space exports register a cut and read keyset pages. The writer
 preserves a row's first pre-image while the cut is active. Large chat threads
 can be read a page at a time while the archive is written.
 An encrypted note requires explicit ciphertext opt-in. Exports use an owned CAS
-hold and bounded buffers. The final ZIP becomes visible after its immutable
+hold and bounded buffers. A privacy mutation invalidates the export generation
+while paired installation backups protect their captured cut. The final ZIP
+becomes visible after its immutable
 storage generation is sealed and its canonical pointer commits. The artifact ID
 names that committed pointer. ETag is the BLAKE3 digest of the ZIP bytes.
 The writer journals plan and export generations before storage writes. It
@@ -70,7 +79,12 @@ workers own the physical operation and recover durable work after interruption.
   opening the source. Archive verification checks ZIP metadata and digests,
   database structure and references, decoded CAS bytes, and external keyring
   readability. SQLite verification reads the stored database slices through a
-  read-only range VFS. The verifier operates under a caller deadline.
+  read-only range VFS in a separate process. The default worker caps SQLite's
+  native heap at 80 MiB and reports the measured native high-water mark.
+  The verifier operates under a caller deadline. Both Notarium binaries
+  dispatch the internal verifier argument before opening storage. An embedding
+  application can supply its own launcher using `SqliteVerifier::with_command`
+  and dispatch to `run_sqlite_verifier` in that process.
 - `run_restore` verifies the complete archive before it creates a target
   generation. Supply a fresh target of the same backend type and the separately
   saved keyring. Local restore can keep an external keyring or provision the

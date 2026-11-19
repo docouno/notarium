@@ -184,6 +184,33 @@ pub(super) async fn recover_holds(store: &CanonicalStore) -> Result<(), PortErro
     })).await
 }
 
+pub(super) async fn reap_scoped_exports(
+    store: &CanonicalStore,
+    budget: &notarium_core::ports::CallBudget,
+    after: String,
+) -> Result<Option<String>, PortError> {
+    let deadline = crate::domain::common::CommandDeadline::start(budget, "reap_archive_holds");
+    store.with_auxiliary_command(Some((budget, deadline)), Ok, move |tx| {
+        Box::pin(async move {
+            let BackendConn::Postgres(conn) = tx else {
+                return Ok(None);
+            };
+            let error = |e: sqlx::Error| internal_not_committed("reap_archive_holds", e.to_string());
+            let ids: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT backup_id FROM backup_holds
+                 WHERE scoped_export=1 AND backup_id>$1 ORDER BY backup_id LIMIT 16",
+            ).bind(after).fetch_all(&mut **conn).await.map_err(error)?;
+            for id in &ids {
+                sqlx::query(
+                    "DELETE FROM backup_holds WHERE backup_id=$1 AND scoped_export=1 AND
+                     pg_try_advisory_xact_lock(hashtextextended(current_schema() || ':' || $1, 7311230))",
+                ).bind(id).execute(&mut **conn).await.map_err(error)?;
+            }
+            Ok(ids.into_iter().last())
+        })
+    }).await
+}
+
 fn fs_error(err: std::io::Error) -> PortError {
     internal_not_committed("backup_artifact_namespace", err.to_string())
 }

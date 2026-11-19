@@ -1719,22 +1719,20 @@ async fn ensure_no_active_backup_holds_for_purge_tx(
     space_id: &SpaceId,
 ) -> Result<(), PortError> {
     let hold_exists: Option<i64> = match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query_scalar("SELECT 1 FROM backup_holds WHERE space_id = ? LIMIT 1")
-                .bind(space_id.as_str())
-                .fetch_optional(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("sqlite_purge_check_holds", err.to_string())
-                })?
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query_scalar("SELECT 1::BIGINT FROM backup_holds WHERE space_id = $1 LIMIT 1")
-                .bind(space_id.as_str())
-                .fetch_optional(&mut **conn)
-                .await
-                .map_err(|err| crate::runtime::pg_read_error("pg_purge_check_holds", err))?
-        }
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(
+            "SELECT 1 FROM backup_holds WHERE space_id = ? AND scoped_export=0 LIMIT 1",
+        )
+        .bind(space_id.as_str())
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| internal_not_committed("sqlite_purge_check_holds", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(
+            "SELECT 1::BIGINT FROM backup_holds WHERE space_id = $1 AND scoped_export=0 LIMIT 1",
+        )
+        .bind(space_id.as_str())
+        .fetch_optional(&mut **conn)
+        .await
+        .map_err(|err| crate::runtime::pg_read_error("pg_purge_check_holds", err))?,
     };
     if hold_exists.is_some() {
         return Err(unavailable_retryable(

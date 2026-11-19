@@ -66,6 +66,21 @@ impl ArchiveJobs {
     }
 
     pub async fn sweep_maintenance(&self, shutdown: &Cancellation) -> Result<(), PortError> {
+        let artifacts = self.artifacts.clone();
+        let cancel = shutdown.clone();
+        tokio::task::spawn_blocking(move || artifacts.reap_scratch(&cancel))
+            .await
+            .map_err(|err| {
+                codec::internal_not_committed("reap_archive_scratch", err.to_string())
+            })??;
+        let mut hold = String::new();
+        while let Some(after) = self
+            .store
+            .reap_archive_export_holds(&command_budget(shutdown)?, hold)
+            .await?
+        {
+            hold = after;
+        }
         let expired = self
             .store
             .expired_export_objects(&command_budget(shutdown)?)
@@ -149,7 +164,6 @@ impl ArchiveJobs {
         let artifact = tokio::time::timeout(
             ctx.budget.remaining,
             self.artifacts.stage_source(
-                ctx.auth().principal(),
                 ctx.scope(),
                 input,
                 self.import_limits.compressed_bytes,
@@ -169,10 +183,11 @@ impl ArchiveJobs {
             codec::deadline_not_committed("stage_archive_source", "upload deadline exceeded")
         })??;
         let ctx = self.fresh_writer(&ctx).await?;
+        let id = artifact.id.clone();
         self.store
-            .finish_archive_source_upload(&ctx, artifact.clone())
+            .finish_archive_source_upload(&ctx, artifact)
             .await?;
-        Ok(artifact)
+        Ok(id)
     }
 
     pub async fn enqueue(
@@ -182,22 +197,13 @@ impl ArchiveJobs {
     ) -> Result<Committed<ContentJob>, PortError> {
         let verified = self.fresh_writer(&ctx).await?;
         match &request.input {
-            ContentJobKind::Import { artifact } => {
-                let source = self
-                    .artifacts
-                    .source(
-                        verified.auth().principal(),
-                        verified.scope(),
-                        artifact,
-                        &verified.budget.cancellation,
-                    )
-                    .await?;
+            ContentJobKind::Import { .. } => {
                 self.store
-                    .create_archive_import_job(ctx, request, source)
+                    .create_archive_import_job(verified, request)
                     .await
             }
             ContentJobKind::Export { .. } | ContentJobKind::ExportSpace { .. } => {
-                self.store.create_job(ctx, request).await
+                self.store.create_job(verified, request).await
             }
             _ => Err(invalid(ValidationReason::InvalidAuthority)),
         }
@@ -303,6 +309,7 @@ impl ArchiveJobs {
                         object,
                         entries,
                     },
+                    job.commit_authority(),
                 )
                 .await?;
             let pinned = progress
@@ -378,7 +385,13 @@ impl ArchiveJobs {
             match batch {
                 ImportBatch::Folder(folder) => {
                     self.store
-                        .apply_import_folder(&ctx, job.claim(), plan.object.digest, folder)
+                        .apply_import_folder(
+                            &ctx,
+                            job.claim(),
+                            plan.object.digest,
+                            folder,
+                            job.commit_authority(),
+                        )
                         .await?;
                     applied += 1;
                     job.report_progress(applied, Some(plan.entries));
@@ -386,7 +399,13 @@ impl ArchiveJobs {
                 ImportBatch::Notes(notes) => {
                     let outcomes = self
                         .store
-                        .apply_import_notes(ctx, job.claim(), plan.object.digest, notes)
+                        .apply_import_notes(
+                            ctx,
+                            job.claim(),
+                            plan.object.digest,
+                            notes,
+                            job.commit_authority(),
+                        )
                         .await?;
                     for outcome in outcomes {
                         outcome?;

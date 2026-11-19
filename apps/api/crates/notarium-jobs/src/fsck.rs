@@ -33,9 +33,12 @@ use crate::{
     backup::capture_pair,
     backup_format::{
         CAS_HEADER_BYTES, CAS_INDEX_MAGIC, CAS_RECORD_BYTES, CasRecord, MANIFEST_LIMIT, Manifest,
-        Payload, ZIP_NAMES, copy_hash, invalid, io_error,
+        Payload, ZIP_NAMES, authenticated_payload, copy_hash, invalid, io_error,
     },
-    db_integrity::{Relations, check_sqlite_canonical, check_sqlite_control},
+    db_integrity::{
+        PgRowChecks, Relations, check_sqlite_blob_owners, check_sqlite_canonical,
+        check_sqlite_control,
+    },
     import::check_cancelled,
     range_source::RangeSource,
     sqlite_range::{sql_error, with_database},
@@ -46,9 +49,9 @@ const MAX_DB_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_HISTORIES: usize = 65_536;
 const MAX_INDEX_COUNTER_BYTES: u64 = 32 * 1024 * 1024;
 
-trait SeekRead: Read + Seek + Send {}
+pub(crate) trait SeekRead: Read + Seek + Send {}
 impl<T: Read + Seek + Send> SeekRead for T {}
-type ArchiveRange = RangeSource<Box<dyn SeekRead>>;
+pub(crate) type ArchiveRange = RangeSource<Box<dyn SeekRead>>;
 
 /// An owned seekable source. The caller opens the immutable file or pins the
 /// remote version before transferring it to the verifier.
@@ -82,6 +85,7 @@ pub struct FsckReport {
     pub blobs: u64,
     pub raw_blob_bytes: u64,
     pub readable_keys: usize,
+    pub sqlite_native_peak_bytes: Option<u64>,
 }
 
 pub(crate) struct VerifiedArchive {
@@ -102,8 +106,10 @@ impl VerifiedArchive {
         self.view(2)
     }
 
-    pub(crate) fn index(&self) -> Result<CasIndex, PortError> {
-        CasIndex::open(self.view(3)?, self.manifest.index.bytes)
+    pub(crate) fn restore_index(&self) -> Result<(u64, impl Read + use<>), PortError> {
+        let mut source = authenticated_payload(self.view(3)?, self.manifest.index);
+        let count = read_index_header(&mut source, self.manifest.index.bytes)?;
+        Ok((count, source))
     }
 
     pub(crate) fn blob(
@@ -238,14 +244,14 @@ pub(crate) fn verify_archive(
             .map_err(io_error)
     };
     let mut index = CasIndex::open(view(3)?, manifest.index.bytes)?;
-    let (blobs, raw_blob_bytes) = check_index_and_data(&mut index, view(4)?, budget, options)?;
+    let (blobs, raw_blob_bytes) = check_index_and_data(&mut index, view(4)?, budget, &options)?;
     let databases = verify_databases(
         view(1)?,
         view(2)?,
         &manifest,
         keyring,
         budget,
-        options,
+        &options,
         Some(&mut index),
     )?;
     let mut whole = source.clone();
@@ -264,6 +270,7 @@ pub(crate) fn verify_archive(
         blobs,
         raw_blob_bytes,
         readable_keys: databases.keys.len(),
+        sqlite_native_peak_bytes: databases.native_peak,
     };
     Ok(VerifiedArchive {
         source,
@@ -278,6 +285,7 @@ pub(crate) fn verify_archive(
 struct Databases {
     histories: Vec<ChangeCursor>,
     keys: Vec<KeyCanary>,
+    native_peak: Option<u64>,
 }
 
 fn verify_databases(
@@ -286,103 +294,30 @@ fn verify_databases(
     manifest: &Manifest,
     keyring: &Path,
     budget: &CallBudget,
-    options: BackupOptions,
+    options: &BackupOptions,
     index: Option<&mut CasIndex>,
 ) -> Result<Databases, PortError> {
     if control.len() != manifest.control.bytes || canonical.len() != manifest.canonical.bytes {
         return Err(invalid(ValidationReason::InvalidDigest));
     }
     let mut control_cursors = BTreeSet::new();
+    let mut native_peak = None;
     let (keys, histories) = match manifest.backend {
         BackupArtifactKind::SqliteSnapshotV1 => {
-            let keys = with_database(
+            let (facts, peak) = crate::sqlite_process::verify_sqlite(
+                &options.sqlite_verifier,
+                manifest,
                 control,
-                manifest.control.bytes,
-                MAX_DB_BYTES,
-                &budget.cancellation,
-                |db| {
-                    check_sqlite_control(db)?;
-                    check_integrity(db)?;
-                    let (install, epoch, state): (String, i64, String) = db.query_row(
-                    "SELECT installation_id,epoch_version,state FROM v1_storage_epoch WHERE singleton=1",
-                    [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-                ).map_err(sql_error)?;
-                    if install != manifest.installation.as_str()
-                        || epoch != i64::from(SUPPORTED_V1_EPOCH)
-                        || state != "ready"
-                    {
-                        return Err(invalid(ValidationReason::InvalidState));
-                    }
-                    for sql in [
-                        "SELECT DISTINCT space_id FROM mcp_delta_owner_cursors",
-                        "SELECT DISTINCT space_id FROM mcp_delta_session_cursors",
-                    ] {
-                        let mut query = db.prepare(sql).map_err(sql_error)?;
-                        let mut rows = query.query([]).map_err(sql_error)?;
-                        while let Some(row) = rows.next().map_err(sql_error)? {
-                            let id: String = row.get(0).map_err(sql_error)?;
-                            record_cursor(&mut control_cursors, &id)?;
-                        }
-                    }
-                    let mut controls = db
-                        .prepare(
-                            "SELECT key_id,key_hash,generation,state,canary FROM secret_keyring
-                     WHERE retired_at IS NULL ORDER BY generation LIMIT 4097",
-                        )
-                        .map_err(sql_error)?;
-                    let keys = controls
-                        .query_map([], |row| {
-                            Ok(BackupKeyRow {
-                                key_id: row.get(0)?,
-                                key_hash: row.get(1)?,
-                                generation: row.get(2)?,
-                                state: row.get(3)?,
-                                canary: row.get(4)?,
-                            })
-                        })
-                        .map_err(sql_error)?
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(sql_error)?;
-                    verify_backup_keys(keyring, keys, budget.clone())
-                },
-            )?;
-            let histories = with_database(
                 canonical,
-                manifest.canonical.bytes,
-                MAX_DB_BYTES,
+                index.as_deref(),
                 &budget.cancellation,
-                |db| {
-                    let (install, epoch, version, checksum, state): (String, i64, u32, Vec<u8>, String) = db.query_row(
-                    "SELECT installation_id,epoch_version,schema_version,manifest_checksum,migration_state
-                     FROM schema_meta WHERE singleton_id=1",
-                    [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
-                ).map_err(sql_error)?;
-                    verify_schema_witness(version, &checksum)?;
-                    if install != manifest.installation.as_str()
-                        || epoch != i64::from(SUPPORTED_V1_EPOCH)
-                        || state != "ready"
-                    {
-                        return Err(invalid(ValidationReason::InvalidState));
-                    }
-                    check_sqlite_canonical(db, version)?;
-                    check_integrity(db)?;
-                    verify_sqlite_references(db, index)?;
-                    let mut query = db.prepare("SELECT space_id,history_incarnation,last_seq FROM spaces ORDER BY space_id").map_err(sql_error)?;
-                    let mut rows = query.query([]).map_err(sql_error)?;
-                    let mut history = Vec::new();
-                    while let Some(row) = rows.next().map_err(sql_error)? {
-                        let space: String = row.get(0).map_err(sql_error)?;
-                        let incarnation: Vec<u8> = row.get(1).map_err(sql_error)?;
-                        let seq: i64 = row.get(2).map_err(sql_error)?;
-                        history.push(cursor(&space, &incarnation, seq)?);
-                        if history.len() > MAX_HISTORIES {
-                            return Err(invalid(ValidationReason::BudgetExceeded));
-                        }
-                    }
-                    Ok(history)
-                },
             )?;
-            (keys, histories)
+            native_peak = Some(peak);
+            control_cursors = facts.control_cursors;
+            (
+                verify_backup_keys(keyring, facts.keys, budget.clone())?,
+                facts.histories,
+            )
         }
         BackupArtifactKind::PostgresSpoolV1 => {
             let keys =
@@ -399,7 +334,128 @@ fn verify_databases(
             return Err(invalid(ValidationReason::HistoryIncarnationMismatch));
         }
     }
-    Ok(Databases { histories, keys })
+    Ok(Databases {
+        histories,
+        keys,
+        native_peak,
+    })
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub(crate) struct SqliteFacts {
+    keys: Vec<BackupKeyRow>,
+    histories: Vec<ChangeCursor>,
+    control_cursors: BTreeSet<SpaceId>,
+}
+
+pub(crate) fn inspect_sqlite(
+    control: ArchiveRange,
+    canonical: ArchiveRange,
+    manifest: &Manifest,
+    cancellation: &notarium_core::ports::Cancellation,
+    index: Option<&mut CasIndex>,
+) -> Result<SqliteFacts, PortError> {
+    let mut control_cursors = BTreeSet::new();
+    let keys = with_database(
+        control,
+        manifest.control.bytes,
+        MAX_DB_BYTES,
+        cancellation,
+        |db| {
+            check_sqlite_control(db)?;
+            check_integrity(db)?;
+            let (install, epoch, state): (String, i64, String) = db.query_row(
+            "SELECT installation_id,epoch_version,state FROM v1_storage_epoch WHERE singleton=1",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        ).map_err(sql_error)?;
+            if install != manifest.installation.as_str()
+                || epoch != i64::from(SUPPORTED_V1_EPOCH)
+                || state != "ready"
+            {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            for sql in [
+                "SELECT DISTINCT space_id FROM mcp_delta_owner_cursors",
+                "SELECT DISTINCT space_id FROM mcp_delta_session_cursors",
+            ] {
+                let mut query = db.prepare(sql).map_err(sql_error)?;
+                let mut rows = query.query([]).map_err(sql_error)?;
+                while let Some(row) = rows.next().map_err(sql_error)? {
+                    let id: String = row.get(0).map_err(sql_error)?;
+                    record_cursor(&mut control_cursors, &id)?;
+                }
+            }
+            let mut controls = db
+                .prepare(
+                    "SELECT key_id,key_hash,generation,state,canary FROM secret_keyring
+             WHERE retired_at IS NULL ORDER BY generation LIMIT 4097",
+                )
+                .map_err(sql_error)?;
+            let mut rows = controls.query([]).map_err(sql_error)?;
+            let mut keys = Vec::new();
+            let mut bytes = 0;
+            while let Some(row) = rows.next().map_err(sql_error)? {
+                let key = BackupKeyRow {
+                    key_id: row.get(0).map_err(sql_error)?,
+                    key_hash: row.get(1).map_err(sql_error)?,
+                    generation: row.get(2).map_err(sql_error)?,
+                    state: row.get(3).map_err(sql_error)?,
+                    canary: row.get(4).map_err(sql_error)?,
+                };
+                bytes += key.key_id.len() + key.key_hash.len() + key.state.len() + key.canary.len();
+                if keys.len() >= 4096 || bytes > 1024 * 1024 {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
+                keys.push(key);
+            }
+            Ok(keys)
+        },
+    )?;
+    let histories = with_database(
+        canonical,
+        manifest.canonical.bytes,
+        MAX_DB_BYTES,
+        cancellation,
+        |db| {
+            let (install, epoch, version, checksum, state): (String, i64, u32, Vec<u8>, String) = db.query_row(
+            "SELECT installation_id,epoch_version,schema_version,manifest_checksum,migration_state
+             FROM schema_meta WHERE singleton_id=1",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).map_err(sql_error)?;
+            verify_schema_witness(version, &checksum)?;
+            if install != manifest.installation.as_str()
+                || epoch != i64::from(SUPPORTED_V1_EPOCH)
+                || state != "ready"
+            {
+                return Err(invalid(ValidationReason::InvalidState));
+            }
+            check_sqlite_canonical(db, version)?;
+            check_integrity(db)?;
+            verify_sqlite_references(db, index)?;
+            let mut query = db
+                .prepare(
+                    "SELECT space_id,history_incarnation,last_seq FROM spaces ORDER BY space_id",
+                )
+                .map_err(sql_error)?;
+            let mut rows = query.query([]).map_err(sql_error)?;
+            let mut history = Vec::new();
+            while let Some(row) = rows.next().map_err(sql_error)? {
+                let space: String = row.get(0).map_err(sql_error)?;
+                let incarnation: Vec<u8> = row.get(1).map_err(sql_error)?;
+                let seq: i64 = row.get(2).map_err(sql_error)?;
+                history.push(cursor(&space, &incarnation, seq)?);
+                if history.len() > MAX_HISTORIES {
+                    return Err(invalid(ValidationReason::BudgetExceeded));
+                }
+            }
+            Ok(history)
+        },
+    )?;
+    Ok(SqliteFacts {
+        keys,
+        histories,
+        control_cursors,
+    })
 }
 
 fn check_integrity(db: &Connection) -> Result<(), PortError> {
@@ -434,12 +490,14 @@ fn verify_sqlite_references(
     db: &Connection,
     mut index: Option<&mut CasIndex>,
 ) -> Result<(), PortError> {
+    check_sqlite_blob_owners(db)?;
     let lost: bool = db.query_row(
         "SELECT EXISTS (SELECT 1 FROM blob_references r
             LEFT JOIN blob_catalog c ON c.space_id=r.space_id AND c.content_blake3=r.content_blake3
             LEFT JOIN blob_publications p ON p.space_id=r.space_id AND p.publication_id=r.publication_id
             WHERE c.content_blake3 IS NULL OR p.publication_id IS NULL OR p.content_blake3<>r.content_blake3
-               OR p.state<>'active')",
+               OR p.state<>'active' OR p.manifest_sealed<>1 OR p.raw_size<>c.raw_size
+               OR c.current_publication_id IS DISTINCT FROM p.publication_id)",
         [], |row| row.get(0),
     ).map_err(sql_error)?;
     if lost {
@@ -580,7 +638,7 @@ fn verify_canonical_spool(
     canonical: ArchiveRange,
     manifest: &Manifest,
     budget: &CallBudget,
-    options: BackupOptions,
+    options: &BackupOptions,
     mut index: Option<&mut CasIndex>,
 ) -> Result<Vec<ChangeCursor>, PortError> {
     use PostgresSpoolValue::{Bytes, Int, Text};
@@ -592,6 +650,7 @@ fn verify_canonical_spool(
     }
     let mut expected_references = vec![0_u32; count as usize];
     let mut ordinal = 0;
+    let mut checks = PgRowChecks::new()?;
     let witness = scan_postgres_spool_v1(
         canonical.clone(),
         manifest.canonical.bytes,
@@ -599,6 +658,7 @@ fn verify_canonical_spool(
         options.max_pg_row_bytes,
         |table, row| {
             check_cancelled(&budget.cancellation)?;
+            checks.check(table, row, None)?;
             match (table.name, row) {
                 (
                     "schema_meta",
@@ -675,6 +735,7 @@ fn verify_canonical_spool(
             options.max_pg_row_bytes,
             |table, row| {
                 check_cancelled(&budget.cancellation)?;
+                checks.check(table, row, Some(keys))?;
                 keys.canonical(table, row)
             },
         )?;
@@ -689,20 +750,16 @@ pub(crate) struct CasIndex {
 }
 
 impl CasIndex {
-    fn open(mut data: ArchiveRange, bytes: u64) -> Result<Self, PortError> {
-        let mut head = [0; CAS_HEADER_BYTES as usize];
-        data.read_exact(&mut head).map_err(io_error)?;
-        let count = u64::from_be_bytes(head[8..].try_into().unwrap());
-        if &head[..8] != CAS_INDEX_MAGIC
-            || count
-                .checked_mul(CAS_RECORD_BYTES)
-                .and_then(|size| size.checked_add(CAS_HEADER_BYTES))
-                != Some(bytes)
-            || bytes != data.len()
-        {
+    pub(crate) fn open(mut data: ArchiveRange, bytes: u64) -> Result<Self, PortError> {
+        if bytes != data.len() {
             return Err(invalid(ValidationReason::InvalidArchive));
         }
+        let count = read_index_header(&mut data, bytes)?;
         Ok(Self { data, count })
+    }
+
+    pub(crate) fn source(&self) -> ArchiveRange {
+        self.data.clone()
     }
 
     pub(crate) fn read(&mut self, ordinal: u64) -> Result<CasRecord, PortError> {
@@ -751,11 +808,26 @@ impl CasIndex {
     }
 }
 
+fn read_index_header(input: &mut impl Read, bytes: u64) -> Result<u64, PortError> {
+    let mut head = [0; CAS_HEADER_BYTES as usize];
+    input.read_exact(&mut head).map_err(io_error)?;
+    let count = u64::from_be_bytes(head[8..].try_into().unwrap());
+    if &head[..8] != CAS_INDEX_MAGIC
+        || count
+            .checked_mul(CAS_RECORD_BYTES)
+            .and_then(|size| size.checked_add(CAS_HEADER_BYTES))
+            != Some(bytes)
+    {
+        return Err(invalid(ValidationReason::InvalidArchive));
+    }
+    Ok(count)
+}
+
 fn check_index_and_data(
     index: &mut CasIndex,
     data: ArchiveRange,
     budget: &CallBudget,
-    options: BackupOptions,
+    options: &BackupOptions,
 ) -> Result<(u64, u64), PortError> {
     if index.count > options.max_index_records {
         return Err(invalid(ValidationReason::BudgetExceeded));
@@ -854,6 +926,7 @@ async fn verify_live(
     let (manifest, database_inputs) = live_inputs(&mut pair)?;
     let keys = external_keyring.to_owned();
     let database_budget = budget.clone();
+    let verify_options = options.clone();
     let databases = tokio::task::spawn_blocking(move || {
         verify_databases(
             database_inputs.0,
@@ -861,7 +934,7 @@ async fn verify_live(
             &manifest,
             &keys,
             &database_budget,
-            options,
+            &verify_options,
             None,
         )
     })
@@ -878,6 +951,7 @@ async fn verify_live(
         blobs,
         raw_blob_bytes,
         readable_keys: databases.keys.len(),
+        sqlite_native_peak_bytes: databases.native_peak,
     })
 }
 

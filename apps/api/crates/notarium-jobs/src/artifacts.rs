@@ -20,20 +20,20 @@ use notarium_core::{
     DomainError,
     epoch::DataRoot,
     error::{PortError, ValidationReason},
-    ids::{ArtifactId, ContentDigest, InstallationId, PrincipalId},
+    ids::{ArtifactId, ContentDigest, InstallationId},
     model::HistoryScope,
     ports::Cancellation,
 };
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::import::check_cancelled;
 
 const SEGMENT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_SOURCE_RECORD: usize = 512 * 1024;
 const MAX_SEGMENTS: usize = 16_384;
 const MAX_OBJECT_BYTES: u64 = (MAX_SEGMENTS * SEGMENT_BYTES) as u64;
 const RETIRED_SEGMENT: &[u8] = b"notarium-archive-segment-retired-v1\n";
+const SCRATCH_GRACE: Duration = Duration::from_secs(3600);
+const SCRATCH_LOCK: &str = ".owner";
 
 /// Private operational artifacts bound to an installation. Cloud staging and
 /// results live in a separately configured S3 namespace, with local work files
@@ -55,6 +55,7 @@ struct LocalArchiveStorage {
 pub(crate) struct ScratchDirectory {
     dir: Dir,
     path: PathBuf,
+    _lock: fs::File,
 }
 
 pub(crate) struct DownloadSource {
@@ -91,15 +92,10 @@ impl ScratchDirectory {
 
 impl Drop for ScratchDirectory {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if let Ok(dir) = self.dir.try_clone() {
+            let _ = dir.remove_open_dir_all();
+        }
     }
-}
-
-#[derive(Deserialize, Serialize)]
-struct SourceRecord {
-    version: u8,
-    owner: PrincipalId,
-    object: ArchiveObject,
 }
 
 impl ArchiveStorage {
@@ -145,25 +141,75 @@ impl ArchiveStorage {
     pub(crate) fn scratch(&self) -> Result<ScratchDirectory, PortError> {
         let name = codec::new_prefixed_hex_id("attempt_")?;
         self.local.work.create_dir(&name).map_err(storage_io)?;
+        let dir = self
+            .local
+            .work
+            .open_dir_nofollow(&name)
+            .map_err(storage_io)?;
+        let lock = scratch_lock(&dir, true).map_err(storage_io)?;
+        lock.try_lock()
+            .map_err(|_| invalid(ValidationReason::InvalidState))?;
         Ok(ScratchDirectory {
-            dir: self
-                .local
-                .work
-                .open_dir_nofollow(&name)
-                .map_err(storage_io)?,
+            dir,
             path: self.local.work_path.join(name),
+            _lock: lock,
         })
+    }
+
+    pub(crate) fn reap_scratch(&self, cancellation: &Cancellation) -> Result<(), PortError> {
+        let mut removed = 0;
+        for entry in self.local.work.entries().map_err(storage_io)? {
+            check_cancelled(cancellation)?;
+            let entry = entry.map_err(storage_io)?;
+            let name = entry.file_name();
+            if !name
+                .to_str()
+                .and_then(|name| name.strip_prefix("attempt_"))
+                .is_some_and(|suffix| {
+                    suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            {
+                continue;
+            }
+            let Ok(dir) = self.local.work.open_dir_nofollow(&name) else {
+                continue;
+            };
+            let age = dir
+                .dir_metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|time| time.into_std().elapsed().ok());
+            if !age.is_some_and(|age| age >= SCRATCH_GRACE) {
+                continue;
+            }
+            // Only an abandoned owner can be claimed. An absent lock can
+            // arise before the creator has admitted the first payload file.
+            match scratch_lock(&dir, false) {
+                Ok(lock) if lock.try_lock().is_ok() => match dir.remove_open_dir_all() {
+                    Ok(()) => removed += 1,
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => return Err(storage_io(err)),
+                },
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    let _ = self.local.work.remove_dir(&name);
+                }
+                _ => {}
+            }
+            if removed >= 16 {
+                break;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn stage_source<F: std::future::Future<Output = Result<(), PortError>>>(
         &self,
-        owner: &PrincipalId,
         scope: &HistoryScope,
         mut input: impl AsyncRead + Unpin,
         max_bytes: u64,
         cancellation: &Cancellation,
         reserve: impl FnOnce(ArtifactId, u64) -> F,
-    ) -> Result<ArtifactId, PortError> {
+    ) -> Result<ArchiveObject, PortError> {
         let scratch = self.scratch()?;
         let mut file = tokio::fs::File::from_std(scratch.open_new("source.zip")?);
         let mut size = 0_u64;
@@ -189,73 +235,15 @@ impl ArchiveStorage {
         drop(file);
         let layout = self.measure_upload(&scratch, "source.zip", max_bytes)?;
         reserve(layout.id.clone(), layout.bytes).await?;
-        let object = self
-            .seal(
-                &scratch,
-                "source.zip",
-                scope,
-                ArchiveObjectKind::Source,
-                layout,
-                cancellation,
-            )
-            .await?;
-        let record = SourceRecord {
-            version: 1,
-            owner: owner.clone(),
-            object,
-        };
-        let metadata = codec::encode_msgpack(&record)?;
-        if metadata.len() > MAX_SOURCE_RECORD {
-            return Err(invalid(ValidationReason::BudgetExceeded));
-        }
-        let key = format!("{}.source", base_key(&record.object));
-        if let Some(remote) = &self.remote {
-            put_segment(remote, &key, Bytes::from(metadata), cancellation).await?;
-        } else {
-            use std::io::Write;
-            let mut meta_file = scratch.open_new("source.record")?;
-            meta_file.write_all(&metadata).map_err(storage_io)?;
-            meta_file.sync_all().map_err(storage_io)?;
-            self.publish_local(&scratch, "source.record", &key)?;
-        }
-        Ok(record.object.id)
-    }
-
-    pub(crate) async fn source(
-        &self,
-        owner: &PrincipalId,
-        scope: &HistoryScope,
-        id: &ArtifactId,
-        cancellation: &Cancellation,
-    ) -> Result<ArchiveObject, PortError> {
-        let key = format!(
-            "{}.source",
-            namespace_key(&self.installation, scope, id, &ArchiveObjectKind::Source)
-        );
-        let bytes = if let Some(remote) = &self.remote {
-            let response = get_segment(remote, &key, None, MAX_SOURCE_RECORD, cancellation).await?;
-            response.body
-        } else {
-            use std::io::Read;
-            let source = open_file(&self.local.objects, &key)?;
-            let mut bytes = Vec::new();
-            source
-                .take(MAX_SOURCE_RECORD as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(storage_io)?;
-            Bytes::from(bytes)
-        };
-        let record: SourceRecord = codec::decode_msgpack_bounded(&bytes, MAX_SOURCE_RECORD)?;
-        if record.version != 1
-            || record.owner != *owner
-            || record.object.id != *id
-            || record.object.kind != ArchiveObjectKind::Source
-        {
-            return Err(DomainError::ResourceNotFound.into());
-        }
-        record.object.scope.check(scope)?;
-        self.check_object(&record.object)?;
-        Ok(record.object)
+        self.seal(
+            &scratch,
+            "source.zip",
+            scope,
+            ArchiveObjectKind::Source,
+            layout,
+            cancellation,
+        )
+        .await
     }
 
     pub(crate) async fn seal(
@@ -536,17 +524,10 @@ impl ArchiveStorage {
         }
         check_cancelled(cancellation)?;
         let base = namespace_key(&self.installation, &upload.scope, &upload.id, &upload.kind);
-        let record = (upload.kind == ArchiveObjectKind::Source).then(|| format!("{base}.source"));
         let Some(remote) = &self.remote else {
-            if let Some(record) = record {
-                self.fence_local_upload(&record)?;
-            }
             return self.fence_local_upload(&base);
         };
         remote.verify_runtime_bucket_mode().await?;
-        if let Some(record) = record {
-            retire_unsealed_key(remote, &record, cancellation).await?;
-        }
         for index in 0..upload.bytes.div_ceil(SEGMENT_BYTES as u64) as usize {
             retire_unsealed_key(remote, &segment_key(&base, index), cancellation).await?;
         }
@@ -630,6 +611,17 @@ impl ArchiveStorage {
             .and_then(|dir| dir.sync_all())
             .map_err(storage_io)
     }
+}
+
+fn scratch_lock(dir: &Dir, create: bool) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(create)
+        .follow(FollowSymlinks::No);
+    dir.open_with(SCRATCH_LOCK, &options)
+        .map(|file| file.into_std())
 }
 
 fn open_local(root: &DataRoot) -> Result<LocalArchiveStorage, PortError> {

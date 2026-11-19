@@ -1598,7 +1598,7 @@ impl crate::CanonicalStore {
                 Box::pin(async move {
                     lock_and_check_space_tx(tx, &scope_in, active_epoch).await?;
                     if reason == RetirementReason::Purge {
-                        ensure_no_backup_holds_tx(tx, &scope_in.space_id).await?;
+                        ensure_no_backup_holds_tx(tx, &scope_in.space_id, reason).await?;
                     }
 
                     let mut ids = Vec::new();
@@ -1689,7 +1689,7 @@ impl crate::CanonicalStore {
                             internal_not_committed("seal_discarded_publication", err.to_string())
                         })?;
                     } else if !result.1.is_empty() {
-                        ensure_no_backup_holds_tx(tx, &scope_in.space_id).await?;
+                        ensure_no_backup_holds_tx(tx, &scope_in.space_id, result.0).await?;
                     }
                     Ok(result)
                 })
@@ -1732,7 +1732,7 @@ impl crate::CanonicalStore {
                                 if current.as_deref() != Some(target_retirement.as_str()) {
                                     return Ok(false);
                                 }
-                                ensure_no_backup_holds_tx(tx, &scope_chk.space_id).await?;
+                                ensure_no_backup_holds_tx(tx, &scope_chk.space_id, reason).await?;
                                 ensure_zero_reachable_refs_tx(tx, &scope_chk.space_id, digest)
                                     .await?;
                                 Ok(true)
@@ -1894,26 +1894,28 @@ pub(crate) fn held_retirement() -> PortError {
 pub(crate) async fn ensure_no_backup_holds_tx(
     tx: &mut BackendConn<'_>,
     space_id: &SpaceId,
+    reason: RetirementReason,
 ) -> Result<(), PortError> {
-    let held: Option<i64> = match tx {
-        BackendConn::Sqlite(conn) => {
-            sqlx::query_scalar("SELECT 1 FROM backup_holds WHERE space_id = ? LIMIT 1")
-                .bind(space_id.as_str())
-                .fetch_optional(&mut **conn)
-                .await
-                .map_err(|err| {
-                    internal_not_committed("sqlite_check_backup_holds", err.to_string())
-                })?
-        }
-        BackendConn::Postgres(conn) => {
-            sqlx::query_scalar("SELECT 1::BIGINT FROM backup_holds WHERE space_id = $1 LIMIT 1")
-                .bind(space_id.as_str())
-                .fetch_optional(&mut **conn)
-                .await
-                .map_err(|err| crate::runtime::pg_read_error("pg_check_backup_holds", err))?
-        }
+    // A privacy mutation revokes export generation immediately. Paired backup
+    // holds still protect the cut, and ordinary GC respects both kinds.
+    const SQL: &str = "SELECT EXISTS(SELECT 1 FROM backup_holds
+        WHERE space_id=$1 AND (scoped_export=0 OR $2))";
+    let gc = reason == RetirementReason::Gc;
+    let held: bool = match tx {
+        BackendConn::Sqlite(conn) => sqlx::query_scalar(SQL)
+            .bind(space_id.as_str())
+            .bind(gc)
+            .fetch_one(&mut **conn)
+            .await
+            .map_err(|err| internal_not_committed("sqlite_check_backup_holds", err.to_string()))?,
+        BackendConn::Postgres(conn) => sqlx::query_scalar(SQL)
+            .bind(space_id.as_str())
+            .bind(gc)
+            .fetch_one(&mut **conn)
+            .await
+            .map_err(|err| crate::runtime::pg_read_error("pg_check_backup_holds", err))?,
     };
-    if held.is_some() {
+    if held {
         return Err(held_retirement());
     }
     Ok(())

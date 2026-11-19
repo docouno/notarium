@@ -36,11 +36,12 @@ use crate::{
     import::check_cancelled,
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct BackupOptions {
     pub max_archive_bytes: u64,
     pub max_index_records: u64,
     pub max_pg_row_bytes: u64,
+    pub sqlite_verifier: crate::SqliteVerifier,
 }
 
 impl Default for BackupOptions {
@@ -49,12 +50,13 @@ impl Default for BackupOptions {
             max_archive_bytes: 64 * 1024 * 1024 * 1024,
             max_index_records: 20_000_000,
             max_pg_row_bytes: 32 * 1024 * 1024,
+            sqlite_verifier: crate::SqliteVerifier::default(),
         }
     }
 }
 
 impl BackupOptions {
-    pub(crate) fn validate(self) -> Result<(), PortError> {
+    pub(crate) fn validate(&self) -> Result<(), PortError> {
         let hard = Self::default();
         if self.max_archive_bytes == 0
             || self.max_archive_bytes > hard.max_archive_bytes
@@ -137,7 +139,7 @@ async fn run_backup_inner(
     let mut pair = capture_pair(ctx.clone(), canonical, control).await?;
     let mut budget = ctx.budget;
     budget.remaining = budget.remaining.saturating_sub(started.elapsed());
-    let cas = pack_cas(canonical, &budget, &mut pair, &work, options).await?;
+    let cas = pack_cas(canonical, &budget, &mut pair, &work, options.clone()).await?;
     let temporary = work.path("backup.zip");
     let index_path = work.path("cas.index");
     let data_path = work.path("cas.data");
@@ -330,6 +332,7 @@ async fn pack_cas(
 ) -> Result<(Payload, Payload), PortError> {
     let (references, mut ref_rx) = mpsc::channel(16);
     let reader = tokio::task::spawn_blocking({
+        let options = options.clone();
         let file = pair.canonical.try_clone().map_err(io_error)?;
         let path = pair.canonical_path.clone();
         let kind = pair.canonical_spool.kind;
@@ -382,6 +385,7 @@ pub(crate) async fn verify_live_cas(
 ) -> Result<(u64, u64), PortError> {
     let (references, mut rx) = mpsc::channel(16);
     let reader = tokio::task::spawn_blocking({
+        let options = options.clone();
         let file = pair.canonical.try_clone().map_err(io_error)?;
         let path = pair.canonical_path.clone();
         let kind = pair.canonical_spool.kind;

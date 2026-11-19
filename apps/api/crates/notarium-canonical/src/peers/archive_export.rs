@@ -42,6 +42,7 @@ const CUT_LIMIT: Duration = Duration::from_millis(50);
 const MAX_EXPORT_ITEMS: i64 = 200_000;
 const MAX_INLINE_BYTES: u64 = 32 * 1024 * 1024;
 const EXPORT_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+const SCHEMA_PATH: &str = ".notarium/fields/schema.yaml";
 
 pub struct ExportCut {
     pub hold_id: BackupId,
@@ -253,12 +254,7 @@ impl CanonicalStore {
         snapshot_elapsed: Duration,
     ) -> Result<ExportCut, PortError> {
         // Validation and sorting need no SQL resources.
-        let mut paths = BTreeSet::new();
-        for entry in &entries {
-            if !paths.insert(validate_path(&entry.path)?) {
-                return Err(invalid(ValidationReason::ArchivePathConflict));
-            }
-        }
+        validate_export_paths(&entries)?;
         entries.sort_by_cached_key(|entry| lookup_key(&entry.path));
         Ok(ExportCut {
             hold_id,
@@ -491,8 +487,10 @@ fn capture_full_sqlite(
     let sid = scope.space_id.as_str();
     let exists: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM content_jobs WHERE space_id=?1 AND job_id=?2 AND job_kind='export'
-         AND state='running' AND lease_owner=?3 AND lease_epoch=?4 AND lease_until_ms>?5 AND payload_erased_by_purge=0)",
-        params![sid, claim.job.id.as_str(), &claim.lease_owner, claim.job.lease.get() as i64, super::now_unix_ms()?],
+         AND state='running' AND lease_owner=?3 AND lease_epoch=?4 AND lease_until_ms>?5
+         AND claim_space_epoch=?6 AND payload_erased_by_purge=0)",
+        params![sid, claim.job.id.as_str(), &claim.lease_owner, claim.job.lease.get() as i64,
+            super::now_unix_ms()?, space.active_epoch.get() as i64],
         |row| row.get(0),
     ).map_err(native_error)?;
     if !exists {
@@ -730,21 +728,27 @@ macro_rules! note_export_query {
                   SELECT h.folder_id, p.name || h.slug || '/', p.depth+1
                     FROM folder_heads h JOIN paths p ON h.parent_folder_id=p.folder_id
                     WHERE h.space_id=$1 AND h.lifecycle_state='active' AND p.depth<256
+                 ), schema_note AS (
+                   SELECT schema_note_id,created_seq FROM space_field_schemas
+                   WHERE space_id=$1 AND is_current=1 AND CAST($2 AS TEXT) IS NULL
                  )
-                 SELECT n.note_id, CASE WHEN s.schema_note_id IS NOT NULL THEN '.notarium/fields/schema.yaml'
-                    ELSE p.name || n.slug || '.md' END AS rel_path, n.doc_class, n.content_blake3
+                 SELECT n.note_id, p.name || n.slug || '.md' AS rel_path, n.doc_class, n.content_blake3
                  FROM note_heads n JOIN paths p ON n.parent_folder_id=p.folder_id
-                 LEFT JOIN space_field_schemas s ON s.space_id=n.space_id AND s.schema_note_id=n.note_id AND s.is_current=1
                  WHERE n.space_id=$1 AND n.lifecycle_state='active'
-                   AND ((CAST($2 AS TEXT) IS NULL AND n.ability_id IS NULL)
+                   AND ((CAST($2 AS TEXT) IS NULL AND n.ability_id IS NULL
+                         AND NOT EXISTS(SELECT 1 FROM schema_note s WHERE s.schema_note_id=n.note_id))
                         OR n.note_id IN (", $selection, "))
+                 UNION ALL
+                 SELECT s.schema_note_id, '.notarium/fields/schema.yaml', 'user-doc', r.content_blake3
+                   FROM schema_note s LEFT JOIN revisions r ON r.space_id=$1 AND r.entity_type='note'
+                    AND r.entity_key=s.schema_note_id AND r.space_seq=s.created_seq
                  LIMIT $3"
         )
     };
 }
 use note_export_query;
 
-type NoteExportRow = (String, String, String, Vec<u8>);
+type NoteExportRow = (String, String, String, Option<Vec<u8>>);
 
 fn validated_note_entries(
     rows: Vec<NoteExportRow>,
@@ -764,7 +768,9 @@ fn validated_note_entries(
             }
             Ok(ExportEntry {
                 path,
-                data: ExportData::Blob(digest(bytes)?),
+                data: ExportData::Blob(digest(
+                    bytes.ok_or_else(|| invalid(ValidationReason::InvalidDigest))?,
+                )?),
             })
         })
         .collect()
@@ -1021,11 +1027,26 @@ fn chat_entry(row: ChatRow) -> Result<ExportChatEntry, PortError> {
     })
 }
 
-fn validate_path(path: &str) -> Result<String, PortError> {
-    for component in path.split('/') {
-        PortableFilename::parse(component)?;
+fn validate_export_paths(entries: &[ExportEntry]) -> Result<(), PortError> {
+    let mut files = BTreeSet::new();
+    let mut directories = BTreeMap::new();
+    for entry in entries {
+        for component in entry.path.split('/') {
+            PortableFilename::parse(component)?;
+        }
+        let key = lookup_key(&entry.path);
+        if directories.contains_key(&key) || !files.insert(key) {
+            return Err(invalid(ValidationReason::ArchivePathConflict));
+        }
+        for (index, _) in entry.path.match_indices('/') {
+            let path = &entry.path[..index];
+            let key = lookup_key(path);
+            if files.contains(&key) || *directories.entry(key).or_insert(path) != path {
+                return Err(invalid(ValidationReason::ArchivePathConflict));
+            }
+        }
     }
-    Ok(lookup_key(path))
+    Ok(())
 }
 
 fn digest(bytes: Vec<u8>) -> Result<ContentDigest, PortError> {

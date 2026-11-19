@@ -283,7 +283,22 @@ async fn exercise_local_archive_worker(entries: usize) {
     assert_eq!(note_count(root, &scope), 0);
 
     let started = std::time::Instant::now();
-    let accepted = import(&jobs, &store, &ctx, &zip(valid())).await;
+    let input = jobs
+        .stage_import(ctx.clone(), zip(valid()).as_slice())
+        .await
+        .unwrap();
+    let command = mutation(
+        &ctx,
+        ContentJobKind::Import {
+            artifact: input.clone(),
+        },
+    );
+    let accepted_job = jobs
+        .enqueue(ctx.clone(), command.clone())
+        .await
+        .unwrap()
+        .value;
+    let accepted = terminal(&store, &ctx, &accepted_job).await;
     eprintln!("import of {entries} linked notes: {:?}", started.elapsed());
     assert_eq!(accepted.state, JobState::Succeeded);
     assert_eq!(note_count(root, &scope), entries as i64);
@@ -361,7 +376,33 @@ async fn exercise_local_archive_worker(entries: usize) {
         [id.as_str()],
     )
     .unwrap();
+    db.execute(
+        "UPDATE archive_uploads SET source_deadline_ms=0 WHERE artifact_id=?1",
+        [input.as_str()],
+    )
+    .unwrap();
     jobs.sweep_maintenance(&stop).await.unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM archive_uploads WHERE artifact_id=?1",
+            [input.as_str()],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+    );
+    assert_eq!(
+        jobs.enqueue(ctx.clone(), command).await.unwrap().value.id,
+        accepted.id
+    );
+    assert!(
+        jobs.enqueue(
+            ctx.clone(),
+            mutation(&ctx, ContentJobKind::Import { artifact: input })
+        )
+        .await
+        .is_err()
+    );
     assert_eq!(
         db.query_row(
             "SELECT count(*) FROM archive_artifacts WHERE artifact_id=?1",

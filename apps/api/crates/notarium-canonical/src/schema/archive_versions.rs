@@ -37,7 +37,7 @@ pub(crate) const VERSIONED: &[Versioned] = &[
         table: "space_field_schemas",
         kind: "schema",
         key: "schema_rev_id",
-        values: &["schema_note_id", "is_current"],
+        values: &["schema_note_id", "is_current", "created_seq"],
     },
     Versioned {
         table: "ability_packages",

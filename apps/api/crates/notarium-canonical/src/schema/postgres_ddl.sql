@@ -408,6 +408,7 @@ CREATE TABLE IF NOT EXISTS backup_holds (
     witness_json TEXT NOT NULL,
     created_at_ms BIGINT NOT NULL,
     owner_generation TEXT NOT NULL DEFAULT '',
+    scoped_export INTEGER NOT NULL DEFAULT 0 CHECK (scoped_export IN (0, 1)),
     PRIMARY KEY (backup_id, space_id),
     FOREIGN KEY (space_id) REFERENCES spaces (space_id)
 );
@@ -727,6 +728,7 @@ CREATE TABLE IF NOT EXISTS content_jobs (
     error_ref BYTEA CHECK (error_ref IS NULL OR octet_length(error_ref) = 32),
     created_seq BIGINT NOT NULL CHECK (created_seq >= 1),
     updated_seq BIGINT NOT NULL CHECK (updated_seq >= 1),
+    claim_space_epoch BIGINT CHECK (claim_space_epoch >= 1),
     PRIMARY KEY (space_id, job_id),
     FOREIGN KEY (space_id) REFERENCES spaces (space_id)
 );
@@ -751,10 +753,14 @@ CREATE INDEX IF NOT EXISTS idx_archive_artifacts_expiry
 CREATE TABLE IF NOT EXISTS archive_import_sources (
     space_id TEXT NOT NULL,
     job_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
     object_msgpack BYTEA NOT NULL,
     PRIMARY KEY (space_id, job_id),
     FOREIGN KEY (space_id, job_id) REFERENCES content_jobs (space_id, job_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_archive_import_sources_artifact
+    ON archive_import_sources (space_id, artifact_id);
 
 CREATE TABLE IF NOT EXISTS archive_uploads (
     space_id TEXT NOT NULL,
@@ -768,9 +774,13 @@ CREATE TABLE IF NOT EXISTS archive_uploads (
     created_at_ms BIGINT NOT NULL,
     object_namespace BYTEA NOT NULL CHECK (octet_length(object_namespace) = 32),
     source_deadline_ms BIGINT,
+    source_owner TEXT,
+    source_object BYTEA,
     PRIMARY KEY (space_id, artifact_id),
-    CHECK ((object_kind = 'input' AND job_id IS NULL AND lease_epoch IS NULL AND source_deadline_ms IS NOT NULL)
-        OR (object_kind <> 'input' AND job_id IS NOT NULL AND lease_epoch IS NOT NULL AND source_deadline_ms IS NULL)),
+    CHECK ((object_kind = 'input' AND job_id IS NULL AND lease_epoch IS NULL AND source_deadline_ms IS NOT NULL
+          AND source_owner IS NOT NULL AND (state <> 'pinned' OR source_object IS NOT NULL))
+        OR (object_kind <> 'input' AND job_id IS NOT NULL AND lease_epoch IS NOT NULL
+          AND source_deadline_ms IS NULL AND source_owner IS NULL AND source_object IS NULL)),
     FOREIGN KEY (space_id, job_id) REFERENCES content_jobs (space_id, job_id)
 );
 

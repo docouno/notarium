@@ -1290,9 +1290,13 @@ impl CanonicalStore {
             None => (None, None),
         };
         let committed_scope = spec.scope.clone();
+        let retained_authority = import_guard.as_ref().map(|guard| guard.authority.clone());
 
         let out = self
-            .with_auxiliary_command(timing, Ok, move |tx| {
+            .with_auxiliary_command(timing, move |out| {
+                drop(retained_authority);
+                Ok(out)
+            }, move |tx| {
                 let spec_cl = spec;
                 let slug_fold_cl = slug_fold;
                 let proj_fold_cl = project_slug_fold;

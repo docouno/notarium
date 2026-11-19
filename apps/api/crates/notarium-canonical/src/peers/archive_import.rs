@@ -1,6 +1,6 @@
 //! Canonical import plan and writer fence. Operational storage owns the bytes.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use notarium_core::{
     DomainError,
@@ -8,7 +8,9 @@ use notarium_core::{
     error::{PortError, ValidationReason},
     ids::{ArtifactId, ContentDigest, FolderId, InstallationId, JobId, LeaseEpoch},
     model::{HistoryScope, PathTarget},
-    ports::{Committed, ContentJob, ContentJobKind, CreateNote, Mutation, SpaceContext},
+    ports::{
+        Committed, ContentJob, ContentJobKind, CreateNote, Mutation, RevocationLease, SpaceContext,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -107,12 +109,28 @@ pub struct PlannedImportFolder {
     pub reuse: bool,
 }
 
+/// A clone belongs to each admitted writer operation. Control's revocation
+/// barrier waits for the last clone, including work whose waiter left early.
+#[derive(Clone)]
+pub struct ArchiveCommitAuthority(Arc<Mutex<Box<dyn RevocationLease>>>);
+
+impl ArchiveCommitAuthority {
+    pub fn new(lease: Box<dyn RevocationLease>) -> Self {
+        Self(Arc::new(Mutex::new(lease)))
+    }
+
+    pub fn check(&self) -> Result<(), PortError> {
+        self.0.lock().unwrap_or_else(|err| err.into_inner()).check()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ImportFolderCommit {
     pub(crate) fence: ImportFence,
     pub(crate) ordinal: u64,
     pub(crate) parent: ImportParent,
     pub(crate) auth: notarium_core::auth::EngineAuthContext,
+    pub(crate) authority: ArchiveCommitAuthority,
 }
 
 impl ImportFolderCommit {
@@ -121,6 +139,7 @@ impl ImportFolderCommit {
         tx: &mut BackendConn<'_>,
         space: &crate::SpaceRecord,
     ) -> Result<(), PortError> {
+        self.authority.check()?;
         validate_import_parent_tx(tx, &self.fence.scope, &space.root_folder_id, &self.parent)
             .await?;
         let (facts, _) = build_resource_facts_tx(
@@ -177,6 +196,7 @@ impl ImportFence {
                     WHERE space_id=$2 AND job_id=$3 AND lease_owner=$4 AND lease_epoch=$5
                       AND substr(result_msgpack,1,37)=$6 AND completed_units=$1-1
                       AND state='running' AND job_kind='import' AND payload_erased_by_purge=0
+                      AND claim_space_epoch=(SELECT active_epoch FROM spaces WHERE space_id=$2)
                       AND total_units >= $1 AND lease_until_ms>", $clock,
                 )
             };
@@ -220,9 +240,8 @@ impl CanonicalStore {
         &self,
         ctx: SpaceContext,
         request: Mutation<ContentJobKind>,
-        source: ArchiveObject,
     ) -> Result<Committed<ContentJob>, PortError> {
-        super::create_job_impl(self, ctx, request, Some(source)).await
+        super::create_job_impl(self, ctx, request, true).await
     }
 
     pub async fn pinned_import_source(
@@ -300,6 +319,7 @@ impl CanonicalStore {
         ctx: &SpaceContext,
         claim: &ClaimedContentJob,
         plan: PinnedImportPlan,
+        authority: ArchiveCommitAuthority,
     ) -> Result<ImportProgress, PortError> {
         let scope = ctx.scope().clone();
         plan.object.scope.check(&scope)?;
@@ -317,72 +337,83 @@ impl CanonicalStore {
             .await?;
         let claimant = claim.clone();
         let auth = ctx.auth().clone();
-        self.with_auxiliary_command(Some((&ctx.budget, deadline)), Ok, move |tx| {
-            Box::pin(async move {
-                lock_and_check_space_tx(tx, &scope, space.active_epoch).await?;
-                let live = load_space_record(tx, &scope.space_id).await?;
-                auth.authorize_space_write(&live.space)?;
-                let progress = check_import_tx(
-                    tx,
-                    &scope,
-                    &claimant.job.id,
-                    &claimant.lease_owner,
-                    claimant.job.lease,
-                )
-                .await?;
-                if let Some(existing) = &progress.plan {
-                    if existing.source != plan.source
-                        || existing.source_digest != plan.source_digest
-                    {
+        let retained = authority.clone();
+        self.with_auxiliary_command(
+            Some((&ctx.budget, deadline)),
+            move |progress| {
+                drop(retained);
+                Ok(progress)
+            },
+            move |tx| {
+                Box::pin(async move {
+                    authority.check()?;
+                    lock_and_check_space_tx(tx, &scope, space.active_epoch).await?;
+                    let live = load_space_record(tx, &scope.space_id).await?;
+                    auth.authorize_space_write(&live.space)?;
+                    let progress = check_import_tx(
+                        tx,
+                        &scope,
+                        &claimant.job.id,
+                        &claimant.lease_owner,
+                        claimant.job.lease,
+                    )
+                    .await?;
+                    if let Some(existing) = &progress.plan {
+                        if existing.source != plan.source
+                            || existing.source_digest != plan.source_digest
+                        {
+                            return Err(invalid(ValidationReason::InvalidDigest));
+                        }
+                        return Ok(progress);
+                    }
+                    let source = import_source_tx(tx, &scope, &claimant.job.id).await?;
+                    if source.id != plan.source || source.digest != plan.source_digest {
                         return Err(invalid(ValidationReason::InvalidDigest));
                     }
-                    return Ok(progress);
-                }
-                let source = import_source_tx(tx, &scope, &claimant.job.id).await?;
-                if source.id != plan.source || source.digest != plan.source_digest {
-                    return Err(invalid(ValidationReason::InvalidDigest));
-                }
-                super::archive_uploads::consume_archive_upload_tx(
-                    tx,
-                    &plan.object,
-                    &claimant.job.id,
-                    claimant.job.lease,
-                )
-                .await?;
-                let mut wire = PLAN_TAG.to_vec();
-                wire.extend_from_slice(plan.object.digest.as_bytes());
-                wire.extend(encode_msgpack(&plan)?);
-                if wire.len() > MAX_MSGPACK_DECODE_BYTES {
-                    return Err(invalid(ValidationReason::BudgetExceeded));
-                }
-                let sql =
+                    super::archive_uploads::consume_archive_upload_tx(
+                        tx,
+                        &plan.object,
+                        &claimant.job.id,
+                        claimant.job.lease,
+                    )
+                    .await?;
+                    let mut wire = PLAN_TAG.to_vec();
+                    wire.extend_from_slice(plan.object.digest.as_bytes());
+                    wire.extend(encode_msgpack(&plan)?);
+                    if wire.len() > MAX_MSGPACK_DECODE_BYTES {
+                        return Err(invalid(ValidationReason::BudgetExceeded));
+                    }
+                    let sql =
                     "UPDATE content_jobs SET result_msgpack=$1, completed_units=0, total_units=$2
                 WHERE space_id=$3 AND job_id=$4";
-                match tx {
-                    BackendConn::Sqlite(conn) => sqlx::query(sql)
-                        .bind(&wire)
-                        .bind(plan.entries as i64)
-                        .bind(scope.space_id.as_str())
-                        .bind(claimant.job.id.as_str())
-                        .execute(&mut **conn)
-                        .await
-                        .map(|_| ()),
-                    BackendConn::Postgres(conn) => sqlx::query(sql)
-                        .bind(&wire)
-                        .bind(plan.entries as i64)
-                        .bind(scope.space_id.as_str())
-                        .bind(claimant.job.id.as_str())
-                        .execute(&mut **conn)
-                        .await
-                        .map(|_| ()),
-                }
-                .map_err(|err| internal_not_committed("install_import_plan", err.to_string()))?;
-                Ok(ImportProgress {
-                    plan: Some(plan),
-                    applied: 0,
+                    match tx {
+                        BackendConn::Sqlite(conn) => sqlx::query(sql)
+                            .bind(&wire)
+                            .bind(plan.entries as i64)
+                            .bind(scope.space_id.as_str())
+                            .bind(claimant.job.id.as_str())
+                            .execute(&mut **conn)
+                            .await
+                            .map(|_| ()),
+                        BackendConn::Postgres(conn) => sqlx::query(sql)
+                            .bind(&wire)
+                            .bind(plan.entries as i64)
+                            .bind(scope.space_id.as_str())
+                            .bind(claimant.job.id.as_str())
+                            .execute(&mut **conn)
+                            .await
+                            .map(|_| ()),
+                    }
+                    .map_err(|err| {
+                        internal_not_committed("install_import_plan", err.to_string())
+                    })?;
+                    Ok(ImportProgress {
+                        plan: Some(plan),
+                        applied: 0,
+                    })
                 })
-            })
-        })
+            },
+        )
         .await
     }
 
@@ -392,6 +423,7 @@ impl CanonicalStore {
         claim: &ClaimedContentJob,
         plan: ContentDigest,
         folder: PlannedImportFolder,
+        authority: ArchiveCommitAuthority,
     ) -> Result<(), PortError> {
         let scope = ctx.scope().clone();
         let space = self
@@ -403,24 +435,37 @@ impl CanonicalStore {
             ordinal: folder.ordinal,
             parent: folder.parent,
             auth: ctx.auth().clone(),
+            authority,
         };
         if folder.reuse {
             let deadline = CommandDeadline::start(&ctx.budget, "reuse_import_folder");
             let slug_fold = normalize_slug_key(&folder.slug)?;
+            let retained = guard.authority.clone();
             return self
-                .with_auxiliary_command(Some((&ctx.budget, deadline)), Ok, move |tx| {
-                    Box::pin(async move {
-                        lock_and_check_space_tx(tx, &scope, space.active_epoch).await?;
-                        let live = load_space_record(tx, &scope.space_id).await?;
-                        guard.check_tx(tx, &live).await?;
-                        let actual =
-                            folder_at_tx(tx, &scope, guard.parent.folder(), &slug_fold).await?;
-                        if actual.as_ref() != Some(&folder.id) {
-                            return Err(path_conflict(&scope, guard.parent.folder(), &folder.slug));
-                        }
+                .with_auxiliary_command(
+                    Some((&ctx.budget, deadline)),
+                    move |()| {
+                        drop(retained);
                         Ok(())
-                    })
-                })
+                    },
+                    move |tx| {
+                        Box::pin(async move {
+                            lock_and_check_space_tx(tx, &scope, space.active_epoch).await?;
+                            let live = load_space_record(tx, &scope.space_id).await?;
+                            guard.check_tx(tx, &live).await?;
+                            let actual =
+                                folder_at_tx(tx, &scope, guard.parent.folder(), &slug_fold).await?;
+                            if actual.as_ref() != Some(&folder.id) {
+                                return Err(path_conflict(
+                                    &scope,
+                                    guard.parent.folder(),
+                                    &folder.slug,
+                                ));
+                            }
+                            Ok(())
+                        })
+                    },
+                )
                 .await;
         }
         self.create_folder_import(
@@ -501,6 +546,7 @@ impl CanonicalStore {
         claim: &ClaimedContentJob,
         plan: ContentDigest,
         notes: Vec<PlannedImportNote>,
+        authority: ArchiveCommitAuthority,
     ) -> Result<Vec<Result<(), PortError>>, PortError> {
         if notes.len() > IMPORT_BATCH_LIMIT
             || notes
@@ -557,8 +603,11 @@ impl CanonicalStore {
             );
             let execute = intent.execute;
             let fence = fence.clone();
+            let authority = authority.clone();
             intent.execute = Box::new(move |tx, item| {
                 Box::pin(async move {
+                    authority.check()?;
+                    item.retain_until_batch_commit(authority);
                     validate_import_parent_tx(tx, &fence.scope, &item.root_folder_id, &parent)
                         .await?;
                     fence.check_and_apply(tx, ordinal).await?;
@@ -567,15 +616,33 @@ impl CanonicalStore {
             });
             intents.push(intent);
         }
-        let mut budget = ctx.budget.clone();
-        budget.remaining = deadline.remaining(&ctx.budget)?;
-        let (outcomes, _) = self
-            .submit_write_batch::<StoredCommittedNoteRevV1>(&budget, &space.scope.space_id, intents)
-            .await?;
-        Ok(outcomes
-            .into_iter()
-            .map(|outcome| outcome.map(drop))
-            .collect())
+        let capacity = intents.len();
+        let mut pending = intents.into_iter();
+        let mut outcomes = Vec::with_capacity(capacity);
+        while pending.len() > 0 {
+            let mut budget = ctx.budget.clone();
+            budget.remaining = deadline.remaining(&ctx.budget)?;
+            let group = pending
+                .by_ref()
+                .take(self.inner.config.writer.max_batch_items)
+                .collect();
+            let (committed, _) = self
+                .submit_write_batch::<StoredCommittedNoteRevV1>(
+                    &budget,
+                    &space.scope.space_id,
+                    group,
+                )
+                .await?;
+            for outcome in committed {
+                let outcome = outcome.map(drop);
+                let stop = outcome.is_err();
+                outcomes.push(outcome);
+                if stop {
+                    return Ok(outcomes);
+                }
+            }
+        }
+        Ok(outcomes)
     }
 }
 
@@ -698,15 +765,16 @@ pub(super) async fn persist_import_source_tx(
     tx: &mut BackendConn<'_>,
     scope: &HistoryScope,
     job: &JobId,
+    artifact: &ArtifactId,
     payload: Vec<u8>,
 ) -> Result<(), PortError> {
-    const INSERT: &str =
-        "INSERT INTO archive_import_sources(space_id,job_id,object_msgpack) VALUES($1,$2,$3)";
+    const INSERT: &str = "INSERT INTO archive_import_sources(space_id,job_id,artifact_id,object_msgpack) VALUES($1,$2,$3,$4)";
     macro_rules! insert {
         ($conn:expr) => {
             sqlx::query(INSERT)
                 .bind(scope.space_id.as_str())
                 .bind(job.as_str())
+                .bind(artifact.as_str())
                 .bind(payload)
                 .execute(&mut **$conn)
                 .await

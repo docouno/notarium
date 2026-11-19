@@ -10,6 +10,7 @@ pub use fresh::FreshLocalInitializer;
 use notarium_core::ids::KeyId;
 
 /// Non-secret metadata from a verified control database image or logical spool.
+#[derive(serde::Deserialize, serde::Serialize)]
 pub struct BackupKeyRow {
     pub key_id: String,
     pub key_hash: String,

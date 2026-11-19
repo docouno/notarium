@@ -180,6 +180,20 @@ async fn upgrade_archive_state_v7(
         |err: sqlx::Error| internal_not_committed("migration_v7_archive_state", err.to_string());
     match conn {
         BackendConn::Sqlite(c) => {
+            let has_claim_epoch: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('content_jobs') WHERE name='claim_space_epoch')",
+            ).fetch_one(&mut **c).await.map_err(error)?;
+            if !has_claim_epoch {
+                sqlx::query("ALTER TABLE content_jobs ADD COLUMN claim_space_epoch INTEGER CHECK (claim_space_epoch >= 1)")
+                    .execute(&mut **c).await.map_err(error)?;
+            }
+            let has_scoped_export: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('backup_holds') WHERE name='scoped_export')",
+            ).fetch_one(&mut **c).await.map_err(error)?;
+            if !has_scoped_export {
+                sqlx::query("ALTER TABLE backup_holds ADD COLUMN scoped_export INTEGER NOT NULL DEFAULT 0 CHECK (scoped_export IN (0,1))")
+                    .execute(&mut **c).await.map_err(error)?;
+            }
             // The earlier SQLite migration may rebuild the catalog from this
             // release's table declaration in the same transaction.
             let columns: i64 = sqlx::query_scalar(
@@ -197,6 +211,10 @@ async fn upgrade_archive_state_v7(
                 "ALTER TABLE blob_catalog ADD COLUMN IF NOT EXISTS quarantined_at_ms BIGINT;
                  ALTER TABLE blob_catalog ADD COLUMN IF NOT EXISTS legacy_cleanup INTEGER NOT NULL DEFAULT 0 CHECK(legacy_cleanup IN (0,1));",
             ).execute(&mut **c).await.map_err(error)?;
+            sqlx::query("ALTER TABLE content_jobs ADD COLUMN IF NOT EXISTS claim_space_epoch BIGINT CHECK (claim_space_epoch >= 1)")
+                .execute(&mut **c).await.map_err(error)?;
+            sqlx::query("ALTER TABLE backup_holds ADD COLUMN IF NOT EXISTS scoped_export INTEGER NOT NULL DEFAULT 0 CHECK (scoped_export IN (0,1))")
+                .execute(&mut **c).await.map_err(error)?;
         }
     }
     const BACKFILL: &str = "UPDATE blob_catalog SET legacy_cleanup=1
@@ -299,6 +317,7 @@ macro_rules! upgrade {
                 "CREATE TABLE IF NOT EXISTS archive_export_shadows (",
                 "CREATE TABLE IF NOT EXISTS archive_uploads (",
                 "CREATE TABLE IF NOT EXISTS archive_import_sources (",
+                "CREATE INDEX IF NOT EXISTS idx_archive_import_sources_artifact",
                 "CREATE INDEX IF NOT EXISTS idx_archive_uploads_created",
             ] {
                 let sql = baseline_statement($ddl, prefix)?;

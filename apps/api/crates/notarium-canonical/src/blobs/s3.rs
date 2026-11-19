@@ -753,6 +753,7 @@ impl S3BlobStore {
         // Re-verify Space epoch & zero backup holds before issuing S3 retirement I/O.
         let scope_pre = scope.clone();
         let private_upload = retirement_id == target.publication_id;
+        let reason = marker.reason;
         store
             .with_read_tx(|tx| {
                 Box::pin(async move {
@@ -764,7 +765,7 @@ impl S3BlobStore {
                         );
                     }
                     if !private_upload {
-                        ensure_no_backup_holds_tx(tx, &scope_pre.space_id).await?;
+                        ensure_no_backup_holds_tx(tx, &scope_pre.space_id, reason).await?;
                     }
                     Ok(())
                 })

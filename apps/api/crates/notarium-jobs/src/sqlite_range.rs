@@ -25,7 +25,6 @@ use crate::{
 const NAME: &CStr = c"archive.sqlite";
 const DB_HEADER_BYTES: usize = 100;
 const MAX_VALUE_BYTES: c_int = 32 * 1024 * 1024;
-const VERIFIER_BYTES: u64 = 128 * 1024 * 1024;
 
 trait SeekRead: Read + Seek + Send {}
 impl<T: Read + Seek + Send> SeekRead for T {}
@@ -130,22 +129,26 @@ fn configure(database: &Connection, cancellation: Cancellation) -> Result<(), Po
          PRAGMA cache_spill=OFF;",
         )
         .map_err(sql_error)?;
-    let baseline = sqlite_memory()?;
     database
-        .progress_handler(
-            2048,
-            Some(move || {
-                cancellation.is_cancelled()
-                    || sqlite_memory().map_or(true, |bytes| {
-                        bytes.saturating_sub(baseline) > VERIFIER_BYTES
-                    })
-            }),
-        )
+        .progress_handler(2048, Some(move || cancellation.is_cancelled()))
         .map_err(sql_error)?;
     Ok(())
 }
 
-fn sqlite_memory() -> Result<u64, PortError> {
+pub(crate) fn cap_verifier_heap(bytes: u64) -> Result<(), PortError> {
+    // SAFETY: This entry point runs only in the isolated verifier child
+    // before it opens any images. The caller validates the positive limit.
+    let installed = unsafe {
+        ffi::sqlite3_hard_heap_limit64(bytes as i64);
+        ffi::sqlite3_hard_heap_limit64(-1)
+    };
+    if installed <= 0 || installed as u64 > bytes {
+        return Err(invalid(ValidationReason::BudgetExceeded));
+    }
+    Ok(())
+}
+
+pub(crate) fn sqlite_heap_peak() -> Result<u64, PortError> {
     let mut current = 0;
     let mut high = 0;
     // SAFETY: Both counters point to writable i64 values for this synchronous
@@ -156,7 +159,7 @@ fn sqlite_memory() -> Result<u64, PortError> {
     if status != ffi::SQLITE_OK {
         return Err(invalid(ValidationReason::BudgetExceeded));
     }
-    Ok(current.max(0) as u64)
+    Ok(high.max(0) as u64)
 }
 
 fn register(
@@ -260,7 +263,9 @@ unsafe extern "C" fn read(
     }
     // SAFETY: SQLite supplies a live OpenFile and a destination of size bytes
     // only while the synchronous callback is live. xOpen bound the owner.
+    // Initialize the output before exposing it as a Rust slice to Read.
     let (window, dest) = unsafe {
+        ptr::write_bytes(data.cast::<u8>(), 0, size as usize);
         (
             &*(*file.cast::<OpenFile>()).owner,
             std::slice::from_raw_parts_mut(data.cast::<u8>(), size as usize),
@@ -271,7 +276,6 @@ unsafe extern "C" fn read(
             return ffi::SQLITE_INTERRUPT;
         }
         let count = window.len.saturating_sub(offset as u64).min(size as u64) as usize;
-        dest[count..].fill(0);
         if count > 0 {
             let Ok(mut source) = window.source.lock() else {
                 return ffi::SQLITE_IOERR_READ;
@@ -364,16 +368,17 @@ unsafe extern "C" fn full_name(
     ffi::SQLITE_OK
 }
 unsafe extern "C" fn random(_: *mut ffi::sqlite3_vfs, cap: c_int, output: *mut c_char) -> c_int {
-    if cap <= 0 {
+    if cap <= 0 || output.is_null() {
         return 0;
     }
-    // SAFETY: SQLite supplies cap writable bytes for xRandomness.
-    let bytes = unsafe { std::slice::from_raw_parts_mut(output.cast::<u8>(), cap as usize) };
-    for chunk in bytes.chunks_mut(32) {
+    for offset in (0..cap as usize).step_by(32) {
         let Ok(sample) = codec::csprng_32() else {
             return 0;
         };
-        chunk.copy_from_slice(&sample[..chunk.len()]);
+        let size = (cap as usize - offset).min(sample.len());
+        // SAFETY: SQLite supplies cap writable bytes. This chunk is in bounds
+        // and the stack sample cannot overlap SQLite's destination.
+        unsafe { ptr::copy_nonoverlapping(sample.as_ptr(), output.cast::<u8>().add(offset), size) };
     }
     cap
 }

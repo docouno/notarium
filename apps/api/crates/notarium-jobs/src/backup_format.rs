@@ -123,7 +123,12 @@ impl WorkDirectory {
         fs::hard_link(self.path(name), destination).map_err(io_error)?;
         File::open(parent)
             .and_then(|dir| dir.sync_all())
-            .map_err(io_error)
+            .map_err(|err| {
+                codec::unknown_commit_non_idempotent(
+                    "backup_archive_publish",
+                    err.kind().to_string(),
+                )
+            })
     }
 }
 
@@ -170,6 +175,49 @@ pub(crate) fn measure_file(
     let identity = copy_hash(file, &mut io::sink(), limit, cancellation)?;
     file.seek(SeekFrom::Start(0)).map_err(io_error)?;
     Ok(identity)
+}
+
+/// Authenticate the exact bytes read by a sequential decoder, including its
+/// trailer. Verify the digest before releasing the final range to the decoder.
+pub(crate) fn authenticated_payload(input: impl Read, expected: Payload) -> impl Read {
+    let mut bytes = 0_u64;
+    let mut hasher = blake3::Hasher::new();
+    let mut input = input;
+    DigestReader(move |output: &mut [u8]| {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let count = input.read(output)?;
+        bytes = bytes
+            .checked_add(count as u64)
+            .ok_or_else(payload_changed)?;
+        if bytes > expected.bytes {
+            return Err(payload_changed());
+        }
+        hasher.update(&output[..count]);
+        if (count == 0 && bytes != expected.bytes)
+            || (bytes == expected.bytes
+                && hasher.finalize().as_bytes() != expected.digest.as_bytes())
+        {
+            return Err(payload_changed());
+        }
+        Ok(count)
+    })
+}
+
+struct DigestReader<F>(F);
+
+impl<F: FnMut(&mut [u8]) -> io::Result<usize>> Read for DigestReader<F> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        (self.0)(output)
+    }
+}
+
+fn payload_changed() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "backup payload changed after verification",
+    )
 }
 
 pub(crate) fn invalid(reason: ValidationReason) -> PortError {

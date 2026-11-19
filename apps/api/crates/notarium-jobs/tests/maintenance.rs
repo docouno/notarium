@@ -6,7 +6,10 @@ use std::{
     time::Duration,
 };
 
-use notarium_canonical::{CanonicalConfig, CanonicalRuntime, CreateSpaceSpec, codec};
+use notarium_canonical::{
+    ArchiveJobClass, CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateSpaceSpec, codec,
+    peers::archive_export::ExportCut,
+};
 use notarium_control::{
     backup::{BackupConfig, ControlBackup},
     keyring::{FreshLocalInitializer, Keyring, KeyringLocation},
@@ -80,7 +83,26 @@ fn open(path: &Path) -> ArchiveInput {
     ArchiveInput::new(File::open(path).unwrap()).unwrap()
 }
 
-fn repackage_with_broken_foreign_key(path: &Path, scratch: &Path) -> ArchiveInput {
+fn sqlite_backup_options() -> BackupOptions {
+    let mut options = BackupOptions::default();
+    options.sqlite_verifier = options.sqlite_verifier.with_command(
+        std::env::current_exe().unwrap(),
+        ["--exact", "sqlite_verifier_protocol_child", "--nocapture"]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    );
+    options
+}
+
+#[test]
+fn sqlite_verifier_protocol_child() {
+    if std::env::var_os("NOTARIUM_SQLITE_VERIFIER_CHILD").is_some() {
+        notarium_jobs::run_sqlite_verifier().unwrap();
+    }
+}
+
+fn repackage_sqlite(path: &Path, scratch: &Path, statement: &str) -> ArchiveInput {
     let mut source = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
     let bytes = |source: &mut zip::ZipArchive<File>, name| {
         let mut bytes = Vec::new();
@@ -91,11 +113,11 @@ fn repackage_with_broken_foreign_key(path: &Path, scratch: &Path) -> ArchiveInpu
             .unwrap();
         bytes
     };
-    let image = scratch.join("forged.sqlite");
+    let image = scratch.join(codec::new_prefixed_hex_id("forged_sqlite_").unwrap());
     fs::write(&image, bytes(&mut source, "db/canonical")).unwrap();
     let db = rusqlite::Connection::open(&image).unwrap();
-    db.execute_batch("PRAGMA foreign_keys=OFF; DELETE FROM folder_heads WHERE is_root=1;")
-        .unwrap();
+    db.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+    db.execute_batch(statement).unwrap();
     assert_eq!(
         db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
             .unwrap(),
@@ -125,6 +147,42 @@ fn repackage_with_broken_foreign_key(path: &Path, scratch: &Path) -> ArchiveInpu
         output.write_all(&data).unwrap();
     }
     ArchiveInput::new(output.finish().unwrap()).unwrap()
+}
+
+async fn held_export(
+    store: &CanonicalStore,
+    scope: &HistoryScope,
+    owner: &PrincipalId,
+) -> ExportCut {
+    let ctx = auth(scope, owner);
+    store
+        .create_job(
+            ctx.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: owner.clone(),
+                    key: CommandKey::from_bytes(codec::ordered_id_16().unwrap()),
+                    hash: ContentDigest::from_bytes([0; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: ContentJobKind::ExportSpace { encrypted: false },
+            },
+        )
+        .await
+        .unwrap();
+    let claim = store
+        .claim_next_archive_job(
+            &budget(),
+            scope,
+            "backup-test-export",
+            Duration::from_secs(60),
+            ArchiveJobClass::Export,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    store.capture_archive_export(&ctx, &claim).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -185,7 +243,7 @@ async fn sqlite_archive_verification_restore_and_rejection() {
             Mutation {
                 identity: CommandIdentity {
                     scope: scope.clone(),
-                    actor: owner,
+                    actor: owner.clone(),
                     key: CommandKey::from_bytes([7; 16]),
                     hash: ContentDigest::from_bytes([8; 32]),
                 },
@@ -201,6 +259,40 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         )
         .await
         .unwrap();
+    canonical
+        .create_note(
+            auth(&scope, &owner),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: owner.clone(),
+                    key: CommandKey::from_bytes([10; 16]),
+                    hash: ContentDigest::from_bytes([11; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateNote {
+                    note: NoteId::from_bytes([12; 16]),
+                    parent: None,
+                    slug: "shared-carrier".into(),
+                    class: DocClass::UserDoc,
+                    carrier: body.into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let export = held_export(&canonical, &scope, &owner).await;
+    rusqlite::Connection::open(root.canonical())
+        .unwrap()
+        .execute(
+            "INSERT INTO archive_export_cuts(backup_id,space_id,cutoff_seq) VALUES(?1,?2,?3)",
+            rusqlite::params![
+                export.hold_id.as_str(),
+                scope.space_id.as_str(),
+                export.seq.get() as i64
+            ],
+        )
+        .unwrap();
 
     let live = run_fsck(
         authority(ServicePurpose::Fsck),
@@ -209,7 +301,7 @@ async fn sqlite_archive_verification_restore_and_rejection() {
             control: &binding,
         },
         &root.keyring(),
-        BackupOptions::default(),
+        sqlite_backup_options(),
     )
     .await
     .unwrap();
@@ -220,15 +312,16 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         &canonical,
         &binding,
         &destination,
-        BackupOptions::default(),
+        sqlite_backup_options(),
     )
     .await
     .unwrap();
+    export.release().await.unwrap();
     let report = run_fsck(
         authority(ServicePurpose::Fsck),
         FsckInput::Archive(open(&destination)),
         &root.keyring(),
-        BackupOptions::default(),
+        sqlite_backup_options(),
     )
     .await
     .unwrap();
@@ -238,6 +331,18 @@ async fn sqlite_archive_verification_restore_and_rejection() {
         (1, 1, 1)
     );
     assert_eq!(report.raw_blob_bytes, body.len() as u64);
+    assert!(
+        report
+            .sqlite_native_peak_bytes
+            .is_some_and(|peak| peak > 0 && peak < 80 * 1024 * 1024)
+    );
+    let mut constrained = sqlite_backup_options();
+    constrained.sqlite_verifier.heap_bytes = 64 * 1024;
+    assert!(matches!(
+        run_fsck(authority(ServicePurpose::Fsck), FsckInput::Archive(open(&destination)), &root.keyring(), constrained).await,
+        Err(notarium_core::error::PortError::Domain(notarium_core::DomainError::ValidationFailed { diagnostic }))
+            if diagnostic.reason == notarium_core::error::ValidationReason::BudgetExceeded
+    ));
 
     let mut zip = zip::ZipArchive::new(File::open(&destination).unwrap()).unwrap();
     assert_eq!(
@@ -264,25 +369,36 @@ async fn sqlite_archive_verification_restore_and_rejection() {
             root: reject.clone(),
             keyring: RestoreKeyring::External(root.keyring()),
         },
-        BackupOptions::default(),
+        sqlite_backup_options(),
     )
     .await;
     assert!(failed.is_err());
     assert!(!reject.root().exists());
 
-    let forged = repackage_with_broken_foreign_key(&destination, &scratch.0);
-    let rejected = run_restore(
-        authority(ServicePurpose::Restore),
-        forged,
-        RestoreTarget::Local {
-            root: reject.clone(),
-            keyring: RestoreKeyring::External(root.keyring()),
-        },
-        BackupOptions::default(),
-    )
-    .await;
-    assert!(rejected.is_err());
-    assert!(!reject.root().exists());
+    for corruption in [
+        "DELETE FROM folder_heads WHERE is_root=1;".to_owned(),
+        format!(
+            "DELETE FROM blob_references WHERE owner_kind='note_revision' AND owner_id='{}';
+                  UPDATE blob_catalog SET ref_count=1 WHERE ref_count=2;",
+            NoteId::from_bytes([9; 16])
+        ),
+        "DROP INDEX uq_spaces_slug_fold; CREATE INDEX uq_spaces_slug_fold ON spaces(slug_fold);"
+            .to_owned(),
+    ] {
+        let forged = repackage_sqlite(&destination, &scratch.0, &corruption);
+        let rejected = run_restore(
+            authority(ServicePurpose::Restore),
+            forged,
+            RestoreTarget::Local {
+                root: reject.clone(),
+                keyring: RestoreKeyring::External(root.keyring()),
+            },
+            sqlite_backup_options(),
+        )
+        .await;
+        assert!(rejected.is_err(), "{corruption}");
+        assert!(!reject.root().exists());
+    }
 
     for (target, existing) in [("absent", false), ("existing", true)] {
         let restored = DataRoot::new(scratch.0.join(target));
@@ -310,7 +426,7 @@ async fn sqlite_archive_verification_restore_and_rejection() {
                 root: restored.clone(),
                 keyring,
             },
-            BackupOptions::default(),
+            sqlite_backup_options(),
         )
         .await
         .unwrap();
@@ -566,7 +682,7 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
             Mutation {
                 identity: CommandIdentity {
                     scope: scope.clone(),
-                    actor: owner,
+                    actor: owner.clone(),
                     key: CommandKey::from_bytes([24; 16]),
                     hash: ContentDigest::from_bytes([25; 32]),
                 },
@@ -582,6 +698,10 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
         )
         .await
         .unwrap();
+    let export = held_export(&store, &scope, &owner).await;
+    sqlx::query("INSERT INTO v1_canonical.archive_export_cuts(backup_id,space_id,cutoff_seq) VALUES($1,$2,$3)")
+        .bind(export.hold_id.as_str()).bind(scope.space_id.as_str()).bind(export.seq.get() as i64)
+        .execute(&mut src_sql).await.unwrap();
     let path = scratch.0.join("cloud.zip");
     let backup = run_backup(
         authority(ServicePurpose::Backup),
@@ -592,6 +712,7 @@ async fn cloud_archive_verification_and_restore_to_an_independent_namespace() {
     )
     .await
     .unwrap();
+    export.release().await.unwrap();
     let validated = run_fsck(
         authority(ServicePurpose::Fsck),
         FsckInput::Archive(open(&path)),

@@ -57,7 +57,18 @@ pub(super) async fn capture(
     let folders = read_folders(store, budget, &cut).await?;
     let schemas = pages(store, budget, &cut, "schema").await?;
     let current_schema = current_schema(schemas)?;
-    let mut files = read_notes(store, budget, &cut, &folders, current_schema, encrypted).await?;
+    let mut files = read_notes(
+        store,
+        budget,
+        &cut,
+        &folders,
+        current_schema.as_ref().map(|(note, _)| note.as_str()),
+        encrypted,
+    )
+    .await?;
+    if let Some((note, seq)) = current_schema {
+        files.push(read_schema_carrier(store, budget, &cut, note, seq).await?);
+    }
     read_packages(store, budget, &cut, &mut files).await?;
     read_chats(store, budget, &cut, &space, ctx.auth(), &mut files).await?;
     Ok((cut.seq, cut.generation, files, elapsed))
@@ -260,14 +271,56 @@ fn folder_path(
     Err(invalid(ValidationReason::InvalidArchive))
 }
 
-fn current_schema(rows: Vec<(String, (String, i64))>) -> Result<Option<String>, PortError> {
+type SchemaRow = (String, (String, i64, i64));
+
+fn current_schema(rows: Vec<SchemaRow>) -> Result<Option<(String, i64)>, PortError> {
     let mut current = None;
-    for (_, (note, active)) in rows {
-        if active == 1 && current.replace(note).is_some() {
+    for (_, (note, active, sequence)) in rows {
+        if active == 1 && current.replace((note, sequence)).is_some() {
             return Err(invalid(ValidationReason::InvalidState));
         }
     }
     Ok(current)
+}
+
+async fn read_schema_carrier(
+    store: &CanonicalStore,
+    budget: &CallBudget,
+    cut: &VersionedCut,
+    note: String,
+    sequence: i64,
+) -> Result<ExportEntry, PortError> {
+    let cut = cut.clone();
+    let bytes: Option<Vec<u8>> = store
+        .with_read_tx_budget(Some(budget), move |tx| {
+            Box::pin(async move {
+                check_cut(tx, &cut).await?;
+                const SQL: &str = "SELECT content_blake3 FROM revisions
+                WHERE space_id=$1 AND entity_type='note' AND entity_key=$2 AND space_seq=$3";
+                macro_rules! row {
+                    ($conn:expr) => {
+                        sqlx::query_scalar(SQL)
+                            .bind(cut.scope.space_id.as_str())
+                            .bind(note)
+                            .bind(sequence)
+                            .fetch_one(&mut **$conn)
+                            .await
+                    };
+                }
+                match tx {
+                    BackendConn::Sqlite(conn) => row!(conn),
+                    BackendConn::Postgres(conn) => row!(conn),
+                }
+                .map_err(sql_error)
+            })
+        })
+        .await?;
+    Ok(ExportEntry {
+        path: SCHEMA_PATH.into(),
+        data: ExportData::Blob(digest(
+            bytes.ok_or_else(|| invalid(ValidationReason::InvalidDigest))?,
+        )?),
+    })
 }
 
 type NoteRow = (
@@ -284,14 +337,14 @@ async fn read_notes(
     budget: &CallBudget,
     cut: &VersionedCut,
     folders: &HashMap<String, FolderRow>,
-    schema: Option<String>,
+    schema: Option<&str>,
     encrypted: bool,
 ) -> Result<Vec<ExportEntry>, PortError> {
     let notes = pages::<NoteRow>(store, budget, cut, "note").await?;
     let mut result = Vec::new();
     let mut cached_paths = HashMap::new();
     for (id, (folder, name, class, ability, hash, lifecycle)) in notes {
-        if lifecycle != "active" || ability.is_some() {
+        if lifecycle != "active" || ability.is_some() || schema == Some(id.as_str()) {
             continue;
         }
         let path = match cached_paths.entry(folder) {
@@ -307,11 +360,7 @@ async fn read_notes(
         if doc_class_from_db(&class)? == DocClass::EncryptedNote && !encrypted {
             return Err(invalid(ValidationReason::ClassEgressForbidden));
         }
-        let path = if schema.as_ref() == Some(&id) {
-            ".notarium/fields/schema.yaml".into()
-        } else {
-            format!("{path}{name}.md")
-        };
+        let path = format!("{path}{name}.md");
         let hash = hex::decode(hash.ok_or_else(|| invalid(ValidationReason::InvalidDigest))?)
             .map_err(|_| invalid(ValidationReason::InvalidDigest))?;
         result.push(ExportEntry {

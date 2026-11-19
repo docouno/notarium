@@ -6,6 +6,7 @@ use std::{
 
 use notarium_canonical::{
     ArchiveJobClass, CanonicalStore, ClaimedContentJob, JobCompletionOutcome, codec,
+    peers::archive_import::ArchiveCommitAuthority,
 };
 use notarium_control::service::ControlService;
 use notarium_core::{
@@ -72,6 +73,7 @@ pub struct JobExecution {
     claim: ClaimedContentJob,
     delegation: JobDelegation,
     cancellation: Cancellation,
+    authority: ArchiveCommitAuthority,
     blocking: Arc<Semaphore>,
     progress: Mutex<(u64, Option<u64>)>,
 }
@@ -89,6 +91,10 @@ impl JobExecution {
         &self.cancellation
     }
 
+    pub(crate) fn commit_authority(&self) -> ArchiveCommitAuthority {
+        self.authority.clone()
+    }
+
     pub fn report_progress(&self, completed: u64, total: Option<u64>) {
         let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
         if completed >= progress.0 {
@@ -99,6 +105,7 @@ impl JobExecution {
     /// Gets current caller authority and confirms the claim before starting a
     /// bounded unit of work. Call again before a new batch or publication.
     pub async fn authorize(&self) -> Result<SpaceContext, PortError> {
+        self.authority.check()?;
         let budget = command_budget(&self.cancellation)?;
         let ctx = self
             .control
@@ -346,6 +353,7 @@ impl ArchiveRunner {
             claim: claim.clone(),
             delegation,
             cancellation: cancellation.clone(),
+            authority: ArchiveCommitAuthority::new(revocation),
             blocking: self.blocking.clone(),
             progress: Mutex::new((claim.job.completed_units, claim.job.total_units)),
         };
@@ -363,7 +371,6 @@ impl ArchiveRunner {
                     return Err(cancelled());
                 }
                 result = &mut work => {
-                    revocation.check()?;
                     execution.authorize().await?;
                     match result {
                         Ok(outcome) => break outcome,
@@ -383,8 +390,15 @@ impl ArchiveRunner {
                 }
             }
         };
-        self.complete(scope, claim, cancellation, outcome).await;
-        drop(revocation);
+        self.store
+            .complete_archive_job(
+                &command_budget(cancellation)?,
+                scope,
+                claim,
+                outcome,
+                execution.commit_authority(),
+            )
+            .await?;
         Ok(())
     }
 

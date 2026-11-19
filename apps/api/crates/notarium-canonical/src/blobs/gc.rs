@@ -148,22 +148,17 @@ pub(crate) async fn reconcile_unowned_tx(
     scope: &HistoryScope,
     epoch: LeaseEpoch,
 ) -> Result<bool, PortError> {
-    let mut after = None;
     let mut planned = false;
     let now = job_clock_ms(tx).await?;
-    loop {
-        let page = candidates(tx, &scope.space_id, after.as_ref()).await?;
-        if page.is_empty() {
-            return Ok(planned);
-        }
-        after = page.last().map(|candidate| candidate.cursor.clone());
-        for candidate in page {
-            planned |= matches!(
-                plan_candidate_tx(tx, scope, epoch, candidate, now).await?,
-                Decision::Retire(_)
-            );
-        }
+    // Leave subsequent pages to the regular sweep. A recovered Space may
+    // contain arbitrarily many zero-reference rows.
+    for candidate in candidates(tx, &scope.space_id, None).await? {
+        planned |= matches!(
+            plan_candidate_tx(tx, scope, epoch, candidate, now).await?,
+            Decision::Retire(_)
+        );
     }
+    Ok(planned)
 }
 
 async fn candidates(
@@ -289,7 +284,7 @@ async fn plan_candidate_tx(
             return Ok(Decision::Skip);
         }
     }
-    match ensure_no_backup_holds_tx(tx, space).await {
+    match ensure_no_backup_holds_tx(tx, space, RetirementReason::Gc).await {
         Ok(()) => {}
         Err(err) if err == super::held_retirement() => return Ok(Decision::Skip),
         Err(err) => return Err(err),

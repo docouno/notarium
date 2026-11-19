@@ -4,6 +4,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args == [notarium_jobs::SQLITE_VERIFIER_ARGUMENT] {
+        return notarium_jobs::run_sqlite_verifier().map_err(std::io::Error::other);
+    }
     if args == ["--help"] {
         println!(
             "notariumd — bootstrap HTTP daemon\nUsage: notariumd [--help]\nPORT defaults to 3000. Product services are not implemented yet."
