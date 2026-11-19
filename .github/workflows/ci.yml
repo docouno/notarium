@@ -17,17 +17,17 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    env:
-      DEVKIT_CACHE_DIR: ${{ runner.temp }}/devkit-cache
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: docker/setup-compose-action@v2.4.0
         with:
           version: v5.0.2
+      - name: Configure Devkit cache directory
+        run: echo "DEVKIT_CACHE_DIR=${RUNNER_TEMP}/devkit-cache" >> "$GITHUB_ENV"
       - uses: actions/cache@v6.1.0
         with:
           path: |
-            ${{ runner.temp }}/devkit-cache
+            ${{ env.DEVKIT_CACHE_DIR }}
             .devkit/cache
           key: devkit-${{ runner.os }}-${{ hashFiles('.devkit/manifest.json', 'pnpm-lock.yaml', 'apps/api/Cargo.lock') }}
           restore-keys: |
