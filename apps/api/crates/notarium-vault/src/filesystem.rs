@@ -40,6 +40,31 @@ pub(crate) fn create_owner_only_test_vault(parent: &Path, name: &OsStr) -> io::R
 
 pub type FsError = io::Error;
 
+/// A problem with one vault name can be reported without detaching the root.
+/// Callers validate the private root and its journal separately.
+pub(crate) fn path_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+    {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return true;
+    }
+    matches!(
+        error.kind(),
+        io::ErrorKind::InvalidData
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::AlreadyExists
+            | io::ErrorKind::NotADirectory
+            | io::ErrorKind::NotFound
+            | io::ErrorKind::Unsupported
+            | io::ErrorKind::WouldBlock
+    )
+}
+
 const STAGE_PREFIX: &str = ".notarium-stage-";
 const DISPLACED_PREFIX: &str = ".notarium-displaced-";
 

@@ -20,7 +20,7 @@ use notarium_core::{
 use super::{PAGE, VaultError, Worker};
 use crate::{
     carrier::{self, NoteCarrier},
-    filesystem::{EntryKind, FileStamp, ObservedFile},
+    filesystem::{EntryKind, FileStamp, ObservedFile, path_error},
     journal::ConflictReason,
     paths::{PathUse, digest, file_identity, file_stamp, is_note, path_use, same_file, vault_path},
     publication::MAX_NOTE_BYTES,
@@ -428,8 +428,14 @@ impl Worker<'_> {
         &mut self,
         candidate: Candidate,
     ) -> Result<Option<Write>, VaultError> {
-        let Some(observed) = self.read_disk(&candidate.relative)? else {
-            return Ok(None);
+        let observed = match self.read_disk(&candidate.relative) {
+            Ok(Some(observed)) => observed,
+            Ok(None) => return Ok(None),
+            Err(error) if path_error(&error) => {
+                self.conflict(&candidate.relative, ConflictReason::UnsafePath, None)?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
         };
         if observed.stamp != candidate.stamp {
             // The watcher will deliver the later write; never submit from
@@ -726,7 +732,14 @@ impl Worker<'_> {
                     .store
                     .read_vault_note(&self.config.context, &edit.old.note)
                     .await?;
-                if let (Some(current), Some(file)) = (current, self.read_disk(&edit.relative)?)
+                let observed = match self.read_disk(&edit.relative) {
+                    Ok(observed) => observed,
+                    Err(error) if path_error(&error) => {
+                        return self.conflict(&edit.relative, ConflictReason::UnsafePath, None);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if let (Some(current), Some(file)) = (current, observed)
                     && file.stamp == edit.stamp
                 {
                     let source = markdown(&file)?;
@@ -1017,16 +1030,4 @@ fn derived_id(digest: ContentDigest, domain: &str) -> [u8; 16] {
 pub(super) fn markdown(observed: &ObservedFile) -> io::Result<&str> {
     std::str::from_utf8(&observed.bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-pub(super) fn path_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::InvalidData
-            | io::ErrorKind::InvalidInput
-            | io::ErrorKind::PermissionDenied
-            | io::ErrorKind::AlreadyExists
-            | io::ErrorKind::NotADirectory
-            | io::ErrorKind::Unsupported
-    )
 }

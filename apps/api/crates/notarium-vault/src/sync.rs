@@ -15,7 +15,7 @@ use notarium_canonical::{
 };
 use notarium_core::{
     DomainError,
-    error::{PortError, RetryAdvice},
+    error::{CommitEffect, PortError, RetryAdvice},
     ids::{ContentDigest, NoteId, SpaceSeq},
     model::HistoryScope,
     ports::{
@@ -422,11 +422,12 @@ impl<'a> Worker<'a> {
             self.roots.verify_current()?;
             match self.sync_step(&mut dirty, reconcile).await {
                 Ok(again) => reconcile = again,
-                Err(VaultError::Canonical(PortError::Unavailable(failure)))
-                    if failure.retry() != RetryAdvice::Never =>
-                {
-                    // A head racing the carrier read is still live. Never
-                    // withdraw it or advance the feed with an incomplete cut.
+                Err(
+                    VaultError::Canonical(error)
+                    | VaultError::Materials(MaterialError::Canonical(error)),
+                ) if retry_reconciliation(&error) => {
+                    // Reconcile an incomplete cut before withdrawing a file
+                    // or advancing the feed after a transient store failure.
                     reconcile = true;
                     self.report(SyncPhase::Reconciling);
                 }
@@ -554,5 +555,17 @@ impl<'a> Worker<'a> {
                 .await?;
         }
         Ok(true)
+    }
+}
+
+fn retry_reconciliation(error: &PortError) -> bool {
+    match error {
+        PortError::DeadlineExceeded(failure) if failure.effect() == CommitEffect::NotCommitted => {
+            true
+        }
+        PortError::DeadlineExceeded(failure) | PortError::Unavailable(failure) => {
+            failure.retry() != RetryAdvice::Never
+        }
+        _ => false,
     }
 }

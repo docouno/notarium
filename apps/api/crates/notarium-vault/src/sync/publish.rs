@@ -8,10 +8,10 @@ use notarium_core::{
     ports::FilenamePin,
 };
 
-use super::{ConversionPublication, VaultError, Worker, disk::path_error};
+use super::{ConversionPublication, VaultError, Worker};
 use crate::{
     carrier::{self, NoteCarrier},
-    filesystem::{CaptureCleanup, CapturedFile, FileStamp},
+    filesystem::{CaptureCleanup, CapturedFile, FileStamp, path_error},
     journal::{
         Action, ArchivedCapture, ConflictReason, ConversionName, DesiredFile, Intent,
         PublishPurpose,
@@ -301,14 +301,23 @@ impl Worker<'_> {
                 },
                 None,
             )?;
-        } else if self.vault.entry_kind(&slot)?.is_some() {
-            // There is no recorded stamp for this file. Preserve it out
-            // of admission without preventing the new publication.
-            self.conflict(
-                &slot,
-                ConflictReason::UnresolvedPublication,
-                Some(slot.clone()),
-            )?;
+        } else {
+            match self.vault.entry_kind(&slot) {
+                Ok(Some(_)) => {
+                    // Without a recorded stamp, preserve the current entry.
+                    self.conflict(
+                        &slot,
+                        ConflictReason::UnresolvedPublication,
+                        Some(slot.clone()),
+                    )?;
+                }
+                Ok(None) => {}
+                Err(error) if path_error(&error) => {
+                    self.conflict(&intent.target, ConflictReason::UnsafePath, None)?;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         self.journal.finish(intent)?;
         self.pending.retain(|saved| saved.id != intent.id);
@@ -407,15 +416,33 @@ impl Worker<'_> {
         captured: CapturedFile,
         successor: Option<NoteId>,
     ) -> Result<bool, VaultError> {
-        match self.vault.clean_capture(&captured.path, &captured.stamp)? {
-            CaptureCleanup::Removed => {
+        let shared = self.vault.path_for_watcher().join(&captured.path);
+        let cleanup = self.vault.clean_capture(&captured.path, &captured.stamp)?;
+        let retained = match cleanup {
+            CaptureCleanup::Removed => None,
+            CaptureCleanup::Absent
+                if self
+                    .captures
+                    .get(&operation)
+                    .is_some_and(|record| record.retained_at != shared) =>
+            {
+                // A previous attempt verified the private recovery location.
+                None
+            }
+            CaptureCleanup::Absent => Some((shared, true)),
+            CaptureCleanup::Retained { path } => {
+                let unlocated = path == shared
+                    && !matches!(self.vault.entry_kind_exact(&captured.path), Ok(Some(_)));
+                Some((path, unlocated))
+            }
+        };
+        match retained {
+            None => {
                 self.journal.clear_capture(operation)?;
                 self.captures.remove(&operation);
                 Ok(true)
             }
-            CaptureCleanup::Retained { path } => {
-                let unlocated = path == self.vault.path_for_watcher().join(&captured.path)
-                    && !matches!(self.vault.entry_kind_exact(&captured.path), Ok(Some(_)));
+            Some((path, unlocated)) => {
                 let record = ArchivedCapture {
                     operation,
                     target: target.to_owned(),
@@ -444,25 +471,8 @@ impl Worker<'_> {
             .filter(|capture| successor.is_none_or(|note| capture.successor.as_ref() == Some(note)))
             .cloned()
             .collect::<Vec<_>>();
-        for mut capture in captures {
+        for capture in captures {
             self.check_stop()?;
-            if capture.retained_at == self.vault.path_for_watcher().join(&capture.slot) {
-                let shared_present = match self.vault.entry_kind_exact(&capture.slot) {
-                    Ok(kind) => kind.is_some(),
-                    Err(error) if path_error(&error) => false,
-                    Err(error) => return Err(error.into()),
-                };
-                if !shared_present && self.vault.recovered_capture(&capture.slot)?.is_none() {
-                    // The shared slot travels with its folder. An absent
-                    // spelling cannot distinguish a move from a deletion.
-                    if !capture.unlocated {
-                        capture.unlocated = true;
-                        self.journal.archive_capture(&capture)?;
-                        self.captures.insert(capture.operation, capture);
-                    }
-                    continue;
-                }
-            }
             self.clean_captured(
                 capture.operation,
                 &capture.target,
@@ -523,10 +533,17 @@ impl Worker<'_> {
         let filename = carrier::conflict_filename(slug, &current.note.revision)?;
         let conflict = relative.with_file_name(filename.as_str());
         let copy = desired(current, source.as_bytes());
-        let copy_exists = self.journal.has_conflict_copy(&conflict, &copy)?
-            && self
-                .read_disk(&conflict)?
-                .is_some_and(|observed| observed.stamp.digest == copy.disk_digest);
+        let copy_exists = if self.journal.has_conflict_copy(&conflict, &copy)? {
+            match self.read_disk(&conflict) {
+                Ok(file) => file.is_some_and(|observed| observed.stamp.digest == copy.disk_digest),
+                Err(error) if path_error(&error) => {
+                    return self.conflict(relative, ConflictReason::UnsafePath, None);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            false
+        };
         if !copy_exists {
             let Some((intent, Placement::Applied { captured, .. })) = self.place(
                 conflict.clone(),

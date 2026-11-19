@@ -574,6 +574,90 @@ fn parked_capture_replays_after_the_original_parent_changes_case() {
     assert_eq!(fs::read(&still_shared).unwrap(), b"still shared");
 }
 
+#[test]
+fn a_capture_moved_after_precheck_is_absent_without_a_disposal_witness() {
+    let fixture = Fixture::new();
+    let roots = fixture.open();
+    let vault = roots.vault().unwrap();
+    let slot = slot();
+    let expected = vault.stage(path(), &slot, b"moved by editor").unwrap();
+    let relocated = fixture.vault.join("relocated");
+
+    let result = vault
+        .clean_capture_after_observation(&slot, &expected, || {
+            fs::rename(fixture.vault.join(&slot), &relocated).unwrap();
+        })
+        .unwrap();
+
+    assert!(matches!(result, CaptureCleanup::Absent));
+    assert!(vault.recovered_capture(&slot).unwrap().is_none());
+    assert_eq!(fs::read(&relocated).unwrap(), b"moved by editor");
+}
+
+#[test]
+fn parked_capture_replays_after_the_original_parent_is_replaced() {
+    let fixture = Fixture::new();
+    let old_dir = fixture.vault.join("Drafts");
+    let relocated = fixture.vault.join("relocated");
+    let new_dir = relocated.join("Drafts");
+    fs::create_dir(&old_dir).unwrap();
+    fs::create_dir(&relocated).unwrap();
+    let target = Path::new("Drafts/note.md");
+    let slot = VaultDir::operation_slot(target, OPERATION).unwrap();
+    let unparked = VaultDir::operation_slot(target, "0303030303030303").unwrap();
+    let roots = fixture.open();
+    let vault = roots.vault().unwrap();
+    let expected = vault.stage(target, &slot, b"before").unwrap();
+    let unparked_stamp = vault.stage(target, &unparked, b"still shared").unwrap();
+    fs::write(fixture.vault.join(&slot), b"edited").unwrap();
+    let parked = assert_retained(vault, &slot, &expected, b"edited");
+    assert!(parked.starts_with(fixture.data.root()));
+
+    drop(roots);
+    fs::rename(&old_dir, &new_dir).unwrap();
+    let still_shared = new_dir.join(unparked.file_name().unwrap());
+    let check_replay = || {
+        let roots = fixture.open();
+        let vault = roots.vault().unwrap();
+        assert!(vault.entry_kind_exact(&unparked).is_err());
+        assert_eq!(
+            vault.recovered_capture(&slot).unwrap(),
+            Some(parked.clone())
+        );
+        assert_eq!(assert_retained(vault, &slot, &expected, b"edited"), parked);
+        assert!(vault.recovered_capture(&unparked).unwrap().is_none());
+        assert!(matches!(
+            vault.clean_capture(&unparked, &unparked_stamp).unwrap(),
+            CaptureCleanup::Retained { path } if path == fixture.vault.join(&unparked)
+        ));
+        assert_eq!(fs::read(&still_shared).unwrap(), b"still shared");
+    };
+
+    fs::write(&old_dir, b"unrelated file").unwrap();
+    check_replay();
+    assert_eq!(fs::read(&old_dir).unwrap(), b"unrelated file");
+
+    #[cfg(unix)]
+    {
+        fs::remove_file(&old_dir).unwrap();
+        // The target has the former basename and the exact shared inode. A
+        // basename or content check alone would not reject this indirection.
+        std::os::unix::fs::symlink(&new_dir, &old_dir).unwrap();
+        check_replay();
+        assert_eq!(fs::read_link(&old_dir).unwrap(), new_dir);
+
+        if rustix::process::geteuid().as_raw() != 0 {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::remove_file(&old_dir).unwrap();
+            fs::create_dir(&old_dir).unwrap();
+            fs::set_permissions(&old_dir, fs::Permissions::from_mode(0o000)).unwrap();
+            check_replay();
+            fs::set_permissions(&old_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+}
+
 fn assert_retained(vault: &VaultDir, slot: &Path, expected: &FileStamp, bytes: &[u8]) -> PathBuf {
     let CaptureCleanup::Retained { path } = vault.clean_capture(slot, expected).unwrap() else {
         panic!("unverified capture was removed");

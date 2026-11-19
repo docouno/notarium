@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use super::{Conversion, ConversionPublication, VaultError, Worker, disk::markdown};
 use crate::{
     carrier,
-    filesystem::{CapturedFile, FileStamp, VaultDir},
+    filesystem::{CapturedFile, FileStamp, VaultDir, path_error},
     journal::{Action, ConflictReason, PublishPurpose, random_digest},
     paths::{digest, same_file},
 };
@@ -279,9 +279,24 @@ impl Worker<'_> {
                 continue;
             }
             let slot = prepared.slot()?;
-            let found = self.read_disk(&slot)?;
+            let found = match self.read_disk(&slot) {
+                Ok(found) => found,
+                Err(error) if path_error(&error) => {
+                    self.conflict(&prepared.target, ConflictReason::UnsafePath, None)?;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let Some(observed) = found else {
-                self.journal.clear_mint(&prepared.key)?;
+                if prepared.staged.is_some() {
+                    self.conflict(
+                        &prepared.target,
+                        ConflictReason::UnresolvedPublication,
+                        None,
+                    )?;
+                } else {
+                    self.journal.clear_mint(&prepared.key)?;
+                }
                 continue;
             };
             if prepared.staged.as_ref() != Some(&observed.stamp)
@@ -312,6 +327,9 @@ impl Worker<'_> {
                         Some(slot),
                     )?;
                 }
+                Err(VaultError::Filesystem(error)) if path_error(&error) => {
+                    self.conflict(&prepared.target, ConflictReason::UnsafePath, None)?;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -330,12 +348,21 @@ impl Worker<'_> {
                 },
                 None,
             )?;
-        } else if self.vault.entry_kind(&slot)?.is_some() {
-            return self.conflict(
-                &prepared.target,
-                ConflictReason::CaptureUnverified,
-                Some(slot),
-            );
+        } else {
+            match self.vault.entry_kind(&slot) {
+                Ok(Some(_)) => {
+                    return self.conflict(
+                        &prepared.target,
+                        ConflictReason::CaptureUnverified,
+                        Some(slot),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) if path_error(&error) => {
+                    return self.conflict(&prepared.target, ConflictReason::UnsafePath, None);
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         self.journal.clear_mint(&prepared.key)?;
         Ok(())

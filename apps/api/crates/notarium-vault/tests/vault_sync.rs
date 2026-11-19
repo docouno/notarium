@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-use notarium_canonical::{CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateSpaceSpec};
+use notarium_canonical::{
+    CanonicalConfig, CanonicalRuntime, CanonicalStore, CreateSpaceSpec, SqlBackendConfig,
+};
 use notarium_core::{
     auth::{EngineAuthContext, SpaceGrant, SpaceKind, SpaceRole, VerifiedHuman},
     classes::DocClass,
@@ -46,12 +48,13 @@ impl Fixture {
         fs::create_dir(&root).unwrap();
         let data = DataRoot::new(temp.path().join("private"));
         let roots = Arc::new(ValidatedRoots::open(&data, Some(&root)).unwrap());
-        let (store, runtime) = CanonicalRuntime::open(CanonicalConfig::local_default(
-            InstallationId::from_bytes([10; 16]),
-            data,
-        ))
-        .await
-        .unwrap();
+        let mut config = CanonicalConfig::local_default(InstallationId::from_bytes([10; 16]), data);
+        if let SqlBackendConfig::Sqlite { read_deadline, .. } = &mut config.sql {
+            // These tests measure filesystem work and convergence. Keep a
+            // slow shared runner's SQLite checkpoint out of that signal.
+            *read_deadline = Duration::from_secs(2);
+        }
+        let (store, runtime) = CanonicalRuntime::open(config).await.unwrap();
         let record = store
             .create_space(CreateSpaceSpec {
                 space_id: SpaceId::from_bytes([11; 16]),
@@ -351,6 +354,33 @@ async fn cold_case_only_folder_rename_keeps_the_folder_and_note_ids() {
     assert_eq!(after.parent, before.parent);
     assert_eq!(after.folders, ["folder"]);
     assert_eq!(disk_id(&new_folder.join("note.md")), Some(id));
+    worker.shutdown().await.unwrap();
+    fixture.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blocked_reserved_path_does_not_stop_note_import() {
+    let fixture = Fixture::open().await;
+    let reserved_path = fixture.root.join(".notarium");
+    fs::write(&reserved_path, b"user-owned entry").unwrap();
+    let note = fixture.root.join("independent.md");
+    fs::write(&note, "# Independent note\n").unwrap();
+
+    let worker = fixture.start();
+    let mut status = worker.status();
+    let settled = ready(&mut status, |_| disk_id(&note).is_some()).await;
+    assert!(
+        settled
+            .conflicts
+            .iter()
+            .any(|issue| { issue.path == ".notarium/fields/schema.yaml" }),
+        "{settled:?}"
+    );
+    assert_eq!(fs::read(&reserved_path).unwrap(), b"user-owned entry");
+
+    fs::remove_file(reserved_path).unwrap();
+    worker.reconcile().await.unwrap();
+    ready(&mut status, |status| status.conflicts.is_empty()).await;
     worker.shutdown().await.unwrap();
     fixture.runtime.shutdown().await.unwrap();
 }

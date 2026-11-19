@@ -19,6 +19,8 @@ const RECOVERY_DIR: &str = "vault-recovery";
 #[derive(Debug)]
 pub enum CaptureCleanup {
     Removed,
+    /// The exact slot was absent, without proof that its inode was removed.
+    Absent,
     /// An absolute path for the operator to inspect. Data may still change if
     /// an editor holds the inode open.
     Retained {
@@ -112,9 +114,14 @@ pub(super) enum ParkAction {
 }
 
 enum Parked {
-    Missing,
+    Absent,
+    #[cfg(windows)]
+    Disposed,
     Shared(PathBuf),
-    Private { dir: Dir, path: PathBuf },
+    Private {
+        dir: Dir,
+        path: PathBuf,
+    },
 }
 
 impl VaultDir {
@@ -130,18 +137,8 @@ impl VaultDir {
             return Ok(None);
         }
         platform::verify_parked_capture(&recovery, name)?;
-        let source = match self.open_dir_exact(source_path) {
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::InvalidInput | io::ErrorKind::NotADirectory
-                ) =>
-            {
-                None
-            }
-            result => result?,
-        };
-        sync_recovery(&recovery, source.as_ref())?;
+        self.probe_capture_source(source_path, |dir| sync_dir(&dir))?;
+        sync_dir(&recovery)?;
         Ok(Some(self.recovery.path.join(name)))
     }
 
@@ -158,14 +155,17 @@ impl VaultDir {
         before_park: impl FnOnce(),
     ) -> io::Result<CaptureCleanup> {
         match self.park(slot, Some(expected), before_park)? {
-            Parked::Missing => Ok(CaptureCleanup::Removed),
+            Parked::Absent => Ok(CaptureCleanup::Absent),
+            #[cfg(windows)]
+            Parked::Disposed => Ok(CaptureCleanup::Removed),
             Parked::Shared(path) => Ok(CaptureCleanup::Retained { path }),
             Parked::Private { dir, path } => {
                 let name = path.file_name().expect("recovery captures have a name");
-                let metadata = present(dir.symlink_metadata(name))?;
-                if metadata.is_none()
-                    || (metadata.is_some_and(|metadata| entry_kind(&metadata) == EntryKind::File)
-                        && platform::clean_slot(&dir, name, expected)?)
+                let Some(metadata) = present(dir.symlink_metadata(name))? else {
+                    return Ok(CaptureCleanup::Absent);
+                };
+                if entry_kind(&metadata) == EntryKind::File
+                    && platform::clean_slot(&dir, name, expected)?
                 {
                     Ok(CaptureCleanup::Removed)
                 } else {
@@ -180,7 +180,7 @@ impl VaultDir {
     pub fn retain_tree(&self, slot: &Path) -> io::Result<PathBuf> {
         match self.park(slot, None, || {})? {
             Parked::Shared(path) | Parked::Private { path, .. } => Ok(path),
-            Parked::Missing => Err(io::Error::new(
+            _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "displaced package is absent from both capture locations",
             )),
@@ -239,6 +239,33 @@ impl VaultDir {
         }
     }
 
+    /// The former location only participates in recovery when the exact old
+    /// parent is accessible and still within the held vault mount.
+    fn probe_capture_source<T>(
+        &self,
+        path: &Path,
+        probe: impl FnOnce(Dir) -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        match self
+            .open_dir_exact(path)
+            .and_then(|dir| dir.map(probe).transpose())
+        {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::InvalidInput
+                        | io::ErrorKind::NotADirectory
+                        | io::ErrorKind::PermissionDenied
+                        | io::ErrorKind::Unsupported
+                ) =>
+            {
+                Ok(None)
+            }
+            result => result,
+        }
+    }
+
     fn park(
         &self,
         slot: &Path,
@@ -254,15 +281,19 @@ impl VaultDir {
             && present(recovery.symlink_metadata(name))?.is_some()
         {
             platform::verify_parked_capture(&recovery, name)?;
-            // The verified private capture survives a rename of the old
-            // parent spelling. Inspect a shared slot only through its exact parent.
-            let source = self.open_dir_exact(source_path)?;
-            // Replay may have observed the private name before the first
-            // operation reached its directory barriers.
-            sync_recovery(&recovery, source.as_ref())?;
-            if let Some(parent) = &source
-                && present(parent.symlink_metadata(name))?.is_some()
-            {
+            // The verified private capture survives changes to its former
+            // parent. Inspect a shared slot only through that exact directory.
+            let shared = self.probe_capture_source(source_path, |parent| {
+                let occupied = present(parent.symlink_metadata(name))?.is_some();
+                if !occupied {
+                    // Replay may have observed the private name before the
+                    // first operation reached the source directory barrier.
+                    sync_dir(&parent)?;
+                }
+                Ok(occupied)
+            })?;
+            sync_dir(&recovery)?;
+            if shared == Some(true) {
                 // Both names survived, or an editor repopulated the shared
                 // slot after parking. Do not consume either independent entry.
                 return Ok(Parked::Shared(private));
@@ -273,14 +304,20 @@ impl VaultDir {
             });
         }
 
-        let Some(parent) = self.open_dir_exact(source_path)? else {
+        let source = self.probe_capture_source(source_path, |parent| {
+            let occupied = present(parent.symlink_metadata(name))?.is_some();
+            Ok((parent, occupied))
+        })?;
+        let Some((parent, occupied)) = source else {
+            // Without a verified private copy or the exact old parent, the
+            // shared slot may have moved with its directory.
             return Ok(Parked::Shared(shared));
         };
-        if present(parent.symlink_metadata(name))?.is_none() {
+        if !occupied {
             #[cfg(windows)]
             // A process may have stopped before syncing a handle disposal.
             sync_dir(&parent)?;
-            return Ok(Parked::Missing);
+            return Ok(Parked::Absent);
         }
 
         let recovery = self
@@ -294,7 +331,7 @@ impl VaultDir {
                     && platform::dispose_cross_volume_capture(&parent, name, expected)?
                 {
                     sync_dir(&parent)?;
-                    return Ok(Parked::Missing);
+                    return Ok(Parked::Disposed);
                 }
                 return Ok(Parked::Shared(shared));
             }
@@ -319,17 +356,18 @@ impl VaultDir {
                 if present(parent.symlink_metadata(name))?.is_some() {
                     Ok(Parked::Shared(shared))
                 } else {
-                    Ok(Parked::Missing)
+                    Ok(Parked::Absent)
                 }
             }
             Err(error) => Err(error),
             #[cfg(windows)]
             Ok(ParkAction::Disposed) => {
                 sync_dir(&parent)?;
-                Ok(Parked::Missing)
+                Ok(Parked::Disposed)
             }
             Ok(ParkAction::Relocated) => {
-                sync_recovery(&recovery, Some(&parent))?;
+                sync_dir(&parent)?;
+                sync_dir(&recovery)?;
                 Ok(Parked::Private {
                     dir: recovery,
                     path: private,
@@ -337,11 +375,4 @@ impl VaultDir {
             }
         }
     }
-}
-
-fn sync_recovery(recovery: &Dir, source: Option<&Dir>) -> io::Result<()> {
-    if let Some(source) = source {
-        sync_dir(source)?;
-    }
-    sync_dir(recovery)
 }

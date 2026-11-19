@@ -21,7 +21,7 @@ use super::{no_access, read_ability_files, schema_yaml};
 use crate::{
     filesystem::{
         CaptureCleanup, EntryKind, FileIdentity, FileStamp, Publication, PublishMode, VaultDir,
-        Withdrawal, same_file_content, sync_dir,
+        Withdrawal, path_error, same_file_content, sync_dir,
     },
     journal::{open_or_create, random_digest, read_records, write_record},
     paths::file_identity,
@@ -37,6 +37,8 @@ const MAX_RECORD_BYTES: u64 =
 pub enum MaterialError {
     #[error("reserved vault material I/O failed")]
     Io(#[from] io::Error),
+    #[error("reserved vault material journal I/O failed")]
+    Journal(#[source] io::Error),
     #[error(transparent)]
     Canonical(#[from] PortError),
     #[error(transparent)]
@@ -152,11 +154,11 @@ impl Record {
         });
     }
 
-    fn retained(&mut self, path: PathBuf, preserved_path: PathBuf) {
+    fn retained(&mut self, path: PathBuf, preserved_path: Option<PathBuf>) {
         let recovery = ReservedConflict {
             path,
             kind: ReservedConflictKind::RetainedCapture,
-            preserved_path: Some(preserved_path),
+            preserved_path,
         };
         if !self.conflicts.contains(&recovery) {
             self.conflicts.push(recovery);
@@ -214,7 +216,9 @@ impl ReservedMaterials {
         for target in targets {
             let record = self.record(&target);
             if record.pending.is_some() {
-                self.recover_record(vault, record, false)?;
+                if let Err(error) = self.recover_record(vault, record, false) {
+                    self.flag_path_error(&target, error)?;
+                }
             }
         }
         Ok(())
@@ -260,7 +264,10 @@ impl ReservedMaterials {
             Err(error) => return Err(error.into()),
         };
         let record = self.record(&target);
-        let record = self.recover_record(vault, record, false)?;
+        let record = match self.recover_record(vault, record, false) {
+            Ok(record) => record,
+            Err(error) => return self.flag_path_error(&target, error),
+        };
         if record.current.as_ref().is_some_and(|current| {
             matches!(&current.version, Version::Ability(revision) if *revision == planned.revision)
         }) {
@@ -332,7 +339,13 @@ impl ReservedMaterials {
             let mut record = self.record(&target);
             if record.pending.is_none() {
                 let expected = record.current.as_ref().map(|item| &item.artifact);
-                let matched = artifact_matches(vault, &target_path, expected)?;
+                let matched = match artifact_matches(vault, &target_path, expected) {
+                    Ok(matched) => matched,
+                    Err(error) => {
+                        self.flag_path_error(&target, error.into())?;
+                        continue;
+                    }
+                };
                 if matched {
                     if record
                         .conflicts
@@ -362,7 +375,19 @@ impl ReservedMaterials {
         desired: Option<(Version, Material)>,
     ) -> Result<(), MaterialError> {
         self.check_root(vault)?;
-        let record = self.record(&target);
+        match self.update_record(vault, &target, desired) {
+            Ok(()) => Ok(()),
+            Err(error) => self.flag_path_error(&target, error),
+        }
+    }
+
+    fn update_record(
+        &mut self,
+        vault: &VaultDir,
+        target: &Target,
+        desired: Option<(Version, Material)>,
+    ) -> Result<(), MaterialError> {
+        let record = self.record(target);
         let mut record = self.recover_record(vault, record, false)?;
         let path = target.path();
         let expected = record.current.as_ref().map(|published| &published.artifact);
@@ -514,9 +539,25 @@ impl ReservedMaterials {
     }
 
     fn save(&mut self, record: Record) -> Result<(), MaterialError> {
-        write_record(&self.state_dir, &record.target.name(), &record)?;
+        write_record(&self.state_dir, &record.target.name(), &record)
+            .map_err(MaterialError::Journal)?;
         self.records.insert(record.target.clone(), record);
         Ok(())
+    }
+
+    fn flag_path_error(
+        &mut self,
+        target: &Target,
+        error: MaterialError,
+    ) -> Result<(), MaterialError> {
+        match error {
+            MaterialError::Io(error) if path_error(&error) => {
+                let mut record = self.record(target);
+                record.conflict(target.path(), ReservedConflictKind::ExternalChange);
+                self.save(record)
+            }
+            error => Err(error),
+        }
     }
 
     fn check_root(&self, vault: &VaultDir) -> io::Result<()> {
@@ -723,22 +764,30 @@ fn nested_capture(path: &Path, package_slot: &Path) -> io::Result<PathBuf> {
     VaultDir::operation_slot(path, &hash.finalize().to_hex())
 }
 
-type RetainedCaptures = Vec<(PathBuf, PathBuf)>;
+type RetainedCaptures = Vec<(PathBuf, Option<PathBuf>)>;
 
 fn retire(vault: &VaultDir, slot: &Path, artifact: &Artifact) -> io::Result<RetainedCaptures> {
     let mut retained = Vec::new();
     match artifact {
         Artifact::File(stamp) => {
             if let Some(path) = vault.recovered_capture(slot)? {
-                retained.push((slot.to_owned(), path));
-            } else if let CaptureCleanup::Retained { path } = vault.clean_capture(slot, stamp)? {
-                retained.push((slot.to_owned(), path));
+                retained.push((slot.to_owned(), Some(path)));
+            } else {
+                match vault.clean_capture(slot, stamp)? {
+                    CaptureCleanup::Removed => {}
+                    CaptureCleanup::Absent => retained.push((slot.to_owned(), None)),
+                    CaptureCleanup::Retained { path } => {
+                        retained.push((slot.to_owned(), Some(path)));
+                    }
+                }
             }
             let shared = vault.path_for_watcher().join(slot);
             if vault.entry_kind(slot)?.is_some()
-                && !retained.iter().any(|(_, path)| *path == shared)
+                && !retained
+                    .iter()
+                    .any(|(_, path)| path.as_ref() == Some(&shared))
             {
-                retained.push((slot.to_owned(), shared));
+                retained.push((slot.to_owned(), Some(shared)));
             }
         }
         Artifact::Tree(tree) => retire_tree(vault, slot, tree, &mut retained)?,
@@ -757,24 +806,27 @@ fn retire_tree(
     for relative in tree.files.keys() {
         let child = slot.join(nested_capture(relative, slot)?);
         if let Some(path) = vault.recovered_capture(&child)? {
-            retained.push((slot.join(relative), path));
+            retained.push((slot.join(relative), Some(path)));
         }
     }
     let retained_member = !retained.is_empty();
     let shared = vault.path_for_watcher().join(slot);
     let archive = match vault.retain_tree(slot) {
         Ok(path) => path,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            retained.push((slot.to_owned(), None));
+            return Ok(());
+        }
         Err(error) => return Err(error),
     };
     if archive == shared {
         // A cross-volume or busy capture still occupies the shared name.
         // No retirement step may delete anything under that name.
-        retained.push((slot.to_owned(), archive));
+        retained.push((slot.to_owned(), Some(archive)));
         return Ok(());
     }
     if vault.entry_kind(slot)?.is_some() {
-        retained.push((slot.to_owned(), shared));
+        retained.push((slot.to_owned(), Some(shared)));
     }
     // Darwin cannot establish the writer exclusion needed for retirement.
     // Preserve its whole displaced directory.
@@ -801,7 +853,7 @@ fn retire_tree(
             return Ok(());
         }
     }
-    retained.push((slot.to_owned(), archive));
+    retained.push((slot.to_owned(), Some(archive)));
     Ok(())
 }
 
@@ -822,16 +874,21 @@ fn retire_tree_members(
                 Withdrawal::Conflict => return Ok(false),
             }
         }
-        if captured.entry_kind(&saved)?.is_some()
-            && let CaptureCleanup::Retained { path: archive } =
-                captured.clean_capture(&saved, expected)?
-        {
-            if archive != captured.path_for_watcher().join(&saved) {
-                retained.push((package_slot.join(path), archive));
+        if captured.entry_kind(&saved)?.is_some() {
+            match captured.clean_capture(&saved, expected)? {
+                CaptureCleanup::Removed => {}
+                CaptureCleanup::Absent => {
+                    retained.push((package_slot.join(path), None));
+                    return Ok(false);
+                }
+                CaptureCleanup::Retained { path: archive } => {
+                    if archive != captured.path_for_watcher().join(&saved) {
+                        retained.push((package_slot.join(path), Some(archive)));
+                    }
+                    // Preserve the remaining members once a capture needs review.
+                    return Ok(false);
+                }
             }
-            // Preserve the remaining members once any captured file needs
-            // operator review. In the original tree its name may now be a slot.
-            return Ok(false);
         }
     }
     // Child directories precede their parents in reverse path order.
