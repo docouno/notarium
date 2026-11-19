@@ -4751,18 +4751,20 @@ async fn redact_chat_entry_impl(
             request.input.thread.as_str(),
         )
         .with_known_base(&request.input.expected_thread_revision)
+        .with_canonical_effect(&ctx)
         .for_chat(ctx.auth(), &request.input.thread, Vec::new());
 
-    if let Some(replayed) = deadline
-        .prepare(&ctx.budget, || {
-            try_replay_completed_receipt::<StoredCommittedRedactedChatV1>(
-                store,
-                &space_rec.scope,
-                &idemp,
-                Some(&ctx.budget),
-            )
-        })
-        .await?
+    if idemp.canonical_effect().is_none()
+        && let Some(replayed) = deadline
+            .prepare(&ctx.budget, || {
+                try_replay_completed_receipt::<StoredCommittedRedactedChatV1>(
+                    store,
+                    &space_rec.scope,
+                    &idemp,
+                    Some(&ctx.budget),
+                )
+            })
+            .await?
     {
         let (committed, zero_refs) = replayed.into_committed();
         if !zero_refs.is_empty() {
@@ -5091,7 +5093,21 @@ async fn redact_chat_entry_impl(
     };
 
     let stored: StoredCommittedRedactedChatV1 = deadline.submit(store, &ctx.budget, intent).await?;
-    let (committed, _) = stored.into_committed();
+    let (committed, zero_refs) = stored.into_committed();
+    if !zero_refs.is_empty() {
+        wait_for_redaction_gc(
+            &ctx.budget,
+            started,
+            store.retire_zero_ref_digests(
+                &space_rec.scope,
+                space_rec.active_epoch,
+                &zero_refs,
+                RetirementReason::Gc,
+                None,
+            ),
+        )
+        .await;
+    }
     wait_for_redaction_gc(
         &ctx.budget,
         started,

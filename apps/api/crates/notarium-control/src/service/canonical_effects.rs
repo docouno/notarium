@@ -33,10 +33,17 @@ impl ControlService {
             CanonicalEffect::ChatInput
                 if authority.kind() == &PrincipalKind::DirectHuman
                     && ctx.auth().kind() == &PrincipalKind::DirectHuman => {}
+            CanonicalEffect::ChatRedaction
+                if matches!(
+                    authority.kind(),
+                    PrincipalKind::DirectHuman | PrincipalKind::Pat | PrincipalKind::OAuth { .. }
+                ) && ctx.auth().kind() == authority.kind() => {}
             CanonicalEffect::ChatClaim
                 if authority.kind() == &PrincipalKind::DirectHuman
                     && matches!(ctx.auth().kind(), PrincipalKind::AgentRun(_)) => {}
-            CanonicalEffect::ChatInput | CanonicalEffect::ChatClaim => {
+            CanonicalEffect::ChatInput
+            | CanonicalEffect::ChatRedaction
+            | CanonicalEffect::ChatClaim => {
                 return Err(DomainError::AccessDenied.into());
             }
         }

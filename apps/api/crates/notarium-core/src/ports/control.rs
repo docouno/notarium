@@ -530,7 +530,7 @@ pub trait ControlPort: Send + Sync {
         &self,
         ctx: AccountContext,
         request: AccountMutation<AbilityBindingChange>,
-    ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>>;
+    ) -> PortFuture<'_, ControlCommit<AbilityRef>>;
     fn compare_authored_ability_preference(
         &self,
         ctx: AccountContext,

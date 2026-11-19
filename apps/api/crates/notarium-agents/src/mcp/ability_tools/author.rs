@@ -949,21 +949,21 @@ pub(super) async fn edit(call: &ToolCallContext<'_>, args: EditArgs) -> Result<V
         steps.push(change_step("availability", "skipped", None));
     }
 
-    if let Some(enabled) = args
-        .enabled
-        .filter(|enabled| *enabled != overlays.preference_enabled)
-    {
+    let promotion_preference_conflict = promotion
+        .as_ref()
+        .filter(|settled| settled.source.preference_revision != plan.overlays.preference_revision)
+        .map(|settled| {
+            settled
+                .source
+                .preference_revision
+                .unwrap_or(ControlRevision::ZERO)
+        });
+    if let Some(enabled) = args.enabled.filter(|enabled| {
+        promotion_preference_conflict.is_some() || *enabled != overlays.preference_enabled
+    }) {
         let result = async {
-            if let Some(promotion) = &promotion
-                && promotion.source.preference_revision != plan.overlays.preference_revision
-            {
-                return Err(DomainError::ControlRevisionConflict {
-                    current: promotion
-                        .source
-                        .preference_revision
-                        .unwrap_or(ControlRevision::ZERO),
-                }
-                .into());
+            if let Some(current) = promotion_preference_conflict {
+                return Err(DomainError::ControlRevisionConflict { current }.into());
             }
             call.registry
                 .control

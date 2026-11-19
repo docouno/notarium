@@ -172,7 +172,7 @@ async fn revoked_chat_receipt(fixture: &mut RuntimeFixture, personal: &HistorySc
     let input = SubmitUserChatInput {
         identity: command(197),
         id: PendingInputId::from_bytes([197; 16]),
-        thread,
+        thread: thread.clone(),
         expected_leaf: ThreadEntrySeq::ZERO,
         body: "Previously committed chat entry".into(),
         mentions_agent: false,
@@ -215,6 +215,122 @@ async fn revoked_chat_receipt(fixture: &mut RuntimeFixture, personal: &HistorySc
             .last_seq,
         before
     );
+    // IMPL-025: redaction (pre-SQL, active SQL, and post-commit replay) must
+    // fail closed under synchronous logout without mutating the thread.
+    let principal = fixture.human.auth().principal().clone();
+    let reader =
+        SpaceContext::new(fixture.human.auth().clone(), personal.clone(), budget()).unwrap();
+    let live_branch = fixture
+        .canonical
+        .read_chat_context(
+            reader.clone(),
+            ChatRead {
+                thread: thread.clone(),
+                leaf: ThreadEntrySeq::ZERO,
+                before: None,
+                max_entries: PageLimit::new(4).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    let entry_seq = live_branch.thread.head;
+    let redact_request = |tag: u8| Mutation {
+        identity: CommandIdentity {
+            scope: personal.clone(),
+            actor: principal.clone(),
+            key: CommandKey::from_bytes([tag; 16]),
+            hash: ContentDigest::from_bytes([tag; 32]),
+        },
+        preconditions: Preconditions::default(),
+        input: RedactChatEntry {
+            thread: thread.clone(),
+            entry: entry_seq,
+            expected_thread_revision: live_branch.thread.revision.clone(),
+        },
+    };
+    let (redact_account, redact_token) = native_session(fixture, 201).await;
+    let denied_redact = revoke_before_effect(
+        fixture.projections.pause_chat_redaction(),
+        supervisor.redact_chat_entry(redact_account, redact_request(201)),
+        fixture.control.logout(support::evidence(
+            AuthEvidenceKind::Session,
+            redact_token.secret.expose(),
+        )),
+    )
+    .await;
+    assert!(
+        matches!(denied_redact, PortError::Cancelled(_)),
+        "{denied_redact:?}"
+    );
+    assert_eq!(
+        fixture
+            .canonical
+            .read_space(&personal.space_id)
+            .await
+            .unwrap()
+            .last_seq,
+        before
+    );
+    let (active_account, active_token) = native_session(fixture, 202).await;
+    let active_denied = revoke_during_active_sql(
+        fixture,
+        supervisor.redact_chat_entry(active_account, redact_request(202)),
+        fixture.control.logout(support::evidence(
+            AuthEvidenceKind::Session,
+            active_token.secret.expose(),
+        )),
+    )
+    .await;
+    assert!(
+        matches!(active_denied, PortError::Cancelled(_))
+            || matches!(&active_denied, PortError::Unavailable(failure)
+                if failure.effect() == notarium_core::error::CommitEffect::Unknown),
+        "{active_denied:?}"
+    );
+    assert_eq!(
+        fixture
+            .canonical
+            .read_space(&personal.space_id)
+            .await
+            .unwrap()
+            .last_seq,
+        before
+    );
+    let committed_redact = redact_request(203);
+    supervisor
+        .redact_chat_entry(fixture.human.clone(), committed_redact.clone())
+        .await
+        .unwrap();
+    let after_redact = fixture
+        .canonical
+        .read_space(&personal.space_id)
+        .await
+        .unwrap()
+        .last_seq;
+    assert!(after_redact > before);
+    let (replay_account, replay_token) = native_session(fixture, 204).await;
+    let replay_denied = revoke_before_effect(
+        fixture.projections.pause_chat_redaction(),
+        supervisor.redact_chat_entry(replay_account, committed_redact),
+        fixture.control.logout(support::evidence(
+            AuthEvidenceKind::Session,
+            replay_token.secret.expose(),
+        )),
+    )
+    .await;
+    assert!(
+        matches!(replay_denied, PortError::Cancelled(_)),
+        "{replay_denied:?}"
+    );
+    assert_eq!(
+        fixture
+            .canonical
+            .read_space(&personal.space_id)
+            .await
+            .unwrap()
+            .last_seq,
+        after_redact
+    );
 }
 
 pub(super) async fn revoked_rollback(
@@ -255,6 +371,38 @@ pub(super) async fn revoked_rollback(
             before
         );
     }
+    // IMPL-035: fast-path rollback also retains its active SQL lease through
+    // revocation and rolls back cleanly with zero sequence advance.
+    let (active_account, active_token) = native_session(fixture, 200).await;
+    let active_denied = revoke_during_active_sql(
+        fixture,
+        supervisor.rollback_run(
+            active_account,
+            scope.clone(),
+            run.clone(),
+            CommandKey::from_bytes([200; 16]),
+        ),
+        fixture.control.logout(support::evidence(
+            AuthEvidenceKind::Session,
+            active_token.secret.expose(),
+        )),
+    )
+    .await;
+    assert!(
+        matches!(active_denied, PortError::Cancelled(_))
+            || matches!(&active_denied, PortError::Unavailable(failure)
+                if failure.effect() == notarium_core::error::CommitEffect::Unknown),
+        "{active_denied:?}"
+    );
+    assert_eq!(
+        fixture
+            .canonical
+            .read_space(&scope.space_id)
+            .await
+            .unwrap()
+            .last_seq,
+        before
+    );
 }
 
 async fn check(pg: bool) {

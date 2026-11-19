@@ -4326,6 +4326,7 @@ async fn execute_pg_fast_rollback_on_conn(
             PgSingleFastAttempt::Handled(BatchExecOutcome::Committed {
                 slots: vec![ItemOutcomeSlot::Failed(err)],
                 space_effective_cuts: cuts,
+                conn_clean: true,
             })
         }
         PgFastInnerResult::Committed {
@@ -4359,6 +4360,7 @@ async fn execute_pg_fast_rollback_on_conn(
                     has_idempotency: true,
                 }],
                 space_effective_cuts: cuts,
+                conn_clean: true,
             })
         }
         PgFastInnerResult::UnknownCommit {
@@ -4471,6 +4473,11 @@ async fn try_execute_pg_root_rollback(
     }
     if !request.input.associated_board_expectations.is_empty() {
         return None;
+    }
+    if let Some(effect) = idemp.canonical_effect()
+        && let Err(err) = effect.check()
+    {
+        return Some(Err(err));
     }
 
     let writer = match store.inner.writer() {
@@ -5370,30 +5377,69 @@ async fn try_execute_pg_root_rollback(
         }
         Err(err) => return Some(Err(err)),
     };
+    let active_effect = match idemp.begin_canonical_effect().await {
+        Ok(lease) => lease,
+        Err(err) => {
+            let _ = sqlx::raw_sql("ROLLBACK").execute(transaction.conn()).await;
+            drop(transaction);
+            return Some(Err(err));
+        }
+    };
     let row = match rollback_wait(&ctx.budget, deadline, apply.fetch_one(transaction.conn())).await
     {
         Ok(Ok(row)) => row,
         Ok(Err(sqlx::Error::Database(err))) if err.message().contains("NOTARIUM_RB_FALLBACK_0") => {
+            let _ = sqlx::raw_sql("ROLLBACK").execute(transaction.conn()).await;
+            drop(transaction);
+            drop(active_effect);
             *try_pg_batch_plan = false;
             return None;
         }
         Ok(Err(sqlx::Error::Database(err))) if err.code().as_deref() == Some("57014") => {
+            let _ = sqlx::raw_sql("ROLLBACK").execute(transaction.conn()).await;
+            drop(transaction);
+            drop(active_effect);
             return Some(Err(deadline_not_committed(
                 "pg_rollback_statement_timeout",
                 "rollback statement exceeded its SQL time budget",
             )));
         }
         Ok(Err(err)) => {
+            let _ = sqlx::raw_sql("ROLLBACK").execute(transaction.conn()).await;
+            drop(transaction);
+            drop(active_effect);
             return Some(Err(internal_not_committed(
                 "pg_lean_rb_apply",
                 err.to_string(),
             )));
         }
-        Err(err) => return Some(Err(err)),
+        Err(err) => {
+            let _ = sqlx::raw_sql("ROLLBACK").execute(transaction.conn()).await;
+            drop(transaction);
+            drop(active_effect);
+            return Some(Err(err));
+        }
     };
     if row.get::<i64, usize>(0) <= 0 {
+        let _ = sqlx::raw_sql("ROLLBACK").execute(transaction.conn()).await;
+        drop(transaction);
+        drop(active_effect);
         *try_pg_batch_plan = false;
         return None;
+    }
+    if let Some(effect) = &active_effect
+        && let Err(err) = effect.check()
+    {
+        let _ = sqlx::raw_sql("ROLLBACK").execute(transaction.conn()).await;
+        drop(transaction);
+        drop(active_effect);
+        return Some(Err(err));
+    }
+    if let Err(err) = rollback_time_left(&ctx.budget, deadline) {
+        let _ = sqlx::raw_sql("ROLLBACK").execute(transaction.conn()).await;
+        drop(transaction);
+        drop(active_effect);
+        return Some(Err(err));
     }
 
     let executor = store.inner.backup_executor.clone();
@@ -5401,11 +5447,22 @@ async fn try_execute_pg_root_rollback(
     let scope = scope.clone();
     let writer = writer.clone();
     let commit = async move {
-        // Retain the backup safe point and room fences until the database
-        // answers, including when the caller stops waiting for the ACK.
+        // Retain the backup safe point, active authority lease and room fences
+        // until the database answers, including when the caller stops waiting.
         let _gate = _commit_gate;
+        if let Some(effect) = &active_effect
+            && let Err(err) = effect.check()
+        {
+            let _ = sqlx::raw_sql("ROLLBACK").execute(transaction.conn()).await;
+            drop(transaction);
+            drop(active_effect);
+            drop(fences_guard);
+            return Err(err);
+        }
         fences_guard.armed_for_drop_consume = true;
-        let connection = match sqlx::raw_sql("COMMIT").execute(transaction.conn()).await {
+        let commit_res = sqlx::raw_sql("COMMIT").execute(transaction.conn()).await;
+        drop(active_effect);
+        let connection = match commit_res {
             Ok(_) => {
                 fences_guard.armed_for_drop_consume = false;
                 transaction.into_completed_connection()
@@ -5546,6 +5603,14 @@ async fn execute_pg_fast_rollback_inner(
     let caller_note_vec: Vec<NoteId> = caller_notes.keys().cloned().collect();
     let caller_note_strs: Vec<&str> = caller_note_vec.iter().map(NoteId::as_str).collect();
 
+    if let Some(effect) = idemp.canonical_effect()
+        && let Err(err) = effect.check()
+    {
+        return PgFastInnerResult::Failed {
+            err,
+            effective_cut: None,
+        };
+    }
     // Round-Trip 1: Single autocommit PL/pgSQL table call with cached SPI plan & single-pass window scan!
     let r_rows = match sqlx::query(
         "SELECT * FROM notarium_pg_fast_rollback_prep_v1($1, $2, $3, $4, $5, $6::TEXT[])",
@@ -6540,6 +6605,10 @@ async fn execute_pg_fast_rollback_inner(
 
         // Round-Trip 2: Single autocommit PL/pgSQL call executing unified single-CTE writes + synchronous WAL flush!
         auth.authorize_space_write(&space_obj)?;
+        let active_effect = idemp.begin_canonical_effect().await?;
+        if let Some(effect) = &active_effect {
+            effect.check()?;
+        }
         let apply_res = sqlx::query_scalar::<_, i64>(
             "SELECT notarium_pg_fast_rollback_apply_v1(
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
@@ -6606,6 +6675,7 @@ async fn execute_pg_fast_rollback_inner(
         .bind(m_op_kinds)
         .fetch_one(&mut *conn)
         .await;
+        drop(active_effect);
 
         match apply_res {
             Ok(code) => Ok((resp_bytes, visibility_seq, code)),

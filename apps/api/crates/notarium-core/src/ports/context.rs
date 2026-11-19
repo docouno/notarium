@@ -348,6 +348,7 @@ pub enum CanonicalEffect {
     ChatInput,
     ChatClaim,
     ChatRollback,
+    ChatRedaction,
 }
 
 /// The step identity and source witness travel together on the trusted writer

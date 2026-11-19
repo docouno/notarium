@@ -75,11 +75,16 @@ impl AgentRunSupervisor {
         let mut submitted = self
             .publish_input(ctx.clone(), input.clone(), &mut route)
             .await;
-        if submitted.as_ref().is_err_and(unknown_commit)
+        if let Err(first) = &submitted
+            && unknown_commit(first)
             && !ownership_lost.is_cancelled()
             && route.as_ref().is_none_or(|lease| lease.check().is_ok())
         {
-            submitted = self.publish_input(ctx.clone(), input, &mut route).await;
+            match self.publish_input(ctx.clone(), input, &mut route).await {
+                Ok(outcome) => submitted = Ok(outcome),
+                Err(retry) if unknown_commit(&retry) => submitted = Err(retry),
+                Err(_) => (),
+            }
         }
         drop(route);
         let outcome = match submitted {
@@ -140,13 +145,11 @@ impl AgentRunSupervisor {
             .await
     }
 
-    pub(super) async fn drain(
+    pub(super) async fn drain_locked(
         &self,
         run: &ActiveRun,
         unsettled: &mut Option<ConsumeAttempt>,
     ) -> Result<(), PortError> {
-        let gate = self.thread_gate(&run.scope, &run.thread);
-        let _admission = gate.lock().await;
         let engine = self.inner.registry.engine();
         for _ in 0..32 {
             if unsettled.is_none() {

@@ -129,13 +129,13 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
         ExclusiveDataRoot::attest_open_writer(),
     );
     let peer_supervisor = AgentRunSupervisor::new_local(
-        local.registry,
+        local.registry.clone(),
         fixture.revocations.clone(),
         ExclusiveDataRoot::attest_open_writer(),
     );
     let options = ChatRunOptions {
-        provider: Some(local.resource.id),
-        model: Some(local.model),
+        provider: Some(local.resource.id.clone()),
+        model: Some(local.model.clone()),
         limits: RunLimits {
             max_steps: 4,
             max_tokens: 100_000,
@@ -350,7 +350,7 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
             scope: scope.clone(),
             thread: thread.clone(),
             expected_leaf: leaf,
-            options,
+            options: options.clone(),
         },
         claimant,
     ))
@@ -385,7 +385,477 @@ async fn supervised_turn_survives_disconnect_and_stops_cleanly(
             .iter()
             .any(|entry| { entry.seq == head && matches!(entry.body, ChatBody::Redacted) })
     );
+    Box::pin(resilience_submit_gate_and_archival(
+        fixture,
+        personal,
+        &local,
+        &supervisor,
+        &listener,
+        options,
+    ))
+    .await;
     supervisor.shutdown();
+}
+
+async fn begin_ollama_stream(stream: &mut tokio::io::BufReader<tokio::net::TcpStream>) {
+    stream
+        .get_mut()
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
+        .await
+        .unwrap();
+}
+
+async fn finish_ollama_stream(
+    stream: &mut tokio::io::BufReader<tokio::net::TcpStream>,
+    message: Value,
+    reason: &str,
+) {
+    let reply = format!(
+        "{}\n{}\n",
+        json!({"model":runtime_ability_cases::MODEL,"message":message,"done":false}),
+        json!({"model":runtime_ability_cases::MODEL,"done":true,"done_reason":reason,"prompt_eval_count":100,"eval_count":2}),
+    );
+    let chunk = format!("{:x}\r\n{reply}\r\n0\r\n\r\n", reply.len());
+    stream.get_mut().write_all(chunk.as_bytes()).await.unwrap();
+}
+
+async fn resilience_submit_gate_and_archival(
+    fixture: &RuntimeFixture,
+    personal: &SpaceContext,
+    local: &runtime_ability_cases::LoopbackProvider,
+    supervisor: &AgentRunSupervisor,
+    listener: &TcpListener,
+    options: ChatRunOptions,
+) {
+    let owner = &fixture.human;
+    let actor = owner.auth().principal();
+    let scope = personal.scope();
+    let thread = ChatThreadId::from_bytes([0xd0; 16]);
+    fixture
+        .canonical
+        .create_chat(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xcf; 16]),
+                    hash: ContentDigest::from_bytes([0xcf; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: thread.clone(),
+                    owner: actor.clone(),
+                    kind: ChatThreadKind::Personal,
+                    title: "Resilience thread".into(),
+                    project_folder: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let seed = fixture
+        .canonical
+        .append_chat(
+            personal.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xd0; 16]),
+                    hash: ContentDigest::from_bytes([0xd0; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: AppendChat {
+                    thread: thread.clone(),
+                    parent: ThreadEntrySeq::ZERO,
+                    kind: ChatEntryKind::Human,
+                    body: ChatInputBody::Text("Seed resilience branch".into()),
+                    tool_calls: Vec::new(),
+                    provenance: None,
+                    proposed_diff: None,
+                    referenced_notes: Vec::new(),
+                    tainted: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let thread = &thread;
+    let leaf = seed.value.seq;
+
+    // IMPL-030: `submit()` keeps `CommitEffect::Unknown` and retains `PendingCredential`
+    // when the first `publish_input` commits `Queued` with a lost ACK and the retry
+    // fails `NotCommitted`, so `drain()` still delivers the message.
+    let _active_run = supervisor
+        .start(
+            owner.clone(),
+            StartChatRun {
+                scope: scope.clone(),
+                thread: thread.clone(),
+                expected_leaf: leaf,
+                options: options.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let (mut wire, _) = timeout(Duration::from_secs(15), read_request(listener))
+        .await
+        .unwrap();
+    begin_ollama_stream(&mut wire).await;
+    fixture
+        .projections
+        .fail_chat_submit_unknown_then_not_committed();
+    let text = "Survive unknown commit plus not-committed retry.";
+    let submit_err = supervisor
+        .enqueue_input(
+            owner.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope: scope.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xd1; 16]),
+                    hash: ContentDigest::from_bytes([0xd1; 32]),
+                },
+                id: PendingInputId::from_bytes([0xd1; 16]),
+                thread: thread.clone(),
+                expected_leaf: leaf,
+                body: text.into(),
+                mentions_agent: false,
+            },
+            options.clone(),
+        )
+        .await
+        .err()
+        .expect("submit must preserve CommitEffect::Unknown");
+    assert!(
+        matches!(
+            &submit_err,
+            PortError::Unavailable(failure)
+                if failure.effect() == notarium_core::error::CommitEffect::Unknown
+        ),
+        "{submit_err:?}"
+    );
+    assert!(
+        fixture
+            .revocations
+            .pending(&notarium_agents::revocation::PendingCredentialKey {
+                scope: scope.clone(),
+                thread: thread.clone(),
+                input: PendingInputId::from_bytes([0xd1; 16]),
+            })
+            .is_some(),
+        "pending credential must survive Unknown+NotCommitted retry"
+    );
+    finish_ollama_stream(
+        &mut wire,
+        json!({"role":"assistant","content":"Done before draining queued message."}),
+        "stop",
+    )
+    .await;
+    drop(wire);
+    let (mut next_wire, prompt) = timeout(Duration::from_secs(15), read_request(listener))
+        .await
+        .unwrap();
+    assert!(
+        prompt["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|msg| msg["role"] == "user" && msg["content"] == text),
+        "queued message after Unknown+NotCommitted retry must be delivered: {prompt}"
+    );
+
+    // IMPL-031: a concurrent `start()` waiting while `run_task` clears `active_run_id`
+    // must wait on `thread_gate` until `remove_run` finishes and never fail with `owner_unavailable()`.
+    let (cleared_entered, cleared_release) = fixture.projections.pause_after_chat_finish_cleared();
+    send_ollama(
+        &mut next_wire,
+        json!({"role":"assistant","content":"Delivered unknown-commit message."}),
+        "stop",
+    )
+    .await;
+    timeout(Duration::from_secs(15), cleared_entered)
+        .await
+        .unwrap()
+        .unwrap();
+    let leaf_after = branch(fixture, personal, thread, ThreadEntrySeq::ZERO)
+        .await
+        .thread
+        .head;
+    let waiting_start = {
+        let supervisor = supervisor.clone();
+        let owner = owner.clone();
+        let start_req = StartChatRun {
+            scope: scope.clone(),
+            thread: thread.clone(),
+            expected_leaf: leaf_after,
+            options: options.clone(),
+        };
+        tokio::spawn(async move { supervisor.start(owner, start_req).await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!waiting_start.is_finished());
+    cleared_release.send(()).unwrap();
+    let _next_run = timeout(Duration::from_secs(15), waiting_start)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect(
+            "concurrent start waiting on run completion must succeed without owner_unavailable",
+        );
+    let (mut wire3, _) = timeout(Duration::from_secs(15), read_request(listener))
+        .await
+        .unwrap();
+    send_ollama(
+        &mut wire3,
+        json!({"role":"assistant","content":"Concurrent start succeeded."}),
+        "stop",
+    )
+    .await;
+    let _ = idle_leaf(fixture, personal, thread).await;
+
+    // IMPL-032: archiving a Shared Space mid-`drain()` (after `Pending`, before consume)
+    // must enter `finish_run_if_queue_empty` closing cleanup without hanging or leaking `active_run_id`.
+    let account_rev = fixture
+        .control
+        .account(owner.clone(), actor.clone())
+        .await
+        .unwrap()
+        .revision;
+    let shared = fixture
+        .control
+        .create_space(
+            owner.clone(),
+            AccountMutation {
+                identity: notarium_core::receipt::AccountCommandIdentity {
+                    owner: actor.clone(),
+                    actor: actor.clone(),
+                    expected: account_rev,
+                    key: CommandKey::from_bytes([0xd2; 16]),
+                    hash: ContentDigest::from_bytes([0xd2; 32]),
+                },
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0xd2; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "ArchivalDrain".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let refreshed_owner = AccountContext::new(
+        fixture
+            .control
+            .trusted_none(
+                PerimeterAttestation::attest_checked().with_human_management(),
+                budget(),
+            )
+            .await
+            .unwrap(),
+        budget(),
+    );
+    approve_disclosure(
+        fixture,
+        &refreshed_owner,
+        local,
+        0xd9,
+        ProviderAttachmentTarget::Personal {
+            owner: actor.clone(),
+            space: shared.history.space_id.clone(),
+        },
+        [DocClass::UserDoc].into(),
+    )
+    .await;
+    approve_disclosure(
+        fixture,
+        &refreshed_owner,
+        local,
+        0xda,
+        ProviderAttachmentTarget::Space(shared.history.space_id.clone()),
+        [DocClass::UserDoc].into(),
+    )
+    .await;
+    let shared_ctx = SpaceContext::new(
+        refreshed_owner.auth().clone(),
+        shared.history.clone(),
+        budget(),
+    )
+    .unwrap();
+    let shared_thread = ChatThreadId::from_bytes([0xd4; 16]);
+    fixture
+        .canonical
+        .create_chat(
+            shared_ctx.clone(),
+            Mutation {
+                identity: CommandIdentity {
+                    scope: shared.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xd4; 16]),
+                    hash: ContentDigest::from_bytes([0xd4; 32]),
+                },
+                preconditions: Preconditions::default(),
+                input: CreateChat {
+                    thread: shared_thread.clone(),
+                    owner: actor.clone(),
+                    kind: ChatThreadKind::SpaceGroup,
+                    title: "Archival drain test".into(),
+                    project_folder: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let first = supervisor
+        .enqueue_input(
+            refreshed_owner.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope: shared.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xd5; 16]),
+                    hash: ContentDigest::from_bytes([0xd5; 32]),
+                },
+                id: PendingInputId::from_bytes([0xd5; 16]),
+                thread: shared_thread.clone(),
+                expected_leaf: ThreadEntrySeq::ZERO,
+                body: "Trigger shared run".into(),
+                mentions_agent: true,
+            },
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    let SubmitUserChatOutcome::Appended(first_entry) = first.outcome else {
+        panic!("expected Appended on shared thread");
+    };
+    let (mut shared_wire, _) = timeout(Duration::from_secs(15), read_request(listener))
+        .await
+        .unwrap();
+    begin_ollama_stream(&mut shared_wire).await;
+    let shared_stream = supervisor
+        .subscribe(
+            refreshed_owner.clone(),
+            shared.history.clone(),
+            shared_thread.clone(),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let queued = supervisor
+        .enqueue_input(
+            refreshed_owner.clone(),
+            SubmitUserChatInput {
+                identity: CommandIdentity {
+                    scope: shared.history.clone(),
+                    actor: actor.clone(),
+                    key: CommandKey::from_bytes([0xd6; 16]),
+                    hash: ContentDigest::from_bytes([0xd6; 32]),
+                },
+                id: PendingInputId::from_bytes([0xd6; 16]),
+                thread: shared_thread.clone(),
+                expected_leaf: first_entry.value.seq,
+                body: "Pending input cancelled by archival".into(),
+                mentions_agent: true,
+            },
+            options,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(queued.outcome, SubmitUserChatOutcome::Queued(_)));
+    let (consume_entered, consume_release) = fixture.projections.pause_chat_consume();
+    finish_ollama_stream(
+        &mut shared_wire,
+        json!({"role":"assistant","content":"Finishing before archival."}),
+        "stop",
+    )
+    .await;
+    drop(shared_wire);
+    timeout(Duration::from_secs(15), consume_entered)
+        .await
+        .unwrap()
+        .unwrap();
+    let space_rev = fixture
+        .control
+        .context_scope(
+            refreshed_owner.clone(),
+            ContextScope::Space(shared.history.space_id.clone()),
+        )
+        .await
+        .unwrap()
+        .revision;
+    let archived = fixture
+        .control
+        .change_space_lifecycle(
+            shared_ctx.clone(),
+            SpaceLifecycleChange {
+                command: CommandKey::from_bytes([0xd7; 16]),
+                lifecycle: notarium_core::auth::SpaceLifecycle::Archived,
+                expected: space_rev,
+            },
+        )
+        .await
+        .unwrap();
+    consume_release.send(()).unwrap();
+    // Wait for `run_task` to finish closing settlement and close its stream.
+    let _ = stream_events(shared_stream).await;
+    // Restore the Space to Active and verify `active_run_id` and the pending queue were cleared.
+    fixture
+        .control
+        .change_space_lifecycle(
+            shared_ctx.clone(),
+            SpaceLifecycleChange {
+                command: CommandKey::from_bytes([0xd8; 16]),
+                lifecycle: notarium_core::auth::SpaceLifecycle::Active,
+                expected: archived.revision,
+            },
+        )
+        .await
+        .unwrap();
+    let restored_owner = AccountContext::new(
+        fixture
+            .control
+            .trusted_none(
+                PerimeterAttestation::attest_checked().with_human_management(),
+                budget(),
+            )
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let restored_ctx = SpaceContext::new(
+        restored_owner.auth().clone(),
+        shared.history.clone(),
+        budget(),
+    )
+    .unwrap();
+    let final_thread = branch(fixture, &restored_ctx, &shared_thread, ThreadEntrySeq::ZERO)
+        .await
+        .thread;
+    assert!(
+        final_thread.active_run.is_none(),
+        "archival mid-drain must clear active_run_id: {:?}",
+        final_thread.active_run
+    );
+    let still_pending = fixture
+        .canonical
+        .dismiss_chat_input(
+            restored_ctx,
+            DismissPending {
+                thread: shared_thread,
+                input: PendingInputId::from_bytes([0xd6; 16]),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        !still_pending,
+        "archival mid-drain must cancel pending inputs"
+    );
 }
 
 async fn queue_conflicts_and_lost_ack(

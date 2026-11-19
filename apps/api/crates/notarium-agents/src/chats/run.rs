@@ -28,40 +28,67 @@ impl AgentRunSupervisor {
             }
             let mut delay = Duration::from_millis(25);
             let mut unsettled = None;
-            let cleanup = loop {
-                match self.drain(&run, &mut unsettled).await {
+            let gate = self.thread_gate(&run.scope, &run.thread);
+            loop {
+                let admission = gate.lock().await;
+                match self.drain_locked(&run, &mut unsettled).await {
                     Err(error)
                         if queue::retry_cleanup(&error)
                             && run.owner.check().is_ok()
                             && !self.inner.shutdown.is_cancelled()
-                            && (!drain_only || unsettled.is_some()) => {}
-                    Err(error) if drain_only || run.owner.check().is_err() => {
-                        let gate = self.thread_gate(&run.scope, &run.thread);
-                        let _admission = gate.lock().await;
-                        if !matches!(
-                            self.settle_unpublished_claim(&run).await,
+                            && (!drain_only || unsettled.is_some()) =>
+                    {
+                        drop(admission);
+                    }
+                    Err(error)
+                        if drain_only
+                            || run.owner.check().is_err()
+                            || matches!(
+                                &error,
+                                PortError::Domain(
+                                    DomainError::SpaceReadOnly | DomainError::ResourceNotFound
+                                )
+                            ) =>
+                    {
+                        match self.settle_unpublished_claim(&run).await {
                             ClaimSettlement::Pending
-                        ) {
-                            break Err(error);
+                                if queue::retry_cleanup(&error)
+                                    && run.owner.check().is_ok()
+                                    && !self.inner.shutdown.is_cancelled() =>
+                            {
+                                drop(admission);
+                            }
+                            _ => {
+                                let _ = self.refresh_current_peer_head(&run).await;
+                                self.finish_and_remove_run(&run, result.err().or(Some(error)));
+                                drop(admission);
+                                return;
+                            }
                         }
                     }
-                    result => break result,
+                    cleanup => {
+                        let _ = self.refresh_current_peer_head(&run).await;
+                        self.finish_and_remove_run(&run, result.err().or_else(|| cleanup.err()));
+                        drop(admission);
+                        return;
+                    }
                 }
                 tokio::select! {
                     () = tokio::time::sleep(delay) => (),
                     () = self.inner.shutdown.cancelled() => (),
                 }
                 delay = (delay * 2).min(Duration::from_secs(2));
-            };
-            let _ = self.refresh_current_peer_head(&run).await;
-            let error = result.err().or_else(|| cleanup.err());
-            if let Some(error) = error {
-                let _ = run.stream.fail(stream_failure(&error));
-            } else {
-                let _ = run.stream.finish();
             }
-            self.remove_run(&run);
         })
+    }
+
+    fn finish_and_remove_run(&self, run: &ActiveRun, error: Option<PortError>) {
+        if let Some(error) = error {
+            let _ = run.stream.fail(stream_failure(&error));
+        } else {
+            let _ = run.stream.finish();
+        }
+        self.remove_run(run);
     }
 
     async fn run_turn(&self, run: &ActiveRun, mut leaf: ThreadEntrySeq) -> Result<(), PortError> {

@@ -375,39 +375,44 @@ impl AgentRunSupervisor {
         run: AgentRunId,
         key: CommandKey,
     ) -> Result<Committed<RollbackResult>, PortError> {
-        let account = self.live_account(account).await?;
-        account.auth().authorize_human_management()?;
-        let ctx = SpaceContext::new(
-            account.auth().clone(),
-            scope.clone(),
-            account.budget.clone(),
-        )?;
-        let ctx = self
-            .inner
-            .registry
-            .control()
-            .fence_canonical_effect(account.auth().clone(), ctx, CanonicalEffect::ChatRollback)
-            .await?;
-        self.inner
-            .registry
-            .engine()
-            .rollback_agent_run_by_id(
-                ctx,
-                Mutation {
-                    identity: CommandIdentity {
-                        scope,
-                        actor: account.auth().principal().clone(),
-                        key,
-                        hash: derive_digest(
-                            "notarium.chats.rollback.v1",
-                            &[run.as_str().as_bytes()],
-                        ),
+        let service = self.clone();
+        detached(async move {
+            let account = service.live_account(account).await?;
+            account.auth().authorize_human_management()?;
+            let ctx = SpaceContext::new(
+                account.auth().clone(),
+                scope.clone(),
+                account.budget.clone(),
+            )?;
+            let ctx = service
+                .inner
+                .registry
+                .control()
+                .fence_canonical_effect(account.auth().clone(), ctx, CanonicalEffect::ChatRollback)
+                .await?;
+            service
+                .inner
+                .registry
+                .engine()
+                .rollback_agent_run_by_id(
+                    ctx,
+                    Mutation {
+                        identity: CommandIdentity {
+                            scope,
+                            actor: account.auth().principal().clone(),
+                            key,
+                            hash: derive_digest(
+                                "notarium.chats.rollback.v1",
+                                &[run.as_str().as_bytes()],
+                            ),
+                        },
+                        preconditions: Preconditions::default(),
+                        input: run,
                     },
-                    preconditions: Preconditions::default(),
-                    input: run,
-                },
-            )
-            .await
+                )
+                .await
+        })
+        .await
     }
 
     /// Redact an entry and stop the local owner of any turn using this branch.
@@ -423,13 +428,22 @@ impl AgentRunSupervisor {
             let gate = service.thread_gate(&scope, &thread);
             let _admission = gate.lock().await;
             let mut account = service.live_account(account).await?;
-            if matches!(&service.inner.coordination, Coordination::Clustered(_)) {
-                account.budget.cancellation = Cancellation::default();
-            }
+            let ownership_lost = Cancellation::default();
+            account.budget = bounded(&account.budget, MAINTENANCE_BUDGET, ownership_lost);
             let route = service
                 .admit_chat_route(&scope, &thread, &account.budget)
                 .await?;
-            let ctx = SpaceContext::new(account.auth().clone(), scope.clone(), account.budget)?;
+            let ctx = SpaceContext::new(
+                account.auth().clone(),
+                scope.clone(),
+                account.budget.clone(),
+            )?;
+            let ctx = service
+                .inner
+                .registry
+                .control()
+                .fence_canonical_effect(account.auth().clone(), ctx, CanonicalEffect::ChatRedaction)
+                .await?;
             let mut holds = service
                 .inner
                 .threads
@@ -890,13 +904,7 @@ impl AgentRunSupervisor {
                     return ClaimSettlement::Pending;
                 }
                 Ok(FinishChatRunOutcome::Pending) => return ClaimSettlement::Retired,
-                Err(PortError::Domain(DomainError::ValidationFailed { diagnostic }))
-                    if matches!(
-                        diagnostic.reason,
-                        ValidationReason::InvalidAuthority
-                            | ValidationReason::HistoryIncarnationMismatch
-                    ) =>
-                {
+                Err(error) if !queue::retry_cleanup(&error) => {
                     return ClaimSettlement::Retired;
                 }
                 _ if !owner_live || self.inner.shutdown.is_cancelled() => {

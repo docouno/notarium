@@ -500,15 +500,463 @@ pub(super) async fn overrides_and_promotion(fixture: &RuntimeFixture) {
         .is_err()
     );
     let scope = SpaceContext::new(human.auth().clone(), shared.history, budget()).unwrap();
-    restricted_publication_waits_for_binding(
+    Box::pin(restricted_publication_waits_for_binding(
         fixture,
         &human,
         scope,
         first,
         &first_handle,
         &second_handle,
-    )
+    ))
     .await;
+}
+
+#[tokio::test]
+async fn sqlite_promotion_conflicts_and_binding_replay() {
+    let _fixture = support::AUTH_TEST_LOCK.lock().await;
+    Box::pin(promotion_conflicts_and_binding_replay_case(false)).await;
+}
+
+#[tokio::test]
+async fn postgres_promotion_conflicts_and_binding_replay() {
+    let _fixture = support::AUTH_TEST_LOCK.lock().await;
+    Box::pin(promotion_conflicts_and_binding_replay_case(true)).await;
+}
+
+async fn promotion_conflicts_and_binding_replay_case(pg: bool) {
+    let fixture = Box::pin(RuntimeFixture::open_named(
+        pg,
+        "agents_ability_promo_replay",
+    ))
+    .await;
+    let owner = fixture.human.auth().principal().clone();
+    let revision = fixture
+        .control
+        .account(fixture.human.clone(), owner.clone())
+        .await
+        .unwrap()
+        .revision;
+    let shared = fixture
+        .control
+        .create_space(
+            fixture.human.clone(),
+            AccountMutation {
+                identity: AccountCommandIdentity {
+                    owner: owner.clone(),
+                    actor: owner.clone(),
+                    expected: revision,
+                    key: CommandKey::from_bytes([0xdf; 16]),
+                    hash: ContentDigest::from_bytes([0xdf; 32]),
+                },
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([0xdf; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "PromoReplay".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let storage = fixture
+        .canonical
+        .read_space(&shared.history.space_id)
+        .await
+        .unwrap();
+    let human = AccountContext::new(
+        fixture
+            .control
+            .trusted_none(
+                PerimeterAttestation::attest_checked()
+                    .with_human_management()
+                    .with_ability_write(),
+                budget(),
+            )
+            .await
+            .unwrap(),
+        budget(),
+    );
+    let first = FolderRef {
+        space_id: shared.history.space_id.clone(),
+        folder_id: FolderId::from_bytes([0xde; 16]),
+    };
+    fixture
+        .canonical
+        .create_folder(CreateFolderSpec {
+            scope: shared.history.clone(),
+            active_epoch: storage.active_epoch,
+            folder_id: first.folder_id.clone(),
+            parent: None,
+            slug: "first".into(),
+            display_name: "first".into(),
+            is_project: true,
+            project_slug: Some("first".into()),
+            actor: owner,
+            timestamp: None,
+        })
+        .await
+        .unwrap();
+    let first_handle = format!("{}/first", shared.slug);
+    Box::pin(binding_replay_after_advance_and_trash(
+        &fixture,
+        &human,
+        &shared.slug,
+        &first,
+        &first_handle,
+    ))
+    .await;
+    Box::pin(promotion_concurrent_source_overlay_conflicts(
+        &fixture,
+        &human,
+        &first,
+        &first_handle,
+    ))
+    .await;
+    Box::pin(fixture.close()).await;
+}
+
+async fn concurrent_overlay_before_promotion<T>(
+    fixture: &RuntimeFixture,
+    promotion: impl Future<Output = T>,
+    concurrent: impl Future<Output = ()>,
+) -> T {
+    let (entered, release) = fixture.projections.pause_note_move();
+    let update = async {
+        timeout(Duration::from_secs(10), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        Box::pin(concurrent).await;
+        release.send(()).unwrap();
+    };
+    tokio::join!(Box::pin(promotion), Box::pin(update)).0
+}
+
+async fn binding_replay_after_advance_and_trash(
+    fixture: &RuntimeFixture,
+    human: &AccountContext,
+    shared_slug: &str,
+    first_project: &FolderRef,
+    first_handle: &str,
+) {
+    let owner = human.auth().principal();
+    // IMPL-026: compare_authored_ability_binding & edit_ability(availability) exact
+    // replay after package revision advance (R1 -> R2) and after trash.
+    let created = call(
+        fixture,
+        human,
+        0xe0,
+        "create_ability",
+        json!({
+            "kind":"role","name":"binding-replay-guide","description":"Test guide",
+            "instructions":"Initial binding guide","placement":{"home":"space","space":shared_slug},
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let [desc]: [AbilityDescriptor; 1] = fixture
+        .control
+        .discover_abilities(
+            human.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(10, None).unwrap(),
+                project: None,
+                kind: Some(notarium_core::classes::AbilityKind::Role),
+                name: Some("binding-replay-guide".into()),
+                authoring: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .try_into()
+        .unwrap();
+    let r1_ref = desc.reference.clone();
+    let avail_edit = json!({
+        "ref":created["ref"],
+        "availability":{"mode":"selected-projects","projects":[first_handle]},
+    });
+    let updated = call(fixture, human, 0xe1, "edit_ability", avail_edit.clone())
+        .await
+        .unwrap()
+        .structured_content;
+    assert_eq!(updated["outcome"], "updated", "{updated}");
+    let current_binding_rev = fixture
+        .control
+        .inspect_ability(human.clone(), r1_ref.identity())
+        .await
+        .unwrap()
+        .overlays
+        .binding_revision;
+    let direct_req = AccountMutation {
+        identity: AccountCommandIdentity {
+            owner: owner.clone(),
+            actor: owner.clone(),
+            expected: ControlRevision::ZERO,
+            key: CommandKey::from_bytes([0xe2; 16]),
+            hash: ContentDigest::from_bytes([0xe2; 32]),
+        },
+        input: AbilityBindingChange {
+            ability: r1_ref.clone(),
+            enabled: true,
+            projects: AbilityProjects::Selected(vec![first_project.clone()]),
+            expected: current_binding_rev,
+        },
+    };
+    let direct_committed = fixture
+        .control
+        .compare_authored_ability_binding(human.clone(), direct_req.clone())
+        .await
+        .unwrap();
+    assert_eq!(direct_committed.value, r1_ref);
+    // Advance package R1 -> R2.
+    let current_view = call(
+        fixture,
+        human,
+        0xe3,
+        "get_ability",
+        json!({"ref":updated["ref"]}),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let r2 = call(
+        fixture,
+        human,
+        0xe4,
+        "edit_ability",
+        json!({
+            "ref":current_view["ref"],
+            "versionToken":current_view["versionToken"],
+            "instructions":"Second binding guide",
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(r2["outcome"], "updated", "{r2}");
+    // Direct compare_authored_ability_binding replay returns exact R1 AbilityRef even at R2.
+    let replayed_direct_r2 = fixture
+        .control
+        .compare_authored_ability_binding(human.clone(), direct_req.clone())
+        .await
+        .unwrap();
+    assert_eq!(replayed_direct_r2.value, r1_ref);
+    assert_eq!(replayed_direct_r2.revision, direct_committed.revision);
+    // MCP edit_ability(availability) replay fails cleanly at bound_ability with RevisionConflict (never Ok(partial)).
+    let replayed_avail_r2 = call(fixture, human, 0xe1, "edit_ability", avail_edit.clone())
+        .await
+        .err()
+        .expect("replaying availability edit after R1 -> R2 must return RevisionConflict");
+    assert!(
+        matches!(
+            replayed_avail_r2,
+            PortError::Domain(DomainError::RevisionConflict { .. })
+        ),
+        "{replayed_avail_r2:?}"
+    );
+    // Trash R2 and verify exact replays still succeed at ControlPort and fail cleanly (not partial) at MCP.
+    call(
+        fixture,
+        human,
+        0xe5,
+        "delete_ability",
+        json!({"ref":r2["ref"]}),
+    )
+    .await
+    .unwrap();
+    let replayed_direct_trashed = fixture
+        .control
+        .compare_authored_ability_binding(human.clone(), direct_req)
+        .await
+        .unwrap();
+    assert_eq!(replayed_direct_trashed.value, r1_ref);
+    let replayed_avail_trashed = call(fixture, human, 0xe1, "edit_ability", avail_edit)
+        .await
+        .err()
+        .expect("replaying availability edit after trash must return ResourceNotFound");
+    assert!(
+        matches!(
+            replayed_avail_trashed,
+            PortError::Domain(DomainError::ResourceNotFound)
+        ),
+        "{replayed_avail_trashed:?}"
+    );
+}
+
+async fn promotion_concurrent_source_overlay_conflicts(
+    fixture: &RuntimeFixture,
+    human: &AccountContext,
+    first_project: &FolderRef,
+    first_handle: &str,
+) {
+    // IMPL-029: promotion + concurrent source preference edit with same target boolean
+    // must report `partial` / `control_revision_conflict` instead of masking as `skipped`.
+    let pref_src = call(
+        fixture,
+        human,
+        0xe6,
+        "create_ability",
+        json!({
+            "kind":"role","name":"promo-pref-race","description":"Test guide",
+            "instructions":"Initial promo pref","placement":{"home":"project","project":first_handle},
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let [pref_desc]: [AbilityDescriptor; 1] = fixture
+        .control
+        .discover_abilities(
+            human.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(10, None).unwrap(),
+                project: Some(first_project.clone()),
+                kind: Some(notarium_core::classes::AbilityKind::Role),
+                name: Some("promo-pref-race".into()),
+                authoring: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .try_into()
+        .unwrap();
+    let pref_promo = json!({
+        "ref":pref_src["ref"],
+        "versionToken":pref_src["versionToken"],
+        "home":{"home":"space"},
+        "instructions":"Promoted with pref conflict",
+        "enabled":false,
+    });
+    let pref_blocked = Box::pin(concurrent_overlay_before_promotion(
+        fixture,
+        call(fixture, human, 0xe7, "edit_ability", pref_promo.clone()),
+        async {
+            fixture
+                .control
+                .set_ability_preference(
+                    human.clone(),
+                    AccountMutation {
+                        identity: runtime_ability_cases::identity(fixture, human, 0xe8).await,
+                        input: AbilityPreferenceUpdate {
+                            ability: pref_desc.reference.clone(),
+                            enabled: false,
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+        },
+    ))
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(pref_blocked["outcome"], "partial", "{pref_blocked}");
+    assert_eq!(pref_blocked["steps"][0]["outcome"], "applied");
+    assert_eq!(pref_blocked["steps"][1]["outcome"], "applied");
+    assert_eq!(
+        pref_blocked["steps"][3]["error"]["code"],
+        "control_revision_conflict"
+    );
+    let pref_replayed = call(fixture, human, 0xe7, "edit_ability", pref_promo)
+        .await
+        .unwrap()
+        .structured_content;
+    assert_eq!(pref_replayed, pref_blocked);
+
+    // IMPL-029: promotion + concurrent source binding edit must report `partial` /
+    // `control_revision_conflict`, preserve the competing binding, and replay identically.
+    let bind_src = call(
+        fixture,
+        human,
+        0xe9,
+        "create_ability",
+        json!({
+            "kind":"role","name":"promo-bind-race","description":"Test guide",
+            "instructions":"Initial promo bind","placement":{"home":"project","project":first_handle},
+        }),
+    )
+    .await
+    .unwrap()
+    .structured_content;
+    let [bind_desc]: [AbilityDescriptor; 1] = fixture
+        .control
+        .discover_abilities(
+            human.clone(),
+            AbilityQuery {
+                page: ControlPageRequest::new(10, None).unwrap(),
+                project: Some(first_project.clone()),
+                kind: Some(notarium_core::classes::AbilityKind::Role),
+                name: Some("promo-bind-race".into()),
+                authoring: true,
+            },
+        )
+        .await
+        .unwrap()
+        .items
+        .try_into()
+        .unwrap();
+    let bind_promo = json!({
+        "ref":bind_src["ref"],
+        "versionToken":bind_src["versionToken"],
+        "home":{"home":"space"},
+        "instructions":"Promoted with bind conflict",
+        "availability":{"mode":"all-projects"},
+    });
+    let bind_blocked = Box::pin(concurrent_overlay_before_promotion(
+        fixture,
+        call(fixture, human, 0xea, "edit_ability", bind_promo.clone()),
+        async {
+            let inspected = fixture
+                .control
+                .inspect_ability(human.clone(), bind_desc.reference.identity())
+                .await
+                .unwrap();
+            fixture
+                .control
+                .update_ability_binding(
+                    human.clone(),
+                    AccountMutation {
+                        identity: runtime_ability_cases::identity(fixture, human, 0xeb).await,
+                        input: AbilityBindingUpdate {
+                            ability: inspected.descriptor.reference,
+                            enabled: false,
+                            expected: inspected.binding_revision,
+                            projects: AbilityProjects::Selected(vec![]),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+        },
+    ))
+    .await
+    .unwrap()
+    .structured_content;
+    assert_eq!(bind_blocked["outcome"], "partial", "{bind_blocked}");
+    assert_eq!(bind_blocked["steps"][0]["outcome"], "applied");
+    assert_eq!(bind_blocked["steps"][1]["outcome"], "applied");
+    assert_eq!(
+        bind_blocked["steps"][2]["error"]["code"],
+        "control_revision_conflict"
+    );
+    let dst_identity = AbilityIdentity {
+        id: bind_desc.reference.id.clone(),
+        placement: AbilityPlacement::OwnedSpace(first_project.space_id.clone()),
+    };
+    let dst_state = fixture
+        .control
+        .inspect_ability(human.clone(), dst_identity)
+        .await
+        .unwrap();
+    assert!(!dst_state.binding_enabled);
+    let bind_replayed = call(fixture, human, 0xea, "edit_ability", bind_promo)
+        .await
+        .unwrap()
+        .structured_content;
+    assert_eq!(bind_replayed, bind_blocked);
 }
 
 async fn restricted_publication_waits_for_binding(

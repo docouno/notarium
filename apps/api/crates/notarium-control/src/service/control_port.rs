@@ -198,7 +198,7 @@ impl ControlPort for ControlPlane {
         &self,
         ctx: AccountContext,
         request: AccountMutation<AbilityBindingChange>,
-    ) -> PortFuture<'_, ControlCommit<AbilityDescriptor>> {
+    ) -> PortFuture<'_, ControlCommit<AbilityRef>> {
         Box::pin(self.control.compare_authored_ability_binding(ctx, request))
     }
     fn compare_authored_ability_preference(

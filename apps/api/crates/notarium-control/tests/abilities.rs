@@ -1257,3 +1257,419 @@ async fn sqlite_selected_project_bindings_and_paged_bulk_discovery() {
 async fn postgres_selected_project_bindings_and_paged_bulk_discovery() {
     selected_project_bindings_and_paged_bulk_discovery(true).await;
 }
+
+async fn concurrent_authored_preferences_and_promotion_merge_cas(pg: bool) {
+    let _serial = AUTH_TEST_LOCK.lock().await;
+    let fixture = Fixture::new(pg, "abilities_concurrent_pref_merge").await;
+    let service = fixture.service(AuthenticationMode::Password).await.unwrap();
+    let bootstrap = service
+        .bootstrap(
+            empty(),
+            budget(),
+            BootstrapAccount {
+                username: "owner".into(),
+                email: None,
+                display_name: "Owner".into(),
+                password: Some(SecretString::new("owner ability password".into())),
+            },
+        )
+        .await
+        .unwrap();
+    let owner_token = bootstrap.session.unwrap().token;
+    let mut owner_ev = evidence(AuthEvidenceKind::Session, owner_token.expose());
+    owner_ev.evidence = owner_ev.evidence.with_ability_write();
+    let owner_ctx = AccountContext::new(service.resolve(owner_ev).await.unwrap(), budget());
+    let shared = service
+        .create_space(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &owner_ctx, 1).await,
+                input: CreateSpace {
+                    id: SpaceId::from_bytes([71; 16]),
+                    kind: SpaceKind::Shared,
+                    name: "SharedAuth".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    let mut owner_ev = evidence(AuthEvidenceKind::Session, owner_token.expose());
+    owner_ev.evidence = owner_ev.evidence.with_ability_write();
+    let owner_ctx = AccountContext::new(service.resolve(owner_ev).await.unwrap(), budget());
+
+    let editor = service
+        .create_account(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &owner_ctx, 2).await,
+                input: NewAccount {
+                    username: "editor".into(),
+                    email: None,
+                    display_name: "Editor".into(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    service
+        .change_password(
+            owner_ctx.clone(),
+            ChangePassword {
+                account: editor.id.clone(),
+                current: None,
+                replacement: SecretString::new("editor ability password".into()),
+                expected: editor.revision,
+            },
+        )
+        .await
+        .unwrap();
+    let scope_rev = service
+        .context_scope(
+            owner_ctx.clone(),
+            ContextScope::Space(shared.space.id.clone()),
+        )
+        .await
+        .unwrap()
+        .revision;
+    service
+        .change_membership(
+            SpaceContext::new(owner_ctx.auth().clone(), shared.history.clone(), budget()).unwrap(),
+            MembershipChange {
+                command: CommandKey::from_bytes([3; 16]),
+                member: editor.id.clone(),
+                role: Some(SpaceRole::Editor),
+                expected: scope_rev,
+            },
+        )
+        .await
+        .unwrap();
+    let editor_login = service
+        .login(
+            budget(),
+            PasswordLogin {
+                identifier: "editor".into(),
+                password: SecretString::new("editor ability password".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let mut editor_ev = evidence(AuthEvidenceKind::Session, editor_login.token.expose());
+    editor_ev.evidence = editor_ev.evidence.with_ability_write();
+    let editor_ctx = AccountContext::new(service.resolve(editor_ev).await.unwrap(), budget());
+
+    let shared_ability = add(
+        &fixture,
+        &shared.space,
+        AbilityPlacement::OwnedSpace(shared.space.id.clone()),
+        72,
+        "shared-guide",
+        vec![],
+    );
+
+    // IMPL-024: concurrent `compare_authored_ability_preference` by two members of
+    // the same Shared Space must not deadlock on PostgreSQL (`FOR SHARE -> FOR UPDATE`).
+    let mut owner_pref_rev: Option<ControlRevision> = None;
+    let mut editor_pref_rev: Option<ControlRevision> = None;
+    for round in 0..8_u8 {
+        let enabled = round % 2 == 0;
+        let owner_call = service.compare_authored_ability_preference(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: command(
+                    owner_ctx.auth().principal(),
+                    owner_ctx.auth().principal(),
+                    10 + round,
+                    ControlRevision::ZERO,
+                ),
+                input: AbilityPreferenceChange {
+                    preference: AbilityPreferenceUpdate {
+                        ability: shared_ability.clone(),
+                        enabled,
+                    },
+                    expected: owner_pref_rev,
+                },
+            },
+        );
+        let editor_call = service.compare_authored_ability_preference(
+            editor_ctx.clone(),
+            AccountMutation {
+                identity: command(
+                    editor_ctx.auth().principal(),
+                    editor_ctx.auth().principal(),
+                    30 + round,
+                    ControlRevision::ZERO,
+                ),
+                input: AbilityPreferenceChange {
+                    preference: AbilityPreferenceUpdate {
+                        ability: shared_ability.clone(),
+                        enabled: !enabled,
+                    },
+                    expected: editor_pref_rev,
+                },
+            },
+        );
+        let (owner_res, editor_res) = tokio::join!(owner_call, editor_call);
+        owner_pref_rev = Some(owner_res.unwrap().revision);
+        editor_pref_rev = Some(editor_res.unwrap().revision);
+    }
+
+    // IMPL-027: merging a source preference into an existing destination preference
+    // during promotion must increment destination preference revision so stale CAS fails.
+    let project = FolderRef {
+        space_id: shared.space.id.clone(),
+        folder_id: FolderId::from_bytes([73; 16]),
+    };
+    fixture.catalog.project_entries.lock().unwrap().insert(
+        (project.space_id.clone(), project.folder_id.clone()),
+        ProjectInfo {
+            project_slug: "merge-proj".into(),
+            folder: project.clone(),
+            name: "Merge Project".into(),
+        },
+    );
+    fixture.catalog.folder_entries.lock().unwrap().insert(
+        (project.space_id.clone(), project.folder_id.clone()),
+        CatalogFolder {
+            reference: project.clone(),
+            space: shared.space.clone(),
+            lifecycle: Lifecycle::Active,
+            ancestor_folders: vec![],
+            write_locked: false,
+        },
+    );
+    let promo_id = AbilityId::from_bytes([74; 16]);
+    let src_ref = AbilityRef {
+        id: promo_id.clone(),
+        placement: AbilityPlacement::OwnedProject(project.clone()),
+        revision: RevisionId::from_bytes([75; 16]),
+    };
+    let dst_ref = AbilityRef {
+        id: promo_id.clone(),
+        placement: AbilityPlacement::OwnedSpace(shared.space.id.clone()),
+        revision: RevisionId::from_bytes([76; 16]),
+    };
+    let note_ref = NoteRef {
+        space_id: shared.space.id.clone(),
+        note_id: NoteId::from_bytes([74; 16]),
+    };
+    fixture.catalog.note_entries.lock().unwrap().insert(
+        (shared.space.id.clone(), note_ref.note_id.clone()),
+        CatalogNote {
+            reference: note_ref.clone(),
+            lifecycle: Lifecycle::Active,
+            facts: ResourceFacts {
+                space: shared.space.clone(),
+                class: DocClass::Skill,
+                project: Some(project.folder_id.clone()),
+                ancestor_folders: vec![project.folder_id.clone()],
+                folder_write_locked: false,
+                ability_package: Some(promo_id.clone()),
+            },
+        },
+    );
+    // Seed an existing destination preference (enabled = true, rev = dst_rev_before)
+    // and a source preference (enabled = false, rev = src_rev < dst_rev_before).
+    fixture
+        .catalog
+        .ability_entries
+        .lock()
+        .unwrap()
+        .push(AbilityDescriptor {
+            attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
+            reference: src_ref.clone(),
+            kind: AbilityKind::Role,
+            name: "merge-guide".into(),
+            enabled: true,
+            healthy: true,
+            lifecycle: Lifecycle::Active,
+            entrypoint: Some(note_ref.clone()),
+            auxiliary_files: vec![],
+        });
+    service
+        .compare_authored_ability_preference(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: command(
+                    owner_ctx.auth().principal(),
+                    owner_ctx.auth().principal(),
+                    50,
+                    ControlRevision::ZERO,
+                ),
+                input: AbilityPreferenceChange {
+                    preference: AbilityPreferenceUpdate {
+                        ability: src_ref.clone(),
+                        enabled: false,
+                    },
+                    expected: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    // Seed a higher-revision pre-existing destination preference row before promotion.
+    let dst_entry_idx = {
+        let mut entries = fixture.catalog.ability_entries.lock().unwrap();
+        entries.push(AbilityDescriptor {
+            attached_skills: vec![],
+            promoted_from: None,
+            requires_explicit_binding: false,
+            reference: dst_ref.clone(),
+            kind: AbilityKind::Role,
+            name: "merge-guide".into(),
+            enabled: true,
+            healthy: true,
+            lifecycle: Lifecycle::Active,
+            entrypoint: Some(note_ref.clone()),
+            auxiliary_files: vec![],
+        });
+        entries.len() - 1
+    };
+    let dst_pref_commit = service
+        .set_ability_preference(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: identity(&service, &owner_ctx, 51).await,
+                input: AbilityPreferenceUpdate {
+                    ability: dst_ref.clone(),
+                    enabled: true,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let stale_dst_rev = dst_pref_commit.revision;
+    // Publish promotion metadata and register source revision before destination tip.
+    {
+        let mut entries = fixture.catalog.ability_entries.lock().unwrap();
+        entries[dst_entry_idx].promoted_from = Some(src_ref.clone());
+        entries.insert(
+            dst_entry_idx,
+            AbilityDescriptor {
+                attached_skills: vec![],
+                promoted_from: None,
+                requires_explicit_binding: false,
+                reference: AbilityRef {
+                    id: promo_id.clone(),
+                    placement: dst_ref.placement.clone(),
+                    revision: src_ref.revision.clone(),
+                },
+                kind: AbilityKind::Role,
+                name: "merge-guide".into(),
+                enabled: true,
+                healthy: true,
+                lifecycle: Lifecycle::Active,
+                entrypoint: Some(note_ref),
+                auxiliary_files: vec![],
+            },
+        );
+    }
+    let promoted = service
+        .adopt_authored_ability_promotion(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: command(
+                    owner_ctx.auth().principal(),
+                    owner_ctx.auth().principal(),
+                    52,
+                    ControlRevision::ZERO,
+                ),
+                input: AdoptAbilityPromotion {
+                    source: src_ref.clone(),
+                    destination: dst_ref.clone(),
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .value;
+    assert!(!promoted.destination.preference_enabled);
+    assert!(
+        promoted.destination.preference_revision.unwrap() > stale_dst_rev,
+        "merged destination preference revision must strictly advance past {stale_dst_rev:?}: {:?}",
+        promoted.destination.preference_revision
+    );
+    let conflict = service
+        .compare_authored_ability_preference(
+            owner_ctx.clone(),
+            AccountMutation {
+                identity: command(
+                    owner_ctx.auth().principal(),
+                    owner_ctx.auth().principal(),
+                    53,
+                    ControlRevision::ZERO,
+                ),
+                input: AbilityPreferenceChange {
+                    preference: AbilityPreferenceUpdate {
+                        ability: dst_ref,
+                        enabled: true,
+                    },
+                    expected: Some(stale_dst_rev),
+                },
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            conflict,
+            Err(PortError::Domain(DomainError::ControlRevisionConflict { current }))
+                if current > stale_dst_rev
+        ),
+        "{conflict:?}"
+    );
+
+    // IMPL-026: exact replay of `compare_authored_ability_binding` succeeds even
+    // after a selected project is removed from the catalog (pre-tx error deferred past replay).
+    let bind_req = AccountMutation {
+        identity: command(
+            owner_ctx.auth().principal(),
+            owner_ctx.auth().principal(),
+            54,
+            ControlRevision::ZERO,
+        ),
+        input: AbilityBindingChange {
+            ability: shared_ability.clone(),
+            enabled: true,
+            projects: AbilityProjects::Selected(vec![project.clone()]),
+            expected: None,
+        },
+    };
+    let bind_committed = service
+        .compare_authored_ability_binding(owner_ctx.clone(), bind_req.clone())
+        .await
+        .unwrap();
+    assert_eq!(bind_committed.value, shared_ability);
+    fixture
+        .catalog
+        .project_entries
+        .lock()
+        .unwrap()
+        .remove(&(project.space_id.clone(), project.folder_id.clone()));
+    let bind_replayed = service
+        .compare_authored_ability_binding(owner_ctx.clone(), bind_req)
+        .await
+        .unwrap();
+    assert_eq!(bind_replayed.revision, bind_committed.revision);
+    assert_eq!(bind_replayed.value, shared_ability);
+
+    drop(service);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_concurrent_authored_preferences_and_promotion_merge_cas() {
+    Box::pin(concurrent_authored_preferences_and_promotion_merge_cas(
+        false,
+    ))
+    .await;
+}
+#[tokio::test]
+async fn postgres_concurrent_authored_preferences_and_promotion_merge_cas() {
+    Box::pin(concurrent_authored_preferences_and_promotion_merge_cas(
+        true,
+    ))
+    .await;
+}

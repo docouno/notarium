@@ -109,6 +109,7 @@ pub struct ProjectionFixtures {
     seed: Mutex<Option<ProjectionFixture>>,
     directory: Mutex<BTreeMap<EffectiveReadId, NoteQuery>>,
     before_ability_trash: Mutex<Option<MutationPause>>,
+    before_note_move: Mutex<Option<MutationPause>>,
     after_ability_publication: Mutex<Option<MutationPause>>,
     before_memory_append: Mutex<Option<MutationPause>>,
     lose_note_edit_ack: Mutex<bool>,
@@ -116,10 +117,13 @@ pub struct ProjectionFixtures {
     chat_consume: Mutex<ChatConsumeFixture>,
     before_chat_submit: Mutex<Option<MutationPause>>,
     before_chat_lookup: Mutex<Option<MutationPause>>,
+    before_chat_redact: Mutex<Option<MutationPause>>,
     before_chat_rollback: Mutex<Option<MutationPause>>,
     before_chat_claim: Mutex<Option<MutationPause>>,
     after_chat_claim: Mutex<Option<MutationPause>>,
+    after_chat_finish_cleared: Mutex<Option<MutationPause>>,
     active_sql_effect: Mutex<Option<MutationPause>>,
+    submit_unknown_then_not_committed: Mutex<u8>,
     lose_claim_acks: Mutex<usize>,
     lose_finish_acks: Mutex<usize>,
 }
@@ -174,8 +178,26 @@ impl ProjectionFixtures {
         MutationPause::install(&self.before_chat_lookup)
     }
 
+    pub fn pause_chat_redaction(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.before_chat_redact)
+    }
+
     pub fn pause_chat_rollback(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
         MutationPause::install(&self.before_chat_rollback)
+    }
+
+    pub fn fail_chat_submit_unknown_then_not_committed(&self) {
+        *self.submit_unknown_then_not_committed.lock().unwrap() = 2;
+    }
+
+    pub fn pause_after_chat_finish_cleared(
+        &self,
+    ) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.after_chat_finish_cleared)
+    }
+
+    pub fn pause_note_move(&self) -> (oneshot::Receiver<Cancellation>, oneshot::Sender<()>) {
+        MutationPause::install(&self.before_note_move)
     }
 
     pub fn pause_ability_publication(
@@ -270,7 +292,6 @@ canonical_port!(NoteWritePort;
     create_note(Mutation<CreateNote>) -> Committed<NoteRevision>,
     delete_note(Mutation<DeleteNote>) -> Committed<NoteRevision>,
     mint_and_purge(Mutation<MintAndPurge>) -> Committed<MintAndPurgeResult>,
-    move_note(Mutation<MoveNote>) -> Committed<NoteRevision>,
     rename_note(Mutation<RenameNote>) -> Committed<NoteRevision>,
     move_folder(Mutation<MoveFolder>) -> Committed<FolderRef>,
     rename_folder(Mutation<RenameFolder>) -> Committed<FolderRef>,
@@ -280,6 +301,17 @@ canonical_port!(NoteWritePort;
     link_many(LinkBatch) -> BatchResult<Link>,
     rollback_agent_run(Mutation<RollbackAgentRun>) -> Committed<RollbackResult>,
     accept_external_observation(Mutation<ExternalObservation>) -> ExternalObservationResult;
+
+    fn move_note(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<MoveNote>,
+    ) -> PortFuture<'_, Committed<NoteRevision>> {
+        Box::pin(async move {
+            MutationPause::enter(&self.1.before_note_move, ctx.budget.cancellation.clone()).await;
+            NoteWritePort::move_note(&self.0, ctx, request).await
+        })
+    }
 
     fn rollback_agent_run_by_id(
         &self,
@@ -349,8 +381,17 @@ canonical_port!(ChatPort;
     queue_chat_input(Mutation<PendingChatInput>) -> QueueInputOutcome,
     list_pending_chat_inputs(ChatThreadId) -> Vec<QueuedChatInput>,
     dismiss_chat_input(DismissPending) -> bool,
-    recover_active_run(ChatRunRequest) -> FinishChatRunOutcome,
-    redact_chat_entry(Mutation<RedactChatEntry>) -> Committed<RedactedChat>;
+    recover_active_run(ChatRunRequest) -> FinishChatRunOutcome;
+    fn redact_chat_entry(
+        &self,
+        ctx: SpaceContext,
+        request: Mutation<RedactChatEntry>,
+    ) -> PortFuture<'_, Committed<RedactedChat>> {
+        Box::pin(async move {
+            MutationPause::enter(&self.1.before_chat_redact, ctx.budget.cancellation.clone()).await;
+            ChatPort::redact_chat_entry(&self.0, ctx, request).await
+        })
+    }
     fn lookup_user_chat_input(
         &self,
         ctx: SpaceContext,
@@ -365,7 +406,30 @@ canonical_port!(ChatPort;
     fn submit_user_chat_input(&self, ctx: SpaceContext, request: SubmitUserChatInput) -> PortFuture<'_, SubmitUserChatOutcome> {
         Box::pin(async move {
             MutationPause::enter(&self.1.before_chat_submit, ctx.budget.cancellation.clone()).await;
-            ChatPort::submit_user_chat_input(&self.0, ctx, request).await
+            let fault_stage = {
+                let mut stage = self.1.submit_unknown_then_not_committed.lock().unwrap();
+                let current = *stage;
+                if current > 0 {
+                    *stage = current - 1;
+                }
+                current
+            };
+            if fault_stage == 1 {
+                return Err(PortError::Unavailable(
+                    OperationalFailure::new(
+                        ContentDigest::from_bytes([0xae; 32]),
+                        CommitEffect::NotCommitted,
+                        RetryAdvice::RetrySameCommand,
+                        true,
+                    )
+                    .unwrap(),
+                ));
+            }
+            let outcome = ChatPort::submit_user_chat_input(&self.0, ctx, request).await?;
+            if fault_stage == 2 && matches!(outcome, SubmitUserChatOutcome::Queued(_)) {
+                return Err(lost_chat_ack());
+            }
+            Ok(outcome)
         })
     }
     fn consume_chat_input(&self, ctx: SpaceContext, request: Mutation<ConsumePending>) -> PortFuture<'_, Committed<ConsumedPending>> {
@@ -397,9 +461,13 @@ canonical_port!(ChatPort;
     }
     fn finish_run_if_queue_empty(&self, ctx: SpaceContext, request: ChatRunRequest) -> PortFuture<'_, FinishChatRunOutcome> {
         Box::pin(async move {
+            let cancellation = ctx.budget.cancellation.clone();
             let finished = ChatPort::finish_run_if_queue_empty(&self.0, ctx, request).await?;
-            if finished == FinishChatRunOutcome::Cleared && lose_ack(&self.1.lose_finish_acks) {
-                return Err(lost_chat_ack());
+            if finished == FinishChatRunOutcome::Cleared {
+                MutationPause::enter(&self.1.after_chat_finish_cleared, cancellation).await;
+                if lose_ack(&self.1.lose_finish_acks) {
+                    return Err(lost_chat_ack());
+                }
             }
             Ok(finished)
         })

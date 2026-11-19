@@ -76,14 +76,16 @@ impl CommandIdentitySpec {
     }
 
     pub(crate) fn requires_standard_writer(&self) -> bool {
-        self.has_confirmed_chat_step() || self.canonical_effect().is_some()
+        self.has_confirmed_chat_step()
     }
 
-    fn canonical_effect(&self) -> Option<&CanonicalEffectAdmission> {
+    pub(crate) fn canonical_effect(&self) -> Option<&CanonicalEffectAdmission> {
         self.authority.as_deref()?.canonical_effect.as_ref()
     }
 
-    async fn begin_canonical_effect(&self) -> Result<Option<Box<dyn RevocationLease>>, PortError> {
+    pub(crate) async fn begin_canonical_effect(
+        &self,
+    ) -> Result<Option<Box<dyn RevocationLease>>, PortError> {
         if let Some(effect) = self.canonical_effect() {
             return effect.begin().await.map(Some);
         }
@@ -1345,8 +1347,14 @@ async fn flush_single_batch(
 
     let exec_result = match &inner.sql {
         SqlDriverState::Sqlite { writer, .. } => {
+            let has_canonical_effect = items.iter().any(|(it, _, _)| {
+                it.idempotency
+                    .as_ref()
+                    .is_some_and(|id| id.canonical_effect().is_some())
+            });
             let can_fast = group_spaces.is_empty()
                 && items.iter().all(|(_, fp, _)| fp.is_some())
+                && (!has_canonical_effect || items.len() == 1)
                 && faults.pre_commit_space_delays.lock().await.is_empty();
             let mut guard = writer.lock().await;
             match guard.as_mut() {
@@ -1446,7 +1454,13 @@ async fn flush_single_batch(
                         )
                         .await
                     };
-                    if matches!(out, BatchExecOutcome::Committed { .. }) {
+                    if matches!(
+                        out,
+                        BatchExecOutcome::Committed {
+                            conn_clean: true,
+                            ..
+                        }
+                    ) {
                         lease.complete();
                         *cached_pg_conn = Some(pooled);
                     }
@@ -1467,6 +1481,7 @@ async fn flush_single_batch(
         BatchExecOutcome::Committed {
             slots,
             space_effective_cuts,
+            ..
         } => {
             let mut slot_iter = slots.into_iter();
             for target in reply_targets {
@@ -1596,6 +1611,7 @@ pub(crate) enum BatchExecOutcome {
     Committed {
         slots: Vec<ItemOutcomeSlot>,
         space_effective_cuts: BTreeMap<SpaceId, SpaceSeq>,
+        conn_clean: bool,
     },
     UnknownCommit {
         slots: Vec<ItemOutcomeSlot>,
@@ -1771,7 +1787,8 @@ async fn execute_batch_on_conn(
             }
             Err(item_err) => {
                 if !use_savepoints {
-                    transaction.rollback().await;
+                    let conn_clean = transaction.rollback().await;
+                    drop(active_effects);
                     let mut space_effective_cuts = BTreeMap::new();
                     for (sid, entry) in &space_states {
                         if let SpaceBatchEntry::Loaded { effective_cut, .. } = entry {
@@ -1781,6 +1798,7 @@ async fn execute_batch_on_conn(
                     return BatchExecOutcome::Committed {
                         slots: vec![ItemOutcomeSlot::Failed(item_err)],
                         space_effective_cuts,
+                        conn_clean,
                     };
                 }
                 // Rollback ONLY this item's savepoint; virtual `effective_cut` stays unchanged!
@@ -1862,7 +1880,7 @@ async fn execute_batch_on_conn(
         .filter_map(|(slot_idx, effect)| effect.check().err().map(|err| (*slot_idx, err)))
         .collect();
     if !revoked_effects.is_empty() {
-        transaction.rollback().await;
+        let conn_clean = transaction.rollback().await;
         drop(active_effects);
         drop(batch_retained_tickets);
         drop(batch_retained_guards);
@@ -1896,6 +1914,7 @@ async fn execute_batch_on_conn(
         return BatchExecOutcome::Committed {
             slots,
             space_effective_cuts,
+            conn_clean,
         };
     }
     // Keep active effects through durable settlement, including a lost waiter.
@@ -1953,6 +1972,7 @@ async fn execute_batch_on_conn(
             BatchExecOutcome::Committed {
                 slots,
                 space_effective_cuts,
+                conn_clean: true,
             }
         }
         Err(commit_err) => {

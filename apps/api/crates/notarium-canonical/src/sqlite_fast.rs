@@ -1640,6 +1640,23 @@ pub(crate) async fn execute_sqlite_fast_batch(
         ));
     }
 
+    let active_effect: Option<Box<dyn notarium_core::ports::RevocationLease>> =
+        if fast_items.len() == 1 {
+            if let Some(idemp) = &fast_items[0].0.idempotency {
+                match idemp.begin_canonical_effect().await {
+                    Ok(lease) => lease,
+                    Err(err) => {
+                        pair.rusqlite_conn = Some(rconn);
+                        return BatchExecOutcome::AbortedBeforeCommit(err);
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
     let has_external_stagings = !extracted_stagings.is_empty();
     let wal_stage1 = wal_opt.clone();
     let current_writer_gen = store.inner.sqlite_writer_commit_gen.load(Ordering::Acquire);
@@ -1656,6 +1673,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
             has_external_stagings,
             current_writer_gen,
             &mut approval_tx_opt,
+            active_effect.as_deref(),
         );
         if let Some(tx) = approval_tx_opt.take() {
             match &stage {
@@ -1674,7 +1692,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
                 }
             }
         }
-        (rconn, stage)
+        (rconn, active_effect, stage)
     });
 
     let local_cas_fut = async {
@@ -1736,8 +1754,8 @@ pub(crate) async fn execute_sqlite_fast_batch(
             }
         };
 
-    let (mut rconn, stage1_res) = match stage1_join {
-        Ok(pair_out) => pair_out,
+    let (mut rconn, active_effect, stage1_res) = match stage1_join {
+        Ok(triple) => triple,
         Err(join_err) => {
             store
                 .cleanup_unretained_local_files_async(cleanup_all_published(local_cas_res))
@@ -1855,6 +1873,32 @@ pub(crate) async fn execute_sqlite_fast_batch(
                     BatchExecOutcome::AbortedBeforeCommit(io_err)
                 }
                 Ok(()) => {
+                    if let Some(effect) = &active_effect
+                        && let Err(revoked_err) = effect.check()
+                    {
+                        store
+                            .cleanup_unretained_local_files_async(published_for_abort_cleanup)
+                            .await;
+                        let rollback_join = tokio::task::spawn_blocking(move || {
+                            let _ = rconn.execute_batch("ROLLBACK");
+                            rconn
+                        })
+                        .await;
+                        if let Ok(rc) = rollback_join {
+                            restore_writer_rconn(pair, rc);
+                        } else if let Ok(reopened) = open_rusqlite_writer_connection(&pair.db_path)
+                        {
+                            pair.rusqlite_conn = Some(reopened);
+                        }
+                        store
+                            .inner
+                            .sqlite_writer_commit_gen
+                            .fetch_add(1, Ordering::Release);
+                        drop(active_effect);
+                        drop(pending.batch_retained_tickets);
+                        drop(pending.batch_retained_guards);
+                        return BatchExecOutcome::AbortedBeforeCommit(revoked_err);
+                    }
                     let wal_stage2 = wal_opt.clone();
                     let commit_join = tokio::task::spawn_blocking(move || {
                         let _ = crate::wal::take_last_wal_commit_frames();
@@ -1882,6 +1926,7 @@ pub(crate) async fn execute_sqlite_fast_batch(
                             (Err(format!("commit join error: {join_err}")), None)
                         }
                     };
+                    drop(active_effect);
 
                     store
                         .inner
@@ -1975,9 +2020,11 @@ fn finalize_committed_batch(
     BatchExecOutcome::Committed {
         slots,
         space_effective_cuts,
+        conn_clean: true,
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sqlite_fast_sql_stage(
     conn: &rusqlite::Connection,
     items: Vec<(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)>,
@@ -1986,6 +2033,7 @@ fn run_sqlite_fast_sql_stage(
     has_external_stagings: bool,
     current_writer_gen: u64,
     approval_tx_opt: &mut Option<tokio::sync::oneshot::Sender<EarlyWaveApproval>>,
+    active_effect: Option<&dyn notarium_core::ports::RevocationLease>,
 ) -> FastSqlStageResult {
     if items.len() > 1 && items.iter().any(|(_, p)| p.requires_savepoint_isolation()) {
         return run_savepoint_fallback_sql_stage(
@@ -1995,6 +2043,7 @@ fn run_sqlite_fast_sql_stage(
             wal,
             has_external_stagings,
             current_writer_gen,
+            active_effect,
         );
     }
     match try_run_optimistic_fast_sql_stage(
@@ -2005,6 +2054,7 @@ fn run_sqlite_fast_sql_stage(
         has_external_stagings,
         current_writer_gen,
         approval_tx_opt,
+        active_effect,
     ) {
         Ok(res) => res,
         Err(()) => {
@@ -2017,6 +2067,7 @@ fn run_sqlite_fast_sql_stage(
                 wal,
                 has_external_stagings,
                 current_writer_gen,
+                active_effect,
             )
         }
     }
@@ -2035,6 +2086,7 @@ fn has_any_pending_blob_retirement_rusqlite(
     Ok(found.is_some())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_run_optimistic_fast_sql_stage(
     conn: &rusqlite::Connection,
     items: &[(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)],
@@ -2043,6 +2095,7 @@ fn try_run_optimistic_fast_sql_stage(
     has_external_stagings: bool,
     current_writer_gen: u64,
     approval_tx_opt: &mut Option<tokio::sync::oneshot::Sender<EarlyWaveApproval>>,
+    active_effect: Option<&dyn notarium_core::ports::RevocationLease>,
 ) -> Result<FastSqlStageResult, ()> {
     if let Err(err) = conn.execute_batch("BEGIN IMMEDIATE") {
         if let Some(w) = wal {
@@ -2193,9 +2246,11 @@ fn try_run_optimistic_fast_sql_stage(
         slots,
         wal,
         has_external_stagings,
+        active_effect,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_savepoint_fallback_sql_stage(
     conn: &rusqlite::Connection,
     items: &[(FastIntentMeta, Box<dyn SqliteSyncItemPlan>)],
@@ -2203,6 +2258,7 @@ fn run_savepoint_fallback_sql_stage(
     wal: Option<&SqliteWalCoordinator>,
     has_external_stagings: bool,
     current_writer_gen: u64,
+    active_effect: Option<&dyn notarium_core::ports::RevocationLease>,
 ) -> FastSqlStageResult {
     if let Err(err) = conn.execute_batch("BEGIN IMMEDIATE") {
         if let Some(w) = wal {
@@ -2369,6 +2425,7 @@ fn run_savepoint_fallback_sql_stage(
         slots,
         wal,
         has_external_stagings,
+        active_effect,
     )
 }
 
@@ -2382,6 +2439,7 @@ fn finish_fast_sql_stage(
     slots: Vec<ItemOutcomeSlot>,
     wal: Option<&SqliteWalCoordinator>,
     has_external_stagings: bool,
+    active_effect: Option<&dyn notarium_core::ports::RevocationLease>,
 ) -> FastSqlStageResult {
     for entry in space_states.values() {
         if let SpaceBatchEntry::Loaded {
@@ -2414,6 +2472,14 @@ fn finish_fast_sql_stage(
     let has_dir_syncs = !batch_dir_syncs.is_empty();
 
     if !has_external_stagings && !has_deferred_publish && !has_dir_syncs {
+        if let Some(effect) = active_effect
+            && let Err(revoked_err) = effect.check()
+        {
+            let _ = conn.execute_batch("ROLLBACK");
+            drop(batch_retained_tickets);
+            drop(batch_retained_guards);
+            return FastSqlStageResult::AbortedBeforeCommit(revoked_err);
+        }
         let _ = crate::wal::take_last_wal_commit_frames();
         match conn.execute_batch("COMMIT") {
             Ok(()) => {
